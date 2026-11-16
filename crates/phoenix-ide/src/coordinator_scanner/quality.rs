@@ -98,6 +98,61 @@ struct PreparedCase {
     message_aliases: BTreeMap<String, String>,
 }
 
+struct PairedSeeds {
+    root: PathBuf,
+    manifest: Value,
+    manifest_sha256: String,
+}
+
+impl PairedSeeds {
+    fn load(root: PathBuf, approved_sha256: &str, corpus: &[u8], oracles: &[u8]) -> Self {
+        assert!(root.is_absolute());
+        let bytes = std::fs::read(root.join("manifest.json")).unwrap();
+        assert_eq!(
+            digest(&bytes),
+            approved_sha256,
+            "exact original seeds required"
+        );
+        let manifest: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(manifest["mode"], "prepared");
+        assert_eq!(manifest["provider_calls"], 0);
+        assert_eq!(manifest["protocol"]["corpus_sha256"], digest(corpus));
+        assert_eq!(manifest["protocol"]["oracles_sha256"], digest(oracles));
+        assert_eq!(manifest["cases"].as_array().unwrap().len(), CALL_LIMIT);
+        Self {
+            root,
+            manifest,
+            manifest_sha256: approved_sha256.into(),
+        }
+    }
+
+    async fn copy_case(&self, case: &Case, destination: &Path) -> (Database, PreparedCase) {
+        let entry = self.manifest["cases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["id"] == case.id)
+            .expect("approved case missing");
+        let source = self.root.join(&case.id);
+        let record = std::fs::read(source.join("prepared.json")).unwrap();
+        assert_eq!(entry["prepared_record_sha256"], digest(&record));
+        let prepared: PreparedCase = serde_json::from_slice(&record).unwrap();
+        assert_eq!(prepared.id, case.id);
+        assert_eq!(entry["binding_id"], prepared.binding_id);
+        assert_eq!(entry["input_sha256"], prepared.input_sha256);
+        let database = std::fs::read(source.join("source.db")).unwrap();
+        assert_eq!(entry["database_sha256"], digest(&database));
+        std::fs::write(destination, database).unwrap();
+        let db = open(destination).await;
+        let attempts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM coordinator_scan_attempts")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(attempts, 0, "paired seeds must never contain live attempts");
+        (db, prepared)
+    }
+}
+
 fn hex(bytes: impl AsRef<[u8]>) -> String {
     use std::fmt::Write as _;
     bytes.as_ref().iter().fold(String::new(), |mut text, byte| {
@@ -640,9 +695,11 @@ fn validate_prepared(
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn scanner_quality_all_real_host_fixtures() {
-    let corpus: Corpus =
-        serde_json::from_slice(&std::fs::read(root().join(CORPUS)).unwrap()).unwrap();
+    let corpus_bytes = std::fs::read(root().join(CORPUS)).unwrap();
+    let oracle_bytes = std::fs::read(root().join(ORACLES)).unwrap();
+    let corpus: Corpus = serde_json::from_slice(&corpus_bytes).unwrap();
     let registry = ModelRegistry::new(&LlmConfig {
         openai_api_key: Some("offline-never-dispatched".into()),
         ..LlmConfig::default()
@@ -651,19 +708,71 @@ async fn scanner_quality_all_real_host_fixtures() {
     let profile = super::profile(service.as_ref(), ScanConnection::OpenAiResponses);
     let root = tempfile::tempdir().unwrap();
     let mut aggregate = 0;
+    let mut entries = Vec::new();
     for case in &corpus.cases {
-        let db = open(&root.path().join(format!("{}.db", case.id))).await;
+        let dir = root.path().join(&case.id);
+        std::fs::create_dir(&dir).unwrap();
+        let db = open(&dir.join("source.db")).await;
         let (source, aliases, event_aliases, message_aliases) = fixture(&db, case).await;
-        let batch = prepare(&db, &profile, time(&case.input.scan_context.captured_at)).await;
+        let now_us = time(&case.input.scan_context.captured_at);
+        let batch = prepare(&db, &profile, now_us).await;
         validate_prepared(case, &batch, &aliases, &event_aliases, &message_aliases);
-        aggregate += model::BoundedRequest::new(prompt::INSTRUCTIONS, batch.input())
+        let content_bytes = model::BoundedRequest::new(prompt::INSTRUCTIONS, batch.input())
             .unwrap()
             .content_bytes();
+        aggregate += content_bytes;
         assert!(aggregate <= CONTENT_LIMIT);
         assert_eq!(snapshot(&db, &source).await["foreground_observations"], 0);
+        let prepared = PreparedCase {
+            id: case.id.clone(),
+            source,
+            now_us,
+            binding_id: batch.binding_id().into(),
+            input_sha256: digest(serde_json::to_vec(batch.input()).unwrap()),
+            content_bytes,
+            aliases,
+            event_aliases,
+            message_aliases,
+        };
+        write(&dir.join("prepared.json"), &prepared);
         db.pool().close().await;
+        entries.push(json!({"id":case.id,"input_sha256":prepared.input_sha256,
+            "binding_id":prepared.binding_id,
+            "database_sha256":digest(std::fs::read(dir.join("source.db")).unwrap()),
+            "prepared_record_sha256":digest(std::fs::read(dir.join("prepared.json")).unwrap())}));
     }
     assert_eq!(corpus.cases.len(), CALL_LIMIT);
+    let manifest = json!({"mode":"prepared","provider_calls":0,"protocol":{
+        "corpus_sha256":digest(&corpus_bytes),"oracles_sha256":digest(&oracle_bytes)},"cases":entries});
+    write(&root.path().join("manifest.json"), &manifest);
+    let approved = digest(std::fs::read(root.path().join("manifest.json")).unwrap());
+    let seeds = PairedSeeds::load(root.path().into(), &approved, &corpus_bytes, &oracle_bytes);
+    let paired = tempfile::tempdir().unwrap();
+    let case = &corpus.cases[0];
+    let frozen_hash = digest(std::fs::read(root.path().join(&case.id).join("source.db")).unwrap());
+    let (db, original) = seeds
+        .copy_case(case, &paired.path().join("source.db"))
+        .await;
+    let mut revised_profile = profile;
+    revised_profile.prompt_hash = Sha256::digest("revised scanner instructions").into();
+    let batch = prepare(&db, &revised_profile, original.now_us).await;
+    validate_prepared(
+        case,
+        &batch,
+        &original.aliases,
+        &original.event_aliases,
+        &original.message_aliases,
+    );
+    assert_eq!(
+        digest(serde_json::to_vec(batch.input()).unwrap()),
+        original.input_sha256
+    );
+    assert_ne!(batch.binding_id(), original.binding_id);
+    assert_eq!(
+        frozen_hash,
+        digest(std::fs::read(root.path().join(&case.id).join("source.db")).unwrap())
+    );
+    db.pool().close().await;
 }
 
 struct RecordingService {
@@ -748,16 +857,47 @@ async fn coordinator_scanner_quality() {
     let mut total_bytes = 0;
     let mut cases = Vec::new();
     if mode == "prepare" {
+        let seeds = std::env::var("PHOENIX_SCANNER_QUALITY_SEED_PREPARED")
+            .ok()
+            .map(|path| {
+                let approved = std::env::var("PHOENIX_SCANNER_QUALITY_SEED_SHA256")
+                    .expect("explicit approved original seed manifest SHA256 required");
+                PairedSeeds::load(path.into(), &approved, &corpus_bytes, &oracle_bytes)
+            });
         for case in &corpus.cases {
             let dir = output.join(&case.id);
             std::fs::create_dir(&dir).unwrap();
-            let db = open(&dir.join("source.db")).await;
-            let (source, aliases, event_aliases, message_aliases) = fixture(&db, case).await;
-            let now_us = time(&case.input.scan_context.captured_at);
+            let (db, original) = if let Some(seeds) = &seeds {
+                let (db, original) = seeds.copy_case(case, &dir.join("source.db")).await;
+                (db, Some(original))
+            } else {
+                (open(&dir.join("source.db")).await, None)
+            };
+            let (source, aliases, event_aliases, message_aliases) = if let Some(old) = &original {
+                (
+                    old.source.clone(),
+                    old.aliases.clone(),
+                    old.event_aliases.clone(),
+                    old.message_aliases.clone(),
+                )
+            } else {
+                fixture(&db, case).await
+            };
+            let now_us = original.as_ref().map_or_else(
+                || time(&case.input.scan_context.captured_at),
+                |old| old.now_us,
+            );
             let batch = prepare(&db, &profile, now_us).await;
             validate_prepared(case, &batch, &aliases, &event_aliases, &message_aliases);
             let request = model::BoundedRequest::new(prompt::INSTRUCTIONS, batch.input()).unwrap();
             let input_bytes = serde_json::to_vec(batch.input()).unwrap();
+            if let Some(original) = &original {
+                assert_eq!(
+                    digest(&input_bytes),
+                    original.input_sha256,
+                    "paired source/candidate projection changed"
+                );
+            }
             total_bytes += request.content_bytes();
             assert!(total_bytes <= CONTENT_LIMIT);
             let prepared = PreparedCase {
@@ -785,6 +925,7 @@ async fn coordinator_scanner_quality() {
         write(
             &output.join("manifest.json"),
             &json!({"mode":"prepared","provider_calls":0,"protocol":static_manifest,
+            "seed_manifest_sha256":seeds.as_ref().map(|seed|&seed.manifest_sha256),
             "total_logical_content_bytes":total_bytes,"cases":cases}),
         );
     } else {

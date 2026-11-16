@@ -21,6 +21,28 @@ PHOENIX_SCANNER_QUALITY_OUTPUT=/absolute/new-prepared-directory \
 ./dev.py qa coordinator-scanner-quality
 ```
 
+For a paired prompt revision, preserve the original prepared databases and use
+them as seeds for a fresh preparation directory:
+
+```sh
+PHOENIX_SCANNER_QUALITY_TEST_BINARY=/absolute/new-retained-test-binary \
+PHOENIX_SCANNER_QUALITY_MODE=prepare \
+PHOENIX_SCANNER_QUALITY_SEED_PREPARED=/absolute/original-prepared-directory \
+PHOENIX_SCANNER_QUALITY_SEED_SHA256=exact_approved_original_manifest_hash \
+PHOENIX_SCANNER_QUALITY_OUTPUT=/absolute/new-paired-prepared-directory \
+./dev.py qa coordinator-scanner-quality
+```
+
+This verifies the original manifest, corpus, oracles, prepared records and source
+database hashes, then copies the closed databases into the new directory. Seeds
+must contain zero scanner attempts. The normal preparation API runs with the
+revised prompt profile and must produce byte-identical `ScanInput`, preserving
+source/candidate identities, aliases and clocks. Only the prompt, batch binding,
+composed byte count and recorded provenance change. The new manifest records the
+original seed manifest hash. Prior live results remain separate; no stored IDs,
+attempts or frontiers are rewritten. Independent approval of the new complete
+manifest is still required before another live invocation.
+
 Preparation creates one real migrated file database per case. Source rows retain
 the supplied role/origin class and prose. Every scanner-source message receives an
 opaque UUID at initial admission. Logical corpus message names and their answer
