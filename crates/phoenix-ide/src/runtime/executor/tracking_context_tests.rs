@@ -535,6 +535,19 @@ mod live {
             .unwrap()
             .authority
             .expect("new isolated input owns its workflow attempt");
+        assert_eq!(
+            repo.preflight_direct_turn_materialization(
+                &phoenix_db::workflow::PreflightDirectTurnMaterializationInput {
+                    turn_id,
+                    authority: authority.clone(),
+                    prepared: payload.clone(),
+                    now: Timestamp(now),
+                }
+            )
+            .await
+            .unwrap(),
+            phoenix_db::workflow::DirectTurnMaterializationEligibility::Fresh
+        );
         Event::AuthoritativeUserMessage {
             payload,
             authority: DirectTurnAttemptAuthority::new(
@@ -560,6 +573,16 @@ mod live {
             context.is_coordinator = true;
             let conversation = self.db.get_conversation(source).await.unwrap();
             context.effort = conversation.effort;
+            assert_eq!(
+                conversation.model.as_deref(),
+                Some(self.model.as_str()),
+                "persisted and runtime model identities agree"
+            );
+            assert_eq!(
+                self.client.model_id(),
+                self.model,
+                "injected provider matches runtime model"
+            );
             let state = conversation.state;
             assert!(matches!(state, ConvState::Idle));
             let registry = self
@@ -575,6 +598,7 @@ mod live {
                 denied: self.denied.clone(),
             };
             let (tx, rx) = mpsc::channel(16);
+            let (acknowledged_tx, acknowledged_rx) = mpsc::channel(1);
             let (states, mut state_rx) = watch::channel(state.clone());
             let sequence = sqlx::query_scalar::<_, i64>(
                 "SELECT COALESCE(MAX(sequence_id),0) FROM messages WHERE conversation_id=?1",
@@ -599,14 +623,25 @@ mod live {
                 SseBroadcaster::new(128, sequence),
             )
             .with_parent_tool_cycle_cap(8)
+            .with_acknowledged_event_receiver(acknowledged_rx)
             .with_state_watcher(states)
             .with_fatal_local_authority_fence(self.manager.fatal_local_authority_fence.clone());
             let task = tokio::spawn(runtime.run());
             let input_id = uuid::Uuid::new_v4().to_string();
-            tx.send(admitted_input(&self.db, source, prompt, &input_id).await)
+            let (acknowledgement, acknowledged) = tokio::sync::oneshot::channel();
+            let (retired, retirement) = tokio::sync::oneshot::channel();
+            acknowledged_tx
+                .send(crate::runtime::AcknowledgedEventRequest {
+                    event: admitted_input(&self.db, source, prompt, &input_id).await,
+                    acknowledgement,
+                    retirement,
+                })
                 .await
                 .unwrap();
             let result = tokio::time::timeout(std::time::Duration::from_secs(120), async {
+                assert_eq!(acknowledged.await.expect("runtime owns admission response").expect("authoritative input dispatch succeeds"), crate::runtime::AcknowledgedEventOutcome::Settled);
+                drop(retired);
+                assert!(self.db.message_exists(&input_id).await.unwrap(), "settled authoritative input must be materialized before waiting for model text");
                 loop {
                     let state = state_rx.borrow().clone();
                     assert!(
