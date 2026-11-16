@@ -20,8 +20,8 @@ The dispatcher spec distinguishes early unavailable results, Layer 0 denial
 before call-resource admission, cleared side-effecting preparation, launch-time admission,
 generation/state/identity completion guards, sender-loss settlement, cooperative
 cancellation, and forced task retirement. Launch/ownership barriers exist, while
-pre-denial resource ordering, preparation responsiveness and several cancellation
-classification/notice paths below remain normative targets with verified gaps.
+pre-denial resource ordering and preparation responsiveness below remain
+normative targets with verified gaps.
 No dispatcher extraction or concurrent tool scheduling is implemented by this
 specification work. Permission counters/escalation remain outside this boundary.
 
@@ -39,42 +39,28 @@ keeps a buffered child pending until it atomically records the completed outcome
 The final-spawn transition snapshots the union of prior admitted children and the
 new batch before changing state, matching the runtime's `all_pending` construction.
 
-The spawn bridge also preserves the native batch identity and separates admission
-from activation. `RuntimeManager::handle_spawn_request` waits on `activation_rx`;
-`persist_state_effect` verifies exact child membership and signals only after
-parent-state persistence. Dropped response/activation receivers invoke native
-unactivated-batch cleanup. That manager helper returns unit and only logs database
-errors; it does not provide a classified reconciliation receipt or fatal forwarding
-for unknown cleanup-write authority. The required cancellation-time handoff must
-retain ownership, classify cleanup, and reconcile every admitted child into parent
-pending membership with terminal cancellation evidence before acknowledging the
-tool abort. The parent must then accept every outcome before ordinary settlement.
-Those response/classification/fan-in seams, including once/join ownership when
-both cancellation and the admission response signal reconciliation, are not
-implemented by this spec change.
+The native spawn handoff retains exact parent, assistant, tool and batch identity.
+After submission, admission responses are selectable alongside cancellation.
+One manager operation owns admission, activation and any unactivated closure;
+cancellation and a lost or late response join that operation. Activation remains
+withheld until `persist_state_effect` commits every exact child in parent pending.
+Live closure preserves authentic terminal outcomes and returns classified private
+evidence without marking children accepted. A separate classified membership
+commit precedes tool-abort acknowledgement; the ordinary atomic parent-state and
+child-acceptance path then drains every outcome. Definite failures select the
+non-resumable sub-agent error path. Unknown database authority and disappearance
+of an armed write owner close the shared process fence.
 
-Normal terminal acceptance is likewise distinct from dispatch. The transport and
-buffer paths leave delivery owed. `update_state_and_accept_sub_agent` commits the
-parent projection and child acceptance marker together; only that established
-receipt acknowledges normal fan-in acceptance. Native unactivated cleanup instead
-sets the child's acceptance timestamp administratively without a matching parent
-completed result. That suppression does not satisfy REQ-SA-004/005 and is not a
-normative exemption: every admitted child still owes parent fan-in, including a
-pre-start cancellation. Task 75011 tracks classified cleanup and exact parent
-reconciliation. The activation and normal atomic-acceptance barriers exist, while
-this cancellation handoff remains a target; no new recovery mechanism is delivered.
-
-The live handoff target retains its original owner until admission/activation or
-classified cancellation reconciliation completes. It cannot normally advance to
-a later call while an unadopted admitted batch remains unresolved. An abnormal
-origin replacement preserves evidence and refuses activation/successor mutation;
-it does not promise historical-turn repair. Interrupted/restart ownership handling
-is unqualified. Missing in-memory ownership alone does not establish unknown
-SQLite authority or trigger the process fence. Early preparation errors likewise
-retain their original assistant/call identity; the responsive target discards a
-late classified error instead of failing a later selection. The existing awaited
-loop prevents those normal late interleavings, while task 75010 owns responsiveness
-and task 75011 owns the required handoff classification/ownership plumbing.
+The live owner blocks ordinary selection advancement and cancellation-backstop
+acknowledgement while reconciliation is unresolved. Abnormal origin replacement
+withholds activation and preserves durable evidence without mutating a successor.
+Missing memory ownership and pre-write shutdown refusal do not manufacture unknown
+SQLite authority. A lost activation receiver after committed membership stops the
+remaining effect chain and reports a non-resumable error. Interrupted/restart
+ownership remains unqualified: the separate historical startup-abandonment policy
+is unchanged, and no automatic historical repair or durable queue is introduced.
+Task 75011 implements this native boundary. Task 75010 owns the remaining inline
+policy, scope, catalog and ordinary preparation responsiveness.
 
 ### Cancellation implementation and remaining gaps
 
@@ -87,7 +73,8 @@ before resource admission; only its exact cleared proof may open a generation.
 Task 75010 includes this preparation-boundary ordering correction.
 
 REQ-BED-005 is partial: the owned executor awaits originating-policy/scope reads
-and intercepted spawn admission before returning to its cancellation select.
+and spawn preparation before returning to its cancellation select. Submitted
+native admission responses have a retained selectable owner.
 This can delay cancellation behind preparation, contrary to the immediate,
 100-ms interruption/nonqueued contract. Task 75010 tracks the separate runtime
 correction; task 14004 covers related global child-materialization races.
@@ -102,8 +89,8 @@ requires established parent/child commit receipts and defers the one notice unti
 the entire owned application, including inline steering, succeeds. The owning
 authority stays alive through the notice write. Ordinary cooperative cancellation
 produces no degraded notice. Task 75009 owns qualification of these residual live
-notice paths; the responsiveness and native cancellation-handoff gaps in tasks
-75010 and 75011 remain separate.
+notice paths; task 75010 owns remaining preparation responsiveness separately
+from task 75011's native cancellation handoff.
 
 The child-deadline path snapshots pending identities, establishes required child
 terminal evidence, and feeds each result through normal atomic parent acceptance.
@@ -119,8 +106,7 @@ authentic terminal-race behavior; those are preserved rather than remaining task
 75009 gaps. The database atomically reuses established raw terminal payload/cause
 or establishes cancellation only when the child is nonterminal. The parent's
 Timeout-to-TimedOut presentation policy remains separate and intact. Interruption
-and the native cancellation handoff remain unqualified; no complete cancellation
-redesign is claimed.
+remains unqualified; the native handoff uses these existing acceptance authorities.
 
 The forced-retirement fact is scoped to the current live cancellation chain.
 Generic restart/error recovery interrupts or replaces that chain under
@@ -160,11 +146,11 @@ Startup, completion, and child-backstop commands retain a mutable reborrow of th
 | **REQ-BED-002:** User Message Handling | ✅ Complete | Rejects while busy, accepts from idle/error |
 | **REQ-BED-003:** LLM Response Processing | ✅ Complete | Handles text, tool use, end_turn |
 | **REQ-BED-004:** Tool Execution Coordination | ✅ Complete | Serial execution with state tracking; shared round admission requires unique call/result correspondence without sorting. Provider schedule validation precedes special-tool interception, and per-invocation channels reject misidentified outcomes as concrete errors. Focused coverage includes malformed approval/question/child-terminal responses and expected-invocation completion errors. Bash wait fallback preserves authentic bounded results, aborts only the wait task on healthy expiry, and closes the shared local-authority fence under REQ-BED-033 if authoritative settlement remains indeterminate at its non-renewing persistence cutoff |
-| **REQ-BED-005:** Cancellation Handling | 🚧 Partial | Synthetic tool results are implemented; awaited policy/scope preparation and intercepted admission can delay cancellation behind the owned loop. Immediate/nonqueued cancellation remains required; task 75010 tracks the runtime gap |
+| **REQ-BED-005:** Cancellation Handling | 🚧 Partial | Native admission responses are selectable with retained exact ownership. Awaited policy/scope/catalog and ordinary preparation still delay cancellation; task 75010 owns that gap |
 | **REQ-BED-005a:** Bounded Cancellation Liveness | 🚧 Partial | Forced tool/sub-agent backstops and live forced-notice carry through delayed cooperative drain are implemented. Task 75009 covers ordered exactly-once notice qualification, including inline steering, existing retries and child-deadline overlap. Broader interruption and cancellation-handoff obligations remain unqualified |
 | **REQ-BED-006:** Error Recovery | ✅ Complete | Retry logic with exponential backoff and typed user-resume admission by ErrorKind |
 | **REQ-BED-007:** State Persistence | ✅ Complete | Database persistence; all selected executing/cancelling buffers are validated before any recovery mutation. File-backed reopen coverage includes malformed standalone and parent-first child buffers retaining exact raw state and producing no partial messages; scoped recovery excludes unrelated malformed buffers. Provider-only interruptions resume from idle, active materialized turns with persisted tool results proactively resume under bounded exact-turn ownership, committed steering retains first-response recovery ownership, and durable continuations retain recovery state |
-| **REQ-BED-008:** Sub-Agent Spawning | 🚧 Partial | Atomic admission and normal exact-child fan-in/duplicate acceptance are live. Unactivated-batch cleanup still suppresses parent delivery administratively; classified all-admitted cancellation reconciliation remains incomplete (task 75011). |
+| **REQ-BED-008:** Sub-Agent Spawning | ✅ Complete | Atomic admission, activation after committed membership, classified live unactivated reconciliation and exact atomic fan-in are implemented. Interrupted/restart ownership is unqualified; historical startup abandonment is unchanged |
 | **REQ-BED-009:** Sub-Agent Isolation | ✅ Complete | Tool set restriction defined |
 | **REQ-BED-010:** Fixed Working Directory | ✅ Complete | Set at creation, passed to tools |
 | **REQ-BED-011:** Real-time Event Streaming | ✅ Complete | SSE with broadcast channels |

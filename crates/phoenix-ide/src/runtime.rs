@@ -10,6 +10,11 @@
 //! REQ-BED-009: Sub-Agent Isolation
 
 mod agent_execution;
+mod native_spawn;
+pub use native_spawn::{
+    NativeSpawnClosureReceipt, NativeSpawnControl, NativeSpawnTerminalEvidence,
+    SubAgentAdmissionReceipt,
+};
 pub(crate) mod close_retirement;
 pub(crate) mod creation_worker;
 pub mod deny_gate;
@@ -230,14 +235,14 @@ pub enum SubAgentAdmissionResponse {
 
 #[derive(Debug)]
 pub struct SubAgentSpawnRequest {
-    pub batch_id: String,
+    pub invocation: phoenix_db::SubAgentSpawnInvocation,
     pub specs: Vec<SubAgentSpec>,
-    pub parent_conversation_id: String,
     pub parent_scope: Option<WorkScopeId>,
     pub parallel_work_qualified: bool,
     pub parent_turn_link: opentelemetry::trace::SpanContext,
-    pub response_tx: oneshot::Sender<SubAgentAdmissionResponse>,
+    pub response_tx: oneshot::Sender<SubAgentAdmissionReceipt>,
     pub activation_rx: oneshot::Receiver<()>,
+    pub control: Arc<NativeSpawnControl>,
 }
 
 /// Request to cancel sub-agents
@@ -4833,45 +4838,82 @@ impl RuntimeManager {
 
     async fn handle_spawn_request(self: &Arc<Self>, req: SubAgentSpawnRequest) {
         let SubAgentSpawnRequest {
-            batch_id,
+            invocation,
             specs,
-            parent_conversation_id,
             parent_scope,
             parallel_work_qualified,
             parent_turn_link,
             response_tx,
             activation_rx,
+            control,
         } = req;
+        let mut lifecycle = native_spawn::NativeSpawnLifecycleOwner::new(Arc::clone(&control));
+        let batch = phoenix_db::SubAgentBatchAdmission {
+            batch_id: invocation.batch_id.clone(),
+            parent_conversation_id: invocation.parent_conversation_id.clone(),
+            parallel_work_qualified,
+            runs: specs
+                .iter()
+                .map(|spec| phoenix_db::SubAgentRunAdmission {
+                    child_conversation_id: spec.agent_id.clone(),
+                    execution_authority: match spec.mode {
+                        SubAgentMode::Explore => phoenix_db::SubAgentExecutionAuthority::ReadOnly,
+                        SubAgentMode::Work => phoenix_db::SubAgentExecutionAuthority::WriteCapable,
+                    },
+                })
+                .collect(),
+        };
         match self
             .admit_sub_agent_batch(
-                &batch_id,
+                &invocation.batch_id,
                 &specs,
-                &parent_conversation_id,
+                &invocation.parent_conversation_id,
                 parent_scope,
                 parallel_work_qualified,
+                &mut lifecycle,
             )
             .await
         {
             Ok(()) => {
-                if response_tx
-                    .send(SubAgentAdmissionResponse::Admitted)
-                    .is_err()
-                {
-                    self.abandon_unactivated_sub_agent_batch(&batch_id).await;
-                    return;
+                let response_lost = response_tx
+                    .send(SubAgentAdmissionReceipt {
+                        invocation: invocation.clone(),
+                        outcome: SubAgentAdmissionResponse::Admitted,
+                    })
+                    .is_err();
+                let activate = if response_lost {
+                    false
+                } else {
+                    tokio::select! {
+                        biased;
+                        () = control.cancelled() => false,
+                        activation = activation_rx => activation.is_ok() && !control.is_cancelled(),
+                    }
+                };
+                if activate {
+                    control.activated();
+                    self.kick_admitted_sub_agent_batch(specs, parent_turn_link);
+                } else {
+                    let evidence = self.close_native_spawn_batch(&batch, &mut lifecycle).await;
+                    if !control.publish(evidence) {
+                        tracing::error!(batch_id = %batch.batch_id, "native spawn closure owner disappeared; terminal evidence retained without parent acceptance");
+                    }
                 }
-                if activation_rx.await.is_err() {
-                    self.abandon_unactivated_sub_agent_batch(&batch_id).await;
-                    return;
-                }
-                self.kick_admitted_sub_agent_batch(specs, parent_turn_link);
             }
             Err(error) if error.starts_with("FATAL_LOCAL_AUTHORITY_UNCLASSIFIED:") => {
                 self.signal_fatal_local_authority("sub_agent_batch_admission");
-                let _ = response_tx.send(SubAgentAdmissionResponse::Unclassified);
+                let _ = response_tx.send(SubAgentAdmissionReceipt {
+                    invocation: invocation.clone(),
+                    outcome: SubAgentAdmissionResponse::Unclassified,
+                });
+                control.publish(NativeSpawnTerminalEvidence::Unclassified);
             }
             Err(error) => {
-                let _ = response_tx.send(SubAgentAdmissionResponse::Rejected(error));
+                let _ = response_tx.send(SubAgentAdmissionReceipt {
+                    invocation: invocation.clone(),
+                    outcome: SubAgentAdmissionResponse::Rejected(error),
+                });
+                control.publish(NativeSpawnTerminalEvidence::NotAdmitted);
             }
         }
     }
@@ -4895,7 +4937,10 @@ impl RuntimeManager {
         parent_conversation_id: &str,
         parent_scope: Option<WorkScopeId>,
         parallel_work_qualified: bool,
+        lifecycle: &mut native_spawn::NativeSpawnLifecycleOwner,
     ) -> Result<(), String> {
+        use phoenix_db::SubAgentExecutionAuthority::{ReadOnly, WriteCapable};
+
         let parent = self
             .db
             .get_conversation(parent_conversation_id)
@@ -4942,12 +4987,8 @@ impl RuntimeManager {
                     run: phoenix_db::SubAgentRunAdmission {
                         child_conversation_id: spec.agent_id.clone(),
                         execution_authority: match spec.mode {
-                            SubAgentMode::Explore => {
-                                phoenix_db::SubAgentExecutionAuthority::ReadOnly
-                            }
-                            SubAgentMode::Work => {
-                                phoenix_db::SubAgentExecutionAuthority::WriteCapable
-                            }
+                            SubAgentMode::Explore => ReadOnly,
+                            SubAgentMode::Work => WriteCapable,
                         },
                     },
                     slug: format!("sub-{}", spec.agent_id),
@@ -4973,25 +5014,29 @@ impl RuntimeManager {
             parallel_work_qualified,
             children,
         };
-        match self.db.admit_sub_agent_batch_atomically(&admission).await {
+        let owner = self.acquire_local_authority_pass().map_err(|()| {
+            "native spawn admission was not issued because local write admission is closed"
+                .to_string()
+        })?;
+        if !lifecycle.control.try_issue() {
+            return Err("native spawn admission was revoked before its database command".into());
+        }
+        let authority = lifecycle.arm_write(owner);
+        let result = self.db.admit_sub_agent_batch_atomically(&admission).await;
+        if matches!(
+            result,
+            phoenix_db::workflow::LocalAuthorityResult::DurableFactUnclassified
+        ) {
+            self.signal_fatal_local_authority("sub_agent_batch_admission");
+        }
+        authority.classified();
+        match result {
             phoenix_db::workflow::LocalAuthorityResult::DurableFactEstablished(result) => {
-                result.map_err(|error| error.to_string())?;
+                result.map(|_| ()).map_err(|error| error.to_string())
             }
             phoenix_db::workflow::LocalAuthorityResult::DurableFactUnclassified => {
-                return Err("FATAL_LOCAL_AUTHORITY_UNCLASSIFIED: sub-agent batch admission commit could not be classified".to_string());
+                Err("FATAL_LOCAL_AUTHORITY_UNCLASSIFIED: sub-agent batch admission commit could not be classified".to_string())
             }
-        }
-
-        Ok(())
-    }
-
-    async fn abandon_unactivated_sub_agent_batch(&self, batch_id: &str) {
-        if let Err(error) = self
-            .db
-            .abandon_unactivated_sub_agent_batch(batch_id, Utc::now())
-            .await
-        {
-            tracing::error!(%batch_id, %error, "failed to terminalize unactivated sub-agent batch");
         }
     }
 
@@ -9457,7 +9502,7 @@ mod scope_liveness_tests {
         )
     }
 
-    async fn test_manager() -> RuntimeManager {
+    pub(super) async fn test_manager() -> RuntimeManager {
         let db = crate::db::Database::open_in_memory().await.expect("db");
         RuntimeManager::new(
             db,
@@ -10736,14 +10781,20 @@ mod scope_liveness_tests {
             agent_name: None,
             persona: None,
         };
-        let admit = || {
-            manager.admit_sub_agent_batch(
-                "trusted-batch",
-                std::slice::from_ref(&spec),
-                &parent.id,
-                parent.attached_work_scope_id.clone(),
-                true,
-            )
+        let admit = async || {
+            let mut lifecycle = native_spawn::NativeSpawnLifecycleOwner::new(
+                NativeSpawnControl::test_for_batch(&parent.id, "trusted-batch"),
+            );
+            manager
+                .admit_sub_agent_batch(
+                    "trusted-batch",
+                    std::slice::from_ref(&spec),
+                    &parent.id,
+                    parent.attached_work_scope_id.clone(),
+                    true,
+                    &mut lifecycle,
+                )
+                .await
         };
         assert!(admit().await.unwrap_err().contains("Work authority"));
         assert!(manager.db().get_conversation(&spec.agent_id).await.is_err());
@@ -10828,7 +10879,7 @@ mod scope_liveness_tests {
             async move {
                 manager
                     .handle_spawn_request(SubAgentSpawnRequest {
-                        batch_id: "atomic-subagent-batch".to_string(),
+                        invocation: phoenix_db::SubAgentSpawnInvocation { batch_id: "atomic-subagent-batch".into(), parent_conversation_id: parent.id.clone(), assistant_message_id: "assistant".into(), tool_use_id: "spawn".into() },
                         specs: vec![SubAgentSpec {
                             agent_id: agent_id.to_string(),
                             task: "persist all child semantics".to_string(),
@@ -10842,18 +10893,18 @@ mod scope_liveness_tests {
                             agent_name: Some("atomic-test".to_string()),
                             persona: Some("test persona".to_string()),
                         }],
-                        parent_conversation_id: parent.id,
                         parent_scope: None,
                         parallel_work_qualified: false,
                         parent_turn_link: opentelemetry::trace::SpanContext::NONE,
                         response_tx,
                         activation_rx,
+                        control: NativeSpawnControl::test_for_batch(&parent.id, "atomic-subagent-batch"),
                     })
                     .await;
             }
         });
         assert!(matches!(
-            response_rx.await.expect("admission response"),
+            response_rx.await.expect("admission response").outcome,
             SubAgentAdmissionResponse::Admitted
         ));
         assert!(
@@ -10925,13 +10976,21 @@ mod scope_liveness_tests {
         let (response_tx, response_rx) = oneshot::channel();
         manager
             .handle_spawn_request(SubAgentSpawnRequest {
-                batch_id: "cancel-during-materialization-batch".to_string(),
+                invocation: phoenix_db::SubAgentSpawnInvocation {
+                    batch_id: "cancel-during-materialization-batch".into(),
+                    parent_conversation_id: parent.id.clone(),
+                    assistant_message_id: "assistant".into(),
+                    tool_use_id: "spawn".into(),
+                },
                 specs: vec![spec.clone()],
-                parent_conversation_id: parent.id.clone(),
                 parent_scope: None,
                 parallel_work_qualified: false,
                 parent_turn_link: opentelemetry::trace::SpanContext::NONE,
                 response_tx,
+                control: NativeSpawnControl::test_for_batch(
+                    &parent.id,
+                    "cancel-during-materialization-batch",
+                ),
                 activation_rx: {
                     let (tx, rx) = oneshot::channel();
                     let _ = tx.send(());
@@ -10940,7 +10999,7 @@ mod scope_liveness_tests {
             })
             .await;
         assert!(matches!(
-            response_rx.await.expect("admission response"),
+            response_rx.await.expect("admission response").outcome,
             SubAgentAdmissionResponse::Admitted
         ));
 
@@ -11086,6 +11145,9 @@ mod scope_liveness_tests {
                 &parent.id,
                 parent.attached_work_scope_id.clone(),
                 false,
+                &mut native_spawn::NativeSpawnLifecycleOwner::new(
+                    NativeSpawnControl::test_for_batch(&parent.id, "cancellation-boundary-batch"),
+                ),
             )
             .await
             .unwrap();
@@ -11423,6 +11485,9 @@ mod scope_liveness_tests {
                 "ordinary-parent",
                 owner.work_scope_id().cloned(),
                 false,
+                &mut native_spawn::NativeSpawnLifecycleOwner::new(
+                    NativeSpawnControl::test_for_batch("ordinary-parent", "ordinary-cancel-batch"),
+                ),
             )
             .await
             .unwrap();
@@ -11585,6 +11650,9 @@ mod scope_liveness_tests {
                     &parent.id,
                     parent.attached_work_scope_id.clone(),
                     false,
+                    &mut native_spawn::NativeSpawnLifecycleOwner::new(
+                        NativeSpawnControl::test_for_batch(&parent.id, "durable-controller-batch"),
+                    ),
                 )
                 .await
                 .unwrap();

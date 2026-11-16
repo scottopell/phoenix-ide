@@ -59,6 +59,8 @@ use tracing::Instrument;
 
 mod capacity;
 mod continuation;
+mod native_spawn;
+use native_spawn::{NativeSpawnCutoff, NativeSpawnHandoff, NativeSpawnPhase};
 mod self_goal;
 #[cfg(test)]
 mod self_goal_tests;
@@ -2191,7 +2193,7 @@ where
         Option<phoenix_core::domain::provider_replay::ProviderReplayUpdate>,
     pending_sub_agent_acceptance: Option<String>,
     pending_sub_agent_terminal: Option<phoenix_db::SubAgentTerminalCause>,
-    pending_sub_agent_activation: Option<PendingSubAgentActivation>,
+    native_spawn_handoff: Option<NativeSpawnHandoff>,
     /// Browser session manager for `ToolContext`
     browser_sessions: Arc<BrowserSessionManager>,
     /// Bash handle registry for `ToolContext` (REQ-BASH-014).
@@ -2520,7 +2522,7 @@ where
             pending_provider_replay_update: None,
             pending_sub_agent_acceptance: None,
             pending_sub_agent_terminal: None,
-            pending_sub_agent_activation: None,
+            native_spawn_handoff: None,
             browser_sessions,
             bash_handles,
             tmux_registry,
@@ -3339,6 +3341,22 @@ where
                         );
                         self.emit_terminal_lifecycle_event().await;
                         return RuntimeExitDisposition::Terminal;
+                    }
+                }
+                observation = async {
+                    match self.native_spawn_handoff.as_mut() {
+                        Some(handoff) => handoff.observe().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    match self.native_spawn_observed(observation).await {
+                        Ok(Some(event)) => {
+                            if let Err(error) = self.process_event(event).await {
+                                tracing::error!(%error, "failed to settle native spawn observation");
+                            }
+                        }
+                        Ok(None) => {},
+                        Err(error) => tracing::error!(%error, "native spawn observation failed"),
                     }
                 }
                 Some((generation, tool_outcome)) = self.tool_outcome_rx.recv() => {
@@ -4468,6 +4486,25 @@ where
         ordinary_input_id: Option<&str>,
         authority: TransitionAuthority,
     ) -> Result<Vec<Event>, String> {
+        let native_adoption = self.native_spawn_adoption_matches(&result.new_state);
+        if let Some(handoff) = &self.native_spawn_handoff {
+            let terminal_interruption = matches!(
+                result.new_state,
+                ConvState::Error { .. } | ConvState::Failed { .. } | ConvState::Terminal
+            );
+            if !handoff.invocation.owns_state(&result.new_state)
+                && !native_adoption
+                && !terminal_interruption
+            {
+                return Err(
+                    "unresolved native spawn handoff cannot advance its originating selection"
+                        .into(),
+                );
+            }
+        }
+        if native_adoption {
+            self.authorize_native_spawn_adoption(&result.new_state);
+        }
         let mut generated_events = Vec::new();
         self.direct_turn_materialization_aborted = false;
         self.proposed_direct_turn_state = None;
@@ -5163,6 +5200,19 @@ where
                 if let Some(gen_event) = effect_result {
                     generated_events.push(gen_event);
                 }
+                if self.native_spawn_handoff.as_ref().is_some_and(|handoff| {
+                    matches!(handoff.phase, NativeSpawnPhase::ActivationOwnerLost)
+                }) {
+                    let mut handoff = self
+                        .native_spawn_handoff
+                        .take()
+                        .expect("activation failure retains native origin");
+                    handoff.phase = NativeSpawnPhase::Closing;
+                    let failure = Box::pin(self.fail_native_spawn("native spawn activation owner disappeared after exact membership committed".into())).await;
+                    self.native_spawn_handoff = Some(handoff);
+                    failure?;
+                    return Ok(Vec::new());
+                }
                 if checkpoint_commits_state {
                     state_committed = true;
                 }
@@ -5417,7 +5467,7 @@ where
     }
 
     fn state_settlement_pending(&self) -> bool {
-        self.pending_sub_agent_activation.is_some()
+        self.native_spawn_activation_pending()
             || self.pending_sub_agent_acceptance.is_some()
             || self.pending_sub_agent_terminal.is_some()
             || self.pending_direct_turn_terminal.is_some()
@@ -5432,7 +5482,7 @@ where
         broadcast: bool,
         admitted: &mut crate::runtime::AdmittedOperation,
     ) -> Result<Option<Event>, String> {
-        let activation = self.pending_sub_agent_activation.take();
+        let activation = self.take_native_spawn_activation();
         if let Some(activation) = &activation {
             let pending = match &self.state {
                 ConvState::ToolExecuting {
@@ -5517,7 +5567,7 @@ where
             }
         }
         if let Some(activation) = activation {
-            let _ = activation.sender.send(());
+            self.release_native_spawn_activation(activation);
         }
 
         if broadcast {
@@ -6450,6 +6500,13 @@ where
             return;
         };
 
+        if self.native_spawn_handoff.is_some() {
+            match self.classify_native_spawn_cutoff(&tool_use_id).await {
+                NativeSpawnCutoff::Reconciled => {}
+                NativeSpawnCutoff::Stop => return,
+            }
+        }
+
         tracing::warn!(
             conv_id = %self.context.conversation_id,
             tool_id = %tool_use_id,
@@ -6584,12 +6641,8 @@ where
         })
     }
 
-    /// Handle the `spawn_agents` tool specially:
-    /// 1. Parse tasks and generate agent IDs
-    /// 2. Send spawn requests to `RuntimeManager` for each task
-    /// 3. Return `SpawnAgentsComplete` event
     #[allow(clippy::too_many_lines)]
-    pub(crate) async fn handle_spawn_agents_tool(
+    pub(crate) async fn start_spawn_agents_tool(
         &mut self,
         tool: ToolCall,
     ) -> Result<Option<Event>, String> {
@@ -6887,17 +6940,50 @@ where
             .collect::<Vec<_>>();
         let (response_tx, response_rx) = oneshot::channel();
         let (activation_tx, activation_rx) = oneshot::channel();
-        let request = SubAgentSpawnRequest {
-            batch_id: uuid::Uuid::new_v4().to_string(),
-            specs,
+        let (closure_tx, closure_rx) = oneshot::channel();
+        let assistant_message_id = match &self.state {
+            ConvState::ToolExecuting {
+                current_tool,
+                assistant_message,
+                ..
+            } if current_tool.id == tool_use_id => assistant_message.message_id.clone(),
+            _ => return Err("native spawn preparation lost its originating selection".into()),
+        };
+        if self.native_spawn_handoff.is_some() {
+            return Err("native spawn origin already has an unresolved handoff".into());
+        }
+        let invocation = phoenix_db::SubAgentSpawnInvocation {
             parent_conversation_id: self.context.conversation_id.clone(),
+            assistant_message_id,
+            tool_use_id: tool_use_id.clone(),
+            batch_id: uuid::Uuid::new_v4().to_string(),
+        };
+        let control = Arc::new(crate::runtime::NativeSpawnControl::new(
+            invocation.clone(),
+            closure_tx,
+        ));
+        let request = SubAgentSpawnRequest {
+            invocation: invocation.clone(),
+            specs,
             parent_scope: self.context.resource_scope.work_scope_id().cloned(),
             parallel_work_qualified,
             parent_turn_link,
             response_tx,
             activation_rx,
+            control: Arc::clone(&control),
         };
+        self.native_spawn_handoff = Some(NativeSpawnHandoff {
+            invocation,
+            members: spawned,
+            control,
+            phase: NativeSpawnPhase::Admission {
+                response: response_rx,
+                activation: activation_tx,
+            },
+            closure: closure_rx,
+        });
         if let Err(error) = spawn_tx.send(request).await {
+            self.native_spawn_handoff = None;
             return Ok(Some(Event::ToolComplete {
                 tool_use_id: tool_use_id.clone(),
                 result: ToolResult::error(
@@ -6906,48 +6992,7 @@ where
                 ),
             }));
         }
-        match response_rx.await {
-            Ok(crate::runtime::SubAgentAdmissionResponse::Admitted) => {}
-            Ok(crate::runtime::SubAgentAdmissionResponse::Rejected(error)) => {
-                return Ok(Some(Event::ToolComplete {
-                    tool_use_id: tool_use_id.clone(),
-                    result: ToolResult::error(tool_use_id, error),
-                }));
-            }
-            Ok(crate::runtime::SubAgentAdmissionResponse::Unclassified) => {
-                return Err("FATAL_LOCAL_AUTHORITY_UNCLASSIFIED: sub-agent batch admission commit could not be classified".to_string());
-            }
-            Err(error) => {
-                return Ok(Some(Event::ToolComplete {
-                    tool_use_id: tool_use_id.clone(),
-                    result: ToolResult::error(
-                        tool_use_id,
-                        format!("Sub-agent admission stopped: {error}"),
-                    ),
-                }));
-            }
-        }
-
-        self.pending_sub_agent_activation = Some(PendingSubAgentActivation {
-            child_ids: spawned.iter().map(|child| child.agent_id.clone()).collect(),
-            sender: activation_tx,
-        });
-
-        // Build success result
-        let agent_ids: Vec<&str> = spawned.iter().map(|p| p.agent_id.as_str()).collect();
-        let output = format!(
-            "Spawning {} sub-agent(s): {}",
-            spawned.len(),
-            agent_ids.join(", ")
-        );
-        let result = ToolResult::success(tool_use_id.clone(), output);
-
-        // Send SpawnAgentsComplete event (synchronously returned, not async)
-        Ok(Some(Event::SpawnAgentsComplete {
-            tool_use_id,
-            result,
-            spawned,
-        }))
+        Ok(None)
     }
 
     /// Execute an effect and optionally return a generated event
@@ -8391,6 +8436,13 @@ where
             ControlEffect::AbortTool { tool_use_id } => {
                 tracing::info!(tool_id = %tool_use_id, "Aborting tool execution");
                 self.tool_execution.request_cancel();
+                if let Some(handoff) = self.native_spawn_handoff.as_mut() {
+                    if handoff.invocation.tool_use_id == tool_use_id
+                        && handoff.invocation.owns_state(&self.state)
+                    {
+                        handoff.request_cancel();
+                    }
+                }
                 Ok(None)
             }
             ControlEffect::CancelSubAgents { ids, cause } => {
@@ -9888,7 +9940,7 @@ where
                 }));
             }
             self.spawn_catalog = Some(catalog);
-            return self.handle_spawn_agents_tool(tool).await;
+            return self.start_spawn_agents_tool(tool).await;
         }
 
         let legacy_tmux_conversation_id = match &self.context.resource_scope {
@@ -23761,10 +23813,17 @@ mod steer_drain_detector_tests {
         let (mut runtime, storage) =
             build_runtime_with_state_and_queue("checkpoint-child-activation", initial, vec![]);
         let (sender, mut activated) = oneshot::channel();
-        runtime.pending_sub_agent_activation = Some(PendingSubAgentActivation {
-            child_ids: vec!["admitted-child".into()],
-            sender,
-        });
+        let expected = handle_outcome(
+            &runtime.state,
+            &runtime.context,
+            EffectOutcome::Tool(ToolExecOutcome::Completed(ToolResult::success(
+                "tool-1".into(),
+                "done".into(),
+            ))),
+        )
+        .unwrap()
+        .new_state;
+        runtime.install_native_activation_for_test(sender, expected);
         runtime
             .process_outcome(EffectOutcome::Tool(ToolExecOutcome::Completed(
                 ToolResult::success("tool-1".into(), "done".into()),
@@ -23772,7 +23831,7 @@ mod steer_drain_detector_tests {
             .await
             .unwrap();
         assert_eq!(activated.try_recv(), Ok(()));
-        assert!(runtime.pending_sub_agent_activation.is_none());
+        assert!(!runtime.native_spawn_activation_pending());
         assert!(matches!(
             storage.get_current_state("checkpoint-child-activation"),
             Some(ConvState::AwaitingSubAgents { .. })
@@ -28282,10 +28341,7 @@ mod steer_drain_detector_tests {
             vec![],
         );
         let (activation_tx, mut activation_rx) = oneshot::channel();
-        rt.pending_sub_agent_activation = Some(PendingSubAgentActivation {
-            child_ids: vec!["child".to_string()],
-            sender: activation_tx,
-        });
+        rt.install_native_activation_for_test(activation_tx, rt.state.clone());
         storage.set_fail_state_update(true);
         let mut admitted = rt.admit_authoritative_effect().unwrap();
         assert!(rt.persist_state_effect(false, &mut admitted).await.is_err());
@@ -28306,7 +28362,7 @@ mod steer_drain_detector_tests {
     /// Regression (task 61005): a `SubAgentResult` buffered from an earlier
     /// batch in the same awaiting-round must survive a subsequent
     /// `spawn_agents` dispatch and be delivered when the parent enters
-    /// `AwaitingSubAgents`. The bug: `handle_spawn_agents_tool` reassigned
+    /// `AwaitingSubAgents`. The bug: each spawn dispatch reassigned
     /// `sub_agent_result_buffer = Vec::with_capacity(..)` on every dispatch,
     /// destroying any result buffered while the parent was still running a
     /// prior tool (e.g. tool sequence `[spawn_agents A, bash, spawn_agents B]`,
@@ -31311,7 +31367,22 @@ mod work_subagent_cwd_guard_tests {
 
         ConversationRuntime::new(
             context,
-            ConvState::Idle,
+            ConvState::ToolExecuting {
+                current_tool: spawn_tool(SpawnAgentsInput { tasks: vec![] }),
+                remaining_tools: vec![],
+                completed_results: vec![],
+                pending_sub_agents: vec![],
+                assistant_message: crate::state_machine::state::AssistantMessage::new(
+                    "spawn-assistant".into(),
+                    vec![ContentBlock::tool_use(
+                        "tool-spawn-1",
+                        "spawn_agents",
+                        serde_json::json!({"tasks": []}),
+                    )],
+                    None,
+                    None,
+                ),
+            },
             storage,
             Arc::new(MockLlmClient::new("gpt-5.6-sol")),
             Arc::new(MockToolExecutor::new()),
@@ -31362,7 +31433,10 @@ mod work_subagent_cwd_guard_tests {
         let specs = request.specs;
         request
             .response_tx
-            .send(crate::runtime::SubAgentAdmissionResponse::Admitted)
+            .send(crate::runtime::SubAgentAdmissionReceipt {
+                invocation: request.invocation,
+                outcome: crate::runtime::SubAgentAdmissionResponse::Admitted,
+            })
             .expect("spawn requester receives admission result");
         specs
     }
@@ -31498,6 +31572,12 @@ mod work_subagent_cwd_guard_tests {
             .await
             .expect("schema validation must finish before spawn admission")
             .unwrap();
+            let event = if rejected {
+                event
+            } else {
+                let observation = resumed.observe_native_spawn().await;
+                resumed.native_spawn_observed(observation).await.unwrap()
+            };
             if rejected {
                 let Some(Event::ToolComplete {
                     tool_use_id,
@@ -31523,7 +31603,7 @@ mod work_subagent_cwd_guard_tests {
         let mut rt = runtime_in_direct_mode(parent.path());
 
         let result = rt
-            .handle_spawn_agents_tool(spawn_tool(SpawnAgentsInput {
+            .prepare_spawn_and_wait(spawn_tool(SpawnAgentsInput {
                 tasks: vec![SubAgentTask {
                     task: "inspect everything".to_string(),
                     cwd: Some("/".to_string()),
@@ -31534,7 +31614,7 @@ mod work_subagent_cwd_guard_tests {
                 }],
             }))
             .await
-            .expect("handle_spawn_agents_tool returned error");
+            .expect("prepare_spawn_and_wait returned error");
 
         match result {
             Some(Event::ToolComplete { result, .. }) => {
@@ -31554,7 +31634,7 @@ mod work_subagent_cwd_guard_tests {
         let mut rt = runtime_in_direct_mode(std::path::Path::new("/"));
 
         let result = rt
-            .handle_spawn_agents_tool(spawn_tool(SpawnAgentsInput {
+            .prepare_spawn_and_wait(spawn_tool(SpawnAgentsInput {
                 tasks: vec![SubAgentTask {
                     task: "inherit root".to_string(),
                     cwd: None,
@@ -31565,7 +31645,7 @@ mod work_subagent_cwd_guard_tests {
                 }],
             }))
             .await
-            .expect("handle_spawn_agents_tool returned error");
+            .expect("prepare_spawn_and_wait returned error");
 
         match result {
             Some(Event::ToolComplete { result, .. }) => {
@@ -31585,7 +31665,7 @@ mod work_subagent_cwd_guard_tests {
         let mut rt = runtime_in_direct_mode(parent.path());
 
         let result = rt
-            .handle_spawn_agents_tool(spawn_tool(SpawnAgentsInput {
+            .prepare_spawn_and_wait(spawn_tool(SpawnAgentsInput {
                 tasks: vec![SubAgentTask {
                     task: "inspect project".to_string(),
                     cwd: Some(deep.to_string_lossy().to_string()),
@@ -31596,7 +31676,7 @@ mod work_subagent_cwd_guard_tests {
                 }],
             }))
             .await
-            .expect("handle_spawn_agents_tool returned error");
+            .expect("prepare_spawn_and_wait returned error");
 
         match result {
             Some(Event::ToolComplete { result, .. }) => {
@@ -31622,7 +31702,7 @@ mod work_subagent_cwd_guard_tests {
         let mut rt = runtime_in_work_mode(worktree.path());
 
         let result = rt
-            .handle_spawn_agents_tool(spawn_tool(SpawnAgentsInput {
+            .prepare_spawn_and_wait(spawn_tool(SpawnAgentsInput {
                 tasks: vec![SubAgentTask {
                     task: "do unsafe writes".to_string(),
                     cwd: Some(outside.path().to_string_lossy().to_string()),
@@ -31633,7 +31713,7 @@ mod work_subagent_cwd_guard_tests {
                 }],
             }))
             .await
-            .expect("handle_spawn_agents_tool returned error");
+            .expect("prepare_spawn_and_wait returned error");
 
         match result {
             Some(Event::ToolComplete { result, .. }) => {
@@ -31675,7 +31755,7 @@ mod work_subagent_cwd_guard_tests {
 
             let responder = tokio::spawn(accept_spawn_batch(spawn_rx));
             let result = rt
-                .handle_spawn_agents_tool(spawn_tool(SpawnAgentsInput {
+                .prepare_spawn_and_wait(spawn_tool(SpawnAgentsInput {
                     tasks: vec![
                         luna_work_task("first partition"),
                         luna_work_task("second partition"),
@@ -31707,7 +31787,7 @@ mod work_subagent_cwd_guard_tests {
         rt.context.model_id = "gpt-5.6-luna".to_string();
 
         let result = rt
-            .handle_spawn_agents_tool(spawn_tool(SpawnAgentsInput {
+            .prepare_spawn_and_wait(spawn_tool(SpawnAgentsInput {
                 tasks: vec![luna_work_task("first"), luna_work_task("second")],
             }))
             .await
@@ -31727,7 +31807,7 @@ mod work_subagent_cwd_guard_tests {
         rt.context.model_id = "gpt-6-luna".to_string();
 
         let result = rt
-            .handle_spawn_agents_tool(spawn_tool(SpawnAgentsInput {
+            .prepare_spawn_and_wait(spawn_tool(SpawnAgentsInput {
                 tasks: vec![
                     luna_work_task("first partition"),
                     luna_work_task("second partition"),
@@ -31756,7 +31836,7 @@ mod work_subagent_cwd_guard_tests {
         rt.context.model_id = "gpt-6-astra".to_string();
 
         let result = rt
-            .handle_spawn_agents_tool(spawn_tool(SpawnAgentsInput {
+            .prepare_spawn_and_wait(spawn_tool(SpawnAgentsInput {
                 tasks: vec![luna_work_task("write")],
             }))
             .await
@@ -31783,7 +31863,7 @@ mod work_subagent_cwd_guard_tests {
 
         let responder = tokio::spawn(accept_spawn_batch(spawn_rx));
         let result = rt
-            .handle_spawn_agents_tool(spawn_tool(SpawnAgentsInput {
+            .prepare_spawn_and_wait(spawn_tool(SpawnAgentsInput {
                 tasks: vec![SubAgentTask {
                     task: "implement the fix".to_string(),
                     cwd: None,
@@ -31794,7 +31874,7 @@ mod work_subagent_cwd_guard_tests {
                 }],
             }))
             .await
-            .expect("handle_spawn_agents_tool returned error");
+            .expect("prepare_spawn_and_wait returned error");
 
         assert!(matches!(result, Some(Event::SpawnAgentsComplete { .. })));
         responder.await.expect("admission responder joins");
@@ -31809,7 +31889,7 @@ mod work_subagent_cwd_guard_tests {
 
         let responder = tokio::spawn(accept_spawn_batch(spawn_rx));
         let result = rt
-            .handle_spawn_agents_tool(spawn_tool(SpawnAgentsInput {
+            .prepare_spawn_and_wait(spawn_tool(SpawnAgentsInput {
                 tasks: vec![SubAgentTask {
                     task: "implement the fix".to_string(),
                     cwd: None,
@@ -31820,7 +31900,7 @@ mod work_subagent_cwd_guard_tests {
                 }],
             }))
             .await
-            .expect("handle_spawn_agents_tool returned error");
+            .expect("prepare_spawn_and_wait returned error");
 
         match result {
             Some(Event::SpawnAgentsComplete {
@@ -31848,7 +31928,7 @@ mod work_subagent_cwd_guard_tests {
         let mut rt = runtime_in_work_mode(worktree.path());
 
         let result = rt
-            .handle_spawn_agents_tool(spawn_tool(SpawnAgentsInput {
+            .prepare_spawn_and_wait(spawn_tool(SpawnAgentsInput {
                 tasks: vec![SubAgentTask {
                     task: "review".to_string(),
                     cwd: None,
@@ -31859,7 +31939,7 @@ mod work_subagent_cwd_guard_tests {
                 }],
             }))
             .await
-            .expect("handle_spawn_agents_tool returned error");
+            .expect("prepare_spawn_and_wait returned error");
 
         match result {
             Some(Event::ToolComplete { result, .. }) => {
@@ -31888,7 +31968,7 @@ mod work_subagent_cwd_guard_tests {
         let mut rt = runtime_in_work_mode(worktree.path());
 
         let result = rt
-            .handle_spawn_agents_tool(spawn_tool(SpawnAgentsInput {
+            .prepare_spawn_and_wait(spawn_tool(SpawnAgentsInput {
                 tasks: vec![
                     SubAgentTask {
                         task: "first".to_string(),
@@ -31915,7 +31995,7 @@ mod work_subagent_cwd_guard_tests {
                 ],
             }))
             .await
-            .expect("handle_spawn_agents_tool returned error");
+            .expect("prepare_spawn_and_wait returned error");
 
         match result {
             Some(Event::ToolComplete { result, .. }) => {
@@ -31945,7 +32025,7 @@ mod work_subagent_cwd_guard_tests {
         );
 
         let result = rt
-            .handle_spawn_agents_tool(spawn_tool(SpawnAgentsInput {
+            .prepare_spawn_and_wait(spawn_tool(SpawnAgentsInput {
                 tasks: vec![SubAgentTask {
                     task: "inspect".to_string(),
                     cwd: None,
@@ -31960,7 +32040,7 @@ mod work_subagent_cwd_guard_tests {
                 }],
             }))
             .await
-            .expect("handle_spawn_agents_tool returned error");
+            .expect("prepare_spawn_and_wait returned error");
 
         match result {
             Some(Event::ToolComplete { result, .. }) => {
@@ -31984,7 +32064,7 @@ mod work_subagent_cwd_guard_tests {
 
         let responder = tokio::spawn(accept_spawn_batch(spawn_rx));
         let result = rt
-            .handle_spawn_agents_tool(spawn_tool(SpawnAgentsInput {
+            .prepare_spawn_and_wait(spawn_tool(SpawnAgentsInput {
                 tasks: vec![SubAgentTask {
                     task: "inspect".to_string(),
                     cwd: Some("  ".to_string()),
@@ -31995,7 +32075,7 @@ mod work_subagent_cwd_guard_tests {
                 }],
             }))
             .await
-            .expect("handle_spawn_agents_tool returned error");
+            .expect("prepare_spawn_and_wait returned error");
 
         assert!(matches!(result, Some(Event::SpawnAgentsComplete { .. })));
         let specs = responder.await.expect("default batch responder");
@@ -32018,7 +32098,7 @@ mod work_subagent_cwd_guard_tests {
         rt.context = ConvContext::coordinator("coordinator", "gpt-5.6-sol", 200_000, 16_384);
         let responder = tokio::spawn(accept_spawn_batch(spawn_rx));
         let result = rt
-            .handle_spawn_agents_tool(spawn_tool(SpawnAgentsInput {
+            .prepare_spawn_and_wait(spawn_tool(SpawnAgentsInput {
                 tasks: (0..2)
                     .map(|i| SubAgentTask {
                         task: format!("Research question {i}"),
@@ -32058,7 +32138,7 @@ mod work_subagent_cwd_guard_tests {
                 runtime_in_direct_mode(parent.path()).with_spawn_channels(spawn_tx, cancel_tx);
             rt.context = ConvContext::coordinator("coordinator", "gpt-5.6-sol", 200_000, 16_384);
             let result = rt
-                .handle_spawn_agents_tool(spawn_tool(SpawnAgentsInput {
+                .prepare_spawn_and_wait(spawn_tool(SpawnAgentsInput {
                     tasks: vec![SubAgentTask {
                         task: "Research".into(),
                         cwd,
@@ -32091,7 +32171,7 @@ mod work_subagent_cwd_guard_tests {
         let mut rt = runtime_in_direct_mode(parent.path());
 
         let result = rt
-            .handle_spawn_agents_tool(spawn_tool(SpawnAgentsInput {
+            .prepare_spawn_and_wait(spawn_tool(SpawnAgentsInput {
                 tasks: vec![SubAgentTask {
                     task: "inspect".to_string(),
                     cwd: Some("nested".to_string()),
@@ -32102,7 +32182,7 @@ mod work_subagent_cwd_guard_tests {
                 }],
             }))
             .await
-            .expect("handle_spawn_agents_tool returned error");
+            .expect("prepare_spawn_and_wait returned error");
 
         match result {
             Some(Event::ToolComplete { result, .. }) => {
@@ -32126,7 +32206,7 @@ mod work_subagent_cwd_guard_tests {
         let mut rt = runtime_in_work_mode(worktree.path()).with_agent_catalog(&catalog);
 
         let result = rt
-            .handle_spawn_agents_tool(spawn_tool(SpawnAgentsInput {
+            .prepare_spawn_and_wait(spawn_tool(SpawnAgentsInput {
                 tasks: vec![SubAgentTask {
                     task: "review".to_string(),
                     cwd: None,
@@ -32137,7 +32217,7 @@ mod work_subagent_cwd_guard_tests {
                 }],
             }))
             .await
-            .expect("handle_spawn_agents_tool returned error");
+            .expect("prepare_spawn_and_wait returned error");
 
         match result {
             Some(Event::ToolComplete { result, .. }) => {
@@ -32168,7 +32248,7 @@ mod work_subagent_cwd_guard_tests {
         let mut rt = runtime_in_work_mode(worktree.path());
 
         let result = rt
-            .handle_spawn_agents_tool(spawn_tool(SpawnAgentsInput {
+            .prepare_spawn_and_wait(spawn_tool(SpawnAgentsInput {
                 tasks: vec![SubAgentTask {
                     task: "do scoped writes".to_string(),
                     cwd: Some(nested.to_string_lossy().to_string()),
@@ -32179,7 +32259,7 @@ mod work_subagent_cwd_guard_tests {
                 }],
             }))
             .await
-            .expect("handle_spawn_agents_tool returned error");
+            .expect("prepare_spawn_and_wait returned error");
 
         match result {
             Some(Event::ToolComplete { result, .. }) => {
@@ -32211,7 +32291,7 @@ mod work_subagent_cwd_guard_tests {
         let mut rt = runtime_in_work_mode(worktree.path());
 
         let result = rt
-            .handle_spawn_agents_tool(spawn_tool(SpawnAgentsInput {
+            .prepare_spawn_and_wait(spawn_tool(SpawnAgentsInput {
                 tasks: vec![SubAgentTask {
                     task: "follow the symlink".to_string(),
                     cwd: Some(symlink.to_string_lossy().to_string()),
@@ -32222,7 +32302,7 @@ mod work_subagent_cwd_guard_tests {
                 }],
             }))
             .await
-            .expect("handle_spawn_agents_tool returned error");
+            .expect("prepare_spawn_and_wait returned error");
 
         match result {
             Some(Event::ToolComplete { result, .. }) => {
@@ -32327,7 +32407,7 @@ mod work_subagent_cwd_guard_tests {
         let mut rt = runtime_in_work_mode(worktree.path());
 
         let result = rt
-            .handle_spawn_agents_tool(spawn_tool(SpawnAgentsInput {
+            .prepare_spawn_and_wait(spawn_tool(SpawnAgentsInput {
                 tasks: vec![SubAgentTask {
                     task: "traverse out".to_string(),
                     cwd: Some(traversing),
@@ -32338,7 +32418,7 @@ mod work_subagent_cwd_guard_tests {
                 }],
             }))
             .await
-            .expect("handle_spawn_agents_tool returned error");
+            .expect("prepare_spawn_and_wait returned error");
 
         match result {
             Some(Event::ToolComplete { result, .. }) => {
