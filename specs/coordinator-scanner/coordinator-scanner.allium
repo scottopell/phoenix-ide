@@ -57,6 +57,9 @@ entity ScanBatch {
         -- its original Unknown source; ambiguous reports/quotes are not commissions.
 
     @invariant BoundedCandidates
+        -- Host selection examines <=32 physical rows per pass and materializes
+        -- <=1 MiB serialized user/assistant content per row. Larger/malformed
+        -- sources remain explicit SourceUnavailable/unprocessed, without advancement.
         -- Source <=8 KiB encoded, registry <=8 KiB with <=16 compact candidates,
         -- individual title/context fields <=256 encoded bytes with clipping flags,
         -- total inference content <=24 KiB. Omissions are explicit. Matching is
@@ -106,7 +109,8 @@ config {
     historical_daily_calls: Integer = 64
     historical_hourly_calls: Integer = 4
     max_input_bytes: Integer = 24576
-    max_output_tokens: Integer = 2048
+    max_accepted_output_tokens: Integer = 2048
+    max_accepted_output_bytes: Integer = 16384
     attempts_per_cycle: Integer = 2
     retry_backoff_us: Integer = 300000000
     inference_timeout_seconds: Integer = 30
@@ -165,7 +169,8 @@ rule ReserveInferenceAttempt {
             budget.historical_daily_calls = budget.historical_daily_calls + 1
             budget.historical_hourly_calls = budget.historical_hourly_calls + 1
     @guidance
-        -- Exact eligible gpt-6-luna/Low connection only; missing route/budget waits
+        -- Exact catalog AND actual outbound gpt-6-luna/Low connection only;
+        -- remapped/unknown outbound names are ineligible. Missing route/budget waits
         -- visibly without blocking foreground turns. No cheap/default fallback.
         -- Select3live:1historical when both pending and limits permit; revisit
         -- members fairly so live work/new members and generation changes progress.
@@ -186,10 +191,13 @@ rule ResumeExhaustedRetryCycle {
 }
 
 rule AcceptCompleteSourceValidResult {
-    when: CompleteResultValidated(batch, attempt)
+    when: CompleteResultValidated(batch, attempt, output_usage_known, reported_output_tokens, utf8_text_bytes)
     requires: batch.state = captured
     requires: attempt.batch = batch
     requires: attempt.state = reserved
+    requires: output_usage_known
+    requires: reported_output_tokens >= 0 and reported_output_tokens <= config.max_accepted_output_tokens
+    requires: utf8_text_bytes >= 0 and utf8_text_bytes <= config.max_accepted_output_bytes
     ensures:
         batch.state = validated
         attempt.state = completed
@@ -200,6 +208,11 @@ rule AcceptCompleteSourceValidResult {
         -- host resolves a unique UTF8 span inside captured generation/digest bounds.
         -- Ambiguous/missing/forged quotes, tool calls and incomplete/truncated
         -- output cannot become this validated state or advance any coverage.
+        -- Validate reported output-token presence and both accepted-output bounds
+        -- before JSON parsing/application. Missing usage or any nontext block is
+        -- rejected. Official-direct requests this generation limit; Codex does
+        -- not enforce it, so no generation/billing ceiling follows from acceptance.
+        -- Preserve each observed usage field independently; unknown is not zero.
 }
 
 rule CommitValidatedBatch {
@@ -291,7 +304,7 @@ surface ScannerHost {
         SourceGenerationObserved(batch.member, new_generation, new_boundary)
         InferencePrepared(batch, budget, now_us)
         RetryResumeObserved(batch.retry_cycle, now_us)
-        CompleteResultValidated(batch, attempt)
+        CompleteResultValidated(batch, attempt, output_usage_known, reported_output_tokens, utf8_text_bytes)
         ApplyBatch(batch, registry_delta, covered_live_tail, covered_historical_range)
         BatchConflictObserved(batch)
         InvalidOrFailedInference(batch, attempt)

@@ -267,6 +267,7 @@ impl AppState {
             .await
             .map_err(std::io::Error::other)?;
         runtime.require_startup_local_authority()?;
+        runtime.start_coordinator_scanner();
         handlers::start_attachment_cleanup_task(db.clone(), Arc::clone(&runtime));
         let terminals = runtime.terminals.clone();
         {
