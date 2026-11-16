@@ -119,6 +119,7 @@ interface ScenarioCommon {
   snapshotError?: string;
   reminderFixture?: ReminderFixture;
   continuationJourney?: boolean;
+  reviewProjectionQa?: boolean;
 }
 
 export type ProductConversationScenario = ScenarioCommon & (

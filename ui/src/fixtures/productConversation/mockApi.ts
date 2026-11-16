@@ -640,6 +640,31 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
   };
   window.addEventListener('product-conversation-fixture-successor-message', publishSuccessorMessage);
 
+  const publishReviewProjection = (event: Event) => {
+    if (!scenario.reviewProjectionQa) return;
+    const source = latestEventSource;
+    if (!source || source.readyState !== FixtureEventSource.OPEN || source.subscriptionCount < 1) {
+      throw new Error('Review projection fixture requires an active transcript SSE subscription');
+    }
+    const mode = (event as CustomEvent<{ mode: string }>).detail?.mode;
+    if (mode === 'none') return;
+    const sequenceId = source.nextSequenceId();
+    if (mode === 'changed-message') {
+      const message = currentMessages.find(message => message.message_id === 'history-answer-3');
+      if (!message) throw new Error('Reviewed latest message missing');
+      const blocks = message.content as { type: 'text'; text: string }[];
+      const content = [{ type: 'text' as const, text: `Intentional changed-message control.\n\n${blocks[0]!.text}` }];
+      currentMessages = currentMessages.map(candidate => candidate === message ? { ...message, content } : candidate);
+      source.emit('message_updated', { opening: null, sequence_id: sequenceId, message_id: message.message_id, transcript_generation: 1, display_data: message.display_data, content });
+    } else {
+      const conversation = { title: `Fixture background projection ${sequenceId}`, updated_at: new Date(Date.parse('2026-07-01T12:00:00Z') + sequenceId).toISOString() };
+      currentConversation = { ...currentConversation, ...conversation };
+      source.emit('conversation_update', { sequence_id: sequenceId, conversation });
+    }
+    document.documentElement.dataset['productConversationFixtureReviewProjectionPublishes'] = '1';
+  };
+  window.addEventListener('product-conversation-fixture-review-projection', publishReviewProjection);
+
   globalThis.EventSource = FixtureEventSource as unknown as typeof EventSource;
   const failLatestEventSource = () => {
     const stream = [...eventSources].find(source => source.memberId === currentConversation.id && source.readyState === FixtureEventSource.OPEN && source.subscriptionCount > 0);
@@ -699,6 +724,8 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
     api.reconcileAcceptedMessages = originalReconcileAcceptedMessages;
     api.continueConversation = originalContinueConversation;
     api.retryContinuationOpening = originalRetryContinuationOpening;
+    window.removeEventListener('product-conversation-fixture-review-projection', publishReviewProjection);
+    delete document.documentElement.dataset['productConversationFixtureReviewProjectionPublishes'];
     window.removeEventListener('product-conversation-fixture-fail-opening-retry', failNextOpeningRetry);
     window.removeEventListener('product-conversation-fixture-release-older', releaseOlderSnapshotResponse);
     globalThis.fetch = originalFetch;

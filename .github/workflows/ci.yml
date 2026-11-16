@@ -959,6 +959,8 @@ jobs:
           node scripts/capture-subagent-task-details.mjs
           node scripts/capture-composer-rejection.mjs
           node scripts/capture-review-reading-position.mjs
+          OVERLAY_IDLE_QA=1 REVIEW_READING_QA_OUT=qa-artifacts/review-overlay-idle node scripts/capture-review-reading-position.mjs
+          OVERLAY_PROJECTION_QA=1 REVIEW_READING_QA_OUT=qa-artifacts/review-overlay-projection node scripts/capture-review-reading-position.mjs
           node scripts/capture-reminders.mjs
           CAPTURE_STORIES=mobile-continuation-ordinary,mobile-continuation-global CAPTURE_VIEWPORT=mobile-light PLAYWRIGHT_INSTALLED_ONLY=1 node scripts/capture-product-conversation.mjs
           if [ -n "${BASE_SHA:-}" ]; then

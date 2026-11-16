@@ -9,9 +9,15 @@ const base = process.env.LADLE_URL;
 assert(base, 'LADLE_URL is required (serve the built fixtures on a hosted runner)');
 assert(['http:', 'https:'].includes(new URL(base).protocol), 'LADLE_URL must be HTTP(S)');
 const baseline = process.env.BASELINE === '1';
+const idleAudit = process.env.OVERLAY_IDLE_QA === '1';
+const overlayProjectionQa = process.env.OVERLAY_PROJECTION_QA === '1';
 const out = path.resolve(process.env.REVIEW_READING_QA_OUT ?? 'qa-artifacts/review-reading-position');
 await mkdir(out, { recursive: true });
 const report = {
+  idleAudit,
+  overlayProjectionQa,
+  overlayProjectionConditions: overlayProjectionQa ? 'Accepted fixture SSE conversation_update; unchanged/no-update control, Mermaid projection, text-only projection, intentional changed-message control; 390px and 1440px.' : null,
+  idleConditions: idleAudit ? 'Long image-free production viewer; ordinary/global, touch-enabled 390px and desktop 1440px; four 2400ms no-input windows after settle; Chromium is not physical iOS.' : null,
   baseline, base, cases: [], mismatches: [], errors: [], controls: [],
   limitations: [
     'HashRouter transports the product path/search/hash inside the hosted Ladle URL; not production-path cold reload acceptance.',
@@ -49,6 +55,18 @@ for (const fixture of fixtures) {
   cases.push({ fixture, width: 1440, position: 'middle', exit: 'fullscreen-return' });
 }
 assert.equal(cases.length, 42);
+if (idleAudit) {
+  cases.length = 0;
+  for (const fixture of fixtures) for (const width of [390, 1440]) {
+    cases.push({ fixture: { ...fixture, story: fixture.story.replace('-long-history', '-idle-review') }, width, position: 'middle', exit: 'discard' });
+  }
+}
+if (overlayProjectionQa) {
+  cases.length = 0;
+  for (const width of [390, 1440]) for (const mode of ['unchanged', 'mermaid-projection', 'text-projection', 'changed-message']) {
+    cases.push({ fixture: { kind: 'ordinary', story: mode === 'text-projection' ? 'review-reading-position--overlay-projection-text' : 'review-reading-position--overlay-projection-mermaid', ready: 'ordinary-lazy-history', entry: '/product-conversations/fixture-product-conversation?source_transcript=history-3#message-history-answer-3' }, width, position: 'middle', exit: 'discard', overlayMode: mode });
+  }
+}
 
 // Wait for geometry to remain stable over animation frames, with enough frames
 // to include the short CSS transitions. No wall-clock journey sleeps.
@@ -58,7 +76,8 @@ async function settle(page) {
     function tick() {
       const el = document.querySelector('#messages');
       const rect = el?.getBoundingClientRect();
-      const value = JSON.stringify([el?.scrollTop, el?.scrollHeight, rect?.width, rect?.height]);
+      const viewer = document.querySelector('.viewer-content');
+      const value = JSON.stringify([el?.scrollTop, el?.scrollHeight, rect?.width, rect?.height, viewer?.scrollTop, viewer?.scrollHeight, viewer?.clientHeight, visualViewport?.offsetTop, visualViewport?.height]);
       stable = value === last ? stable + 1 : 0; last = value;
       if (++frames >= 20 && stable >= 8) resolve();
       else if (frames > 180) reject(new Error('Transcript geometry did not settle'));
@@ -144,18 +163,222 @@ function compare(id, stage, before, after, geometry) {
   if (JSON.stringify(scrolls(before)) !== JSON.stringify(scrolls(after))) mismatch(id, stage, 'ancestor scroll changed', scrolls(before), scrolls(after));
 }
 
+async function traceIdle(page, result, stage) {
+  result.idle ??= {};
+  result.idle[stage] = await page.evaluate(async () => {
+    const root = document.querySelector('.viewer-shell');
+    if (!root || root.querySelector('img, video, iframe')) throw new Error('Idle probe requires an image-free viewer');
+    const content = root.querySelector('.viewer-content');
+    if (!content || content.scrollHeight <= content.clientHeight + 100) throw new Error('Idle viewer must have real overflowing prose');
+    const candidates = [...content.querySelectorAll('p')];
+    const box = content.getBoundingClientRect();
+    const anchor = candidates.find(p => p.getBoundingClientRect().top >= box.top && p.getBoundingClientRect().bottom <= box.bottom);
+    if (!anchor) throw new Error('No fully visible viewer paragraph');
+    const ids = new WeakMap(); let nextId = 0;
+    const identify = node => {
+      if (!node) return null;
+      if (!ids.has(node)) ids.set(node, ++nextId);
+      return { node: ids.get(node), tag: node.tagName ?? node.nodeName, id: node.id, className: node.className, label: node.getAttribute?.('aria-label') };
+    };
+    const textWalker = document.createTreeWalker(anchor, NodeFilter.SHOW_TEXT);
+    let textNode;
+    while (textWalker.nextNode()) {
+      if (textWalker.currentNode.textContent.trim().length > 32) { textNode = textWalker.currentNode; break; }
+    }
+    if (!textNode) throw new Error('Idle anchor must contain measurable text');
+    const expectedText = anchor.textContent;
+    const expectedSlice = textNode.textContent.slice(0, 32);
+    const textRect = paragraph => {
+      if (!paragraph || paragraph.textContent !== expectedText) return null;
+      const walker = document.createTreeWalker(paragraph, NodeFilter.SHOW_TEXT);
+      while (walker.nextNode()) {
+        const start = walker.currentNode.textContent.indexOf(expectedSlice);
+        if (start < 0) continue;
+        const range = document.createRange(); range.setStart(walker.currentNode, start); range.setEnd(walker.currentNode, start + expectedSlice.length);
+        return [...range.getClientRects()].map(rect => ({ x: rect.x, y: rect.y, width: rect.width, height: rect.height }));
+      }
+      return null;
+    };
+    const events = [];
+    const onEvent = event => {
+      const target = event.target === document ? document.scrollingElement : event.target;
+      events.push({ time: performance.now(), type: event.type, target: identify(event.target), focus: identify(document.activeElement), top: target?.scrollTop, left: target?.scrollLeft });
+    };
+    for (const name of ['focusin', 'scroll', 'pointerdown', 'touchstart', 'keydown']) document.addEventListener(name, onEvent, true);
+    const samples = [];
+    const started = performance.now();
+    const commandStart = window.reviewIdleCommands?.length ?? 0;
+    try {
+      while (performance.now() - started < 2400) {
+        const liveAnchor = anchor.isConnected ? anchor : [...content.querySelectorAll('p')].find(p => p.textContent === anchor.textContent);
+        const nodes = new Set([document.scrollingElement, document.querySelector('#messages'), root, content]);
+        for (let parent = content.parentElement; parent; parent = parent.parentElement) nodes.add(parent);
+        samples.push({
+          time: performance.now() - started,
+          focus: identify(document.activeElement),
+          textRects: textRect(liveAnchor),
+          highlighted: Boolean(content.querySelector('.annotatable--highlighted')),
+          viewerConnected: root.isConnected, contentConnected: content.isConnected, anchorConnected: anchor.isConnected,
+          anchor: { text: liveAnchor?.textContent, top: liveAnchor?.getBoundingClientRect().top, height: liveAnchor?.getBoundingClientRect().height, node: identify(liveAnchor)?.node },
+          viewport: { x: scrollX, y: scrollY, width: innerWidth, height: innerHeight, visualTop: visualViewport?.offsetTop, visualHeight: visualViewport?.height },
+          scrollers: [...nodes].filter(Boolean).map(node => ({ ...identify(node), top: node.scrollTop, left: node.scrollLeft, scrollHeight: node.scrollHeight, clientHeight: node.clientHeight, rectTop: node.getBoundingClientRect().top, rectHeight: node.getBoundingClientRect().height, overflow: getComputedStyle(node).overflowY })),
+        });
+        await new Promise(requestAnimationFrame);
+      }
+    } finally {
+      for (const name of ['focusin', 'scroll', 'pointerdown', 'touchstart', 'keydown']) document.removeEventListener(name, onEvent, true);
+    }
+    return { samples, events, commands: window.reviewIdleCommands?.slice(commandStart) ?? [], windowMs: 2400, anchorText: anchor.textContent };
+  });
+  const trace = result.idle[stage];
+  const first = trace.samples[0];
+  assert(first.textRects?.some(rect => rect.width > 0 && rect.height > 0), 'Idle anchor must have visible text geometry');
+  if (stage === 'note-navigation-expiry-idle') {
+    assert(first.highlighted, 'Highlight expired before recording; expiry coverage is inconclusive');
+    assert(!trace.samples.at(-1).highlighted, 'Highlight expiry must occur during recording');
+  }
+  for (const event of trace.events) {
+    if (event.type === 'focusin' && JSON.stringify(event.focus) !== JSON.stringify(first.focus)) mismatch(result.id, stage, 'idle focus event changed focus', first.focus, event);
+    if (event.type === 'scroll') {
+      const original = first.scrollers.find(scroller => scroller.node === event.target?.node || (event.target?.tag === '#document' && scroller.tag === 'HTML'));
+      if (!original || event.top !== original.top || event.left !== original.left) mismatch(result.id, stage, 'idle scroll event changed offset', original, event);
+    }
+  }
+  for (const sample of trace.samples) {
+    if (sample.anchor.text !== first.anchor.text || JSON.stringify(sample.textRects) !== JSON.stringify(first.textRects)) mismatch(result.id, stage, 'idle visible text range changed', first.textRects, sample.textRects);
+    if (sample.anchor.top === undefined || Math.abs(sample.anchor.top - first.anchor.top) > 2 || !sample.contentConnected || !sample.viewerConnected) mismatch(result.id, stage, 'idle visible viewer text moved/missing', first, sample);
+    if (JSON.stringify(sample.focus) !== JSON.stringify(first.focus)) mismatch(result.id, stage, 'idle focus changed', first.focus, sample.focus);
+    if (JSON.stringify(sample.viewport) !== JSON.stringify(first.viewport)) mismatch(result.id, stage, 'idle document/visual viewport moved', first.viewport, sample.viewport);
+    if (JSON.stringify(sample.scrollers) !== JSON.stringify(first.scrollers)) mismatch(result.id, stage, 'idle scroller/ancestor geometry changed', first.scrollers, sample.scrollers);
+  }
+  assert(!trace.events.some(event => ['pointerdown', 'touchstart', 'keydown'].includes(event.type)), 'Idle trace must contain no input');
+}
+
+async function captureOverlayProjection(page, result, mode, fixture) {
+  const mermaid = mode !== 'text-projection';
+  await page.goto(`${base}/?story=${fixture.story}&theme=light&fixtureEntry=${encodeURIComponent(fixture.entry)}`);
+  await page.waitForSelector('[data-product-conversation-fixture-ready="ordinary-lazy-history"]');
+  await settle(page);
+  const row = page.locator('[data-render-unit-key="history-answer-3"]');
+  await row.getByRole('button', { name: 'Open message reviewer', exact: true }).click();
+  await page.waitForSelector('.viewer-content');
+  if (mermaid) await page.waitForSelector('.viewer-content .mermaid-svg svg');
+  await page.evaluate(() => document.fonts.ready);
+  await settle(page);
+  await page.evaluate(() => {
+    const content = document.querySelector('.viewer-content');
+    const anchor = [...content.querySelectorAll('p')].find(p => p.textContent.startsWith('Review paragraph 10:'));
+    if (!anchor) throw new Error('Missing same-text anchor');
+    content.scrollTop += anchor.getBoundingClientRect().top - content.getBoundingClientRect().top - 120;
+  });
+  await settle(page);
+  await page.screenshot({ path: path.join(out, result.id + '-before.png') });
+  result.trace = await page.evaluate(async ({ mode }) => {
+    const content = document.querySelector('.viewer-content');
+    const original = [...content.querySelectorAll('p')].find(p => p.textContent.startsWith('Review paragraph 10:'));
+    const expectedText = original.textContent;
+    const originalDiagram = content.querySelector('.mermaid-diagram');
+    const originalSvg = originalDiagram?.querySelector('svg');
+    const initialParagraphs = [...content.querySelectorAll('p')].map(p => p.textContent);
+    const probeBefore = { ...document.querySelector('[data-review-projection-probe]').dataset };
+    const events = [], mutations = [], samples = [];
+    const identity = node => node ? { tag: node.tagName, id: node.id, class: String(node.className) } : null;
+    const read = () => {
+      const anchor = original.isConnected ? original : [...content.querySelectorAll('p')].find(p => p.textContent === expectedText);
+      const rects = [];
+      if (anchor) {
+        const walker = document.createTreeWalker(anchor, NodeFilter.SHOW_TEXT);
+        if (walker.nextNode()) {
+          const range = document.createRange(); range.setStart(walker.currentNode, 0); range.setEnd(walker.currentNode, Math.min(32, walker.currentNode.length));
+          rects.push(...[...range.getClientRects()].map(r => ({ x: r.x, y: r.y, width: r.width, height: r.height })));
+        }
+      }
+      const nodes = new Set([document.scrollingElement, document.querySelector('#messages'), content]);
+      for (let parent = content.parentElement; parent; parent = parent.parentElement) nodes.add(parent);
+      return { time: performance.now(), sameNode: anchor === original, sameDiagram: !originalDiagram || originalDiagram === content.querySelector('.mermaid-diagram'), sameSvg: !originalSvg || originalSvg === content.querySelector('.mermaid-diagram svg'), rects,
+        loading: Boolean(content.querySelector('.mermaid-diagram-loading')), svg: Boolean(content.querySelector('.mermaid-svg svg')),
+        ancestors: [...nodes].filter(Boolean).map(n => ({ ...identity(n), top: n.scrollTop, left: n.scrollLeft })), focus: identity(document.activeElement),
+        viewport: window.visualViewport ? { top: visualViewport.offsetTop, left: visualViewport.offsetLeft, height: visualViewport.height, width: visualViewport.width, scale: visualViewport.scale } : null };
+    };
+    const onEvent = e => events.push({ type: e.type, target: identity(e.target), time: performance.now() });
+    const names = ['pointerdown', 'touchstart', 'keydown', 'click', 'focusin', 'scroll'];
+    names.forEach(name => document.addEventListener(name, onEvent, true));
+    const observer = new MutationObserver(records => mutations.push({ ...read(), addedLoading: records.some(r => [...r.addedNodes].some(n => n.nodeType === 1 && (n.matches('.mermaid-diagram-loading') || n.querySelector('.mermaid-diagram-loading')))) }));
+    observer.observe(content, { subtree: true, childList: true });
+    const before = read();
+    try {
+      window.dispatchEvent(new CustomEvent('product-conversation-fixture-review-projection', { detail: { mode: mode === 'changed-message' ? 'changed-message' : mode === 'unchanged' ? 'none' : 'projection' } }));
+      const started = performance.now();
+      while (performance.now() - started < 1800) { samples.push(read()); await new Promise(requestAnimationFrame); }
+      return { before, after: read(), samples, mutations, events, probeBefore, probeAfter: { ...document.querySelector('[data-review-projection-probe]').dataset }, paragraphsUnchanged: JSON.stringify(initialParagraphs) === JSON.stringify([...content.querySelectorAll('p')].map(p => p.textContent)), fixture: { ...document.documentElement.dataset } };
+    } finally { observer.disconnect(); names.forEach(name => document.removeEventListener(name, onEvent, true)); }
+  }, { mode });
+  const { before, samples, mutations, events, after } = result.trace;
+  result.geometryPreserved = samples.every(s => JSON.stringify(s.rects) === JSON.stringify(before.rects));
+  result.nodesPreserved = samples.every(s => s.sameNode && s.sameDiagram && s.sameSvg);
+  result.loadingObserved = [...samples, ...mutations].some(s => s.loading || s.addedLoading);
+  assert.equal(events.filter(e => ['pointerdown', 'touchstart', 'keydown', 'click', 'focusin'].includes(e.type)).length, 0, 'New input or focus during background measurement');
+  if (mode === 'changed-message') {
+    assert.equal(result.trace.paragraphsUnchanged, false, 'Intentional content update must reach reviewed message');
+    assert.notEqual(result.trace.probeBefore.reviewedContent, result.trace.probeAfter.reviewedContent, 'Changed-message control must reach atom');
+    assert(after.rects.length > 0, 'Changed-message control must retain unchanged anchor text');
+  } else {
+    assert(result.trace.paragraphsUnchanged, 'Unchanged reviewed Markdown must retain all prose');
+    assert.equal(result.trace.probeBefore.reviewedContent, result.trace.probeAfter.reviewedContent, 'Reviewed atom content changed during projection');
+    if (mode !== 'unchanged') assert.match(result.trace.probeAfter.title, /^Fixture background projection /, 'SSE conversation_update was not accepted');
+    if (mode !== 'unchanged') assert.equal(result.trace.fixture.productConversationFixtureReviewProjectionPublishes, '1', 'Eligible SSE update was not published');
+    if (mode === 'unchanged' || !baseline) {
+      assert(result.nodesPreserved, 'Unchanged reviewed message unnecessarily remounted');
+      assert(result.geometryPreserved, 'Unchanged reviewed same-text geometry moved');
+      assert(!result.loadingObserved, 'Already-rendered Mermaid returned to loading');
+    } else {
+      assert(!result.nodesPreserved, 'Baseline must demonstrate unnecessary renderer remount');
+      if (mermaid) assert(result.loadingObserved, 'Baseline must observe fresh Mermaid loading');
+    }
+  }
+  await page.screenshot({ path: path.join(out, result.id + '-after.png') });
+}
+
 try {
   for (const test of cases) {
-    const { fixture, width, position, exit } = test;
-    const id = `${fixture.kind}-${width}-${position}-${exit}`;
+    const { fixture, width, position, exit, overlayMode } = test;
+    const id = overlayProjectionQa ? `overlay-${overlayMode}-${width}` : `${fixture.kind}-${width}-${position}-${exit}`;
     const result = { id, stages: {} };
     report.cases.push(result);
-    const context = await browser.newContext({ viewport: { width, height: width === 390 ? 844 : 900 } });
+    const context = await browser.newContext({ viewport: { width, height: width === 390 ? 844 : 900 }, hasTouch: (idleAudit || overlayProjectionQa) && width === 390 });
     const page = await context.newPage();
     page.setDefaultTimeout(6500);
     page.setDefaultNavigationTimeout(15000);
     page.on('pageerror', error => report.errors.push(`${id}: ${error.message}`));
     page.on('console', message => { if (message.type() === 'error') report.errors.push(`${id}: console: ${message.text()}`); });
+    if (overlayProjectionQa) {
+      try {
+        await page.route('**/api/**', route => { report.errors.push(`${id}: unexpected network API ${route.request().url()}`); return route.abort('blockedbyclient'); });
+        await captureOverlayProjection(page, result, overlayMode, fixture);
+
+      } catch (error) {
+        result.error = String(error); report.errors.push(`${id}: ${error}`);
+        await page.screenshot({ path: path.join(out, `${id}-error.png`) }).catch(() => {});
+      } finally {
+        await context.close(); await save();
+      }
+      continue;
+    }
+    if (idleAudit) await page.addInitScript(() => {
+      window.reviewIdleCommands = [];
+      window.reviewSetupEvents = [];
+      for (const type of ['pointerdown', 'pointerup', 'touchstart', 'touchend', 'click', 'focusin']) {
+        document.addEventListener(type, event => window.reviewSetupEvents.push({ time: performance.now(), type, target: { tag: event.target.tagName, className: event.target.className }, editorOpen: Boolean(document.querySelector('.annotation-dialog-input')) }), true);
+      }
+      for (const [prototype, method] of [[HTMLElement.prototype, 'focus'], [Element.prototype, 'scrollIntoView'], [Element.prototype, 'scrollTo'], [Element.prototype, 'scrollBy']]) {
+        const original = prototype[method];
+        if (!original) continue;
+        prototype[method] = function (...args) {
+          window.reviewIdleCommands.push({ time: performance.now(), method, target: { tag: this.tagName, id: this.id, className: this.className, label: this.getAttribute('aria-label') }, args, stack: new Error().stack });
+          return original.apply(this, args);
+        };
+      }
+    });
     await page.route('**/api/**', route => {
       report.errors.push(`${id}: unexpected network API ${route.request().url()}`);
       return route.abort('blockedbyclient');
@@ -242,11 +465,54 @@ try {
       const opened = result.stages.open = await measure(page);
       compare(id, 'open', before, opened, false);
       await page.screenshot({ path: path.join(out, `${id}-open.png`) });
+      if (idleAudit) {
+        await viewer.locator('.viewer-content').evaluate(el => { el.scrollTop = (el.scrollHeight - el.clientHeight) * 0.45; });
+        await settle(page);
+        await traceIdle(page, result, 'review-open-idle');
+        await page.screenshot({ animations: 'disabled', path: path.join(out, `${id}-idle.png`) });
+      }
       if (exit === 'discard' || exit === 'send') {
-        await viewer.getByRole('button', { name: 'Add note to line 1', exact: true }).click({ force: true });
+        const lineAction = idleAudit ? await viewer.locator('.viewer-content').evaluate(content => {
+          const box = content.getBoundingClientRect();
+          return [...content.querySelectorAll('p')].filter(p => p.getBoundingClientRect().top >= box.top && p.getBoundingClientRect().bottom <= box.bottom)
+            .sort((a, b) => Math.abs((a.getBoundingClientRect().top + a.getBoundingClientRect().bottom) / 2 - innerHeight / 2) - Math.abs((b.getBoundingClientRect().top + b.getBoundingClientRect().bottom) / 2 - innerHeight / 2))[0]?.querySelector('.annotatable__btn')?.getAttribute('aria-label');
+        }) : 'Add note to line 1';
+        assert(lineAction, 'Annotation action must belong to a visible paragraph');
+        if (idleAudit && width === 390) {
+          const point = await viewer.locator('.annotatable').filter({ has: page.locator(`button[aria-label=${JSON.stringify(lineAction)}]`) }).evaluate(block => {
+            const rect = block.getBoundingClientRect();
+            return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
+          });
+          const touch = await context.newCDPSession(page);
+          try {
+            await touch.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: [point] });
+            await page.locator('.annotation-dialog-input').waitFor({ state: 'visible' });
+          } finally {
+            await touch.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] });
+            await touch.detach();
+          }
+        } else {
+          await viewer.getByRole('button', { name: lineAction, exact: true }).click({ force: true });
+        }
         const note = `reading-position-note-${id}`;
         await page.locator('.annotation-dialog-input').fill(note);
+        if (idleAudit) {
+          await settle(page);
+          await traceIdle(page, result, 'annotation-editor-idle');
+          await page.screenshot({ animations: 'disabled', path: path.join(out, `${id}-editor-idle.png`) });
+        }
         await page.getByRole('button', { name: 'Add Note', exact: true }).click();
+        if (idleAudit) {
+          await settle(page);
+          await traceIdle(page, result, 'saved-note-idle');
+          await page.screenshot({ animations: 'disabled', path: path.join(out, `${id}-saved-idle.png`) });
+          const noteAnchor = viewer.locator('.notes-panel-note-anchor').first();
+          if (!await noteAnchor.isVisible()) await viewer.getByRole('button', { name: '1 notes', exact: true }).click();
+          await noteAnchor.click();
+          await settle(page);
+          await traceIdle(page, result, 'note-navigation-expiry-idle');
+          await page.screenshot({ animations: 'disabled', path: path.join(out, `${id}-note-navigation-idle.png`) });
+        }
         if (exit === 'send') {
           await viewer.getByRole('button', { name: 'Send notes', exact: true }).click();
           const input = page.locator('.product-conversation-page__composer #message-input');
@@ -294,17 +560,20 @@ try {
         report.controls.push({ id, locationBefore, locationAfter, targetVisible: true });
       }
     } catch (error) {
+      if (idleAudit) result.commands = await page.evaluate(() => window.reviewIdleCommands).catch(() => []);
       result.error = String(error);
       report.errors.push(`${id}: ${error}`);
       await page.screenshot({ path: path.join(out, `${id}-error.png`) }).catch(() => {});
     } finally {
+      if (idleAudit && !result.error) result.commands = await page.evaluate(() => window.reviewIdleCommands).catch(() => []);
+      if (idleAudit) result.setupEvents = await page.evaluate(() => window.reviewSetupEvents).catch(() => []);
       await context.close();
       await save();
     }
   }
   assert.equal(report.errors.length, 0, `Harness/interaction errors: ${report.errors.join('\n')}`);
-  assert.equal(report.controls.length, 1, 'Missing true chapter navigation control');
-  if (baseline) assert(report.mismatches.length > 0, 'BASELINE must reproduce at least one position/route/node mismatch');
+  assert.equal(report.controls.length, idleAudit || overlayProjectionQa ? 0 : 1, 'Unexpected chapter navigation control count');
+  if (baseline && !overlayProjectionQa) assert(report.mismatches.length > 0, 'BASELINE must reproduce at least one position/route/node mismatch');
   else assert.equal(report.mismatches.length, 0, `Reading-position regressions: ${report.mismatches.length}; see ${out}/report.json`);
   console.log(`${baseline ? 'BASELINE reproduced' : 'PASS'}: ${report.cases.length} cases, ${report.mismatches.length} mismatches; ${out}`);
 } finally {
