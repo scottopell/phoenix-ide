@@ -2,11 +2,8 @@ use super::{
     InputOrigin, ScanCandidate, ScanCandidateState, ScanFragment, ScanLane, ScanPosition, ScanRole,
     TrackingKind, TrackingRetirement,
 };
-use crate::{Database, DbError, DbResult, MessageContent};
-use phoenix_core::domain::{
-    llm_types::ContentBlock,
-    product_conversation::{ProductConversationId, ProductConversationKind},
-};
+use crate::{DbError, DbResult, MessageContent};
+use phoenix_core::domain::llm_types::ContentBlock;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use sqlx::{Row, Sqlite, Transaction};
@@ -43,34 +40,84 @@ pub(super) fn lane_name(lane: ScanLane) -> &'static str {
     }
 }
 
-pub(super) async fn topology(
-    tx: &mut Transaction<'_, Sqlite>,
-) -> DbResult<
-    Option<(
-        String,
-        Vec<crate::product_conversation_read::ProductConversationTranscriptRow>,
-    )>,
-> {
-    let head: Option<String> =
-        sqlx::query_scalar("SELECT id FROM conversations WHERE coordinator_head=1")
-            .fetch_optional(&mut **tx)
-            .await?;
+pub(super) const CHAIN: &str = "WITH RECURSIVE chain(id, depth) AS (
+ SELECT id,0 FROM conversations WHERE id=?1 AND product_conversation_id=?2
+ AND runtime_role='coordinator' AND parent_conversation_id IS NULL
+ UNION ALL SELECT p.id,chain.depth+1 FROM chain JOIN conversations p ON p.continued_in_conv_id=chain.id
+ WHERE p.product_conversation_id=?2 AND p.runtime_role='coordinator' AND p.parent_conversation_id IS NULL
+), members AS (
+ SELECT c.id, (SELECT MAX(depth) FROM chain)-chain.depth AS ordinal,c.transcript_generation,
+ COALESCE((SELECT MAX(sequence_id) FROM messages WHERE conversation_id=c.id),0) AS tail
+ FROM chain JOIN conversations c ON c.id=chain.id) ";
+
+pub(super) struct Topology {
+    pub owner: String,
+    pub head: String,
+    pub maximum: i64,
+}
+#[derive(Debug)]
+pub(super) struct Member {
+    pub id: String,
+    pub ordinal: i64,
+    pub generation: i64,
+    pub tail: i64,
+}
+fn member_row(row: &sqlx::sqlite::SqliteRow) -> DbResult<Member> {
+    Ok(Member {
+        id: row.try_get("id")?,
+        ordinal: row.try_get("ordinal")?,
+        generation: row.try_get("transcript_generation")?,
+        tail: row.try_get("tail")?,
+    })
+}
+pub(super) async fn owner(tx: &mut Transaction<'_, Sqlite>) -> DbResult<Option<(String, String)>> {
+    let head:Option<String> = sqlx::query_scalar("SELECT c.id FROM conversations c JOIN product_conversations p ON p.id=c.product_conversation_id WHERE c.coordinator_head=1 AND c.runtime_role='coordinator' AND c.parent_conversation_id IS NULL AND p.kind='coordinator' AND NOT EXISTS(SELECT 1 FROM product_creation_jobs j WHERE j.product_conversation_id=p.id AND j.status<>'published')").fetch_optional(&mut **tx).await?;
     let Some(head) = head else { return Ok(None) };
     let owner = crate::coordinator_tracking::require_owner(tx, &head).await?;
-    let id: ProductConversationId = owner
-        .parse()
-        .map_err(|e| invalid(format!("invalid coordinator product: {e}")))?;
-    let aggregate =
-        Database::get_product_conversation_on(tx, &id, ProductConversationKind::Coordinator)
-            .await?;
-    Ok(Some((
+    Ok(Some((owner, head)))
+}
+pub(super) async fn topology(tx: &mut Transaction<'_, Sqlite>) -> DbResult<Option<Topology>> {
+    let Some((owner, head)) = owner(tx).await? else {
+        return Ok(None);
+    };
+    let maximum: i64 = sqlx::query_scalar(&format!("{CHAIN} SELECT MAX(ordinal) FROM members"))
+        .bind(&head)
+        .bind(&owner)
+        .fetch_one(&mut **tx)
+        .await?;
+    Ok(Some(Topology {
         owner,
-        aggregate
-            .segments
-            .into_iter()
-            .map(|s| s.transcript_row)
-            .collect(),
-    )))
+        head,
+        maximum,
+    }))
+}
+pub(super) async fn member_page(
+    tx: &mut Transaction<'_, Sqlite>,
+    topology: &Topology,
+    start: i64,
+) -> DbResult<Vec<Member>> {
+    let rows = sqlx::query(&format!(
+        "{CHAIN} SELECT * FROM members WHERE ordinal>=?3 ORDER BY ordinal LIMIT 8"
+    ))
+    .bind(&topology.head)
+    .bind(&topology.owner)
+    .bind(start)
+    .fetch_all(&mut **tx)
+    .await?;
+    rows.iter().map(member_row).collect()
+}
+pub(super) async fn member(
+    tx: &mut Transaction<'_, Sqlite>,
+    topology: &Topology,
+    id: &str,
+) -> DbResult<Option<Member>> {
+    let row = sqlx::query(&format!("{CHAIN} SELECT * FROM members WHERE id=?3"))
+        .bind(&topology.head)
+        .bind(&topology.owner)
+        .bind(id)
+        .fetch_optional(&mut **tx)
+        .await?;
+    row.as_ref().map(member_row).transpose()
 }
 pub(super) fn position(row: &sqlx::sqlite::SqliteRow, lane: ScanLane) -> DbResult<ScanPosition> {
     let prefix = lane_name(lane);

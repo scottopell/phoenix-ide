@@ -1963,3 +1963,5 @@ async fn scanner_bounded_contention_leaves_pending_then_progresses_when_quiet() 
         ScanCoverageState::Covered
     ));
 }
+
+mod topology;

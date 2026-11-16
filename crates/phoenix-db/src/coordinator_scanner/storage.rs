@@ -1,7 +1,7 @@
 use super::{
     source::{
         advance, candidates, capture, capture_range, encoded, hash, hex, invalid, lane_name,
-        position, seq, topology,
+        member, member_page, owner, position, seq, topology, CHAIN,
     },
     PreparedScanBatch, ReservedScanAttempt, ScanBlocker, ScanContext, ScanCoveragePage,
     ScanCoverageState, ScanCoverageSummary, ScanFailure, ScanFreshness, ScanInput, ScanLane,
@@ -79,7 +79,7 @@ impl Database {
         now_us: i64,
     ) -> LocalAuthorityResult<DbResult<()>> {
         write_tx!(self, tx, async {
-            let Some((owner, _)) = topology(&mut tx).await? else {
+            let Some((owner, _)) = owner(&mut tx).await? else {
                 return Err(crate::DbError::CurrentCoordinatorRequired);
             };
             if owner != attempt.batch.owner_product_id {
@@ -131,48 +131,44 @@ async fn prepare(
     if now < 0 {
         return Err(invalid("negative scan time"));
     }
-    let Some((owner, members)) = topology(tx).await? else {
+    let Some(topology) = topology(tx).await? else {
         return Ok(ScanPreparation::Idle);
     };
-    coordinator_tracking::ensure_registry(tx, &owner).await?;
-    let maximum = members.last().map_or(0, |m| m.segment_ordinal);
-    sqlx::query("INSERT INTO coordinator_scan_state(singleton,activation_member_ordinal,discovery_next_ordinal,observed_at_us) VALUES(1,?1,0,?2) ON CONFLICT(singleton) DO NOTHING").bind(maximum).bind(now).execute(&mut **tx).await?;
+    let owner = &topology.owner;
+    coordinator_tracking::ensure_registry(tx, owner).await?;
+    sqlx::query("INSERT INTO coordinator_scan_state(singleton,activation_member_ordinal,discovery_next_ordinal,observed_at_us) VALUES(1,?1,0,?2) ON CONFLICT(singleton) DO NOTHING").bind(topology.maximum).bind(now).execute(&mut **tx).await?;
     let state = sqlx::query("SELECT * FROM coordinator_scan_state WHERE singleton=1")
         .fetch_one(&mut **tx)
         .await?;
     let activated: i64 = state.try_get("activation_member_ordinal")?;
     let next: i64 = state.try_get("discovery_next_ordinal")?;
-    let mut selected = members
-        .iter()
-        .filter(|m| m.segment_ordinal >= next)
-        .take(8)
-        .collect::<Vec<_>>();
+    let mut selected = member_page(tx, &topology, next).await?;
     if selected.is_empty() {
-        selected = members.iter().take(8).collect();
+        selected = member_page(tx, &topology, 0).await?;
     }
-    if let Some(head) = members.last() {
-        if !selected
-            .iter()
-            .any(|m| m.conversation.id == head.conversation.id)
-        {
-            selected.push(head);
-        }
-    }
-    for member in &selected {
-        let boundary = if member.segment_ordinal > activated {
+    let revisit = selected.last().map_or(0, |last| {
+        if last.ordinal >= topology.maximum {
             0
         } else {
-            member.tail_sequence_id
-        };
-        sqlx::query("INSERT INTO coordinator_scan_members(transcript_id,continuation_ordinal,generation,activation_boundary,frontier_revision,live_seq,historical_seq) VALUES(?1,?2,?3,?4,0,?4,?4) ON CONFLICT(transcript_id) DO NOTHING").bind(&member.conversation.id).bind(member.segment_ordinal).bind(member.conversation.transcript_generation).bind(boundary).execute(&mut **tx).await?;
-        sqlx::query("UPDATE coordinator_scan_members SET generation=?2,activation_boundary=?3,frontier_revision=frontier_revision+1,live_seq=?3,historical_seq=?3,live_message_id=NULL,live_part=NULL,live_offset=NULL,live_digest=NULL,historical_message_id=NULL,historical_part=NULL,historical_offset=NULL,historical_digest=NULL WHERE transcript_id=?1 AND generation<>?2").bind(&member.conversation.id).bind(member.conversation.transcript_generation).bind(member.tail_sequence_id).execute(&mut **tx).await?;
+            last.ordinal + 1
+        }
+    });
+    if !selected.iter().any(|m| m.id == topology.head) {
+        selected.push(
+            member(tx, &topology, &topology.head)
+                .await?
+                .ok_or_else(|| invalid("coordinator head missing from own topology"))?,
+        );
     }
-    let revisit = selected
-        .iter()
-        .filter(|m| m.segment_ordinal >= next)
-        .map(|m| m.segment_ordinal)
-        .max()
-        .map_or(0, |n| if n >= maximum { 0 } else { n + 1 });
+    for member in &selected {
+        let boundary = if member.ordinal > activated {
+            0
+        } else {
+            member.tail
+        };
+        sqlx::query("INSERT INTO coordinator_scan_members(transcript_id,continuation_ordinal,generation,activation_boundary,frontier_revision,live_seq,historical_seq) VALUES(?1,?2,?3,?4,0,?4,?4) ON CONFLICT(transcript_id) DO NOTHING").bind(&member.id).bind(member.ordinal).bind(member.generation).bind(boundary).execute(&mut **tx).await?;
+        sqlx::query("UPDATE coordinator_scan_members SET generation=?2,activation_boundary=?3,frontier_revision=frontier_revision+1,live_seq=?3,historical_seq=?3,live_message_id=NULL,live_part=NULL,live_offset=NULL,live_digest=NULL,historical_message_id=NULL,historical_part=NULL,historical_offset=NULL,historical_digest=NULL WHERE transcript_id=?1 AND generation<>?2").bind(&member.id).bind(member.generation).bind(member.tail).execute(&mut **tx).await?;
+    }
     sqlx::query("UPDATE coordinator_scan_state SET discovery_next_ordinal=?1,observed_at_us=?2 WHERE singleton=1").bind(revisit).bind(now).execute(&mut **tx).await?;
     let streak: i64 = state.try_get("live_streak")?;
     let preferred = if streak >= 3 {
@@ -182,13 +178,10 @@ async fn prepare(
     };
     let mut waiting = None;
     for lane in preferred {
-        let rows=sqlx::query("SELECT m.*,c.transcript_generation,COALESCE((SELECT MAX(sequence_id) FROM messages WHERE conversation_id=m.transcript_id),0) AS tail FROM coordinator_scan_members m JOIN conversations c ON c.id=m.transcript_id WHERE m.generation=c.transcript_generation AND ((?1='live' AND (m.live_message_id IS NOT NULL OR m.live_seq<COALESCE((SELECT MAX(sequence_id) FROM messages WHERE conversation_id=m.transcript_id),0))) OR (?1='historical' AND m.historical_seq>0)) ORDER BY m.selected_at_us,m.continuation_ordinal DESC LIMIT 32").bind(lane_name(lane)).fetch_all(&mut **tx).await?;
-
+        let rows=sqlx::query(&format!("{CHAIN} SELECT s.*,m.transcript_generation,m.tail FROM coordinator_scan_members s JOIN members m ON m.id=s.transcript_id WHERE s.generation=m.transcript_generation AND ((?3='live' AND (s.live_message_id IS NOT NULL OR s.live_seq<m.tail)) OR (?3='historical' AND s.historical_seq>0)) ORDER BY s.selected_at_us,s.continuation_ordinal DESC LIMIT 32"))
+            .bind(&topology.head).bind(&topology.owner).bind(lane_name(lane)).fetch_all(&mut **tx).await?;
         for row in &rows {
             let transcript: String = row.try_get("transcript_id")?;
-            if !members.iter().any(|m| m.conversation.id == transcript) {
-                continue;
-            }
             let generation: i64 = row.try_get("generation")?;
             if generation != row.try_get::<i64, _>("transcript_generation")? {
                 continue;
@@ -240,7 +233,7 @@ async fn prepare(
             .await?;
             let frontier_revision = row.try_get("frontier_revision")?;
             let binding_id = hash(encoded(&(
-                &owner,
+                owner,
                 &transcript,
                 generation,
                 lane,
@@ -297,7 +290,7 @@ async fn prepare(
                 end: captured.end,
                 frontier_revision,
                 source_digest: captured.source_digest,
-                owner_product_id: owner,
+                owner_product_id: owner.clone(),
             })));
         }
     }
@@ -338,15 +331,13 @@ pub(super) async fn batch_current(
     tx: &mut Transaction<'_, Sqlite>,
     batch: &PreparedScanBatch,
 ) -> DbResult<bool> {
-    let Some((owner, members)) = topology(tx).await? else {
+    let Some(topology) = topology(tx).await? else {
         return Ok(false);
     };
-    if owner != batch.owner_product_id
-        || !members.iter().any(|m| {
-            m.conversation.id == batch.input.scan_context.transcript_id
-                && m.conversation.transcript_generation
-                    == batch.input.scan_context.source_generation
-        })
+    if topology.owner != batch.owner_product_id
+        || member(tx, &topology, &batch.input.scan_context.transcript_id)
+            .await?
+            .is_none_or(|m| m.generation != batch.input.scan_context.source_generation)
     {
         return Ok(false);
     }
@@ -496,23 +487,34 @@ async fn coverage(
     if after.is_some_and(|n| n < 0) {
         return Err(invalid("negative member cursor"));
     }
-    let Some((_, members)) = topology(tx).await? else {
+    let Some(topology) = topology(tx).await? else {
         return Err(crate::DbError::CurrentCoordinatorRequired);
     };
     let state = sqlx::query("SELECT * FROM coordinator_scan_state WHERE singleton=1")
         .fetch_optional(&mut **tx)
         .await?;
-    let rows = sqlx::query("SELECT * FROM coordinator_scan_members ORDER BY continuation_ordinal")
-        .fetch_all(&mut **tx)
-        .await?;
+    let totals=sqlx::query(&format!("{CHAIN} SELECT COUNT(*) AS total,COUNT(s.transcript_id) AS enrolled,
+        COALESCE(SUM(s.transcript_id IS NULL OR s.generation<>m.transcript_generation OR s.live_message_id IS NOT NULL OR s.live_seq<m.tail),0) AS live,
+        COALESCE(SUM(s.transcript_id IS NULL OR s.generation<>m.transcript_generation OR s.historical_seq>0),0) AS historical,
+        COALESCE(SUM(s.transcript_id IS NOT NULL AND s.generation<>m.transcript_generation),0) AS stale
+        FROM members m LEFT JOIN coordinator_scan_members s ON s.transcript_id=m.id"))
+        .bind(&topology.head).bind(&topology.owner).fetch_one(&mut **tx).await?;
+    let count = |column: &str| -> DbResult<usize> {
+        usize::try_from(totals.try_get::<i64, _>(column)?).map_err(|e| invalid(e.to_string()))
+    };
+    let total = count("total")?;
     let mut summary = ScanCoverageSummary {
-        enrolled_members: rows.len(),
-        pending_live_members: 0,
-        pending_historical_members: 0,
-        generation_stale_members: 0,
+        enrolled_members: count("enrolled")?,
+        pending_live_members: count("live")?,
+        pending_historical_members: count("historical")?,
+        generation_stale_members: count("stale")?,
         blocker: None,
         next_resume_at_us: None,
     };
+    let mut rows=sqlx::query(&format!("{CHAIN} SELECT m.*,s.* FROM members m LEFT JOIN coordinator_scan_members s ON s.transcript_id=m.id WHERE m.ordinal>?3 ORDER BY m.ordinal LIMIT 9"))
+        .bind(&topology.head).bind(&topology.owner).bind(after.unwrap_or(-1)).fetch_all(&mut **tx).await?;
+    let has_more = rows.len() > 8;
+    rows.truncate(8);
     let captured_at_us = if let Some(state) = state {
         summary.blocker = state
             .try_get::<Option<String>, _>("last_blocker")?
@@ -526,12 +528,10 @@ async fn coverage(
     } else {
         0
     };
-    let mut projection = Vec::new();
-    for member in members {
-        let saved = rows.iter().find(|r| {
-            r.try_get::<String, _>("transcript_id").ok().as_deref()
-                == Some(member.conversation.id.as_str())
-        });
+    let mut members = Vec::with_capacity(rows.len());
+    for row in rows {
+        let generation: Option<i64> = row.try_get("generation")?;
+        let source_generation: i64 = row.try_get("transcript_generation")?;
         let (
             covered_generation,
             live_boundary,
@@ -539,31 +539,21 @@ async fn coverage(
             live_frontier,
             historical_frontier,
             status,
-        ) = if let Some(row) = saved {
-            let generation: i64 = row.try_get("generation")?;
-            let live = position(row, ScanLane::Live)?;
-            let historical = position(row, ScanLane::Historical)?;
-            let generation_changed = generation != member.conversation.transcript_generation;
-            let live_pending = generation_changed
+        ) = if let Some(generation) = generation {
+            let live = position(&row, ScanLane::Live)?;
+            let historical = position(&row, ScanLane::Historical)?;
+            let stale = generation != source_generation;
+            let live_pending = stale
                 || matches!(live, ScanPosition::Fragment { .. })
-                || seq(&live) < member.tail_sequence_id;
-            let historical_pending = generation_changed || seq(&historical) > 0;
-            if generation_changed {
-                summary.generation_stale_members += 1;
-            }
-            if live_pending {
-                summary.pending_live_members += 1;
-            }
-            if historical_pending {
-                summary.pending_historical_members += 1;
-            }
+                || seq(&live) < row.try_get::<i64, _>("tail")?;
+            let historical_pending = stale || seq(&historical) > 0;
             (
                 Some(generation),
                 row.try_get("activation_boundary")?,
                 Some(row.try_get("activation_boundary")?),
                 Some(live),
                 Some(historical),
-                if generation_changed {
+                if stale {
                     ScanCoverageState::GenerationStale
                 } else if live_pending || historical_pending {
                     ScanCoverageState::Incomplete
@@ -572,14 +562,12 @@ async fn coverage(
                 },
             )
         } else {
-            summary.pending_live_members += 1;
-            summary.pending_historical_members += 1;
             (None, 0, None, None, None, ScanCoverageState::PendingInitial)
         };
-        projection.push(ScanMemberCoverage {
-            transcript_id: member.conversation.id,
-            continuation_ordinal: member.segment_ordinal,
-            source_generation: member.conversation.transcript_generation,
+        members.push(ScanMemberCoverage {
+            transcript_id: row.try_get("id")?,
+            continuation_ordinal: row.try_get("ordinal")?,
+            source_generation,
             covered_generation,
             live_boundary,
             historical_boundary,
@@ -588,12 +576,6 @@ async fn coverage(
             state: status,
         });
     }
-    let total = projection.len();
-    let mut remaining = projection
-        .into_iter()
-        .filter(|m| after.is_none_or(|n| m.continuation_ordinal > n));
-    let members: Vec<_> = remaining.by_ref().take(8).collect();
-    let has_more = remaining.next().is_some();
     let next_member = if has_more {
         members.last().map(|m| m.continuation_ordinal)
     } else {
