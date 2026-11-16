@@ -5211,6 +5211,19 @@ where
                 if let Some(gen_event) = effect_result {
                     generated_events.push(gen_event);
                 }
+                if self.native_spawn_handoff.as_ref().is_some_and(|handoff| {
+                    matches!(handoff.phase, NativeSpawnPhase::ActivationOwnerLost)
+                }) {
+                    let mut handoff = self
+                        .native_spawn_handoff
+                        .take()
+                        .expect("activation failure retains native origin");
+                    handoff.phase = NativeSpawnPhase::Closing;
+                    let failure = Box::pin(self.fail_native_spawn("native spawn activation owner disappeared after exact membership committed".into())).await;
+                    self.native_spawn_handoff = Some(handoff);
+                    failure?;
+                    return Ok(Vec::new());
+                }
                 if checkpoint_commits_state {
                     state_committed = true;
                 }
@@ -5566,11 +5579,13 @@ where
         }
         if let Some(activation) = activation {
             if activation.sender.send(()).is_err() && self.native_spawn_handoff.is_some() {
-                return Err(
-                    "native spawn activation owner disappeared after membership committed".into(),
-                );
+                self.native_spawn_handoff
+                    .as_mut()
+                    .expect("native owner retained")
+                    .phase = NativeSpawnPhase::ActivationOwnerLost;
+            } else {
+                self.native_spawn_handoff = None;
             }
-            self.native_spawn_handoff = None;
         }
 
         if broadcast {

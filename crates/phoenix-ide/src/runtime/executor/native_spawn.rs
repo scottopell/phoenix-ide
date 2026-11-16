@@ -7,6 +7,7 @@ use crate::runtime::{
 pub(super) enum NativeSpawnPhase {
     Admission(oneshot::Receiver<SubAgentAdmissionReceipt>),
     Admitted,
+    ActivationOwnerLost,
     Closing,
 }
 
@@ -417,6 +418,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn native_postcommit_activation_receiver_loss_stops_effect_tail_without_fencing() {
+        let (manager, mut runtime, request) = pending_native_spawn().await;
+        manager
+            .admit_sub_agent_batch(
+                &request.invocation.batch_id,
+                &request.specs,
+                &request.invocation.parent_conversation_id,
+                request.parent_scope,
+                request.parallel_work_qualified,
+            )
+            .await
+            .unwrap();
+        let next = ToolCall::new(
+            "later",
+            ToolInput::from(crate::tools::BashToolInput::run("true")),
+        );
+        if let ConvState::ToolExecuting {
+            remaining_tools,
+            assistant_message,
+            ..
+        } = &mut runtime.state
+        {
+            remaining_tools.push(next.clone());
+            assistant_message.content.push(ContentBlock::tool_use(
+                "later",
+                next.name(),
+                next.input.to_value(),
+            ));
+        }
+        manager
+            .db()
+            .update_conversation_state(&runtime.context.conversation_id, &runtime.state)
+            .await
+            .unwrap();
+        request
+            .response_tx
+            .send(SubAgentAdmissionReceipt {
+                invocation: request.invocation.clone(),
+                outcome: SubAgentAdmissionResponse::Admitted,
+            })
+            .unwrap();
+        drop(request.activation_rx);
+        let response = runtime.observe_native_spawn().await;
+        let event = runtime
+            .native_spawn_observed(response)
+            .await
+            .unwrap()
+            .unwrap();
+        runtime.process_event(event).await.unwrap();
+        assert!(matches!(
+            runtime.state,
+            ConvState::Error {
+                error_kind: crate::db::ErrorKind::SubAgentError,
+                ..
+            }
+        ));
+        assert!(!manager.fatal_local_authority_fence.is_closed());
+        assert!(runtime.tool_executor.recorded_executions().is_empty());
+        assert!(runtime.llm_client.recorded_requests().is_empty());
+        assert!(runtime
+            .native_spawn_handoff
+            .as_ref()
+            .is_some_and(|handoff| handoff.invocation == request.invocation));
+        let accepted: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sub_agent_runs WHERE parent_accepted_at_unix_micros IS NOT NULL OR initial_dispatch_claimed_at_unix_micros IS NOT NULL").fetch_one(manager.db().pool()).await.unwrap();
+        assert_eq!(accepted, 0);
+        drop(request.closure_tx);
+        let missing_receipt = runtime.observe_native_spawn().await;
+        assert!(runtime
+            .native_spawn_observed(missing_receipt)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(!manager.fatal_local_authority_fence.is_closed());
+    }
+
+    #[tokio::test]
     async fn native_abnormal_replaced_origin_withholds_activation_without_fencing() {
         let (manager, mut runtime, request) = pending_native_spawn().await;
         let manager_task = tokio::spawn({
@@ -470,7 +547,9 @@ impl NativeSpawnHandoff {
             NativeSpawnPhase::Admission(receiver) => {
                 NativeSpawnObservation::Admission(receiver.await)
             }
-            NativeSpawnPhase::Closing | NativeSpawnPhase::Admitted => {
+            NativeSpawnPhase::Closing
+            | NativeSpawnPhase::Admitted
+            | NativeSpawnPhase::ActivationOwnerLost => {
                 NativeSpawnObservation::Closure((&mut self.closure).await)
             }
         }
@@ -690,7 +769,9 @@ where
         }
     }
 
-    async fn fail_native_spawn(&mut self, error: String) -> Result<(), String> {
+    pub(super) async fn fail_native_spawn(&mut self, error: String) -> Result<(), String> {
+        let handoff = self.native_spawn_handoff.take();
+        tracing::error!(invocation = ?handoff.as_ref().map(|owner| &owner.invocation), %error, "native spawn cannot complete its live handoff");
         let new_state = ConvState::Error {
             message: error,
             error_kind: crate::db::ErrorKind::SubAgentError,
@@ -706,7 +787,6 @@ where
             self.fatal_local_authority_fence
                 .close("native_spawn_failure_settlement");
         }
-        self.native_spawn_handoff = None;
         result.map(|_| ())
     }
 
