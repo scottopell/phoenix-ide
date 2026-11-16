@@ -1974,7 +1974,13 @@ impl RuntimeManager {
                     } else {
                         None
                     };
-                    probe_retry_worktree_writers(&path, &quarantine, tombstone.as_ref())?;
+                    probe_retry_worktree_writers(
+                        &path,
+                        &quarantine,
+                        tombstone.as_ref(),
+                        #[cfg(test)]
+                        self.clean_close_writer_fixture,
+                    )?;
                     if let Some(tombstone) = &tombstone {
                         let object = tombstone.root.join("object");
                         if object.try_exists().map_err(|error| error.to_string())? {
@@ -5987,6 +5993,7 @@ fn probe_retry_worktree_writers(
     original: &Path,
     quarantine: &Path,
     tombstone: Option<&CloseWorktreeFinalTombstone>,
+    #[cfg(test)] clean_writer_fixture: bool,
 ) -> Result<(), String> {
     probe_retry_worktree_writers_with(original, quarantine, tombstone, |path| {
         if !path
@@ -5994,6 +6001,15 @@ fn probe_retry_worktree_writers(
             .map_err(|error| format!("cannot probe retry writer target: {error}"))?
         {
             return Ok(RetryTargetObservation::Absent);
+        }
+        // Match the existing per-manager deletion-checkpoint fixture. The
+        // runner's ambient /proc access is not evidence about this isolated
+        // Git fixture; production and non-opted-in tests retain the detector.
+        #[cfg(test)]
+        if clean_writer_fixture {
+            return Ok(RetryTargetObservation::Present(
+                ExternalWriterEvidence::NoPositiveEvidence,
+            ));
         }
         Ok(RetryTargetObservation::Present(
             quarantine_has_external_writer(path)?,
@@ -9418,7 +9434,10 @@ mod tests {
         use std::collections::BTreeSet;
 
         // Keep the initial run running while any successor inspection is recorded.
-        let fixture = process_step_fixture_with_worktree(false, live_worktree).await;
+        let mut fixture = process_step_fixture_with_worktree(false, live_worktree).await;
+        // Isolate this Git identity/drift journey from ambient runner processes.
+        // The same per-manager fixture already controls deletion checkpoints.
+        fixture.manager.clean_close_writer_fixture = advance_to_successor_inspection;
         let db = fixture.manager.db();
         let targets = db
             .list_close_expected_retirement_resources(fixture.run.attempt_id.as_str())
