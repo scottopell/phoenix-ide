@@ -102,6 +102,7 @@ describe('MessageViewer stale interactions', () => {
 
       expect(writeText).toHaveBeenCalledWith('Fallback markdown');
       expect(copiedTextareaValues).toEqual(['Fallback markdown']);
+      expect(select).toHaveBeenCalledTimes(1);
       expect(execCommand).toHaveBeenCalledWith('copy');
       expect(document.body.querySelector('textarea')).not.toBeInTheDocument();
       expect(screen.getByRole('button', { name: 'Copied!' })).toBeInTheDocument();
