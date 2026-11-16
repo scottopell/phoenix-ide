@@ -1,6 +1,6 @@
 # Ember phase 2: retire the stale delivery roadmap
 
-Parent: [06013](./06013-p1-in-progress--ember-consistency-and-durable-tracking.md). User explicitly requested deprecation because the roadmap is stale and infrequently used. This is a standalone retirement slice; scanner delivery is not a dependency.
+Parent: [06013](./06013-p1-done--ember-consistency-and-durable-tracking.md). User explicitly requested deprecation because the roadmap is stale and infrequently used. This is a standalone retirement slice; scanner delivery is not a dependency.
 
 ## Outcome
 

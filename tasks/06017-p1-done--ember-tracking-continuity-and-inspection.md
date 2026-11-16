@@ -1,6 +1,6 @@
 # Ember phase 6: tracking continuity and inspection
 
-Parent: [06013](./06013-p1-in-progress--ember-consistency-and-durable-tracking.md). Depends on [phase 5](./06016-p1-in-progress--ember-durable-tracking-store-and-tools.md). This slice proves the feature helps after continuation before adding a model scanner.
+Parent: [06013](./06013-p1-done--ember-consistency-and-durable-tracking.md). Depends on [phase 5](./06016-p1-done--ember-durable-tracking-store-and-tools.md). This slice proves the feature helps after continuation before adding a model scanner.
 
 ## Outcome
 
@@ -39,7 +39,7 @@ Share a cooldown, deduplication and an at-most-one cue budget per existing admit
 
 Ember inspects and updates a surfaced item through existing tools, advances authorized work when appropriate, or records a concrete wait/restriction and moves on. Merely surfacing an item is not an explicit review. No useful eligible item means no extra review read or worker nudge to fill a quota. The paginated list remains available for the current request and other work. Avoid interrupting the user's question and report only material results/blockers. Current known-worker events continue through existing subscriptions; they do not alone demonstrate recovery of forgotten intent.
 
-This is a planning direction, not activated behavior or a claim that prompting guarantees attention. Qualify both paths against forgotten-request recovery, pagination starvation, irrelevant detours, repetitive reviews and silent bookmark accumulation. Known-worker checkpoint handling is existing infrastructure, not a competing new feature.
+This policy does not claim that prompting guarantees attention; its qualification evidence is recorded below. Qualify both paths against forgotten-request recovery, pagination starvation, irrelevant detours, repetitive reviews and silent bookmark accumulation. Known-worker checkpoint handling is existing infrastructure, not a competing new feature.
 
 Small-list regression: two recently reviewed unchanged items and many foreground turns inside the review interval produce no alternating review queries or messages. A new relevant fact or due existing follow-up can make an item eligible earlier; elapsed wall-clock time alone does not start Ember. Review selection and actual source review remain distinct.
 
@@ -67,4 +67,24 @@ Out of scope: scanner inference, new periodic review wakeups, a workstream taxon
 
 ## Delivery evidence
 
-PR #1093 qualifies the manual record → detour → real continuation → recovered stopping points → unprompted owed-question journey, including quiet arithmetic and bookmark scope. The [report](../scripts/qa/ember-tracking/manual-memory-aca480.md) retains actual model/usage/trace details and earlier failed/inconclusive experiments. Post-review quiet was not exercised because of the declared byte margin. Two recently reviewed requested items, contextual recovery beyond the small list and scanner composition remain mandatory phase-8 qualification; this task is not marked done prematurely.
+PR [#1093](https://github.com/scottopell/phoenix-ide/pull/1093) merged at `5b0e01c09`
+with the manual record → detour → real continuation → recovered stopping points →
+unprompted owed-question gate accepted. Its [report](../scripts/qa/ember-tracking/manual-memory-aca480.md)
+retains the declared post-review control not-run and earlier failed experiments.
+
+The subsequent [complete foreground qualification](../scripts/qa/ember-foreground-memory/foreground-32ada836a.md)
+closes the post-review quiet/two-recent-items and contextual pagination gates:
+actual structured reply, pause CAS and quiet arithmetic; hidden saved intent
+beyond eight entries and two handoffs recovered through real reads/search and
+original source, followed by its owed question. Root and fresh independent
+full-trace review accepted both fixed journeys. Earlier foreground failures remain
+linked in that report; general reliability or UI/deployment utility is not claimed.
+
+One actual-input scanner composition passed with eighteen runner/kick tests:
+idle capture adds no turn, the next authoritative input sees the fresh index,
+and pause evidence invalidates the old step through two real continuations.
+The final eight-variant inventory is accepted at `89ff24d7b`. The third scanner
+quality trial at `e978b7686` was independently accepted with typed host chronology;
+both earlier trials remain rejected and linked. Implementation and qualification
+are complete; delivery PR #1098 owns exact review, CI and main integration.
+No production deployment or general relevance reliability is claimed.

@@ -1,6 +1,6 @@
 # Ember phase 4: useful, bounded event context and qualification
 
-Parent: [06013](./06013-p1-in-progress--ember-consistency-and-durable-tracking.md). Depends on [phase 3 exact evidence](./06020-p1-in-progress--bind-watch-events-to-ending-response-evi.md) and only the event-relevant [phase 1 baseline](./06014-p1-in-progress--ember-tool-contract-and-consistency-base.md), not a whole-program contract freeze. Lane B brings captured evidence into existing completion events independently of lane A's manual memory delivery; either useful slice may ship first. Neither waits for scanner activation.
+Parent: [06013](./06013-p1-done--ember-consistency-and-durable-tracking.md). Depends on [phase 3 exact evidence](./06020-p1-done--bind-watch-events-to-ending-response-evi.md) and only the event-relevant [phase 1 baseline](./06014-p1-done--ember-tool-contract-and-consistency-base.md), not a whole-program contract freeze. Lane B brings captured evidence into existing completion events independently of lane A's manual memory delivery; either useful slice may ship first. Neither waits for scanner activation.
 
 ## Outcome
 
@@ -54,11 +54,17 @@ Out of scope: notification filtering/coalescing, another send alert, new automat
 
 ## Current delivery evidence
 
-PR [#1092](https://github.com/scottopell/phoenix-ide/pull/1092) implements this
-component. Scoped capture, settlement, native read/schema/privacy, genuine codegen
-and fixture web checks pass. Independent review accepted compact projection C's
-[complete 39-trial comparison](../scripts/qa/ember-event-eval/results-cfda0b0.md);
-the earlier capped invocation remains partial/unaccepted. This task stays in
-progress until memory migration 164 is integrated, event migration 165 is rebased,
-exact-head CI/review pass and the PR merges. No deployment or combined Ember
-qualification is claimed.
+PR [#1092](https://github.com/scottopell/phoenix-ide/pull/1092) merged at
+`3a842c5` after independent review and green component CI, with manual migration
+164 before event migration 165. Scoped capture/settlement, native schema/read,
+privacy, genuine codegen and fixture web checks passed. Independent review
+accepted compact projection C's [complete 39-trial comparison](../scripts/qa/ember-event-eval/results-cfda0b0.md),
+including attribution and whole-source version checks. The earlier capped run
+remains partial/unaccepted; requested Codex output tokens were not an enforced
+generation/billing cap.
+
+This independently delivered component is merged; obsolete rebase/merge gates are
+closed. Final scanner/program qualification is separate, with no production
+deployment, remote enrichment parity or physical-device claim. Implementation
+and component qualification are complete; combined qualification is recorded in
+PR #1098, whose GitHub state owns exact review, CI and main integration.

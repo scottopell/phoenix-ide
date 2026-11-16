@@ -18,6 +18,9 @@ pub(crate) mod executor;
 pub(crate) mod fork_resolve;
 pub mod pr_status_poll;
 mod recovery;
+#[cfg(test)]
+#[path = "coordinator_scanner/kick_tests.rs"]
+mod scanner_kick_tests;
 mod svg_artifacts;
 pub mod traits;
 pub mod usage_limit_sweep;
@@ -861,6 +864,7 @@ pub struct RuntimeManager {
     creation_kick_rx: RwLock<Option<tokio::sync::watch::Receiver<u64>>>,
     direct_turn_kick_tx: tokio::sync::watch::Sender<u64>,
     direct_turn_kick_rx: RwLock<Option<tokio::sync::watch::Receiver<u64>>>,
+    coordinator_scanner: crate::coordinator_scanner::ScannerWake,
     fatal_local_authority_fence: Arc<FatalLocalAuthorityFence>,
 }
 
@@ -1519,6 +1523,7 @@ pub struct SseBroadcaster {
     gate: Arc<Mutex<BroadcastGate>>,
     persisted_message_reservation: Arc<Semaphore>,
     fatal_local_authority_fence: Option<Arc<FatalLocalAuthorityFence>>,
+    scanner_kick: Option<Arc<Notify>>,
 }
 
 impl SseBroadcaster {
@@ -1542,6 +1547,7 @@ impl SseBroadcaster {
             gate: Arc::new(Mutex::new(BroadcastGate::default())),
             persisted_message_reservation: Arc::new(Semaphore::new(1)),
             fatal_local_authority_fence: None,
+            scanner_kick: None,
         }
     }
 
@@ -1555,6 +1561,11 @@ impl SseBroadcaster {
 
     fn with_fatal_local_authority_fence(mut self, fence: Arc<FatalLocalAuthorityFence>) -> Self {
         self.fatal_local_authority_fence = Some(fence);
+        self
+    }
+
+    fn with_scanner_kick(mut self, notify: Arc<Notify>) -> Self {
+        self.scanner_kick = Some(notify);
         self
     }
 
@@ -1645,6 +1656,19 @@ impl SseBroadcaster {
                     });
             }
             RingOp::BroadcastOnly => {}
+        }
+        if matches!(op, RingOp::Anchor)
+            || matches!(
+                &event,
+                SseEvent::MessageUpdated {
+                    transcript_generation: Some(_),
+                    ..
+                }
+            )
+        {
+            if let Some(notify) = &self.scanner_kick {
+                notify.notify_one();
+            }
         }
         self.tx.send(event).map_err(|_| ())
     }
@@ -2734,6 +2758,7 @@ impl RuntimeManager {
             creation_kick_rx: RwLock::new(Some(creation_kick_rx)),
             direct_turn_kick_tx,
             direct_turn_kick_rx: RwLock::new(Some(direct_turn_kick_rx)),
+            coordinator_scanner: crate::coordinator_scanner::ScannerWake::default(),
             fatal_local_authority_fence,
         }
     }
@@ -4629,6 +4654,10 @@ impl RuntimeManager {
         DatabaseStorage::new(self.db.clone())
             .update_state(conversation_id, &fallback_state, state_updated_at)
             .await
+    }
+
+    pub(crate) fn start_coordinator_scanner(self: &Arc<Self>) {
+        crate::coordinator_scanner::start(self.clone(), &self.coordinator_scanner);
     }
 
     pub async fn start_direct_turn_worker(
@@ -7683,7 +7712,8 @@ impl RuntimeManager {
             .await
             .unwrap_or(0);
         let candidate = SseBroadcaster::new(SSE_BROADCAST_CAPACITY, initial_last_seq)
-            .with_fatal_local_authority_fence(Arc::clone(&self.fatal_local_authority_fence));
+            .with_fatal_local_authority_fence(Arc::clone(&self.fatal_local_authority_fence))
+            .with_scanner_kick(self.coordinator_scanner.notifier());
         if self.fatal_local_authority_fence.is_closed() {
             candidate.close_publication();
         }

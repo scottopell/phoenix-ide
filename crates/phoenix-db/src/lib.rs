@@ -14,6 +14,7 @@ pub use slack_gateway::*;
 mod close_foundation;
 mod coordinator_authority;
 mod coordinator_query;
+pub mod coordinator_scanner;
 pub mod coordinator_tracking;
 mod coordinator_watches;
 mod coordinator_work_scope;

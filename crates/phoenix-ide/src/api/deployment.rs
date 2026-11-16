@@ -1690,6 +1690,7 @@ fn native_available_memory() -> Option<u64> {
 
     // SAFETY: sysconf and mach_host_self take no pointers.
     let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    #[allow(deprecated)]
     let host = unsafe { libc::mach_host_self() };
     if host == libc::MACH_PORT_NULL as libc::mach_port_t {
         return None;

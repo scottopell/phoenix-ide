@@ -9,3 +9,21 @@ Reproduce with a disposable real database and provider/tool barriers: return pro
 Starting points: crates/phoenix-state-machine/src/transition.rs ToolExecuting/CancellingTool transitions; crates/phoenix-ide/src/runtime/executor.rs checkpoint and abort-deadline execution; crates/phoenix-ide/src/runtime.rs replay ring; crates/phoenix-ide/src/api/handlers.rs initialization messages; crates/phoenix-db/src/lib.rs reset_all_to_idle. Follow specs/bedrock and the SSE/recovery contracts before changing behavior.
 
 Captured during Ember delivery after the tracking native-write fix exposed the distinction between a durable pending round and an assistant message row. That tracking fix does not establish a Stop bug or repair this presentation hypothesis.
+
+
+### Separate malformed-state probe
+
+Scanner qualification exposed a source-level observation in
+`crates/phoenix-db/src/lib.rs::parse_conversation_row` (near line 15440): when
+persisted `ConvState` JSON cannot deserialize, it logs a warning and returns
+`ConvState::Idle`. The scanner's deliberately corrupted, oversized metadata
+fixture therefore uses raw persisted-state checks rather than treating the
+conversation-row parser's fallback as proof of valid state.
+
+This corruption fixture is **not a Stop reproduction** and does not establish
+permanent response loss or an existing recovery-contract violation. As a narrow
+probe in this investigation, inspect the normative bedrock/persistence/recovery
+contract and actual startup/checkpoint callers before deciding whether this
+fallback is intended or defective. Keep that question separate from genuine
+Stop barriers, replay-overflow presentation and partial-stream policy; no new
+feature, recovery framework or guarantee is commissioned by the observation.

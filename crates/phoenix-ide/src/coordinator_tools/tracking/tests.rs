@@ -57,7 +57,7 @@ async fn tracking_native_registry_and_closed_requests_use_real_application_servi
     assert!(schema.get("oneOf").is_none());
     assert_eq!(schema["additionalProperties"], false);
     let branches = schema["properties"]["request"]["oneOf"].as_array().unwrap();
-    assert_eq!(branches.len(), 7);
+    assert_eq!(branches.len(), 8);
     for branch in branches {
         assert_eq!(branch["additionalProperties"], false);
     }
@@ -65,6 +65,7 @@ async fn tracking_native_registry_and_closed_requests_use_real_application_servi
         json!({"instance":"remote","request":{"op":"list"}}),
         json!({"request":{"op":"list","after":42}}),
         json!({"request":{"op":"read","id":"x","source":"spoof"}}),
+        json!({"request":{"op":"coverage","after_member":-1}}),
     ] {
         assert!(tool
             .run_inner(invalid, context(&source, true))
@@ -75,6 +76,12 @@ async fn tracking_native_registry_and_closed_requests_use_real_application_servi
         .run_inner(json!({"request":{"op":"list"}}), context(&source, false))
         .await
         .is_err());
+    let coverage = tool
+        .run_inner(json!({"request":{"op":"coverage"}}), context(&source, true))
+        .await
+        .unwrap();
+    assert_eq!(coverage["members"][0]["state"], "pending_initial");
+    assert_eq!(coverage["has_more"], false);
     let record = json!({"op":"record","record":{"kind":"bookmark","title":"Why the earlier design mattered","note":"Useful question, not a fresh commission","resumption":"Explain the stopping point when the user returns","references":[],"evidence":[]}});
     db.update_conversation_state(
         &source,

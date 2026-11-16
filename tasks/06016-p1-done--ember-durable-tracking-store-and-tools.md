@@ -1,6 +1,6 @@
 # Ember phase 5: durable tracking store and native tool
 
-Parent: [06013](./06013-p1-in-progress--ember-consistency-and-durable-tracking.md). Requires only the tracking-related terminology/baseline from [phase 1](./06014-p1-in-progress--ember-tool-contract-and-consistency-base.md). This task owns its record/native-tool/reconciliation contract before implementation; event and scanner design and the aggregate completion of phase 1 do not gate it. No scanner/model calls in this slice.
+Parent: [06013](./06013-p1-done--ember-consistency-and-durable-tracking.md). Requires only the tracking-related terminology/baseline from [phase 1](./06014-p1-done--ember-tool-contract-and-consistency-base.md). This task owns its record/native-tool/reconciliation contract before implementation; event and scanner design and the aggregate completion of phase 1 do not gate it. No scanner/model calls in this slice.
 
 ## Outcome
 
@@ -48,4 +48,16 @@ Out of scope: fresh context/UI projection, scanner inference, new wake policy an
 
 ## Delivery evidence
 
-The manual native-write and usefulness gates are accepted in PR #1093; see the [sanitized qualification report](../scripts/qa/ember-tracking/manual-memory-aca480.md). Final rebased checks/CI and integration with the scanner remain tracked by the parent and phase 8. Task status stays in progress until those delivery checks close.
+Manual native writes and the usefulness gate are accepted, and PR
+[#1093](https://github.com/scottopell/phoenix-ide/pull/1093) merged at `5b0e01c09`
+after component review and green CI. Twelve storage/service tests, the actual
+native registry/service case and four runtime continuity/authority regressions
+passed. The [manual report](../scripts/qa/ember-tracking/manual-memory-aca480.md)
+retains exact model/usage/trace evidence and prior failures.
+
+The candidate scanner composition also passed actual admitted-input, fresh-index,
+missed-pause and two-continuation assertions. The third frozen cheap-model trial
+was independently accepted after typed host chronology; the two earlier rejected
+runs remain preserved. Implementation and qualification are complete. PR #1098
+tracks exact combined review, CI and main integration, with no production
+deployment implied.

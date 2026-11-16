@@ -154,14 +154,14 @@ The user selected both recommendations. Remaining model budgets, excerpt tuning 
 
 | Phase | Scope | Task |
 | --- | --- | --- |
-| 1 | Current-deployment baseline and narrow contracts | [06014](./06014-p1-in-progress--ember-tool-contract-and-consistency-base.md) |
+| 1 | Current-deployment baseline and narrow contracts | [06014](./06014-p1-done--ember-tool-contract-and-consistency-base.md) |
 | 2 | Independent roadmap retirement | [06015](./06015-p1-done--retire-stale-delivery-roadmap.md) |
-| 3 | Exact completion-evidence binding | [06020](./06020-p1-in-progress--bind-watch-events-to-ending-response-evi.md) |
-| 4 | Useful bounded event context and incremental qualification | [06021](./06021-p1-in-progress--enrich-ember-event-context-and-measure-f.md) |
-| 5 | Durable tracking store/application service/tools | [06016](./06016-p1-in-progress--ember-durable-tracking-store-and-tools.md) |
-| 6 | Fresh continuity context and inspection | [06017](./06017-p1-in-progress--ember-tracking-continuity-and-inspection.md) |
-| 7 | Cheap origin-aware scanner | [06018](./06018-p1-in-progress--ember-cheap-transcript-safety-net.md) |
-| 8 | Final cross-feature acceptance/cutover | [06019](./06019-p1-in-progress--ember-coordination-end-to-end-qualificat.md) |
+| 3 | Exact completion-evidence binding | [06020](./06020-p1-done--bind-watch-events-to-ending-response-evi.md) |
+| 4 | Useful bounded event context and incremental qualification | [06021](./06021-p1-done--enrich-ember-event-context-and-measure-f.md) |
+| 5 | Durable tracking store/application service/tools | [06016](./06016-p1-done--ember-durable-tracking-store-and-tools.md) |
+| 6 | Fresh continuity context and inspection | [06017](./06017-p1-done--ember-tracking-continuity-and-inspection.md) |
+| 7 | Cheap origin-aware scanner | [06018](./06018-p1-done--ember-cheap-transcript-safety-net.md) |
+| 8 | Final cross-feature acceptance/cutover | [06019](./06019-p1-done--ember-coordination-end-to-end-qualificat.md) |
 
 Dependencies are feature-local: the event-relevant baseline/contract in phase 1 unblocks 3→4; the tracking-relevant subset unblocks 5→6→7. Neither requires all of phase 1 to finish. Phase 3 owns its occurrence/retention/privacy/capture contract, phase 5 its record/native-tool/reconciliation contract, and phase 7 its frontier/invalidation/application/model-budget contract before activation. Scanner design cannot block events or direct tracking. Phase 2 is independently shippable; phase 8 combines delivered slices. Each slice qualifies before integration; event measurements do not wait for the scanner.
 
@@ -221,4 +221,77 @@ Out of scope: broad tool consolidation, new wrappers around every API, already-d
 
 ## Current delivery evidence
 
-Roadmap retirement shipped in #1091. The tool audit and bounded local watch-recovery gate shipped in #1096; final assembled inventory remains phase-8 work. Manual tracking's usefulness gate is accepted in #1093, with final rebased CI still pending; see its [qualification report](../scripts/qa/ember-tracking/manual-memory-aca480.md). Event component C passed the independently reviewed 39-trial comparison in #1092; its first capped experiment remains explicitly unaccepted. Migration ordering requires tracking 164 before event evidence 165, then scanner 166. Scanner implementation and the independently reviewed corpus are active under phase 7; no scanner activation, full combined acceptance or production deployment is claimed.
+| Phase | Verified implementation/qualification | Delivery scope |
+|---|---|---|
+| 1: Tool consistency | #1096 merged at `e67fb4ec1`; local-watch recovery accepted; final assembled inventory at `89ff24d7b` accepted | Exact delivery state in PR #1098 |
+| 2: Roadmap retirement | #1091 merged at `6cebf545f`; workflow/variables/Issue cutoff independently verified | Complete; historical records retained |
+| 3: Ending evidence | #1092 merged at `3a842c5`; exact settlement/capture/privacy/read regressions and component CI passed | No production deployment claim |
+| 4: Useful event context | #1092 accepted compact C after the complete 39-trial comparison and fixture web checks | First capped experiment remains partial/unaccepted; no general billing or remote-parity claim |
+| 5: Tracking store/tools | #1093 merged at `5b0e01c09`; native/store/authority checks and manual usefulness accepted | Scanner composition qualified; delivery in PR #1098 |
+| 6: Continuity and attention | Manual detour/continuation gate accepted; [foreground quiet/contextual recovery](../scripts/qa/ember-foreground-memory/foreground-32ada836a.md) accepted; actual-input scanner composition passed | Supplemental guidance/composition qualified; delivery in PR #1098 |
+| 7: Cheap safety net | Thirty-one DB tests, eighteen runner/kick tests, actual 37-case host fixtures, owning all-target Clippy and fresh source reviews passed; third real-model trial independently accepted | Earlier two trials remain rejected; bounded synthetic qualification |
+| 8: Combined qualification | Inventory, actual-input/two-continuation/pause lifecycle composition and third frozen scanner semantic trial accepted | Implementation/qualification complete; GitHub owns exact review/CI/merge state |
+
+The manual [qualification report](../scripts/qa/ember-tracking/manual-memory-aca480.md)
+and complete [event comparison](../scripts/qa/ember-event-eval/results-cfda0b0.md)
+retain their exact configuration, failed earlier experiments and limitations.
+Scanner [first](../scripts/qa/coordinator-scanner-quality/results-ec570d0f3.md)
+and [paired](../scripts/qa/coordinator-scanner-quality/results-db6f2b44f.md)
+37-case runs remain rejected: valid quotes and recall do not excuse omitted
+restrictions or invented renewal of retired work. The [third trial](../scripts/qa/coordinator-scanner-quality/results-e978b7686.md)
+with typed host chronology was independently accepted: 11/11 requested units,
+4/5 bookmarks, 13/13 restrictions, 29/29 valid quotes, no false commissions,
+negative captures, visible duplicates or authority/reopen violations. B04's
+bookmark miss is allowed by the frozen threshold; I01's genuine invisible
+duplicate is reported separately. Implementation and qualification are complete;
+the earlier failed experiments remain failures.
+
+The accepted assembled export contains eight language/catalog/spawn variants,
+28 tools without authenticated skills and 29 with them, including tracking's
+eight operations and the local-only event evidence read. Artifact SHA256:
+`d4a4f557a1eeb059c52dafd4b69fd9718d4f3a598492e88ae8e0eef29d2fad7f`.
+These are observed synthetic configurations, not a fixed roster or deployed count.
+
+Migration ordering is manual tracking 164, event evidence 165, scanner 166.
+Merged source, reviewed local candidates and deployed behavior remain distinct.
+No production deployment, physical-phone campaign or live historical backfill
+completion is claimed or newly required by this local qualification record.
+Task completion records implementation and qualification. [PR #1098](https://github.com/scottopell/phoenix-ide/pull/1098) provides exact review, CI and main-integration state.
+
+
+Final host review repaired discovery-cursor skipping across intermediate members
+and removed full runtime/handoff decoding from scanner topology reads. The
+final host follow-up records twenty-five DB tests passed at `6c11894f7`; owning
+all-target Clippy and all 37 host fixtures passed at binding-name-only head
+`74881f401`. A fourteen-transcript/thirteen-continuation regression covers every
+middle member and generation revisit after restart; metadata/corruption and detached-source
+CAS regressions cover scalar-only selection and exact membership. Eight-member
+pages plus priority head/coverage lookahead bound data returned to scanner/Rust;
+recursive traversal/count work still scales with lineage. Offline preparation uses zero
+providers and preserves every accepted input, prior state, prepared record and
+binding byte for byte. Exact receipts are appended to the [accepted scanner report](../scripts/qa/coordinator-scanner-quality/results-e978b7686.md#host-only-topology-follow-up);
+its `e978b7686` paid-trial identity and limitations remain unchanged.
+
+
+The later host-resource/fairness repair at `1824f48d3` passed thirty DB tests,
+owning Clippy, scoped Allium and all 37 host fixtures. Preparation shares one
+32-fetched-source-row allowance across members/lanes, charges before errors/backoff
+and checks known spending before prose. Exhausted blocked Wait persists opposite
+lane preference; non-prose Progress uses ordinary preference without an inference
+charge, and Ready retains normal reserve behavior. Restart, route-absence,
+continuous non-prose progress and actual hourly-cap regressions passed. Zero-call
+offline preparation retains all 111 files/37 hashes/bindings exactly; see the
+[resource receipts](../scripts/qa/coordinator-scanner-quality/results-e978b7686.md#later-host-resource-and-fairness-follow-up).
+Paid model and topology receipts retain their original provenance.
+
+
+The later engine-size correction passed thirty-one DB tests at `a5680344a` and
+owning Clippy/all 37 host fixtures at test-lint-only successor `ba39ee48d`.
+Nested type CASE and direct-column byte metadata avoid accessing excluded content
+or loading oversized eligible prose. Actual UTF-8/32 MiB negative controls under
+a 2 MiB connection per-value limit distinguish the old CAST/full read from the
+real scanner query; oversized user coverage stays pending and small Unicode is
+exact. Zero-call offline preparation preserves all 111 accepted files and 37
+hashes/bindings. [Separate engine receipts](../scripts/qa/coordinator-scanner-quality/results-e978b7686.md#later-sqlite-engine-size-follow-up)
+retain every earlier source and result; no total CPU/RSS or UTF-16 compatibility
+claim is added.

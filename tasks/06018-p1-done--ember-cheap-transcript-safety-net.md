@@ -1,6 +1,6 @@
 # Ember phase 7: cheap transcript-scanning safety net
 
-Parent: [06013](./06013-p1-in-progress--ember-consistency-and-durable-tracking.md). Depends on the relevant terminology/baseline from [phase 1](./06014-p1-in-progress--ember-tool-contract-and-consistency-base.md), [phase 5](./06016-p1-in-progress--ember-durable-tracking-store-and-tools.md) and [phase 6](./06017-p1-in-progress--ember-tracking-continuity-and-inspection.md). This task owns frontier/invalidation/application/model-budget contracts before scanner activation; those decisions do not gate event or direct-tracking delivery. User authorizes automatic capture; Ember bears stale/duplicate retirement.
+Parent: [06013](./06013-p1-done--ember-consistency-and-durable-tracking.md). Depends on the relevant terminology/baseline from [phase 1](./06014-p1-done--ember-tool-contract-and-consistency-base.md), [phase 5](./06016-p1-done--ember-durable-tracking-store-and-tools.md) and [phase 6](./06017-p1-done--ember-tracking-continuity-and-inspection.md). This task owns frontier/invalidation/application/model-budget contracts before scanner activation; those decisions do not gate event or direct-tracking delivery. User authorizes automatic capture; Ember bears stale/duplicate retirement.
 
 ## Outcome
 
@@ -56,3 +56,81 @@ Required post-coverage edit case: fully cover through sequence 100 at generation
 Required missed-pause case: an existing actionable note receives previously missed user-pause evidence, then Ember continues. Index/detail/overflow report reconciliation required, trusted source reconciliation retains the pause, and scanning cannot clear it. No new wakeup or permission is manufactured.
 
 Out of scope: worker/remote corpus discovery, scanner retirement/reopening, foreground inference, expensive default-route fallback, scheduling saved work and perfect semantic deduplication.
+
+
+## Current delivery evidence
+
+Scanner candidate PR #1098 includes migration 166 on merged manual/event migrations
+164/165. At `89ff24d7b`, twenty DB tests passed, including no-append old-source
+restart/reset, actual externally changed prose, exact deduplication, retained
+retirement, live gaps and bounded contention recovery. Eighteen runner/kick tests,
+one actual authoritative-input/two-continuation/pause composition and the actual
+37-case host fixture preparation passed. These prove lifecycle/resource boundaries,
+not semantic model quality.
+
+The [first](../scripts/qa/coordinator-scanner-quality/results-ec570d0f3.md) and
+[paired prompt correction](../scripts/qa/coordinator-scanner-quality/results-db6f2b44f.md)
+37-case Luna/Low runs are independently rejected. The paired run recovered all
+eleven requested outcomes, five bookmarks and thirteen restrictions, with 33 valid
+quotes, but recreated two retired requests. No structural reopen occurred; the
+semantic renewals still fail the unchanged gates. Original sources, oracles,
+raw outputs and failed results remain retained.
+
+The typed host chronology projection passed twenty-two DB tests, owning
+all-target Clippy, actual 37-case host fixtures and fresh source reviews before
+the accepted model trial. The later host-only follow-up expanded that suite to
+twenty-five passing tests, as recorded below. The
+[third frozen trial](../scripts/qa/coordinator-scanner-quality/results-e978b7686.md)
+at `e978b7686` was independently accepted after all 37 exact payloads were
+reviewed: 11/11 requested units, 4/5 bookmarks, 13/13 restrictions, 29/29 valid
+quotes, zero false commissions/21, all seventeen negatives correct, zero visible
+duplicates/11 and no authority/reopen violations. Unknown cases passed; H01 stays
+historical and I01's genuine invisible duplicate remains separately measured.
+B04's bookmark miss is within the unchanged threshold; perfect recall is not
+claimed. Both prior reports remain rejected.
+
+Implementation and qualification are complete. Delivery PR #1098 is the authority
+for exact review, CI and main integration. No production deployment or completed
+production backfill is claimed.
+
+
+Final topology qualification passed all twenty-five DB tests at `6c11894f7`,
+then owning DB/IDE all-target Clippy and all 37 host fixtures at the subsequent
+binding-name-only head `74881f401`. Discovery advances from
+the eight-member page before appending the priority head, preventing skipped
+middle members. Scalar head-lineage/member/coverage queries avoid runtime/handoff
+aggregate decoding; recursive traversal/count cost still scales with lineage.
+Regressions use fourteen transcripts/thirteen actual continuations, middle-member
+generation revisit after restart, 1 MiB irrelevant malformed metadata with a real
+typed handoff seeded before corruption, and an explicit test-only edge-guard drop
+to verify detached-source CAS refusal. The [offline follow-up](../scripts/qa/coordinator-scanner-quality/results-e978b7686.md#host-only-topology-follow-up)
+made zero model calls and reproduced all 37 accepted inputs, prepared records,
+prior states and bindings exactly. The accepted paid run remains `e978b7686`.
+
+
+The later resource/fairness repair at `1824f48d3` passed all thirty DB tests,
+owning DB/IDE Clippy, scoped Allium and all 37 host fixtures. A single non-Clone
+32-row allowance limits fetched source rows for the whole preparation across
+members and lanes, charging before errors/backoff and checking known spending
+before prose. Exhausted blocked Wait, including absent route, persists preference
+for the opposite of the last consumed lane; committed non-prose Progress updates
+the ordinary preference without an inference charge or clearing blockers. Ready
+continues through existing reserve behavior. Restart in both directions,
+continuous non-prose backlog and real hourly-cap cases passed. [Offline receipts](../scripts/qa/coordinator-scanner-quality/results-e978b7686.md#later-host-resource-and-fairness-follow-up)
+show zero provider calls, all 111 files byte-identical to the accepted preparation
+and unchanged 37 input hashes/bindings. Earlier e978 model and 7488 topology
+qualification remain separate unchanged evidence.
+
+
+The later SQLite engine-size correction passed all thirty-one DB tests at
+`a5680344a`; its equivalent test-lint-only successor `ba39ee48d` passed owning
+Clippy and all 37 host fixtures. Nested type CASE reads no excluded payload/size,
+and direct-column `octet_length` gates eligible user/agent content before returning
+at most 1 MiB. Formal UTF-8 file-DB controls use stored 32 MiB tool/user values
+and a dedicated 2 MiB per-value connection limit: direct/old-CAST queries fail,
+actual preparation advances only excluded tools or leaves oversized user source
+unprocessed, and small Unicode remains exact. Restoration/closure are checked.
+The [engine follow-up](../scripts/qa/coordinator-scanner-quality/results-e978b7686.md#later-sqlite-engine-size-follow-up)
+records zero-call preparation/all 111 accepted artifacts and 37 hashes/bindings
+unchanged. Earlier evidence stays separate; no process-RSS/constant-CPU bound or
+new UTF-16 conversion contract is claimed.
