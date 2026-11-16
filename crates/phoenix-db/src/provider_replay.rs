@@ -477,7 +477,19 @@ impl Database {
             content,
             phoenix_core::domain::db_schema::MessageContent::Agent(_)
         ) {
-            crate::record_initial_execution_outcome_tx(&mut tx, conversation_id, state).await?;
+            let response = crate::coordinator_watches::ending_evidence::capture_response_tx(
+                &mut tx,
+                conversation_id,
+                Some(message_id),
+            )
+            .await?;
+            crate::record_initial_execution_outcome_with_response_tx(
+                &mut tx,
+                conversation_id,
+                state,
+                &response,
+            )
+            .await?;
         }
         sqlx::query("DELETE FROM active_responses_replay_sets WHERE conversation_id = ?1")
             .bind(conversation_id)

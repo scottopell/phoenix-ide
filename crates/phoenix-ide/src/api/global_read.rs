@@ -4355,10 +4355,10 @@ mod tests {
         db.add_message("event-read-response", &source.id, &content, None, None)
             .await
             .unwrap();
-        let digest = format!(
-            "{:x}",
-            Sha256::digest(serde_json::to_vec(&content.to_json()).unwrap())
-        );
+        let mut digest = String::with_capacity(64);
+        for byte in Sha256::digest(serde_json::to_vec(&content.to_json()).unwrap()) {
+            write!(&mut digest, "{byte:02x}").unwrap();
+        }
         let event_id = uuid::Uuid::new_v4().to_string();
         sqlx::query("INSERT INTO coordinator_watch_events(event_id,watch_id,source_occurrence_kind,source_occurrence_id,source_generation,source_transcript_id,terminal_kind,occurred_at_us) SELECT ?1,id,'creation','pinned-read',0,?2,'completed',1 FROM coordinator_watches WHERE source_product_conversation_id=?3")
             .bind(&event_id).bind(&source.id).bind(source.product_conversation_id.as_str()).execute(db.pool()).await.unwrap();

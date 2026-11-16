@@ -8,6 +8,13 @@ Ember can often understand a finished response without first querying the worker
 
 ## Projection
 
+Implementation review chose one narrow interface adjustment: expose pinned recovery
+as local-only `read_event_evidence` (`event_id`, `cursor`) rather than admitting a
+local-only event reference into the shared local/remote `read_conversation` schema.
+The closed request rejects peer fields structurally and cannot issue a remote RPC.
+The generic conversation-read contract remains unchanged. ADR-261 records why the
+correct-by-construction requirement outweighs the earlier same-read-surface preference.
+
 - Read the occurrence-bound evidence captured by phase 3. Never query latest message at prompt rendering or delayed notification delivery.
 - Compose the event with follow-up retrieval through an occurrence-bound evidence reference consumed by the existing read surface. It binds the event's exact message and full-content digest/version; generic transcript/message links remain explicitly current-source navigation, not recovery of occurrence-time omitted content. The pinned read path cannot silently drop that expectation or fall back to an unguarded current-message read.
 - An evidence reference conveys identity/version expectations, not access authority. Existing authenticated read and private/shared boundaries still apply.
