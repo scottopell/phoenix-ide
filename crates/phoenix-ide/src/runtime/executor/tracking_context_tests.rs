@@ -347,6 +347,17 @@ mod live {
                 })
                 .collect::<Vec<_>>();
             eprintln!("tracking_eval_response end_turn={} blocks={} tools={tool_names:?} input_tokens={} cache_read_tokens={} cache_creation_tokens={} output_tokens={}",response.end_turn,response.content.len(),response.usage.input_tokens,response.usage.cache_read_tokens,response.usage.cache_creation_tokens,response.usage.output_tokens);
+            for block in &response.content {
+                match block {
+                    ContentBlock::Text { text } => {
+                        eprintln!("tracking_eval_visible_assistant_text text={text:?}")
+                    }
+                    ContentBlock::ToolUse { id, name, input } => {
+                        eprintln!("tracking_eval_tool_call id={id} name={name} input={input}")
+                    }
+                    _ => {}
+                }
+            }
             self.budget.reported_input_tokens.fetch_add(
                 response
                     .usage
@@ -452,7 +463,20 @@ mod live {
                     "Isolated evaluation: external/effectful tools are disabled",
                 ));
             }
-            self.inner.execute(call, ctx).await
+            if name == "tracking" {
+                eprintln!("tracking_eval_native_input input={input}");
+            }
+            let result = self.inner.execute(call, ctx).await;
+            if name == "tracking" {
+                if let Some(output) = &result {
+                    eprintln!(
+                        "tracking_eval_native_output success={} output={:?}",
+                        output.is_success(),
+                        output.output()
+                    );
+                }
+            }
+            result
         }
         async fn definitions(&self) -> Vec<phoenix_llm::ToolDefinition> {
             self.inner.definitions().await
@@ -679,31 +703,16 @@ mod live {
                         {
                             assert_eq!(messages[index].origin, phoenix_core::domain::db_schema::InputOrigin::UserApi, "fixture exercises actual human-input admission rather than generated legacy messages");
                             assert!(!messages[index + 1..].iter().any(|message| matches!(&message.content, MessageContent::System(notice) if notice.text.contains("Tool-use iteration limit reached"))), "bounded evaluation exhausted its per-turn tool-cycle cap");
-                            if let Some(text) = messages[index + 1..].iter().rev().find_map(
-                                |message| match &message.content {
-                                    MessageContent::Agent(blocks) => {
-                                        let text = blocks
-                                            .iter()
-                                            .filter_map(|block| match block {
-                                                ContentBlock::Text { text } => Some(text.clone()),
-                                                ContentBlock::ToolUse { name, input, .. }
-                                                    if name == "ask_user_question" =>
-                                                {
-                                                    Some(input.to_string())
-                                                }
-                                                _ => None,
-                                            })
-                                            .collect::<Vec<_>>()
-                                            .join("\n");
-                                        if text.is_empty() {
-                                            None
-                                        } else {
-                                            Some(text)
-                                        }
-                                    }
-                                    _ => None,
-                                },
-                            ) {
+                            let text = messages[index + 1..].iter().flat_map(|message| match &message.content {
+                                MessageContent::Agent(blocks) => blocks.as_slice(),
+                                _ => &[],
+                            }).filter_map(|block| match block {
+                                ContentBlock::Text { text } => Some(text.clone()),
+                                ContentBlock::ToolUse { name, input, .. } if name == "ask_user_question" => Some(input.to_string()),
+                                _ => None,
+                            }).collect::<Vec<_>>().join("\n");
+                            if !text.is_empty() {
+                                eprintln!("tracking_eval_turn_visible source={source} input={canonical_input_id} text={text:?}");
                                 break text;
                             }
                         }
@@ -755,7 +764,7 @@ mod live {
             ),
         );
         let client = Arc::new(MockLlmClient::new("test-model"));
-        client.queue_response(LlmResponse{provider_replay:None,content:vec![ContentBlock::ToolUse{id:"pending-record-call".into(),name:"tracking".into(),input:serde_json::json!({"request":{"op":"record","record":{"kind":"requested_work","title":"Native pending-round request","note":"Real runtime owns the pending assistant","resumption":"Return to the user's outcome after a detour","references":[],"evidence":[]}}})}],end_turn:false,usage:phoenix_llm::Usage::default(),usage_observation:phoenix_core::domain::llm_types::UsageObservation::default(),stream_telemetry:phoenix_llm::ProviderStreamTelemetry::non_streaming()});
+        client.queue_response(LlmResponse{provider_replay:None,content:vec![ContentBlock::text("Which comparison period should we use?"),ContentBlock::ToolUse{id:"pending-record-call".into(),name:"tracking".into(),input:serde_json::json!({"request":{"op":"record","record":{"kind":"requested_work","title":"Native pending-round request","note":"Real runtime owns the pending assistant","resumption":"Return to the user's outcome after a detour","references":[],"evidence":[]}}})}],end_turn:false,usage:phoenix_llm::Usage::default(),usage_observation:phoenix_core::domain::llm_types::UsageObservation::default(),stream_telemetry:phoenix_llm::ProviderStreamTelemetry::non_streaming()});
         client.queue_response(LlmResponse {
             provider_replay: None,
             content: vec![ContentBlock::text("Saved the request.")],
@@ -775,10 +784,11 @@ mod live {
             denied: Arc::new(Mutex::new(Vec::new())),
             source_checkpoint_presence: Arc::new(Mutex::new(Vec::new())),
         };
-        assert!(fixture
+        let visible = fixture
             .turn(&source, "Remember the requested outcome in tracking.")
-            .await
-            .contains("Saved"));
+            .await;
+        assert!(visible.contains("Saved"));
+        assert!(visible.contains("Which comparison period should we use?"), "current-turn prose before a tool call remains user-visible and must be retained by the oracle");
         assert_eq!(*fixture.source_checkpoint_presence.lock().unwrap(),vec![false],"normal execution occurs before the assistant message checkpoint; no fixture preinserts state or message rows");
         let page = db
             .list_coordinator_tracking(&source, None, false)
@@ -990,11 +1000,14 @@ mod live {
             captured.requested_item_due_for_review.unwrap().id,
             expected_item.id
         );
-        assert!(
-            recovered.contains("Cobalt"),
-            "due forgotten request returns without user naming it: {recovered}"
-        );
         let state = db.get_conversation(&successor.id).await.unwrap().state;
+        let recovered_lower = recovered.to_lowercase();
+        assert!(
+            recovered.contains("Cobalt")
+                && (recovered_lower.contains("period") || recovered_lower.contains("timeframe") || recovered_lower.contains("time frame"))
+                && (recovered.contains('?') || matches!(state, ConvState::AwaitingUserResponse { .. })),
+            "due forgotten request must return with its specific period question, without the user naming it: {recovered}"
+        );
         if matches!(state, ConvState::Idle)
             && budget.calls.load(Ordering::SeqCst) < 14
             && budget.request_bytes.load(Ordering::SeqCst) < 1_750_000
