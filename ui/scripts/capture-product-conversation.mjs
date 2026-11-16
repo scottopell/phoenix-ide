@@ -1,3 +1,4 @@
+import { captureComposerFocus } from './capture-focus-regressions.mjs';
 import { writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import process from 'node:process';
@@ -485,6 +486,10 @@ runSurfaceCapture({
     await page.route('**/api/**', route => route.abort('blockedbyclient'));
   },
   captureStory: async ({ page, id, outDir, viewport }) => {
+    if (id === 'composer-focus') {
+      await captureComposerFocus({ page, outDir, viewport });
+      return false;
+    }
     if (id === 'mobile-continuation-ordinary' || id === 'mobile-continuation-global') {
       await assertMobileContinuation(page, id, viewport, outDir);
       return;

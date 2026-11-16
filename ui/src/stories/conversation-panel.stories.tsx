@@ -1,4 +1,5 @@
 import type { Story } from '@ladle/react';
+import { QuestionFocusFixture } from '../fixtures/conversationPanel/questionFocus';
 import { ConversationPanelFixture, conversationPanelScenarios } from '../fixtures/conversationPanel';
 
 const storyFor = (id: string): Story => {
@@ -23,3 +24,6 @@ NarrowDark.storyName = 'narrow-dark';
 
 export const ArchivedDark = storyFor('archived-dark');
 ArchivedDark.storyName = 'archived-dark';
+
+export const QuestionFocus: Story = () => <QuestionFocusFixture />;
+QuestionFocus.storyName = 'question-focus';

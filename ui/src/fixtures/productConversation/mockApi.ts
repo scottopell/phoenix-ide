@@ -614,12 +614,15 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
     const phase = (event as CustomEvent<{ type: string; attempt?: number; summary?: string }>).detail;
     const source = latestEventSource;
     if (!phase || !source || source.readyState !== FixtureEventSource.OPEN || source.subscriptionCount < 1) return;
+    const sequenceId = source.nextSequenceId();
     source.emit('state_change', {
-      sequence_id: source.nextSequenceId(),
+      sequence_id: sequenceId,
       state: phase,
       presentation_mode: phase.type,
       state_updated_at: '2026-07-01T12:00:01Z',
     });
+    record('EmittedPhaseSequence', sequenceId);
+    record('EmittedPhaseMember', source.memberId);
   };
   window.addEventListener('product-conversation-fixture-phase', publishPhase);
   let successorMessageCount = 0;

@@ -159,6 +159,13 @@ THEN THE SYSTEM SHALL preserve that owner's focus instead of focusing the compos
 IF a transient conversation phase has not rendered a focusable composer
 THEN THE SYSTEM SHALL retain the navigation focus request until the same route renders one
 
+WHEN an explicit user action requests composer focus
+THE SYSTEM SHALL consume that request only after the writable composer receives focus
+AND SHALL retain the request while the composer is absent, cannot receive focus, or a higher focus scope or viewer owns interaction
+AND SHALL NOT replay a consumed request when the composer remounts or background state changes
+
+An explicit review Send Notes action MAY hand focus to the composer after returning to the same originating review pane. Interruption by another interaction owner SHALL revoke this special handoff while preserving the ordinary pending request until ownership is released.
+
 **Dependencies:** `specs/keyboard-interaction/` REQ-KB-001, REQ-KB-002A, and REQ-KB-008 define topmost interaction ownership; `specs/viewer_slot/` defines when a route-owned viewer has settled and owns the interaction surface.
 
 **Rationale:** Users expect standard text input behavior. Draft persistence prevents frustrating message loss.
