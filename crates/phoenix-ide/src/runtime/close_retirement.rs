@@ -9954,7 +9954,22 @@ mod tests {
             ),
             join_actor(actor),
         );
-        let NativeCloseRetryResult::NewlyAdmitted(receipt) = result.unwrap() else {
+        let result = match result {
+            Ok(result) => result,
+            Err(error) => {
+                // Storage also represents a durably classified execution failure.
+                // Retain its domain detail rather than hiding it behind unwrap.
+                let attempt = fixture.run.attempt_id.as_str();
+                let failures = db.list_close_cleanup_failures(attempt).await;
+                let obligation = db.get_close_obligation(attempt).await;
+                let counts = retained_counts(db, attempt).await;
+                panic!(
+                    "native retry route failed: {error:?}; failures: {failures:#?}; \
+                     obligation: {obligation:#?}; retained counts: {counts:?}"
+                );
+            }
+        };
+        let NativeCloseRetryResult::NewlyAdmitted(receipt) = result else {
             panic!("expected fresh explicit retry admission");
         };
         assert_eq!(receipt.admitted.run_ordinal.get(), 2);
