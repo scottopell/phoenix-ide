@@ -13,6 +13,8 @@ const idleAudit = process.env.OVERLAY_IDLE_QA === '1';
 const out = path.resolve(process.env.REVIEW_READING_QA_OUT ?? 'qa-artifacts/review-reading-position');
 await mkdir(out, { recursive: true });
 const report = {
+  idleAudit,
+  idleConditions: idleAudit ? 'Long image-free production viewer; ordinary/global, touch-enabled 390px and desktop 1440px; three 2400ms no-input windows after settle; Chromium is not physical iOS.' : null,
   baseline, base, cases: [], mismatches: [], errors: [], controls: [],
   limitations: [
     'HashRouter transports the product path/search/hash inside the hosted Ladle URL; not production-path cold reload acceptance.',
@@ -397,7 +399,7 @@ try {
     }
   }
   assert.equal(report.errors.length, 0, `Harness/interaction errors: ${report.errors.join('\n')}`);
-  assert.equal(report.controls.length, 1, 'Missing true chapter navigation control');
+  assert.equal(report.controls.length, idleAudit ? 0 : 1, 'Unexpected chapter navigation control count');
   if (baseline) assert(report.mismatches.length > 0, 'BASELINE must reproduce at least one position/route/node mismatch');
   else assert.equal(report.mismatches.length, 0, `Reading-position regressions: ${report.mismatches.length}; see ${out}/report.json`);
   console.log(`${baseline ? 'BASELINE reproduced' : 'PASS'}: ${report.cases.length} cases, ${report.mismatches.length} mismatches; ${out}`);
