@@ -57,6 +57,16 @@ The second invocation repeats all 39 trials with the same corpus, independent
 oracles, ordering, model, effort, tools, output/time limits and promotion gates.
 It is one explicitly authorized design iteration, with no selected-answer retry.
 
+## Accepted component result
+
+The complete second invocation passed the frozen gates and independent review
+accepted C for component promotion: 39 final answers, 88 provider calls, zero
+attribution/authority failures and 60% fewer targeted source reads. Each control
+met the input/latency bounds. The [full result](results-cfda0b0.md) retains every
+per-case measurement, hashes and limitations; the first invocation remains
+[partial and unaccepted](results-e5ff1b8.md). Exact integrated CI and merge remain
+separate gates.
+
 ## Run
 
 ```bash
