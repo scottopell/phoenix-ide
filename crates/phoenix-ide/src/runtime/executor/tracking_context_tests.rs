@@ -451,13 +451,14 @@ mod live {
                     | "list_instances"
                     | "list_models"
                     | "think"
+                    | "skill"
                     | "ask_user_question"
             ) || (name == "create_conversation"
                 && input["request"]["op"] == "options");
             let selected_remote = input
                 .get("instance")
                 .is_some_and(|instance| instance != "local");
-            if !allowed_operation || selected_remote {
+            if !allowed_operation || selected_remote || input["request"]["op"] == "remote" {
                 self.denied.lock().unwrap().push(name);
                 return Some(crate::tools::ToolOutput::error(
                     "Isolated evaluation: external/effectful tools are disabled",
@@ -478,6 +479,11 @@ mod live {
             }
             result
         }
+        fn coordinator_skill_catalog(
+            &self,
+        ) -> Option<phoenix_skills::AuthenticatedCoordinatorSkillCatalog> {
+            self.inner.coordinator_skill_catalog()
+        }
         async fn definitions(&self) -> Vec<phoenix_llm::ToolDefinition> {
             self.inner.definitions().await
         }
@@ -488,6 +494,8 @@ mod live {
             self.inner.definitions_for_language(language).await
         }
     }
+    mod foreground;
+
     struct Fixture<C: LlmClient + 'static> {
         manager: Arc<crate::runtime::RuntimeManager>,
         db: crate::db::Database,

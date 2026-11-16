@@ -3433,6 +3433,23 @@ def cmd_qa_coordinator_scanner_quality() -> None:
                    cwd=ROOT, env=env, check=True)
 
 
+def cmd_qa_ember_foreground_memory() -> None:
+    """Run opt-in admitted-runtime memory qualification from a retained test binary."""
+    env = _resolved_phoenix_env()
+    test_name = "runtime::executor::tracking_context_tests::live::foreground::foreground_memory_qualification"
+    binary = Path(env.get("PHOENIX_FOREGROUND_QA_TEST_BINARY", ""))
+    if not binary.is_absolute() or not binary.is_file() or not os.access(binary, os.X_OK):
+        raise SystemExit("foreground qualification requires an absolute retained executable test binary")
+    listing = subprocess.run([str(binary), "--list"], cwd=ROOT, env=env,
+                             check=True, capture_output=True, text=True)
+    if test_name + ": test" not in listing.stdout.splitlines():
+        raise SystemExit("selected test binary does not contain foreground qualification")
+    with binary.open("rb") as stream:
+        env["PHOENIX_FOREGROUND_QA_BINARY_SHA256"] = hashlib.file_digest(stream, "sha256").hexdigest()
+    subprocess.run([str(binary), test_name, "--ignored", "--exact", "--nocapture"],
+                   cwd=ROOT, env=env, check=True)
+
+
 def cmd_qa_grounding_panel() -> None:
     """Capture grounding panel Ladle screenshots into ignored local artifacts."""
     subprocess.run(
@@ -13250,6 +13267,7 @@ def main():
     qa_sub.add_parser("coordinator-drive-eval", help="Run isolated opt-in Coordinator action evaluation")
     qa_sub.add_parser("ember-watch-recovery", help="Qualify isolated local-watch tool recovery")
     qa_sub.add_parser("ember-event-eval", help="Compare bounded completion-event context on synthetic data")
+    qa_sub.add_parser("ember-foreground-memory", help="Qualify isolated admitted-runtime memory behavior")
     qa_sub.add_parser("coordinator", help="Capture Coordinator screenshots across responsive viewports")
     qa_sub.add_parser("mobile-multi-pr-conversation", help="Capture a mobile conversation with two open PRs")
     qa_sub.add_parser("desktop-multi-pr-conversation", help="Capture a desktop conversation with multiple open PRs")
@@ -13475,6 +13493,8 @@ def main():
             cmd_qa_ember_watch_recovery()
         elif args.qa_command == "ember-event-eval":
             cmd_qa_ember_event_eval()
+        elif args.qa_command == "ember-foreground-memory":
+            cmd_qa_ember_foreground_memory()
         elif args.qa_command == "coordinator":
             cmd_qa_coordinator()
         elif args.qa_command == "mobile-multi-pr-conversation":
