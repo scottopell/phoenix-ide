@@ -47,13 +47,16 @@ enum RetirementAnchorClassification {
     Excluded,
 }
 
-/// Retained original capture data, not live retry or cleanup authority.
+/// Retained original capture data and matching historical outcomes, not live retry or cleanup authority.
+/// Missing outcomes remain unresolved; this evidence is not proof that retirement is complete.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoppedCloseOriginalRetirementProof {
     pub run: CloseRun,
     pub snapshot: CloseRetirementSnapshot,
     pub scopes: Vec<CloseAttemptScope>,
     pub resources: Vec<CloseExpectedRetirementResource>,
+    /// Receipts for this original snapshot only; absent receipts leave resources unresolved.
+    pub outcomes: Vec<CloseRetiredResource>,
 }
 
 impl CloseWriterDetector {
@@ -5075,12 +5078,26 @@ impl Database {
     ///
     /// # Errors
     /// Rejects missing, non-stopped, excluded, unanchored, or incomplete provenance.
-    #[allow(clippy::too_many_lines)] // All original-snapshot checks share one read transaction.
     pub async fn read_stopped_close_original_retirement_proof(
         &self,
         run: &CloseRunRef,
     ) -> DbResult<StoppedCloseOriginalRetirementProof> {
         let mut tx = self.pool.begin().await?;
+        let proof = Self::read_stopped_close_original_retirement_proof_tx(&mut tx, run).await?;
+        tx.commit().await?;
+        Ok(proof)
+    }
+
+    /// Reads original stopped-run provenance and matching historical receipts in an existing transaction.
+    /// Missing receipts remain unresolved; this does not authorize retry, dispatch, or cleanup.
+    ///
+    /// # Errors
+    /// Rejects missing, non-stopped, excluded, unanchored, or incomplete provenance.
+    #[allow(clippy::too_many_lines)] // All original-snapshot checks share one read transaction.
+    pub(crate) async fn read_stopped_close_original_retirement_proof_tx(
+        tx: &mut SqliteConnection,
+        run: &CloseRunRef,
+    ) -> DbResult<StoppedCloseOriginalRetirementProof> {
         let retained = sqlx::query(
             "SELECT runs.attempt_id, runs.run_ordinal, runs.status
              FROM close_runs runs
@@ -5264,12 +5281,36 @@ impl Database {
                 ));
             }
         }
-        tx.commit().await?;
+        let outcomes = sqlx::query(
+            "SELECT resource.attempt_id, resource.scope, resource.inspection_generation,
+                    resource.inspection_fingerprint, resource.resource_kind,
+                    resource.identity_kind, resource.identity_codec, resource.identity_value,
+                    resource.proof_kind, resource.absence_basis, resource.residual_reason,
+                    resource.detail, resource.created_at, resource.updated_at,
+                    captured.captured_worktree_fingerprint, captured.captured_worktree_locator
+             FROM close_retirement_resources resource
+             JOIN close_attempt_scopes captured
+               ON captured.attempt_id = resource.attempt_id AND captured.scope = resource.scope
+             WHERE resource.attempt_id = ?1
+               AND resource.inspection_generation = ?2
+               AND resource.inspection_fingerprint = ?3
+             ORDER BY resource.scope, resource.resource_kind, resource.identity_kind,
+                      resource.identity_codec, resource.identity_value",
+        )
+        .bind(run.attempt_id.as_str())
+        .bind(snapshot.generation())
+        .bind(snapshot.fingerprint())
+        .fetch_all(&mut *tx)
+        .await?
+        .into_iter()
+        .map(parse_close_retired_resource_row)
+        .collect::<DbResult<Vec<_>>>()?;
         Ok(StoppedCloseOriginalRetirementProof {
             run: retained,
             snapshot,
             scopes,
             resources,
+            outcomes,
         })
     }
 
@@ -17942,6 +17983,18 @@ mod tests {
         assert!(current_resources
             .iter()
             .all(|resource| resource.snapshot == replacement));
+        // The later generation may succeed without rewriting the G1 residual.
+        // Original-bound reads must not substitute this conflicting G2 receipt.
+        db.record_close_retirement_evidence(RecordCloseRetirementEvidenceRequest {
+            attempt_id: attempt.clone(),
+            snapshot: replacement.clone(),
+            scope: scope.clone(),
+            resource: worktree.resource.clone(),
+            outcome: RetirementOutcome::Retired,
+            detail: Some("later generation succeeded".to_string()),
+        })
+        .await
+        .unwrap();
         let initial_run = CloseRunRef::initial(attempt.clone());
         assert!(db
             .read_stopped_close_original_retirement_proof(&initial_run)
@@ -17963,6 +18016,15 @@ mod tests {
         assert_eq!(proof.run.status, CloseRunStatus::Stopped);
         assert_eq!(proof.snapshot, snapshot);
         assert_eq!(proof.resources, resources);
+        assert_eq!(proof.outcomes.len(), 1);
+        assert_eq!(proof.outcomes[0].snapshot, snapshot);
+        assert_eq!(proof.outcomes[0].resource, worktree.resource);
+        assert_eq!(
+            proof.outcomes[0].outcome,
+            RetirementOutcome::Residual {
+                residual_reason: RetirementFailureReason::RemovalFailed,
+            }
+        );
         assert_eq!(proof.scopes.len(), 1);
         assert_eq!(proof.scopes[0].scope, scope);
         assert_eq!(
@@ -17988,6 +18050,84 @@ mod tests {
             .read_stopped_close_original_retirement_proof(&stale_run)
             .await
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn stopped_original_retirement_proof_keeps_missing_work_scope_outcome_unresolved() {
+        let db = Database::open_in_memory().await.unwrap();
+        create_root(&db, "root").await;
+        let scope = allocate_scope_worktree(&db, "root").await;
+        let attempt = CloseAttemptId::parse("attempt-original-outcome-gap").unwrap();
+        db.begin_close_foundation(
+            &product_id("root"),
+            &transcript_id("root"),
+            attempt.as_str(),
+        )
+        .await
+        .unwrap();
+        set_close_phase(&db, attempt.as_str(), ClosePhase::RetirementRequested).await;
+        let snapshot = current_test_snapshot(&db, attempt.as_str()).await;
+        let resources = db
+            .capture_close_retirement_inventory(CaptureCloseRetirementInventoryRequest {
+                attempt_id: attempt.clone(),
+                snapshot: snapshot.clone(),
+                scopes: vec![CaptureCloseRetirementInventoryScopeRequest {
+                    scope: scope.clone(),
+                    inventory: CloseOwnedResourceInventory {
+                        worktree: Some(current_test_worktree(&db, &scope).await),
+                        work_scopes: std::collections::BTreeSet::default(),
+                        bash_process_groups: std::collections::BTreeSet::default(),
+                        tmux_servers: std::collections::BTreeSet::default(),
+                        pty_sessions: std::collections::BTreeSet::default(),
+                        browser_sessions: std::collections::BTreeSet::default(),
+                        equivalent_live_resources: std::collections::BTreeSet::default(),
+                    },
+                }],
+            })
+            .await
+            .unwrap();
+        let worktree = resources
+            .iter()
+            .find(|resource| resource.resource.kind() == RetiredResourceKind::Worktree)
+            .unwrap();
+        let work_scope = resources
+            .iter()
+            .find(|resource| resource.resource.kind() == RetiredResourceKind::WorkScope)
+            .unwrap();
+        db.record_close_retirement_dispatch(RecordCloseRetirementDispatchRequest {
+            attempt_id: attempt.clone(),
+            snapshot: snapshot.clone(),
+            scope: scope.clone(),
+            resource: worktree.resource.clone(),
+        })
+        .await
+        .unwrap();
+        db.record_close_retirement_evidence(RecordCloseRetirementEvidenceRequest {
+            attempt_id: attempt.clone(),
+            snapshot: snapshot.clone(),
+            scope: scope.clone(),
+            resource: worktree.resource.clone(),
+            outcome: RetirementOutcome::Retired,
+            detail: None,
+        })
+        .await
+        .unwrap();
+        let run = CloseRunRef::initial(attempt);
+        db.classify_interrupted_close_run(&run).await.unwrap();
+
+        let proof = db
+            .read_stopped_close_original_retirement_proof(&run)
+            .await
+            .unwrap();
+        assert_eq!(proof.resources, resources);
+        assert!(proof
+            .resources
+            .iter()
+            .any(|expected| expected.resource == work_scope.resource));
+        assert_eq!(proof.outcomes.len(), 1);
+        assert_eq!(proof.outcomes[0].resource, worktree.resource);
+        assert_eq!(proof.outcomes[0].outcome, RetirementOutcome::Retired);
+        assert_eq!(proof.outcomes[0].snapshot, snapshot);
     }
 
     #[tokio::test]
