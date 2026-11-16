@@ -11,6 +11,7 @@ use phoenix_core::domain::db_schema::SourceToolCall;
 use phoenix_core::domain::llm_types::ContentBlock;
 use phoenix_core::domain::product_conversation::ProductConversationId;
 use phoenix_db::native_close::{NativeCloseCommand, NativeCloseIntent, NativeCloseRunRef};
+use std::sync::Arc;
 
 use crate::state_machine::ConvState;
 
@@ -160,6 +161,7 @@ fn command_from_executing_source(
 /// Cleanup is a separate mutation unit and is deliberately not dispatched here.
 pub(crate) struct NativeCloseInitialRequest {
     pub source: SourceToolCall,
+    pub backend: Arc<crate::runtime::RuntimeManager>,
     pub target: ProductConversationId,
     pub admitted: super::AdmittedOperation,
     pub target_gate: tokio::sync::OwnedMutexGuard<()>,
@@ -177,7 +179,7 @@ impl super::RuntimeManager {
     /// this route. A queued Stop is not an acknowledged durable Stop; whichever
     /// request the source actor processes first establishes the ordering.
     pub(crate) async fn apply_native_close_initial(
-        &self,
+        self: &Arc<Self>,
         source_transcript_id: &str,
         source: SourceToolCall,
         target: ProductConversationId,
@@ -201,6 +203,7 @@ impl super::RuntimeManager {
                 super::AcknowledgedRuntimeRequest::ExecuteNativeCloseInitial(Box::new(
                     NativeCloseInitialRequest {
                         source,
+                        backend: Arc::clone(self),
                         target,
                         admitted,
                         target_gate,

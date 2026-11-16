@@ -118,6 +118,18 @@ impl CloseFixture {
         }
     }
 
+    fn backend(&self, db: Database) -> Arc<crate::runtime::RuntimeManager> {
+        Arc::new(crate::runtime::RuntimeManager::new(
+            db,
+            Arc::new(phoenix_llm::ModelRegistry::new_empty()),
+            crate::platform::PlatformCapability::None {
+                details: "native test".into(),
+            },
+            Arc::new(crate::tools::mcp::McpClientManager::new()),
+            None,
+        ))
+    }
+
     fn runtime(&self, is_coordinator: bool) -> RuntimeHarness {
         let mut harness =
             runtime_with_storage(self.state.clone(), Arc::new(InMemoryStorage::new()));
@@ -226,6 +238,7 @@ fn initial_request(
 ) -> AcknowledgedRuntimeRequest {
     AcknowledgedRuntimeRequest::ExecuteNativeCloseInitial(Box::new(NativeCloseInitialRequest {
         source: fixture.source.clone(),
+        backend: fixture.backend(fixture.db.clone()),
         target: fixture.target.clone(),
         admitted,
         target_gate,
@@ -234,7 +247,7 @@ fn initial_request(
 }
 
 #[tokio::test]
-async fn native_retry_backend_requires_actor_database_authority_not_matching_path() {
+async fn native_close_backend_requires_actor_database_authority_not_matching_path() {
     let fixture = CloseFixture::new().await;
     let mut harness = fixture.runtime(true);
     let cloned_backend = fixture.db.clone();
@@ -243,24 +256,63 @@ async fn native_retry_backend_requires_actor_database_authority_not_matching_pat
     assert_eq!(
         harness
             .runtime
-            .check_native_close_retry_backend(&cloned_backend),
+            .check_native_close_backend(&cloned_backend),
         Ok(())
     );
     assert_eq!(
         harness
             .runtime
-            .check_native_close_retry_backend(&unrelated_backend),
+            .check_native_close_backend(&unrelated_backend),
         Err(NativeCloseApplicationError::SourceRefused)
     );
     harness.runtime.native_task_admission_db = None;
     assert_eq!(
         harness
             .runtime
-            .check_native_close_retry_backend(&cloned_backend),
+            .check_native_close_backend(&cloned_backend),
         Err(NativeCloseApplicationError::SourceRefused)
     );
     assert_eq!(count(&fixture.db, "close_runs").await, 0);
     assert_eq!(count(&unrelated_backend, "close_runs").await, 0);
+}
+
+#[tokio::test]
+async fn initial_mismatched_backend_refuses_before_database_work_and_releases_owner() {
+    let fixture = CloseFixture::new().await;
+    let unrelated_db = Database::open_in_memory().await.unwrap();
+    let backend = fixture.backend(unrelated_db.clone());
+    let mut harness = fixture.runtime(true);
+    let fence = Arc::clone(&harness.runtime.fatal_local_authority_fence);
+    let admitted = harness.runtime.admit_authoritative_effect().unwrap();
+
+    assert_eq!(
+        harness
+            .runtime
+            .execute_native_close_initial(
+                &backend,
+                fixture.source.clone(),
+                fixture.target.clone(),
+                admitted,
+            )
+            .await,
+        Err(NativeCloseApplicationError::SourceRefused)
+    );
+    assert_eq!(fence.owner_count(), 0);
+    assert_eq!(count(&fixture.db, "native_close_initial_receipts").await, 0);
+    assert_eq!(count(&fixture.db, "close_runs").await, 0);
+    assert_eq!(
+        count(&fixture.db, "close_completion_retry_allowances").await,
+        0
+    );
+    assert_eq!(
+        count(&unrelated_db, "native_close_initial_receipts").await,
+        0
+    );
+    assert_eq!(count(&unrelated_db, "close_runs").await, 0);
+    assert_eq!(
+        count(&unrelated_db, "close_completion_retry_allowances").await,
+        0
+    );
 }
 
 #[tokio::test]
@@ -519,12 +571,13 @@ async fn aborted_owning_initial_execution_task_latches_authority_before_releasin
     let admitted = harness.runtime.admit_authoritative_effect().unwrap();
     let source = fixture.source.clone();
     let target = fixture.target.clone();
+    let backend = fixture.backend(fixture.db.clone());
     let (suspended, reached_boundary) = oneshot::channel();
     let owning_task = tokio::spawn(async move {
         let mut future = Box::pin(
             harness
                 .runtime
-                .execute_native_close_initial(source, target, admitted),
+                .execute_native_close_initial(&backend, source, target, admitted),
         );
         // The sole connection is held outside this task. Every earlier check is
         // synchronous, so Pending witnesses the actual DB-await boundary.
@@ -566,7 +619,12 @@ async fn established_initial_rollback_releases_owner_without_closing_authority()
     assert_eq!(
         harness
             .runtime
-            .execute_native_close_initial(fixture.source.clone(), fixture.target.clone(), admitted,)
+            .execute_native_close_initial(
+                &fixture.backend(fixture.db.clone()),
+                fixture.source.clone(),
+                fixture.target.clone(),
+                admitted,
+            )
             .await,
         Err(NativeCloseApplicationError::Storage)
     );

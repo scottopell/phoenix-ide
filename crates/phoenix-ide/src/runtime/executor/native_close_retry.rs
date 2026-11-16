@@ -86,23 +86,6 @@ where
     L: LlmClient + 'static,
     T: ToolExecutor + 'static,
 {
-    /// Bind backend work to the actor's installed database handle, not a path or
-    /// independently opened pool. Cloned handles preserve this authority identity.
-    pub(super) fn check_native_close_retry_backend(
-        &self,
-        backend_db: &phoenix_db::Database,
-    ) -> Result<(), NativeCloseApplicationError> {
-        if self
-            .native_task_admission_db
-            .as_ref()
-            .is_some_and(|actor_db| actor_db.shares_authority_with(backend_db))
-        {
-            Ok(())
-        } else {
-            Err(NativeCloseApplicationError::SourceRefused)
-        }
-    }
-
     /// Runs the retry solely in the acknowledged source actor; gate ownership
     /// transferred with the request is retained through durable classification.
     // Keep receipt lookup, admission, execution and settlement ownership together.
@@ -127,7 +110,7 @@ where
         {
             return Err(NativeCloseApplicationError::SourceRefused);
         }
-        self.check_native_close_retry_backend(backend.db())?;
+        self.check_native_close_backend(backend.db())?;
         let command = retry_command_from_executing_source(
             &self.state,
             &self.context.conversation_id,

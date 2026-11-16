@@ -18,6 +18,23 @@ where
     L: LlmClient + 'static,
     T: ToolExecutor + 'static,
 {
+    /// Bind backend work to the actor's installed database authority, not its path.
+    /// A cloned database handle preserves this identity; a separately opened pool does not.
+    pub(super) fn check_native_close_backend(
+        &self,
+        backend_db: &phoenix_db::Database,
+    ) -> Result<(), NativeCloseApplicationError> {
+        if self
+            .native_task_admission_db
+            .as_ref()
+            .is_some_and(|actor_db| actor_db.shares_authority_with(backend_db))
+        {
+            Ok(())
+        } else {
+            Err(NativeCloseApplicationError::SourceRefused)
+        }
+    }
+
     /// Invoked only by the SOURCE actor's dedicated acknowledged request branch.
     /// No actor RPC, target lock acquisition or cleanup is permitted here. Exclusive
     /// actor ownership spans live source matching, receipt lookup, actual DB commit
@@ -25,10 +42,12 @@ where
     /// transactionally, not inferred from the queued request or watch state.
     pub(super) async fn execute_native_close_initial(
         &mut self,
+        backend: &crate::runtime::RuntimeManager,
         source: SourceToolCall,
         target: ProductConversationId,
         admitted: crate::runtime::AdmittedOperation,
     ) -> Result<NativeCloseInitialResult, NativeCloseApplicationError> {
+        self.check_native_close_backend(backend.db())?;
         if !self.context.is_coordinator
             || self.context.is_sub_agent
             || self

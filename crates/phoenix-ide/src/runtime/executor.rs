@@ -3306,12 +3306,14 @@ where
                         AcknowledgedRuntimeRequest::Event(event) => *event,
                         AcknowledgedRuntimeRequest::ExecuteNativeCloseInitial(request) => {
                             let super::native_close_application::NativeCloseInitialRequest {
-                                source, target, admitted, target_gate, response,
+                                source, backend, target, admitted, target_gate, response,
                             } = *request;
                             // The actual source actor remains exclusively borrowed
                             // through the whole DB transaction and classification.
                             // It must not reacquire the transferred target gate.
-                            let result = self.execute_native_close_initial(source, target, admitted).await;
+                            let result = self
+                                .execute_native_close_initial(&backend, source, target, admitted)
+                                .await;
                             let fatal = matches!(result, Err(super::native_close_application::NativeCloseApplicationError::FatalAuthority));
                             drop(target_gate);
                             let _ = response.send(result);
