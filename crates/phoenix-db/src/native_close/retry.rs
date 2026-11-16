@@ -65,6 +65,10 @@ impl Database {
     /// The source actor must perform its exclusive live source occurrence check before this call;
     /// this persisted source/receipt check supports that owner and does not replace its authority.
     /// It does not establish fresh predecessor proof or grant execution/finalization authority.
+    ///
+    /// # Errors
+    /// Rejects non-retry intents, invalid current sources or targets, and conflicting receipts.
+    /// Returns storage errors if the source or retained receipt cannot be read.
     pub async fn read_native_close_explicit_retry_receipt(
         &self,
         command: &NativeCloseCommand,

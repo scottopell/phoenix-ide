@@ -68,7 +68,7 @@ jobs:
             explicit_retry_receipt_lookup_replays_successor_without_predecessor_proof \
             explicit_retry_receipt_lookup_revalidates_source_before_existing_receipt \
             explicit_retry_receipt_lookup_refuses_nonretry_and_conflicting_source_binding; do
-            grep -F "native_close::retry::tests::$test: test" evidence/selected-tests.txt
+            grep -F "close_foundation::tests::native_retry::$test: test" evidence/selected-tests.txt
           done
       - name: Execute complete Close foundation module
         if: success()
