@@ -305,9 +305,12 @@ impl World {
             panic!("event user content")
         };
         let compact = projected.llm_text().to_owned();
-        let runtime = Arc::new(RuntimeManager::new(
+        let retriever = Arc::new(db.fts_retriever());
+        retriever.reconcile().await.unwrap();
+        let runtime = Arc::new(RuntimeManager::new_with_message_retriever(
             db,
             models,
+            retriever,
             crate::platform::PlatformCapability::None {
                 details: "isolated event comparison".into(),
             },
@@ -624,6 +627,24 @@ async fn event_eval_fixture_uses_captured_evidence_and_real_read_tools() {
                 world.registry.find_tool(name).is_some(),
                 "allowed tool {name} must be installed"
             );
+        }
+        for (name, input) in [
+            ("search_conversations", json!({"query":"readiness"})),
+            (
+                "read_conversation",
+                json!({"conversation_id":format!("@transcript:{}", world.source["source_transcript_id"].as_str().unwrap())}),
+            ),
+            (
+                "resolve_reference",
+                json!({"reference":format!("@conv:{}", world.source["product_conversation_id"].as_str().unwrap())}),
+            ),
+            (
+                "think",
+                json!({"thought":"Inspect only the synthetic evidence."}),
+            ),
+        ] {
+            let (output, error, denied) = world.dispatch(name, &input).await;
+            assert!(!error && !denied, "{name}: {output}");
         }
         let (query_output, error, denied) = world
             .dispatch(
