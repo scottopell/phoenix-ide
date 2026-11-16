@@ -75,6 +75,12 @@ export function ConversationListPage() {
   const productList = useProductConversationList();
   const productConversations = productList.rows;
   const productListError = productList.error;
+  const productListAvailable = productList.fresh || productList.fromCache;
+  const listAvailability = productListAvailable
+    ? 'available'
+    : productListError
+      ? 'error'
+      : 'loading';
   const coordinatorUnreadState = coordinatorUnread(productList);
   const mainRef = useRef<HTMLElement | null>(null);
   const didRestoreScrollRef = useRef(false);
@@ -102,12 +108,6 @@ export function ConversationListPage() {
   const { isOnline, isReady, initError, pendingOpsCount } = useAppMachine();
   const { toasts, dismissToast, showWarning, showError } = useToast();
 
-  // Loading is derived: we're loading until we have at least one conversation
-  // observed *or* the cache hydration + first poll have completed (signalled
-  // by `isReady` being true and the list being populated, OR isReady true
-  // with no rows server-side which is also a valid empty state).
-  // Concretely: hide the skeleton as soon as we have any rows, OR when
-  // we've completed at least one refresh while online.
   const [hasCompletedFirstFetch, setHasCompletedFirstFetch] = useState(false);
   useEffect(() => {
     if (!isReady) return;
@@ -119,12 +119,7 @@ export function ConversationListPage() {
       cancelled = true;
     };
   }, [isReady, refresh]);
-  const loading =
-    !hasCompletedFirstFetch &&
-    conversations.length === 0 &&
-    archivedConversations.length === 0 &&
-    productConversations.length === 0 &&
-    productListError === null;
+  const loading = !productListAvailable && productListError === null;
 
   // Delete confirmation state
 
@@ -452,12 +447,17 @@ export function ConversationListPage() {
           <>
             {productListError && (
               <div role="status" className="coordinator-error">
-                <span>Showing cached conversations — {productListError}</span>
+                <span>{productList.fromCache
+                  ? `Showing cached conversations — ${productListError}`
+                  : productList.fresh
+                    ? `Showing last loaded conversations — ${productListError}`
+                    : `Unable to load conversations — ${productListError}`}</span>
                 <button type="button" onClick={() => void refreshProductConversationList()}>Retry</button>
               </div>
             )}
             <ConversationList
               coordinatorUnread={coordinatorUnreadState}
+              listAvailability={listAvailability}
               productConversations={openProductConversations}
               archivedProductConversations={archivedProductConversations}
               showArchived={showArchived}

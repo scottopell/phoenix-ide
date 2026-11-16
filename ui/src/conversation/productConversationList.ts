@@ -54,8 +54,9 @@ function initialSnapshot(): ProductConversationListSnapshot {
 
 let snapshot: ProductConversationListSnapshot = initialSnapshot();
 const listeners = new Set<() => void>();
-let inFlight: { controller: AbortController; promise: Promise<void> } | null = null;
+let inFlight: { controller: AbortController; promise: Promise<void>; rowsChanged: boolean } | null = null;
 let stopRevisionSubscription: (() => void) | null = null;
+let refreshAfterCurrent = false;
 
 function publish(next: ProductConversationListSnapshot): void {
   snapshot = next;
@@ -67,12 +68,17 @@ function publish(next: ProductConversationListSnapshot): void {
  * in flight, so a slow response can never overwrite fresher rows.
  */
 export function refreshProductConversationList(): Promise<void> {
+  return fetchProductConversationList(true);
+}
+
+function fetchProductConversationList(clearError: boolean): Promise<void> {
   inFlight?.controller.abort();
+  if (clearError && snapshot.error !== null) publish({ ...snapshot, error: null });
   const controller = new AbortController();
   const timeout = window.setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
   const promise = api.listProductConversations(controller.signal)
     .then((response) => {
-      if (inFlight?.controller !== controller) return;
+      if (inFlight?.controller !== controller || inFlight.rowsChanged) return;
       writeCache(response.product_conversations, response.coordinator);
       publish({
         rows: response.product_conversations,
@@ -88,10 +94,24 @@ export function refreshProductConversationList(): Promise<void> {
     })
     .finally(() => {
       window.clearTimeout(timeout);
-      if (inFlight?.controller === controller) inFlight = null;
+      if (inFlight?.controller === controller) {
+        inFlight = null;
+        if (refreshAfterCurrent) {
+          refreshAfterCurrent = false;
+          if (listeners.size > 0) void fetchProductConversationList(false);
+        }
+      }
     });
-  inFlight = { controller, promise };
+  inFlight = { controller, promise, rowsChanged: false };
   return promise;
+}
+
+function refreshInvalidatedList(): void {
+  if (inFlight !== null) {
+    refreshAfterCurrent = true;
+  } else {
+    void fetchProductConversationList(false);
+  }
 }
 
 /** Apply an optimistic change (rename, close, delete) to the shared rows. */
@@ -100,6 +120,10 @@ export function updateProductConversationRows(
 ): void {
   const rows = updater(snapshot.rows);
   if (rows === snapshot.rows) return;
+  if (inFlight !== null) {
+    inFlight.rowsChanged = true;
+    refreshAfterCurrent = true;
+  }
   writeCache(rows, snapshot.coordinator);
   publish({ ...snapshot, rows });
 }
@@ -107,14 +131,15 @@ export function updateProductConversationRows(
 function subscribe(listener: () => void): () => void {
   listeners.add(listener);
   if (listeners.size === 1) {
-    stopRevisionSubscription = subscribeProductConversationListRevision(() => { void refreshProductConversationList(); });
-    void refreshProductConversationList();
+    stopRevisionSubscription = subscribeProductConversationListRevision(refreshInvalidatedList);
+    void fetchProductConversationList(false);
   }
   return () => {
     listeners.delete(listener);
     if (listeners.size === 0) {
       stopRevisionSubscription?.();
       stopRevisionSubscription = null;
+      refreshAfterCurrent = false;
     }
   };
 }
@@ -143,6 +168,7 @@ function resetForTests(): void {
   listeners.clear();
   inFlight?.controller.abort();
   inFlight = null;
+  refreshAfterCurrent = false;
   try { localStorage.removeItem(CACHE_KEY); } catch { /* ignore */ }
   snapshot = initialSnapshot();
 }
