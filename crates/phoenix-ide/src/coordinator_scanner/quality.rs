@@ -123,6 +123,11 @@ struct PredecessorInput {
 fn expected_predecessor_projection(bytes: &[u8], original_input_sha256: &str) -> ScanInput {
     let old: PredecessorInput = serde_json::from_slice(bytes).unwrap();
     assert_eq!(
+        serde_json::to_value(&old).unwrap(),
+        serde_json::from_slice::<Value>(bytes).unwrap(),
+        "predecessor reader must preserve every supplied field"
+    );
+    assert_eq!(
         digest(serde_json::to_vec(&old).unwrap()),
         original_input_sha256
     );
