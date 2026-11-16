@@ -11,7 +11,9 @@
 
 mod agent_execution;
 mod native_spawn;
-pub use native_spawn::{NativeSpawnClosureReceipt, NativeSpawnTerminalEvidence, SubAgentAdmissionReceipt};
+pub use native_spawn::{
+    NativeSpawnClosureReceipt, NativeSpawnTerminalEvidence, SubAgentAdmissionReceipt,
+};
 pub(crate) mod close_retirement;
 pub(crate) mod creation_worker;
 pub mod deny_gate;
@@ -4850,13 +4852,16 @@ impl RuntimeManager {
             batch_id: invocation.batch_id.clone(),
             parent_conversation_id: invocation.parent_conversation_id.clone(),
             parallel_work_qualified,
-            runs: specs.iter().map(|spec| phoenix_db::SubAgentRunAdmission {
-                child_conversation_id: spec.agent_id.clone(),
-                execution_authority: match spec.mode {
-                    SubAgentMode::Explore => phoenix_db::SubAgentExecutionAuthority::ReadOnly,
-                    SubAgentMode::Work => phoenix_db::SubAgentExecutionAuthority::WriteCapable,
-                },
-            }).collect(),
+            runs: specs
+                .iter()
+                .map(|spec| phoenix_db::SubAgentRunAdmission {
+                    child_conversation_id: spec.agent_id.clone(),
+                    execution_authority: match spec.mode {
+                        SubAgentMode::Explore => phoenix_db::SubAgentExecutionAuthority::ReadOnly,
+                        SubAgentMode::Work => phoenix_db::SubAgentExecutionAuthority::WriteCapable,
+                    },
+                })
+                .collect(),
         };
         match self
             .admit_sub_agent_batch(
@@ -4869,10 +4874,15 @@ impl RuntimeManager {
             .await
         {
             Ok(()) => {
-                let response_lost = response_tx.send(SubAgentAdmissionReceipt {
-                    invocation: invocation.clone(), outcome: SubAgentAdmissionResponse::Admitted,
-                }).is_err();
-                let activate = if response_lost { false } else {
+                let response_lost = response_tx
+                    .send(SubAgentAdmissionReceipt {
+                        invocation: invocation.clone(),
+                        outcome: SubAgentAdmissionResponse::Admitted,
+                    })
+                    .is_err();
+                let activate = if response_lost {
+                    false
+                } else {
                     tokio::select! {
                         biased;
                         () = cancellation.cancelled() => false,
@@ -4883,19 +4893,37 @@ impl RuntimeManager {
                     self.kick_admitted_sub_agent_batch(specs, parent_turn_link);
                 } else {
                     let evidence = self.close_native_spawn_batch(&batch).await;
-                    if closure_tx.send(NativeSpawnClosureReceipt { invocation, evidence }).is_err() {
+                    if closure_tx
+                        .send(NativeSpawnClosureReceipt {
+                            invocation,
+                            evidence,
+                        })
+                        .is_err()
+                    {
                         tracing::error!(batch_id = %batch.batch_id, "native spawn closure owner disappeared; terminal evidence retained without parent acceptance");
                     }
                 }
             }
             Err(error) if error.starts_with("FATAL_LOCAL_AUTHORITY_UNCLASSIFIED:") => {
                 self.signal_fatal_local_authority("sub_agent_batch_admission");
-                let _ = response_tx.send(SubAgentAdmissionReceipt { invocation: invocation.clone(), outcome: SubAgentAdmissionResponse::Unclassified });
-                let _ = closure_tx.send(NativeSpawnClosureReceipt { invocation, evidence: NativeSpawnTerminalEvidence::Unclassified });
+                let _ = response_tx.send(SubAgentAdmissionReceipt {
+                    invocation: invocation.clone(),
+                    outcome: SubAgentAdmissionResponse::Unclassified,
+                });
+                let _ = closure_tx.send(NativeSpawnClosureReceipt {
+                    invocation,
+                    evidence: NativeSpawnTerminalEvidence::Unclassified,
+                });
             }
             Err(error) => {
-                let _ = response_tx.send(SubAgentAdmissionReceipt { invocation: invocation.clone(), outcome: SubAgentAdmissionResponse::Rejected(error) });
-                let _ = closure_tx.send(NativeSpawnClosureReceipt { invocation, evidence: NativeSpawnTerminalEvidence::NotAdmitted });
+                let _ = response_tx.send(SubAgentAdmissionReceipt {
+                    invocation: invocation.clone(),
+                    outcome: SubAgentAdmissionResponse::Rejected(error),
+                });
+                let _ = closure_tx.send(NativeSpawnClosureReceipt {
+                    invocation,
+                    evidence: NativeSpawnTerminalEvidence::NotAdmitted,
+                });
             }
         }
     }
@@ -4997,7 +5025,9 @@ impl RuntimeManager {
             parallel_work_qualified,
             children,
         };
-        let owner = self.acquire_local_authority_pass().map_err(|()| "FATAL_LOCAL_AUTHORITY_UNCLASSIFIED: native spawn admission fence closed".to_string())?;
+        let owner = self.acquire_local_authority_pass().map_err(|()| {
+            "FATAL_LOCAL_AUTHORITY_UNCLASSIFIED: native spawn admission fence closed".to_string()
+        })?;
         let mut authority = native_spawn::NativeSpawnWriteAuthority { owner: Some(owner) };
         let result = self.db.admit_sub_agent_batch_atomically(&admission).await;
         authority.owner = None;
@@ -10944,7 +10974,12 @@ mod scope_liveness_tests {
         let (response_tx, response_rx) = oneshot::channel();
         manager
             .handle_spawn_request(SubAgentSpawnRequest {
-                invocation: phoenix_db::SubAgentSpawnInvocation { batch_id: "cancel-during-materialization-batch".into(), parent_conversation_id: parent.id.clone(), assistant_message_id: "assistant".into(), tool_use_id: "spawn".into() },
+                invocation: phoenix_db::SubAgentSpawnInvocation {
+                    batch_id: "cancel-during-materialization-batch".into(),
+                    parent_conversation_id: parent.id.clone(),
+                    assistant_message_id: "assistant".into(),
+                    tool_use_id: "spawn".into(),
+                },
                 specs: vec![spec.clone()],
                 parent_scope: None,
                 parallel_work_qualified: false,

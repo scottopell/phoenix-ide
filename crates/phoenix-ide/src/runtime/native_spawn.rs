@@ -41,10 +41,17 @@ impl RuntimeManager {
             return NativeSpawnTerminalEvidence::Unclassified;
         };
         let mut authority = NativeSpawnWriteAuthority { owner: Some(owner) };
-        let result = self.db.close_live_unactivated_sub_agent_batch(batch, Utc::now()).await;
+        let result = self
+            .db
+            .close_live_unactivated_sub_agent_batch(batch, Utc::now())
+            .await;
         let evidence = match result {
-            phoenix_db::workflow::LocalAuthorityResult::DurableFactEstablished(Ok(terminals)) => NativeSpawnTerminalEvidence::Terminal(terminals),
-            phoenix_db::workflow::LocalAuthorityResult::DurableFactEstablished(Err(error)) => NativeSpawnTerminalEvidence::Failed(error.to_string()),
+            phoenix_db::workflow::LocalAuthorityResult::DurableFactEstablished(Ok(terminals)) => {
+                NativeSpawnTerminalEvidence::Terminal(terminals)
+            }
+            phoenix_db::workflow::LocalAuthorityResult::DurableFactEstablished(Err(error)) => {
+                NativeSpawnTerminalEvidence::Failed(error.to_string())
+            }
             phoenix_db::workflow::LocalAuthorityResult::DurableFactUnclassified => {
                 self.signal_fatal_local_authority("native_spawn_closure");
                 NativeSpawnTerminalEvidence::Unclassified

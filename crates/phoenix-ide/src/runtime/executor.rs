@@ -4489,15 +4489,31 @@ where
         authority: TransitionAuthority,
     ) -> Result<Vec<Event>, String> {
         if let Some(handoff) = &self.native_spawn_handoff {
-            let terminal_interruption = matches!(result.new_state, ConvState::Error { .. } | ConvState::Failed { .. } | ConvState::Terminal);
-            let adopted = matches!(handoff.phase, NativeSpawnPhase::Admitted) && match &result.new_state {
-                ConvState::ToolExecuting { pending_sub_agents: pending, .. }
-                | ConvState::AwaitingSubAgents { pending, .. }
-                | ConvState::CancellingSubAgents { pending, .. } => handoff.members.iter().all(|member| pending.contains(member)),
-                _ => false,
-            };
-            if !handoff.invocation.owns_state(&result.new_state) && !adopted && !terminal_interruption {
-                return Err("unresolved native spawn handoff cannot advance its originating selection".into());
+            let terminal_interruption = matches!(
+                result.new_state,
+                ConvState::Error { .. } | ConvState::Failed { .. } | ConvState::Terminal
+            );
+            let adopted = matches!(handoff.phase, NativeSpawnPhase::Admitted)
+                && match &result.new_state {
+                    ConvState::ToolExecuting {
+                        pending_sub_agents: pending,
+                        ..
+                    }
+                    | ConvState::AwaitingSubAgents { pending, .. }
+                    | ConvState::CancellingSubAgents { pending, .. } => handoff
+                        .members
+                        .iter()
+                        .all(|member| pending.contains(member)),
+                    _ => false,
+                };
+            if !handoff.invocation.owns_state(&result.new_state)
+                && !adopted
+                && !terminal_interruption
+            {
+                return Err(
+                    "unresolved native spawn handoff cannot advance its originating selection"
+                        .into(),
+                );
             }
         }
         let mut generated_events = Vec::new();
@@ -5550,7 +5566,9 @@ where
         }
         if let Some(activation) = activation {
             if activation.sender.send(()).is_err() && self.native_spawn_handoff.is_some() {
-                return Err("native spawn activation owner disappeared after membership committed".into());
+                return Err(
+                    "native spawn activation owner disappeared after membership committed".into(),
+                );
             }
             self.native_spawn_handoff = None;
         }
@@ -6487,7 +6505,8 @@ where
 
         if let Some(handoff) = self.native_spawn_handoff.as_mut() {
             handoff.request_cancel();
-            self.fatal_local_authority_fence.close("native_spawn_cancellation_deadline");
+            self.fatal_local_authority_fence
+                .close("native_spawn_cancellation_deadline");
             return;
         }
 
@@ -6930,7 +6949,11 @@ where
         let (activation_tx, activation_rx) = oneshot::channel();
         let (closure_tx, closure_rx) = oneshot::channel();
         let assistant_message_id = match &self.state {
-            ConvState::ToolExecuting { current_tool, assistant_message, .. } if current_tool.id == tool_use_id => assistant_message.message_id.clone(),
+            ConvState::ToolExecuting {
+                current_tool,
+                assistant_message,
+                ..
+            } if current_tool.id == tool_use_id => assistant_message.message_id.clone(),
             _ => return Err("native spawn preparation lost its originating selection".into()),
         };
         if self.native_spawn_handoff.is_some() {
@@ -8417,7 +8440,9 @@ where
                 tracing::info!(tool_id = %tool_use_id, "Aborting tool execution");
                 self.tool_execution.request_cancel();
                 if let Some(handoff) = self.native_spawn_handoff.as_mut() {
-                    if handoff.invocation.tool_use_id == tool_use_id && handoff.invocation.owns_state(&self.state) {
+                    if handoff.invocation.tool_use_id == tool_use_id
+                        && handoff.invocation.owns_state(&self.state)
+                    {
                         handoff.request_cancel();
                     }
                 }
@@ -31346,7 +31371,16 @@ mod work_subagent_cwd_guard_tests {
                 remaining_tools: vec![],
                 completed_results: vec![],
                 pending_sub_agents: vec![],
-                assistant_message: crate::state_machine::state::AssistantMessage::new("spawn-assistant".into(), vec![ContentBlock::tool_use("tool-spawn-1", "spawn_agents", serde_json::json!({"tasks": []}))], None, None),
+                assistant_message: crate::state_machine::state::AssistantMessage::new(
+                    "spawn-assistant".into(),
+                    vec![ContentBlock::tool_use(
+                        "tool-spawn-1",
+                        "spawn_agents",
+                        serde_json::json!({"tasks": []}),
+                    )],
+                    None,
+                    None,
+                ),
             },
             storage,
             Arc::new(MockLlmClient::new("gpt-5.6-sol")),
@@ -31398,7 +31432,10 @@ mod work_subagent_cwd_guard_tests {
         let specs = request.specs;
         request
             .response_tx
-            .send(crate::runtime::SubAgentAdmissionReceipt { invocation: request.invocation, outcome: crate::runtime::SubAgentAdmissionResponse::Admitted })
+            .send(crate::runtime::SubAgentAdmissionReceipt {
+                invocation: request.invocation,
+                outcome: crate::runtime::SubAgentAdmissionResponse::Admitted,
+            })
             .expect("spawn requester receives admission result");
         specs
     }
@@ -31534,7 +31571,9 @@ mod work_subagent_cwd_guard_tests {
             .await
             .expect("schema validation must finish before spawn admission")
             .unwrap();
-            let event = if rejected { event } else {
+            let event = if rejected {
+                event
+            } else {
                 let observation = resumed.observe_native_spawn().await;
                 resumed.native_spawn_observed(observation).await.unwrap()
             };

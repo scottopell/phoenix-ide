@@ -503,10 +503,18 @@ pub trait StateStore: Send + Sync {
         state_updated_at: DateTime<Utc>,
     ) -> phoenix_db::workflow::LocalAuthorityResult<Result<ConvState, String>> {
         let result = async {
-            let state = membership.reconciled_state().map_err(|error| error.to_string())?;
-            self.update_state(&membership.invocation.parent_conversation_id, &state, state_updated_at).await?;
+            let state = membership
+                .reconciled_state()
+                .map_err(|error| error.to_string())?;
+            self.update_state(
+                &membership.invocation.parent_conversation_id,
+                &state,
+                state_updated_at,
+            )
+            .await?;
             Ok(state)
-        }.await;
+        }
+        .await;
         phoenix_db::workflow::LocalAuthorityResult::DurableFactEstablished(result)
     }
 
@@ -1283,7 +1291,9 @@ impl<T: StateStore + ?Sized> StateStore for Arc<T> {
         membership: &phoenix_db::UnactivatedSubAgentMembership,
         state_updated_at: DateTime<Utc>,
     ) -> phoenix_db::workflow::LocalAuthorityResult<Result<ConvState, String>> {
-        (**self).establish_unactivated_sub_agent_membership(membership, state_updated_at).await
+        (**self)
+            .establish_unactivated_sub_agent_membership(membership, state_updated_at)
+            .await
     }
     async fn record_execution_cancel(&self, conversation_id: &str) -> Result<(), String> {
         (**self).record_execution_cancel(conversation_id).await
@@ -2725,9 +2735,19 @@ impl StateStore for DatabaseStorage {
         membership: &phoenix_db::UnactivatedSubAgentMembership,
         state_updated_at: DateTime<Utc>,
     ) -> phoenix_db::workflow::LocalAuthorityResult<Result<ConvState, String>> {
-        match self.db.establish_unactivated_sub_agent_membership(membership, state_updated_at).await {
-            phoenix_db::workflow::LocalAuthorityResult::DurableFactEstablished(result) => phoenix_db::workflow::LocalAuthorityResult::DurableFactEstablished(result.map_err(|error| error.to_string())),
-            phoenix_db::workflow::LocalAuthorityResult::DurableFactUnclassified => phoenix_db::workflow::LocalAuthorityResult::DurableFactUnclassified,
+        match self
+            .db
+            .establish_unactivated_sub_agent_membership(membership, state_updated_at)
+            .await
+        {
+            phoenix_db::workflow::LocalAuthorityResult::DurableFactEstablished(result) => {
+                phoenix_db::workflow::LocalAuthorityResult::DurableFactEstablished(
+                    result.map_err(|error| error.to_string()),
+                )
+            }
+            phoenix_db::workflow::LocalAuthorityResult::DurableFactUnclassified => {
+                phoenix_db::workflow::LocalAuthorityResult::DurableFactUnclassified
+            }
         }
     }
     async fn record_execution_cancel(&self, conversation_id: &str) -> Result<(), String> {

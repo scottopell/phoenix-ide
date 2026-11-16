@@ -282,11 +282,23 @@ pub struct SubAgentSpawnInvocation {
 impl SubAgentSpawnInvocation {
     pub fn owns_state(&self, state: &ConvState) -> bool {
         match state {
-            ConvState::ToolExecuting { current_tool, assistant_message, .. } =>
-                current_tool.id == self.tool_use_id && current_tool.name() == "spawn_agents"
-                && assistant_message.message_id == self.assistant_message_id,
-            ConvState::CancellingTool { tool_use_id, assistant_message, .. } =>
-                *tool_use_id == self.tool_use_id && assistant_message.message_id == self.assistant_message_id,
+            ConvState::ToolExecuting {
+                current_tool,
+                assistant_message,
+                ..
+            } => {
+                current_tool.id == self.tool_use_id
+                    && current_tool.name() == "spawn_agents"
+                    && assistant_message.message_id == self.assistant_message_id
+            }
+            ConvState::CancellingTool {
+                tool_use_id,
+                assistant_message,
+                ..
+            } => {
+                *tool_use_id == self.tool_use_id
+                    && assistant_message.message_id == self.assistant_message_id
+            }
             _ => false,
         }
     }
@@ -302,12 +314,18 @@ pub struct UnactivatedSubAgentMembership {
 impl UnactivatedSubAgentMembership {
     pub fn reconciled_state(&self) -> DbResult<ConvState> {
         if !self.invocation.owns_state(&self.previous_state) {
-            return Err(lifecycle_conflict("unactivated membership lost its exact spawn origin"));
+            return Err(lifecycle_conflict(
+                "unactivated membership lost its exact spawn origin",
+            ));
         }
         let mut state = self.previous_state.clone();
         let pending = match &mut state {
-            ConvState::ToolExecuting { pending_sub_agents, .. }
-            | ConvState::CancellingTool { pending_sub_agents, .. } => pending_sub_agents,
+            ConvState::ToolExecuting {
+                pending_sub_agents, ..
+            }
+            | ConvState::CancellingTool {
+                pending_sub_agents, ..
+            } => pending_sub_agents,
             _ => unreachable!("spawn origin checked"),
         };
         let mut seen = std::collections::HashSet::new();
@@ -315,9 +333,16 @@ impl UnactivatedSubAgentMembership {
             if !seen.insert(&member.agent_id) {
                 return Err(lifecycle_conflict("duplicate unactivated member"));
             }
-            match pending.iter().find(|existing| existing.agent_id == member.agent_id) {
-                Some(existing) if existing != member => return Err(lifecycle_conflict("unactivated member differs from parent pending")),
-                Some(_) => {},
+            match pending
+                .iter()
+                .find(|existing| existing.agent_id == member.agent_id)
+            {
+                Some(existing) if existing != member => {
+                    return Err(lifecycle_conflict(
+                        "unactivated member differs from parent pending",
+                    ))
+                }
+                Some(_) => {}
                 None => pending.push(member.clone()),
             }
         }
@@ -780,7 +805,12 @@ impl Database {
         membership: &UnactivatedSubAgentMembership,
         state_updated_at: DateTime<Utc>,
     ) -> crate::workflow::LocalAuthorityResult<DbResult<ConvState>> {
-        self.establish_unactivated_sub_agent_membership_with_cut(membership, state_updated_at, TerminalEvidenceTransactionCut::None).await
+        self.establish_unactivated_sub_agent_membership_with_cut(
+            membership,
+            state_updated_at,
+            TerminalEvidenceTransactionCut::None,
+        )
+        .await
     }
 
     async fn establish_unactivated_sub_agent_membership_with_cut(
@@ -822,10 +852,17 @@ impl Database {
             Err(error) => return LocalAuthorityResult::DurableFactEstablished(Err(error)),
         };
         if let Err(error) = cut.commit(tx).await {
-            let classified = if cut.classifier_unavailable() { Err(sqlx::Error::PoolClosed) } else {
-                sqlx::query_scalar::<_, bool>("SELECT state = ?2 AND state_updated_at = ?3 FROM conversations WHERE id = ?1")
-                    .bind(&membership.invocation.parent_conversation_id).bind(&encoded)
-                    .bind(state_updated_at.to_rfc3339()).fetch_one(&self.pool).await
+            let classified = if cut.classifier_unavailable() {
+                Err(sqlx::Error::PoolClosed)
+            } else {
+                sqlx::query_scalar::<_, bool>(
+                    "SELECT state = ?2 AND state_updated_at = ?3 FROM conversations WHERE id = ?1",
+                )
+                .bind(&membership.invocation.parent_conversation_id)
+                .bind(&encoded)
+                .bind(state_updated_at.to_rfc3339())
+                .fetch_one(&self.pool)
+                .await
             };
             return match classified {
                 Ok(true) => LocalAuthorityResult::DurableFactEstablished(Ok(state)),
