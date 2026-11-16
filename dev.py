@@ -910,7 +910,7 @@ LAUNCHD_TRANSITION_TIMEOUT_SECS = 30.0
 LAUNCHD_RESTART_SHUTDOWN_TIMEOUT_SECS = 35.0
 LAUNCHD_HEALTH_TIMEOUT_SECS = 120.0
 LAUNCHD_STALE_HANDOFF_ALLOWANCE_SECS = 30.0
-LAUNCHD_HANDOFF_PROTOCOL_VERSION = 2
+LAUNCHD_HANDOFF_PROTOCOL_VERSION = 3
 LAUNCHD_RESTART_HANDOFF_PROTOCOL_VERSION = 2
 NEWSYSLOG_CONF_PATH = Path("/etc/newsyslog.d") / f"{LAUNCHD_LABEL}.conf"
 
@@ -12347,6 +12347,7 @@ def _report_launchd_handoff(transaction_id: str, identity: RuntimeIdentity) -> N
         print(f"  Transaction: {transaction_id}")
         print(f"  Candidate: {identity.version} ({identity.git_sha})")
         print("  The Phoenix connection may close while the service is replaced.")
+        print("  The independent helper verifies and retains a native SQLite backup before migrations.")
         print("  After reconnecting, run: ./dev.py prod status")
     except BrokenPipeError:
         pass
@@ -12846,9 +12847,36 @@ def _print_launchd_deploy_status() -> None:
             print(f"    Failure: {deploy['failure']}")
         if deploy.get("rollback_failure"):
             print(f"    Historical rollback failure: {deploy['rollback_failure']}")
-        if deploy.get("state") == "failed":
-            print("    Manual recovery required. The candidate may have changed the database; "
-                  "do not start an older binary without its matching offline database restore.")
+        proof_path = LAUNCHD_DEPLOY_STATUS_PATH.with_suffix(".proof.json")
+        proof = {}
+        if proof_path.is_file() and not proof_path.is_symlink():
+            try:
+                candidate_proof = json.loads(proof_path.read_text())
+                if (isinstance(candidate_proof, dict)
+                        and candidate_proof.get("transaction_id") == deploy.get("transaction_id")):
+                    proof = candidate_proof
+            except (OSError, ValueError, TypeError):
+                pass
+        if proof:
+            print(f"    Boundary: {proof.get('boundary', 'unknown')} (phase {proof.get('phase', 'unknown')})")
+        elif deploy.get("state") == "failed":
+            print("    Proof: unavailable; migration boundary and backup verification are unknown.")
+        backup = proof.get("backup")
+        if isinstance(backup, dict) and backup.get("backup_path") and backup.get("backup_sha256"):
+            print(f"    Verified backup: {backup['backup_path']} ({backup.get('backup_bytes', 'unknown')} bytes, "
+                  f"SHA-256 {backup['backup_sha256']})")
+        if proof.get("recovery_outcome") == "predecessor_recovered_verified" and proof.get("predecessor_verified") is True:
+            print("    Recovery: captured predecessor privately bootstrapped and health/PID verified; canonical plist published.")
+        elif deploy.get("state") == "failed":
+            if proof.get("boundary") == "not_crossed":
+                print("    Manual recovery required. Migration was not attempted; inspect the quarantined plist and service.")
+            else:
+                print("    Manual recovery required. The candidate may have changed the database; "
+                      "do not start an older binary without its matching offline database restore.")
+            if proof.get("recovery_uncertainty"):
+                print(f"    Recovery uncertainty: {proof['recovery_uncertainty']}")
+            if proof.get("quarantine_path"):
+                print(f"    Quarantined predecessor plist: {proof['quarantine_path']}")
         if owner is not None:
             print("    Inspect activation.log and the retained transaction. Clear the active marker "
                   "only after confirming no helper is running and choosing a manual recovery action.")

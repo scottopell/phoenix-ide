@@ -108,6 +108,7 @@ if sys.argv[1:] == ["--migrate-only"]:
     status = json.loads(Path(os.environ["STATUS_PATH"]).read_text())
     assert status["state"] == "migration_started"
     with sqlite3.connect(os.environ["PHOENIX_DB_PATH"]) as database:
+        database.execute("CREATE TABLE IF NOT EXISTS migration_effects(candidate TEXT)")
         database.execute("INSERT INTO migration_effects VALUES (?)", (identity["git_sha"],))
     if {migration_failure!r}:
         print("injected failure after committed migration write", file=sys.stderr, flush=True)
@@ -225,7 +226,7 @@ def restart_identity_fixture():
     }
 
 
-def run_scenario(root, domain, *, failure=None):
+def run_scenario(root, domain, *, failure=None, first_install=False):
     suffix = uuid.uuid4().hex
     target_label = f"test.phoenix-ide.server.{suffix}"
     helper_label = f"com.phoenix-ide.deploy.{suffix}"
@@ -239,8 +240,9 @@ def run_scenario(root, domain, *, failure=None):
     binary.write_text(server_script(previous))
     binary.chmod(0o755)
     database = root / "application.db"
-    with sqlite3.connect(database) as db:
-        db.execute("CREATE TABLE migration_effects(candidate TEXT)")
+    if not first_install:
+        with sqlite3.connect(database) as db:
+            db.execute("CREATE TABLE migration_effects(candidate TEXT)")
     status, log, starts = root / "status.json", root / "helper.log", root / "starts"
     environment = {"PHOENIX_DB_PATH": str(database), "STATUS_PATH": str(status), "STARTS_PATH": str(starts)}
     canonical = root / "service.plist"
@@ -250,13 +252,16 @@ def run_scenario(root, domain, *, failure=None):
     candidate.chmod(0o755)
     candidate_plist = root / "candidate.plist"
     candidate_plist.write_bytes(canonical.read_bytes())
+    if first_install:
+        binary.unlink()
+        canonical.unlink()
     helper = root / "activate.py"
     helper.write_bytes(HELPER.read_bytes())
     helper.chmod(0o500)
     active = root / "active"
     active.write_text(suffix + "\n")
     manifest = {
-        "manifest_version": 2, "transaction_id": suffix,
+        "manifest_version": 3, "transaction_id": suffix,
         "source_kind": "local_head", "source_commit": fixture["source_commit"],
         "release_tag": None, "release_commit": None, "expected": expected,
         "candidate_binary": str(candidate), "candidate_binary_sha256": digest(candidate),
@@ -289,9 +294,11 @@ def run_scenario(root, domain, *, failure=None):
     )
     process = None
     try:
-        subprocess.run(["launchctl", "bootstrap", domain, str(canonical)], check=True)
-        wait_identity(manifest["health_url"], previous, time.monotonic() + 10)
-        previous_pid = launchd_pid(domain, target_label)
+        previous_pid = None
+        if not first_install:
+            subprocess.run(["launchctl", "bootstrap", domain, str(canonical)], check=True)
+            wait_identity(manifest["health_url"], previous, time.monotonic() + 10)
+            previous_pid = launchd_pid(domain, target_label)
         process = subprocess.Popen([sys.executable, str(initiator)], start_new_session=True)
         deadline = time.monotonic() + 10
         while not handoff.exists() and time.monotonic() < deadline:
@@ -304,13 +311,32 @@ def run_scenario(root, domain, *, failure=None):
         expected_state = "failed" if failure else "committed"
         if result["state"] != expected_state:
             raise RuntimeError(f"unexpected status: {result}; log={log.read_text()}")
+        proof = json.loads(status.with_suffix(".proof.json").read_text())
+        backup = proof.get("backup")
+        if proof.get("transaction_id") != suffix:
+            raise RuntimeError(f"deployment lost transaction proof: {proof}")
+        if first_install:
+            if proof.get("database_source") != "absent" or backup is not None or list(root.glob("database-backup-*.sqlite")):
+                raise RuntimeError(f"first install falsely claimed a verified backup: {proof}")
+        else:
+            if not isinstance(backup, dict):
+                raise RuntimeError(f"deployment lost transaction backup proof: {proof}")
+            retained = Path(backup["backup_path"])
+            if not retained.is_file() or digest(retained) != backup["backup_sha256"]:
+                raise RuntimeError(f"deployment backup artifact differs from proof: {backup}")
+        if proof.get("boundary") not in {"attempted", "crossed"}:
+            raise RuntimeError(f"migration boundary omitted from proof: {proof}")
+        if failure and proof.get("recovery_outcome") == "predecessor_recovered_verified":
+            raise RuntimeError(f"post-migration failure incorrectly recovered predecessor: {proof}")
         wait_unloaded(domain, helper_label, time.monotonic() + 5)
         with sqlite3.connect(database) as db:
             writes = db.execute("SELECT candidate FROM migration_effects").fetchall()
         if writes != [(CANDIDATE_COMMIT,)]:
             raise RuntimeError(f"candidate migration did not run exactly once behind checkpoint: {writes}")
-        if starts.read_text().splitlines().count(PREVIOUS_DEPLOYED_COMMIT) != 1:
+        if not first_install and starts.read_text().splitlines().count(PREVIOUS_DEPLOYED_COMMIT) != 1:
             raise RuntimeError("predecessor was restarted")
+        if first_install and starts.read_text().splitlines() != [CANDIDATE_COMMIT]:
+            raise RuntimeError("first install did not start only the candidate")
         if failure:
             wait_unloaded(domain, target_label, time.monotonic() + 5)
             if not active.is_file() or canonical.exists():
@@ -327,7 +353,7 @@ def run_scenario(root, domain, *, failure=None):
                 raise RuntimeError("loaded private plist differs from published canonical plist")
             if active.exists() or Path(manifest["deployed_sha_path"]).read_text().strip() != CANDIDATE_COMMIT:
                 raise RuntimeError("deployment did not commit identity and release its claim")
-        print(f"PASS: {expected_state} ({failure or 'healthy'}) after initiator SIGKILL; migration writes retained")
+        print(f"PASS: {expected_state} ({'first install' if first_install else failure or 'healthy'}) after initiator SIGKILL; migration writes retained")
     finally:
         if process is not None and process.poll() is None:
             os.killpg(process.pid, signal.SIGKILL)
@@ -460,6 +486,7 @@ def main():
         root = Path(td)
         domain = f"gui/{os.getuid()}"
         run_scenario(root, domain)
+        run_scenario(root, domain, first_install=True)
         run_scenario(root, domain, failure="migration")
         run_scenario(root, domain, failure="health")
         run_restart_scenario(root, domain)
