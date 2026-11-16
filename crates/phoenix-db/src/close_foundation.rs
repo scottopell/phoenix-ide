@@ -2627,10 +2627,18 @@ impl Database {
         attempt_id: &str,
     ) -> DbResult<CloseObligation> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        let obligation = close_obligation_for_update(&mut tx, attempt_id).await?;
+        let obligation = Self::advance_close_settlement_when_quiescent_tx(&mut tx, attempt_id).await?;
+        tx.commit().await?;
+        Ok(obligation)
+    }
+
+    pub(crate) async fn advance_close_settlement_when_quiescent_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        attempt_id: &str,
+    ) -> DbResult<CloseObligation> {
+        let obligation = close_obligation_for_update(tx, attempt_id).await?;
         match obligation.phase() {
             ClosePhase::AwaitingRetirementInspection | ClosePhase::Completed => {
-                tx.commit().await?;
                 return Ok(obligation);
             }
             ClosePhase::SettlingActiveWork | ClosePhase::CancelRequestedDuringSettlement => {}
@@ -2645,8 +2653,8 @@ impl Database {
                 )));
             }
         }
-        Self::reconcile_close_direct_turn_settlement_receipts_tx(&mut tx, attempt_id).await?;
-        Self::require_close_participants_quiescent_tx(&mut tx, attempt_id).await?;
+        Self::reconcile_close_direct_turn_settlement_receipts_tx(tx, attempt_id).await?;
+        Self::require_close_participants_quiescent_tx(tx, attempt_id).await?;
         if obligation.phase() == ClosePhase::CancelRequestedDuringSettlement {
             sqlx::query(
                 "UPDATE close_obligations
@@ -2655,19 +2663,17 @@ impl Database {
             )
             .bind(attempt_id)
             .bind(Utc::now().to_rfc3339())
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await?;
         } else {
             set_close_phase_tx(
-                &mut tx,
+                tx,
                 attempt_id,
                 ClosePhase::AwaitingRetirementInspection,
             )
             .await?;
         }
-        let obligation = close_obligation_for_update(&mut tx, attempt_id).await?;
-        tx.commit().await?;
-        Ok(obligation)
+        close_obligation_for_update(tx, attempt_id).await
     }
 
     pub async fn list_close_settlement_conversation_ids(

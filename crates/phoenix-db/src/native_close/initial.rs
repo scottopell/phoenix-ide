@@ -64,6 +64,32 @@ impl Database {
         }
     }
 
+    /// Advances only the exact source-owned initial run after durable work is quiescent.
+    /// No effects, cancellation, blocker, retry, or historical-source fallback is accepted.
+    /// Errors are classified only after rollback succeeds; commit/rollback uncertainty
+    /// stays unclassified. An arbitrary precondition error is not permission to continue.
+    pub async fn settle_native_close_initial(
+        &self,
+        command: &NativeCloseCommand,
+        receipt: &NativeCloseReceipt,
+        live_source: &phoenix_core::domain::sm_state::ConvState,
+    ) -> LocalAuthorityResult<DbResult<NativeCloseInitialExecution>> {
+        let mut tx = match self.pool.begin_with("BEGIN IMMEDIATE").await {
+            Ok(tx) => tx,
+            Err(error) => return LocalAuthorityResult::DurableFactEstablished(Err(error.into())),
+        };
+        match settle_initial_tx(&mut tx, command, receipt, live_source).await {
+            Ok(result) => match tx.commit().await {
+                Ok(()) => LocalAuthorityResult::DurableFactEstablished(Ok(result)),
+                Err(_) => LocalAuthorityResult::DurableFactUnclassified,
+            },
+            Err(error) => match tx.rollback().await {
+                Ok(()) => LocalAuthorityResult::DurableFactEstablished(Err(error)),
+                Err(_) => LocalAuthorityResult::DurableFactUnclassified,
+            },
+        }
+    }
+
     /// Accepts initial Close atomically, with one server-owned operation and receipt.
     ///
     /// `command` is correlation, NOT live source authority. The SOURCE actor must
@@ -95,13 +121,74 @@ impl Database {
     }
 }
 
-#[allow(clippy::too_many_lines)] // Source, exact run and target capture are one atomic boundary.
 async fn prepare_initial_execution_tx(
     tx: &mut Transaction<'_, Sqlite>,
     command: &NativeCloseCommand,
     receipt: &NativeCloseReceipt,
     live_source: &phoenix_core::domain::sm_state::ConvState,
 ) -> DbResult<NativeCloseInitialExecution> {
+    let (admitted, busy) = require_initial_execution_tx(
+        tx,
+        command,
+        receipt,
+        live_source,
+        phoenix_core::domain::close::ClosePhase::AwaitingBlockerResolution,
+    )
+    .await?;
+    let next_phase = if busy {
+        phoenix_core::domain::close::ClosePhase::AwaitingStopWorkConfirmation
+    } else {
+        phoenix_core::domain::close::ClosePhase::SettlingActiveWork
+    };
+    super::super::close_foundation::set_close_phase_tx(
+        tx,
+        admitted.attempt_id.as_str(),
+        next_phase,
+    )
+    .await?;
+    if !busy {
+        Database::capture_close_direct_turn_settlement_targets_tx(tx, admitted.attempt_id.as_str())
+            .await?;
+    }
+    Ok(NativeCloseInitialExecution {
+        run: admitted,
+        phase: next_phase,
+    })
+}
+
+async fn settle_initial_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    command: &NativeCloseCommand,
+    receipt: &NativeCloseReceipt,
+    live_source: &phoenix_core::domain::sm_state::ConvState,
+) -> DbResult<NativeCloseInitialExecution> {
+    let (admitted, _) = require_initial_execution_tx(
+        tx,
+        command,
+        receipt,
+        live_source,
+        phoenix_core::domain::close::ClosePhase::SettlingActiveWork,
+    )
+    .await?;
+    let obligation = Database::advance_close_settlement_when_quiescent_tx(
+        tx,
+        admitted.attempt_id.as_str(),
+    )
+    .await?;
+    Ok(NativeCloseInitialExecution {
+        run: admitted,
+        phase: obligation.phase(),
+    })
+}
+
+#[allow(clippy::too_many_lines)] // Live source, durable receipt and exact run share one boundary.
+async fn require_initial_execution_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    command: &NativeCloseCommand,
+    receipt: &NativeCloseReceipt,
+    live_source: &phoenix_core::domain::sm_state::ConvState,
+    expected_phase: phoenix_core::domain::close::ClosePhase,
+) -> DbResult<(NativeCloseRunRef, bool)> {
     let NativeCloseIntent::Initial { target } = command.intent() else {
         return Err(DbError::CloseFoundationPrecondition(
             "expected initial Close intent".into(),
@@ -168,7 +255,7 @@ async fn prepare_initial_execution_tx(
     let latest_status: Option<String> = row.try_get("latest_status")?;
     let captured_state: Option<String> = row.try_get("captured_state_kind")?;
     if managed != 1
-        || phase != phoenix_core::domain::close::ClosePhase::AwaitingBlockerResolution
+        || phase != expected_phase
         || run_status != "running"
         || latest_ordinal != Some(CloseRunOrdinal::INITIAL.get())
         || latest_status.as_deref() != Some("running")
@@ -186,25 +273,7 @@ async fn prepare_initial_execution_tx(
                 DbError::Serialization("unknown captured conversation state kind".into())
             })?
             .is_busy();
-    let next_phase = if busy {
-        phoenix_core::domain::close::ClosePhase::AwaitingStopWorkConfirmation
-    } else {
-        phoenix_core::domain::close::ClosePhase::SettlingActiveWork
-    };
-    super::super::close_foundation::set_close_phase_tx(
-        tx,
-        admitted.attempt_id.as_str(),
-        next_phase,
-    )
-    .await?;
-    if !busy {
-        Database::capture_close_direct_turn_settlement_targets_tx(tx, admitted.attempt_id.as_str())
-            .await?;
-    }
-    Ok(NativeCloseInitialExecution {
-        run: admitted,
-        phase: next_phase,
-    })
+    Ok((admitted, busy))
 }
 
 #[allow(clippy::too_many_lines)] // Source-before-replay and initial capture share one transaction.
