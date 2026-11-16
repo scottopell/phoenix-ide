@@ -1,3 +1,5 @@
+mod owner_handoff;
+
 use super::*;
 use crate::runtime::RuntimeManager;
 use phoenix_core::domain::db_schema::{InputOrigin, MessageContent};
