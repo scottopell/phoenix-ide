@@ -994,7 +994,15 @@ where
     tracing::info!(parent: &span, conv_id = %conv_id, tool = %tool_name, id = %tool_use_id, "Executing tool");
     let tool_start = std::time::Instant::now();
 
-    let callable = tool_surface.callable_tools(tool_executor.definitions().await);
+    let definitions = tokio::select! {
+        biased;
+        () = cancel_token_check.cancelled() => return ToolExecOutcome::Aborted {
+            tool_use_id,
+            reason: crate::state_machine::AbortReason::CancellationRequested,
+        },
+        definitions = tool_executor.definitions() => definitions,
+    };
+    let callable = tool_surface.callable_tools(definitions);
     if !callable
         .iter()
         .any(|definition| definition.name == tool_name && definition.input_schema == request_schema)
