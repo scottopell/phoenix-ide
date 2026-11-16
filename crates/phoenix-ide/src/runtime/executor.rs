@@ -6995,9 +6995,11 @@ where
         self.native_spawn_handoff = Some(NativeSpawnHandoff {
             invocation,
             members: spawned,
-            activation: Some(activation_tx),
             cancellation,
-            phase: NativeSpawnPhase::Admission(response_rx),
+            phase: NativeSpawnPhase::Admission {
+                response: response_rx,
+                activation: activation_tx,
+            },
             closure: closure_rx,
         });
         if let Err(error) = spawn_tx.send(request).await {

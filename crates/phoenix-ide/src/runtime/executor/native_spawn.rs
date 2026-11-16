@@ -5,7 +5,10 @@ use crate::runtime::{
 };
 
 pub(super) enum NativeSpawnPhase {
-    Admission(oneshot::Receiver<SubAgentAdmissionReceipt>),
+    Admission {
+        response: oneshot::Receiver<SubAgentAdmissionReceipt>,
+        activation: oneshot::Sender<()>,
+    },
     Admitted,
     ActivationOwnerLost,
     Closing,
@@ -369,6 +372,7 @@ mod tests {
     #[tokio::test]
     async fn native_activation_loss_is_observed_by_retained_admitted_owner() {
         let (manager, mut runtime, request) = pending_native_spawn().await;
+        let invocation = request.invocation.clone();
         let manager_task = tokio::spawn({
             let manager = Arc::clone(&manager);
             async move { manager.handle_spawn_request(request).await }
@@ -378,6 +382,17 @@ mod tests {
             runtime.native_spawn_observed(response).await.unwrap(),
             Some(Event::SpawnAgentsComplete { .. })
         ));
+        assert!(runtime
+            .native_spawn_observed(NativeSpawnObservation::Admission(Ok(
+                SubAgentAdmissionReceipt {
+                    invocation,
+                    outcome: SubAgentAdmissionResponse::Admitted
+                }
+            )))
+            .await
+            .unwrap()
+            .is_none());
+        assert!(runtime.pending_sub_agent_activation.is_some());
         drop(runtime.pending_sub_agent_activation.take());
         manager_task.await.unwrap();
         let closure = runtime.observe_native_spawn().await;
@@ -640,7 +655,6 @@ mod tests {
 pub(super) struct NativeSpawnHandoff {
     pub(super) invocation: phoenix_db::SubAgentSpawnInvocation,
     pub(super) members: Vec<crate::state_machine::state::PendingSubAgent>,
-    pub(super) activation: Option<oneshot::Sender<()>>,
     pub(super) cancellation: CancellationToken,
     pub(super) phase: NativeSpawnPhase,
     pub(super) closure: oneshot::Receiver<NativeSpawnClosureReceipt>,
@@ -654,14 +668,13 @@ pub(super) enum NativeSpawnObservation {
 impl NativeSpawnHandoff {
     pub(super) fn request_cancel(&mut self) {
         self.cancellation.cancel();
-        self.activation = None;
         self.phase = NativeSpawnPhase::Closing;
     }
 
     pub(super) async fn observe(&mut self) -> NativeSpawnObservation {
         match &mut self.phase {
-            NativeSpawnPhase::Admission(receiver) => {
-                NativeSpawnObservation::Admission(receiver.await)
+            NativeSpawnPhase::Admission { response, .. } => {
+                NativeSpawnObservation::Admission(response.await)
             }
             NativeSpawnPhase::Closing
             | NativeSpawnPhase::Admitted
@@ -738,17 +751,18 @@ where
                         handoff.request_cancel();
                         return Ok(None);
                     }
-                    handoff.phase = NativeSpawnPhase::Admitted;
+                    let phase = std::mem::replace(&mut handoff.phase, NativeSpawnPhase::Admitted);
+                    let NativeSpawnPhase::Admission { activation, .. } = phase else {
+                        handoff.phase = phase;
+                        return Ok(None);
+                    };
                     self.pending_sub_agent_activation = Some(PendingSubAgentActivation {
                         child_ids: handoff
                             .members
                             .iter()
                             .map(|member| member.agent_id.clone())
                             .collect(),
-                        sender: handoff
-                            .activation
-                            .take()
-                            .ok_or("native spawn activation capability lost")?,
+                        sender: activation,
                     });
                     Ok(Some(Event::SpawnAgentsComplete {
                         tool_use_id: origin.tool_use_id.clone(),
