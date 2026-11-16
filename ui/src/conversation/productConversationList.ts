@@ -56,6 +56,7 @@ let snapshot: ProductConversationListSnapshot = initialSnapshot();
 const listeners = new Set<() => void>();
 let inFlight: { controller: AbortController; promise: Promise<void> } | null = null;
 let stopRevisionSubscription: (() => void) | null = null;
+let refreshAfterCurrent = false;
 
 function publish(next: ProductConversationListSnapshot): void {
   snapshot = next;
@@ -68,6 +69,7 @@ function publish(next: ProductConversationListSnapshot): void {
  */
 export function refreshProductConversationList(): Promise<void> {
   inFlight?.controller.abort();
+  if (snapshot.error !== null) publish({ ...snapshot, error: null });
   const controller = new AbortController();
   const timeout = window.setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
   const promise = api.listProductConversations(controller.signal)
@@ -88,10 +90,24 @@ export function refreshProductConversationList(): Promise<void> {
     })
     .finally(() => {
       window.clearTimeout(timeout);
-      if (inFlight?.controller === controller) inFlight = null;
+      if (inFlight?.controller === controller) {
+        inFlight = null;
+        if (refreshAfterCurrent) {
+          refreshAfterCurrent = false;
+          if (listeners.size > 0) void refreshProductConversationList();
+        }
+      }
     });
   inFlight = { controller, promise };
   return promise;
+}
+
+function refreshInvalidatedList(): void {
+  if (inFlight !== null) {
+    refreshAfterCurrent = true;
+  } else {
+    void refreshProductConversationList();
+  }
 }
 
 /** Apply an optimistic change (rename, close, delete) to the shared rows. */
@@ -107,7 +123,7 @@ export function updateProductConversationRows(
 function subscribe(listener: () => void): () => void {
   listeners.add(listener);
   if (listeners.size === 1) {
-    stopRevisionSubscription = subscribeProductConversationListRevision(() => { void refreshProductConversationList(); });
+    stopRevisionSubscription = subscribeProductConversationListRevision(refreshInvalidatedList);
     void refreshProductConversationList();
   }
   return () => {
@@ -115,6 +131,7 @@ function subscribe(listener: () => void): () => void {
     if (listeners.size === 0) {
       stopRevisionSubscription?.();
       stopRevisionSubscription = null;
+      refreshAfterCurrent = false;
     }
   };
 }
@@ -143,6 +160,7 @@ function resetForTests(): void {
   listeners.clear();
   inFlight?.controller.abort();
   inFlight = null;
+  refreshAfterCurrent = false;
   try { localStorage.removeItem(CACHE_KEY); } catch { /* ignore */ }
   snapshot = initialSnapshot();
 }

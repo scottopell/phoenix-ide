@@ -6,6 +6,7 @@ import {
 } from '../notifications';
 import { act, render, fireEvent, waitFor } from '@testing-library/react';
 import { Link, MemoryRouter, useLocation } from 'react-router-dom';
+import { refreshProductConversationList } from '../conversation/productConversationList';
 import { ApiResponseError, ConflictError } from '../api';
 import type { Conversation, ProductConversationListRow } from '../api';
 
@@ -163,6 +164,90 @@ describe('Sidebar — ProductConversation navigation', () => {
 
     fireEvent.click(getByRole('button', { name: /Expand sidebar/ }));
     expect(onToggle).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps an uncached empty list in loading state across route changes until the first snapshot succeeds', async () => {
+    let resolveList!: (value: { product_conversations: ProductConversationListRow[]; coordinator: null }) => void;
+    apiMock.listProductConversations.mockReturnValueOnce(new Promise((resolve) => { resolveList = resolve; }));
+    function RouteHarness() {
+      const { pathname } = useLocation();
+      return <>
+        <output aria-label="Current route">{pathname}</output>
+        <Link to="/global">Global</Link>
+        <Sidebar collapsed={false} onToggle={vi.fn()} conversations={[]} archivedConversations={[]} activeSlug={pathname.startsWith('/c/') ? pathname.slice(3) : null} onConversationCreated={vi.fn()} />
+      </>;
+    }
+    const { getByRole, queryByText } = render(
+      <MemoryRouter initialEntries={['/c/some-conversation']}>
+        <RouteHarness />
+      </MemoryRouter>,
+    );
+    const signal = apiMock.listProductConversations.mock.calls[0][0] as AbortSignal;
+
+    expect(getByRole('button', { name: /Open …/ })).toBeInTheDocument();
+    expect(getByRole('button', { name: /History …/ })).toBeInTheDocument();
+    expect(getByRole('list', { name: '' })).toHaveTextContent('Loading conversations');
+    expect(queryByText('No Open conversations')).toBeNull();
+    fireEvent.click(getByRole('link', { name: 'Global' }));
+    expect(getByRole('status', { name: 'Current route' })).toHaveTextContent('/global');
+    expect(getByRole('button', { name: /Open …/ })).toBeInTheDocument();
+    expect(getByRole('button', { name: /History …/ })).toBeInTheDocument();
+    expect(getByRole('list', { name: '' })).toHaveTextContent('Loading conversations');
+    expect(queryByText('No Open conversations')).toBeNull();
+    expect(apiMock.listProductConversations).toHaveBeenCalledTimes(1);
+    expect(signal.aborted).toBe(false);
+
+    await act(async () => {
+      resolveList({ product_conversations: [], coordinator: null });
+    });
+    expect(getByRole('button', { name: 'Open 0' })).toBeInTheDocument();
+    expect(getByRole('list', { name: '' })).toHaveTextContent('No Open conversations');
+  });
+
+  it.each([
+    { label: 'empty', rows: [] },
+    { label: 'nonempty', rows: [makeProductConversation('pc-recovered')] },
+  ])('shows an initial failure and retries to a successful $label snapshot', async ({ rows }) => {
+    let resolveList!: (value: { product_conversations: ProductConversationListRow[]; coordinator: null }) => void;
+    apiMock.listProductConversations.mockReset();
+    apiMock.listProductConversations
+      .mockRejectedValueOnce(new Error('offline'))
+      .mockReturnValueOnce(new Promise((resolve) => { resolveList = resolve; }));
+    const { container, getByRole, queryByText } = render(
+      <MemoryRouter initialEntries={['/']}>
+        <Sidebar collapsed={false} onToggle={vi.fn()} conversations={[]} archivedConversations={[]} activeSlug={null} onConversationCreated={vi.fn()} />
+      </MemoryRouter>,
+    );
+
+    expect(await waitFor(() => getByRole('status'))).toHaveTextContent('Unable to load conversations');
+    expect(queryByText('No Open conversations')).toBeNull();
+    fireEvent.click(getByRole('button', { name: 'Retry' }));
+    expect(getByRole('list', { name: '' })).toHaveTextContent('Loading conversations');
+    expect(queryByText('No Open conversations')).toBeNull();
+    await act(async () => {
+      resolveList({ product_conversations: rows, coordinator: null });
+    });
+    if (rows.length > 0) {
+      expect(container.querySelector('[data-product-conversation-id="pc-recovered"]')).not.toBeNull();
+    } else {
+      expect(getByRole('list', { name: '' })).toHaveTextContent('No Open conversations');
+    }
+  });
+
+  it('preserves cached-empty provenance and count when refresh fails', async () => {
+    localStorage.setItem('phoenix:product-conversation-list:v1', JSON.stringify({ product_conversations: [], coordinator: null }));
+    (globalThis as { __phoenixResetProductConversationListSnapshot?: () => void })
+      .__phoenixResetProductConversationListSnapshot?.();
+    apiMock.listProductConversations.mockRejectedValueOnce(new Error('offline'));
+    const { getByRole } = render(
+      <MemoryRouter initialEntries={['/']}>
+        <Sidebar collapsed={false} onToggle={vi.fn()} conversations={[]} archivedConversations={[]} activeSlug={null} onConversationCreated={vi.fn()} />
+      </MemoryRouter>,
+    );
+
+    expect(await waitFor(() => getByRole('status'))).toHaveTextContent('Showing cached conversations');
+    expect(getByRole('button', { name: 'Open 0' })).toBeInTheDocument();
+    expect(getByRole('list', { name: '' })).toHaveTextContent('No Open conversations');
   });
 
   it('renders cached product rows when the refresh fails and recovers on retry', async () => {
@@ -600,7 +685,7 @@ describe('Sidebar — ProductConversation navigation', () => {
       </MemoryRouter>,
     );
 
-    notifyProductConversationListMayHaveChanged();
+    await act(async () => { await refreshProductConversationList(); });
     await waitFor(() => expect(container.querySelector('[data-product-conversation-id="pc-newer"]')).not.toBeNull());
     resolveFirst({ product_conversations: [makeProductConversation('pc-older')] });
 

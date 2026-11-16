@@ -1,9 +1,16 @@
-import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { ProductConversationListRow } from '../api';
 import { ApiResponseError, api } from '../api';
+import { __testing } from '../conversation/productConversationList';
 import { ConversationListPage } from './ConversationListPage';
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((res) => { resolve = res; });
+  return { promise, resolve };
+}
 
 const pageMocks = vi.hoisted(() => ({
   refresh: vi.fn().mockResolvedValue(undefined),
@@ -90,6 +97,7 @@ function touchActivate(element: HTMLElement): void {
 
 describe('ConversationListPage mobile ProductConversation actions', () => {
   beforeEach(() => {
+    __testing.reset();
     vi.clearAllMocks();
     pageMocks.refresh.mockResolvedValue(undefined);
     pageMocks.isOnline = true;
@@ -100,6 +108,43 @@ describe('ConversationListPage mobile ProductConversation actions', () => {
       product_conversations: [productConversation()],
       coordinator: null,
     });
+  });
+
+  it('keeps a ready mobile page loading until an uncached product-list request succeeds', async () => {
+    const request = deferred<{ product_conversations: ProductConversationListRow[]; coordinator: null }>();
+    vi.mocked(api.listProductConversations).mockReturnValue(request.promise);
+    pageMocks.isReady = true;
+    pageMocks.refresh.mockResolvedValue(undefined);
+
+    render(<MemoryRouter initialEntries={['/']}><ConversationListPage /></MemoryRouter>);
+    expect(screen.getByTitle('Loading conversations')).toBeInTheDocument();
+    expect(screen.queryByText(/No conversations/)).toBeNull();
+    expect(pageMocks.refresh).toHaveBeenCalled();
+
+    await act(async () => request.resolve({ product_conversations: [], coordinator: null }));
+    await waitFor(() => expect(screen.queryByTitle('Loading conversations')).toBeNull());
+    expect(screen.queryByRole('status')).toBeNull();
+  });
+
+  it('shows an initial load failure without claiming cached or empty data, then retries to real empty success', async () => {
+    const retry = deferred<{ product_conversations: ProductConversationListRow[]; coordinator: null }>();
+    vi.mocked(api.listProductConversations)
+      .mockRejectedValueOnce(new Error('offline'))
+      .mockReturnValueOnce(retry.promise);
+    pageMocks.isReady = true;
+    pageMocks.refresh.mockResolvedValue(undefined);
+
+    render(<MemoryRouter initialEntries={['/']}><ConversationListPage /></MemoryRouter>);
+    expect(await screen.findByRole('status')).toHaveTextContent('Unable to load conversations — offline');
+    expect(screen.queryByText(/Showing cached conversations/)).toBeNull();
+    expect(screen.queryByText(/No conversations/)).toBeNull();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Retry' }));
+    expect(screen.queryByRole('status')).toBeNull();
+    expect(screen.getByTitle('Loading conversations')).toBeInTheDocument();
+    await act(async () => retry.resolve({ product_conversations: [], coordinator: null }));
+    await waitFor(() => expect(screen.queryByTitle('Loading conversations')).toBeNull());
+    expect(screen.queryByRole('status')).toBeNull();
   });
 
   it('orders the pinned mobile header as toolbar, Ember, then Open and History', async () => {

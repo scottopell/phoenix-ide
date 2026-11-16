@@ -373,6 +373,39 @@ const defaultProps = {
   onNewConversation: vi.fn(),
 };
 
+describe('ConversationList — snapshot availability', () => {
+  it('does not present unknown uncached rows as an empty successful list', () => {
+    const { getByText, queryByText } = render(
+      <MemoryRouter>
+        <ConversationList {...defaultProps} listAvailability="loading" />
+      </MemoryRouter>,
+    );
+
+    expect(getByText('Loading conversations')).toBeInTheDocument();
+    expect(queryByText('No Open conversations')).toBeNull();
+  });
+
+  it('does not present an initial load failure as a successful empty list', () => {
+    const { queryByText } = render(
+      <MemoryRouter>
+        <ConversationList {...defaultProps} listAvailability="error" />
+      </MemoryRouter>,
+    );
+
+    expect(queryByText('No Open conversations')).toBeNull();
+  });
+
+  it('shows a successful empty snapshot', () => {
+    const { getByText } = render(
+      <MemoryRouter>
+        <ConversationList {...defaultProps} listAvailability="available" />
+      </MemoryRouter>,
+    );
+
+    expect(getByText('No Open conversations')).toBeInTheDocument();
+  });
+});
+
 describe('ConversationList — product conversations', () => {
   it('renders a single-line row: status dot, one title, no metadata line', () => {
     const open = makeProductConversation('pc-open', {
