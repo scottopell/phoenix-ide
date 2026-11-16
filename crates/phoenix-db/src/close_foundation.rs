@@ -18053,7 +18053,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stopped_original_retirement_proof_keeps_missing_work_scope_outcome_unresolved() {
+    #[allow(clippy::too_many_lines)] // One fixture follows missing scope evidence through interruption.
+    async fn stopped_original_retirement_proof_keeps_independent_work_scope_unresolved() {
         let db = Database::open_in_memory().await.unwrap();
         create_root(&db, "root").await;
         let scope = allocate_scope_worktree(&db, "root").await;
@@ -18112,6 +18113,15 @@ mod tests {
         })
         .await
         .unwrap();
+        let scope_receipts: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM close_retirement_resources
+             WHERE attempt_id = ?1 AND resource_kind = 'work_scope'",
+        )
+        .bind(attempt.as_str())
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(scope_receipts, 0);
         let run = CloseRunRef::initial(attempt);
         db.classify_interrupted_close_run(&run).await.unwrap();
 
@@ -18124,10 +18134,30 @@ mod tests {
             .resources
             .iter()
             .any(|expected| expected.resource == work_scope.resource));
-        assert_eq!(proof.outcomes.len(), 1);
-        assert_eq!(proof.outcomes[0].resource, worktree.resource);
-        assert_eq!(proof.outcomes[0].outcome, RetirementOutcome::Retired);
-        assert_eq!(proof.outcomes[0].snapshot, snapshot);
+        // Interruption records the missing scope outcome as unresolved; it must
+        // never inherit the distinct worktree's successful retirement.
+        assert_eq!(proof.outcomes.len(), 2);
+        let worktree_outcome = proof
+            .outcomes
+            .iter()
+            .find(|outcome| outcome.resource == worktree.resource)
+            .unwrap();
+        assert_eq!(worktree_outcome.outcome, RetirementOutcome::Retired);
+        let scope_outcome = proof
+            .outcomes
+            .iter()
+            .find(|outcome| outcome.resource == work_scope.resource)
+            .unwrap();
+        assert_eq!(
+            scope_outcome.outcome,
+            RetirementOutcome::Residual {
+                residual_reason: RetirementFailureReason::ManualRepairRequired,
+            }
+        );
+        assert!(proof
+            .outcomes
+            .iter()
+            .all(|outcome| outcome.snapshot == snapshot));
     }
 
     #[tokio::test]
