@@ -1,6 +1,6 @@
 use super::*;
 use crate::conversation_action_tools::tests::native_runtime;
-use phoenix_core::domain::{db_schema::MessageContent, llm_types::ContentBlock};
+use phoenix_core::domain::llm_types::ContentBlock;
 fn context(source: &str, with_call: bool) -> ToolContext {
     struct Offline;
     impl phoenix_core::llm_service::LlmSelector for Offline {
@@ -75,19 +75,36 @@ async fn tracking_native_registry_and_closed_requests_use_real_application_servi
         .await
         .is_err());
     let record = json!({"op":"record","record":{"kind":"bookmark","title":"Why the earlier design mattered","note":"Useful question, not a fresh commission","resumption":"Explain the stopping point when the user returns","references":[],"evidence":[]}});
-    db.add_message(
-        "tracking-message",
+    db.update_conversation_state(
         &source,
-        &MessageContent::Agent(vec![ContentBlock::ToolUse {
-            id: "tracking-call".into(),
-            name: "tracking".into(),
-            input: json!({"request":record}),
-        }]),
-        None,
-        None,
+        &crate::state_machine::ConvState::ToolExecuting {
+            current_tool: crate::state_machine::state::ToolCall::new(
+                "tracking-call",
+                crate::state_machine::state::ToolInput::from_name_and_value(
+                    "tracking",
+                    json!({"request":record}),
+                ),
+            ),
+            remaining_tools: vec![],
+            completed_results: vec![],
+            pending_sub_agents: vec![],
+            assistant_message: crate::state_machine::state::AssistantMessage {
+                message_id: "tracking-message".into(),
+                content: vec![ContentBlock::ToolUse {
+                    id: "tracking-call".into(),
+                    name: "tracking".into(),
+                    input: json!({"request":record}),
+                }],
+                ..Default::default()
+            },
+        },
     )
     .await
     .unwrap();
+    assert!(
+        !db.message_exists("tracking-message").await.unwrap(),
+        "the production assistant checkpoint does not exist until the tool round ends"
+    );
     let receipt = tool
         .run_inner(json!({"request":record}), context(&source, true))
         .await

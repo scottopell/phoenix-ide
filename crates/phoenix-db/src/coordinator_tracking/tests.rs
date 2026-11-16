@@ -49,15 +49,46 @@ async fn call(db: &Database, source: &str, mutation: &TrackingMutation) -> Sourc
     )
     .await
     .unwrap();
+    db.update_conversation_state(
+        source,
+        &phoenix_core::domain::sm_state::ConvState::ToolExecuting {
+            current_tool: phoenix_core::domain::sm_state::ToolCall::new(
+                &call.tool_use_id,
+                phoenix_core::domain::sm_state::ToolInput::from_name_and_value(
+                    "tracking",
+                    serde_json::json!({"request":mutation}),
+                ),
+            ),
+            remaining_tools: vec![],
+            completed_results: vec![],
+            pending_sub_agents: vec![],
+            assistant_message: phoenix_core::domain::sm_state::AssistantMessage {
+                message_id: call.message_id.clone(),
+                content: vec![ContentBlock::ToolUse {
+                    id: call.tool_use_id.clone(),
+                    name: "tracking".into(),
+                    input: serde_json::json!({"request":mutation}),
+                }],
+                ..Default::default()
+            },
+        },
+    )
+    .await
+    .unwrap();
     call
 }
 async fn apply(db: &Database, source: &str, mutation: TrackingMutation) -> TrackingReceipt {
     let call = call(db, source, &mutation).await;
-    db.mutate_coordinator_tracking(source, &call, &mutation)
+    let receipt = db
+        .mutate_coordinator_tracking(source, &call, &mutation)
         .await
         .established()
         .unwrap()
-        .unwrap()
+        .unwrap();
+    db.update_conversation_state(source, &phoenix_core::domain::sm_state::ConvState::Idle)
+        .await
+        .unwrap();
+    receipt
 }
 #[tokio::test]
 async fn tracking_call_replay_conflict_and_structural_authority() {
@@ -704,4 +735,56 @@ async fn tracking_explicit_kind_change_preserves_evidence_and_pause_without_disp
         db.get_conversation(&source).await.unwrap().state,
         phoenix_core::domain::sm_state::ConvState::Idle
     ));
+}
+
+#[tokio::test]
+async fn tracking_current_durable_tool_round_authorizes_before_assistant_checkpoint() {
+    let (db, source) = setup().await;
+    let mutation = record(TrackingKind::RequestedWork, "Pending assistant call");
+    let invocation = call(&db, &source, &mutation).await;
+    sqlx::query("DELETE FROM messages WHERE message_id=?1")
+        .bind(&invocation.message_id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    assert!(!db.message_exists(&invocation.message_id).await.unwrap());
+    let receipt = db
+        .mutate_coordinator_tracking(&source, &invocation, &mutation)
+        .await
+        .established()
+        .unwrap()
+        .unwrap();
+    assert_eq!(receipt.outcome, TrackingOutcome::Applied);
+    assert!(!db.read_coordinator_tracking(&source,&receipt.item_id,0).await.unwrap().recorded_by_ember.unwrap().source_available,"recording locator is retained, not falsely presented as an already-persisted assistant message");
+    db.update_conversation_state(&source, &phoenix_core::domain::sm_state::ConvState::Idle)
+        .await
+        .unwrap();
+    assert_eq!(
+        db.mutate_coordinator_tracking(&source, &invocation, &mutation)
+            .await
+            .established()
+            .unwrap()
+            .unwrap()
+            .outcome,
+        TrackingOutcome::Replayed
+    );
+    let other = record(TrackingKind::RequestedWork, "Original pending intent");
+    let other_call = call(&db, &source, &other).await;
+    assert!(db
+        .mutate_coordinator_tracking(
+            &source,
+            &other_call,
+            &record(TrackingKind::RequestedWork, "Forged changed intent")
+        )
+        .await
+        .established()
+        .unwrap()
+        .is_err());
+    assert_eq!(
+        db.list_coordinator_tracking(&source, None, false)
+            .await
+            .unwrap()
+            .active_count,
+        1
+    );
 }

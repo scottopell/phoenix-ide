@@ -465,24 +465,60 @@ impl Database {
         let owner = require_owner(tx, source).await?;
         bounded(&call.message_id, 256, true)?;
         bounded(&call.tool_use_id, 256, true)?;
-        let source_row =
-            sqlx::query("SELECT * FROM messages WHERE message_id=?1 AND conversation_id=?2")
-                .bind(&call.message_id)
-                .bind(source)
-                .fetch_optional(&mut **tx)
-                .await?
-                .ok_or_else(|| invalid("source assistant message unavailable"))?;
-        let source_message = crate::parse_message_row(source_row)?;
-        let valid_call=match source_message.content {crate::MessageContent::Agent(blocks)=>blocks.iter().any(|block|matches!(block,phoenix_core::domain::llm_types::ContentBlock::ToolUse{id,name,..} if id==&call.tool_use_id && name=="tracking")),_=>false};
-        if !valid_call {
-            return Err(invalid("source call is not an owned tracking invocation"));
-        }
         let fingerprint =
             digest(&serde_json::to_vec(mutation).map_err(|error| invalid(&error.to_string()))?);
         if let Some(row)=sqlx::query("SELECT * FROM coordinator_tracking_operations WHERE source_transcript_id=?1 AND source_message_id=?2 AND source_tool_use_id=?3").bind(source).bind(&call.message_id).bind(&call.tool_use_id).fetch_optional(&mut **tx).await? {
    if row.try_get::<String,_>("fingerprint")? != fingerprint {return Err(invalid("call identity reused with changed intent"));}
    return Ok(TrackingReceipt{outcome:TrackingOutcome::Replayed,item_id:row.try_get("item_id")?,item_revision:row.try_get("item_revision")?,registry_revision:row.try_get("registry_revision")?});
   }
+        let state_json: String = sqlx::query_scalar("SELECT state FROM conversations WHERE id=?1")
+            .bind(source)
+            .fetch_one(&mut **tx)
+            .await?;
+        let state: phoenix_core::domain::sm_state::ConvState =
+            serde_json::from_str(&state_json).map_err(|error| invalid(&error.to_string()))?;
+        let phoenix_core::domain::sm_state::ConvState::ToolExecuting {
+            current_tool,
+            assistant_message,
+            ..
+        } = state
+        else {
+            return Err(invalid("source has no current durable tool round"));
+        };
+        if assistant_message.message_id != call.message_id
+            || current_tool.id != call.tool_use_id
+            || current_tool.name() != "tracking"
+        {
+            return Err(invalid(
+                "source call is not the owned current tracking invocation",
+            ));
+        }
+        let pending: TrackingMutation =
+            serde_json::from_value(current_tool.input.to_value()["request"].clone())
+                .map_err(|error| invalid(&error.to_string()))?;
+        if digest(&serde_json::to_vec(&pending).map_err(|error| invalid(&error.to_string()))?)
+            != fingerprint
+        {
+            return Err(invalid(
+                "source arguments differ from the durable tool round",
+            ));
+        }
+        let matched = assistant_message.content.iter().any(|block| match block {
+            phoenix_core::domain::llm_types::ContentBlock::ToolUse { id, name, input }
+                if id == &call.tool_use_id && name == "tracking" =>
+            {
+                serde_json::from_value::<TrackingMutation>(input["request"].clone())
+                    .ok()
+                    .and_then(|input| serde_json::to_vec(&input).ok())
+                    .is_some_and(|bytes| digest(&bytes) == fingerprint)
+            }
+            _ => false,
+        });
+        if !matched {
+            return Err(invalid(
+                "owned assistant round does not contain the source call",
+            ));
+        }
         ensure_registry(tx, &owner).await?;
         let now = Utc::now().timestamp_micros();
         let (id, revision, changed) = match mutation {

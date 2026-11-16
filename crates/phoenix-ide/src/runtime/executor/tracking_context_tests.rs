@@ -56,25 +56,57 @@ async fn save(db: &crate::db::Database, source: &str, kind: TrackingKind, title:
             evidence: vec![],
         },
     };
+    apply_pending_round(db, source, &call, &mutation)
+        .await
+        .item_id
+}
+async fn apply_pending_round(
+    db: &crate::db::Database,
+    source: &str,
+    call: &SourceToolCall,
+    mutation: &TrackingMutation,
+) -> phoenix_db::coordinator_tracking::TrackingReceipt {
+    let input = serde_json::json!({"request":mutation});
+    let blocks = vec![ContentBlock::ToolUse {
+        id: call.tool_use_id.clone(),
+        name: "tracking".into(),
+        input: input.clone(),
+    }];
+    db.update_conversation_state(
+        source,
+        &ConvState::ToolExecuting {
+            current_tool: crate::state_machine::state::ToolCall::new(
+                &call.tool_use_id,
+                crate::state_machine::state::ToolInput::from_name_and_value("tracking", input),
+            ),
+            remaining_tools: vec![],
+            completed_results: vec![],
+            pending_sub_agents: vec![],
+            assistant_message: crate::state_machine::state::AssistantMessage {
+                message_id: call.message_id.clone(),
+                content: blocks.clone(),
+                ..Default::default()
+            },
+        },
+    )
+    .await
+    .unwrap();
+    assert!(!db.message_exists(&call.message_id).await.unwrap());
+    let receipt = db
+        .mutate_coordinator_tracking(source, call, mutation)
+        .await
+        .established()
+        .unwrap()
+        .unwrap();
     db.add_message(
         &call.message_id,
         source,
-        &MessageContent::Agent(vec![ContentBlock::ToolUse {
-            id: call.tool_use_id.clone(),
-            name: "tracking".into(),
-            input: serde_json::json!({"request":mutation}),
-        }]),
+        &MessageContent::Agent(blocks),
         None,
         None,
     )
     .await
     .unwrap();
-    let receipt = db
-        .mutate_coordinator_tracking(source, &call, &mutation)
-        .await
-        .established()
-        .unwrap()
-        .unwrap();
     db.add_message(
         &uuid::Uuid::new_v4().to_string(),
         source,
@@ -88,7 +120,10 @@ async fn save(db: &crate::db::Database, source: &str, kind: TrackingKind, title:
     )
     .await
     .unwrap();
-    receipt.item_id
+    db.update_conversation_state(source, &ConvState::Idle)
+        .await
+        .unwrap();
+    receipt
 }
 async fn dispatch(runtime: &mut Runtime, llm: &MockLlmClient) {
     llm.queue_response(phoenix_llm::LlmResponse {
@@ -168,38 +203,7 @@ async fn tracking_production_registry_prompt_prefix_and_real_continuation_recove
             quotation: "Do not proceed until I lift the pause".into(),
         }],
     };
-    db.add_message(
-        &call.message_id,
-        &source,
-        &MessageContent::Agent(vec![ContentBlock::ToolUse {
-            id: call.tool_use_id.clone(),
-            name: "tracking".into(),
-            input: serde_json::json!({"request":mutation}),
-        }]),
-        None,
-        None,
-    )
-    .await
-    .unwrap();
-    let receipt = db
-        .mutate_coordinator_tracking(&source, &call, &mutation)
-        .await
-        .established()
-        .unwrap()
-        .unwrap();
-    db.add_message(
-        &uuid::Uuid::new_v4().to_string(),
-        &source,
-        &MessageContent::Tool(crate::db::ToolContent::new(
-            &call.tool_use_id,
-            serde_json::to_string(&receipt).unwrap(),
-            false,
-        )),
-        None,
-        None,
-    )
-    .await
-    .unwrap();
+    apply_pending_round(&db, &source, &call, &mutation).await;
     let persisted_max = sqlx::query_scalar::<_, i64>(
         "SELECT MAX(sequence_id) FROM messages WHERE conversation_id=?1",
     )
