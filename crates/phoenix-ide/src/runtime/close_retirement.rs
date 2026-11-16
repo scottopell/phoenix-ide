@@ -9662,7 +9662,8 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread")]
     #[allow(clippy::too_many_lines)]
-    async fn native_retry_source_actor_completes_original_worktree_and_scope_under_new_generation() {
+    async fn native_retry_source_actor_completes_original_worktree_and_scope_under_new_generation()
+    {
         use crate::state_machine::state::{AssistantMessage, ToolCall, ToolInput};
         use phoenix_core::domain::close::CloseRunOrdinal;
         use phoenix_core::domain::db_schema::SourceToolCall;
@@ -9677,7 +9678,10 @@ mod tests {
                 let _ = actor.await;
                 panic!("bounded native retry actor did not finish");
             }
-            assert!(!result.unwrap().unwrap(), "retry actor must not exit fatally");
+            assert!(
+                !result.unwrap().unwrap(),
+                "retry actor must not exit fatally"
+            );
         }
 
         async fn retained_counts(db: &crate::db::Database, attempt: &str) -> Vec<i64> {
@@ -9814,22 +9818,29 @@ mod tests {
                     state.clone(),
                     std::sync::Arc::clone(&fatal_local_authority_fence),
                 );
-        let _source_events = manager.inject_handle_with_event_capture_for_test(
-            &source_conversation.id, state.clone(),
-        ).await;
-        manager.runtimes.write().await.get_mut(&source_conversation.id).unwrap()
+        let _source_events = manager
+            .inject_handle_with_event_capture_for_test(&source_conversation.id, state.clone())
+            .await;
+        manager
+            .runtimes
+            .write()
+            .await
+            .get_mut(&source_conversation.id)
+            .unwrap()
             .acknowledged_event_tx = sender;
         // Exercise the production manager route: it owns lock acquisition, backend
         // selection, envelope construction and response classification.
         let (result, ()) = tokio::join!(
             manager.apply_native_close_explicit_retry(
-                &source_conversation.id, source.clone(), target.clone(),
-                fixture.run.attempt_id.clone(), CloseRunOrdinal::INITIAL,
+                &source_conversation.id,
+                source.clone(),
+                target.clone(),
+                fixture.run.attempt_id.clone(),
+                CloseRunOrdinal::INITIAL,
             ),
             join_actor(actor),
         );
-        let NativeCloseRetryResult::NewlyAdmitted(receipt) = result.unwrap()
-        else {
+        let NativeCloseRetryResult::NewlyAdmitted(receipt) = result.unwrap() else {
             panic!("expected fresh explicit retry admission");
         };
         assert_eq!(receipt.admitted.run_ordinal.get(), 2);
@@ -9849,20 +9860,27 @@ mod tests {
                     state.clone(),
                     std::sync::Arc::clone(&fatal_local_authority_fence),
                 );
-        let _replay_events = manager.inject_handle_with_event_capture_for_test(
-            &source_conversation.id, state.clone(),
-        ).await;
-        manager.runtimes.write().await.get_mut(&source_conversation.id).unwrap()
+        let _replay_events = manager
+            .inject_handle_with_event_capture_for_test(&source_conversation.id, state.clone())
+            .await;
+        manager
+            .runtimes
+            .write()
+            .await
+            .get_mut(&source_conversation.id)
+            .unwrap()
             .acknowledged_event_tx = replay_sender;
         let (result, ()) = tokio::join!(
             manager.apply_native_close_explicit_retry(
-                &source_conversation.id, source.clone(), target.clone(),
-                fixture.run.attempt_id.clone(), CloseRunOrdinal::INITIAL,
+                &source_conversation.id,
+                source.clone(),
+                target.clone(),
+                fixture.run.attempt_id.clone(),
+                CloseRunOrdinal::INITIAL,
             ),
             join_actor(replay_actor),
         );
-        let NativeCloseRetryResult::Replay(replayed_receipt) = result.unwrap()
-        else {
+        let NativeCloseRetryResult::Replay(replayed_receipt) = result.unwrap() else {
             panic!("expected exact retry receipt replay");
         };
         assert_eq!(replayed_receipt, receipt);
@@ -9872,7 +9890,9 @@ mod tests {
             "receipt replay must not append plans, effects, dispatches or writer observations"
         );
         assert_eq!(
-            db.get_close_obligation(fixture.run.attempt_id.as_str()).await.unwrap(),
+            db.get_close_obligation(fixture.run.attempt_id.as_str())
+                .await
+                .unwrap(),
             obligation_before_replay
         );
         // A stale persisted source is insufficient even for a known receipt:
@@ -9884,20 +9904,34 @@ mod tests {
                     db.clone(), source_conversation.id.clone(), stopped_state.clone(),
                     std::sync::Arc::clone(&fatal_local_authority_fence),
                 );
-        let _stopped_events = manager.inject_handle_with_event_capture_for_test(
-            &source_conversation.id, stopped_state,
-        ).await;
-        manager.runtimes.write().await.get_mut(&source_conversation.id).unwrap()
+        let _stopped_events = manager
+            .inject_handle_with_event_capture_for_test(&source_conversation.id, stopped_state)
+            .await;
+        manager
+            .runtimes
+            .write()
+            .await
+            .get_mut(&source_conversation.id)
+            .unwrap()
             .acknowledged_event_tx = stopped_sender;
         let (result, ()) = tokio::join!(
             manager.apply_native_close_explicit_retry(
-                &source_conversation.id, source.clone(), target.clone(),
-                fixture.run.attempt_id.clone(), CloseRunOrdinal::INITIAL,
+                &source_conversation.id,
+                source.clone(),
+                target.clone(),
+                fixture.run.attempt_id.clone(),
+                CloseRunOrdinal::INITIAL,
             ),
             join_actor(stopped_actor),
         );
-        assert_eq!(result, Err(crate::runtime::NativeCloseApplicationError::SourceRefused));
-        assert_eq!(retained_counts(db, fixture.run.attempt_id.as_str()).await, before_replay);
+        assert_eq!(
+            result,
+            Err(crate::runtime::NativeCloseApplicationError::SourceRefused)
+        );
+        assert_eq!(
+            retained_counts(db, fixture.run.attempt_id.as_str()).await,
+            before_replay
+        );
 
         let run_count: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM close_runs WHERE attempt_id=?1")

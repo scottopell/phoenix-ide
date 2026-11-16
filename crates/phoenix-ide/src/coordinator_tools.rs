@@ -2934,13 +2934,19 @@ mod tests {
         let schema = tool.input_schema();
         assert_eq!(schema["type"], "object");
         assert_eq!(schema["additionalProperties"], false);
-        assert_eq!(schema["required"], json!(["action", "product_conversation_id"]));
+        assert_eq!(
+            schema["required"],
+            json!(["action", "product_conversation_id"])
+        );
         assert_eq!(
             schema["properties"]["action"]["enum"],
             json!(["initial", "observe", "explicit_retry"])
         );
         for rejected in ["oneOf", "allOf", "anyOf"] {
-            assert!(schema.get(rejected).is_none(), "provider rejects {rejected}");
+            assert!(
+                schema.get(rejected).is_none(),
+                "provider rejects {rejected}"
+            );
         }
     }
 
