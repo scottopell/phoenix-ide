@@ -1,4 +1,4 @@
-# ADR-264: Publish recovered launchd plist before canonical bootstrap
+# ADR-265: Publish recovered launchd plist before canonical bootstrap
 
 - **Status:** Accepted
 - **Date:** 2026-11-16
