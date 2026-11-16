@@ -68,8 +68,12 @@ function publish(next: ProductConversationListSnapshot): void {
  * in flight, so a slow response can never overwrite fresher rows.
  */
 export function refreshProductConversationList(): Promise<void> {
+  return fetchProductConversationList(true);
+}
+
+function fetchProductConversationList(clearError: boolean): Promise<void> {
   inFlight?.controller.abort();
-  if (snapshot.error !== null) publish({ ...snapshot, error: null });
+  if (clearError && snapshot.error !== null) publish({ ...snapshot, error: null });
   const controller = new AbortController();
   const timeout = window.setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
   const promise = api.listProductConversations(controller.signal)
@@ -94,7 +98,7 @@ export function refreshProductConversationList(): Promise<void> {
         inFlight = null;
         if (refreshAfterCurrent) {
           refreshAfterCurrent = false;
-          if (listeners.size > 0) void refreshProductConversationList();
+          if (listeners.size > 0) void fetchProductConversationList(false);
         }
       }
     });
@@ -106,7 +110,7 @@ function refreshInvalidatedList(): void {
   if (inFlight !== null) {
     refreshAfterCurrent = true;
   } else {
-    void refreshProductConversationList();
+    void fetchProductConversationList(false);
   }
 }
 
@@ -128,7 +132,7 @@ function subscribe(listener: () => void): () => void {
   listeners.add(listener);
   if (listeners.size === 1) {
     stopRevisionSubscription = subscribeProductConversationListRevision(refreshInvalidatedList);
-    void refreshProductConversationList();
+    void fetchProductConversationList(false);
   }
   return () => {
     listeners.delete(listener);

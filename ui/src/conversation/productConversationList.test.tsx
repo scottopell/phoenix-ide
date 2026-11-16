@@ -148,10 +148,38 @@ describe('useProductConversationList', () => {
     expect(list).toHaveBeenCalledTimes(2);
     expect(result.current.fresh).toBe(false);
     expect(result.current.fromCache).toBe(false);
-    expect(result.current.error).toBeNull();
+    expect(result.current.error).toBe('offline');
     await act(async () => followUp.resolve({ product_conversations: [row('recovered')], coordinator: null }));
     expect(result.current.fresh).toBe(true);
     expect(result.current.rows.map((r) => r.product_conversation_id)).toEqual(['recovered']);
+  });
+
+  it('keeps timeout failures visible during repeated passive retries until a request succeeds', async () => {
+    vi.useFakeTimers();
+    const recovery = deferred<{ product_conversations: ProductConversationListRow[]; coordinator: null }>();
+    const hungRequest = (signal?: AbortSignal) => new Promise<never>((_resolve, reject) => {
+      signal?.addEventListener('abort', () => reject(new Error('list timed out')), { once: true });
+    });
+    const list = vi.spyOn(api, 'listProductConversations')
+      .mockImplementationOnce(hungRequest)
+      .mockImplementationOnce(hungRequest)
+      .mockReturnValueOnce(recovery.promise);
+    const { result } = renderHook(() => useProductConversationList());
+    const invalidations = window.setInterval(notifyProductConversationListMayHaveChanged, 5_000);
+    await act(async () => { await vi.advanceTimersByTimeAsync(15_000); });
+    expect(list).toHaveBeenCalledTimes(2);
+    expect(result.current.error).toBe('list timed out');
+    expect(result.current.fresh).toBe(false);
+    await act(async () => { await vi.advanceTimersByTimeAsync(10_000); });
+    window.clearInterval(invalidations);
+    await act(async () => { await vi.advanceTimersByTimeAsync(5_000); });
+    expect(list).toHaveBeenCalledTimes(3);
+    expect(result.current.error).toBe('list timed out');
+    expect(result.current.fresh).toBe(false);
+    await act(async () => recovery.resolve({ product_conversations: [], coordinator: null }));
+    expect(result.current.error).toBeNull();
+    expect(result.current.fresh).toBe(true);
+    expect(result.current.rows).toEqual([]);
   });
 
   it.each(['rename', 'delete'] as const)('retains acknowledged %s rows and cache when a pre-mutation response arrives and reconciliation fails', async (mutation) => {
