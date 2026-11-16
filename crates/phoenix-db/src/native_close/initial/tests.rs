@@ -335,7 +335,10 @@ async fn initial_settlement_requires_exact_released_turn_generation_not_latest_i
     let settled: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM close_attempt_direct_turn_settlements WHERE attempt_id = ?1 AND settled_at IS NOT NULL",
     ).bind(receipt.admitted.attempt_id.as_str()).fetch_one(f.db.pool()).await.unwrap();
-    assert_eq!(settled, 1, "the exact released generation must be reconciled");
+    assert_eq!(
+        settled, 1,
+        "the exact released generation must be reconciled"
+    );
     assert_one_operation(&f, &receipt, 0).await;
 }
 
