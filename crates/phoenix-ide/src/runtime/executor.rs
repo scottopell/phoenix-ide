@@ -634,6 +634,8 @@ const DIRECT_TURN_TERMINAL_SETTLEMENT_RETRIES: u8 = 3;
 /// on top of (not instead of) the per-tool line caps. 100 KB keeps a generous
 /// amount of legitimate output while making the pathological case impossible.
 const MAX_TOOL_OUTPUT_BYTES: usize = 100 * 1024;
+const _: () =
+    assert!(phoenix_db::coordinator_tracking::TRACKING_DETAIL_BYTES < MAX_TOOL_OUTPUT_BYTES);
 
 /// Maximum number of sub-agent tasks accepted in a single `spawn_agents` call.
 /// Realises the `SpawnLimit` invariant in `specs/bedrock/bedrock.allium`
