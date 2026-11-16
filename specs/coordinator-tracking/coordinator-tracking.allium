@@ -204,8 +204,16 @@ rule SurfaceDueRequest {
         -- Select at most one eligible item per admitted input, often zero. Prefer
         -- least recently surfaced, then explicitly reviewed, with stable creation/ID
         -- ties. Surfacing never changes reviewed_at_us or reviewed_evidence_ordinal.
-        -- Contextual foreground inspection shares this cue budget. A cue applies
-        -- only after its owning input; a later input makes it historical.
+        -- This cooldown and cue budget govern unsolicited review. Before answering
+        -- a current work-planning or next-step question, perform a bounded targeted
+        -- lookup of relevant saved intent, including items omitted from a partial
+        -- index. Use targeted reads or bounded pages without enumerating unrelated
+        -- items, then read/reconcile a relevant record and its sources and resume
+        -- its actual owed question while preserving user restrictions and pauses.
+        -- That relevant lookup needs no due cue and is not blocked by the cooldown.
+        -- Neutral arithmetic and greetings cause no additional lookup without an
+        -- actual current-input cue. A cue applies only after its owning input;
+        -- a later input makes it historical.
         -- After handling the current request, inspect the selected item through one
         -- bounded read and reconcile new evidence. Advance only a permitted step.
         -- For an owed conversational question, give a short item refresher and ask
