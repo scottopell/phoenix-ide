@@ -26,7 +26,7 @@ pub use coordinator_watches::{
     append_mandatory_close_failure_event_tx, CloseFailureStop, EndingResponse,
     MandatoryCloseFailureSubject, PendingWatchEvent, SettledWatchInput, WatchEndingEvidence,
     WatchEventPresentation, WatchEventProvenance, WatchEventRoute, WatchOutcome, WatchResponsePage,
-    WatchSnapshot,
+    WatchSnapshot, MAX_WATCH_RESPONSE_CURSOR,
 };
 pub use federation_peers::FederationPeerConnection;
 mod ddl;

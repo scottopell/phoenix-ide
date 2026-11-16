@@ -2,6 +2,7 @@ pub(crate) mod ending_evidence;
 pub(crate) mod goal_facts;
 pub use ending_evidence::{
     EndingResponse, SettledWatchInput, WatchEndingEvidence, WatchResponsePage,
+    MAX_WATCH_RESPONSE_CURSOR,
 };
 mod mandatory_close;
 mod presentation;

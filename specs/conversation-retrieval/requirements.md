@@ -9,6 +9,8 @@ page SHALL retain the event/version expectation. Changed, deleted, uncaptured or
 unsupported evidence SHALL produce an explicit nonmatching/unavailable result rather
 than silently reading current content. Ordinary exact-message links SHALL remain
 current-source navigation and SHALL NOT imply occurrence-time version recovery.
+WHEN the bounded response-read domain is exhausted, THE SYSTEM SHALL report any
+remaining prose as explicitly omitted and SHALL NOT return an unsupported next cursor.
 
 ## User Story
 
