@@ -9,6 +9,7 @@ import {
   openFindSession,
   previousFindSessionMatch,
   replaceFindSessionResults,
+  reduceFindSession,
   resetFindSession,
   setFindSessionQueryAndResults,
   type FindSessionCommand,
@@ -183,7 +184,7 @@ describe('findSession', () => {
     expect(result.commands).toEqual([]);
   });
 
-  it('replace-results reveals a retained active match when its target is refreshed', () => {
+  it('refresh-results retains position while replace-results reveals; explicit navigation uses the new target', () => {
     const alpha = makeMatch('alpha', 0);
     const beta = makeMatch('beta', 1);
     let state = openFindSession(createClosedFindSession<Target, FocusOrigin>(), makeSurface({
@@ -194,14 +195,38 @@ describe('findSession', () => {
     state = activateFindSessionMatch(state, beta.id).state;
 
     const movedBeta = makeMatch('beta', 8);
-    const result = replaceFindSessionResults(state, [alpha, movedBeta]);
+    expect(replaceFindSessionResults(state, [alpha, movedBeta]).commands).toEqual([
+      { kind: 'reveal-match', matchId: beta.id, target: movedBeta.target },
+    ]);
+    const result = reduceFindSession(state, { type: 'refresh-results', matches: [alpha, movedBeta] });
 
     expect(result.state.status).toBe('open');
     if (result.state.status !== 'open') throw new Error('expected open state');
     expect(result.state.activeMatchId).toBe(beta.id);
-    expect(result.commands).toEqual([
+    expect(result.commands).toEqual([]);
+    expect(activateFindSessionMatch(result.state, beta.id).commands).toEqual([
       { kind: 'reveal-match', matchId: beta.id, target: movedBeta.target },
     ]);
+    expect(previousFindSessionMatch(nextFindSessionMatch(result.state).state).commands).toEqual([
+      { kind: 'reveal-match', matchId: beta.id, target: movedBeta.target },
+    ]);
+  });
+
+  it('refresh-results still reveals fallback selection and a new query, and ignores closed sessions', () => {
+    const alpha = makeMatch('alpha', 0);
+    const beta = makeMatch('beta', 1);
+    let state = openFindSession(createClosedFindSession<Target, FocusOrigin>(), makeSurface({ query: 'a', matches: [alpha, beta], focusOrigin: { scope: 'viewer', token: 'origin' } })).state;
+    state = activateFindSessionMatch(state, beta.id).state;
+    const removed = reduceFindSession(state, { type: 'refresh-results', matches: [alpha] });
+    expect(removed.commands).toEqual([{ kind: 'reveal-match', matchId: alpha.id, target: alpha.target }]);
+    const cleared = reduceFindSession(removed.state, { type: 'set-query', query: 'new' });
+    expect(reduceFindSession(cleared.state, { type: 'refresh-results', matches: [alpha] }).commands)
+      .toEqual([{ kind: 'reveal-match', matchId: alpha.id, target: alpha.target }]);
+    expect(reduceFindSession(state, { type: 'refresh-results', matches: [] }).commands).toEqual([{ kind: 'clear-decorations' }]);
+    for (const type of ['close', 'reset'] as const) {
+      const closed = reduceFindSession(state, { type });
+      expect(reduceFindSession(closed.state, { type: 'refresh-results', matches: [alpha] })).toEqual({ state: closed.state, commands: [] });
+    }
   });
 
   it('replace-results falls back to the nearest prior ordinal on shrink, insertion, reorder, and removal', () => {

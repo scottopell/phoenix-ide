@@ -43,6 +43,7 @@ export type FindSessionAction<TTarget, TFocusOrigin> =
   | { type: 'set-query'; query: string }
   | { type: 'set-query-and-results'; query: string; matches: readonly FindSessionMatch<TTarget>[] }
   | { type: 'replace-results'; matches: readonly FindSessionMatch<TTarget>[] }
+  | { type: 'refresh-results'; matches: readonly FindSessionMatch<TTarget>[] }
   | { type: 'next' }
   | { type: 'previous' }
   | { type: 'activate'; matchId: MatchId }
@@ -81,6 +82,8 @@ export function reduceFindSession<TTarget, TFocusOrigin>(
       return setFindSessionQueryAndResults(state, action.query, action.matches);
     case 'replace-results':
       return replaceFindSessionResults(state, action.matches);
+    case 'refresh-results':
+      return replaceFindSessionResults(state, action.matches, 'retain-position');
     case 'next':
       return nextFindSessionMatch(state);
     case 'previous':
@@ -157,18 +160,20 @@ export function setFindSessionQueryAndResults<TTarget, TFocusOrigin>(
 export function replaceFindSessionResults<TTarget, TFocusOrigin>(
   state: FindSessionState<TTarget, TFocusOrigin>,
   matches: readonly FindSessionMatch<TTarget>[],
+  retainedTarget: 'reveal' | 'retain-position' = 'reveal',
 ): ReduceFindSessionResult<TTarget, TFocusOrigin> {
   if (state.status === 'closed') return { state, commands: [] };
-  const previousActiveMatch = state.matches.find((match) => match.id === state.activeMatchId);
   const nextState = reconcileOpenState(state, state.query, matches, state.activeMatchId);
-  const nextActiveMatch = nextState.matches.find((match) => match.id === nextState.activeMatchId);
   const activeMatchChanged = nextState.activeMatchId !== state.activeMatchId;
-  const activeTargetChanged = !sameFindTarget(previousActiveMatch?.target, nextActiveMatch?.target);
+  const previousActiveMatch = state.matches.find((match) => match.id === state.activeMatchId);
+  const nextActiveMatch = nextState.matches.find((match) => match.id === nextState.activeMatchId);
+  const revealRefreshedTarget = retainedTarget === 'reveal'
+    && !sameFindTarget(previousActiveMatch?.target, nextActiveMatch?.target);
   return {
     state: nextState,
     commands: nextState.activeMatchId === null
       ? [{ kind: 'clear-decorations' }]
-      : activeMatchChanged || activeTargetChanged
+      : activeMatchChanged || revealRefreshedTarget
         ? revealCommand(nextState)
         : [],
   };

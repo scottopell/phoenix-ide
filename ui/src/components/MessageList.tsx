@@ -1,3 +1,4 @@
+import { conversationProjectionSessionMatches } from './viewer-find/projectionSession';
 import { observeOwningAnchor, type ViewAnchorIntent, type ViewAnchorProbe, type ViewAnchorTerminal } from '../hooks/conversationViewAnchorProbe';
 import {
   memo,
@@ -18,7 +19,6 @@ import {
   activeSessionMatchIndex,
   buildConversationSearchProjection,
   createSurfaceKey,
-  projectionMatchesToSessionMatches,
   useFindSession,
   useViewerFindKeyboardShortcut,
   type ConversationFragmentRevealTarget,
@@ -543,15 +543,6 @@ function EmptyTranscriptState() {
   );
 }
 
-function stableConversationMatchId(match: {
-  sourceId: string;
-  start: number;
-  end: number;
-}): string {
-  return `${match.sourceId}:${match.start}:${match.end}`;
-}
-
-
 function OpenFindStreamingBuffer({ slug, onChange }: { slug: string; onChange: (buffer: import('../conversation/atom').StreamingBuffer | null) => void }) {
   const buffer = useStreamingBuffer(slug);
   useEffect(() => onChange(buffer), [buffer, onChange]);
@@ -738,18 +729,17 @@ function MessageListImpl({
     [allUnits, density, findLiveBashProgress, findOpen, findQuery, findStreamingBuffer, latestAgentKey, systemPrompt, systemPromptExpanded]
   );
   const findSessionMatches = useMemo(
-    () => projectionMatchesToSessionMatches(findProjection.matches, stableConversationMatchId),
-    [findProjection.matches],
+    () => conversationProjectionSessionMatches(findProjection, allUnits),
+    [findProjection, allUnits],
   );
   const activeFindIndex = findSession ? activeSessionMatchIndex(findSession.matches, findSession.activeMatchId) : -1;
+  const activeFindMatchId = findSession?.activeMatchId ?? null;
   const activeFindMatch = activeFindIndex >= 0 ? findSession?.matches[activeFindIndex]?.target ?? null : null;
   const activeFindMatchRef = useRef(activeFindMatch);
   activeFindMatchRef.current = activeFindMatch;
   const findSourcesRef = useRef(findProjection.sources);
   findSourcesRef.current = findProjection.sources;
-  const activeFindMatchKey = activeFindMatch
-    ? `${activeFindMatch.kind}:${activeFindMatch.sourceId}:${activeFindMatch.start}:${activeFindMatch.end}:${findRevealVersion}`
-    : null;
+  const handledFindRevealVersion = useRef(0);
   const activeFindRevealTarget = activeFindMatch?.kind === 'unit-text'
     ? findSourcesRef.current.find((candidate) => candidate.id === activeFindMatch.sourceId)?.revealTarget ?? null
     : null;
@@ -834,7 +824,7 @@ function MessageListImpl({
   }, [conversationId, sendFind]);
   useEffect(() => {
     if (!findOpen || findQuery.length === 0) return;
-    sendFind({ type: 'replace-results', matches: findSessionMatches });
+    sendFind({ type: 'refresh-results', matches: findSessionMatches });
   }, [findOpen, findQuery, findSessionMatches, sendFind]);
   const changeFindQuery = useCallback((query: string) => sendFind({ type: 'set-query', query }), [sendFind]);
   const nextFindMatch = useCallback(() => sendFind({ type: 'next' }), [sendFind]);
@@ -1809,21 +1799,31 @@ function MessageListImpl({
     clearFindRowMatches();
     const match = activeFindMatchRef.current;
     if (!match) return undefined;
+    const activeRow = match.kind === 'header-text' ? systemPromptRef.current : findRowByKey(match.unitKey);
+    activeRow?.classList.add('viewer-find-row-match', 'viewer-find-row-match--active');
+  }, [activeFindMatch, clearFindRowMatches, findRowByKey]);
+
+  useEffect(() => {
+    const match = activeFindMatchRef.current;
+    if (!match || handledFindRevealVersion.current === findRevealVersion) return undefined;
+    handledFindRevealVersion.current = findRevealVersion;
     dispatchScrollEvent({ type: 'navigationJumped' });
     if (match.kind === 'header-text') {
       setPendingRevealRequest(null);
       const timers = [0, 80, 220].map((delay) => window.setTimeout(() => {
         const header = systemPromptRef.current;
-        if (!header) return;
+        if (!header || activeFindMatchRef.current?.kind !== 'header-text') return;
         clearFindRowMatches();
         header.classList.add('viewer-find-row-match', 'viewer-find-row-match--active');
         header.scrollIntoView({ block: 'center' });
       }, delay));
       return () => timers.forEach(clearTimeout);
     }
-    const unitMatch = match;
-    if (!unitMatch.fragmentId) setPendingRevealRequest(null);
-    if (unitMatch.fragmentId) {
+    const requestFragmentReveal = (unitMatch: typeof match) => {
+      if (!unitMatch.fragmentId) {
+        setPendingRevealRequest(null);
+        return;
+      }
       const source = findSourcesRef.current.find((candidate) => candidate.id === unitMatch.sourceId);
       const revealTarget: ConversationFragmentRevealTarget = source?.revealTarget ?? { kind: 'agent-text', key: unitMatch.fragmentId };
       setPendingRevealRequest({
@@ -1832,9 +1832,13 @@ function MessageListImpl({
         revealTarget,
         nonce: Date.now(),
       });
-    }
-    transcriptRef.current?.scrollToIndex(unitMatch.unitIndex, 'start');
+    };
+    requestFragmentReveal(match);
+    transcriptRef.current?.scrollToIndex(match.unitIndex, 'start');
     const timers = [80, 220, 500].map((delay) => window.setTimeout(() => {
+      const unitMatch = activeFindMatchRef.current;
+      if (!unitMatch || unitMatch.kind !== 'unit-text') return;
+      requestFragmentReveal(unitMatch);
       const row = findRowByKey(unitMatch.unitKey);
       if (!row) return;
       clearFindRowMatches();
@@ -1843,11 +1847,16 @@ function MessageListImpl({
       if (unitMatch.fragmentId) {
         const source = findSourcesRef.current.find((candidate) => candidate.id === unitMatch.sourceId);
         const revealTarget = source?.revealTarget ?? { kind: 'agent-text' as const, key: unitMatch.fragmentId };
-        findConversationFragmentElement(row, unitMatch.fragmentId, revealTarget)?.scrollIntoView({ block: 'center' });
+        const fragment = findConversationFragmentElement(row, unitMatch.fragmentId, revealTarget);
+        const target = fragment?.querySelector('[data-viewer-find-active-target]') ?? fragment;
+        target?.scrollIntoView({ block: 'center' });
       }
     }, delay));
-    return () => timers.forEach(clearTimeout);
-  }, [activeFindMatchKey, clearFindRowMatches, dispatchScrollEvent, findRowByKey]);
+    return () => {
+      timers.forEach(clearTimeout);
+      setPendingRevealRequest(null);
+    };
+  }, [activeFindMatchId, findRevealVersion, clearFindRowMatches, dispatchScrollEvent, findRowByKey]);
 
   useEffect(() => {
     if (findOpen || activeScope !== findScopeId) return;
