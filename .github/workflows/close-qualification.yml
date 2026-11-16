@@ -73,6 +73,20 @@ jobs:
             explicit_retry_receipt_lookup_refuses_nonretry_and_conflicting_source_binding; do
             grep -F "close_foundation::tests::native_retry::$test: test" evidence/selected-tests.txt
           done
+          for test in \
+            migration_163_upgrades_populated_162_without_rebinding_g1_or_g2 \
+            migration_163_g1_failure_guards_preserve_g2_and_exact_pending_children \
+            migration_163_upgrade_preserves_installed_source_fence_behavior \
+            migration_163_unknown_installed_prefix_rolls_back_both_trigger_rewrites; do
+            grep -F "close_foundation::tests::native_retry::$test: test" evidence/selected-tests.txt
+          done
+      - name: Execute migration163 populated upgrade and authority regressions
+        if: success()
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p phoenix-db --lib close_foundation::tests::native_retry::migration_163_ -- --nocapture --test-threads=1 2>&1 | tee evidence/migration163.log
+          grep -E 'test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored;' evidence/migration163.log
       - name: Execute complete Close foundation module
         if: success()
         shell: bash

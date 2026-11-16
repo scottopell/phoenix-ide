@@ -5,6 +5,8 @@ use crate::native_close::{
 };
 use crate::workflow::LocalAuthorityResult;
 
+include!("migration163_tests.rs");
+
 fn opaque_resource(kind: RetiredResourceKind, value: &str) -> RetiredResourceIdentity {
     RetiredResourceIdentity::parse(
         kind,
