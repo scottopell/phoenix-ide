@@ -931,11 +931,15 @@ fn parse_product_creation_job_row(row: SqliteRow) -> Result<ProductCreationJobRe
 }
 
 impl Database {
+    /// # Panics
+    /// Panics if the test clock mutex is poisoned.
     #[cfg(any(test, feature = "test-support"))]
     pub fn test_set_product_creation_now(&self, now: DateTime<Utc>) {
         *self.product_creation_test_now.lock().unwrap() = Some(now);
     }
 
+    /// # Panics
+    /// Panics if the test clock mutex is poisoned.
     #[cfg(any(test, feature = "test-support"))]
     #[must_use]
     pub fn test_product_creation_now(&self) -> Option<DateTime<Utc>> {
