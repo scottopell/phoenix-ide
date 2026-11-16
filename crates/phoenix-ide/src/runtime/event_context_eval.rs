@@ -396,6 +396,14 @@ fn user(text: impl Into<String>) -> LlmMessage {
     }
 }
 
+fn message_snapshot(messages: &[LlmMessage]) -> Vec<Value> {
+    messages.iter().map(|message| json!({
+        "source_message_id":message.source_message_id,
+        "role":match message.role {MessageRole::User=>"user", MessageRole::Assistant=>"assistant"},
+        "content":message.content,
+    })).collect()
+}
+
 #[derive(Default)]
 struct Budget {
     calls: usize,
@@ -428,10 +436,10 @@ async fn trial(
         )),
         user(&case.question),
     ];
-    let mut record = json!({"case":case.id,"group":case.group,"variant":["A","B","C"][variant],
+    let mut record = json!({"case":case.id,"group":case.group,"variant":(["A","B","C"][variant]),
         "repetition":repetition,"model":model,"effort":effort,"system_prompt":prompt,"system_sha256":digest(prompt.as_bytes()),
         "tool_definitions":definitions,"tools_sha256":digest(serde_json::to_vec(&definitions).unwrap()),
-        "initial_messages":messages,"source":world.source,"steps":[],"termination":"prepared"});
+        "initial_messages":message_snapshot(&messages),"source":world.source,"steps":[],"termination":"prepared"});
     persist(path, &record);
     let Some(client) = client else { return };
     let began = Instant::now();
@@ -459,7 +467,7 @@ async fn trial(
             cache_key: PromptCacheKey::stable(format!("ember-event-eval-{}-{variant}", case.id)),
         };
         let request_bytes = serde_json::to_vec(
-            &json!({"system":prompt,"messages":request.messages,"tools":definitions}),
+            &json!({"system":prompt,"messages":message_snapshot(&request.messages),"tools":definitions}),
         )
         .unwrap()
         .len();
@@ -650,14 +658,7 @@ async fn ember_event_eval() {
     let output = Path::new(&output);
     std::fs::create_dir(output)
         .expect("new output directory with existing parent; never overwrite evidence");
-    let config = if mode == "live" {
-        LlmConfig::from_env(Arc::new(PhoenixRuntimeEnvironment::detect()))
-    } else {
-        LlmConfig {
-            openai_api_key: Some("offline-not-dispatched".into()),
-            ..LlmConfig::default()
-        }
-    };
+    let config = LlmConfig::from_env(Arc::new(PhoenixRuntimeEnvironment::detect()));
     let endpoint_hash = digest(
         serde_json::to_vec(&json!({"anthropic":config.anthropic_base_url,
         "responses":config.openai_responses_base_url,"chat":config.openai_chat_completions_base_url,
@@ -665,19 +666,14 @@ async fn ember_event_eval() {
         .unwrap(),
     );
     let models = Arc::new(ModelRegistry::new(&config));
-    let client = if mode == "live" {
-        assert!(
-            models.supports_effort(&model, effort),
-            "configured model must support exact effort"
-        );
-        Some(
-            models
-                .get(&model)
-                .expect("explicit model unavailable; no fallback"),
-        )
-    } else {
-        None
-    };
+    assert!(
+        models.supports_effort(&model, effort),
+        "configured model must support exact effort"
+    );
+    let configured_client = models
+        .get(&model)
+        .expect("explicit model unavailable; no fallback");
+    let client = (mode == "live").then_some(configured_client);
     let corpus: Corpus = serde_json::from_str(CASES).unwrap();
     let mut manifest = json!({"mode":mode,"model":model,"effort":effort,
         "connection":models.connection_for_model(&model),"endpoint_configuration_sha256":endpoint_hash,
