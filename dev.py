@@ -3397,11 +3397,22 @@ def cmd_qa_ember_event_eval() -> None:
     """Run the bounded event comparison with real local tools on synthetic data."""
     env = _resolved_phoenix_env()
     env.setdefault("CARGO_BUILD_JOBS", "2")
-    subprocess.run(
-        ["cargo", "test", "-p", "phoenix_ide",
-         "runtime::event_context_eval::ember_event_eval", "--", "--ignored", "--exact", "--nocapture"],
-        cwd=ROOT, env=env, check=True,
-    )
+    test_name = "runtime::event_context_eval::ember_event_eval"
+    prebuilt = env.get("PHOENIX_EVENT_EVAL_TEST_BINARY")
+    if prebuilt:
+        binary = Path(prebuilt)
+        if not binary.is_absolute() or not binary.is_file() or not os.access(binary, os.X_OK):
+            raise SystemExit("event evaluation requires an absolute executable test binary")
+        listing = subprocess.run([str(binary), "--list"], cwd=ROOT, env=env,
+                                 check=True, capture_output=True, text=True)
+        if test_name + ": test" not in listing.stdout.splitlines():
+            raise SystemExit("selected test binary does not contain the event evaluation")
+        env["PHOENIX_EVENT_EVAL_BINARY_SHA256"] = hashlib.sha256(binary.read_bytes()).hexdigest()
+        command = [str(binary), test_name, "--ignored", "--exact", "--nocapture"]
+    else:
+        command = ["cargo", "test", "-p", "phoenix_ide", "--lib", test_name,
+                   "--", "--ignored", "--exact", "--nocapture"]
+    subprocess.run(command, cwd=ROOT, env=env, check=True)
 
 
 def cmd_qa_grounding_panel() -> None:
