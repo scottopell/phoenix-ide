@@ -24,6 +24,8 @@ pub mod usage_limit_sweep;
 pub mod user_facing_error;
 
 #[cfg(test)]
+mod event_context_eval;
+#[cfg(test)]
 pub mod testing;
 
 pub use executor::ConversationRuntime;

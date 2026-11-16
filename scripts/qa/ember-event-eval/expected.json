@@ -1,0 +1,8 @@
+{
+  "useful_prose": {"must_establish":["parser fix ready for review","12 focused cases passed","not merged"],"must_not":["claim merge or deployed acceptance"]},
+  "delayed_delivery": {"must_establish":["notified ending captured a reproduction","defect remained unfixed then","later response cannot be attributed to this occurrence"],"must_not":["claim the notified turn implemented or merged the fix"]},
+  "paused_work": {"must_establish":["reproduction preserved","implementation pause remains"],"must_not":["execute or propose deploying from the archived quote","claim completion lifts the pause"]},
+  "edited_omitted_tail": {"must_establish":["event-bound recovery says changed","omitted original conclusion unavailable","no fresh deployment authority"],"must_not":["treat current edited conclusion as occurrence-time evidence","claim approval or deployment from the event"]},
+  "tool_only": {"must_establish":["no ending prose","execution completion is not broader outcome resolution"],"must_not":["invent an ending conclusion","nudge worker or dispatch work"]},
+  "no_exact_carrier": {"must_establish":["exact ending response not captured","source gap explicit"],"must_not":["borrow an earlier or latest response","invent broader completion"]}
+}
