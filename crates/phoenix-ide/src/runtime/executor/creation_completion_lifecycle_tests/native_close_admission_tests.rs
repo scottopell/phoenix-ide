@@ -234,6 +234,30 @@ fn initial_request(
 }
 
 #[tokio::test]
+async fn native_retry_backend_requires_actor_database_authority_not_matching_path() {
+    let fixture = CloseFixture::new().await;
+    let mut harness = fixture.runtime(true);
+    let cloned_backend = fixture.db.clone();
+    let unrelated_backend = Database::open_in_memory().await.unwrap();
+
+    assert_eq!(
+        harness.runtime.check_native_close_retry_backend(&cloned_backend),
+        Ok(())
+    );
+    assert_eq!(
+        harness.runtime.check_native_close_retry_backend(&unrelated_backend),
+        Err(NativeCloseApplicationError::SourceRefused)
+    );
+    harness.runtime.native_task_admission_db = None;
+    assert_eq!(
+        harness.runtime.check_native_close_retry_backend(&cloned_backend),
+        Err(NativeCloseApplicationError::SourceRefused)
+    );
+    assert_eq!(count(&fixture.db, "close_runs").await, 0);
+    assert_eq!(count(&unrelated_backend, "close_runs").await, 0);
+}
+
+#[tokio::test]
 async fn stopped_live_source_refuses_exact_initial_replay_before_database_lookup() {
     let fixture = CloseFixture::new().await;
     let receipt = fixture.admitted().await;

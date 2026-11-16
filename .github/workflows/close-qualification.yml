@@ -174,6 +174,7 @@ jobs:
         run: |
           set -euo pipefail
           for test in \
+            database_authority_identity_is_stable_across_clones_only \
             close_attempt_retires_its_captured_active_user_owner_scope \
             completed_close_attempt_cannot_authorize_scope_retirement \
             close_attempt_cannot_authorize_uncaptured_scope_retirement \
@@ -196,6 +197,7 @@ jobs:
           set -euo pipefail
           cargo test -p phoenix_ide --lib -- --list 2>&1 | tee evidence/runtime-inventory.log
           grep -E 'native_close_application::tests::.*: test$|native_close_admission_tests::.*: test$' evidence/runtime-inventory.log > evidence/runtime-selected-tests.txt
+          grep -F 'native_close_admission_tests::native_retry_backend_requires_actor_database_authority_not_matching_path: test' evidence/runtime-selected-tests.txt
           test -s evidence/runtime-selected-tests.txt
           grep -F 'stopped_live_source_refuses_exact_observe_replay_before_database_lookup: test' evidence/runtime-selected-tests.txt
           cargo test -p phoenix_ide --lib native_close_application::tests:: -- --nocapture --test-threads=1 2>&1 | tee evidence/native-close-runtime-matcher.log

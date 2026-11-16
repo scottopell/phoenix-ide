@@ -1748,6 +1748,7 @@ impl SteeringCapacityTestControl {
 }
 
 pub struct Database {
+    authority_identity: std::sync::Arc<()>,
     pool: SqlitePool,
     slack_gateway_wakeup: std::sync::Arc<tokio::sync::Notify>,
     goal_version_committed:
@@ -1782,6 +1783,7 @@ pub struct Database {
 impl Clone for Database {
     fn clone(&self) -> Self {
         Self {
+            authority_identity: self.authority_identity.clone(),
             pool: self.pool.clone(),
             slack_gateway_wakeup: self.slack_gateway_wakeup.clone(),
             goal_version_committed: self.goal_version_committed.clone(),
@@ -1950,6 +1952,16 @@ const PROMPT_TAIL_AFTER_SQL: &str =
      ORDER BY sequence_id ASC";
 
 impl Database {
+    /// Returns whether these handles share the same database authority identity.
+    ///
+    /// A clone shares its original handle's identity. Separately constructed
+    /// handles have distinct identities even when they point to the same path;
+    /// path equality does not establish shared authority.
+    #[must_use]
+    pub fn shares_authority_with(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.authority_identity, &other.authority_identity)
+    }
+
     /// Access the underlying connection pool (for migrations and testing).
     #[must_use]
     pub fn pool(&self) -> &SqlitePool {
@@ -2048,6 +2060,7 @@ impl Database {
         sqlite_workload_collector: SqliteWorkloadCollector,
     ) -> Self {
         Self {
+            authority_identity: std::sync::Arc::new(()),
             pool,
             slack_gateway_wakeup: std::sync::Arc::new(tokio::sync::Notify::new()),
             goal_version_committed: tokio::sync::broadcast::channel(128).0,
@@ -17221,6 +17234,18 @@ mod tests {
                 .sum::<u64>(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn database_authority_identity_is_stable_across_clones_only() {
+        let original = Database::open_in_memory().await.unwrap();
+        let clone = original.clone();
+        let separate = Database::open_in_memory().await.unwrap();
+
+        assert_eq!(original.path, "");
+        assert_eq!(separate.path, "");
+        assert!(original.shares_authority_with(&clone));
+        assert!(!original.shares_authority_with(&separate));
     }
 
     #[tokio::test]

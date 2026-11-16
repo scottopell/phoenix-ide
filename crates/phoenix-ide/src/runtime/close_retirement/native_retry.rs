@@ -156,10 +156,10 @@ impl super::RuntimeManager {
             .scopes
             .iter()
             .find(|s| s.scope == effect.scope)
-            .ok_or_else(|| NativeRetryExecutionError::Unclassified)?;
+            .ok_or(NativeRetryExecutionError::Unclassified)?;
         let legacy = captured.captured_worktree.as_ref().and_then(|wt| match wt {
             super::CapturedWorktreeIdentity::Resolved(wt) => Some(super::worktree_path(wt)),
-            _ => None,
+            super::CapturedWorktreeIdentity::Unresolved { .. } => None,
         });
         let discovery = self
             .tmux_registry()
@@ -305,6 +305,8 @@ impl super::RuntimeManager {
         .await
     }
 
+    // Keep original-plan binding, source fencing, and destructive callbacks in order.
+    #[allow(clippy::too_many_lines)]
     async fn native_retry_worktree(
         &self,
         command: &NativeCloseCommand,
@@ -322,7 +324,7 @@ impl super::RuntimeManager {
             .scopes
             .iter()
             .find(|s| s.scope == effect.scope)
-            .ok_or_else(|| NativeRetryExecutionError::Unclassified)?;
+            .ok_or(NativeRetryExecutionError::Unclassified)?;
         let identity = match scope.captured_worktree.as_ref() {
             Some(super::CapturedWorktreeIdentity::Resolved(identity)) => identity.clone(),
             _ => {
@@ -342,13 +344,13 @@ impl super::RuntimeManager {
             .iter()
             .find(|(target, _)| target.scope == effect.scope)
             .map(|(_, snapshot)| snapshot.clone())
-            .ok_or_else(|| NativeRetryExecutionError::Unclassified)?;
+            .ok_or(NativeRetryExecutionError::Unclassified)?;
         let root = super::worktree_path(&identity);
         let quarantine = super::worktree_quarantine_path(&identity)
             .map_err(|_| NativeRetryExecutionError::Unclassified)?;
         // A retained plan owns the administrative incarnation and final tombstone.
         // Never rediscover and replace it from a later filesystem generation.
-        let plan = match self
+        let plan = if let Some(plan) = self
             .db()
             .close_worktree_cleanup_plan(
                 &admitted.attempt_id,
@@ -359,46 +361,44 @@ impl super::RuntimeManager {
             .await
             .map_err(|_| NativeRetryExecutionError::Unclassified)?
         {
-            Some(plan) => plan,
-            None => {
-                let inspection_path = if root
-                    .try_exists()
-                    .map_err(|_| NativeRetryExecutionError::Unclassified)?
-                {
-                    &root
-                } else {
-                    &quarantine
-                };
-                let common = super::exact_worktree_common_git_dir(inspection_path)?;
-                let administrative_dir =
-                    super::exact_worktree_administrative_dir(inspection_path, &common)?;
-                let administrative_dir_incarnation =
-                    super::observe_administrative_dir_incarnation(&administrative_dir)?;
-                self.native_retry_metadata(
-                    command,
-                    admitted,
-                    self.db()
-                        .record_native_close_retry_worktree_cleanup_plan(
-                            command,
-                            admitted,
-                            RecordCloseWorktreeCleanupPlanRequest {
-                                attempt_id: admitted.attempt_id.clone(),
-                                scope: effect.scope.clone(),
-                                snapshot: context.snapshot.clone(),
-                                resource: effect.resource.clone(),
-                                administrative_dir: administrative_dir.clone(),
-                                administrative_dir_incarnation: administrative_dir_incarnation
-                                    .clone(),
-                            },
-                        )
-                        .await,
-                )
-                .await?;
-                crate::db::CloseWorktreeCleanupPlan {
-                    administrative_dir,
-                    administrative_dir_incarnation,
-                    final_tombstone: None,
-                }
+            plan
+        } else {
+            let inspection_path = if root
+                .try_exists()
+                .map_err(|_| NativeRetryExecutionError::Unclassified)?
+            {
+                &root
+            } else {
+                &quarantine
+            };
+            let common = super::exact_worktree_common_git_dir(inspection_path)?;
+            let administrative_dir =
+                super::exact_worktree_administrative_dir(inspection_path, &common)?;
+            let administrative_dir_incarnation =
+                super::observe_administrative_dir_incarnation(&administrative_dir)?;
+            self.native_retry_metadata(
+                command,
+                admitted,
+                self.db()
+                    .record_native_close_retry_worktree_cleanup_plan(
+                        command,
+                        admitted,
+                        RecordCloseWorktreeCleanupPlanRequest {
+                            attempt_id: admitted.attempt_id.clone(),
+                            scope: effect.scope.clone(),
+                            snapshot: context.snapshot.clone(),
+                            resource: effect.resource.clone(),
+                            administrative_dir: administrative_dir.clone(),
+                            administrative_dir_incarnation: administrative_dir_incarnation
+                                .clone(),
+                        },
+                    )
+                    .await,
+            )?;
+            crate::db::CloseWorktreeCleanupPlan {
+                administrative_dir,
+                administrative_dir_incarnation,
+                final_tombstone: None,
             }
         };
         match self
@@ -549,12 +549,8 @@ impl super::RuntimeManager {
                 super::ExactWorktreeRemoval::StopFailed { detail }
                 | super::ExactWorktreeRemoval::Residual { detail }
                 | super::ExactWorktreeRemoval::ReinspectionRequired { detail },
-            ) => {
-                return self
-                    .native_retry_failure(command, admitted, context, effect, &detail)
-                    .await
-            }
-            Err(detail) => {
+            )
+            | Err(detail) => {
                 return self
                     .native_retry_failure(command, admitted, context, effect, &detail)
                     .await
@@ -573,7 +569,7 @@ impl super::RuntimeManager {
         }
     }
 
-    async fn native_retry_metadata(
+    fn native_retry_metadata(
         &self,
         _command: &NativeCloseCommand,
         _admitted: &NativeCloseRunRef,

@@ -45,9 +45,27 @@ where
     L: LlmClient + 'static,
     T: ToolExecutor + 'static,
 {
+    /// Bind backend work to the actor's installed database handle, not a path or
+    /// independently opened pool. Cloned handles preserve this authority identity.
+    pub(super) fn check_native_close_retry_backend(
+        &self,
+        backend_db: &phoenix_db::Database,
+    ) -> Result<(), NativeCloseApplicationError> {
+        if self
+            .native_task_admission_db
+            .as_ref()
+            .is_some_and(|actor_db| actor_db.shares_authority_with(backend_db))
+        {
+            Ok(())
+        } else {
+            Err(NativeCloseApplicationError::SourceRefused)
+        }
+    }
+
     /// Runs the retry solely in the acknowledged source actor; gate ownership
     /// transferred with the request is retained through durable classification.
-    #[allow(clippy::too_many_arguments)]
+    // Keep receipt lookup, admission, execution and settlement ownership together.
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     pub(super) async fn execute_native_close_retry(
         &mut self,
         source: SourceToolCall,
@@ -68,6 +86,7 @@ where
         {
             return Err(NativeCloseApplicationError::SourceRefused);
         }
+        self.check_native_close_retry_backend(backend.db())?;
         let command = retry_command_from_executing_source(
             &self.state,
             &self.context.conversation_id,
@@ -78,8 +97,8 @@ where
         )
         .map_err(|_| NativeCloseApplicationError::SourceRefused)?;
 
-        // The retained receipt is resolved before any live retry assessment. Use
-        // the backend's database for every boundary so tests cannot split authority.
+        // The retained receipt is resolved before any live retry assessment. The
+        // backend is already bound to this actor's database authority above.
         if let Some(admitted_run) = backend
             .db()
             .read_native_close_explicit_retry_receipt(&command)
