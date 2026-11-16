@@ -14,7 +14,7 @@ const out = path.resolve(process.env.REVIEW_READING_QA_OUT ?? 'qa-artifacts/revi
 await mkdir(out, { recursive: true });
 const report = {
   idleAudit,
-  idleConditions: idleAudit ? 'Long image-free production viewer; ordinary/global, touch-enabled 390px and desktop 1440px; three 2400ms no-input windows after settle; Chromium is not physical iOS.' : null,
+  idleConditions: idleAudit ? 'Long image-free production viewer; ordinary/global, touch-enabled 390px and desktop 1440px; four 2400ms no-input windows after settle; Chromium is not physical iOS.' : null,
   baseline, base, cases: [], mismatches: [], errors: [], controls: [],
   limitations: [
     'HashRouter transports the product path/search/hash inside the hosted Ladle URL; not production-path cold reload acceptance.',
@@ -67,7 +67,8 @@ async function settle(page) {
     function tick() {
       const el = document.querySelector('#messages');
       const rect = el?.getBoundingClientRect();
-      const value = JSON.stringify([el?.scrollTop, el?.scrollHeight, rect?.width, rect?.height]);
+      const viewer = document.querySelector('.viewer-content');
+      const value = JSON.stringify([el?.scrollTop, el?.scrollHeight, rect?.width, rect?.height, viewer?.scrollTop, viewer?.scrollHeight, viewer?.clientHeight, visualViewport?.offsetTop, visualViewport?.height]);
       stable = value === last ? stable + 1 : 0; last = value;
       if (++frames >= 20 && stable >= 8) resolve();
       else if (frames > 180) reject(new Error('Transcript geometry did not settle'));
@@ -178,13 +179,14 @@ async function traceIdle(page, result, stage) {
     const commandStart = window.reviewIdleCommands?.length ?? 0;
     try {
       while (performance.now() - started < 2400) {
+        const liveAnchor = anchor.isConnected ? anchor : [...content.querySelectorAll('p')].find(p => p.textContent === anchor.textContent);
         const nodes = new Set([document.scrollingElement, document.querySelector('#messages'), root, content]);
         for (let parent = content.parentElement; parent; parent = parent.parentElement) nodes.add(parent);
         samples.push({
           time: performance.now() - started,
           focus: identify(document.activeElement),
           viewerConnected: root.isConnected, contentConnected: content.isConnected, anchorConnected: anchor.isConnected,
-          anchor: { text: anchor.textContent, top: anchor.getBoundingClientRect().top, height: anchor.getBoundingClientRect().height },
+          anchor: { text: liveAnchor?.textContent, top: liveAnchor?.getBoundingClientRect().top, height: liveAnchor?.getBoundingClientRect().height, node: identify(liveAnchor)?.node },
           viewport: { x: scrollX, y: scrollY, width: innerWidth, height: innerHeight, visualTop: visualViewport?.offsetTop, visualHeight: visualViewport?.height },
           scrollers: [...nodes].filter(Boolean).map(node => ({ ...identify(node), top: node.scrollTop, left: node.scrollLeft, scrollHeight: node.scrollHeight, clientHeight: node.clientHeight, rectTop: node.getBoundingClientRect().top, rectHeight: node.getBoundingClientRect().height, overflow: getComputedStyle(node).overflowY })),
         });
@@ -198,7 +200,7 @@ async function traceIdle(page, result, stage) {
   const trace = result.idle[stage];
   const first = trace.samples[0];
   for (const sample of trace.samples) {
-    if (Math.abs(sample.anchor.top - first.anchor.top) > 2 || !sample.anchorConnected || !sample.contentConnected || !sample.viewerConnected) mismatch(result.id, stage, 'idle visible viewer text moved/remounted', first, sample);
+    if (sample.anchor.top === undefined || Math.abs(sample.anchor.top - first.anchor.top) > 2 || !sample.contentConnected || !sample.viewerConnected) mismatch(result.id, stage, 'idle visible viewer text moved/missing', first, sample);
     if (JSON.stringify(sample.focus) !== JSON.stringify(first.focus)) mismatch(result.id, stage, 'idle focus changed', first.focus, sample.focus);
     if (JSON.stringify(sample.viewport) !== JSON.stringify(first.viewport)) mismatch(result.id, stage, 'idle document/visual viewport moved', first.viewport, sample.viewport);
     if (JSON.stringify(sample.scrollers) !== JSON.stringify(first.scrollers)) mismatch(result.id, stage, 'idle scroller/ancestor geometry changed', first.scrollers, sample.scrollers);
@@ -340,6 +342,12 @@ try {
           await settle(page);
           await traceIdle(page, result, 'saved-note-idle');
           await page.screenshot({ animations: 'disabled', path: path.join(out, `${id}-saved-idle.png`) });
+          const noteAnchor = viewer.locator('.notes-panel-note-anchor').first();
+          if (!await noteAnchor.isVisible()) await viewer.getByRole('button', { name: '1 notes', exact: true }).click();
+          await noteAnchor.click();
+          await settle(page);
+          await traceIdle(page, result, 'note-navigation-expiry-idle');
+          await page.screenshot({ animations: 'disabled', path: path.join(out, `${id}-note-navigation-idle.png`) });
         }
         if (exit === 'send') {
           await viewer.getByRole('button', { name: 'Send notes', exact: true }).click();
