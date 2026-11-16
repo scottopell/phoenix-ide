@@ -17,7 +17,7 @@ fn assert_engine_too_big(result: Result<sqlx::sqlite::SqliteRow, sqlx::Error>) {
     assert_eq!(
         error
             .as_database_error()
-            .and_then(|error| error.code())
+            .and_then(sqlx::error::DatabaseError::code)
             .as_deref(),
         Some("18"),
         "expected SQLite SQLITE_TOOBIG, got {error}"
@@ -71,7 +71,9 @@ async fn scanner_utf8_engine_length_guard_never_materializes_excluded_or_oversiz
         .fetch_one(&mut connection)
         .await
         .unwrap();
-        if kind != "utf8" {
+        if kind == "utf8" {
+            assert!(size < i64::from(ENGINE_LIMIT));
+        } else {
             assert!(size > i64::try_from(PAYLOAD_BYTES).unwrap());
             assert_engine_too_big(
                 sqlx::query("SELECT content FROM messages WHERE message_id='sized-source'")
@@ -79,8 +81,6 @@ async fn scanner_utf8_engine_length_guard_never_materializes_excluded_or_oversiz
                     .await,
             );
             assert_engine_too_big(sqlx::query("SELECT length(CAST(content AS BLOB)) FROM messages WHERE message_id='sized-source'").fetch_one(&mut connection).await);
-        } else {
-            assert!(size < i64::from(ENGINE_LIMIT));
         }
         let mut tx = connection.begin_with("BEGIN IMMEDIATE").await.unwrap();
         let mut allowance = source::SourceReadAllowance::new();
