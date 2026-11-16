@@ -397,6 +397,49 @@ const wideMarkdownTableMessages: Message[] = [
 ];
 
 
+const delayedImageMessages: Message[] = [
+  {
+    event_presentation: null,
+    message_id: 'delayed-image-older',
+    conversation_id: 'fixture-message-list-delayed-image-scroll',
+    sequence_id: 1,
+    type: 'agent',
+    message_type: 'agent',
+    created_at: '2025-01-01T10:00:00.000Z',
+    content: [{ type: 'text', text: `Earlier image row: this conversation history is intentionally ahead of the reading anchor.\n\n![Earlier delayed screenshot](https://message-list-fixture.invalid/delayed-image.svg?id=earlier)\n\n${'Earlier context paragraph. '.repeat(32)}` }],
+    display_data: {},
+  },
+  {
+    event_presentation: null,
+    message_id: 'delayed-image-anchor',
+    conversation_id: 'fixture-message-list-delayed-image-scroll',
+    sequence_id: 2,
+    type: 'agent',
+    message_type: 'agent',
+    created_at: '2025-01-01T10:01:00.000Z',
+    content: [{ type: 'text', text: [
+      'Reading position setup: this is the same full MessageList render path used by conversations.',
+      '',
+      '![Delayed screenshot](https://message-list-fixture.invalid/delayed-image.svg?id=anchor)',
+      '',
+      'Keep this exact sentence visible while the image is pending and after its bytes load.',
+      '',
+      ...Array.from({ length: 24 }, (_, index) => `Anchor detail ${String(index + 1).padStart(2, '0')}: delayed image layout changes must not silently discard this reading position.`),
+    ].join('\n') }],
+    display_data: {},
+  },
+  {
+    event_presentation: null,
+    message_id: 'delayed-image-tail',
+    conversation_id: 'fixture-message-list-delayed-image-scroll',
+    sequence_id: 3,
+    type: 'user',
+    message_type: 'user',
+    created_at: '2025-01-01T10:02:00.000Z',
+    content: { text: 'Tail checkpoint: use this to test follow-latest and intentional navigation.' },
+    display_data: {},
+  },
+];
 const continuityParagraphs = Array.from({ length: 28 }, (_, index) => (
   `Continuity marker ${String(index + 1).padStart(2, '0')}: this is deterministic tall-row text used to keep a precise reading position visible while earlier history is inserted.`
 ));
@@ -452,6 +495,12 @@ export const prefixContinuityEarlierMessages: Message[] = Array.from({ length: 1
 } as Message));
 
 export const messageListScenarios = [
+  {
+    id: 'delayed-image-scroll',
+    title: 'Settled reading through delayed images',
+    description: 'Cold images above and within the reading row; responses controlled by browser QA.',
+    theme: 'dark',
+  },
   {
     id: 'compact-latest-expanded',
     title: 'Compact latest expanded',
@@ -537,7 +586,9 @@ export function messageListFixtureData(scenario: MessageListScenario): MessageLi
           ? scrollPolicyMessages
           : scenario.id === 'prefix-continuity-offset-bug'
             ? prefixContinuityMessages
-            : baseMessages;
+            : scenario.id === 'delayed-image-scroll'
+              ? delayedImageMessages
+              : baseMessages;
   return {
     conversationId: `fixture-message-list-${scenario.id}`,
     slug: `fixture-message-list-${scenario.id}`,

@@ -37,3 +37,6 @@ WideMarkdownTableLight.storyName = 'wide-markdown-table-light';
 
 export const MarkdownImageDark = storyFor('markdown-image-dark');
 MarkdownImageDark.storyName = 'markdown-image-dark';
+
+export const DelayedImageScroll = storyFor('delayed-image-scroll');
+DelayedImageScroll.storyName = 'delayed-image-scroll';

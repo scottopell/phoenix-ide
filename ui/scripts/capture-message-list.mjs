@@ -1,4 +1,5 @@
 import { runSurfaceCapture } from './capture-ladle-surface.mjs';
+import { captureDelayedImages, prepareDelayedImages } from './message-list-delayed-image.mjs';
 import { writeFile } from 'node:fs/promises';
 import path from 'node:path';
 
@@ -432,8 +433,10 @@ runSurfaceCapture({
   readyAttribute: 'data-message-list-fixture-ready',
   outDir: process.env.MESSAGE_LIST_QA_OUT ?? 'qa-artifacts/message-list',
   viewport: { width, height },
+  preparePage: prepareDelayedImages,
   captureStory: async (context) => (
-    await verifyWideTable(context)
+    await captureDelayedImages(context)
+      || await verifyWideTable(context)
       || await captureCompactChronology(context)
       || await verifyNarrowMarkdownTable(context)
       || await captureContinuityReproduction(context)

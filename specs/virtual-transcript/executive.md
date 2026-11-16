@@ -22,6 +22,14 @@ Virtual Transcript is the platform-neutral contract and Phoenix-owned web implem
 
 Successful finish execution calls `completePosition` before parent notification, transferring matching command ownership to a settled geometric anchor scoped by the history-view key. `interruptPosition` handles accepted user takeover and detach even without a native scroll event; replacement/view changes retire settled ownership. The real reducer/executor parent fixture covers applied → idle authority removal → late header mounting, distinct from constant-authority component cases. Command finish and position counts remain exact-once. Post-settlement controls cover scroll, takeover without scroll, cancellation, replacement, stale completion, and same-conversation view reset. ADR-120 records the capability/geometry lifetime distinction. Actual corrected-artifact qualification is not established by these source tests.
 
+## Settled reader content witness — candidate
+
+The candidate `VirtualTranscript` implementation adds `ContentWitness`, with acquisition in `acquireContentWitness`, eligibility in `witnessEligible`, and mounted identity checks in `witnessLocalOffset`. Acquisition uses a bounded text-block search in the top visible row and retains a pre-change viewport offset. `applyAnchor` combines the surviving block's row-local offset with the authoritative unit position in one compensation target. Missing or replaced witnesses fall back to unit anchoring. `scheduleWitness` gates reacquisition after interaction using the existing scroll-settle and stale-touch bounds; it is not a positioning-success timer.
+
+This is an ephemeral refinement inside the existing physical authority, not a new owner or height model. Media retains natural sizing. Preservation is limited to surviving visible text-block starts, not arbitrary glyph reflow or content-level history restoration. ADR-266 records the decision.
+
+Focused component and fixture tests pass (91 tests). A disposable full-MessageList Chromium fixture with held HTTP image responses retained the same visible paragraph within 0.5px across four fresh reader runs; earlier-row growth, simultaneous earlier/current-row growth, and follow-latest controls passed. The durable equivalent runs through `capture-message-list.mjs` with `CAPTURE_STORIES=delayed-image-scroll`; hosted validation is pending. A matched three-run 4x-CPU sample observed four layouts for both baseline and candidate across two loads, no recurring idle observer/layout work, and additional script work in the candidate; this is bounded scenario evidence, not universal performance clearance. Physical Safari acceptance remains unverified, and Playwright WebKit coverage is not a substitute for it.
+
 ## Verification matrix
 
 | Requirement | Verification |
@@ -31,4 +39,5 @@ Successful finish execution calls `completePosition` before parent notification,
 | REQ-VT-006–007 | `ui/src/conversation/transcriptPositioning.test.ts` reducer tests for target resolution, missing-target evidence, position-issued revision gating, physical observation, replacement/null/view/interruption/detach supersession, terminal identity scoping, and exact-once finish |
 | REQ-VT-008–010 | MessageList scroll-policy tests and dynamic measurement browser scenarios |
 | REQ-VT-011 | Root JSON Schema/corpus validation and `ui/src/fixtures/virtualTranscript/scenarios.ts` adapter tests |
-| REQ-VT-012 | Playwright Chromium, WebKit, and Firefox conformance runs |
+| REQ-VT-012 | Browser conformance scenarios target Chromium, WebKit, and Firefox; candidate runs and physical Safari acceptance remain unverified |
+| REQ-VT-014 | Passing `VirtualTranscript.test.tsx` witness regressions for combined row/local displacement, invalid-witness fallback, lifecycle retirement, and stale-touch reacquisition; delayed-image browser regression in the existing MessageList capture runner |

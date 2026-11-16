@@ -156,3 +156,18 @@ WHILE the scroll port holds keyboard focus
 THE SYSTEM SHALL render a visible focus indicator within the port's own bounds, so that clipping ancestors cannot hide it.
 
 THE SYSTEM SHALL NOT move focus to the scroll port on conversation entry, which would take focus from the message composer.
+
+### REQ-VT-014: Settled Reader Content Witness
+
+WHILE the web reader is passively settled, with no active gesture, pending positioning, command or settled directional ownership, or tail-follow execution
+THE SYSTEM SHALL attempt bounded acquisition of an ephemeral text-block witness in the physically top visible render unit, selecting only a nonempty, positive-height text block whose start lies inside the viewport.
+
+WHEN a subsequent measured layout change moves that same connected text block within the same mounted unit
+THE SYSTEM SHALL preserve its captured viewport-start offset within the web continuity tolerance and native scroll bounds
+AND SHALL combine the unit-position change and the block's row-local displacement into one target in the existing physical anchor compensation path, not issue an independent content correction.
+
+The witness SHALL be captured before the change it compensates and SHALL remain local to the mounted view. If no eligible block is found within the bounded search, or the witnessed block or unit is removed or replaced, ordinary unit-anchor reconciliation SHALL remain the fallback. The system SHALL NOT reconstruct a pre-change content location from post-change geometry.
+
+User gesture or scrolling, navigation authority, tail positioning, view change, and executor detach SHALL retire the witness. Reacquisition SHALL wait for passive settled eligibility and SHALL respect the bounded stale-touch and platform live-touch semantics of REQ-VT-004; a lost touch-end event SHALL NOT indefinitely prevent reacquisition. An elapsed settle delay permits capture, not proof of positioning success.
+
+Content SHALL retain natural sizing rather than require fixed media boxes to satisfy this behavior. This contract preserves a surviving text-block start, not arbitrary glyph positions through reflow, replaced text identity, or content-level history restoration. It introduces neither another viewport owner nor another measured-height model.
