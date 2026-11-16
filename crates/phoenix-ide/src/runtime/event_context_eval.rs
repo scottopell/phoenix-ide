@@ -96,6 +96,7 @@ struct World {
     runtime: Arc<RuntimeManager>,
     coordinator: String,
     registry: ToolRegistry,
+    catalog: Option<phoenix_skills::AuthenticatedCoordinatorSkillCatalog>,
     packets: [String; 3],
     source: Value,
 }
@@ -296,13 +297,14 @@ impl World {
         let catalog =
             phoenix_skills::AuthenticatedCoordinatorSkillCatalog::discover(Some(skills.path()));
         let registry = runtime
-            .coordinator_tool_registry(&coordinator, catalog)
+            .coordinator_tool_registry(&coordinator, catalog.clone())
             .await
             .unwrap();
         Self {
             runtime,
             coordinator,
             registry,
+            catalog,
             packets: [
                 raw.clone(),
                 format!("{raw}\n{}", evidence.readable(&event.event_id)),
@@ -407,7 +409,7 @@ async fn trial(
 ) {
     let prompt = crate::system_prompt::build_coordinator_system_prompt(
         LlmLanguage::default(),
-        None,
+        world.catalog.as_ref(),
         &phoenix_core::domain::coordinator_authority::CoordinatorAuthority::default(),
     );
     let definitions = world.definitions(model);
