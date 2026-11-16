@@ -90,6 +90,31 @@ catalog/language, binary, tool definitions and assembled system prompt. It
 creates consistent SQLite snapshots using `VACUUM INTO` before admitting the
 mock prompt probe; the live seed has neither probe input nor its in-flight claim.
 
+For a guidance correction, preserve the failed semantic journey instead of
+reselecting a random hidden item. Run `prepare` with
+`PHOENIX_FOREGROUND_QA_PREPARED` pointing to the original approved manifest and
+`PHOENIX_FOREGROUND_QA_APPROVED_SHA256` set to its original digest. This verifies
+the original route/limits and every closed seed hash, copies each seed only into
+a fresh probe database, and executes an actual admitted mock probe with the new
+binary/registry. Original seed paths/hashes, source identities, prefixes, target,
+prompt and expected outcomes remain unchanged. Only assembled system/tool
+metadata and new probe evidence are refreshed. Original seeds are inspected
+through an immutable read-only connection and rehashed; neither probe may enter
+a live seed.
+
+The same-runtime session waits at an actual serialized settlement boundary after
+visible Idle or QuestionWait: acknowledged `SteeringQueueChanged` must return
+`SteeringWake(NothingToDrain)` without changing state, transcript or model-request
+count. In `executor.rs`, the main receive-loop branch awaits
+`process_acknowledged_event`, which awaits `process_event` and its generated-event
+drain before replying. The barrier is queued after the prior visible response,
+so it cannot run until that prior executor work returns. Idle additionally
+requires the exact authoritative turn to be Terminal before another synthetic
+claim. A structured QuestionWait correctly retains Accepted; the exact turn ID
+is carried through the real reply and checked once Idle. This is test
+synchronization using an existing protocol, not a new production wake policy,
+state overwrite, sleep or retry.
+
 Independent review must approve the exact `manifest.json` digest before live:
 
 ```sh

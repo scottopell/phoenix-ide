@@ -36,10 +36,29 @@ struct TurnTrace {
     state: ConvState,
 }
 
+trait ObservedRequests: Send + Sync {
+    fn request_count(&self) -> usize;
+}
+impl ObservedRequests for MockLlmClient {
+    fn request_count(&self) -> usize {
+        self.recorded_requests().len()
+    }
+}
+impl ObservedRequests for ForegroundClient {
+    fn request_count(&self) -> usize {
+        self.trace.lock().unwrap()["requests"]
+            .as_array()
+            .unwrap()
+            .len()
+    }
+}
+
 struct Session {
     source: String,
     manager: Arc<crate::runtime::RuntimeManager>,
     db: crate::db::Database,
+    requests: Arc<dyn ObservedRequests>,
+    active_turn_id: Option<u64>,
     handle: crate::runtime::ConversationHandle,
     task: tokio::task::JoinHandle<crate::runtime::executor::RuntimeExitDisposition>,
 }
@@ -49,7 +68,7 @@ impl Drop for Session {
     }
 }
 impl Session {
-    async fn start<C: LlmClient + 'static>(
+    async fn start<C: LlmClient + ObservedRequests + 'static>(
         fixture: &Fixture<C>,
         source: &str,
         catalog: Option<phoenix_skills::AuthenticatedCoordinatorSkillCatalog>,
@@ -131,6 +150,8 @@ impl Session {
             source: source.into(),
             manager: fixture.manager.clone(),
             db: fixture.db.clone(),
+            requests: fixture.client.clone(),
+            active_turn_id: None,
             handle,
             task: tokio::spawn(runtime.run()),
         }
@@ -154,8 +175,13 @@ impl Session {
     }
     async fn input_inner(&mut self, prompt: &str) -> TurnTrace {
         assert!(matches!(*self.handle.state_rx.borrow(), ConvState::Idle));
+        assert!(
+            self.active_turn_id.is_none(),
+            "previous accepted turn is not terminal"
+        );
         let input_id = uuid::Uuid::new_v4().to_string();
         let (event, turn_id) = admitted_input(&self.db, &self.source, prompt, &input_id).await;
+        self.active_turn_id = Some(turn_id.0);
         let (acknowledgement, acknowledged) = tokio::sync::oneshot::channel();
         let (retired, retirement) = tokio::sync::oneshot::channel();
         self.handle
@@ -235,6 +261,58 @@ impl Session {
         }).await.expect("actual question answer was not persisted");
         self.wait_visible(&id, None, request_id).await
     }
+    async fn settled_boundary(&mut self, state: &ConvState) {
+        let before = prefix(&self.db, &self.source).await;
+        let requests = self.requests.request_count();
+        let (acknowledgement, acknowledged) = tokio::sync::oneshot::channel();
+        let (retired, retirement) = tokio::sync::oneshot::channel();
+        self.handle
+            .acknowledged_event_tx
+            .send(crate::runtime::AcknowledgedEventRequest {
+                event: Event::SteeringQueueChanged,
+                acknowledgement,
+                retirement,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            acknowledged.await.unwrap().unwrap(),
+            crate::runtime::AcknowledgedEventOutcome::SteeringWake(
+                crate::runtime::SteeringWakeOutcome::NothingToDrain
+            )
+        );
+        drop(retired);
+        assert_eq!(*self.handle.state_rx.borrow(), *state);
+        assert_eq!(
+            self.db.get_conversation(&self.source).await.unwrap().state,
+            *state
+        );
+        assert_eq!(prefix(&self.db, &self.source).await, before);
+        assert_eq!(self.requests.request_count(), requests);
+        if let Some(id) = self.active_turn_id {
+            let turn = self
+                .db
+                .workflow_repository()
+                .load_authoritative_turn(phoenix_workflow::TurnAuthorityId(id))
+                .await
+                .unwrap()
+                .unwrap();
+            match state {
+                ConvState::Idle => {
+                    assert!(matches!(
+                        turn.lifecycle,
+                        phoenix_workflow::TurnLifecycle::Terminal { .. }
+                    ));
+                    self.active_turn_id = None;
+                }
+                ConvState::AwaitingUserResponse { .. } => assert!(matches!(
+                    turn.lifecycle,
+                    phoenix_workflow::TurnLifecycle::Accepted { .. }
+                )),
+                _ => panic!("not a settled foreground boundary"),
+            }
+        }
+    }
     async fn wait_visible(
         &mut self,
         input_id: &str,
@@ -293,6 +371,7 @@ impl Session {
                             }
                         }
                         if !prose.is_empty() {
+                            self.settled_boundary(&state).await;
                             return TurnTrace {
                                 source: self.source.clone(),
                                 input_message_id: input_id.into(),
@@ -784,6 +863,119 @@ async fn prepare_case(
     json!({"id":id,"home":home,"seed_db":seed_path,"seed_db_sha256":digest(std::fs::read(&seed_path).unwrap()),"source":current,"original_source":source,"all_sources":sources,"seed_prefix":seed_prefix,"seed_turn":seeded,"target_id":target,"target_detail":detail,"other_recent_id":recently_reviewed_other,"prompt":prompt,"expected":expected,"system_debug":format!("{:?}",request.system),"system_debug_sha256":digest(format!("{:?}",request.system)),"tool_definitions":request.tool_availability.declarations(),"tool_definitions_sha256":digest(serde_json::to_vec(request.tool_availability.declarations()).unwrap()),"probe_input_not_in_seed":probe_turn.input_message_id})
 }
 
+#[allow(clippy::too_many_lines)]
+async fn reprepare_case(
+    root: &Path,
+    original: &Value,
+    registry: Arc<ModelRegistry>,
+    config: &phoenix_llm::LlmConfig,
+) -> Value {
+    let seed = Path::new(original["seed_db"].as_str().unwrap());
+    assert_eq!(
+        digest(std::fs::read(seed).unwrap()),
+        original["seed_db_sha256"]
+    );
+    let probe_home = root.join(original["id"].as_str().unwrap());
+    std::fs::create_dir(&probe_home).unwrap();
+    let probe_path = probe_home.join("probe.sqlite");
+    std::fs::copy(seed, &probe_path).unwrap();
+    let db = crate::db::Database::open(probe_path.to_str().unwrap())
+        .await
+        .unwrap();
+    let source = original["source"].as_str().unwrap();
+    assert!(matches!(
+        db.get_conversation(source).await.unwrap().state,
+        ConvState::Idle
+    ));
+    for (member, expected) in original["seed_prefix"].as_object().unwrap() {
+        assert_eq!(prefix(&db, member).await, *expected.as_array().unwrap());
+    }
+    assert!(!db
+        .message_exists(original["probe_input_not_in_seed"].as_str().unwrap())
+        .await
+        .unwrap());
+    let target = original["target_id"].as_str().unwrap();
+    assert_eq!(
+        json!(db
+            .read_coordinator_tracking(source, target, 0)
+            .await
+            .unwrap()),
+        original["target_detail"]
+    );
+    let home = Path::new(original["home"].as_str().unwrap());
+    let mock = Arc::new(MockLlmClient::new(MODEL));
+    let fixture = fixture(
+        db.clone(),
+        registry,
+        mock.clone(),
+        home,
+        config.credential_helper.clone(),
+    )
+    .await;
+    mock.queue_response(terminal("Preparation only."));
+    let mut session = Session::start(&fixture, source, Some(catalog(home))).await;
+    let probe = session.input(original["prompt"].as_str().unwrap()).await;
+    let observed = observation(&db, source).await;
+    if original["id"] == "post-review-quiet" {
+        assert_eq!(observed.requested_item_due_for_review.unwrap().id, target);
+    } else {
+        assert!(observed.requested_item_due_for_review.is_none());
+        assert!(!observed
+            .captured_registry
+            .items
+            .iter()
+            .any(|item| item.id == target));
+        assert_eq!(observed.captured_registry.omitted_count, 2);
+    }
+    session.close().await;
+    let requests = mock.recorded_requests();
+    assert_eq!(requests.len(), 1);
+    let request = &requests[0];
+    if original["id"] == "contextual-hidden" {
+        let text = request_text(request);
+        assert!(
+            !text.contains(target)
+                && !text.contains(original["target_detail"]["item"]["title"].as_str().unwrap())
+        );
+    }
+    let mut case = original.clone();
+    case["system_debug"] = json!(format!("{:?}", request.system));
+    case["system_debug_sha256"] = json!(digest(format!("{:?}", request.system)));
+    case["tool_definitions"] = json!(request.tool_availability.declarations());
+    case["tool_definitions_sha256"] = json!(digest(
+        serde_json::to_vec(request.tool_availability.declarations()).unwrap()
+    ));
+    case["reprepare_probe"] = json!(probe);
+    let seed_db = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(
+            sqlx::sqlite::SqliteConnectOptions::new()
+                .filename(seed)
+                .read_only(true)
+                .immutable(true),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM messages WHERE message_id=?1")
+            .bind(
+                case["reprepare_probe"]["input_message_id"]
+                    .as_str()
+                    .unwrap()
+            )
+            .fetch_one(&seed_db)
+            .await
+            .unwrap(),
+        0
+    );
+    seed_db.close().await;
+    assert_eq!(
+        digest(std::fs::read(seed).unwrap()),
+        original["seed_db_sha256"]
+    );
+    case
+}
+
 fn turn_calls(turn: &TurnTrace) -> Vec<&Value> {
     turn.assistant_messages
         .iter()
@@ -846,6 +1038,12 @@ async fn run_case(
         .message_exists(case["probe_input_not_in_seed"].as_str().unwrap())
         .await
         .unwrap());
+    if let Some(probe) = case.get("reprepare_probe") {
+        assert!(!db
+            .message_exists(probe["input_message_id"].as_str().unwrap())
+            .await
+            .unwrap());
+    }
     for (member, expected) in case["seed_prefix"].as_object().unwrap() {
         assert_eq!(prefix(&db, member).await, *expected.as_array().unwrap());
     }
@@ -1084,10 +1282,42 @@ async fn foreground_memory_qualification() {
         .expect("retained test executable digest");
     let mut manifest = json!({"mode":mode,"model":MODEL,"actual_outbound_model":outbound,"effort":"high","connection":registry.connection_for_model(MODEL),"endpoint_configuration_sha256":endpoints,"language":"phoenix-native","authenticated_catalog":true,"binary_sha256":binary,"limits":{"provider_requests_per_journey":MAX_REQUESTS,"request_debug_bytes_per_journey":MAX_BYTES,"requested_output_tokens":MAX_OUTPUT,"accepted_reported_output_tokens_max":MAX_OUTPUT,"accepted_content_bytes_max":16384,"request_timeout_seconds":60,"turn_timeout_seconds":120,"tool_cycles_per_turn":8,"retries":0,"skips":0},"status":"prepared","cases":[]});
     if mode == "prepare" {
-        for id in ["post-review-quiet", "contextual-hidden"] {
-            let case = prepare_case(&output, id, registry.clone(), &config).await;
-            manifest["cases"].as_array_mut().unwrap().push(case);
-            save_json(&output.join("manifest.json"), &manifest);
+        if let Ok(path) = std::env::var("PHOENIX_FOREGROUND_QA_PREPARED") {
+            let bytes = std::fs::read(path).unwrap();
+            assert_eq!(
+                digest(&bytes),
+                std::env::var("PHOENIX_FOREGROUND_QA_APPROVED_SHA256")
+                    .expect("approved original manifest digest")
+            );
+            let original: Value = serde_json::from_slice(&bytes).unwrap();
+            for key in [
+                "model",
+                "actual_outbound_model",
+                "effort",
+                "connection",
+                "endpoint_configuration_sha256",
+                "language",
+                "authenticated_catalog",
+                "limits",
+            ] {
+                assert_eq!(manifest[key], original[key], "original {key} changed");
+            }
+            let cases = original["cases"].as_array().unwrap();
+            assert_eq!(cases.len(), 2);
+            assert_eq!(cases[0]["id"], "post-review-quiet");
+            assert_eq!(cases[1]["id"], "contextual-hidden");
+            manifest["reprepared_from_manifest_sha256"] = json!(digest(bytes));
+            for case in cases {
+                let case = reprepare_case(&output, case, registry.clone(), &config).await;
+                manifest["cases"].as_array_mut().unwrap().push(case);
+                save_json(&output.join("manifest.json"), &manifest);
+            }
+        } else {
+            for id in ["post-review-quiet", "contextual-hidden"] {
+                let case = prepare_case(&output, id, registry.clone(), &config).await;
+                manifest["cases"].as_array_mut().unwrap().push(case);
+                save_json(&output.join("manifest.json"), &manifest);
+            }
         }
     } else {
         let approved = PathBuf::from(

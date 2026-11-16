@@ -101,3 +101,15 @@ ranker, model, wakeup or lifecycle is introduced. The same fixtures/oracles and
 budgets require a new prepared manifest, independent approval and full model run
 before the correction can be claimed effective. Scanner lifecycle/composition,
 final inventory and deployment remain separate gates.
+
+
+A source-only harness repair followed the guidance change. An intermediate
+`dd9be14f7` build compiled, but its deterministic fixture failed with SQLite code
+517 (`database is locked`) in the existing authoritative claim helper after the
+actual structured pause CAS succeeded. That attempt made no model calls and is
+unqualified. The fixture adds an existing same-runtime queue acknowledgement as
+a settlement boundary and checks exact turn lifecycle before the next claim;
+it does not sleep, retry or overwrite state. Repreparation also binds the
+original approved manifest and closed seeds, preserving Harbor and both original
+journeys while capturing the corrected actual assembled instructions. These
+harness repairs require deterministic validation before another approved trial.
