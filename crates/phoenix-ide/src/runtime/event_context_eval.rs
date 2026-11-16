@@ -41,7 +41,7 @@ use std::{
 const CASES: &str = include_str!("../../../../scripts/qa/ember-event-eval/cases.json");
 const EXPECTED: &str = include_str!("../../../../scripts/qa/ember-event-eval/expected.json");
 const MAX_CALLS: usize = 4;
-const MAX_TOTAL_CALLS: usize = 72;
+const MAX_TOTAL_CALLS: usize = 120;
 const INPUT_STOP: u64 = 2_000_000;
 
 #[derive(Deserialize)]
@@ -401,6 +401,7 @@ async fn trial(
     world: &World,
     case: &Case,
     variant: usize,
+    repetition: usize,
     model: &str,
     effort: ModelEffort,
     client: Option<&dyn LlmService>,
@@ -422,7 +423,7 @@ async fn trial(
         user(&case.question),
     ];
     let mut record = json!({"case":case.id,"group":case.group,"variant":["A","B","C"][variant],
-        "model":model,"effort":effort,"system_prompt":prompt,"system_sha256":digest(prompt.as_bytes()),
+        "repetition":repetition,"model":model,"effort":effort,"system_prompt":prompt,"system_sha256":digest(prompt.as_bytes()),
         "tool_definitions":definitions,"tools_sha256":digest(serde_json::to_vec(&definitions).unwrap()),
         "initial_messages":messages,"source":world.source,"steps":[],"termination":"prepared"});
     persist(path, &record);
@@ -579,6 +580,19 @@ async fn event_eval_fixture_uses_captured_evidence_and_real_read_tools() {
     for case in &corpus.cases {
         let world = World::new(case, models.clone()).await;
         let event_id = world.source["event_id"].as_str().unwrap();
+        for name in [
+            "think",
+            "query_database",
+            "read_conversation",
+            "read_event_evidence",
+            "search_conversations",
+            "resolve_reference",
+        ] {
+            assert!(
+                world.registry.find_tool(name).is_some(),
+                "allowed tool {name} must be installed"
+            );
+        }
         let (_, error, denied) = world
             .dispatch(
                 "query_database",
@@ -665,32 +679,39 @@ async fn ember_event_eval() {
             "timeout_seconds":60,"observed_input_token_stop_threshold":INPUT_STOP},
         "promotion":{"attribution_or_authority_failures":0,"targeted_read_reduction_min_percent":25,
             "control_input_regression_max_percent":10,"control_median_latency_regression_max_percent":20},
+        "repetitions":{"targeted":1,"control":3},
         "status":"running","trials":[]});
     persist(&output.join("manifest.json"), &manifest);
     let mut budget = Budget::default();
     for (case_index, case) in corpus.cases.iter().enumerate() {
         let world = World::new(case, models.clone()).await;
-        for offset in 0..3 {
-            let variant = (case_index + offset) % 3;
-            let filename = format!("{}-{}.json", case.id, ["A", "B", "C"][variant]);
-            trial(
-                &world,
-                case,
-                variant,
-                &model,
-                effort,
-                client.as_deref(),
-                &output.join(&filename),
-                &mut budget,
-            )
-            .await;
-            manifest["trials"]
-                .as_array_mut()
-                .unwrap()
-                .push(json!(filename));
-            manifest["provider_calls"] = json!(budget.calls);
-            manifest["observed_input_tokens_including_cache"] = json!(budget.observed_input_tokens);
-            persist(&output.join("manifest.json"), &manifest);
+        let repetitions = if case.group == "control" { 3 } else { 1 };
+        for repetition in 1..=repetitions {
+            for offset in 0..3 {
+                let variant = (case_index + repetition - 1 + offset) % 3;
+                let filename =
+                    format!("{}-{}-{repetition}.json", case.id, ["A", "B", "C"][variant]);
+                trial(
+                    &world,
+                    case,
+                    variant,
+                    repetition,
+                    &model,
+                    effort,
+                    client.as_deref(),
+                    &output.join(&filename),
+                    &mut budget,
+                )
+                .await;
+                manifest["trials"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(json!(filename));
+                manifest["provider_calls"] = json!(budget.calls);
+                manifest["observed_input_tokens_including_cache"] =
+                    json!(budget.observed_input_tokens);
+                persist(&output.join("manifest.json"), &manifest);
+            }
         }
     }
     manifest["status"] = json!("recorded_not_qualified");
