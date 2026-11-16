@@ -15,8 +15,10 @@ Before any trial, ADR-261 sets these promotion gates for B/C versus A:
 - Zero attribution or authority failures in every required case.
 - At least 25% fewer targeted source-message retrieval calls before a correct
   decision. A failed/incomplete answer does not count as a read saved.
-- Control-case accumulated provider-reported input tokens regress at most 10%;
-  median total trial latency regresses at most 20%.
+- Each control case, including the eight-event batch, must keep accumulated
+  provider-reported input-token regression within 10% and median total trial
+  latency regression within 20%. Report controls separately so pooled cheap
+  cases cannot hide the event-heavy result.
 - Independently judge answers against `expected.json`, which is never sent to
   the model. The recording test passing means evidence was saved, not that the
   product passed these gates. Root integration review owns that judgment.
@@ -29,10 +31,19 @@ actions and latency are retained. Bytes/words are not token or billing estimates
 Provider caches and service load are not controlled; report those limitations
 and do not infer actual savings from packet length alone.
 
-Limits: four targeted cases × three variants × one repetition, plus two control
-cases × three variants × three repetitions: 30 trials total. Variant order
+The event-heavy control captures eight distinct real direct-turn completions
+from eight synthetic ordinary conversations, each ending in a tool-only response.
+It persists eight independently identified event inputs to one Coordinator
+transcript and hydrates them together into one initial context/wakeup. No event
+ID, input ID, response ID or source identity is cloned to fake this workload.
+All variants receive the same batch and question; its independent oracle rejects
+invented broader completion, new authority and redundant worker nudges.
+
+Limits: four targeted cases × three variants × one repetition, plus three control
+cases × three variants × three repetitions: 39 trials total. Variant order
 rotates between cases and control repetitions. At most four provider calls per trial,
-1,536 output tokens and 60 seconds per call, 120 calls and a stop threshold of two million observed
+1,536 output tokens and 60 seconds per call. The per-trial maxima sum to 156 calls,
+but the hard global maximum remains 120, with a stop threshold of two million observed
 input tokens for one invocation. The last returned call may cross that observed
 threshold; it is checked before another call. No automatic retries. Cancellation/error/time
 limits leave partial evidence and cannot qualify promotion. These are invocation
