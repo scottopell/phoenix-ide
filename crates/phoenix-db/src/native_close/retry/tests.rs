@@ -5,6 +5,14 @@ use crate::native_close::{
 };
 use crate::workflow::LocalAuthorityResult;
 
+fn opaque_resource(kind: RetiredResourceKind, value: &str) -> RetiredResourceIdentity {
+    RetiredResourceIdentity::parse(
+        kind,
+        LossItemIdentity::Opaque(OpaqueIdentity::parse(value).unwrap()),
+    )
+    .unwrap()
+}
+
 #[derive(Clone)]
 struct Assessment {
     command: NativeCloseCommand,

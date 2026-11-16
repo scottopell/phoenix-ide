@@ -80,7 +80,7 @@ pub(super) async fn read_receipt_tx(
             } => {
                 &referenced.attempt_id == attempt_id
                     && failed_run_ordinal.checked_next().ok() == Some(referenced.run_ordinal)
-            },
+            }
         };
         if source_transcript != command.source_transcript_id()
             || message != command.source().message_id

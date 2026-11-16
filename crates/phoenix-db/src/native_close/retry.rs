@@ -1,6 +1,8 @@
 //! Explicit native retry admission. No runtime or tool owns this dormant entry point yet.
 
-use phoenix_core::domain::close::{CloseRunRef, CloseRunStatus, RetiredResourceKind, RetirementOutcome};
+use phoenix_core::domain::close::{
+    CloseRunRef, CloseRunStatus, RetiredResourceKind, RetirementOutcome,
+};
 use sha2::{Digest, Sha256};
 use sqlx::{Sqlite, Transaction};
 
@@ -66,7 +68,12 @@ impl Database {
         assessment: &impl NativeCloseRetrySourceAssessment,
     ) -> DbResult<NativeCloseRetryResult> {
         super::receipts::require_source_and_target_tx(tx, command).await?;
-        let NativeCloseIntent::ExplicitRetry { target: product, attempt_id, failed_run_ordinal } = command.intent() else {
+        let NativeCloseIntent::ExplicitRetry {
+            target: product,
+            attempt_id,
+            failed_run_ordinal,
+        } = command.intent()
+        else {
             return Err(refused("explicit retry requires its exact intent"));
         };
         if let Some(admitted) = super::receipts::read_receipt_tx(tx, command).await? {
@@ -75,10 +82,15 @@ impl Database {
                 admitted,
             }));
         }
-        let failed_run = CloseRunRef { attempt_id: attempt_id.clone(), ordinal: *failed_run_ordinal };
+        let failed_run = CloseRunRef {
+            attempt_id: attempt_id.clone(),
+            ordinal: *failed_run_ordinal,
+        };
         let proof = Self::read_stopped_close_original_retirement_proof_tx(tx, &failed_run).await?;
         if &proof != assessment.original_proof() {
-            return Err(refused("original retirement proof changed after assessment"));
+            return Err(refused(
+                "original retirement proof changed after assessment",
+            ));
         }
         let eligible: bool = sqlx::query_scalar(
             "SELECT EXISTS (SELECT 1 FROM close_obligations
@@ -91,21 +103,30 @@ impl Database {
         .fetch_one(&mut **tx)
         .await?;
         if !eligible || proof.run.status != CloseRunStatus::Stopped {
-            return Err(refused("retry requires the exact latest stopped incomplete Close"));
+            return Err(refused(
+                "retry requires the exact latest stopped incomplete Close",
+            ));
         }
         let request = assessment.request();
         if request.failed_run != failed_run || request.requested_by != CloseRetryRequestedBy::User {
-            return Err(refused("native explicit retry requires its exact user-requested predecessor"));
+            return Err(refused(
+                "native explicit retry requires its exact user-requested predecessor",
+            ));
         }
         let now = chrono::Utc::now().timestamp_micros();
-        if request.observed_at_us < 0 || request.observed_at_us > now
+        if request.observed_at_us < 0
+            || request.observed_at_us > now
             || request.precondition_resolution.trim().is_empty()
             || request.safety_evidence.trim().is_empty()
         {
-            return Err(refused("native retry requires fresh read-only precondition and safety evidence"));
+            return Err(refused(
+                "native retry requires fresh read-only precondition and safety evidence",
+            ));
         }
         if request.remaining_effects.is_empty() {
-            return Err(refused("native completion-only retry requires a separate completion proof"));
+            return Err(refused(
+                "native completion-only retry requires a separate completion proof",
+            ));
         }
         let pending = original_pending_effects_tx(tx, &proof).await?;
         validate_plan(&pending, &request.remaining_effects)?;
@@ -113,7 +134,11 @@ impl Database {
             .ordinal
             .checked_next()
             .map_err(|error| refused(&error.to_string()))?;
-        let effects: Vec<_> = request.remaining_effects.iter().map(|effect| (&effect.scope, &effect.resource)).collect();
+        let effects: Vec<_> = request
+            .remaining_effects
+            .iter()
+            .map(|effect| (&effect.scope, &effect.resource))
+            .collect();
         let plan_bytes = serde_json::to_vec(&(
             command.fingerprint(),
             &failed_run,
@@ -124,7 +149,14 @@ impl Database {
             effects,
         ))
         .map_err(|error| DbError::Serialization(error.to_string()))?;
-        let plan_fingerprint = format!("native-close-retry-plan-v1:{:x}", Sha256::digest(plan_bytes));
+        let plan_fingerprint = Sha256::digest(plan_bytes).iter().fold(
+            String::from("native-close-retry-plan-v1:"),
+            |mut encoded, byte| {
+                use std::fmt::Write as _;
+                write!(encoded, "{byte:02x}").expect("writing to String cannot fail");
+                encoded
+            },
+        );
 
         sqlx::query("UPDATE close_obligations SET native_managed = 1 WHERE attempt_id = ?1")
             .bind(failed_run.attempt_id.as_str())
@@ -147,7 +179,10 @@ impl Database {
         .bind(i64::try_from(request.remaining_effects.len()).map_err(|_| refused("retry plan is too large"))?)
         .execute(&mut **tx)
         .await?;
-        let run = CloseRunRef { attempt_id: failed_run.attempt_id.clone(), ordinal: next_ordinal };
+        let run = CloseRunRef {
+            attempt_id: failed_run.attempt_id.clone(),
+            ordinal: next_ordinal,
+        };
         Self::insert_close_retry_plan_and_run_tx(tx, request, &run, now).await?;
         let admitted = NativeCloseRunRef {
             target: product.clone(),
@@ -168,12 +203,18 @@ async fn original_pending_effects_tx(
 ) -> DbResult<Vec<CloseSafeRetryEffect>> {
     let mut pending = Vec::new();
     for expected in &proof.resources {
-        let receipt = proof.outcomes.iter().find(|receipt| {
-            receipt.attempt_id == expected.attempt_id
-                && receipt.scope == expected.scope
-                && receipt.snapshot == expected.snapshot
-                && receipt.resource == expected.resource
-        }).ok_or_else(|| refused("original resource is missing its original-generation receipt"))?;
+        let receipt = proof
+            .outcomes
+            .iter()
+            .find(|receipt| {
+                receipt.attempt_id == expected.attempt_id
+                    && receipt.scope == expected.scope
+                    && receipt.snapshot == expected.snapshot
+                    && receipt.resource == expected.resource
+            })
+            .ok_or_else(|| {
+                refused("original resource is missing its original-generation receipt")
+            })?;
         if !matches!(receipt.outcome, RetirementOutcome::Residual { .. }) {
             continue;
         }
@@ -217,23 +258,39 @@ async fn original_pending_effects_tx(
     Ok(pending)
 }
 
-fn validate_plan(pending: &[CloseSafeRetryEffect], effects: &[CloseSafeRetryEffect]) -> DbResult<()> {
+fn validate_plan(
+    pending: &[CloseSafeRetryEffect],
+    effects: &[CloseSafeRetryEffect],
+) -> DbResult<()> {
     if pending.is_empty() || effects.len() != pending.len() {
-        return Err(refused("native retry requires a nonempty complete original residual plan"));
+        return Err(refused(
+            "native retry requires a nonempty complete original residual plan",
+        ));
     }
     for (index, effect) in effects.iter().enumerate() {
         if !pending.contains(effect) || effects[..index].contains(effect) {
-            return Err(refused("retry effect is duplicate or not an exact original residual identity"));
+            return Err(refused(
+                "retry effect is duplicate or not an exact original residual identity",
+            ));
         }
-        if !matches!(effect.resource.kind(), RetiredResourceKind::Worktree | RetiredResourceKind::WorkScope | RetiredResourceKind::TmuxServer) {
-            return Err(refused("native retry cannot replay process-local resources"));
+        if !matches!(
+            effect.resource.kind(),
+            RetiredResourceKind::Worktree
+                | RetiredResourceKind::WorkScope
+                | RetiredResourceKind::TmuxServer
+        ) {
+            return Err(refused(
+                "native retry cannot replay process-local resources",
+            ));
         }
         if effect.resource.kind() == RetiredResourceKind::WorkScope
-            && effects[index + 1..].iter().any(|later| later.scope == effect.scope && later.resource.kind() != RetiredResourceKind::WorkScope)
+            && effects[index + 1..].iter().any(|later| {
+                later.scope == effect.scope
+                    && later.resource.kind() != RetiredResourceKind::WorkScope
+            })
         {
             return Err(refused("work scope retry must follow its resource effects"));
         }
     }
     Ok(())
 }
-
