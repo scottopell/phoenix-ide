@@ -933,6 +933,42 @@ class CheckPlanTests(unittest.TestCase):
         self.assertIn("check-devpy:", workflow)
         self.assertEqual(2, workflow.count("check-e2e, check-devpy, check-ui"))
 
+    def test_expensive_workflow_jobs_wait_for_early_source_checks(self):
+        workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text()
+        early_job = workflow.split("  check-worker-budget:\n", 1)[1].split(
+            "  plan_check:\n", 1
+        )[0]
+        self.assertIn("cargo fmt --all -- --check", early_job)
+        self.assertIn("python scripts/check_migration_ledger.py", early_job)
+        self.assertIn("-p test_check_plan.py", early_job)
+        self.assertIn("-p test_check_migration_ledger.py", early_job)
+
+        for job in (
+            "check-rust-build",
+            "check-rust-musl",
+            "check-clippy",
+            "check-e2e",
+            "check-devpy",
+            "check-ui",
+            "check-finalization-geometry",
+            "check-fast",
+        ):
+            with self.subTest(job=job):
+                job_body = workflow.split(f"  {job}:\n", 1)[1][:500]
+                self.assertIn(
+                    "needs: [plan_check, check-worker-budget]",
+                    job_body,
+                )
+
+        self.assertEqual(
+            2,
+            workflow.count(
+                "needs: [check-worker-budget, plan_check, check-rust, "
+                "check-clippy, check-e2e, check-devpy, check-ui, "
+                "check-finalization-geometry, check-fast]"
+            ),
+        )
+
     def test_devpy_ci_job_installs_ast_grep_before_running_tests(self):
         workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text()
         devpy_job = workflow.split("  check-devpy:\n", 1)[1].split("  check-ui:\n", 1)[0]
