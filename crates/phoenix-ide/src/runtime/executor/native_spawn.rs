@@ -12,6 +12,11 @@ use std::sync::Arc;
 use tokio::sync::oneshot;
 
 pub(super) enum NativeSpawnPhase {
+    Submission {
+        send: std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>>,
+        response: oneshot::Receiver<SubAgentAdmissionReceipt>,
+        activation: oneshot::Sender<()>,
+    },
     Admission {
         response: oneshot::Receiver<SubAgentAdmissionReceipt>,
         activation: oneshot::Sender<()>,
@@ -55,15 +60,41 @@ impl NativeSpawnHandoff {
     }
 
     pub(super) async fn observe(&mut self) -> NativeSpawnObservation {
-        match &mut self.phase {
-            NativeSpawnPhase::Admission { response, .. } => {
-                NativeSpawnObservation::Admission(response.await)
-            }
-            NativeSpawnPhase::Closing
-            | NativeSpawnPhase::Admitted { .. }
-            | NativeSpawnPhase::Adopting { .. }
-            | NativeSpawnPhase::ActivationOwnerLost => {
-                NativeSpawnObservation::Closure((&mut self.closure).await)
+        loop {
+            match &mut self.phase {
+                NativeSpawnPhase::Submission { send, .. } => {
+                    let submitted = send.await;
+                    let phase = std::mem::replace(&mut self.phase, NativeSpawnPhase::Closing);
+                    let NativeSpawnPhase::Submission {
+                        response,
+                        activation,
+                        ..
+                    } = phase
+                    else {
+                        unreachable!("submission phase remains exclusively borrowed");
+                    };
+                    if let Err(error) = submitted {
+                        self.control
+                            .publish(NativeSpawnTerminalEvidence::NotAdmitted);
+                        return NativeSpawnObservation::Admission(Ok(SubAgentAdmissionReceipt {
+                            invocation: self.invocation.clone(),
+                            outcome: SubAgentAdmissionResponse::Rejected(error),
+                        }));
+                    }
+                    self.phase = NativeSpawnPhase::Admission {
+                        response,
+                        activation,
+                    };
+                }
+                NativeSpawnPhase::Admission { response, .. } => {
+                    return NativeSpawnObservation::Admission(response.await);
+                }
+                NativeSpawnPhase::Closing
+                | NativeSpawnPhase::Admitted { .. }
+                | NativeSpawnPhase::Adopting { .. }
+                | NativeSpawnPhase::ActivationOwnerLost => {
+                    return NativeSpawnObservation::Closure((&mut self.closure).await);
+                }
             }
         }
     }
@@ -490,7 +521,7 @@ where
         &mut self,
         tool: ToolCall,
     ) -> Result<Option<Event>, String> {
-        let event = self.start_spawn_agents_tool(tool).await?;
+        let event = self.start_spawn_agents_tool(tool)?;
         if event.is_some() {
             return Ok(event);
         }

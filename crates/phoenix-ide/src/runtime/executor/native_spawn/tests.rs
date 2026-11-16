@@ -85,11 +85,7 @@ async fn pending_native_spawn() -> (Arc<RuntimeManager>, TestRuntime, SubAgentSp
     )
     .with_spawn_channels(spawn_tx, cancel_tx)
     .with_fatal_local_authority_fence(Arc::clone(&manager.fatal_local_authority_fence));
-    assert!(runtime
-        .start_spawn_agents_tool(call)
-        .await
-        .unwrap()
-        .is_none());
+    assert!(runtime.start_spawn_agents_tool(call).unwrap().is_none());
     let request = spawn_rx
         .try_recv()
         .expect("native admission request was submitted");
@@ -111,15 +107,15 @@ async fn issue_native_spawn(
     manager: &Arc<RuntimeManager>,
     request: SubAgentSpawnRequest,
 ) -> tokio::task::JoinHandle<()> {
-    let mut issued = request.control.subscribe_issue_attempt();
+    let mut admitted = request.control.subscribe_batch_admitted();
     let manager = Arc::clone(manager);
     let task = tokio::spawn(async move { manager.handle_spawn_request(request).await });
     tokio::time::timeout(
         Duration::from_secs(60),
-        issued.wait_for(|issued| *issued == Some(true)),
+        admitted.wait_for(|admitted| *admitted),
     )
     .await
-    .expect("native database command was issued")
+    .expect("the real native batch admission committed")
     .unwrap();
     task
 }

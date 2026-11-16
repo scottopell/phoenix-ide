@@ -4560,7 +4560,6 @@ mod tests {
 
         let event = runtime
             .start_spawn_agents_tool(call)
-            .await
             .expect("handler must not error out");
 
         match event {

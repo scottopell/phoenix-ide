@@ -6642,7 +6642,7 @@ where
     }
 
     #[allow(clippy::too_many_lines)]
-    pub(crate) async fn start_spawn_agents_tool(
+    pub(crate) fn start_spawn_agents_tool(
         &mut self,
         tool: ToolCall,
     ) -> Result<Option<Event>, String> {
@@ -6916,20 +6916,6 @@ where
             }));
         };
 
-        if let Err(error) = self
-            .storage
-            .establish_parent_reconcile_action(&self.context.conversation_id)
-            .await
-        {
-            let result = ToolResult::error(
-                tool_use_id.clone(),
-                format!("failed to persist parent recovery authority: {error}"),
-            );
-            return Ok(Some(Event::ToolComplete {
-                tool_use_id,
-                result,
-            }));
-        }
         let spawned = specs
             .iter()
             .map(|spec| PendingSubAgent {
@@ -6982,15 +6968,48 @@ where
             },
             closure: closure_rx,
         });
-        if let Err(error) = spawn_tx.send(request).await {
-            self.native_spawn_handoff = None;
-            return Ok(Some(Event::ToolComplete {
-                tool_use_id: tool_use_id.clone(),
-                result: ToolResult::error(
-                    tool_use_id,
-                    format!("Failed to submit sub-agent batch: {error}"),
-                ),
-            }));
+        match spawn_tx.try_send(request) {
+            Ok(()) => {}
+            Err(tokio::sync::mpsc::error::TrySendError::Full(request)) => {
+                let sender = spawn_tx.clone();
+                let handoff = self
+                    .native_spawn_handoff
+                    .as_mut()
+                    .expect("native origin retained before submission");
+                let phase = std::mem::replace(&mut handoff.phase, NativeSpawnPhase::Closing);
+                let NativeSpawnPhase::Admission {
+                    response,
+                    activation,
+                } = phase
+                else {
+                    unreachable!("fresh native origin is awaiting its admission response");
+                };
+                handoff.phase = NativeSpawnPhase::Submission {
+                    send: Box::pin(async move {
+                        sender
+                            .send(request)
+                            .await
+                            .map_err(|error| format!("Failed to submit sub-agent batch: {error}"))
+                    }),
+                    response,
+                    activation,
+                };
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(error)) => {
+                if let Some(handoff) = self.native_spawn_handoff.take() {
+                    handoff.control.request_cancel();
+                }
+                return Ok(Some(Event::ToolComplete {
+                    tool_use_id: tool_use_id.clone(),
+                    result: ToolResult::error(
+                        tool_use_id,
+                        format!(
+                            "Failed to submit sub-agent batch: {}",
+                            tokio::sync::mpsc::error::SendError(error)
+                        ),
+                    ),
+                }));
+            }
         }
         Ok(None)
     }
@@ -9940,7 +9959,7 @@ where
                 }));
             }
             self.spawn_catalog = Some(catalog);
-            return self.start_spawn_agents_tool(tool).await;
+            return self.start_spawn_agents_tool(tool);
         }
 
         let legacy_tmux_conversation_id = match &self.context.resource_scope {

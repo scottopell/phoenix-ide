@@ -4875,6 +4875,8 @@ impl RuntimeManager {
             .await
         {
             Ok(()) => {
+                #[cfg(test)]
+                control.mark_batch_admitted();
                 let response_lost = response_tx
                     .send(SubAgentAdmissionReceipt {
                         invocation: invocation.clone(),
@@ -5018,10 +5020,36 @@ impl RuntimeManager {
             "native spawn admission was not issued because local write admission is closed"
                 .to_string()
         })?;
-        if !lifecycle.control.try_issue() {
+        let control = Arc::clone(&lifecycle.control);
+        if !control.try_issue() {
             return Err("native spawn admission was revoked before its database command".into());
         }
         let authority = lifecycle.arm_write(owner);
+        match self
+            .db
+            .establish_live_parent_reconcile_action(parent_conversation_id)
+            .await
+        {
+            phoenix_db::workflow::LocalAuthorityResult::DurableFactEstablished(Ok(())) => {}
+            phoenix_db::workflow::LocalAuthorityResult::DurableFactEstablished(Err(error)) => {
+                authority.classified();
+                return Err(format!(
+                    "failed to persist parent recovery authority: {error}"
+                ));
+            }
+            phoenix_db::workflow::LocalAuthorityResult::DurableFactUnclassified => {
+                self.signal_fatal_local_authority("native_spawn_parent_reconcile_action");
+                authority.classified();
+                return Err(
+                    "FATAL_LOCAL_AUTHORITY_UNCLASSIFIED: native parent reconciliation authority"
+                        .into(),
+                );
+            }
+        }
+        if self.fatal_local_authority_fence.is_closed() || control.is_cancelled() {
+            authority.classified();
+            return Err("native spawn batch was not issued after parent authority settled because admission closed or cancellation was requested".into());
+        }
         let result = self.db.admit_sub_agent_batch_atomically(&admission).await;
         if matches!(
             result,
