@@ -2932,8 +2932,16 @@ mod tests {
         assert!(!output.is_success());
         assert!(output.output().contains("source_refused"));
         let schema = tool.input_schema();
+        assert_eq!(schema["type"], "object");
         assert_eq!(schema["additionalProperties"], false);
-        assert_eq!(schema["oneOf"].as_array().unwrap().len(), 3);
+        assert_eq!(schema["required"], json!(["action", "product_conversation_id"]));
+        assert_eq!(
+            schema["properties"]["action"]["enum"],
+            json!(["initial", "observe", "explicit_retry"])
+        );
+        for rejected in ["oneOf", "allOf", "anyOf"] {
+            assert!(schema.get(rejected).is_none(), "provider rejects {rejected}");
+        }
     }
 
     #[tokio::test]

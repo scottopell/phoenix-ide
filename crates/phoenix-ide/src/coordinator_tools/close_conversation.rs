@@ -73,11 +73,14 @@ fn parse(input: &Value) -> Result<NativeCloseIntent, String> {
     Ok(intent)
 }
 
+// Provider schemas cannot use root combinators. The tagged parser above owns
+// exact action-specific requirements and rejects irrelevant coordinates.
 fn schema() -> Value {
     let target = json!({"type":"string", "minLength":1});
     let ordinal = json!({"type":"integer", "minimum":1, "maximum":i64::MAX});
     json!({
         "type":"object",
+        "description":"initial requires only action and product_conversation_id. observe additionally requires attempt_id and run_ordinal. explicit_retry additionally requires attempt_id and failed_run_ordinal. No other action coordinates are allowed.",
         "properties": {
             "action":{"type":"string", "enum":["initial", "observe", "explicit_retry"]},
             "product_conversation_id":target,
@@ -86,15 +89,7 @@ fn schema() -> Value {
             "failed_run_ordinal":ordinal
         },
         "required":["action", "product_conversation_id"],
-        "additionalProperties":false,
-        "oneOf":[
-            {"properties":{"action":{"const":"initial"}},
-             "not":{"anyOf":[{"required":["attempt_id"]},{"required":["run_ordinal"]},{"required":["failed_run_ordinal"]}]}},
-            {"properties":{"action":{"const":"observe"}},
-             "required":["attempt_id","run_ordinal"], "not":{"required":["failed_run_ordinal"]}},
-            {"properties":{"action":{"const":"explicit_retry"}},
-             "required":["attempt_id","failed_run_ordinal"], "not":{"required":["run_ordinal"]}}
-        ]
+        "additionalProperties":false
     })
 }
 
