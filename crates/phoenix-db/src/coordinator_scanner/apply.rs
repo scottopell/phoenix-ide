@@ -54,14 +54,17 @@ fn quotes<'a>(
         }
         let matches = fragment
             .text
-            .match_indices(&quote.quotation)
+            .char_indices()
+            .filter(|(offset, _)| fragment.text[*offset..].starts_with(&quote.quotation))
+            .take(2)
+            .map(|(offset, _)| offset)
             .collect::<Vec<_>>();
         if matches.len() != 1 {
             return Err(ScanRejection::InvalidQuote {
                 detail: "source quotation must identify exactly one captured UTF8 span".into(),
             });
         }
-        let start = fragment.utf8_start + matches[0].0;
+        let start = fragment.utf8_start + matches[0];
         let end = start + quote.quotation.len();
         let evidence = TrackingEvidence {
             instance_id: instance.to_owned(),

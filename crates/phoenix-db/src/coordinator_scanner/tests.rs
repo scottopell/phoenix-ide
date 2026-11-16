@@ -1099,3 +1099,567 @@ async fn scanner_acceptance_requires_known_bounded_output_metrics() {
         ScanCoverageState::Incomplete
     ));
 }
+
+#[tokio::test]
+async fn scanner_overlapping_quote_is_ambiguous_not_a_unique_span() {
+    let (db, source) = setup().await;
+    message(&db, &source, 1, "aaaa", &InputOrigin::UserApi).await;
+    let batch = prepare(&db, 1000).await;
+    let mut output = capture(&batch);
+    let ScanResult::Complete { actions } = &mut output;
+    let ScanAction::New { quotes, .. } = &mut actions[0] else {
+        unreachable!()
+    };
+    quotes[0].quotation = "aaa".into();
+    let attempt = reserve(&db, batch, 1000).await;
+    assert!(matches!(
+        db.apply_coordinator_scan(&attempt, &output, metrics(), 1001)
+            .await
+            .established()
+            .unwrap()
+            .unwrap(),
+        ScanApplyOutcome::Rejected(ScanRejection::InvalidQuote { .. })
+    ));
+    assert_eq!(
+        db.list_coordinator_tracking(&source, None, false)
+            .await
+            .unwrap()
+            .active_count,
+        0
+    );
+    assert!(matches!(
+        db.read_coordinator_scan_coverage(&source, None)
+            .await
+            .unwrap()
+            .members[0]
+            .state,
+        ScanCoverageState::Incomplete
+    ));
+}
+#[tokio::test]
+async fn scanner_captured_range_survives_new_tail_and_keeps_later_live_gap() {
+    let (db, source) = setup().await;
+    message(
+        &db,
+        &source,
+        1,
+        "Please retain Cobalt.",
+        &InputOrigin::UserApi,
+    )
+    .await;
+    let batch = prepare(&db, 1000).await;
+    let output = capture(&batch);
+    message(
+        &db,
+        &source,
+        2,
+        "An unrelated detour.",
+        &InputOrigin::UserApi,
+    )
+    .await;
+    let attempt = reserve(&db, batch, 1001).await;
+    assert!(matches!(
+        db.apply_coordinator_scan(&attempt, &output, metrics(), 1002)
+            .await
+            .established()
+            .unwrap()
+            .unwrap(),
+        ScanApplyOutcome::Applied { .. }
+    ));
+    let batch = prepare(&db, 1003).await;
+    assert_eq!(batch.input.scan_context.lane, ScanLane::Live);
+    assert_eq!(batch.input.fragments[0].message_id, format!("{source}-2"));
+    message(
+        &db,
+        &source,
+        3,
+        "Another detour note.",
+        &InputOrigin::UserApi,
+    )
+    .await;
+    let attempt = reserve(&db, batch, 1004).await;
+    assert!(matches!(
+        db.apply_coordinator_scan(
+            &attempt,
+            &ScanResult::Complete { actions: vec![] },
+            metrics(),
+            1005
+        )
+        .await
+        .established()
+        .unwrap()
+        .unwrap(),
+        ScanApplyOutcome::Applied { .. }
+    ));
+    let coverage = db
+        .read_coordinator_scan_coverage(&source, None)
+        .await
+        .unwrap();
+    assert!(matches!(
+        coverage.members[0].state,
+        ScanCoverageState::Incomplete
+    ));
+    assert_eq!(
+        coverage.members[0].live_frontier,
+        Some(ScanPosition::Boundary { sequence_id: 2 })
+    );
+    let remaining = prepare(&db, 1006).await;
+    assert_eq!(remaining.input.fragments.len(), 1);
+    assert_eq!(
+        remaining.input.fragments[0].message_id,
+        format!("{source}-3")
+    );
+}
+#[tokio::test]
+async fn scanner_manual_retirement_during_inference_conflicts_then_reconciles_closed_candidate() {
+    use crate::coordinator_tracking::{TrackingMutation, TrackingRetirement, TrackingState};
+    let (db, source) = setup().await;
+    message(
+        &db,
+        &source,
+        1,
+        "Please retain Cobalt.",
+        &InputOrigin::UserApi,
+    )
+    .await;
+    let first = prepare(&db, 1000).await;
+    let output = capture(&first);
+    let attempt = reserve(&db, first, 1000).await;
+    let ScanApplyOutcome::Applied {
+        created_item_ids, ..
+    } = db
+        .apply_coordinator_scan(&attempt, &output, metrics(), 1001)
+        .await
+        .established()
+        .unwrap()
+        .unwrap()
+    else {
+        panic!("not captured")
+    };
+    let id = &created_item_ids[0];
+    message(
+        &db,
+        &source,
+        2,
+        "Keep the earlier Cobalt request in mind.",
+        &InputOrigin::UserApi,
+    )
+    .await;
+    let pending = prepare(&db, 2000).await;
+    let output = append_output(&pending, id);
+    let attempt = reserve(&db, pending, 2000).await;
+    native(
+        &db,
+        &source,
+        TrackingMutation::Retire {
+            id: id.clone(),
+            expected_revision: 1,
+            disposition: TrackingRetirement::Dismissed,
+            reason: "User intentionally dropped this work".into(),
+        },
+    )
+    .await;
+    let retired = db.read_coordinator_tracking(&source, id, 0).await.unwrap();
+    assert!(matches!(
+        db.apply_coordinator_scan(&attempt, &output, metrics(), 2001)
+            .await
+            .established()
+            .unwrap()
+            .unwrap(),
+        ScanApplyOutcome::Conflict
+    ));
+    let after = db.read_coordinator_tracking(&source, id, 0).await.unwrap();
+    assert_eq!(after.registry_revision, retired.registry_revision);
+    assert_eq!(after.evidence.len(), retired.evidence.len());
+    assert_eq!(after.item.revision, retired.item.revision);
+    let coverage = db
+        .read_coordinator_scan_coverage(&source, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        coverage.members[0].live_frontier,
+        Some(ScanPosition::Boundary { sequence_id: 1 })
+    );
+    let next = prepare(&db, 2002).await;
+    assert!(next
+        .input
+        .candidates
+        .iter()
+        .any(|c| c.id == *id && c.disposition == TrackingDisposition::Dismissed));
+    let attempt = reserve(&db, next, 2002).await;
+    db.apply_coordinator_scan(
+        &attempt,
+        &ScanResult::Complete { actions: vec![] },
+        metrics(),
+        2003,
+    )
+    .await
+    .established()
+    .unwrap()
+    .unwrap();
+    assert!(
+        matches!(db.read_coordinator_tracking(&source,id,0).await.unwrap().item.disposition,TrackingState::Dismissed{reason}if reason.contains("intentionally"))
+    );
+    assert_eq!(
+        db.list_coordinator_tracking(&source, None, false)
+            .await
+            .unwrap()
+            .active_count,
+        0
+    );
+}
+async fn continue_head(db: &Database, source: &str) -> String {
+    db.update_conversation_state(
+        source,
+        &phoenix_core::domain::sm_state::ConvState::ContextExhausted {
+            summary: "Only unrelated detour context; older request deliberately absent".into(),
+        },
+    )
+    .await
+    .unwrap();
+    match db.continue_conversation(source).await.unwrap() {
+        crate::ContinueOutcome::Created(next) => next.id,
+        other => panic!("{other:?}"),
+    }
+}
+async fn drain_empty(db: &Database, now: &mut i64, append: Option<(&str, &str)>) {
+    for _ in 0..100 {
+        *now += 1;
+        match db
+            .prepare_coordinator_scan(Some(&profile()), *now)
+            .await
+            .established()
+            .unwrap()
+            .unwrap()
+        {
+            ScanPreparation::Ready(batch) => {
+                let output = if let Some((item, message)) = append {
+                    if let Some(fragment) = batch
+                        .input
+                        .fragments
+                        .iter()
+                        .find(|f| f.message_id == message)
+                    {
+                        ScanResult::Complete {
+                            actions: vec![ScanAction::Append {
+                                item_id: item.into(),
+                                quotes: vec![ScanQuote {
+                                    fragment_id: fragment.fragment_id.clone(),
+                                    quotation: fragment.text.clone(),
+                                }],
+                            }],
+                        }
+                    } else {
+                        ScanResult::Complete { actions: vec![] }
+                    }
+                } else {
+                    ScanResult::Complete { actions: vec![] }
+                };
+                let attempt = reserve(db, batch, *now).await;
+                assert!(matches!(
+                    db.apply_coordinator_scan(&attempt, &output, metrics(), *now)
+                        .await
+                        .established()
+                        .unwrap()
+                        .unwrap(),
+                    ScanApplyOutcome::Applied { .. }
+                ));
+            }
+            ScanPreparation::Progress => {}
+            ScanPreparation::Idle => return,
+            ScanPreparation::Wait {
+                next_at_us: Some(resume),
+                ..
+            } => *now = resume,
+            other => panic!("{other:?}"),
+        }
+    }
+    panic!("bounded drain did not finish")
+}
+#[tokio::test]
+async fn scanner_restart_finds_old_generation_edit_without_append_across_two_continuations() {
+    use crate::coordinator_tracking::{TrackingMutation, TrackingRetirement, TrackingState};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("old-edit.db");
+    let db = Database::open(path.to_str().unwrap()).await.unwrap();
+    crate::run_pending_migrations(db.pool()).await.unwrap();
+    let source = db
+        .get_or_create_coordinator(None, LlmLanguage::default())
+        .await
+        .unwrap()
+        .id;
+    for sequence in 1..=100 {
+        if sequence == 5 {
+            message(
+                &db,
+                &source,
+                sequence,
+                "Please retain Cobalt.",
+                &InputOrigin::UserApi,
+            )
+            .await
+        } else {
+            db.add_message_with_seq(
+                &format!("system-{sequence}"),
+                &source,
+                sequence,
+                &MessageContent::system("Excluded machine bookkeeping"),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        }
+    }
+    let mut now = 1000;
+    let mut captured = None;
+    for _ in 0..10 {
+        now += 1;
+        match db
+            .prepare_coordinator_scan(Some(&profile()), now)
+            .await
+            .established()
+            .unwrap()
+            .unwrap()
+        {
+            ScanPreparation::Progress => {}
+            ScanPreparation::Ready(batch) => {
+                let fragment = batch
+                    .input
+                    .fragments
+                    .iter()
+                    .find(|f| f.message_id == format!("{source}-5"))
+                    .unwrap();
+                let output = ScanResult::Complete {
+                    actions: vec![ScanAction::New {
+                        kind: TrackingKind::RequestedWork,
+                        title: "Old Cobalt request".into(),
+                        note: "Historical user request".into(),
+                        resumption: "Ask before any work".into(),
+                        quotes: vec![ScanQuote {
+                            fragment_id: fragment.fragment_id.clone(),
+                            quotation: fragment.text.clone(),
+                        }],
+                    }],
+                };
+                let attempt = reserve(&db, batch, now).await;
+                let ScanApplyOutcome::Applied {
+                    created_item_ids, ..
+                } = db
+                    .apply_coordinator_scan(&attempt, &output, metrics(), now)
+                    .await
+                    .established()
+                    .unwrap()
+                    .unwrap()
+                else {
+                    panic!("not applied")
+                };
+                captured = Some(created_item_ids[0].clone());
+                break;
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+    let item = captured.unwrap();
+    drain_empty(&db, &mut now, None).await;
+    assert!(matches!(
+        db.read_coordinator_scan_coverage(&source, None)
+            .await
+            .unwrap()
+            .members[0]
+            .state,
+        ScanCoverageState::Covered
+    ));
+    native(
+        &db,
+        &source,
+        TrackingMutation::Retire {
+            id: item.clone(),
+            expected_revision: 1,
+            disposition: TrackingRetirement::Dismissed,
+            reason: "Intentional user retirement remains retained".into(),
+        },
+    )
+    .await;
+    let generation = db
+        .update_message_display_data(
+            &format!("{source}-5"),
+            &serde_json::json!({"old_edit":"no append and no scanner kick"}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(generation, 2);
+    db.pool().close().await;
+    let db = Database::open(path.to_str().unwrap()).await.unwrap();
+    crate::run_pending_migrations(db.pool()).await.unwrap();
+    let stale = db
+        .read_coordinator_scan_coverage(&source, None)
+        .await
+        .unwrap();
+    assert!(matches!(
+        stale.members[0].state,
+        ScanCoverageState::GenerationStale
+    ));
+    assert!(matches!(
+        db.prepare_coordinator_scan(Some(&profile()), now + 1)
+            .await
+            .established()
+            .unwrap()
+            .unwrap(),
+        ScanPreparation::Progress
+    ));
+    let reset = db
+        .read_coordinator_scan_coverage(&source, None)
+        .await
+        .unwrap();
+    assert_eq!(reset.members[0].covered_generation, Some(2));
+    assert_eq!(reset.members[0].historical_boundary, Some(100));
+    assert!(matches!(
+        reset.members[0].state,
+        ScanCoverageState::Incomplete
+    ));
+    let second = continue_head(&db, &source).await;
+    let max: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(MAX(sequence_id),0) FROM messages WHERE conversation_id=?1",
+    )
+    .bind(&second)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    message(
+        &db,
+        &second,
+        max + 1,
+        "Unrelated detour note.",
+        &InputOrigin::UserApi,
+    )
+    .await;
+    let third = continue_head(&db, &second).await;
+    let max: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(MAX(sequence_id),0) FROM messages WHERE conversation_id=?1",
+    )
+    .bind(&third)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    message(
+        &db,
+        &third,
+        max + 1,
+        "Another unrelated detour.",
+        &InputOrigin::UserApi,
+    )
+    .await;
+    let live = prepare(&db, now + 2).await;
+    assert_eq!(live.input.scan_context.lane, ScanLane::Live);
+    assert_eq!(live.input.scan_context.transcript_id, third);
+    let attempt = reserve(&db, live, now + 2).await;
+    db.apply_coordinator_scan(
+        &attempt,
+        &ScanResult::Complete { actions: vec![] },
+        metrics(),
+        now + 3,
+    )
+    .await
+    .established()
+    .unwrap()
+    .unwrap();
+    let gaps = db
+        .read_coordinator_scan_coverage(&third, None)
+        .await
+        .unwrap();
+    assert_eq!(gaps.members.len(), 3);
+    assert!(matches!(
+        gaps.members[0].state,
+        ScanCoverageState::Incomplete
+    ));
+    assert!(gaps.summary.pending_live_members > 0);
+    assert!(gaps.summary.pending_historical_members > 0);
+    now += 4;
+    drain_empty(&db, &mut now, Some((&item, &format!("{source}-5")))).await;
+    let complete = db
+        .read_coordinator_scan_coverage(&third, None)
+        .await
+        .unwrap();
+    assert!(complete
+        .members
+        .iter()
+        .all(|m| matches!(m.state, ScanCoverageState::Covered)));
+    let retained = db
+        .read_coordinator_tracking(&third, &item, 0)
+        .await
+        .unwrap();
+    assert_eq!(retained.evidence.len(), 1);
+    assert_eq!(retained.item.revision, 2);
+    assert!(
+        matches!(retained.item.disposition,TrackingState::Dismissed{reason}if reason.contains("Intentional"))
+    );
+}
+#[tokio::test]
+async fn scanner_bounded_contention_leaves_pending_then_progresses_when_quiet() {
+    use crate::coordinator_tracking::{TrackingMutation, TrackingRecord};
+    let (db, source) = setup().await;
+    message(
+        &db,
+        &source,
+        1,
+        "Please retain Cobalt.",
+        &InputOrigin::UserApi,
+    )
+    .await;
+    for n in 0..3 {
+        let now = 1000 + n;
+        let batch = prepare(&db, now).await;
+        let output = capture(&batch);
+        let attempt = reserve(&db, batch, now).await;
+        native(
+            &db,
+            &source,
+            TrackingMutation::Record {
+                record: TrackingRecord {
+                    kind: TrackingKind::Bookmark,
+                    title: format!("Concurrent bookmark{n}"),
+                    note: "Independent registry revision".into(),
+                    resumption: "Return when asked".into(),
+                    references: vec![],
+                    evidence: vec![],
+                },
+            },
+        )
+        .await;
+        assert!(matches!(
+            db.apply_coordinator_scan(&attempt, &output, metrics(), now)
+                .await
+                .established()
+                .unwrap()
+                .unwrap(),
+            ScanApplyOutcome::Conflict
+        ));
+    }
+    let batch = prepare(&db, 2000).await;
+    let output = capture(&batch);
+    let attempt = reserve(&db, batch, 2000).await;
+    assert!(matches!(
+        db.apply_coordinator_scan(&attempt, &output, metrics(), 2001)
+            .await
+            .established()
+            .unwrap()
+            .unwrap(),
+        ScanApplyOutcome::Applied { .. }
+    ));
+    assert_eq!(
+        db.list_coordinator_tracking(&source, None, false)
+            .await
+            .unwrap()
+            .active_count,
+        4
+    );
+    assert!(matches!(
+        db.read_coordinator_scan_coverage(&source, None)
+            .await
+            .unwrap()
+            .members[0]
+            .state,
+        ScanCoverageState::Covered
+    ));
+}

@@ -355,12 +355,13 @@ pub(super) async fn batch_current(
     {
         return Ok(false);
     }
-    let fresh = capture(
+    let fresh = capture_range(
         tx,
         &batch.input.scan_context.transcript_id,
         batch.input.scan_context.source_generation,
         batch.input.scan_context.lane,
         &batch.start,
+        Some(&batch.end),
     )
     .await?;
     Ok(fresh.source_digest == batch.source_digest

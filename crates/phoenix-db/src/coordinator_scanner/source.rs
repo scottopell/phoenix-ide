@@ -120,6 +120,16 @@ pub(super) async fn capture(
     lane: ScanLane,
     start: &ScanPosition,
 ) -> DbResult<Captured> {
+    capture_range(tx, transcript, generation, lane, start, None).await
+}
+pub(super) async fn capture_range(
+    tx: &mut Transaction<'_, Sqlite>,
+    transcript: &str,
+    generation: i64,
+    lane: ScanLane,
+    start: &ScanPosition,
+    through: Option<&ScanPosition>,
+) -> DbResult<Captured> {
     let mut query=sqlx::QueryBuilder::<Sqlite>::new("SELECT message_id,conversation_id,sequence_id,message_type,created_at,origin_kind,origin_product_conversation_id,origin_transcript_id,origin_subscription_event_id,origin_source_instance_id,origin_slack_request_id,origin_reminder_id,origin_source_message_id,origin_source_tool_use_id,CASE WHEN message_type IN('user','agent') THEN CAST(substr(CAST(content AS BLOB),1,1048577) AS TEXT) ELSE NULL END AS prose_content,length(CAST(content AS BLOB)) AS content_bytes,EXISTS(SELECT 1 FROM message_images WHERE message_images.message_id=messages.message_id) OR EXISTS(SELECT 1 FROM message_files WHERE message_files.message_id=messages.message_id) AS has_attachments FROM messages WHERE conversation_id=");
     query.push_bind(transcript);
     query.push(match (lane, start) {
@@ -128,6 +138,15 @@ pub(super) async fn capture(
         (ScanLane::Historical, _) => " AND sequence_id<=",
     });
     query.push_bind(seq(start));
+    if let Some(through) = through {
+        query.push(match (lane, through) {
+            (ScanLane::Live, _) => " AND sequence_id<=",
+            (ScanLane::Historical, ScanPosition::Boundary { .. }) => " AND sequence_id>",
+            (ScanLane::Historical, ScanPosition::Fragment { .. }) => " AND sequence_id>=",
+        });
+        query.push_bind(seq(through));
+    }
+
     query.push(if lane == ScanLane::Live {
         " ORDER BY sequence_id,message_id LIMIT 32"
     } else {
@@ -216,7 +235,26 @@ pub(super) async fn capture(
             if offset >= text.len() {
                 continue;
             }
-            let mut stop = text.len();
+            let mut stop = match through {
+                Some(ScanPosition::Fragment {
+                    sequence_id,
+                    message_id,
+                    part_ordinal,
+                    utf8_offset,
+                    prose_digest,
+                }) if *sequence_id == message_seq && part == part_ordinal => {
+                    if message_id != &message.message_id
+                        || prose_digest != &digest
+                        || *utf8_offset > text.len()
+                        || *utf8_offset < offset
+                        || !text.is_char_boundary(*utf8_offset)
+                    {
+                        return Err(invalid("captured source end changed"));
+                    }
+                    *utf8_offset
+                }
+                _ => text.len(),
+            };
             let mut fragment;
             loop {
                 let id = hash(encoded(&(
@@ -267,6 +305,9 @@ pub(super) async fn capture(
                 prose_digest: digest,
             };
             fragments.push(fragment);
+            if through == Some(&end) {
+                return captured(fragments, end, &identities);
+            }
             if stop < text.len() {
                 return captured(fragments, end, &identities);
             }
@@ -297,7 +338,7 @@ fn captured(
         )
     });
     Ok(Captured {
-        source_digest: hash(encoded(identities)?),
+        source_digest: hash(encoded(&(&fragments, &end))?),
         fragments,
         end,
     })
