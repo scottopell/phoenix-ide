@@ -9,6 +9,7 @@ const base = process.env.LADLE_URL;
 assert(base, 'LADLE_URL is required (serve the built fixtures on a hosted runner)');
 assert(['http:', 'https:'].includes(new URL(base).protocol), 'LADLE_URL must be HTTP(S)');
 const baseline = process.env.BASELINE === '1';
+const idleAudit = process.env.OVERLAY_IDLE_QA === '1';
 const out = path.resolve(process.env.REVIEW_READING_QA_OUT ?? 'qa-artifacts/review-reading-position');
 await mkdir(out, { recursive: true });
 const report = {
@@ -49,6 +50,12 @@ for (const fixture of fixtures) {
   cases.push({ fixture, width: 1440, position: 'middle', exit: 'fullscreen-return' });
 }
 assert.equal(cases.length, 42);
+if (idleAudit) {
+  cases.length = 0;
+  for (const fixture of fixtures) for (const width of [390, 1440]) {
+    cases.push({ fixture: { ...fixture, story: fixture.story.replace('-long-history', '-idle-review') }, width, position: 'middle', exit: 'discard' });
+  }
+}
 
 // Wait for geometry to remain stable over animation frames, with enough frames
 // to include the short CSS transitions. No wall-clock journey sleeps.
@@ -144,13 +151,65 @@ function compare(id, stage, before, after, geometry) {
   if (JSON.stringify(scrolls(before)) !== JSON.stringify(scrolls(after))) mismatch(id, stage, 'ancestor scroll changed', scrolls(before), scrolls(after));
 }
 
+async function traceIdle(page, result, stage) {
+  result.idle ??= {};
+  result.idle[stage] = await page.evaluate(async () => {
+    const root = document.querySelector('.viewer-shell');
+    if (!root || root.querySelector('img, video, iframe')) throw new Error('Idle probe requires an image-free viewer');
+    const content = root.querySelector('.viewer-content');
+    if (!content || content.scrollHeight <= content.clientHeight + 100) throw new Error('Idle viewer must have real overflowing prose');
+    const candidates = [...content.querySelectorAll('p')];
+    const box = content.getBoundingClientRect();
+    const anchor = candidates.find(p => p.getBoundingClientRect().top >= box.top && p.getBoundingClientRect().bottom <= box.bottom);
+    if (!anchor) throw new Error('No fully visible viewer paragraph');
+    const ids = new WeakMap(); let nextId = 0;
+    const identify = node => {
+      if (!node) return null;
+      if (!ids.has(node)) ids.set(node, ++nextId);
+      return { node: ids.get(node), tag: node.tagName, id: node.id, className: node.className, label: node.getAttribute('aria-label') };
+    };
+    const events = [];
+    const onEvent = event => events.push({ time: performance.now(), type: event.type, target: identify(event.target) });
+    for (const name of ['focusin', 'scroll', 'pointerdown', 'touchstart', 'keydown']) document.addEventListener(name, onEvent, true);
+    const samples = [];
+    const started = performance.now();
+    try {
+      while (performance.now() - started < 2400) {
+        const nodes = new Set([document.scrollingElement, document.querySelector('#messages'), root, content]);
+        for (let parent = content.parentElement; parent; parent = parent.parentElement) nodes.add(parent);
+        samples.push({
+          time: performance.now() - started,
+          focus: identify(document.activeElement),
+          viewerConnected: root.isConnected, contentConnected: content.isConnected, anchorConnected: anchor.isConnected,
+          anchor: { text: anchor.textContent, top: anchor.getBoundingClientRect().top, height: anchor.getBoundingClientRect().height },
+          viewport: { x: scrollX, y: scrollY, width: innerWidth, height: innerHeight, visualTop: visualViewport?.offsetTop, visualHeight: visualViewport?.height },
+          scrollers: [...nodes].filter(Boolean).map(node => ({ ...identify(node), top: node.scrollTop, left: node.scrollLeft, scrollHeight: node.scrollHeight, clientHeight: node.clientHeight, rectTop: node.getBoundingClientRect().top, rectHeight: node.getBoundingClientRect().height, overflow: getComputedStyle(node).overflowY })),
+        });
+        await new Promise(requestAnimationFrame);
+      }
+    } finally {
+      for (const name of ['focusin', 'scroll', 'pointerdown', 'touchstart', 'keydown']) document.removeEventListener(name, onEvent, true);
+    }
+    return { samples, events, windowMs: 2400, anchorText: anchor.textContent };
+  });
+  const trace = result.idle[stage];
+  const first = trace.samples[0];
+  for (const sample of trace.samples) {
+    if (Math.abs(sample.anchor.top - first.anchor.top) > 2 || !sample.anchorConnected || !sample.contentConnected || !sample.viewerConnected) mismatch(result.id, stage, 'idle visible viewer text moved/remounted', first, sample);
+    if (JSON.stringify(sample.focus) !== JSON.stringify(first.focus)) mismatch(result.id, stage, 'idle focus changed', first.focus, sample.focus);
+    if (JSON.stringify(sample.viewport) !== JSON.stringify(first.viewport)) mismatch(result.id, stage, 'idle document/visual viewport moved', first.viewport, sample.viewport);
+    if (JSON.stringify(sample.scrollers) !== JSON.stringify(first.scrollers)) mismatch(result.id, stage, 'idle scroller/ancestor geometry changed', first.scrollers, sample.scrollers);
+  }
+  assert(!trace.events.some(event => ['pointerdown', 'touchstart', 'keydown'].includes(event.type)), 'Idle trace must contain no input');
+}
+
 try {
   for (const test of cases) {
     const { fixture, width, position, exit } = test;
     const id = `${fixture.kind}-${width}-${position}-${exit}`;
     const result = { id, stages: {} };
     report.cases.push(result);
-    const context = await browser.newContext({ viewport: { width, height: width === 390 ? 844 : 900 } });
+    const context = await browser.newContext({ viewport: { width, height: width === 390 ? 844 : 900 }, hasTouch: idleAudit && width === 390 });
     const page = await context.newPage();
     page.setDefaultTimeout(6500);
     page.setDefaultNavigationTimeout(15000);
@@ -242,10 +301,21 @@ try {
       const opened = result.stages.open = await measure(page);
       compare(id, 'open', before, opened, false);
       await page.screenshot({ path: path.join(out, `${id}-open.png`) });
+      if (idleAudit) {
+        await viewer.locator('.viewer-content').evaluate(el => { el.scrollTop = (el.scrollHeight - el.clientHeight) * 0.45; });
+        await settle(page);
+        await traceIdle(page, result, 'review-open-idle');
+        await page.screenshot({ animations: 'disabled', path: path.join(out, `${id}-idle.png`) });
+      }
       if (exit === 'discard' || exit === 'send') {
         await viewer.getByRole('button', { name: 'Add note to line 1', exact: true }).click({ force: true });
         const note = `reading-position-note-${id}`;
         await page.locator('.annotation-dialog-input').fill(note);
+        if (idleAudit) {
+          await settle(page);
+          await traceIdle(page, result, 'annotation-editor-idle');
+          await page.screenshot({ animations: 'disabled', path: path.join(out, `${id}-editor-idle.png`) });
+        }
         await page.getByRole('button', { name: 'Add Note', exact: true }).click();
         if (exit === 'send') {
           await viewer.getByRole('button', { name: 'Send notes', exact: true }).click();

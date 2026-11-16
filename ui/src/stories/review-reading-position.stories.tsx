@@ -45,3 +45,18 @@ export const OrdinaryLongHistory: Story = () => <ProductConversationFixture scen
 OrdinaryLongHistory.storyName = 'ordinary-long-history';
 export const GlobalLongHistory: Story = () => <ProductConversationFixture scenario={global} />;
 GlobalLongHistory.storyName = 'global-long-history';
+
+// Long, image-free prose for distinguishing viewer-content scrolling from the background reader.
+function longReviewMessages(messages: EnrichedMessage[]): EnrichedMessage[] {
+  return messages.map(message => message.message_type === 'agent' ? {
+    ...message,
+    content: [{ type: 'text' as const, text: Array.from({ length: 36 }, (_, index) =>
+      `Review paragraph ${index + 1}: preserve the visible reading position while this image-free message is settled. Notes remain linked to their original source; opening an editor must preserve intentional keyboard navigation.`).join('\n\n') }],
+  } : message);
+}
+const idleOrdinary = { ...ordinary, snapshot: { ...ordinary.snapshot, segments: ordinary.snapshot.segments.map(segment => ({ ...segment, messages: longReviewMessages(segment.messages) })) } };
+const idleGlobal = { ...global, snapshot: { ...global.snapshot, segments: global.snapshot.segments.map(segment => ({ ...segment, messages: longReviewMessages(segment.messages) })) } };
+export const OrdinaryIdleReview: Story = () => <ProductConversationFixture scenario={idleOrdinary} />;
+OrdinaryIdleReview.storyName = 'ordinary-idle-review';
+export const GlobalIdleReview: Story = () => <ProductConversationFixture scenario={idleGlobal} />;
+GlobalIdleReview.storyName = 'global-idle-review';
