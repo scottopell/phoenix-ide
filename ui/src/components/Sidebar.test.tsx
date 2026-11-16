@@ -182,7 +182,7 @@ describe('Sidebar — ProductConversation navigation', () => {
         <RouteHarness />
       </MemoryRouter>,
     );
-    const signal = apiMock.listProductConversations.mock.calls[0][0] as AbortSignal;
+    const signal = apiMock.listProductConversations.mock.calls[0]![0] as AbortSignal;
 
     expect(getByRole('button', { name: /Open …/ })).toBeInTheDocument();
     expect(getByRole('button', { name: /History …/ })).toBeInTheDocument();

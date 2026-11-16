@@ -54,7 +54,7 @@ function initialSnapshot(): ProductConversationListSnapshot {
 
 let snapshot: ProductConversationListSnapshot = initialSnapshot();
 const listeners = new Set<() => void>();
-let inFlight: { controller: AbortController; promise: Promise<void> } | null = null;
+let inFlight: { controller: AbortController; promise: Promise<void>; rowsChanged: boolean } | null = null;
 let stopRevisionSubscription: (() => void) | null = null;
 let refreshAfterCurrent = false;
 
@@ -74,7 +74,7 @@ export function refreshProductConversationList(): Promise<void> {
   const timeout = window.setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
   const promise = api.listProductConversations(controller.signal)
     .then((response) => {
-      if (inFlight?.controller !== controller) return;
+      if (inFlight?.controller !== controller || inFlight.rowsChanged) return;
       writeCache(response.product_conversations, response.coordinator);
       publish({
         rows: response.product_conversations,
@@ -98,7 +98,7 @@ export function refreshProductConversationList(): Promise<void> {
         }
       }
     });
-  inFlight = { controller, promise };
+  inFlight = { controller, promise, rowsChanged: false };
   return promise;
 }
 
@@ -116,6 +116,10 @@ export function updateProductConversationRows(
 ): void {
   const rows = updater(snapshot.rows);
   if (rows === snapshot.rows) return;
+  if (inFlight !== null) {
+    inFlight.rowsChanged = true;
+    refreshAfterCurrent = true;
+  }
   writeCache(rows, snapshot.coordinator);
   publish({ ...snapshot, rows });
 }

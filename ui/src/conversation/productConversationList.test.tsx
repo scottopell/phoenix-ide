@@ -116,7 +116,7 @@ describe('useProductConversationList', () => {
     const { result } = renderHook(() => useProductConversationList());
     expect(list).toHaveBeenCalledTimes(1);
 
-    const signal = list.mock.calls[0][0] as AbortSignal;
+    const signal = list.mock.calls[0]![0] as AbortSignal;
     for (let revision = 0; revision < 3; revision += 1) {
       act(() => { notifyProductConversationListMayHaveChanged(); });
       await act(async () => { await vi.advanceTimersByTimeAsync(0); });
@@ -154,6 +154,44 @@ describe('useProductConversationList', () => {
     expect(result.current.rows.map((r) => r.product_conversation_id)).toEqual(['recovered']);
   });
 
+  it.each(['rename', 'delete'] as const)('retains acknowledged %s rows and cache when a pre-mutation response arrives and reconciliation fails', async (mutation) => {
+    vi.useFakeTimers();
+    const original = row('original');
+    const renamed: ProductConversationListRow = {
+      ...original,
+      canonical_route: '/c/renamed',
+      canonical_root: { ...original.canonical_root, slug: 'renamed', title: 'Renamed' },
+    };
+    const expected = mutation === 'rename' ? [renamed] : [];
+    const initial = deferred<{ product_conversations: ProductConversationListRow[]; coordinator: null }>();
+    const stale = deferred<{ product_conversations: ProductConversationListRow[]; coordinator: null }>();
+    const list = vi.spyOn(api, 'listProductConversations')
+      .mockReturnValueOnce(initial.promise)
+      .mockReturnValueOnce(stale.promise)
+      .mockRejectedValueOnce(new Error('reconciliation offline'));
+    const { result } = renderHook(() => useProductConversationList());
+    await act(async () => initial.resolve({ product_conversations: [original], coordinator: null }));
+    expect(result.current.rows).toEqual([original]);
+    let pending!: Promise<void>;
+    act(() => { pending = refreshProductConversationList(); });
+    const signal = list.mock.calls[1]![0] as AbortSignal;
+    act(() => {
+      updateProductConversationRows(() => expected);
+      notifyProductConversationListMayHaveChanged();
+    });
+    await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+    expect(result.current.rows).toEqual(expected);
+    expect(signal.aborted).toBe(false);
+    await act(async () => {
+      stale.resolve({ product_conversations: [original], coordinator: null });
+      await pending;
+    });
+    expect(list).toHaveBeenCalledTimes(3);
+    expect(result.current.error).toBe('reconciliation offline');
+    expect(result.current.rows).toEqual(expected);
+    expect(JSON.parse(localStorage.getItem(__testing.cacheKey)!).product_conversations).toEqual(expected);
+  });
+
   it('keeps stale superseded request failures and finalizers from replacing a newer success', async () => {
     const stale = deferred<{ product_conversations: ProductConversationListRow[]; coordinator: null }>();
     const current = deferred<{ product_conversations: ProductConversationListRow[]; coordinator: null }>();
@@ -179,7 +217,7 @@ describe('useProductConversationList', () => {
     expect(list).toHaveBeenCalledTimes(2);
   });
 
-  it('shares one initial request and revision subscription across list consumers', async () => {
+  it('shares one initial request across concurrent list consumers', async () => {
     const request = deferred<{ product_conversations: ProductConversationListRow[]; coordinator: null }>();
     const list = vi.spyOn(api, 'listProductConversations').mockReturnValue(request.promise);
     const first = renderHook(() => useProductConversationList());

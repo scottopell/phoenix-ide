@@ -118,11 +118,12 @@ describe('ConversationListPage mobile ProductConversation actions', () => {
 
     render(<MemoryRouter initialEntries={['/']}><ConversationListPage /></MemoryRouter>);
     expect(screen.getByTitle('Loading conversations')).toBeInTheDocument();
-    expect(screen.queryByText(/No conversations/)).toBeNull();
+    expect(screen.queryByText('No Open conversations')).toBeNull();
     expect(pageMocks.refresh).toHaveBeenCalled();
 
     await act(async () => request.resolve({ product_conversations: [], coordinator: null }));
-    await waitFor(() => expect(screen.queryByTitle('Loading conversations')).toBeNull());
+    expect(screen.queryByTitle('Loading conversations')).toBeNull();
+    expect(screen.getByText('No Open conversations')).toBeInTheDocument();
     expect(screen.queryByRole('status')).toBeNull();
   });
 
@@ -137,13 +138,14 @@ describe('ConversationListPage mobile ProductConversation actions', () => {
     render(<MemoryRouter initialEntries={['/']}><ConversationListPage /></MemoryRouter>);
     expect(await screen.findByRole('status')).toHaveTextContent('Unable to load conversations — offline');
     expect(screen.queryByText(/Showing cached conversations/)).toBeNull();
-    expect(screen.queryByText(/No conversations/)).toBeNull();
+    expect(screen.queryByText('No Open conversations')).toBeNull();
 
     fireEvent.click(screen.getByRole('button', { name: 'Retry' }));
     expect(screen.queryByRole('status')).toBeNull();
     expect(screen.getByTitle('Loading conversations')).toBeInTheDocument();
     await act(async () => retry.resolve({ product_conversations: [], coordinator: null }));
-    await waitFor(() => expect(screen.queryByTitle('Loading conversations')).toBeNull());
+    expect(screen.queryByTitle('Loading conversations')).toBeNull();
+    expect(screen.getByText('No Open conversations')).toBeInTheDocument();
     expect(screen.queryByRole('status')).toBeNull();
   });
 
