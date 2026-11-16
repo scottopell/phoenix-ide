@@ -1,7 +1,7 @@
 use super::{
     source::{
         advance, candidates, capture, capture_range, chain_query, encoded, hash, hex, invalid,
-        lane_name, member, member_page, owner, position, seq, topology,
+        lane_name, member, member_page, owner, position, seq, topology, SourceReadAllowance,
     },
     PreparedScanBatch, ReservedScanAttempt, ScanBlocker, ScanContext, ScanCoveragePage,
     ScanCoverageState, ScanCoverageSummary, ScanFailure, ScanFreshness, ScanInput, ScanLane,
@@ -122,11 +122,20 @@ pub(super) async fn set_blocker(
     sqlx::query("UPDATE coordinator_scan_state SET last_blocker=?1,next_resume_at_us=?2,observed_at_us=?3 WHERE singleton=1").bind(reason.as_str()).bind(next).bind(now).execute(&mut **tx).await?;
     Ok(())
 }
-#[allow(clippy::too_many_lines)]
 async fn prepare(
     tx: &mut Transaction<'_, Sqlite>,
     profile: Option<&ScanProfile>,
     now: i64,
+) -> DbResult<ScanPreparation> {
+    let mut allowance = SourceReadAllowance::new();
+    prepare_with_allowance(tx, profile, now, &mut allowance).await
+}
+#[allow(clippy::too_many_lines)]
+pub(super) async fn prepare_with_allowance(
+    tx: &mut Transaction<'_, Sqlite>,
+    profile: Option<&ScanProfile>,
+    now: i64,
+    allowance: &mut SourceReadAllowance,
 ) -> DbResult<ScanPreparation> {
     if now < 0 {
         return Err(invalid("negative scan time"));
@@ -180,7 +189,22 @@ async fn prepare(
     for lane in preferred {
         let rows=sqlx::query(chain_query!(" SELECT s.*,m.transcript_generation,m.tail FROM coordinator_scan_members s JOIN members m ON m.id=s.transcript_id WHERE s.generation=m.transcript_generation AND ((?3='live' AND (s.live_message_id IS NOT NULL OR s.live_seq<m.tail)) OR (?3='historical' AND s.historical_seq>0)) ORDER BY s.selected_at_us,s.continuation_ordinal DESC LIMIT 32"))
             .bind(&topology.head).bind(&topology.owner).bind(lane_name(lane)).fetch_all(&mut **tx).await?;
+        if rows.is_empty() {
+            continue;
+        }
+        let known_bytes = i64::try_from(profile.map_or(0, |p| p.instruction_bytes))
+            .map_err(|e| invalid(e.to_string()))?;
+        if let Some(reason) = budget_pause(tx, lane, now, known_bytes).await? {
+            waiting = Some(reason);
+            continue;
+        }
+        if allowance.remaining() == 0 {
+            break;
+        }
         for row in &rows {
+            if allowance.remaining() == 0 {
+                break;
+            }
             let transcript: String = row.try_get("transcript_id")?;
             let generation: i64 = row.try_get("generation")?;
             if generation != row.try_get::<i64, _>("transcript_generation")? {
@@ -204,7 +228,8 @@ async fn prepare(
             .bind(now)
             .execute(&mut **tx)
             .await?;
-            let captured = match capture(tx, &transcript, generation, lane, &start).await {
+            let captured = match capture(tx, &transcript, generation, lane, &start, allowance).await
+            {
                 Ok(c) => c,
                 Err(crate::DbError::Serialization(error)) => {
                     tracing::warn!(%transcript,%error,"scanner source remains pending");
@@ -255,10 +280,6 @@ async fn prepare(
             .flatten();
             if resume.is_some_and(|t| t > now) {
                 waiting = Some((ScanBlocker::RetryBackoff, resume));
-                continue;
-            }
-            if let Some(reason) = budget_pause(tx, lane, now, 0).await? {
-                waiting = Some(reason);
                 continue;
             }
             let input = ScanInput {
@@ -363,6 +384,7 @@ pub(super) async fn batch_current(
         batch.input.scan_context.lane,
         &batch.start,
         Some(&batch.end),
+        &mut SourceReadAllowance::new(),
     )
     .await?;
     Ok(fresh.source_digest == batch.source_digest

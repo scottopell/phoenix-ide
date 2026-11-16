@@ -171,14 +171,33 @@ pub(super) struct Captured {
     pub end: ScanPosition,
     pub source_digest: String,
 }
+pub(super) struct SourceReadAllowance {
+    remaining: usize,
+}
+impl SourceReadAllowance {
+    pub fn new() -> Self {
+        Self { remaining: 32 }
+    }
+    pub fn remaining(&self) -> usize {
+        self.remaining
+    }
+    fn charge(&mut self, fetched: usize) -> DbResult<()> {
+        self.remaining = self
+            .remaining
+            .checked_sub(fetched)
+            .ok_or_else(|| invalid("source read exceeded pass allowance"))?;
+        Ok(())
+    }
+}
 pub(super) async fn capture(
     tx: &mut Transaction<'_, Sqlite>,
     transcript: &str,
     generation: i64,
     lane: ScanLane,
     start: &ScanPosition,
+    allowance: &mut SourceReadAllowance,
 ) -> DbResult<Captured> {
-    capture_range(tx, transcript, generation, lane, start, None).await
+    capture_range(tx, transcript, generation, lane, start, None, allowance).await
 }
 #[allow(clippy::too_many_lines)]
 pub(super) async fn capture_range(
@@ -188,7 +207,11 @@ pub(super) async fn capture_range(
     lane: ScanLane,
     start: &ScanPosition,
     through: Option<&ScanPosition>,
+    allowance: &mut SourceReadAllowance,
 ) -> DbResult<Captured> {
+    if allowance.remaining() == 0 {
+        return Err(invalid("source read allowance exhausted"));
+    }
     let mut query=sqlx::QueryBuilder::<Sqlite>::new("SELECT message_id,conversation_id,sequence_id,message_type,created_at,origin_kind,origin_product_conversation_id,origin_transcript_id,origin_subscription_event_id,origin_source_instance_id,origin_slack_request_id,origin_reminder_id,origin_source_message_id,origin_source_tool_use_id,CASE WHEN message_type IN('user','agent') THEN CAST(substr(CAST(content AS BLOB),1,1048577) AS TEXT) ELSE NULL END AS prose_content,length(CAST(content AS BLOB)) AS content_bytes,EXISTS(SELECT 1 FROM message_images WHERE message_images.message_id=messages.message_id) OR EXISTS(SELECT 1 FROM message_files WHERE message_files.message_id=messages.message_id) AS has_attachments FROM messages WHERE conversation_id=");
     query.push_bind(transcript);
     query.push(match (lane, start) {
@@ -207,11 +230,13 @@ pub(super) async fn capture_range(
     }
 
     query.push(if lane == ScanLane::Live {
-        " ORDER BY sequence_id,message_id LIMIT 32"
+        " ORDER BY sequence_id,message_id LIMIT "
     } else {
-        " ORDER BY sequence_id DESC,message_id DESC LIMIT 32"
+        " ORDER BY sequence_id DESC,message_id DESC LIMIT "
     });
+    query.push_bind(i64::try_from(allowance.remaining()).map_err(|e| invalid(e.to_string()))?);
     let rows = query.build().fetch_all(&mut **tx).await?;
+    allowance.charge(rows.len())?;
     let mut fragments = Vec::new();
     let mut end = start.clone();
     let mut identities = Vec::new();
