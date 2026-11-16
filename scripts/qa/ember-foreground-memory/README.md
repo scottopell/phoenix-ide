@@ -15,9 +15,11 @@ tool results and model requests are retained for independent review.
 
 1. **Post-review quiet.** Seed two requested items. Cobalt owes a specific invoice
    comparison-period question; Sage must wait without checking or nudging its
-   owner. Consistently backdate the tracking creation/update/review timestamps
-   and relevant synthetic source messages by three days, then review Sage via
-   the native CAS update. The live neutral greeting must expose the due Cobalt
+   owner. Review Sage through the native CAS update while both items are recent.
+   Then backdate only Cobalt's tracking creation/update/review timestamps and the
+   original setup messages by three days, preserving the later Sage review and
+   message chronology. Actual attention rows remain untouched. The live neutral
+   greeting must expose the due Cobalt
    question and inspect its actual item. A normal user reply pauses it until an
    explicit resume. A structured question, if used, is answered through the
    actual `respond_to_question` service on the same running runtime handle.

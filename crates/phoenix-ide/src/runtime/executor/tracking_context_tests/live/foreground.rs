@@ -671,34 +671,50 @@ async fn prepare_case(
             .find(|item| item.title == "Wait for Sage owner")
             .unwrap()
             .clone();
+        let seed_end = sqlx::query_scalar::<_, i64>(
+            "SELECT MAX(sequence_id) FROM messages WHERE conversation_id=?1",
+        )
+        .bind(&source)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        mock.queue_response(LlmResponse{content:vec![ContentBlock::ToolUse{id:"recent-sage-review".into(),name:"tracking".into(),input:json!({"request":{"op":"update","id":other.id,"expected_revision":other.revision,"kind":"requested_work","title":other.title,"note":records[1]["note"],"resumption":records[1]["resumption"],"reviewed_evidence_ordinal":0,"references":[]}})}],end_turn:false,..terminal("")});
+        mock.queue_response(terminal("The Sage request is reviewed and remains quiet."));
+        let mut session = Session::start(&fixture, &source, Some(catalog(&home))).await;
+        let _=session.input("Review the saved Sage waiting instruction without checking or nudging its owner. Preserve its no-action restriction.").await;
+        session.close().await;
+        assert!(observation(&db, &source)
+            .await
+            .requested_item_due_for_review
+            .is_none());
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM coordinator_tracking_attention WHERE item_id=?1",
+            )
+            .bind(&target)
+            .fetch_one(db.pool())
+            .await
+            .unwrap(),
+            0
+        );
         let aged = Utc::now() - chrono::Duration::days(3);
-        sqlx::query("UPDATE coordinator_tracking_items SET created_at_us=?1,updated_at_us=?1,reviewed_at_us=?1").bind(aged.timestamp_micros()).execute(db.pool()).await.unwrap();
+        sqlx::query("UPDATE coordinator_tracking_items SET created_at_us=?1,updated_at_us=?1,reviewed_at_us=?1 WHERE id=?2")
+            .bind(aged.timestamp_micros()).bind(&target).execute(db.pool()).await.unwrap();
         sqlx::query(
-            "UPDATE messages SET created_at=?1 WHERE conversation_id=?2 AND message_type!='user'",
+            "UPDATE messages SET created_at=?1 WHERE conversation_id=?2 AND sequence_id<=?3",
         )
         .bind(aged.to_rfc3339())
         .bind(&source)
+        .bind(seed_end)
         .execute(db.pool())
         .await
         .unwrap();
-        let original_input = seeded.input_message_id.clone();
-        sqlx::query("UPDATE messages SET created_at=?1 WHERE message_id=?2")
-            .bind(aged.to_rfc3339())
-            .bind(original_input)
-            .execute(db.pool())
-            .await
-            .unwrap();
         sqlx::query("UPDATE conversations SET created_at=?1 WHERE id=?2")
             .bind((aged - chrono::Duration::hours(1)).to_rfc3339())
             .bind(&source)
             .execute(db.pool())
             .await
             .unwrap();
-        mock.queue_response(LlmResponse{content:vec![ContentBlock::ToolUse{id:"recent-sage-review".into(),name:"tracking".into(),input:json!({"request":{"op":"update","id":other.id,"expected_revision":other.revision,"kind":"requested_work","title":other.title,"note":records[1]["note"],"resumption":records[1]["resumption"],"reviewed_evidence_ordinal":0,"references":[]}})}],end_turn:false,..terminal("")});
-        mock.queue_response(terminal("The Sage request is reviewed and remains quiet."));
-        let mut session = Session::start(&fixture, &source, Some(catalog(&home))).await;
-        let _=session.input("Review the saved Sage waiting instruction without checking or nudging its owner. Preserve its no-action restriction.").await;
-        session.close().await;
         recently_reviewed_other = json!(other.id);
         prompt = "Hello.".to_owned();
         expected = json!({"question_terms":["period","date"],"pause":"Pause this until I explicitly say resume. Do not ask the period question again until then.","arithmetic":"What is 8+5?","answer":"13"});
