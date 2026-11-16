@@ -54,6 +54,25 @@ function installProbe() {
       top: element.getBoundingClientRect().top,
       bottom: element.getBoundingClientRect().bottom,
     }));
+    // Streaming rows expose selection at row level rather than an inline mark.
+    if (highlights.length === 0 && document.querySelector('[data-find-finalization="streaming"]')) {
+      const row = scroller.querySelector('.viewer-find-row-match--active');
+      const walker = row && document.createTreeWalker(row, NodeFilter.SHOW_TEXT);
+      for (let node = walker?.nextNode(); node; node = walker.nextNode()) {
+        const start = node.textContent.indexOf('alpha');
+        if (start < 0) continue;
+        const range = document.createRange();
+        range.setStart(node, start);
+        range.setEnd(node, start + 5);
+        const rect = range.getBoundingClientRect();
+        highlights.push({
+          text: range.toString(), connected: node.isConnected,
+          ownerText: node.parentElement.closest('p')?.textContent,
+          top: rect.top, bottom: rect.bottom,
+        });
+        break;
+      }
+    }
     const bounds = scroller.getBoundingClientRect();
     return {
       time: performance.now(), scrollTop: scroller.scrollTop, texts, highlights,
@@ -170,10 +189,11 @@ export async function captureFindFinalization({ page, id, outDir }) {
           await page.getByRole('button', { name: direction, exact: true }).click();
           await page.waitForFunction((previous) => document.querySelector('.viewer-find-bar__status')?.textContent !== previous, previousStatus);
           const navigation = await page.evaluate(() => window.__findFinalizationProbe.settle(600));
+          results.at(-1).navigation.push({ direction, ...navigation });
           assertHighlight(navigation, `${mode} ${direction}`);
           assert(navigation.commandCount > 0, `${mode} ${direction}: no reveal command`);
           assert(navigation.highlights.some((item) => item.top >= navigation.bounds.top && item.bottom <= navigation.bounds.bottom), `${mode} ${direction}: active match not revealed in viewport`);
-          results.at(-1).navigation.push({ direction, ...navigation });
+
         }
       }
       await page.evaluate(() => window.__findFinalizationProbe.restore());
