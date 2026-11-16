@@ -8368,10 +8368,9 @@ where
                         self.storage
                             .sub_agent_terminal_is_accepted(child)
                             .await
-                            .map_err(|error| {
+                            .inspect_err(|_| {
                                 self.fatal_local_authority_fence
                                     .close(boundary.settlement());
-                                error
                             })?
                     }
                     _ => false,

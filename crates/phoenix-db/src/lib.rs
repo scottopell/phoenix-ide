@@ -27408,11 +27408,11 @@ mod tests {
                 serde_json::to_value(&decoded).unwrap()["forced_tool_retirement"],
                 "not_observed"
             );
-            let mut stale = decoded.clone();
+            let mut conflicting_retirement = decoded.clone();
             if let ConvState::CancellingSubAgents {
                 forced_tool_retirement,
                 ..
-            } = &mut stale
+            } = &mut conflicting_retirement
             {
                 *forced_tool_retirement =
                     phoenix_core::domain::sm_state::ForcedToolRetirement::Observed;
@@ -27425,7 +27425,7 @@ mod tests {
             let mut malformed = legacy_state.clone();
             malformed["pending"] = serde_json::json!("not a child collection");
             for (stored, expected) in [
-                (legacy_state.clone(), stale),
+                (legacy_state.clone(), conflicting_retirement),
                 (unknown, decoded.clone()),
                 (malformed, decoded.clone()),
             ] {
