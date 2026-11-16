@@ -3407,7 +3407,8 @@ def cmd_qa_ember_event_eval() -> None:
                                  check=True, capture_output=True, text=True)
         if test_name + ": test" not in listing.stdout.splitlines():
             raise SystemExit("selected test binary does not contain the event evaluation")
-        env["PHOENIX_EVENT_EVAL_BINARY_SHA256"] = hashlib.sha256(binary.read_bytes()).hexdigest()
+        with binary.open("rb") as stream:
+            env["PHOENIX_EVENT_EVAL_BINARY_SHA256"] = hashlib.file_digest(stream, "sha256").hexdigest()
         command = [str(binary), test_name, "--ignored", "--exact", "--nocapture"]
     else:
         command = ["cargo", "test", "-p", "phoenix_ide", "--lib", test_name,
