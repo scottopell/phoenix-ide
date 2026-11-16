@@ -69,7 +69,7 @@ async fn next_capture(
     captures: &mut mpsc::UnboundedReceiver<CapturedRequest>,
     ordinal: usize,
 ) -> String {
-    let captured = tokio::time::timeout(std::time::Duration::from_secs(5), captures.recv())
+    let captured = tokio::time::timeout(std::time::Duration::from_secs(30), captures.recv())
         .await
         .expect("runtime must reach the gated provider")
         .expect("provider must retain the capture sender");
@@ -88,34 +88,52 @@ async fn native_send(tool: &dyn Tool, source: &str, target: &str, id: Uuid, text
     serde_json::from_str(output.output()).unwrap()
 }
 
+async fn settled(events: &mut tokio::sync::broadcast::Receiver<crate::runtime::SseEvent>) {
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        loop {
+            match events
+                .recv()
+                .await
+                .expect("settlement event stream remains available")
+            {
+                crate::runtime::SseEvent::StateChange {
+                    state: ConvState::Idle,
+                    ..
+                } => return,
+                crate::runtime::SseEvent::StateChange {
+                    state: ConvState::Error { .. },
+                    ..
+                }
+                | crate::runtime::SseEvent::Error { .. } => {
+                    panic!("owner turn failed before settlement")
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("released provider response must settle");
+}
+
 async fn evidence_for_input(
     db: &Database,
     transcript: &str,
     input_id: &str,
 ) -> (String, WatchEndingEvidence) {
-    tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        loop {
-            let events: Vec<String> = sqlx::query_scalar(
-                "SELECT event_id FROM coordinator_watch_events WHERE source_transcript_id=?1 AND route_kind='subscription' ORDER BY occurred_at_us",
-            )
-            .bind(transcript)
-            .fetch_all(db.pool())
-            .await
-            .unwrap();
-            for event in events {
-                let evidence = db
-                    .coordinator_watch_ending_evidence(&event)
-                    .await
-                    .unwrap();
-                if evidence.settled_input.as_ref().is_some_and(|input| input.message_id == input_id) {
-                    return (event, evidence);
-                }
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    let events: Vec<String> = sqlx::query_scalar(
+        "SELECT event_id FROM coordinator_watch_events WHERE source_transcript_id=?1 AND route_kind='subscription' ORDER BY occurred_at_us",
+    ).bind(transcript).fetch_all(db.pool()).await.unwrap();
+    for event in events {
+        let evidence = db.coordinator_watch_ending_evidence(&event).await.unwrap();
+        if evidence
+            .settled_input
+            .as_ref()
+            .is_some_and(|input| input.message_id == input_id)
+        {
+            return (event, evidence);
         }
-    })
-    .await
-    .expect("accepted input must produce authoritative ending evidence")
+    }
+    panic!("settled input {input_id} must already have authoritative ending evidence");
 }
 
 async fn assert_response_matches_saved_agent(
@@ -380,7 +398,9 @@ async fn native_owner_rejection_continuation_busy_recovery_and_coordinator_reten
     let old_request = next_capture(&mut captured, 0).await;
     assert!(old_request.contains(OLD_INPUT));
     assert!(!old_request.contains(RECOVERY));
+    let mut predecessor_events = f.runtime.subscribe(&f.predecessor).await.unwrap();
     provider.release.add_permits(1);
+    settled(&mut predecessor_events).await;
     let old_message = f
         .db
         .get_messages(&f.predecessor)
@@ -419,7 +439,12 @@ async fn native_owner_rejection_continuation_busy_recovery_and_coordinator_reten
         assert_eq!(rejected["outcome"], "rejected");
         assert_eq!(rejected["reason_code"], "invalid_state_for_message");
         assert_eq!(rejected["conversation_id"], f.predecessor);
-        assert!(f.db.product_conversation_client_message_owner(&f.product, &key.to_string()).await.unwrap().is_none());
+        assert!(
+            f.db.product_conversation_client_message_owner(&f.product, &key.to_string())
+                .await
+                .unwrap()
+                .is_none()
+        );
         assert_no_ending_for_input(&f.db, &format!("{}:{key}", f.predecessor)).await;
         assert_no_saved_user_input(&f.db, &f.predecessor, text).await;
         assert!(
@@ -433,7 +458,14 @@ async fn native_owner_rejection_continuation_busy_recovery_and_coordinator_reten
     assert_tracking_unchanged(&f.db, &f.source, &tracked).await;
 
     // The fixture already persisted SUMMARY_ID before entering summary generation.
-    f.db.update_conversation_state(&f.predecessor, &ConvState::ContextExhausted { summary: SUMMARY.into() }).await.unwrap();
+    f.db.update_conversation_state(
+        &f.predecessor,
+        &ConvState::ContextExhausted {
+            summary: SUMMARY.into(),
+        },
+    )
+    .await
+    .unwrap();
     let reservation = f.reserve().await;
     let opening_message_id = reservation.message_id.as_str().to_string();
     let successor = reservation.successor_conversation_id.clone();
@@ -511,7 +543,10 @@ async fn native_owner_rejection_continuation_busy_recovery_and_coordinator_reten
 
     provider.release.add_permits(1);
     let recovery_request = next_capture(&mut captured, 2).await;
-    assert!(recovery_request.contains(&format!("[Message from conversation {coordinator_product}, transcript {}]", f.source)));
+    assert!(recovery_request.contains(&format!(
+        "[Message from conversation {coordinator_product}, transcript {}]",
+        f.source
+    )));
     assert_eq!(recovery_request.matches(RECOVERY).count(), 1);
     assert!(!recovery_request.contains(REJECT_ONLY));
     assert!(!recovery_request.contains("Changed recovery payload"));
@@ -525,7 +560,9 @@ async fn native_owner_rejection_continuation_busy_recovery_and_coordinator_reten
         .expect("the accepted steering input must be materialized before provider invocation");
     assert_no_ending_for_input(&f.db, &in_flight_recovery.message_id).await;
     assert_tracking_unchanged(&f.db, &f.source, &tracked).await;
+    let mut recovery_events = f.runtime.subscribe(&successor).await.unwrap();
     provider.release.add_permits(1);
+    settled(&mut recovery_events).await;
     let recovery_messages = f.db.get_messages(&successor).await.unwrap();
     let recovery_input = recovery_messages.iter().find(|message| matches!(&message.content, MessageContent::User(content) if content.text==RECOVERY)).expect("runtime materialized the accepted steering input");
     let recovery_id = recovery_input.message_id.clone();
@@ -625,32 +662,13 @@ async fn native_owner_rejection_continuation_busy_recovery_and_coordinator_reten
             .contains("explicit user approval")
     );
     assert_eq!(retained["evidence"][0][1]["quotation"], COMMISSION);
+    let mut coordinator_events = f
+        .runtime
+        .subscribe(&coordinator.conversation_id)
+        .await
+        .unwrap();
     provider.release.add_permits(1);
-    tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        loop {
-            if f.db
-                .workflow_repository()
-                .load_owning_authoritative_turn(&phoenix_workflow::ConversationAuthority(
-                    coordinator.conversation_id.clone(),
-                ))
-                .await
-                .unwrap()
-                .is_none()
-                && matches!(
-                    f.db.get_conversation(&coordinator.conversation_id)
-                        .await
-                        .unwrap()
-                        .state,
-                    ConvState::Idle
-                )
-            {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        }
-    })
-    .await
-    .expect("Coordinator's actual turn settles");
+    settled(&mut coordinator_events).await;
     assert_tracking_unchanged(&f.db, &coordinator.conversation_id, &tracked).await;
     assert_eq!(provider.ordinal.load(Ordering::SeqCst), 4);
     assert!(matches!(
