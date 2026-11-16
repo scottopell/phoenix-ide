@@ -1603,7 +1603,160 @@ async fn scanner_restart_finds_old_generation_edit_without_append_across_two_con
     assert_eq!(retained.evidence.len(), 1);
     assert_eq!(retained.item.revision, 2);
     assert!(
-        matches!(retained.item.disposition,TrackingState::Dismissed{reason}if reason.contains("Intentional"))
+        matches!(retained.item.disposition,TrackingState::Dismissed{ref reason}if reason.contains("Intentional"))
+    );
+    let message_id = format!("{source}-5");
+    let before_message = db.get_message_by_id(&message_id).await.unwrap();
+    let before_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    let changed_text = "Please retain Cobalt. Preserve this changed-source restriction: do not start until I explicitly resume.";
+    let changed_content = MessageContent::User(UserContent::new(changed_text));
+    let mut edit = db.pool().begin().await.unwrap();
+    assert_eq!(sqlx::query("UPDATE messages SET content=?1 WHERE message_id=?2 AND conversation_id=?3 AND sequence_id=5")
+        .bind(serde_json::to_string(&changed_content.to_stored_json()).unwrap())
+        .bind(&message_id).bind(&source).execute(&mut *edit).await.unwrap().rows_affected(),1);
+    let changed_generation:i64 = sqlx::query_scalar("UPDATE conversations SET transcript_generation=transcript_generation+1 WHERE id=?1 RETURNING transcript_generation")
+        .bind(&source).fetch_one(&mut *edit).await.unwrap();
+    assert_eq!(changed_generation, 3);
+    edit.commit().await.unwrap();
+    db.pool().close().await;
+    let db = Database::open(path.to_str().unwrap()).await.unwrap();
+    crate::run_pending_migrations(db.pool()).await.unwrap();
+    let changed_message = db.get_message_by_id(&message_id).await.unwrap();
+    assert_eq!(changed_message.message_id, before_message.message_id);
+    assert_eq!(
+        changed_message.conversation_id,
+        before_message.conversation_id
+    );
+    assert_eq!(changed_message.sequence_id, before_message.sequence_id);
+    assert_eq!(changed_message.message_type, before_message.message_type);
+    assert_eq!(changed_message.origin, before_message.origin);
+    assert_eq!(changed_message.created_at, before_message.created_at);
+    assert_eq!(changed_message.content, changed_content);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM messages")
+            .fetch_one(db.pool())
+            .await
+            .unwrap(),
+        before_rows
+    );
+    let stale = db
+        .read_coordinator_scan_coverage(&third, None)
+        .await
+        .unwrap();
+    assert!(matches!(
+        stale
+            .members
+            .iter()
+            .find(|member| member.transcript_id == source)
+            .unwrap()
+            .state,
+        ScanCoverageState::GenerationStale
+    ));
+    let mut saw_changed_source = false;
+    for _ in 0..100 {
+        now += 1;
+        match db
+            .prepare_coordinator_scan(Some(&profile()), now)
+            .await
+            .established()
+            .unwrap()
+            .unwrap()
+        {
+            ScanPreparation::Progress => {}
+            ScanPreparation::Ready(batch) => {
+                let changed = batch
+                    .input
+                    .fragments
+                    .iter()
+                    .find(|fragment| fragment.message_id == message_id);
+                let output = if let Some(fragment) = changed {
+                    assert_eq!(fragment.text, changed_text);
+                    assert_eq!(fragment.origin, InputOrigin::UserApi);
+                    assert_eq!(
+                        batch.input.scan_context.source_generation,
+                        changed_generation
+                    );
+                    assert_ne!(fragment.prose_digest, source::hash("Please retain Cobalt."));
+                    saw_changed_source = true;
+                    ScanResult::Complete {
+                        actions: vec![ScanAction::Append {
+                            item_id: item.clone(),
+                            quotes: vec![ScanQuote {
+                                fragment_id: fragment.fragment_id.clone(),
+                                quotation: fragment.text.clone(),
+                            }],
+                        }],
+                    }
+                } else {
+                    ScanResult::Complete { actions: vec![] }
+                };
+                let attempt = reserve(&db, batch, now).await;
+                let outcome = db
+                    .apply_coordinator_scan(&attempt, &output, metrics(), now)
+                    .await
+                    .established()
+                    .unwrap()
+                    .unwrap();
+                let ScanApplyOutcome::Applied {
+                    created_item_ids,
+                    changed_item_count,
+                    ..
+                } = outcome
+                else {
+                    panic!("changed source not applied: {outcome:?}")
+                };
+                assert!(created_item_ids.is_empty());
+                if saw_changed_source {
+                    assert_eq!(changed_item_count, 1);
+                    break;
+                }
+            }
+            ScanPreparation::Wait {
+                next_at_us: Some(resume),
+                ..
+            } => now = resume,
+            other @ (ScanPreparation::Idle | ScanPreparation::Wait { .. }) => {
+                panic!("old prose change not rediscovered: {other:?}")
+            }
+        }
+    }
+    assert!(
+        saw_changed_source,
+        "externally changed old prose at a new generation must be recaptured after restart"
+    );
+    drain_empty(&db, &mut now, Some((&item, &message_id))).await;
+    let changed = db
+        .read_coordinator_tracking(&third, &item, 0)
+        .await
+        .unwrap();
+    assert_eq!(changed.evidence.len(), 2);
+    assert_eq!(changed.item.revision, retained.item.revision + 1);
+    assert_eq!(changed.evidence[0].1.quotation, "Please retain Cobalt.");
+    assert_eq!(changed.evidence[1].1.quotation, changed_text);
+    assert_eq!(changed.evidence[1].1.message_id, message_id);
+    assert!(
+        matches!(changed.item.disposition,TrackingState::Dismissed{ref reason}if reason.contains("Intentional"))
+    );
+    assert_eq!(
+        changed.retirement_history.len(),
+        retained.retirement_history.len()
+    );
+    assert_eq!(
+        db.list_coordinator_tracking(&third, None, false)
+            .await
+            .unwrap()
+            .active_count,
+        0
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM messages")
+            .fetch_one(db.pool())
+            .await
+            .unwrap(),
+        before_rows
     );
 }
 #[tokio::test]
