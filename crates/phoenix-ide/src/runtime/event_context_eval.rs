@@ -167,15 +167,20 @@ impl World {
         let TurnOutcome::Created { turn_id, .. } = accepted.outcome else {
             panic!("new turn")
         };
-        db.add_message_with_seq_and_origin(
+        db.add_message_with_seq(
             "event-eval-input",
             &source.id,
             1,
             &MessageContent::user(&case.input),
             None,
             None,
-            &InputOrigin::UserApi,
         )
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE messages SET origin_kind='user_api' WHERE message_id='event-eval-input'",
+        )
+        .execute(db.pool())
         .await
         .unwrap();
         sqlx::query("UPDATE durable_turns SET canonical_message_id='event-eval-input', materialized=1 WHERE turn_id=?1")
