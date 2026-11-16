@@ -13254,6 +13254,7 @@ impl Database {
                     completed_results,
                     cause,
                     spawn_tool_id,
+                    ..
                 } => Some((
                     pending,
                     completed_results,
@@ -27277,7 +27278,7 @@ mod tests {
 
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
-    async fn startup_cancelling_sub_agents_reaches_cause_destination() {
+    async fn startup_cancelling_sub_agents_without_retirement_marker_reaches_cause_destination() {
         use phoenix_core::domain::sm_event::CancelCause;
         use phoenix_core::domain::sm_state::{PendingSubAgent, SubAgentMode};
 
@@ -27335,10 +27336,38 @@ mod tests {
                     completed_results: Vec::new(),
                     cause,
                     spawn_tool_id: None,
+
+                    forced_tool_retirement:
+                        phoenix_core::domain::sm_state::ForcedToolRetirement::NotObserved,
                 },
             )
             .await
             .unwrap();
+            let mut legacy_state =
+                serde_json::to_value(db.get_conversation(&parent_id).await.unwrap().state).unwrap();
+            legacy_state
+                .as_object_mut()
+                .unwrap()
+                .remove("forced_tool_retirement");
+            sqlx::query("UPDATE conversations SET state = ?1 WHERE id = ?2")
+                .bind(legacy_state.to_string())
+                .bind(&parent_id)
+                .execute(db.pool())
+                .await
+                .unwrap();
+            let decoded = db.get_conversation(&parent_id).await.unwrap().state;
+            assert!(matches!(
+                decoded,
+                ConvState::CancellingSubAgents {
+                    forced_tool_retirement:
+                        phoenix_core::domain::sm_state::ForcedToolRetirement::NotObserved,
+                    ..
+                }
+            ));
+            assert_eq!(
+                serde_json::to_value(decoded).unwrap()["forced_tool_retirement"],
+                "not_observed"
+            );
             let ids = std::collections::HashSet::from([parent_id.clone()]);
 
             let reconciled = db.reconcile_startup_obligated_parents(&ids).await.unwrap();
@@ -27362,6 +27391,7 @@ mod tests {
             if !expects_request {
                 assert!(matches!(state, ConvState::Idle));
             }
+            assert!(!db.get_messages(&parent_id).await.unwrap().iter().any(|message| matches!(&message.content, MessageContent::System(content) if content.text.starts_with("Cancellation completed."))));
             let summary = db
                 .get_messages(&parent_id)
                 .await

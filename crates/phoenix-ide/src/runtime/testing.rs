@@ -2027,6 +2027,18 @@ impl MessageStore for InMemoryStorage {
         if let Some(release) = release {
             let _ = release.await;
         }
+        {
+            let mut failures = self
+                .terminal_obligation_establishment_failures
+                .lock()
+                .unwrap();
+            if *failures > 0 {
+                *failures -= 1;
+                return crate::runtime::traits::TerminalMutationEstablishment::KnownNotCommitted(
+                    "terminal obligation establishment failed before commit".to_string(),
+                );
+            }
+        }
         self.terminal_obligation_calls
             .lock()
             .unwrap()
@@ -3991,6 +4003,9 @@ mod tests {
             completed_results: vec![],
             cause: crate::state_machine::event::CancelCause::UserRequested,
             spawn_tool_id: Some("spawn-1".to_string()),
+
+            forced_tool_retirement:
+                phoenix_core::domain::sm_state::ForcedToolRetirement::NotObserved,
         };
 
         let runtime = ConversationRuntime::new(
@@ -4983,6 +4998,9 @@ mod tests {
             completed_results: vec![],
             cause: crate::state_machine::event::CancelCause::UserRequested,
             spawn_tool_id: Some("spawn-1".to_string()),
+
+            forced_tool_retirement:
+                phoenix_core::domain::sm_state::ForcedToolRetirement::NotObserved,
         };
 
         // Real result for X → Idle.
@@ -5052,6 +5070,9 @@ mod tests {
             completed_results: vec![],
             cause: crate::state_machine::event::CancelCause::UserRequested,
             spawn_tool_id: Some("spawn-1".to_string()),
+
+            forced_tool_retirement:
+                phoenix_core::domain::sm_state::ForcedToolRetirement::NotObserved,
         };
 
         // Duplicate TimedOut for X (not in pending) → InvalidTransition.
@@ -5225,6 +5246,9 @@ mod tests {
             completed_results: vec![],
             cause: crate::state_machine::event::CancelCause::UserRequested,
             spawn_tool_id: Some("spawn-1".to_string()),
+
+            forced_tool_retirement:
+                phoenix_core::domain::sm_state::ForcedToolRetirement::NotObserved,
         };
         assert_ne!(
             std::mem::discriminant(&one),

@@ -1113,6 +1113,7 @@ mod tests {
                 completed_results: vec![],
                 cause: crate::domain::sm_event::CancelCause::UserRequested,
                 spawn_tool_id: None,
+                forced_tool_retirement: ForcedToolRetirement::NotObserved,
             },
             ConvState::Completed {
                 result: "ok".into(),
@@ -1447,6 +1448,14 @@ pub struct ServerOverloadRetry {
     pub model_id: String,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ForcedToolRetirement {
+    #[default]
+    NotObserved,
+    Observed,
+}
+
 /// Conversation state
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -1552,9 +1561,14 @@ pub enum ConvState {
         cause: crate::domain::sm_event::CancelCause,
         /// `tool_use_id` of the originating `spawn_agents` call, when teardown
         /// began from `AwaitingSubAgents`. `None` for the `CancellingTool`-origin
-        /// path (no spawn id exists), which suppresses result persistence to
-        /// avoid an orphaned `tool_result`. Transient/owned like `cause`.
+        /// path; its results use a standalone summary instead of a tool result.
+        /// Transient/owned like `cause`.
         spawn_tool_id: Option<String>,
+        // owned: pre-feature rows recorded no forced-retirement fact. Startup
+        // reconciliation decodes them before phase reset; NotObserved is correct,
+        // no migration owed.
+        #[serde(default)]
+        forced_tool_retirement: ForcedToolRetirement,
     },
 
     /// Sub-agent completed successfully (terminal state, sub-agent only)
@@ -1712,6 +1726,9 @@ pub enum CoreState {
         cause: crate::domain::sm_event::CancelCause,
         /// See `ConvState::CancellingSubAgents::spawn_tool_id`.
         spawn_tool_id: Option<String>,
+        // owned: same pre-feature absence as ConvState::CancellingSubAgents.
+        #[serde(default)]
+        forced_tool_retirement: ForcedToolRetirement,
     },
     Error {
         message: String,
@@ -1885,11 +1902,13 @@ impl From<CoreState> for ConvState {
                 completed_results,
                 cause,
                 spawn_tool_id,
+                forced_tool_retirement,
             } => ConvState::CancellingSubAgents {
                 pending,
                 completed_results,
                 cause,
                 spawn_tool_id,
+                forced_tool_retirement,
             },
             CoreState::Error {
                 message,
@@ -1988,11 +2007,13 @@ impl TryFrom<ConvState> for ParentState {
                 completed_results,
                 cause,
                 spawn_tool_id,
+                forced_tool_retirement,
             } => Ok(ParentState::Core(CoreState::CancellingSubAgents {
                 pending,
                 completed_results,
                 cause,
                 spawn_tool_id,
+                forced_tool_retirement,
             })),
             ConvState::Error {
                 message,
@@ -2121,11 +2142,13 @@ impl TryFrom<ConvState> for SubAgentState {
                 completed_results,
                 cause,
                 spawn_tool_id,
+                forced_tool_retirement,
             } => Ok(SubAgentState::Core(CoreState::CancellingSubAgents {
                 pending,
                 completed_results,
                 cause,
                 spawn_tool_id,
+                forced_tool_retirement,
             })),
             ConvState::Error {
                 message,

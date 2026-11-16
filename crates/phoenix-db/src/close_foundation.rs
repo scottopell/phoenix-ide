@@ -9336,6 +9336,9 @@ mod tests {
                     completed_results: Vec::new(),
                     cause: phoenix_core::domain::sm_event::CancelCause::UserRequested,
                     spawn_tool_id: Some("tool-1".to_string()),
+
+                    forced_tool_retirement:
+                        phoenix_core::domain::sm_state::ForcedToolRetirement::NotObserved,
                 },
             ),
         ];
