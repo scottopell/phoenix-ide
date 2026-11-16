@@ -72,6 +72,10 @@ CompactEventsOrdinary.storyName = 'compact-events-ordinary';
 export const CompactEventsGlobal: Story = () => <ProductConversationFixture scenario={compactGlobal} />;
 CompactEventsGlobal.storyName = 'compact-events-global';
 
+const compactRedacted = makeCompactEventsScenario(false, true);
+export const CompactEventsRedacted: Story = () => <ProductConversationFixture scenario={compactRedacted} />;
+CompactEventsRedacted.storyName = 'compact-events-redacted';
+
 const reminderBase = getProductConversationScenario('mobile-open');
 const reminderOwner = reminderBase.snapshot?.product_conversation_id;
 if (!reminderOwner) throw new globalThis.Error('Reminders fixture requires a product conversation owner');

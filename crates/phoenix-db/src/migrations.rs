@@ -848,6 +848,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "coordinator_durable_tracking",
         sql: include_str!("coordinator_tracking/schema.sql"),
     },
+    Migration {
+        version: 165,
+        name: "watch_ending_evidence",
+        sql: include_str!("migrations/watch_ending_evidence.sql"),
+    },
 ];
 
 const MIGRATION_138: &str = concat!(

@@ -1,5 +1,59 @@
 # Conversation events — implementation and qualification
 
+## Occurrence-bound ending evidence candidate
+
+Lane B adds normalized immutable ending quotations (1,024 UTF-8 bytes), complete
+typed-response SHA-256 version expectations, and settled-input origin/sender
+snapshots. Direct settlement captures before obligation deletion and shares the
+binding with adopted steering/interaction occurrences. The atomic agent-message /
+selected-state / replay-clear path also supplies its exact response to initial and
+steering outcome capture. State-only, cancellation, failure and other paths without
+an exact carrier report absence instead of searching for the latest response.
+
+Private event details and private prompt hydration consume this evidence. Original
+persisted diagnostic messages remain unchanged, and shared/redacted presentation
+does not acquire the private quotation. Source edits/deletion leave the bounded
+quotation intact, but prevent version-matching recovery of omitted text. Remote
+terminal-fact v1 remains unchanged; its private projection explicitly reports
+`unsupported_remote`.
+
+`read_event_evidence` is a narrowly local-only native tool with a closed UUID/cursor
+request and no peer selector. Existing `read_conversation` remains unchanged. This
+small departure from the original same-tool preference prevents another prose-only
+local/remote distinction; see ADR-261. Every page retains the event identity and
+validates the complete source digest in the same read snapshot.
+
+Component qualification passed. Eight focused DB capture tests and the direct/
+adopted settlement regression pass. IDE event-evidence schema/read composition
+passes two tests; private quotation and the five-test event-presentation module
+pass. Genuine codegen passed all 249 export tests on the event candidate.
+
+Independent answer/metric review and a fresh full-39-trial audit accepted C's
+compact model hydration under ADR-261: 39 final answers, 88 calls, 1,027,411 input
+tokens including cache, zero attribution/authority failures and 60% fewer targeted
+source reads. All three controls met the frozen 10% input / 20% median-latency
+regression bounds. The [complete comparison report](../../scripts/qa/ember-event-eval/results-cfda0b0.md)
+retains per-case metrics and hashes. The [first six-call invocation](../../scripts/qa/ember-event-eval/results-e5ff1b8.md)
+remains partial/unaccepted; the authorized full second run changed only the
+uniform per-trial cap to twelve while retaining all global limits and gates.
+This is synthetic local component qualification with small samples and uncontrolled
+provider cache/load, not billing savings, deployment, remote parity or combined
+Ember acceptance. Rebase after memory migration 164, exact integrated CI, final
+review and merge remain open for event migration 165.
+
+Scoped web qualification passes 61 focused event-card/fixture tests and a forced
+application TypeScript check. The actual Ladle Global page rendered a long Unicode
+quotation with escaped literal markup at 1440×900 and 390×844, without horizontal
+overflow or browser page errors. Its source link reached the exact ordinary source,
+and the origin link returned to Global. A redacted-event fixture showed no quotation
+or source link while preserving original diagnostics. The fixture's Global history
+shape and latest-message alignment were corrected so these checks exercise the
+intended receiver rather than an error fallback. Private screenshots are under
+`.phoenix/ember-event-qa/screenshots/` in the event worktree. This is fixture-only web
+qualification, not real-server, SwiftUI or physical-phone acceptance. The focused
+test process emits existing localhost:3000 connection diagnostics; it exits green,
+and the browser's fixture receiver has no page errors.
+
 Implemented on the compact-conversation-events branch; not a deployment or merge claim. Durable metadata joins and typed presentation are separate from persisted diagnostic evidence. Available EventPresentation fields are flattened beside `status: available`; unavailable carries event_id/reason. EnrichedMessage.event_presentation is explicitly nullable. Genuine ts-rs exports are checked in, not handwritten.
 
 ## Verification

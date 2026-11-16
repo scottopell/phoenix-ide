@@ -24,9 +24,10 @@ pub use federation_enrollment::FederationSendAuthority;
 mod federation_peers;
 pub mod federation_subscriptions;
 pub use coordinator_watches::{
-    append_mandatory_close_failure_event_tx, CloseFailureStop, MandatoryCloseFailureSubject,
-    PendingWatchEvent, WatchEventPresentation, WatchEventProvenance, WatchEventRoute, WatchOutcome,
-    WatchSnapshot,
+    append_mandatory_close_failure_event_tx, CloseFailureStop, EndingResponse,
+    MandatoryCloseFailureSubject, PendingWatchEvent, SettledWatchInput, WatchEndingEvidence,
+    WatchEventPresentation, WatchEventProvenance, WatchEventRoute, WatchOutcome, WatchResponsePage,
+    WatchSnapshot, MAX_WATCH_RESPONSE_CURSOR,
 };
 pub use federation_peers::FederationPeerConnection;
 mod ddl;
@@ -14015,6 +14016,7 @@ impl Database {
         .fetch_all(&mut *tx)
         .await?;
         hydrate_attachments_conn(&mut tx, &mut messages).await?;
+        coordinator_watches::ending_evidence::project_prompt_events(&mut tx, &mut messages).await?;
         let snapshot = HydratedPromptSnapshot::try_new(conversation_id, generation, messages)?;
         tx.commit().await?;
         Ok(snapshot)
@@ -14064,6 +14066,7 @@ impl Database {
             }
         };
         hydrate_attachments_conn(&mut tx, &mut messages).await?;
+        coordinator_watches::ending_evidence::project_prompt_events(&mut tx, &mut messages).await?;
         let tail = HydratedPromptTail::try_current(conversation_id, after.position(), messages)?;
         tx.commit().await?;
         Ok(tail)
@@ -16557,6 +16560,21 @@ pub(crate) async fn record_initial_execution_outcome_tx(
     conversation_id: &str,
     state: &ConvState,
 ) -> DbResult<()> {
+    record_initial_execution_outcome_with_response_tx(
+        tx,
+        conversation_id,
+        state,
+        &EndingResponse::NoCarrier,
+    )
+    .await
+}
+
+pub(crate) async fn record_initial_execution_outcome_with_response_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    conversation_id: &str,
+    state: &ConvState,
+    ending_response: &EndingResponse,
+) -> DbResult<()> {
     if let ConvState::RecoverableContinuationFailure { failure } = state {
         return crate::coordinator_watches::record_summary_failure_tx(tx, conversation_id, failure)
             .await;
@@ -16597,13 +16615,14 @@ pub(crate) async fn record_initial_execution_outcome_tx(
                     ("Failed", Some(reason.as_str()))
                 }
             };
-            crate::coordinator_watches::record_steering_event_tx(
+            crate::coordinator_watches::record_steering_event_with_response_tx(
                 tx,
                 source_kind,
                 &message_id,
                 conversation_id,
                 kind,
                 reason,
+                ending_response,
             )
             .await?;
             sqlx::query("DELETE FROM steering_execution_occurrences WHERE conversation_id = ?1")
@@ -16620,12 +16639,13 @@ pub(crate) async fn record_initial_execution_outcome_tx(
         let generation: i64 = job.try_get("generation")?;
         let generation =
             u64::try_from(generation).map_err(|error| DbError::Serialization(error.to_string()))?;
-        classify_creation_watch_outcome(
+        classify_creation_watch_outcome_with_response(
             tx,
             &job.try_get::<String, _>("id")?,
             conversation_id,
             generation,
             state,
+            ending_response,
         )
         .await?;
     }
@@ -16638,6 +16658,25 @@ async fn classify_creation_watch_outcome(
     conversation_id: &str,
     generation: u64,
     state: &ConvState,
+) -> DbResult<()> {
+    classify_creation_watch_outcome_with_response(
+        tx,
+        job_id,
+        conversation_id,
+        generation,
+        state,
+        &EndingResponse::NoCarrier,
+    )
+    .await
+}
+
+async fn classify_creation_watch_outcome_with_response(
+    tx: &mut Transaction<'_, Sqlite>,
+    job_id: &str,
+    conversation_id: &str,
+    generation: u64,
+    state: &ConvState,
+    ending_response: &EndingResponse,
 ) -> DbResult<()> {
     let (terminal_kind, reason) = match state {
         ConvState::Idle | ConvState::Terminal | ConvState::Completed { .. } => ("Completed", None),
@@ -16664,13 +16703,14 @@ async fn classify_creation_watch_outcome(
         | ConvState::AwaitingUserResponse { .. }
         | ConvState::HandedOff { .. } => return Ok(()),
     };
-    crate::coordinator_watches::record_creation_event_tx(
+    crate::coordinator_watches::record_creation_event_with_response_tx(
         tx,
         job_id,
         generation,
         conversation_id,
         terminal_kind,
         reason,
+        ending_response,
     )
     .await
 }
