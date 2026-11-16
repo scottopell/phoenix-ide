@@ -776,6 +776,8 @@ pub struct RuntimeManager {
     #[cfg(test)]
     fork_command_barrier: AsyncMutex<Option<Arc<tokio::sync::Barrier>>>,
     #[cfg(test)]
+    native_admission_prewrite_barrier: AsyncMutex<Option<Arc<tokio::sync::Barrier>>>,
+    #[cfg(test)]
     browser_retirement_barrier: AsyncMutex<Option<Arc<tokio::sync::Barrier>>>,
     #[cfg(test)]
     hard_delete_barrier: AsyncMutex<Option<Arc<tokio::sync::Barrier>>>,
@@ -2713,6 +2715,8 @@ impl RuntimeManager {
             runtime_exit_barriers: AsyncMutex::new(HashMap::new()),
             #[cfg(test)]
             fork_command_barrier: AsyncMutex::new(None),
+            #[cfg(test)]
+            native_admission_prewrite_barrier: AsyncMutex::new(None),
             #[cfg(test)]
             browser_retirement_barrier: AsyncMutex::new(None),
             #[cfg(test)]
@@ -5016,6 +5020,11 @@ impl RuntimeManager {
             parallel_work_qualified,
             children,
         };
+        #[cfg(test)]
+        if let Some(barrier) = self.native_admission_prewrite_barrier.lock().await.take() {
+            barrier.wait().await;
+            barrier.wait().await;
+        }
         let owner = self.acquire_local_authority_pass().map_err(|()| {
             "native spawn admission was not issued because local write admission is closed"
                 .to_string()
