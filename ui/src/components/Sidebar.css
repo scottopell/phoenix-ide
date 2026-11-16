@@ -82,6 +82,7 @@
 
 @media (any-pointer: coarse) {
   .sidebar .sidebar-header > button,
+  .sidebar .sidebar-header .sidebar-new-btn,
   .sidebar .sidebar-header .settings-dropdown-trigger,
   .sidebar .sidebar-lifecycle-tab {
     min-width: 44px;
