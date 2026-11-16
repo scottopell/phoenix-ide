@@ -12886,6 +12886,49 @@ impl Database {
     ) -> DbResult<()> {
         let (content, display_data) = build_sub_agent_fan_in(results);
         let mut tx = self.pool.begin().await?;
+        let observed_state: String =
+            sqlx::query_scalar("SELECT state FROM conversations WHERE id = ?1")
+                .bind(conversation_id)
+                .fetch_one(&mut *tx)
+                .await?;
+        let decoded: ConvState = serde_json::from_str(&observed_state)
+            .map_err(|error| DbError::Serialization(error.to_string()))?;
+        if decoded != *expected_state {
+            return Err(DbError::Serialization(format!(
+                "parent {conversation_id} changed during recovered fan-in"
+            )));
+        }
+        let observed_shape: serde_json::Value = serde_json::from_str(&observed_state)
+            .map_err(|error| DbError::Serialization(error.to_string()))?;
+        let expected_shape = serde_json::to_value(&decoded)
+            .map_err(|error| DbError::Serialization(error.to_string()))?;
+        let expected_encoding = serde_json::to_string(&decoded)
+            .map_err(|error| DbError::Serialization(error.to_string()))?;
+        let absent_retirement_marker = matches!(
+            decoded,
+            ConvState::CancellingSubAgents {
+                forced_tool_retirement:
+                    phoenix_core::domain::sm_state::ForcedToolRetirement::NotObserved,
+                ..
+            }
+        ) && observed_shape.get("forced_tool_retirement").is_none();
+        let shapes_match = observed_state == expected_encoding
+            || (absent_retirement_marker
+                && observed_shape
+                    .as_object()
+                    .zip(expected_shape.as_object())
+                    .is_some_and(|(observed, expected)| {
+                        observed.len() + 1 == expected.len()
+                            && expected
+                                .iter()
+                                .filter(|(key, _)| key.as_str() != "forced_tool_retirement")
+                                .all(|(key, value)| observed.get(key) == Some(value))
+                    }));
+        if !shapes_match {
+            return Err(DbError::Serialization(format!(
+                "parent {conversation_id} has unrecognized state fields during recovered fan-in"
+            )));
+        }
         if let Some(tool_id) = spawn_tool_id {
             let messages = sqlx::query(
                 "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_instance_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id, origin_reminder_id
@@ -12988,10 +13031,7 @@ impl Database {
         .bind(conv_state_kind(destination))
         .bind(now.to_rfc3339())
         .bind(conversation_id)
-        .bind(
-            serde_json::to_string(expected_state)
-                .map_err(|error| DbError::Serialization(error.to_string()))?,
-        )
+        .bind(&observed_state)
         .execute(&mut *tx)
         .await?;
         if projection_update.rows_affected() != 1 {
@@ -27329,7 +27369,7 @@ mod tests {
                 &parent_id,
                 &ConvState::CancellingSubAgents {
                     pending: vec![PendingSubAgent {
-                        agent_id: child_id,
+                        agent_id: child_id.clone(),
                         task: "cancel".to_string(),
                         mode: SubAgentMode::Explore,
                     }],
@@ -27365,9 +27405,69 @@ mod tests {
                 }
             ));
             assert_eq!(
-                serde_json::to_value(decoded).unwrap()["forced_tool_retirement"],
+                serde_json::to_value(&decoded).unwrap()["forced_tool_retirement"],
                 "not_observed"
             );
+            let mut stale = decoded.clone();
+            if let ConvState::CancellingSubAgents {
+                forced_tool_retirement,
+                ..
+            } = &mut stale
+            {
+                *forced_tool_retirement =
+                    phoenix_core::domain::sm_state::ForcedToolRetirement::Observed;
+            }
+            let mut unknown = legacy_state.clone();
+            unknown
+                .as_object_mut()
+                .unwrap()
+                .insert("unknown_field".into(), serde_json::json!(true));
+            let mut malformed = legacy_state.clone();
+            malformed["pending"] = serde_json::json!("not a child collection");
+            for (stored, expected) in [
+                (legacy_state.clone(), stale),
+                (unknown, decoded.clone()),
+                (malformed, decoded.clone()),
+            ] {
+                let encoded = stored.to_string();
+                sqlx::query("UPDATE conversations SET state = ?1 WHERE id = ?2")
+                    .bind(&encoded)
+                    .bind(&parent_id)
+                    .execute(db.pool())
+                    .await
+                    .unwrap();
+                assert!(matches!(
+                    db.persist_startup_sub_agent_fan_in(
+                        &parent_id,
+                        &[],
+                        None,
+                        &expected,
+                        &ConvState::Idle,
+                        StartupParentAction::Cancel,
+                        Utc::now(),
+                    )
+                    .await
+                    .unwrap_err(),
+                    DbError::Serialization(_)
+                ));
+                let retained: String =
+                    sqlx::query_scalar("SELECT state FROM conversations WHERE id = ?1")
+                        .bind(&parent_id)
+                        .fetch_one(db.pool())
+                        .await
+                        .unwrap();
+                assert_eq!(retained, encoded);
+                assert!(db.get_messages(&parent_id).await.unwrap().is_empty());
+                let accepted: Option<i64> = sqlx::query_scalar("SELECT parent_accepted_at_unix_micros FROM sub_agent_runs WHERE child_conversation_id = ?1")
+                    .bind(&child_id).fetch_one(db.pool()).await.unwrap();
+                assert!(accepted.is_none());
+            }
+            sqlx::query("UPDATE conversations SET state = ?1 WHERE id = ?2")
+                .bind(legacy_state.to_string())
+                .bind(&parent_id)
+                .execute(db.pool())
+                .await
+                .unwrap();
             let ids = std::collections::HashSet::from([parent_id.clone()]);
 
             let reconciled = db.reconcile_startup_obligated_parents(&ids).await.unwrap();
