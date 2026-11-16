@@ -2193,7 +2193,6 @@ where
         Option<phoenix_core::domain::provider_replay::ProviderReplayUpdate>,
     pending_sub_agent_acceptance: Option<String>,
     pending_sub_agent_terminal: Option<phoenix_db::SubAgentTerminalCause>,
-    pending_sub_agent_activation: Option<PendingSubAgentActivation>,
     native_spawn_handoff: Option<NativeSpawnHandoff>,
     /// Browser session manager for `ToolContext`
     browser_sessions: Arc<BrowserSessionManager>,
@@ -2523,7 +2522,6 @@ where
             pending_provider_replay_update: None,
             pending_sub_agent_acceptance: None,
             pending_sub_agent_terminal: None,
-            pending_sub_agent_activation: None,
             native_spawn_handoff: None,
             browser_sessions,
             bash_handles,
@@ -4488,26 +4486,14 @@ where
         ordinary_input_id: Option<&str>,
         authority: TransitionAuthority,
     ) -> Result<Vec<Event>, String> {
+        let native_adoption = self.native_spawn_adoption_matches(&result.new_state);
         if let Some(handoff) = &self.native_spawn_handoff {
             let terminal_interruption = matches!(
                 result.new_state,
                 ConvState::Error { .. } | ConvState::Failed { .. } | ConvState::Terminal
             );
-            let adopted = matches!(handoff.phase, NativeSpawnPhase::Admitted)
-                && match &result.new_state {
-                    ConvState::ToolExecuting {
-                        pending_sub_agents: pending,
-                        ..
-                    }
-                    | ConvState::AwaitingSubAgents { pending, .. }
-                    | ConvState::CancellingSubAgents { pending, .. } => handoff
-                        .members
-                        .iter()
-                        .all(|member| pending.contains(member)),
-                    _ => false,
-                };
             if !handoff.invocation.owns_state(&result.new_state)
-                && !adopted
+                && !native_adoption
                 && !terminal_interruption
             {
                 return Err(
@@ -4515,6 +4501,9 @@ where
                         .into(),
                 );
             }
+        }
+        if native_adoption {
+            self.authorize_native_spawn_adoption(&result.new_state);
         }
         let mut generated_events = Vec::new();
         self.direct_turn_materialization_aborted = false;
@@ -5478,7 +5467,7 @@ where
     }
 
     fn state_settlement_pending(&self) -> bool {
-        self.pending_sub_agent_activation.is_some()
+        self.native_spawn_activation_pending()
             || self.pending_sub_agent_acceptance.is_some()
             || self.pending_sub_agent_terminal.is_some()
             || self.pending_direct_turn_terminal.is_some()
@@ -5493,7 +5482,7 @@ where
         broadcast: bool,
         admitted: &mut crate::runtime::AdmittedOperation,
     ) -> Result<Option<Event>, String> {
-        let activation = self.pending_sub_agent_activation.take();
+        let activation = self.take_native_spawn_activation();
         if let Some(activation) = &activation {
             let pending = match &self.state {
                 ConvState::ToolExecuting {
@@ -23822,10 +23811,17 @@ mod steer_drain_detector_tests {
         let (mut runtime, storage) =
             build_runtime_with_state_and_queue("checkpoint-child-activation", initial, vec![]);
         let (sender, mut activated) = oneshot::channel();
-        runtime.pending_sub_agent_activation = Some(PendingSubAgentActivation {
-            child_ids: vec!["admitted-child".into()],
-            sender,
-        });
+        let expected = handle_outcome(
+            &runtime.state,
+            &runtime.context,
+            EffectOutcome::Tool(ToolExecOutcome::Completed(ToolResult::success(
+                "tool-1".into(),
+                "done".into(),
+            ))),
+        )
+        .unwrap()
+        .new_state;
+        runtime.install_native_activation_for_test(sender, expected);
         runtime
             .process_outcome(EffectOutcome::Tool(ToolExecOutcome::Completed(
                 ToolResult::success("tool-1".into(), "done".into()),
@@ -23833,7 +23829,7 @@ mod steer_drain_detector_tests {
             .await
             .unwrap();
         assert_eq!(activated.try_recv(), Ok(()));
-        assert!(runtime.pending_sub_agent_activation.is_none());
+        assert!(!runtime.native_spawn_activation_pending());
         assert!(matches!(
             storage.get_current_state("checkpoint-child-activation"),
             Some(ConvState::AwaitingSubAgents { .. })
@@ -28343,10 +28339,7 @@ mod steer_drain_detector_tests {
             vec![],
         );
         let (activation_tx, mut activation_rx) = oneshot::channel();
-        rt.pending_sub_agent_activation = Some(PendingSubAgentActivation {
-            child_ids: vec!["child".to_string()],
-            sender: activation_tx,
-        });
+        rt.install_native_activation_for_test(activation_tx, rt.state.clone());
         storage.set_fail_state_update(true);
         let mut admitted = rt.admit_authoritative_effect().unwrap();
         assert!(rt.persist_state_effect(false, &mut admitted).await.is_err());

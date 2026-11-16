@@ -379,8 +379,8 @@ async fn native_activation_loss_is_observed_by_retained_admitted_owner() {
         .await
         .unwrap()
         .is_none());
-    assert!(runtime.pending_sub_agent_activation.is_some());
-    drop(runtime.pending_sub_agent_activation.take());
+    assert!(runtime.native_spawn_activation_pending());
+    runtime.native_spawn_handoff.as_mut().unwrap().phase = NativeSpawnPhase::Closing;
     manager_task.await.unwrap();
     let closure = runtime.observe_native_spawn().await;
     let completion = runtime

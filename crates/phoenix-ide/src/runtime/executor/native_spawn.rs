@@ -16,7 +16,13 @@ pub(super) enum NativeSpawnPhase {
         response: oneshot::Receiver<SubAgentAdmissionReceipt>,
         activation: oneshot::Sender<()>,
     },
-    Admitted,
+    Admitted {
+        activation: oneshot::Sender<()>,
+    },
+    Adopting {
+        expected_parent: Box<ConvState>,
+        activation: oneshot::Sender<()>,
+    },
     ActivationOwnerLost,
     Closing,
 }
@@ -49,7 +55,8 @@ impl NativeSpawnHandoff {
                 NativeSpawnObservation::Admission(response.await)
             }
             NativeSpawnPhase::Closing
-            | NativeSpawnPhase::Admitted
+            | NativeSpawnPhase::Admitted { .. }
+            | NativeSpawnPhase::Adopting { .. }
             | NativeSpawnPhase::ActivationOwnerLost => {
                 NativeSpawnObservation::Closure((&mut self.closure).await)
             }
@@ -63,6 +70,120 @@ where
     L: LlmClient + 'static,
     T: ToolExecutor + 'static,
 {
+    pub(super) fn native_spawn_adoption_matches(&self, proposed: &ConvState) -> bool {
+        self.native_spawn_handoff.as_ref().is_some_and(|handoff| {
+            if let NativeSpawnPhase::Adopting {
+                expected_parent, ..
+            } = &handoff.phase
+            {
+                return **expected_parent == *proposed;
+            }
+            matches!(handoff.phase, NativeSpawnPhase::Admitted { .. })
+                && handoff.invocation.owns_state(&self.state)
+                && match proposed {
+                    ConvState::ToolExecuting {
+                        pending_sub_agents, ..
+                    } => handoff
+                        .members
+                        .iter()
+                        .all(|member| pending_sub_agents.contains(member)),
+                    ConvState::AwaitingSubAgents { pending, .. } => handoff
+                        .members
+                        .iter()
+                        .all(|member| pending.contains(member)),
+                    _ => false,
+                }
+        })
+    }
+
+    pub(super) fn authorize_native_spawn_adoption(&mut self, proposed: &ConvState) {
+        let Some(handoff) = self.native_spawn_handoff.as_mut() else {
+            return;
+        };
+        let phase = std::mem::replace(&mut handoff.phase, NativeSpawnPhase::Closing);
+        let NativeSpawnPhase::Admitted { activation } = phase else {
+            handoff.phase = phase;
+            return;
+        };
+        handoff.phase = NativeSpawnPhase::Adopting {
+            expected_parent: Box::new(proposed.clone()),
+            activation,
+        };
+    }
+
+    pub(super) fn native_spawn_activation_pending(&self) -> bool {
+        self.native_spawn_handoff.as_ref().is_some_and(|handoff| {
+            matches!(
+                handoff.phase,
+                NativeSpawnPhase::Admitted { .. } | NativeSpawnPhase::Adopting { .. }
+            )
+        })
+    }
+
+    pub(super) fn take_native_spawn_activation(&mut self) -> Option<PendingSubAgentActivation> {
+        let handoff = self.native_spawn_handoff.as_ref()?;
+        let replaced = match &handoff.phase {
+            NativeSpawnPhase::Admitted { .. } => !handoff.invocation.owns_state(&self.state),
+            NativeSpawnPhase::Adopting {
+                expected_parent, ..
+            } => **expected_parent != self.state,
+            _ => false,
+        };
+        if replaced {
+            tracing::error!(invocation = ?handoff.invocation, "native spawn activation projection was replaced; withholding activation");
+            self.native_spawn_handoff = None;
+            return None;
+        }
+        let handoff = self.native_spawn_handoff.as_mut()?;
+        if !matches!(handoff.phase, NativeSpawnPhase::Adopting { .. }) {
+            return None;
+        }
+        let phase = std::mem::replace(&mut handoff.phase, NativeSpawnPhase::Closing);
+        let NativeSpawnPhase::Adopting { activation, .. } = phase else {
+            unreachable!("adoption phase checked");
+        };
+        Some(PendingSubAgentActivation {
+            child_ids: handoff
+                .members
+                .iter()
+                .map(|member| member.agent_id.clone())
+                .collect(),
+            sender: activation,
+        })
+    }
+
+    #[cfg(test)]
+    pub(super) fn install_native_activation_for_test(
+        &mut self,
+        sender: oneshot::Sender<()>,
+        expected_parent: ConvState,
+    ) {
+        let ConvState::ToolExecuting {
+            current_tool,
+            assistant_message,
+            pending_sub_agents,
+            ..
+        } = &self.state
+        else {
+            panic!("activation fixture requires tool round");
+        };
+        self.native_spawn_handoff = Some(NativeSpawnHandoff {
+            invocation: phoenix_db::SubAgentSpawnInvocation {
+                parent_conversation_id: self.context.conversation_id.clone(),
+                assistant_message_id: assistant_message.message_id.clone(),
+                tool_use_id: current_tool.id.clone(),
+                batch_id: "fixture-batch".into(),
+            },
+            members: pending_sub_agents.clone(),
+            cancellation: CancellationToken::new(),
+            phase: NativeSpawnPhase::Adopting {
+                expected_parent: Box::new(expected_parent),
+                activation: sender,
+            },
+            closure: oneshot::channel().1,
+        });
+    }
+
     pub(super) fn release_native_spawn_activation(
         &mut self,
         activation: PendingSubAgentActivation,
@@ -136,19 +257,12 @@ where
                         handoff.request_cancel();
                         return Ok(None);
                     }
-                    let phase = std::mem::replace(&mut handoff.phase, NativeSpawnPhase::Admitted);
+                    let phase = std::mem::replace(&mut handoff.phase, NativeSpawnPhase::Closing);
                     let NativeSpawnPhase::Admission { activation, .. } = phase else {
                         handoff.phase = phase;
                         return Ok(None);
                     };
-                    self.pending_sub_agent_activation = Some(PendingSubAgentActivation {
-                        child_ids: handoff
-                            .members
-                            .iter()
-                            .map(|member| member.agent_id.clone())
-                            .collect(),
-                        sender: activation,
-                    });
+                    handoff.phase = NativeSpawnPhase::Admitted { activation };
                     Ok(Some(Event::SpawnAgentsComplete {
                         tool_use_id: origin.tool_use_id.clone(),
                         result: ToolResult::success(
