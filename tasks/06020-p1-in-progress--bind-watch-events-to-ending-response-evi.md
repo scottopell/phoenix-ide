@@ -1,6 +1,6 @@
 # Ember phase 3: bind completion events to their exact ending evidence
 
-Parent: [06013](./06013-p1-ready--ember-consistency-and-durable-tracking.md). Requires only the event-specific baseline/contract subset described in [phase 1](./06014-p1-ready--ember-tool-contract-and-consistency-base.md), not completion of that entire task or any tracking/scanner design. This slice owns acceptance of its occurrence/retention/privacy/capture contract before implementation and is followed by [phase 4 projection/evaluation](./06021-p1-ready--enrich-ember-event-context-and-measure-f.md).
+Parent: [06013](./06013-p1-ready--ember-consistency-and-durable-tracking.md). Requires only the event-specific baseline/contract subset described in [phase 1](./06014-p1-ready--ember-tool-contract-and-consistency-base.md), not completion of that entire task or any tracking/scanner design. This slice owns acceptance of its occurrence/retention/privacy/capture contract before implementation and is followed by [phase 4 projection/evaluation](./06021-p1-in-progress--enrich-ember-event-context-and-measure-f.md).
 
 ## User-approved outcome
 
@@ -41,3 +41,14 @@ A direct turn settles with an adopted steering/interaction occurrence, then retr
 An oversized response is edited after capture: its unchanged frozen prefix cannot make the edited tail appear occurrence-bound. The captured full-content digest supplies phase 4's explicit match/changed/unavailable read result; an excerpt-only hash is insufficient.
 
 Out of scope: changing notification frequency/timing, remote protocol expansion, model summaries, broad report-fragment extraction and tracker/scanner implementation.
+
+## Current delivery evidence
+
+PR [#1092](https://github.com/scottopell/phoenix-ide/pull/1092) implements this
+component. Scoped capture, settlement, native read/schema/privacy, genuine codegen
+and fixture web checks pass. Independent review accepted compact projection C's
+[complete 39-trial comparison](../scripts/qa/ember-event-eval/results-cfda0b0.md);
+the earlier capped invocation remains partial/unaccepted. This task stays in
+progress until memory migration 164 is integrated, event migration 165 is rebased,
+exact-head CI/review pass and the PR merges. No deployment or combined Ember
+qualification is claimed.

@@ -23,15 +23,23 @@ small departure from the original same-tool preference prevents another prose-on
 local/remote distinction; see ADR-261. Every page retains the event identity and
 validates the complete source digest in the same read snapshot.
 
-Candidate validation is in progress. Eight focused DB tests pass, covering frozen
-quotation, digest-guarded pages, rollback/retry, honest absence, historical private
-presentation, unavailable input origins, prefix stability and atomic non-direct
-capture. The direct/adopted settlement/replay regression also passed. Genuine codegen
-passed all 249 export tests. IDE privacy/schema/read composition, full CI and model
-effectiveness remain open.
-Compact model hydration requires the
-predeclared A/B/C evaluation gate in ADR-261 before merge/activation. No deployment
-acceptance or actual savings are claimed by source implementation alone.
+Component qualification passed. Eight focused DB capture tests and the direct/
+adopted settlement regression pass. IDE event-evidence schema/read composition
+passes two tests; private quotation and the five-test event-presentation module
+pass. Genuine codegen passed all 249 export tests on the event candidate.
+
+Independent answer/metric review and a fresh full-39-trial audit accepted C's
+compact model hydration under ADR-261: 39 final answers, 88 calls, 1,027,411 input
+tokens including cache, zero attribution/authority failures and 60% fewer targeted
+source reads. All three controls met the frozen 10% input / 20% median-latency
+regression bounds. The [complete comparison report](../../scripts/qa/ember-event-eval/results-cfda0b0.md)
+retains per-case metrics and hashes. The [first six-call invocation](../../scripts/qa/ember-event-eval/results-e5ff1b8.md)
+remains partial/unaccepted; the authorized full second run changed only the
+uniform per-trial cap to twelve while retaining all global limits and gates.
+This is synthetic local component qualification with small samples and uncontrolled
+provider cache/load, not billing savings, deployment, remote parity or combined
+Ember acceptance. Rebase after memory migration 164, exact integrated CI, final
+review and merge remain open for event migration 165.
 
 Scoped web qualification passes 61 focused event-card/fixture tests and a forced
 application TypeScript check. The actual Ladle Global page rendered a long Unicode
