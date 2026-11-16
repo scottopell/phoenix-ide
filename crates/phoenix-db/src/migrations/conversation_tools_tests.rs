@@ -279,6 +279,7 @@ fn registered_identity_order_and_exact_bodies() {
         (162, "slack_saved_capture"),
         (163, "product_conversation_read_state"),
         (164, "coordinator_durable_tracking"),
+        (165, "watch_ending_evidence"),
     ];
     for (version, name) in identities {
         let entries = MIGRATIONS
@@ -312,6 +313,7 @@ fn registered_identity_order_and_exact_bodies() {
         (include_str!("slack_saved_capture.sql"), 162),
         (include_str!("product_conversation_read_state.sql"), 163),
         (include_str!("../coordinator_tracking/schema.sql"), 164),
+        (include_str!("watch_ending_evidence.sql"), 165),
     ] {
         let entries = MIGRATIONS
             .iter()

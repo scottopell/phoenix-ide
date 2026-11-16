@@ -2,4 +2,4 @@
 import type { EventOutcome } from "./EventOutcome";
 import type { EventProvenance } from "./EventProvenance";
 
-export type EventPresentationPayload = { event_id: string, product_conversation_id: string, display_name: string | null, source_transcript_id: string, source_occurrence_kind: string, source_occurrence_id: string, source_generation: number, outcome: EventOutcome, occurred_at_us: number, provenance: EventProvenance, };
+export type EventPresentationPayload = { event_id: string, product_conversation_id: string, display_name: string | null, source_transcript_id: string, source_occurrence_kind: string, source_occurrence_id: string, source_generation: number, outcome: EventOutcome, occurred_at_us: number, provenance: EventProvenance, ending_evidence: string, };

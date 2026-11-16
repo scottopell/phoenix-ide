@@ -17,6 +17,22 @@ fn message(id: &str) -> Message {
     }
 }
 
+#[tokio::test]
+async fn ending_quotation_is_private_and_never_added_to_shared_original_diagnostic() {
+    let (db, messages) = fixture(1).await;
+    sqlx::query("INSERT INTO coordinator_watch_ending_evidence(event_id,response_state,response_message_id,digest_version,response_digest,excerpt,prose_bytes,capture_limit,input_message_id,origin_kind) VALUES ('event-0','captured','private-response',1,?1,'private ending quotation',24,1024,'private-input','user_api')")
+        .bind("a".repeat(64)).execute(db.pool()).await.unwrap();
+    let private = EventPresentations::load(&db, &messages).await;
+    let private = serde_json::to_string(&private.enrich(&messages[0])).unwrap();
+    assert!(private.contains("private ending quotation"));
+    assert!(private.contains("private-input"));
+    let shared =
+        serde_json::to_string(&EventPresentations::redacted().enrich(&messages[0])).unwrap();
+    assert!(!shared.contains("private ending quotation"));
+    assert!(!shared.contains("private-input"));
+    assert!(shared.contains("Original event"));
+}
+
 pub(crate) async fn fixture(count: usize) -> (Database, Vec<Message>) {
     let db = Database::open_in_memory().await.unwrap();
     let source = db
@@ -187,6 +203,7 @@ fn ordinary_message_serializes_explicit_null_and_all_outcomes_preserve_reasons()
         (WatchOutcome::AwaitingTaskApproval, "awaiting_task_approval"),
     ] {
         let event = WatchEventPresentation {
+            ending_evidence: phoenix_db::WatchEndingEvidence::default(),
             event_id: "event".into(),
             product_conversation_id:
                 phoenix_core::domain::product_conversation::ProductConversationId::parse("product")

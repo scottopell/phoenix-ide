@@ -10,7 +10,7 @@ use crate::send_chat_service::{
     MessageExpansionPolicy, SendChatApplicationService, SendChatOutcome, SendChatRequest,
 };
 
-fn notification(event: &PendingWatchEvent) -> String {
+pub(crate) fn notification(event: &PendingWatchEvent) -> String {
     let label = match &event.route {
         WatchEventRoute::Subscription => "Watched conversation event",
         WatchEventRoute::MandatoryCloseFailure { .. } => "Mandatory Close cleanup failure",

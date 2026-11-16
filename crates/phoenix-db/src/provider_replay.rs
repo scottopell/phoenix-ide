@@ -14,6 +14,34 @@ use sqlx::Row;
 mod canonical_receipt;
 pub(crate) use canonical_receipt::CanonicalReceipt;
 
+async fn record_exact_agent_ending_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    conversation_id: &str,
+    message_id: &str,
+    content: &phoenix_core::domain::db_schema::MessageContent,
+    state: &phoenix_core::domain::sm_state::ConvState,
+) -> DbResult<()> {
+    if matches!(
+        content,
+        phoenix_core::domain::db_schema::MessageContent::Agent(_)
+    ) {
+        let response = crate::coordinator_watches::ending_evidence::capture_response_tx(
+            tx,
+            conversation_id,
+            Some(message_id),
+        )
+        .await?;
+        crate::record_initial_execution_outcome_with_response_tx(
+            tx,
+            conversation_id,
+            state,
+            &response,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
 pub(crate) fn validate_goal_round_replay(
     assistant: &Message,
     update: &phoenix_core::domain::provider_replay::ProviderReplayUpdate,
@@ -473,12 +501,7 @@ impl Database {
             .bind(conversation_id)
             .execute(&mut *tx)
             .await?;
-        if matches!(
-            content,
-            phoenix_core::domain::db_schema::MessageContent::Agent(_)
-        ) {
-            crate::record_initial_execution_outcome_tx(&mut tx, conversation_id, state).await?;
-        }
+        record_exact_agent_ending_tx(&mut tx, conversation_id, message_id, content, state).await?;
         sqlx::query("DELETE FROM active_responses_replay_sets WHERE conversation_id = ?1")
             .bind(conversation_id)
             .execute(&mut *tx)

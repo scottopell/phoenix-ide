@@ -126,6 +126,7 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
   api.getProductConversationHistorySnapshot = async (_productConversationId, options = {}) => {
     const requestOptions = options ?? {};
     if (!requestOptions.before) checkSnapshotFailure();
+    if (scenario.sourceSnapshot && !scenario.sourceIsGlobal && _productConversationId === scenario.sourceSnapshot.product_conversation_id) return scenario.sourceSnapshot;
     if (scenario.kind === 'coordinator') throw new Error('Global must not request ordinary history');
     if (scenario.sourceSnapshot && _productConversationId !== 'fixture-product-conversation') {
       if (scenario.sourceIsGlobal) throw new Error("Global must not request ordinary snapshot");
