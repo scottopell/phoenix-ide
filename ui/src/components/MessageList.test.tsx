@@ -4885,8 +4885,16 @@ describe('find navigation intent across finalization', () => {
         expect(agentMessageProps.some((entry) => entry.revealRequest?.fragmentId === 'agent-text-0')).toBe(true);
         act(() => vi.advanceTimersByTime(600));
         expect(scrolling).toHaveBeenCalledWith({ block: 'center' });
+        const activeOccurrence = document.createElement('mark');
+        activeOccurrence.dataset['viewerFindActiveTarget'] = 'active-occurrence';
+        activeOccurrence.textContent = 'alpha';
+        currentFragment.append(activeOccurrence);
+        scrolling.mockClear();
         fireEvent.click(screen.getByRole('button', { name: 'Previous' }));
         expect(screen.getByText('2 of 3')).toBeInTheDocument();
+        act(() => vi.advanceTimersByTime(600));
+        expect(scrolling.mock.contexts).toContain(activeOccurrence);
+        expect(scrolling.mock.contexts).not.toContain(currentFragment);
       }
       unmount();
     } finally {

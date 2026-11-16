@@ -1847,7 +1847,9 @@ function MessageListImpl({
       if (unitMatch.fragmentId) {
         const source = findSourcesRef.current.find((candidate) => candidate.id === unitMatch.sourceId);
         const revealTarget = source?.revealTarget ?? { kind: 'agent-text' as const, key: unitMatch.fragmentId };
-        findConversationFragmentElement(row, unitMatch.fragmentId, revealTarget)?.scrollIntoView({ block: 'center' });
+        const fragment = findConversationFragmentElement(row, unitMatch.fragmentId, revealTarget);
+        const target = fragment?.querySelector('[data-viewer-find-active-target]') ?? fragment;
+        target?.scrollIntoView({ block: 'center' });
       }
     }, delay));
     return () => {
