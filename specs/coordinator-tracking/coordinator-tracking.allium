@@ -207,9 +207,12 @@ rule SurfaceDueRequest {
         -- Contextual foreground inspection shares this cue budget. A cue applies
         -- only after its owning input; a later input makes it historical.
         -- After handling the current request, inspect the selected item through one
-        -- bounded read and reconcile new evidence. Advance only a permitted step,
-        -- preserve/record a concrete wait or restriction, or finish quietly when no
-        -- useful action exists. This host review instruction is not a new user
+        -- bounded read and reconcile new evidence. Advance only a permitted step.
+        -- For an owed conversational question, give a short item refresher and ask
+        -- that specific question without waiting for the user to name the item again.
+        -- Do not substitute generic topic selection or invent a pause. Preserve a
+        -- wait or finish quietly only for an actual restriction/dependency or no
+        -- useful next step. This host review instruction is not a new user
         -- commission, execution permission, mandatory recital or worker nudge.
         -- No eligible item means no recital, redundant worker nudge or new wakeup.
 }
