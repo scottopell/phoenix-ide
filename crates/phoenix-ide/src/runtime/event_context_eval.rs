@@ -40,7 +40,7 @@ use std::{
 
 const CASES: &str = include_str!("../../../../scripts/qa/ember-event-eval/cases.json");
 const EXPECTED: &str = include_str!("../../../../scripts/qa/ember-event-eval/expected.json");
-const MAX_CALLS: usize = 4;
+const MAX_CALLS: usize = 6;
 const MAX_TOTAL_CALLS: usize = 120;
 const INPUT_STOP: u64 = 2_000_000;
 
