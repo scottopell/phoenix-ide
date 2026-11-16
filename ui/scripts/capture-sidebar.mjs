@@ -12,6 +12,14 @@ runSurfaceCapture({
   ],
   captureStory: async ({ page, id, outDir, viewport }) => {
     if (id.startsWith('sidebar-visual-')) {
+      const media = await page.evaluate(() => ({
+        coarse: matchMedia('(any-pointer: coarse)').matches,
+        fine: matchMedia('(pointer: fine)').matches,
+        hover: matchMedia('(hover: hover)').matches,
+        width: innerWidth, height: innerHeight, deviceScaleFactor: devicePixelRatio,
+      }));
+      await writeFile(`${outDir}/${id}--${viewport.name}.environment.json`, JSON.stringify(media, null, 2));
+      if (media.coarse !== !!viewport.hasTouch) throw new Error('Capture pointer media does not match requested context');
       const rows = page.locator('.product-conversation-list-row');
       await rows.first().waitFor();
       await page.screenshot({ path: `${outDir}/${id}--${viewport.name}.png`, fullPage: true });
@@ -42,6 +50,13 @@ runSurfaceCapture({
           if (viewport.hasTouch && (g.menu.width < 44 || g.menu.height < 44 || g.main.height < 44)) throw new Error('Touch target smaller than 44px');
         }
       }
+      await page.locator('.sidebar').evaluate(el => { el.tabIndex = -1; el.focus(); });
+      await page.keyboard.press('Escape');
+      await page.keyboard.press('ArrowDown');
+      await page.waitForFunction(() => document.querySelectorAll('.product-conversation-list-row.keyboard-selected').length === 1);
+      await page.keyboard.press('ArrowDown');
+      if (!(await rows.nth(1).evaluate(el => el.classList.contains('keyboard-selected')))) throw new Error('Arrow navigation lost');
+      await page.screenshot({ path: `${outDir}/${id}--${viewport.name}-keyboard.png`, fullPage: true });
       const trigger = rows.first().getByRole('button', { name: /Actions for conversation/ });
       await trigger.focus();
       await page.keyboard.press('Enter');

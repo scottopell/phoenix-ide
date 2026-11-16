@@ -43,14 +43,19 @@ jobs:
           git show 6cebf545fe6d16ed02c134a873ab254fea3ad29b:ui/src/components/ConversationList.css > src/components/ConversationList.css
           git show 6cebf545fe6d16ed02c134a873ab254fea3ad29b:ui/src/components/EmberEntry.css > src/components/EmberEntry.css
           : > src/components/Sidebar.css
-          node scripts/capture-sidebar.mjs
+          for viewport in desktop touch; do
+            CAPTURE_VIEWPORT="$viewport" node scripts/capture-sidebar.mjs
+          done
       - name: Capture sidebar geometry
         working-directory: ui
         env:
           PHOENIX_LADLE: '1'
           CAPTURE_STORIES: sidebar-visual-normal,sidebar-visual-narrow
           SIDEBAR_QA_OUT: qa-artifacts/sidebar/after
-        run: node scripts/capture-sidebar.mjs
+        run: |
+          for viewport in desktop touch; do
+            CAPTURE_VIEWPORT="$viewport" node scripts/capture-sidebar.mjs
+          done
       - uses: actions/upload-artifact@v6
         if: always()
         with:

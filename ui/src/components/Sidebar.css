@@ -9,7 +9,7 @@
 }
 
 .sidebar .sidebar-header > button,
-.sidebar .sidebar-header .settings-trigger {
+.sidebar .sidebar-header .settings-dropdown-trigger {
   flex-shrink: 0;
 }
 
@@ -82,7 +82,7 @@
 
 @media (any-pointer: coarse) {
   .sidebar .sidebar-header > button,
-  .sidebar .sidebar-header .settings-trigger,
+  .sidebar .sidebar-header .settings-dropdown-trigger,
   .sidebar .sidebar-lifecycle-tab {
     min-width: 44px;
     min-height: 44px;
