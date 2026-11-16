@@ -3,6 +3,8 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { Message } from '../api';
 import { ReviewNotesProvider } from '../contexts/ReviewNotesContext';
 import { MessageViewer } from './MessageViewer';
+import { CopyButton } from './CopyButton';
+import { copyToClipboard } from '../utils/clipboard';
 
 function message(text: string): Message {
   return {
@@ -128,6 +130,79 @@ describe('MessageViewer stale interactions', () => {
       expect(writeText).toHaveBeenCalledWith('# Heading\n\nExact **message** text');
       expect(execCommand).not.toHaveBeenCalled();
       expect(select).not.toHaveBeenCalled();
+      expect(screen.getByRole('button', { name: 'Copied!' })).toBeInTheDocument();
+    } finally {
+      view.unmount();
+      restoreClipboard();
+      restoreExecCommand();
+    }
+  });
+
+  it('preserves the one-argument legacy copy path without a native clipboard', async () => {
+    const restoreClipboard = setNavigatorProperty('clipboard', undefined);
+    const { execCommand, restore: restoreExecCommand } = mockExecCommand();
+    const values: string[] = [];
+    vi.spyOn(HTMLTextAreaElement.prototype, 'select').mockImplementation(function (this: HTMLTextAreaElement) {
+      values.push(this.value);
+    });
+    try {
+      expect(await copyToClipboard('Legacy exact text')).toBe(true);
+      expect(values).toEqual(['Legacy exact text']);
+      expect(execCommand).toHaveBeenCalledWith('copy');
+      expect(document.body.querySelector('textarea')).not.toBeInTheDocument();
+    } finally {
+      restoreClipboard();
+      restoreExecCommand();
+    }
+  });
+
+  it.each(['text', 'disabled'] as const)('invalidates pending copy when %s changes', async (change) => {
+    let rejectWrite: ((reason: Error) => void) | undefined;
+    const writeText = vi.fn(() => new Promise<void>((_resolve, reject) => { rejectWrite = reject; }));
+    const restoreClipboard = setNavigatorProperty('clipboard', { writeText });
+    const { execCommand, restore: restoreExecCommand } = mockExecCommand();
+    const select = vi.spyOn(HTMLTextAreaElement.prototype, 'select');
+    const view = render(<CopyButton text="Original" />);
+    try {
+      fireEvent.click(screen.getByRole('button', { name: 'Copy to clipboard' }));
+      expect(writeText).toHaveBeenCalledWith('Original');
+      view.rerender(<CopyButton text={change === 'text' ? 'Replacement' : 'Original'} disabled={change === 'disabled'} />);
+      await act(async () => {
+        rejectWrite?.(new Error('clipboard denied'));
+        await Promise.resolve();
+      });
+      expect(select).not.toHaveBeenCalled();
+      expect(execCommand).not.toHaveBeenCalled();
+      expect(screen.queryByRole('button', { name: 'Copied!' })).not.toBeInTheDocument();
+    } finally {
+      view.unmount();
+      restoreClipboard();
+      restoreExecCommand();
+    }
+  });
+
+  it('keeps newer copy feedback when a superseded native write later rejects', async () => {
+    let rejectFirst: ((reason: Error) => void) | undefined;
+    const writeText = vi.fn()
+      .mockImplementationOnce(() => new Promise<void>((_resolve, reject) => { rejectFirst = reject; }))
+      .mockResolvedValue(undefined);
+    const restoreClipboard = setNavigatorProperty('clipboard', { writeText });
+    const { execCommand, restore: restoreExecCommand } = mockExecCommand();
+    const select = vi.spyOn(HTMLTextAreaElement.prototype, 'select');
+    const view = render(<CopyButton text="Exact text" />);
+    try {
+      const button = screen.getByRole('button', { name: 'Copy to clipboard' });
+      fireEvent.click(button);
+      fireEvent.click(button);
+      await act(async () => { await Promise.resolve(); });
+      expect(writeText).toHaveBeenCalledTimes(2);
+      expect(screen.getByRole('button', { name: 'Copied!' })).toBeInTheDocument();
+      await act(async () => {
+        rejectFirst?.(new Error('clipboard denied'));
+        await Promise.resolve();
+      });
+      expect(select).not.toHaveBeenCalled();
+      expect(execCommand).not.toHaveBeenCalled();
       expect(screen.getByRole('button', { name: 'Copied!' })).toBeInTheDocument();
     } finally {
       view.unmount();

@@ -1,4 +1,4 @@
-import { useState, useCallback, useEffect, useRef } from 'react';
+import { useState, useCallback, useLayoutEffect, useRef } from 'react';
 import { copyToClipboard } from '../utils/clipboard';
 
 interface CopyButtonProps {
@@ -28,33 +28,44 @@ function CopiedIcon() {
 export function CopyButton({ text, className = '', title = 'Copy to clipboard', disabled = false }: CopyButtonProps) {
   const [copied, setCopied] = useState(false);
   const resetTimeout = useRef<number | null>(null);
+  const activeCopy = useRef<AbortController | null>(null);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
+    activeCopy.current?.abort();
+    activeCopy.current = null;
     setCopied(false);
     if (resetTimeout.current !== null) {
       window.clearTimeout(resetTimeout.current);
       resetTimeout.current = null;
     }
-  }, [text]);
 
-  useEffect(() => {
     return () => {
+      activeCopy.current?.abort();
+      activeCopy.current = null;
       if (resetTimeout.current !== null) {
         window.clearTimeout(resetTimeout.current);
+        resetTimeout.current = null;
       }
     };
-  }, []);
+  }, [text, disabled]);
 
   const handleCopy = useCallback(async (e: React.MouseEvent) => {
     e.stopPropagation();
     if (disabled) return;
-    if (await copyToClipboard(text)) {
+
+    activeCopy.current?.abort();
+    if (resetTimeout.current !== null) {
+      window.clearTimeout(resetTimeout.current);
+      resetTimeout.current = null;
+    }
+    const controller = new AbortController();
+    activeCopy.current = controller;
+    setCopied(false);
+
+    if (await copyToClipboard(text, controller.signal) && !controller.signal.aborted) {
       setCopied(true);
-      if (resetTimeout.current !== null) {
-        window.clearTimeout(resetTimeout.current);
-      }
       resetTimeout.current = window.setTimeout(() => {
-        setCopied(false);
+        if (!controller.signal.aborted) setCopied(false);
         resetTimeout.current = null;
       }, 2000);
     }
