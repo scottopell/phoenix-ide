@@ -61,3 +61,32 @@ impl RuntimeManager {
         evidence
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn native_write_owner_abort_or_panic_closes_shared_authority() {
+        for panic in [false, true] {
+            let manager = Arc::new(super::super::scope_liveness_tests::test_manager().await);
+            let owner = manager.acquire_local_authority_pass().unwrap();
+            let (started, observed) = oneshot::channel();
+            let task = tokio::spawn(async move {
+                let _authority = NativeSpawnWriteAuthority { owner: Some(owner) };
+                started.send(()).unwrap();
+                if panic {
+                    panic!("injected native write owner panic");
+                }
+                std::future::pending::<()>().await;
+            });
+            observed.await.unwrap();
+            if !panic {
+                task.abort();
+            }
+            assert!(task.await.is_err());
+            assert!(manager.fatal_local_authority_fence.is_closed());
+            assert_eq!(manager.fatal_local_authority_fence.owner_count(), 0);
+        }
+    }
+}

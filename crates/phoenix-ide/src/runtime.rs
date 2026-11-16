@@ -9505,7 +9505,7 @@ mod scope_liveness_tests {
         )
     }
 
-    async fn test_manager() -> RuntimeManager {
+    pub(super) async fn test_manager() -> RuntimeManager {
         let db = crate::db::Database::open_in_memory().await.expect("db");
         RuntimeManager::new(
             db,

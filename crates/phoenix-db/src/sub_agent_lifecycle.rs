@@ -830,15 +830,17 @@ impl Database {
             if current != membership.previous_state {
                 return Err(lifecycle_conflict("parent changed before unactivated membership commit"));
             }
-            let members: Vec<String> = sqlx::query_scalar(
-                "SELECT r.child_conversation_id FROM sub_agent_runs r
+            let members: Vec<(String, bool)> = sqlx::query_as(
+                "SELECT r.child_conversation_id,
+                        r.initial_dispatch_claimed_at_unix_micros IS NULL
+                        AND r.terminal_at_unix_micros IS NOT NULL
+                        AND r.parent_accepted_at_unix_micros IS NULL
+                 FROM sub_agent_runs r
                  JOIN sub_agent_batches b ON b.batch_id = r.batch_id
-                 WHERE b.batch_id = ?1 AND b.parent_conversation_id = ?2
-                   AND r.initial_dispatch_claimed_at_unix_micros IS NULL
-                   AND r.terminal_at_unix_micros IS NOT NULL
-                   AND r.parent_accepted_at_unix_micros IS NULL ORDER BY r.ordinal",
+                 WHERE b.batch_id = ?1 AND b.parent_conversation_id = ?2 ORDER BY r.ordinal",
             ).bind(&origin.batch_id).bind(&origin.parent_conversation_id).fetch_all(&mut *tx).await?;
-            if members.is_empty() || !members.iter().eq(membership.members.iter().map(|member| &member.agent_id)) {
+            if members.is_empty() || !members.iter().all(|(_, valid)| *valid)
+                || !members.iter().map(|(child, _)| child).eq(membership.members.iter().map(|member| &member.agent_id)) {
                 return Err(lifecycle_conflict("unactivated membership lacks exact terminal batch"));
             }
             let encoded = serde_json::to_string(&state).map_err(|e| DbError::Serialization(e.to_string()))?;
@@ -1983,6 +1985,192 @@ impl Database {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn native_spawn_state() -> ConvState {
+        use phoenix_core::domain::sm_state::{
+            AssistantMessage, SpawnAgentsInput, ToolCall, ToolInput,
+        };
+        ConvState::ToolExecuting {
+            current_tool: ToolCall::new(
+                "spawn",
+                ToolInput::SpawnAgents(SpawnAgentsInput { tasks: vec![] }),
+            ),
+            remaining_tools: vec![],
+            completed_results: vec![],
+            pending_sub_agents: vec![],
+            assistant_message: AssistantMessage::new("assistant".into(), vec![], None, None),
+        }
+    }
+
+    fn native_membership() -> UnactivatedSubAgentMembership {
+        UnactivatedSubAgentMembership {
+            invocation: SubAgentSpawnInvocation {
+                parent_conversation_id: "parent".into(),
+                assistant_message_id: "assistant".into(),
+                tool_use_id: "spawn".into(),
+                batch_id: "batch".into(),
+            },
+            previous_state: native_spawn_state(),
+            members: vec![phoenix_core::domain::sm_state::PendingSubAgent {
+                agent_id: "child".into(),
+                task: "work".into(),
+                mode: phoenix_core::domain::sm_state::SubAgentMode::Work,
+            }],
+        }
+    }
+
+    #[tokio::test]
+    async fn live_unactivated_membership_classifies_commit_and_retains_owed_terminal() {
+        for cut in [
+            TerminalEvidenceTransactionCut::BeforeCommit,
+            TerminalEvidenceTransactionCut::AfterCommit,
+            TerminalEvidenceTransactionCut::AfterCommitLookupUnavailable,
+        ] {
+            let db = Database::open_in_memory().await.unwrap();
+            let scope = atomic_parent(&db).await;
+            db.admit_sub_agent_batch_atomically(&atomic_batch("batch", scope))
+                .await
+                .established()
+                .unwrap()
+                .unwrap();
+            db.close_live_unactivated_sub_agent_batch(
+                &batch(
+                    "batch",
+                    "parent",
+                    false,
+                    &[("child", SubAgentExecutionAuthority::WriteCapable)],
+                ),
+                Utc::now(),
+            )
+            .await
+            .established()
+            .unwrap()
+            .unwrap();
+            let membership = native_membership();
+            db.update_conversation_state("parent", &membership.previous_state)
+                .await
+                .unwrap();
+            let result = db
+                .establish_unactivated_sub_agent_membership_with_cut(&membership, Utc::now(), cut)
+                .await;
+            match cut {
+                TerminalEvidenceTransactionCut::BeforeCommit => {
+                    assert!(result.established().unwrap().is_err());
+                    assert_eq!(
+                        db.get_conversation("parent").await.unwrap().state,
+                        membership.previous_state
+                    );
+                }
+                TerminalEvidenceTransactionCut::AfterCommit => assert_eq!(
+                    result.established().unwrap().unwrap(),
+                    membership.reconciled_state().unwrap()
+                ),
+                TerminalEvidenceTransactionCut::AfterCommitLookupUnavailable => assert!(matches!(
+                    result,
+                    crate::workflow::LocalAuthorityResult::DurableFactUnclassified
+                )),
+                TerminalEvidenceTransactionCut::None => unreachable!(),
+            }
+            assert!(!db.sub_agent_terminal_is_accepted("child").await.unwrap());
+            assert_eq!(
+                db.owed_sub_agent_terminals("parent").await.unwrap().len(),
+                1
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn live_unactivated_membership_rejects_different_origin_or_batch() {
+        let db = Database::open_in_memory().await.unwrap();
+        let scope = atomic_parent(&db).await;
+        db.admit_sub_agent_batch_atomically(&atomic_batch("batch", scope))
+            .await
+            .established()
+            .unwrap()
+            .unwrap();
+        db.close_live_unactivated_sub_agent_batch(
+            &batch(
+                "batch",
+                "parent",
+                false,
+                &[("child", SubAgentExecutionAuthority::WriteCapable)],
+            ),
+            Utc::now(),
+        )
+        .await
+        .established()
+        .unwrap()
+        .unwrap();
+        let membership = native_membership();
+        db.update_conversation_state("parent", &membership.previous_state)
+            .await
+            .unwrap();
+        for field in ["parent", "assistant", "tool", "batch", "child"] {
+            let mut wrong = membership.clone();
+            match field {
+                "parent" => wrong.invocation.parent_conversation_id = "other".into(),
+                "assistant" => wrong.invocation.assistant_message_id = "other".into(),
+                "tool" => wrong.invocation.tool_use_id = "other".into(),
+                "batch" => wrong.invocation.batch_id = "other".into(),
+                "child" => wrong.members[0].agent_id = "other".into(),
+                _ => unreachable!(),
+            }
+            assert!(
+                db.establish_unactivated_sub_agent_membership(&wrong, Utc::now())
+                    .await
+                    .established()
+                    .unwrap()
+                    .is_err(),
+                "{field}"
+            );
+            assert_eq!(
+                db.get_conversation("parent").await.unwrap().state,
+                membership.previous_state
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn live_unactivated_closure_sql_failure_rolls_back_every_child() {
+        let db = Database::open_in_memory().await.unwrap();
+        let scope = atomic_parent(&db).await;
+        let mut admission = atomic_batch("batch", scope);
+        admission.children[0].run.execution_authority = SubAgentExecutionAuthority::ReadOnly;
+        let mut second = admission.children[0].clone();
+        second.run.child_conversation_id = "child-2".into();
+        second.slug = "child-2".into();
+        second.initial_message_id = "initial-2".into();
+        admission.children.push(second);
+        db.admit_sub_agent_batch_atomically(&admission)
+            .await
+            .established()
+            .unwrap()
+            .unwrap();
+        sqlx::query("CREATE TRIGGER reject_second_terminal BEFORE UPDATE OF terminal_cause ON sub_agent_runs WHEN NEW.child_conversation_id = 'child-2' BEGIN SELECT RAISE(ABORT, 'known second terminal failure'); END").execute(db.pool()).await.unwrap();
+        let closure = batch(
+            "batch",
+            "parent",
+            false,
+            &[
+                ("child", SubAgentExecutionAuthority::ReadOnly),
+                ("child-2", SubAgentExecutionAuthority::ReadOnly),
+            ],
+        );
+        assert!(db
+            .close_live_unactivated_sub_agent_batch(&closure, Utc::now())
+            .await
+            .established()
+            .unwrap()
+            .is_err());
+        for child in ["child", "child-2"] {
+            assert!(matches!(
+                db.get_conversation(child).await.unwrap().state,
+                ConvState::Idle
+            ));
+            let row: (Option<i64>, Option<i64>, Option<i64>) = sqlx::query_as("SELECT cancellation_requested_at_unix_micros, terminal_at_unix_micros, parent_accepted_at_unix_micros FROM sub_agent_runs WHERE child_conversation_id = ?1").bind(child).fetch_one(db.pool()).await.unwrap();
+            assert_eq!(row, (None, None, None));
+        }
+    }
 
     async fn parent_with_children(db: &Database, parent: &str, children: &[&str]) {
         db.create_conversation(parent, parent, "/tmp", true, None, Some("gpt-5.6-sol"))
