@@ -68,6 +68,36 @@ runSurfaceCapture({
           if (viewport.hasTouch && (g.menu.width < 44 || g.menu.height < 44 || g.main.height < 44)) throw new Error('Touch target smaller than 44px');
         }
       }
+      if (process.env.SIDEBAR_VISUAL_BASELINE !== '1' && id === 'sidebar-visual-normal') {
+        const sweep = [];
+        const sidebar = page.locator('.sidebar');
+        for (const width of [160, 180, 200, 220, 230, 240, 260, 280, 320, 500]) {
+          await sidebar.evaluate((el, value) => el.style.setProperty('--sidebar-pane-width', `${value}px`), width);
+          const sample = await sidebar.evaluate(el => {
+            const bounds = el.getBoundingClientRect();
+            const rows = [...el.querySelectorAll('.product-conversation-list-row')].map(row => {
+              const main = row.querySelector('.conv-item-main').getBoundingClientRect();
+              const title = row.querySelector('.conv-item-title').getBoundingClientRect();
+              const menu = row.querySelector('.conv-item-menu-btn').getBoundingClientRect();
+              const badge = row.querySelector('.pr-badge')?.getBoundingClientRect();
+              return { titleWidth: title.width, inside: [main, menu, badge].filter(Boolean).every(r => r.x >= bounds.x && r.right <= bounds.right),
+                badgeClear: !badge || badge.top >= main.bottom || badge.right <= menu.x && badge.x >= main.right };
+            });
+            const controls = [...el.querySelectorAll('.sidebar-header button, .sidebar-lifecycle-tab')].map(control => {
+              const r = control.getBoundingClientRect();
+              return { fits: control.scrollWidth <= control.clientWidth, inside: r.x >= bounds.x && r.right <= bounds.right + 1, width: r.width, height: r.height };
+            });
+            return { rows, controls };
+          });
+          sweep.push({ width, ...sample });
+        }
+        await sidebar.evaluate(el => el.style.removeProperty('--sidebar-pane-width'));
+        await writeFile(`${outDir}/${id}--${viewport.name}.width-sweep.json`, JSON.stringify(sweep, null, 2));
+        for (const sample of sweep) {
+          if (sample.rows.some(row => row.titleWidth < 40 || !row.inside || !row.badgeClear)) throw new Error(`Row allocation failed at sidebar width ${sample.width}`);
+          if (sample.controls.some(c => !c.fits || !c.inside || viewport.hasTouch && (c.width < 44 || c.height < 44))) throw new Error(`Header allocation failed at sidebar width ${sample.width}`);
+        }
+      }
       await page.locator('.sidebar').evaluate(el => { el.tabIndex = -1; el.focus(); });
       await page.keyboard.press('Escape');
       await page.keyboard.press('ArrowDown');
