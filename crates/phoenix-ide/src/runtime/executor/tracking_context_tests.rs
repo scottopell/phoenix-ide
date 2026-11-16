@@ -350,10 +350,10 @@ mod live {
             for block in &response.content {
                 match block {
                     ContentBlock::Text { text } => {
-                        eprintln!("tracking_eval_visible_assistant_text text={text:?}")
+                        eprintln!("tracking_eval_visible_assistant_text text={text:?}");
                     }
                     ContentBlock::ToolUse { id, name, input } => {
-                        eprintln!("tracking_eval_tool_call id={id} name={name} input={input}")
+                        eprintln!("tracking_eval_tool_call id={id} name={name} input={input}");
                     }
                     _ => {}
                 }
