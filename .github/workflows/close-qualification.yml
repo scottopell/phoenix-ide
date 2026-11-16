@@ -89,6 +89,12 @@ jobs:
             native_resource_failure_rolls_back_late_outbox_and_outcome_message_errors; do
             grep -F "close_foundation::tests::native_retry::$test: test" evidence/selected-tests.txt
           done
+          for test in \
+            native_retry_execution_context_reads_original_typed_plan_without_mutation \
+            native_retry_execution_context_checks_live_source_before_retained_receipt \
+            native_retry_execution_context_refuses_forged_receipt_wrong_failed_run_and_stopped_latest; do
+            grep -F "close_foundation::tests::native_retry::$test: test" evidence/selected-tests.txt
+          done
       - name: Execute migration163 populated upgrade and authority regressions
         if: success()
         shell: bash

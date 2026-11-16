@@ -1007,7 +1007,7 @@ pub struct TerminalizeInitialCloseCleanupFailureRequest {
     pub occurred_at_us: i64,
 }
 
-fn parse_cleanup_resource_identity(row: &SqliteRow) -> DbResult<RetiredResourceIdentity> {
+pub(crate) fn parse_cleanup_resource_identity(row: &SqliteRow) -> DbResult<RetiredResourceIdentity> {
     RetiredResourceIdentity::parse(
         parse_retired_resource_kind(&row.try_get::<String, _>("resource_kind")?)?,
         parse_loss_item_identity(
@@ -6780,14 +6780,20 @@ impl Database {
         obligation: CloseObligation,
     ) -> DbResult<CloseObligation> {
         let (scope, resource, snapshot) = match &request.authority {
-            CloseCleanupFailureAuthority::ExpectedResource { scope, resource, snapshot } => {
-                (scope, resource, Some(snapshot))
-            }
+            CloseCleanupFailureAuthority::ExpectedResource {
+                scope,
+                resource,
+                snapshot,
+            } => (scope, resource, Some(snapshot)),
             CloseCleanupFailureAuthority::CapturedScope { scope, resource }
             | CloseCleanupFailureAuthority::ObservedProcessResource { scope, resource } => {
                 (scope, resource, None)
             }
-            _ => return Err(close_precondition("resource occurrence requires resource authority")),
+            _ => {
+                return Err(close_precondition(
+                    "resource occurrence requires resource authority",
+                ))
+            }
         };
         let identity = resource.identity();
         sqlx::query(
@@ -6827,14 +6833,20 @@ impl Database {
         request: &TerminalizeInitialCloseCleanupFailureRequest,
     ) -> DbResult<bool> {
         let (scope, resource, snapshot) = match &request.authority {
-            CloseCleanupFailureAuthority::ExpectedResource { scope, resource, snapshot } => {
-                (scope, resource, Some(snapshot))
-            }
+            CloseCleanupFailureAuthority::ExpectedResource {
+                scope,
+                resource,
+                snapshot,
+            } => (scope, resource, Some(snapshot)),
             CloseCleanupFailureAuthority::CapturedScope { scope, resource }
             | CloseCleanupFailureAuthority::ObservedProcessResource { scope, resource } => {
                 (scope, resource, None)
             }
-            _ => return Err(close_precondition("resource occurrence requires resource authority")),
+            _ => {
+                return Err(close_precondition(
+                    "resource occurrence requires resource authority",
+                ))
+            }
         };
         let identity = resource.identity();
         let exact: bool = sqlx::query_scalar(

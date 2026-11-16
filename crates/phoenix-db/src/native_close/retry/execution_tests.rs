@@ -4,7 +4,7 @@ use phoenix_core::domain::close::{GitPathIdentity, WorktreeFingerprint};
 async fn generic_resource_failure_still_terminalizes_and_replays_non_native_retry() {
     let db = Database::open_in_memory().await.unwrap();
     let failure = fixture(&db, Vec::new(), true).await;
-    let run = db.admit_close_safe_retry(&native_retry_request(&failure)).await.unwrap();
+    let run = db.admit_close_safe_retry(&safe_retry_request(&failure)).await.unwrap();
     let mut request = failure.clone();
     request.failure_occurrence_id = run.failure_occurrence_id();
     request.occurred_at_us = Utc::now().timestamp_micros();
@@ -23,6 +23,115 @@ async fn native_resource_failure_fixture() -> (Database, Assessment, NativeClose
     let (db, assessment, receipt) = migration_163_pending_fixture().await;
     crate::migrations::run_pending_migrations(db.pool()).await.unwrap();
     (db, assessment, receipt)
+}
+
+#[tokio::test]
+async fn native_retry_execution_context_reads_original_typed_plan_without_mutation() {
+    use std::fmt::Write as _;
+
+    let (db, assessment, receipt) = native_resource_failure_fixture().await;
+    let run = CloseRunRef {
+        attempt_id: receipt.admitted.attempt_id.clone(),
+        ordinal: receipt.admitted.run_ordinal,
+    };
+    let g2 = current_test_snapshot(&db, run.attempt_id.as_str()).await;
+    assert_ne!(g2, assessment.proof.snapshot);
+    let worktree = assessment.request.remaining_effects.iter()
+        .find(|effect| effect.resource.kind() == RetiredResourceKind::Worktree).unwrap();
+    success_recorded(db.record_native_close_retry_success(
+        &assessment.command, &receipt.admitted, worktree, "original worktree completed",
+    ).await);
+    let retained = migration_163_retained_state(&db).await;
+    let metadata = lookup_metadata(&db, &run.attempt_id).await;
+    let counts = native_failure_side_effect_counts(&db).await;
+    let context = db.read_native_close_retry_execution_context(
+        &assessment.command, &receipt.admitted,
+    ).await.unwrap();
+    assert_eq!(context.snapshot, assessment.proof.snapshot);
+    assert_eq!(context.scopes, assessment.proof.scopes);
+    assert_eq!(context.resources, assessment.proof.resources);
+    assert_eq!(context.effects, assessment.request.remaining_effects);
+    assert_eq!(context.progress, db.close_safe_retry_progress(&run).await.unwrap());
+    assert_eq!(context.progress.successful, vec![worktree.clone()]);
+    assert_eq!(context.progress.pending, assessment.request.remaining_effects.iter()
+        .filter(|effect| *effect != worktree).cloned().collect::<Vec<_>>());
+    assert!(context.resources.iter().all(|resource| resource.snapshot == context.snapshot));
+    assert!(context.scopes.iter().any(|scope| matches!(
+        &scope.captured_worktree,
+        Some(phoenix_core::domain::close::CapturedWorktreeIdentity::Resolved(_))
+    )));
+    let retained_g2 = db.list_close_retirement_inspections(run.attempt_id.as_str()).await.unwrap();
+    assert!(!context.worktree_snapshots.is_empty());
+    assert_eq!(context.worktree_snapshots.len(), context.scopes.iter()
+        .filter(|scope| scope.captured_worktree.is_some()).count());
+    let mut generation = String::from("v1");
+    let mut fingerprint = String::from("v1");
+    for (target, snapshot) in &context.worktree_snapshots {
+        let scope = target.scope.as_str();
+        write!(generation, "{}:{scope}{}:{}", scope.len(), snapshot.generation().len(), snapshot.generation()).unwrap();
+        write!(fingerprint, "{}:{scope}{}:{}", scope.len(), snapshot.fingerprint().len(), snapshot.fingerprint()).unwrap();
+        assert!(retained_g2.iter().any(|inspection| inspection.target == *target
+            && inspection.snapshot != *snapshot), "retained G2 poison must not supply G1 inputs");
+    }
+    assert_eq!(generation, context.snapshot.generation());
+    assert_eq!(fingerprint, context.snapshot.fingerprint());
+    assert_eq!(current_test_snapshot(&db, run.attempt_id.as_str()).await, g2);
+    assert_eq!(migration_163_retained_state(&db).await, retained);
+    assert_eq!(lookup_metadata(&db, &run.attempt_id).await, metadata);
+    assert_eq!(native_failure_side_effect_counts(&db).await, counts);
+}
+
+#[tokio::test]
+async fn native_retry_execution_context_checks_live_source_before_retained_receipt() {
+    let (db, assessment, receipt) = native_resource_failure_fixture().await;
+    assert!(db.read_native_close_explicit_retry_receipt(&assessment.command).await.unwrap().is_some());
+    write_source_fence_state(&db, &assessment.command, &ConvState::Idle, false).await.unwrap();
+    let retained = migration_163_retained_state(&db).await;
+    let metadata = lookup_metadata(&db, &receipt.admitted.attempt_id).await;
+    let counts = native_failure_side_effect_counts(&db).await;
+    let result = db.read_native_close_retry_execution_context(
+        &assessment.command, &receipt.admitted,
+    ).await;
+    let Err(DbError::CloseFoundationPrecondition(message)) = result else {
+        panic!("stale source must refuse before receipt replay: {result:?}");
+    };
+    assert!(message.contains("current executing source"), "{message}");
+    assert_eq!(migration_163_retained_state(&db).await, retained);
+    assert_eq!(lookup_metadata(&db, &receipt.admitted.attempt_id).await, metadata);
+    assert_eq!(native_failure_side_effect_counts(&db).await, counts);
+}
+
+#[tokio::test]
+async fn native_retry_execution_context_refuses_forged_receipt_wrong_failed_run_and_stopped_latest() {
+    let (db, assessment, receipt) = native_resource_failure_fixture().await;
+    let retained = migration_163_retained_state(&db).await;
+    let metadata = lookup_metadata(&db, &receipt.admitted.attempt_id).await;
+    let counts = native_failure_side_effect_counts(&db).await;
+    let mut forged = receipt.admitted.clone();
+    forged.run_ordinal = forged.run_ordinal.checked_next().unwrap();
+    assert!(db.read_native_close_retry_execution_context(&assessment.command, &forged).await.is_err());
+    assert_eq!(migration_163_retained_state(&db).await, retained);
+    assert_eq!(lookup_metadata(&db, &receipt.admitted.attempt_id).await, metadata);
+    assert_eq!(native_failure_side_effect_counts(&db).await, counts);
+    let pending = assessment.request.remaining_effects.clone();
+    let request = native_resource_failure_request(&assessment, &receipt, &pending, 0);
+    retry_completed(db.terminalize_native_close_retry_resource_failure(
+        &assessment.command, &receipt.admitted, request,
+    ).await);
+    let retained = migration_163_retained_state(&db).await;
+    let metadata = lookup_metadata(&db, &receipt.admitted.attempt_id).await;
+    let counts = native_failure_side_effect_counts(&db).await;
+    assert!(db.read_native_close_explicit_retry_receipt(&assessment.command).await.unwrap().is_some());
+    assert!(db.read_native_close_retry_execution_context(&assessment.command, &receipt.admitted).await.is_err());
+    let wrong_failed = retry_command(&db, "context-wrong-failed", NativeCloseIntent::ExplicitRetry {
+        target: receipt.admitted.target.clone(),
+        attempt_id: receipt.admitted.attempt_id.clone(),
+        failed_run_ordinal: receipt.admitted.run_ordinal,
+    }).await;
+    assert!(db.read_native_close_retry_execution_context(&wrong_failed, &receipt.admitted).await.is_err());
+    assert_eq!(migration_163_retained_state(&db).await, retained);
+    assert_eq!(lookup_metadata(&db, &receipt.admitted.attempt_id).await, metadata);
+    assert_eq!(native_failure_side_effect_counts(&db).await, counts);
 }
 
 fn native_resource_failure_request(
@@ -156,25 +265,25 @@ async fn assert_native_resource_failure_pending_tail_replay(failed_index: usize)
             &assessment.command, &receipt.admitted, request.clone(),
         ).await), obligation);
     }
-    let mut changes = Vec::new();
+    let mut conflicting_requests = Vec::new();
     let mut changed = request.clone();
     changed.detail.push_str(" changed");
-    changes.push(changed);
+    conflicting_requests.push(changed);
     let mut changed = request.clone();
     changed.reason = RetirementFailureReason::Interrupted;
-    changes.push(changed);
+    conflicting_requests.push(changed);
     let mut changed = request.clone();
     changed.occurred_at_us -= 1;
-    changes.push(changed);
+    conflicting_requests.push(changed);
     let mut changed = request.clone();
     changed.remaining_resources[failed_index].disposition = CloseCleanupResourceDisposition::Unattempted;
-    changes.push(changed);
+    conflicting_requests.push(changed);
     let mut changed = request.clone();
     changed.stop_certainty = CloseStopCertainty::ConversationAndProcessesStopped {
         confirmed_at_us: request.occurred_at_us,
     };
-    changes.push(changed);
-    for changed in changes {
+    conflicting_requests.push(changed);
+    for changed in conflicting_requests {
         completion_refused(db.terminalize_native_close_retry_resource_failure(
             &assessment.command, &receipt.admitted, changed,
         ).await);
@@ -217,7 +326,7 @@ async fn native_resource_failure_refuses_full_identity_and_caller_evidence_misma
     assert_eq!(pending.len(), 3);
     let retained = migration_163_retained_state(&db).await;
     let counts = native_failure_side_effect_counts(&db).await;
-    let mut changes = Vec::new();
+    let mut conflicting_requests = Vec::new();
     let LossItemIdentity::Worktree(captured) = pending[index].resource.identity() else { panic!("worktree"); };
     for (fingerprint, locator) in [
         (WorktreeFingerprint::parse("changed-native-fingerprint").unwrap(), captured.locator().clone()),
@@ -230,56 +339,56 @@ async fn native_resource_failure_refuses_full_identity_and_caller_evidence_misma
                 captured.id().clone(), fingerprint, locator,
             ))).unwrap();
         let forged = resource.clone();
-        changes.push(changed.clone());
+        conflicting_requests.push(changed.clone());
         changed.remaining_resources[index].resource = forged.clone();
-        changes.push(changed);
+        conflicting_requests.push(changed);
         let mut children_only = request.clone();
         children_only.remaining_resources[index].resource = forged;
-        changes.push(children_only);
+        conflicting_requests.push(children_only);
     }
     let mut changed = request.clone();
     let CloseCleanupFailureAuthority::ExpectedResource { snapshot, .. } = &mut changed.authority else { unreachable!() };
     *snapshot = current_test_snapshot(&db, run.attempt_id.as_str()).await;
-    changes.push(changed);
+    conflicting_requests.push(changed);
     let mut changed = request.clone();
     changed.failure_occurrence_id.push_str("-wrong");
-    changes.push(changed);
+    conflicting_requests.push(changed);
     let mut changed = request.clone();
     changed.source_product_conversation_id = ProductConversationId::parse("wrong-target").unwrap();
-    changes.push(changed);
+    conflicting_requests.push(changed);
     let mut changed = request.clone();
     changed.authority = CloseCleanupFailureAuthority::AttemptInterrupted;
-    changes.push(changed);
+    conflicting_requests.push(changed);
     let mut changed = request.clone();
     changed.remaining_resources.reverse();
-    changes.push(changed);
+    conflicting_requests.push(changed);
     for scope_index in pending.iter().enumerate().filter_map(|(index, effect)| {
         (effect.resource.kind() == RetiredResourceKind::WorkScope).then_some(index)
     }) {
         let mut changed = request.clone();
         changed.remaining_resources.remove(scope_index);
-        changes.push(changed);
+        conflicting_requests.push(changed);
         let mut changed = request.clone();
         changed.remaining_resources[scope_index].scope = WorkScopeId::parse("foreign-scope").unwrap();
-        changes.push(changed);
+        conflicting_requests.push(changed);
     }
     let mut changed = request.clone();
     changed.remaining_resources[index].disposition = CloseCleanupResourceDisposition::Residual;
-    changes.push(changed);
+    conflicting_requests.push(changed);
     let mut changed = request.clone();
     changed.detail = " \n\t".into();
-    changes.push(changed);
+    conflicting_requests.push(changed);
     for occurred in [-1, 0, i64::MAX] {
         let mut changed = request.clone();
         changed.occurred_at_us = occurred;
-        changes.push(changed);
+        conflicting_requests.push(changed);
     }
     for confirmed in [-1, request.occurred_at_us + 1] {
         let mut changed = request.clone();
         changed.stop_certainty = CloseStopCertainty::ConversationAndProcessesStopped { confirmed_at_us: confirmed };
-        changes.push(changed);
+        conflicting_requests.push(changed);
     }
-    for changed in changes {
+    for changed in conflicting_requests {
         completion_refused(db.terminalize_native_close_retry_resource_failure(
             &assessment.command, &receipt.admitted, changed,
         ).await);

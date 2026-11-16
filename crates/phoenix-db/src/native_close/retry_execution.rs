@@ -1,21 +1,103 @@
 //! Source-bound execution of the exact admitted native resource plan.
 
+use std::collections::{BTreeMap, BTreeSet};
+
 use phoenix_core::domain::close::{
-    CloseObligation, CloseRetirementSnapshot, CloseRunRef, CloseStopCertainty,
+    CloseAttemptScope, CloseExpectedRetirementResource, CloseObligation, CloseRetirementSnapshot,
+    CloseRetirementTarget, CloseRunRef, CloseStopCertainty,
 };
+use phoenix_core::work_scope::WorkScopeId;
 use sqlx::{Row, Sqlite, Transaction};
 
 use super::{NativeCloseCommand, NativeCloseIntent, NativeCloseRunRef};
 use crate::close_foundation::{
-    close_obligation_for_update, retained_close_retry_progress_tx, CloseCleanupFailureAuthority,
-    CloseCleanupFailureResource, CloseCleanupResourceDisposition, CloseSafeRetryEffect,
-    TerminalizeInitialCloseCleanupFailureRequest,
+    close_obligation_for_update, parse_cleanup_resource_identity, retained_close_retry_progress_tx,
+    CloseCleanupFailureAuthority, CloseCleanupFailureResource, CloseCleanupResourceDisposition,
+    CloseSafeRetryEffect, CloseSafeRetryProgress, TerminalizeInitialCloseCleanupFailureRequest,
 };
 use crate::workflow::LocalAuthorityResult;
 use crate::{Database, DbError, DbResult};
 
 fn refused(message: &str) -> DbError {
     DbError::CloseFoundationPrecondition(message.to_owned())
+}
+
+/// Persisted original-generation inputs, not permission to dispatch resource effects.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeCloseRetryExecutionContext {
+    pub snapshot: CloseRetirementSnapshot,
+    pub effects: Vec<CloseSafeRetryEffect>,
+    pub progress: CloseSafeRetryProgress,
+    pub scopes: Vec<CloseAttemptScope>,
+    pub resources: Vec<CloseExpectedRetirementResource>,
+    pub worktree_snapshots: Vec<(CloseRetirementTarget, CloseRetirementSnapshot)>,
+}
+
+fn decode_snapshot_component(encoded: &str) -> DbResult<BTreeMap<WorkScopeId, &str>> {
+    fn take_component<'a>(remaining: &mut &'a str) -> DbResult<&'a str> {
+        let invalid = || refused("malformed original aggregate snapshot component");
+        let (digits, rest) = remaining.split_once(':').ok_or_else(invalid)?;
+        let length = digits.parse::<usize>().map_err(|_| invalid())?;
+        if length.to_string() != digits {
+            return Err(invalid());
+        }
+        let value = rest.get(..length).ok_or_else(invalid)?;
+        *remaining = rest.get(length..).ok_or_else(invalid)?;
+        Ok(value)
+    }
+
+    if encoded == "no-worktree" {
+        return Ok(BTreeMap::new());
+    }
+    let mut remaining = encoded
+        .strip_prefix("v1")
+        .filter(|rest| !rest.is_empty())
+        .ok_or_else(|| refused("original snapshot lacks a nonempty v1 aggregate"))?;
+    let mut components = BTreeMap::new();
+    while !remaining.is_empty() {
+        let scope = WorkScopeId::parse(take_component(&mut remaining)?)
+            .map_err(|error| DbError::Serialization(error.to_string()))?;
+        let value = take_component(&mut remaining)?;
+        if components
+            .last_key_value()
+            .is_some_and(|(previous, _)| previous >= &scope)
+        {
+            return Err(refused(
+                "original aggregate scopes are duplicate or unordered",
+            ));
+        }
+        components.insert(scope, value);
+    }
+    Ok(components)
+}
+
+fn original_worktree_snapshots(
+    snapshot: &CloseRetirementSnapshot,
+    scopes: &[CloseAttemptScope],
+) -> DbResult<Vec<(CloseRetirementTarget, CloseRetirementSnapshot)>> {
+    let generations = decode_snapshot_component(snapshot.generation())?;
+    let mut fingerprints = decode_snapshot_component(snapshot.fingerprint())?;
+    let captured = scopes
+        .iter()
+        .filter(|scope| scope.captured_worktree.is_some())
+        .map(|scope| &scope.scope)
+        .collect::<BTreeSet<_>>();
+    if generations.keys().ne(fingerprints.keys()) || generations.keys().ne(captured) {
+        return Err(refused(
+            "original aggregate differs from captured worktree scopes",
+        ));
+    }
+    generations
+        .into_iter()
+        .map(|(scope, generation)| {
+            let fingerprint = fingerprints
+                .remove(&scope)
+                .ok_or_else(|| refused("original aggregate fingerprint scope is missing"))?;
+            let snapshot = CloseRetirementSnapshot::parse(generation, fingerprint)
+                .map_err(|error| DbError::Serialization(error.to_string()))?;
+            Ok((CloseRetirementTarget { scope }, snapshot))
+        })
+        .collect()
 }
 
 struct NativeCloseRetryPlanIdentity {
@@ -26,6 +108,85 @@ struct NativeCloseRetryPlanIdentity {
 }
 
 impl Database {
+    /// Reads the exact latest running resource retry in one read-only transaction.
+    /// The actor must hold its exclusive source occurrence and execution lock; this
+    /// context neither owns that authority nor authorizes dispatch or fresh inspection.
+    ///
+    /// # Errors
+    /// Refuses stale source, mismatched receipt/plan, non-running successor, or
+    /// unreadable original identities without changing any retained state.
+    pub async fn read_native_close_retry_execution_context(
+        &self,
+        command: &NativeCloseCommand,
+        admitted: &NativeCloseRunRef,
+    ) -> DbResult<NativeCloseRetryExecutionContext> {
+        let mut tx = self.pool.begin().await?;
+        let effect_count = Self::require_native_close_retry_plan_tx(&mut tx, command, admitted).await?;
+        let NativeCloseIntent::ExplicitRetry {
+            failed_run_ordinal, ..
+        } = command.intent()
+        else {
+            return Err(refused(
+                "native retry context requires an explicit retry intent",
+            ));
+        };
+        let original = Self::read_stopped_close_original_retirement_proof_tx(
+            &mut tx,
+            &CloseRunRef {
+                attempt_id: admitted.attempt_id.clone(),
+                ordinal: *failed_run_ordinal,
+            },
+        )
+        .await?;
+        let run = CloseRunRef {
+            attempt_id: admitted.attempt_id.clone(),
+            ordinal: admitted.run_ordinal,
+        };
+        let progress = retained_close_retry_progress_tx(&mut tx, &run).await?;
+        let effects = sqlx::query(
+            "SELECT effect.*, captured.captured_worktree_fingerprint, captured.captured_worktree_locator
+             FROM close_run_retry_effects effect
+             JOIN close_attempt_scopes captured
+               ON captured.attempt_id = effect.attempt_id AND captured.scope = effect.scope
+             WHERE effect.attempt_id = ?1 AND effect.run_ordinal = ?2 ORDER BY effect.ordinal",
+        )
+        .bind(run.attempt_id.as_str())
+        .bind(run.ordinal.get())
+        .fetch_all(&mut *tx)
+        .await?
+        .into_iter()
+        .map(|row| {
+            Ok(CloseSafeRetryEffect {
+                scope: WorkScopeId::parse(row.try_get::<String, _>("scope")?)
+                    .map_err(|error| DbError::Serialization(error.to_string()))?,
+                resource: parse_cleanup_resource_identity(&row)?,
+            })
+        })
+        .collect::<DbResult<Vec<_>>>()?;
+        if i64::try_from(effects.len()).ok() != Some(effect_count)
+            || effects.len() != progress.successful.len() + progress.pending.len()
+            || effects.iter().any(|effect| {
+                !original.resources.iter().any(|expected| {
+                    expected.scope == effect.scope && expected.resource == effect.resource
+                })
+            })
+        {
+            return Err(refused(
+                "native retry context requires every exact original planned identity",
+            ));
+        }
+        let worktree_snapshots = original_worktree_snapshots(&original.snapshot, &original.scopes)?;
+        tx.commit().await?;
+        Ok(NativeCloseRetryExecutionContext {
+            snapshot: original.snapshot,
+            effects,
+            progress,
+            scopes: original.scopes,
+            resources: original.resources,
+            worktree_snapshots,
+        })
+    }
+
     /// Records one exact planned success while its native source and successor remain live.
     /// Identical evidence replays without another row, but never bypasses live authority
     /// or full effect equality (including captured worktree identity).
@@ -116,7 +277,8 @@ impl Database {
         };
         let result = Self::terminalize_native_close_retry_resource_failure_tx(
             &mut tx, command, admitted, &request,
-        ).await;
+        )
+        .await;
         match result {
             Ok(obligation) => match tx.commit().await {
                 Ok(()) => LocalAuthorityResult::DurableFactEstablished(Ok(obligation)),
@@ -140,8 +302,15 @@ impl Database {
             attempt_id: admitted.attempt_id.clone(),
             ordinal: admitted.run_ordinal,
         };
-        let CloseCleanupFailureAuthority::ExpectedResource { scope, snapshot, resource } = &request.authority else {
-            return Err(refused("native resource failure requires expected-resource authority"));
+        let CloseCleanupFailureAuthority::ExpectedResource {
+            scope,
+            snapshot,
+            resource,
+        } = &request.authority
+        else {
+            return Err(refused(
+                "native resource failure requires expected-resource authority",
+            ));
         };
         let now = chrono::Utc::now().timestamp_micros();
         if request.attempt_id != run.attempt_id
@@ -153,39 +322,59 @@ impl Database {
             || request.occurred_at_us < plan.created_at_us
             || request.occurred_at_us > now
             || chrono::DateTime::from_timestamp_micros(request.occurred_at_us).is_none()
-            || request.stop_certainty.confirmed_at_us().is_some_and(|confirmed| {
-                confirmed < 0 || confirmed > request.occurred_at_us
-            })
+            || request
+                .stop_certainty
+                .confirmed_at_us()
+                .is_some_and(|confirmed| confirmed < 0 || confirmed > request.occurred_at_us)
         {
             return Err(refused("native resource failure requires exact original authority and valid occurrence evidence"));
         }
         let progress = retained_close_retry_progress_tx(tx, &run).await?;
-        let failed = CloseSafeRetryEffect { scope: scope.clone(), resource: resource.clone() };
-        if i64::try_from(progress.successful.len() + progress.pending.len()).ok() != Some(plan.effect_count)
+        let failed = CloseSafeRetryEffect {
+            scope: scope.clone(),
+            resource: resource.clone(),
+        };
+        if i64::try_from(progress.successful.len() + progress.pending.len()).ok()
+            != Some(plan.effect_count)
             || !progress.pending.contains(&failed)
         {
-            return Err(refused("native resource failure requires a pending full-identity planned effect"));
+            return Err(refused(
+                "native resource failure requires a pending full-identity planned effect",
+            ));
         }
-        let remaining: Vec<_> = progress.pending.iter().map(|effect| CloseCleanupFailureResource {
-            scope: effect.scope.clone(),
-            resource: effect.resource.clone(),
-            disposition: if effect == &failed {
-                CloseCleanupResourceDisposition::Failed
-            } else {
-                CloseCleanupResourceDisposition::Unattempted
-            },
-        }).collect();
+        let remaining: Vec<_> = progress
+            .pending
+            .iter()
+            .map(|effect| CloseCleanupFailureResource {
+                scope: effect.scope.clone(),
+                resource: effect.resource.clone(),
+                disposition: if effect == &failed {
+                    CloseCleanupResourceDisposition::Failed
+                } else {
+                    CloseCleanupResourceDisposition::Unattempted
+                },
+            })
+            .collect();
         if request.remaining_resources != remaining {
-            return Err(refused("native failure children must equal the ordered pending original plan"));
+            return Err(refused(
+                "native failure children must equal the ordered pending original plan",
+            ));
         }
-        if matches!(request.stop_certainty, CloseStopCertainty::ConversationAndProcessesStopped { .. }) {
+        if matches!(
+            request.stop_certainty,
+            CloseStopCertainty::ConversationAndProcessesStopped { .. }
+        ) {
             Self::require_native_close_original_process_proof_tx(tx, &run, &plan.snapshot).await?;
         }
         let obligation = close_obligation_for_update(tx, run.attempt_id.as_str()).await?;
         if !plan.running {
             let ended_at_us: Option<i64> = sqlx::query_scalar(
                 "SELECT ended_at_us FROM close_runs WHERE attempt_id = ?1 AND run_ordinal = ?2",
-            ).bind(run.attempt_id.as_str()).bind(run.ordinal.get()).fetch_one(&mut **tx).await?;
+            )
+            .bind(run.attempt_id.as_str())
+            .bind(run.ordinal.get())
+            .fetch_one(&mut **tx)
+            .await?;
             if ended_at_us != Some(request.occurred_at_us)
                 || !Self::retained_close_cleanup_failure_matches_tx(tx, &run, request).await?
             {
@@ -233,7 +422,9 @@ impl Database {
         ).bind(run.attempt_id.as_str()).bind(run.ordinal.get())
             .bind(snapshot.generation()).bind(snapshot.fingerprint()).fetch_one(&mut **tx).await?;
         if unresolved {
-            return Err(refused("confirmed native stop requires exact original-generation process proof"));
+            return Err(refused(
+                "confirmed native stop requires exact original-generation process proof",
+            ));
         }
         Ok(())
     }
@@ -278,7 +469,9 @@ impl Database {
     ) -> DbResult<i64> {
         let plan = Self::require_native_close_retry_plan_identity_tx(tx, command, admitted).await?;
         if !plan.running {
-            return Err(refused("native retry execution requires its exact latest running plan"));
+            return Err(refused(
+                "native retry execution requires its exact latest running plan",
+            ));
         }
         Ok(plan.effect_count)
     }
@@ -347,9 +540,63 @@ impl Database {
             snapshot: CloseRetirementSnapshot::parse(
                 row.try_get::<String, _>("inspection_generation")?,
                 row.try_get::<String, _>("inspection_fingerprint")?,
-            ).map_err(|error| DbError::Serialization(error.to_string()))?,
+            )
+            .map_err(|error| DbError::Serialization(error.to_string()))?,
             running: row.try_get("running")?,
             created_at_us: row.try_get("created_at_us")?,
         })
+    }
+}
+
+#[cfg(test)]
+mod snapshot_tests {
+    use super::*;
+    use phoenix_core::domain::close::{CapturedWorktreeIdentity, CloseAttemptId, GitPathIdentity};
+
+    #[test]
+    fn aggregate_component_requires_exact_canonical_byte_lengths_and_unique_scopes() {
+        let decoded = decode_snapshot_component("v11:a2:é1:b3:x:y").unwrap();
+        assert_eq!(decoded[&WorkScopeId::parse("a").unwrap()], "é");
+        assert_eq!(decoded[&WorkScopeId::parse("b").unwrap()], "x:y");
+        for malformed in [
+            "", "v1", "v21:a1:g", "v11:a1:g!", "v11:a1:g1:a1:h",
+            "v11:b1:g1:a1:h", "v11:a2:g", "v11:a1:é", "v11:é1:g",
+            "v199999999999999999999999999999999999999:a1:g", "v101:a1:g",
+            "v1+1:a1:g", "v10:1:g", "v11:a", "v11:a1:g1:b",
+        ] {
+            assert!(decode_snapshot_component(malformed).is_err(), "{malformed:?}");
+        }
+    }
+
+    #[test]
+    fn original_snapshots_require_matching_captured_scopes_and_nonempty_values() {
+        let mut scope = CloseAttemptScope {
+            attempt_id: CloseAttemptId::parse("snapshot-codec").unwrap(),
+            scope: WorkScopeId::parse("a").unwrap(),
+            captured_worktree: Some(CapturedWorktreeIdentity::Unresolved {
+                locator: GitPathIdentity::from_bytes(b"/snapshot-codec".to_vec()),
+            }),
+            captured_at: chrono::Utc::now(),
+        };
+        let original = CloseRetirementSnapshot::parse("v11:a2:é", "v11:a3:x:y").unwrap();
+        let decoded = original_worktree_snapshots(&original, std::slice::from_ref(&scope)).unwrap();
+        assert_eq!(decoded, vec![(
+            CloseRetirementTarget { scope: scope.scope.clone() },
+            CloseRetirementSnapshot::parse("é", "x:y").unwrap(),
+        )]);
+        for (generation, fingerprint) in [
+            ("v11:a1:g", "v11:b1:f"), ("v11:b1:g", "v11:b1:f"),
+            ("v11:a0:", "v11:a1:f"), ("v11:a1:g", "v11:a0:"),
+            ("no-worktree", "no-worktree"), ("no-worktree", "v11:a1:f"),
+            ("v11:a1:g", "no-worktree"),
+        ] {
+            let snapshot = CloseRetirementSnapshot::parse(generation, fingerprint).unwrap();
+            assert!(original_worktree_snapshots(&snapshot, std::slice::from_ref(&scope)).is_err());
+        }
+        let empty = CloseRetirementSnapshot::parse("no-worktree", "no-worktree").unwrap();
+        assert!(original_worktree_snapshots(&empty, &[]).unwrap().is_empty());
+        scope.captured_worktree = None;
+        assert!(original_worktree_snapshots(&empty, std::slice::from_ref(&scope)).unwrap().is_empty());
+        assert!(original_worktree_snapshots(&original, &[scope]).is_err());
     }
 }
