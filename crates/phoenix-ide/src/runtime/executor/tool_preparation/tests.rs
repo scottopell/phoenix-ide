@@ -116,7 +116,13 @@ async fn cancellation_while_read_held(mut runtime: TestRuntime, (entered, releas
     );
     if let Some(turn) = active_turn {
         let obligations = storage.recorded_terminal_obligations();
-        assert_eq!(obligations.len(), 1);
+        let terminal = obligations
+            .first()
+            .expect("terminal cancellation fact must be acknowledged");
+        assert!(
+            obligations.iter().all(|receipt| receipt == terminal),
+            "each idempotent acknowledgement must describe the same exact terminal fact"
+        );
         assert_eq!(obligations[0].turn_id, turn.turn_id);
         assert_eq!(obligations[0].expected_generation, turn.generation);
         assert!(matches!(obligations[0].projection.state, ConvState::Idle));
@@ -384,4 +390,64 @@ async fn rejected_cancel_checkpoint_revokes_read_without_false_completion_or_lat
     assert!(matches!(runtime.state, ConvState::Idle));
     assert!(runtime.tool_executor.recorded_executions().is_empty());
     assert!(runtime.llm_client.recorded_requests().is_empty());
+}
+
+#[tokio::test]
+async fn ordinary_live_catalog_wait_cannot_launch_after_cancellation() {
+    let call = bash("live-catalog", "git status --short");
+    let mut runtime = runtime_for(call.clone()).await;
+    selected(&mut runtime, "original", call.clone());
+    let tools = Arc::clone(&runtime.tool_executor);
+    let (entered, release) = tools.hold_next_definitions();
+    assert!(runtime
+        .dispatch_tool_for_test(call)
+        .await
+        .unwrap()
+        .is_none());
+    tokio::time::timeout(Duration::from_secs(60), entered)
+        .await
+        .unwrap()
+        .unwrap();
+    let (events, receiver) = mpsc::channel(4);
+    runtime.event_tx = events.clone();
+    runtime.event_rx = receiver;
+    let (state_tx, mut states) = watch::channel(runtime.state.clone());
+    let task = tokio::spawn(runtime.with_state_watcher(state_tx).run());
+    tokio::time::pause();
+    events
+        .send(Event::UserCancel {
+            reason: None,
+            cause: crate::state_machine::event::CancelCause::UserRequested,
+        })
+        .await
+        .unwrap();
+    let cancelled_before_release = tokio::time::timeout(
+        Duration::from_millis(100),
+        states.wait_for(|state| matches!(state, ConvState::Idle)),
+    )
+    .await
+    .is_ok();
+    let read_revoked = release.send(Ok(())).is_err();
+    tokio::time::resume();
+    tokio::time::timeout(
+        Duration::from_secs(60),
+        states.wait_for(|state| matches!(state, ConvState::Idle)),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    events.send(Event::Shutdown).await.unwrap();
+    assert_eq!(
+        task.await.unwrap(),
+        RuntimeExitDisposition::CoordinatedShutdown
+    );
+    assert_eq!(
+        (
+            cancelled_before_release,
+            read_revoked,
+            tools.recorded_executions().len()
+        ),
+        (true, true, 0),
+        "cancellation must settle before the read releases and prevent any late tool execution"
+    );
 }
