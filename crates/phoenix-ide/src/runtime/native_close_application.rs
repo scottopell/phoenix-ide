@@ -26,6 +26,14 @@ pub(crate) enum NativeCloseApplicationError {
     FatalAuthority,
 }
 
+/// Keeps admission receipts distinct from fresh retained observations.
+#[derive(Debug)]
+pub(crate) enum NativeCloseApplicationResult {
+    Initial(phoenix_db::native_close::NativeCloseInitialResult),
+    Observe(phoenix_db::native_close::NativeCloseObserveResult),
+    ExplicitRetry(phoenix_db::native_close::NativeCloseRetryResult),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum NativeCloseSourceRefusal {
     NotExactExecutingSource,
@@ -40,7 +48,6 @@ pub(super) enum NativeCloseSourceRefusal {
 ///
 /// The actor must supply its own transcript ID, not an input field. No request UUID
 /// or fingerprint is accepted from the public request.
-#[allow(dead_code)] // Dormant until the source-owned transactional application is assembled.
 pub(super) fn initial_command_from_executing_source(
     state: &ConvState,
     source_transcript_id: &str,
@@ -169,7 +176,6 @@ impl super::RuntimeManager {
     /// No inline self-message is used: only the detached tool adapter may call
     /// this route. A queued Stop is not an acknowledged durable Stop; whichever
     /// request the source actor processes first establishes the ordering.
-    #[allow(dead_code)] // Dormant until the complete unified adapter is qualified.
     pub(crate) async fn apply_native_close_initial(
         &self,
         source_transcript_id: &str,

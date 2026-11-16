@@ -204,6 +204,19 @@ jobs:
           grep -E 'test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored;' evidence/native-close-runtime-matcher.log
           cargo test -p phoenix_ide --lib native_close_admission_tests:: -- --nocapture --test-threads=1 2>&1 | tee evidence/native-close-runtime-actor.log
           grep -E 'test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored;' evidence/native-close-runtime-actor.log
+      - name: Qualify native Close public adapter parsing and discovery
+        if: success() || failure()
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -F 'coordinator_tools::close_conversation::tests::native_close_parser_accepts_only_exact_action_coordinates: test' evidence/runtime-inventory.log
+          grep -F 'coordinator_tools::tests::native_close_tool_requires_trusted_source_before_target_lookup: test' evidence/runtime-inventory.log
+          cargo test -p phoenix_ide --lib coordinator_tools::close_conversation::tests:: -- --nocapture --test-threads=1 2>&1 | tee evidence/native-close-public-parser.log
+          grep -Eq 'test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored;' evidence/native-close-public-parser.log
+          for test in native_close_tool_requires_trusted_source_before_target_lookup coordinator_bash_is_available_without_platform_sandbox_support coordinator_question_registry_preserves_exact_authority; do
+            cargo test -p phoenix_ide --lib "coordinator_tools::tests::$test" -- --exact --nocapture --test-threads=1 2>&1 | tee "evidence/$test.log"
+            grep -Eq 'test result: ok\. 1 passed; 0 failed; 0 ignored;' "evidence/$test.log"
+          done
       - name: Qualify original-bound native retry assessment
         shell: bash
         run: |

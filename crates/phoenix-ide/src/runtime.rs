@@ -299,6 +299,7 @@ pub(crate) enum AcknowledgedRuntimeRequest {
 }
 
 mod native_close_application;
+pub(crate) use native_close_application::{NativeCloseApplicationError, NativeCloseApplicationResult};
 mod task_approval_admission;
 
 #[cfg(test)]

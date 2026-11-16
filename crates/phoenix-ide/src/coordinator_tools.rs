@@ -4,6 +4,7 @@ use crate::api::global_read::{
 };
 
 mod authority;
+mod close_conversation;
 mod goals;
 pub(crate) mod instance;
 
@@ -317,6 +318,7 @@ pub(crate) fn tools(
         db: watch_db,
         peer_db: db.clone(),
     }));
+    tools.push(Arc::new(close_conversation::CloseConversation(Arc::clone(&close_retry))));
     tools.push(Arc::new(SafeRetryClose(close_retry)));
     tools.push(Arc::new(AskUserQuestionTool));
     tools
@@ -2844,6 +2846,7 @@ mod tests {
                 "watch_conversation",
                 "unwatch_conversation",
                 "list_watched_conversations",
+                "close_conversation",
                 "retry_close_safely",
                 "ask_user_question"
             ]
@@ -2905,6 +2908,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn native_close_tool_requires_trusted_source_before_target_lookup() {
+        let (_, coordinator) = application_tools().await;
+        assert_eq!(coordinator.iter().filter(|tool| tool.name() == "close_conversation").count(), 1);
+        let tool = coordinator.into_iter().find(|tool| tool.name() == "close_conversation").unwrap();
+        let output = tool.run(
+            json!({"action":"initial", "product_conversation_id":"missing-target"}),
+            context("missing-source"),
+        ).await;
+        assert!(!output.is_success());
+        assert!(output.output().contains("source_refused"));
+        let schema = tool.input_schema();
+        assert_eq!(schema["additionalProperties"], false);
+        assert_eq!(schema["oneOf"].as_array().unwrap().len(), 3);
+    }
+
+    #[tokio::test]
     async fn safe_retry_tool_rejects_non_current_global_before_target_lookup() {
         let (_, coordinator) = application_tools().await;
         let tool = coordinator
@@ -2949,6 +2968,7 @@ mod tests {
                 "watch_conversation",
                 "unwatch_conversation",
                 "list_watched_conversations",
+                "close_conversation",
                 "retry_close_safely",
                 "ask_user_question"
             ]

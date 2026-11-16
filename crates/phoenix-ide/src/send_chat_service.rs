@@ -231,6 +231,36 @@ impl SendChatApplicationService {
         &self.db
     }
 
+    /// Detached tool ingress; the source actor owns live authority and settlement.
+    pub(crate) async fn close_conversation(
+        &self,
+        source_transcript_id: &str,
+        source: phoenix_core::domain::db_schema::SourceToolCall,
+        intent: phoenix_db::native_close::NativeCloseIntent,
+    ) -> Result<
+        crate::runtime::NativeCloseApplicationResult,
+        crate::runtime::NativeCloseApplicationError,
+    > {
+        use crate::runtime::NativeCloseApplicationResult;
+        use phoenix_db::native_close::{NativeCloseIntent, NativeCloseRunRef};
+
+        match intent {
+            NativeCloseIntent::Initial { target } => self.runtime
+                .apply_native_close_initial(source_transcript_id, source, target)
+                .await.map(NativeCloseApplicationResult::Initial),
+            NativeCloseIntent::Observe { target, attempt_id, run_ordinal } => self.runtime
+                .apply_native_close_observe(source_transcript_id, source, NativeCloseRunRef {
+                    target, attempt_id, run_ordinal,
+                })
+                .await.map(NativeCloseApplicationResult::Observe),
+            NativeCloseIntent::ExplicitRetry { target, attempt_id, failed_run_ordinal } => self.runtime
+                .apply_native_close_explicit_retry(
+                    source_transcript_id, source, target, attempt_id, failed_run_ordinal,
+                )
+                .await.map(NativeCloseApplicationResult::ExplicitRetry),
+        }
+    }
+
     pub(crate) async fn retry_close_as_current_global(
         &self,
         authorizer_conversation_id: &str,
