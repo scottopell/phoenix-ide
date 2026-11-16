@@ -2,6 +2,8 @@
 
 ## Conclusion and evidence boundary
 
+Subsequent [projection discriminator evidence](review-overlay-projection-evidence.md) demonstrates the Markdown/Mermaid remount mechanism and records the bounded correction. This audit preserves the earlier source-path investigation and its limits.
+
 The earlier short static browser windows did **not** exhaust source investigation. This audit identifies concrete routes that those windows did not stimulate. The strongest new overlay-local candidate is **background projection churn → new annotation callback → replacement Markdown component types → Mermaid remount → loading-placeholder/SVG geometry change**. It needs no image and no new touch. With plain unchanged prose, the same replacement does not by itself prove unequal layout or motion.
 
 Other concrete gaps are an uncancelled clipboard fallback selection after a deferred rejection, a missing touch-cancellation binding for an armed long press, and background focus effects without overlay ownership guards. These are reachable source mechanisms, **not proof of the reported iPhone displacement**. No generic focus suppression, product correction, production mutation, or repeated browser matrix was performed.
