@@ -191,10 +191,10 @@ async fn terminal_self_tool(
         .await
         .unwrap();
     let event = runtime
-        .execute_effect(Effect::ExecuteTool { tool })
+        .dispatch_tool_for_test(tool)
         .await
         .unwrap()
-        .expect("runtime-owned tool produces a synchronous round completion");
+        .expect("runtime-owned tool produces a prepared round completion");
     assert!(matches!(
         &event,
         Event::ToolRoundComplete {
@@ -585,9 +585,7 @@ async fn database_runtime_mixed_self_goal_round_refuses_both_intents_in_either_o
             .unwrap();
 
             let first_event = runtime
-                .execute_effect(Effect::ExecuteTool {
-                    tool: first.clone(),
-                })
+                .dispatch_tool_for_test(first.clone())
                 .await
                 .unwrap()
                 .expect("first own-tool producer returns a round result");

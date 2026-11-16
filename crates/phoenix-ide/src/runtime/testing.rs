@@ -209,10 +209,46 @@ impl LlmClient for StreamingMockLlmClient {
 // Mock Tool Executor
 // ============================================================================
 
+#[derive(Default)]
+struct PreparationReadBarrier(
+    Mutex<
+        Option<(
+            tokio::sync::oneshot::Sender<()>,
+            tokio::sync::oneshot::Receiver<Result<(), String>>,
+        )>,
+    >,
+);
+
+impl PreparationReadBarrier {
+    fn hold(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<Result<(), String>>,
+    ) {
+        let (started, entered) = tokio::sync::oneshot::channel();
+        let (release, wait) = tokio::sync::oneshot::channel();
+        *self.0.lock().unwrap() = Some((started, wait));
+        (entered, release)
+    }
+
+    async fn wait(&self) -> Result<(), String> {
+        let gate = self.0.lock().unwrap().take();
+        if let Some((started, release)) = gate {
+            let _ = started.send(());
+            release
+                .await
+                .map_err(|_| "preparation read gate disappeared")??;
+        }
+        Ok(())
+    }
+}
+
 /// Mock tool executor with predefined outputs
 #[allow(dead_code)]
 pub struct MockToolExecutor {
     outputs: HashMap<String, ToolOutput>,
+    definitions_gate: PreparationReadBarrier,
     definitions: Vec<ToolDefinition>,
     clearable: std::collections::HashSet<String>,
     /// Record of tool executions
@@ -224,10 +260,20 @@ impl MockToolExecutor {
     pub fn new() -> Self {
         Self {
             outputs: HashMap::new(),
+            definitions_gate: PreparationReadBarrier::default(),
             definitions: Vec::new(),
             clearable: std::collections::HashSet::new(),
             executions: Mutex::new(Vec::new()),
         }
+    }
+
+    pub fn hold_next_definitions(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<Result<(), String>>,
+    ) {
+        self.definitions_gate.hold()
     }
 
     /// Add a tool with a predefined output
@@ -274,6 +320,10 @@ impl ToolExecutor for MockToolExecutor {
     }
 
     async fn definitions(&self) -> Vec<ToolDefinition> {
+        self.definitions_gate
+            .wait()
+            .await
+            .expect("definitions barrier released");
         self.definitions.clone()
     }
 
@@ -650,12 +700,9 @@ pub struct InMemoryStorage {
     svg_artifacts: Mutex<StoredSvgArtifacts>,
     tool_admission_policies:
         Mutex<HashMap<String, phoenix_core::domain::tool_availability::ToolAvailability>>,
-    tool_policy_read_gate: Mutex<
-        Option<(
-            tokio::sync::oneshot::Sender<()>,
-            tokio::sync::oneshot::Receiver<Result<(), String>>,
-        )>,
-    >,
+    tool_policy_read_gate: PreparationReadBarrier,
+    tool_scope_read_gate: PreparationReadBarrier,
+    self_goal_read_gate: PreparationReadBarrier,
     messages: Mutex<HashMap<String, Vec<Message>>>,
     states: Mutex<HashMap<String, ConvState>>,
     state_updated_ats: Mutex<HashMap<String, chrono::DateTime<chrono::Utc>>>,
@@ -780,11 +827,27 @@ impl InMemoryStorage {
         tokio::sync::oneshot::Receiver<()>,
         tokio::sync::oneshot::Sender<Result<(), String>>,
     ) {
-        let (started, entered) = tokio::sync::oneshot::channel();
-        let (release, wait) = tokio::sync::oneshot::channel();
-        *self.tool_policy_read_gate.lock().unwrap() = Some((started, wait));
-        (entered, release)
+        self.tool_policy_read_gate.hold()
     }
+
+    pub fn hold_next_tool_scope_read(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<Result<(), String>>,
+    ) {
+        self.tool_scope_read_gate.hold()
+    }
+
+    pub fn hold_next_self_goal_read(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<Result<(), String>>,
+    ) {
+        self.self_goal_read_gate.hold()
+    }
+
     pub fn gate_tracking_observation(
         &self,
     ) -> (
@@ -806,7 +869,9 @@ impl InMemoryStorage {
             handoff_candidates: Mutex::new(Vec::new()),
             svg_artifacts: Mutex::new(HashMap::new()),
             tool_admission_policies: Mutex::new(HashMap::new()),
-            tool_policy_read_gate: Mutex::new(None),
+            tool_policy_read_gate: PreparationReadBarrier::default(),
+            tool_scope_read_gate: PreparationReadBarrier::default(),
+            self_goal_read_gate: PreparationReadBarrier::default(),
             messages: Mutex::new(HashMap::new()),
             states: Mutex::new(HashMap::new()),
             state_updated_ats: Mutex::new(HashMap::new()),
@@ -2723,17 +2788,31 @@ impl StateStore for InMemoryStorage {
         self.seed_tool_admission_policy(conversation_id, policy.clone());
         Ok(policy)
     }
+    async fn get_work_scope_legacy_conversation_id(
+        &self,
+        _scope: &phoenix_core::work_scope::WorkScopeId,
+    ) -> Result<Option<String>, String> {
+        self.tool_scope_read_gate.wait().await?;
+        Ok(None)
+    }
+
+    async fn prepare_self_goal_tool(
+        &self,
+        _transcript: &str,
+        _turn: &crate::runtime::traits::ActiveDirectTurn,
+        _message_id: &str,
+        _tool_use_id: &str,
+        _operation: phoenix_core::domain::conversation_goal::SelfGoalOperation,
+    ) -> Result<phoenix_core::domain::conversation_goal::PendingSelfGoal, String> {
+        self.self_goal_read_gate.wait().await?;
+        Err("self-goal tools require durable runtime storage".into())
+    }
+
     async fn load_tool_admission_policy(
         &self,
         conversation_id: &str,
     ) -> Result<phoenix_core::domain::tool_availability::ToolAvailability, String> {
-        let gate = self.tool_policy_read_gate.lock().unwrap().take();
-        if let Some((started, release)) = gate {
-            let _ = started.send(());
-            release
-                .await
-                .map_err(|_| "policy read gate disappeared")??;
-        }
+        self.tool_policy_read_gate.wait().await?;
         Ok(self
             .tool_admission_policies
             .lock()

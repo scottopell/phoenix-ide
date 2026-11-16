@@ -274,6 +274,27 @@ impl<S: Storage + Clone + 'static, L: LlmClient + 'static, T: ToolExecutor + 'st
         }
     }
 
+    pub(super) fn interrupt_read_preparation_before_cancellation_checkpoint(
+        &mut self,
+        event: &Event,
+        next: &ConvState,
+    ) {
+        if matches!(event, Event::UserCancel { .. })
+            && matches!(self.state, ConvState::ToolExecuting { .. })
+            && matches!(next, ConvState::CancellingTool { .. })
+        {
+            if let Some(pending) = self.tool_preparation.as_mut() {
+                if pending
+                    .selection
+                    .owns(self.tool_preparation_runtime, &self.state)
+                    && pending.selection.owns(self.tool_preparation_runtime, next)
+                {
+                    pending.read = None;
+                }
+            }
+        }
+    }
+
     pub(super) fn cancel_read_only_tool_preparation(&mut self, tool_use_id: &str) -> bool {
         if self.tool_preparation.as_ref().is_some_and(|pending| {
             pending.selection.tool.id == tool_use_id
@@ -295,3 +316,6 @@ fn unavailable(tool: &ToolCall, message: &str) -> PreparedTool {
         result: ToolResult::error(tool.id.clone(), format!("EUNAVAIL: {message}")),
     })
 }
+
+#[cfg(test)]
+mod tests;

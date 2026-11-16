@@ -199,7 +199,7 @@ async fn uncertain_registered_setting_closes_authority_and_stops_https_superviso
         &manager.bash_handles,
     );
     assert!(runtime
-        .execute_effect(Effect::ExecuteTool { tool })
+        .dispatch_tool_for_test(tool)
         .await
         .unwrap()
         .is_none());

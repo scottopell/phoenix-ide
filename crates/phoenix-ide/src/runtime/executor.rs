@@ -4186,6 +4186,10 @@ where
             ) {
                 self.settle_llm_trusted_context(&result);
             }
+            self.interrupt_read_preparation_before_cancellation_checkpoint(
+                &terminal_event,
+                &result.new_state,
+            );
             self.interrupt_native_before_cancellation_checkpoint(
                 &terminal_event,
                 &result.new_state,
@@ -9890,6 +9894,26 @@ where
     ) -> tokio::sync::mpsc::UnboundedSender<phoenix_core::domain::llm_types::LlmAttemptMetrics>
     {
         self.create_tool_llm_metrics_sink(admitted)
+    }
+
+    #[cfg(test)]
+    async fn observe_tool_preparation_for_test(&mut self) -> Result<Option<Event>, String> {
+        let observed = self
+            .tool_preparation
+            .as_mut()
+            .expect("preparation installed")
+            .observe()
+            .await;
+        self.accept_tool_preparation(observed)
+    }
+
+    #[cfg(test)]
+    async fn dispatch_tool_for_test(&mut self, tool: ToolCall) -> Result<Option<Event>, String> {
+        assert!(self
+            .execute_effect(Effect::ExecuteTool { tool })
+            .await?
+            .is_none());
+        self.observe_tool_preparation_for_test().await
     }
 
     #[cfg(test)]
@@ -23450,12 +23474,10 @@ mod steer_drain_detector_tests {
             unreachable!()
         };
         let event = runtime
-            .execute_effect(Effect::ExecuteTool {
-                tool: current_tool.clone(),
-            })
+            .dispatch_tool_for_test(current_tool.clone())
             .await
             .unwrap()
-            .expect("unavailable declaration yields an inline completion");
+            .expect("unavailable declaration yields a prepared completion");
         assert!(matches!(event, Event::ToolComplete { .. }));
         assert!(runtime.tool_executor.recorded_executions().is_empty());
         storage.set_fail_tool_round_persist(true);
@@ -34654,7 +34676,7 @@ mod tool_generation_guard_tests {
 
     /// Build a runtime parked in `ToolExecuting` for `tool_use_id`, modelling a
     /// live tool round whose stale outcome could later collide on id reuse.
-    fn runtime_tool_executing(tool_use_id: &str) -> TestRuntime {
+    pub(super) fn runtime_tool_executing(tool_use_id: &str) -> TestRuntime {
         let storage = Arc::new(InMemoryStorage::new());
         let context = ConvContext::new(
             "conv-tool-gen",
@@ -34672,7 +34694,7 @@ mod tool_generation_guard_tests {
             vec![ContentBlock::ToolUse {
                 id: tool_use_id.to_string(),
                 name: "bash".to_string(),
-                input: serde_json::json!({}),
+                input: ToolInput::from(crate::tools::BashToolInput::run("cmd")).to_value(),
             }],
             None,
             None,
@@ -34860,9 +34882,7 @@ mod tool_generation_guard_tests {
         }
         let generation = rt.tool_execution.generation();
         let mut broadcasts = rt.broadcast_tx.subscribe();
-        rt.execute_effect(Effect::ExecuteTool { tool: denied })
-            .await
-            .unwrap();
+        let event = rt.dispatch_tool_for_test(denied).await.unwrap();
         assert_eq!(
             rt.tool_execution.generation(),
             generation,
@@ -34880,13 +34900,18 @@ mod tool_generation_guard_tests {
                 "denied call must have no start publication"
             );
         }
-        let (_, outcome) = tokio::time::timeout(Duration::from_secs(60), rt.tool_outcome_rx.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        let ToolExecOutcome::Completed(result) = outcome else {
-            panic!("denial must remain an ordinary result")
+        assert!(
+            rt.tool_outcome_rx.try_recv().is_err(),
+            "denial owns no ordinary outcome channel"
+        );
+        let Some(Event::ToolComplete {
+            tool_use_id,
+            result,
+        }) = event
+        else {
+            panic!("denial must remain an ordinary paired result")
         };
+        assert_eq!(tool_use_id, "denied");
         assert_eq!(result.tool_use_id, "denied");
         assert!(result.is_error());
         assert!(result.output().contains("command_safety_rejected"));
@@ -35018,32 +35043,33 @@ mod tool_generation_guard_tests {
                 phoenix_llm::Usage::default(),
             ));
 
-        rt.execute_effect(Effect::ExecuteTool { tool: denied })
+        let generation_before_denial = rt.tool_execution.generation();
+        let denial = rt
+            .dispatch_tool_for_test(denied)
             .await
-            .unwrap();
-        let (denial_generation, denial) =
-            tokio::time::timeout(Duration::from_secs(30), rt.tool_outcome_rx.recv())
-                .await
-                .expect("permission denial outcome must reach the runtime")
-                .expect("tool outcome channel stays open for the denied call");
-        assert!(!rt.tool_outcome_is_stale(denial_generation));
+            .unwrap()
+            .expect("paired denial event");
+        assert_eq!(rt.tool_execution.generation(), generation_before_denial);
         assert!(tools.recorded_executions().is_empty());
-        let ToolExecOutcome::Completed(result) = &denial else {
+        let Event::ToolComplete { result, .. } = &denial else {
             panic!("denial must produce a completed error result");
         };
         assert_eq!(result.tool_use_id, "denied");
         assert!(result.is_error());
         assert!(result.output().contains("command_safety_rejected"));
 
-        rt.process_outcome(EffectOutcome::Tool(denial))
+        rt.process_event(denial).await.unwrap();
+        assert!(rt
+            .observe_tool_preparation_for_test()
             .await
-            .unwrap();
+            .unwrap()
+            .is_none());
         let (allowed_generation, outcome) =
             tokio::time::timeout(Duration::from_secs(30), rt.tool_outcome_rx.recv())
                 .await
                 .expect("the allowed tool after the denial must complete")
                 .expect("tool outcome channel stays open for the allowed call");
-        assert!(rt.tool_outcome_is_stale(denial_generation));
+        assert_eq!(allowed_generation, generation_before_denial + 1);
         assert!(!rt.tool_outcome_is_stale(allowed_generation));
         assert_eq!(tools.recorded_executions().len(), 1);
         assert_eq!(
