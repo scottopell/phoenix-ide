@@ -77,7 +77,9 @@ semantic renewals still fail the unchanged gates. Original sources, oracles,
 raw outputs and failed results remain retained.
 
 The typed host chronology projection passed twenty-two DB tests, owning
-all-target Clippy, actual 37-case host fixtures and fresh source reviews. The
+all-target Clippy, actual 37-case host fixtures and fresh source reviews before
+the accepted model trial. The later host-only follow-up expanded that suite to
+twenty-five passing tests, as recorded below. The
 [third frozen trial](../scripts/qa/coordinator-scanner-quality/results-e978b7686.md)
 at `e978b7686` was independently accepted after all 37 exact payloads were
 reviewed: 11/11 requested units, 4/5 bookmarks, 13/13 restrictions, 29/29 valid
@@ -90,3 +92,17 @@ claimed. Both prior reports remain rejected.
 Implementation and qualification are complete. Delivery PR #1098 is the authority
 for exact review, CI and main integration. No production deployment or completed
 production backfill is claimed.
+
+
+Final topology qualification passed all twenty-five DB tests at `6c11894f7`,
+then owning DB/IDE all-target Clippy and all 37 host fixtures at the subsequent
+binding-name-only head `74881f401`. Discovery advances from
+the eight-member page before appending the priority head, preventing skipped
+middle members. Scalar head-lineage/member/coverage queries avoid runtime/handoff
+aggregate decoding; recursive traversal/count cost still scales with lineage.
+Regressions use fourteen transcripts/thirteen actual continuations, middle-member
+generation revisit after restart, 1 MiB irrelevant malformed metadata with a real
+typed handoff seeded before corruption, and an explicit test-only edge-guard drop
+to verify detached-source CAS refusal. The [offline follow-up](../scripts/qa/coordinator-scanner-quality/results-e978b7686.md#host-only-topology-follow-up)
+made zero model calls and reproduced all 37 accepted inputs, prepared records,
+prior states and bindings exactly. The accepted paid run remains `e978b7686`.

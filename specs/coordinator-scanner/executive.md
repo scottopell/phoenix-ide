@@ -10,7 +10,7 @@ activation is claimed.
 
 | Requirements | Qualification evidence | Scope |
 |---|---|---|
-| REQ-SCAN-001–005: Scope, coverage, source validity, authority and recovery | Twenty-two actual DB tests passed, including strict typed retirement/source chronology, old-prose generation-only restart, two continuations, exact deduplication, retirement races, live gaps and contention recovery | Deterministic production-host lifecycle evidence |
+| REQ-SCAN-001–005: Scope, coverage, source validity, authority and recovery | Twenty-five actual DB tests passed, including strict typed retirement/source chronology, old-prose generation-only restart, two continuations, exact deduplication, retirement races, live gaps and contention recovery | Deterministic production-host lifecycle evidence |
 | REQ-SCAN-006: Bounded resource use | Eighteen runner/kick tests passed; strict catalog/outbound Luna/Low, accepted-output bounds, durable spending/retry limits and no foreground wake are covered | Codex generation/billing is not capped by accepted-output checks |
 | REQ-SCAN-007: Bounded inspectability | Native coverage inspection and accepted eight-variant assembled inventory include the closed tracking coverage operation | Synthetic assembled configuration, not production inventory |
 | REQ-SCAN-008: Historical recovery and qualification | Manual/foreground usefulness, actual 37-case host fixtures, owning all-target Clippy and fresh source reviews passed; third semantic trial independently accepted | Small synthetic corpus; bookmark miss and invisible duplicate disclosed below |
@@ -21,7 +21,7 @@ sees a fresh bounded index; appended pause evidence invalidates the old stopping
 point through two real continuations. This synthetic inference proves lifecycle
 composition, not cheap-model interpretation or general user utility.
 
-The twenty-two DB tests preserve original/retired evidence through supported file
+The twenty-five DB tests preserve original/retired evidence through supported file
 restart. The old sequence-5/covered-through-100 case first proves metadata-only
 invalidation and unchanged exact deduplication, then atomically changes valid
 old prose and its generation without appending a row, closes/reopens and recovers
@@ -29,6 +29,25 @@ new exact evidence. That latter fixture models externally changed source; it
 adds no user-edit API or UI capability. Normal history/live fairness, explicit
 source gaps, reserve-crash retry accounting, later recovery and bounded
 contention remain separate assertions.
+
+Final topology review found and corrected two host defects: a priority-head append
+could advance discovery past intermediate members, and full topology loading
+unnecessarily decoded runtime/handoff blobs. The cursor now advances from the
+eight-member discovery page before adding the head. Scalar actual-head lineage
+queries return at most eight discovery members plus the head, exact membership,
+and eight coverage entries plus one lookahead, without decoding runtime/handoff
+aggregates. Recursive traversal and counts still scale with lineage; this bounds
+data returned to scanner/Rust, not SQL CPU independently of history size.
+
+All twenty-five DB tests passed, including fourteen transcripts formed by thirteen
+actual continuations, middle-member enrollment/restart generation revisit,
+1 MiB irrelevant malformed runtime state and a real typed handoff seeded before
+corruption, and detached-source CAS refusal after an explicit test-only edge-guard
+drop. Owning DB/IDE all-target Clippy and all 37 host fixtures passed. Offline
+preparation at `74881f401` made zero provider calls; all 37 inputs, prepared records,
+prior states, input hashes and bindings match the accepted trial byte for byte.
+The [accepted report's host follow-up](../../scripts/qa/coordinator-scanner-quality/results-e978b7686.md#host-only-topology-follow-up)
+records new executable/manifest hashes without changing its original model trial.
 
 ## Frozen quality evidence
 

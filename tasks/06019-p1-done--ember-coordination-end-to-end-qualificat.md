@@ -57,9 +57,11 @@ obligations above or claim that synthetic lifecycle success proves model usefuln
 Merged components are #1091 retirement, #1096 tool audit, #1093 manual tracking
 (`5b0e01c09`) and #1092 event evidence/context (`3a842c5`). Delivery of the
 qualified scanner implementation is tracked in PR #1098. The third frozen scanner
-trial at `e978b7686` was independently accepted after typed host chronology, all
-37 prepared inputs, twenty-two DB tests, owning all-target Clippy, actual host
-fixtures and fresh source reviews. Both earlier semantic trials remain rejected.
+trial at `e978b7686` was independently accepted after typed host chronology,
+review of all 37 prepared inputs, twenty-two DB tests, owning all-target Clippy,
+actual host fixtures and fresh source reviews. The later topology repair passed
+twenty-five DB tests at `6c11894f7`, followed by Clippy, host fixtures and offline
+input equivalence at `74881f401`. Both earlier semantic trials remain rejected.
 This completes implementation and qualification; exact review, CI and main
 integration are tracked by GitHub PR #1098.
 
@@ -75,10 +77,10 @@ integration are tracked by GitHub PR #1098.
 | 8: Roadmap cutoff | #1091 independent workflow/variable/Issue readback and historical retention | Complete |
 | 9: Exact ending versus newer response | Event capture/settlement/read/privacy regressions and accepted complete 39-trial C2 comparison | Component merged; deployment unclaimed |
 | 10: Event reports, corrections and broader outcome | Host machine-source restrictions and append-only scanner authority; actual origin-preserving corpus inputs | Third trial: all restrictions/negatives and source-authority gates passed; first two failures retained |
-| 11: Whole-history progress and no wakeup | Own-chain/member enrollment, historical/live fairness/gaps and file restart; idle scanner → next normal admitted input fresh index | Host lifecycle and separate semantic gates passed; deployed backfill unclaimed |
+| 11: Whole-history progress and no wakeup | Own-chain/member enrollment, historical/live fairness/gaps and file restart; repaired discovery-page cursor covers fourteen transcripts/thirteen actual continuations and revisits middle generations; idle scanner → next normal admitted input fresh index | Host lifecycle and separate semantic gates passed; deployed backfill unclaimed |
 | 12: Edited uncaptured tail and paging | Whole typed-response digest, explicit changed/unavailable reads, between-page edits and C2 controls | Component merged; no mixed-version quotation claim |
 | 13: Missed pause and stale resumption | Storage CAS/overflow/review-required tests plus actual scanner append → two-continuation invalidation | Host review-state/CAS proof plus third trial 13/13 restriction attachments |
-| 14: Old source edit without append/kick | DB22 includes the `89ff24d7b` case: sequence-5/covered-through-100 metadata restart/dedup, then external valid-prose/new-generation rewrite, reopen/rescan/new evidence with old history retained; contention recovery | Externally changed source fixture; no generic user-edit API claimed |
+| 14: Old source edit without append/kick | DB25 includes the `89ff24d7b` case: sequence-5/covered-through-100 metadata restart/dedup, then external valid-prose/new-generation rewrite, reopen/rescan/new evidence with old history retained; contention recovery | Externally changed source fixture; no generic user-edit API claimed |
 | 15: Immutable prefix and bounded context | Assembled request prefix/no-change snapshot regressions; manual/foreground actual request and token accounting | No provider cache/billing savings inferred |
 | 16: Useful owed next step | Accepted manual `aca480f4a` and foreground `32ada836a` due-item → specific question → real user pause → revision-checked update | Controlled synthetic usefulness; general utility/deployment unclaimed |
 | 17: Two recently reviewed items stay quiet | Accepted foreground arithmetic returns only its answer with zero tools/cue after actual pause reconciliation; durable cooldown tests | No wall-clock wakeup or healthy-worker polling introduced |
@@ -110,3 +112,18 @@ acceptance campaign is introduced. Delivery PR #1098 owns exact review, CI and
 main integration. Local
 model/host evidence, merged source and deployed/physical-device behavior remain
 explicitly distinct.
+
+
+Final host-only follow-up passed twenty-five DB tests at `6c11894f7`, then
+owning DB/IDE all-target Clippy and all 37 host fixtures at the subsequent
+binding-name-only head `74881f401`. Discovery-cursor advancement
+uses only the eight-member discovery page before priority-head inclusion; scalar
+actual-head lineage, exact membership and eight-plus-lookahead coverage avoid
+runtime/handoff aggregate decoding. Metadata returned to scanner/Rust is bounded;
+SQLite internal working data and recursive traversal/count work can scale with
+lineage; constant CPU is not claimed. Long-chain, malformed irrelevant
+metadata/genuine pre-corruption handoff and explicitly detached-source regressions
+passed. Offline preparation made zero provider calls and matches all 37 accepted
+inputs, prepared records, prior states, input hashes and bindings byte for byte.
+The [accepted report](../scripts/qa/coordinator-scanner-quality/results-e978b7686.md#host-only-topology-follow-up)
+retains the original `e978b7686` model trial and appends the later host receipts.

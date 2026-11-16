@@ -229,7 +229,7 @@ Out of scope: broad tool consolidation, new wrappers around every API, already-d
 | 4: Useful event context | #1092 accepted compact C after the complete 39-trial comparison and fixture web checks | First capped experiment remains partial/unaccepted; no general billing or remote-parity claim |
 | 5: Tracking store/tools | #1093 merged at `5b0e01c09`; native/store/authority checks and manual usefulness accepted | Scanner composition qualified; delivery in PR #1098 |
 | 6: Continuity and attention | Manual detour/continuation gate accepted; [foreground quiet/contextual recovery](../scripts/qa/ember-foreground-memory/foreground-32ada836a.md) accepted; actual-input scanner composition passed | Supplemental guidance/composition qualified; delivery in PR #1098 |
-| 7: Cheap safety net | Twenty-two DB tests, eighteen runner/kick tests, actual 37-case host fixtures, owning all-target Clippy and fresh source reviews passed; third real-model trial independently accepted | Earlier two trials remain rejected; bounded synthetic qualification |
+| 7: Cheap safety net | Twenty-five DB tests, eighteen runner/kick tests, actual 37-case host fixtures, owning all-target Clippy and fresh source reviews passed; third real-model trial independently accepted | Earlier two trials remain rejected; bounded synthetic qualification |
 | 8: Combined qualification | Inventory, actual-input/two-continuation/pause lifecycle composition and third frozen scanner semantic trial accepted | Implementation/qualification complete; GitHub owns exact review/CI/merge state |
 
 The manual [qualification report](../scripts/qa/ember-tracking/manual-memory-aca480.md)
@@ -257,3 +257,17 @@ Merged source, reviewed local candidates and deployed behavior remain distinct.
 No production deployment, physical-phone campaign or live historical backfill
 completion is claimed or newly required by this local qualification record.
 Task completion records implementation and qualification. [PR #1098](https://github.com/scottopell/phoenix-ide/pull/1098) provides exact review, CI and main-integration state.
+
+
+Final host review repaired discovery-cursor skipping across intermediate members
+and removed full runtime/handoff decoding from scanner topology reads. The
+final host follow-up records twenty-five DB tests passed at `6c11894f7`; owning
+all-target Clippy and all 37 host fixtures passed at binding-name-only head
+`74881f401`. A fourteen-transcript/thirteen-continuation regression covers every
+middle member and generation revisit after restart; metadata/corruption and detached-source
+CAS regressions cover scalar-only selection and exact membership. Eight-member
+pages plus priority head/coverage lookahead bound data returned to scanner/Rust;
+recursive traversal/count work still scales with lineage. Offline preparation uses zero
+providers and preserves every accepted input, prior state, prepared record and
+binding byte for byte. Exact receipts are appended to the [accepted scanner report](../scripts/qa/coordinator-scanner-quality/results-e978b7686.md#host-only-topology-follow-up);
+its `e978b7686` paid-trial identity and limitations remain unchanged.

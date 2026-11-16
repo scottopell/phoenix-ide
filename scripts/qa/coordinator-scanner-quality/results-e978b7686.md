@@ -151,3 +151,47 @@ application, rejected-proposal audits, every before/after state, record hashes,
 live manifest, and durable command log/exit status. Acceptance followed independent
 semantic and SQL review, not recorder exit status. No additional provider run is
 needed or authorized by this report.
+
+
+## Host-only topology follow-up
+
+After the accepted model trial, final review found two host defects: priority-head
+inclusion could move discovery past intermediate members, and topology reads
+materialized unnecessary runtime/handoff aggregates. The repair advances the
+cursor from the eight-member discovery page before adding the head. Scalar
+actual-head lineage queries supply at most eight discovery members plus priority
+head, exact membership and eight coverage entries plus a lookahead. They do not
+decode runtime state or historical handoff blobs. Recursive traversal/count work
+still scales with lineage; bounded data returned to scanner/Rust is not a constant
+SQL CPU guarantee. SQLite CTE working data may also scale with lineage.
+
+All twenty-five DB tests passed at `6c11894f75b60463b79586e62d840849ea761fcd`.
+The subsequent binding-name-only head `74881f401c187ed6b74f576d0eeae8011ac0b8a0`
+passed owning DB/IDE all-target Clippy and the actual 37-case host fixture test.
+The three added regressions cover fourteen transcripts made by thirteen actual
+continuations, enrollment/restart generation revisit of intermediate members,
+1 MiB irrelevant malformed runtime state and an actual typed handoff seeded before
+corruption, and detached-source CAS refusal after an explicit test-only edge-guard
+drop. The DB tests took 23.96 seconds; owning Clippy took 2m24s; the 37-case fixture
+test took 54.86 seconds. Independent source review found no additional blocker.
+
+A new offline preparation reused the original `9057badc…` closed seeds and made
+zero provider calls. Root and a fresh independent reviewer compared all 111
+input/prepared/before files across the 37 cases. Every file matched the accepted
+`288329e4…` preparation byte for byte; input hashes and binding IDs also matched.
+Prompt, DTO, corpus, oracles, endpoint, limits and 262,621 total logical content
+bytes were unchanged; protocol differences
+were only source/workspace and executable identities. This is host-input
+comparison evidence, not a new paid model trial or a change to the scores above.
+
+| Later host artifact | SHA256 / identity |
+|---|---|
+| Compiled source and preparation workspace | `74881f401c187ed6b74f576d0eeae8011ac0b8a0` |
+| Retained executable | `b90fc537e8ae7b4c019832badcceab717956a5d977f501bb4760c10dee5e511b` |
+| Offline prepared manifest | `957a2cfa5ac11d473a79f7d1738a891d849f47d3e44f6bcc7b323b1e319bb99e` |
+| Offline protocol | `35593a2ffc8e923f9b08552b1810c89d74c85a80bf6743fd4bee48f0c1fc8f9d` |
+
+The original `e978b7686` paid-trial source, executable, prepared/live hashes,
+37-case scores, missed bookmark, invisible duplicate, prior rejected experiments
+and provider accounting remain unchanged. Exact delivery review/CI/merge state is
+tracked by PR #1098. No additional provider call was made for this follow-up.

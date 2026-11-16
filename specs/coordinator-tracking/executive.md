@@ -28,9 +28,19 @@ operations including coverage. Export SHA256:
 These are observed synthetic configurations, not a fixed roster or deployed count.
 
 Both earlier scanner quality trials remain independently rejected. The typed
-host chronology correction passed twenty-two DB tests and actual host fixtures;
-the third frozen trial was independently accepted. See the [scanner status](../coordinator-scanner/executive.md)
+host chronology correction passed twenty-two DB tests and actual host fixtures
+before the third frozen trial was independently accepted. The later host-only
+follow-up passed twenty-five tests, as recorded below. See the [scanner status](../coordinator-scanner/executive.md)
 and [accepted report](../../scripts/qa/coordinator-scanner-quality/results-e978b7686.md)
 for all gates, the allowed bookmark miss, separately measured invisible duplicate
 and retained failures. Implementation/qualification is complete; GitHub PR #1098
 owns review, CI and merge state. Production deployment remains unclaimed.
+
+
+The final host-only scanner follow-up passed twenty-five DB tests, owning
+all-target Clippy and all 37 host fixtures. Fourteen transcripts/thirteen real
+continuations exercise the repaired discovery-page cursor and scalar metadata
+path; exact membership refuses a detached source. Offline preparation at
+`74881f401` retains all 37 accepted model inputs and bindings unchanged and makes
+zero provider calls. See the [host follow-up](../../scripts/qa/coordinator-scanner-quality/results-e978b7686.md#host-only-topology-follow-up).
+Data returned to scanner/Rust is bounded; recursive lineage/count work is not constant CPU.
