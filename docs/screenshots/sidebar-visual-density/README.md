@@ -21,7 +21,7 @@ Synthetic qualification for [PR #1094](https://github.com/scottopell/phoenix-ide
 
 ## Measurements and executable checks
 
-Geometry/control/environment/settings JSON accompanies the crops. The title is 13px after (16px before), unread weight 600/read 400. Normal desktop rows are 36px, with active row 35px, versus 56px before; normal touch rows are 48px, with active row 47px. At 160px, badges move below titles: desktop PR rows 52px (active 55px), touch PR rows 92px (active 95px). Narrow rows intentionally become taller rather than overlapping titles or shrinking touch targets.
+Geometry/control/environment/settings JSON accompanies the crops. The title is 13px after (16px before), unread weight 600/read 400. Normal desktop rows are 36px versus 56px before; normal touch rows are 48px. At 160px, badges move below titles: desktop PR rows are 52px and touch PR rows are 92px, including the active row. Narrow rows intentionally become taller rather than overlapping titles or shrinking touch targets.
 
 Two width-sweep JSON files cover 28 widths each: 160, 180, 200, **every integer 220–240**, 260, 280, 320, and 500. This is sampled coverage of the supported range, not every integer throughout 160–500. Five rows at each width cover open/draft/merged/closed/no-PR, long titles, working/error, unread and active states. The active merged/unread row is the tightest allocation: at 239px pane / 238px list width, title width is 52px desktop and **40px touch**. Below that boundary, the badge occupies a second row. Every sampled row remains inside its row bounds with badge clearance; header controls fit and do not overlap.
 

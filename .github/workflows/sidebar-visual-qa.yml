@@ -3,6 +3,7 @@ on:
   pull_request:
     paths:
       - 'ui/**'
+      - 'docs/screenshots/sidebar-visual-density/**'
       - '.github/workflows/sidebar-visual-qa.yml'
 permissions:
   contents: read
