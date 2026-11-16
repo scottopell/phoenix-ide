@@ -130,7 +130,7 @@ runSurfaceCapture({
       await writeFile(`${outDir}/${id}--${viewport.name}.settings.json`, JSON.stringify(popup, null, 2));
       await page.screenshot({ path: `${outDir}/${id}--${viewport.name}-settings.png`, fullPage: false });
       if (Math.abs(popup.top - popup.triggerBottom - 6) > 1 || popup.x < 0 || popup.right > popup.viewportWidth || popup.bottom > popup.viewportHeight || !popup.unclipped) throw new Error('Settings popup shifted or clipped');
-      const about = settings.getByRole('button', { name: 'About', exact: true });
+      const about = settings.getByRole('button', { name: 'About this deployment →', exact: true });
       await about.scrollIntoViewIfNeeded();
       if (!(await about.evaluate(el => { const r = el.getBoundingClientRect(); return el.contains(document.elementFromPoint(r.x + r.width / 2, r.y + r.height / 2)); }))) throw new Error('Settings bottom control is clipped');
       await page.screenshot({ path: `${outDir}/${id}--${viewport.name}-settings-bottom.png`, fullPage: false });
