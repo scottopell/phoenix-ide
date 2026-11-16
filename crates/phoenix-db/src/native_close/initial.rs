@@ -36,6 +36,13 @@ pub struct NativeCloseInitialExecution {
     pub phase: phoenix_core::domain::close::ClosePhase,
 }
 
+/// One source-owned settlement step, not a terminal Close result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NativeCloseInitialSettlement {
+    WaitingForQuiescence,
+    Advanced(NativeCloseInitialExecution),
+}
+
 impl Database {
     /// Prepares execution of the one exact newly admitted initial run.
     ///
@@ -53,6 +60,67 @@ impl Database {
             Err(error) => return LocalAuthorityResult::DurableFactEstablished(Err(error.into())),
         };
         match prepare_initial_execution_tx(&mut tx, command, receipt, live_source).await {
+            Ok(result) => match tx.commit().await {
+                Ok(()) => LocalAuthorityResult::DurableFactEstablished(Ok(result)),
+                Err(_) => LocalAuthorityResult::DurableFactUnclassified,
+            },
+            Err(error) => match tx.rollback().await {
+                Ok(()) => LocalAuthorityResult::DurableFactEstablished(Err(error)),
+                Err(_) => LocalAuthorityResult::DurableFactUnclassified,
+            },
+        }
+    }
+
+    /// Checks one exact source-owned initial settlement boundary without polling.
+    /// Only captured durable work that has not quiesced yields `WaitingForQuiescence`;
+    /// stale source, receipt, run, or phase remains an error after classified rollback.
+    /// Waiting may commit reconciled exact-turn receipts, but dispatches no effects.
+    pub async fn try_settle_native_close_initial(
+        &self,
+        command: &NativeCloseCommand,
+        receipt: &NativeCloseReceipt,
+        live_source: &phoenix_core::domain::sm_state::ConvState,
+    ) -> LocalAuthorityResult<DbResult<NativeCloseInitialSettlement>> {
+        let mut tx = match self.pool.begin_with("BEGIN IMMEDIATE").await {
+            Ok(tx) => tx,
+            Err(error) => return LocalAuthorityResult::DurableFactEstablished(Err(error.into())),
+        };
+        let result = async {
+            let (admitted, _) = require_initial_execution_tx(
+                &mut tx,
+                command,
+                receipt,
+                live_source,
+                phoenix_core::domain::close::ClosePhase::SettlingActiveWork,
+            )
+            .await?;
+            let pending_direct = Database::reconcile_close_direct_turn_settlement_receipts_tx(
+                &mut tx,
+                admitted.attempt_id.as_str(),
+            )
+            .await?;
+            let pending_participants = Database::count_close_settlement_active_participants_tx(
+                &mut tx,
+                admitted.attempt_id.as_str(),
+            )
+            .await?;
+            if pending_direct != 0 || pending_participants != 0 {
+                return Ok(NativeCloseInitialSettlement::WaitingForQuiescence);
+            }
+            let obligation = Database::advance_close_settlement_when_quiescent_tx(
+                &mut tx,
+                admitted.attempt_id.as_str(),
+            )
+            .await?;
+            Ok(NativeCloseInitialSettlement::Advanced(
+                NativeCloseInitialExecution {
+                    run: admitted,
+                    phase: obligation.phase(),
+                },
+            ))
+        }
+        .await;
+        match result {
             Ok(result) => match tx.commit().await {
                 Ok(()) => LocalAuthorityResult::DurableFactEstablished(Ok(result)),
                 Err(_) => LocalAuthorityResult::DurableFactUnclassified,

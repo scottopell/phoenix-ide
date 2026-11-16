@@ -14,6 +14,7 @@ use phoenix_workflow::{
     AcceptedDisposition, ClientTurnKey, ConversationAuthority, PreparedTurn, Timestamp, TurnOutcome,
 };
 use serde_json::json;
+use uuid::Uuid;
 
 struct Fixture {
     db: Database,
@@ -900,4 +901,85 @@ async fn failed_topology_capture_rolls_back_all_initial_admission_rows() {
     ] {
         assert_eq!(count(&f.db, table).await, 0, "{table}");
     }
+}
+
+#[tokio::test]
+async fn try_settle_waits_for_captured_direct_turn_then_advances_after_exact_release() {
+    let f = Fixture::new().await;
+    let turn_id = source_turn(&f.db, f.target.as_str(), "try-settle-turn").await;
+    let (command, receipt, live_source) = prepared_initial(&f).await;
+
+    assert!(matches!(
+        f.db.try_settle_native_close_initial(&command, &receipt, &live_source)
+            .await,
+        LocalAuthorityResult::DurableFactEstablished(Ok(
+            NativeCloseInitialSettlement::WaitingForQuiescence
+        ))
+    ));
+    assert_eq!(initial_phase(&f, &receipt).await, "settling_active_work");
+
+    assert_turn_unsettled(&f.db, turn_id).await;
+    // Terminal-looking work with the wrong generation is still pending, not proof.
+    sqlx::query(
+        "UPDATE durable_turns SET generation = 2, terminal_kind = 'Completed', owns_conversation = 0
+         WHERE turn_id = ?1",
+    )
+    .bind(i64::try_from(turn_id).unwrap())
+    .execute(f.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        f.db.try_settle_native_close_initial(&command, &receipt, &live_source)
+            .await
+            .established()
+            .unwrap()
+            .unwrap(),
+        NativeCloseInitialSettlement::WaitingForQuiescence
+    );
+
+    sqlx::query("UPDATE durable_turns SET generation = 1 WHERE turn_id = ?1")
+        .bind(i64::try_from(turn_id).unwrap())
+        .execute(f.db.pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        f.db.try_settle_native_close_initial(&command, &receipt, &live_source)
+            .await
+            .established()
+            .unwrap()
+            .unwrap(),
+        NativeCloseInitialSettlement::Advanced(NativeCloseInitialExecution {
+            run: receipt.admitted.clone(),
+            phase: ClosePhase::AwaitingRetirementInspection,
+        })
+    );
+    assert_one_operation(&f, &receipt, 0).await;
+}
+
+#[tokio::test]
+async fn try_settle_rejects_stale_source_and_wrong_receipt_before_waiting_classification() {
+    let f = Fixture::new().await;
+    let _turn_id = source_turn(&f.db, f.target.as_str(), "try-settle-stale-turn").await;
+    let (command, receipt, live_source) = prepared_initial(&f).await;
+    let mut wrong_receipt = receipt.clone();
+    wrong_receipt.request_id = Uuid::new_v4();
+    assert!(matches!(
+        f.db.try_settle_native_close_initial(&command, &wrong_receipt, &live_source)
+            .await,
+        LocalAuthorityResult::DurableFactEstablished(Err(DbError::CloseFoundationPrecondition(_)))
+    ));
+    let stale_source = ConvState::Idle;
+    assert!(matches!(
+        f.db.try_settle_native_close_initial(&command, &receipt, &stale_source)
+            .await,
+        LocalAuthorityResult::DurableFactEstablished(Err(DbError::CloseFoundationPrecondition(_)))
+    ));
+    f.db.update_conversation_state(&f.coordinator, &ConvState::Idle)
+        .await
+        .unwrap();
+    assert!(matches!(
+        f.db.try_settle_native_close_initial(&command, &receipt, &live_source)
+            .await,
+        LocalAuthorityResult::DurableFactEstablished(Err(DbError::CloseFoundationPrecondition(_)))
+    ));
 }

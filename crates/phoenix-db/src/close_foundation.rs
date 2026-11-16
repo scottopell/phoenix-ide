@@ -2556,10 +2556,10 @@ impl Database {
         Ok(obligation)
     }
 
-    async fn reconcile_close_direct_turn_settlement_receipts_tx(
+    pub(crate) async fn reconcile_close_direct_turn_settlement_receipts_tx(
         tx: &mut Transaction<'_, Sqlite>,
         attempt_id: &str,
-    ) -> DbResult<()> {
+    ) -> DbResult<i64> {
         sqlx::query(
             "UPDATE close_attempt_direct_turn_settlements
              SET settled_at = ?2
@@ -2583,19 +2583,13 @@ impl Database {
         .bind(attempt_id)
         .fetch_one(&mut **tx)
         .await?;
-        if unsettled == 0 {
-            Ok(())
-        } else {
-            Err(close_precondition(format!(
-                "attempt {attempt_id} still has {unsettled} unsettled direct-turn receipt(s)"
-            )))
-        }
+        Ok(unsettled)
     }
 
-    async fn require_close_participants_quiescent_tx(
+    pub(crate) async fn count_close_settlement_active_participants_tx(
         tx: &mut Transaction<'_, Sqlite>,
         attempt_id: &str,
-    ) -> DbResult<()> {
+    ) -> DbResult<i64> {
         let active_members: i64 = sqlx::query_scalar(
             "SELECT COUNT(*)
              FROM close_attempt_participants captured
@@ -2630,12 +2624,7 @@ impl Database {
         .bind(attempt_id)
         .fetch_one(&mut **tx)
         .await?;
-        if active_members != 0 {
-            return Err(close_precondition(format!(
-                "attempt {attempt_id} still has {active_members} active durable member obligation(s)"
-            )));
-        }
-        Ok(())
+        Ok(active_members)
     }
 
     async fn require_generic_close_settlement_tx(
@@ -2756,8 +2745,18 @@ impl Database {
                 )));
             }
         }
-        Self::reconcile_close_direct_turn_settlement_receipts_tx(tx, attempt_id).await?;
-        Self::require_close_participants_quiescent_tx(tx, attempt_id).await?;
+        let unsettled = Self::reconcile_close_direct_turn_settlement_receipts_tx(tx, attempt_id).await?;
+        if unsettled != 0 {
+            return Err(close_precondition(format!(
+                "attempt {attempt_id} still has {unsettled} unsettled direct-turn receipt(s)"
+            )));
+        }
+        let active_members = Self::count_close_settlement_active_participants_tx(tx, attempt_id).await?;
+        if active_members != 0 {
+            return Err(close_precondition(format!(
+                "attempt {attempt_id} still has {active_members} active durable member obligation(s)"
+            )));
+        }
         if obligation.phase() == ClosePhase::CancelRequestedDuringSettlement {
             sqlx::query(
                 "UPDATE close_obligations
