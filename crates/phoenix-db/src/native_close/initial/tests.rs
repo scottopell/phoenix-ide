@@ -263,6 +263,40 @@ async fn initial_phase(f: &Fixture, receipt: &NativeCloseReceipt) -> String {
 }
 
 #[tokio::test]
+async fn prepared_native_initial_is_not_generic_settlement_work() {
+    let f = Fixture::new().await;
+    let (command, receipt, live_source) = prepared_initial(&f).await;
+    assert!(f
+        .db
+        .list_pending_generic_close_settlements()
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(f
+        .db
+        .advance_close_settlement_when_quiescent(receipt.admitted.attempt_id.as_str())
+        .await
+        .is_err());
+    assert_eq!(
+        initial_phase(&f, &receipt).await,
+        ClosePhase::SettlingActiveWork.as_str()
+    );
+    assert_no_dispatch_effects(&f.db, &receipt).await;
+    assert_one_operation(&f, &receipt, 0).await;
+
+    // The exact source-owned path remains available; exclusion does not strand
+    // this run behind a generic-worker-only advancement API.
+    let established = f
+        .db
+        .settle_native_close_initial(&command, &receipt, &live_source)
+        .await
+        .established()
+        .unwrap()
+        .unwrap();
+    assert_eq!(established.phase, ClosePhase::AwaitingRetirementInspection);
+}
+
+#[tokio::test]
 async fn initial_settlement_advances_exact_quiescent_run_without_dispatch() {
     let f = Fixture::new().await;
     let (command, receipt, live_source) = prepared_initial(&f).await;

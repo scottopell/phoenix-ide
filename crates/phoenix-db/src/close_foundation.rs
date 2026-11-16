@@ -18,11 +18,26 @@ use sqlx::{Connection, Row, Sqlite, SqliteConnection, Transaction};
 use std::fmt::Write as _;
 
 use crate::coordinator_watches::append_mandatory_close_failure_event_tx;
-
 use crate::{
     conv_state_kind, parse_conversation_row, CloseFoundationRepair, ConvState, Conversation,
     Database, DbError, DbResult,
 };
+
+/// Database-admitted input for the generic background settlement worker.
+///
+/// Initial-origin receipts are immutable: observation adoption does not transfer
+/// a generic operation to the source-owned initial driver. The private field
+/// prevents callers from passing arbitrary native obligations to that worker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GenericCloseSettlement {
+    obligation: CloseObligation,
+}
+
+impl GenericCloseSettlement {
+    pub fn obligation(&self) -> &CloseObligation {
+        &self.obligation
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CloseWriterDetector {
@@ -2622,11 +2637,96 @@ impl Database {
         Ok(())
     }
 
+    async fn require_generic_close_settlement_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        attempt_id: &str,
+        product_conversation_id: &str,
+    ) -> DbResult<()> {
+        let native_initial: i64 = sqlx::query_scalar(
+            "SELECT EXISTS (
+                 SELECT 1 FROM native_close_initial_receipts receipt
+                 WHERE receipt.attempt_id = ?1
+                   AND receipt.product_conversation_id = ?2
+                   AND receipt.intent = 'initial'
+                   AND receipt.run_ordinal = 1
+             )",
+        )
+        .bind(attempt_id)
+        .bind(product_conversation_id)
+        .fetch_one(&mut **tx)
+        .await?;
+        if native_initial != 0 {
+            return Err(close_precondition(format!(
+                "attempt {attempt_id} is owned by native initial Close settlement"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Lists only settlement work admitted to the generic background worker.
+    pub async fn list_pending_generic_close_settlements(
+        &self,
+    ) -> DbResult<Vec<GenericCloseSettlement>> {
+        let rows = sqlx::query(
+            "SELECT o.attempt_id, o.product_conversation_id, o.phase,
+                    o.inspection_generation, o.inspection_fingerprint, o.created_at,
+                    o.updated_at, o.completed_at, o.close_outcome
+             FROM close_obligations o
+             WHERE o.phase IN ('settling_active_work', 'cancel_requested_during_settlement')
+               AND NOT EXISTS (
+                   SELECT 1 FROM native_close_initial_receipts receipt
+                   WHERE receipt.attempt_id = o.attempt_id
+                     AND receipt.product_conversation_id = o.product_conversation_id
+                     AND receipt.intent = 'initial' AND receipt.run_ordinal = 1
+               )
+             ORDER BY o.created_at DESC, o.attempt_id DESC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|row| {
+                parse_close_obligation_row(row).map(|obligation| GenericCloseSettlement { obligation })
+            })
+            .collect()
+    }
+
+    /// Rechecks generic worker authority against fresh durable state before effects.
+    pub async fn validate_generic_close_settlement(
+        &self,
+        settlement: &GenericCloseSettlement,
+    ) -> DbResult<bool> {
+        let mut tx = self.pool.begin().await?;
+        Self::require_generic_close_settlement_tx(
+            &mut tx,
+            settlement.obligation.attempt_id().as_str(),
+            settlement.obligation.product_conversation_id().as_str(),
+        )
+        .await?;
+        let current = close_obligation_for_update(
+            &mut tx,
+            settlement.obligation.attempt_id().as_str(),
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(current.product_conversation_id() == settlement.obligation.product_conversation_id()
+            && matches!(
+                current.phase(),
+                ClosePhase::SettlingActiveWork | ClosePhase::CancelRequestedDuringSettlement
+            ))
+    }
+
     pub async fn advance_close_settlement_when_quiescent(
         &self,
         attempt_id: &str,
     ) -> DbResult<CloseObligation> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let current = close_obligation_for_update(&mut tx, attempt_id).await?;
+        Self::require_generic_close_settlement_tx(
+            &mut tx,
+            attempt_id,
+            current.product_conversation_id().as_str(),
+        )
+        .await?;
         let obligation =
             Self::advance_close_settlement_when_quiescent_tx(&mut tx, attempt_id).await?;
         tx.commit().await?;

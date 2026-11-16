@@ -114,6 +114,54 @@ impl Fixture {
 }
 
 #[tokio::test]
+async fn observation_does_not_transfer_generic_settlement_ownership() {
+    for adopt in [false, true] {
+        let f = Fixture::new().await;
+        let referenced = f.begin().await;
+        let attempt = referenced.attempt_id.as_str();
+        f.db.begin_close_idle_settlement(attempt).await.unwrap();
+        let mut pending = f.db.list_pending_generic_close_settlements().await.unwrap();
+        assert_eq!(pending.len(), 1);
+        let admitted = pending.pop().unwrap();
+        assert_eq!(admitted.obligation().attempt_id(), &referenced.attempt_id);
+
+        if adopt {
+            let command = f.command(&referenced);
+            f.executing(&command).await;
+            assert!(matches!(
+                f.apply(&command).await.unwrap(),
+                NativeCloseObserveResult::Observed(_)
+            ));
+        }
+        // Observation adoption may happen after selection. It must not revoke
+        // the existing generic driver or turn its receipt into initial authority.
+        assert!(f
+            .db
+            .validate_generic_close_settlement(&admitted)
+            .await
+            .unwrap());
+        assert_eq!(
+            f.db.list_pending_generic_close_settlements()
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        let advanced = f
+            .db
+            .advance_close_settlement_when_quiescent(attempt)
+            .await
+            .unwrap();
+        assert_eq!(advanced.phase(), ClosePhase::AwaitingRetirementInspection);
+        assert!(!f
+            .db
+            .validate_generic_close_settlement(&admitted)
+            .await
+            .unwrap());
+    }
+}
+
+#[tokio::test]
 async fn exact_observation_duplicate_replays_one_immutable_receipt_without_admission() {
     let f = Fixture::new().await;
     let referenced = f.begin().await;

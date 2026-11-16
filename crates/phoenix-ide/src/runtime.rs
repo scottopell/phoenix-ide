@@ -3756,7 +3756,7 @@ impl RuntimeManager {
     pub async fn resume_pending_close_settlements(self: &Arc<Self>) -> Result<usize, String> {
         let obligations = self
             .db
-            .list_pending_close_obligations()
+            .list_pending_generic_close_settlements()
             .await
             .map_err(|error| error.to_string())?;
         let manager = Arc::clone(self);
@@ -3769,13 +3769,22 @@ impl RuntimeManager {
 
     async fn settle_close_obligation(
         self: &Arc<Self>,
-        obligation: phoenix_core::domain::close::CloseObligation,
+        settlement: crate::db::GenericCloseSettlement,
     ) -> Result<bool, String> {
+        let obligation = settlement.obligation();
         if !matches!(
             obligation.phase(),
             phoenix_core::domain::close::ClosePhase::SettlingActiveWork
                 | phoenix_core::domain::close::ClosePhase::CancelRequestedDuringSettlement
         ) {
+            return Ok(false);
+        }
+        if !self
+            .db
+            .validate_generic_close_settlement(&settlement)
+            .await
+            .map_err(|error| error.to_string())?
+        {
             return Ok(false);
         }
         let conversation_ids = self
