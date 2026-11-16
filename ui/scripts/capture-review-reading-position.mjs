@@ -10,10 +10,13 @@ assert(base, 'LADLE_URL is required (serve the built fixtures on a hosted runner
 assert(['http:', 'https:'].includes(new URL(base).protocol), 'LADLE_URL must be HTTP(S)');
 const baseline = process.env.BASELINE === '1';
 const idleAudit = process.env.OVERLAY_IDLE_QA === '1';
+const overlayProjectionQa = process.env.OVERLAY_PROJECTION_QA === '1';
 const out = path.resolve(process.env.REVIEW_READING_QA_OUT ?? 'qa-artifacts/review-reading-position');
 await mkdir(out, { recursive: true });
 const report = {
   idleAudit,
+  overlayProjectionQa,
+  overlayProjectionConditions: overlayProjectionQa ? 'Accepted fixture SSE conversation_update; unchanged/no-update control, Mermaid projection, text-only projection, intentional changed-message control; 390px and 1440px.' : null,
   idleConditions: idleAudit ? 'Long image-free production viewer; ordinary/global, touch-enabled 390px and desktop 1440px; four 2400ms no-input windows after settle; Chromium is not physical iOS.' : null,
   baseline, base, cases: [], mismatches: [], errors: [], controls: [],
   limitations: [
@@ -56,6 +59,12 @@ if (idleAudit) {
   cases.length = 0;
   for (const fixture of fixtures) for (const width of [390, 1440]) {
     cases.push({ fixture: { ...fixture, story: fixture.story.replace('-long-history', '-idle-review') }, width, position: 'middle', exit: 'discard' });
+  }
+}
+if (overlayProjectionQa) {
+  cases.length = 0;
+  for (const width of [390, 1440]) for (const mode of ['unchanged', 'mermaid-projection', 'text-projection', 'changed-message']) {
+    cases.push({ fixture: { kind: 'ordinary', story: mode === 'text-projection' ? 'review-reading-position--overlay-projection-text' : 'review-reading-position--overlay-projection-mermaid', ready: 'ordinary-lazy-history', entry: '/product-conversations/fixture-product-conversation?source_transcript=history-3#message-history-answer-3' }, width, position: 'middle', exit: 'discard', overlayMode: mode });
   }
 }
 
@@ -245,14 +254,112 @@ async function traceIdle(page, result, stage) {
   assert(!trace.events.some(event => ['pointerdown', 'touchstart', 'keydown'].includes(event.type)), 'Idle trace must contain no input');
 }
 
+async function captureOverlayProjection(page, result, mode, fixture) {
+  const mermaid = mode !== 'text-projection';
+  await page.goto(`${base}/?story=${fixture.story}&theme=light&fixtureEntry=${encodeURIComponent(fixture.entry)}`);
+  await page.waitForSelector('[data-product-conversation-fixture-ready="ordinary-lazy-history"]');
+  await settle(page);
+  const row = page.locator('[data-render-unit-key="history-answer-3"]');
+  await row.getByRole('button', { name: 'Open message reviewer', exact: true }).click();
+  await page.waitForSelector('.viewer-content');
+  if (mermaid) await page.waitForSelector('.viewer-content .mermaid-svg svg');
+  await page.evaluate(() => document.fonts.ready);
+  await settle(page);
+  await page.evaluate(() => {
+    const content = document.querySelector('.viewer-content');
+    const anchor = [...content.querySelectorAll('p')].find(p => p.textContent.startsWith('Review paragraph 10:'));
+    if (!anchor) throw new Error('Missing same-text anchor');
+    content.scrollTop += anchor.getBoundingClientRect().top - content.getBoundingClientRect().top - 120;
+  });
+  await settle(page);
+  await page.screenshot({ path: path.join(out, result.id + '-before.png') });
+  result.trace = await page.evaluate(async ({ mode }) => {
+    const content = document.querySelector('.viewer-content');
+    const original = [...content.querySelectorAll('p')].find(p => p.textContent.startsWith('Review paragraph 10:'));
+    const expectedText = original.textContent;
+    const originalDiagram = content.querySelector('.mermaid-diagram');
+    const originalSvg = originalDiagram?.querySelector('svg');
+    const initialParagraphs = [...content.querySelectorAll('p')].map(p => p.textContent);
+    const probeBefore = { ...document.querySelector('[data-review-projection-probe]').dataset };
+    const events = [], mutations = [], samples = [];
+    const identity = node => node ? { tag: node.tagName, id: node.id, class: String(node.className) } : null;
+    const read = () => {
+      const anchor = original.isConnected ? original : [...content.querySelectorAll('p')].find(p => p.textContent === expectedText);
+      const rects = [];
+      if (anchor) {
+        const walker = document.createTreeWalker(anchor, NodeFilter.SHOW_TEXT);
+        if (walker.nextNode()) {
+          const range = document.createRange(); range.setStart(walker.currentNode, 0); range.setEnd(walker.currentNode, Math.min(32, walker.currentNode.length));
+          rects.push(...[...range.getClientRects()].map(r => ({ x: r.x, y: r.y, width: r.width, height: r.height })));
+        }
+      }
+      const nodes = new Set([document.scrollingElement, document.querySelector('#messages'), content]);
+      for (let parent = content.parentElement; parent; parent = parent.parentElement) nodes.add(parent);
+      return { time: performance.now(), sameNode: anchor === original, sameDiagram: !originalDiagram || originalDiagram === content.querySelector('.mermaid-diagram'), sameSvg: !originalSvg || originalSvg === content.querySelector('.mermaid-diagram svg'), rects,
+        loading: Boolean(content.querySelector('.mermaid-diagram-loading')), svg: Boolean(content.querySelector('.mermaid-svg svg')),
+        ancestors: [...nodes].filter(Boolean).map(n => ({ ...identity(n), top: n.scrollTop, left: n.scrollLeft })), focus: identity(document.activeElement),
+        viewport: window.visualViewport ? { top: visualViewport.offsetTop, left: visualViewport.offsetLeft, height: visualViewport.height, width: visualViewport.width, scale: visualViewport.scale } : null };
+    };
+    const onEvent = e => events.push({ type: e.type, target: identity(e.target), time: performance.now() });
+    const names = ['pointerdown', 'touchstart', 'keydown', 'click', 'focusin', 'scroll'];
+    names.forEach(name => document.addEventListener(name, onEvent, true));
+    const observer = new MutationObserver(records => mutations.push({ ...read(), addedLoading: records.some(r => [...r.addedNodes].some(n => n.nodeType === 1 && (n.matches('.mermaid-diagram-loading') || n.querySelector('.mermaid-diagram-loading')))) }));
+    observer.observe(content, { subtree: true, childList: true });
+    const before = read();
+    try {
+      window.dispatchEvent(new CustomEvent('product-conversation-fixture-review-projection', { detail: { mode: mode === 'changed-message' ? 'changed-message' : mode === 'unchanged' ? 'none' : 'projection' } }));
+      const started = performance.now();
+      while (performance.now() - started < 1800) { samples.push(read()); await new Promise(requestAnimationFrame); }
+      return { before, after: read(), samples, mutations, events, probeBefore, probeAfter: { ...document.querySelector('[data-review-projection-probe]').dataset }, paragraphsUnchanged: JSON.stringify(initialParagraphs) === JSON.stringify([...content.querySelectorAll('p')].map(p => p.textContent)), fixture: { ...document.documentElement.dataset } };
+    } finally { observer.disconnect(); names.forEach(name => document.removeEventListener(name, onEvent, true)); }
+  }, { mode });
+  const { before, samples, mutations, events, after } = result.trace;
+  result.geometryPreserved = samples.every(s => JSON.stringify(s.rects) === JSON.stringify(before.rects));
+  result.nodesPreserved = samples.every(s => s.sameNode && s.sameDiagram && s.sameSvg);
+  result.loadingObserved = [...samples, ...mutations].some(s => s.loading || s.addedLoading);
+  assert.equal(events.filter(e => ['pointerdown', 'touchstart', 'keydown', 'click'].includes(e.type)).length, 0, 'New input during background measurement');
+  if (mode === 'changed-message') {
+    assert.equal(result.trace.paragraphsUnchanged, false, 'Intentional content update must reach reviewed message');
+    assert.notEqual(result.trace.probeBefore.reviewedContent, result.trace.probeAfter.reviewedContent, 'Changed-message control must reach atom');
+    assert(after.rects.length > 0, 'Changed-message control must retain unchanged anchor text');
+  } else {
+    assert(result.trace.paragraphsUnchanged, 'Unchanged reviewed Markdown must retain all prose');
+    assert.equal(result.trace.probeBefore.reviewedContent, result.trace.probeAfter.reviewedContent, 'Reviewed atom content changed during projection');
+    if (mode !== 'unchanged') assert.match(result.trace.probeAfter.title, /^Fixture background projection /, 'SSE conversation_update was not accepted');
+    if (mode !== 'unchanged') assert.equal(result.trace.fixture.productConversationFixtureReviewProjectionPublishes, '1', 'Eligible SSE update was not published');
+    if (mode === 'unchanged' || !baseline) {
+      assert(result.nodesPreserved, 'Unchanged reviewed message unnecessarily remounted');
+      assert(result.geometryPreserved, 'Unchanged reviewed same-text geometry moved');
+      assert(!result.loadingObserved, 'Already-rendered Mermaid returned to loading');
+    } else {
+      assert(!result.nodesPreserved, 'Baseline must demonstrate unnecessary renderer remount');
+      if (mermaid) assert(result.loadingObserved, 'Baseline must observe fresh Mermaid loading');
+    }
+  }
+  await page.screenshot({ path: path.join(out, result.id + '-after.png') });
+}
+
 try {
   for (const test of cases) {
-    const { fixture, width, position, exit } = test;
-    const id = `${fixture.kind}-${width}-${position}-${exit}`;
+    const { fixture, width, position, exit, overlayMode } = test;
+    const id = overlayProjectionQa ? `overlay-${overlayMode}-${width}` : `${fixture.kind}-${width}-${position}-${exit}`;
     const result = { id, stages: {} };
     report.cases.push(result);
-    const context = await browser.newContext({ viewport: { width, height: width === 390 ? 844 : 900 }, hasTouch: idleAudit && width === 390 });
+    const context = await browser.newContext({ viewport: { width, height: width === 390 ? 844 : 900 }, hasTouch: (idleAudit || overlayProjectionQa) && width === 390 });
     const page = await context.newPage();
+    if (overlayProjectionQa) {
+      try {
+        await page.route('**/api/**', route => { report.errors.push(`${id}: unexpected network API ${route.request().url()}`); return route.abort('blockedbyclient'); });
+        await captureOverlayProjection(page, result, overlayMode, fixture);
+
+      } catch (error) {
+        result.error = String(error); report.errors.push(`${id}: ${error}`);
+        await page.screenshot({ path: path.join(out, `${id}-error.png`) }).catch(() => {});
+      } finally {
+        await context.close(); await save();
+      }
+      continue;
+    }
     if (idleAudit) await page.addInitScript(() => {
       window.reviewIdleCommands = [];
       window.reviewSetupEvents = [];
@@ -465,8 +572,8 @@ try {
     }
   }
   assert.equal(report.errors.length, 0, `Harness/interaction errors: ${report.errors.join('\n')}`);
-  assert.equal(report.controls.length, idleAudit ? 0 : 1, 'Unexpected chapter navigation control count');
-  if (baseline) assert(report.mismatches.length > 0, 'BASELINE must reproduce at least one position/route/node mismatch');
+  assert.equal(report.controls.length, idleAudit || overlayProjectionQa ? 0 : 1, 'Unexpected chapter navigation control count');
+  if (baseline && !overlayProjectionQa) assert(report.mismatches.length > 0, 'BASELINE must reproduce at least one position/route/node mismatch');
   else assert.equal(report.mismatches.length, 0, `Reading-position regressions: ${report.mismatches.length}; see ${out}/report.json`);
   console.log(`${baseline ? 'BASELINE reproduced' : 'PASS'}: ${report.cases.length} cases, ${report.mismatches.length} mismatches; ${out}`);
 } finally {
