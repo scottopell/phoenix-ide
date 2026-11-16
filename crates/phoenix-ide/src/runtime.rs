@@ -5026,10 +5026,17 @@ impl RuntimeManager {
             children,
         };
         let owner = self.acquire_local_authority_pass().map_err(|()| {
-            "FATAL_LOCAL_AUTHORITY_UNCLASSIFIED: native spawn admission fence closed".to_string()
+            "native spawn admission was not issued because local write admission is closed"
+                .to_string()
         })?;
         let mut authority = native_spawn::NativeSpawnWriteAuthority { owner: Some(owner) };
         let result = self.db.admit_sub_agent_batch_atomically(&admission).await;
+        if matches!(
+            result,
+            phoenix_db::workflow::LocalAuthorityResult::DurableFactUnclassified
+        ) {
+            self.signal_fatal_local_authority("sub_agent_batch_admission");
+        }
         authority.owner = None;
         match result {
             phoenix_db::workflow::LocalAuthorityResult::DurableFactEstablished(result) => {

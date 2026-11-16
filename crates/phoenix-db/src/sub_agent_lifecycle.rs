@@ -280,6 +280,7 @@ pub struct SubAgentSpawnInvocation {
 }
 
 impl SubAgentSpawnInvocation {
+    #[must_use]
     pub fn owns_state(&self, state: &ConvState) -> bool {
         match state {
             ConvState::ToolExecuting {

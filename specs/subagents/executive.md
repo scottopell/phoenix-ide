@@ -66,7 +66,7 @@ only the architectural seams.
   tools must be the sole tool in their LLM response; the transition
   function enforces this structurally.
 - **Spawn-layer** (`tools/subagent.rs` + `runtime/executor.rs::
-  handle_spawn_agents_tool`) validates the call, applies defaults
+  start_spawn_agents_tool`) validates the call, applies defaults
   (mode, model, max_turns, cwd, timeout), enforces exact parent-model
   qualification plus cwd scoping, then hands each task to
   `RuntimeManager::handle_spawn_request`. `runtime.rs` derives the
@@ -107,8 +107,8 @@ only the architectural seams.
 | **REQ-SA-001:** Parallel Task Execution | ✅ Complete | Explore parallelism and bounds remain live; qualified Work batches are admitted atomically before child startup |
 | **REQ-SA-002:** Sub-Agent Isolation | ✅ Complete | Tool registries exclude `spawn_agents`, `ask_user_question`, `skill`, `propose_task`; sub-agents tagged `user_initiated = false` |
 | **REQ-SA-003:** Result Submission | ✅ Complete | Terminal evidence precedes addressed parent delivery; acceptance is idempotent and atomic with parent state persistence |
-| **REQ-SA-004:** Parent Fan-In | Partially implemented | Normal parent-state/child-acceptance commits remove exact children and accepted duplicates converge. Native unactivated-batch cleanup suppresses delivery without a matching parent outcome; all-admitted cancellation reconciliation remains incomplete (task 75011). |
-| **REQ-SA-005:** Cancellation Propagation | Partially implemented | Durable cancellation and the activation barrier prevent initial work, but unactivated cleanup does not classify its result back to the parent owner or reconcile every admitted cancellation through parent fan-in. Task 75011 captures that seam; parent preparation priority remains task 75010. |
+| **REQ-SA-004:** Parent Fan-In | ✅ Complete | Live unactivated closure retains every exact child as owed, commits parent pending membership and drains authentic outcomes through normal atomic acceptance. Duplicates converge without a second result; interrupted/restart ownership remains unqualified |
+| **REQ-SA-005:** Cancellation Propagation | Partially implemented | Submitted native admission has retained selectable ownership; cancellation and late/lost responses join one classified reconciliation before abort acknowledgement. Activation remains gated on committed membership. Inline preparation priority remains task 75010 |
 | **REQ-SA-006:** Timeout Enforcement | ✅ Complete | `DEFAULT_SUBAGENT_TIMEOUT = 20 min`; deadline races in executor `select!` |
 | **REQ-SA-007:** Model Selection | ✅ Complete | `generic_omission_inherits_parent_execution`, `override_replaces_execution_and_keeps_persona`, and `explicit_connection_is_exact_and_never_falls_back`; persisted selection verified by `unattached_sub_agent_persists_selection_without_parent_effort_leak` |
 | **REQ-SA-008:** Context Injection via Read-First | ❌ Not Started | `read_first` field not yet on `SubAgentTask`; deferred |
@@ -116,7 +116,20 @@ only the architectural seams.
 | **REQ-SA-010:** Turn-Limit Grace Prompt Integrity | ✅ Complete | Grace request advertises terminal tools only; Work guidance routes unfinished required edits through `submit_error` |
 | **REQ-SA-011:** Spawn Override Defaults and Path Base | ✅ Complete | `omitted_execution_and_blank_cwd_use_defaults`, `relative_cwd_resolves_from_parent_working_directory`, and `advertised_model_removed_from_live_registry_is_rejected` |
 
-**Progress:** 9 complete; 1 deferred; 1 retired wake requirement (retirement verification ongoing).
+**Progress:** 8 complete; 1 partial; 1 deferred; 1 retired wake requirement (retirement verification ongoing).
+
+## Live native handoff verification
+
+Task 75011 separates live unactivated closure from the unchanged historical
+startup-abandonment helper. Deterministic native journeys cover cancellation with
+a late admission response, one closure transaction, lost admission/activation
+channels, exact committed pending membership before abort, atomic fan-in,
+duplicate delivery, stale assistant identity, definite SQL failures and lost
+memory ownership. SQLite commit-cut tests distinguish rollback, lost commit
+acknowledgement and unavailable classification for both child evidence and parent
+membership. Armed write-owner panic/abort is fatal; a known pre-write refusal or
+postcommit activation-receiver loss does not invent unknown SQLite authority.
+No restart repair, durable queue or broader recovery qualification is added.
 
 ## Execution-selection verification
 

@@ -38,7 +38,10 @@ impl RuntimeManager {
         batch: &phoenix_db::SubAgentBatchAdmission,
     ) -> NativeSpawnTerminalEvidence {
         let Ok(owner) = self.acquire_local_authority_pass() else {
-            return NativeSpawnTerminalEvidence::Unclassified;
+            return NativeSpawnTerminalEvidence::Failed(
+                "native spawn closure was not issued because local write admission is closed"
+                    .into(),
+            );
         };
         let mut authority = NativeSpawnWriteAuthority { owner: Some(owner) };
         let result = self

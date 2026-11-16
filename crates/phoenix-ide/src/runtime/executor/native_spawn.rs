@@ -118,6 +118,118 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn native_prewrite_refusal_is_known_without_unknown_authority_or_false_completion() {
+        let (manager, mut runtime, request) = pending_native_spawn().await;
+        manager
+            .fatal_local_authority_fence
+            .close_for_process_shutdown();
+        manager.handle_spawn_request(request).await;
+        let response = runtime.observe_native_spawn().await;
+        assert!(matches!(
+            &response,
+            NativeSpawnObservation::Admission(Ok(SubAgentAdmissionReceipt {
+                outcome: SubAgentAdmissionResponse::Rejected(_),
+                ..
+            }))
+        ));
+        assert!(runtime.native_spawn_observed(response).await.is_err());
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sub_agent_runs")
+            .fetch_one(manager.db().pool())
+            .await
+            .unwrap();
+        assert_eq!(count, 0);
+        assert!(!manager
+            .fatal_local_authority_fence
+            .fatal_authority_loss_is_latched());
+
+        let (manager, runtime, request) = pending_native_spawn().await;
+        manager
+            .admit_sub_agent_batch(
+                &request.invocation.batch_id,
+                &request.specs,
+                &request.invocation.parent_conversation_id,
+                request.parent_scope.clone(),
+                request.parallel_work_qualified,
+            )
+            .await
+            .unwrap();
+        let batch = phoenix_db::SubAgentBatchAdmission {
+            batch_id: request.invocation.batch_id.clone(),
+            parent_conversation_id: request.invocation.parent_conversation_id.clone(),
+            parallel_work_qualified: request.parallel_work_qualified,
+            runs: request
+                .specs
+                .iter()
+                .map(|spec| phoenix_db::SubAgentRunAdmission {
+                    child_conversation_id: spec.agent_id.clone(),
+                    execution_authority: phoenix_db::SubAgentExecutionAuthority::ReadOnly,
+                })
+                .collect(),
+        };
+        manager
+            .fatal_local_authority_fence
+            .close_for_process_shutdown();
+        assert!(matches!(
+            manager.close_native_spawn_batch(&batch).await,
+            NativeSpawnTerminalEvidence::Failed(_)
+        ));
+        let owed: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sub_agent_runs WHERE parent_accepted_at_unix_micros IS NULL AND terminal_at_unix_micros IS NULL AND initial_dispatch_claimed_at_unix_micros IS NULL").fetch_one(manager.db().pool()).await.unwrap();
+        assert_eq!(owed, 2);
+        assert!(!manager
+            .fatal_local_authority_fence
+            .fatal_authority_loss_is_latched());
+        assert!(matches!(runtime.state, ConvState::ToolExecuting { .. }));
+        drop(request);
+    }
+
+    #[tokio::test]
+    async fn native_run_loop_accepts_cancellation_while_admission_response_is_outstanding() {
+        let (manager, runtime, request) = pending_native_spawn().await;
+        let origin = request.invocation.clone();
+        let event_tx = runtime.event_tx.clone();
+        let (state_tx, mut state_rx) = watch::channel(runtime.state.clone());
+        let task = tokio::spawn(runtime.with_state_watcher(state_tx).run());
+        event_tx
+            .send(Event::UserCancel {
+                reason: None,
+                cause: crate::state_machine::event::CancelCause::UserRequested,
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(60),
+            state_rx.wait_for(|state| matches!(state, ConvState::CancellingTool { .. })),
+        )
+        .await
+        .expect("live native wait remains cancellable")
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(60), request.cancellation.cancelled())
+            .await
+            .expect("native cancellation disposition was signalled");
+        manager.handle_spawn_request(request).await;
+        tokio::time::timeout(
+            Duration::from_secs(60),
+            state_rx.wait_for(|state| matches!(state, ConvState::Idle)),
+        )
+        .await
+        .expect("native cancellation reaches real parent fan-in")
+        .unwrap();
+        assert!(manager
+            .db()
+            .owed_sub_agent_terminals(&origin.parent_conversation_id)
+            .await
+            .unwrap()
+            .is_empty());
+        let accepted: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sub_agent_runs WHERE parent_accepted_at_unix_micros IS NOT NULL AND initial_dispatch_claimed_at_unix_micros IS NULL").fetch_one(manager.db().pool()).await.unwrap();
+        assert_eq!(accepted, 2);
+        event_tx.send(Event::Shutdown).await.unwrap();
+        assert_eq!(
+            task.await.unwrap(),
+            RuntimeExitDisposition::CoordinatedShutdown
+        );
+    }
+
+    #[tokio::test]
     async fn native_cancel_and_late_admission_join_one_closure_then_atomic_fan_in() {
         let (manager, mut runtime, request) = pending_native_spawn().await;
         let origin = request.invocation.clone();
@@ -570,6 +682,7 @@ where
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     pub(super) async fn native_spawn_observed(
         &mut self,
         observation: NativeSpawnObservation,
@@ -587,6 +700,12 @@ where
             self.fatal_local_authority_fence
                 .close("native_spawn_authority");
             return Err("FATAL_LOCAL_AUTHORITY_UNCLASSIFIED: native spawn operation".into());
+        }
+        if self.fatal_local_authority_fence.is_closed() {
+            return Err(
+                "native spawn observation interrupted because local write admission is closed"
+                    .into(),
+            );
         }
         let Some(handoff) = self.native_spawn_handoff.as_ref() else {
             tracing::error!("native spawn observation lost its originating owner");
@@ -724,6 +843,13 @@ where
                             .storage
                             .establish_unactivated_sub_agent_membership(&membership, updated_at)
                             .await;
+                        if matches!(
+                            established,
+                            phoenix_db::workflow::LocalAuthorityResult::DurableFactUnclassified
+                        ) {
+                            self.fatal_local_authority_fence
+                                .close("native_spawn_parent_membership");
+                        }
                         authority.owner = None;
                         match established {
                             phoenix_db::workflow::LocalAuthorityResult::DurableFactEstablished(
