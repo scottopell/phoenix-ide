@@ -3312,8 +3312,8 @@ where
                             // It must not reacquire the transferred target gate.
                             let result = self.execute_native_close_initial(source, target, admitted).await;
                             let fatal = matches!(result, Err(super::native_close_application::NativeCloseApplicationError::FatalAuthority));
-                            let _ = response.send(result);
                             drop(target_gate);
+                            let _ = response.send(result);
                             if fatal {
                                 return self.fatal_local_authority_exit();
                             }
@@ -3325,8 +3325,8 @@ where
                             } = *request;
                             let result = self.execute_native_close_observe(source, referenced, admitted).await;
                             let fatal = matches!(result, Err(super::native_close_application::NativeCloseApplicationError::FatalAuthority));
-                            let _ = response.send(result);
                             drop(target_gate);
+                            let _ = response.send(result);
                             if fatal {
                                 return self.fatal_local_authority_exit();
                             }

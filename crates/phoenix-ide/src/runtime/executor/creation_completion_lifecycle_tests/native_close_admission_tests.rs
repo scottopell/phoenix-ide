@@ -403,7 +403,8 @@ async fn stopped_live_source_refuses_exact_observe_replay_before_database_lookup
             .unwrap(),
         Err(NativeCloseApplicationError::SourceRefused)
     ));
-    stop_actor(&sender).await;
+    // The awaited request has already settled and released its owner and gate.
+    // A second UserCancel is not a FIFO barrier: CancellingTool rejects it.
     assert_eq!(count(&fixture.db, "native_close_initial_receipts").await, 1);
     assert_eq!(count(&fixture.db, "close_runs").await, 1);
     assert_eq!(fence.owner_count(), 0);
@@ -442,7 +443,9 @@ async fn dropped_observe_reply_keeps_queue_ownership_through_adoption_and_classi
          JOIN native_close_initial_receipts r ON r.attempt_id = o.attempt_id
          WHERE o.attempt_id = ?1 AND r.intent = 'observe'",
     ).bind(referenced.attempt_id.as_str()).fetch_one(fixture.db.pool()).await.unwrap();
-    assert_eq!(adopted, (1, 0, 1, 1));
+    // Observation/adoption and stopping the distinct source do not consume or
+    // suppress the target operation's allowance.
+    assert_eq!(adopted, (1, 0, 0, 1));
     assert_eq!(fence.owner_count(), 0);
     assert!(!fence.fatal_authority_loss_is_latched());
     assert!(Arc::clone(&gate).try_lock_owned().is_ok());
