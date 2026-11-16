@@ -28,6 +28,27 @@ jobs:
           pnpm exec vitest run src/fixtures/sidebar/scenarios.test.ts src/components/Sidebar.test.tsx src/components/ConversationList.test.tsx
       - run: pnpm exec playwright install --with-deps chromium
         working-directory: ui
+      - name: Capture RC6 sidebar with identical fixture
+        working-directory: ui
+        env:
+          PHOENIX_LADLE: '1'
+          CAPTURE_STORIES: sidebar-visual-normal,sidebar-visual-narrow
+          SIDEBAR_VISUAL_BASELINE: '1'
+          SIDEBAR_QA_OUT: qa-artifacts/sidebar/rc6
+        run: |
+          for file in src/components/ConversationList.css src/components/Sidebar.css src/components/EmberEntry.css src/index.css; do
+            cp "$file" "/tmp/rc6-$(basename "$file")"
+          done
+          trap 'for file in src/components/ConversationList.css src/components/Sidebar.css src/components/EmberEntry.css src/index.css; do cp "/tmp/rc6-$(basename "$file")" "$file"; done' EXIT
+          git show bccfd66b2470a86910b952f22ccf327ed2c78f2f:ui/src/components/ConversationList.css > src/components/ConversationList.css
+          git show bccfd66b2470a86910b952f22ccf327ed2c78f2f:ui/src/components/EmberEntry.css > src/components/EmberEntry.css
+          git show bccfd66b2470a86910b952f22ccf327ed2c78f2f:ui/src/index.css > src/index.css
+          : > src/components/Sidebar.css
+          for viewport in desktop touch; do
+            for story in ${CAPTURE_STORIES//,/ }; do
+              CAPTURE_VIEWPORT="$viewport" CAPTURE_STORIES="$story" node scripts/capture-sidebar.mjs
+            done
+          done
       - name: Capture unchanged-product baseline with identical fixture
         working-directory: ui
         env:
