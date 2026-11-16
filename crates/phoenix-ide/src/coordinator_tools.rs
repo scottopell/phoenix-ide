@@ -6,6 +6,7 @@ use crate::api::global_read::{
 mod authority;
 mod goals;
 pub(crate) mod instance;
+mod tracking;
 
 #[cfg(test)]
 use instance::InstanceSelector;
@@ -16,6 +17,9 @@ pub(crate) fn goal_tools(runtime: &Arc<crate::runtime::RuntimeManager>) -> Vec<A
 
 pub(crate) fn authority_tools(runtime: &Arc<crate::runtime::RuntimeManager>) -> Vec<Arc<dyn Tool>> {
     authority::tools(runtime)
+}
+pub(crate) fn tracking_tool(runtime: &Arc<crate::runtime::RuntimeManager>) -> Arc<dyn Tool> {
+    tracking::tool(runtime)
 }
 
 pub(crate) fn previous_transcripts_tool(

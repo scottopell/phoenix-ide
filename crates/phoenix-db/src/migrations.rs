@@ -843,6 +843,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "product_conversation_read_state",
         sql: include_str!("migrations/product_conversation_read_state.sql"),
     },
+    Migration {
+        version: 164,
+        name: "coordinator_durable_tracking",
+        sql: include_str!("coordinator_tracking/schema.sql"),
+    },
 ];
 
 const MIGRATION_138: &str = concat!(
@@ -13745,7 +13750,7 @@ mod tests {
         .unwrap();
         assert_eq!(before, vec![158]);
 
-        assert_eq!(run_pending_migrations(pool).await.unwrap(), 6);
+        assert_eq!(run_pending_migrations(pool).await.unwrap(), 7);
 
         let after: Vec<i64> = sqlx::query_scalar(
             "SELECT version FROM _migrations WHERE version >= 156 ORDER BY version",
@@ -13753,7 +13758,7 @@ mod tests {
         .fetch_all(pool)
         .await
         .unwrap();
-        assert_eq!(after, vec![156, 158, 159, 160, 161, 162, 163]);
+        assert_eq!(after, vec![156, 158, 159, 160, 161, 162, 163, 164]);
         sqlx::query("SELECT enrollment_id FROM conversation_goal_actors LIMIT 0")
             .execute(pool)
             .await
@@ -16265,6 +16270,7 @@ mod tests {
                 (161, "slack_single_trigger_emoji".into()),
                 (162, "slack_saved_capture".into()),
                 (163, "product_conversation_read_state".into()),
+                (164, "coordinator_durable_tracking".into()),
             ]
         );
     }
@@ -16274,6 +16280,7 @@ mod tests {
         let ledger = compiled_migration_ledger();
         assert!(ledger.windows(2).all(|pair| pair[0].0 < pair[1].0));
         let expected_tail = [
+            (164, "coordinator_durable_tracking"),
             (163, "product_conversation_read_state"),
             (162, "slack_saved_capture"),
             (161, "slack_single_trigger_emoji"),
@@ -20557,6 +20564,7 @@ mod tests {
                 (161, "slack_single_trigger_emoji"),
                 (162, "slack_saved_capture"),
                 (163, "product_conversation_read_state"),
+                (164, "coordinator_durable_tracking"),
             ]
         );
         let goal = MIGRATIONS

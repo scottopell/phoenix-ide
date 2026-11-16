@@ -2153,6 +2153,7 @@ where
     /// Executor-owned hydrated durable prompt rows. Provider tasks receive only
     /// request-local rendered clones; this projection never leaves the runtime.
     active_prompt_projection: Option<ActivePromptProjection>,
+    tracking_observation_pending: bool,
     capacity_prefix_tracker: capacity::PrefixTracker,
     pending_trusted_tool_results: Vec<PendingTrustedToolResult>,
     /// Accepted provider-private replay mutation waiting for the reducer's
@@ -2484,6 +2485,7 @@ where
             clearable_names,
             clear_watermark_cache: Arc::new(std::sync::Mutex::new(None)),
             active_prompt_projection: None,
+            tracking_observation_pending: true,
             capacity_prefix_tracker: capacity::PrefixTracker::default(),
             pending_trusted_tool_results: Vec::new(),
             pending_provider_replay_update: None,
@@ -3978,6 +3980,7 @@ where
 
         if matches!(event, Event::UserMessage { .. }) {
             self.parent_tool_cycle_count = 0;
+            self.tracking_observation_pending = true;
         }
 
         // A steer normally waits for the next drain hook. If channel delivery
@@ -4121,6 +4124,7 @@ where
 
             if authoritative_event {
                 self.parent_tool_cycle_count = 0;
+                self.tracking_observation_pending = true;
             }
             if matches!(
                 terminal_event,
@@ -8440,6 +8444,7 @@ where
             SteeringDrainPostCommit::StartLlmAndNotifyState => {
                 self.ordinary_turn_context = None;
                 self.parent_tool_cycle_count = 0;
+                self.tracking_observation_pending = true;
                 let _ = self
                     .broadcast_tx
                     .admitted_publication(admitted)
@@ -8891,6 +8896,33 @@ where
                     logical_request_id: logical_request_id.clone(),
                     model_id: model_id.clone(),
                 }));
+            }
+        }
+        if self.context.is_coordinator && self.tracking_observation_pending {
+            let sequence_id = self.broadcast_tx.next_seq();
+            match self
+                .storage
+                .append_coordinator_tracking_observation(
+                    &self.context.conversation_id,
+                    sequence_id,
+                    Utc::now().timestamp_micros(),
+                )
+                .await
+            {
+                phoenix_db::workflow::LocalAuthorityResult::DurableFactEstablished(result) => {
+                    if let Some(message) = result? {
+                        let _ = self
+                            .broadcast_tx
+                            .admitted_publication(admitted)
+                            .persisted_message(message);
+                    }
+                    self.tracking_observation_pending = false;
+                }
+                phoenix_db::workflow::LocalAuthorityResult::DurableFactUnclassified => {
+                    self.fatal_local_authority_fence
+                        .close("coordinator_tracking_observation_unclassified");
+                    return Err("FATAL_LOCAL_AUTHORITY_UNCLASSIFIED: tracking observation".into());
+                }
             }
         }
         self.refresh_active_prompt_projection().await?;
@@ -34350,3 +34382,6 @@ mod tool_generation_guard_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod tracking_context_tests;

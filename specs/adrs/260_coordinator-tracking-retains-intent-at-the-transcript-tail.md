@@ -2,7 +2,7 @@
 
 - **Status:** Accepted
 - **Date:** 2026-11-15
-- **Affects:** REQ-TRACK-001–007, REQ-GR-010
+- **Affects:** REQ-TRACK-001–007, REQ-GR-011
 
 ## Context
 

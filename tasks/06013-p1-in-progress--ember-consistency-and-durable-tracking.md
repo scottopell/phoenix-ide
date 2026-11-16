@@ -158,10 +158,10 @@ The user selected both recommendations. Remaining model budgets, excerpt tuning 
 | 2 | Independent roadmap retirement | [06015](./06015-p1-in-progress--retire-stale-delivery-roadmap.md) |
 | 3 | Exact completion-evidence binding | [06020](./06020-p1-ready--bind-watch-events-to-ending-response-evi.md) |
 | 4 | Useful bounded event context and incremental qualification | [06021](./06021-p1-ready--enrich-ember-event-context-and-measure-f.md) |
-| 5 | Durable tracking store/application service/tools | [06016](./06016-p1-ready--ember-durable-tracking-store-and-tools.md) |
-| 6 | Fresh continuity context and inspection | [06017](./06017-p1-ready--ember-tracking-continuity-and-inspection.md) |
+| 5 | Durable tracking store/application service/tools | [06016](./06016-p1-in-progress--ember-durable-tracking-store-and-tools.md) |
+| 6 | Fresh continuity context and inspection | [06017](./06017-p1-in-progress--ember-tracking-continuity-and-inspection.md) |
 | 7 | Cheap origin-aware scanner | [06018](./06018-p1-ready--ember-cheap-transcript-safety-net.md) |
-| 8 | Final cross-feature acceptance/cutover | [06019](./06019-p1-ready--ember-coordination-end-to-end-qualificat.md) |
+| 8 | Final cross-feature acceptance/cutover | [06019](./06019-p1-in-progress--ember-coordination-end-to-end-qualificat.md) |
 
 Dependencies are feature-local: the event-relevant baseline/contract in phase 1 unblocks 3→4; the tracking-relevant subset unblocks 5→6→7. Neither requires all of phase 1 to finish. Phase 3 owns its occurrence/retention/privacy/capture contract, phase 5 its record/native-tool/reconciliation contract, and phase 7 its frontier/invalidation/application/model-budget contract before activation. Scanner design cannot block events or direct tracking. Phase 2 is independently shippable; phase 8 combines delivered slices. Each slice qualifies before integration; event measurements do not wait for the scanner.
 

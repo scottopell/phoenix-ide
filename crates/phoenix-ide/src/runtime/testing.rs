@@ -1388,6 +1388,15 @@ impl Default for InMemoryStorage {
 
 #[async_trait]
 impl MessageStore for InMemoryStorage {
+    async fn append_coordinator_tracking_observation(
+        &self,
+        _source: &str,
+        _sequence_id: i64,
+        _now_us: i64,
+    ) -> phoenix_db::workflow::LocalAuthorityResult<Result<Option<Message>, String>> {
+        phoenix_db::workflow::LocalAuthorityResult::DurableFactEstablished(Ok(None))
+    }
+
     async fn terminalize_sub_agent_cancellation_backstop(
         &self,
         _child_conversation_id: &str,

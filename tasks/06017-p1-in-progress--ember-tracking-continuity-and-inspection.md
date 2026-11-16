@@ -1,6 +1,6 @@
 # Ember phase 6: tracking continuity and inspection
 
-Parent: [06013](./06013-p1-ready--ember-consistency-and-durable-tracking.md). Depends on [phase 5](./06016-p1-ready--ember-durable-tracking-store-and-tools.md). This slice proves the feature helps after continuation before adding a model scanner.
+Parent: [06013](./06013-p1-in-progress--ember-consistency-and-durable-tracking.md). Depends on [phase 5](./06016-p1-in-progress--ember-durable-tracking-store-and-tools.md). This slice proves the feature helps after continuation before adding a model scanner.
 
 ## Outcome
 

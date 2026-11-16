@@ -1,6 +1,6 @@
 # Ember phase 5: durable tracking store and native tool
 
-Parent: [06013](./06013-p1-ready--ember-consistency-and-durable-tracking.md). Requires only the tracking-related terminology/baseline from [phase 1](./06014-p1-in-progress--ember-tool-contract-and-consistency-base.md). This task owns its record/native-tool/reconciliation contract before implementation; event and scanner design and the aggregate completion of phase 1 do not gate it. No scanner/model calls in this slice.
+Parent: [06013](./06013-p1-in-progress--ember-consistency-and-durable-tracking.md). Requires only the tracking-related terminology/baseline from [phase 1](./06014-p1-in-progress--ember-tool-contract-and-consistency-base.md). This task owns its record/native-tool/reconciliation contract before implementation; event and scanner design and the aggregate completion of phase 1 do not gate it. No scanner/model calls in this slice.
 
 ## Outcome
 
