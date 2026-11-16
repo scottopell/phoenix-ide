@@ -252,12 +252,31 @@ async fn native_retry_requires_complete_exact_scope_identity_and_rejects_process
                 assessment.request.remaining_effects[scope_index].resource = opaque_resource(RetiredResourceKind::WorkScope, "foreign-scope");
             }
             "wrong-order" => {
-                assert!(scope_index > 0);
-                assessment.request.remaining_effects.swap(0, scope_index);
+                let effects = &mut assessment.request.remaining_effects;
+                let (resource_index, dependent_scope_index) = effects
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, effect)| effect.resource.kind() != RetiredResourceKind::WorkScope)
+                    .find_map(|(index, effect)| {
+                        effects
+                            .iter()
+                            .position(|candidate| {
+                                candidate.scope == effect.scope
+                                    && candidate.resource.kind() == RetiredResourceKind::WorkScope
+                            })
+                            .map(|scope_index| (index, scope_index))
+                    })
+                    .expect("fixture has a resource and its dependent scope retirement");
+                assert!(resource_index < dependent_scope_index);
+                effects.swap(resource_index, dependent_scope_index);
             }
             _ => {}
         }
-        refused(db.apply_native_close_explicit_retry(&assessment).await);
+        let result = db.apply_native_close_explicit_retry(&assessment).await;
+        assert!(
+            matches!(result, NativeCloseCommitOutcome::DurableFactEstablished(Err(_))),
+            "{mode}: {result:?}"
+        );
         assert_no_admission(&db, &failure.attempt_id).await;
     }
 }
