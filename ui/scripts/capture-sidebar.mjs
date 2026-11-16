@@ -80,6 +80,23 @@ runSurfaceCapture({
       await page.keyboard.press('Enter');
       await rows.first().getByRole('button', { name: /Rename conversation/ }).waitFor();
       await page.screenshot({ path: `${outDir}/${id}--${viewport.name}-menu.png`, fullPage: false });
+      await page.keyboard.press('Escape');
+      if (!(await trigger.evaluate(el => el === document.activeElement))) throw new Error('Action menu did not restore focus');
+      await page.getByRole('button', { name: 'Settings', exact: true }).click();
+      const settings = page.getByRole('dialog', { name: 'Settings', exact: true });
+      await settings.waitFor({ state: 'visible' });
+      const popup = await settings.evaluate(el => {
+        const r = el.getBoundingClientRect();
+        const t = document.querySelector('.settings-dropdown-trigger').getBoundingClientRect();
+        const hit = document.elementFromPoint(r.right - 8, r.top + 8);
+        return { x: r.x, right: r.right, top: r.top, bottom: r.bottom, triggerBottom: t.bottom,
+          viewportWidth: innerWidth, viewportHeight: innerHeight, unclipped: !!hit && el.contains(hit) };
+      });
+      await writeFile(`${outDir}/${id}--${viewport.name}.settings.json`, JSON.stringify(popup, null, 2));
+      await page.screenshot({ path: `${outDir}/${id}--${viewport.name}-settings.png`, fullPage: false });
+      if (Math.abs(popup.top - popup.triggerBottom - 6) > 1 || popup.x < 0 || popup.right > popup.viewportWidth || popup.bottom > popup.viewportHeight || !popup.unclipped) throw new Error('Settings popup shifted or clipped');
+      await page.keyboard.press('Escape');
+      await settings.waitFor({ state: 'hidden' });
       return true;
     }
     if (id !== 'product-actions-continued') return false;

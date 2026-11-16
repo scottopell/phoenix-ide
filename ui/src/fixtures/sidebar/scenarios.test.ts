@@ -1,4 +1,6 @@
 import { describe, expect, it } from 'vitest';
+import { api } from '../../api';
+import { installSidebarFixtureApi } from './mockApi';
 import { sidebarFixtureData, sidebarScenarios } from './scenarios';
 
 describe('sidebar fixture scenarios', () => {
@@ -23,6 +25,26 @@ describe('sidebar fixture scenarios', () => {
     expect(sidebarFixtureData.productConversations?.['product-actions-continued']).toHaveLength(1);
     for (const scenario of sidebarScenarios.filter((item) => item.id !== 'product-actions-continued' && !item.id.startsWith('sidebar-visual-'))) {
       expect(sidebarFixtureData.productConversations?.[scenario.id] ?? []).toHaveLength(0);
+    }
+  });
+
+  it('serves a typed product snapshot for the continued-actions scenario', async () => {
+    const restore = installSidebarFixtureApi(sidebarFixtureData, 'product-actions-continued');
+    try {
+      const snapshot = await api.getProductConversationSnapshot('pc-continued-fixture', { message_limit: 1 });
+      expect(snapshot.product_conversation_id).toBe('pc-continued-fixture');
+      expect(snapshot.latest_transcript_row_id).toBe('pc-latest-continuation');
+      expect(snapshot.segments).toEqual([{
+        segment_ordinal: 0,
+        transcript_row_id: 'pc-latest-continuation',
+        slug: 'fixture-product-root',
+        title: 'Fixture Product Root',
+        messages: [],
+        handoff: null,
+      }]);
+      await expect(api.getProductConversationSnapshot('missing-fixture')).rejects.toThrow('Unknown product conversation fixture');
+    } finally {
+      restore();
     }
   });
 
