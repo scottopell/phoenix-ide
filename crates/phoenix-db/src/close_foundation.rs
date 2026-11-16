@@ -4524,20 +4524,12 @@ impl Database {
         Ok(())
     }
 
-    /// Durably binds the validated Git administrative directory to an exact
-    /// dispatched worktree retirement before either filesystem location is deleted.
-    ///
-    /// # Errors
-    /// Returns a database error unless the exact dispatch exists and the plan is
-    /// either new or byte-for-byte identical to the prior plan.
-    pub async fn record_close_worktree_cleanup_plan(
-        &self,
+    pub(crate) async fn record_close_worktree_cleanup_plan_tx(
+        tx: &mut Transaction<'_, Sqlite>,
         request: RecordCloseWorktreeCleanupPlanRequest,
     ) -> DbResult<()> {
         if request.resource.kind() != RetiredResourceKind::Worktree {
-            return Err(close_precondition(
-                "cleanup plan resource is not a worktree",
-            ));
+            return Err(close_precondition("cleanup plan resource is not a worktree"));
         }
         let identity = request.resource.identity();
         let administrative_dir_value = encode_host_path(&request.administrative_dir);
@@ -4562,7 +4554,7 @@ impl Database {
         .bind(&administrative_dir_value)
         .bind(&request.administrative_dir_incarnation)
         .bind(Utc::now().timestamp_micros())
-        .execute(&self.pool)
+        .execute(&mut **tx)
         .await?;
         if result.rows_affected() == 0 {
             let prior: Option<(String, String, String)> = sqlx::query_as(
@@ -4582,20 +4574,125 @@ impl Database {
             .bind(identity.identity_kind())
             .bind(identity.codec())
             .bind(identity.value())
-            .fetch_optional(&self.pool)
+            .fetch_optional(&mut **tx)
             .await?;
             if prior.as_ref().map(|(codec, value, incarnation)| {
                 (codec.as_str(), value.as_str(), incarnation.as_str())
-            }) != Some((
-                "hex_path_v1",
-                administrative_dir_value.as_str(),
-                request.administrative_dir_incarnation.as_str(),
-            )) {
-                return Err(close_precondition(
-                    "exact worktree cleanup plan conflicts with durable plan",
-                ));
+            }) != Some(("hex_path_v1", administrative_dir_value.as_str(), request.administrative_dir_incarnation.as_str())) {
+                return Err(close_precondition("exact worktree cleanup plan conflicts with durable plan"));
             }
         }
+        Ok(())
+    }
+
+    pub(crate) async fn bind_close_worktree_final_tombstone_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        request: BindCloseWorktreeFinalTombstoneRequest,
+    ) -> DbResult<()> {
+        let identity = request.resource.identity();
+        let root = encode_host_path(&request.tombstone.root);
+        let device = request.tombstone.device.to_string();
+        let inode = request.tombstone.inode.to_string();
+        let result = sqlx::query(
+            "UPDATE close_worktree_cleanup_plans
+             SET final_tombstone_root_codec = 'hex_path_v1', final_tombstone_root_value = ?1,
+                 final_tombstone_root_device = ?2, final_tombstone_root_inode = ?3
+             WHERE attempt_id = ?4 AND scope = ?5 AND inspection_generation = ?6
+               AND inspection_fingerprint = ?7 AND resource_kind = ?8 AND identity_kind = ?9
+               AND identity_codec = ?10 AND identity_value = ?11
+               AND final_tombstone_root_codec IS NULL",
+        )
+        .bind(&root).bind(&device).bind(&inode)
+        .bind(request.attempt_id.as_str()).bind(request.scope.as_str())
+        .bind(request.snapshot.generation()).bind(request.snapshot.fingerprint())
+        .bind(request.resource.kind().as_str()).bind(identity.identity_kind())
+        .bind(identity.codec()).bind(identity.value()).execute(&mut **tx).await?;
+        if result.rows_affected() == 1 { return Ok(()); }
+        let prior: Option<OptionalFinalTombstoneColumns> = sqlx::query_as(
+            "SELECT final_tombstone_root_codec, final_tombstone_root_value,
+                    final_tombstone_root_device, final_tombstone_root_inode,
+                    final_tombstone_object_device, final_tombstone_object_inode
+             FROM close_worktree_cleanup_plans WHERE attempt_id = ?1 AND scope = ?2
+               AND inspection_generation = ?3 AND inspection_fingerprint = ?4
+               AND resource_kind = ?5 AND identity_kind = ?6 AND identity_codec = ?7 AND identity_value = ?8",
+        )
+        .bind(request.attempt_id.as_str()).bind(request.scope.as_str())
+        .bind(request.snapshot.generation()).bind(request.snapshot.fingerprint())
+        .bind(request.resource.kind().as_str()).bind(identity.identity_kind())
+        .bind(identity.codec()).bind(identity.value()).fetch_optional(&mut **tx).await?;
+        if prior.as_ref().map(|(codec, value, device, inode, _, _)| (codec.as_deref(), value.as_deref(), device.as_deref(), inode.as_deref()))
+            == Some((Some("hex_path_v1"), Some(root.as_str()), Some(device.as_str()), Some(inode.as_str()))) { Ok(()) }
+        else { Err(close_precondition("exact worktree final tombstone conflicts with durable plan")) }
+    }
+
+    pub(crate) async fn bind_close_worktree_final_tombstone_object_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        request: BindCloseWorktreeFinalTombstoneObjectRequest,
+    ) -> DbResult<()> {
+        let identity = request.resource.identity();
+        let device = request.object_device.to_string();
+        let inode = request.object_inode.to_string();
+        let result = sqlx::query(
+            "UPDATE close_worktree_cleanup_plans SET final_tombstone_object_device = ?1,
+                 final_tombstone_object_inode = ?2
+             WHERE attempt_id = ?3 AND scope = ?4 AND inspection_generation = ?5
+               AND inspection_fingerprint = ?6 AND resource_kind = ?7 AND identity_kind = ?8
+               AND identity_codec = ?9 AND identity_value = ?10
+               AND final_tombstone_root_codec IS NOT NULL AND final_tombstone_object_device IS NULL",
+        )
+        .bind(&device).bind(&inode).bind(request.attempt_id.as_str()).bind(request.scope.as_str())
+        .bind(request.snapshot.generation()).bind(request.snapshot.fingerprint())
+        .bind(request.resource.kind().as_str()).bind(identity.identity_kind())
+        .bind(identity.codec()).bind(identity.value()).execute(&mut **tx).await?;
+        if result.rows_affected() == 1 { return Ok(()); }
+        let prior: Option<(Option<String>, Option<String>)> = sqlx::query_as(
+            "SELECT final_tombstone_object_device, final_tombstone_object_inode
+             FROM close_worktree_cleanup_plans WHERE attempt_id = ?1 AND scope = ?2
+               AND inspection_generation = ?3 AND inspection_fingerprint = ?4
+               AND resource_kind = ?5 AND identity_kind = ?6 AND identity_codec = ?7 AND identity_value = ?8",
+        )
+        .bind(request.attempt_id.as_str()).bind(request.scope.as_str())
+        .bind(request.snapshot.generation()).bind(request.snapshot.fingerprint())
+        .bind(request.resource.kind().as_str()).bind(identity.identity_kind())
+        .bind(identity.codec()).bind(identity.value()).fetch_optional(&mut **tx).await?;
+        if prior.as_ref().map(|(d, i)| (d.as_deref(), i.as_deref())) == Some((Some(device.as_str()), Some(inode.as_str()))) { Ok(()) }
+        else { Err(close_precondition("exact worktree final tombstone object conflicts with durable plan")) }
+    }
+
+    async fn reject_completed_native_worktree_metadata_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        attempt_id: &CloseAttemptId,
+    ) -> DbResult<()> {
+        let native_completed: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM close_obligations
+             WHERE attempt_id = ?1 AND native_managed = 1 AND phase = 'completed')",
+        )
+        .bind(attempt_id.as_str())
+        .fetch_one(&mut **tx)
+        .await?;
+        if native_completed {
+            return Err(close_precondition(
+                "generic worktree metadata is not authorized for a completed native close",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Durably binds the validated Git administrative directory to an exact
+    /// dispatched worktree retirement before either filesystem location is deleted.
+    ///
+    /// # Errors
+    /// Returns a database error unless the exact dispatch exists and the plan is
+    /// either new or byte-for-byte identical to the prior plan. Completed native-managed
+    /// attempts must use native retry authority.
+    pub async fn record_close_worktree_cleanup_plan(
+        &self,
+        request: RecordCloseWorktreeCleanupPlanRequest,
+    ) -> DbResult<()> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        Self::reject_completed_native_worktree_metadata_tx(&mut tx, &request.attempt_id).await?;
+        Self::record_close_worktree_cleanup_plan_tx(&mut tx, request).await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -4605,158 +4702,34 @@ impl Database {
     ///
     /// # Errors
     /// Returns a database error or a precondition error when the exact plan is absent
-    /// or already binds a different path or filesystem identity.
+    /// or already binds a different path or filesystem identity. Completed native-managed
+    /// attempts must use native retry authority.
     pub async fn bind_close_worktree_final_tombstone(
         &self,
         request: BindCloseWorktreeFinalTombstoneRequest,
     ) -> DbResult<()> {
-        let identity = request.resource.identity();
-        let root = encode_host_path(&request.tombstone.root);
-        let device = request.tombstone.device.to_string();
-        let inode = request.tombstone.inode.to_string();
-        let result = sqlx::query(
-            "UPDATE close_worktree_cleanup_plans
-             SET final_tombstone_root_codec = 'hex_path_v1',
-                 final_tombstone_root_value = ?1,
-                 final_tombstone_root_device = ?2,
-                 final_tombstone_root_inode = ?3
-             WHERE attempt_id = ?4 AND scope = ?5
-               AND inspection_generation = ?6 AND inspection_fingerprint = ?7
-               AND resource_kind = ?8 AND identity_kind = ?9
-               AND identity_codec = ?10 AND identity_value = ?11
-               AND final_tombstone_root_codec IS NULL",
-        )
-        .bind(&root)
-        .bind(&device)
-        .bind(&inode)
-        .bind(request.attempt_id.as_str())
-        .bind(request.scope.as_str())
-        .bind(request.snapshot.generation())
-        .bind(request.snapshot.fingerprint())
-        .bind(request.resource.kind().as_str())
-        .bind(identity.identity_kind())
-        .bind(identity.codec())
-        .bind(identity.value())
-        .execute(&self.pool)
-        .await?;
-        if result.rows_affected() == 1 {
-            return Ok(());
-        }
-        let prior: Option<OptionalFinalTombstoneColumns> = sqlx::query_as(
-            "SELECT final_tombstone_root_codec, final_tombstone_root_value,
-                    final_tombstone_root_device, final_tombstone_root_inode,
-                    final_tombstone_object_device, final_tombstone_object_inode
-             FROM close_worktree_cleanup_plans
-             WHERE attempt_id = ?1 AND scope = ?2
-               AND inspection_generation = ?3 AND inspection_fingerprint = ?4
-               AND resource_kind = ?5 AND identity_kind = ?6
-               AND identity_codec = ?7 AND identity_value = ?8",
-        )
-        .bind(request.attempt_id.as_str())
-        .bind(request.scope.as_str())
-        .bind(request.snapshot.generation())
-        .bind(request.snapshot.fingerprint())
-        .bind(request.resource.kind().as_str())
-        .bind(identity.identity_kind())
-        .bind(identity.codec())
-        .bind(identity.value())
-        .fetch_optional(&self.pool)
-        .await?;
-        if prior
-            .as_ref()
-            .map(|(codec, value, prior_device, prior_inode, _, _)| {
-                match (
-                    codec.as_deref(),
-                    value.as_deref(),
-                    prior_device.as_deref(),
-                    prior_inode.as_deref(),
-                ) {
-                    (Some(codec), Some(value), Some(device), Some(inode)) => {
-                        (codec, value, device, inode)
-                    }
-                    _ => ("", "", "", ""),
-                }
-            })
-            == Some((
-                "hex_path_v1",
-                root.as_str(),
-                device.as_str(),
-                inode.as_str(),
-            ))
-        {
-            Ok(())
-        } else {
-            Err(close_precondition(
-                "exact worktree final tombstone conflicts with durable plan",
-            ))
-        }
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        Self::reject_completed_native_worktree_metadata_tx(&mut tx, &request.attempt_id).await?;
+        Self::bind_close_worktree_final_tombstone_tx(&mut tx, request).await?;
+        tx.commit().await?;
+        Ok(())
     }
 
     /// Binds the moved final tombstone object after rename and before deletion.
     ///
     /// # Errors
     /// Returns a database or precondition error when the exact root plan is absent
-    /// or the object identity conflicts with an earlier binding.
+    /// or the object identity conflicts with an earlier binding. Completed native-managed
+    /// attempts must use native retry authority.
     pub async fn bind_close_worktree_final_tombstone_object(
         &self,
         request: BindCloseWorktreeFinalTombstoneObjectRequest,
     ) -> DbResult<()> {
-        let identity = request.resource.identity();
-        let device = request.object_device.to_string();
-        let inode = request.object_inode.to_string();
-        let result = sqlx::query(
-            "UPDATE close_worktree_cleanup_plans
-             SET final_tombstone_object_device = ?1,
-                 final_tombstone_object_inode = ?2
-             WHERE attempt_id = ?3 AND scope = ?4
-               AND inspection_generation = ?5 AND inspection_fingerprint = ?6
-               AND resource_kind = ?7 AND identity_kind = ?8
-               AND identity_codec = ?9 AND identity_value = ?10
-               AND final_tombstone_root_codec IS NOT NULL
-               AND final_tombstone_object_device IS NULL",
-        )
-        .bind(&device)
-        .bind(&inode)
-        .bind(request.attempt_id.as_str())
-        .bind(request.scope.as_str())
-        .bind(request.snapshot.generation())
-        .bind(request.snapshot.fingerprint())
-        .bind(request.resource.kind().as_str())
-        .bind(identity.identity_kind())
-        .bind(identity.codec())
-        .bind(identity.value())
-        .execute(&self.pool)
-        .await?;
-        if result.rows_affected() == 1 {
-            return Ok(());
-        }
-        let prior: Option<(Option<String>, Option<String>)> = sqlx::query_as(
-            "SELECT final_tombstone_object_device, final_tombstone_object_inode
-             FROM close_worktree_cleanup_plans
-             WHERE attempt_id = ?1 AND scope = ?2
-               AND inspection_generation = ?3 AND inspection_fingerprint = ?4
-               AND resource_kind = ?5 AND identity_kind = ?6
-               AND identity_codec = ?7 AND identity_value = ?8",
-        )
-        .bind(request.attempt_id.as_str())
-        .bind(request.scope.as_str())
-        .bind(request.snapshot.generation())
-        .bind(request.snapshot.fingerprint())
-        .bind(request.resource.kind().as_str())
-        .bind(identity.identity_kind())
-        .bind(identity.codec())
-        .bind(identity.value())
-        .fetch_optional(&self.pool)
-        .await?;
-        if prior.as_ref().map(|(d, i)| (d.as_deref(), i.as_deref()))
-            == Some((Some(device.as_str()), Some(inode.as_str())))
-        {
-            Ok(())
-        } else {
-            Err(close_precondition(
-                "exact worktree final tombstone object conflicts with durable plan",
-            ))
-        }
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        Self::reject_completed_native_worktree_metadata_tx(&mut tx, &request.attempt_id).await?;
+        Self::bind_close_worktree_final_tombstone_object_tx(&mut tx, request).await?;
+        tx.commit().await?;
+        Ok(())
     }
 
     /// Returns the administrative directory from an exact durable worktree cleanup plan.

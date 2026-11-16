@@ -479,7 +479,7 @@ async fn registered_fresh_upgrade_slack_children_ledger_and_reentry() {
             let mut conn = pool.acquire().await.unwrap();
             preserved(&mut conn, &before).await;
             drop(conn);
-            assert_eq!(run_pending_migrations(&pool).await.unwrap(), 14);
+            assert_eq!(run_pending_migrations(&pool).await.unwrap(), 15);
             let mut conn = pool.acquire().await.unwrap();
             let live_images: i64 =
                 sqlx::query_scalar("SELECT COUNT(*) FROM product_creation_job_images")
@@ -528,6 +528,7 @@ async fn registered_fresh_upgrade_slack_children_ledger_and_reentry() {
                     (162, "native_close_source_fence"),
                     (163, "native_close_retry_failure"),
                     (164, "native_close_retry_dispatch"),
+                    (165, "native_close_retry_worktree_metadata"),
                 ]
             );
             drop(conn);

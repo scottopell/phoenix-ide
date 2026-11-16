@@ -1,3 +1,8 @@
+use crate::close_foundation::{
+    BindCloseWorktreeFinalTombstoneObjectRequest, BindCloseWorktreeFinalTombstoneRequest,
+    CloseWorktreeFinalTombstone, RecordCloseWorktreeCleanupPlanRequest,
+};
+
 type DispatchRow = (String, String, String, String, String, String, String, String, i64);
 async fn retry_dispatch_state(db: &Database, attempt: &CloseAttemptId) -> String {
     let rows: String = sqlx::query_scalar(
@@ -300,7 +305,7 @@ async fn migration_164_preserves_populated_163_rows_and_rewrites_only_dispatch_a
         "SELECT version, name, applied_at FROM _migrations ORDER BY version",
     ).fetch_all(db.pool()).await.unwrap();
     assert_eq!(ledger.last().unwrap().0, 163);
-    assert_eq!(crate::migrations::run_pending_migrations(db.pool()).await.unwrap(), 1);
+    assert_eq!(crate::migrations::run_through_for_test(db.pool(), 164).await.unwrap(), 1);
     assert_eq!(retry_dispatch_state(&db, attempt).await, before);
     for (name, installed) in definitions {
         let rewritten: String = sqlx::query_scalar("SELECT sql FROM sqlite_schema WHERE name = ?1")
@@ -323,7 +328,7 @@ async fn migration_164_preserves_populated_163_rows_and_rewrites_only_dispatch_a
     assert_eq!(upgraded.len(), ledger.len() + 1);
     assert_eq!(upgraded.last().unwrap().0, 164);
     assert_eq!(upgraded.last().unwrap().1, "native_close_retry_dispatch");
-    assert_eq!(crate::migrations::run_pending_migrations(db.pool()).await.unwrap(), 0);
+    assert_eq!(crate::migrations::run_through_for_test(db.pool(), 164).await.unwrap(), 0);
     assert_eq!(retry_dispatch_state(&db, attempt).await, before);
     success_recorded(db.record_native_close_retry_retirement_dispatch(
         &assessment.command, &receipt.admitted, worktree,
@@ -352,4 +357,90 @@ async fn non_native_retry_dispatch_retains_legacy_current_snapshot_authority() {
     let before = retry_dispatch_state(&db, &run.attempt_id).await;
     db.record_close_retirement_dispatch(request).await.unwrap();
     assert_eq!(retry_dispatch_state(&db, &run.attempt_id).await, before);
+}
+
+
+#[tokio::test]
+async fn migration_165_unknown_second_authority_prefix_rolls_back_first_rewrite_and_ledger() {
+    let (db, _, _) = migration_163_pending_fixture().await;
+    assert_eq!(crate::migrations::run_through_for_test(db.pool(), 164).await.unwrap(), 2);
+    let second: String = sqlx::query_scalar(
+        "SELECT sql FROM sqlite_schema WHERE name = 'close_worktree_tombstone_require_retry_authority'",
+    )
+    .fetch_one(db.pool()).await.unwrap();
+    let unknown = second.replacen("\nBEGIN", "\nAND 1 = 1\nBEGIN", 1);
+    sqlx::raw_sql("DROP TRIGGER close_worktree_tombstone_require_retry_authority")
+        .execute(db.pool()).await.unwrap();
+    sqlx::raw_sql(sqlx::AssertSqlSafe(unknown)).execute(db.pool()).await.unwrap();
+    let before: Vec<(String, String)> = sqlx::query_as(
+        "SELECT name, sql FROM sqlite_schema WHERE type = 'trigger' ORDER BY name",
+    ).fetch_all(db.pool()).await.unwrap();
+    let ledger: Vec<(i64, String, String)> = sqlx::query_as(
+        "SELECT version, name, applied_at FROM _migrations ORDER BY version",
+    ).fetch_all(db.pool()).await.unwrap();
+
+    assert!(crate::migrations::run_through_for_test(db.pool(), 165).await.is_err());
+    let after: Vec<(String, String)> = sqlx::query_as(
+        "SELECT name, sql FROM sqlite_schema WHERE type = 'trigger' ORDER BY name",
+    ).fetch_all(db.pool()).await.unwrap();
+    let after_ledger: Vec<(i64, String, String)> = sqlx::query_as(
+        "SELECT version, name, applied_at FROM _migrations ORDER BY version",
+    ).fetch_all(db.pool()).await.unwrap();
+    assert_eq!(after, before);
+    assert_eq!(after_ledger, ledger);
+    assert_eq!(ledger.last().unwrap().0, 164);
+}
+
+#[tokio::test]
+async fn migration_165_refuses_native_g2_legacy_metadata_authority() {
+    let (db, assessment, receipt) = migration_163_pending_fixture().await;
+    assert_eq!(crate::migrations::run_through_for_test(db.pool(), 164).await.unwrap(), 2);
+    assert_eq!(crate::migrations::run_through_for_test(db.pool(), 165).await.unwrap(), 1);
+    let worktree = assessment.request.remaining_effects.iter()
+        .find(|effect| effect.resource.kind() == RetiredResourceKind::Worktree).unwrap();
+    let snapshot = current_test_snapshot(&db, receipt.admitted.attempt_id.as_str()).await;
+    let plan = RecordCloseWorktreeCleanupPlanRequest {
+        attempt_id: receipt.admitted.attempt_id.clone(),
+        scope: worktree.scope.clone(),
+        snapshot: snapshot.clone(),
+        resource: worktree.resource.clone(),
+        administrative_dir_incarnation: "g2-forbidden".into(),
+        administrative_dir: std::path::PathBuf::from("/tmp/g2-forbidden"),
+    };
+    let tombstone = BindCloseWorktreeFinalTombstoneRequest {
+        attempt_id: receipt.admitted.attempt_id.clone(),
+        scope: worktree.scope.clone(),
+        snapshot: snapshot.clone(),
+        resource: worktree.resource.clone(),
+        tombstone: CloseWorktreeFinalTombstone {
+            root: std::path::PathBuf::from("/tmp/g2-forbidden-tombstone"),
+            device: 1,
+            inode: 2,
+            object_device: None,
+            object_inode: None,
+        },
+    };
+    let object = BindCloseWorktreeFinalTombstoneObjectRequest {
+        attempt_id: receipt.admitted.attempt_id.clone(),
+        scope: worktree.scope.clone(),
+        snapshot,
+        resource: worktree.resource.clone(),
+        object_device: 1,
+        object_inode: 2,
+    };
+    let before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM close_worktree_cleanup_plans")
+        .fetch_one(db.pool()).await.unwrap();
+    for result in [
+        db.record_close_worktree_cleanup_plan(plan).await,
+        db.bind_close_worktree_final_tombstone(tombstone).await,
+        db.bind_close_worktree_final_tombstone_object(object).await,
+    ] {
+        let Err(crate::DbError::CloseFoundationPrecondition(message)) = result else {
+            panic!("generic G2 metadata API must refuse native authority: {result:?}");
+        };
+        assert!(message.contains("completed native close"), "{message}");
+    }
+    let after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM close_worktree_cleanup_plans")
+        .fetch_one(db.pool()).await.unwrap();
+    assert_eq!(after, before);
 }

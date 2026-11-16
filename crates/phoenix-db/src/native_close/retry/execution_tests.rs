@@ -18,6 +18,138 @@ async fn generic_resource_failure_still_terminalizes_and_replays_non_native_retr
     assert_eq!(native_failure_side_effect_counts(&db).await, counts);
 }
 
+#[tokio::test]
+async fn native_retry_worktree_metadata_is_source_bound_to_pending_original_g1_effect() {
+    let (db, assessment, receipt) = native_resource_failure_fixture().await;
+    let effect = assessment.request.remaining_effects.iter()
+        .find(|effect| effect.resource.kind() == RetiredResourceKind::Worktree).unwrap().clone();
+    let make_request = || RecordCloseWorktreeCleanupPlanRequest {
+        attempt_id: receipt.admitted.attempt_id.clone(),
+        scope: effect.scope.clone(),
+        snapshot: assessment.proof.snapshot.clone(),
+        resource: effect.resource.clone(),
+        administrative_dir_incarnation: "native-retry-test".into(),
+        administrative_dir: std::path::PathBuf::from("/tmp/native-retry-admin"),
+    };
+    assert_ne!(current_test_snapshot(&db, receipt.admitted.attempt_id.as_str()).await,
+        assessment.proof.snapshot);
+
+    success_recorded(db.record_native_close_retry_retirement_dispatch(
+        &assessment.command, &receipt.admitted, &effect,
+    ).await);
+    let request = make_request();
+    success_recorded(db.record_native_close_retry_worktree_cleanup_plan(
+        &assessment.command, &receipt.admitted, request.clone(),
+    ).await);
+    success_recorded(db.record_native_close_retry_worktree_cleanup_plan(
+        &assessment.command, &receipt.admitted, request,
+    ).await);
+
+    let tombstone_request = BindCloseWorktreeFinalTombstoneRequest {
+        attempt_id: receipt.admitted.attempt_id.clone(),
+        scope: effect.scope.clone(),
+        snapshot: assessment.proof.snapshot.clone(),
+        resource: effect.resource.clone(),
+        tombstone: CloseWorktreeFinalTombstone {
+            root: std::path::PathBuf::from("/tmp/native-retry-tombstone"),
+            device: 10,
+            inode: 20,
+            object_device: None,
+            object_inode: None,
+        },
+    };
+    success_recorded(db.bind_native_close_retry_worktree_final_tombstone(
+        &assessment.command, &receipt.admitted, tombstone_request.clone(),
+    ).await);
+    success_recorded(db.bind_native_close_retry_worktree_final_tombstone(
+        &assessment.command, &receipt.admitted, tombstone_request.clone(),
+    ).await);
+    let object_request = BindCloseWorktreeFinalTombstoneObjectRequest {
+        attempt_id: receipt.admitted.attempt_id.clone(),
+        scope: effect.scope.clone(),
+        snapshot: assessment.proof.snapshot.clone(),
+        resource: effect.resource.clone(),
+        object_device: 10,
+        object_inode: 20,
+    };
+    success_recorded(db.bind_native_close_retry_worktree_final_tombstone_object(
+        &assessment.command, &receipt.admitted, object_request.clone(),
+    ).await);
+    success_recorded(db.bind_native_close_retry_worktree_final_tombstone_object(
+        &assessment.command, &receipt.admitted, object_request.clone(),
+    ).await);
+
+    let g2 = current_test_snapshot(&db, receipt.admitted.attempt_id.as_str()).await;
+    let mut g2_plan = make_request();
+    g2_plan.snapshot = g2.clone();
+    let mut g2_tombstone = tombstone_request.clone();
+    g2_tombstone.snapshot = g2.clone();
+    let mut g2_object = object_request.clone();
+    g2_object.snapshot = g2;
+    for result in [
+        db.record_native_close_retry_worktree_cleanup_plan(
+            &assessment.command, &receipt.admitted, g2_plan,
+        ).await.established(),
+        db.bind_native_close_retry_worktree_final_tombstone(
+            &assessment.command, &receipt.admitted, g2_tombstone,
+        ).await.established(),
+        db.bind_native_close_retry_worktree_final_tombstone_object(
+            &assessment.command, &receipt.admitted, g2_object,
+        ).await.established(),
+    ] {
+        assert!(result.unwrap().is_err(), "current G2 cannot replace immutable G1 metadata identity");
+    }
+
+    assert_generic_native_metadata_refused(
+        &db, make_request(), tombstone_request.clone(), object_request.clone(),
+    ).await;
+
+    let mut forged = make_request();
+    forged.snapshot = current_test_snapshot(&db, receipt.admitted.attempt_id.as_str()).await;
+    assert!(db.record_native_close_retry_worktree_cleanup_plan(
+        &assessment.command, &receipt.admitted, forged,
+    ).await.established().unwrap().is_err());
+
+    let retained = migration_163_retained_state(&db).await;
+    write_source_fence_state(&db, &assessment.command, &ConvState::Idle, false).await.unwrap();
+    let stale_results = [
+        db.record_native_close_retry_worktree_cleanup_plan(
+            &assessment.command, &receipt.admitted, make_request(),
+        ).await,
+        db.bind_native_close_retry_worktree_final_tombstone(
+            &assessment.command, &receipt.admitted, tombstone_request,
+        ).await,
+        db.bind_native_close_retry_worktree_final_tombstone_object(
+            &assessment.command, &receipt.admitted, object_request,
+        ).await,
+    ];
+    for stale in stale_results {
+        let LocalAuthorityResult::DurableFactEstablished(Err(DbError::CloseFoundationPrecondition(message))) = stale else {
+            panic!("stale source must refuse metadata writes: {stale:?}");
+        };
+        assert!(message.contains("current executing source"), "{message}");
+    }
+    assert_eq!(migration_163_retained_state(&db).await, retained);
+}
+
+async fn assert_generic_native_metadata_refused(
+    db: &Database,
+    plan: RecordCloseWorktreeCleanupPlanRequest,
+    tombstone: BindCloseWorktreeFinalTombstoneRequest,
+    object: BindCloseWorktreeFinalTombstoneObjectRequest,
+) {
+    for result in [
+        db.record_close_worktree_cleanup_plan(plan).await,
+        db.bind_close_worktree_final_tombstone(tombstone).await,
+        db.bind_close_worktree_final_tombstone_object(object).await,
+    ] {
+        let Err(DbError::CloseFoundationPrecondition(message)) = result else {
+            panic!("generic metadata API must reject completed native attempts: {result:?}");
+        };
+        assert!(message.contains("completed native close"), "{message}");
+    }
+}
+
 async fn native_resource_failure_fixture() -> (Database, Assessment, NativeCloseReceipt) {
     // This fixture installs 162 once, then upgrades that same DB to 163.
     let (db, assessment, receipt) = migration_163_pending_fixture().await;
@@ -184,8 +316,6 @@ async fn native_retry_pre_admission_context_keeps_historical_stopped_readable_an
         &assessment.command, &receipt.admitted, request,
     ).await);
 
-    let original_source = db.get_conversation(assessment.command.source_transcript_id())
-        .await.unwrap().state;
     let mut retry = assessment.request.clone();
     retry.failed_run = failed_run.clone();
     retry.remaining_effects = pending;
@@ -198,8 +328,8 @@ async fn native_retry_pre_admission_context_keeps_historical_stopped_readable_an
     }).await;
     let successor = Assessment { command, request: retry, proof };
     let admitted = admitted(db.apply_native_close_explicit_retry(&successor).await);
-    db.update_conversation_state(assessment.command.source_transcript_id(), &original_source)
-        .await.unwrap();
+    // Restoring the predecessor tool state here would legitimately stop the
+    // running successor through the native source fence.
 
     let retained = migration_163_retained_state(&db).await;
     let counts = native_failure_side_effect_counts(&db).await;

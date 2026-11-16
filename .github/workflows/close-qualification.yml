@@ -113,6 +113,12 @@ jobs:
             grep -F "close_foundation::tests::native_retry::$test: test" evidence/selected-tests.txt
           done
           for test in \
+            native_retry_worktree_metadata_is_source_bound_to_pending_original_g1_effect \
+            migration_165_unknown_second_authority_prefix_rolls_back_first_rewrite_and_ledger \
+            migration_165_refuses_native_g2_legacy_metadata_authority; do
+            grep -F "close_foundation::tests::native_retry::$test: test" evidence/selected-tests.txt
+          done
+          for test in \
             native_scope_retirement_requires_g1_worktree_success_and_separate_scope_success \
             native_scope_retirement_rejects_forged_identity_kind_precondition_and_empty_reason \
             native_scope_retirement_rechecks_source_before_lifecycle_mutation \

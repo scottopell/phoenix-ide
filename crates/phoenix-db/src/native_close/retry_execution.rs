@@ -16,7 +16,9 @@ use super::{NativeCloseCommand, NativeCloseIntent, NativeCloseRunRef};
 use crate::close_foundation::{
     close_obligation_for_update, parse_cleanup_resource_identity, retained_close_retry_progress_tx,
     CloseCleanupFailureAuthority, CloseCleanupFailureResource, CloseCleanupResourceDisposition,
+    BindCloseWorktreeFinalTombstoneObjectRequest, BindCloseWorktreeFinalTombstoneRequest,
     CloseSafeRetryEffect, CloseSafeRetryProgress, RecordCloseRetirementDispatchRequest,
+    RecordCloseWorktreeCleanupPlanRequest,
     StoppedCloseOriginalRetirementProof, TerminalizeInitialCloseCleanupFailureRequest,
 };
 use crate::workflow::LocalAuthorityResult;
@@ -116,6 +118,22 @@ struct NativeCloseRetryPlanIdentity {
     snapshot: CloseRetirementSnapshot,
     running: bool,
     created_at_us: i64,
+}
+
+enum NativeCloseRetryWorktreeMetadata {
+    Plan(RecordCloseWorktreeCleanupPlanRequest),
+    Tombstone(BindCloseWorktreeFinalTombstoneRequest),
+    TombstoneObject(BindCloseWorktreeFinalTombstoneObjectRequest),
+}
+
+impl NativeCloseRetryWorktreeMetadata {
+    fn identity(&self) -> (phoenix_core::domain::close::CloseAttemptId, WorkScopeId, CloseRetirementSnapshot, phoenix_core::domain::close::RetiredResourceIdentity) {
+        match self {
+            Self::Plan(request) => (request.attempt_id.clone(), request.scope.clone(), request.snapshot.clone(), request.resource.clone()),
+            Self::Tombstone(request) => (request.attempt_id.clone(), request.scope.clone(), request.snapshot.clone(), request.resource.clone()),
+            Self::TombstoneObject(request) => (request.attempt_id.clone(), request.scope.clone(), request.snapshot.clone(), request.resource.clone()),
+        }
+    }
 }
 
 impl Database {
@@ -222,6 +240,66 @@ impl Database {
         })
     }
 
+    pub async fn record_native_close_retry_worktree_cleanup_plan(
+        &self, command: &NativeCloseCommand, admitted: &NativeCloseRunRef,
+        request: RecordCloseWorktreeCleanupPlanRequest,
+    ) -> LocalAuthorityResult<DbResult<()>> {
+        self.write_native_close_retry_worktree_metadata(command, admitted, NativeCloseRetryWorktreeMetadata::Plan(request)).await
+    }
+
+    pub async fn bind_native_close_retry_worktree_final_tombstone(
+        &self, command: &NativeCloseCommand, admitted: &NativeCloseRunRef,
+        request: BindCloseWorktreeFinalTombstoneRequest,
+    ) -> LocalAuthorityResult<DbResult<()>> {
+        self.write_native_close_retry_worktree_metadata(command, admitted, NativeCloseRetryWorktreeMetadata::Tombstone(request)).await
+    }
+
+    pub async fn bind_native_close_retry_worktree_final_tombstone_object(
+        &self, command: &NativeCloseCommand, admitted: &NativeCloseRunRef,
+        request: BindCloseWorktreeFinalTombstoneObjectRequest,
+    ) -> LocalAuthorityResult<DbResult<()>> {
+        self.write_native_close_retry_worktree_metadata(command, admitted, NativeCloseRetryWorktreeMetadata::TombstoneObject(request)).await
+    }
+
+    async fn write_native_close_retry_worktree_metadata(
+        &self, command: &NativeCloseCommand, admitted: &NativeCloseRunRef,
+        metadata: NativeCloseRetryWorktreeMetadata,
+    ) -> LocalAuthorityResult<DbResult<()>> {
+        let (attempt_id, scope, snapshot, resource) = metadata.identity();
+        let mut tx = match self.pool.begin_with("BEGIN IMMEDIATE").await {
+            Ok(tx) => tx,
+            Err(error) => return LocalAuthorityResult::DurableFactEstablished(Err(error.into())),
+        };
+        let result = async {
+            let plan = Self::require_native_close_retry_plan_identity_tx(&mut tx, command, admitted).await?;
+            if !plan.running || attempt_id != admitted.attempt_id || snapshot != plan.snapshot || resource.kind() != RetiredResourceKind::Worktree {
+                return Err(refused("native retry metadata requires its exact original running worktree plan"));
+            }
+            let run = CloseRunRef { attempt_id: admitted.attempt_id.clone(), ordinal: admitted.run_ordinal };
+            let progress = retained_close_retry_progress_tx(&mut tx, &run).await?;
+            let matching = progress.pending.iter().any(|effect| effect.scope == scope && effect.resource == resource);
+            if !matching || i64::try_from(progress.successful.len() + progress.pending.len()).ok() != Some(plan.effect_count) {
+                return Err(refused("native retry metadata requires an exact pending full-identity worktree effect"));
+            }
+            match metadata {
+                NativeCloseRetryWorktreeMetadata::Plan(request) => Self::record_close_worktree_cleanup_plan_tx(&mut tx, request).await,
+                NativeCloseRetryWorktreeMetadata::Tombstone(request) => Self::bind_close_worktree_final_tombstone_tx(&mut tx, request).await,
+                NativeCloseRetryWorktreeMetadata::TombstoneObject(request) => Self::bind_close_worktree_final_tombstone_object_tx(&mut tx, request).await,
+            }
+        }.await;
+        match result {
+            Ok(()) => match tx.commit().await {
+                Ok(()) => LocalAuthorityResult::DurableFactEstablished(Ok(())),
+                Err(_) => LocalAuthorityResult::DurableFactUnclassified,
+            },
+            Err(error) => match tx.rollback().await {
+                Ok(()) => LocalAuthorityResult::DurableFactEstablished(Err(error)),
+                Err(_) => LocalAuthorityResult::DurableFactUnclassified,
+            },
+        }
+    }
+
+    /// Records dispatch of one pending original-generation worktree effect under the
     /// Records dispatch of one pending original-generation worktree effect under the
     /// exact live native command and latest running retry plan. No current inspection
     /// snapshot is accepted from the caller.
