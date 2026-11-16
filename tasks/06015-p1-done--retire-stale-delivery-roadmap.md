@@ -1,6 +1,6 @@
 # Ember phase 2: retire the stale delivery roadmap
 
-Parent: [06013](./06013-p1-ready--ember-consistency-and-durable-tracking.md). User explicitly requested deprecation because the roadmap is stale and infrequently used. This is a standalone retirement slice; scanner delivery is not a dependency.
+Parent: [06013](./06013-p1-in-progress--ember-consistency-and-durable-tracking.md). User explicitly requested deprecation because the roadmap is stale and infrequently used. This is a standalone retirement slice; scanner delivery is not a dependency.
 
 ## Outcome
 
@@ -54,5 +54,4 @@ start. Final projection/comments are retained; no roadmap record was posted.
 Validation: task/spec-shape/spec-anchors lanes pass; CI YAML parses; exact CI diff
 removes only the retired reducer step; original protocol text and all14 retained
 IDs verified; added relative links and whitespace pass. Rust/UI checks are not
-applicable. Source PR review/CI and merge remain integrator-owned gates before
-marking this task done.
+applicable. [PR #1091](https://github.com/scottopell/phoenix-ide/pull/1091) passed independent review and CI and merged as `6cebf545fe6d16ed02c134a873ab254fea3ad29b`. The accountable integrator verified the live cutoff evidence above. Retirement is complete; no production runtime deployment is required for this removed GitHub automation/guidance slice.

@@ -1,0 +1,16 @@
+# Coordinator tracking status
+
+Manual storage, native tools and durable context integration are implemented and the manual usefulness gate is accepted. Scanner activation and combined-program qualification remain separate mandatory work. No production deployment is claimed.
+
+| Requirement | Current evidence | Remaining gate |
+|---|---|---|
+| REQ-TRACK-001–005 | Twelve schema/service tests and one actual native registry/service test pass, including normalized retirement history, exact current-call authority, source gaps and encoded output bounds | Final rebased integration checks and CI |
+| REQ-TRACK-006–007 | Four production-runtime tests pass, including accepted/claimed UserApi input, pre-checkpoint native execution, visible pre-tool prose, prefix/DB continuation, sequence reservation and ownership loss; the real-model recovery/quiet/due-question journey is accepted | Final rebased integration checks and CI; broader phase-8 controls |
+
+Initial bounds: eight compact index entries; full notes on demand; eight evidence/retirement entries per detail page with explicit remaining cursors; complete detail at most 96 KiB; combined editable metadata at most 16 KiB serialized JSON and complete evidence entries/retirement reasons at most 4 KiB serialized; compact observation at most 8 KiB. Explicit-review/surfacing cooldown is 24 hours with a new-evidence exception. Per-input observation identity prevents repeated retry cues; per-item attention receipts survive continuation and never advance explicit review. These are initial limits, not measured provider savings.
+
+The [accepted manual qualification report](../../scripts/qa/ember-tracking/manual-memory-aca480.md) records the frozen journey, prior failed/inconclusive experiments, configuration, actual usage, trace hashes and limitations. At `aca480f4a`, explicit Astra/High/CodexAuth recovered both the requested outcome and question bookmark after a real continuation, stayed quiet during unrelated arithmetic, then read and revision-updated the selected request and asked its specific owed date-range/period question. Twelve successful requests, seven tool calls and no external-effect attempts were observed. All current-turn assistant prose was evaluated, including prose preceding tools.
+
+The post-review neutral turn was not exercised because the predeclared request-byte margin was exhausted. That control, two recently reviewed requested items, contextual recovery beyond this small list, final assembled inventory and scanner composition remain mandatory [phase-8 work](../../tasks/06019-p1-in-progress--ember-coordination-end-to-end-qualificat.md). A useful list and a single successful model journey do not establish complete combined acceptance.
+
+The focused behavioral authority is `coordinator-tracking.allium`; its structural checker passes. Selected current-input cues require bounded inspection followed by an already-permitted useful step, such as asking an owed conversational question with a short refresher. An actual restriction/dependency can justify waiting or silence; inspection alone and invented topic-selection pauses do not establish follow-through. Historical cues do not renew review, and saved data grants no execution authority or new wakeup.

@@ -637,6 +637,12 @@ pub enum ToolRoundPersistenceFault {
 /// In-memory storage for testing
 #[allow(dead_code)]
 pub struct InMemoryStorage {
+    tracking_observation_gate: Mutex<
+        Option<(
+            tokio::sync::oneshot::Sender<i64>,
+            tokio::sync::oneshot::Receiver<()>,
+        )>,
+    >,
     coordinator_authority:
         Mutex<Result<phoenix_core::domain::coordinator_authority::CoordinatorAuthority, String>>,
     pub handoff_candidates: Mutex<Vec<crate::db::ContinuationHandoffCandidate>>,
@@ -761,9 +767,21 @@ impl InMemoryStorage {
             .unwrap()
             .insert(conversation_id.to_owned(), policy);
     }
+    pub fn gate_tracking_observation(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<i64>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (started, observed) = tokio::sync::oneshot::channel();
+        let (release, wait) = tokio::sync::oneshot::channel();
+        *self.tracking_observation_gate.lock().unwrap() = Some((started, wait));
+        (observed, release)
+    }
 
     pub fn new() -> Self {
         Self {
+            tracking_observation_gate: Mutex::new(None),
             coordinator_authority: Mutex::new(Ok(
                 phoenix_core::domain::coordinator_authority::CoordinatorAuthority::default(),
             )),
@@ -1388,6 +1406,35 @@ impl Default for InMemoryStorage {
 
 #[async_trait]
 impl MessageStore for InMemoryStorage {
+    async fn append_coordinator_tracking_observation(
+        &self,
+        source: &str,
+        sequence_id: i64,
+        _now_us: i64,
+    ) -> phoenix_db::workflow::LocalAuthorityResult<Result<Option<Message>, String>> {
+        let gate = self.tracking_observation_gate.lock().unwrap().take();
+        if let Some((started, release)) = gate {
+            let _ = started.send(sequence_id);
+            let _ = release.await;
+            let result = self
+                .add_message_with_seq(
+                    "gated-tracking-observation",
+                    source,
+                    sequence_id,
+                    &MessageContent::User(crate::db::UserContent::meta(
+                        "Tracking test observation",
+                    )),
+                    None,
+                    None,
+                )
+                .await
+                .map(Some);
+            phoenix_db::workflow::LocalAuthorityResult::DurableFactEstablished(result)
+        } else {
+            phoenix_db::workflow::LocalAuthorityResult::DurableFactEstablished(Ok(None))
+        }
+    }
+
     async fn terminalize_sub_agent_cancellation_backstop(
         &self,
         _child_conversation_id: &str,

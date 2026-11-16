@@ -1,6 +1,6 @@
 # Ember phase 8: end-to-end qualification and cutover
 
-Parent: [06013](./06013-p1-ready--ember-consistency-and-durable-tracking.md). Final combined qualification depends on delivered phases 1 and 3–7; [phase 2](./06015-p1-in-progress--retire-stale-delivery-roadmap.md) retirement is independently verifiable. Each slice qualifies before integration: the [phase 4 event comparison](./06021-p1-ready--enrich-ember-event-context-and-measure-f.md) must not wait for scanner delivery.
+Parent: [06013](./06013-p1-in-progress--ember-consistency-and-durable-tracking.md). Final combined qualification depends on delivered phases 1 and 3–7; [phase 2](./06015-p1-done--retire-stale-delivery-roadmap.md) retirement is independently verifiable. Each slice qualifies before integration: the [phase 4 event comparison](./06021-p1-ready--enrich-ember-event-context-and-measure-f.md) must not wait for scanner delivery.
 
 ## Outcome
 

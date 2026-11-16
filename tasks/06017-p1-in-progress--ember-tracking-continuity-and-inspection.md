@@ -1,6 +1,6 @@
 # Ember phase 6: tracking continuity and inspection
 
-Parent: [06013](./06013-p1-ready--ember-consistency-and-durable-tracking.md). Depends on [phase 5](./06016-p1-ready--ember-durable-tracking-store-and-tools.md). This slice proves the feature helps after continuation before adding a model scanner.
+Parent: [06013](./06013-p1-in-progress--ember-consistency-and-durable-tracking.md). Depends on [phase 5](./06016-p1-in-progress--ember-durable-tracking-store-and-tools.md). This slice proves the feature helps after continuation before adding a model scanner.
 
 ## Outcome
 
@@ -64,3 +64,7 @@ Qualify through production context construction and a controlled real continuati
 Compare successive assembled provider requests: registry/page updates may append context but must leave the tracker-independent system block and earlier message prefix unchanged. Test no-change loops, retry/restart, an idle scanner commit, same-turn tool mutation and continuation. Record request/context accounting; do not infer actual provider cache savings from prefix equality alone. A requested-work detour/continuation journey must recover useful follow-through on an existing wakeup without a fresh user reminder.
 
 Out of scope: scanner inference, new periodic review wakeups, a workstream taxonomy/hierarchy, per-worker checker, silence sweep, executive dashboard/projection and human read markers.
+
+## Delivery evidence
+
+PR #1093 qualifies the manual record → detour → real continuation → recovered stopping points → unprompted owed-question journey, including quiet arithmetic and bookmark scope. The [report](../scripts/qa/ember-tracking/manual-memory-aca480.md) retains actual model/usage/trace details and earlier failed/inconclusive experiments. Post-review quiet was not exercised because of the declared byte margin. Two recently reviewed requested items, contextual recovery beyond the small list and scanner composition remain mandatory phase-8 qualification; this task is not marked done prematurely.

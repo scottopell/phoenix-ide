@@ -1,6 +1,6 @@
 # Ember phase 1: tool contracts and consistency baseline
 
-Parent: [06013](./06013-p1-ready--ember-consistency-and-durable-tracking.md). Read its accepted user decisions, proposed scope, derisking evidence and non-goals before implementation. This is a shared baseline task, not a first-complete global implementation gate. Lanes A/B own their necessary contract subsets; lane C closes the remaining bounded audit after roadmap retirement.
+Parent: [06013](./06013-p1-in-progress--ember-consistency-and-durable-tracking.md). Read its accepted user decisions, proposed scope, derisking evidence and non-goals before implementation. This is a shared baseline task, not a first-complete global implementation gate. Lanes A/B own their necessary contract subsets; lane C closes the remaining bounded audit after roadmap retirement.
 
 ## Outcome
 
@@ -85,5 +85,5 @@ or production activation. Exact final-head full CI remains required.
 **Mandatory final-composition follow-up:** rerun the assembled inventory after
 tracking/event integration, reconcile their tool/guidance entries and preserve
 actual configuration/language/catalog scope. This remains owned by this task and
-[combined acceptance](./06019-p1-ready--ember-coordination-end-to-end-qualificat.md).
+[combined acceptance](./06019-p1-in-progress--ember-coordination-end-to-end-qualificat.md).
 Do not mark phase 1 complete from the pre-integration inventory or this one trial.

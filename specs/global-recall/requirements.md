@@ -338,6 +338,8 @@ AND SHALL instruct the Coordinator to query relevant current transcript rows, ti
 WHEN the Coordinator dispatches a model request
 THE SYSTEM SHALL NOT automatically inject current activity facts into its system instructions or conversation context
 
+Saved user intent under `../coordinator-tracking/requirements.md` is distinct from live activity. At existing admitted Coordinator turn boundaries, the system MAY append bounded versioned saved-intent observations to the durable transcript tail, including after continuation. It SHALL preserve system instructions and earlier message prefixes, label observations as captured historical data, and require fresh evidence for current worker-state claims. Saving or scanning intent SHALL NOT schedule a foreground turn.
+
 WHEN delegating commissioned work to an existing owner
 THE SYSTEM SHALL direct the Coordinator to specify the outcome, required completion evidence and established boundaries while leaving the owner free to choose and revise in-scope methods
 AND SHALL NOT impose additional approval gates on in-scope command corrections, fixture repairs or test reruns

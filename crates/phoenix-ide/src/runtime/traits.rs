@@ -126,6 +126,13 @@ pub struct AuthoritativeUserMessageAdoptionInput {
 /// Storage for conversation messages
 #[async_trait]
 pub trait MessageStore: Send + Sync {
+    async fn append_coordinator_tracking_observation(
+        &self,
+        source: &str,
+        sequence_id: i64,
+        now_us: i64,
+    ) -> phoenix_db::workflow::LocalAuthorityResult<Result<Option<Message>, String>>;
+
     async fn coordinator_authority(
         &self,
     ) -> Result<phoenix_core::domain::coordinator_authority::CoordinatorAuthority, String>;
@@ -887,6 +894,17 @@ impl<T: MessageStore + ?Sized> MessageStore for Arc<T> {
         &self,
     ) -> Result<phoenix_core::domain::coordinator_authority::CoordinatorAuthority, String> {
         (**self).coordinator_authority().await
+    }
+
+    async fn append_coordinator_tracking_observation(
+        &self,
+        source: &str,
+        sequence_id: i64,
+        now_us: i64,
+    ) -> phoenix_db::workflow::LocalAuthorityResult<Result<Option<Message>, String>> {
+        (**self)
+            .append_coordinator_tracking_observation(source, sequence_id, now_us)
+            .await
     }
 
     async fn save_continuation_handoff_candidate(
@@ -1755,6 +1773,28 @@ fn direct_turn_terminal_command(
 
 #[async_trait]
 impl MessageStore for DatabaseStorage {
+    async fn append_coordinator_tracking_observation(
+        &self,
+        source: &str,
+        sequence_id: i64,
+        now_us: i64,
+    ) -> phoenix_db::workflow::LocalAuthorityResult<Result<Option<Message>, String>> {
+        match self
+            .db
+            .append_coordinator_tracking_observation(source, sequence_id, now_us)
+            .await
+        {
+            phoenix_db::workflow::LocalAuthorityResult::DurableFactEstablished(result) => {
+                phoenix_db::workflow::LocalAuthorityResult::DurableFactEstablished(
+                    result.map_err(|error| error.to_string()),
+                )
+            }
+            phoenix_db::workflow::LocalAuthorityResult::DurableFactUnclassified => {
+                phoenix_db::workflow::LocalAuthorityResult::DurableFactUnclassified
+            }
+        }
+    }
+
     async fn coordinator_authority(
         &self,
     ) -> Result<phoenix_core::domain::coordinator_authority::CoordinatorAuthority, String> {
