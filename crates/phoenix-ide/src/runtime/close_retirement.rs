@@ -9814,35 +9814,21 @@ mod tests {
                     state.clone(),
                     std::sync::Arc::clone(&fatal_local_authority_fence),
                 );
-        let target_gate = manager
-            .conversation_admission(target.as_str())
-            .await
-            .lock_owned()
-            .await;
-        let attempt_gate = manager
-            .close_retirement_execution
-            .lock(fixture.run.attempt_id.as_str())
-            .await;
-        let admitted = manager.acquire_local_authority_pass().unwrap();
-        let (response, response_rx) = tokio::sync::oneshot::channel();
-        sender
-            .send(crate::runtime::AcknowledgedRuntimeRequest::ExecuteNativeCloseRetry(
-                Box::new(crate::runtime::native_close_application::NativeCloseRetryRequest {
-                    source: source.clone(),
-                    target: target.clone(),
-                    attempt_id: fixture.run.attempt_id.clone(),
-                    failed_run_ordinal: CloseRunOrdinal::INITIAL,
-                    backend: std::sync::Arc::clone(&manager),
-                    admitted,
-                    target_gate,
-                    attempt_gate,
-                    response,
-                }),
-            ))
-            .await
-            .unwrap();
-        join_actor(actor).await;
-        let NativeCloseRetryResult::NewlyAdmitted(receipt) = response_rx.await.unwrap().unwrap()
+        let _source_events = manager.inject_handle_with_event_capture_for_test(
+            &source_conversation.id, state.clone(),
+        ).await;
+        manager.runtimes.write().await.get_mut(&source_conversation.id).unwrap()
+            .acknowledged_event_tx = sender;
+        // Exercise the production manager route: it owns lock acquisition, backend
+        // selection, envelope construction and response classification.
+        let (result, ()) = tokio::join!(
+            manager.apply_native_close_explicit_retry(
+                &source_conversation.id, source.clone(), target.clone(),
+                fixture.run.attempt_id.clone(), CloseRunOrdinal::INITIAL,
+            ),
+            join_actor(actor),
+        );
+        let NativeCloseRetryResult::NewlyAdmitted(receipt) = result.unwrap()
         else {
             panic!("expected fresh explicit retry admission");
         };
@@ -9863,35 +9849,19 @@ mod tests {
                     state.clone(),
                     std::sync::Arc::clone(&fatal_local_authority_fence),
                 );
-        let target_gate = manager
-            .conversation_admission(target.as_str())
-            .await
-            .lock_owned()
-            .await;
-        let attempt_gate = manager
-            .close_retirement_execution
-            .lock(fixture.run.attempt_id.as_str())
-            .await;
-        let admitted = manager.acquire_local_authority_pass().unwrap();
-        let (response, response_rx) = tokio::sync::oneshot::channel();
-        replay_sender
-            .send(crate::runtime::AcknowledgedRuntimeRequest::ExecuteNativeCloseRetry(
-                Box::new(crate::runtime::native_close_application::NativeCloseRetryRequest {
-                    source: source.clone(),
-                    target: target.clone(),
-                    attempt_id: fixture.run.attempt_id.clone(),
-                    failed_run_ordinal: CloseRunOrdinal::INITIAL,
-                    backend: std::sync::Arc::clone(&manager),
-                    admitted,
-                    target_gate,
-                    attempt_gate,
-                    response,
-                }),
-            ))
-            .await
-            .unwrap();
-        join_actor(replay_actor).await;
-        let NativeCloseRetryResult::Replay(replayed_receipt) = response_rx.await.unwrap().unwrap()
+        let _replay_events = manager.inject_handle_with_event_capture_for_test(
+            &source_conversation.id, state.clone(),
+        ).await;
+        manager.runtimes.write().await.get_mut(&source_conversation.id).unwrap()
+            .acknowledged_event_tx = replay_sender;
+        let (result, ()) = tokio::join!(
+            manager.apply_native_close_explicit_retry(
+                &source_conversation.id, source.clone(), target.clone(),
+                fixture.run.attempt_id.clone(), CloseRunOrdinal::INITIAL,
+            ),
+            join_actor(replay_actor),
+        );
+        let NativeCloseRetryResult::Replay(replayed_receipt) = result.unwrap()
         else {
             panic!("expected exact retry receipt replay");
         };
@@ -9905,6 +9875,30 @@ mod tests {
             db.get_close_obligation(fixture.run.attempt_id.as_str()).await.unwrap(),
             obligation_before_replay
         );
+        // A stale persisted source is insufficient even for a known receipt:
+        // the actual source actor no longer has the executing occurrence.
+        let stopped_state = crate::state_machine::ConvState::Idle;
+        let (stopped_sender, stopped_actor) =
+            crate::runtime::executor::creation_completion_lifecycle_tests::
+                spawn_bounded_native_close_retry_actor(
+                    db.clone(), source_conversation.id.clone(), stopped_state.clone(),
+                    std::sync::Arc::clone(&fatal_local_authority_fence),
+                );
+        let _stopped_events = manager.inject_handle_with_event_capture_for_test(
+            &source_conversation.id, stopped_state,
+        ).await;
+        manager.runtimes.write().await.get_mut(&source_conversation.id).unwrap()
+            .acknowledged_event_tx = stopped_sender;
+        let (result, ()) = tokio::join!(
+            manager.apply_native_close_explicit_retry(
+                &source_conversation.id, source.clone(), target.clone(),
+                fixture.run.attempt_id.clone(), CloseRunOrdinal::INITIAL,
+            ),
+            join_actor(stopped_actor),
+        );
+        assert_eq!(result, Err(crate::runtime::NativeCloseApplicationError::SourceRefused));
+        assert_eq!(retained_counts(db, fixture.run.attempt_id.as_str()).await, before_replay);
+
         let run_count: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM close_runs WHERE attempt_id=?1")
                 .bind(fixture.run.attempt_id.as_str())

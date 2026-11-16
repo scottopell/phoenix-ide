@@ -21,26 +21,50 @@ pub(super) struct CloseConversation(pub Arc<SendChatApplicationService>);
 #[derive(Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 enum Input {
-    Initial { product_conversation_id: String },
-    Observe { product_conversation_id: String, attempt_id: String, run_ordinal: i64 },
-    ExplicitRetry { product_conversation_id: String, attempt_id: String, failed_run_ordinal: i64 },
+    Initial {
+        product_conversation_id: String,
+    },
+    Observe {
+        product_conversation_id: String,
+        attempt_id: String,
+        run_ordinal: i64,
+    },
+    ExplicitRetry {
+        product_conversation_id: String,
+        attempt_id: String,
+        failed_run_ordinal: i64,
+    },
 }
 
 fn parse(input: &Value) -> Result<NativeCloseIntent, String> {
     let raw: Input = serde_json::from_value(input.clone()).map_err(|error| error.to_string())?;
     let intent = match raw {
-        Input::Initial { product_conversation_id } => NativeCloseIntent::Initial {
-            target: ProductConversationId::parse(product_conversation_id).map_err(|e| e.to_string())?,
+        Input::Initial {
+            product_conversation_id,
+        } => NativeCloseIntent::Initial {
+            target: ProductConversationId::parse(product_conversation_id)
+                .map_err(|e| e.to_string())?,
         },
-        Input::Observe { product_conversation_id, attempt_id, run_ordinal } => NativeCloseIntent::Observe {
-            target: ProductConversationId::parse(product_conversation_id).map_err(|e| e.to_string())?,
+        Input::Observe {
+            product_conversation_id,
+            attempt_id,
+            run_ordinal,
+        } => NativeCloseIntent::Observe {
+            target: ProductConversationId::parse(product_conversation_id)
+                .map_err(|e| e.to_string())?,
             attempt_id: CloseAttemptId::parse(attempt_id).map_err(|e| e.to_string())?,
             run_ordinal: CloseRunOrdinal::parse(run_ordinal).map_err(|e| e.to_string())?,
         },
-        Input::ExplicitRetry { product_conversation_id, attempt_id, failed_run_ordinal } => NativeCloseIntent::ExplicitRetry {
-            target: ProductConversationId::parse(product_conversation_id).map_err(|e| e.to_string())?,
+        Input::ExplicitRetry {
+            product_conversation_id,
+            attempt_id,
+            failed_run_ordinal,
+        } => NativeCloseIntent::ExplicitRetry {
+            target: ProductConversationId::parse(product_conversation_id)
+                .map_err(|e| e.to_string())?,
             attempt_id: CloseAttemptId::parse(attempt_id).map_err(|e| e.to_string())?,
-            failed_run_ordinal: CloseRunOrdinal::parse(failed_run_ordinal).map_err(|e| e.to_string())?,
+            failed_run_ordinal: CloseRunOrdinal::parse(failed_run_ordinal)
+                .map_err(|e| e.to_string())?,
         },
     };
     if &intent.source_input() != input {
@@ -94,7 +118,9 @@ fn observation(status: &str, value: &NativeCloseObservation) -> Value {
 fn output(result: NativeCloseApplicationResult) -> Value {
     match result {
         NativeCloseApplicationResult::Initial(result) => match result {
-            NativeCloseInitialResult::NewlyAdmitted(value) => receipt("initial", "newly_admitted", &value),
+            NativeCloseInitialResult::NewlyAdmitted(value) => {
+                receipt("initial", "newly_admitted", &value)
+            }
             NativeCloseInitialResult::Replay(value) => receipt("initial", "replay", &value),
             NativeCloseInitialResult::ExistingOperationNeedsExactReference(value) => json!({
                 "action":"initial", "status":"needs_exact_reference", "existing":reference(&value)
@@ -105,7 +131,9 @@ fn output(result: NativeCloseApplicationResult) -> Value {
             NativeCloseObserveResult::Replay(value) => observation("replay", &value),
         },
         NativeCloseApplicationResult::ExplicitRetry(result) => match result {
-            NativeCloseRetryResult::NewlyAdmitted(value) => receipt("explicit_retry", "newly_admitted", &value),
+            NativeCloseRetryResult::NewlyAdmitted(value) => {
+                receipt("explicit_retry", "newly_admitted", &value)
+            }
             NativeCloseRetryResult::Replay(value) => receipt("explicit_retry", "replay", &value),
         },
     }
@@ -123,13 +151,17 @@ fn application_error(error: NativeCloseApplicationError) -> ToolOutput {
 
 #[async_trait]
 impl Tool for CloseConversation {
-    fn name(&self) -> &'static str { "close_conversation" }
+    fn name(&self) -> &'static str {
+        "close_conversation"
+    }
 
     fn description(&self) -> String {
         "Native Coordinator Close: initial admits a new exact operation; observe reads an exact retained run; explicit_retry freshly validates and retries only the named failed run's retained resources. Use ProductConversation IDs, not transcript aliases. Receipts identify admission, not completed shutdown or cleanup. The server derives request identity from the live tool occurrence; replay never redispatches. No caller safety flags, automatic retry loop, or implicit latest-run selection.".into()
     }
 
-    fn input_schema(&self) -> Value { schema() }
+    fn input_schema(&self) -> Value {
+        schema()
+    }
 
     async fn run(&self, input: Value, ctx: ToolContext) -> ToolOutput {
         let Some(source) = ctx.source_tool_call() else {
@@ -137,9 +169,17 @@ impl Tool for CloseConversation {
         };
         let intent = match parse(&input) {
             Ok(intent) => intent,
-            Err(error) => return ToolOutput::error(json!({"code":"invalid_input", "message":error}).to_string()),
+            Err(error) => {
+                return ToolOutput::error(
+                    json!({"code":"invalid_input", "message":error}).to_string(),
+                )
+            }
         };
-        match self.0.close_conversation(&ctx.conversation_id, source, intent).await {
+        match self
+            .0
+            .close_conversation(&ctx.conversation_id, source, intent)
+            .await
+        {
             Ok(result) => ToolOutput::success(output(result).to_string()),
             Err(error) => application_error(error),
         }
@@ -158,7 +198,13 @@ mod tests {
             json!({"action":"explicit_retry","product_conversation_id":"target","attempt_id":"attempt","failed_run_ordinal":2}),
         ] {
             assert_eq!(parse(&input).unwrap().source_input(), input);
-            for key in ["source", "request_id", "authorizer", "target_conversation_id", "safety_evidence"] {
+            for key in [
+                "source",
+                "request_id",
+                "authorizer",
+                "target_conversation_id",
+                "safety_evidence",
+            ] {
                 let mut extra = input.clone();
                 extra[key] = json!("untrusted");
                 assert!(parse(&extra).is_err(), "accepted {key}");
@@ -174,7 +220,9 @@ mod tests {
             json!({"action":"explicit_retry","product_conversation_id":"target","attempt_id":"attempt","failed_run_ordinal":2.0}),
             json!({"action":"observe","product_conversation_id":"target","attempt_id":"attempt","run_ordinal":18446744073709551615_u64}),
             json!({"action":"observe","product_conversation_id":"target","attempt_id":"attempt","run_ordinal":1,"failed_run_ordinal":1}),
-        ] { assert!(parse(&input).is_err(), "accepted {input}"); }
+        ] {
+            assert!(parse(&input).is_err(), "accepted {input}");
+        }
     }
 
     #[test]
@@ -187,7 +235,9 @@ mod tests {
                 run_ordinal: CloseRunOrdinal::parse(2).unwrap(),
             },
         };
-        let result = output(NativeCloseApplicationResult::ExplicitRetry(NativeCloseRetryResult::Replay(value)));
+        let result = output(NativeCloseApplicationResult::ExplicitRetry(
+            NativeCloseRetryResult::Replay(value),
+        ));
         assert_eq!(result["status"], "replay");
         assert_eq!(result["admitted"]["run_ordinal"], 2);
         assert!(result.get("closed").is_none());

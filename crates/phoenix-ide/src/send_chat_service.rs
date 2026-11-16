@@ -245,19 +245,43 @@ impl SendChatApplicationService {
         use phoenix_db::native_close::{NativeCloseIntent, NativeCloseRunRef};
 
         match intent {
-            NativeCloseIntent::Initial { target } => self.runtime
+            NativeCloseIntent::Initial { target } => self
+                .runtime
                 .apply_native_close_initial(source_transcript_id, source, target)
-                .await.map(NativeCloseApplicationResult::Initial),
-            NativeCloseIntent::Observe { target, attempt_id, run_ordinal } => self.runtime
-                .apply_native_close_observe(source_transcript_id, source, NativeCloseRunRef {
-                    target, attempt_id, run_ordinal,
-                })
-                .await.map(NativeCloseApplicationResult::Observe),
-            NativeCloseIntent::ExplicitRetry { target, attempt_id, failed_run_ordinal } => self.runtime
-                .apply_native_close_explicit_retry(
-                    source_transcript_id, source, target, attempt_id, failed_run_ordinal,
+                .await
+                .map(NativeCloseApplicationResult::Initial),
+            NativeCloseIntent::Observe {
+                target,
+                attempt_id,
+                run_ordinal,
+            } => self
+                .runtime
+                .apply_native_close_observe(
+                    source_transcript_id,
+                    source,
+                    NativeCloseRunRef {
+                        target,
+                        attempt_id,
+                        run_ordinal,
+                    },
                 )
-                .await.map(NativeCloseApplicationResult::ExplicitRetry),
+                .await
+                .map(NativeCloseApplicationResult::Observe),
+            NativeCloseIntent::ExplicitRetry {
+                target,
+                attempt_id,
+                failed_run_ordinal,
+            } => self
+                .runtime
+                .apply_native_close_explicit_retry(
+                    source_transcript_id,
+                    source,
+                    target,
+                    attempt_id,
+                    failed_run_ordinal,
+                )
+                .await
+                .map(NativeCloseApplicationResult::ExplicitRetry),
         }
     }
 

@@ -318,7 +318,9 @@ pub(crate) fn tools(
         db: watch_db,
         peer_db: db.clone(),
     }));
-    tools.push(Arc::new(close_conversation::CloseConversation(Arc::clone(&close_retry))));
+    tools.push(Arc::new(close_conversation::CloseConversation(Arc::clone(
+        &close_retry,
+    ))));
     tools.push(Arc::new(SafeRetryClose(close_retry)));
     tools.push(Arc::new(AskUserQuestionTool));
     tools
@@ -2910,12 +2912,23 @@ mod tests {
     #[tokio::test]
     async fn native_close_tool_requires_trusted_source_before_target_lookup() {
         let (_, coordinator) = application_tools().await;
-        assert_eq!(coordinator.iter().filter(|tool| tool.name() == "close_conversation").count(), 1);
-        let tool = coordinator.into_iter().find(|tool| tool.name() == "close_conversation").unwrap();
-        let output = tool.run(
-            json!({"action":"initial", "product_conversation_id":"missing-target"}),
-            context("missing-source"),
-        ).await;
+        assert_eq!(
+            coordinator
+                .iter()
+                .filter(|tool| tool.name() == "close_conversation")
+                .count(),
+            1
+        );
+        let tool = coordinator
+            .into_iter()
+            .find(|tool| tool.name() == "close_conversation")
+            .unwrap();
+        let output = tool
+            .run(
+                json!({"action":"initial", "product_conversation_id":"missing-target"}),
+                context("missing-source"),
+            )
+            .await;
         assert!(!output.is_success());
         assert!(output.output().contains("source_refused"));
         let schema = tool.input_schema();
