@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Single-use gate for the frozen 0.13.2-rc.6 release candidate."""
+"""Single-use gate for the frozen 0.13.2-rc.7 release candidate."""
 
 import json
 import subprocess
@@ -8,12 +8,12 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-BASE = "f3926c7c784934efcbb11985ed66aa64c46c0ae1"
-CANDIDATE = "bccfd66b2470a86910b952f22ccf327ed2c78f2f"
-TAG = "v0.13.2-rc.6"
-VERSION = "0.13.2-rc.6"
+BASE = "d3b57573ccf8662d05125338aad2307bb03da598"
+CANDIDATE = "86071b4cc2ab0f9efdb8a3debf03b8569baf26f9"
+TAG = "v0.13.2-rc.7"
+VERSION = "0.13.2-rc.7"
 OLD_VERSION = b"0.13.2-rc.4"
-NEW_VERSION = b"0.13.2-rc.6"
+NEW_VERSION = b"0.13.2-rc.7"
 MANIFEST = "crates/phoenix-ide/Cargo.toml"
 LOCKFILE = "Cargo.lock"
 REPOSITORY = "scottopell/phoenix-ide"
@@ -57,6 +57,14 @@ def expected_lockfile(data):
     return data.replace(old, new, 1)
 
 
+def verify_frozen_base_on_main(repo, main_ref="origin/main"):
+    try:
+        git(repo, "merge-base", "--is-ancestor", BASE, main_ref)
+    except subprocess.CalledProcessError as error:
+        raise ValueError("frozen application base is not an ancestor of main") from error
+    return True
+
+
 def verify_candidate(repo):
     if git(repo, "rev-parse", f"{CANDIDATE}^{{commit}}").decode().strip() != CANDIDATE:
         raise ValueError("pinned candidate commit is unavailable")
@@ -86,7 +94,7 @@ def verify_candidate(repo):
         raise ValueError("candidate differs from exact two-file/version-only tree: " + ", ".join(mismatches[:8]))
     candidate_manifest = git(repo, "cat-file", "blob", CANDIDATE + ":" + MANIFEST)
     if candidate_manifest.count(NEW_VERSION) != 1:
-        raise ValueError("candidate manifest does not encode exactly one rc.6 version")
+        raise ValueError("candidate manifest does not encode exactly one rc.7 version")
     return True
 
 
@@ -94,7 +102,7 @@ def workflow_dispatch_ci_run():
     """Require the newest matching manual ci.yml run to have completed successfully."""
     query = urllib.parse.urlencode({"head_sha": CANDIDATE, "event": "workflow_dispatch", "per_page": 100})
     url = f"https://api.github.com/repos/{REPOSITORY}/actions/workflows/ci.yml/runs?{query}"
-    request = urllib.request.Request(url, headers={"Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28", "User-Agent": "phoenix-frozen-rc6-gate"})
+    request = urllib.request.Request(url, headers={"Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28", "User-Agent": "phoenix-frozen-rc7-gate"})
     try:
         with urllib.request.urlopen(request, timeout=15) as response:
             payload = json.load(response)
@@ -126,6 +134,7 @@ def verify_tag_unused(repo):
 
 def gate(repo="."):
     verify_candidate(repo)
+    verify_frozen_base_on_main(repo)
     run = workflow_dispatch_ci_run()
     verify_tag_unused(repo)
     print(f"Frozen release gate passed: candidate={CANDIDATE} ci_run={run['id']} tag={TAG}", file=sys.stderr)
@@ -140,7 +149,7 @@ def gate(repo="."):
 
 if __name__ == "__main__":
     if sys.argv[1:] not in ([], ["gate"]):
-        raise SystemExit("frozen rc6 gate accepts no candidate, base, tag, or run inputs")
+        raise SystemExit("frozen rc7 gate accepts no candidate, base, tag, or run inputs")
     try:
         gate()
     except (ValueError, subprocess.CalledProcessError) as error:

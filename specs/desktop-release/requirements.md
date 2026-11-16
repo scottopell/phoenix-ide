@@ -20,6 +20,8 @@ SHALL preserve `phoenix_ide-aarch64-apple-darwin`, `phoenix_ide-x86_64-apple-dar
 SHALL preserve `phoenix_ide-x86_64-unknown-linux-musl-debug` and `phoenix_ide-aarch64-unknown-linux-musl-debug`,
 AND SHALL build every named artifact from one exact tagged main commit.
 
+For the single fixed operation `release-frozen-rc7`, the tagged source is the exact immutable candidate `86071b4cc2ab0f9efdb8a3debf03b8569baf26f9`, whose sole parent is frozen application base `d3b57573ccf8662d05125338aad2307bb03da598`. The base SHALL be an ancestor of `main`; the candidate SHALL differ from that base only by the exact `0.13.2-rc.4` to `0.13.2-rc.7` version edits in `crates/phoenix-ide/Cargo.toml` and `Cargo.lock`. The protected operation SHALL require a completed successful `workflow_dispatch` CI run for the exact candidate, reject any nonempty tag input before fetching the frozen candidate ref, and refuse creation or replacement when the RC7 tag already exists. This narrow exception permits tagged artifacts from that candidate without asserting that the candidate itself is on `main`; it SHALL NOT select or incorporate later `main` application changes. It does not alter the normal tagged-main rule for any other operation and does not authorize deployment or installation.
+
 ## REQ-DESKTOP-REL-003 — Sign and notarize distributable apps
 
 BEFORE a Phoenix.app archive becomes public,

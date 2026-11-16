@@ -19,7 +19,7 @@ def git(repo, *args, input=None):
                           stdout=subprocess.PIPE, stderr=subprocess.PIPE).stdout.decode().strip()
 
 
-class FrozenRc5GateTests(unittest.TestCase):
+class FrozenRc7GateTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="frozen-rc5-test-")
         self.addCleanup(self.temp.cleanup)
@@ -37,6 +37,7 @@ class FrozenRc5GateTests(unittest.TestCase):
         git(self.repo, "commit", "-qm", "base")
         self.base = git(self.repo, "rev-parse", "HEAD")
         self.patch_base = mock.patch.object(release, "BASE", self.base)
+        git(self.repo, "update-ref", "refs/remotes/origin/main", self.base)
         self.patch_base.start()
         self.addCleanup(self.patch_base.stop)
 
@@ -44,9 +45,9 @@ class FrozenRc5GateTests(unittest.TestCase):
         git(self.repo, "checkout", "-q", "--detach", parent or self.base)
         manifest = self.repo / "crates/phoenix-ide/Cargo.toml"
         lock = self.repo / "Cargo.lock"
-        manifest.write_bytes(manifest.read_bytes().replace(b"0.13.2-rc.4", b"0.13.2-rc.6"))
+        manifest.write_bytes(manifest.read_bytes().replace(b"0.13.2-rc.4", b"0.13.2-rc.7"))
         lock.write_bytes(lock.read_bytes().replace(b'phoenix_ide"\nversion = "0.13.2-rc.4',
-                                                    b'phoenix_ide"\nversion = "0.13.2-rc.6'))
+                                                    b'phoenix_ide"\nversion = "0.13.2-rc.7'))
         if mutate:
             mutate(self.repo)
         if mode:
@@ -59,6 +60,14 @@ class FrozenRc5GateTests(unittest.TestCase):
 
     def test_accepts_exact_version_only_candidate(self):
         self.assertTrue(self.candidate())
+
+    def test_frozen_application_base_must_be_on_main(self):
+        self.assertTrue(release.verify_frozen_base_on_main(self.repo))
+        tree = git(self.repo, "rev-parse", self.base + "^{tree}")
+        other = git(self.repo, "commit-tree", tree, input=b"unrelated main\n")
+        git(self.repo, "update-ref", "refs/remotes/origin/main", other)
+        with self.assertRaisesRegex(ValueError, "not an ancestor of main"):
+            release.verify_frozen_base_on_main(self.repo)
 
     def test_rejects_extra_path(self):
         def add_extra(repo):
@@ -75,7 +84,7 @@ class FrozenRc5GateTests(unittest.TestCase):
     def test_rejects_version_mismatch(self):
         def wrong_version(repo):
             path = repo / "crates/phoenix-ide/Cargo.toml"
-            path.write_bytes(path.read_bytes().replace(b"0.13.2-rc.6", b"0.13.2-rc.5"))
+            path.write_bytes(path.read_bytes().replace(b"0.13.2-rc.7", b"0.13.2-rc.5"))
         with self.assertRaisesRegex(ValueError, "exact two-file/version-only"):
             self.candidate(mutate=wrong_version)
 
@@ -140,15 +149,19 @@ class FrozenRc5GateTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "latest exact-candidate"):
                 release.workflow_dispatch_ci_run()
 
-    def test_workflow_wires_only_the_frozen_rc6_controller(self):
+    def test_workflow_wires_only_the_frozen_rc7_controller(self):
         workflow = (ROOT / ".github/workflows/release.yml").read_text()
-        self.assertIn("release-frozen-rc6", workflow)
-        self.assertIn("refs/heads/release/frozen-rc6", workflow)
+        self.assertIn("release-frozen-rc7", workflow)
+        self.assertIn("refs/heads/release/frozen-rc7", workflow)
         self.assertIn(release.CANDIDATE, workflow)
         self.assertIn("refs/heads/main", workflow)
         self.assertIn('test \"$(git rev-parse FETCH_HEAD)\" = \"$GITHUB_SHA\"', workflow)
-        self.assertIn("needs.gate.outputs.operation == 'release-frozen-rc6' && needs.gate.outputs.controller_commit", workflow)
-        self.assertIn('"${{ needs.gate.outputs.operation }}" == release-frozen-rc6', workflow)
+        self.assertIn("needs.gate.outputs.operation == 'release-frozen-rc7' && needs.gate.outputs.controller_commit", workflow)
+        self.assertIn('"${{ needs.gate.outputs.operation }}" == release-frozen-rc7', workflow)
+        self.assertIn("86071b4cc2ab0f9efdb8a3debf03b8569baf26f9", workflow)
+        frozen_case = workflow.split("              release-frozen-rc7)", 1)[1].split("                ;;", 1)[0]
+        self.assertLess(frozen_case.index('[[ -z "$RETRY_TAG" ]]'), frozen_case.index("git fetch --no-tags origin refs/heads/release/frozen-rc7"))
+        self.assertIn('exit 1', frozen_case.split('git fetch', 1)[0])
 
 
 if __name__ == "__main__":
