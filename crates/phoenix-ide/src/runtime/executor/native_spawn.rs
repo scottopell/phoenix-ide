@@ -580,6 +580,19 @@ where
         &mut self,
         tool: ToolCall,
     ) -> Result<Option<Event>, String> {
+        let ConvState::ToolExecuting {
+            current_tool,
+            assistant_message,
+            ..
+        } = &mut self.state
+        else {
+            return Err("native fixture requires an executing selection".into());
+        };
+        assert_eq!(current_tool.id, tool.id);
+        *current_tool = tool.clone();
+        let selected_block = assistant_message.content.iter_mut().find(|block| matches!(block, phoenix_llm::ContentBlock::ToolUse { id, .. } if id == &tool.id)).expect("native fixture holds the selected tool use");
+        *selected_block =
+            phoenix_llm::ContentBlock::tool_use(&tool.id, tool.name(), tool.input.to_value());
         let event = self.start_spawn_agents_tool(tool)?;
         if event.is_some() {
             return Ok(event);

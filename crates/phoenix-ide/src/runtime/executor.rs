@@ -9915,6 +9915,17 @@ where
     }
 
     #[cfg(test)]
+    async fn settle_prepared_completions_for_test(&mut self) -> Result<(), String> {
+        while self.tool_preparation.is_some() {
+            let Some(event) = self.observe_tool_preparation_for_test().await? else {
+                break;
+            };
+            self.process_event(event).await?;
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
     async fn dispatch_tool_for_test(&mut self, tool: ToolCall) -> Result<Option<Event>, String> {
         assert!(self
             .execute_effect(Effect::ExecuteTool { tool })
@@ -22998,6 +23009,10 @@ mod steer_drain_detector_tests {
                 .process_outcome(EffectOutcome::Tool(ToolExecOutcome::Completed(
                     ToolResult::success("tool-1".into(), "done".into()),
                 )))
+                .await
+                .unwrap();
+            runtime
+                .settle_prepared_completions_for_test()
                 .await
                 .unwrap();
             assert!(!runtime.fatal_local_authority_fence.is_closed(), "{path}");

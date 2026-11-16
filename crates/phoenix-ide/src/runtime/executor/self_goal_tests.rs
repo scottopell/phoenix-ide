@@ -597,6 +597,10 @@ async fn database_runtime_mixed_self_goal_round_refuses_both_intents_in_either_o
                 }
             ));
             runtime.process_event(first_event).await.unwrap();
+            runtime
+                .settle_prepared_completions_for_test()
+                .await
+                .unwrap();
 
             assert!(matches!(runtime.state, ConvState::LlmRequesting { .. }));
             let (generation, outcome) = tokio::time::timeout(
