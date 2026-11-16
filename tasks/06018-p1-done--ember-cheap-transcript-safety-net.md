@@ -1,6 +1,6 @@
 # Ember phase 7: cheap transcript-scanning safety net
 
-Parent: [06013](./06013-p1-in-progress--ember-consistency-and-durable-tracking.md). Depends on the relevant terminology/baseline from [phase 1](./06014-p1-in-progress--ember-tool-contract-and-consistency-base.md), [phase 5](./06016-p1-in-progress--ember-durable-tracking-store-and-tools.md) and [phase 6](./06017-p1-in-progress--ember-tracking-continuity-and-inspection.md). This task owns frontier/invalidation/application/model-budget contracts before scanner activation; those decisions do not gate event or direct-tracking delivery. User authorizes automatic capture; Ember bears stale/duplicate retirement.
+Parent: [06013](./06013-p1-done--ember-consistency-and-durable-tracking.md). Depends on the relevant terminology/baseline from [phase 1](./06014-p1-done--ember-tool-contract-and-consistency-base.md), [phase 5](./06016-p1-done--ember-durable-tracking-store-and-tools.md) and [phase 6](./06017-p1-done--ember-tracking-continuity-and-inspection.md). This task owns frontier/invalidation/application/model-budget contracts before scanner activation; those decisions do not gate event or direct-tracking delivery. User authorizes automatic capture; Ember bears stale/duplicate retirement.
 
 ## Outcome
 
@@ -76,7 +76,17 @@ quotes, but recreated two retired requests. No structural reopen occurred; the
 semantic renewals still fail the unchanged gates. Original sources, oracles,
 raw outputs and failed results remain retained.
 
-The next typed host chronology projection is untested. New exact prepared-input
-review, an accepted semantic trial, final integrated CI/review and merge remain
-mandatory. No scanner activation or production backfill is claimed, and this task
-stays in progress.
+The typed host chronology projection passed twenty-two DB tests, owning
+all-target Clippy, actual 37-case host fixtures and fresh source reviews. The
+[third frozen trial](../scripts/qa/coordinator-scanner-quality/results-e978b7686.md)
+at `e978b7686` was independently accepted after all 37 exact payloads were
+reviewed: 11/11 requested units, 4/5 bookmarks, 13/13 restrictions, 29/29 valid
+quotes, zero false commissions/21, all seventeen negatives correct, zero visible
+duplicates/11 and no authority/reopen violations. Unknown cases passed; H01 stays
+historical and I01's genuine invisible duplicate remains separately measured.
+B04's bookmark miss is within the unchanged threshold; perfect recall is not
+claimed. Both prior reports remain rejected.
+
+Implementation and qualification are complete. Delivery PR #1098 is the authority
+for exact review, CI and main integration. No production deployment or completed
+production backfill is claimed.

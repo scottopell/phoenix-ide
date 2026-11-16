@@ -1,6 +1,6 @@
 # Ember phase 1: tool contracts and consistency baseline
 
-Parent: [06013](./06013-p1-in-progress--ember-consistency-and-durable-tracking.md). Read its accepted user decisions, proposed scope, derisking evidence and non-goals before implementation. This is a shared baseline task, not a first-complete global implementation gate. Lanes A/B own their necessary contract subsets; lane C closes the remaining bounded audit after roadmap retirement.
+Parent: [06013](./06013-p1-done--ember-consistency-and-durable-tracking.md). Read its accepted user decisions, proposed scope, derisking evidence and non-goals before implementation. This is a shared baseline task, not a first-complete global implementation gate. Lanes A/B own their necessary contract subsets; lane C closes the remaining bounded audit after roadmap retirement.
 
 ## Outcome
 
@@ -23,7 +23,7 @@ The owning feature task specifies and qualifies its contract. This shared task k
 - Retain the production-grounded list-watch regression below, using the closed request contract merged in #1088. That narrow implementation is complete; do not rebuild it as audit work. Inventory coverage alone does not qualify integrated model recovery.
 - Make native-first/public-API-fallback guidance and identity handoffs explicit. Preserve stable product targets versus exact transcript/message/predecessor/summary/run/revision/reference meanings and deliberate local/peer differences.
 - Align tracking terminology with phase 5's requirements/executive and ADR for singleton-owned memory, retired records, normalized references, review-needed evidence, fresh context retrieval and feature-scoped forward recovery. Phase 5 owns its record/native-tool contract; phase 7 owns precise coverage semantics. Record the user's roadmap deprecation separately; phase 2 owns its removal.
-- Specify occurrence-bound completion evidence and its retention/projection contract for [phase 3](./06020-p1-in-progress--bind-watch-events-to-ending-response-evi.md). Reuse the terminal obligation's exact response carrier; distinguish execution generation from source-content version. Existing historical/remote facts need honest absent-capability states. Preserve original diagnostics, private/shared boundaries and current event timing. [Phase 4](./06021-p1-in-progress--enrich-ember-event-context-and-measure-f.md) qualifies the bounded excerpt and compact model projection; do not build another send alert or summary model.
+- Specify occurrence-bound completion evidence and its retention/projection contract for [phase 3](./06020-p1-done--bind-watch-events-to-ending-response-evi.md). Reuse the terminal obligation's exact response carrier; distinguish execution generation from source-content version. Existing historical/remote facts need honest absent-capability states. Preserve original diagnostics, private/shared boundaries and current event timing. [Phase 4](./06021-p1-done--enrich-ember-event-context-and-measure-f.md) qualifies the bounded excerpt and compact model projection; do not build another send alert or summary model.
 - Freeze capture versus rendering limits before capture implementation: initial evaluation uses 1,024 UTF-8 bytes for both. Persist capture provenance; a later higher rendering limit cannot recover uncaptured content from changed source. Before trials, declare attribution/authority gates, targeted retrieval reduction and allowed total-context/latency regressions in control cases.
 - Record the settled scanner scope in the shared map: Ember's own continuation chain ONLY, user-requested work and meaningful bookmarks, all-history bounded backfill prioritizing new messages, and no new periodic review wakeups. Read Issue #1075. Phase 7 owns the live/backfill frontier, generation invalidation, application identity and route/budget contracts; resolve them there before activation. Worker/remote transcripts remain excluded.
 - Each feature freezes its own exact API replay/revision behavior before implementing its mutations. Avoid adding per-item priority/deadlines/assignments by default.
@@ -90,5 +90,6 @@ Export SHA256:
 `d4a4f557a1eeb059c52dafd4b69fd9718d4f3a598492e88ae8e0eef29d2fad7f`.
 This completes the requested inventory rerun after manual/event integration.
 It is synthetic assembled-runtime evidence, not a deployed configuration or a
-new fixed tool authority. Final candidate CI/review and task reconciliation remain
-separate; no status rename is made from this receipt alone.
+new fixed tool authority. Implementation and qualification are complete. Exact
+review, CI and main integration are tracked by delivery PR #1098; the task status
+does not substitute for GitHub's delivery state.

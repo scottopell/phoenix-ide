@@ -1,6 +1,6 @@
 # Ember phase 5: durable tracking store and native tool
 
-Parent: [06013](./06013-p1-in-progress--ember-consistency-and-durable-tracking.md). Requires only the tracking-related terminology/baseline from [phase 1](./06014-p1-in-progress--ember-tool-contract-and-consistency-base.md). This task owns its record/native-tool/reconciliation contract before implementation; event and scanner design and the aggregate completion of phase 1 do not gate it. No scanner/model calls in this slice.
+Parent: [06013](./06013-p1-done--ember-consistency-and-durable-tracking.md). Requires only the tracking-related terminology/baseline from [phase 1](./06014-p1-done--ember-tool-contract-and-consistency-base.md). This task owns its record/native-tool/reconciliation contract before implementation; event and scanner design and the aggregate completion of phase 1 do not gate it. No scanner/model calls in this slice.
 
 ## Outcome
 
@@ -56,7 +56,8 @@ passed. The [manual report](../scripts/qa/ember-tracking/manual-memory-aca480.md
 retains exact model/usage/trace evidence and prior failures.
 
 The candidate scanner composition also passed actual admitted-input, fresh-index,
-missed-pause and two-continuation assertions. Scanner semantic quality is separate:
-both cheap-model trials are rejected. Final program CI/review/merge remains with
-the parent and phase 8; no production deployment or scanner acceptance is implied.
-Filename status is unchanged pending final delivery reconciliation.
+missed-pause and two-continuation assertions. The third frozen cheap-model trial
+was independently accepted after typed host chronology; the two earlier rejected
+runs remain preserved. Implementation and qualification are complete. PR #1098
+tracks exact combined review, CI and main integration, with no production
+deployment implied.

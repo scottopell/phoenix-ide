@@ -1,6 +1,6 @@
 # Ember phase 4: useful, bounded event context and qualification
 
-Parent: [06013](./06013-p1-in-progress--ember-consistency-and-durable-tracking.md). Depends on [phase 3 exact evidence](./06020-p1-in-progress--bind-watch-events-to-ending-response-evi.md) and only the event-relevant [phase 1 baseline](./06014-p1-in-progress--ember-tool-contract-and-consistency-base.md), not a whole-program contract freeze. Lane B brings captured evidence into existing completion events independently of lane A's manual memory delivery; either useful slice may ship first. Neither waits for scanner activation.
+Parent: [06013](./06013-p1-done--ember-consistency-and-durable-tracking.md). Depends on [phase 3 exact evidence](./06020-p1-done--bind-watch-events-to-ending-response-evi.md) and only the event-relevant [phase 1 baseline](./06014-p1-done--ember-tool-contract-and-consistency-base.md), not a whole-program contract freeze. Lane B brings captured evidence into existing completion events independently of lane A's manual memory delivery; either useful slice may ship first. Neither waits for scanner activation.
 
 ## Outcome
 
@@ -65,5 +65,6 @@ generation/billing cap.
 
 This independently delivered component is merged; obsolete rebase/merge gates are
 closed. Final scanner/program qualification is separate, with no production
-deployment, remote enrichment parity or physical-device claim. Task filename
-status remains unchanged until final delivery reconciliation.
+deployment, remote enrichment parity or physical-device claim. Implementation
+and component qualification are complete; combined qualification is recorded in
+PR #1098, whose GitHub state owns exact review, CI and main integration.

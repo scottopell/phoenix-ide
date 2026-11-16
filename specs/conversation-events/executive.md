@@ -3,8 +3,9 @@
 Occurrence-bound evidence and compact projection are merged in
 [PR #1092](https://github.com/scottopell/phoenix-ide/pull/1092) as `3a842c5`, after
 independent review and green component CI. Manual migration 164 and event migration
-165 are integrated in order. Scanner migration 166 and combined scanner quality
-remain separate candidate work; no production deployment is claimed.
+165 are integrated in order. Qualified scanner migration 166 and combined evidence are recorded in
+[PR #1098](https://github.com/scottopell/phoenix-ide/pull/1098); exact review/CI/merge
+state belongs to GitHub. No production deployment is claimed.
 
 ## Occurrence-bound ending evidence
 
@@ -49,7 +50,8 @@ Original evidence/hashes and the semantic/input/latency gates remain unchanged.
 This is synthetic local component qualification with small samples and uncontrolled
 provider cache/load, not billing savings, deployment, remote parity or combined
 Ember acceptance. Event migration 165 passed integrated component CI/review and
-merged after manual migration 164; final scanner integration remains separate.
+merged after manual migration 164; combined scanner qualification is recorded in
+PR #1098.
 
 Scoped web qualification passes 61 focused event-card/fixture tests and a forced
 application TypeScript check. The actual Ladle Global page rendered a long Unicode
@@ -70,7 +72,7 @@ Durable metadata joins and typed presentation are separate from persisted diagno
 
 | Contract | Evidence | Remaining boundary |
 |---|---|---|
-| REQ-CEVT-001 | Four DB tests; API batch completeness including 400/401 identities, fallback and outcome tests | Merged component CI passed; scanner final CI remains separate |
+| REQ-CEVT-001 | Four DB tests; API batch completeness including 400/401 identities, fallback and outcome tests | Merged component CI passed; combined delivery is tracked in PR #1098 |
 | REQ-CEVT-002/003 | 223 earlier focused UI tests; final c6b app TypeScript and 36 focused tests; actual dark/light browser rendering | Not physical-phone qualification |
 | REQ-CEVT-004 | Ordinary library cargo check; eight event-presentation tests including five genuine export tests; SSE Complete/Tail/Preserve pending-event and redaction parity regression; genuine EnrichedMessage export | Merged component codegen/freshness checks passed; fixture browser is not actual backend acceptance |
 | REQ-CEVT-005 | Eight rendered cases with 88 passing assertions, including distinct Global-to-ordinary source and return; only human prompt in chapter strip; no duplicate events | Real-server pagination/live/share browser campaign not performed |

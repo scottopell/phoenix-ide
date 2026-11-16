@@ -1,6 +1,6 @@
 # Ember phase 8: end-to-end qualification and cutover
 
-Parent: [06013](./06013-p1-in-progress--ember-consistency-and-durable-tracking.md). Final combined qualification depends on delivered phases 1 and 3–7; [phase 2](./06015-p1-done--retire-stale-delivery-roadmap.md) retirement is independently verifiable. Each slice qualifies before integration: the [phase 4 event comparison](./06021-p1-in-progress--enrich-ember-event-context-and-measure-f.md) must not wait for scanner delivery.
+Parent: [06013](./06013-p1-done--ember-consistency-and-durable-tracking.md). Final combined qualification depends on delivered phases 1 and 3–7; [phase 2](./06015-p1-done--retire-stale-delivery-roadmap.md) retirement is independently verifiable. Each slice qualifies before integration: the [phase 4 event comparison](./06021-p1-done--enrich-ember-event-context-and-measure-f.md) must not wait for scanner delivery.
 
 ## Outcome
 
@@ -55,27 +55,30 @@ Out of scope: inventing new wake or suppression policy, expanding remote event p
 This table records exercised boundaries; it does not replace the eighteen
 obligations above or claim that synthetic lifecycle success proves model usefulness.
 Merged components are #1091 retirement, #1096 tool audit, #1093 manual tracking
-(`5b0e01c09`) and #1092 event evidence/context (`3a842c5`). Scanner PR #1098 is a
-candidate. Both scanner semantic runs are rejected; the new typed chronology
-projection is untested. Exact final CI/review/merge and accepted cheap-model
-quality remain open. No task filename status is changed by this record.
+(`5b0e01c09`) and #1092 event evidence/context (`3a842c5`). Delivery of the
+qualified scanner implementation is tracked in PR #1098. The third frozen scanner
+trial at `e978b7686` was independently accepted after typed host chronology, all
+37 prepared inputs, twenty-two DB tests, owning all-target Clippy, actual host
+fixtures and fresh source reviews. Both earlier semantic trials remain rejected.
+This completes implementation and qualification; exact review, CI and main
+integration are tracked by GitHub PR #1098.
 
-| Journey | Concrete qualified evidence | Remaining boundary |
+| Journey | Concrete qualified evidence | Qualification scope |
 |---|---|---|
-| 1: Omitted work and bookmark after detour | Manual real-model request/bookmark recovery; actual-input scanner capture/index composition; actual 37-case prepared host fixtures | Cheap-model multi-intent/bookmark semantic qualification |
-| 2: Continuation identity and stopping point | Four runtime continuity/authority regressions and actual scanner/pause composition through two continuations | Final candidate CI/review |
-| 3: Retirement during inference and renewal | DB retirement/CAS race, closed candidate readback and distinct unreviewed renewal with old record closed | Stale-retired semantic rediscovery fails both model runs |
-| 4: Atomic capture/coverage and restart | Classified transaction, exact application replay, durable reservation/crash and file-reopen host tests | Final candidate CI/review; no physical power-fault claim |
-| 5: Live gap, incomplete/unavailable source and failures | DB partial Unicode, malformed/oversized source, live gaps/fairness; runner route/output/timeout bounds | Historical cancellation/restriction semantic quality remains part of the frozen corpus gate |
-| 6: Receipts, pauses and authority | Typed send/event/Goal distinctions, scanner no-dispatch authority, actual pause/quiet foreground and no-wake composition | Final integration; no second worker-checkpoint lifecycle |
-| 7: Local/peer/exact routing | Merged native federation/no-fallback and local-only schema regressions; accepted assembled inventory | Exact final CI/review; no remote enrichment expansion |
+| 1: Omitted work and bookmark after detour | Manual real-model request/bookmark recovery; actual-input scanner capture/index composition; actual 37-case prepared host fixtures | Accepted e978 scanner gates; B04 bookmark miss remains within 4/5 threshold |
+| 2: Continuation identity and stopping point | Four runtime continuity/authority regressions and actual scanner/pause composition through two continuations | Controlled production-runtime lifecycle evidence; PR #1098 delivery state |
+| 3: Retirement during inference and renewal | DB retirement/CAS race, closed candidate readback and distinct unreviewed renewal with old record closed | Third trial passed all visible-retired negatives with typed host chronology; earlier failures retained |
+| 4: Atomic capture/coverage and restart | Classified transaction, exact application replay, durable reservation/crash and file-reopen host tests | Transaction/restart evidence; no physical power-fault claim |
+| 5: Live gap, incomplete/unavailable source and failures | DB partial Unicode, malformed/oversized source, live gaps/fairness; runner route/output/timeout bounds | Accepted frozen semantic gates; outside-window H01 remains historical/unverified |
+| 6: Receipts, pauses and authority | Typed send/event/Goal distinctions, scanner no-dispatch authority, actual pause/quiet foreground and no-wake composition | No second worker-checkpoint lifecycle or new authority |
+| 7: Local/peer/exact routing | Merged native federation/no-fallback and local-only schema regressions; accepted assembled inventory | Existing routing contracts preserved; no remote enrichment expansion |
 | 8: Roadmap cutoff | #1091 independent workflow/variable/Issue readback and historical retention | Complete |
 | 9: Exact ending versus newer response | Event capture/settlement/read/privacy regressions and accepted complete 39-trial C2 comparison | Component merged; deployment unclaimed |
-| 10: Event reports, corrections and broader outcome | Host machine-source restrictions and append-only scanner authority; actual origin-preserving corpus inputs | Semantic gate remains rejected despite valid exact quotes |
-| 11: Whole-history progress and no wakeup | Own-chain/member enrollment, historical/live fairness/gaps and file restart; idle scanner → next normal admitted input fresh index | Final integration and scanner semantic quality; deployed backfill unclaimed |
+| 10: Event reports, corrections and broader outcome | Host machine-source restrictions and append-only scanner authority; actual origin-preserving corpus inputs | Third trial: all restrictions/negatives and source-authority gates passed; first two failures retained |
+| 11: Whole-history progress and no wakeup | Own-chain/member enrollment, historical/live fairness/gaps and file restart; idle scanner → next normal admitted input fresh index | Host lifecycle and separate semantic gates passed; deployed backfill unclaimed |
 | 12: Edited uncaptured tail and paging | Whole typed-response digest, explicit changed/unavailable reads, between-page edits and C2 controls | Component merged; no mixed-version quotation claim |
-| 13: Missed pause and stale resumption | Storage CAS/overflow/review-required tests plus actual scanner append → two-continuation invalidation | Final integration; model must attach the required evidence |
-| 14: Old source edit without append/kick | DB20 at `89ff24d7b`: sequence-5/covered-through-100 metadata restart/dedup, then external valid-prose/new-generation rewrite, reopen/rescan/new evidence with old history retained; contention recovery | Final integrated checks; no generic user-edit API claimed |
+| 13: Missed pause and stale resumption | Storage CAS/overflow/review-required tests plus actual scanner append → two-continuation invalidation | Host review-state/CAS proof plus third trial 13/13 restriction attachments |
+| 14: Old source edit without append/kick | DB22 includes the `89ff24d7b` case: sequence-5/covered-through-100 metadata restart/dedup, then external valid-prose/new-generation rewrite, reopen/rescan/new evidence with old history retained; contention recovery | Externally changed source fixture; no generic user-edit API claimed |
 | 15: Immutable prefix and bounded context | Assembled request prefix/no-change snapshot regressions; manual/foreground actual request and token accounting | No provider cache/billing savings inferred |
 | 16: Useful owed next step | Accepted manual `aca480f4a` and foreground `32ada836a` due-item → specific question → real user pause → revision-checked update | Controlled synthetic usefulness; general utility/deployment unclaimed |
 | 17: Two recently reviewed items stay quiet | Accepted foreground arithmetic returns only its answer with zero tools/cue after actual pause reconciliation; durable cooldown tests | No wall-clock wakeup or healthy-worker polling introduced |
@@ -87,6 +90,13 @@ preserves its earlier failed/harness-rejected runs and presentation limits. The
 capped experiment. Scanner [first](../scripts/qa/coordinator-scanner-quality/results-ec570d0f3.md)
 and [paired](../scripts/qa/coordinator-scanner-quality/results-db6f2b44f.md) reports
 retain both complete rejected trials, raw/host effect distinctions and exact hashes.
+The [accepted third trial](../scripts/qa/coordinator-scanner-quality/results-e978b7686.md)
+records 11/11 requested units, 4/5 bookmarks, 13/13 restrictions and 29/29 valid
+quotes; zero false commissions/21, all seventeen negatives correct, zero visible
+duplicates/11 and no authority/reopen violations. B04 is the allowed bookmark
+miss. L01/L02 pass, H01 remains historical, and I01's one genuine invisible
+duplicate is reported separately. Root and fresh independent review inspected all
+raw results, record hashes and host effects before acceptance.
 
 The final assembled inventory matrix and export passed at `89ff24d7b`: eight
 language/catalog/spawn variants, 28/29 tools without/with authenticated skills,
@@ -94,7 +104,9 @@ and tracking's eight operations including coverage. Export SHA256:
 `d4a4f557a1eeb059c52dafd4b69fd9718d4f3a598492e88ae8e0eef29d2fad7f`.
 This is configuration-scoped evidence, not production inventory.
 
-No further feature slice or new acceptance campaign is introduced here. Remaining
-work is the revised typed chronology/source gate, independent model adjudication,
-factual closure and exact final checks/review/merge. Local model/host evidence,
-merged source and deployed/physical-device behavior remain explicitly distinct.
+Implementation and qualification for the existing eight phases and eighteen
+journeys are complete within these stated boundaries. No further feature slice or
+acceptance campaign is introduced. Delivery PR #1098 owns exact review, CI and
+main integration. Local
+model/host evidence, merged source and deployed/physical-device behavior remain
+explicitly distinct.

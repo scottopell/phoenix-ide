@@ -1,6 +1,6 @@
 # Ember phase 3: bind completion events to their exact ending evidence
 
-Parent: [06013](./06013-p1-in-progress--ember-consistency-and-durable-tracking.md). Requires only the event-specific baseline/contract subset described in [phase 1](./06014-p1-in-progress--ember-tool-contract-and-consistency-base.md), not completion of that entire task or any tracking/scanner design. This slice owns acceptance of its occurrence/retention/privacy/capture contract before implementation and is followed by [phase 4 projection/evaluation](./06021-p1-in-progress--enrich-ember-event-context-and-measure-f.md).
+Parent: [06013](./06013-p1-done--ember-consistency-and-durable-tracking.md). Requires only the event-specific baseline/contract subset described in [phase 1](./06014-p1-done--ember-tool-contract-and-consistency-base.md), not completion of that entire task or any tracking/scanner design. This slice owns acceptance of its occurrence/retention/privacy/capture contract before implementation and is followed by [phase 4 projection/evaluation](./06021-p1-done--enrich-ember-event-context-and-measure-f.md).
 
 ## User-approved outcome
 
@@ -55,5 +55,6 @@ generation/billing cap.
 
 This independently delivered component is merged; obsolete rebase/merge gates are
 closed. Final scanner/program qualification is separate, with no production
-deployment, remote enrichment parity or physical-device claim. Task filename
-status remains unchanged until final delivery reconciliation.
+deployment, remote enrichment parity or physical-device claim. Implementation
+and component qualification are complete; combined qualification is recorded in
+PR #1098, whose GitHub state owns exact review, CI and main integration.

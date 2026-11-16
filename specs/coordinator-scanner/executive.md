@@ -1,19 +1,19 @@
 # Coordinator scanner status
 
 Scanner migration 166, bounded host preparation/reservation/application, coverage
-inspection and the supervised background runner are implemented on the composed
-manual-tracking/event candidate. Scanner activation is **not qualified**: both
-complete 37-case real-model trials were independently rejected. A typed
-retirement/source chronology projection is being implemented and remains untested.
-PR #1098, exact final checks/review and merge remain open. No production deployment
-or candidate-server activation is claimed.
+inspection and the supervised background runner are implemented and qualified.
+Delivery is tracked in [PR #1098](https://github.com/scottopell/phoenix-ide/pull/1098),
+which is the authority for exact review, CI and merge state. Independent review
+accepted the third complete 37-case real-model trial at `e978b7686`; both earlier
+rejected trials remain preserved. No production deployment or candidate-server
+activation is claimed.
 
-| Requirements | Current evidence | Remaining gate |
+| Requirements | Qualification evidence | Scope |
 |---|---|---|
-| REQ-SCAN-001–005: Scope, coverage, source validity, authority and recovery | Twenty actual DB tests passed at `89ff24d7b`, including old-prose generation-only restart, two continuations, exact deduplication, retirement races, live gaps and contention recovery | Typed chronology projection and exact integrated checks/review |
-| REQ-SCAN-006: Bounded resource use | Eighteen runner/kick tests passed; strict catalog/outbound Luna/Low, accepted-output bounds, durable spending/retry limits and no foreground wake are covered | Qualify the revised candidate before activation |
-| REQ-SCAN-007: Bounded inspectability | Native coverage inspection and accepted eight-variant assembled inventory include the closed tracking coverage operation | Exact final integrated CI/review |
-| REQ-SCAN-008: Historical recovery and qualification | Manual/foreground usefulness accepted; actual host fixtures pass; both cheap-model semantic trials rejected | New exact prepared-input review, independently accepted quality trial and final CI/review/merge |
+| REQ-SCAN-001–005: Scope, coverage, source validity, authority and recovery | Twenty-two actual DB tests passed, including strict typed retirement/source chronology, old-prose generation-only restart, two continuations, exact deduplication, retirement races, live gaps and contention recovery | Deterministic production-host lifecycle evidence |
+| REQ-SCAN-006: Bounded resource use | Eighteen runner/kick tests passed; strict catalog/outbound Luna/Low, accepted-output bounds, durable spending/retry limits and no foreground wake are covered | Codex generation/billing is not capped by accepted-output checks |
+| REQ-SCAN-007: Bounded inspectability | Native coverage inspection and accepted eight-variant assembled inventory include the closed tracking coverage operation | Synthetic assembled configuration, not production inventory |
+| REQ-SCAN-008: Historical recovery and qualification | Manual/foreground usefulness, actual 37-case host fixtures, owning all-target Clippy and fresh source reviews passed; third semantic trial independently accepted | Small synthetic corpus; bookmark miss and invisible duplicate disclosed below |
 
 The production-runtime composition test passed with the runner/kick suite: an
 idle capture adds no foreground turn/messages; the next actual admitted input
@@ -21,7 +21,7 @@ sees a fresh bounded index; appended pause evidence invalidates the old stopping
 point through two real continuations. This synthetic inference proves lifecycle
 composition, not cheap-model interpretation or general user utility.
 
-The twenty DB tests preserve original/retired evidence through supported file
+The twenty-two DB tests preserve original/retired evidence through supported file
 restart. The old sequence-5/covered-through-100 case first proves metadata-only
 invalidation and unchanged exact deduplication, then atomically changes valid
 old prose and its generation without appending a row, closes/reopens and recovers
@@ -57,11 +57,27 @@ units, five bookmarks, all thirteen restrictions and all 33 quotes passed, but
 two stale retired requests became new active records. Both runs remain rejected;
 zero structural reopen writes does not excuse invented semantic renewal.
 
-The next input projection supplies host-derived fragments strictly later than a
-retired candidate, so inference does not compare long timestamp integers.
-Temporal eligibility is not renewal intent, semantic matching or permission.
-It is not proven by either prior trial. Corpus/oracles/thresholds remain unchanged;
-new exact payloads and quality results require independent review before activation.
+The typed input projection supplies host-derived fragments strictly later than
+a retired candidate. Inference uses that temporal relation rather than comparing
+long timestamp integers; eligibility is not renewal intent or permission. The
+same original sources, candidate facts, UUIDs, corpus, oracles and thresholds were
+retained, with the expected projection difference independently reviewed before
+calls. DB tests cover strict equality/order and per-candidate chronology.
+
+The [accepted third trial](../../scripts/qa/coordinator-scanner-quality/results-e978b7686.md)
+recovered all eleven requested units, four of five bookmarks and all thirteen
+restrictions, with 29/29 exact valid quotes. It produced zero false requested-work
+commissions across 21 opportunities, no new items in all seventeen negatives,
+zero visible duplicates across eleven opportunities and no authority/reopen
+violations. Root and a fresh independent reviewer inspected every raw result,
+record hash and host effect before acceptance.
+
+The missed bookmark is B04, within the predeclared four-of-five threshold.
+Unknown apparent-request/machine-negative cases passed. H01 remains historical
+without knowledge of withheld cancellation; I01 produced one separately reported
+invisible duplicate because the matching record was genuinely omitted. Perfect
+recall or semantic deduplication is not claimed. Exact configuration, usage,
+latency, original failures and all artifact hashes are in the reports.
 
 ## Bounds and limits
 

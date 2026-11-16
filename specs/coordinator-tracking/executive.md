@@ -1,11 +1,11 @@
 # Coordinator tracking status
 
-Manual storage, native tools and durable context integration are merged in PR #1093 (`5b0e01c09`), with all component CI checks passed. The manual usefulness gate and both controlled foreground quiet/contextual recovery journeys are accepted. Scanner activation and combined-program qualification remain separate mandatory work. No production deployment is claimed.
+Manual storage, native tools and durable context integration are merged in PR #1093 (`5b0e01c09`), with all component CI checks passed. The manual usefulness gate and both controlled foreground quiet/contextual recovery journeys are accepted. Scanner host composition and the third frozen quality trial are also qualified; combined delivery is tracked by [PR #1098](https://github.com/scottopell/phoenix-ide/pull/1098). No production deployment is claimed.
 
 | Requirement | Current evidence | Remaining gate |
 |---|---|---|
-| REQ-TRACK-001–005 | Twelve schema/service tests and one actual native registry/service test pass, including normalized retirement history, exact current-call authority, source gaps and encoded output bounds | Final scanner quality and program CI/review/merge |
-| REQ-TRACK-006–007 | Four production-runtime tests pass, including accepted/claimed UserApi input, pre-checkpoint native execution, visible pre-tool prose, prefix/DB continuation, sequence reservation and ownership loss; the real-model manual journey and both controlled foreground quiet/contextual journeys are accepted | Final scanner quality and integrated CI/review/merge |
+| REQ-TRACK-001–005 | Twelve schema/service tests and one actual native registry/service test pass, including normalized retirement history, exact current-call authority, source gaps and encoded output bounds | Qualified host composition; exact delivery state in PR #1098 |
+| REQ-TRACK-006–007 | Four production-runtime tests pass, including accepted/claimed UserApi input, pre-checkpoint native execution, visible pre-tool prose, prefix/DB continuation, sequence reservation and ownership loss; the real-model manual journey and both controlled foreground quiet/contextual journeys are accepted | Qualified continuity/foreground/scanner composition; delivery in PR #1098 |
 
 Initial bounds: eight compact index entries; full notes on demand; eight evidence/retirement entries per detail page with explicit remaining cursors; complete detail at most 96 KiB; combined editable metadata at most 16 KiB serialized JSON and complete evidence entries/retirement reasons at most 4 KiB serialized; compact observation at most 8 KiB. Unsolicited-review/surfacing cooldown is 24 hours with a new-evidence exception; relevant bounded retrieval needed to answer the current work-planning question is independent of that cooldown. Per-input observation identity prevents repeated retry cues; per-item attention receipts survive continuation and never advance explicit review. These are initial limits, not measured provider savings.
 
@@ -13,7 +13,7 @@ The [accepted manual qualification report](../../scripts/qa/ember-tracking/manua
 
 The accepted manual journey did not exercise a post-review neutral turn because its predeclared request-byte margin was exhausted. Later controlled foreground qualification preserves the [initial contextual failure](../../scripts/qa/ember-foreground-memory/foreground-c14462de7.md) and [paired recovery with a read-only harness rejection](../../scripts/qa/ember-foreground-memory/foreground-d50bbbf54.md). The [complete paired report](../../scripts/qa/ember-foreground-memory/foreground-32ada836a.md) records both original journeys passing: actual structured Cobalt reply, pause CAS and quiet arithmetic with two recently reviewed requests; and contextual Harbor recovery beyond the first eight entries and two handoffs, through actual bounded reads and original source recovery. Root full-trace review and a fresh independent full-trace/SQLite/numeric review accepted both. The remaining verbose baseline framing and missing explicit Harbor-name refresher are disclosed, without further policy tuning.
 
-Static guidance distinguishes targeted retrieval needed to answer a current work-planning question from unsolicited review cooldown. The two fixed synthetic journeys do not establish general reliability, production or UI acceptance. The assembled inventory and synthetic scanner composition are accepted; scanner semantic quality, final checks/review and merge remain mandatory [phase-8 work](../../tasks/06019-p1-in-progress--ember-coordination-end-to-end-qualificat.md).
+Static guidance distinguishes targeted retrieval needed to answer a current work-planning question from unsolicited review cooldown. The two fixed synthetic journeys do not establish general reliability, production or UI acceptance. The assembled inventory, synthetic scanner composition and third scanner quality trial are accepted; exact delivery checks and state are tracked in PR #1098 and [phase-8 evidence](../../tasks/06019-p1-done--ember-coordination-end-to-end-qualificat.md).
 
 The focused behavioral authority is `coordinator-tracking.allium`; its structural checker passes. Selected current-input cues require bounded inspection followed by an already-permitted useful step, such as asking an owed conversational question with a short refresher. An actual restriction/dependency can justify waiting or silence; inspection alone and invented topic-selection pauses do not establish follow-through. Historical cues do not renew review, and saved data grants no execution authority or new wakeup.
 
@@ -27,7 +27,10 @@ operations including coverage. Export SHA256:
 `d4a4f557a1eeb059c52dafd4b69fd9718d4f3a598492e88ae8e0eef29d2fad7f`.
 These are observed synthetic configurations, not a fixed roster or deployed count.
 
-Both scanner quality trials were independently rejected; their failed semantics
-do not invalidate accepted manual/foreground journeys or qualify scanner activation.
-See the [scanner status](../coordinator-scanner/executive.md) and retained reports.
-The next typed chronology projection is untested; final integration remains open.
+Both earlier scanner quality trials remain independently rejected. The typed
+host chronology correction passed twenty-two DB tests and actual host fixtures;
+the third frozen trial was independently accepted. See the [scanner status](../coordinator-scanner/executive.md)
+and [accepted report](../../scripts/qa/coordinator-scanner-quality/results-e978b7686.md)
+for all gates, the allowed bookmark miss, separately measured invisible duplicate
+and retained failures. Implementation/qualification is complete; GitHub PR #1098
+owns review, CI and merge state. Production deployment remains unclaimed.
