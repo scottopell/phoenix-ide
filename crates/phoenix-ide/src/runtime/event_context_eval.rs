@@ -60,6 +60,7 @@ struct Case {
     response: Response,
     mutation: Mutation,
     question: String,
+    event_count: Option<usize>,
 }
 
 #[derive(Deserialize)]
@@ -103,9 +104,209 @@ struct World {
     coordinator: String,
     registry: ToolRegistry,
     catalog: Option<phoenix_skills::AuthenticatedCoordinatorSkillCatalog>,
-    packets: [String; 3],
-    source: Value,
+    packets: [Vec<String>; 3],
+    sources: Vec<Value>,
     _database_dir: tempfile::TempDir,
+}
+
+async fn capture_occurrence(
+    db: &Database,
+    coordinator: &str,
+    case: &Case,
+    ordinal: usize,
+) -> (String, String, Value) {
+    let input_id = format!("event-eval-input-{ordinal}");
+    let ending_id = format!("event-eval-ending-{ordinal}");
+    let source = db
+        .create_conversation(
+            &format!("event-eval-source-{ordinal}"),
+            &format!("synthetic-event-source-{ordinal}"),
+            "/tmp",
+            true,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    db.watch_product_conversation(&source.product_conversation_id)
+        .await
+        .unwrap();
+    let payload = PreparedDirectTurnPayload::from_parts(
+        SubmittedDirectTurnIdentity {
+            message_id: input_id.clone(),
+            origin: InputOrigin::UserApi,
+            text: case.input.clone(),
+            images: vec![],
+            files: vec![],
+            user_agent: None,
+            skill_invocation: None,
+            expansion_policy: SubmittedDirectTurnExpansionPolicy::LiteralText,
+        },
+        PreparedDirectTurnDelivery {
+            text: case.input.clone(),
+            llm_text: None,
+            images: vec![],
+            files: vec![],
+            user_agent: None,
+            skill_invocation: None,
+        },
+    );
+    let repo = db.workflow_repository();
+    let accepted = repo
+        .accept_authoritative_turn(&AcceptAuthoritativeTurn {
+            client_key: ClientTurnKey::new(format!("event-eval-client-{ordinal}")).unwrap(),
+            prepared: PreparedTurn::from_exact_payload(
+                &ConversationAuthority(source.id.clone()),
+                payload.to_exact_bytes().unwrap(),
+            ),
+            disposition: AcceptedDisposition::Runtime,
+            accepted_at: Timestamp(1),
+        })
+        .await
+        .established()
+        .expect("fixture acceptance established")
+        .unwrap();
+    let TurnOutcome::Created { turn_id, .. } = accepted.outcome else {
+        panic!("new turn")
+    };
+    db.add_message_with_seq(
+        &input_id,
+        &source.id,
+        1,
+        &MessageContent::user(&case.input),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    sqlx::query("UPDATE messages SET origin_kind='user_api' WHERE message_id=?1")
+        .bind(&input_id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE durable_turns SET canonical_message_id=?2, materialized=1 WHERE turn_id=?1",
+    )
+    .bind(i64::try_from(turn_id.0).unwrap())
+    .bind(&input_id)
+    .execute(db.pool())
+    .await
+    .unwrap();
+    let prefix = match &case.response {
+        Response::Prose { prefix, .. } => prefix
+            .as_ref()
+            .map_or_else(String::new, |prefix| prefix.text.repeat(prefix.repetitions)),
+        Response::ToolOnly | Response::NoCarrier => String::new(),
+    };
+    let response = match &case.response {
+        Response::Prose { text, .. } => Some(MessageContent::agent(vec![ContentBlock::text(
+            format!("{prefix}{text}"),
+        )])),
+        Response::ToolOnly => Some(MessageContent::agent(vec![ContentBlock::tool_use(
+            format!("ending-think-{ordinal}"),
+            "think",
+            json!({"thought":"Readiness inspection stopped."}),
+        )])),
+        Response::NoCarrier => None,
+    };
+    let projection = PersistedConversationProjection {
+        state: ConvState::Idle,
+        state_updated_at: chrono::Utc::now(),
+    };
+    let obligation = DirectTurnTerminalObligationInput {
+        turn_id,
+        expected_generation: 0,
+        terminal: TurnTerminal::Completed,
+        projection: projection.clone(),
+        response_message_id: response.as_ref().map(|_| ending_id.clone()),
+    };
+    if let Some(response) = &response {
+        db.add_message_with_seq_and_terminal_obligation(
+            &ending_id,
+            &source.id,
+            2,
+            response,
+            None,
+            None,
+            &obligation,
+        )
+        .await
+        .unwrap();
+    } else {
+        repo.persist_terminal_obligation(&obligation).await.unwrap();
+    }
+    repo.terminalize_authoritative_turn(&TerminalizeAuthoritativeTurnInput {
+        command: TurnCommand::Complete {
+            turn_id,
+            expected_generation: 0,
+        },
+        projection: Some(projection),
+        provider_replay_settlement: ProviderReplaySettlement::Preserve,
+    })
+    .await
+    .unwrap();
+    let events = db.pending_coordinator_watch_events(16).await.unwrap();
+    assert_eq!(events.len(), ordinal + 1);
+    let occurrence_id = turn_id.0.to_string();
+    let matching = events
+        .iter()
+        .filter(|event| {
+            event.source_transcript_id == source.id
+                && event.source_occurrence_kind == "direct_turn"
+                && event.source_occurrence_id == occurrence_id
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(matching.len(), 1);
+    let event = matching[0];
+    let raw = crate::coordinator_watch_delivery::notification(event);
+    db.add_message_with_seq_and_origin(
+        &event.event_id,
+        coordinator,
+        i64::try_from(ordinal + 1).unwrap(),
+        &MessageContent::user(&raw),
+        None,
+        None,
+        &InputOrigin::SubscriptionEvent {
+            event_id: event.event_id.clone(),
+        },
+    )
+    .await
+    .unwrap();
+    let evidence = db
+        .coordinator_watch_ending_evidence(&event.event_id)
+        .await
+        .unwrap();
+    match &case.mutation {
+        Mutation::None => {}
+        Mutation::LaterResponse { text } => {
+            db.add_message(
+                &format!("event-eval-later-{ordinal}"),
+                &source.id,
+                &MessageContent::agent(vec![ContentBlock::text(text)]),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        }
+        Mutation::EditTail { text } => {
+            let content =
+                MessageContent::agent(vec![ContentBlock::text(format!("{prefix}{text}"))]);
+            sqlx::query("UPDATE messages SET content=?1 WHERE message_id=?2")
+                .bind(serde_json::to_string(&content.to_stored_json()).unwrap())
+                .bind(&ending_id)
+                .execute(db.pool())
+                .await
+                .unwrap();
+        }
+    }
+
+    (
+        raw.clone(),
+        format!("{raw}\n{}", evidence.readable(&event.event_id)),
+        json!({"event_id":event.event_id,"source_transcript_id":source.id,
+            "product_conversation_id":source.product_conversation_id,"ending_evidence":evidence}),
+    )
 }
 
 impl World {
@@ -126,185 +327,40 @@ impl World {
             .await
             .unwrap()
             .id;
-        let source = db
-            .create_conversation(
-                "event-eval-source",
-                "Synthetic event source",
-                "/tmp",
-                true,
-                None,
-                None,
-            )
-            .await
-            .unwrap();
-        db.watch_product_conversation(&source.product_conversation_id)
-            .await
-            .unwrap();
-        let payload = PreparedDirectTurnPayload::from_parts(
-            SubmittedDirectTurnIdentity {
-                message_id: "event-eval-input".into(),
-                origin: InputOrigin::UserApi,
-                text: case.input.clone(),
-                images: vec![],
-                files: vec![],
-                user_agent: None,
-                skill_invocation: None,
-                expansion_policy: SubmittedDirectTurnExpansionPolicy::LiteralText,
-            },
-            PreparedDirectTurnDelivery {
-                text: case.input.clone(),
-                llm_text: None,
-                images: vec![],
-                files: vec![],
-                user_agent: None,
-                skill_invocation: None,
-            },
-        );
-        let repo = db.workflow_repository();
-        let accepted = repo
-            .accept_authoritative_turn(&AcceptAuthoritativeTurn {
-                client_key: ClientTurnKey::new("event-eval-client").unwrap(),
-                prepared: PreparedTurn::from_exact_payload(
-                    &ConversationAuthority(source.id.clone()),
-                    payload.to_exact_bytes().unwrap(),
-                ),
-                disposition: AcceptedDisposition::Runtime,
-                accepted_at: Timestamp(1),
-            })
-            .await
-            .established()
-            .expect("fixture acceptance established")
-            .unwrap();
-        let TurnOutcome::Created { turn_id, .. } = accepted.outcome else {
-            panic!("new turn")
-        };
-        db.add_message_with_seq(
-            "event-eval-input",
-            &source.id,
-            1,
-            &MessageContent::user(&case.input),
-            None,
-            None,
-        )
-        .await
-        .unwrap();
-        sqlx::query(
-            "UPDATE messages SET origin_kind='user_api' WHERE message_id='event-eval-input'",
-        )
-        .execute(db.pool())
-        .await
-        .unwrap();
-        sqlx::query("UPDATE durable_turns SET canonical_message_id='event-eval-input', materialized=1 WHERE turn_id=?1")
-            .bind(i64::try_from(turn_id.0).unwrap())
-            .execute(db.pool())
-            .await
-            .unwrap();
-        let prefix = match &case.response {
-            Response::Prose { prefix, .. } => prefix
-                .as_ref()
-                .map_or_else(String::new, |prefix| prefix.text.repeat(prefix.repetitions)),
-            Response::ToolOnly | Response::NoCarrier => String::new(),
-        };
-        let response = match &case.response {
-            Response::Prose { text, .. } => Some(MessageContent::agent(vec![ContentBlock::text(
-                format!("{prefix}{text}"),
-            )])),
-            Response::ToolOnly => Some(MessageContent::agent(vec![ContentBlock::tool_use(
-                "ending-think",
-                "think",
-                json!({"thought":"Readiness inspection stopped."}),
-            )])),
-            Response::NoCarrier => None,
-        };
-        let projection = PersistedConversationProjection {
-            state: ConvState::Idle,
-            state_updated_at: chrono::Utc::now(),
-        };
-        let obligation = DirectTurnTerminalObligationInput {
-            turn_id,
-            expected_generation: 0,
-            terminal: TurnTerminal::Completed,
-            projection: projection.clone(),
-            response_message_id: response.as_ref().map(|_| "event-eval-ending".into()),
-        };
-        if let Some(response) = &response {
-            db.add_message_with_seq_and_terminal_obligation(
-                "event-eval-ending",
-                &source.id,
-                2,
-                response,
-                None,
-                None,
-                &obligation,
-            )
-            .await
-            .unwrap();
-        } else {
-            repo.persist_terminal_obligation(&obligation).await.unwrap();
+        let event_count = case.event_count.unwrap_or(1);
+        assert!((1..=8).contains(&event_count));
+        if event_count > 1 {
+            assert!(matches!(&case.response, Response::ToolOnly));
+            assert!(matches!(&case.mutation, Mutation::None));
         }
-        repo.terminalize_authoritative_turn(&TerminalizeAuthoritativeTurnInput {
-            command: TurnCommand::Complete {
-                turn_id,
-                expected_generation: 0,
-            },
-            projection: Some(projection),
-            provider_replay_settlement: ProviderReplaySettlement::Preserve,
-        })
-        .await
-        .unwrap();
-        let events = db.pending_coordinator_watch_events(16).await.unwrap();
-        assert_eq!(events.len(), 1);
-        let event = &events[0];
-        let raw = crate::coordinator_watch_delivery::notification(event);
-        db.add_message_with_seq_and_origin(
-            &event.event_id,
-            &coordinator,
-            1,
-            &MessageContent::user(&raw),
-            None,
-            None,
-            &InputOrigin::SubscriptionEvent {
-                event_id: event.event_id.clone(),
-            },
-        )
-        .await
-        .unwrap();
-        let evidence = db
-            .coordinator_watch_ending_evidence(&event.event_id)
-            .await
-            .unwrap();
-        match &case.mutation {
-            Mutation::None => {}
-            Mutation::LaterResponse { text } => {
-                db.add_message(
-                    "event-eval-later",
-                    &source.id,
-                    &MessageContent::agent(vec![ContentBlock::text(text)]),
-                    None,
-                    None,
-                )
-                .await
-                .unwrap();
-            }
-            Mutation::EditTail { text } => {
-                let content =
-                    MessageContent::agent(vec![ContentBlock::text(format!("{prefix}{text}"))]);
-                sqlx::query("UPDATE messages SET content=?1 WHERE message_id='event-eval-ending'")
-                    .bind(serde_json::to_string(&content.to_stored_json()).unwrap())
-                    .execute(db.pool())
-                    .await
-                    .unwrap();
-            }
+        let mut packets: [Vec<String>; 3] = std::array::from_fn(|_| Vec::new());
+        let mut sources = Vec::new();
+        for ordinal in 0..event_count {
+            let (raw, enriched, source) =
+                capture_occurrence(&db, &coordinator, case, ordinal).await;
+            packets[0].push(raw);
+            packets[1].push(enriched);
+            sources.push(source);
         }
         let (_, _, messages) = db
             .load_hydrated_prompt_snapshot(&coordinator)
             .await
             .unwrap()
             .into_parts();
-        let MessageContent::User(projected) = &messages[0].content else {
-            panic!("event user content")
-        };
-        let compact = projected.llm_text().to_owned();
+        assert_eq!(messages.len(), event_count);
+        for (message, source) in messages.iter().zip(&sources) {
+            assert_eq!(message.message_id, source["event_id"].as_str().unwrap());
+            let MessageContent::User(projected) = &message.content else {
+                panic!("event user content")
+            };
+            if !matches!(&case.response, Response::NoCarrier) {
+                assert!(
+                    projected.llm_text.is_some(),
+                    "captured event must use production hydration"
+                );
+            }
+            packets[2].push(projected.llm_text().to_owned());
+        }
         let retriever = Arc::new(db.fts_retriever());
         retriever.reconcile().await.unwrap();
         let runtime = Arc::new(RuntimeManager::new_with_message_retriever(
@@ -330,13 +386,8 @@ impl World {
             coordinator,
             registry,
             catalog,
-            packets: [
-                raw.clone(),
-                format!("{raw}\n{}", evidence.readable(&event.event_id)),
-                compact,
-            ],
-            source: json!({"event_id":event.event_id,"source_transcript_id":source.id,
-                "product_conversation_id":source.product_conversation_id,"ending_evidence":evidence}),
+            packets,
+            sources,
             _database_dir: database_dir,
         }
     }
@@ -448,18 +499,17 @@ async fn trial(
         &phoenix_core::domain::coordinator_authority::CoordinatorAuthority::default(),
     );
     let definitions = world.definitions(model);
-    let mut messages = vec![
-        user(format!("Earlier user request: {}", case.input)),
-        user(format!(
-            "[origin: subscription_event]\n{}",
-            world.packets[variant]
-        )),
-        user(&case.question),
-    ];
+    let mut messages = vec![user(format!("Earlier user request: {}", case.input))];
+    messages.extend(
+        world.packets[variant]
+            .iter()
+            .map(|packet| user(format!("[origin: subscription_event]\n{packet}"))),
+    );
+    messages.push(user(&case.question));
     let mut record = json!({"case":case.id,"group":case.group,"variant":(["A","B","C"][variant]),
         "repetition":repetition,"model":model,"effort":effort,"system_prompt":prompt,"system_sha256":digest(prompt.as_bytes()),
         "tool_definitions":definitions,"tools_sha256":digest(serde_json::to_vec(&definitions).unwrap()),
-        "initial_messages":message_snapshot(&messages),"source":world.source,"steps":[],"termination":"prepared"});
+        "initial_messages":message_snapshot(&messages),"sources":world.sources,"steps":[],"termination":"prepared"});
     persist(path, &record);
     let Some(client) = client else { return };
     let began = Instant::now();
@@ -598,7 +648,7 @@ fn event_eval_effect_boundary_rejects_mutation_and_remote_routing() {
     let corpus: Corpus = serde_json::from_str(CASES).unwrap();
     let expected: Value = serde_json::from_str(EXPECTED).unwrap();
     assert_eq!(corpus.version, 1);
-    assert_eq!(corpus.cases.len(), 6);
+    assert_eq!(corpus.cases.len(), 7);
     for case in corpus.cases {
         assert!(expected.get(&case.id).is_some());
     }
@@ -614,7 +664,65 @@ async fn event_eval_fixture_uses_captured_evidence_and_real_read_tools() {
     }));
     for case in &corpus.cases {
         let world = World::new(case, models.clone()).await;
-        let event_id = world.source["event_id"].as_str().unwrap();
+        let event_id = world.sources[0]["event_id"].as_str().unwrap();
+        let event_count = case.event_count.unwrap_or(1);
+        assert_eq!(world.sources.len(), event_count);
+        for packets in &world.packets {
+            assert_eq!(packets.len(), event_count);
+        }
+        for field in [
+            "event_id",
+            "source_transcript_id",
+            "product_conversation_id",
+        ] {
+            let distinct = world
+                .sources
+                .iter()
+                .map(|source| source[field].as_str().unwrap())
+                .collect::<std::collections::BTreeSet<_>>();
+            assert_eq!(distinct.len(), event_count, "distinct {field}");
+        }
+        let inputs = world
+            .sources
+            .iter()
+            .filter_map(|source| source["ending_evidence"]["settled_input"]["message_id"].as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            inputs.len(),
+            event_count,
+            "distinct captured input identities"
+        );
+        if matches!(&case.response, Response::ToolOnly) {
+            let endings = world
+                .sources
+                .iter()
+                .filter_map(|source| source["ending_evidence"]["response"]["message_id"].as_str())
+                .collect::<std::collections::BTreeSet<_>>();
+            assert_eq!(
+                endings.len(),
+                event_count,
+                "distinct tool-only ending identities"
+            );
+            assert!(world
+                .sources
+                .iter()
+                .all(|source| source["ending_evidence"]["response"]["prose_bytes"] == 0));
+        }
+        let captured_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM coordinator_watch_ending_evidence")
+                .fetch_one(world.runtime.db().pool())
+                .await
+                .unwrap();
+        assert_eq!(captured_count, i64::try_from(event_count).unwrap());
+        for source in &world.sources {
+            let (output, error, denied) = world
+                .dispatch(
+                    "read_event_evidence",
+                    &json!({"event_id":source["event_id"],"cursor":0}),
+                )
+                .await;
+            assert!(!error && !denied, "{output}");
+        }
         for name in [
             "think",
             "query_database",
@@ -632,11 +740,11 @@ async fn event_eval_fixture_uses_captured_evidence_and_real_read_tools() {
             ("search_conversations", json!({"query":"readiness"})),
             (
                 "read_conversation",
-                json!({"conversation_id":format!("@transcript:{}", world.source["source_transcript_id"].as_str().unwrap())}),
+                json!({"conversation_id":format!("@transcript:{}", world.sources[0]["source_transcript_id"].as_str().unwrap())}),
             ),
             (
                 "resolve_reference",
-                json!({"reference":format!("@conv:{}", world.source["product_conversation_id"].as_str().unwrap())}),
+                json!({"reference":format!("@conv:{}", world.sources[0]["product_conversation_id"].as_str().unwrap())}),
             ),
             (
                 "think",
@@ -713,6 +821,11 @@ async fn ember_event_eval() {
         .expect("explicit model unavailable; no fallback");
     let client = (mode == "live").then_some(configured_client);
     let corpus: Corpus = serde_json::from_str(CASES).unwrap();
+    let planned_trials: usize = corpus
+        .cases
+        .iter()
+        .map(|case| 3 * if case.group == "control" { 3 } else { 1 })
+        .sum();
     let mut manifest = json!({"mode":mode,"model":model,"effort":effort,
         "connection":models.connection_for_model(&model),"endpoint_configuration_sha256":endpoint_hash,
         "cases_sha256":digest(CASES),"expected_sha256":digest(EXPECTED),"expected_shown_to_model":false,
@@ -721,7 +834,8 @@ async fn ember_event_eval() {
             "timeout_seconds":60,"observed_input_token_stop_threshold":INPUT_STOP},
         "promotion":{"attribution_or_authority_failures":0,"targeted_read_reduction_min_percent":25,
             "control_input_regression_max_percent":10,"control_median_latency_regression_max_percent":20},
-        "repetitions":{"targeted":1,"control":3},
+        "repetitions":{"targeted":1,"control":3},"planned_trials":planned_trials,
+        "potential_per_trial_call_sum":planned_trials * MAX_CALLS,
         "status":"running","trials":[]});
     persist(&output.join("manifest.json"), &manifest);
     let mut budget = Budget::default();
