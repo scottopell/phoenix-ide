@@ -22,12 +22,12 @@ runSurfaceCapture({
       if (media.coarse !== !!viewport.hasTouch) throw new Error('Capture pointer media does not match requested context');
       const rows = page.locator('.product-conversation-list-row');
       await rows.first().waitFor();
-      await page.screenshot({ path: `${outDir}/${id}--${viewport.name}.png`, fullPage: true });
+      await page.screenshot({ path: `${outDir}/${id}--${viewport.name}.png`, fullPage: false });
       await page.locator('.sidebar').screenshot({ path: `${outDir}/${id}--${viewport.name}-sidebar.png` });
       const controls = await page.locator('.sidebar-header button, .sidebar-header a, .sidebar-lifecycle-tab, .ember-entry').evaluateAll(elements => elements.map(el => {
         const r = el.getBoundingClientRect();
         const sidebar = el.closest('.sidebar').getBoundingClientRect();
-        return { name: el.getAttribute('aria-label') ?? el.textContent.trim(), x: r.x, right: r.right,
+        return { name: el.getAttribute('aria-label') ?? el.textContent.trim(), contentFits: el.scrollWidth <= el.clientWidth, x: r.x, right: r.right,
           width: r.width, height: r.height, sidebarRight: sidebar.right, sidebarLeft: sidebar.x };
       }));
       await writeFile(`${outDir}/${id}--${viewport.name}.controls.json`, JSON.stringify(controls, null, 2));
@@ -51,6 +51,7 @@ runSurfaceCapture({
       if (geometry.length !== 5) throw new Error('Missing visual state rows');
       if (process.env.SIDEBAR_VISUAL_BASELINE !== '1') {
         for (const c of controls) {
+          if (c.name === '+ New' && !c.contentFits) throw new Error('New label clipped');
           if (c.x < c.sidebarLeft - 1 || c.right > c.sidebarRight + 1) throw new Error('Header control escapes sidebar');
           if (viewport.hasTouch && (c.width < 44 || c.height < 44)) throw new Error('Header touch target smaller than 44px');
         }
@@ -73,12 +74,12 @@ runSurfaceCapture({
       await page.waitForFunction(() => document.querySelectorAll('.product-conversation-list-row.keyboard-selected').length === 1);
       await page.keyboard.press('ArrowDown');
       if (!(await rows.nth(1).evaluate(el => el.classList.contains('keyboard-selected')))) throw new Error('Arrow navigation lost');
-      await page.screenshot({ path: `${outDir}/${id}--${viewport.name}-keyboard.png`, fullPage: true });
+      await page.screenshot({ path: `${outDir}/${id}--${viewport.name}-keyboard.png`, fullPage: false });
       const trigger = rows.first().getByRole('button', { name: /Actions for conversation/ });
       await trigger.focus();
       await page.keyboard.press('Enter');
       await rows.first().getByRole('button', { name: /Rename conversation/ }).waitFor();
-      await page.screenshot({ path: `${outDir}/${id}--${viewport.name}-menu.png`, fullPage: true });
+      await page.screenshot({ path: `${outDir}/${id}--${viewport.name}-menu.png`, fullPage: false });
       return true;
     }
     if (id !== 'product-actions-continued') return false;

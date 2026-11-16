@@ -1,3 +1,4 @@
+import './SidebarFixture.css';
 import { useEffect, useMemo, useState } from 'react';
 import { MemoryRouter } from 'react-router-dom';
 import { Sidebar } from '../../components/Sidebar';
