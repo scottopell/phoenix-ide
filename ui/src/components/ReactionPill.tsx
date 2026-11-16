@@ -297,8 +297,9 @@ export function ReactionPill({ source, sourceRange, touchDocked = false, capture
                 }
               }}
             />
-            <button type="button" aria-label="Add to draft" title={available ? 'Add to draft (Cmd/Ctrl+Enter)' : 'Draft unavailable. Your reaction is retained.'} disabled={!available || !body.trim()} onClick={onAdd}>
+            <button type="button" className="reaction-pill-add" aria-label="Add to message" title={available ? 'Add to message (Cmd/Ctrl+Enter)' : 'Draft unavailable. Your reaction is retained.'} disabled={!available || !body.trim()} onClick={onAdd}>
               <ListPlus size={20} aria-hidden="true" />
+              <span>Add to message</span>
             </button>
           </>
         )}

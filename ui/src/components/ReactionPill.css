@@ -92,6 +92,18 @@
   cursor: default;
 }
 
+.reaction-pill .reaction-pill-add {
+  gap: 6px;
+  padding: 0 10px;
+  appearance: none;
+  color: var(--accent-blue);
+  font-size: 12px;
+  font-weight: 500;
+  white-space: nowrap;
+}
+
+.reaction-pill-add svg { flex-shrink: 0; }
+
 .reaction-pill .reaction-pill-return {
   flex: 1;
   min-width: 0;

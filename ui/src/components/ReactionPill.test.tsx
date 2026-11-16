@@ -175,7 +175,7 @@ describe('reaction pill', () => {
     fireEvent.click(returnButton);
     await waitFor(() => expect(returnButton).toHaveTextContent('Passage unavailable. Your reaction is saved here.'));
     expect(screen.getByRole('textbox')).toHaveValue('Retained desktop note');
-    expect(screen.getByRole('button', { name: 'Add to draft' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Add to message' })).toBeDisabled();
     expect(add).not.toHaveBeenCalled();
   });
 
@@ -345,7 +345,7 @@ describe('reaction pill', () => {
     expect(input).not.toHaveFocus();
     expect(screen.getByRole('status')).toHaveTextContent('Draft unavailable. Your reaction is retained.');
     expect(screen.getByText('“second” · draft unavailable; retained')).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: 'Add to draft' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Add to message' })).toBeDisabled();
 
     viewport.height = 420;
     view.rerender(<Fixture touchDocked body="Retained" composerKey="resumed" composerTop={340} bubbleRef={bubbleRef} />);
@@ -356,7 +356,7 @@ describe('reaction pill', () => {
     expect(restoredInput).toHaveValue('Retained');
     expect(restoredInput).not.toHaveFocus();
     expect(screen.queryByText('Draft unavailable · reaction retained')).not.toBeInTheDocument();
-    expect(screen.getByRole('button', { name: 'Add to draft' })).toBeEnabled();
+    expect(screen.getByRole('button', { name: 'Add to message' })).toBeEnabled();
     expect(add).not.toHaveBeenCalled();
     viewport.height = 700;
   });

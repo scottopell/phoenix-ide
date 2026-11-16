@@ -455,7 +455,7 @@ AND SHALL restore the highlight when the source passage mounts after transcript 
 THE SYSTEM SHALL wrap reaction text and grow the input vertically as soon as it exceeds the visible line width
 AND SHALL shrink the input when text is removed
 AND SHALL bound its height to fit the visible viewport, using vertical scrolling for longer reactions
-AND SHALL provide explicit Add to draft and dismiss controls.
+AND SHALL provide explicit Add to message and dismiss controls.
 
 WHEN the selected passage leaves the transcript viewport or its row unmounts
 THE SYSTEM SHALL retain an unfinished reaction in a compact dock with a reaction preview and Return to passage action.
@@ -473,7 +473,7 @@ AND SHALL keep the touch/coarse-pointer dock directly above the current composer
 
 ### REQ-PF-019: Add Reaction to Draft
 
-WHEN the user activates Add to draft with a non-blank reaction
+WHEN the user activates Add to message with a non-blank reaction
 THE SYSTEM SHALL add one annotation card owning the complete selected quotation, its source identity, and the reaction to the current draft exactly once
 AND SHALL preserve existing draft text, including intervening edits and whitespace
 AND SHALL NOT submit a message, write to the clipboard, or modify the review-note collection.
@@ -526,7 +526,7 @@ WHEN append succeeds
 THE SYSTEM SHALL dismiss and clear the reaction input and acknowledge the addition accessibly
 AND SHALL preserve the transcript reading position without focusing the composer.
 
-THE SYSTEM SHALL label the action Add to draft and use an append-oriented icon
+THE SYSTEM SHALL visibly label the action Add to message and use an append-oriented icon
 AND SHALL support Cmd/Ctrl+Enter to add and IME composition without accidental addition.
 
 WHEN a visible anchored pill is unfocused and the user presses unmodified Enter outside another interactive control
