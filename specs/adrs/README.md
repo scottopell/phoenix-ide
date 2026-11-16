@@ -45,6 +45,7 @@ Allowing gaps does not approve an ID allocation, decision, or publication.
 | ADR | Title | Status | Affects |
 | --- | --- | --- | --- |
 | [262](262_retire-delivery-roadmap-with-preserved-history.md) | Retire the delivery roadmap while preserving historical evidence | Accepted | REQ-ROADMAP-001–014 |
+| [260](260_coordinator-tracking-retains-intent-at-the-transcript-tail.md) | Retain Coordinator intent independently of continuations | Accepted | REQ-TRACK-001–007, REQ-GR-011 |
 | [259](259_bounded-resource-recorder-reuses-shared-observations.md) | A bounded resource recorder reuses shared observations | Accepted | REQ-DEPLOY-007a–007d |
 | [258](258_search-hidden-visibility-trusts-fts-index.md) | Ranked search trusts indexed text for hidden-message eligibility | Accepted | REQ-RET-003, REQ-RET-007 |
 | [257](257_watch-list-requests-separate-local-and-remote-shapes.md) | Watch listing separates local and remote request shapes | Accepted | REQ-FED-009 |
