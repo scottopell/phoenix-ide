@@ -85,7 +85,7 @@ export async function captureDelayedImages({ page, id, outDir }) {
   };
 
   try {
-    for (const mode of ['reader-1', 'reader-2', 'reader-3', 'reader-4', 'concurrent', 'follow-latest', 'end-navigation']) {
+    for (const mode of ['reader-1', 'reader-2', 'reader-3', 'reader-4', 'rapid-successive', 'concurrent', 'follow-latest', 'end-navigation']) {
       const pending = new Map();
       const counts = new Map();
       const hold = (route) => {
@@ -130,7 +130,7 @@ export async function captureDelayedImages({ page, id, outDir }) {
           tail(end);
           assert.ok(end.top > before.top + 20, 'End must actually leave the reading position');
         }
-        const release = async (keys) => {
+        const release = async (keys, settleMs = 800) => {
           await Promise.all(keys.map(async (key) => {
             assert.ok(pending.has(key), `Missing held request: ${key}`);
             await pending.get(key).fulfill(imageResponse);
@@ -141,13 +141,13 @@ export async function captureDelayedImages({ page, id, outDir }) {
               .find((node) => new URL(node.src).searchParams.get('id') === key);
             return image?.complete && image.naturalWidth === 640;
           }), keys);
-          await settle();
+          await page.waitForTimeout(settleMs);
         };
         const check = mode === 'follow-latest' || mode === 'end-navigation' ? tail : reader;
         if (mode === 'concurrent') {
           await release(['earlier', 'anchor']);
         } else {
-          await release(['earlier']);
+          await release(['earlier'], mode === 'rapid-successive' ? 50 : 800);
           const earlier = await sample(mode, 'earlier-loaded');
           images(earlier, ['earlier']);
           check(earlier);

@@ -1159,9 +1159,10 @@ function VirtualTranscriptInner<T>(
     setTailFollowAllowed(allowed) {
       const current = storeRef.current;
       if (current) {
+        const changed = current.tailFollowAllowed !== allowed;
         current.tailFollowAllowed = allowed;
         if (allowed && current.pinned) current.contentWitness = null;
-        else if (!allowed) scheduleWitness();
+        else if (!allowed && changed) scheduleWitness();
       }
     },
     isProgrammaticScroll(scrollTop) {

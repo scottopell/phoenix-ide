@@ -127,7 +127,7 @@ beforeEach(() => {
 });
 
 describe('VirtualTranscript', () => {
-  it('holds a settled paragraph through image growth inside its row and growth before the row', () => {
+  it.each(['baseline', 'unchanged-policy', 'policy-transition'] as const)('holds a settled paragraph through image growth (%s)', mode => {
     vi.useFakeTimers();
     const originalRect = HTMLElement.prototype.getBoundingClientRect;
     try {
@@ -173,7 +173,11 @@ describe('VirtualTranscript', () => {
       // The hit lands in the row gutter, not on the paragraph. The first text
       // block is clipped; the next block is image-only.
       Object.defineProperty(document, 'elementFromPoint', { configurable: true, value: () => row });
-      act(() => { viewport.scrollTop = 600; fireEvent.scroll(viewport); });
+      act(() => {
+        viewport.scrollTop = 600;
+        fireEvent.scroll(viewport);
+        ref.current?.setTailFollowAllowed(false);
+      });
       act(() => vi.advanceTimersByTime(SCROLL_SETTLE_MS + 2));
       expect(setup.getBoundingClientRect().top).toBe(-15);
       expect(image.getBoundingClientRect().top).toBe(15);
@@ -183,6 +187,8 @@ describe('VirtualTranscript', () => {
       act(() => resizeObservers[0]!.triggerEntries([[row, 1075]]));
       expect(viewport.scrollTop).toBe(675);
       expect(paragraph.getBoundingClientRect().top).toBe(60);
+      if (mode === 'unchanged-policy') act(() => ref.current?.setTailFollowAllowed(false));
+      act(() => vi.advanceTimersByTime(50));
       earlierHeight += 20;
       screen.getByTestId('payload-before').setAttribute('data-height', '220');
       act(() => resizeObservers[0]!.triggerEntries([[earlier, 220]]));
@@ -197,6 +203,8 @@ describe('VirtualTranscript', () => {
       expect(writes).toEqual([715]);
       expect(viewport.scrollTop).toBe(715);
       expect(paragraph.getBoundingClientRect().top).toBe(60);
+      if (mode === 'unchanged-policy') act(() => ref.current?.setTailFollowAllowed(false));
+      act(() => vi.advanceTimersByTime(50));
       imageHeight += 10;
       payload.setAttribute('data-height', '1095');
       act(() => resizeObservers[0]!.triggerEntries([[row, 1095]]));
@@ -205,7 +213,14 @@ describe('VirtualTranscript', () => {
       screen.getByTestId('payload-item-0').setAttribute('data-height', '30');
       act(() => resizeObservers[0]!.triggerEntries([[below, 30]]));
       expect(viewport.scrollTop).toBe(725);
-      fireEvent.wheel(viewport);
+      if (mode === 'policy-transition') {
+        act(() => {
+          ref.current?.setTailFollowAllowed(true);
+          ref.current?.setTailFollowAllowed(false);
+        });
+      } else {
+        fireEvent.wheel(viewport);
+      }
       imageHeight += 30;
       payload.setAttribute('data-height', '1125');
       act(() => resizeObservers[0]!.triggerEntries([[row, 1125]]));
@@ -228,7 +243,10 @@ describe('VirtualTranscript', () => {
       payload.setAttribute('data-height', '1180');
       act(() => resizeObservers[0]!.triggerEntries([[row, 1180]]));
       expect(viewport.scrollTop).toBe(755);
-      act(() => ref.current?.scrollToTail());
+      act(() => {
+        ref.current?.setTailFollowAllowed(true);
+        ref.current?.scrollToTail();
+      });
       imageHeight += 40;
       payload.setAttribute('data-height', '1220');
       const tailTop = viewport.scrollTop;
