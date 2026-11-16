@@ -469,6 +469,85 @@ mod live {
         denied: Arc<Mutex<Vec<String>>>,
         source_checkpoint_presence: Arc<Mutex<Vec<bool>>>,
     }
+    async fn admitted_input(
+        db: &crate::db::Database,
+        source: &str,
+        prompt: &str,
+        input_id: &str,
+    ) -> Event {
+        use phoenix_core::domain::sm_event::{
+            DirectTurnAttemptAuthority, PreparedDirectTurnDelivery, PreparedDirectTurnPayload,
+            SubmittedDirectTurnExpansionPolicy, SubmittedDirectTurnIdentity,
+        };
+        use phoenix_workflow::{
+            AcceptedDisposition, ClientTurnKey, ConversationAuthority, LeaseExpiry, PreparedTurn,
+            ProcessIncarnation, Timestamp, TurnOutcome,
+        };
+        let payload = PreparedDirectTurnPayload::from_parts(
+            SubmittedDirectTurnIdentity {
+                origin: phoenix_core::domain::db_schema::InputOrigin::UserApi,
+                text: prompt.into(),
+                images: vec![],
+                files: vec![],
+                message_id: input_id.into(),
+                user_agent: Some("isolated-tracking-evaluation".into()),
+                skill_invocation: None,
+                expansion_policy: SubmittedDirectTurnExpansionPolicy::LiteralText,
+            },
+            PreparedDirectTurnDelivery {
+                text: prompt.into(),
+                llm_text: None,
+                images: vec![],
+                files: vec![],
+                user_agent: Some("isolated-tracking-evaluation".into()),
+                skill_invocation: None,
+            },
+        );
+        let now = u64::try_from(Utc::now().timestamp()).unwrap();
+        let repo = db.workflow_repository();
+        let accepted = repo
+            .accept_authoritative_turn(&phoenix_db::workflow::AcceptAuthoritativeTurn {
+                client_key: ClientTurnKey::new(input_id).unwrap(),
+                prepared: PreparedTurn::from_exact_payload(
+                    &ConversationAuthority(source.into()),
+                    payload.to_exact_bytes().unwrap(),
+                ),
+                disposition: AcceptedDisposition::Runtime,
+                accepted_at: Timestamp(now),
+            })
+            .await
+            .established()
+            .expect("input acceptance is classified")
+            .unwrap();
+        let TurnOutcome::Created { turn_id, .. } = accepted.outcome else {
+            panic!("new isolated input must be accepted")
+        };
+        let workflow_id = repo.workflow_id_for_turn(turn_id).await.unwrap().unwrap();
+        let authority = repo
+            .claim_authoritative_turn(&phoenix_db::workflow::ClaimAuthoritativeTurnInput {
+                turn_id,
+                workflow_id,
+                process_incarnation: ProcessIncarnation(1),
+                now: Timestamp(now),
+                lease_until: LeaseExpiry(now + 300),
+            })
+            .await
+            .unwrap()
+            .authority
+            .expect("new isolated input owns its workflow attempt");
+        Event::AuthoritativeUserMessage {
+            payload,
+            authority: DirectTurnAttemptAuthority::new(
+                authority.workflow_id.0,
+                turn_id.0,
+                authority.effect_id.0,
+                authority.attempt_id.0,
+                authority.declared_workflow_version.0,
+                authority.generation.0,
+                authority.process_incarnation.0,
+            ),
+        }
+    }
     impl<C: LlmClient + 'static> Fixture<C> {
         #[allow(clippy::too_many_lines)]
         async fn turn(&self, source: &str, prompt: &str) -> String {
@@ -524,17 +603,9 @@ mod live {
             .with_fatal_local_authority_fence(self.manager.fatal_local_authority_fence.clone());
             let task = tokio::spawn(runtime.run());
             let input_id = uuid::Uuid::new_v4().to_string();
-            tx.send(Event::UserMessage {
-                text: prompt.into(),
-                llm_text: None,
-                images: vec![],
-                files: vec![],
-                message_id: input_id.clone(),
-                user_agent: Some("isolated-tracking-evaluation".into()),
-                skill_invocation: None,
-            })
-            .await
-            .unwrap();
+            tx.send(admitted_input(&self.db, source, prompt, &input_id).await)
+                .await
+                .unwrap();
             let result = tokio::time::timeout(std::time::Duration::from_secs(120), async {
                 loop {
                     let state = state_rx.borrow().clone();
@@ -558,7 +629,8 @@ mod live {
                             .iter()
                             .position(|message| message.message_id == input_id)
                         {
-                            assert!(!messages[index + 1..].iter().any(|message| matches!(&message.content, MessageContent::System(content) if content.text.contains("Tool-use iteration limit reached"))), "bounded evaluation exhausted its per-turn tool-cycle cap");
+                            assert_eq!(messages[index].origin, phoenix_core::domain::db_schema::InputOrigin::UserApi, "fixture exercises actual human-input admission rather than generated legacy messages");
+                            assert!(!messages[index + 1..].iter().any(|message| matches!(&message.content, MessageContent::System(notice) if notice.text.contains("Tool-use iteration limit reached"))), "bounded evaluation exhausted its per-turn tool-cycle cap");
                             if let Some(text) = messages[index + 1..].iter().rev().find_map(
                                 |message| match &message.content {
                                     MessageContent::Agent(blocks) => {
@@ -829,6 +901,22 @@ mod live {
         .await
         .unwrap();
         let recovered = fixture.turn(&successor.id, "Hello.").await;
+        let cue: Option<String> = sqlx::query_scalar(
+            "SELECT cue_item_id FROM coordinator_tracking_observations WHERE transcript_id=?1",
+        )
+        .bind(&successor.id)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            cue.as_deref(),
+            saved
+                .items
+                .iter()
+                .find(|item| item.kind == TrackingKind::RequestedWork)
+                .map(|item| item.id.as_str()),
+            "due review must be admitted independently of model behavior"
+        );
         assert!(
             recovered.contains("Cobalt"),
             "due forgotten request returns without user naming it: {recovered}"
