@@ -244,6 +244,8 @@ mod tests {
             .unwrap();
         sqlx::query("CREATE TRIGGER count_live_closure AFTER UPDATE OF cancellation_requested_at_unix_micros ON sub_agent_runs BEGIN INSERT INTO closure_counts VALUES (NEW.child_conversation_id, 1) ON CONFLICT(child) DO UPDATE SET n = n + 1; END").execute(manager.db().pool()).await.unwrap();
         cancel(&mut runtime).await;
+        let cancellation_entered_at = runtime.state_updated_at;
+        let cancellation_deadline = runtime.deadline;
         runtime
             .native_spawn_handoff
             .as_mut()
@@ -256,6 +258,8 @@ mod tests {
             .await
             .unwrap()
             .expect("one reconciled cancellation receipt");
+        assert_eq!(runtime.state_updated_at, cancellation_entered_at);
+        assert_eq!(runtime.deadline, cancellation_deadline);
         assert!(
             matches!(&event, Event::ToolAborted { tool_use_id } if *tool_use_id == origin.tool_use_id)
         );
@@ -834,7 +838,7 @@ where
                             previous_state: self.state.clone(),
                             members: members.clone(),
                         };
-                        let updated_at = Utc::now();
+                        let updated_at = self.state_updated_at;
                         let owner = self.admit_authoritative_effect()?;
                         let mut authority = super::super::native_spawn::NativeSpawnWriteAuthority {
                             owner: Some(owner),

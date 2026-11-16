@@ -845,9 +845,9 @@ impl Database {
                 return Err(lifecycle_conflict("unactivated membership lacks exact terminal batch"));
             }
             let encoded = serde_json::to_string(&state).map_err(|e| DbError::Serialization(e.to_string()))?;
-            sqlx::query("UPDATE conversations SET state = ?2, state_kind = ?3, state_updated_at = ?4, updated_at = ?4 WHERE id = ?1")
+            sqlx::query("UPDATE conversations SET state = ?2, state_kind = ?3, state_updated_at = ?4, updated_at = ?5 WHERE id = ?1")
                 .bind(&origin.parent_conversation_id).bind(&encoded).bind(crate::conv_state_kind(&state))
-                .bind(state_updated_at.to_rfc3339()).execute(&mut *tx).await?;
+                .bind(state_updated_at.to_rfc3339()).bind(Utc::now().to_rfc3339()).execute(&mut *tx).await?;
             Ok::<_, DbError>((tx, state, encoded))
         }.await;
         let (tx, state, encoded) = match prepared {
@@ -2048,11 +2048,16 @@ mod tests {
             .unwrap()
             .unwrap();
             let membership = native_membership();
-            db.update_conversation_state("parent", &membership.previous_state)
+            let phase_entered_at = Utc::now() - chrono::Duration::days(1);
+            db.update_conversation_state_at("parent", &membership.previous_state, phase_entered_at)
                 .await
                 .unwrap();
             let result = db
-                .establish_unactivated_sub_agent_membership_with_cut(&membership, Utc::now(), cut)
+                .establish_unactivated_sub_agent_membership_with_cut(
+                    &membership,
+                    phase_entered_at,
+                    cut,
+                )
                 .await;
             match cut {
                 TerminalEvidenceTransactionCut::BeforeCommit => {
@@ -2072,6 +2077,9 @@ mod tests {
                 )),
                 TerminalEvidenceTransactionCut::None => unreachable!(),
             }
+            let parent = db.get_conversation("parent").await.unwrap();
+            assert_eq!(parent.state_updated_at, phase_entered_at);
+            assert!(parent.updated_at > phase_entered_at);
             assert!(!db.sub_agent_terminal_is_accepted("child").await.unwrap());
             assert_eq!(
                 db.owed_sub_agent_terminals("parent").await.unwrap().len(),
