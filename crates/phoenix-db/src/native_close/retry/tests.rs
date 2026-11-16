@@ -150,6 +150,14 @@ fn refused(result: LocalAuthorityResult<DbResult<NativeCloseRetryResult>>) {
     assert!(matches!(&result, LocalAuthorityResult::DurableFactEstablished(Err(_))), "{result:?}");
 }
 
+fn success_recorded(result: LocalAuthorityResult<DbResult<()>>) {
+    assert!(matches!(&result, LocalAuthorityResult::DurableFactEstablished(Ok(()))), "{result:?}");
+}
+
+fn success_refused(result: LocalAuthorityResult<DbResult<()>>) {
+    assert!(matches!(&result, LocalAuthorityResult::DurableFactEstablished(Err(_))), "{result:?}");
+}
+
 async fn assert_no_admission(db: &Database, attempt: &CloseAttemptId) {
     let counts: (i64, i64, i64, i64, i64) = sqlx::query_as(
         "SELECT
@@ -325,9 +333,9 @@ async fn native_retry_atomically_binds_original_plan_and_replays_after_progress(
         assessment.proof.snapshot.generation().into(), assessment.proof.snapshot.fingerprint().into(),
         assessment.command.request_id().to_string(), assessment.command.fingerprint().into(),
     ));
-    let run = CloseRunRef { attempt_id: failure.attempt_id.clone(), ordinal: receipt.admitted.run_ordinal };
-    db.record_close_safe_retry_success(&run, &assessment.request.remaining_effects[0], "exact identity retired")
-        .await.unwrap();
+    success_recorded(db.record_native_close_retry_success(
+        &assessment.command, &receipt.admitted, &assessment.request.remaining_effects[0], "exact identity retired",
+    ).await);
     assessment.proof.outcomes.clear();
     assessment.request.remaining_effects.clear();
     match db.apply_native_close_explicit_retry(&assessment).await {
@@ -512,6 +520,107 @@ async fn native_retry_uses_g1_residuals_not_g2_success() {
     assert_eq!(bound, (original.generation().into(), original.fingerprint().into()));
     let run = CloseRunRef { attempt_id: failure.attempt_id.clone(), ordinal: receipt.admitted.run_ordinal };
     assert!(db.close_safe_retry_progress(&run).await.unwrap().pending.iter().any(|effect| effect.resource == worktree));
+    let effect = assessment.request.remaining_effects.iter()
+        .find(|effect| effect.resource == worktree).unwrap();
+    success_recorded(db.record_native_close_retry_success(
+        &assessment.command, &receipt.admitted, effect, "G1 worktree retired under native plan",
+    ).await);
+    let progress = db.close_safe_retry_progress(&run).await.unwrap();
+    assert_eq!(progress.successful, vec![effect.clone()]);
+    assert!(!progress.pending.contains(effect));
+    let current = current_test_snapshot(&db, failure.attempt_id.as_str()).await;
+    assert_ne!(current, original);
+    let retained: (String, String) = sqlx::query_as(
+        "SELECT inspection_generation, inspection_fingerprint FROM native_close_retry_plans",
+    ).fetch_one(db.pool()).await.unwrap();
+    assert_eq!(retained, bound);
+}
+
+#[tokio::test]
+async fn native_retry_success_requires_exact_live_receipt_effect_and_evidence_before_replay() {
+    use phoenix_core::domain::close::{GitPathIdentity, WorktreeFingerprint};
+
+    let db = Database::open_in_memory().await.unwrap();
+    let failure = fixture(&db, Vec::new(), true).await;
+    let assessment = assess(&db, &failure, "success-binding").await;
+    let receipt = admitted(db.apply_native_close_explicit_retry(&assessment).await);
+    let run = CloseRunRef {
+        attempt_id: failure.attempt_id.clone(),
+        ordinal: receipt.admitted.run_ordinal,
+    };
+    let effect = assessment.request.remaining_effects.iter()
+        .find(|effect| effect.resource.kind() == RetiredResourceKind::Worktree).unwrap();
+    let LossItemIdentity::Worktree(worktree) = effect.resource.identity() else {
+        panic!("expected captured worktree");
+    };
+    // These share the persisted identity value but not the complete captured identity.
+    let forged_effects: Vec<_> = [
+        WorktreeIdentity::from_parts(
+            worktree.id().clone(), WorktreeFingerprint::parse("wrong-fingerprint").unwrap(),
+            worktree.locator().clone(),
+        ),
+        WorktreeIdentity::from_parts(
+            worktree.id().clone(), worktree.fingerprint().clone(),
+            GitPathIdentity::from_bytes(b"/wrong/worktree".to_vec()),
+        ),
+    ].into_iter().map(|identity| CloseSafeRetryEffect {
+        scope: effect.scope.clone(),
+        resource: RetiredResourceIdentity::parse(
+            RetiredResourceKind::Worktree, LossItemIdentity::Worktree(identity),
+        ).unwrap(),
+    }).collect();
+    let detail = "exact native worktree retired";
+    for forged in &forged_effects {
+        success_refused(db.record_native_close_retry_success(
+            &assessment.command, &receipt.admitted, forged, detail,
+        ).await);
+    }
+    success_refused(db.record_native_close_retry_success(
+        &assessment.command, &receipt.admitted, effect, " ",
+    ).await);
+    assert!(db.record_close_safe_retry_success(&run, effect, detail).await.is_err());
+    assert!(db.close_safe_retry_progress(&run).await.unwrap().successful.is_empty());
+    success_recorded(db.record_native_close_retry_success(
+        &assessment.command, &receipt.admitted, effect, detail,
+    ).await);
+    let before: (i64, String, i64) = sqlx::query_as(
+        "SELECT ordinal, detail, observed_at_us FROM close_run_retry_successes
+         WHERE attempt_id = ?1 AND run_ordinal = ?2",
+    ).bind(run.attempt_id.as_str()).bind(run.ordinal.get()).fetch_one(db.pool()).await.unwrap();
+    success_recorded(db.record_native_close_retry_success(
+        &assessment.command, &receipt.admitted, effect, detail,
+    ).await);
+    success_refused(db.record_native_close_retry_success(
+        &assessment.command, &receipt.admitted, effect, "conflicting evidence",
+    ).await);
+    for forged in &forged_effects {
+        success_refused(db.record_native_close_retry_success(
+            &assessment.command, &receipt.admitted, forged, detail,
+        ).await);
+    }
+    let mut wrong_run = receipt.admitted.clone();
+    wrong_run.run_ordinal = wrong_run.run_ordinal.checked_next().unwrap();
+    success_refused(db.record_native_close_retry_success(
+        &assessment.command, &wrong_run, effect, detail,
+    ).await);
+    let wrong_source = NativeCloseCommand::new(
+        assessment.command.source_transcript_id().into(),
+        phoenix_core::domain::db_schema::SourceToolCall {
+            message_id: "foreign-message".into(), tool_use_id: "foreign-tool".into(),
+        },
+        assessment.command.intent().clone(),
+    ).unwrap();
+    success_refused(db.record_native_close_retry_success(
+        &wrong_source, &receipt.admitted, effect, detail,
+    ).await);
+    assert!(db.record_close_safe_retry_success(&run, effect, detail).await.is_err());
+    let after: Vec<(i64, String, i64)> = sqlx::query_as(
+        "SELECT ordinal, detail, observed_at_us FROM close_run_retry_successes
+         WHERE attempt_id = ?1 AND run_ordinal = ?2",
+    ).bind(run.attempt_id.as_str()).bind(run.ordinal.get()).fetch_all(db.pool()).await.unwrap();
+    assert_eq!(after, vec![before]);
+    assert_eq!(db.get_close_run(&run).await.unwrap().status, CloseRunStatus::Running);
+    assert_eq!(db.close_safe_retry_progress(&run).await.unwrap().successful, vec![effect.clone()]);
 }
 
 #[tokio::test]
@@ -522,8 +631,9 @@ async fn native_second_retry_discharges_only_prior_native_bound_success() {
     let receipt = admitted(db.apply_native_close_explicit_retry(&first).await);
     let run = CloseRunRef { attempt_id: failure.attempt_id.clone(), ordinal: receipt.admitted.run_ordinal };
     let succeeded = first.request.remaining_effects[0].clone();
-    db.record_close_safe_retry_success(&run, &succeeded, "native-bound retirement succeeded")
-        .await.unwrap();
+    success_recorded(db.record_native_close_retry_success(
+        &first.command, &receipt.admitted, &succeeded, "native-bound retirement succeeded",
+    ).await);
     db.classify_interrupted_close_run(&run).await.unwrap();
     let proof = db.read_stopped_close_original_retirement_proof(&run).await.unwrap();
     let command = retry_command(&db, "second-success", NativeCloseIntent::ExplicitRetry {

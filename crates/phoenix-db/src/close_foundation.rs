@@ -5796,9 +5796,51 @@ impl Database {
     /// Persists successful retirement of one exact-run planned resource.
     ///
     /// # Errors
-    /// Rejects empty evidence, unplanned resources, stopped runs, and duplicate success.
+    /// Rejects native-managed operations, empty evidence, unplanned resources, stopped
+    /// runs without retained success, and conflicting success replay.
     pub async fn record_close_safe_retry_success(
         &self,
+        run: &CloseRunRef,
+        effect: &CloseSafeRetryEffect,
+        detail: &str,
+    ) -> DbResult<()> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let native_managed: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM close_obligations
+             WHERE attempt_id = ?1 AND native_managed = 1)",
+        )
+        .bind(run.attempt_id.as_str())
+        .fetch_one(&mut *tx)
+        .await?;
+        if native_managed {
+            return Err(close_precondition("native retry success requires its live source binding"));
+        }
+        Self::record_close_safe_retry_success_tx(&mut tx, run, effect, detail).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    // Native callers validate live source, exact receipt/header and full effect membership first.
+    pub(crate) async fn record_native_close_retry_success_effect_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        run: &CloseRunRef,
+        effect: &CloseSafeRetryEffect,
+        detail: &str,
+        effect_count: i64,
+    ) -> DbResult<()> {
+        let progress = close_safe_retry_progress_tx(tx, run).await?;
+        let count = progress.successful.len() + progress.pending.len();
+        if effect_count <= 0 || i64::try_from(count).ok() != Some(effect_count)
+            || !(progress.successful.contains(effect) || progress.pending.contains(effect))
+        {
+            return Err(close_precondition("native retry success requires the complete exact effect plan"));
+        }
+        Self::record_close_safe_retry_success_tx(tx, run, effect, detail).await
+    }
+
+    // Shared storage body; native authority is checked before even an identical replay.
+    async fn record_close_safe_retry_success_tx(
+        tx: &mut Transaction<'_, Sqlite>,
         run: &CloseRunRef,
         effect: &CloseSafeRetryEffect,
         detail: &str,
@@ -5807,7 +5849,6 @@ impl Database {
             return Err(close_precondition("retry success requires evidence"));
         }
         let identity = effect.resource.identity();
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let retained: Option<String> = sqlx::query_scalar(
                 "SELECT success.detail FROM close_run_retry_successes success
                  JOIN close_run_retry_effects planned ON planned.attempt_id = success.attempt_id
@@ -5821,7 +5862,7 @@ impl Database {
             )
             .bind(run.attempt_id.as_str()).bind(run.ordinal.get()).bind(effect.scope.as_str())
             .bind(effect.resource.kind().as_str()).bind(identity.identity_kind()).bind(identity.codec())
-            .bind(identity.value()).fetch_optional(&mut *tx).await?;
+            .bind(identity.value()).fetch_optional(&mut **tx).await?;
         if let Some(retained) = retained {
             if retained == detail {
                 return Ok(());
@@ -5830,7 +5871,7 @@ impl Database {
                 "retry success replay conflicts with retained detail",
             ));
         }
-        let progress = close_safe_retry_progress_tx(&mut tx, run).await?;
+        let progress = close_safe_retry_progress_tx(tx, run).await?;
         if !progress.pending.contains(effect) {
             return Err(close_precondition(
                 "retry success requires a pending exact-run effect",
@@ -5845,13 +5886,12 @@ impl Database {
             .bind(run.attempt_id.as_str()).bind(run.ordinal.get()).bind(effect.scope.as_str())
             .bind(effect.resource.kind().as_str()).bind(identity.identity_kind()).bind(identity.codec())
             .bind(identity.value()).bind(detail).bind(Utc::now().timestamp_micros())
-            .execute(&mut *tx).await?;
+            .execute(&mut **tx).await?;
         if inserted.rows_affected() != 1 {
             return Err(close_precondition(
                 "retry success requires exact running planned resource",
             ));
         }
-        tx.commit().await?;
         Ok(())
     }
 
@@ -13898,7 +13938,23 @@ mod tests {
             db.close_safe_retry_progress(&run).await.unwrap().pending,
             request.remaining_effects[1..]
         );
+        let retained_successes = "SELECT ordinal, detail, observed_at_us FROM close_run_retry_successes
+             WHERE attempt_id = ?1 AND run_ordinal = ?2 ORDER BY ordinal";
+        let before = sqlx::query_as::<_, (i64, String, i64)>(retained_successes).bind(run.attempt_id.as_str())
+            .bind(run.ordinal.get()).fetch_all(db.pool()).await.unwrap();
         let original = db.classify_interrupted_close_run(&run).await.unwrap();
+        // Legacy non-native exact success replay remains read-only after interruption.
+        db.record_close_safe_retry_success(&run, &request.remaining_effects[0], "worktree removed")
+            .await.unwrap();
+        assert!(db.record_close_safe_retry_success(
+            &run, &request.remaining_effects[0], "changed after interruption",
+        ).await.is_err());
+        assert!(db.record_close_safe_retry_success(
+            &run, &request.remaining_effects[1], "new success after interruption",
+        ).await.is_err());
+        let after = sqlx::query_as::<_, (i64, String, i64)>(retained_successes).bind(run.attempt_id.as_str())
+            .bind(run.ordinal.get()).fetch_all(db.pool()).await.unwrap();
+        assert_eq!(before, after);
         assert_eq!(
             original.close_outcome(),
             Some(CloseCompletionOutcome::CloseIncomplete)

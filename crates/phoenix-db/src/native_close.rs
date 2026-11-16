@@ -196,6 +196,7 @@ pub use initial::{NativeCloseInitialResult, NativeCloseReceipt, NativeCloseRunRe
 mod observe;
 mod receipts;
 mod retry;
+mod retry_execution;
 mod source_fence;
 pub use observe::{NativeCloseObservation, NativeCloseObserveReceipt, NativeCloseObserveResult};
 pub use retry::{NativeCloseRetryResult, NativeCloseRetrySourceAssessment};

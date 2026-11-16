@@ -10,6 +10,21 @@ async fn source_fence_fixture() -> (Database, Assessment, CloseRunRef) {
     (db, assessment, run)
 }
 
+async fn record_source_bound_success(
+    db: &Database,
+    assessment: &Assessment,
+    run: &CloseRunRef,
+    effect: &CloseSafeRetryEffect,
+    detail: &str,
+) -> LocalAuthorityResult<DbResult<()>> {
+    let admitted = crate::native_close::NativeCloseRunRef {
+        target: assessment.command.intent().target().clone(),
+        attempt_id: run.attempt_id.clone(),
+        run_ordinal: run.ordinal,
+    };
+    db.record_native_close_retry_success(&assessment.command, &admitted, effect, detail).await
+}
+
 async fn write_source_fence_state(
     db: &Database,
     command: &NativeCloseCommand,
@@ -223,18 +238,18 @@ async fn source_fence_preserves_successes_and_reports_only_exact_pending_effects
     assert!(before.pending.len() >= 2);
     let succeeded = before.pending[0].clone();
     let detail = "exact planned resource retired before source stop";
-    db.record_close_safe_retry_success(&run, &succeeded, detail).await.unwrap();
+    success_recorded(record_source_bound_success(&db, &assessment, &run, &succeeded, detail).await);
     let progress = db.close_safe_retry_progress(&run).await.unwrap();
     assert_eq!(progress.successful, vec![succeeded.clone()]);
     assert_eq!(progress.pending, before.pending[1..]);
 
     write_source_fence_state(&db, &assessment.command, &ConvState::Idle, false).await.unwrap();
     assert_source_fenced(&db, &assessment, &run, &progress.pending).await;
-    // An exact success replay reads the retained receipt, including after the run stops.
-    db.record_close_safe_retry_success(&run, &succeeded, detail).await.unwrap();
-    assert!(db.record_close_safe_retry_success(
-        &run, &progress.pending[0], "must not retire an effect after source stop",
-    ).await.is_err());
+    // Retained success does not authorize replay after the source and run stop.
+    success_refused(record_source_bound_success(&db, &assessment, &run, &succeeded, detail).await);
+    success_refused(record_source_bound_success(
+        &db, &assessment, &run, &progress.pending[0], "must not retire an effect after source stop",
+    ).await);
     assert!(db.complete_close_safe_retry(&run).await.is_err());
 }
 
@@ -256,8 +271,9 @@ async fn empty_pending_source_fence_does_not_invent_allowance_or_failed_resource
         let progress = db.close_safe_retry_progress(&run).await.unwrap();
         assert!(!progress.pending.is_empty());
         for effect in &progress.pending {
-            db.record_close_safe_retry_success(&run, effect, "retired before source stop")
-                .await.unwrap();
+            success_recorded(record_source_bound_success(
+                &db, &assessment, &run, effect, "retired before source stop",
+            ).await);
         }
         assert!(db.close_safe_retry_progress(&run).await.unwrap().pending.is_empty());
         write_source_fence_state(&db, &assessment.command, &ConvState::Idle, replay).await.unwrap();
@@ -273,8 +289,9 @@ async fn finalized_native_retry_only_suppresses_allowance_on_source_loss() {
         let (db, assessment, run) = source_fence_fixture().await;
         let progress = db.close_safe_retry_progress(&run).await.unwrap();
         for effect in &progress.pending {
-            db.record_close_safe_retry_success(&run, effect, "retired before finalization")
-                .await.unwrap();
+            success_recorded(record_source_bound_success(
+                &db, &assessment, &run, effect, "retired before finalization",
+            ).await);
         }
         let completed = db.complete_close_safe_retry(&run).await.unwrap();
         assert_eq!(completed.close_outcome(), Some(CloseCompletionOutcome::Archived));
@@ -338,8 +355,9 @@ async fn stopped_explicit_native_source_loss_suppresses_without_a_running_succes
         let (db, assessment, run) = source_fence_fixture().await;
         let progress = db.close_safe_retry_progress(&run).await.unwrap();
         for effect in &progress.pending {
-            db.record_close_safe_retry_success(&run, effect, "retired before interruption")
-                .await.unwrap();
+            success_recorded(record_source_bound_success(
+                &db, &assessment, &run, effect, "retired before interruption",
+            ).await);
         }
         let interruption = TerminalizeInitialCloseCleanupFailureRequest {
             failure_occurrence_id: run.failure_occurrence_id(),
@@ -452,8 +470,9 @@ async fn startup_and_observer_interrupt_native_retry_from_original_pending_plan_
                 let (db, assessment, run) = source_fence_fixture().await;
                 let before = db.close_safe_retry_progress(&run).await.unwrap();
                 assert!(before.pending.len() >= 2);
-                db.record_close_safe_retry_success(&run, &before.pending[0], "retired before interruption")
-                    .await.unwrap();
+                success_recorded(record_source_bound_success(
+                    &db, &assessment, &run, &before.pending[0], "retired before interruption",
+                ).await);
                 let pending = db.close_safe_retry_progress(&run).await.unwrap().pending;
                 set_startup_allowance_bits(&db, &run, consumed, suppressed).await;
                 let original = db.get_close_obligation(run.attempt_id.as_str()).await.unwrap();
@@ -468,8 +487,9 @@ async fn startup_and_observer_interrupt_native_retry_from_original_pending_plan_
                     CloseCleanupFailureAuthority::AttemptInterrupted).await;
                 assert_eq!(source_fence_allowance(&db, &run).await, Some((consumed, suppressed)));
                 assert_eq!(db.get_close_obligation(run.attempt_id.as_str()).await.unwrap(), original);
-                db.record_close_safe_retry_success(&run, &before.pending[0], "retired before interruption")
-                    .await.unwrap();
+                success_refused(record_source_bound_success(
+                    &db, &assessment, &run, &before.pending[0], "retired before interruption",
+                ).await);
                 let failures = db.list_close_cleanup_failures(run.attempt_id.as_str()).await.unwrap();
                 db.classify_interrupted_close_run(&run).await.unwrap();
                 db.reset_all_to_idle().await.unwrap();
@@ -526,8 +546,9 @@ async fn startup_leaves_completed_native_retry_and_allowance_untouched() {
         for suppressed in [0_i64, 1_i64] {
             let (db, assessment, run) = source_fence_fixture().await;
             for effect in db.close_safe_retry_progress(&run).await.unwrap().pending {
-                db.record_close_safe_retry_success(&run, &effect, "retired before completion")
-                    .await.unwrap();
+                success_recorded(record_source_bound_success(
+                    &db, &assessment, &run, &effect, "retired before completion",
+                ).await);
             }
             let completed = db.complete_close_safe_retry(&run).await.unwrap();
             set_startup_allowance_bits(&db, &run, consumed, suppressed).await;
