@@ -110,8 +110,10 @@ async fn native_retry_worktree_metadata_is_source_bound_to_pending_original_g1_e
         &assessment.command, &receipt.admitted, forged,
     ).await.established().unwrap().is_err());
 
-    let retained = migration_163_retained_state(&db).await;
     write_source_fence_state(&db, &assessment.command, &ConvState::Idle, false).await.unwrap();
+    // Replacing the live source durably stops its admitted successor. Compare
+    // metadata refusal against that established state, not the prior running run.
+    let retained = migration_163_retained_state(&db).await;
     let stale_results = [
         db.record_native_close_retry_worktree_cleanup_plan(
             &assessment.command, &receipt.admitted, make_request(),

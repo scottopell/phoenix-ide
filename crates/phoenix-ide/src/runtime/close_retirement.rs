@@ -9660,6 +9660,204 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    #[allow(clippy::too_many_lines)]
+    async fn native_retry_runner_completes_original_worktree_and_scope_under_new_generation() {
+        use crate::state_machine::state::{AssistantMessage, ToolCall, ToolInput};
+        use phoenix_core::domain::close::CloseRunOrdinal;
+        use phoenix_core::domain::db_schema::SourceToolCall;
+        use phoenix_core::domain::product_conversation::ProductConversationId;
+        use phoenix_core::domain::llm_types::ContentBlock;
+        use phoenix_db::native_close::{
+            NativeCloseCommand, NativeCloseIntent, NativeCloseRetrySourceAssessment,
+        };
+        use phoenix_db::{AdmitCloseSafeRetryRequest, CloseRetryRequestedBy};
+
+        struct Assessment {
+            command: NativeCloseCommand,
+            original: super::NativeCloseRetryAssessment,
+            request: AdmitCloseSafeRetryRequest,
+        }
+        impl NativeCloseRetrySourceAssessment for Assessment {
+            fn command(&self) -> &NativeCloseCommand { &self.command }
+            fn original_proof(&self) -> &phoenix_db::StoppedCloseOriginalRetirementProof {
+                &self.original.original
+            }
+            fn request(&self) -> &AdmitCloseSafeRetryRequest { &self.request }
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let linked = linked_close_worktree(&temp);
+        let (fixture, original, _) =
+            stopped_native_retry_fixture_with_worktree(Some(&linked)).await;
+        let db = fixture.manager.db();
+        let obligation = db
+            .get_close_obligation(fixture.run.attempt_id.as_str())
+            .await
+            .unwrap();
+        let scope = fixture.scopes[0].as_str();
+        let generation = "G2";
+        let fingerprint = "G2-fingerprint";
+        let g2 = super::CloseRetirementSnapshot::parse(
+            format!(
+                "v1{}:{scope}{}:{generation}",
+                scope.len(),
+                generation.len()
+            ),
+            format!(
+                "v1{}:{scope}{}:{fingerprint}",
+                scope.len(),
+                fingerprint.len()
+            ),
+        )
+        .unwrap();
+        let mut tx = db.pool().begin().await.unwrap();
+        sqlx::query("UPDATE close_retirement_inspections SET generation=?1, fingerprint=?2 WHERE attempt_id=?3 AND scope=?4")
+            .bind(generation).bind(fingerprint)
+            .bind(fixture.run.attempt_id.as_str()).bind(scope)
+            .execute(&mut *tx).await.unwrap();
+        sqlx::query("UPDATE close_obligations SET inspection_generation=?1, inspection_fingerprint=?2 WHERE attempt_id=?3")
+            .bind(g2.generation()).bind(g2.fingerprint())
+            .bind(fixture.run.attempt_id.as_str())
+            .execute(&mut *tx).await.unwrap();
+        tx.commit().await.unwrap();
+        assert_ne!(g2, original.snapshot);
+
+        let assessment = fixture.manager.assess_native_close_retry(&fixture.run).await.unwrap();
+        assert_eq!(assessment.original, original);
+        assert_eq!(assessment.remaining_effects.len(), 2);
+        assert!(assessment.remaining_effects.iter().any(|effect|
+            effect.resource.kind() == super::RetiredResourceKind::Worktree));
+        assert!(assessment.remaining_effects.iter().any(|effect|
+            effect.resource.kind() == super::RetiredResourceKind::WorkScope));
+
+        let source_conversation = db
+            .get_or_create_coordinator(None, phoenix_core::llm_language::LlmLanguage::default())
+            .await
+            .unwrap();
+        let target: ProductConversationId = ProductConversationId::parse(
+            sqlx::query_scalar::<_, String>("SELECT product_conversation_id FROM close_obligations WHERE attempt_id=?1")
+                .bind(fixture.run.attempt_id.as_str()).fetch_one(db.pool()).await.unwrap(),
+        ).unwrap();
+        let source = SourceToolCall {
+            message_id: "retry-source-message".into(),
+            tool_use_id: "retry-source-call".into(),
+        };
+        let intent = NativeCloseIntent::ExplicitRetry {
+            target: target.clone(),
+            attempt_id: fixture.run.attempt_id.clone(),
+            failed_run_ordinal: fixture.run.ordinal,
+        };
+        let input = intent.source_input();
+        let state = crate::state_machine::ConvState::ToolExecuting {
+            current_tool: ToolCall::new(
+                &source.tool_use_id,
+                ToolInput::Unknown { name: "close_conversation".into(), input: input.clone() },
+            ),
+            remaining_tools: vec![],
+            completed_results: vec![],
+            pending_sub_agents: vec![],
+            assistant_message: AssistantMessage::new(
+                source.message_id.clone(),
+                vec![ContentBlock::ToolUse {
+                    id: source.tool_use_id.clone(),
+                    name: "close_conversation".into(),
+                    input,
+                }],
+                None,
+                None,
+            ),
+        };
+        db.update_conversation_state(&source_conversation.id, &state).await.unwrap();
+        let command = crate::runtime::native_close_application::retry_command_from_executing_source(
+            &state,
+            &source_conversation.id,
+            &source,
+            target,
+            fixture.run.attempt_id.clone(),
+            CloseRunOrdinal::INITIAL,
+        ).unwrap();
+        let admission = Assessment {
+            command: command.clone(),
+            request: AdmitCloseSafeRetryRequest {
+                failed_run: fixture.run.clone(),
+                requested_by: CloseRetryRequestedBy::User,
+                observed_at_us: chrono::Utc::now().timestamp_micros(),
+                precondition_resolution: "live source occurrence and retirement state revalidated".into(),
+                safety_evidence: assessment.safety_evidence.clone(),
+                remaining_effects: assessment.remaining_effects.clone(),
+            },
+            original: assessment,
+        };
+        let receipt = db
+            .apply_native_close_explicit_retry(&admission)
+            .await
+            .established()
+            .expect("retry admission must establish a durable result")
+            .unwrap();
+        let phoenix_db::native_close::NativeCloseRetryResult::NewlyAdmitted(receipt) = receipt else {
+            panic!("expected fresh explicit retry admission");
+        };
+        assert_eq!(receipt.admitted.run_ordinal.get(), 2);
+        fixture
+            .manager
+            .execute_native_close_retry(&command, &receipt.admitted)
+            .await
+            .established()
+            .expect("retry execution must establish a durable result")
+            .unwrap();
+
+        assert!(!linked.exists(), "the exact clean captured worktree should be retired");
+        let completed = db.get_close_obligation(fixture.run.attempt_id.as_str()).await.unwrap();
+        assert_ne!(completed, obligation);
+        assert_eq!(db.get_close_run(&fixture.run).await.unwrap(), original.run);
+        let retry_run = super::CloseRunRef {
+            attempt_id: fixture.run.attempt_id.clone(),
+            ordinal: receipt.admitted.run_ordinal,
+        };
+        assert_eq!(db.get_close_run(&retry_run).await.unwrap().status, super::CloseRunStatus::Completed);
+        let worktree_success: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM close_run_retry_successes success
+             JOIN close_run_retry_effects effect ON effect.attempt_id=success.attempt_id
+               AND effect.run_ordinal=success.run_ordinal AND effect.ordinal=success.ordinal
+             JOIN native_close_retry_plans plan ON plan.attempt_id=effect.attempt_id
+               AND plan.run_ordinal=effect.run_ordinal
+             WHERE success.attempt_id=?1 AND success.run_ordinal=?2
+               AND effect.resource_kind='worktree'
+               AND plan.inspection_generation=?3 AND plan.inspection_fingerprint=?4",
+        ).bind(fixture.run.attempt_id.as_str()).bind(receipt.admitted.run_ordinal.get())
+            .bind(original.snapshot.generation()).bind(original.snapshot.fingerprint())
+            .fetch_one(db.pool()).await.unwrap();
+        let scope_success: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM close_run_retry_successes success
+             JOIN close_run_retry_effects effect ON effect.attempt_id=success.attempt_id
+               AND effect.run_ordinal=success.run_ordinal AND effect.ordinal=success.ordinal
+             JOIN native_close_retry_plans plan ON plan.attempt_id=effect.attempt_id
+               AND plan.run_ordinal=effect.run_ordinal
+             WHERE success.attempt_id=?1 AND success.run_ordinal=?2
+               AND effect.resource_kind='work_scope'
+               AND plan.inspection_generation=?3 AND plan.inspection_fingerprint=?4",
+        ).bind(fixture.run.attempt_id.as_str()).bind(receipt.admitted.run_ordinal.get())
+            .bind(original.snapshot.generation()).bind(original.snapshot.fingerprint())
+            .fetch_one(db.pool()).await.unwrap();
+        assert_eq!((worktree_success, scope_success), (1, 1));
+        assert_eq!(
+            db.get_close_obligation(fixture.run.attempt_id.as_str())
+                .await
+                .unwrap()
+                .snapshot(),
+            Some(&g2),
+        );
+        assert_eq!(
+            db.list_close_retirement_inspections(fixture.run.attempt_id.as_str())
+                .await
+                .unwrap()[0]
+                .snapshot,
+            super::CloseRetirementSnapshot::parse(generation, fingerprint).unwrap(),
+        );
+    }
+
+    #[cfg(unix)]
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
     async fn native_retry_pending_worktree_uses_g1_under_g2_and_refuses_live_drift() {

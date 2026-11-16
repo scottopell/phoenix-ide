@@ -15,8 +15,8 @@ mod federated_subscriptions;
 mod goal_execution;
 mod local_goal_watch;
 mod native_close_retry_dispatch;
-mod native_close_retry_worktree_metadata;
 mod native_close_retry_failure;
+mod native_close_retry_worktree_metadata;
 mod native_close_source_fence;
 mod retire_commission_review;
 mod settle_historical_continuation;
@@ -23542,7 +23542,7 @@ mod close_completion_allowance_tests {
             2
         );
 
-        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 6);
+        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 7);
         let migrated: (i64, i64) = sqlx::query_as(
             "SELECT (SELECT COUNT(*) FROM close_original_retirement_anchors WHERE attempt_id = ?1),
                     (SELECT COUNT(*) FROM close_retirement_anchor_exclusions WHERE attempt_id = ?1)"

@@ -10,11 +10,13 @@ use crate::runtime::native_close_application::{
 use phoenix_core::domain::close::{CloseAttemptId, CloseRunOrdinal, CloseRunRef};
 use phoenix_core::domain::db_schema::SourceToolCall;
 use phoenix_core::domain::product_conversation::ProductConversationId;
-use phoenix_db::{AdmitCloseSafeRetryRequest, CloseRetryRequestedBy, StoppedCloseOriginalRetirementProof};
 use phoenix_db::native_close::{
     NativeCloseCommand, NativeCloseIntent, NativeCloseRetryResult, NativeCloseRetrySourceAssessment,
 };
 use phoenix_db::workflow::LocalAuthorityResult;
+use phoenix_db::{
+    AdmitCloseSafeRetryRequest, CloseRetryRequestedBy, StoppedCloseOriginalRetirementProof,
+};
 use std::sync::Arc;
 
 struct NativeCloseRetryAssessment {
@@ -28,9 +30,7 @@ impl NativeCloseRetrySourceAssessment for NativeCloseRetryAssessment {
         &self.command
     }
 
-    fn original_proof(
-        &self,
-    ) -> &StoppedCloseOriginalRetirementProof {
+    fn original_proof(&self) -> &StoppedCloseOriginalRetirementProof {
         &self.original.original
     }
 
@@ -114,7 +114,8 @@ where
             failed_run,
             requested_by: CloseRetryRequestedBy::User,
             observed_at_us: chrono::Utc::now().timestamp_micros(),
-            precondition_resolution: "explicit retry source and current retirement state revalidated".into(),
+            precondition_resolution:
+                "explicit retry source and current retirement state revalidated".into(),
             safety_evidence: original.safety_evidence.clone(),
             remaining_effects: original.remaining_effects.clone(),
         };
@@ -128,7 +129,11 @@ where
             owner: Some(admitted),
             abandoned_reason: "native Close retry admission or execution owner disappeared",
         };
-        match backend.db().apply_native_close_explicit_retry(&assessment).await {
+        match backend
+            .db()
+            .apply_native_close_explicit_retry(&assessment)
+            .await
+        {
             LocalAuthorityResult::DurableFactUnclassified => {
                 Err(NativeCloseApplicationError::FatalAuthority)
             }
@@ -136,11 +141,15 @@ where
                 authority.owner = None;
                 Err(NativeCloseApplicationError::Storage)
             }
-            LocalAuthorityResult::DurableFactEstablished(Ok(NativeCloseRetryResult::Replay(receipt))) => {
+            LocalAuthorityResult::DurableFactEstablished(Ok(NativeCloseRetryResult::Replay(
+                receipt,
+            ))) => {
                 authority.owner = None;
                 Ok(NativeCloseRetryResult::Replay(receipt))
             }
-            LocalAuthorityResult::DurableFactEstablished(Ok(NativeCloseRetryResult::NewlyAdmitted(receipt))) => {
+            LocalAuthorityResult::DurableFactEstablished(Ok(
+                NativeCloseRetryResult::NewlyAdmitted(receipt),
+            )) => {
                 match backend
                     .execute_native_close_retry(&command, &receipt.admitted)
                     .await

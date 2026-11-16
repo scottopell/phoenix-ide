@@ -31,8 +31,15 @@ impl super::super::RuntimeManager {
         attempt_id: CloseAttemptId,
         failed_run_ordinal: CloseRunOrdinal,
     ) -> Result<NativeCloseRetryResult, NativeCloseApplicationError> {
-        let target_gate = self.conversation_admission(target.as_str()).await.lock_owned().await;
-        let attempt_gate = self.close_retirement_execution.lock(attempt_id.as_str()).await;
+        let target_gate = self
+            .conversation_admission(target.as_str())
+            .await
+            .lock_owned()
+            .await;
+        let attempt_gate = self
+            .close_retirement_execution
+            .lock(attempt_id.as_str())
+            .await;
         let admitted = self
             .acquire_local_authority_pass()
             .map_err(|()| NativeCloseApplicationError::FatalAuthority)?;
@@ -45,19 +52,21 @@ impl super::super::RuntimeManager {
         .ok_or(NativeCloseApplicationError::Unavailable)?;
         let (response, receiver) = oneshot::channel();
         sender
-            .send(crate::runtime::AcknowledgedRuntimeRequest::ExecuteNativeCloseRetry(
-                Box::new(NativeCloseRetryRequest {
-                    source,
-                    target,
-                    attempt_id,
-                    failed_run_ordinal,
-                    backend: Arc::clone(self),
-                    admitted,
-                    target_gate,
-                    attempt_gate,
-                    response,
-                }),
-            ))
+            .send(
+                crate::runtime::AcknowledgedRuntimeRequest::ExecuteNativeCloseRetry(Box::new(
+                    NativeCloseRetryRequest {
+                        source,
+                        target,
+                        attempt_id,
+                        failed_run_ordinal,
+                        backend: Arc::clone(self),
+                        admitted,
+                        target_gate,
+                        attempt_gate,
+                        response,
+                    },
+                )),
+            )
             .await
             .map_err(|_| NativeCloseApplicationError::Unavailable)?;
         receiver
@@ -71,9 +80,9 @@ mod tests {
     use super::super::{retry_command_from_executing_source, NativeCloseSourceRefusal};
     use crate::state_machine::state::{AssistantMessage, ToolCall, ToolInput};
     use crate::state_machine::ConvState;
-    use phoenix_core::domain::llm_types::ContentBlock;
     use phoenix_core::domain::close::{CloseAttemptId, CloseRunOrdinal};
     use phoenix_core::domain::db_schema::SourceToolCall;
+    use phoenix_core::domain::llm_types::ContentBlock;
     use phoenix_core::domain::product_conversation::ProductConversationId;
     use serde_json::json;
 

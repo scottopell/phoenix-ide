@@ -22,9 +22,8 @@ fn installed_trigger_prefix(name: &str) -> Option<String> {
 }
 
 fn is_known_installed_trigger(name: &str, definition: &str) -> bool {
-    installed_trigger_prefix(name).is_some_and(|expected| {
-        definition == expected || definition == format!("{expected};")
-    })
+    installed_trigger_prefix(name)
+        .is_some_and(|expected| definition == expected || definition == format!("{expected};"))
 }
 
 pub(super) async fn run(pool: &SqlitePool, migration: &Migration) -> DbResult<()> {

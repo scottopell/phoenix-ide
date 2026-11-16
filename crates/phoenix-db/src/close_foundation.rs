@@ -4529,7 +4529,9 @@ impl Database {
         request: RecordCloseWorktreeCleanupPlanRequest,
     ) -> DbResult<()> {
         if request.resource.kind() != RetiredResourceKind::Worktree {
-            return Err(close_precondition("cleanup plan resource is not a worktree"));
+            return Err(close_precondition(
+                "cleanup plan resource is not a worktree",
+            ));
         }
         let identity = request.resource.identity();
         let administrative_dir_value = encode_host_path(&request.administrative_dir);
@@ -4578,8 +4580,14 @@ impl Database {
             .await?;
             if prior.as_ref().map(|(codec, value, incarnation)| {
                 (codec.as_str(), value.as_str(), incarnation.as_str())
-            }) != Some(("hex_path_v1", administrative_dir_value.as_str(), request.administrative_dir_incarnation.as_str())) {
-                return Err(close_precondition("exact worktree cleanup plan conflicts with durable plan"));
+            }) != Some((
+                "hex_path_v1",
+                administrative_dir_value.as_str(),
+                request.administrative_dir_incarnation.as_str(),
+            )) {
+                return Err(close_precondition(
+                    "exact worktree cleanup plan conflicts with durable plan",
+                ));
             }
         }
         Ok(())
@@ -4602,12 +4610,22 @@ impl Database {
                AND identity_codec = ?10 AND identity_value = ?11
                AND final_tombstone_root_codec IS NULL",
         )
-        .bind(&root).bind(&device).bind(&inode)
-        .bind(request.attempt_id.as_str()).bind(request.scope.as_str())
-        .bind(request.snapshot.generation()).bind(request.snapshot.fingerprint())
-        .bind(request.resource.kind().as_str()).bind(identity.identity_kind())
-        .bind(identity.codec()).bind(identity.value()).execute(&mut **tx).await?;
-        if result.rows_affected() == 1 { return Ok(()); }
+        .bind(&root)
+        .bind(&device)
+        .bind(&inode)
+        .bind(request.attempt_id.as_str())
+        .bind(request.scope.as_str())
+        .bind(request.snapshot.generation())
+        .bind(request.snapshot.fingerprint())
+        .bind(request.resource.kind().as_str())
+        .bind(identity.identity_kind())
+        .bind(identity.codec())
+        .bind(identity.value())
+        .execute(&mut **tx)
+        .await?;
+        if result.rows_affected() == 1 {
+            return Ok(());
+        }
         let prior: Option<OptionalFinalTombstoneColumns> = sqlx::query_as(
             "SELECT final_tombstone_root_codec, final_tombstone_root_value,
                     final_tombstone_root_device, final_tombstone_root_inode,
@@ -4620,9 +4638,25 @@ impl Database {
         .bind(request.snapshot.generation()).bind(request.snapshot.fingerprint())
         .bind(request.resource.kind().as_str()).bind(identity.identity_kind())
         .bind(identity.codec()).bind(identity.value()).fetch_optional(&mut **tx).await?;
-        if prior.as_ref().map(|(codec, value, device, inode, _, _)| (codec.as_deref(), value.as_deref(), device.as_deref(), inode.as_deref()))
-            == Some((Some("hex_path_v1"), Some(root.as_str()), Some(device.as_str()), Some(inode.as_str()))) { Ok(()) }
-        else { Err(close_precondition("exact worktree final tombstone conflicts with durable plan")) }
+        if prior.as_ref().map(|(codec, value, device, inode, _, _)| {
+            (
+                codec.as_deref(),
+                value.as_deref(),
+                device.as_deref(),
+                inode.as_deref(),
+            )
+        }) == Some((
+            Some("hex_path_v1"),
+            Some(root.as_str()),
+            Some(device.as_str()),
+            Some(inode.as_str()),
+        )) {
+            Ok(())
+        } else {
+            Err(close_precondition(
+                "exact worktree final tombstone conflicts with durable plan",
+            ))
+        }
     }
 
     pub(crate) async fn bind_close_worktree_final_tombstone_object_tx(
@@ -4644,7 +4678,9 @@ impl Database {
         .bind(request.snapshot.generation()).bind(request.snapshot.fingerprint())
         .bind(request.resource.kind().as_str()).bind(identity.identity_kind())
         .bind(identity.codec()).bind(identity.value()).execute(&mut **tx).await?;
-        if result.rows_affected() == 1 { return Ok(()); }
+        if result.rows_affected() == 1 {
+            return Ok(());
+        }
         let prior: Option<(Option<String>, Option<String>)> = sqlx::query_as(
             "SELECT final_tombstone_object_device, final_tombstone_object_inode
              FROM close_worktree_cleanup_plans WHERE attempt_id = ?1 AND scope = ?2
@@ -4655,8 +4691,15 @@ impl Database {
         .bind(request.snapshot.generation()).bind(request.snapshot.fingerprint())
         .bind(request.resource.kind().as_str()).bind(identity.identity_kind())
         .bind(identity.codec()).bind(identity.value()).fetch_optional(&mut **tx).await?;
-        if prior.as_ref().map(|(d, i)| (d.as_deref(), i.as_deref())) == Some((Some(device.as_str()), Some(inode.as_str()))) { Ok(()) }
-        else { Err(close_precondition("exact worktree final tombstone object conflicts with durable plan")) }
+        if prior.as_ref().map(|(d, i)| (d.as_deref(), i.as_deref()))
+            == Some((Some(device.as_str()), Some(inode.as_str())))
+        {
+            Ok(())
+        } else {
+            Err(close_precondition(
+                "exact worktree final tombstone object conflicts with durable plan",
+            ))
+        }
     }
 
     async fn reject_completed_native_worktree_metadata_tx(
@@ -13088,7 +13131,7 @@ mod tests {
             crate::migrations::run_pending_migrations(db.pool())
                 .await
                 .unwrap(),
-            5
+            6
         );
         let after: (String, String, String, String, String, String, String, i64) = sqlx::query_as(
             "SELECT request_id, source_transcript_id, source_message_id, source_tool_use_id,

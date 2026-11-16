@@ -212,6 +212,7 @@ jobs:
           grep -E 'test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored;' evidence/native-close-retry-source.log
           cargo test -p phoenix_ide --lib close_retirement::native_retry::tests:: -- --nocapture --test-threads=1 2>&1 | tee evidence/native-close-retry-execution.log
           grep -E 'test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored;' evidence/native-close-retry-execution.log
+          grep -F 'runtime::close_retirement::tests::native_retry_runner_completes_original_worktree_and_scope_under_new_generation: test' evidence/runtime-inventory.log
           grep -F 'runtime::close_retirement::tests::native_retry_pending_worktree_uses_g1_under_g2_and_refuses_live_drift: test' evidence/runtime-inventory.log
           grep -F 'runtime::close_retirement::tests::native_retry_refuses_missing_duplicate_and_mismatched_original_evidence: test' evidence/runtime-inventory.log
           grep -F 'runtime::close_retirement::tests::native_retry_assessment_keeps_exact_snapshot_and_does_not_dispatch: test' evidence/runtime-inventory.log
