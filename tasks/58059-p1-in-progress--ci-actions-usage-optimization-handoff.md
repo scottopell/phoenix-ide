@@ -175,14 +175,14 @@ Run logs warn that `actions/checkout@v4`, `actions/upload-artifact@v4`, `astral-
 
 ### P3-4: roadmap reducer noise
 
-`roadmap-issue-reducer.yml` creates a skipped run for every comment on any issue: 130 of 136 runs in the window. That costs almost nothing, but it clutters the Actions UI. `issue_comment` can't be filtered by issue number at the trigger level, so leave it unless the noise matters.
+Historical finding: `roadmap-issue-reducer.yml` created a skipped run for every comment on any issue: 130 of 136 runs in the measured window. ADR-262 retires that workflow and its reducer entirely; no trigger optimization or continued operation remains in this task.
 
 ## Tools and how to reproduce the measurements
 
 - **Run list:** `GET /repos/scottopell/phoenix-ide/actions/runs?per_page=100&created=>=DATE`.
 - **Jobs per run:** `GET /actions/runs/{id}/jobs`.
 - **Per-test timing:** each CI rust job uploads `rust-evidence-<run>-<attempt>`. `check/rust-tests/process-*.json` holds `identity`, `wall_ms`, `total_cpu_ms`, `user_cpu_ms` and `returncode` per test. Comparing two runs by `identity` is how the CPU-slowdown evidence in P1-1 was produced.
-- **Lane plan:** the `plan check lanes` job decides which lanes run (`dev.py` `_LANE_DEFS`, around line 4100). Spec-only PRs already skip heavy lanes; see the roadmap item "Spec-only changes skip dev.py tests".
+- **Lane plan:** the `plan check lanes` job decides which lanes run (`dev.py` `_LANE_DEFS`, around line 4100). Spec-only PRs already skip heavy lanes; verify current behavior in the lane planner and its tests rather than the retired roadmap item.
 
 ## Open questions for the product owner
 

@@ -21,7 +21,7 @@ This is an implementation handoff to the Phoenix Coordinator. Coordinate ownersh
 
 ## Start with current authority and coordination
 
-Read Issue #651, VISION.md, the relevant specifications, and the current implementation before editing. Coordinate with the automatic-context-continuation and lifecycle/admission owners. Earlier exploration's roadmap cited automatic-continuation owner @conv:583071fc and commit 6e81f0324, but neither was available through local reference/commit lookup; resolve current full identity and branch rather than assuming these are still current.
+Read VISION.md, the relevant specifications, current task/PR ownership and the implementation before editing. Issues #651/#806 are historical; no roadmap read or posting duty remains. Coordinate with the automatic-context-continuation and lifecycle/admission owners. Earlier exploration's roadmap cited automatic-continuation owner @conv:583071fc and commit 6e81f0324, but neither was available through local reference/commit lookup; resolve current full identity and branch rather than assuming these are still current.
 
 Determine the definitive automatic-continuation admission/settlement outcome. Exclude successful handoff using that authority, never timers or polling to infer whether execution resumed. Follow the dependency order of active lifecycle changes; do not duplicate their continuation or Close authority.
 

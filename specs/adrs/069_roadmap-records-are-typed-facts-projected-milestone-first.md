@@ -1,6 +1,6 @@
 # ADR-069: Roadmap records are typed facts projected milestone-first
 
-- **Status:** Accepted
+- **Status:** Superseded by [ADR-262](262_retire-delivery-roadmap-with-preserved-history.md)
 - **Date:** 2026-09-27
 - **Affects:** REQ-ROADMAP-001 through REQ-ROADMAP-014
 

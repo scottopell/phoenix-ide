@@ -2,7 +2,7 @@
 
 ## Approved scope
 
-Implement the user-reaffirmed direction from [design PR #705](https://github.com/scottopell/phoenix-ide/pull/705), extended by the September design discussion. That PR was closed for roadmap capacity and ownership; its product direction remains accepted. [Roadmap #651](https://github.com/scottopell/phoenix-ide/issues/651) is the coordination authority.
+Implement the user-reaffirmed direction from [design PR #705](https://github.com/scottopell/phoenix-ide/pull/705), extended by the September design discussion. That PR was closed for roadmap capacity and ownership; its product direction remains accepted. The historical [Roadmap #651](https://github.com/scottopell/phoenix-ide/issues/651) explains that disposition, but it and successor #806 are retired. Current user instructions, task/PR ownership and the relevant specs/ADRs govern delivery.
 
 Production evidence motivating this work: a four-worker spawn with omitted model overrides failed because a filesystem agent's hidden default requested an unavailable provider model. Explicitly selecting a registered model admitted the retry. The new catalog must prevent that predictable failure before advertising a worker.
 
@@ -35,7 +35,7 @@ Reuse the existing model registry and backend connection slots. No second router
 
 ## Integration
 
-Worktree: `phoenix-agent-config-45015`; branch `codex/45015-agent-execution-config`. Source on essmbp; heavy validation on devmbp because the roadmap's laptop disk gate is active. The next ADR/migration numbers are taken from current main; reconcile numbering on rebase if concurrent PRs merge first rather than creating dependency placeholders.
+Worktree: `phoenix-agent-config-45015`; branch `codex/45015-agent-execution-config`. Source on essmbp; the historical handoff assigned heavy validation to devmbp because of a laptop disk gate. Reverify current resource admission with the owner; the retired roadmap cannot establish a current hold. The next ADR/migration numbers are taken from current main; reconcile numbering on rebase if concurrent PRs merge first rather than creating dependency placeholders.
 
 ## Separate follow-ups
 

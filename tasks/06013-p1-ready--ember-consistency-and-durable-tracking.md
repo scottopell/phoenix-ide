@@ -155,7 +155,7 @@ The user selected both recommendations. Remaining model budgets, excerpt tuning 
 | Phase | Scope | Task |
 | --- | --- | --- |
 | 1 | Current-deployment baseline and narrow contracts | [06014](./06014-p1-ready--ember-tool-contract-and-consistency-base.md) |
-| 2 | Independent roadmap retirement | [06015](./06015-p1-ready--retire-stale-delivery-roadmap.md) |
+| 2 | Independent roadmap retirement | [06015](./06015-p1-in-progress--retire-stale-delivery-roadmap.md) |
 | 3 | Exact completion-evidence binding | [06020](./06020-p1-ready--bind-watch-events-to-ending-response-evi.md) |
 | 4 | Useful bounded event context and incremental qualification | [06021](./06021-p1-ready--enrich-ember-event-context-and-measure-f.md) |
 | 5 | Durable tracking store/application service/tools | [06016](./06016-p1-ready--ember-durable-tracking-store-and-tools.md) |

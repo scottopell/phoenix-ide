@@ -70,16 +70,9 @@ ios/             # Native iOS client (SwiftUI, offline-first; spec: specs/ios_cl
 
 ### Delivery Roadmap
 
-GitHub Issue [#806](https://github.com/scottopell/phoenix-ide/issues/806) is the phoenix-ide delivery roadmap: a milestone-first view of committed outcomes, their owners, open gates, delivery per surface, and freshness. At the start of development work, read its generated body before relying on local task or PR context alone. If GitHub is unavailable, continue from the domain authorities below and report that roadmap context could not be verified.
+GitHub Issue [#806](https://github.com/scottopell/phoenix-ide/issues/806) is a historical archive, not current coordination authority. Do not read it as a required development preflight or post roadmap records. Its final projection and comments remain historical evidence; old ownership, holds and delivery claims require current verification.
 
-The roadmap is harness-neutral: any harness (each Phoenix instance, Codex, Claude Code) contributes the same way, by posting structured records as Issue comments. Its protocol is [`specs/roadmap/requirements.md`](specs/roadmap/requirements.md); read it before posting. In short:
-
-- the primary Phoenix instance is the coordinator: it alone curates outcomes, milestones, priority, and ownership;
-- workers post `evidence`, `status`, and technical `gate`s for outcomes they work on; record user scope calls as `decision`s quoting the user;
-- evidence must be checkable through GitHub (PR, commit, check run, release, or a deploy record naming a commit); links that only resolve on one machine belong in `status` pointers, labelled with their harness;
-- never edit the generated body or a posted record; post a new record instead.
-
-The roadmap is a coordination authority only. It does not replace the authorities for requirements (specs/Allium), decisions (ADRs), repository task status (taskmd filenames), review state (PRs), or shipped behavior (`main`). When the roadmap conflicts with one of those authorities, the domain authority wins and the owning agent posts a correcting record.
+Use current user instructions and the existing domain authorities: specs/Allium for requirements, ADRs for decisions, taskmd filenames for repository task status, PRs for review/merge state, and exact deployed evidence for production behavior. Keep current ownership, next action and checkable evidence with the task/PR or active coordination conversation. Ember tracking preserves intent and links; it does not replace these authorities. See [ADR-262](specs/adrs/262_retire-delivery-roadmap-with-preserved-history.md).
 
 ### Task Tracking
 
