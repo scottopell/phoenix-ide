@@ -230,7 +230,9 @@ impl Database {
     ) -> DbResult<()> {
         let plan = Self::require_native_close_retry_plan_identity_tx(tx, command, admitted).await?;
         if !plan.running {
-            return Err(refused("native retry dispatch requires its exact latest running plan"));
+            return Err(refused(
+                "native retry dispatch requires its exact latest running plan",
+            ));
         }
         let run = CloseRunRef {
             attempt_id: admitted.attempt_id.clone(),
@@ -242,7 +244,9 @@ impl Database {
                 != Some(plan.effect_count)
             || !progress.pending.contains(effect)
         {
-            return Err(refused("native retry dispatch requires a pending full-identity worktree effect"));
+            return Err(refused(
+                "native retry dispatch requires a pending full-identity worktree effect",
+            ));
         }
         Self::insert_close_retirement_dispatch_tx(
             tx,

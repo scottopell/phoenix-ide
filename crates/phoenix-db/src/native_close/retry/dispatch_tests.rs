@@ -1,3 +1,4 @@
+type DispatchRow = (String, String, String, String, String, String, String, String, i64);
 async fn retry_dispatch_state(db: &Database, attempt: &CloseAttemptId) -> String {
     let rows: String = sqlx::query_scalar(
         "SELECT json_object(
@@ -74,7 +75,7 @@ async fn native_retry_dispatch_uses_original_g1_under_g2_and_replays_without_mut
     success_recorded(db.record_native_close_retry_retirement_dispatch(
         &assessment.command, &receipt.admitted, worktree,
     ).await);
-    let rows: Vec<(String, String, String, String, String, String, String, String, i64)> =
+    let rows: Vec<DispatchRow> =
         sqlx::query_as(
             "SELECT attempt_id, scope, inspection_generation, inspection_fingerprint,
               resource_kind, identity_kind, identity_codec, identity_value, dispatched_at_us
@@ -87,7 +88,7 @@ async fn native_retry_dispatch_uses_original_g1_under_g2_and_replays_without_mut
         assessment.proof.snapshot.generation().to_owned(),
         assessment.proof.snapshot.fingerprint().to_owned(),
         "worktree".to_owned(), identity.identity_kind().to_owned(),
-        identity.codec().to_owned(), identity.value().to_owned(), rows[0].8,
+        identity.codec().to_owned(), identity.value().clone(), rows[0].8,
     ));
     assert!(rows[0].8 > 0);
     assert_eq!(migration_163_retained_state(&db).await, retained);
