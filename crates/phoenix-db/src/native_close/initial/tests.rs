@@ -195,7 +195,7 @@ async fn source_turn(db: &Database, conversation: &str, key: &str) -> u64 {
         .accept_authoritative_turn(&AcceptAuthoritativeTurn {
             client_key: ClientTurnKey::new(key).unwrap(),
             prepared: PreparedTurn::from_exact_payload(
-                &ConversationAuthority(conversation.into()),
+                &ConversationAuthority(conversation),
                 payload.to_exact_bytes().unwrap(),
             ),
             disposition: AcceptedDisposition::Runtime,

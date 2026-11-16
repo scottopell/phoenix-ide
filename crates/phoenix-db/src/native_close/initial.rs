@@ -95,6 +95,7 @@ impl Database {
     }
 }
 
+#[allow(clippy::too_many_lines)] // Source, exact run and target capture are one atomic boundary.
 async fn prepare_initial_execution_tx(
     tx: &mut Transaction<'_, Sqlite>,
     command: &NativeCloseCommand,
