@@ -636,7 +636,7 @@ impl instance::RoutedTool for WatchConversation {
         false
     }
     fn description(&self) -> String {
-        "Subscribe this Global Coordinator to future terminal facts for an open ordinary stable ProductConversation. Returns its current transcript and state atomically with enrollment. No historical events are replayed.".into()
+        "Subscribe this Global Coordinator to an open ordinary stable ProductConversation across continuation. Local watches report execution completion, failure, cancellation, entry into question or task-approval waits, and supported Goal metadata changes; selected-peer watches report terminal facts only. Returns the enrollment snapshot. No historical events are replayed, and a wait is not execution completion.".into()
     }
     fn schema_without_instance(&self) -> Value {
         json!({"type":"object","properties":{"product_conversation_id":{"type":"string","minLength":1,"maxLength":1024}},"required":["product_conversation_id"],"additionalProperties":false})

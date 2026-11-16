@@ -226,3 +226,70 @@ Both Coordinator language variants include an explicit outcome-delegation rule a
 The Phoenix-language Coordinator prompt opens with a 524-word / 3,165-character Ember persona block (ceiling 550 words / 3,300 characters, checked separately from the base and delegation sections). It replaces the former one-clause identity and the superseded "Write for a busy user missing history" sentence; all other reporting, silence, security and delegation guidance is unchanged. Caveman, UI labels and internal Coordinator naming are unchanged. Static checks do not demonstrate live voice quality (ADR-214).
 
 The web list navigation presents one pinned compact Ember entry (Global coordinator), outside ordinary conversation lifecycle/counts, on desktop and mobile; the collapsed desktop rail retains an accessible Ember mark. The existing `/global` singleton route is unchanged. Loading and return-navigation identity use Ember. See REQ-GR-023 and ADR-229. Focused UI tests cover web entry navigation and accessibility naming.
+
+## Reproducing the assembled tool inventory
+
+The opt-in `runtime::tool_surface_inventory::export_coordinator_tool_surface_inventory`
+fixture calls `RuntimeManager::coordinator_tool_registry`, then the same
+`SpawnCatalog::resolve`/`tool_definition` used to specialize configured spawn
+choices. It exports both instruction languages, with/without the authenticated
+built-in skill catalog, and generic versus synthetic configured worker/tier
+choices. Every entry includes the actual descriptions, input schemas, deferred
+flags and byte/word measurements. There is no separately maintained tool roster
+or fixed tool count.
+
+An ordinary test assembles these same variants and checks optional authenticated
+skills, configured worker/tier specialization, unique installed names,
+provider-compatible object roots and the corrected watch guidance. The opt-in
+exporter reuses that assembly; neither path dispatches model or action tools.
+
+```bash
+PHOENIX_TOOL_INVENTORY_OUTPUT=/absolute/path/tool-surface.json \
+  cargo test -p phoenix_ide export_coordinator_tool_surface_inventory -- --ignored
+```
+
+The fixture uses an isolated database and an offline model configuration; it
+performs no provider requests or target mutations. It describes that synthetic
+configuration, not installed production options or a provider's token accounting.
+Final inventory execution must follow integration of newly registered tracking
+tools. Existing create/rename/generated-continuation/Goal capabilities and
+provider-compatible nested schemas remain their owning contracts, not new work
+commissioned by inventory generation.
+
+The watch description distinguishes local question/task-approval wait entries
+from selected-peer v1 terminal facts. A wait is not execution completion. The
+registry composition comment no longer incorrectly claims that host-supplied
+creation tools are absent. These are guidance corrections, not watch timing,
+lifecycle or protocol changes.
+
+The description also names supported local Goal metadata changes. Under
+REQ-GR-015 and REQ-GOAL-AC-002, the installed Goal control path calls
+`coordinator_watches::goal_facts::settled_change_tx`: eligible enrolled open
+ordinary sources receive a `goal_change` occurrence keyed to the saved Goal
+version. Disabled control emits none, and the generic Goal report path excludes
+progress-only `Report` changes. This wording does not promise a notification for
+every progress report or change peer terminal-fact v1.
+
+The final runtime candidate at 2e098a302 compiled and exported eight synthetic
+variants. Its ordinary inventory matrix, opt-in export and real local-read
+recovery fixture pass; earlier registered watch-list (three) and coordinator
+prompt (seven) regressions also passed. The fixture smoke test exercises actual
+list/query/read/search/resolve/think tools against a retained isolated file
+SQLite database and runtime environment, and rejects remote/effectful dispatch.
+
+One separately prepared and independently reviewed real-model trial on
+`gpt-6-astra`, requested high effort, the normal discovered Codex route,
+PhoenixNative instructions and authenticated skills recovered on its first tool
+call: `list_watched_conversations {"request":{"op":"local"}}`. The actual enrolled
+watch was returned and the final answer correctly reported one idle conversation.
+There were no UUID guesses, remote selections, effectful attempts, helper denials
+or errors. Two provider requests used 21,921 observed input tokens including cache
+and 74 output tokens. The frozen budget was not expanded and there was no retry.
+The trace, binary, prompt and definition hashes and exact scope are recorded in
+`scripts/qa/ember-watch-recovery/README.md`.
+
+This qualifies one synthetic retained-history/model read-selection and actual
+registered-dispatch journey. It does not qualify full runtime input admission,
+production activation, every provider or final integrated context. Exact final
+CI and the inventory rerun after tracking/event integration remain required;
+phase 1 stays open for that final composition evidence.

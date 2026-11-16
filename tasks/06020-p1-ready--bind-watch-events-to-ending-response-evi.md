@@ -1,6 +1,6 @@
 # Ember phase 3: bind completion events to their exact ending evidence
 
-Parent: [06013](./06013-p1-ready--ember-consistency-and-durable-tracking.md). Requires only the event-specific baseline/contract subset described in [phase 1](./06014-p1-ready--ember-tool-contract-and-consistency-base.md), not completion of that entire task or any tracking/scanner design. This slice owns acceptance of its occurrence/retention/privacy/capture contract before implementation and is followed by [phase 4 projection/evaluation](./06021-p1-ready--enrich-ember-event-context-and-measure-f.md).
+Parent: [06013](./06013-p1-ready--ember-consistency-and-durable-tracking.md). Requires only the event-specific baseline/contract subset described in [phase 1](./06014-p1-in-progress--ember-tool-contract-and-consistency-base.md), not completion of that entire task or any tracking/scanner design. This slice owns acceptance of its occurrence/retention/privacy/capture contract before implementation and is followed by [phase 4 projection/evaluation](./06021-p1-ready--enrich-ember-event-context-and-measure-f.md).
 
 ## User-approved outcome
 

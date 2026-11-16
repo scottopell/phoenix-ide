@@ -25,6 +25,10 @@ pub mod user_facing_error;
 
 #[cfg(test)]
 pub mod testing;
+#[cfg(test)]
+mod tool_surface_inventory;
+#[cfg(test)]
+mod tool_surface_recovery;
 
 pub use executor::ConversationRuntime;
 pub use traits::*;

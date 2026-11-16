@@ -1,6 +1,6 @@
 # Ember phase 7: cheap transcript-scanning safety net
 
-Parent: [06013](./06013-p1-ready--ember-consistency-and-durable-tracking.md). Depends on the relevant terminology/baseline from [phase 1](./06014-p1-ready--ember-tool-contract-and-consistency-base.md), [phase 5](./06016-p1-ready--ember-durable-tracking-store-and-tools.md) and [phase 6](./06017-p1-ready--ember-tracking-continuity-and-inspection.md). This task owns frontier/invalidation/application/model-budget contracts before scanner activation; those decisions do not gate event or direct-tracking delivery. User authorizes automatic capture; Ember bears stale/duplicate retirement.
+Parent: [06013](./06013-p1-ready--ember-consistency-and-durable-tracking.md). Depends on the relevant terminology/baseline from [phase 1](./06014-p1-in-progress--ember-tool-contract-and-consistency-base.md), [phase 5](./06016-p1-ready--ember-durable-tracking-store-and-tools.md) and [phase 6](./06017-p1-ready--ember-tracking-continuity-and-inspection.md). This task owns frontier/invalidation/application/model-budget contracts before scanner activation; those decisions do not gate event or direct-tracking delivery. User authorizes automatic capture; Ember bears stale/duplicate retirement.
 
 ## Outcome
 
