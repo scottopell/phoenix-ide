@@ -298,14 +298,15 @@ async fn explicit_retry_receipt_lookup_refuses_nonretry_and_conflicting_source_b
 
     let receipt_assessment = assess(&db, &failure, "lookup-conflict").await;
     admitted(db.apply_native_close_explicit_retry(&receipt_assessment).await);
-    let other_failure = fixture(&db, Vec::new(), true).await;
+    // Reuse the source occurrence with a different predecessor binding, not another
+    // fixed-ID foundation fixture in the same database.
     let conflicting = retry_command(
         &db,
         "lookup-conflict",
         NativeCloseIntent::ExplicitRetry {
-            target: other_failure.source_product_conversation_id.clone(),
-            attempt_id: other_failure.attempt_id.clone(),
-            failed_run_ordinal: CloseRunOrdinal::INITIAL,
+            target: failure.source_product_conversation_id.clone(),
+            attempt_id: failure.attempt_id.clone(),
+            failed_run_ordinal: CloseRunOrdinal::INITIAL.checked_next().unwrap(),
         },
     )
     .await;
