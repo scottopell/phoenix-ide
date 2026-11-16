@@ -6,7 +6,7 @@ use phoenix_core::process_identity::{
 };
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::os::fd::AsRawFd;
 #[cfg(target_os = "linux")]
@@ -142,6 +142,25 @@ impl BrowserCli {
 
 impl Drop for BrowserCli {
     fn drop(&mut self) {
+        if std::thread::panicking() {
+            // Capture the daemon's last 16 KiB before Close and TempDir teardown.
+            if let Ok(entries) = std::fs::read_dir(self.directory.path()) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.extension().is_some_and(|extension| extension == "log") {
+                        let tail = (|| -> std::io::Result<String> {
+                            let mut file = std::fs::File::open(&path)?;
+                            let length = file.metadata()?.len().min(16 * 1024);
+                            file.seek(SeekFrom::End(-length.cast_signed()))?;
+                            let mut bytes = Vec::new();
+                            file.take(length).read_to_end(&mut bytes)?;
+                            Ok(String::from_utf8_lossy(&bytes).into_owned())
+                        })();
+                        eprintln!("daemon log {}: {tail:?}", path.display());
+                    }
+                }
+            }
+        }
         let _ = self.command().arg("close").output();
         if let Ok(names) = self.extra_sessions.lock() {
             for name in names.iter() {
@@ -160,13 +179,17 @@ impl Drop for BrowserCli {
 }
 
 fn fixture() -> String {
+    fixture_with_script("")
+}
+
+fn fixture_with_script(script: &str) -> String {
     let html = r#"<!doctype html><title>CLI browser journey</title>
 <label>Name <input id="name" aria-label="Name"></label>
 <button id="increment" onclick="window.clicks += 1; console.log('clicked', window.clicks)">Increment</button>
-<script>window.clicks = 0; console.error('navigation-marker');</script>"#;
+<script>window.clicks = 0; console.error('navigation-marker');"#;
     format!(
         "data:text/html;base64,{}",
-        base64::engine::general_purpose::STANDARD.encode(html)
+        base64::engine::general_purpose::STANDARD.encode(format!("{html}{script}</script>"))
     )
 }
 
@@ -2291,70 +2314,180 @@ fn malformed_or_recursive_chrome_exec_request_never_enters_cli() {
     }
 }
 
+struct LiveEvidence {
+    daemon_lifetime: String,
+    browser_lifetime: String,
+    reference: String,
+    artifact: PathBuf,
+    resources: (PathBuf, ProcessIdentity),
+    sentinel: PathBuf,
+}
+
+struct KilledEvidence(LiveEvidence);
+struct RetiredEvidence(LiveEvidence);
+
+impl LiveEvidence {
+    fn capture(cli: &BrowserCli, opened: &Value) -> Self {
+        assert_eq!(opened["result"]["navigation"], "succeeded", "{opened}");
+        assert_eq!(
+            cli.eval(
+                r"new Promise(resolve => {
+                if (document.readyState === 'complete') resolve(true);
+                else window.addEventListener('load', () => resolve(true), {once:true});
+            })"
+            ),
+            true
+        );
+        assert_eq!(
+            cli.eval(
+                r"document.querySelector('#increment').removeAttribute('aria-label');
+                for (let i = 0; i < 150; i++) {
+                    const button = document.createElement('button');
+                    button.textContent = 'Large snapshot control ' + i;
+                    document.body.append(button);
+                }
+                window.clicks === 0"
+            ),
+            true
+        );
+        cli.ok(&["profile", "cpu_start"]);
+        let snapshot = cli.ok(&["snapshot"]);
+        assert_eq!(snapshot["lifetime"], opened["lifetime"], "{snapshot}");
+        assert_eq!(
+            snapshot["browser_lifetime"], opened["browser_lifetime"],
+            "{snapshot}"
+        );
+        let artifact = PathBuf::from(
+            snapshot["result"]["artifacts"][0]
+                .as_str()
+                .expect("explicit snapshot must spill its tree"),
+        );
+        let tree = std::fs::read_to_string(&artifact).expect("read last successful snapshot");
+        let reference = reference(&tree, "Increment");
+        cli.ok(&["click", &reference]);
+        assert_eq!(
+            cli.eval("window.clicks"),
+            1,
+            "last snapshot ref must work before killing Chrome"
+        );
+        assert_eq!(cli.eval("window.clicks = 0"), 0);
+        assert!(artifact.is_file());
+        let resources = live_resources(cli);
+        let sentinel = resources.0.join("old-lifetime-sentinel");
+        std::fs::write(&sentinel, b"old browser state").unwrap();
+        Self {
+            daemon_lifetime: opened["lifetime"]
+                .as_str()
+                .expect("live daemon identity")
+                .to_owned(),
+            browser_lifetime: opened["browser_lifetime"]
+                .as_str()
+                .expect("live browser identity")
+                .to_owned(),
+            reference,
+            artifact,
+            resources,
+            sentinel,
+        }
+    }
+
+    fn kill(self) -> KilledEvidence {
+        record_owned_chrome_layout(&self.resources, "before-root-kill", true);
+        signal_owned(self.resources.1, libc::SIGKILL);
+        record_owned_chrome_layout(&self.resources, "after-root-kill-before-status", false);
+        KilledEvidence(self)
+    }
+}
+
+impl KilledEvidence {
+    fn retire(self, cli: &BrowserCli) -> RetiredEvidence {
+        let live = self.0;
+        let status = wait_for_observation("manager reported Chrome retirement", || {
+            let status = cli.ok(&["status"]);
+            (status["result"]["active"] == false).then_some(status)
+        });
+        assert_eq!(status["lifetime"], live.daemon_lifetime);
+        assert_eq!(status["result"]["active"], false);
+        assert!(status["browser_lifetime"].is_null());
+        assert!(status["result"]["profile_path"].is_null());
+        assert!(
+            !live.artifact.exists(),
+            "dead browser retained its snapshot artifact"
+        );
+        assert_resources_removed(&live.resources);
+        assert!(
+            !live.sentinel.exists(),
+            "old browser profile contents survived retirement"
+        );
+        await_process_exit(live.resources.1);
+        let missing = cli.invoke(&["snapshot"], None, false);
+        assert_eq!(missing["error"]["code"], "state_lost");
+        assert_eq!(missing["lifetime"], live.daemon_lifetime);
+        assert!(missing["browser_lifetime"].is_null(), "{missing}");
+        RetiredEvidence(live)
+    }
+}
+
+impl RetiredEvidence {
+    fn reopen(self, cli: &BrowserCli, url: &str) {
+        let live = self.0;
+        let reopened = cli.ok(&["open", url]);
+        assert_eq!(reopened["lifetime"], live.daemon_lifetime);
+        let browser_lifetime = reopened["browser_lifetime"]
+            .as_str()
+            .expect("replacement browser identity");
+        assert_ne!(browser_lifetime, live.browser_lifetime);
+        assert!(
+            !live.sentinel.exists(),
+            "old browser profile contents survived replacement"
+        );
+        assert!(!live.artifact.exists(), "old snapshot artifact reappeared");
+        assert_resources_removed(&live.resources);
+        let rejected = cli.invoke(&["click", &live.reference], None, false);
+        assert_eq!(rejected["browser_lifetime"], reopened["browser_lifetime"]);
+        assert!(rejected["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("snapshot"));
+        assert_eq!(cli.eval("window.clicks"), 0);
+        let retired_profile = cli.invoke(&["profile", "cpu_stop"], None, false);
+        assert_eq!(
+            retired_profile["browser_lifetime"],
+            reopened["browser_lifetime"]
+        );
+        assert!(retired_profile["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("not active"));
+        cli.ok(&["close"]);
+    }
+}
+
 #[test]
 fn lost_chrome_reports_state_loss_and_open_replaces_only_browser_lifetime() {
-    // REQ-BCLI-004, REQ-BCLI-005: the daemon can outlive its owned Chrome.
+    // REQ-BCLI-004, REQ-BCLI-005, REQ-BCLI-007.
     if !chrome_enabled() {
         return;
     }
-    let cli = BrowserCli::new();
-    let url = fixture();
-    let opened = cli.ok(&["open", &url]);
-    let tree = &opened["result"]["snapshot"]["result"]["text"];
-    let stale = reference(tree.as_str().unwrap(), "Increment");
-    cli.ok(&["profile", "cpu_start"]);
-    cli.eval("for(let i=0;i<150;i++){const b=document.createElement('button');b.textContent='Large snapshot control '+i;document.body.append(b)};true");
-    let snapshot = cli.ok(&["snapshot"]);
-    let artifact = PathBuf::from(snapshot["result"]["artifacts"][0].as_str().unwrap());
-    assert!(artifact.is_file());
-    let resources = live_resources(&cli);
-    let sentinel = resources.0.join("old-lifetime-sentinel");
-    std::fs::write(&sentinel, b"old browser state").unwrap();
-    record_owned_chrome_layout(&resources, "before-root-kill", true);
-    signal_owned(resources.1, libc::SIGKILL);
-    record_owned_chrome_layout(&resources, "after-root-kill-before-status", false);
-    let status = wait_for_observation("owned Chrome was reaped", || {
-        let status = cli.ok(&["status"]);
-        (status["result"]["active"] == false).then_some(status)
-    });
-    await_process_exit(resources.1);
-    assert_eq!(status["lifetime"], opened["lifetime"]);
-    assert_eq!(status["result"]["active"], false);
-    assert!(status["browser_lifetime"].is_null());
-    assert!(status["result"]["profile_path"].is_null());
-    assert!(
-        !artifact.exists(),
-        "dead browser retained its snapshot artifact"
+    let ordinary = fixture();
+    let failed_snapshot = fixture_with_script(
+        "document.querySelector('#increment').ariaLabel = 'x'.repeat(9 * 1024 * 1024);",
     );
-    assert_resources_removed(&resources);
-    let missing = cli.invoke(&["snapshot"], None, false);
-    assert_eq!(missing["error"]["code"], "state_lost");
-    assert_eq!(missing["lifetime"], opened["lifetime"]);
-    let reopened = cli.ok(&["open", &url]);
-    assert_eq!(reopened["lifetime"], opened["lifetime"]);
-    assert_ne!(reopened["browser_lifetime"], opened["browser_lifetime"]);
-    assert!(
-        !sentinel.exists(),
-        "old browser profile contents survived replacement"
-    );
-    assert!(!process_identity_matches(resources.1));
-    let rejected = cli.invoke(&["click", &stale], None, false);
-    assert_eq!(rejected["browser_lifetime"], reopened["browser_lifetime"]);
-    assert!(rejected["error"]["message"]
-        .as_str()
-        .unwrap()
-        .contains("snapshot"));
-    assert_eq!(cli.eval("window.clicks"), 0);
-    let retired_profile = cli.invoke(&["profile", "cpu_stop"], None, false);
-    assert_eq!(
-        retired_profile["browser_lifetime"],
-        reopened["browser_lifetime"]
-    );
-    assert!(retired_profile["error"]["message"]
-        .as_str()
-        .unwrap()
-        .contains("not active"));
-    cli.ok(&["close"]);
+    for (url, force_snapshot_failure) in [(&ordinary, false), (&failed_snapshot, true)] {
+        let cli = BrowserCli::new();
+        let opened = cli.ok(&["open", url]);
+        if force_snapshot_failure {
+            assert_eq!(opened["result"]["snapshot"]["status"], "error", "{opened}");
+            assert!(
+                opened["result"]["snapshot"]["result"]["text"].is_null(),
+                "{opened}"
+            );
+        }
+        let live = LiveEvidence::capture(&cli, &opened);
+        let killed = live.kill();
+        let retired = killed.retire(&cli);
+        retired.reopen(&cli, &ordinary);
+    }
 }
 
 #[test]
