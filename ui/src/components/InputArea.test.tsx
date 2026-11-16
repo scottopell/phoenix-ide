@@ -1,10 +1,11 @@
 import { useRef } from 'react';
+import { FocusScopeProvider, useFocusScopeCommands } from '../hooks/useFocusScope';
 import { InputArea, ConnectedInputArea } from './InputArea';
 import { DraftStore } from '../conversation/DraftStore';
 import { DraftContext } from '../conversation/DraftContext';
 import { AgentMessage } from './MessageComponents';
 import { VoicePermission } from './VoiceInput/VoicePermission';
-import type { ComposerQuickAction, InputAreaHandle } from './InputArea';
+import type { ComposerFocusRequest, ComposerQuickAction, InputAreaHandle } from './InputArea';
 import type { ConversationState, Message, SkillEntry } from '../api';
 import { api } from '../api';
 import { describe, expect, it, vi } from 'vitest';
@@ -377,7 +378,7 @@ interface InputAreaTestProps {
   onDraftChange?: (text: string) => void;
   onCancel?: () => void;
   onSend?: (text: string, images: ImageData[], files: FileAttachment[]) => void;
-  focusToken?: number;
+  focusRequest?: ComposerFocusRequest | null;
   quickAction?: ComposerQuickAction;
 }
 
@@ -389,10 +390,10 @@ function renderInput({
   onDraftChange = () => {},
   onCancel = () => {},
   onSend = () => {},
-  focusToken,
+  focusRequest,
   quickAction,
 }: InputAreaTestProps) {
-  const focusProps = focusToken === undefined ? {} : { focusToken };
+  const focusProps = focusRequest === undefined ? {} : { focusRequest };
   return render(
     <InputArea
       cwd={cwd}
@@ -630,8 +631,8 @@ describe('InputArea compact composer layout', () => {
   });
 });
 
-describe('InputArea focusToken contract', () => {
-  it('does not steal focus on mount when focusToken is the initial 0', () => {
+describe('InputArea focusRequest contract', () => {
+  it('does not steal focus on mount when focusRequest is null', () => {
     // External anchor to verify focus didn't move into the textarea.
     const anchor = document.createElement('button');
     anchor.textContent = 'anchor';
@@ -639,13 +640,13 @@ describe('InputArea focusToken contract', () => {
     anchor.focus();
     expect(document.activeElement).toBe(anchor);
 
-    renderInput({ cwd: 'conv-a', focusToken: 0 });
+    renderInput({ cwd: 'conv-a', focusRequest: null });
 
     expect(document.activeElement).toBe(anchor);
     document.body.removeChild(anchor);
   });
 
-  it('does not steal focus on mount when focusToken is undefined', () => {
+  it('does not steal focus on mount when focusRequest is undefined', () => {
     const anchor = document.createElement('button');
     document.body.appendChild(anchor);
     anchor.focus();
@@ -656,12 +657,13 @@ describe('InputArea focusToken contract', () => {
     document.body.removeChild(anchor);
   });
 
-  it('focuses the textarea when focusToken is bumped', () => {
+  it('focuses the textarea when a focus request arrives', () => {
+    const acknowledge = vi.fn();
     const anchor = document.createElement('button');
     document.body.appendChild(anchor);
     anchor.focus();
 
-    const { rerender } = renderInput({ cwd: 'conv-a', focusToken: 0 });
+    const { rerender } = renderInput({ cwd: 'conv-a', focusRequest: null });
     expect(document.activeElement).toBe(anchor);
 
     rerender(
@@ -676,7 +678,7 @@ describe('InputArea focusToken contract', () => {
         failedMessages={[]}
         draft=""
         onDraftChange={() => {}}
-        focusToken={1}
+        focusRequest={{ acknowledge }}
         onSend={() => {}}
         onCancel={() => {}}
         onRetry={() => {}}
@@ -684,7 +686,99 @@ describe('InputArea focusToken contract', () => {
     );
 
     expect(document.activeElement).toBe(screen.getByRole('textbox'));
+    expect(acknowledge).toHaveBeenCalledOnce();
     document.body.removeChild(anchor);
+  });
+
+  it('does not acknowledge a request when focus fails', () => {
+    const acknowledge = vi.fn();
+    const focus = vi.spyOn(HTMLTextAreaElement.prototype, 'focus').mockImplementation(() => {});
+    try {
+      renderInput({ cwd: 'conv-a', focusRequest: { acknowledge } });
+      expect(focus).toHaveBeenCalledOnce();
+      expect(acknowledge).not.toHaveBeenCalled();
+    } finally {
+      focus.mockRestore();
+    }
+  });
+
+  it('retains the request until the mounted composer becomes writable', () => {
+    const acknowledge = vi.fn();
+    const request = { acknowledge };
+    function Harness() {
+      const [convState, setConvState] = useState<ConversationState>({ type: 'awaiting_llm' });
+      return <>
+        <button onClick={() => setConvState(idleState)}>ready</button>
+        <InputArea cwd="conv-a" scopeKey="conv-a" uploadConversationId="conv-a"
+          convState={convState} images={[]} setImages={() => {}} isOffline={false}
+          failedMessages={[]} draft="" onDraftChange={() => {}} focusRequest={request}
+          onSend={() => {}} onCancel={() => {}} onRetry={() => {}} />
+      </>;
+    }
+    render(<Harness />);
+    expect(acknowledge).not.toHaveBeenCalled();
+    expect(screen.getByRole('textbox')).not.toHaveFocus();
+    fireEvent.click(screen.getByRole('button', { name: 'ready' }));
+    expect(screen.getByRole('textbox')).toHaveFocus();
+    expect(acknowledge).toHaveBeenCalledOnce();
+  });
+
+  it.each([false, true])('defers to an intervening scope on writable transition (remount: %s)', (remount) => {
+    const acknowledge = vi.fn();
+    const request = { acknowledge };
+    function Harness() {
+      const { pushScope, popScope } = useFocusScopeCommands();
+      const [ready, setReady] = useState(false);
+      return <>
+        <button onClick={(event) => { pushScope('command-palette'); event.currentTarget.focus(); }}>open owner</button>
+        <button onClick={() => popScope('command-palette')}>close owner</button>
+        <button onClick={() => setReady(true)}>ready</button>
+        <InputArea key={remount && ready ? 'replacement' : 'original'}
+          cwd="conv-a" scopeKey="conv-a" uploadConversationId="conv-a"
+          convState={ready ? idleState : { type: 'awaiting_llm' }} images={[]} setImages={() => {}} isOffline={false}
+          failedMessages={[]} draft="" onDraftChange={() => {}} focusRequest={request}
+          onSend={() => {}} onCancel={() => {}} onRetry={() => {}} />
+      </>;
+    }
+    render(<FocusScopeProvider><Harness /></FocusScopeProvider>);
+    expect(acknowledge).not.toHaveBeenCalled();
+    const owner = screen.getByRole('button', { name: 'open owner' });
+    fireEvent.click(owner);
+    fireEvent.click(screen.getByRole('button', { name: 'ready' }));
+    expect(owner).toHaveFocus();
+    expect(acknowledge).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole('button', { name: 'close owner' }));
+    expect(screen.getByRole('textbox')).toHaveFocus();
+    expect(acknowledge).toHaveBeenCalledOnce();
+  });
+
+  it('accepts only the named yielding viewer scope and waits for a newer owner to release', () => {
+    const acknowledge = vi.fn();
+    function Harness() {
+      const { pushScope, popScope } = useFocusScopeCommands();
+      const [request, setRequest] = useState<ComposerFocusRequest | null>(null);
+      return <>
+        <button onClick={(event) => {
+          pushScope('message-viewer');
+          pushScope('command-palette');
+          event.currentTarget.focus();
+          setRequest({ yieldingScope: 'message-viewer', acknowledge });
+        }}>send with newer owner</button>
+        <button onClick={() => popScope('command-palette')}>release modal</button>
+        <InputArea cwd="conv-a" scopeKey="conv-a" uploadConversationId="conv-a"
+          convState={idleState} images={[]} setImages={() => {}} isOffline={false}
+          failedMessages={[]} draft="" onDraftChange={() => {}} focusRequest={request}
+          onSend={() => {}} onCancel={() => {}} onRetry={() => {}} />
+      </>;
+    }
+    render(<FocusScopeProvider><Harness /></FocusScopeProvider>);
+    const owner = screen.getByRole('button', { name: 'send with newer owner' });
+    fireEvent.click(owner);
+    expect(owner).toHaveFocus();
+    expect(acknowledge).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole('button', { name: 'release modal' }));
+    expect(screen.getByRole('textbox')).toHaveFocus();
+    expect(acknowledge).toHaveBeenCalledOnce();
   });
 
   it('exposes an imperative focus() handle that focuses the textarea', () => {

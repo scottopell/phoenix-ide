@@ -8,7 +8,7 @@ import { useDocumentViewportOwnership } from '../../components/viewportRoutes';
 import { FileExplorerProvider } from '../../components/FileExplorer';
 import { ConversationReadinessProvider } from '../../contexts/ConversationReadinessContext';
 import { ViewerSlotProvider } from '../../contexts/ViewerSlotContext';
-import { ConversationProvider } from '../../conversation';
+import { ConversationProvider, useConversationAtom } from '../../conversation';
 import { useDraftActions } from '../../hooks/useDraft';
 import { ProductConversationPage } from '../../pages/ProductConversationPage';
 import '../../index.css';
@@ -31,6 +31,14 @@ function FixtureAlias() { const { slug } = useParams(); return <ProductConversat
 interface Props {
   scenario: ProductConversationScenario;
   children?: ReactNode;
+}
+
+function FixtureAcceptedPhase({ conversationId }: { conversationId: string }) {
+  const [atom] = useConversationAtom(conversationId);
+  return <output hidden data-fixture-accepted-phase={atom.phase.type}
+    data-fixture-phase-sequence={atom.phaseLastAppliedEventSeq}
+    data-fixture-stream-incarnation={atom.streamIncarnation ?? ''}
+    data-fixture-phase-member={atom.conversationId ?? ''} />;
 }
 
 function SeedReactionDraft({ slug, text }: { slug: string; text: string }) {
@@ -123,6 +131,9 @@ function ProductConversationFixtureBody({ scenario, children }: Props) {
         <FixtureLocation />
         <FocusScopeProvider>
           <ConversationProvider>
+            {scenario.id === 'composer-focus' && scenario.snapshot?.latest_transcript_row_id && (
+              <FixtureAcceptedPhase conversationId={scenario.snapshot.latest_transcript_row_id} />
+            )}
             {scenario.initialDraft && scenario.snapshot?.latest_transcript_row_id && (
               <SeedReactionDraft slug={`product:${scenario.snapshot.product_conversation_id}`} text={scenario.initialDraft} />
             )}

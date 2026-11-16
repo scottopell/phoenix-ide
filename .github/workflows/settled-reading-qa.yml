@@ -30,7 +30,7 @@ jobs:
         working-directory: ui
       - name: Focused executor and fixture tests
         working-directory: ui
-        run: pnpm exec vitest run src/components/VirtualTranscript.test.tsx src/components/MessageList.test.tsx src/components/viewer-find src/fixtures/messageList/scenarios.test.ts
+        run: pnpm exec vitest run src/components/VirtualTranscript.test.tsx src/components/MessageList.test.tsx src/components/viewer-find src/fixtures/messageList/scenarios.test.ts src/components/QuestionPanel.test.tsx src/components/InputArea.test.tsx src/pages/ConversationPage.archived.test.tsx scripts/capture-ladle-surface.test.mjs
       - run: pnpm exec playwright install --with-deps chromium
         working-directory: ui
       - name: Settled image and Find finalization navigation controls
@@ -39,6 +39,21 @@ jobs:
           PHOENIX_LADLE: '1'
           CAPTURE_STORIES: delayed-image-scroll,find-identical-finalization
         run: node scripts/capture-message-list.mjs
+      - name: Question refresh and confirmation focus controls
+        working-directory: ui
+        env:
+          PHOENIX_LADLE: '1'
+          PLAYWRIGHT_INSTALLED_ONLY: '1'
+          CAPTURE_STORIES: question-focus
+        run: node scripts/capture-conversation-panel.mjs
+      - name: Composer consumed and absent insertion focus controls
+        working-directory: ui
+        env:
+          PHOENIX_LADLE: '1'
+          PLAYWRIGHT_INSTALLED_ONLY: '1'
+          CAPTURE_STORIES: composer-focus
+          CAPTURE_VIEWPORT: desktop-dark
+        run: node scripts/capture-product-conversation.mjs
       - uses: actions/upload-artifact@v4
         if: always()
         with:

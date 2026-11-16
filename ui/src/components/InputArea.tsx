@@ -31,6 +31,7 @@ import { DraftAnnotationCards } from './DraftAnnotationCards';
 import { SUPPORTED_IMAGE_TYPES, processImageFiles } from '../utils/images';
 import { FILE_TREE_DRAG_TYPE } from './FileExplorer/FileTree';
 import './InputArea.css';
+import { useFocusScope } from '../hooks/useFocusScope';
 
 export interface InputAreaHandle {
   /** Focus the mounted composer textarea. False when this phase renders no textarea. */
@@ -47,6 +48,12 @@ const EMPTY_FILES: FileAttachment[] = [];
 
 function sameItems<T>(a: T[], b: T[]): boolean {
   return a.length === b.length && a.every((item, index) => item === b[index]);
+}
+
+export interface ComposerFocusRequest {
+  acknowledge: () => void;
+  /** Explicit review handoff; other active scopes still defer delivery. */
+  yieldingScope?: 'message-viewer' | 'file-viewer';
 }
 
 interface InputAreaProps {
@@ -89,13 +96,8 @@ interface InputAreaProps {
   draftRecovery?: ComposerDraftRecovery;
   annotationCards?: ReactNode;
   hasAnnotations?: boolean;
-  /**
-   * Monotonic counter bumped by the parent when it wants the textarea
-   * focused (terminal selection arrival, retry-of-failed, skill insert,
-   * prose-reader send-notes). Survives unmount/remount: a parent bump while
-   * InputArea is unmounted lands as a fresh effect tick on re-mount.
-   */
-  focusToken?: number;
+  /** Pending explicit intent, acknowledged only after the textarea receives focus. */
+  focusRequest?: ComposerFocusRequest | null;
   /** Optional action and context displayed directly above the composer. */
   quickAction?: Pick<ComposerQuickAction, 'label' | 'compactLabel'> & { send: () => Promise<void> | void } | undefined;
   /**
@@ -166,7 +168,7 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
   convModeLabel,
   draft,
   onDraftChange,
-  focusToken,
+  focusRequest,
   draftRecovery,
   annotationCards,
   hasAnnotations = false,
@@ -231,12 +233,14 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
     },
   }), [acceptsChatMessage]);
 
-  // Consume parent's focus-token bumps. Skipping the initial 0 means
-  // mounting alone doesn't steal focus — the parent has to explicitly ask.
+  const { activeScope } = useFocusScope();
   useEffect(() => {
-    if (!focusToken) return;
-    textareaRef.current?.focus();
-  }, [focusToken]);
+    const textarea = textareaRef.current;
+    if (!focusRequest || !textarea || !acceptsChatMessage) return;
+    if (activeScope !== null && activeScope !== focusRequest.yieldingScope) return;
+    textarea.focus();
+    if (document.activeElement === textarea) focusRequest.acknowledge();
+  }, [focusRequest, acceptsChatMessage, activeScope]);
 
   // Voice input: base text (accumulated finals) + interim (current partial)
   const [voiceBase, setVoiceBase] = useScopedState<string | null>(scopeKey, null); // null = not recording

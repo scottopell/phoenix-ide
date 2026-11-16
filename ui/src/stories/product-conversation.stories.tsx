@@ -103,3 +103,9 @@ export const RemindersLoadedStaleAndUpcoming: Story = () => <ProductConversation
 RemindersLoadedStaleAndUpcoming.storyName = 'reminders-loaded-stale-upcoming';
 export const RemindersRetryAndMutationRejection: Story = () => <ProductConversationFixture scenario={withReminders('reminders-retry-mutation-rejection', 0, true, 1)} />;
 RemindersRetryAndMutationRejection.storyName = 'reminders-retry-mutation-rejection';
+
+const composerFocusScenario = { ...getProductConversationScenario('ordinary-lazy-history'), id: 'composer-focus' as const };
+export const ComposerFocus: Story = () => <ProductConversationFixture scenario={composerFocusScenario}>
+  <input id="focus-outside" aria-label="Outside focus target" style={{ position: 'fixed', top: 0, left: 0, zIndex: 10000 }} />
+</ProductConversationFixture>;
+ComposerFocus.storyName = 'composer-focus';

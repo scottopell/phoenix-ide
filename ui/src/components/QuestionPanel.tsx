@@ -8,7 +8,7 @@
  * Submit calls api.respondToQuestion; Dismiss calls api.dismissQuestion.
  */
 
-import { useState, useCallback, useEffect, useRef } from 'react';
+import { useState, useCallback, useEffect, useLayoutEffect, useRef } from 'react';
 import { api } from '../api';
 import type { UserQuestion } from '../api';
 import {
@@ -93,6 +93,10 @@ export function QuestionPanel({
     isError: boolean;
   } | null>(null);
   const [showConfirmDismiss, setShowConfirmDismiss] = useState(false);
+  const confirmDismissVisibleRef = useRef(showConfirmDismiss);
+  useLayoutEffect(() => {
+    confirmDismissVisibleRef.current = showConfirmDismiss;
+  }, [showConfirmDismiss]);
   const [multiSelections, setMultiSelections] = useState<
     Record<string, Set<string>>
   >({});
@@ -342,14 +346,14 @@ export function QuestionPanel({
 
   const panelRef = useRef<HTMLDivElement>(null);
 
-  // --- Focus management: auto-focus on mount and step change (REQ-KB-004) ---
+  const hasCurrentQuestion = currentQuestion !== undefined;
   useEffect(() => {
-    if (!currentQuestion) return;
-    // Focus the panel root so it receives keyboard events
-    requestAnimationFrame(() => {
-      panelRef.current?.focus();
+    if (!hasCurrentQuestion) return;
+    const frame = requestAnimationFrame(() => {
+      if (!confirmDismissVisibleRef.current) panelRef.current?.focus();
     });
-  }, [currentStep, currentQuestion]);
+    return () => cancelAnimationFrame(frame);
+  }, [currentStep, hasCurrentQuestion]);
 
   // --- Update focused preview when focusedIndex changes ---
   useEffect(() => {

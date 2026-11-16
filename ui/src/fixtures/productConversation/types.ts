@@ -73,6 +73,7 @@ export const productConversationScenarioDefinitions = [
   { id: 'compact-events-ordinary', title: 'Compact ordinary events', viewport: 'desktop', state: 'ready' },
   { id: 'compact-events-global', title: 'Compact Global events', viewport: 'desktop', state: 'ready' },
   { id: 'compact-events-redacted', title: 'Redacted event evidence', viewport: 'desktop', state: 'ready' },
+  { id: 'composer-focus', title: 'Composer focus ownership', viewport: 'desktop', state: 'ready' },
   { id: 'reminders-initial-failure', title: 'Reminders initial GET failure', viewport: 'mobile', state: 'ready' },
   { id: 'reminders-alias-fallback-initial-failure', title: 'Conversation alias 404 fallback reminders initial GET failure', viewport: 'mobile', state: 'ready' },
   { id: 'reminders-loaded-stale-upcoming', title: 'Loaded stale and upcoming reminders', viewport: 'mobile', state: 'ready' },

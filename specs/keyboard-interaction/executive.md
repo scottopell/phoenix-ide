@@ -33,14 +33,20 @@ shortcuts use modifier keys and are never blocked by panel-level handlers.
 | **REQ-KB-002:** Global Shortcuts Pass Through | ✅ Complete | `useGlobalKeyboardShortcuts` keeps global commands available across scope-local handlers |
 | **REQ-KB-002A:** Topmost Eligible Shortcut Ownership | ✅ Complete | Viewer-local `Cmd/Ctrl+F` routing checks `activeScope` and ignores obscured lower layers via `useViewerFindKeyboardShortcut` |
 | **REQ-KB-003:** Scope-Local Key Consumption | ✅ Complete | Panel-local `onKeyDown` handlers consume owned keys so lower scopes do not react |
-| **REQ-KB-004:** Auto-Focus on Panel Appearance | ✅ Complete | Question-panel and viewer-find affordances move focus into their primary control on open |
+| **REQ-KB-004:** Auto-Focus on Panel Appearance | Implemented; focus-fix hosted qualification pending | Question-panel appearance and explicit step navigation focus the panel; same-question refresh does not. Pending callbacks are cancelled on cleanup and yield to dismissal confirmation. Local qualification is scoped below; viewer-find open behavior is unchanged. |
 | **REQ-KB-004A:** Repeated Shortcut Refocus | ✅ Complete | Re-pressing `Cmd/Ctrl+F` refocuses/selects the existing find query instead of opening another bar |
 | **REQ-KB-005:** Escape Key Behavior | ✅ Complete | Escape hierarchy remains sub-context -> confirm if unsaved -> dismiss -> navigate; viewer find closes before its enclosing viewer |
 | **REQ-KB-006:** Shortcut Help Panel | ✅ Complete | `?` key opens `ShortcutHelpPanel` |
 | **REQ-KB-007:** Tooltip Shortcut Hints | ✅ Complete | Shortcut-bearing controls expose their key hints in tooltips or labels |
 | **REQ-KB-008:** Prevent Key Leak to Inactive Scopes | ✅ Complete | Lower-priority keyboard navigation stays gated behind the active scope |
 
-**Progress:** 10 of 10 complete
+## Question-Panel Focus Qualification
+
+The local `QuestionPanel.test.tsx` run passed 16 tests, including same-question refresh, callback cleanup, and confirmation ownership. The actual-source browser diagnostic accepted same-value state-change and reconnect updates without remounting the panel and preserved outside focus after the fix. Positive controls retained mount/step keyboard interaction, confirmation-close restoration, and fresh-panel focus. Harness-local receipts: `/tmp/question-focus-diag/results-after.json`, `positive-controls-after.json`, and `tests-after.log`.
+
+The durable browser helper also passed locally for the question-panel and composer scenarios (`/tmp/focus-hosted-validation/positive`); negative controls detected same-question refresh and consumed-request remount focus theft (`/tmp/focus-hosted-validation/negative`). The five-suite run passed 201 tests with two skipped before the latest composer handoff extension, not at final head. Composer ownership and the revocable originating-review Send Notes handoff are specified by REQ-CONV-003.
+
+This is scoped local evidence, not deployed acceptance or full application qualification. Final handoff qualification, hosted exact-head CI/review, and production verification remain pending.
 
 ## Cross-Spec References
 

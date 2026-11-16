@@ -96,6 +96,10 @@ WHEN an interactive panel appears that accepts keyboard input
 THE SYSTEM SHALL focus the primary interactive element within 100ms
 AND the user SHALL be able to begin keyboard interaction without clicking
 
+For a question panel, appearance and explicit question-step navigation SHALL initiate focus; refreshing the same question's data without changing the step SHALL NOT initiate focus or displace the user's active control.
+
+Pending question-panel focus callbacks SHALL be cancelled when their panel disappears or their step is superseded, and SHALL NOT take focus from an open dismissal confirmation. Closing that confirmation SHALL restore its invoking control without replaying panel-appearance focus.
+
 A reaction input revealed by native text selection SHALL remain unfocused until the user explicitly enters it by click, tap, or unmodified Enter while the anchored pill is visible. Enter-to-focus SHALL preserve other controls’ normal Enter behavior and SHALL NOT trigger during IME composition. This preserves native copy actions and avoids an unsolicited mobile keyboard.
 
 WHEN focus cannot be set (element not yet rendered)
