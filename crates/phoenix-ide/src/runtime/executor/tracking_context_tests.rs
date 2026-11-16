@@ -317,10 +317,11 @@ mod live {
     impl BoundedClient {
         fn admit(&self, request: &LlmRequest) -> Result<(), LlmError> {
             use sha2::Digest;
-            let system_hash = format!(
-                "{:x}",
-                sha2::Sha256::digest(format!("{:?}", request.system).as_bytes())
-            );
+            use std::fmt::Write as _;
+            let mut system_hash = String::with_capacity(64);
+            for byte in sha2::Sha256::digest(format!("{:?}", request.system).as_bytes()) {
+                write!(system_hash, "{byte:02x}").unwrap();
+            }
             let calls = self.budget.calls.fetch_add(1, Ordering::SeqCst) + 1;
             let request_bytes = format!("{request:?}").len();
             let bytes = self
