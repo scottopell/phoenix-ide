@@ -205,7 +205,7 @@ async fn capture_occurrence(
         Response::ToolOnly => Some(MessageContent::agent(vec![ContentBlock::tool_use(
             format!("ending-think-{ordinal}"),
             "think",
-            json!({"thought":"Readiness inspection stopped."}),
+            json!({"thoughts":"Readiness inspection stopped."}),
         )])),
         Response::NoCarrier => None,
     };
@@ -748,7 +748,7 @@ async fn event_eval_fixture_uses_captured_evidence_and_real_read_tools() {
             ),
             (
                 "think",
-                json!({"thought":"Inspect only the synthetic evidence."}),
+                json!({"thoughts":"Inspect only the synthetic evidence."}),
             ),
         ] {
             let (output, error, denied) = world.dispatch(name, &input).await;
