@@ -262,7 +262,6 @@ registry composition comment no longer incorrectly claims that host-supplied
 creation tools are absent. These are guidance corrections, not watch timing,
 lifecycle or protocol changes.
 
-
 The description also names supported local Goal metadata changes. Under
 REQ-GR-015 and REQ-GOAL-AC-002, the installed Goal control path calls
 `coordinator_watches::goal_facts::settled_change_tx`: eligible enrolled open
@@ -271,10 +270,26 @@ version. Disabled control emits none, and the generic Goal report path excludes
 progress-only `Report` changes. This wording does not promise a notification for
 every progress report or change peer terminal-fact v1.
 
-The inventory candidate at 4bf9e4d31 compiled and exported eight synthetic variants;
-the ordinary matrix, export, three registered watch-list and seven coordinator
-prompt regressions passed. The read-only model-recovery fixture and its later
-source changes still require compilation and prepared-route/manual oracle review.
-Its frozen limits and limitations are in
-`scripts/qa/ember-watch-recovery/README.md`. Final integrated inventory and live
-acceptance remain separate evidence.
+The final runtime candidate at 2e098a302 compiled and exported eight synthetic
+variants. Its ordinary inventory matrix, opt-in export and real local-read
+recovery fixture pass; earlier registered watch-list (three) and coordinator
+prompt (seven) regressions also passed. The fixture smoke test exercises actual
+list/query/read/search/resolve/think tools against a retained isolated file
+SQLite database and runtime environment, and rejects remote/effectful dispatch.
+
+One separately prepared and independently reviewed real-model trial on
+`gpt-6-astra`, requested high effort, the normal discovered Codex route,
+PhoenixNative instructions and authenticated skills recovered on its first tool
+call: `list_watched_conversations {"request":{"op":"local"}}`. The actual enrolled
+watch was returned and the final answer correctly reported one idle conversation.
+There were no UUID guesses, remote selections, effectful attempts, helper denials
+or errors. Two provider requests used 21,921 observed input tokens including cache
+and 74 output tokens. The frozen budget was not expanded and there was no retry.
+The trace, binary, prompt and definition hashes and exact scope are recorded in
+`scripts/qa/ember-watch-recovery/README.md`.
+
+This qualifies one synthetic retained-history/model read-selection and actual
+registered-dispatch journey. It does not qualify full runtime input admission,
+production activation, every provider or final integrated context. Exact final
+CI and the inventory rerun after tracking/event integration remain required;
+phase 1 stays open for that final composition evidence.

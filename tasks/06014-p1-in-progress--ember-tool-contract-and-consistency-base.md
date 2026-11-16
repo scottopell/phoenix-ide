@@ -72,5 +72,18 @@ and generic/configured worker/tier variants, with bytes/words rather than a toke
 claim. It has no fixed list/count. Final execution/qualification follows memory
 integration so new tools cannot be omitted from the reported current surface.
 
-Formatting/whitespace pass. Rust compilation, export readback, schema/provider and
-composed model-recovery qualification remain pending; this task is not done.
+Runtime compilation, eight-variant export readback, the ordinary inventory matrix,
+real allowed local-read fixture, registered watch-list and Coordinator prompt
+regressions pass. One prepared, bounded Astra/high trial through the normal
+discovered Codex route recovered the exact local request on its first tool call,
+received the actual enrolled watch and reported its idle state correctly. The
+integrator independently accepted this narrow gate. Sanitized trace/hash receipts
+and limitations are in scripts/qa/ember-watch-recovery/README.md. This proves one
+synthetic model read-selection/registered-dispatch case, not full runtime admission
+or production activation. Exact final-head full CI remains required.
+
+**Mandatory final-composition follow-up:** rerun the assembled inventory after
+tracking/event integration, reconcile their tool/guidance entries and preserve
+actual configuration/language/catalog scope. This remains owned by this task and
+[combined acceptance](./06019-p1-ready--ember-coordination-end-to-end-qualificat.md).
+Do not mark phase 1 complete from the pre-integration inventory or this one trial.

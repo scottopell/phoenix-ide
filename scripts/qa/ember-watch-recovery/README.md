@@ -54,3 +54,34 @@ This proves read-only model selection and actual registered dispatch for this
 synthetic configuration. It does not exercise full runtime turn admission,
 durable tool-round checkpointing, production activation or every provider. Rerun
 the inventory after tracking/event integration to qualify the final composition.
+
+
+## Qualification receipt
+
+The integrator independently accepted the one live trial from runtime source
+`2e098a3021600cb997d3ed68e457559d9f596977`. Preparation and execution used identical
+route, binary, system prompt, definitions, limits and oracle. Actual discovery
+selected `gpt-6-astra` / requested high effort / `codex`, PhoenixNative language
+and the authenticated catalog. The emitted arguments were exactly
+`{"request":{"op":"local"}}`; the registered tool returned the enrolled synthetic
+**Watch Recovery Sentinel**, with its exact stable identity, transcript and idle
+state. The final answer named that one conversation and its idle state correctly.
+
+Two provider requests, one tool call, 21,921 observed input tokens including cache
+and 74 output tokens were recorded. There were zero UUID guesses, remote
+selections, effectful attempts, helper denials or errors. The test process took
+6.95 seconds; that is whole-trial wall time, not a provider latency benchmark.
+No budget change or second trial was used.
+
+- Binary SHA-256: `af678fd42762b5444e5831d6597a78cc80deb68ea141ca5a5a77d3965910e60e`.
+- System prompt SHA-256: `787109b6cc371b0b51a0a62105c918bfc5a529ab6e3c4af070c4774bc82966f0`.
+- Tool definitions SHA-256: `62b3c1346f994c03cca1465ff2f0af1150fadc00da16dddb3c9ca262b60c70ae`.
+- Prepared trace SHA-256: `daee18480acd73deb604060401bcc51db459bc409b1dbbfceddf0fb8b54d1a86`.
+- Live trace SHA-256: `7b228ca4d2563d34862aa5cf38076e08035950449929ce1483cf761d5c4d009b`.
+
+Private raw artifacts are retained under the audit worktree's
+`.phoenix/qualification/tool-audit/recovery-2e098-{prepared,live}/recovery.json`.
+Only this sanitized summary and hashes are committed. The isolated deterministic
+fixture also passed actual list/query/read/search/resolve/think smoke calls before
+provider execution. Full runtime admission, deployed behavior and the final
+integrated tracking/event surface remain outside this receipt.
