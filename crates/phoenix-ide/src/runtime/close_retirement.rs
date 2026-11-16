@@ -145,7 +145,7 @@ enum CloseRetryReceiptSource {
 struct CloseRetryLiveEvidence<'a> {
     scopes: &'a [CloseAttemptScope],
     expected: &'a [CloseExpectedRetirementResource],
-    inspections: &'a [CloseInspection],
+    worktree_snapshots: &'a [(CloseRetirementTarget, CloseRetirementSnapshot)],
     retired: &'a [CloseRetiredResource],
     receipt_source: CloseRetryReceiptSource,
 }
@@ -154,7 +154,7 @@ struct CloseRetryLiveEvidence<'a> {
 fn native_close_retry_remaining_effects(
     run: &CloseRunRef,
     proof: &StoppedCloseOriginalRetirementProof,
-    inspections: &[CloseInspection],
+    worktree_snapshots: &[(CloseRetirementTarget, CloseRetirementSnapshot)],
 ) -> Result<Vec<CloseSafeRetryEffect>, String> {
     if proof.run.run != *run || proof.run.status != CloseRunStatus::Stopped {
         return Err("native retry assessment requires the exact stopped run".into());
@@ -203,23 +203,22 @@ fn native_close_retry_remaining_effects(
                 );
             }
         }
-        let confirmed = inspections
+        let confirmed = worktree_snapshots
             .iter()
-            .filter(|inspection| inspection.target.scope == captured.scope);
+            .filter(|(target, _)| target.scope == captured.scope);
         if confirmed.count() != usize::from(captured.captured_worktree.is_some()) {
             return Err(
                 "native retry assessment lacks a unique original worktree inspection".into(),
             );
         }
     }
-    for inspection in inspections {
-        if inspection.attempt_id != run.attempt_id
-            || !proof
-                .scopes
-                .iter()
-                .any(|captured| captured.scope == inspection.target.scope)
+    for (target, _) in worktree_snapshots {
+        if !proof
+            .scopes
+            .iter()
+            .any(|captured| captured.scope == target.scope)
         {
-            return Err("native retry assessment has mismatched inspection evidence".into());
+            return Err("native retry assessment has mismatched worktree snapshot evidence".into());
         }
     }
     for (index, target) in proof.resources.iter().enumerate() {
@@ -1824,21 +1823,15 @@ impl RuntimeManager {
         &self,
         failed_run: &CloseRunRef,
     ) -> Result<NativeCloseRetryAssessment, String> {
-        let original = self
+        let context = self
             .db()
-            .read_stopped_close_original_retirement_proof(failed_run)
+            .read_native_close_retry_pre_admission_context(failed_run)
             .await
             .map_err(|error| error.to_string())?;
-        let inspections = self
-            .db()
-            .list_close_retirement_inspections_for_snapshot(
-                failed_run.attempt_id.as_str(),
-                &original.snapshot,
-            )
-            .await
-            .map_err(|error| error.to_string())?;
+        let original = context.original;
+        let worktree_snapshots = context.worktree_snapshots;
         let remaining_effects =
-            native_close_retry_remaining_effects(failed_run, &original, &inspections)?;
+            native_close_retry_remaining_effects(failed_run, &original, &worktree_snapshots)?;
         let safety_evidence = self
             .validate_close_safe_retry_with_evidence(
                 &failed_run.attempt_id,
@@ -1847,7 +1840,7 @@ impl RuntimeManager {
                 CloseRetryLiveEvidence {
                     scopes: &original.scopes,
                     expected: &original.resources,
-                    inspections: &inspections,
+                    worktree_snapshots: &worktree_snapshots,
                     retired: &original.outcomes,
                     receipt_source: CloseRetryReceiptSource::OriginalSnapshotOnly,
                 },
@@ -1881,6 +1874,10 @@ impl RuntimeManager {
             .list_close_retirement_inspections(attempt_id.as_str())
             .await
             .map_err(|error| error.to_string())?;
+        let worktree_snapshots = inspections
+            .iter()
+            .map(|inspection| (inspection.target.clone(), inspection.snapshot.clone()))
+            .collect::<Vec<_>>();
         let retired = self
             .db()
             .list_close_retirement_evidence(attempt_id.as_str())
@@ -1893,7 +1890,7 @@ impl RuntimeManager {
             CloseRetryLiveEvidence {
                 scopes: &scopes,
                 expected: &expected,
-                inspections: &inspections,
+                worktree_snapshots: &worktree_snapshots,
                 retired: &retired,
                 receipt_source: CloseRetryReceiptSource::GenericRetryHistory,
             },
@@ -1912,7 +1909,7 @@ impl RuntimeManager {
         let CloseRetryLiveEvidence {
             scopes,
             expected,
-            inspections,
+            worktree_snapshots,
             retired,
             receipt_source,
         } = evidence;
@@ -1979,13 +1976,13 @@ impl RuntimeManager {
                     if let Some(tombstone) = &tombstone {
                         let object = tombstone.root.join("object");
                         if object.try_exists().map_err(|error| error.to_string())? {
-                            let confirmed = inspections
+                            let confirmed = worktree_snapshots
                                 .iter()
-                                .find(|inspection| inspection.target.scope == *scope)
+                                .find(|(target, _)| target.scope == *scope)
                                 .ok_or_else(|| {
                                     format!("scope {scope} lacks a confirmed worktree inspection")
                                 })?;
-                            verify_retained_worktree(identity, object, &confirmed.snapshot).await?;
+                            verify_retained_worktree(identity, object, &confirmed.1).await?;
                         }
                     }
                     let active = path.try_exists().map_err(|error| error.to_string())?;
@@ -2012,15 +2009,15 @@ impl RuntimeManager {
                             .iter()
                             .any(|effect| effect.resource.kind() == RetiredResourceKind::Worktree)
                         {
-                            let confirmed = inspections
+                            let confirmed = worktree_snapshots
                                 .iter()
-                                .find(|inspection| inspection.target.scope == *scope)
+                                .find(|(target, _)| target.scope == *scope)
                                 .ok_or_else(|| {
                                     format!("scope {scope} lacks a confirmed worktree inspection")
                                 })?;
                             ensure_no_ignored_content(&path)?;
                             let (fresh, losses) = inspect_worktree_at(identity, path).await?;
-                            if fresh.fingerprint() != confirmed.snapshot.fingerprint()
+                            if fresh.fingerprint() != confirmed.1.fingerprint()
                                 || !losses.is_empty()
                             {
                                 return Err(format!(
@@ -9191,8 +9188,15 @@ mod tests {
         identity
     }
 
-    #[allow(clippy::too_many_lines)]
     async fn process_step_fixture(two_scopes: bool) -> ProcessStepFixture {
+        process_step_fixture_with_worktree(two_scopes, None).await
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn process_step_fixture_with_worktree(
+        two_scopes: bool,
+        live_worktree: Option<&Path>,
+    ) -> ProcessStepFixture {
         use phoenix_core::domain::close::{CloseOwnedResourceInventory, TranscriptConversationId};
         use std::collections::BTreeSet;
         use std::sync::Arc;
@@ -9204,6 +9208,16 @@ mod tests {
             .unwrap();
         let mut scopes = vec![source.attached_work_scope_id.clone().unwrap()];
         let mut worktrees = vec![mark_process_step_scope_allocated(&db, &scopes[0], "first").await];
+        if let Some(path) = live_worktree {
+            let identity = inspection_identity(path);
+            sqlx::query("UPDATE work_scopes SET worktree_path=?1, worktree_id=?2, worktree_fingerprint=?3 WHERE id=?4")
+                .bind(path.to_str().unwrap())
+                .bind(identity.id().as_str())
+                .bind(identity.fingerprint().as_str())
+                .bind(scopes[0].as_str())
+                .execute(db.pool()).await.unwrap();
+            worktrees[0] = identity;
+        }
         let mut latest_id = source.id.clone();
         if two_scopes {
             db.update_conversation_state(
@@ -9259,11 +9273,16 @@ mod tests {
             .map(|captured| captured.scope)
             .collect();
         scopes.sort();
-        let snapshot = super::CloseRetirementSnapshot::parse(
-            "process-step-generation",
-            "process-step-fingerprint",
-        )
-        .unwrap();
+        let snapshot = if live_worktree.is_some() {
+            let (snapshot, losses) = super::inspect_worktree(&worktrees[0]).await.unwrap();
+            assert!(losses.is_empty());
+            snapshot
+        } else {
+            super::CloseRetirementSnapshot::parse(
+                "process-step-generation",
+                "process-step-fingerprint",
+            ).unwrap()
+        };
         db.replace_close_inspection(crate::db::ReplaceCloseInspectionRequest {
             attempt_id: run.attempt_id.clone(),
             scopes: scopes
@@ -9363,19 +9382,30 @@ mod tests {
         }
     }
 
-    async fn stopped_native_retry_fixture() -> (
+    type NativeRetryFixture = (
         ProcessStepFixture,
         super::StoppedCloseOriginalRetirementProof,
-        Vec<super::CloseInspection>,
-    ) {
-        let fixture = process_step_fixture(false).await;
+        Vec<(super::CloseRetirementTarget, super::CloseRetirementSnapshot)>,
+    );
+
+    async fn stopped_native_retry_fixture() -> NativeRetryFixture {
+        stopped_native_retry_fixture_with_worktree(None).await
+    }
+
+    async fn stopped_native_retry_fixture_with_worktree(
+        live_worktree: Option<&Path>,
+    ) -> NativeRetryFixture {
+        let fixture = process_step_fixture_with_worktree(false, live_worktree).await;
         let db = fixture.manager.db();
         let targets = db
             .list_close_expected_retirement_resources(fixture.run.attempt_id.as_str())
             .await
             .unwrap();
         for target in targets {
-            if target.resource.kind() != super::RetiredResourceKind::WorkScope {
+            if target.resource.kind() != super::RetiredResourceKind::WorkScope
+                && !(live_worktree.is_some()
+                    && target.resource.kind() == super::RetiredResourceKind::Worktree)
+            {
                 db.record_close_retirement_evidence(
                     crate::db::RecordCloseRetirementEvidenceRequest {
                         attempt_id: fixture.run.attempt_id.clone(),
@@ -9397,14 +9427,17 @@ mod tests {
             .read_stopped_close_original_retirement_proof(&fixture.run)
             .await
             .unwrap();
-        let inspections = db
+        let worktree_snapshots = db
             .list_close_retirement_inspections_for_snapshot(
                 fixture.run.attempt_id.as_str(),
                 &original.snapshot,
             )
             .await
-            .unwrap();
-        (fixture, original, inspections)
+            .unwrap()
+            .into_iter()
+            .map(|inspection| (inspection.target, inspection.snapshot))
+            .collect();
+        (fixture, original, worktree_snapshots)
     }
 
     #[tokio::test]
@@ -9612,6 +9645,79 @@ mod tests {
             .get_close_run(&successor)
             .await
             .is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn native_retry_pending_worktree_uses_g1_under_g2_and_refuses_live_drift() {
+        let temp = tempfile::tempdir().unwrap();
+        let linked = linked_close_worktree(&temp);
+        let (fixture, original, snapshots) =
+            stopped_native_retry_fixture_with_worktree(Some(&linked)).await;
+        let db = fixture.manager.db();
+        let effects =
+            super::native_close_retry_remaining_effects(&fixture.run, &original, &snapshots)
+                .unwrap();
+        let worktree = effects.iter().find(|effect| {
+            effect.resource.kind() == super::RetiredResourceKind::Worktree
+        }).unwrap();
+        assert_eq!(effects.len(), 2);
+        assert_eq!(snapshots.len(), 1);
+        assert!(!original.outcomes.iter().any(|outcome| {
+            outcome.resource == worktree.resource
+                && matches!(outcome.outcome, super::RetirementOutcome::Retired
+                    | super::RetirementOutcome::AbsenceAdopted { .. })
+        }));
+
+        // Install conflicting retained inspection evidence, not a live filesystem change.
+        let scope = snapshots[0].0.scope.as_str();
+        let g2_generation = "conflicting-g2";
+        let g2_fingerprint = "conflicting-g2-fingerprint";
+        let g2 = super::CloseRetirementSnapshot::parse(
+            format!("v1{}:{scope}{}:{g2_generation}", scope.len(), g2_generation.len()),
+            format!("v1{}:{scope}{}:{g2_fingerprint}", scope.len(), g2_fingerprint.len()),
+        ).unwrap();
+        let mut tx = db.pool().begin().await.unwrap();
+        sqlx::query("UPDATE close_retirement_inspections SET generation=?1, fingerprint=?2 WHERE attempt_id=?3 AND scope=?4")
+            .bind(g2_generation).bind(g2_fingerprint)
+            .bind(fixture.run.attempt_id.as_str()).bind(scope)
+            .execute(&mut *tx).await.unwrap();
+        sqlx::query("UPDATE close_obligations SET inspection_generation=?1, inspection_fingerprint=?2 WHERE attempt_id=?3")
+            .bind(g2.generation()).bind(g2.fingerprint())
+            .bind(fixture.run.attempt_id.as_str())
+            .execute(&mut *tx).await.unwrap();
+        tx.commit().await.unwrap();
+        let obligation = db.get_close_obligation(fixture.run.attempt_id.as_str()).await.unwrap();
+        let inspections = db.list_close_retirement_inspections(fixture.run.attempt_id.as_str()).await.unwrap();
+        assert_eq!(obligation.snapshot(), Some(&g2));
+        assert_ne!(g2, original.snapshot);
+        assert!(db.list_close_retirement_inspections_for_snapshot(
+            fixture.run.attempt_id.as_str(), &original.snapshot,
+        ).await.is_err());
+
+        let assessment = fixture.manager.assess_native_close_retry(&fixture.run).await.unwrap();
+        assert_eq!(assessment.original, original);
+        assert_eq!(assessment.remaining_effects, effects);
+        std::fs::write(linked.join("new-unique-data"), "must survive\n").unwrap();
+        let error = fixture.manager.assess_native_close_retry(&fixture.run).await.unwrap_err();
+        assert!(error.contains("not unchanged and reconstructible"), "{error}");
+        assert_eq!(std::fs::read_to_string(linked.join("new-unique-data")).unwrap(), "must survive\n");
+
+        assert_eq!(db.get_close_obligation(fixture.run.attempt_id.as_str()).await.unwrap(), obligation);
+        assert_eq!(db.list_close_retirement_inspections(fixture.run.attempt_id.as_str()).await.unwrap(), inspections);
+        assert_eq!(db.read_stopped_close_original_retirement_proof(&fixture.run).await.unwrap(), original);
+        assert_eq!(db.get_close_run(&fixture.run).await.unwrap(), original.run);
+        let successor = super::CloseRunRef {
+            attempt_id: fixture.run.attempt_id.clone(),
+            ordinal: super::CloseRunOrdinal::parse(2).unwrap(),
+        };
+        assert!(db.get_close_run(&successor).await.is_err());
+        for effect in &effects {
+            assert!(!db.close_retirement_resource_was_dispatched(
+                &fixture.run.attempt_id, &effect.scope, &original.snapshot, &effect.resource,
+            ).await.unwrap());
+        }
     }
 
     async fn run_scope(

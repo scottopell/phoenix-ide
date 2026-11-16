@@ -141,6 +141,84 @@ async fn native_retry_execution_context_refuses_forged_receipt_wrong_failed_run_
     assert_eq!(native_failure_side_effect_counts(&db).await, counts);
 }
 
+#[tokio::test]
+async fn native_retry_pre_admission_context_reads_exact_stopped_g1_without_mutation() {
+    let (db, assessment, receipt) = native_resource_failure_fixture().await;
+    let run = CloseRunRef {
+        attempt_id: receipt.admitted.attempt_id.clone(),
+        ordinal: receipt.admitted.run_ordinal,
+    };
+    let g2 = current_test_snapshot(&db, run.attempt_id.as_str()).await;
+    assert_ne!(g2, assessment.proof.snapshot);
+    let pending = db.close_safe_retry_progress(&run).await.unwrap().pending;
+    let request = native_resource_failure_request(&assessment, &receipt, &pending, 0);
+    retry_completed(db.terminalize_native_close_retry_resource_failure(
+        &assessment.command, &receipt.admitted, request,
+    ).await);
+
+    let retained = migration_163_retained_state(&db).await;
+    let metadata = lookup_metadata(&db, &run.attempt_id).await;
+    let counts = native_failure_side_effect_counts(&db).await;
+    let context = db.read_native_close_retry_pre_admission_context(&run).await.unwrap();
+    assert_eq!(context.original.snapshot, assessment.proof.snapshot);
+    assert_eq!(context.original.scopes, assessment.proof.scopes);
+    assert_eq!(context.original.resources, assessment.proof.resources);
+    assert!(!context.worktree_snapshots.is_empty());
+    assert!(context.worktree_snapshots.iter().all(|(_, snapshot)| snapshot != &g2));
+    assert_eq!(current_test_snapshot(&db, run.attempt_id.as_str()).await, g2);
+    assert_eq!(migration_163_retained_state(&db).await, retained);
+    assert_eq!(lookup_metadata(&db, &run.attempt_id).await, metadata);
+    assert_eq!(native_failure_side_effect_counts(&db).await, counts);
+}
+
+#[tokio::test]
+async fn native_retry_pre_admission_context_keeps_historical_stopped_readable_and_rejects_running_successor() {
+    let (db, assessment, receipt) = native_resource_failure_fixture().await;
+    let failed_run = CloseRunRef {
+        attempt_id: receipt.admitted.attempt_id.clone(),
+        ordinal: receipt.admitted.run_ordinal,
+    };
+    let pending = db.close_safe_retry_progress(&failed_run).await.unwrap().pending;
+    let request = native_resource_failure_request(&assessment, &receipt, &pending, 0);
+    retry_completed(db.terminalize_native_close_retry_resource_failure(
+        &assessment.command, &receipt.admitted, request,
+    ).await);
+
+    let original_source = db.get_conversation(assessment.command.source_transcript_id())
+        .await.unwrap().state;
+    let mut retry = assessment.request.clone();
+    retry.failed_run = failed_run.clone();
+    retry.remaining_effects = pending;
+    retry.observed_at_us = Utc::now().timestamp_micros();
+    let proof = db.read_stopped_close_original_retirement_proof(&failed_run).await.unwrap();
+    let command = retry_command(&db, "preadmission-successor", NativeCloseIntent::ExplicitRetry {
+        target: receipt.admitted.target.clone(),
+        attempt_id: failed_run.attempt_id.clone(),
+        failed_run_ordinal: failed_run.ordinal,
+    }).await;
+    let successor = Assessment { command, request: retry, proof };
+    let admitted = admitted(db.apply_native_close_explicit_retry(&successor).await);
+    db.update_conversation_state(assessment.command.source_transcript_id(), &original_source)
+        .await.unwrap();
+
+    let retained = migration_163_retained_state(&db).await;
+    let counts = native_failure_side_effect_counts(&db).await;
+    assert_eq!(db.read_native_close_retry_pre_admission_context(&failed_run).await.unwrap()
+        .original.snapshot, assessment.proof.snapshot);
+    let running_successor = CloseRunRef {
+        attempt_id: admitted.admitted.attempt_id.clone(),
+        ordinal: admitted.admitted.run_ordinal,
+    };
+    assert!(db.read_native_close_retry_pre_admission_context(&running_successor).await.is_err());
+    let wrong_predecessor = CloseRunRef {
+        attempt_id: failed_run.attempt_id.clone(),
+        ordinal: admitted.admitted.run_ordinal,
+    };
+    assert!(db.read_native_close_retry_pre_admission_context(&wrong_predecessor).await.is_err());
+    assert_eq!(migration_163_retained_state(&db).await, retained);
+    assert_eq!(native_failure_side_effect_counts(&db).await, counts);
+}
+
 fn native_resource_failure_request(
     assessment: &Assessment,
     receipt: &NativeCloseReceipt,

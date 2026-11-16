@@ -15,6 +15,7 @@ use sqlx::{Row, Sqlite, Transaction};
 use super::{NativeCloseCommand, NativeCloseIntent, NativeCloseRunRef};
 use crate::close_foundation::{
     close_obligation_for_update, parse_cleanup_resource_identity, retained_close_retry_progress_tx,
+    StoppedCloseOriginalRetirementProof,
     CloseCleanupFailureAuthority, CloseCleanupFailureResource, CloseCleanupResourceDisposition,
     CloseSafeRetryEffect, CloseSafeRetryProgress, RecordCloseRetirementDispatchRequest,
     TerminalizeInitialCloseCleanupFailureRequest,
@@ -34,6 +35,13 @@ pub struct NativeCloseRetryExecutionContext {
     pub progress: CloseSafeRetryProgress,
     pub scopes: Vec<CloseAttemptScope>,
     pub resources: Vec<CloseExpectedRetirementResource>,
+    pub worktree_snapshots: Vec<(CloseRetirementTarget, CloseRetirementSnapshot)>,
+}
+
+/// Exact stopped original-generation evidence for read-only pre-admission assessment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeCloseRetryPreAdmissionContext {
+    pub original: StoppedCloseOriginalRetirementProof,
     pub worktree_snapshots: Vec<(CloseRetirementTarget, CloseRetirementSnapshot)>,
 }
 
@@ -112,6 +120,25 @@ struct NativeCloseRetryPlanIdentity {
 }
 
 impl Database {
+    /// Reads an exact stopped predecessor's original snapshot context in one read-only
+    /// transaction. Historical stopped predecessors remain readable after later runs;
+    /// this context confers no admission, dispatch, or cleanup authority.
+    ///
+    /// # Errors
+    /// Refuses a run that is not an exact stopped original-generation predecessor or
+    /// whose persisted aggregate does not match its captured scopes. The read does not
+    /// mutate retained state.
+    pub async fn read_native_close_retry_pre_admission_context(
+        &self,
+        failed_run: &CloseRunRef,
+    ) -> DbResult<NativeCloseRetryPreAdmissionContext> {
+        let mut tx = self.pool.begin().await?;
+        let original = Self::read_stopped_close_original_retirement_proof_tx(&mut tx, failed_run).await?;
+        let worktree_snapshots = original_worktree_snapshots(&original.snapshot, &original.scopes)?;
+        tx.commit().await?;
+        Ok(NativeCloseRetryPreAdmissionContext { original, worktree_snapshots })
+    }
+
     /// Reads the exact latest running resource retry in one read-only transaction.
     /// The actor must hold its exclusive source occurrence and execution lock; this
     /// context neither owns that authority nor authorizes dispatch or fresh inspection.

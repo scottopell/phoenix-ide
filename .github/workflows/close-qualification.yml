@@ -96,6 +96,11 @@ jobs:
             grep -F "close_foundation::tests::native_retry::$test: test" evidence/selected-tests.txt
           done
           for test in \
+            native_retry_pre_admission_context_reads_exact_stopped_g1_without_mutation \
+            native_retry_pre_admission_context_keeps_historical_stopped_readable_and_rejects_running_successor; do
+            grep -F "native_close::retry::execution_tests::$test: test" evidence/selected-tests.txt
+          done
+          for test in \
             native_retry_dispatch_uses_original_g1_under_g2_and_replays_without_mutation \
             native_retry_dispatch_refuses_forged_identity_non_worktree_and_success \
             native_retry_dispatch_checks_stale_source_before_retained_dispatch_replay \
@@ -195,6 +200,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          grep -F 'runtime::close_retirement::tests::native_retry_pending_worktree_uses_g1_under_g2_and_refuses_live_drift: test' evidence/runtime-inventory.log
+          grep -F 'runtime::close_retirement::tests::native_retry_refuses_missing_duplicate_and_mismatched_original_evidence: test' evidence/runtime-inventory.log
+          grep -F 'runtime::close_retirement::tests::native_retry_assessment_keeps_exact_snapshot_and_does_not_dispatch: test' evidence/runtime-inventory.log
           cargo test -p phoenix_ide --lib close_retirement::tests::native_retry_ -- --nocapture --test-threads=1 2>&1 | tee evidence/native-close-retry-assessment.log
           grep -Eq 'test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored;' evidence/native-close-retry-assessment.log
       - name: Qualify Coordinator Goal discovery migration ledger

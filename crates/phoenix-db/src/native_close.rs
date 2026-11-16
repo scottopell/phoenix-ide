@@ -200,7 +200,9 @@ mod retry_execution;
 mod source_fence;
 pub use observe::{NativeCloseObservation, NativeCloseObserveReceipt, NativeCloseObserveResult};
 pub use retry::{NativeCloseRetryResult, NativeCloseRetrySourceAssessment};
-pub use retry_execution::NativeCloseRetryExecutionContext;
+pub use retry_execution::{
+    NativeCloseRetryExecutionContext, NativeCloseRetryPreAdmissionContext,
+};
 pub(crate) use source_fence::{
     fence_native_retry_sources_tx, interrupt_native_retry_tx, recover_native_retry_sources_tx,
     NativeRetrySourceFence,
