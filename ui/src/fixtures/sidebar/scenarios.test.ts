@@ -48,6 +48,22 @@ describe('sidebar fixture scenarios', () => {
     }
   });
 
+  it('preserves needs-action presentation in snapshot fixtures', async () => {
+    const row = sidebarFixtureData.productConversations?.['product-actions-continued']?.[0];
+    if (!row) throw new Error('Missing continued-actions fixture');
+    const presentation = { kind: 'needs_action' as const, display_name: 'Review required' };
+    const restore = installSidebarFixtureApi({
+      ...sidebarFixtureData,
+      productConversations: { 'product-actions-continued': [{ ...row, presentation }] },
+    }, 'product-actions-continued');
+    try {
+      const snapshot = await api.getProductConversationSnapshot(row.product_conversation_id);
+      expect(snapshot.presentation).toEqual(presentation);
+    } finally {
+      restore();
+    }
+  });
+
   it('mocks settings and version endpoints and restores their original API methods', async () => {
     const originals = {
       getNotificationSettings: api.getNotificationSettings,
@@ -95,8 +111,8 @@ describe('sidebar fixture scenarios', () => {
       expect(active?.cached_pr?.display_state).toBe('merged');
       expect(active?.read_state.state).toBe('unread');
     }
-    expect(rows[0]?.presentation.presentation_mode).toBe('working');
-    expect(rows[3]?.presentation.presentation_mode).toBe('error');
+    expect(rows[0]?.presentation).toEqual(expect.objectContaining({ kind: 'state', presentation_mode: 'working' }));
+    expect(rows[3]?.presentation).toEqual(expect.objectContaining({ kind: 'state', presentation_mode: 'error' }));
   });
 
   it('keeps every active scenario slug backed by fixture data', () => {

@@ -24,7 +24,7 @@ jobs:
       - name: Typecheck and sidebar regressions
         working-directory: ui
         run: |
-          pnpm exec tsc --noEmit
+          pnpm exec tsc -b --pretty false
           pnpm exec vitest run src/fixtures/sidebar/scenarios.test.ts src/components/Sidebar.test.tsx src/components/ConversationList.test.tsx
       - run: pnpm exec playwright install --with-deps chromium
         working-directory: ui

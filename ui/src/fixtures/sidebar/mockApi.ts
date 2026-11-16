@@ -83,7 +83,7 @@ export function installSidebarFixtureApi(data: SidebarFixtureData, scenarioId: k
       writable_transcript_row_id: latestTranscriptRowId,
       latest_opening: { status: 'none' },
       updated_at: row.updated_at,
-      presentation: { kind: 'state', display_name: row.presentation.display_name, presentation_mode: row.presentation.presentation_mode },
+      presentation: row.presentation,
       work_identity: null,
       source: null,
       chain_qa_compatibility: null,

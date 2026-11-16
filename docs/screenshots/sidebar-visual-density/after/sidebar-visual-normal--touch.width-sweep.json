@@ -1,0 +1,3026 @@
+[
+  {
+    "width": 160,
+    "listWidth": 159,
+    "rows": [
+      {
+        "titleWidth": 60,
+        "mainWidth": 87,
+        "inside": true,
+        "badgeClear": true
+      },
+      {
+        "titleWidth": 73,
+        "mainWidth": 87,
+        "inside": true,
+        "badgeClear": true
+      },
+      {
+        "titleWidth": 57,
+        "mainWidth": 84,
+        "inside": true,
+        "badgeClear": true
+      },
+      {
+        "titleWidth": 73,
+        "mainWidth": 87,
+        "inside": true,
+        "badgeClear": true
+      },
+      {
+        "titleWidth": 73,
+        "mainWidth": 87,
+        "inside": true,
+        "badgeClear": true
+      }
+    ],
+    "controls": [
+      {
+        "fits": true,
+        "inside": true,
+        "x": 8,
+        "right": 52,
+        "top": 8,
+        "bottom": 52,
+        "width": 44,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 56,
+        "right": 152,
+        "top": 8,
+        "bottom": 52,
+        "width": 96,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 8,
+        "right": 56,
+        "top": 56,
+        "bottom": 100,
+        "width": 48,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 60,
+        "right": 104,
+        "top": 56,
+        "bottom": 100,
+        "width": 44,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 108,
+        "right": 152,
+        "top": 56,
+        "bottom": 100,
+        "width": 44,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 8,
+        "right": 151,
+        "top": 164,
+        "bottom": 208,
+        "width": 143,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 8,
+        "right": 151,
+        "top": 212,
+        "bottom": 256,
+        "width": 143,
+        "height": 44
+      }
+    ]
+  },
+  {
+    "width": 180,
+    "listWidth": 179,
+    "rows": [
+      {
+        "titleWidth": 80,
+        "mainWidth": 107,
+        "inside": true,
+        "badgeClear": true
+      },
+      {
+        "titleWidth": 93,
+        "mainWidth": 107,
+        "inside": true,
+        "badgeClear": true
+      },
+      {
+        "titleWidth": 77,
+        "mainWidth": 104,
+        "inside": true,
+        "badgeClear": true
+      },
+      {
+        "titleWidth": 93,
+        "mainWidth": 107,
+        "inside": true,
+        "badgeClear": true
+      },
+      {
+        "titleWidth": 93,
+        "mainWidth": 107,
+        "inside": true,
+        "badgeClear": true
+      }
+    ],
+    "controls": [
+      {
+        "fits": true,
+        "inside": true,
+        "x": 8,
+        "right": 52,
+        "top": 8,
+        "bottom": 52,
+        "width": 44,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 56,
+        "right": 171,
+        "top": 8,
+        "bottom": 52,
+        "width": 115,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 8,
+        "right": 75,
+        "top": 56,
+        "bottom": 100,
+        "width": 67,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 79,
+        "right": 123,
+        "top": 56,
+        "bottom": 100,
+        "width": 44,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 127,
+        "right": 171,
+        "top": 56,
+        "bottom": 100,
+        "width": 44,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 8,
+        "right": 171,
+        "top": 164,
+        "bottom": 208,
+        "width": 163,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 8,
+        "right": 171,
+        "top": 212,
+        "bottom": 256,
+        "width": 163,
+        "height": 44
+      }
+    ]
+  },
+  {
+    "width": 200,
+    "listWidth": 199,
+    "rows": [
+      {
+        "titleWidth": 100,
+        "mainWidth": 127,
+        "inside": true,
+        "badgeClear": true
+      },
+      {
+        "titleWidth": 113,
+        "mainWidth": 127,
+        "inside": true,
+        "badgeClear": true
+      },
+      {
+        "titleWidth": 97,
+        "mainWidth": 124,
+        "inside": true,
+        "badgeClear": true
+      },
+      {
+        "titleWidth": 113,
+        "mainWidth": 127,
+        "inside": true,
+        "badgeClear": true
+      },
+      {
+        "titleWidth": 113,
+        "mainWidth": 127,
+        "inside": true,
+        "badgeClear": true
+      }
+    ],
+    "controls": [
+      {
+        "fits": true,
+        "inside": true,
+        "x": 8,
+        "right": 52,
+        "top": 8,
+        "bottom": 52,
+        "width": 44,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 56,
+        "right": 191,
+        "top": 8,
+        "bottom": 52,
+        "width": 135,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 8,
+        "right": 95,
+        "top": 56,
+        "bottom": 100,
+        "width": 87,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 99,
+        "right": 143,
+        "top": 56,
+        "bottom": 100,
+        "width": 44,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 147,
+        "right": 191,
+        "top": 56,
+        "bottom": 100,
+        "width": 44,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 8,
+        "right": 191,
+        "top": 164,
+        "bottom": 208,
+        "width": 183,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 8,
+        "right": 191,
+        "top": 212,
+        "bottom": 256,
+        "width": 183,
+        "height": 44
+      }
+    ]
+  },
+  {
+    "width": 220,
+    "listWidth": 219,
+    "rows": [
+      {
+        "titleWidth": 120,
+        "mainWidth": 147,
+        "inside": true,
+        "badgeClear": true
+      },
+      {
+        "titleWidth": 133,
+        "mainWidth": 147,
+        "inside": true,
+        "badgeClear": true
+      },
+      {
+        "titleWidth": 117,
+        "mainWidth": 144,
+        "inside": true,
+        "badgeClear": true
+      },
+      {
+        "titleWidth": 133,
+        "mainWidth": 147,
+        "inside": true,
+        "badgeClear": true
+      },
+      {
+        "titleWidth": 133,
+        "mainWidth": 147,
+        "inside": true,
+        "badgeClear": true
+      }
+    ],
+    "controls": [
+      {
+        "fits": true,
+        "inside": true,
+        "x": 8,
+        "right": 52,
+        "top": 8,
+        "bottom": 52,
+        "width": 44,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 56,
+        "right": 211,
+        "top": 8,
+        "bottom": 52,
+        "width": 155,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 8,
+        "right": 115,
+        "top": 56,
+        "bottom": 100,
+        "width": 107,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 119,
+        "right": 163,
+        "top": 56,
+        "bottom": 100,
+        "width": 44,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 167,
+        "right": 211,
+        "top": 56,
+        "bottom": 100,
+        "width": 44,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 8,
+        "right": 211,
+        "top": 164,
+        "bottom": 208,
+        "width": 203,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 8,
+        "right": 211,
+        "top": 212,
+        "bottom": 256,
+        "width": 203,
+        "height": 44
+      }
+    ]
+  },
+  {
+    "width": 221,
+    "listWidth": 220,
+    "rows": [
+      {
+        "titleWidth": 121,
+        "mainWidth": 148,
+        "inside": true,
+        "badgeClear": true
+      },
+      {
+        "titleWidth": 134,
+        "mainWidth": 148,
+        "inside": true,
+        "badgeClear": true
+      },
+      {
+        "titleWidth": 118,
+        "mainWidth": 145,
+        "inside": true,
+        "badgeClear": true
+      },
+      {
+        "titleWidth": 134,
+        "mainWidth": 148,
+        "inside": true,
+        "badgeClear": true
+      },
+      {
+        "titleWidth": 134,
+        "mainWidth": 148,
+        "inside": true,
+        "badgeClear": true
+      }
+    ],
+    "controls": [
+      {
+        "fits": true,
+        "inside": true,
+        "x": 8,
+        "right": 52,
+        "top": 8,
+        "bottom": 52,
+        "width": 44,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 56,
+        "right": 109.640625,
+        "top": 8,
+        "bottom": 52,
+        "width": 53.640625,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 113.640625,
+        "right": 164,
+        "top": 8,
+        "bottom": 52,
+        "width": 50.359375,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 168,
+        "right": 212,
+        "top": 8,
+        "bottom": 52,
+        "width": 44,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 8,
+        "right": 52,
+        "top": 56,
+        "bottom": 100,
+        "width": 44,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 8,
+        "right": 108,
+        "top": 164,
+        "bottom": 208,
+        "width": 100,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 112,
+        "right": 212,
+        "top": 164,
+        "bottom": 208,
+        "width": 100,
+        "height": 44
+      }
+    ]
+  },
+  {
+    "width": 222,
+    "listWidth": 221,
+    "rows": [
+      {
+        "titleWidth": 122,
+        "mainWidth": 149,
+        "inside": true,
+        "badgeClear": true
+      },
+      {
+        "titleWidth": 135,
+        "mainWidth": 149,
+        "inside": true,
+        "badgeClear": true
+      },
+      {
+        "titleWidth": 119,
+        "mainWidth": 146,
+        "inside": true,
+        "badgeClear": true
+      },
+      {
+        "titleWidth": 135,
+        "mainWidth": 149,
+        "inside": true,
+        "badgeClear": true
+      },
+      {
+        "titleWidth": 135,
+        "mainWidth": 149,
+        "inside": true,
+        "badgeClear": true
+      }
+    ],
+    "controls": [
+      {
+        "fits": true,
+        "inside": true,
+        "x": 8,
+        "right": 52,
+        "top": 8,
+        "bottom": 52,
+        "width": 44,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 56,
+        "right": 110.640625,
+        "top": 8,
+        "bottom": 52,
+        "width": 54.640625,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 114.640625,
+        "right": 165,
+        "top": 8,
+        "bottom": 52,
+        "width": 50.359375,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 169,
+        "right": 213,
+        "top": 8,
+        "bottom": 52,
+        "width": 44,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 8,
+        "right": 52,
+        "top": 56,
+        "bottom": 100,
+        "width": 44,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 8,
+        "right": 108.5,
+        "top": 164,
+        "bottom": 208,
+        "width": 100.5,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 112.5,
+        "right": 213,
+        "top": 164,
+        "bottom": 208,
+        "width": 100.5,
+        "height": 44
+      }
+    ]
+  },
+  {
+    "width": 223,
+    "listWidth": 222,
+    "rows": [
+      {
+        "titleWidth": 123,
+        "mainWidth": 150,
+        "inside": true,
+        "badgeClear": true
+      },
+      {
+        "titleWidth": 136,
+        "mainWidth": 150,
+        "inside": true,
+        "badgeClear": true
+      },
+      {
+        "titleWidth": 120,
+        "mainWidth": 147,
+        "inside": true,
+        "badgeClear": true
+      },
+      {
+        "titleWidth": 136,
+        "mainWidth": 150,
+        "inside": true,
+        "badgeClear": true
+      },
+      {
+        "titleWidth": 136,
+        "mainWidth": 150,
+        "inside": true,
+        "badgeClear": true
+      }
+    ],
+    "controls": [
+      {
+        "fits": true,
+        "inside": true,
+        "x": 8,
+        "right": 52,
+        "top": 8,
+        "bottom": 52,
+        "width": 44,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 56,
+        "right": 111.640625,
+        "top": 8,
+        "bottom": 52,
+        "width": 55.640625,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 115.640625,
+        "right": 166,
+        "top": 8,
+        "bottom": 52,
+        "width": 50.359375,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 170,
+        "right": 214,
+        "top": 8,
+        "bottom": 52,
+        "width": 44,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 8,
+        "right": 52,
+        "top": 56,
+        "bottom": 100,
+        "width": 44,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 8,
+        "right": 109,
+        "top": 164,
+        "bottom": 208,
+        "width": 101,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 113,
+        "right": 214,
+        "top": 164,
+        "bottom": 208,
+        "width": 101,
+        "height": 44
+      }
+    ]
+  },
+  {
+    "width": 224,
+    "listWidth": 223,
+    "rows": [
+      {
+        "titleWidth": 124,
+        "mainWidth": 151,
+        "inside": true,
+        "badgeClear": true
+      },
+      {
+        "titleWidth": 137,
+        "mainWidth": 151,
+        "inside": true,
+        "badgeClear": true
+      },
+      {
+        "titleWidth": 121,
+        "mainWidth": 148,
+        "inside": true,
+        "badgeClear": true
+      },
+      {
+        "titleWidth": 137,
+        "mainWidth": 151,
+        "inside": true,
+        "badgeClear": true
+      },
+      {
+        "titleWidth": 137,
+        "mainWidth": 151,
+        "inside": true,
+        "badgeClear": true
+      }
+    ],
+    "controls": [
+      {
+        "fits": true,
+        "inside": true,
+        "x": 8,
+        "right": 52,
+        "top": 8,
+        "bottom": 52,
+        "width": 44,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 56,
+        "right": 112.640625,
+        "top": 8,
+        "bottom": 52,
+        "width": 56.640625,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 116.640625,
+        "right": 167,
+        "top": 8,
+        "bottom": 52,
+        "width": 50.359375,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 171,
+        "right": 215,
+        "top": 8,
+        "bottom": 52,
+        "width": 44,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 8,
+        "right": 52,
+        "top": 56,
+        "bottom": 100,
+        "width": 44,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 8,
+        "right": 109.5,
+        "top": 164,
+        "bottom": 208,
+        "width": 101.5,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 113.5,
+        "right": 215,
+        "top": 164,
+        "bottom": 208,
+        "width": 101.5,
+        "height": 44
+      }
+    ]
+  },
+  {
+    "width": 225,
+    "listWidth": 224,
+    "rows": [
+      {
+        "titleWidth": 125,
+        "mainWidth": 152,
+        "inside": true,
+        "badgeClear": true
+      },
+      {
+        "titleWidth": 138,
+        "mainWidth": 152,
+        "inside": true,
+        "badgeClear": true
+      },
+      {
+        "titleWidth": 122,
+        "mainWidth": 149,
+        "inside": true,
+        "badgeClear": true
+      },
+      {
+        "titleWidth": 138,
+        "mainWidth": 152,
+        "inside": true,
+        "badgeClear": true
+      },
+      {
+        "titleWidth": 138,
+        "mainWidth": 152,
+        "inside": true,
+        "badgeClear": true
+      }
+    ],
+    "controls": [
+      {
+        "fits": true,
+        "inside": true,
+        "x": 8,
+        "right": 52,
+        "top": 8,
+        "bottom": 52,
+        "width": 44,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 56,
+        "right": 113.640625,
+        "top": 8,
+        "bottom": 52,
+        "width": 57.640625,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 117.640625,
+        "right": 168,
+        "top": 8,
+        "bottom": 52,
+        "width": 50.359375,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 172,
+        "right": 216,
+        "top": 8,
+        "bottom": 52,
+        "width": 44,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 8,
+        "right": 52,
+        "top": 56,
+        "bottom": 100,
+        "width": 44,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 8,
+        "right": 110,
+        "top": 164,
+        "bottom": 208,
+        "width": 102,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 114,
+        "right": 216,
+        "top": 164,
+        "bottom": 208,
+        "width": 102,
+        "height": 44
+      }
+    ]
+  },
+  {
+    "width": 226,
+    "listWidth": 225,
+    "rows": [
+      {
+        "titleWidth": 126,
+        "mainWidth": 153,
+        "inside": true,
+        "badgeClear": true
+      },
+      {
+        "titleWidth": 139,
+        "mainWidth": 153,
+        "inside": true,
+        "badgeClear": true
+      },
+      {
+        "titleWidth": 123,
+        "mainWidth": 150,
+        "inside": true,
+        "badgeClear": true
+      },
+      {
+        "titleWidth": 139,
+        "mainWidth": 153,
+        "inside": true,
+        "badgeClear": true
+      },
+      {
+        "titleWidth": 139,
+        "mainWidth": 153,
+        "inside": true,
+        "badgeClear": true
+      }
+    ],
+    "controls": [
+      {
+        "fits": true,
+        "inside": true,
+        "x": 8,
+        "right": 52,
+        "top": 8,
+        "bottom": 52,
+        "width": 44,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 56,
+        "right": 114.640625,
+        "top": 8,
+        "bottom": 52,
+        "width": 58.640625,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 118.640625,
+        "right": 169,
+        "top": 8,
+        "bottom": 52,
+        "width": 50.359375,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 173,
+        "right": 217,
+        "top": 8,
+        "bottom": 52,
+        "width": 44,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 8,
+        "right": 52,
+        "top": 56,
+        "bottom": 100,
+        "width": 44,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 8,
+        "right": 110.5,
+        "top": 164,
+        "bottom": 208,
+        "width": 102.5,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 114.5,
+        "right": 217,
+        "top": 164,
+        "bottom": 208,
+        "width": 102.5,
+        "height": 44
+      }
+    ]
+  },
+  {
+    "width": 227,
+    "listWidth": 226,
+    "rows": [
+      {
+        "titleWidth": 127,
+        "mainWidth": 154,
+        "inside": true,
+        "badgeClear": true
+      },
+      {
+        "titleWidth": 140,
+        "mainWidth": 154,
+        "inside": true,
+        "badgeClear": true
+      },
+      {
+        "titleWidth": 124,
+        "mainWidth": 151,
+        "inside": true,
+        "badgeClear": true
+      },
+      {
+        "titleWidth": 140,
+        "mainWidth": 154,
+        "inside": true,
+        "badgeClear": true
+      },
+      {
+        "titleWidth": 140,
+        "mainWidth": 154,
+        "inside": true,
+        "badgeClear": true
+      }
+    ],
+    "controls": [
+      {
+        "fits": true,
+        "inside": true,
+        "x": 8,
+        "right": 52,
+        "top": 8,
+        "bottom": 52,
+        "width": 44,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 56,
+        "right": 115.640625,
+        "top": 8,
+        "bottom": 52,
+        "width": 59.640625,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 119.640625,
+        "right": 170,
+        "top": 8,
+        "bottom": 52,
+        "width": 50.359375,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 174,
+        "right": 218,
+        "top": 8,
+        "bottom": 52,
+        "width": 44,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 8,
+        "right": 52,
+        "top": 56,
+        "bottom": 100,
+        "width": 44,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 8,
+        "right": 111,
+        "top": 164,
+        "bottom": 208,
+        "width": 103,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 115,
+        "right": 218,
+        "top": 164,
+        "bottom": 208,
+        "width": 103,
+        "height": 44
+      }
+    ]
+  },
+  {
+    "width": 228,
+    "listWidth": 227,
+    "rows": [
+      {
+        "titleWidth": 128,
+        "mainWidth": 155,
+        "inside": true,
+        "badgeClear": true
+      },
+      {
+        "titleWidth": 141,
+        "mainWidth": 155,
+        "inside": true,
+        "badgeClear": true
+      },
+      {
+        "titleWidth": 125,
+        "mainWidth": 152,
+        "inside": true,
+        "badgeClear": true
+      },
+      {
+        "titleWidth": 141,
+        "mainWidth": 155,
+        "inside": true,
+        "badgeClear": true
+      },
+      {
+        "titleWidth": 141,
+        "mainWidth": 155,
+        "inside": true,
+        "badgeClear": true
+      }
+    ],
+    "controls": [
+      {
+        "fits": true,
+        "inside": true,
+        "x": 8,
+        "right": 52,
+        "top": 8,
+        "bottom": 52,
+        "width": 44,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 56,
+        "right": 116.640625,
+        "top": 8,
+        "bottom": 52,
+        "width": 60.640625,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 120.640625,
+        "right": 171,
+        "top": 8,
+        "bottom": 52,
+        "width": 50.359375,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 175,
+        "right": 219,
+        "top": 8,
+        "bottom": 52,
+        "width": 44,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 8,
+        "right": 52,
+        "top": 56,
+        "bottom": 100,
+        "width": 44,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 8,
+        "right": 111.5,
+        "top": 164,
+        "bottom": 208,
+        "width": 103.5,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 115.5,
+        "right": 219,
+        "top": 164,
+        "bottom": 208,
+        "width": 103.5,
+        "height": 44
+      }
+    ]
+  },
+  {
+    "width": 229,
+    "listWidth": 228,
+    "rows": [
+      {
+        "titleWidth": 129,
+        "mainWidth": 156,
+        "inside": true,
+        "badgeClear": true
+      },
+      {
+        "titleWidth": 142,
+        "mainWidth": 156,
+        "inside": true,
+        "badgeClear": true
+      },
+      {
+        "titleWidth": 126,
+        "mainWidth": 153,
+        "inside": true,
+        "badgeClear": true
+      },
+      {
+        "titleWidth": 142,
+        "mainWidth": 156,
+        "inside": true,
+        "badgeClear": true
+      },
+      {
+        "titleWidth": 142,
+        "mainWidth": 156,
+        "inside": true,
+        "badgeClear": true
+      }
+    ],
+    "controls": [
+      {
+        "fits": true,
+        "inside": true,
+        "x": 8,
+        "right": 52,
+        "top": 8,
+        "bottom": 52,
+        "width": 44,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 56,
+        "right": 117.640625,
+        "top": 8,
+        "bottom": 52,
+        "width": 61.640625,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 121.640625,
+        "right": 172,
+        "top": 8,
+        "bottom": 52,
+        "width": 50.359375,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 176,
+        "right": 220,
+        "top": 8,
+        "bottom": 52,
+        "width": 44,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 8,
+        "right": 52,
+        "top": 56,
+        "bottom": 100,
+        "width": 44,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 8,
+        "right": 112,
+        "top": 164,
+        "bottom": 208,
+        "width": 104,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 116,
+        "right": 220,
+        "top": 164,
+        "bottom": 208,
+        "width": 104,
+        "height": 44
+      }
+    ]
+  },
+  {
+    "width": 230,
+    "listWidth": 229,
+    "rows": [
+      {
+        "titleWidth": 130,
+        "mainWidth": 157,
+        "inside": true,
+        "badgeClear": true
+      },
+      {
+        "titleWidth": 143,
+        "mainWidth": 157,
+        "inside": true,
+        "badgeClear": true
+      },
+      {
+        "titleWidth": 127,
+        "mainWidth": 154,
+        "inside": true,
+        "badgeClear": true
+      },
+      {
+        "titleWidth": 143,
+        "mainWidth": 157,
+        "inside": true,
+        "badgeClear": true
+      },
+      {
+        "titleWidth": 143,
+        "mainWidth": 157,
+        "inside": true,
+        "badgeClear": true
+      }
+    ],
+    "controls": [
+      {
+        "fits": true,
+        "inside": true,
+        "x": 8,
+        "right": 52,
+        "top": 8,
+        "bottom": 52,
+        "width": 44,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 56,
+        "right": 118.640625,
+        "top": 8,
+        "bottom": 52,
+        "width": 62.640625,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 122.640625,
+        "right": 173,
+        "top": 8,
+        "bottom": 52,
+        "width": 50.359375,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 177,
+        "right": 221,
+        "top": 8,
+        "bottom": 52,
+        "width": 44,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 8,
+        "right": 52,
+        "top": 56,
+        "bottom": 100,
+        "width": 44,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 8,
+        "right": 112.5,
+        "top": 164,
+        "bottom": 208,
+        "width": 104.5,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 116.5,
+        "right": 221,
+        "top": 164,
+        "bottom": 208,
+        "width": 104.5,
+        "height": 44
+      }
+    ]
+  },
+  {
+    "width": 231,
+    "listWidth": 230,
+    "rows": [
+      {
+        "titleWidth": 131,
+        "mainWidth": 158,
+        "inside": true,
+        "badgeClear": true
+      },
+      {
+        "titleWidth": 144,
+        "mainWidth": 158,
+        "inside": true,
+        "badgeClear": true
+      },
+      {
+        "titleWidth": 128,
+        "mainWidth": 155,
+        "inside": true,
+        "badgeClear": true
+      },
+      {
+        "titleWidth": 144,
+        "mainWidth": 158,
+        "inside": true,
+        "badgeClear": true
+      },
+      {
+        "titleWidth": 144,
+        "mainWidth": 158,
+        "inside": true,
+        "badgeClear": true
+      }
+    ],
+    "controls": [
+      {
+        "fits": true,
+        "inside": true,
+        "x": 8,
+        "right": 52,
+        "top": 8,
+        "bottom": 52,
+        "width": 44,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 56,
+        "right": 119.640625,
+        "top": 8,
+        "bottom": 52,
+        "width": 63.640625,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 123.640625,
+        "right": 174,
+        "top": 8,
+        "bottom": 52,
+        "width": 50.359375,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 178,
+        "right": 222,
+        "top": 8,
+        "bottom": 52,
+        "width": 44,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 8,
+        "right": 52,
+        "top": 56,
+        "bottom": 100,
+        "width": 44,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 8,
+        "right": 113,
+        "top": 164,
+        "bottom": 208,
+        "width": 105,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 117,
+        "right": 222,
+        "top": 164,
+        "bottom": 208,
+        "width": 105,
+        "height": 44
+      }
+    ]
+  },
+  {
+    "width": 232,
+    "listWidth": 231,
+    "rows": [
+      {
+        "titleWidth": 132,
+        "mainWidth": 159,
+        "inside": true,
+        "badgeClear": true
+      },
+      {
+        "titleWidth": 145,
+        "mainWidth": 159,
+        "inside": true,
+        "badgeClear": true
+      },
+      {
+        "titleWidth": 129,
+        "mainWidth": 156,
+        "inside": true,
+        "badgeClear": true
+      },
+      {
+        "titleWidth": 145,
+        "mainWidth": 159,
+        "inside": true,
+        "badgeClear": true
+      },
+      {
+        "titleWidth": 145,
+        "mainWidth": 159,
+        "inside": true,
+        "badgeClear": true
+      }
+    ],
+    "controls": [
+      {
+        "fits": true,
+        "inside": true,
+        "x": 8,
+        "right": 52,
+        "top": 8,
+        "bottom": 52,
+        "width": 44,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 56,
+        "right": 120.640625,
+        "top": 8,
+        "bottom": 52,
+        "width": 64.640625,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 124.640625,
+        "right": 175,
+        "top": 8,
+        "bottom": 52,
+        "width": 50.359375,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 179,
+        "right": 223,
+        "top": 8,
+        "bottom": 52,
+        "width": 44,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 8,
+        "right": 52,
+        "top": 56,
+        "bottom": 100,
+        "width": 44,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 8,
+        "right": 113.5,
+        "top": 164,
+        "bottom": 208,
+        "width": 105.5,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 117.5,
+        "right": 223,
+        "top": 164,
+        "bottom": 208,
+        "width": 105.5,
+        "height": 44
+      }
+    ]
+  },
+  {
+    "width": 233,
+    "listWidth": 232,
+    "rows": [
+      {
+        "titleWidth": 133,
+        "mainWidth": 160,
+        "inside": true,
+        "badgeClear": true
+      },
+      {
+        "titleWidth": 146,
+        "mainWidth": 160,
+        "inside": true,
+        "badgeClear": true
+      },
+      {
+        "titleWidth": 130,
+        "mainWidth": 157,
+        "inside": true,
+        "badgeClear": true
+      },
+      {
+        "titleWidth": 146,
+        "mainWidth": 160,
+        "inside": true,
+        "badgeClear": true
+      },
+      {
+        "titleWidth": 146,
+        "mainWidth": 160,
+        "inside": true,
+        "badgeClear": true
+      }
+    ],
+    "controls": [
+      {
+        "fits": true,
+        "inside": true,
+        "x": 8,
+        "right": 52,
+        "top": 8,
+        "bottom": 52,
+        "width": 44,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 56,
+        "right": 121.640625,
+        "top": 8,
+        "bottom": 52,
+        "width": 65.640625,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 125.640625,
+        "right": 176,
+        "top": 8,
+        "bottom": 52,
+        "width": 50.359375,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 180,
+        "right": 224,
+        "top": 8,
+        "bottom": 52,
+        "width": 44,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 8,
+        "right": 52,
+        "top": 56,
+        "bottom": 100,
+        "width": 44,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 8,
+        "right": 114,
+        "top": 164,
+        "bottom": 208,
+        "width": 106,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 118,
+        "right": 224,
+        "top": 164,
+        "bottom": 208,
+        "width": 106,
+        "height": 44
+      }
+    ]
+  },
+  {
+    "width": 234,
+    "listWidth": 233,
+    "rows": [
+      {
+        "titleWidth": 134,
+        "mainWidth": 161,
+        "inside": true,
+        "badgeClear": true
+      },
+      {
+        "titleWidth": 147,
+        "mainWidth": 161,
+        "inside": true,
+        "badgeClear": true
+      },
+      {
+        "titleWidth": 131,
+        "mainWidth": 158,
+        "inside": true,
+        "badgeClear": true
+      },
+      {
+        "titleWidth": 147,
+        "mainWidth": 161,
+        "inside": true,
+        "badgeClear": true
+      },
+      {
+        "titleWidth": 147,
+        "mainWidth": 161,
+        "inside": true,
+        "badgeClear": true
+      }
+    ],
+    "controls": [
+      {
+        "fits": true,
+        "inside": true,
+        "x": 8,
+        "right": 52,
+        "top": 8,
+        "bottom": 52,
+        "width": 44,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 56,
+        "right": 122.640625,
+        "top": 8,
+        "bottom": 52,
+        "width": 66.640625,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 126.640625,
+        "right": 177,
+        "top": 8,
+        "bottom": 52,
+        "width": 50.359375,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 181,
+        "right": 225,
+        "top": 8,
+        "bottom": 52,
+        "width": 44,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 8,
+        "right": 52,
+        "top": 56,
+        "bottom": 100,
+        "width": 44,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 8,
+        "right": 114.5,
+        "top": 164,
+        "bottom": 208,
+        "width": 106.5,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 118.5,
+        "right": 225,
+        "top": 164,
+        "bottom": 208,
+        "width": 106.5,
+        "height": 44
+      }
+    ]
+  },
+  {
+    "width": 235,
+    "listWidth": 234,
+    "rows": [
+      {
+        "titleWidth": 135,
+        "mainWidth": 162,
+        "inside": true,
+        "badgeClear": true
+      },
+      {
+        "titleWidth": 148,
+        "mainWidth": 162,
+        "inside": true,
+        "badgeClear": true
+      },
+      {
+        "titleWidth": 132,
+        "mainWidth": 159,
+        "inside": true,
+        "badgeClear": true
+      },
+      {
+        "titleWidth": 148,
+        "mainWidth": 162,
+        "inside": true,
+        "badgeClear": true
+      },
+      {
+        "titleWidth": 148,
+        "mainWidth": 162,
+        "inside": true,
+        "badgeClear": true
+      }
+    ],
+    "controls": [
+      {
+        "fits": true,
+        "inside": true,
+        "x": 8,
+        "right": 52,
+        "top": 8,
+        "bottom": 52,
+        "width": 44,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 56,
+        "right": 123.640625,
+        "top": 8,
+        "bottom": 52,
+        "width": 67.640625,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 127.640625,
+        "right": 178,
+        "top": 8,
+        "bottom": 52,
+        "width": 50.359375,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 182,
+        "right": 226,
+        "top": 8,
+        "bottom": 52,
+        "width": 44,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 8,
+        "right": 52,
+        "top": 56,
+        "bottom": 100,
+        "width": 44,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 8,
+        "right": 115,
+        "top": 164,
+        "bottom": 208,
+        "width": 107,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 119,
+        "right": 226,
+        "top": 164,
+        "bottom": 208,
+        "width": 107,
+        "height": 44
+      }
+    ]
+  },
+  {
+    "width": 236,
+    "listWidth": 235,
+    "rows": [
+      {
+        "titleWidth": 136,
+        "mainWidth": 163,
+        "inside": true,
+        "badgeClear": true
+      },
+      {
+        "titleWidth": 149,
+        "mainWidth": 163,
+        "inside": true,
+        "badgeClear": true
+      },
+      {
+        "titleWidth": 133,
+        "mainWidth": 160,
+        "inside": true,
+        "badgeClear": true
+      },
+      {
+        "titleWidth": 149,
+        "mainWidth": 163,
+        "inside": true,
+        "badgeClear": true
+      },
+      {
+        "titleWidth": 149,
+        "mainWidth": 163,
+        "inside": true,
+        "badgeClear": true
+      }
+    ],
+    "controls": [
+      {
+        "fits": true,
+        "inside": true,
+        "x": 8,
+        "right": 52,
+        "top": 8,
+        "bottom": 52,
+        "width": 44,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 56,
+        "right": 124.640625,
+        "top": 8,
+        "bottom": 52,
+        "width": 68.640625,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 128.640625,
+        "right": 179,
+        "top": 8,
+        "bottom": 52,
+        "width": 50.359375,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 183,
+        "right": 227,
+        "top": 8,
+        "bottom": 52,
+        "width": 44,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 8,
+        "right": 52,
+        "top": 56,
+        "bottom": 100,
+        "width": 44,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 8,
+        "right": 115.5,
+        "top": 164,
+        "bottom": 208,
+        "width": 107.5,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 119.5,
+        "right": 227,
+        "top": 164,
+        "bottom": 208,
+        "width": 107.5,
+        "height": 44
+      }
+    ]
+  },
+  {
+    "width": 237,
+    "listWidth": 236,
+    "rows": [
+      {
+        "titleWidth": 137,
+        "mainWidth": 164,
+        "inside": true,
+        "badgeClear": true
+      },
+      {
+        "titleWidth": 150,
+        "mainWidth": 164,
+        "inside": true,
+        "badgeClear": true
+      },
+      {
+        "titleWidth": 134,
+        "mainWidth": 161,
+        "inside": true,
+        "badgeClear": true
+      },
+      {
+        "titleWidth": 150,
+        "mainWidth": 164,
+        "inside": true,
+        "badgeClear": true
+      },
+      {
+        "titleWidth": 150,
+        "mainWidth": 164,
+        "inside": true,
+        "badgeClear": true
+      }
+    ],
+    "controls": [
+      {
+        "fits": true,
+        "inside": true,
+        "x": 8,
+        "right": 52,
+        "top": 8,
+        "bottom": 52,
+        "width": 44,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 56,
+        "right": 125.640625,
+        "top": 8,
+        "bottom": 52,
+        "width": 69.640625,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 129.640625,
+        "right": 180,
+        "top": 8,
+        "bottom": 52,
+        "width": 50.359375,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 184,
+        "right": 228,
+        "top": 8,
+        "bottom": 52,
+        "width": 44,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 8,
+        "right": 52,
+        "top": 56,
+        "bottom": 100,
+        "width": 44,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 8,
+        "right": 116,
+        "top": 164,
+        "bottom": 208,
+        "width": 108,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 120,
+        "right": 228,
+        "top": 164,
+        "bottom": 208,
+        "width": 108,
+        "height": 44
+      }
+    ]
+  },
+  {
+    "width": 238,
+    "listWidth": 237,
+    "rows": [
+      {
+        "titleWidth": 138,
+        "mainWidth": 165,
+        "inside": true,
+        "badgeClear": true
+      },
+      {
+        "titleWidth": 151,
+        "mainWidth": 165,
+        "inside": true,
+        "badgeClear": true
+      },
+      {
+        "titleWidth": 135,
+        "mainWidth": 162,
+        "inside": true,
+        "badgeClear": true
+      },
+      {
+        "titleWidth": 151,
+        "mainWidth": 165,
+        "inside": true,
+        "badgeClear": true
+      },
+      {
+        "titleWidth": 151,
+        "mainWidth": 165,
+        "inside": true,
+        "badgeClear": true
+      }
+    ],
+    "controls": [
+      {
+        "fits": true,
+        "inside": true,
+        "x": 8,
+        "right": 52,
+        "top": 8,
+        "bottom": 52,
+        "width": 44,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 56,
+        "right": 126.640625,
+        "top": 8,
+        "bottom": 52,
+        "width": 70.640625,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 130.640625,
+        "right": 181,
+        "top": 8,
+        "bottom": 52,
+        "width": 50.359375,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 185,
+        "right": 229,
+        "top": 8,
+        "bottom": 52,
+        "width": 44,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 8,
+        "right": 52,
+        "top": 56,
+        "bottom": 100,
+        "width": 44,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 8,
+        "right": 116.5,
+        "top": 164,
+        "bottom": 208,
+        "width": 108.5,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 120.5,
+        "right": 229,
+        "top": 164,
+        "bottom": 208,
+        "width": 108.5,
+        "height": 44
+      }
+    ]
+  },
+  {
+    "width": 239,
+    "listWidth": 238,
+    "rows": [
+      {
+        "titleWidth": 85,
+        "mainWidth": 112,
+        "inside": true,
+        "badgeClear": true
+      },
+      {
+        "titleWidth": 62,
+        "mainWidth": 76,
+        "inside": true,
+        "badgeClear": true
+      },
+      {
+        "titleWidth": 40,
+        "mainWidth": 67,
+        "inside": true,
+        "badgeClear": true
+      },
+      {
+        "titleWidth": 56,
+        "mainWidth": 70,
+        "inside": true,
+        "badgeClear": true
+      },
+      {
+        "titleWidth": 144,
+        "mainWidth": 158,
+        "inside": true,
+        "badgeClear": true
+      }
+    ],
+    "controls": [
+      {
+        "fits": true,
+        "inside": true,
+        "x": 8,
+        "right": 52,
+        "top": 8,
+        "bottom": 52,
+        "width": 44,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 56,
+        "right": 127.640625,
+        "top": 8,
+        "bottom": 52,
+        "width": 71.640625,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 131.640625,
+        "right": 182,
+        "top": 8,
+        "bottom": 52,
+        "width": 50.359375,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 186,
+        "right": 230,
+        "top": 8,
+        "bottom": 52,
+        "width": 44,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 8,
+        "right": 52,
+        "top": 56,
+        "bottom": 100,
+        "width": 44,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 8,
+        "right": 117,
+        "top": 164,
+        "bottom": 208,
+        "width": 109,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 121,
+        "right": 230,
+        "top": 164,
+        "bottom": 208,
+        "width": 109,
+        "height": 44
+      }
+    ]
+  },
+  {
+    "width": 240,
+    "listWidth": 239,
+    "rows": [
+      {
+        "titleWidth": 86,
+        "mainWidth": 113,
+        "inside": true,
+        "badgeClear": true
+      },
+      {
+        "titleWidth": 63,
+        "mainWidth": 77,
+        "inside": true,
+        "badgeClear": true
+      },
+      {
+        "titleWidth": 41,
+        "mainWidth": 68,
+        "inside": true,
+        "badgeClear": true
+      },
+      {
+        "titleWidth": 57,
+        "mainWidth": 71,
+        "inside": true,
+        "badgeClear": true
+      },
+      {
+        "titleWidth": 145,
+        "mainWidth": 159,
+        "inside": true,
+        "badgeClear": true
+      }
+    ],
+    "controls": [
+      {
+        "fits": true,
+        "inside": true,
+        "x": 8,
+        "right": 52,
+        "top": 8,
+        "bottom": 52,
+        "width": 44,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 56,
+        "right": 128.640625,
+        "top": 8,
+        "bottom": 52,
+        "width": 72.640625,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 132.640625,
+        "right": 183,
+        "top": 8,
+        "bottom": 52,
+        "width": 50.359375,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 187,
+        "right": 231,
+        "top": 8,
+        "bottom": 52,
+        "width": 44,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 8,
+        "right": 52,
+        "top": 56,
+        "bottom": 100,
+        "width": 44,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 8,
+        "right": 117.5,
+        "top": 164,
+        "bottom": 208,
+        "width": 109.5,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 121.5,
+        "right": 231,
+        "top": 164,
+        "bottom": 208,
+        "width": 109.5,
+        "height": 44
+      }
+    ]
+  },
+  {
+    "width": 260,
+    "listWidth": 259,
+    "rows": [
+      {
+        "titleWidth": 106,
+        "mainWidth": 133,
+        "inside": true,
+        "badgeClear": true
+      },
+      {
+        "titleWidth": 83,
+        "mainWidth": 97,
+        "inside": true,
+        "badgeClear": true
+      },
+      {
+        "titleWidth": 61,
+        "mainWidth": 88,
+        "inside": true,
+        "badgeClear": true
+      },
+      {
+        "titleWidth": 77,
+        "mainWidth": 91,
+        "inside": true,
+        "badgeClear": true
+      },
+      {
+        "titleWidth": 165,
+        "mainWidth": 179,
+        "inside": true,
+        "badgeClear": true
+      }
+    ],
+    "controls": [
+      {
+        "fits": true,
+        "inside": true,
+        "x": 8,
+        "right": 52,
+        "top": 8,
+        "bottom": 52,
+        "width": 44,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 56,
+        "right": 100.640625,
+        "top": 8,
+        "bottom": 52,
+        "width": 44.640625,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 104.640625,
+        "right": 155,
+        "top": 8,
+        "bottom": 52,
+        "width": 50.359375,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 159,
+        "right": 203,
+        "top": 8,
+        "bottom": 52,
+        "width": 44,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 207,
+        "right": 251,
+        "top": 8,
+        "bottom": 52,
+        "width": 44,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 8,
+        "right": 127.5,
+        "top": 116,
+        "bottom": 160,
+        "width": 119.5,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 131.5,
+        "right": 251,
+        "top": 116,
+        "bottom": 160,
+        "width": 119.5,
+        "height": 44
+      }
+    ]
+  },
+  {
+    "width": 280,
+    "listWidth": 279,
+    "rows": [
+      {
+        "titleWidth": 126,
+        "mainWidth": 153,
+        "inside": true,
+        "badgeClear": true
+      },
+      {
+        "titleWidth": 103,
+        "mainWidth": 117,
+        "inside": true,
+        "badgeClear": true
+      },
+      {
+        "titleWidth": 81,
+        "mainWidth": 108,
+        "inside": true,
+        "badgeClear": true
+      },
+      {
+        "titleWidth": 97,
+        "mainWidth": 111,
+        "inside": true,
+        "badgeClear": true
+      },
+      {
+        "titleWidth": 185,
+        "mainWidth": 199,
+        "inside": true,
+        "badgeClear": true
+      }
+    ],
+    "controls": [
+      {
+        "fits": true,
+        "inside": true,
+        "x": 8,
+        "right": 52,
+        "top": 8,
+        "bottom": 52,
+        "width": 44,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 56,
+        "right": 120.640625,
+        "top": 8,
+        "bottom": 52,
+        "width": 64.640625,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 124.640625,
+        "right": 175,
+        "top": 8,
+        "bottom": 52,
+        "width": 50.359375,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 179,
+        "right": 223,
+        "top": 8,
+        "bottom": 52,
+        "width": 44,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 227,
+        "right": 271,
+        "top": 8,
+        "bottom": 52,
+        "width": 44,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 8,
+        "right": 137.5,
+        "top": 116,
+        "bottom": 160,
+        "width": 129.5,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 141.5,
+        "right": 271,
+        "top": 116,
+        "bottom": 160,
+        "width": 129.5,
+        "height": 44
+      }
+    ]
+  },
+  {
+    "width": 320,
+    "listWidth": 319,
+    "rows": [
+      {
+        "titleWidth": 166,
+        "mainWidth": 193,
+        "inside": true,
+        "badgeClear": true
+      },
+      {
+        "titleWidth": 143,
+        "mainWidth": 157,
+        "inside": true,
+        "badgeClear": true
+      },
+      {
+        "titleWidth": 121,
+        "mainWidth": 148,
+        "inside": true,
+        "badgeClear": true
+      },
+      {
+        "titleWidth": 137,
+        "mainWidth": 151,
+        "inside": true,
+        "badgeClear": true
+      },
+      {
+        "titleWidth": 225,
+        "mainWidth": 239,
+        "inside": true,
+        "badgeClear": true
+      }
+    ],
+    "controls": [
+      {
+        "fits": true,
+        "inside": true,
+        "x": 8,
+        "right": 52,
+        "top": 8,
+        "bottom": 52,
+        "width": 44,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 56,
+        "right": 160.640625,
+        "top": 8,
+        "bottom": 52,
+        "width": 104.640625,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 164.640625,
+        "right": 215,
+        "top": 8,
+        "bottom": 52,
+        "width": 50.359375,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 219,
+        "right": 263,
+        "top": 8,
+        "bottom": 52,
+        "width": 44,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 267,
+        "right": 311,
+        "top": 8,
+        "bottom": 52,
+        "width": 44,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 8,
+        "right": 157.5,
+        "top": 116,
+        "bottom": 160,
+        "width": 149.5,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 161.5,
+        "right": 311,
+        "top": 116,
+        "bottom": 160,
+        "width": 149.5,
+        "height": 44
+      }
+    ]
+  },
+  {
+    "width": 500,
+    "listWidth": 499,
+    "rows": [
+      {
+        "titleWidth": 215.28125,
+        "mainWidth": 373,
+        "inside": true,
+        "badgeClear": true
+      },
+      {
+        "titleWidth": 323,
+        "mainWidth": 337,
+        "inside": true,
+        "badgeClear": true
+      },
+      {
+        "titleWidth": 216.015625,
+        "mainWidth": 328,
+        "inside": true,
+        "badgeClear": true
+      },
+      {
+        "titleWidth": 317,
+        "mainWidth": 331,
+        "inside": true,
+        "badgeClear": true
+      },
+      {
+        "titleWidth": 405,
+        "mainWidth": 419,
+        "inside": true,
+        "badgeClear": true
+      }
+    ],
+    "controls": [
+      {
+        "fits": true,
+        "inside": true,
+        "x": 8,
+        "right": 52,
+        "top": 8,
+        "bottom": 52,
+        "width": 44,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 56,
+        "right": 340.640625,
+        "top": 8,
+        "bottom": 52,
+        "width": 284.640625,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 344.640625,
+        "right": 395,
+        "top": 8,
+        "bottom": 52,
+        "width": 50.359375,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 399,
+        "right": 443,
+        "top": 8,
+        "bottom": 52,
+        "width": 44,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 447,
+        "right": 491,
+        "top": 8,
+        "bottom": 52,
+        "width": 44,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 8,
+        "right": 247.5,
+        "top": 116,
+        "bottom": 160,
+        "width": 239.5,
+        "height": 44
+      },
+      {
+        "fits": true,
+        "inside": true,
+        "x": 251.5,
+        "right": 491,
+        "top": 116,
+        "bottom": 160,
+        "width": 239.5,
+        "height": 44
+      }
+    ]
+  }
+]
