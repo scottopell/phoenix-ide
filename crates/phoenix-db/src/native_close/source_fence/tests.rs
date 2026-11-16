@@ -604,3 +604,336 @@ async fn startup_leaves_completed_native_retry_and_allowance_untouched() {
         }
     }
 }
+
+#[tokio::test]
+async fn source_fence_refuses_resource_plan_inspection_and_retry_artifact_near_misses_atomically() {
+    for near_miss in ["resource_count", "inspection_binding", "retry_evidence"] {
+        let (db, assessment, run) = source_fence_fixture().await;
+        let source = db
+            .get_conversation(assessment.command.source_transcript_id())
+            .await
+            .unwrap()
+            .state;
+        let failures = db.list_close_cleanup_failures(run.attempt_id.as_str()).await.unwrap();
+        let events = db
+            .pending_coordinator_watch_events(100)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|event| event.event_id)
+            .collect::<Vec<_>>();
+        let effects: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM close_run_retry_effects WHERE attempt_id = ?1 AND run_ordinal = ?2",
+        )
+        .bind(run.attempt_id.as_str())
+        .bind(run.ordinal.get())
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert!(effects > 0);
+
+        match near_miss {
+            "resource_count" => {
+                sqlx::query("DROP TRIGGER native_close_retry_plans_immutable")
+                    .execute(db.pool())
+                    .await
+                    .unwrap();
+                sqlx::query(
+                    "UPDATE native_close_retry_plans SET effect_count = effect_count + 1
+                     WHERE attempt_id = ?1 AND run_ordinal = ?2",
+                )
+                .bind(run.attempt_id.as_str())
+                .bind(run.ordinal.get())
+                .execute(db.pool())
+                .await
+                .unwrap();
+            }
+            "inspection_binding" => {
+                sqlx::query("DROP TRIGGER native_close_retry_plans_immutable")
+                    .execute(db.pool())
+                    .await
+                    .unwrap();
+                sqlx::query(
+                    "UPDATE native_close_retry_plans
+                     SET inspection_fingerprint = 'unbound-inspection'
+                     WHERE attempt_id = ?1 AND run_ordinal = ?2",
+                )
+                .bind(run.attempt_id.as_str())
+                .bind(run.ordinal.get())
+                .execute(db.pool())
+                .await
+                .unwrap();
+            }
+            "retry_evidence" => {
+                sqlx::query("DROP TRIGGER close_runs_terminal_and_identity_immutable")
+                    .execute(db.pool())
+                    .await
+                    .unwrap();
+                sqlx::query(
+                    "UPDATE close_runs SET retry_evidence_kind = 'verified_completion'
+                     WHERE attempt_id = ?1 AND run_ordinal = ?2",
+                )
+                .bind(run.attempt_id.as_str())
+                .bind(run.ordinal.get())
+                .execute(db.pool())
+                .await
+                .unwrap();
+            }
+            _ => unreachable!(),
+        };
+
+        assert!(write_source_fence_state(&db, &assessment.command, &ConvState::Idle, false)
+            .await
+            .is_err());
+        assert_eq!(
+            db.get_conversation(assessment.command.source_transcript_id()).await.unwrap().state,
+            source,
+        );
+        assert_eq!(
+            db.get_close_run(&run).await.unwrap().status,
+            CloseRunStatus::Running
+        );
+        assert_eq!(
+            db.list_close_cleanup_failures(run.attempt_id.as_str())
+                .await
+                .unwrap(),
+            failures
+        );
+        assert_eq!(
+            db.pending_coordinator_watch_events(100)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|event| event.event_id)
+                .collect::<Vec<_>>(),
+            events
+        );
+        assert_eq!(source_fence_allowance(&db, &run).await, Some((0, 0)));
+        let run_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM close_runs WHERE attempt_id = ?1",
+        )
+        .bind(run.attempt_id.as_str())
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(run_count, 2);
+    }
+}
+
+#[tokio::test]
+async fn migration_166_populated_upgrade_preserves_retry_and_adds_initial_source_authority() {
+    let (retry_db, assessment, receipt) = migration_163_pending_fixture().await;
+    assert_eq!(
+        crate::migrations::run_through_for_test(retry_db.pool(), 165)
+            .await
+            .unwrap(),
+        3
+    );
+    let retry_run = CloseRunRef {
+        attempt_id: receipt.admitted.attempt_id,
+        ordinal: receipt.admitted.run_ordinal,
+    };
+    let retry_pending = retry_db
+        .close_safe_retry_progress(&retry_run)
+        .await
+        .unwrap()
+        .pending;
+    assert!(!retry_pending.is_empty());
+
+    let initial_pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    crate::migrations::setup_real_162_for_test(&initial_pool).await;
+    let initial_db = Database::from_pool_for_tests(initial_pool, String::new());
+    assert_eq!(
+        crate::migrations::run_through_for_test(initial_db.pool(), 165)
+            .await
+            .unwrap(),
+        3
+    );
+    create_root(&initial_db, "migration166-initial").await;
+    let initial_command = retry_command(
+        &initial_db,
+        "migration166-initial",
+        NativeCloseIntent::Initial {
+            target: product_id("migration166-initial"),
+        },
+    )
+    .await;
+    let LocalAuthorityResult::DurableFactEstablished(Ok(
+        crate::native_close::NativeCloseInitialResult::NewlyAdmitted(initial_receipt),
+    )) = initial_db
+        .apply_native_close_initial(&initial_command)
+        .await
+    else {
+        panic!("expected initial native admission before migration 166");
+    };
+    let initial_run = CloseRunRef::initial(initial_receipt.admitted.attempt_id);
+
+    assert_eq!(
+        crate::migrations::run_through_for_test(retry_db.pool(), 166)
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        crate::migrations::run_through_for_test(initial_db.pool(), 166)
+            .await
+            .unwrap(),
+        1
+    );
+    write_source_fence_state(&retry_db, &assessment.command, &ConvState::Idle, false)
+        .await
+        .unwrap();
+    assert_source_fenced(&retry_db, &assessment, &retry_run, &retry_pending).await;
+    assert_eq!(source_fence_allowance(&retry_db, &retry_run).await, Some((0, 1)));
+
+    write_source_fence_state(&initial_db, &initial_command, &ConvState::Idle, false)
+        .await
+        .unwrap();
+    let initial_failures = initial_db
+        .list_close_cleanup_failures(initial_run.attempt_id.as_str())
+        .await
+        .unwrap();
+    assert_eq!(initial_failures.len(), 1);
+    assert_eq!(
+        initial_failures[0].occurrence.authority,
+        CloseCleanupFailureAuthority::ExplicitlySuppressed
+    );
+    assert!(initial_failures[0].occurrence.remaining_resources.is_empty());
+    assert_eq!(source_fence_allowance(&initial_db, &initial_run).await, Some((0, 1)));
+}
+
+#[tokio::test]
+async fn initial_source_fence_refuses_existing_inspection_artifacts_without_mutation() {
+    let db = Database::open_in_memory().await.unwrap();
+    create_root(&db, "initial-source-fence-inspection").await;
+    let scope = allocate_scope_worktree(&db, "initial-source-fence-inspection").await;
+    let command = retry_command(
+        &db,
+        "initial-source-fence-inspection",
+        NativeCloseIntent::Initial {
+            target: product_id("initial-source-fence-inspection"),
+        },
+    )
+    .await;
+    let LocalAuthorityResult::DurableFactEstablished(Ok(
+        crate::native_close::NativeCloseInitialResult::NewlyAdmitted(receipt),
+    )) = db.apply_native_close_initial(&command).await
+    else {
+        panic!("expected initial native admission");
+    };
+    let attempt_id = receipt.admitted.attempt_id.clone();
+    let run = CloseRunRef::initial(attempt_id.clone());
+    let live_source = db
+        .get_conversation(command.source_transcript_id())
+        .await
+        .unwrap()
+        .state;
+    assert!(matches!(
+        db.prepare_native_close_initial_execution(&command, &receipt, &live_source)
+            .await,
+        LocalAuthorityResult::DurableFactEstablished(Ok(_))
+    ));
+    assert!(matches!(
+        db.settle_native_close_initial(&command, &receipt, &live_source)
+            .await,
+        LocalAuthorityResult::DurableFactEstablished(Ok(_))
+    ));
+
+    // Synthetic partial-inspection crash fixture: the aggregate snapshot remains null.
+    sqlx::query(
+        "INSERT INTO close_retirement_inspections (attempt_id, scope, generation, fingerprint, inspected_at)
+         VALUES (?1, ?2, 'inspection-generation', 'inspection-fingerprint', '2026-11-16T00:00:00Z')",
+    )
+    .bind(attempt_id.as_str())
+    .bind(scope.as_str())
+    .execute(db.pool())
+    .await
+    .unwrap();
+
+    let source_before = db
+        .get_conversation(command.source_transcript_id())
+        .await
+        .unwrap()
+        .state;
+    let run_before = sqlx::query_as::<_, (String, i64)>(
+        "SELECT status, created_at_us FROM close_runs WHERE attempt_id = ?1 AND run_ordinal = ?2",
+    )
+    .bind(run.attempt_id.as_str())
+    .bind(run.ordinal.get())
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    let obligation_before = db
+        .get_close_obligation(attempt_id.as_str())
+        .await
+        .unwrap();
+    let failures_before = db
+        .list_close_cleanup_failures(attempt_id.as_str())
+        .await
+        .unwrap();
+    let event_ids_before = db
+        .pending_coordinator_watch_events(100)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|event| event.event_id)
+        .collect::<Vec<_>>();
+    let allowance_before = source_fence_allowance(&db, &run).await;
+
+    assert!(write_source_fence_state(&db, &command, &ConvState::Idle, false)
+        .await
+        .is_err());
+    assert_eq!(
+        db.get_conversation(command.source_transcript_id())
+            .await
+            .unwrap()
+            .state,
+        source_before
+    );
+    assert_eq!(
+        sqlx::query_as::<_, (String, i64)>(
+            "SELECT status, created_at_us FROM close_runs WHERE attempt_id = ?1 AND run_ordinal = ?2",
+        )
+        .bind(run.attempt_id.as_str())
+        .bind(run.ordinal.get())
+        .fetch_one(db.pool())
+        .await
+        .unwrap(),
+        run_before
+    );
+    assert_eq!(
+        db.get_close_obligation(attempt_id.as_str()).await.unwrap(),
+        obligation_before
+    );
+    assert_eq!(
+        db.list_close_cleanup_failures(attempt_id.as_str())
+            .await
+            .unwrap(),
+        failures_before
+    );
+    assert_eq!(
+        db.pending_coordinator_watch_events(100)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|event| event.event_id)
+            .collect::<Vec<_>>(),
+        event_ids_before
+    );
+    assert_eq!(source_fence_allowance(&db, &run).await, allowance_before);
+    assert_eq!(allowance_before, Some((0, 0)));
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM close_retirement_inspections WHERE attempt_id = ?1",
+        )
+        .bind(attempt_id.as_str())
+        .fetch_one(db.pool())
+        .await
+        .unwrap(),
+        1
+    );
+}

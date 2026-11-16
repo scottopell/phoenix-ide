@@ -409,11 +409,10 @@ async fn initial_settlement_rejects_mismatched_receipt_and_live_or_durable_sourc
         LocalAuthorityResult::DurableFactEstablished(Err(DbError::CloseFoundationPrecondition(_)))
     ));
     assert_eq!(initial_phase(&f, &receipt).await, "completed");
-    let failures = f
-        .db
-        .list_close_cleanup_failures(receipt.admitted.attempt_id.as_str())
-        .await
-        .unwrap();
+    let failures =
+        f.db.list_close_cleanup_failures(receipt.admitted.attempt_id.as_str())
+            .await
+            .unwrap();
     assert_eq!(failures.len(), 1);
     assert_eq!(
         failures[0].occurrence.authority,

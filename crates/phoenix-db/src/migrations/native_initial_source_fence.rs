@@ -5,7 +5,7 @@ const INITIAL_RECEIPT_EXCEPTION: &str = "NOT EXISTS (\n    SELECT 1 FROM native_
 
 // Preserve the completion guard's lifecycle, participant, and message checks;
 // extend only its zero-resource disposition alternative.
-const INITIAL_SUPPRESSED_DISPOSITION: &str = r#"((failure.authority_kind = 'attempt_interrupted' OR (
+const INITIAL_SUPPRESSED_DISPOSITION: &str = r"((failure.authority_kind = 'attempt_interrupted' OR (
             failure.authority_kind = 'explicitly_suppressed'
             AND failure.scope IS NULL AND failure.resource_kind IS NULL
             AND failure.identity_kind IS NULL AND failure.identity_codec IS NULL AND failure.identity_value IS NULL
@@ -31,7 +31,7 @@ const INITIAL_SUPPRESSED_DISPOSITION: &str = r#"((failure.authority_kind = 'atte
             AND NOT EXISTS (SELECT 1 FROM close_run_retry_successes WHERE attempt_id = NEW.attempt_id)
             AND NOT EXISTS (SELECT 1 FROM native_close_retry_plans WHERE attempt_id = NEW.attempt_id)
         ))
-            AND NOT EXISTS"#;
+            AND NOT EXISTS";
 
 pub(super) async fn run(pool: &SqlitePool, migration: &Migration) -> DbResult<()> {
     let mut guard = WritableSchemaGuard::enable(pool).await?;

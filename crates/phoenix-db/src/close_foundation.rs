@@ -34,6 +34,7 @@ pub struct GenericCloseSettlement {
 }
 
 impl GenericCloseSettlement {
+    #[must_use]
     pub fn obligation(&self) -> &CloseObligation {
         &self.obligation
     }
@@ -7154,7 +7155,9 @@ impl Database {
         .fetch_one(&mut **tx)
         .await?;
         if !eligible {
-            return Err(close_precondition("initial source fence requires an exact effect-free native admission"));
+            return Err(close_precondition(
+                "initial source fence requires an exact effect-free native admission",
+            ));
         }
         let obligation = close_obligation_for_update(tx, run.attempt_id.as_str()).await?;
         let occurred_at_us = Utc::now().timestamp_micros();
