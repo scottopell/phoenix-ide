@@ -129,6 +129,7 @@ async fn assembled_coordinator_inventory_preserves_catalog_and_spawn_specializat
         let description = watch["description"].as_str().unwrap();
         assert!(description.contains("question or task-approval waits"));
         assert!(description.contains("selected-peer watches report terminal facts only"));
+        assert!(description.contains("supported Goal metadata changes"));
     }
 }
 

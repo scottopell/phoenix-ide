@@ -261,3 +261,20 @@ from selected-peer v1 terminal facts. A wait is not execution completion. The
 registry composition comment no longer incorrectly claims that host-supplied
 creation tools are absent. These are guidance corrections, not watch timing,
 lifecycle or protocol changes.
+
+
+The description also names supported local Goal metadata changes. Under
+REQ-GR-015 and REQ-GOAL-AC-002, the installed Goal control path calls
+`coordinator_watches::goal_facts::settled_change_tx`: eligible enrolled open
+ordinary sources receive a `goal_change` occurrence keyed to the saved Goal
+version. Disabled control emits none, and the generic Goal report path excludes
+progress-only `Report` changes. This wording does not promise a notification for
+every progress report or change peer terminal-fact v1.
+
+The inventory candidate at 4bf9e4d31 compiled and exported eight synthetic variants;
+the ordinary matrix, export, three registered watch-list and seven coordinator
+prompt regressions passed. The read-only model-recovery fixture and its later
+source changes still require compilation and prepared-route/manual oracle review.
+Its frozen limits and limitations are in
+`scripts/qa/ember-watch-recovery/README.md`. Final integrated inventory and live
+acceptance remain separate evidence.
