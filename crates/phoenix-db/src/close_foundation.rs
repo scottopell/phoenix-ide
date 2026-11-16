@@ -5813,7 +5813,9 @@ impl Database {
         .fetch_one(&mut *tx)
         .await?;
         if native_managed {
-            return Err(close_precondition("native retry success requires its live source binding"));
+            return Err(close_precondition(
+                "native retry success requires its live source binding",
+            ));
         }
         Self::record_close_safe_retry_success_tx(&mut tx, run, effect, detail).await?;
         tx.commit().await?;
@@ -5830,10 +5832,13 @@ impl Database {
     ) -> DbResult<()> {
         let progress = close_safe_retry_progress_tx(tx, run).await?;
         let count = progress.successful.len() + progress.pending.len();
-        if effect_count <= 0 || i64::try_from(count).ok() != Some(effect_count)
+        if effect_count <= 0
+            || i64::try_from(count).ok() != Some(effect_count)
             || !(progress.successful.contains(effect) || progress.pending.contains(effect))
         {
-            return Err(close_precondition("native retry success requires the complete exact effect plan"));
+            return Err(close_precondition(
+                "native retry success requires the complete exact effect plan",
+            ));
         }
         Self::record_close_safe_retry_success_tx(tx, run, effect, detail).await
     }
@@ -5910,7 +5915,9 @@ impl Database {
         .fetch_one(&mut *tx)
         .await?;
         if native_managed {
-            return Err(close_precondition("native retry completion requires its live source binding"));
+            return Err(close_precondition(
+                "native retry completion requires its live source binding",
+            ));
         }
         let obligation = Self::complete_close_retry_tx(&mut tx, run).await?;
         tx.commit().await?;
@@ -13959,22 +13966,42 @@ mod tests {
             db.close_safe_retry_progress(&run).await.unwrap().pending,
             request.remaining_effects[1..]
         );
-        let retained_successes = "SELECT ordinal, detail, observed_at_us FROM close_run_retry_successes
+        let retained_successes =
+            "SELECT ordinal, detail, observed_at_us FROM close_run_retry_successes
              WHERE attempt_id = ?1 AND run_ordinal = ?2 ORDER BY ordinal";
-        let before = sqlx::query_as::<_, (i64, String, i64)>(retained_successes).bind(run.attempt_id.as_str())
-            .bind(run.ordinal.get()).fetch_all(db.pool()).await.unwrap();
+        let before = sqlx::query_as::<_, (i64, String, i64)>(retained_successes)
+            .bind(run.attempt_id.as_str())
+            .bind(run.ordinal.get())
+            .fetch_all(db.pool())
+            .await
+            .unwrap();
         let original = db.classify_interrupted_close_run(&run).await.unwrap();
         // Legacy non-native exact success replay remains read-only after interruption.
         db.record_close_safe_retry_success(&run, &request.remaining_effects[0], "worktree removed")
-            .await.unwrap();
-        assert!(db.record_close_safe_retry_success(
-            &run, &request.remaining_effects[0], "changed after interruption",
-        ).await.is_err());
-        assert!(db.record_close_safe_retry_success(
-            &run, &request.remaining_effects[1], "new success after interruption",
-        ).await.is_err());
-        let after = sqlx::query_as::<_, (i64, String, i64)>(retained_successes).bind(run.attempt_id.as_str())
-            .bind(run.ordinal.get()).fetch_all(db.pool()).await.unwrap();
+            .await
+            .unwrap();
+        assert!(db
+            .record_close_safe_retry_success(
+                &run,
+                &request.remaining_effects[0],
+                "changed after interruption",
+            )
+            .await
+            .is_err());
+        assert!(db
+            .record_close_safe_retry_success(
+                &run,
+                &request.remaining_effects[1],
+                "new success after interruption",
+            )
+            .await
+            .is_err());
+        let after = sqlx::query_as::<_, (i64, String, i64)>(retained_successes)
+            .bind(run.attempt_id.as_str())
+            .bind(run.ordinal.get())
+            .fetch_all(db.pool())
+            .await
+            .unwrap();
         assert_eq!(before, after);
         assert_eq!(
             original.close_outcome(),

@@ -34,9 +34,9 @@ impl Database {
             Ok(tx) => tx,
             Err(error) => return LocalAuthorityResult::DurableFactEstablished(Err(error.into())),
         };
-        let result = Self::record_native_close_retry_success_tx(
-            &mut tx, command, admitted, effect, detail,
-        ).await;
+        let result =
+            Self::record_native_close_retry_success_tx(&mut tx, command, admitted, effect, detail)
+                .await;
         match result {
             Ok(()) => match tx.commit().await {
                 Ok(()) => LocalAuthorityResult::DurableFactEstablished(Ok(())),
@@ -50,7 +50,7 @@ impl Database {
     }
 
     /// Completes only the exact latest running native retry after every persisted effect
-    /// (including independent WorkScope retirement) has durably succeeded.
+    /// (including independent `WorkScope` retirement) has durably succeeded.
     /// The source actor must first hold and check its exclusive live source occurrence;
     /// this transactional fence does not itself authorize dispatch.
     ///
@@ -111,7 +111,8 @@ impl Database {
             attempt_id: admitted.attempt_id.clone(),
             ordinal: admitted.run_ordinal,
         };
-        Self::record_native_close_retry_success_effect_tx(tx, &run, effect, detail, effect_count).await
+        Self::record_native_close_retry_success_effect_tx(tx, &run, effect, detail, effect_count)
+            .await
     }
 
     // Shared by success recording and finalization; receipt identity never replaces
@@ -123,11 +124,22 @@ impl Database {
     ) -> DbResult<i64> {
         // Source authority must precede receipt lookup, even for retained success replay.
         super::receipts::require_source_and_target_tx(tx, command).await?;
-        let NativeCloseIntent::ExplicitRetry { failed_run_ordinal, .. } = command.intent() else {
-            return Err(refused("native retry execution requires an explicit retry intent"));
+        let NativeCloseIntent::ExplicitRetry {
+            failed_run_ordinal, ..
+        } = command.intent()
+        else {
+            return Err(refused(
+                "native retry execution requires an explicit retry intent",
+            ));
         };
-        if super::receipts::read_receipt_tx(tx, command).await?.as_ref() != Some(admitted) {
-            return Err(refused("native retry execution requires its exact admitted receipt"));
+        if super::receipts::read_receipt_tx(tx, command)
+            .await?
+            .as_ref()
+            != Some(admitted)
+        {
+            return Err(refused(
+                "native retry execution requires its exact admitted receipt",
+            ));
         }
         // Original G1 authority is deliberate: the obligation may retain a later G2 inspection.
         let effect_count: Option<i64> = sqlx::query_scalar(
