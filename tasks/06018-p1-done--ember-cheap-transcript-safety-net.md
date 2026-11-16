@@ -120,3 +120,17 @@ continuous non-prose backlog and real hourly-cap cases passed. [Offline receipts
 show zero provider calls, all 111 files byte-identical to the accepted preparation
 and unchanged 37 input hashes/bindings. Earlier e978 model and 7488 topology
 qualification remain separate unchanged evidence.
+
+
+The later SQLite engine-size correction passed all thirty-one DB tests at
+`a5680344a`; its equivalent test-lint-only successor `ba39ee48d` passed owning
+Clippy and all 37 host fixtures. Nested type CASE reads no excluded payload/size,
+and direct-column `octet_length` gates eligible user/agent content before returning
+at most 1 MiB. Formal UTF-8 file-DB controls use stored 32 MiB tool/user values
+and a dedicated 2 MiB per-value connection limit: direct/old-CAST queries fail,
+actual preparation advances only excluded tools or leaves oversized user source
+unprocessed, and small Unicode remains exact. Restoration/closure are checked.
+The [engine follow-up](../scripts/qa/coordinator-scanner-quality/results-e978b7686.md#later-sqlite-engine-size-follow-up)
+records zero-call preparation/all 111 accepted artifacts and 37 hashes/bindings
+unchanged. Earlier evidence stays separate; no process-RSS/constant-CPU bound or
+new UTF-16 conversion contract is claimed.

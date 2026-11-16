@@ -52,3 +52,12 @@ allowance spans preparation members/lanes; blocked exhaustion persists opposite
 lane preference, while non-prose Progress preserves normal fairness without
 inference spending. All 111 offline artifacts and 37 hashes/bindings match the
 accepted preparation; zero provider calls were made. See the [separate resource receipts](../../scripts/qa/coordinator-scanner-quality/results-e978b7686.md#later-host-resource-and-fairness-follow-up).
+
+
+The later SQLite source-size gate passed thirty-one DB tests at `a5680344a`;
+owning Clippy, all 37 host fixtures and zero-call offline preparation passed at
+its test-lint-only successor `ba39ee48d`. A metadata-first type/byte gate avoids
+materializing excluded or oversized source in the supported UTF-8 fixture under
+a real per-value SQLite limit. All 111 accepted artifacts/37 hashes and bindings
+remain unchanged. See the [engine-size receipts](../../scripts/qa/coordinator-scanner-quality/results-e978b7686.md#later-sqlite-engine-size-follow-up);
+no CPU/RSS or new encoding-compatibility guarantee is inferred.

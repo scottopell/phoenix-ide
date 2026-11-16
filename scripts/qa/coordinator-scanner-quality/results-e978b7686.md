@@ -239,3 +239,57 @@ host-only evidence, not another model trial.
 The original e978 paid-trial identity, hashes, scores, failed experiments and
 B04/I01 limitations remain unchanged, as does the earlier 7488 topology receipt
 above. No additional provider calls were made or used to replace prior evidence.
+
+
+## Later SQLite engine-size follow-up
+
+Final review found that `length(CAST(content AS BLOB))` could materialize an
+entire large TEXT value even when bounded substring output or message-type
+exclusion hid that content from Rust. The corrected SELECT nests its type CASE:
+excluded message kinds access neither content nor its size; eligible user/agent
+content uses direct-column `octet_length` metadata before returning the complete
+value only when at most 1 MiB. Oversized eligible content returns NULL and remains
+explicitly SourceUnavailable/unprocessed, without coverage advancement.
+
+SQLite's [primary octet_length documentation](https://www.sqlite.org/lang_corefunc.html#octet_length)
+explains that direct TEXT/BLOB columns can use stored size metadata without
+reading their payload, and that byte counts depend on database encoding.
+The pinned bundled SQLite 3.51.3 investigation and actual Rust regression are
+scoped to a verified UTF-8 database; no UTF-16 conversion compatibility is added.
+
+The formal file-DB regression inserts 32 MiB tool and user values before lowering
+`SQLITE_LIMIT_LENGTH` to 2 MiB on a dedicated detached connection. Both direct
+content and the old CAST-size controls fail with SQLITE_TOOBIG (18). The actual
+scanner preparation succeeds: excluded tool rows advance as non-prose, oversized
+user rows remain SourceUnavailable without advancing their frontier, and a small
+Unicode control is returned exactly. The test verifies limit restoration and
+connection closure. This establishes the tested per-value engine gate; it is
+not a total SQLite CPU, internal-working-memory or process-RSS guarantee.
+
+All thirty-one DB tests passed at `a5680344ac0d37e239600be7f122a1136c93c50b`
+(41.15 seconds). Production code remained identical at
+`ba39ee48d92141ea100ad33971499ce8ab19d2cd`, which changes only two equivalent
+test-lint expressions. That head passed owning DB/IDE Clippy (2m18s) and the actual
+37-case host fixture (55.21 seconds); root and fresh source review found no blocker.
+
+Offline preparation reused the original closed seeds and made zero provider
+calls (3.82 seconds). Root and a fresh independent reviewer verified all 111
+input/prepared/before files byte for byte against the accepted `288329e4…`
+preparation, with all 37 input hashes and bindings unchanged. Current database
+hashes matched the manifest; binary and prompt/corpus/oracle references matched,
+and Clippy/fixture/preparation receipts exited zero. Model, prompt, DTO, corpus,
+oracles, endpoint, limits and
+262,621 logical content bytes were identical; full protocol differences were
+only source/workspace and executable provenance.
+
+| Later engine artifact | SHA256 / identity |
+|---|---|
+| DB31-tested production correction | `a5680344ac0d37e239600be7f122a1136c93c50b` |
+| Compiled/prepared test-lint-only successor | `ba39ee48d92141ea100ad33971499ce8ab19d2cd` |
+| Retained executable | `3c9e749cbd48b2cac9713d7d9b183f56ca7cf3788fabf5d9e1594156f301fd7b` |
+| Offline prepared manifest | `4df68a102ff5eec03a7e42eced14c9457e2231e7e98fc5fc022ce4459109850f` |
+| Offline protocol | `0fb24a6d0f97614985797f6d4b3839e1e10056a5aeddf27e7609b3d029003f56` |
+
+No additional model call occurred. Every earlier e978 paid-trial identity,
+configuration, score, failure and limitation, plus 7488 topology and 1824
+resource/fairness receipts, remains unchanged above.

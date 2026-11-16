@@ -10,7 +10,7 @@ activation is claimed.
 
 | Requirements | Qualification evidence | Scope |
 |---|---|---|
-| REQ-SCAN-001–005: Scope, coverage, source validity, authority and recovery | Thirty actual DB tests passed, including strict typed retirement/source chronology, old-prose generation-only restart, two continuations, exact deduplication, retirement races, live gaps and contention recovery | Deterministic production-host lifecycle evidence |
+| REQ-SCAN-001–005: Scope, coverage, source validity, authority and recovery | Thirty-one actual DB tests passed, including strict typed retirement/source chronology, old-prose generation-only restart, two continuations, exact deduplication, retirement races, live gaps and contention recovery | Deterministic production-host lifecycle evidence |
 | REQ-SCAN-006: Bounded resource use | Eighteen runner/kick tests passed; strict catalog/outbound Luna/Low, accepted-output bounds, durable spending/retry limits and no foreground wake are covered | Codex generation/billing is not capped by accepted-output checks |
 | REQ-SCAN-007: Bounded inspectability | Native coverage inspection and accepted eight-variant assembled inventory include the closed tracking coverage operation | Synthetic assembled configuration, not production inventory |
 | REQ-SCAN-008: Historical recovery and qualification | Manual/foreground usefulness, actual 37-case host fixtures, owning all-target Clippy and fresh source reviews passed; third semantic trial independently accepted | Small synthetic corpus; bookmark miss and invisible duplicate disclosed below |
@@ -21,7 +21,7 @@ sees a fresh bounded index; appended pause evidence invalidates the old stopping
 point through two real continuations. This synthetic inference proves lifecycle
 composition, not cheap-model interpretation or general user utility.
 
-The thirty DB tests preserve original/retired evidence through supported file
+The thirty-one DB tests preserve original/retired evidence through supported file
 restart. The old sequence-5/covered-through-100 case first proves metadata-only
 invalidation and unchanged exact deduplication, then atomically changes valid
 old prose and its generation without appending a row, closes/reopens and recovers
@@ -135,3 +135,22 @@ The [separate resource follow-up](../../scripts/qa/coordinator-scanner-quality/r
 records exact receipts. The original paid model trial and earlier topology
 qualification remain unchanged; SQLite traversal/working data can still scale
 with lineage.
+
+
+## Later SQLite engine-size qualification
+
+The engine-size gate passed thirty-one DB tests at `a5680344a`; the later
+`ba39ee48d` changes only equivalent test-lint syntax and passed owning Clippy and
+all 37 host fixtures. Nested type CASE avoids accessing excluded payloads or their
+sizes. Direct-column `octet_length` checks metadata before returning full eligible
+user/agent content at most 1 MiB; oversized eligible prose returns SourceUnavailable
+without advancing coverage.
+
+An actual UTF-8 file-database test inserts 32 MiB tool/user values, then lowers a
+dedicated detached connection's per-value limit to 2 MiB. Direct/old-CAST controls
+fail with SQLITE_TOOBIG, while the real preparation excludes tool content, preserves
+the oversized user gap and returns small Unicode exactly. Limit restoration and
+connection closure are checked. This is not a total CPU/process-RSS bound or a new
+UTF-16 conversion compatibility claim. [Later engine receipts](../../scripts/qa/coordinator-scanner-quality/results-e978b7686.md#later-sqlite-engine-size-follow-up)
+record zero-call offline preparation with all 111 accepted files and 37 bindings
+unchanged; prior model/topology/quota receipts remain historical evidence.

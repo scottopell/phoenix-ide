@@ -229,7 +229,7 @@ Out of scope: broad tool consolidation, new wrappers around every API, already-d
 | 4: Useful event context | #1092 accepted compact C after the complete 39-trial comparison and fixture web checks | First capped experiment remains partial/unaccepted; no general billing or remote-parity claim |
 | 5: Tracking store/tools | #1093 merged at `5b0e01c09`; native/store/authority checks and manual usefulness accepted | Scanner composition qualified; delivery in PR #1098 |
 | 6: Continuity and attention | Manual detour/continuation gate accepted; [foreground quiet/contextual recovery](../scripts/qa/ember-foreground-memory/foreground-32ada836a.md) accepted; actual-input scanner composition passed | Supplemental guidance/composition qualified; delivery in PR #1098 |
-| 7: Cheap safety net | Thirty DB tests, eighteen runner/kick tests, actual 37-case host fixtures, owning all-target Clippy and fresh source reviews passed; third real-model trial independently accepted | Earlier two trials remain rejected; bounded synthetic qualification |
+| 7: Cheap safety net | Thirty-one DB tests, eighteen runner/kick tests, actual 37-case host fixtures, owning all-target Clippy and fresh source reviews passed; third real-model trial independently accepted | Earlier two trials remain rejected; bounded synthetic qualification |
 | 8: Combined qualification | Inventory, actual-input/two-continuation/pause lifecycle composition and third frozen scanner semantic trial accepted | Implementation/qualification complete; GitHub owns exact review/CI/merge state |
 
 The manual [qualification report](../scripts/qa/ember-tracking/manual-memory-aca480.md)
@@ -283,3 +283,15 @@ continuous non-prose progress and actual hourly-cap regressions passed. Zero-cal
 offline preparation retains all 111 files/37 hashes/bindings exactly; see the
 [resource receipts](../scripts/qa/coordinator-scanner-quality/results-e978b7686.md#later-host-resource-and-fairness-follow-up).
 Paid model and topology receipts retain their original provenance.
+
+
+The later engine-size correction passed thirty-one DB tests at `a5680344a` and
+owning Clippy/all 37 host fixtures at test-lint-only successor `ba39ee48d`.
+Nested type CASE and direct-column byte metadata avoid accessing excluded content
+or loading oversized eligible prose. Actual UTF-8/32 MiB negative controls under
+a 2 MiB connection per-value limit distinguish the old CAST/full read from the
+real scanner query; oversized user coverage stays pending and small Unicode is
+exact. Zero-call offline preparation preserves all 111 accepted files and 37
+hashes/bindings. [Separate engine receipts](../scripts/qa/coordinator-scanner-quality/results-e978b7686.md#later-sqlite-engine-size-follow-up)
+retain every earlier source and result; no total CPU/RSS or UTF-16 compatibility
+claim is added.
