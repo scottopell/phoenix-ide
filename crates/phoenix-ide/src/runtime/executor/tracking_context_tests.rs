@@ -363,6 +363,8 @@ mod live {
     }
     struct GuardedTools {
         inner: ToolRegistryExecutor,
+        db: crate::db::Database,
+        source_checkpoint_presence: Arc<Mutex<Vec<bool>>>,
         calls: Arc<Mutex<Vec<String>>>,
         denied: Arc<Mutex<Vec<String>>>,
     }
@@ -374,6 +376,16 @@ mod live {
             ctx: crate::tools::ToolContext,
         ) -> Option<crate::tools::ToolOutput> {
             let name = call.name().to_owned();
+            if name == "tracking" {
+                let source = ctx
+                    .source_tool_call()
+                    .expect("runtime supplies exact source call");
+                let present = self.db.message_exists(&source.message_id).await.unwrap();
+                self.source_checkpoint_presence
+                    .lock()
+                    .unwrap()
+                    .push(present);
+            }
             let (_, input) = call.clone().into_parts();
             self.calls.lock().unwrap().push(name.clone());
             let allowed_operation = matches!(
@@ -414,17 +426,18 @@ mod live {
             self.inner.definitions_for_language(language).await
         }
     }
-    struct Fixture {
+    struct Fixture<C: LlmClient + 'static> {
         manager: Arc<crate::runtime::RuntimeManager>,
         db: crate::db::Database,
         registry: Arc<ModelRegistry>,
-        client: Arc<BoundedClient>,
+        client: Arc<C>,
         model: String,
         cwd: PathBuf,
         calls: Arc<Mutex<Vec<String>>>,
         denied: Arc<Mutex<Vec<String>>>,
+        source_checkpoint_presence: Arc<Mutex<Vec<bool>>>,
     }
-    impl Fixture {
+    impl<C: LlmClient + 'static> Fixture<C> {
         async fn turn(&self, source: &str, prompt: &str) -> String {
             let mut context =
                 ConvContext::new(source, self.cwd.clone(), &self.model, 200_000, 2048);
@@ -438,6 +451,8 @@ mod live {
                 .unwrap();
             let tools = GuardedTools {
                 inner: ToolRegistryExecutor::builtin_only(registry, Arc::from([])),
+                db: self.db.clone(),
+                source_checkpoint_presence: self.source_checkpoint_presence.clone(),
                 calls: self.calls.clone(),
                 denied: self.denied.clone(),
             };
@@ -492,6 +507,13 @@ mod live {
                         state,
                         ConvState::Idle | ConvState::AwaitingUserResponse { .. }
                     ) {
+                        if self.db.get_conversation(source).await.unwrap().state != state {
+                            state_rx
+                                .changed()
+                                .await
+                                .expect("stable live state must follow its durable commit");
+                            continue;
+                        }
                         let messages = self.db.get_messages(source).await.unwrap();
                         if let Some(index) = messages
                             .iter()
@@ -538,6 +560,94 @@ mod live {
             result.expect("tracking evaluation turn exceeded 120 seconds")
         }
     }
+    #[tokio::test]
+    async fn tracking_real_runtime_loop_applies_native_record_before_assistant_checkpoint() {
+        let directory = tempfile::tempdir().unwrap();
+        let isolated =
+            phoenix_core::runtime_env::PhoenixRuntimeEnvironment::with_root(directory.path());
+        let db = crate::db::Database::open_in_memory().await.unwrap();
+        db.initialize_coordinator_work_scope(directory.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let source = db
+            .get_or_create_coordinator(
+                Some("test-model"),
+                phoenix_core::llm_language::LlmLanguage::PhoenixNative,
+            )
+            .await
+            .unwrap()
+            .id;
+        let registry = Arc::new(ModelRegistry::new_empty());
+        let manager = Arc::new(
+            crate::runtime::RuntimeManager::new_with_message_retriever_and_runtime_env(
+                db.clone(),
+                registry.clone(),
+                Arc::new(db.fts_retriever()),
+                crate::platform::PlatformCapability::None {
+                    details: "offline complete runtime ordering regression".into(),
+                },
+                Arc::new(crate::tools::mcp::McpClientManager::new()),
+                None,
+                &isolated,
+            ),
+        );
+        let client = Arc::new(MockLlmClient::new("test-model"));
+        client.queue_response(LlmResponse{provider_replay:None,content:vec![ContentBlock::ToolUse{id:"pending-record-call".into(),name:"tracking".into(),input:serde_json::json!({"request":{"op":"record","record":{"kind":"requested_work","title":"Native pending-round request","note":"Real runtime owns the pending assistant","resumption":"Return to the user's outcome after a detour","references":[],"evidence":[]}}})}],end_turn:false,usage:phoenix_llm::Usage::default(),usage_observation:phoenix_core::domain::llm_types::UsageObservation::default(),stream_telemetry:phoenix_llm::ProviderStreamTelemetry::non_streaming()});
+        client.queue_response(LlmResponse {
+            provider_replay: None,
+            content: vec![ContentBlock::text("Saved the request.")],
+            end_turn: true,
+            usage: phoenix_llm::Usage::default(),
+            usage_observation: phoenix_core::domain::llm_types::UsageObservation::default(),
+            stream_telemetry: phoenix_llm::ProviderStreamTelemetry::non_streaming(),
+        });
+        let fixture = Fixture {
+            manager,
+            db: db.clone(),
+            registry,
+            client: client.clone(),
+            model: "test-model".into(),
+            cwd: directory.path().to_path_buf(),
+            calls: Arc::new(Mutex::new(Vec::new())),
+            denied: Arc::new(Mutex::new(Vec::new())),
+            source_checkpoint_presence: Arc::new(Mutex::new(Vec::new())),
+        };
+        assert!(fixture
+            .turn(&source, "Remember the requested outcome in tracking.")
+            .await
+            .contains("Saved"));
+        assert_eq!(*fixture.source_checkpoint_presence.lock().unwrap(),vec![false],"normal execution occurs before the assistant message checkpoint; no fixture preinserts state or message rows");
+        let page = db
+            .list_coordinator_tracking(&source, None, false)
+            .await
+            .unwrap();
+        assert_eq!(page.active_count, 1);
+        let detail = db
+            .read_coordinator_tracking(&source, &page.items[0].id, 0)
+            .await
+            .unwrap();
+        assert!(
+            detail.recorded_by_ember.unwrap().source_available,
+            "completed tool round checkpoints its owning assistant"
+        );
+        let messages = db.get_messages(&source).await.unwrap();
+        let result = messages
+            .iter()
+            .find_map(|message| match &message.content {
+                MessageContent::Tool(result) if result.tool_use_id == "pending-record-call" => {
+                    Some(result)
+                }
+                _ => None,
+            })
+            .expect("real checkpoint retains the tool result");
+        assert!(!result.is_error, "{}", result.content);
+        let receipt: serde_json::Value = serde_json::from_str(&result.content).unwrap();
+        assert_eq!(receipt["outcome"], "applied");
+        assert_eq!(client.recorded_requests().len(), 2);
+        assert_eq!(*fixture.calls.lock().unwrap(), vec!["tracking"]);
+        assert!(fixture.denied.lock().unwrap().is_empty());
+    }
+
     /// Opt-in, synthetic and isolated. Expected behavior is fixed before model calls:
     /// two records; quiet arithmetic; summary-independent return; then a due request.
     #[tokio::test]
@@ -596,6 +706,7 @@ mod live {
             cwd: directory.path().to_path_buf(),
             calls: Arc::new(Mutex::new(Vec::new())),
             denied: Arc::new(Mutex::new(Vec::new())),
+            source_checkpoint_presence: Arc::new(Mutex::new(Vec::new())),
         };
         fixture.turn(&source,"Use tracking to remember exactly two synthetic items for this evaluation: requested work titled 'Check Cobalt export totals', whose next step is asking which period to compare; and a bookmark titled 'Why the Orchard boundary?', whose stopping point is explaining why ownership is separate from execution. Record purpose and resumption; references/evidence may be empty because this is the original request. Ask about the period when this request is worth returning to after our detour. Do not read files, create Goals, start workers, send messages, use Bash or act outside this disposable evaluation; the bookmark remains only a question. Briefly acknowledge.").await;
         let saved = db
