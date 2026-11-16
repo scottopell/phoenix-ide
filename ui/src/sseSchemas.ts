@@ -169,6 +169,7 @@ export const EventPresentationSchema: v.GenericSchema<unknown, EventPresentation
     source_generation: v.number(),
     occurred_at_us: v.number(),
     provenance: v.picklist(['subscription', 'mandatory_close_failure']),
+    ending_evidence: v.string(),
     outcome: v.variant('kind', [
       v.looseObject({ kind: v.literal('turn_finished') }),
       v.looseObject({ kind: v.literal('failed'), reason: v.string() }),

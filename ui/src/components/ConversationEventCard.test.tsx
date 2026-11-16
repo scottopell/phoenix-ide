@@ -13,6 +13,7 @@ import { copyToClipboard } from '../utils/clipboard';
 
 vi.mock('../utils/clipboard', () => ({ copyToClipboard: vi.fn().mockResolvedValue(true) }));
 const available = {
+  ending_evidence: 'Historical ending evidence not captured.',
   status: 'available', event_id: 'event-exact', product_conversation_id: 'product-1', display_name: 'Fix routing',
   source_transcript_id: 'transcript-exact', source_occurrence_kind: 'turn', source_occurrence_id: 'occurrence-exact',
   source_generation: 7, occurred_at_us: 1791800000123456, provenance: 'subscription', outcome: { kind: 'turn_finished' },

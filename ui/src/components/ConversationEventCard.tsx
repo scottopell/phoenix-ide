@@ -63,6 +63,7 @@ export function eventCardFragments(presentation: EventPresentation | null, event
       `Transcript ID: ${presentation.source_transcript_id}`, `Occurrence kind: ${presentation.source_occurrence_kind}`,
       `Occurrence ID: ${presentation.source_occurrence_id}`, `Generation: ${presentation.source_generation}`,
       `Time (microseconds): ${presentation.occurred_at_us}`, `Provenance: ${presentation.provenance}`,
+      presentation.ending_evidence,
     ].join('\n'),
   };
 }

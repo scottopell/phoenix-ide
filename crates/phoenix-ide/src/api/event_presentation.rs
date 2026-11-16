@@ -52,6 +52,7 @@ pub struct EventPresentationPayload {
     pub outcome: EventOutcome,
     pub occurred_at_us: i64,
     pub provenance: EventProvenance,
+    pub ending_evidence: String,
 }
 
 #[derive(Debug, Clone, Serialize, TS)]
@@ -186,6 +187,7 @@ pub enum EventProvenance {
 impl From<WatchEventPresentation> for EventPresentationPayload {
     fn from(event: WatchEventPresentation) -> Self {
         Self {
+            ending_evidence: event.ending_evidence.readable(&event.event_id),
             event_id: event.event_id,
             product_conversation_id: event.product_conversation_id.to_string(),
             display_name: event.display_name,

@@ -24,8 +24,9 @@ pub use federation_enrollment::FederationSendAuthority;
 mod federation_peers;
 pub mod federation_subscriptions;
 pub use coordinator_watches::{
-    append_mandatory_close_failure_event_tx, CloseFailureStop, MandatoryCloseFailureSubject,
-    PendingWatchEvent, WatchEventPresentation, WatchEventProvenance, WatchEventRoute, WatchOutcome,
+    append_mandatory_close_failure_event_tx, CloseFailureStop, EndingResponse,
+    MandatoryCloseFailureSubject, PendingWatchEvent, SettledWatchInput, WatchEndingEvidence,
+    WatchEventPresentation, WatchEventProvenance, WatchEventRoute, WatchOutcome, WatchResponsePage,
     WatchSnapshot,
 };
 pub use federation_peers::FederationPeerConnection;
@@ -14015,6 +14016,7 @@ impl Database {
         .fetch_all(&mut *tx)
         .await?;
         hydrate_attachments_conn(&mut tx, &mut messages).await?;
+        coordinator_watches::ending_evidence::project_prompt_events(&mut tx, &mut messages).await?;
         let snapshot = HydratedPromptSnapshot::try_new(conversation_id, generation, messages)?;
         tx.commit().await?;
         Ok(snapshot)
@@ -14064,6 +14066,7 @@ impl Database {
             }
         };
         hydrate_attachments_conn(&mut tx, &mut messages).await?;
+        coordinator_watches::ending_evidence::project_prompt_events(&mut tx, &mut messages).await?;
         let tail = HydratedPromptTail::try_current(conversation_id, after.position(), messages)?;
         tx.commit().await?;
         Ok(tail)

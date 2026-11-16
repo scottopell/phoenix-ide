@@ -187,6 +187,7 @@ fn ordinary_message_serializes_explicit_null_and_all_outcomes_preserve_reasons()
         (WatchOutcome::AwaitingTaskApproval, "awaiting_task_approval"),
     ] {
         let event = WatchEventPresentation {
+            ending_evidence: phoenix_db::WatchEndingEvidence::default(),
             event_id: "event".into(),
             product_conversation_id:
                 phoenix_core::domain::product_conversation::ProductConversationId::parse("product")
