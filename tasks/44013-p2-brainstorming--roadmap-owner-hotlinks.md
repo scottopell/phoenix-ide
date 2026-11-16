@@ -1,8 +1,8 @@
-# Coding-harness owner identity and optional roadmap hotlinks
+# Coding-harness owner identity and optional verified hotlinks
 
 ## Need
 
-The central delivery roadmap identifies workstream owners with human-readable labels, but a project manager cannot reliably navigate to the owning coding-agent conversation. Capture a stable harness-native identity and, when the harness exposes a verified deep-link contract, an optional hotlink.
+Delivery coordination identifies owners with human-readable labels, but a project manager cannot reliably navigate to the owning coding-agent conversation. The retired roadmap is not a destination for this work; its former hotlink proposal is historical context. Capture a stable harness-native identity and, when the harness exposes a verified deep-link contract, an optional hotlink.
 
 ## Facts established
 
@@ -26,7 +26,7 @@ A hotlink must not become the identity, and an invented URI must not represent a
 ## First user journey
 
 ```text
-Project manager reads a roadmap workstream
+Project manager reads a current task/PR or coordination handoff
   -> sees which coding harness/conversation owns it
   -> opens the owning conversation when a verified hotlink exists
   -> otherwise can copy the stable opaque identity
@@ -36,7 +36,7 @@ Project manager reads a roadmap workstream
 
 1. Verify and document the Phoenix macOS app's actual custom URL contract from its owning implementation.
 2. Determine whether Codex exposes a supported external navigation API or URI contract; do not infer one from its internal task-navigation primitive.
-3. Decide whether the roadmap should store a generic owner reference or only a verified hotlink, while preserving the distinctions above.
+3. Decide which existing task/PR or coordination surface needs a generic owner reference or verified hotlink, while preserving the distinctions above; do not revive the retired roadmap.
 4. Define behavior for unavailable harnesses and anchors without building presence, messaging, an alias registry, or a general agent directory.
 
 ## Out of scope

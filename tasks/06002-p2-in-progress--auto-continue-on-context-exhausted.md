@@ -6,7 +6,7 @@ Implement from refreshed live `origin/main`, with the commissioned investigation
 
 This is Phoenix-only user-authorized work. Do not merge, deploy, continue any production conversation, edit lifecycle rows manually, or perform destructive repair. Until the coordinator releases devmbp’s sole heavy slot, perform only source/spec analysis and lightweight spec work; do not run Cargo/rustc, `./dev.py check`, Playwright, Vitest, or `xcodebuild`.
 
-The GitHub #651 roadmap was unavailable in network-blocked Explore mode. Before implementation, use `phoenix-development` to refresh main and inspect the generated roadmap plus #764/#765 current state. Specs/Allium, ADRs, task filenames, merged main, and explicit dependency ownership remain the domain authorities.
+The GitHub #651 roadmap was unavailable in network-blocked Explore mode. That archive is no longer an implementation preflight. Before implementation, use `phoenix-development` to refresh main and inspect #764/#765 current state plus current task/PR ownership. Specs/Allium, ADRs, task filenames, merged main, and explicit dependency ownership remain the domain authorities.
 
 ## Observed journey
 

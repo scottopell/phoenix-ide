@@ -31,3 +31,28 @@ No bulk import and no dual-write period. Reconcile still-live obligations select
 No executable updater path or active posting instruction remains; workflows/CI reference no removed scripts; REQ IDs/history remain retrievable; live workflow/config/Issue readback proves cutoff; only confirmed current obligations are carried forward. Use git diff --check, task validation, workflow checks and scoped reference search. Rust/UI builds are unnecessary solely for this retirement.
 
 Out of scope: deleting historical evidence, blanket roadmap import, dual writing and waiting for the scanner to stop stale automation.
+
+## Implementation and live cutoff — 2026-11-16
+
+Source retirement removes the updater workflow/reducer and its dedicated tests/CI
+step together. ADR-262 supersedes ADR-069; the original protocol remains verbatim
+beneath an explicit whole-document non-normative archive notice, with all 14 IDs
+marked retired in the executive. Canonical agent guidance and the named active
+task duties no longer require reading/posting to the roadmap. Historical
+commissions, evidence and unrelated scope remain.
+
+Live workflow330648486 is `disabled_manually`; both repository variables were
+deleted. No in-progress/waiting updater jobs were present. Issue806 now has a
+historical-only notice and no activation marker; exact body readback and a later
+independent read were stable. The parent integrator separately verified workflow,
+variables, notice and absent marker. Two stale November11 records still report
+queued but contain zero jobs; GitHub refuses both normal and force cancellation
+with409 “has not been queued yet.” Do not claim zero queued records. The disabled
+workflow, absent configuration and absent marker prevent writes if these later
+start. Final projection/comments are retained; no roadmap record was posted.
+
+Validation: task/spec-shape/spec-anchors lanes pass; CI YAML parses; exact CI diff
+removes only the retired reducer step; original protocol text and all14 retained
+IDs verified; added relative links and whitespace pass. Rust/UI checks are not
+applicable. Source PR review/CI and merge remain integrator-owned gates before
+marking this task done.
