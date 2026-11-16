@@ -62,7 +62,7 @@ async fn migration_163_pending_fixture() -> (Database, Assessment, NativeCloseRe
         .unwrap();
     }
     let resource = failure.remaining_resources.iter()
-        .find(|pending| pending.resource.kind() == RetiredResourceKind::WorkScope)
+        .find(|pending| pending.scope == scope && pending.resource.kind() == RetiredResourceKind::WorkScope)
         .unwrap().resource.clone();
     failure.remaining_resources = db.expected_close_cleanup_failure_resources(
         failure.attempt_id.as_str(), &scope, &resource,
@@ -191,7 +191,7 @@ async fn migration_163_upgrades_populated_162_without_rebinding_g1_or_g2() {
         .fetch_one(db.pool()).await.unwrap();
     assert_eq!(latest, 163);
     let run = CloseRunRef { attempt_id: receipt.admitted.attempt_id, ordinal: receipt.admitted.run_ordinal };
-    assert_eq!(db.close_safe_retry_progress(&run).await.unwrap().pending.len(), 2);
+    assert_eq!(db.close_safe_retry_progress(&run).await.unwrap().pending.len(), 3);
     assert_eq!(crate::migrations::run_pending_migrations(db.pool()).await.unwrap(), 0);
 }
 
@@ -201,6 +201,11 @@ async fn migration_163_g1_failure_guards_preserve_g2_and_exact_pending_children(
     crate::migrations::run_pending_migrations(db.pool()).await.unwrap();
     let before = migration_163_retained_state(&db).await;
     let run = CloseRunRef { attempt_id: receipt.admitted.attempt_id, ordinal: receipt.admitted.run_ordinal };
+    let pending = db.close_safe_retry_progress(&run).await.unwrap().pending;
+    assert_eq!(pending.len(), 3);
+    assert_eq!(pending[0].resource.kind(), RetiredResourceKind::Worktree);
+    assert!(pending[1..].iter().all(|effect| effect.resource.kind() == RetiredResourceKind::WorkScope));
+    assert_ne!(pending[1].scope, pending[2].scope);
     let original: (String, String) = sqlx::query_as(
         "SELECT inspection_generation, inspection_fingerprint FROM native_close_retry_plans",
     ).fetch_one(db.pool()).await.unwrap();
@@ -226,6 +231,18 @@ async fn migration_163_g1_failure_guards_preserve_g2_and_exact_pending_children(
         assert_eq!(migration_163_insert_child(&mut tx, &run, 0, 0, "failed").await.unwrap().rows_affected(), 1);
         assert!(migration_163_insert_child(&mut tx, &run, 1, 1, "residual").await.is_err(), "G1 residual evidence is not a new attempt");
         assert_eq!(migration_163_insert_child(&mut tx, &run, 1, 1, "unattempted").await.unwrap().rows_affected(), 1);
+        assert!(migration_163_insert_child(&mut tx, &run, 2, 2, "failed").await.is_err(), "independent scope was not the failed effect");
+        assert!(migration_163_insert_child(&mut tx, &run, 2, 2, "residual").await.is_err(), "independent scope is still unattempted");
+        assert_eq!(migration_163_insert_child(&mut tx, &run, 2, 2, "unattempted").await.unwrap().rows_affected(), 1);
+        let children: Vec<(i64, String, String)> = sqlx::query_as(
+            "SELECT ordinal, scope, disposition FROM close_cleanup_failure_resources
+             WHERE failure_occurrence_id = ?1 ORDER BY ordinal",
+        ).bind(run.failure_occurrence_id().as_str()).fetch_all(&mut *tx).await.unwrap();
+        assert_eq!(children, vec![
+            (0, pending[0].scope.as_str().to_owned(), "failed".to_owned()),
+            (1, pending[1].scope.as_str().to_owned(), "unattempted".to_owned()),
+            (2, pending[2].scope.as_str().to_owned(), "unattempted".to_owned()),
+        ]);
         tx.rollback().await.unwrap();
     }
     let mut tx = db.pool().begin().await.unwrap();
@@ -235,6 +252,17 @@ async fn migration_163_g1_failure_guards_preserve_g2_and_exact_pending_children(
     migration_163_insert_parent(&mut tx, &run, 1, &g1, created + 10, None).await.unwrap();
     assert!(migration_163_insert_child(&mut tx, &run, 0, 0, "unattempted").await.is_err(), "successful child is not pending");
     assert_eq!(migration_163_insert_child(&mut tx, &run, 1, 0, "failed").await.unwrap().rows_affected(), 1);
+    assert!(migration_163_insert_child(&mut tx, &run, 2, 1, "failed").await.is_err(), "only the designated scope failed");
+    assert!(migration_163_insert_child(&mut tx, &run, 2, 1, "residual").await.is_err(), "other scope remains unattempted");
+    assert_eq!(migration_163_insert_child(&mut tx, &run, 2, 1, "unattempted").await.unwrap().rows_affected(), 1);
+    let children: Vec<(i64, String, String)> = sqlx::query_as(
+        "SELECT ordinal, scope, disposition FROM close_cleanup_failure_resources
+         WHERE failure_occurrence_id = ?1 ORDER BY ordinal",
+    ).bind(run.failure_occurrence_id().as_str()).fetch_all(&mut *tx).await.unwrap();
+    assert_eq!(children, vec![
+        (0, pending[1].scope.as_str().to_owned(), "failed".to_owned()),
+        (1, pending[2].scope.as_str().to_owned(), "unattempted".to_owned()),
+    ]);
     tx.rollback().await.unwrap();
     assert_eq!(migration_163_retained_state(&db).await, before);
 }

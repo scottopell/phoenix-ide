@@ -1432,6 +1432,14 @@ async fn close_safe_retry_progress_tx(
             "retry progress requires the exact latest running resource plan",
         ));
     }
+    retained_close_retry_progress_tx(tx, run).await
+}
+
+// The caller must validate exact native plan identity before reading a stopped run.
+pub(crate) async fn retained_close_retry_progress_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    run: &CloseRunRef,
+) -> DbResult<CloseSafeRetryProgress> {
     let rows = sqlx::query(
         "SELECT effect.*, captured.captured_worktree_fingerprint, captured.captured_worktree_locator,
                 success.ordinal AS success_ordinal
@@ -1586,7 +1594,7 @@ pub struct CloseWorktreeCleanupPlan {
     pub final_tombstone: Option<CloseWorktreeFinalTombstone>,
 }
 
-async fn close_obligation_for_update(
+pub(crate) async fn close_obligation_for_update(
     tx: &mut Transaction<'_, Sqlite>,
     attempt_id: &str,
 ) -> DbResult<CloseObligation> {
@@ -6325,6 +6333,21 @@ impl Database {
             ));
         }
         let initial = run.ordinal == CloseRunOrdinal::INITIAL;
+        if !initial {
+            let native_retry: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM native_close_retry_plans
+                 WHERE attempt_id = ?1 AND run_ordinal = ?2)",
+            )
+            .bind(run.attempt_id.as_str())
+            .bind(run.ordinal.get())
+            .fetch_one(&mut **tx)
+            .await?;
+            if native_retry {
+                return Err(close_precondition(
+                    "native retry failure requires its live source binding",
+                ));
+            }
+        }
         if request.occurred_at_us < 0
             || request
                 .stop_certainty
@@ -6485,39 +6508,8 @@ impl Database {
         .fetch_one(&mut **tx)
         .await?;
         if existing {
-            let exact: bool = sqlx::query_scalar(
-                "SELECT EXISTS(SELECT 1 FROM close_cleanup_failures
-                 WHERE failure_occurrence_id = ?1 AND attempt_id = ?2 AND cleanup_run_ordinal = ?16
-                   AND source_product_conversation_id = ?3 AND scope = ?4
-                   AND inspection_generation IS ?5 AND inspection_fingerprint IS ?6
-                   AND resource_kind = ?7 AND identity_kind = ?8 AND identity_codec = ?9
-                   AND identity_value = ?10 AND reason = ?11 AND detail = ?12
-                   AND stop_certainty = ?13 AND confirmed_at_us IS ?14 AND occurred_at_us = ?15
-                   AND authority_kind = ?17)",
-            )
-            .bind(&request.failure_occurrence_id)
-            .bind(request.attempt_id.as_str())
-            .bind(request.source_product_conversation_id.as_str())
-            .bind(scope.as_str())
-            .bind(snapshot.map(CloseRetirementSnapshot::generation))
-            .bind(snapshot.map(CloseRetirementSnapshot::fingerprint))
-            .bind(resource.kind().as_str())
-            .bind(identity.identity_kind())
-            .bind(identity.codec())
-            .bind(identity.value())
-            .bind(request.reason.as_str())
-            .bind(&request.detail)
-            .bind(request.stop_certainty.as_str())
-            .bind(request.stop_certainty.confirmed_at_us())
-            .bind(request.occurred_at_us)
-            .bind(run.ordinal.get())
-            .bind(request.authority.as_str())
-            .fetch_one(&mut **tx)
-            .await?;
-            let retained_resources =
-                close_cleanup_failure_resources_tx(tx, &request.failure_occurrence_id).await?;
+            let exact = Self::retained_close_cleanup_failure_matches_tx(tx, run, request).await?;
             if !exact
-                || retained_resources != request.remaining_resources
                 || obligation.phase() != ClosePhase::Completed
                 || (initial
                     && obligation.close_outcome()
@@ -6778,6 +6770,26 @@ impl Database {
             .execute(&mut **tx)
             .await?;
         }
+        Self::insert_and_finish_close_resource_failure_tx(tx, run, request, obligation).await
+    }
+
+    pub(crate) async fn insert_and_finish_close_resource_failure_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        run: &CloseRunRef,
+        request: &TerminalizeInitialCloseCleanupFailureRequest,
+        obligation: CloseObligation,
+    ) -> DbResult<CloseObligation> {
+        let (scope, resource, snapshot) = match &request.authority {
+            CloseCleanupFailureAuthority::ExpectedResource { scope, resource, snapshot } => {
+                (scope, resource, Some(snapshot))
+            }
+            CloseCleanupFailureAuthority::CapturedScope { scope, resource }
+            | CloseCleanupFailureAuthority::ObservedProcessResource { scope, resource } => {
+                (scope, resource, None)
+            }
+            _ => return Err(close_precondition("resource occurrence requires resource authority")),
+        };
+        let identity = resource.identity();
         sqlx::query(
             "INSERT INTO close_cleanup_failures (
                 failure_occurrence_id, attempt_id, cleanup_run_ordinal,
@@ -6807,6 +6819,56 @@ impl Database {
                 .bind(remaining.disposition.as_str()).execute(&mut **tx).await?;
         }
         Self::finish_close_failure_tx(tx, run, request, obligation).await
+    }
+
+    pub(crate) async fn retained_close_cleanup_failure_matches_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        run: &CloseRunRef,
+        request: &TerminalizeInitialCloseCleanupFailureRequest,
+    ) -> DbResult<bool> {
+        let (scope, resource, snapshot) = match &request.authority {
+            CloseCleanupFailureAuthority::ExpectedResource { scope, resource, snapshot } => {
+                (scope, resource, Some(snapshot))
+            }
+            CloseCleanupFailureAuthority::CapturedScope { scope, resource }
+            | CloseCleanupFailureAuthority::ObservedProcessResource { scope, resource } => {
+                (scope, resource, None)
+            }
+            _ => return Err(close_precondition("resource occurrence requires resource authority")),
+        };
+        let identity = resource.identity();
+        let exact: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM close_cleanup_failures
+             WHERE failure_occurrence_id = ?1 AND attempt_id = ?2 AND cleanup_run_ordinal = ?16
+               AND source_product_conversation_id = ?3 AND scope = ?4
+               AND inspection_generation IS ?5 AND inspection_fingerprint IS ?6
+               AND resource_kind = ?7 AND identity_kind = ?8 AND identity_codec = ?9
+               AND identity_value = ?10 AND reason = ?11 AND detail = ?12
+               AND stop_certainty = ?13 AND confirmed_at_us IS ?14 AND occurred_at_us = ?15
+               AND authority_kind = ?17)",
+        )
+        .bind(&request.failure_occurrence_id)
+        .bind(request.attempt_id.as_str())
+        .bind(request.source_product_conversation_id.as_str())
+        .bind(scope.as_str())
+        .bind(snapshot.map(CloseRetirementSnapshot::generation))
+        .bind(snapshot.map(CloseRetirementSnapshot::fingerprint))
+        .bind(resource.kind().as_str())
+        .bind(identity.identity_kind())
+        .bind(identity.codec())
+        .bind(identity.value())
+        .bind(request.reason.as_str())
+        .bind(&request.detail)
+        .bind(request.stop_certainty.as_str())
+        .bind(request.stop_certainty.confirmed_at_us())
+        .bind(request.occurred_at_us)
+        .bind(run.ordinal.get())
+        .bind(request.authority.as_str())
+        .fetch_one(&mut **tx)
+        .await?;
+        let retained_resources =
+            close_cleanup_failure_resources_tx(tx, &request.failure_occurrence_id).await?;
+        Ok(exact && retained_resources == request.remaining_resources)
     }
 
     async fn terminalize_scope_free_interruption_tx(
@@ -13014,7 +13076,7 @@ mod tests {
             crate::migrations::run_pending_migrations(db.pool())
                 .await
                 .unwrap(),
-            3
+            4
         );
         let after: (String, String, String, String, String, String, String, i64) = sqlx::query_as(
             "SELECT request_id, source_transcript_id, source_message_id, source_tool_use_id,

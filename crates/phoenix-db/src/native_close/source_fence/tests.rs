@@ -373,18 +373,7 @@ async fn stopped_explicit_native_source_loss_suppresses_without_a_running_succes
                 &db, &assessment, &run, effect, "retired before interruption",
             ).await);
         }
-        let interruption = TerminalizeInitialCloseCleanupFailureRequest {
-            failure_occurrence_id: run.failure_occurrence_id(),
-            attempt_id: run.attempt_id.clone(),
-            source_product_conversation_id: assessment.command.intent().target().clone(),
-            authority: CloseCleanupFailureAuthority::AttemptInterrupted,
-            remaining_resources: vec![],
-            reason: RetirementFailureReason::Interrupted,
-            detail: "native retry interrupted before finalization".into(),
-            stop_certainty: CloseStopCertainty::ShutdownUncertain,
-            occurred_at_us: Utc::now().timestamp_micros(),
-        };
-        db.terminalize_close_run_cleanup_failure(&run, &interruption).await.unwrap();
+        db.classify_interrupted_close_run(&run).await.unwrap();
         assert_eq!(source_fence_allowance(&db, &run).await, Some((0, 0)));
         assert_stopped_source_loss_only_suppresses(&db, &assessment.command, &run, replay, 2).await;
     }

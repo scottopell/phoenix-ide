@@ -80,6 +80,15 @@ jobs:
             migration_163_unknown_installed_prefix_rolls_back_both_trigger_rewrites; do
             grep -F "close_foundation::tests::native_retry::$test: test" evidence/selected-tests.txt
           done
+          for test in \
+            generic_resource_failure_still_terminalizes_and_replays_non_native_retry \
+            native_resource_failure_uses_g1_pending_tail_and_exact_stopped_replay \
+            native_resource_failure_refuses_full_identity_and_caller_evidence_mismatches \
+            native_resource_failure_replay_refuses_a_stopped_predecessor_after_successor_admission \
+            native_resource_failure_requires_truthful_original_process_success \
+            native_resource_failure_rolls_back_late_outbox_and_outcome_message_errors; do
+            grep -F "close_foundation::tests::native_retry::$test: test" evidence/selected-tests.txt
+          done
       - name: Execute migration163 populated upgrade and authority regressions
         if: success()
         shell: bash
