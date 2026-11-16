@@ -3,5 +3,6 @@ import type { FederatedEventDisposition } from "./FederatedEventDisposition";
 import type { FederatedEventNavigation } from "./FederatedEventNavigation";
 import type { FederatedEventOutcome } from "./FederatedEventOutcome";
 import type { FederatedOccurrenceKind } from "./FederatedOccurrenceKind";
+import type { RemoteEndingEvidence } from "./RemoteEndingEvidence";
 
-export type FederatedFactPresentation = { event_id: string, source_instance_id: string, source_product_conversation_id: string, subscription_id: string, source_event_id: string, sequence: number, source_occurrence_kind: FederatedOccurrenceKind, source_occurrence_id: string, source_generation: number, source_transcript_id: string, outcome: FederatedEventOutcome, occurred_at_us: number, disposition: FederatedEventDisposition, navigation: FederatedEventNavigation, };
+export type FederatedFactPresentation = { event_id: string, source_instance_id: string, source_product_conversation_id: string, subscription_id: string, source_event_id: string, sequence: number, source_occurrence_kind: FederatedOccurrenceKind, source_occurrence_id: string, source_generation: number, source_transcript_id: string, outcome: FederatedEventOutcome, occurred_at_us: number, disposition: FederatedEventDisposition, navigation: FederatedEventNavigation, ending_evidence: RemoteEndingEvidence, };

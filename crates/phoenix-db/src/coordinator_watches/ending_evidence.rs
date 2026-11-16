@@ -10,6 +10,7 @@ use std::fmt::Write as _;
 use crate::{Database, DbError, DbResult};
 
 pub const ENDING_CAPTURE_LIMIT: usize = 1024;
+pub const MAX_WATCH_RESPONSE_CURSOR: usize = 1_000_000;
 
 pub(crate) async fn project_prompt_events(
     connection: &mut sqlx::SqliteConnection,
@@ -388,6 +389,7 @@ pub enum WatchResponsePage {
         message_id: String,
         prose: String,
         next_cursor: Option<usize>,
+        omitted: bool,
     },
     Changed,
     Unavailable,
@@ -420,6 +422,11 @@ impl Database {
         event_id: &str,
         cursor: usize,
     ) -> DbResult<WatchResponsePage> {
+        if cursor > MAX_WATCH_RESPONSE_CURSOR {
+            return Err(DbError::Serialization(format!(
+                "event response cursor exceeds maximum {MAX_WATCH_RESPONSE_CURSOR}"
+            )));
+        }
         let mut tx = self.pool().begin().await?;
         let row = sqlx::query(
             "SELECT v.*,e.source_transcript_id FROM coordinator_watch_events e
@@ -448,13 +455,19 @@ impl Database {
         if current_digest != digest {
             return Ok(WatchResponsePage::Changed);
         }
-        let page: String = prose.chars().skip(cursor).take(4096).collect();
+        let page: String = prose
+            .chars()
+            .skip(cursor)
+            .take(4096.min(MAX_WATCH_RESPONSE_CURSOR - cursor))
+            .collect();
         let next = cursor.saturating_add(page.chars().count());
+        let has_more = prose.chars().count() > next;
         Ok(WatchResponsePage::Matching {
             transcript_id,
             message_id,
             prose: page,
-            next_cursor: (prose.chars().count() > next).then_some(next),
+            next_cursor: (has_more && next < MAX_WATCH_RESPONSE_CURSOR).then_some(next),
+            omitted: has_more && next >= MAX_WATCH_RESPONSE_CURSOR,
         })
     }
 }
