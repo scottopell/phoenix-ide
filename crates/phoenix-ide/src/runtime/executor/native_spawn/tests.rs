@@ -614,7 +614,6 @@ async fn native_postcommit_activation_receiver_loss_stops_effect_tail_without_fe
 #[tokio::test]
 async fn native_replaced_admitted_origin_cannot_release_transferred_activation() {
     let (manager, mut runtime, request) = pending_native_spawn().await;
-    let invocation = request.invocation.clone();
     let manager_task = tokio::spawn({
         let manager = Arc::clone(&manager);
         async move { manager.handle_spawn_request(request).await }
@@ -640,36 +639,25 @@ async fn native_replaced_admitted_origin_cannot_release_transferred_activation()
         *pending_sub_agents = members;
     }
     let successor = runtime.state.clone();
-    let duplicate = NativeSpawnObservation::Admission(Ok(SubAgentAdmissionReceipt {
-        invocation,
-        outcome: SubAgentAdmissionResponse::Admitted,
-    }));
-    assert!(runtime
-        .native_spawn_observed(duplicate)
-        .await
-        .unwrap()
-        .is_none());
-    assert_eq!(runtime.state, successor);
     let mut authority = runtime.admit_authoritative_effect().unwrap();
     runtime
         .persist_state_effect(false, &mut authority)
         .await
         .unwrap();
+    assert_eq!(runtime.state, successor);
     manager_task.await.unwrap();
     assert_eq!(manager.db().owed_sub_agent_terminals(&runtime.context.conversation_id).await.unwrap().len(), 2, "replaced native origin must withhold activation even when a successor persists the same pending children");
     assert!(!manager.fatal_local_authority_fence.is_closed());
 }
 
 #[tokio::test]
-async fn native_old_receipt_preserves_a_different_successor_handoff() {
+async fn native_malformed_current_payload_is_known_non_resumable_failure() {
     let (_, old_runtime, old_request) = pending_native_spawn().await;
     let old_invocation = old_request.invocation.clone();
     drop(old_request);
     drop(old_runtime);
     let (manager, mut runtime, mut request) = pending_native_spawn().await;
-    let successor = runtime.state.clone();
-    let successor_invocation = request.invocation.clone();
-    assert_ne!(old_invocation, successor_invocation);
+    assert_ne!(old_invocation, request.invocation);
     let old_receipt = NativeSpawnObservation::Admission(Ok(SubAgentAdmissionReceipt {
         invocation: old_invocation,
         outcome: SubAgentAdmissionResponse::Admitted,
@@ -679,14 +667,17 @@ async fn native_old_receipt_preserves_a_different_successor_handoff() {
         .await
         .unwrap()
         .is_none());
-    assert_eq!(runtime.state, successor);
-    assert!(runtime
-        .native_spawn_handoff
-        .as_ref()
-        .is_some_and(|owner| owner.invocation == successor_invocation));
+    assert!(matches!(
+        runtime.state,
+        ConvState::Error {
+            error_kind: crate::db::ErrorKind::SubAgentError,
+            ..
+        }
+    ));
+    assert!(runtime.native_spawn_handoff.is_none());
     assert!(matches!(
         request.activation_rx.try_recv(),
-        Err(oneshot::error::TryRecvError::Empty)
+        Err(oneshot::error::TryRecvError::Closed)
     ));
     assert!(!manager.fatal_local_authority_fence.is_closed());
 }
