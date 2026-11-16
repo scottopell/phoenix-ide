@@ -19,6 +19,7 @@ const available = {
   source_generation: 7, occurred_at_us: 1791800000123456, provenance: 'subscription', outcome: { kind: 'turn_finished' },
 } satisfies EventPresentation;
 const federatedFact = {
+  ending_evidence: 'unsupported_remote',
   status: 'federated_fact', event_id: 'admission-1', source_instance_id: 'remote-1',
   source_product_conversation_id: 'product-remote', subscription_id: 'subscription-1',
   source_event_id: 'source-event-1', sequence: 8, source_occurrence_kind: 'direct_turn',

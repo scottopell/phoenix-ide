@@ -47,7 +47,10 @@ impl Database {
                 "SELECT e.event_id, e.route_kind,
                     COALESCE(w.source_product_conversation_id, e.mandatory_source_product_id) AS product_id,
                     e.source_transcript_id, e.source_occurrence_kind, e.source_occurrence_id,
-                    e.source_generation, e.terminal_kind, e.terminal_reason, e.occurred_at_us, v.*,
+                    e.source_generation, e.terminal_kind, e.terminal_reason, e.occurred_at_us,
+                    v.response_state,v.response_message_id,v.digest_version,v.response_digest,v.excerpt,v.prose_bytes,v.capture_limit,
+                    v.input_message_id,v.origin_kind,v.origin_product_conversation_id,v.origin_transcript_id,v.origin_subscription_event_id,
+                    v.origin_source_instance_id,v.origin_slack_request_id,v.origin_reminder_id,v.origin_source_message_id,v.origin_source_tool_use_id,
                     (SELECT COALESCE(NULLIF(root.title, ''),
                                      NULLIF(root.slug, ''), 'Untitled conversation')
                      FROM conversations root

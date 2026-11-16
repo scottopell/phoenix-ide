@@ -182,6 +182,7 @@ export const EventPresentationSchema: v.GenericSchema<unknown, EventPresentation
   }),
   v.looseObject({
     status: v.literal('federated_fact'),
+    ending_evidence: v.literal('unsupported_remote'),
     event_id: v.string(),
     source_instance_id: v.string(),
     source_product_conversation_id: v.string(),

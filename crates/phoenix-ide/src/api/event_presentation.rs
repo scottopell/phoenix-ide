@@ -143,6 +143,14 @@ pub struct FederatedFactPresentation {
     pub occurred_at_us: i64,
     pub disposition: FederatedEventDisposition,
     pub navigation: FederatedEventNavigation,
+    pub ending_evidence: RemoteEndingEvidence,
+}
+
+#[derive(Debug, Clone, Serialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub enum RemoteEndingEvidence {
+    UnsupportedRemote,
 }
 
 #[derive(Debug, Clone, Serialize, TS)]
@@ -331,6 +339,7 @@ fn federated_presentation(
                 DbError::Serialization("federated occurrence generation exceeds i64".into())
             })?;
             EventPresentation::FederatedFact(FederatedFactPresentation {
+                ending_evidence: RemoteEndingEvidence::UnsupportedRemote,
                 event_id: admission_id,
                 source_instance_id,
                 source_product_conversation_id,

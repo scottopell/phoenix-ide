@@ -34,6 +34,13 @@ clipping and tool-only/empty distinction. Current-source navigation is not histo
 recovery. An event-bound read validates the full digest and returns one bounded prose
 page from that same database snapshot; repeat validation on every page.
 
+Expose this recovery through the closed, local-only `read_event_evidence`
+capability (`event_id`, `cursor`), rather than adding a local-only reference to
+the shared local/remote `read_conversation` schema. The prior list-watch failure
+demonstrated that a prose routing warning is insufficient. This narrow additional
+tool preserves the existing conversation-read contract and rejects peer selectors
+structurally; it cannot issue a remote request or fall back between peers.
+
 Existing private event details and model input consume the same typed authority.
 Shared/redacted views acquire no private evidence. Remote terminal-fact v1 remains
 unchanged and explicitly lacks this capability. Delivery, waits, suppression and
