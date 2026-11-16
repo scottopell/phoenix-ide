@@ -282,26 +282,23 @@ pub struct SubAgentSpawnInvocation {
 impl SubAgentSpawnInvocation {
     #[must_use]
     pub fn owns_state(&self, state: &ConvState) -> bool {
-        match state {
-            ConvState::ToolExecuting {
-                current_tool,
-                assistant_message,
-                ..
-            } => {
-                current_tool.id == self.tool_use_id
-                    && current_tool.name() == "spawn_agents"
-                    && assistant_message.message_id == self.assistant_message_id
-            }
-            ConvState::CancellingTool {
+        if let ConvState::ToolExecuting {
+            current_tool,
+            assistant_message,
+            ..
+        } = state
+        {
+            return current_tool.id == self.tool_use_id
+                && current_tool.name() == "spawn_agents"
+                && assistant_message.message_id == self.assistant_message_id;
+        }
+        matches!(state, ConvState::CancellingTool {
                 tool_use_id,
                 assistant_message,
                 ..
-            } => {
-                *tool_use_id == self.tool_use_id
+            } if *tool_use_id == self.tool_use_id
                     && assistant_message.message_id == self.assistant_message_id
-            }
-            _ => false,
-        }
+        )
     }
 }
 
@@ -313,6 +310,8 @@ pub struct UnactivatedSubAgentMembership {
 }
 
 impl UnactivatedSubAgentMembership {
+    /// # Errors
+    /// Returns a lifecycle conflict for a different origin or inconsistent members.
     pub fn reconciled_state(&self) -> DbResult<ConvState> {
         if !self.invocation.owns_state(&self.previous_state) {
             return Err(lifecycle_conflict(
@@ -320,14 +319,16 @@ impl UnactivatedSubAgentMembership {
             ));
         }
         let mut state = self.previous_state.clone();
-        let pending = match &mut state {
-            ConvState::ToolExecuting {
-                pending_sub_agents, ..
-            }
-            | ConvState::CancellingTool {
-                pending_sub_agents, ..
-            } => pending_sub_agents,
-            _ => unreachable!("spawn origin checked"),
+        let (ConvState::ToolExecuting {
+            pending_sub_agents: pending,
+            ..
+        }
+        | ConvState::CancellingTool {
+            pending_sub_agents: pending,
+            ..
+        }) = &mut state
+        else {
+            unreachable!("spawn origin checked")
         };
         let mut seen = std::collections::HashSet::new();
         for member in &self.members {
@@ -2602,7 +2603,7 @@ mod tests {
                     ));
                 }
                 TerminalEvidenceTransactionCut::AfterCommit => {
-                    assert_eq!(result.established().unwrap().unwrap().len(), 1)
+                    assert_eq!(result.established().unwrap().unwrap().len(), 1);
                 }
                 TerminalEvidenceTransactionCut::AfterCommitLookupUnavailable => assert!(matches!(
                     result,
