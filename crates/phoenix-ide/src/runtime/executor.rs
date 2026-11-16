@@ -61,6 +61,7 @@ mod capacity;
 mod continuation;
 mod native_close;
 mod native_close_observe;
+mod native_close_retry;
 mod native_task_approval;
 mod self_goal;
 #[cfg(test)]
@@ -3326,6 +3327,22 @@ where
                             let result = self.execute_native_close_observe(source, referenced, admitted).await;
                             let fatal = matches!(result, Err(super::native_close_application::NativeCloseApplicationError::FatalAuthority));
                             drop(target_gate);
+                            let _ = response.send(result);
+                            if fatal {
+                                return self.fatal_local_authority_exit();
+                            }
+                            continue;
+                        }
+                        AcknowledgedRuntimeRequest::ExecuteNativeCloseRetry(request) => {
+                            let super::native_close_application::NativeCloseRetryRequest {
+                                source, target, attempt_id, failed_run_ordinal, backend,
+                                admitted, target_gate, attempt_gate, response,
+                            } = *request;
+                            let result = self.execute_native_close_retry(
+                                source, target, attempt_id, failed_run_ordinal, backend,
+                                admitted, target_gate, attempt_gate,
+                            ).await;
+                            let fatal = matches!(result, Err(super::native_close_application::NativeCloseApplicationError::FatalAuthority));
                             let _ = response.send(result);
                             if fatal {
                                 return self.fatal_local_authority_exit();

@@ -1,11 +1,12 @@
-//! Source matching for the dormant native Close application.
+//! Exact source matching and acknowledged requests for native Close application.
 //!
 //! This is a read-only predicate, NOT an admission token or an application
-//! facade. Its eventual caller must be the SOURCE conversation actor and keep
-//! exclusive actor ownership from this check through receipt lookup and commit.
+//! facade. Its caller must be the SOURCE conversation actor and keep exclusive
+//! ownership from source matching through receipt lookup, admission and execution.
 //! Calling it against a watch snapshot or persisted state does not establish that
 //! ordering. Current-Coordinator and target checks still belong in the transaction.
 
+use phoenix_core::domain::close::{CloseAttemptId, CloseRunOrdinal};
 use phoenix_core::domain::db_schema::SourceToolCall;
 use phoenix_core::domain::llm_types::ContentBlock;
 use phoenix_core::domain::product_conversation::ProductConversationId;
@@ -51,6 +52,26 @@ pub(super) fn initial_command_from_executing_source(
         source_transcript_id,
         source,
         NativeCloseIntent::Initial { target },
+    )
+}
+
+pub(super) fn retry_command_from_executing_source(
+    state: &ConvState,
+    source_transcript_id: &str,
+    source: &SourceToolCall,
+    target: ProductConversationId,
+    attempt_id: CloseAttemptId,
+    failed_run_ordinal: CloseRunOrdinal,
+) -> Result<NativeCloseCommand, NativeCloseSourceRefusal> {
+    command_from_executing_source(
+        state,
+        source_transcript_id,
+        source,
+        NativeCloseIntent::ExplicitRetry {
+            target,
+            attempt_id,
+            failed_run_ordinal,
+        },
     )
 }
 
@@ -191,6 +212,8 @@ impl super::RuntimeManager {
 
 mod observe;
 pub(crate) use observe::NativeCloseObserveRequest;
+mod retry;
+pub(crate) use retry::NativeCloseRetryRequest;
 
 #[cfg(test)]
 mod tests;

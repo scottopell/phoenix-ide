@@ -1,5 +1,7 @@
 //! Exact-instance resource fences and receipts for Close retirement.
 
+mod native_retry;
+
 use std::{
     collections::BTreeSet,
     fmt::Write as _,
@@ -12,9 +14,8 @@ use phoenix_core::domain::close::{
     AbsenceBasis, CapturedWorktreeIdentity, CloseAttemptId, CloseAttemptScope,
     CloseCompletionOutcome, CloseExpectedRetirementResource, CloseLossItem,
     CloseOwnedResourceInventory, ClosePhase, CloseRetiredResource, CloseRetirementSnapshot,
-    CloseRetirementTarget,
-    CloseRunOrdinal, CloseRunRef, CloseRunStatus, CloseStopCertainty, GitOidIdentity,
-    GitPathIdentity, LossItemIdentity, OpaqueIdentity, RetiredResourceIdentity,
+    CloseRetirementTarget, CloseRunOrdinal, CloseRunRef, CloseRunStatus, CloseStopCertainty,
+    GitOidIdentity, GitPathIdentity, LossItemIdentity, OpaqueIdentity, RetiredResourceIdentity,
     RetiredResourceKind, RetirementFailureReason, RetirementOutcome, WorktreeIdentity,
 };
 use phoenix_core::work_scope::{
@@ -2653,6 +2654,7 @@ impl RuntimeManager {
                             let identity = identity.clone();
                             let cleanup_plan = cleanup_plan.clone();
                             let writer_probe = CloseWriterProbe {
+                                persistence_uncertain: None,
                                 #[cfg(test)]
                                 clean_writer_fixture: self.clean_close_writer_fixture,
                                 db: self.db().clone(),
@@ -2794,6 +2796,7 @@ impl RuntimeManager {
                             let confirmed_snapshot = confirmed.snapshot;
                             let identity = identity.clone();
                             let writer_probe = CloseWriterProbe {
+                                persistence_uncertain: None,
                                 #[cfg(test)]
                                 clean_writer_fixture: self.clean_close_writer_fixture,
                                 db: self.db().clone(),
@@ -2992,6 +2995,7 @@ impl RuntimeManager {
                             let runtime = tokio::runtime::Handle::current();
                             let persistence_runtime = runtime.clone();
                             let writer_probe = CloseWriterProbe {
+                                persistence_uncertain: None,
                                 #[cfg(test)]
                                 clean_writer_fixture: self.clean_close_writer_fixture,
                                 db: self.db().clone(),
@@ -5871,6 +5875,9 @@ fn writer_gap(
 
 #[derive(Clone)]
 struct CloseWriterProbe {
+    // Native execution must not classify an untyped writer-observation commit
+    // error as a proven terminal failure.
+    persistence_uncertain: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     #[cfg(test)]
     clean_writer_fixture: bool,
     db: crate::db::Database,
@@ -5907,6 +5914,9 @@ impl CloseWriterProbe {
                     },
                 ))
                 .map_err(|error| {
+                    if let Some(uncertain) = &self.persistence_uncertain {
+                        uncertain.store(true, std::sync::atomic::Ordering::SeqCst);
+                    }
                     format!("cannot persist Close writer observation; target preserved: {error}")
                 })?;
             if let CloseWriterObservation::InspectionGap {

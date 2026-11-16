@@ -283,6 +283,7 @@ pub(crate) enum AcknowledgedRuntimeRequest {
     Event(Box<AcknowledgedEventRequest>),
     ExecuteNativeCloseInitial(Box<native_close_application::NativeCloseInitialRequest>),
     ExecuteNativeCloseObserve(Box<native_close_application::NativeCloseObserveRequest>),
+    ExecuteNativeCloseRetry(Box<native_close_application::NativeCloseRetryRequest>),
     ExecuteNativeTaskApproval {
         command: Box<phoenix_db::native_task_approval::NativeTaskApprovalCommand>,
         response: tokio::sync::oneshot::Sender<task_approval_admission::NativeTaskApprovalOutcome>,
@@ -308,7 +309,8 @@ impl AcknowledgedRuntimeRequest {
             Self::InspectNativeTaskApprovalAdmission { .. }
             | Self::ExecuteNativeTaskApproval { .. }
             | Self::ExecuteNativeCloseInitial(_)
-            | Self::ExecuteNativeCloseObserve(_) => panic!("expected event request"),
+            | Self::ExecuteNativeCloseObserve(_)
+            | Self::ExecuteNativeCloseRetry(_) => panic!("expected event request"),
         }
     }
 }
