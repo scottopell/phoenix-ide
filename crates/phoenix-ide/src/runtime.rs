@@ -3762,54 +3762,57 @@ impl RuntimeManager {
         let manager = Arc::clone(self);
         self.run_authority_units(obligations, move |obligation| {
             let manager = Arc::clone(&manager);
-            async move {
-                if !matches!(
-                    obligation.phase(),
-                    phoenix_core::domain::close::ClosePhase::SettlingActiveWork
-                        | phoenix_core::domain::close::ClosePhase::CancelRequestedDuringSettlement
-                ) {
-                    return Ok(false);
-                }
-                let conversation_ids = manager
-                    .db
-                    .list_close_settlement_conversation_ids(obligation.attempt_id().as_str())
-                    .await
-                    .map_err(|error| error.to_string())?;
-                for conversation_id in &conversation_ids {
-                    match manager
-                        .db
-                        .cancel_conversation_creation(conversation_id, Utc::now())
-                        .await
-                    {
-                        Ok(()) | Err(crate::db::DbError::Sqlx(sqlx::Error::RowNotFound)) => {}
-                        Err(error) => return Err(error.to_string()),
-                    }
-                }
-                manager.kick_creation_worker();
-                manager
-                    .settle_close_direct_turn_targets(obligation.attempt_id().as_str())
-                    .await?;
-                match manager
-                    .db
-                    .advance_close_settlement_when_quiescent(obligation.attempt_id().as_str())
-                    .await
-                {
-                    Ok(advanced) => {
-                        if advanced.phase()
-                            == phoenix_core::domain::close::ClosePhase::AwaitingRetirementInspection
-                        {
-                            manager
-                                .inspect_close_retirement(advanced.attempt_id().clone())
-                                .await?;
-                        }
-                        Ok(true)
-                    }
-                    Err(crate::db::DbError::CloseFoundationPrecondition(_)) => Ok(false),
-                    Err(error) => Err(error.to_string()),
-                }
-            }
+            async move { manager.settle_close_obligation(obligation).await }
         })
         .await
+    }
+
+    async fn settle_close_obligation(
+        self: &Arc<Self>,
+        obligation: phoenix_core::domain::close::CloseObligation,
+    ) -> Result<bool, String> {
+        if !matches!(
+            obligation.phase(),
+            phoenix_core::domain::close::ClosePhase::SettlingActiveWork
+                | phoenix_core::domain::close::ClosePhase::CancelRequestedDuringSettlement
+        ) {
+            return Ok(false);
+        }
+        let conversation_ids = self
+            .db
+            .list_close_settlement_conversation_ids(obligation.attempt_id().as_str())
+            .await
+            .map_err(|error| error.to_string())?;
+        for conversation_id in &conversation_ids {
+            match self
+                .db
+                .cancel_conversation_creation(conversation_id, Utc::now())
+                .await
+            {
+                Ok(()) | Err(crate::db::DbError::Sqlx(sqlx::Error::RowNotFound)) => {}
+                Err(error) => return Err(error.to_string()),
+            }
+        }
+        self.kick_creation_worker();
+        self.settle_close_direct_turn_targets(obligation.attempt_id().as_str())
+            .await?;
+        match self
+            .db
+            .advance_close_settlement_when_quiescent(obligation.attempt_id().as_str())
+            .await
+        {
+            Ok(advanced) => {
+                if advanced.phase()
+                    == phoenix_core::domain::close::ClosePhase::AwaitingRetirementInspection
+                {
+                    self.inspect_close_retirement(advanced.attempt_id().clone())
+                        .await?;
+                }
+                Ok(true)
+            }
+            Err(crate::db::DbError::CloseFoundationPrecondition(_)) => Ok(false),
+            Err(error) => Err(error.to_string()),
+        }
     }
 
     /// Materialize persisted continuation operations so restart recovery does
