@@ -238,10 +238,10 @@ pub enum ScanFailure {
 }
 #[derive(Debug, Clone)]
 pub struct ScanUsage {
-    pub input_tokens: u64,
-    pub cache_read_tokens: u64,
-    pub cache_creation_tokens: u64,
-    pub output_tokens: u64,
+    pub input_tokens: Option<u64>,
+    pub cache_read_tokens: Option<u64>,
+    pub cache_creation_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
 }
 #[derive(Debug, Clone)]
 pub struct ScanMetrics {

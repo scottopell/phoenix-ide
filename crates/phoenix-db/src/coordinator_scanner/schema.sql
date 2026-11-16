@@ -51,10 +51,14 @@ CREATE TABLE coordinator_scan_attempts (
  elapsed_ms INTEGER CHECK(elapsed_ms IS NULL OR (typeof(elapsed_ms)='integer' AND elapsed_ms>=0)),
  input_tokens INTEGER, cache_read_tokens INTEGER, cache_creation_tokens INTEGER, output_tokens INTEGER,
  UNIQUE(binding_id,cycle,ordinal),
- CHECK((input_tokens IS NULL AND cache_read_tokens IS NULL AND cache_creation_tokens IS NULL AND output_tokens IS NULL) OR
-       (typeof(input_tokens)='integer' AND input_tokens>=0 AND typeof(cache_read_tokens)='integer' AND cache_read_tokens>=0 AND typeof(cache_creation_tokens)='integer' AND cache_creation_tokens>=0 AND typeof(output_tokens)='integer' AND output_tokens>=0)),
+ CHECK(input_tokens IS NULL OR (typeof(input_tokens)='integer' AND input_tokens>=0)),
+ CHECK(cache_read_tokens IS NULL OR (typeof(cache_read_tokens)='integer' AND cache_read_tokens>=0)),
+ CHECK(cache_creation_tokens IS NULL OR (typeof(cache_creation_tokens)='integer' AND cache_creation_tokens>=0)),
+ CHECK(output_tokens IS NULL OR (typeof(output_tokens)='integer' AND output_tokens>=0)),
  CHECK((state='reserved' AND elapsed_ms IS NULL AND failure_kind IS NULL AND failure_detail IS NULL) OR
-       (state!='reserved' AND elapsed_ms IS NOT NULL))
+       (state IN ('applied','conflict') AND elapsed_ms IS NOT NULL AND failure_kind IS NULL AND failure_detail IS NULL) OR
+       (state='rejected' AND elapsed_ms IS NOT NULL AND failure_kind='invalid_output' AND failure_detail IS NOT NULL) OR
+       (state='failed' AND elapsed_ms IS NOT NULL AND failure_kind IS NOT NULL AND failure_detail IS NOT NULL))
 );
 CREATE INDEX coordinator_scan_attempt_budget ON coordinator_scan_attempts(reserved_at_us,binding_id);
 CREATE TABLE coordinator_scan_applications (

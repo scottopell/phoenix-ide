@@ -164,7 +164,6 @@ async fn prepare(
         .max()
         .map_or(0, |n| if n >= maximum { 0 } else { n + 1 });
     sqlx::query("UPDATE coordinator_scan_state SET discovery_next_ordinal=?1,observed_at_us=?2 WHERE singleton=1").bind(revisit).bind(now).execute(&mut **tx).await?;
-    let rows=sqlx::query("SELECT m.*,c.transcript_generation,COALESCE((SELECT MAX(sequence_id) FROM messages WHERE conversation_id=m.transcript_id),0) AS tail FROM coordinator_scan_members m JOIN conversations c ON c.id=m.transcript_id ORDER BY m.selected_at_us,m.continuation_ordinal DESC LIMIT 32").fetch_all(&mut **tx).await?;
     let streak: i64 = state.try_get("live_streak")?;
     let preferred = if streak >= 3 {
         [ScanLane::Historical, ScanLane::Live]
@@ -173,6 +172,8 @@ async fn prepare(
     };
     let mut waiting = None;
     for lane in preferred {
+        let rows=sqlx::query("SELECT m.*,c.transcript_generation,COALESCE((SELECT MAX(sequence_id) FROM messages WHERE conversation_id=m.transcript_id),0) AS tail FROM coordinator_scan_members m JOIN conversations c ON c.id=m.transcript_id WHERE m.generation=c.transcript_generation AND ((?1='live' AND (m.live_message_id IS NOT NULL OR m.live_seq<COALESCE((SELECT MAX(sequence_id) FROM messages WHERE conversation_id=m.transcript_id),0))) OR (?1='historical' AND m.historical_seq>0)) ORDER BY m.selected_at_us,m.continuation_ordinal DESC LIMIT 32").bind(lane_name(lane)).fetch_all(&mut **tx).await?;
+
         for row in &rows {
             let transcript: String = row.try_get("transcript_id")?;
             if !members.iter().any(|m| m.conversation.id == transcript) {
@@ -470,7 +471,7 @@ pub(super) async fn complete_attempt(
     });
     let usage = metrics.usage.as_ref();
     let n = |v: u64| i64::try_from(v).map_err(|e| invalid(e.to_string()));
-    sqlx::query("UPDATE coordinator_scan_attempts SET state=?2,failure_kind=?3,failure_detail=?4,elapsed_ms=?5,input_tokens=?6,cache_read_tokens=?7,cache_creation_tokens=?8,output_tokens=?9 WHERE id=?1 AND state='reserved'").bind(attempt.id).bind(state).bind(failure.map(|(s,_)|s)).bind(detail).bind(n(metrics.elapsed_ms)?).bind(usage.map(|u|n(u.input_tokens)).transpose()?).bind(usage.map(|u|n(u.cache_read_tokens)).transpose()?).bind(usage.map(|u|n(u.cache_creation_tokens)).transpose()?).bind(usage.map(|u|n(u.output_tokens)).transpose()?).execute(&mut **tx).await?;
+    sqlx::query("UPDATE coordinator_scan_attempts SET state=?2,failure_kind=?3,failure_detail=?4,elapsed_ms=?5,input_tokens=?6,cache_read_tokens=?7,cache_creation_tokens=?8,output_tokens=?9 WHERE id=?1 AND state='reserved'").bind(attempt.id).bind(state).bind(failure.map(|(s,_)|s)).bind(detail).bind(n(metrics.elapsed_ms)?).bind(usage.and_then(|u|u.input_tokens).map(n).transpose()?).bind(usage.and_then(|u|u.cache_read_tokens).map(n).transpose()?).bind(usage.and_then(|u|u.cache_creation_tokens).map(n).transpose()?).bind(usage.and_then(|u|u.output_tokens).map(n).transpose()?).execute(&mut **tx).await?;
     Ok(())
 }
 

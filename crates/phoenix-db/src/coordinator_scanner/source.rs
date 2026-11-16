@@ -120,26 +120,29 @@ pub(super) async fn capture(
     lane: ScanLane,
     start: &ScanPosition,
 ) -> DbResult<Captured> {
-    let sql = match (lane,start) {
-        (ScanLane::Live,ScanPosition::Boundary{..})=>"SELECT * FROM messages WHERE conversation_id=?1 AND sequence_id>?2 ORDER BY sequence_id,message_id LIMIT 32",
-        (ScanLane::Live,_)=>"SELECT * FROM messages WHERE conversation_id=?1 AND sequence_id>=?2 ORDER BY sequence_id,message_id LIMIT 32",
-        (ScanLane::Historical,_)=>"SELECT * FROM messages WHERE conversation_id=?1 AND sequence_id<=?2 ORDER BY sequence_id DESC,message_id DESC LIMIT 32"
-    };
-    let rows = sqlx::query(sql)
-        .bind(transcript)
-        .bind(seq(start))
-        .fetch_all(&mut **tx)
-        .await?;
+    let mut query=sqlx::QueryBuilder::<Sqlite>::new("SELECT message_id,conversation_id,sequence_id,message_type,created_at,origin_kind,origin_product_conversation_id,origin_transcript_id,origin_subscription_event_id,origin_source_instance_id,origin_slack_request_id,origin_reminder_id,origin_source_message_id,origin_source_tool_use_id,CASE WHEN message_type IN('user','agent') THEN CAST(substr(CAST(content AS BLOB),1,1048577) AS TEXT) ELSE NULL END AS prose_content,length(CAST(content AS BLOB)) AS content_bytes,EXISTS(SELECT 1 FROM message_images WHERE message_images.message_id=messages.message_id) OR EXISTS(SELECT 1 FROM message_files WHERE message_files.message_id=messages.message_id) AS has_attachments FROM messages WHERE conversation_id=");
+    query.push_bind(transcript);
+    query.push(match (lane, start) {
+        (ScanLane::Live, ScanPosition::Boundary { .. }) => " AND sequence_id>",
+        (ScanLane::Live, _) => " AND sequence_id>=",
+        (ScanLane::Historical, _) => " AND sequence_id<=",
+    });
+    query.push_bind(seq(start));
+    query.push(if lane == ScanLane::Live {
+        " ORDER BY sequence_id,message_id LIMIT 32"
+    } else {
+        " ORDER BY sequence_id DESC,message_id DESC LIMIT 32"
+    });
+    let rows = query.build().fetch_all(&mut **tx).await?;
     let mut fragments = Vec::new();
     let mut end = start.clone();
     let mut identities = Vec::new();
     for row in rows {
-        let message = crate::parse_prompt_message_row(row)
-            .map_err(|e| invalid(format!("unreadable scanner source: {e}")))?;
+        let message = project_source(&row)?;
         let message_seq = message.sequence_id;
         let origin = message.origin;
         let (role, is_meta, parts) = match message.content {
-            MessageContent::User(user) => {
+            Some(MessageContent::User(user)) => {
                 if user.llm_text.is_some() {
                     tracing::debug!(message_id=%message.message_id,"scanner consumes original prose, not reference expansion");
                 }
@@ -152,7 +155,7 @@ pub(super) async fn capture(
                     (ScanRole::User, user.is_meta, vec![(0, user.text)])
                 }
             }
-            MessageContent::Agent(blocks) => {
+            Some(MessageContent::Agent(blocks)) => {
                 let mut parts = Vec::new();
                 for (ordinal, block) in blocks.into_iter().enumerate() {
                     match block {
@@ -164,11 +167,14 @@ pub(super) async fn capture(
                 }
                 (ScanRole::Assistant, false, parts)
             }
-            MessageContent::Tool(_)
-            | MessageContent::System(_)
-            | MessageContent::Error(_)
-            | MessageContent::Continuation(_)
-            | MessageContent::Skill(_) => (ScanRole::Assistant, true, Vec::new()),
+            Some(
+                MessageContent::Tool(_)
+                | MessageContent::System(_)
+                | MessageContent::Error(_)
+                | MessageContent::Continuation(_)
+                | MessageContent::Skill(_),
+            )
+            | None => (ScanRole::Assistant, true, Vec::new()),
         };
         identities.push((
             message.message_id.clone(),
@@ -228,7 +234,7 @@ pub(super) async fn capture(
                     role,
                     origin: origin.clone(),
                     is_meta,
-                    created_at_us: message.created_at.timestamp_micros(),
+                    created_at_us: message.created_at_us,
                     part_ordinal: *part,
                     utf8_start: offset,
                     utf8_end: stop,
@@ -242,11 +248,7 @@ pub(super) async fn capture(
                     break;
                 }
                 if !fragments.is_empty() {
-                    return Ok(Captured {
-                        source_digest: hash(encoded(&identities)?),
-                        fragments,
-                        end,
-                    });
+                    return captured(fragments, end, &identities);
                 }
                 let remaining = stop.saturating_sub(offset);
                 if remaining <= 1 {
@@ -266,11 +268,7 @@ pub(super) async fn capture(
             };
             fragments.push(fragment);
             if stop < text.len() {
-                return Ok(Captured {
-                    source_digest: hash(encoded(&identities)?),
-                    fragments,
-                    end,
-                });
+                return captured(fragments, end, &identities);
             }
         }
         end = ScanPosition::Boundary {
@@ -281,6 +279,13 @@ pub(super) async fn capture(
             },
         };
     }
+    captured(fragments, end, &identities)
+}
+fn captured(
+    mut fragments: Vec<ScanFragment>,
+    end: ScanPosition,
+    identities: &[(String, i64, String)],
+) -> DbResult<Captured> {
     fragments.sort_by_key(|f| {
         (
             identities
@@ -292,9 +297,59 @@ pub(super) async fn capture(
         )
     });
     Ok(Captured {
-        source_digest: hash(encoded(&identities)?),
+        source_digest: hash(encoded(identities)?),
         fragments,
         end,
+    })
+}
+struct ProseProjection {
+    message_id: String,
+    sequence_id: i64,
+    origin: InputOrigin,
+    created_at_us: i64,
+    content: Option<MessageContent>,
+}
+fn project_source(row: &sqlx::sqlite::SqliteRow) -> DbResult<ProseProjection> {
+    let message_id: String = row.try_get("message_id")?;
+    let message_type: String = row.try_get("message_type")?;
+    if row.try_get::<bool, _>("has_attachments")? {
+        tracing::debug!(%message_id,"scanner prose projection excludes attachment payloads");
+    }
+    let content = match message_type.as_str() {
+        "user" | "agent" => {
+            if row.try_get::<i64, _>("content_bytes")? > 1_048_576 {
+                return Err(invalid(
+                    "source row exceeds1MiB projection limit; remains explicitly pending",
+                ));
+            }
+            let value = serde_json::from_str(&row.try_get::<String, _>("prose_content")?)
+                .map_err(|e| invalid(format!("unreadable source JSON: {e}")))?;
+            let kind = if message_type == "user" {
+                crate::MessageType::User
+            } else {
+                crate::MessageType::Agent
+            };
+            Some(
+                MessageContent::from_stored_json(kind, value)
+                    .map_err(|e| invalid(format!("unreadable typed source: {e}")))?,
+            )
+        }
+        "tool" | "system" | "error" | "continuation" | "skill" => {
+            tracing::debug!(%message_id,%message_type,"scanner excludes non-discovery message payload");
+            None
+        }
+        _ => return Err(invalid("unknown source message kind")),
+    };
+    Ok(ProseProjection {
+        message_id,
+        sequence_id: row.try_get("sequence_id")?,
+        origin: crate::decode_origin(row)?,
+        created_at_us: chrono::DateTime::parse_from_rfc3339(
+            &row.try_get::<String, _>("created_at")?,
+        )
+        .map_err(|e| invalid(format!("unreadable source time: {e}")))?
+        .timestamp_micros(),
+        content,
     })
 }
 

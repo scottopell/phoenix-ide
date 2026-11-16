@@ -135,6 +135,20 @@ async fn apply(
             .await?;
     let ScanResult::Complete { actions } = result;
     let validate = || -> Result<Vec<Vec<EvidenceSource<'_>>>, ScanRejection> {
+        if encoded(result)
+            .map_err(|e| ScanRejection::InvalidOutput {
+                detail: e.to_string(),
+            })?
+            .len()
+            > SCAN_MAX_OUTPUT_BYTES
+            || metrics
+                .usage
+                .as_ref()
+                .and_then(|u| u.output_tokens)
+                .is_none_or(|n| n > u64::from(SCAN_MAX_OUTPUT_TOKENS))
+        {
+            return Err(ScanRejection::InvalidOutput{detail:"accepted result requires at most16KiB encoded output and reported output tokens at most2048".into()});
+        }
         if actions.len() > 16 {
             return Err(ScanRejection::InvalidOutput {
                 detail: "at most16 scanner actions".into(),

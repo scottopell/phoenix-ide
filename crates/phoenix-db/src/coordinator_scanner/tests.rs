@@ -15,10 +15,10 @@ fn metrics() -> ScanMetrics {
     ScanMetrics {
         elapsed_ms: 10,
         usage: Some(ScanUsage {
-            input_tokens: 20,
-            cache_read_tokens: 0,
-            cache_creation_tokens: 0,
-            output_tokens: 10,
+            input_tokens: Some(20),
+            cache_read_tokens: Some(0),
+            cache_creation_tokens: Some(0),
+            output_tokens: Some(10),
         }),
     }
 }
@@ -451,4 +451,651 @@ async fn scanner_machine_prose_cannot_establish_a_new_commission() {
             .active_count,
         0
     );
+}
+
+#[tokio::test]
+async fn scanner_history_window_is_chronological_and_live_gets_three_to_one_priority() {
+    let (db, source) = setup().await;
+    for n in 1..=12 {
+        message(
+            &db,
+            &source,
+            n,
+            &format!("historical-{n} {}", "x".repeat(3000)),
+            &InputOrigin::UserApi,
+        )
+        .await;
+    }
+    let historical = prepare(&db, 1000).await;
+    let sequences = historical
+        .input
+        .fragments
+        .iter()
+        .map(|f| {
+            f.message_id
+                .rsplit('-')
+                .next()
+                .unwrap()
+                .parse::<i64>()
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    assert!(sequences.windows(2).all(|pair| pair[0] <= pair[1]));
+    drop(historical);
+    for n in 13..=26 {
+        message(
+            &db,
+            &source,
+            n,
+            &format!("live-{n} {}", "y".repeat(3000)),
+            &InputOrigin::UserApi,
+        )
+        .await;
+    }
+    for (offset, expected) in [
+        ScanLane::Live,
+        ScanLane::Live,
+        ScanLane::Live,
+        ScanLane::Historical,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let now = 2000 + i64::try_from(offset).unwrap();
+        let batch = prepare(&db, now).await;
+        assert_eq!(batch.input.scan_context.lane, expected);
+        let sequences = batch
+            .input
+            .fragments
+            .iter()
+            .map(|f| {
+                f.message_id
+                    .rsplit('-')
+                    .next()
+                    .unwrap()
+                    .parse::<i64>()
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert!(sequences.windows(2).all(|pair| pair[0] <= pair[1]));
+        let attempt = reserve(&db, batch, now).await;
+        db.apply_coordinator_scan(
+            &attempt,
+            &ScanResult::Complete { actions: vec![] },
+            metrics(),
+            now,
+        )
+        .await
+        .established()
+        .unwrap()
+        .unwrap();
+    }
+}
+#[tokio::test]
+async fn scanner_malformed_and_oversized_source_remain_pending_without_dropping_history() {
+    let (db, source) = setup().await;
+    message(
+        &db,
+        &source,
+        1,
+        "Please retain Cobalt.",
+        &InputOrigin::UnknownHistorical,
+    )
+    .await;
+    sqlx::query("UPDATE messages SET content='not-json' WHERE conversation_id=?1")
+        .bind(&source)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    assert!(matches!(
+        db.prepare_coordinator_scan(Some(&profile()), 1000)
+            .await
+            .established()
+            .unwrap()
+            .unwrap(),
+        ScanPreparation::Wait {
+            reason: ScanBlocker::SourceUnavailable,
+            ..
+        }
+    ));
+    let before = db
+        .read_coordinator_scan_coverage(&source, None)
+        .await
+        .unwrap();
+    assert!(matches!(
+        before.members[0].historical_frontier,
+        Some(ScanPosition::Boundary { sequence_id: 1 })
+    ));
+    let content = serde_json::to_string(
+        &MessageContent::User(UserContent::new("x".repeat(1_048_577))).to_stored_json(),
+    )
+    .unwrap();
+    sqlx::query("UPDATE messages SET content=?2 WHERE conversation_id=?1")
+        .bind(&source)
+        .bind(content)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    assert!(matches!(
+        db.prepare_coordinator_scan(Some(&profile()), 1001)
+            .await
+            .established()
+            .unwrap()
+            .unwrap(),
+        ScanPreparation::Wait {
+            reason: ScanBlocker::SourceUnavailable,
+            ..
+        }
+    ));
+    assert_eq!(
+        db.read_coordinator_scan_coverage(&source, None)
+            .await
+            .unwrap()
+            .members[0]
+            .historical_frontier,
+        before.members[0].historical_frontier
+    );
+}
+#[tokio::test]
+async fn scanner_budget_charges_crashes_and_keeps_partially_observed_usage() {
+    let (db, source) = setup().await;
+    message(
+        &db,
+        &source,
+        1,
+        "Please retain Cobalt.",
+        &InputOrigin::UserApi,
+    )
+    .await;
+    let batch = prepare(&db, 1000).await;
+    let attempt = reserve(&db, batch, 1000).await;
+    let partial = ScanMetrics {
+        elapsed_ms: 20,
+        usage: Some(ScanUsage {
+            input_tokens: None,
+            cache_read_tokens: None,
+            cache_creation_tokens: None,
+            output_tokens: Some(12),
+        }),
+    };
+    db.fail_coordinator_scan(
+        &attempt,
+        ScanFailure::Provider("temporary outage".into()),
+        partial,
+        1001,
+    )
+    .await
+    .established()
+    .unwrap()
+    .unwrap();
+    let row =
+        sqlx::query("SELECT input_tokens,output_tokens FROM coordinator_scan_attempts WHERE id=?1")
+            .bind(attempt.id)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(row.get::<Option<i64>, _>("input_tokens"), None);
+    assert_eq!(row.get::<Option<i64>, _>("output_tokens"), Some(12));
+    for step in 1..4 {
+        let mut route = profile();
+        route.prompt_hash = [step + 10; 32];
+        for _ in 0..2 {
+            let batch = match db
+                .prepare_coordinator_scan(Some(&route), 2000)
+                .await
+                .established()
+                .unwrap()
+                .unwrap()
+            {
+                ScanPreparation::Ready(b) => b,
+                ScanPreparation::Wait {
+                    reason: ScanBlocker::HistoricalBudgetPaused,
+                    ..
+                } => {
+                    let count: i64 =
+                        sqlx::query_scalar("SELECT COUNT(*) FROM coordinator_scan_attempts")
+                            .fetch_one(db.pool())
+                            .await
+                            .unwrap();
+                    assert_eq!(count, 4);
+                    return;
+                }
+                other => panic!("{other:?}"),
+            };
+            let bytes = serde_json::to_vec(batch.input()).unwrap().len() + 64;
+            match db
+                .reserve_coordinator_scan(batch, bytes, 2000)
+                .await
+                .established()
+                .unwrap()
+                .unwrap()
+            {
+                ScanReservation::Reserved(_) => {}
+                ScanReservation::Paused {
+                    reason: ScanBlocker::HistoricalBudgetPaused,
+                    ..
+                } => {
+                    let count: i64 =
+                        sqlx::query_scalar("SELECT COUNT(*) FROM coordinator_scan_attempts")
+                            .fetch_one(db.pool())
+                            .await
+                            .unwrap();
+                    assert_eq!(count, 4);
+                    return;
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+    }
+    panic!("historical budget never paused")
+}
+#[tokio::test]
+async fn scanner_file_restart_keeps_reserved_attempt_and_retry_cycle() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("scanner.db");
+    let db = Database::open(path.to_str().unwrap()).await.unwrap();
+    crate::run_pending_migrations(db.pool()).await.unwrap();
+    let source = db
+        .get_or_create_coordinator(None, LlmLanguage::default())
+        .await
+        .unwrap()
+        .id;
+    message(
+        &db,
+        &source,
+        1,
+        "Please retain Cobalt.",
+        &InputOrigin::UnknownHistorical,
+    )
+    .await;
+    let first = prepare(&db, 1000).await;
+    let binding = first.binding_id.clone();
+    let _lost = reserve(&db, first, 1000).await;
+    db.pool().close().await;
+    let db = Database::open(path.to_str().unwrap()).await.unwrap();
+    crate::run_pending_migrations(db.pool()).await.unwrap();
+    let second = prepare(&db, 1001).await;
+    assert_eq!(second.binding_id, binding);
+    let _lost = reserve(&db, second, 1001).await;
+    db.pool().close().await;
+    let db = Database::open(path.to_str().unwrap()).await.unwrap();
+    crate::run_pending_migrations(db.pool()).await.unwrap();
+    assert!(matches!(
+        db.prepare_coordinator_scan(Some(&profile()), 1002)
+            .await
+            .established()
+            .unwrap()
+            .unwrap(),
+        ScanPreparation::Wait {
+            reason: ScanBlocker::RetryBackoff,
+            ..
+        }
+    ));
+    let later = prepare(&db, 1001 + SCAN_RETRY_BACKOFF_US).await;
+    let output = capture(&later);
+    let attempt = reserve(&db, later, 1001 + SCAN_RETRY_BACKOFF_US).await;
+    assert!(matches!(
+        db.apply_coordinator_scan(&attempt, &output, metrics(), 1002 + SCAN_RETRY_BACKOFF_US)
+            .await
+            .established()
+            .unwrap()
+            .unwrap(),
+        ScanApplyOutcome::Applied { .. }
+    ));
+}
+
+async fn native(
+    db: &Database,
+    source: &str,
+    mutation: crate::coordinator_tracking::TrackingMutation,
+) -> crate::coordinator_tracking::TrackingReceipt {
+    use phoenix_core::domain::{
+        db_schema::SourceToolCall,
+        llm_types::ContentBlock,
+        sm_state::{AssistantMessage, ConvState, ToolCall, ToolInput},
+    };
+    let call = SourceToolCall {
+        message_id: uuid::Uuid::new_v4().to_string(),
+        tool_use_id: uuid::Uuid::new_v4().to_string(),
+    };
+    let input = serde_json::json!({"request":mutation});
+    db.update_conversation_state(
+        source,
+        &ConvState::ToolExecuting {
+            current_tool: ToolCall::new(
+                &call.tool_use_id,
+                ToolInput::from_name_and_value("tracking", input.clone()),
+            ),
+            remaining_tools: vec![],
+            completed_results: vec![],
+            pending_sub_agents: vec![],
+            assistant_message: AssistantMessage {
+                message_id: call.message_id.clone(),
+                content: vec![ContentBlock::ToolUse {
+                    id: call.tool_use_id.clone(),
+                    name: "tracking".into(),
+                    input,
+                }],
+                ..Default::default()
+            },
+        },
+    )
+    .await
+    .unwrap();
+    let result = db
+        .mutate_coordinator_tracking(source, &call, &mutation)
+        .await
+        .established()
+        .unwrap()
+        .unwrap();
+    db.update_conversation_state(source, &ConvState::Idle)
+        .await
+        .unwrap();
+    result
+}
+fn append_output(batch: &PreparedScanBatch, id: &str) -> ScanResult {
+    ScanResult::Complete {
+        actions: vec![ScanAction::Append {
+            item_id: id.into(),
+            quotes: vec![ScanQuote {
+                fragment_id: batch.input.fragments[0].fragment_id.clone(),
+                quotation: batch.input.fragments[0].text.clone(),
+            }],
+        }],
+    }
+}
+#[tokio::test]
+async fn scanner_unchanged_generation_rescan_dedups_but_new_restriction_invalidates_review() {
+    use crate::coordinator_tracking::TrackingMutation;
+    let (db, source) = setup().await;
+    message(
+        &db,
+        &source,
+        1,
+        "Please retain Cobalt.",
+        &InputOrigin::UserApi,
+    )
+    .await;
+    let batch = prepare(&db, 1000).await;
+    let output = capture(&batch);
+    let attempt = reserve(&db, batch, 1000).await;
+    let ScanApplyOutcome::Applied {
+        created_item_ids, ..
+    } = db
+        .apply_coordinator_scan(&attempt, &output, metrics(), 1001)
+        .await
+        .established()
+        .unwrap()
+        .unwrap()
+    else {
+        panic!("not captured")
+    };
+    let id = &created_item_ids[0];
+    native(
+        &db,
+        &source,
+        TrackingMutation::Update {
+            id: id.clone(),
+            expected_revision: 1,
+            kind: TrackingKind::RequestedWork,
+            title: "Cobalt".into(),
+            note: "User's Cobalt question".into(),
+            resumption: "Ask which period before any work".into(),
+            reviewed_evidence_ordinal: 1,
+            references: vec![],
+        },
+    )
+    .await;
+    let before = db.read_coordinator_tracking(&source, id, 0).await.unwrap();
+    assert!(matches!(
+        before.item.resumption,
+        TrackingResumption::Reviewed { .. }
+    ));
+    db.update_message_display_data(
+        &format!("{source}-1"),
+        &serde_json::json!({"display_only":"changed"}),
+    )
+    .await
+    .unwrap();
+    let batch = prepare(&db, 2000).await;
+    assert_eq!(batch.input.scan_context.source_generation, 2);
+    let output = append_output(&batch, id);
+    let attempt = reserve(&db, batch, 2000).await;
+    let ScanApplyOutcome::Applied {
+        changed_item_count,
+        registry_revision,
+        ..
+    } = db
+        .apply_coordinator_scan(&attempt, &output, metrics(), 2001)
+        .await
+        .established()
+        .unwrap()
+        .unwrap()
+    else {
+        panic!("not applied")
+    };
+    assert_eq!(changed_item_count, 0);
+    assert_eq!(registry_revision, before.registry_revision);
+    let detail = db.read_coordinator_tracking(&source, id, 0).await.unwrap();
+    assert_eq!(detail.item.revision, before.item.revision);
+    assert!(matches!(
+        detail.item.resumption,
+        TrackingResumption::Reviewed { .. }
+    ));
+    assert_eq!(detail.evidence.len(), 1);
+    message(
+        &db,
+        &source,
+        2,
+        "Pause Cobalt. Do not start until I explicitly resume.",
+        &InputOrigin::UserApi,
+    )
+    .await;
+    let batch = prepare(&db, 3000).await;
+    let output = append_output(&batch, id);
+    let attempt = reserve(&db, batch, 3000).await;
+    db.apply_coordinator_scan(&attempt, &output, metrics(), 3001)
+        .await
+        .established()
+        .unwrap()
+        .unwrap();
+    let detail = db.read_coordinator_tracking(&source, id, 0).await.unwrap();
+    assert!(matches!(
+        detail.item.resumption,
+        TrackingResumption::ReviewRequired { .. }
+    ));
+    assert_eq!(detail.evidence.len(), 2);
+    assert!(detail.evidence[1].1.quotation.contains("Pause"));
+    assert_eq!(detail.item.revision, before.item.revision + 1);
+}
+#[tokio::test]
+async fn scanner_fresh_renewal_stays_visible_without_reopening_retired_record() {
+    use crate::coordinator_tracking::{TrackingMutation, TrackingRetirement, TrackingState};
+    let (db, source) = setup().await;
+    message(
+        &db,
+        &source,
+        1,
+        "Please retain Cobalt.",
+        &InputOrigin::UserApi,
+    )
+    .await;
+    let batch = prepare(&db, 1000).await;
+    let output = capture(&batch);
+    let attempt = reserve(&db, batch, 1000).await;
+    let ScanApplyOutcome::Applied {
+        created_item_ids, ..
+    } = db
+        .apply_coordinator_scan(&attempt, &output, metrics(), 1001)
+        .await
+        .established()
+        .unwrap()
+        .unwrap()
+    else {
+        panic!("not captured")
+    };
+    let old = &created_item_ids[0];
+    native(
+        &db,
+        &source,
+        TrackingMutation::Retire {
+            id: old.clone(),
+            expected_revision: 1,
+            disposition: TrackingRetirement::Dismissed,
+            reason: "User abandoned the earlier request".into(),
+        },
+    )
+    .await;
+    message(
+        &db,
+        &source,
+        2,
+        "I now renew Cobalt. Please ask which new period before any work.",
+        &InputOrigin::UserApi,
+    )
+    .await;
+    let batch = prepare(&db, 2000).await;
+    assert!(batch
+        .input
+        .candidates
+        .iter()
+        .any(|c| c.id == *old && c.disposition == TrackingDisposition::Dismissed));
+    let output = capture(&batch);
+    let attempt = reserve(&db, batch, 2000).await;
+    let ScanApplyOutcome::Applied {
+        created_item_ids, ..
+    } = db
+        .apply_coordinator_scan(&attempt, &output, metrics(), 2001)
+        .await
+        .established()
+        .unwrap()
+        .unwrap()
+    else {
+        panic!("renewal not captured")
+    };
+    let renewed = &created_item_ids[0];
+    assert_ne!(old, renewed);
+    let old_detail = db.read_coordinator_tracking(&source, old, 0).await.unwrap();
+    assert!(
+        matches!(old_detail.item.disposition,TrackingState::Dismissed{ref reason}if reason.contains("abandoned"))
+    );
+    let page = db
+        .list_coordinator_tracking(&source, None, false)
+        .await
+        .unwrap();
+    assert_eq!(page.active_count, 1);
+    assert_eq!(page.items[0].id, *renewed);
+    assert!(page.items[0].review_required);
+    let observation = db
+        .append_coordinator_tracking_observation(&source, 100, 2002)
+        .await
+        .established()
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let text = observation.content.to_json()["text"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(text.contains(renewed));
+    assert!(text.contains("requested_item_due_for_review"));
+}
+#[tokio::test]
+async fn scanner_two_inflight_batches_cas_one_winner_and_no_omitted_source() {
+    let (db, source) = setup().await;
+    message(
+        &db,
+        &source,
+        1,
+        "Please retain Cobalt.",
+        &InputOrigin::UserApi,
+    )
+    .await;
+    let first = prepare(&db, 1000).await;
+    let second = prepare(&db, 1001).await;
+    assert_eq!(first.binding_id, second.binding_id);
+    let output = capture(&first);
+    let first = reserve(&db, first, 1000).await;
+    let second = reserve(&db, second, 1001).await;
+    assert!(matches!(
+        db.apply_coordinator_scan(&first, &output, metrics(), 1002)
+            .await
+            .established()
+            .unwrap()
+            .unwrap(),
+        ScanApplyOutcome::Applied { .. }
+    ));
+    let replay = db
+        .apply_coordinator_scan(&second, &output, metrics(), 1003)
+        .await
+        .established()
+        .unwrap()
+        .unwrap();
+    assert!(matches!(replay, ScanApplyOutcome::Replayed));
+    assert_eq!(
+        db.list_coordinator_tracking(&source, None, false)
+            .await
+            .unwrap()
+            .active_count,
+        1
+    );
+    assert!(matches!(
+        db.read_coordinator_scan_coverage(&source, None)
+            .await
+            .unwrap()
+            .members[0]
+            .state,
+        ScanCoverageState::Covered
+    ));
+}
+
+#[tokio::test]
+async fn scanner_acceptance_requires_known_bounded_output_metrics() {
+    let (db, source) = setup().await;
+    message(
+        &db,
+        &source,
+        1,
+        "Please retain Cobalt.",
+        &InputOrigin::UserApi,
+    )
+    .await;
+    for (n, output_tokens) in [None, Some(2049)].into_iter().enumerate() {
+        let now = 1000 + i64::try_from(n).unwrap();
+        let batch = prepare(&db, now).await;
+        let output = capture(&batch);
+        let attempt = reserve(&db, batch, now).await;
+        let metrics = ScanMetrics {
+            elapsed_ms: 10,
+            usage: Some(ScanUsage {
+                input_tokens: Some(20),
+                cache_read_tokens: None,
+                cache_creation_tokens: None,
+                output_tokens,
+            }),
+        };
+        assert!(matches!(
+            db.apply_coordinator_scan(&attempt, &output, metrics, now)
+                .await
+                .established()
+                .unwrap()
+                .unwrap(),
+            ScanApplyOutcome::Rejected(ScanRejection::InvalidOutput { .. })
+        ));
+    }
+    assert_eq!(
+        db.list_coordinator_tracking(&source, None, false)
+            .await
+            .unwrap()
+            .active_count,
+        0
+    );
+    assert!(matches!(
+        db.read_coordinator_scan_coverage(&source, None)
+            .await
+            .unwrap()
+            .members[0]
+            .state,
+        ScanCoverageState::Incomplete
+    ));
 }
