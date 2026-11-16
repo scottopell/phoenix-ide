@@ -38,7 +38,7 @@ import {
 import { ConnectedInputArea } from '../components/InputArea';
 import { useAnnotationDraft } from '../hooks/useDraft';
 import type { AnnotationDraft } from '../conversation/AnnotationDraftStore';
-import type { ComposerQuickAction, InputAreaHandle } from '../components/InputArea';
+import type { ComposerFocusRequest, ComposerQuickAction, InputAreaHandle } from '../components/InputArea';
 import type { TerminalPanelStatus } from '../components/TerminalPanel';
 import { ExploreOnboardingBanner } from '../components/ExploreOnboardingBanner';
 import { MessageListSkeleton } from '../components/Skeleton';
@@ -558,17 +558,43 @@ function ConversationPageContent({
   const { setDraftIfEmpty: setDraftIfEmptyCb, appendDraft: appendDraftCb } = useDraftActions(composerScopeKey ?? slug!);
   const annotationDraft = useAnnotationDraft(composerScopeKey ?? slug!);
 
-  // Monotonic focus-request counter. Any time we mutate the draft from
-  // outside the textarea (terminal selection, prose-reader notes, retry,
-  // seed hydration, skill insert), we bump this so InputArea's focus
-  // effect fires — including across an unmount/remount on narrow viewports.
-  // Reset on slug change in the per-slug reset block below — otherwise a
-  // non-zero token from the previous conversation would steal focus on the
-  // next remount of <InputArea> without an explicit request.
-  const [focusToken, setFocusToken] = useState(0);
-  const requestComposerFocus = useCallback(() => {
-    setFocusToken((t) => t + 1);
+  const reviewViewerIdentity = messageSlot
+    ? JSON.stringify(['message', messageSlot.sequenceId, messageSlot.messageId, messageSlot.occurrenceToken])
+    : proseSlot ? JSON.stringify(['prose', proseSlot.file.path, proseSlot.file.rootDir]) : null;
+  type ReviewFocusHandoff = {
+    viewerIdentity: string;
+    scope: 'message-viewer' | 'file-viewer';
+  };
+  type PendingComposerFocus = {
+    acknowledge: () => void;
+    handoff?: ReviewFocusHandoff;
+  };
+  const [focusRequest, setFocusRequest] = useState<PendingComposerFocus | null>(null);
+  const reviewPane = messageSlot?.presentation === 'pane' || proseSlot?.presentation === 'pane';
+  const deliverableFocusRequest = useMemo<ComposerFocusRequest | null>(() => {
+    if (!focusRequest) return null;
+    const { acknowledge, handoff } = focusRequest;
+    if (slotKind === 'none') return { acknowledge };
+    if (reviewPane && handoff?.viewerIdentity === reviewViewerIdentity) {
+      return { acknowledge, yieldingScope: handoff.scope };
+    }
+    return null;
+  }, [focusRequest, slotKind, reviewPane, reviewViewerIdentity]);
+  const requestComposerFocus = useCallback((handoff?: ReviewFocusHandoff) => {
+    const request: PendingComposerFocus = {
+      ...(handoff ? { handoff } : {}),
+      acknowledge: () => setFocusRequest((pending) => pending === request ? null : pending),
+    };
+    setFocusRequest(request);
   }, []);
+
+  useLayoutEffect(() => {
+    const handoff = focusRequest?.handoff;
+    if (!handoff) return;
+    if (reviewViewerIdentity === handoff.viewerIdentity
+      && (activeScope === null || activeScope === handoff.scope)) return;
+    requestComposerFocus();
+  }, [activeScope, focusRequest, requestComposerFocus, reviewViewerIdentity]);
 
   const [routeFocusState, dispatchRouteFocus] = useReducer(
     reduceRouteFocusState,
@@ -692,7 +718,7 @@ function ConversationPageContent({
     setShowTaskApproval(false);
     setApprovalContextWindowUsed(null);
     setShowFirstTaskWelcome(false);
-    setFocusToken(0);
+    setFocusRequest(null);
     // Ref resets — immediate, no re-render.
     sendingMessagesRef.current = new Set();
     seedHydratedRef.current = null;
@@ -1774,8 +1800,7 @@ function ConversationPageContent({
       // Dispatching into `DraftStore` works the same whether `<InputArea>`
       // is currently mounted (right-pane / mobile-overlay flow) or unmounted
       // (narrow-desktop fullscreen flow — the viewer closes immediately
-      // below). `requestComposerFocus()` is a token bump that InputArea
-      // consumes on its next render, including after a remount.
+      // below). The pending focus request survives until InputArea acknowledges it.
       appendDraftCb(formattedNotes);
       requestComposerFocus();
       fileExplorer.closeFile();
@@ -1785,9 +1810,12 @@ function ConversationPageContent({
   const handleSendFocusedNotes = useCallback(
     (formattedNotes: string) => {
       appendDraftCb(formattedNotes);
-      requestComposerFocus();
+      requestComposerFocus(reviewViewerIdentity === null ? undefined : {
+        viewerIdentity: reviewViewerIdentity,
+        scope: slotKind === 'message' ? 'message-viewer' : 'file-viewer',
+      });
     },
-    [appendDraftCb, requestComposerFocus],
+    [appendDraftCb, requestComposerFocus, reviewViewerIdentity, slotKind],
   );
 
   const handleOpenFileFromPatch = useCallback(
@@ -2551,7 +2579,7 @@ function ConversationPageContent({
           isOffline={isOffline}
           failedMessages={failedMessages}
           convModeLabel={conversation.conv_mode_label}
-          focusToken={focusToken}
+          focusRequest={deliverableFocusRequest}
           quickAction={composerQuickAction}
           onSend={handleSend}
           onCancel={handleCancel}
@@ -2610,7 +2638,7 @@ function ConversationPageContent({
             isOffline={isOffline}
             failedMessages={failedMessages}
             convModeLabel={conversation.conv_mode_label}
-            focusToken={focusToken}
+            focusRequest={deliverableFocusRequest}
             quickAction={composerQuickAction}
             onSend={handleSend}
             onCancel={handleCancel}
@@ -2670,7 +2698,7 @@ function ConversationPageContent({
           isOffline={isOffline}
           failedMessages={failedMessages}
           convModeLabel={conversation.conv_mode_label}
-          focusToken={focusToken}
+          focusRequest={deliverableFocusRequest}
           quickAction={composerQuickAction}
           onSend={handleSend}
           onCancel={handleCancel}
