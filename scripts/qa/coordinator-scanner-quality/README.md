@@ -22,7 +22,12 @@ PHOENIX_SCANNER_QUALITY_OUTPUT=/absolute/new-prepared-directory \
 ```
 
 Preparation creates one real migrated file database per case. Source rows retain
-the supplied role/origin class and prose. Subscription-event sources first create
+the supplied role/origin class and prose. Every scanner-source message receives an
+opaque UUID at initial admission. Logical corpus message names and their answer
+categories stay only in the hash-bound prepared review record; they never enter
+`ScanInput`. Validation matches the actual captured UUID through that host-only
+alias map and rejects any logical source alias appearing in serialized inference
+content. No persisted message identity is rewritten. Subscription-event sources first create
 a real watched worker, authoritative materialized input, exact response and
 terminal settlement. The resulting normalized event IDs replace only logical
 fixture event aliases at initial admission; the hash-bound prepared record

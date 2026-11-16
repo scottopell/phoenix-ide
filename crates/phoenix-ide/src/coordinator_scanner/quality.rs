@@ -95,6 +95,7 @@ struct PreparedCase {
     content_bytes: usize,
     aliases: BTreeMap<String, String>,
     event_aliases: BTreeMap<String, String>,
+    message_aliases: BTreeMap<String, String>,
 }
 
 fn hex(bytes: impl AsRef<[u8]>) -> String {
@@ -308,7 +309,12 @@ async fn watched_event(db: &Database, case: &str, event_text: &str) -> String {
 async fn fixture(
     db: &Database,
     case: &Case,
-) -> (String, BTreeMap<String, String>, BTreeMap<String, String>) {
+) -> (
+    String,
+    BTreeMap<String, String>,
+    BTreeMap<String, String>,
+    BTreeMap<String, String>,
+) {
     let source = db
         .get_or_create_coordinator(None, LlmLanguage::default())
         .await
@@ -316,6 +322,7 @@ async fn fixture(
         .id;
     let mut aliases = BTreeMap::new();
     let mut event_aliases = BTreeMap::new();
+    let mut message_aliases = BTreeMap::new();
     let seeds = case
         .host_only_candidate_seed
         .as_ref()
@@ -376,6 +383,10 @@ async fn fixture(
         assert!(aliases.insert(candidate.id.clone(), id).is_none());
     }
     for (ordinal, message) in case.input.messages.iter().enumerate() {
+        let actual_message_id = uuid::Uuid::new_v4().to_string();
+        assert!(message_aliases
+            .insert(message.message_id.clone(), actual_message_id.clone())
+            .is_none());
         let text = case
             .host_only_full_source
             .as_ref()
@@ -406,7 +417,7 @@ async fn fixture(
             | InputOrigin::ScheduledReminder { .. }) => original.clone(),
         };
         db.add_message_with_seq_and_origin(
-            &message.message_id,
+            &actual_message_id,
             &source,
             i64::try_from(ordinal + 1).unwrap(),
             &content,
@@ -423,12 +434,12 @@ async fn fixture(
         });
         sqlx::query("UPDATE messages SET created_at=? WHERE message_id=?")
             .bind(&message.created_at)
-            .bind(&message.message_id)
+            .bind(&actual_message_id)
             .execute(db.pool())
             .await
             .unwrap();
     }
-    (source, aliases, event_aliases)
+    (source, aliases, event_aliases, message_aliases)
 }
 async fn prepare(db: &Database, profile: &ScanProfile, now: i64) -> Box<PreparedScanBatch> {
     for _ in 0..4 {
@@ -534,6 +545,7 @@ fn validate_prepared(
     batch: &PreparedScanBatch,
     aliases: &BTreeMap<String, String>,
     event_aliases: &BTreeMap<String, String>,
+    message_aliases: &BTreeMap<String, String>,
 ) {
     assert_eq!(batch.input().scan_context.lane, ScanLane::Historical);
     assert_eq!(
@@ -542,12 +554,24 @@ fn validate_prepared(
         "every corpus row must be captured: {}",
         case.id
     );
+    assert_eq!(message_aliases.len(), case.input.messages.len());
+    let encoded = serde_json::to_string(batch.input()).unwrap();
+    for (logical, actual) in message_aliases {
+        assert!(
+            uuid::Uuid::parse_str(actual).is_ok(),
+            "source identifiers must be opaque UUIDs"
+        );
+        assert!(
+            !encoded.contains(logical),
+            "logical source alias must remain outside inference"
+        );
+    }
     for source in &case.input.messages {
         let actual = batch
             .input()
             .fragments
             .iter()
-            .find(|fragment| fragment.message_id == source.message_id)
+            .find(|fragment| fragment.message_id == message_aliases[&source.message_id])
             .unwrap();
         assert_eq!(
             actual.text, source.text,
@@ -629,9 +653,9 @@ async fn scanner_quality_all_real_host_fixtures() {
     let mut aggregate = 0;
     for case in &corpus.cases {
         let db = open(&root.path().join(format!("{}.db", case.id))).await;
-        let (source, aliases, event_aliases) = fixture(&db, case).await;
+        let (source, aliases, event_aliases, message_aliases) = fixture(&db, case).await;
         let batch = prepare(&db, &profile, time(&case.input.scan_context.captured_at)).await;
-        validate_prepared(case, &batch, &aliases, &event_aliases);
+        validate_prepared(case, &batch, &aliases, &event_aliases, &message_aliases);
         aggregate += model::BoundedRequest::new(prompt::INSTRUCTIONS, batch.input())
             .unwrap()
             .content_bytes();
@@ -728,10 +752,10 @@ async fn coordinator_scanner_quality() {
             let dir = output.join(&case.id);
             std::fs::create_dir(&dir).unwrap();
             let db = open(&dir.join("source.db")).await;
-            let (source, aliases, event_aliases) = fixture(&db, case).await;
+            let (source, aliases, event_aliases, message_aliases) = fixture(&db, case).await;
             let now_us = time(&case.input.scan_context.captured_at);
             let batch = prepare(&db, &profile, now_us).await;
-            validate_prepared(case, &batch, &aliases, &event_aliases);
+            validate_prepared(case, &batch, &aliases, &event_aliases, &message_aliases);
             let request = model::BoundedRequest::new(prompt::INSTRUCTIONS, batch.input()).unwrap();
             let input_bytes = serde_json::to_vec(batch.input()).unwrap();
             total_bytes += request.content_bytes();
@@ -745,6 +769,7 @@ async fn coordinator_scanner_quality() {
                 content_bytes: request.content_bytes(),
                 aliases,
                 event_aliases,
+                message_aliases,
             };
             write(&dir.join("input.json"), batch.input());
             write(
