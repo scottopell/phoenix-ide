@@ -6985,12 +6985,12 @@ where
                     unreachable!("fresh native origin is awaiting its admission response");
                 };
                 handoff.phase = NativeSpawnPhase::Submission {
-                    send: Box::pin(async move {
+                    send: std::sync::Mutex::new(Box::pin(async move {
                         sender
                             .send(request)
                             .await
                             .map_err(|error| format!("Failed to submit sub-agent batch: {error}"))
-                    }),
+                    })),
                     response,
                     activation,
                 };

@@ -13,7 +13,9 @@ use tokio::sync::oneshot;
 
 pub(super) enum NativeSpawnPhase {
     Submission {
-        send: std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>>,
+        send: std::sync::Mutex<
+            std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>>,
+        >,
         response: oneshot::Receiver<SubAgentAdmissionReceipt>,
         activation: oneshot::Sender<()>,
     },
@@ -63,7 +65,11 @@ impl NativeSpawnHandoff {
         loop {
             match &mut self.phase {
                 NativeSpawnPhase::Submission { send, .. } => {
-                    let submitted = send.await;
+                    let submitted = send
+                        .get_mut()
+                        .expect("native submission future poisoned")
+                        .as_mut()
+                        .await;
                     let phase = std::mem::replace(&mut self.phase, NativeSpawnPhase::Closing);
                     let NativeSpawnPhase::Submission {
                         response,
