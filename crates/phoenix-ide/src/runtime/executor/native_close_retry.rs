@@ -144,7 +144,12 @@ where
             .db()
             .read_native_close_explicit_retry_receipt(&command)
             .await
-            .map_err(|_| NativeCloseApplicationError::Storage)?
+            .map_err(|error| {
+                tracing::warn!(%error, "native Close retry receipt lookup failed");
+                #[cfg(test)]
+                eprintln!("native Close retry receipt lookup failed: {error}");
+                NativeCloseApplicationError::Storage
+            })?
         {
             return Ok(NativeCloseRetryResult::Replay(
                 phoenix_db::native_close::NativeCloseReceipt {
@@ -169,7 +174,12 @@ where
         let original = backend
             .assess_native_close_retry(&failed_run)
             .await
-            .map_err(|_| NativeCloseApplicationError::Storage)?;
+            .map_err(|error| {
+                tracing::warn!(%error, "native Close retry assessment failed");
+                #[cfg(test)]
+                eprintln!("native Close retry assessment failed: {error}");
+                NativeCloseApplicationError::Storage
+            })?;
         let request = AdmitCloseSafeRetryRequest {
             failed_run,
             requested_by: CloseRetryRequestedBy::User,
@@ -197,7 +207,10 @@ where
             LocalAuthorityResult::DurableFactUnclassified => {
                 Err(NativeCloseApplicationError::FatalAuthority)
             }
-            LocalAuthorityResult::DurableFactEstablished(Err(_)) => {
+            LocalAuthorityResult::DurableFactEstablished(Err(error)) => {
+                tracing::warn!(%error, "native Close retry admission failed");
+                #[cfg(test)]
+                eprintln!("native Close retry admission failed: {error}");
                 authority.owner = None;
                 Err(NativeCloseApplicationError::Storage)
             }
