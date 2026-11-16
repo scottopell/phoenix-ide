@@ -474,7 +474,7 @@ mod live {
         source: &str,
         prompt: &str,
         input_id: &str,
-    ) -> Event {
+    ) -> (Event, phoenix_workflow::TurnAuthorityId) {
         use phoenix_core::domain::sm_event::{
             DirectTurnAttemptAuthority, PreparedDirectTurnDelivery, PreparedDirectTurnPayload,
             SubmittedDirectTurnExpansionPolicy, SubmittedDirectTurnIdentity,
@@ -548,18 +548,21 @@ mod live {
             .unwrap(),
             phoenix_db::workflow::DirectTurnMaterializationEligibility::Fresh
         );
-        Event::AuthoritativeUserMessage {
-            payload,
-            authority: DirectTurnAttemptAuthority::new(
-                authority.workflow_id.0,
-                turn_id.0,
-                authority.effect_id.0,
-                authority.attempt_id.0,
-                authority.declared_workflow_version.0,
-                authority.generation.0,
-                authority.process_incarnation.0,
-            ),
-        }
+        (
+            Event::AuthoritativeUserMessage {
+                payload,
+                authority: DirectTurnAttemptAuthority::new(
+                    authority.workflow_id.0,
+                    turn_id.0,
+                    authority.effect_id.0,
+                    authority.attempt_id.0,
+                    authority.declared_workflow_version.0,
+                    authority.generation.0,
+                    authority.process_incarnation.0,
+                ),
+            },
+            turn_id,
+        )
     }
     impl<C: LlmClient + 'static> Fixture<C> {
         #[allow(clippy::too_many_lines)]
@@ -630,9 +633,10 @@ mod live {
             let input_id = uuid::Uuid::new_v4().to_string();
             let (acknowledgement, acknowledged) = tokio::sync::oneshot::channel();
             let (retired, retirement) = tokio::sync::oneshot::channel();
+            let (event, turn_id) = admitted_input(&self.db, source, prompt, &input_id).await;
             acknowledged_tx
                 .send(crate::runtime::AcknowledgedEventRequest {
-                    event: admitted_input(&self.db, source, prompt, &input_id).await,
+                    event,
                     acknowledgement,
                     retirement,
                 })
@@ -641,7 +645,10 @@ mod live {
             let result = tokio::time::timeout(std::time::Duration::from_secs(120), async {
                 assert_eq!(acknowledged.await.expect("runtime owns admission response").expect("authoritative input dispatch succeeds"), crate::runtime::AcknowledgedEventOutcome::Settled);
                 drop(retired);
-                assert!(self.db.message_exists(&input_id).await.unwrap(), "settled authoritative input must be materialized before waiting for model text");
+                let accepted = self.db.workflow_repository().load_authoritative_turn(turn_id).await.unwrap().unwrap();
+                let phoenix_workflow::Materialization::Materialized { message_id } = accepted.materialization else { panic!("settled authoritative input must have a materialization receipt") };
+                let canonical_input_id = message_id.0;
+                assert!(self.db.message_exists(&canonical_input_id).await.unwrap(), "materialization receipt must name the actual input row before waiting for model text");
                 loop {
                     let state = state_rx.borrow().clone();
                     assert!(
@@ -662,7 +669,7 @@ mod live {
                         let messages = self.db.get_messages(source).await.unwrap();
                         if let Some(index) = messages
                             .iter()
-                            .position(|message| message.message_id == input_id)
+                            .position(|message| message.message_id == canonical_input_id)
                         {
                             assert_eq!(messages[index].origin, phoenix_core::domain::db_schema::InputOrigin::UserApi, "fixture exercises actual human-input admission rather than generated legacy messages");
                             assert!(!messages[index + 1..].iter().any(|message| matches!(&message.content, MessageContent::System(notice) if notice.text.contains("Tool-use iteration limit reached"))), "bounded evaluation exhausted its per-turn tool-cycle cap");
@@ -936,21 +943,46 @@ mod live {
         .await
         .unwrap();
         let recovered = fixture.turn(&successor.id, "Hello.").await;
-        let cue: Option<String> = sqlx::query_scalar(
-            "SELECT cue_item_id FROM coordinator_tracking_observations WHERE transcript_id=?1",
-        )
-        .bind(&successor.id)
-        .fetch_one(db.pool())
-        .await
-        .unwrap();
+        let (cue, input_id, observation_id): (Option<String>, String, String) = sqlx::query_as("SELECT cue_item_id,input_message_id,message_id FROM coordinator_tracking_observations WHERE transcript_id=?1").bind(&successor.id).fetch_one(db.pool()).await.unwrap();
+        let expected_item = saved
+            .items
+            .iter()
+            .find(|item| item.kind == TrackingKind::RequestedWork)
+            .unwrap();
         assert_eq!(
             cue.as_deref(),
-            saved
-                .items
-                .iter()
-                .find(|item| item.kind == TrackingKind::RequestedWork)
-                .map(|item| item.id.as_str()),
+            Some(expected_item.id.as_str()),
             "due review must be admitted independently of model behavior"
+        );
+        let messages = db.get_messages(&successor.id).await.unwrap();
+        let current_input = messages
+            .iter()
+            .find(|message| message.message_id == input_id)
+            .unwrap();
+        assert_eq!(
+            current_input.origin,
+            phoenix_core::domain::db_schema::InputOrigin::UserApi
+        );
+        assert!(
+            matches!(&current_input.content, MessageContent::User(content) if content.text == "Hello.")
+        );
+        let observation = messages
+            .iter()
+            .find(|message| message.message_id == observation_id)
+            .unwrap();
+        assert!(observation.sequence_id > current_input.sequence_id);
+        let MessageContent::User(meta) = &observation.content else {
+            panic!("tracking observation is a durable meta message")
+        };
+        let captured: phoenix_db::coordinator_tracking::TrackingObservation =
+            serde_json::from_str(meta.text.split_once('\n').unwrap().1).unwrap();
+        assert_eq!(
+            captured.admitted_input_sequence_id,
+            Some(current_input.sequence_id)
+        );
+        assert_eq!(
+            captured.requested_item_due_for_review.unwrap().id,
+            expected_item.id
         );
         assert!(
             recovered.contains("Cobalt"),
