@@ -111,3 +111,18 @@
 .ember-entry.unread .ember-entry-copy strong {
   font-weight: 700;
 }
+
+.sidebar .ember-entry {
+  font-family: inherit;
+}
+
+.sidebar .ember-entry-copy strong,
+.sidebar .ember-entry-copy small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sidebar .ember-entry-arrow {
+  flex-shrink: 0;
+}

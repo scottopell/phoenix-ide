@@ -1,3 +1,4 @@
+import './Sidebar.css';
 import { useState, useCallback, useEffect, useRef, useSyncExternalStore } from 'react';
 import { useNavigate, useLocation } from 'react-router-dom';
 import { ApiResponseError, ConflictError, api } from '../api';
