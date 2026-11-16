@@ -9682,18 +9682,18 @@ mod tests {
 
         async fn retained_counts(db: &crate::db::Database, attempt: &str) -> Vec<i64> {
             let mut counts = Vec::new();
-            for table in [
-                "close_runs",
-                "close_run_retry_effects",
-                "close_run_retry_successes",
-                "native_close_retry_plans",
-                "close_retirement_resource_dispatches",
-                "close_writer_observations",
-                "close_retirement_inspections",
-                "close_retirement_inventories",
+            for query in [
+                "SELECT COUNT(*) FROM close_runs WHERE attempt_id=?1",
+                "SELECT COUNT(*) FROM close_run_retry_effects WHERE attempt_id=?1",
+                "SELECT COUNT(*) FROM close_run_retry_successes WHERE attempt_id=?1",
+                "SELECT COUNT(*) FROM native_close_retry_plans WHERE attempt_id=?1",
+                "SELECT COUNT(*) FROM close_retirement_resource_dispatches WHERE attempt_id=?1",
+                "SELECT COUNT(*) FROM close_writer_observations WHERE attempt_id=?1",
+                "SELECT COUNT(*) FROM close_retirement_inspections WHERE attempt_id=?1",
+                "SELECT COUNT(*) FROM close_retirement_inventories WHERE attempt_id=?1",
             ] {
                 counts.push(
-                    sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table} WHERE attempt_id=?1"))
+                    sqlx::query_scalar(query)
                         .bind(attempt)
                         .fetch_one(db.pool())
                         .await
