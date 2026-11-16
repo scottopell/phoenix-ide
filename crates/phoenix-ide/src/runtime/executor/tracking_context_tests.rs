@@ -304,6 +304,11 @@ mod live {
         reported_input_tokens: AtomicU64,
         failed_calls: AtomicUsize,
     }
+    impl Drop for Budget {
+        fn drop(&mut self) {
+            eprintln!("tracking_eval_budget_final calls={} failed_calls={} request_debug_bytes={} reported_total_input_tokens={} reported_output_tokens={}",self.calls.load(Ordering::SeqCst),self.failed_calls.load(Ordering::SeqCst),self.request_bytes.load(Ordering::SeqCst),self.reported_input_tokens.load(Ordering::SeqCst),self.output_tokens.load(Ordering::SeqCst));
+        }
+    }
     struct BoundedClient {
         inner: Arc<dyn LlmClient>,
         model: String,
@@ -327,6 +332,15 @@ mod live {
             Ok(())
         }
         fn record(&self, response: &LlmResponse) {
+            let tool_names = response
+                .content
+                .iter()
+                .filter_map(|block| match block {
+                    ContentBlock::ToolUse { name, .. } => Some(name.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            eprintln!("tracking_eval_response end_turn={} blocks={} tools={tool_names:?} input_tokens={} cache_read_tokens={} cache_creation_tokens={} output_tokens={}",response.end_turn,response.content.len(),response.usage.input_tokens,response.usage.cache_read_tokens,response.usage.cache_creation_tokens,response.usage.output_tokens);
             self.budget.reported_input_tokens.fetch_add(
                 response
                     .usage
@@ -354,10 +368,9 @@ mod live {
         }
         async fn complete(&self, request: &LlmRequest) -> Result<LlmResponse, LlmError> {
             self.admit(request)?;
-            let response = self.inner.complete(request).await.map_err(|error| {
+            let response = self.inner.complete(request).await.inspect_err(|error| {
                 self.budget.failed_calls.fetch_add(1, Ordering::SeqCst);
                 eprintln!("tracking_eval_provider_failure kind={:?}", error.kind);
-                error
             })?;
             self.record(&response);
             Ok(response)
@@ -372,10 +385,9 @@ mod live {
                 .inner
                 .complete_streaming(request, chunks)
                 .await
-                .map_err(|error| {
+                .inspect_err(|error| {
                     self.budget.failed_calls.fetch_add(1, Ordering::SeqCst);
                     eprintln!("tracking_eval_provider_failure kind={:?}", error.kind);
-                    error
                 })?;
             self.record(&response);
             Ok(response)
@@ -460,6 +472,10 @@ mod live {
     impl<C: LlmClient + 'static> Fixture<C> {
         #[allow(clippy::too_many_lines)]
         async fn turn(&self, source: &str, prompt: &str) -> String {
+            eprintln!(
+                "tracking_eval_turn_start source={source} prompt_bytes={}",
+                prompt.len()
+            );
             let mut context =
                 ConvContext::new(source, self.cwd.clone(), &self.model, 200_000, 2048);
             context.is_coordinator = true;
@@ -503,7 +519,7 @@ mod live {
                 tx.clone(),
                 SseBroadcaster::new(128, sequence),
             )
-            .with_parent_tool_cycle_cap(3)
+            .with_parent_tool_cycle_cap(8)
             .with_state_watcher(states)
             .with_fatal_local_authority_fence(self.manager.fatal_local_authority_fence.clone());
             let task = tokio::spawn(runtime.run());
@@ -542,6 +558,7 @@ mod live {
                             .iter()
                             .position(|message| message.message_id == input_id)
                         {
+                            assert!(!messages[index + 1..].iter().any(|message| matches!(&message.content, MessageContent::System(content) if content.text.contains("Tool-use iteration limit reached"))), "bounded evaluation exhausted its per-turn tool-cycle cap");
                             if let Some(text) = messages[index + 1..].iter().rev().find_map(
                                 |message| match &message.content {
                                     MessageContent::Agent(blocks) => {
@@ -578,6 +595,9 @@ mod live {
                 }
             })
             .await;
+            if result.is_err() {
+                eprintln!("tracking_eval_timeout durable_state={:?} observed_state={:?} runtime_finished={}",self.db.get_conversation(source).await.unwrap().state,*state_rx.borrow(),task.is_finished());
+            }
             task.abort();
             let _ = task.await;
             result.expect("tracking evaluation turn exceeded 120 seconds")
