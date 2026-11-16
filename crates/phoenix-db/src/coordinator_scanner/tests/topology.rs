@@ -182,7 +182,12 @@ async fn scanner_metadata_does_not_decode_irrelevant_runtime_or_handoff_blobs() 
         .execute(db.pool())
         .await
         .unwrap();
-    assert!(db.get_conversation(&first).await.is_err());
+    let stored: String = sqlx::query_scalar("SELECT state FROM conversations WHERE id=?")
+        .bind(&first)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert!(serde_json::from_str::<phoenix_core::domain::sm_state::ConvState>(&stored).is_err());
     let changed = sqlx::query("UPDATE messages SET content=?1 WHERE message_type='continuation'")
         .bind(serde_json::json!({"not":"MessageContent","padding":padding}).to_string())
         .execute(db.pool())
