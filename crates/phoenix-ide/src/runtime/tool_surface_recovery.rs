@@ -62,8 +62,7 @@ impl Fixture {
             .get_conversation("watch-recovery-source")
             .await
             .unwrap()
-            .product_conversation_id
-            .to_string();
+            .product_conversation_id;
         db.watch_product_conversation(&target).await.unwrap();
         let retriever = Arc::new(db.fts_retriever());
         retriever.reconcile().await.unwrap();
@@ -91,7 +90,7 @@ impl Fixture {
         Self {
             runtime,
             coordinator,
-            target,
+            target: target.to_string(),
             registry,
             catalog,
             _root: root,
