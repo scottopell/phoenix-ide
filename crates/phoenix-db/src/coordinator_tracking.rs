@@ -190,6 +190,8 @@ pub struct TrackingDetail {
     pub next_retirement_revision: Option<i64>,
     pub omitted_retirement_count: i64,
     pub recorded_by_ember: Option<TrackingRecordingSource>,
+    pub recorded_by_scanner: Option<crate::coordinator_scanner::ScanRecordingSource>,
+    pub page_scanner_evidence_provenance: Vec<crate::coordinator_scanner::ScanEvidenceProvenance>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TrackingRecordingSource {
@@ -273,7 +275,10 @@ fn digest(value: &[u8]) -> String {
     encoded
 }
 
-async fn require_owner(tx: &mut Transaction<'_, Sqlite>, source: &str) -> DbResult<String> {
+pub(crate) async fn require_owner(
+    tx: &mut Transaction<'_, Sqlite>,
+    source: &str,
+) -> DbResult<String> {
     bounded(source, 256, true)?;
     crate::product_conversation_rename::require_current_gc_tx(tx, source).await?;
     let owner: String =
@@ -299,7 +304,7 @@ async fn registry_revision(tx: &mut Transaction<'_, Sqlite>) -> DbResult<i64> {
     .await?
     .unwrap_or(0))
 }
-async fn ensure_registry(tx: &mut Transaction<'_, Sqlite>, owner: &str) -> DbResult<()> {
+pub(crate) async fn ensure_registry(tx: &mut Transaction<'_, Sqlite>, owner: &str) -> DbResult<()> {
     sqlx::query("INSERT INTO coordinator_tracking_registry(singleton,owner_product_id,revision) VALUES(1,?1,0) ON CONFLICT(singleton) DO NOTHING").bind(owner).execute(&mut **tx).await?;
     let saved: String = sqlx::query_scalar(
         "SELECT owner_product_id FROM coordinator_tracking_registry WHERE singleton=1",
@@ -311,7 +316,7 @@ async fn ensure_registry(tx: &mut Transaction<'_, Sqlite>, owner: &str) -> DbRes
     }
     Ok(())
 }
-async fn latest_evidence(tx: &mut Transaction<'_, Sqlite>, id: &str) -> DbResult<i64> {
+pub(crate) async fn latest_evidence(tx: &mut Transaction<'_, Sqlite>, id: &str) -> DbResult<i64> {
     Ok(sqlx::query_scalar(
         "SELECT COALESCE(MAX(ordinal),0) FROM coordinator_tracking_evidence WHERE item_id=?1",
     )
@@ -319,7 +324,7 @@ async fn latest_evidence(tx: &mut Transaction<'_, Sqlite>, id: &str) -> DbResult
     .fetch_one(&mut **tx)
     .await?)
 }
-async fn append_evidence(
+pub(crate) async fn append_evidence(
     tx: &mut Transaction<'_, Sqlite>,
     id: &str,
     values: &[TrackingEvidence],
@@ -344,6 +349,60 @@ async fn append_evidence(
         }
     }
     Ok(changed)
+}
+#[derive(Clone, Copy)]
+pub(crate) enum TrackingInitialReview {
+    Reviewed,
+    NeedsReview,
+}
+pub(crate) fn validate_scanner_record(
+    kind: TrackingKind,
+    title: &str,
+    note: &str,
+    resumption: &str,
+) -> DbResult<()> {
+    editable_fields(kind, title, note, resumption, &[])
+}
+pub(crate) async fn create_tracking_item_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    record: &TrackingRecord,
+    review: TrackingInitialReview,
+    now: i64,
+) -> DbResult<String> {
+    editable_fields(
+        record.kind,
+        &record.title,
+        &record.note,
+        &record.resumption,
+        &record.references,
+    )?;
+    let id = uuid::Uuid::new_v4().to_string();
+    let reviewed_at = match review {
+        TrackingInitialReview::Reviewed => Some(now),
+        TrackingInitialReview::NeedsReview => None,
+    };
+    sqlx::query("INSERT INTO coordinator_tracking_items(id,kind,title,note,resumption,revision,reviewed_evidence_ordinal,created_at_us,updated_at_us,reviewed_at_us) VALUES(?1,?2,?3,?4,?5,1,-1,?6,?6,?7)").bind(&id).bind(record.kind.as_str()).bind(&record.title).bind(&record.note).bind(&record.resumption).bind(now).bind(reviewed_at).execute(&mut **tx).await?;
+    for (ordinal, reference) in record.references.iter().enumerate() {
+        insert_reference(
+            tx,
+            &id,
+            i64::try_from(ordinal).map_err(|_| invalid("reference count"))?,
+            reference,
+        )
+        .await?;
+    }
+    append_evidence(tx, &id, &record.evidence, now).await?;
+    if matches!(review, TrackingInitialReview::Reviewed) {
+        let latest = latest_evidence(tx, &id).await?;
+        sqlx::query(
+            "UPDATE coordinator_tracking_items SET reviewed_evidence_ordinal=?2 WHERE id=?1",
+        )
+        .bind(&id)
+        .bind(latest)
+        .execute(&mut **tx)
+        .await?;
+    }
+    Ok(id)
 }
 async fn insert_reference(
     tx: &mut Transaction<'_, Sqlite>,
@@ -578,27 +637,8 @@ impl Database {
         let now = Utc::now().timestamp_micros();
         let (id, revision, changed) = match mutation {
             TrackingMutation::Record { record } => {
-                editable_fields(
-                    record.kind,
-                    &record.title,
-                    &record.note,
-                    &record.resumption,
-                    &record.references,
-                )?;
-                let id = uuid::Uuid::new_v4().to_string();
-                sqlx::query("INSERT INTO coordinator_tracking_items(id,kind,title,note,resumption,revision,reviewed_evidence_ordinal,created_at_us,updated_at_us,reviewed_at_us) VALUES(?1,?2,?3,?4,?5,1,0,?6,?6,?6)").bind(&id).bind(record.kind.as_str()).bind(&record.title).bind(&record.note).bind(&record.resumption).bind(now).execute(&mut **tx).await?;
-                for (ordinal, reference) in record.references.iter().enumerate() {
-                    insert_reference(
-                        tx,
-                        &id,
-                        i64::try_from(ordinal).map_err(|_| invalid("reference count"))?,
-                        reference,
-                    )
+                let id = create_tracking_item_tx(tx, record, TrackingInitialReview::Reviewed, now)
                     .await?;
-                }
-                append_evidence(tx, &id, &record.evidence, now).await?;
-                let latest = latest_evidence(tx, &id).await?;
-                sqlx::query("UPDATE coordinator_tracking_items SET reviewed_evidence_ordinal=?2 WHERE id=?1").bind(&id).bind(latest).execute(&mut **tx).await?;
                 (id, 1, true)
             }
             other @ (TrackingMutation::Update { .. }
@@ -903,6 +943,27 @@ impl Database {
                 })
             })
             .transpose()?;
+        let recorded_by_scanner=sqlx::query("SELECT a.reserved_at_us,w.lane,w.source_generation,w.connection,w.prompt_hash,w.endpoint_hash FROM coordinator_scan_item_origins o JOIN coordinator_scan_attempts a ON a.id=o.attempt_id JOIN coordinator_scan_work w ON w.binding_id=a.binding_id WHERE o.item_id=?1").bind(id).fetch_optional(&mut *tx).await?.map(|row|{
+            Ok::<_,DbError>(crate::coordinator_scanner::ScanRecordingSource {
+                captured_at_us:row.try_get("reserved_at_us")?,
+                lane:serde_json::from_value(serde_json::Value::String(row.try_get("lane")?)).map_err(|e|invalid(&e.to_string()))?,
+                source_generation:row.try_get("source_generation")?,
+                model:crate::coordinator_scanner::SCAN_MODEL.into(),
+                connection:serde_json::from_value(serde_json::Value::String(row.try_get("connection")?)).map_err(|e|invalid(&e.to_string()))?,
+                prompt_hash:row.try_get("prompt_hash")?,endpoint_hash:row.try_get("endpoint_hash")?
+            })
+        }).transpose()?;
+        let mut page_scanner_evidence_provenance = Vec::new();
+        for (ordinal, _) in &evidence {
+            if let Some(row)=sqlx::query("SELECT * FROM coordinator_scan_evidence_origins WHERE item_id=?1 AND evidence_ordinal=?2").bind(id).bind(ordinal).fetch_optional(&mut *tx).await?{
+                page_scanner_evidence_provenance.push(crate::coordinator_scanner::ScanEvidenceProvenance {
+                    evidence_ordinal:*ordinal,
+                    origin_kind:serde_json::from_value(serde_json::Value::String(row.try_get("origin_kind")?)).map_err(|e|invalid(&e.to_string()))?,
+                    source_role:serde_json::from_value(serde_json::Value::String(row.try_get("source_role")?)).map_err(|e|invalid(&e.to_string()))?,
+                    source_generation:row.try_get("source_generation")?,utf8_start:row.try_get("utf8_start")?,utf8_end:row.try_get("utf8_end")?
+                });
+            }
+        }
         let omitted_retirement_count = total - count(retirement_history.len())?;
         let next_retirement_revision = if omitted_retirement_count > 0 {
             retirement_history.last().map(|entry| entry.item_revision)
@@ -922,6 +983,8 @@ impl Database {
             next_retirement_revision,
             omitted_retirement_count,
             recorded_by_ember,
+            recorded_by_scanner,
+            page_scanner_evidence_provenance,
         };
         encoded_limit(&detail, TRACKING_DETAIL_BYTES, "complete tracking detail")?;
         Ok(detail)

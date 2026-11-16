@@ -15,6 +15,7 @@ mod close_foundation;
 mod coordinator_authority;
 mod coordinator_query;
 pub mod coordinator_tracking;
+pub mod coordinator_scanner;
 mod coordinator_watches;
 mod coordinator_work_scope;
 mod federation_conversation_authority;

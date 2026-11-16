@@ -1197,7 +1197,7 @@ impl Database {
     }
 
     #[allow(clippy::too_many_lines)]
-    async fn get_product_conversation_on(
+    pub(crate) async fn get_product_conversation_on(
         connection: &mut SqliteConnection,
         product_conversation_id: &ProductConversationId,
         kind: ProductConversationKind,

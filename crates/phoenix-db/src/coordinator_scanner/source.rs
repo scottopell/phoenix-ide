@@ -1,0 +1,369 @@
+use super::*;
+use crate::{Database, DbError, DbResult, MessageContent};
+use phoenix_core::domain::{
+    llm_types::ContentBlock,
+    product_conversation::{ProductConversationId, ProductConversationKind},
+};
+use sha2::{Digest, Sha256};
+use sqlx::{Row, Sqlite, Transaction};
+
+pub(super) fn invalid(value: impl Into<String>) -> DbError {
+    DbError::Serialization(value.into())
+}
+pub(super) fn hex(bytes: impl AsRef<[u8]>) -> String {
+    bytes.as_ref().iter().map(|b| format!("{b:02x}")).collect()
+}
+pub(super) fn hash(bytes: impl AsRef<[u8]>) -> String {
+    hex(Sha256::digest(bytes.as_ref()))
+}
+pub(super) fn encoded<T: Serialize + ?Sized>(value: &T) -> DbResult<Vec<u8>> {
+    serde_json::to_vec(value).map_err(|e| invalid(e.to_string()))
+}
+pub(super) fn seq(position: &ScanPosition) -> i64 {
+    match position {
+        ScanPosition::Boundary { sequence_id } | ScanPosition::Fragment { sequence_id, .. } => {
+            *sequence_id
+        }
+    }
+}
+pub(super) fn lane_name(lane: ScanLane) -> &'static str {
+    match lane {
+        ScanLane::Live => "live",
+        ScanLane::Historical => "historical",
+    }
+}
+
+pub(super) async fn topology(
+    tx: &mut Transaction<'_, Sqlite>,
+) -> DbResult<
+    Option<(
+        String,
+        Vec<crate::product_conversation_read::ProductConversationTranscriptRow>,
+    )>,
+> {
+    let head: Option<String> =
+        sqlx::query_scalar("SELECT id FROM conversations WHERE coordinator_head=1")
+            .fetch_optional(&mut **tx)
+            .await?;
+    let Some(head) = head else { return Ok(None) };
+    let owner = crate::coordinator_tracking::require_owner(tx, &head).await?;
+    let id: ProductConversationId = owner
+        .parse()
+        .map_err(|e| invalid(format!("invalid coordinator product: {e}")))?;
+    let aggregate =
+        Database::get_product_conversation_on(tx, &id, ProductConversationKind::Coordinator)
+            .await?;
+    Ok(Some((
+        owner,
+        aggregate
+            .segments
+            .into_iter()
+            .map(|s| s.transcript_row)
+            .collect(),
+    )))
+}
+pub(super) fn position(row: &sqlx::sqlite::SqliteRow, lane: ScanLane) -> DbResult<ScanPosition> {
+    let prefix = lane_name(lane);
+    let sequence_id = row.try_get(format!("{prefix}_seq").as_str())?;
+    let message_id: Option<String> = row.try_get(format!("{prefix}_message_id").as_str())?;
+    match message_id {
+        None => Ok(ScanPosition::Boundary { sequence_id }),
+        Some(message_id) => Ok(ScanPosition::Fragment {
+            sequence_id,
+            message_id,
+            part_ordinal: usize::try_from(
+                row.try_get::<i64, _>(format!("{prefix}_part").as_str())?,
+            )
+            .map_err(|e| invalid(e.to_string()))?,
+            utf8_offset: usize::try_from(
+                row.try_get::<i64, _>(format!("{prefix}_offset").as_str())?,
+            )
+            .map_err(|e| invalid(e.to_string()))?,
+            prose_digest: row.try_get(format!("{prefix}_digest").as_str())?,
+        }),
+    }
+}
+pub(super) async fn advance(
+    tx: &mut Transaction<'_, Sqlite>,
+    transcript: &str,
+    lane: ScanLane,
+    end: &ScanPosition,
+) -> DbResult<()> {
+    let (message, part, offset, digest) = match end {
+        ScanPosition::Boundary { .. } => (None, None, None, None),
+        ScanPosition::Fragment {
+            message_id,
+            part_ordinal,
+            utf8_offset,
+            prose_digest,
+            ..
+        } => (
+            Some(message_id),
+            Some(i64::try_from(*part_ordinal).map_err(|e| invalid(e.to_string()))?),
+            Some(i64::try_from(*utf8_offset).map_err(|e| invalid(e.to_string()))?),
+            Some(prose_digest),
+        ),
+    };
+    sqlx::query(match lane { ScanLane::Live=>"UPDATE coordinator_scan_members SET live_seq=?2,live_message_id=?3,live_part=?4,live_offset=?5,live_digest=?6,frontier_revision=frontier_revision+1 WHERE transcript_id=?1",ScanLane::Historical=>"UPDATE coordinator_scan_members SET historical_seq=?2,historical_message_id=?3,historical_part=?4,historical_offset=?5,historical_digest=?6,frontier_revision=frontier_revision+1 WHERE transcript_id=?1"}).bind(transcript).bind(seq(end)).bind(message).bind(part).bind(offset).bind(digest).execute(&mut **tx).await?;
+    Ok(())
+}
+
+pub(super) struct Captured {
+    pub fragments: Vec<ScanFragment>,
+    pub end: ScanPosition,
+    pub source_digest: String,
+}
+pub(super) async fn capture(
+    tx: &mut Transaction<'_, Sqlite>,
+    transcript: &str,
+    generation: i64,
+    lane: ScanLane,
+    start: &ScanPosition,
+) -> DbResult<Captured> {
+    let sql = match (lane,start) {
+        (ScanLane::Live,ScanPosition::Boundary{..})=>"SELECT * FROM messages WHERE conversation_id=?1 AND sequence_id>?2 ORDER BY sequence_id,message_id LIMIT 32",
+        (ScanLane::Live,_)=>"SELECT * FROM messages WHERE conversation_id=?1 AND sequence_id>=?2 ORDER BY sequence_id,message_id LIMIT 32",
+        (ScanLane::Historical,_)=>"SELECT * FROM messages WHERE conversation_id=?1 AND sequence_id<=?2 ORDER BY sequence_id DESC,message_id DESC LIMIT 32"
+    };
+    let rows = sqlx::query(sql)
+        .bind(transcript)
+        .bind(seq(start))
+        .fetch_all(&mut **tx)
+        .await?;
+    let mut fragments = Vec::new();
+    let mut end = start.clone();
+    let mut identities = Vec::new();
+    for row in rows {
+        let message = crate::parse_prompt_message_row(row)
+            .map_err(|e| invalid(format!("unreadable scanner source: {e}")))?;
+        let message_seq = message.sequence_id;
+        let origin = message.origin;
+        let (role, is_meta, parts) = match message.content {
+            MessageContent::User(user) => {
+                if user.llm_text.is_some() {
+                    tracing::debug!(message_id=%message.message_id,"scanner consumes original prose, not reference expansion");
+                }
+                if user.is_meta
+                    && matches!(origin, InputOrigin::SystemGenerated)
+                    && user.text.starts_with("[Saved Ember tracking observation:")
+                {
+                    (ScanRole::User, true, Vec::new())
+                } else {
+                    (ScanRole::User, user.is_meta, vec![(0, user.text)])
+                }
+            }
+            MessageContent::Agent(blocks) => {
+                let mut parts = Vec::new();
+                for (ordinal, block) in blocks.into_iter().enumerate() {
+                    match block {
+                        ContentBlock::Text { text } => parts.push((ordinal, text)),
+                        other => {
+                            tracing::debug!(message_id=%message.message_id,block=?std::mem::discriminant(&other),"scanner excludes non-prose assistant block")
+                        }
+                    }
+                }
+                (ScanRole::Assistant, false, parts)
+            }
+            MessageContent::Tool(_)
+            | MessageContent::System(_)
+            | MessageContent::Error(_)
+            | MessageContent::Continuation(_)
+            | MessageContent::Skill(_) => (ScanRole::Assistant, true, Vec::new()),
+        };
+        identities.push((
+            message.message_id.clone(),
+            message_seq,
+            hash(encoded(&parts)?),
+        ));
+        for (part, text) in &parts {
+            if text.is_empty() {
+                continue;
+            }
+            let digest = hash(text.as_bytes());
+            let offset = match start {
+                ScanPosition::Fragment {
+                    sequence_id,
+                    message_id,
+                    part_ordinal,
+                    utf8_offset,
+                    prose_digest,
+                } if *sequence_id == message_seq => {
+                    if message_id != &message.message_id {
+                        return Err(invalid(
+                            "scanner source position no longer identifies same message",
+                        ));
+                    }
+                    if part < part_ordinal {
+                        continue;
+                    }
+                    if part == part_ordinal {
+                        if prose_digest != &digest || !text.is_char_boundary(*utf8_offset) {
+                            return Err(invalid("scanner source fragment changed"));
+                        }
+                        *utf8_offset
+                    } else {
+                        0
+                    }
+                }
+                _ => 0,
+            };
+            if offset >= text.len() {
+                continue;
+            }
+            let mut stop = text.len();
+            let mut fragment;
+            loop {
+                let id = hash(encoded(&(
+                    transcript,
+                    &message.message_id,
+                    generation,
+                    part,
+                    offset,
+                    stop,
+                    &digest,
+                ))?);
+                fragment = ScanFragment {
+                    fragment_id: id,
+                    message_id: message.message_id.clone(),
+                    role,
+                    origin: origin.clone(),
+                    is_meta,
+                    created_at_us: message.created_at.timestamp_micros(),
+                    part_ordinal: *part,
+                    utf8_start: offset,
+                    utf8_end: stop,
+                    complete_message: offset == 0 && stop == text.len() && parts.len() == 1,
+                    prose_digest: digest.clone(),
+                    text: text[offset..stop].to_owned(),
+                };
+                let mut trial = fragments.clone();
+                trial.push(fragment.clone());
+                if encoded(&trial)?.len() <= 8192 {
+                    break;
+                }
+                if !fragments.is_empty() {
+                    return Ok(Captured {
+                        source_digest: hash(encoded(&identities)?),
+                        fragments,
+                        end,
+                    });
+                }
+                let remaining = stop.saturating_sub(offset);
+                if remaining <= 1 {
+                    return Err(invalid("scanner fragment metadata exceeds source budget"));
+                }
+                stop = offset + remaining / 2;
+                while !text.is_char_boundary(stop) {
+                    stop -= 1
+                }
+            }
+            end = ScanPosition::Fragment {
+                sequence_id: message_seq,
+                message_id: message.message_id.clone(),
+                part_ordinal: *part,
+                utf8_offset: stop,
+                prose_digest: digest,
+            };
+            fragments.push(fragment);
+            if stop < text.len() {
+                return Ok(Captured {
+                    source_digest: hash(encoded(&identities)?),
+                    fragments,
+                    end,
+                });
+            }
+        }
+        end = ScanPosition::Boundary {
+            sequence_id: if lane == ScanLane::Live {
+                message_seq
+            } else {
+                sqlx::query_scalar("SELECT COALESCE(MAX(sequence_id),0) FROM messages WHERE conversation_id=?1 AND sequence_id<?2").bind(transcript).bind(message_seq).fetch_one(&mut **tx).await?
+            },
+        };
+    }
+    fragments.sort_by_key(|f| {
+        (
+            identities
+                .iter()
+                .find(|(id, _, _)| id == &f.message_id)
+                .map_or(0, |(_, seq, _)| *seq),
+            f.part_ordinal,
+            f.utf8_start,
+        )
+    });
+    Ok(Captured {
+        source_digest: hash(encoded(&identities)?),
+        fragments,
+        end,
+    })
+}
+
+fn clip(value: &str, limit: usize) -> DbResult<(String, bool)> {
+    let mut end = value.len();
+    while encoded(&value[..end])?.len() > limit {
+        end = end.saturating_sub(1);
+        while !value.is_char_boundary(end) {
+            end -= 1
+        }
+    }
+    Ok((value[..end].to_owned(), end < value.len()))
+}
+pub(super) async fn candidates(
+    tx: &mut Transaction<'_, Sqlite>,
+    fragments: &[ScanFragment],
+) -> DbResult<(Vec<ScanCandidate>, usize, usize)> {
+    let ids: Vec<&str> = fragments.iter().map(|f| f.message_id.as_str()).collect();
+    let ids = String::from_utf8(encoded(&ids)?).map_err(|e| invalid(e.to_string()))?;
+    let rows=sqlx::query("SELECT i.id,i.kind,i.title,i.resumption,COALESCE(r.disposition,'tracking') AS disposition,r.reason,r.recorded_at_us AS retired_at_us FROM coordinator_tracking_items i LEFT JOIN coordinator_tracking_retirements r ON r.item_id=i.id AND r.item_revision=i.current_retirement_revision ORDER BY EXISTS(SELECT 1 FROM coordinator_tracking_evidence e WHERE e.item_id=i.id AND e.message_id IN(SELECT value FROM json_each(?1))) DESC,i.updated_at_us DESC,i.id LIMIT 16").bind(ids).fetch_all(&mut **tx).await?;
+    let totals=sqlx::query("SELECT COUNT(*) AS all_count,COALESCE(SUM(current_retirement_revision IS NULL),0) AS active_count FROM coordinator_tracking_items").fetch_one(&mut **tx).await?;
+    let active: usize = usize::try_from(totals.try_get::<i64, _>("active_count")?)
+        .map_err(|e| invalid(e.to_string()))?;
+    let all: usize = usize::try_from(totals.try_get::<i64, _>("all_count")?)
+        .map_err(|e| invalid(e.to_string()))?;
+    let mut out = Vec::new();
+    let mut included_active = 0;
+    for row in rows {
+        let kind = match row.try_get::<String, _>("kind")?.as_str() {
+            "requested_work" => TrackingKind::RequestedWork,
+            "bookmark" => TrackingKind::Bookmark,
+            _ => return Err(invalid("invalid tracking kind")),
+        };
+        let disposition = match row.try_get::<String, _>("disposition")?.as_str() {
+            "tracking" => TrackingDisposition::Tracking,
+            "resolved" => TrackingDisposition::Resolved,
+            "dismissed" => TrackingDisposition::Dismissed,
+            _ => return Err(invalid("invalid disposition")),
+        };
+        let (title, title_truncated) = clip(&row.try_get::<String, _>("title")?, 256)?;
+        let hint = if disposition == TrackingDisposition::Tracking {
+            row.try_get::<String, _>("resumption")?
+        } else {
+            row.try_get::<String, _>("reason")?
+        };
+        let (context_hint, context_hint_truncated) = clip(&hint, 256)?;
+        let candidate = ScanCandidate {
+            id: row.try_get("id")?,
+            kind,
+            disposition,
+            title,
+            title_truncated,
+            context_hint,
+            context_hint_truncated,
+            retired_at_us: row.try_get("retired_at_us")?,
+        };
+        out.push(candidate);
+        if encoded(&out)?.len() > 8192 {
+            out.pop();
+            break;
+        }
+        if disposition == TrackingDisposition::Tracking {
+            included_active += 1
+        }
+    }
+    let included_retired = out.len() - included_active;
+    Ok((
+        out,
+        active - included_active,
+        all - active - included_retired,
+    ))
+}
