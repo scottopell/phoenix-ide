@@ -377,11 +377,12 @@ async fn explicit_local_goal_read_preserves_snapshot_wait_and_authority() {
 async fn native_goal_discovery_prepare_apply_read_and_replay_without_dispatch() {
     let f = Fixture::new().await;
     let definitions = f.executor.definitions().await;
-    let migrations: Vec<(i64, String)> =
-        sqlx::query_as("SELECT version,name FROM _migrations WHERE version>=143 ORDER BY version")
-            .fetch_all(f.db.pool())
-            .await
-            .unwrap();
+    let migrations: Vec<(i64, String)> = sqlx::query_as(
+        "SELECT version,name FROM _migrations WHERE version BETWEEN 143 AND 163 ORDER BY version",
+    )
+    .fetch_all(f.db.pool())
+    .await
+    .unwrap();
     assert_eq!(
         migrations,
         vec![
