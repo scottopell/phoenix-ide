@@ -307,9 +307,13 @@ describe('ProductConversationFixture', () => {
     const restore = installProductConversationFixtureApi(scenario);
     try {
       expect(scenario.initialEntry).toBe('/global/event-latest');
-      expect(scenario.alignedLatestMessages).toHaveLength(4);
+      expect(scenario.alignedLatestMessages?.map(message => message.message_id)).toEqual(['event-failed', 'event-missing', 'event-human-prompt']);
       expect(await api.resolveCoordinatorRoute('event-latest')).toEqual({ coordinator_id: 'event-latest' });
       expect(await api.resolveCoordinatorRoute('source-member')).toEqual({ coordinator_id: null });
+      const receiver = await api.getCoordinatorHistory('event-latest');
+      expect(receiver.product_conversation_id).toBe('event-latest');
+      expect(receiver).not.toHaveProperty('ordinary_lifecycle');
+      await expect(api.getCoordinatorHistory('unknown-global')).rejects.toThrow('Unknown Global member');
       const source = await api.getProductConversationSnapshot('source-member');
       expect(source.product_conversation_id).toBe('source-member');
       expect(source.segments[0]!.messages[0]!.content).toEqual({ text: 'Source conversation for compact event acceptance.' });
@@ -323,6 +327,20 @@ describe('ProductConversationFixture', () => {
       restore();
     }
     expect(globalThis.fetch).toBe(originalFetch);
+  });
+
+  it('keeps quoted Unicode evidence private while redacted event diagnostics stay unchanged', () => {
+    const privateScenario = makeCompactEventsScenario(false);
+    const redactedScenario = makeCompactEventsScenario(false, true);
+    const privateEvents = privateScenario.snapshot!.segments.flatMap(segment => segment.messages).filter(message => message.origin.kind === 'subscription_event');
+    const redactedEvents = redactedScenario.snapshot!.segments.flatMap(segment => segment.messages).filter(message => message.origin.kind === 'subscription_event');
+    expect(privateEvents[0]!.event_presentation).toMatchObject({ status: 'available', ending_evidence: expect.stringContaining('東京の会話 🦊') });
+    for (const [index, message] of redactedEvents.entries()) {
+      expect(message.event_presentation).toEqual({ status: 'unavailable', event_id: privateEvents[index]!.event_presentation!.event_id, reason: 'redacted' });
+      expect(message.content).toEqual(privateEvents[index]!.content);
+      expect(JSON.stringify(message)).not.toContain('Keep deployment paused');
+      expect(JSON.stringify(message)).not.toContain('東京の会話 🦊');
+    }
   });
 
   it('preserves origin-aware navigation after mounting a continued transcript again', async () => {

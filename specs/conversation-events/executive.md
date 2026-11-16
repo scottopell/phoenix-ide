@@ -26,11 +26,25 @@ validates the complete source digest in the same read snapshot.
 Candidate validation is in progress. Eight focused DB tests pass, covering frozen
 quotation, digest-guarded pages, rollback/retry, honest absence, historical private
 presentation, unavailable input origins, prefix stability and atomic non-direct
-capture. The direct/adopted settlement/replay regression also passed. Genuine codegen,
-IDE privacy/schema/read composition, full CI and model effectiveness remain open.
+capture. The direct/adopted settlement/replay regression also passed. Genuine codegen
+passed all 249 export tests. IDE privacy/schema/read composition, full CI and model
+effectiveness remain open.
 Compact model hydration requires the
 predeclared A/B/C evaluation gate in ADR-261 before merge/activation. No deployment
 acceptance or actual savings are claimed by source implementation alone.
+
+Scoped web qualification passes 61 focused event-card/fixture tests and a forced
+application TypeScript check. The actual Ladle Global page rendered a long Unicode
+quotation with escaped literal markup at 1440×900 and 390×844, without horizontal
+overflow or browser page errors. Its source link reached the exact ordinary source,
+and the origin link returned to Global. A redacted-event fixture showed no quotation
+or source link while preserving original diagnostics. The fixture's Global history
+shape and latest-message alignment were corrected so these checks exercise the
+intended receiver rather than an error fallback. Private screenshots are under
+`.phoenix/ember-event-qa/screenshots/` in the event worktree. This is fixture-only web
+qualification, not real-server, SwiftUI or physical-phone acceptance. The focused
+test process emits existing localhost:3000 connection diagnostics; it exits green,
+and the browser's fixture receiver has no page errors.
 
 Implemented on the compact-conversation-events branch; not a deployment or merge claim. Durable metadata joins and typed presentation are separate from persisted diagnostic evidence. Available EventPresentation fields are flattened beside `status: available`; unavailable carries event_id/reason. EnrichedMessage.event_presentation is explicitly nullable. Genuine ts-rs exports are checked in, not handwritten.
 
