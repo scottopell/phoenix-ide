@@ -120,6 +120,7 @@ impl World {
         )
         .await
         .unwrap();
+        phoenix_db::run_pending_migrations(db.pool()).await.unwrap();
         let coordinator = db
             .get_or_create_coordinator(None, LlmLanguage::default())
             .await
