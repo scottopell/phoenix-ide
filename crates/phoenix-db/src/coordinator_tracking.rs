@@ -222,6 +222,9 @@ pub struct TrackingReceipt {
 fn invalid(message: &str) -> DbError {
     DbError::Serialization(format!("Tracking: {message}"))
 }
+fn count(value: usize) -> DbResult<i64> {
+    i64::try_from(value).map_err(|_| invalid("collection count exceeds storage bounds"))
+}
 fn bounded(value: &str, max: usize, nonblank: bool) -> DbResult<()> {
     if value.len() > max || (nonblank && value.trim().is_empty()) {
         Err(invalid("blank or oversized text"))
@@ -424,6 +427,9 @@ fn summary(row: &sqlx::sqlite::SqliteRow) -> DbResult<TrackingSummary> {
 
 impl Database {
     /// Applies a current-Coordinator mutation with durable exact-call receipts.
+    ///
+    /// # Errors
+    /// Rejects stale/foreign sources, invalid input or revisions, and storage failures.
     pub async fn mutate_coordinator_tracking(
         &self,
         source: &str,
@@ -441,9 +447,7 @@ impl Database {
             Ok(value) => value,
             Err(error) => return Established(Err(error.into())),
         };
-        let result = self
-            .mutate_tracking_tx(&mut tx, source, call, mutation)
-            .await;
+        let result = Self::mutate_tracking_tx(&mut tx, source, call, mutation).await;
         match result {
             Ok(receipt) => match tx.commit().await {
                 Ok(()) => Established(Ok(receipt)),
@@ -455,8 +459,8 @@ impl Database {
             },
         }
     }
+    #[allow(clippy::too_many_lines)]
     async fn mutate_tracking_tx(
-        &self,
         tx: &mut Transaction<'_, Sqlite>,
         source: &str,
         call: &phoenix_core::domain::db_schema::SourceToolCall,
@@ -503,7 +507,9 @@ impl Database {
                 "source arguments differ from the durable tool round",
             ));
         }
-        let matched = assistant_message.content.iter().any(|block| match block {
+        let matched =
+            assistant_message.content.iter().any(|block| {
+                match block {
             phoenix_core::domain::llm_types::ContentBlock::ToolUse { id, name, input }
                 if id == &call.tool_use_id && name == "tracking" =>
             {
@@ -512,8 +518,21 @@ impl Database {
                     .and_then(|input| serde_json::to_vec(&input).ok())
                     .is_some_and(|bytes| digest(&bytes) == fingerprint)
             }
-            _ => false,
-        });
+            phoenix_core::domain::llm_types::ContentBlock::Text{..}
+            | phoenix_core::domain::llm_types::ContentBlock::Image{..}
+            | phoenix_core::domain::llm_types::ContentBlock::ToolUse{..}
+            | phoenix_core::domain::llm_types::ContentBlock::ToolResult{..}
+            | phoenix_core::domain::llm_types::ContentBlock::ServerToolUse{..}
+            | phoenix_core::domain::llm_types::ContentBlock::ToolSearchToolResult{..}
+            | phoenix_core::domain::llm_types::ContentBlock::WebSearchToolResult{..}
+            | phoenix_core::domain::llm_types::ContentBlock::WebFetchToolResult{..}
+            | phoenix_core::domain::llm_types::ContentBlock::CodeExecutionToolResult{..}
+            | phoenix_core::domain::llm_types::ContentBlock::BashCodeExecutionToolResult{..}
+            | phoenix_core::domain::llm_types::ContentBlock::TextEditorCodeExecutionToolResult{..}
+            | phoenix_core::domain::llm_types::ContentBlock::McpToolUse{..}
+            | phoenix_core::domain::llm_types::ContentBlock::McpToolResult{..}=>false,
+        }
+            });
         if !matched {
             return Err(invalid(
                 "owned assistant round does not contain the source call",
@@ -545,7 +564,10 @@ impl Database {
                 sqlx::query("UPDATE coordinator_tracking_items SET reviewed_evidence_ordinal=?2 WHERE id=?1").bind(&id).bind(latest).execute(&mut **tx).await?;
                 (id, 1, true)
             }
-            other => {
+            other @ (TrackingMutation::Update { .. }
+            | TrackingMutation::AppendEvidence { .. }
+            | TrackingMutation::Retire { .. }
+            | TrackingMutation::Reopen { .. }) => {
                 let (id, expected) = match other {
                     TrackingMutation::Update {
                         id,
@@ -614,7 +636,7 @@ impl Database {
                             .execute(&mut **tx)
                             .await?;
                         for (ordinal, reference) in references.iter().enumerate() {
-                            insert_reference(tx, id, ordinal as i64, reference).await?;
+                            insert_reference(tx, id, count(ordinal)?, reference).await?;
                         }
                         true
                     }
@@ -685,6 +707,9 @@ impl Database {
         })
     }
     /// Reads one bounded registry page. Cursor is the last returned stable item ID.
+    ///
+    /// # Errors
+    /// Rejects a stale/foreign source and failed or malformed stored reads.
     pub async fn list_coordinator_tracking(
         &self,
         source: &str,
@@ -698,6 +723,9 @@ impl Database {
         Ok(page)
     }
     /// Reads one item and one bounded page of its retained historical evidence.
+    ///
+    /// # Errors
+    /// Rejects invalid cursors, stale/foreign sources, missing items or storage failure.
     pub async fn read_coordinator_tracking(
         &self,
         source: &str,
@@ -707,6 +735,11 @@ impl Database {
         self.read_coordinator_tracking_page(source, id, after_evidence, None)
             .await
     }
+    /// Reads separately paginated evidence and retirement history with a single snapshot.
+    ///
+    /// # Errors
+    /// Rejects invalid cursors, stale/foreign sources, missing items or storage failure.
+    #[allow(clippy::too_many_lines)]
     pub async fn read_coordinator_tracking_page(
         &self,
         source: &str,
@@ -756,7 +789,7 @@ impl Database {
                 _ => return Err(invalid("invalid reference")),
             });
         }
-        let mut rows=sqlx::query("SELECT * FROM coordinator_tracking_evidence WHERE item_id=?1 AND ordinal>?2 ORDER BY ordinal LIMIT ?3").bind(id).bind(after_evidence).bind((EVIDENCE_PAGE_SIZE+1) as i64).fetch_all(&mut *tx).await?;
+        let mut rows=sqlx::query("SELECT * FROM coordinator_tracking_evidence WHERE item_id=?1 AND ordinal>?2 ORDER BY ordinal LIMIT ?3").bind(id).bind(after_evidence).bind(count(EVIDENCE_PAGE_SIZE+1)?).fetch_all(&mut *tx).await?;
         let more = rows.len() > EVIDENCE_PAGE_SIZE;
         rows.truncate(EVIDENCE_PAGE_SIZE);
         let mut evidence = Vec::new();
@@ -837,7 +870,7 @@ impl Database {
                 })
             })
             .transpose()?;
-        let omitted_retirement_count = total - retirement_history.len() as i64;
+        let omitted_retirement_count = total - count(retirement_history.len())?;
         let next_retirement_revision = if omitted_retirement_count > 0 {
             retirement_history.last().map(|entry| entry.item_revision)
         } else {
@@ -868,7 +901,7 @@ async fn tracking_page_tx(
     let mut rows = sqlx::query("SELECT i.*,COALESCE(r.disposition,'tracking') AS disposition,r.reason AS retirement_reason,COALESCE((SELECT MAX(ordinal) FROM coordinator_tracking_evidence e WHERE e.item_id=i.id),0) AS latest_evidence_ordinal FROM coordinator_tracking_items i LEFT JOIN coordinator_tracking_retirements r ON r.item_id=i.id AND r.item_revision=i.current_retirement_revision WHERE (?1 OR i.current_retirement_revision IS NULL) AND (?2 IS NULL OR i.id>?2) ORDER BY i.id LIMIT ?3")
         .bind(include_retired)
         .bind(after)
-        .bind((TRACKING_PAGE_SIZE + 1) as i64)
+        .bind(count(TRACKING_PAGE_SIZE+1)?)
         .fetch_all(&mut **tx)
         .await?;
     let more = rows.len() > TRACKING_PAGE_SIZE;
@@ -884,7 +917,7 @@ async fn tracking_page_tx(
         registry_revision: registry_revision(tx).await?,
         active_count: counts.try_get("active_count")?,
         review_required_count: counts.try_get("review_required_count")?,
-        omitted_count: total - items.len() as i64,
+        omitted_count: total - count(items.len())?,
         items,
         has_more: more,
         next_cursor: next,
@@ -902,6 +935,9 @@ pub struct TrackingObservation {
 }
 impl Database {
     /// Atomically appends a changed saved-intent observation and its attention receipt.
+    ///
+    /// # Errors
+    /// Rejects stale sources, invalid bounds/time, or failed storage with classified durability.
     pub async fn append_coordinator_tracking_observation(
         &self,
         source: &str,
@@ -932,6 +968,7 @@ impl Database {
         }
     }
 }
+#[allow(clippy::too_many_lines)]
 async fn append_observation_tx(
     tx: &mut Transaction<'_, Sqlite>,
     source: &str,
