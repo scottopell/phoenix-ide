@@ -167,7 +167,7 @@ jobs:
             completed_close_attempt_cannot_authorize_scope_retirement \
             close_attempt_cannot_authorize_uncaptured_scope_retirement \
             successful_retirement_preserves_conversation_and_scope_history; do
-            grep -F "tests::$test: test" evidence/db-inventory.log
+            grep -F "tests::$test: test" evidence/inventory.log
             cargo test -p phoenix-db --lib "tests::$test" -- --exact --nocapture --test-threads=1 2>&1 | tee "evidence/$test.log"
             grep -Eq 'test result: ok\. 1 passed; 0 failed; 0 ignored;' "evidence/$test.log"
           done
