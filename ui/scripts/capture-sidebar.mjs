@@ -89,7 +89,7 @@ runSurfaceCapture({
               const r = control.getBoundingClientRect();
               return { fits: control.scrollWidth <= control.clientWidth, inside: r.x >= bounds.x && r.right <= bounds.right + 1, x: r.x, right: r.right, top: r.top, bottom: r.bottom, width: r.width, height: r.height };
             });
-            return { rows, controls };
+            return { listWidth: el.querySelector('.sidebar-list').getBoundingClientRect().width, rows, controls };
           });
           sweep.push({ width, ...sample });
         }
