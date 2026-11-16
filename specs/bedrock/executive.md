@@ -19,9 +19,10 @@ Bedrock represents one active call separately from its ordered remaining queue.
 The dispatcher spec distinguishes early unavailable results, Layer 0 denial
 before call-resource admission, cleared side-effecting preparation, launch-time admission,
 generation/state/identity completion guards, sender-loss settlement, cooperative
-cancellation, and forced task retirement. Launch/ownership barriers exist, while
-pre-denial resource ordering and preparation responsiveness below remain
-normative targets with verified gaps.
+cancellation, and forced task retirement. Preparation reads have a selectable
+owner bound to the runtime, held assistant and exact call. Only a cleared checked
+call reaches ordinary invocation resources; denial returns a paired ordinary result.
+Focused and owning runtime coverage passes; full qualification remains pending.
 No dispatcher extraction or concurrent tool scheduling is implemented by this
 specification work. Permission counters/escalation remain outside this boundary.
 
@@ -59,25 +60,38 @@ SQLite authority. A lost activation receiver after committed membership stops th
 remaining effect chain and reports a non-resumable error. Interrupted/restart
 ownership remains unqualified: the separate historical startup-abandonment policy
 is unchanged, and no automatic historical repair or durable queue is introduced.
-Task 75011 implements this native boundary. Task 75010 owns the remaining inline
-policy, scope, catalog and ordinary preparation responsiveness.
+Task 75011 implements this native boundary. Task 75010 adds selectable policy,
+scope, catalog and typed self-goal reads, plus owned bounded native submission.
+The existing manager operation owns the classified live parent-action UPSERT
+before batch admission under the same affine write guard and request control.
+The startup UPSERT and historical abandonment policy are unchanged.
 
-### Cancellation implementation and remaining gaps
+### Cancellation implementation and qualification
 
-REQ-PERM-004's no-resource denial is partial at the dispatcher: the existing code
-broadcasts the tool start, allocates a channel/token/generation and constructs a
-context/metrics writer before `DenyGate::check`. A denied call launches no tool
-task, but it has already reserved resources, so that ordering does not fulfill the
-whole requirement. The target gate operates on immutable selected-call identity
-before resource admission; only its exact cleared proof may open a generation.
-Task 75010 includes this preparation-boundary ordering correction.
+The dispatcher checks Layer 0 before ordinary start publication, outcome channel,
+cancellation token, generation, context or metrics writer. A private cleared-call
+proof carries the checked payload and originating schema into resource admission.
+An unavailable call or denial returns its exact paired ordinary completion.
+Permission counting and escalation remain unimplemented.
 
-REQ-BED-005 is partial: the owned executor awaits originating-policy/scope reads
-and spawn preparation before returning to its cancellation select. Submitted
-native admission responses have a retained selectable owner.
-This can delay cancellation behind preparation, contrary to the immediate,
-100-ms interruption/nonqueued contract. Task 75010 tracks the separate runtime
-correction; task 14004 covers related global child-materialization races.
+The owned loop selects user cancellation alongside originating-policy, WorkScope,
+native catalog and typed self-goal preparation reads. The final live-definition
+read inside an admitted ordinary tool task also selects cancellation before
+execution. Interrupted read work retains affirmative no-call-effects ownership
+until the cancellation checkpoint succeeds; a rejected checkpoint cannot publish
+an abort or permit a late launch. Native submission and issued parent/admission
+writes retain their separate classified native owner. Actual unclassified SQLite
+authority closes the shared fence before origin checks; an ordinary read diagnostic
+is not a persistence classification.
+
+Twelve focused regressions pass at `091f2d45b`, including deterministic 100-ms
+virtual-time cancellation with reads held, denial before resources, exact-origin
+clear/deny/error guards, failed cancellation persistence and live catalog release.
+The 249-case owning runtime selection passes at `934b331a5`, including existing
+native activation, forced-notice, required-settlement, goal and policy contracts.
+Its native Bash fixture was built at `091f2d45b`; the intervening delta is test-only.
+These in-memory timing checks do not measure end-to-end SQLite latency. Local
+static/default, isolated review and hosted qualification remain pending.
 
 Forced tool retirement has a distinct `ToolCancellationRetired` event and a
 phase-scoped `ForcedToolRetirement` fact in `CancellingSubAgents`. Nonfinal child
@@ -89,8 +103,9 @@ requires established parent/child commit receipts and defers the one notice unti
 the entire owned application, including inline steering, succeeds. The owning
 authority stays alive through the notice write. Ordinary cooperative cancellation
 produces no degraded notice. Task 75009 owns qualification of these residual live
-notice paths; task 75010 owns remaining preparation responsiveness separately
-from task 75011's native cancellation handoff.
+notice paths. Task 75010 implements preparation responsiveness alongside task
+75011's native cancellation handoff; interrupted/restart ownership remains
+explicitly unqualified.
 
 The child-deadline path snapshots pending identities, establishes required child
 terminal evidence, and feeds each result through normal atomic parent acceptance.
@@ -128,7 +143,7 @@ Implements Elm Architecture with a typed-effect executor boundary. The SM has tw
 
 Ordinary typed tool outcomes and generated tool-completion events own a command boundary through required steering preparation, checkpoint, replay, and state effects. The closed settlement result selects established continuation or the existing process fail-stop contract; an unavailable compound exact classifier does not authorize a retry. Watcher and SSE state publication waits for the required writes, including an inline steering drain, and the held command authority closes the fence if its owner disappears. Checkpoints commit the round and next state atomically; redundant state writes are skipped while owed child activation, acceptance, and terminal settlements remain enforced. Startup recovery holds the same affine authority discipline through required reads and settlements, while established provider/configuration failures retain their feature error paths. Focused executor and adjacent grace, trust/replay, creation, terminal, and lifecycle regressions pass locally with the exact-source native Bash launcher. Coverage includes checkpoint begin/write/commit errors, a lost commit acknowledgement, required state/replay/steering failures, command cancellation, an isolated file-backed SQLite FULL/reopen path, and a process cut immediately after checkpoint commit. Full repository and hosted qualification remain separate.
 
-The completion owner also drains synchronous local dispatch follow-ups before reporting established settlement. Freeze rejection, cycle-cap cancellation, grace hard stop, and unavailable-tool chains return typed local events rather than relying on self-queue delivery without a producer. The established tool-settlement variant carries no pending events. Follow-up state remains private until its write commits; cancellation of an owned follow-up closes the shared fence. Existing terminal ownership transfers only where the current transition freshly registers its terminal retry/reconstruction, and child acceptance transfers only after the exact current `SubAgentResult` is retained and its existing retry is registered. Stale retry flags do not classify a failed write. A required steering-commit failure closes its owning command boundary in both inline and ordinary effect loops before an already-accepted child can be incorrectly assigned its retry. Preparation-read failures before acceptance restore the original pending state, entry time, and absolute deadline so the exact child retry remains consumable without renewing its liveness window. When final cancellation owes both child acceptance and the active parent turn’s terminal settlement, the state effect completes both through their existing receipt/terminal-obligation APIs. A known terminal failure retains its exact terminal retry; an accepted raw child cannot stand in for it. Post-terminal steering work retains admitted authority through preparation, typed local follow-ups, and watcher adoption, including when invoked by that retry. Standalone child-result failures use the existing other-local-authority observation category; child owner loss retains a child-specific owner-disappearance label. Focused coverage includes the actual checkpoint-success/dispatch-failure/error-write-failure caller disposition, positive persisted errors, queue loss, cancellation, unavailable chains, end-first acceptance order, and direct-turn/grace known-failure retries.
+The completion owner also drains synchronous local dispatch follow-ups before reporting established settlement. Freeze rejection, cycle-cap cancellation and grace hard stop return typed local events rather than relying on self-queue delivery without a producer. Unavailable-tool decisions use the retained read owner, and each accepted paired completion enters its required settlement boundary without event-queue delivery. The established tool-settlement variant carries no pending events. Follow-up state remains private until its write commits; cancellation of an owned follow-up closes the shared fence. Existing terminal ownership transfers only where the current transition freshly registers its terminal retry/reconstruction, and child acceptance transfers only after the exact current `SubAgentResult` is retained and its existing retry is registered. Stale retry flags do not classify a failed write. A required steering-commit failure closes its owning command boundary in both inline and ordinary effect loops before an already-accepted child can be incorrectly assigned its retry. Preparation-read failures before acceptance restore the original pending state, entry time, and absolute deadline so the exact child retry remains consumable without renewing its liveness window. When final cancellation owes both child acceptance and the active parent turn’s terminal settlement, the state effect completes both through their existing receipt/terminal-obligation APIs. A known terminal failure retains its exact terminal retry; an accepted raw child cannot stand in for it. Post-terminal steering work retains admitted authority through preparation, typed local follow-ups, and watcher adoption, including when invoked by that retry. Standalone child-result failures use the existing other-local-authority observation category; child owner loss retains a child-specific owner-disappearance label. Focused coverage includes the actual checkpoint-success/dispatch-failure/error-write-failure caller disposition, positive persisted errors, queue loss, cancellation, unavailable chains, end-first acceptance order, and direct-turn/grace known-failure retries.
 
 The completion boundary includes synthetic `ToolAborted` and racing `ToolComplete` events in `CancellingTool`, and pending-child results consumed by normal fan-in. Required child-backstop terminal evidence remains owned through parent acceptance. Its native result preserves an already committed authentic outcome, distinguishes a definite rejection that settles as nonretryable `SubAgentError`, and closes authority when classification is unavailable. An explicitly registered acceptance or terminal retry retains its feature contract. Backstop completion notices consume the exact native command’s established acceptance receipts, so inline steering may advance into a new turn without suppressing the old chain’s notice; retry, failed, timeout, and duplicate forced-notice paths do not publish it. The `Arc<MessageStore>` adapter delegates the terminal-evidence and acceptance queries to its underlying store. Standalone nonterminal summaries commit their exact message, parent projection, and child acceptance in one native transaction; a single exact classifier handles lost commit acknowledgement. The transition consumes an explicit parent-commit receipt, while terminal summary/obligation establishment remains a separate receipt with acceptance and direct-turn settlement still owed. Durable terminal retry ownership carries the original projection timestamp across actor rollback. Causal coverage includes real SQLite acceptance/settlement aborts, authentic terminal races, lost acknowledgement, unavailable classification, inline steering, and preserved summary identities after reopen.
 
@@ -146,7 +161,7 @@ Startup, completion, and child-backstop commands retain a mutable reborrow of th
 | **REQ-BED-002:** User Message Handling | ✅ Complete | Rejects while busy, accepts from idle/error |
 | **REQ-BED-003:** LLM Response Processing | ✅ Complete | Handles text, tool use, end_turn |
 | **REQ-BED-004:** Tool Execution Coordination | ✅ Complete | Serial execution with state tracking; shared round admission requires unique call/result correspondence without sorting. Provider schedule validation precedes special-tool interception, and per-invocation channels reject misidentified outcomes as concrete errors. Focused coverage includes malformed approval/question/child-terminal responses and expected-invocation completion errors. Bash wait fallback preserves authentic bounded results, aborts only the wait task on healthy expiry, and closes the shared local-authority fence under REQ-BED-033 if authoritative settlement remains indeterminate at its non-renewing persistence cutoff |
-| **REQ-BED-005:** Cancellation Handling | 🚧 Partial | Native admission responses are selectable with retained exact ownership. Awaited policy/scope/catalog and ordinary preparation still delay cancellation; task 75010 owns that gap |
+| **REQ-BED-005:** Cancellation Handling | 🚧 Partial | Preparation reads and native submission are selectable with exact ownership; issued parent/admission writes remain classified in the manager. Focused 12/12 and owning 249/249 pass; full qualification is pending |
 | **REQ-BED-005a:** Bounded Cancellation Liveness | 🚧 Partial | Forced tool/sub-agent backstops and live forced-notice carry through delayed cooperative drain are implemented. Task 75009 covers ordered exactly-once notice qualification, including inline steering, existing retries and child-deadline overlap. Broader interruption and cancellation-handoff obligations remain unqualified |
 | **REQ-BED-006:** Error Recovery | ✅ Complete | Retry logic with exponential backoff and typed user-resume admission by ErrorKind |
 | **REQ-BED-007:** State Persistence | ✅ Complete | Database persistence; all selected executing/cancelling buffers are validated before any recovery mutation. File-backed reopen coverage includes malformed standalone and parent-first child buffers retaining exact raw state and producing no partial messages; scoped recovery excludes unrelated malformed buffers. Provider-only interruptions resume from idle, active materialized turns with persisted tool results proactively resume under bounded exact-turn ownership, committed steering retains first-response recovery ownership, and durable continuations retain recovery state |
