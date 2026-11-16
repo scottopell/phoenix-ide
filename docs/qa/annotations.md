@@ -67,7 +67,7 @@ Ladle groups these under **Annotations**:
 12. `12-editing` — second annotation selected, full quotation and long comment in the modal.
 13. `13-after-delete` — middle annotation deleted; surviving labels stay 1 and 3.
 14. `14-many-annotations` — eight annotations in the bounded scrolling stack.
-15. `15-focused-annotation` — second card focused, with its exact passage and matching source number emphasized.
+15. `15-focused-annotation` — a mid-line phrase focused through its second card; its exact passage is emphasized and its grouped number remains in the gutter, clear of source text.
 
 For example:
 <http://127.0.0.1:61123/?story=annotations--06-several-annotations&mode=preview&fixtureTheme=light>

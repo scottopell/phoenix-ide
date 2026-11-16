@@ -110,10 +110,12 @@ try {
           const marker=document.querySelector('.annotation-source-marker.is-emphasized');
           const card=document.querySelector('.draft-annotation.is-emphasized');
           const row=document.querySelector('.virtual-transcript-row').getBoundingClientRect();
-          return {exact:ranges.length===1 && expected==='“'+ranges[0].toString()+'”',number:marker?.textContent,aligned:Math.abs(card.getBoundingClientRect().left-row.left-8)<1};
+          const start=ranges[0]?.startContainer;
+          const block=(start?.nodeType===Node.ELEMENT_NODE?start:start?.parentElement)?.closest('.agent-text-block');
+          return {exact:ranges.length===1 && expected==='“'+ranges[0].toString()+'”',number:marker?.textContent,gutter:!!marker && !!block && marker.getBoundingClientRect().right<block.getBoundingClientRect().left,aligned:Math.abs(card.getBoundingClientRect().left-row.left-8)<1};
         })()`);
         const focus = result.data?.value;
-        if (!focus?.exact || focus.number !== '2' || (layout.name === 'desktop' && !focus.aligned)) throw new Error(`Source/card correspondence failed: ${JSON.stringify(focus)}`);
+        if (!focus?.exact || focus.number !== '2+' || !focus.gutter || (layout.name === 'desktop' && !focus.aligned)) throw new Error(`Source/card correspondence failed: ${JSON.stringify(focus)}`);
         metrics.focus = focus;
       }
       if (story.id === '14-many-annotations') {

@@ -42,7 +42,10 @@ export function AnnotationSourceMarkers({ annotations, emphasizedId }: {
         if (!bounds || typeof range.getClientRects !== 'function') continue;
         const rect = Array.from(range.getClientRects()).find(rect => rect.width > 0 && rect.height > 0 && rect.top >= bounds.top && rect.bottom <= bounds.bottom);
         if (!rect) continue;
-        const left = Math.max(1, rect.left - 21);
+        const start = range.startContainer.nodeType === Node.ELEMENT_NODE ? range.startContainer as Element : range.startContainer.parentElement;
+        const block = start?.closest('.agent-text-block');
+        if (!block) continue;
+        const left = Math.max(1, block.getBoundingClientRect().left - 21);
         const top = rect.top + (rect.height - 18) / 2;
         const shared = next.find(marker => Math.abs(marker.top - top) < 2 && Math.abs(marker.left - left) < 2);
         if (shared) shared.numbers.push(annotation.number);
