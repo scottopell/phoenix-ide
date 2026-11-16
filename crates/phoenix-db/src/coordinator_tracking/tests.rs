@@ -444,6 +444,7 @@ async fn input(db: &Database, source: &str, text: &str) {
     .unwrap();
 }
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn tracking_observations_survive_continuation_without_rewriting_prefix_or_repeating_recent_items(
 ) {
     let (db, source) = setup().await;
@@ -494,7 +495,8 @@ async fn tracking_observations_survive_continuation_without_rewriting_prefix_or_
     .unwrap();
     let successor = match db.continue_conversation(&source).await.unwrap() {
         crate::ContinueOutcome::Created(next) => next,
-        other => panic!("{other:?}"),
+        other @ (crate::ContinueOutcome::AlreadyContinued(_)
+        | crate::ContinueOutcome::ParentNotContextExhausted { .. }) => panic!("{other:?}"),
     };
     let fresh = observation(&db, &successor.id, now + 2_000_000)
         .await

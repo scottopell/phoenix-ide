@@ -8,6 +8,12 @@
 
 User requests and useful questions disappear from generated handoffs despite surviving in history. Existing Goals and subscriptions describe known worker execution, rather than retaining forgotten intent. The user authorized one singleton list, explicit retirement and eventual automatic capture, and required immutable conversation prefixes.
 
+## Options considered
+
+1. Rely on search and generated handoffs alone. History remains available, but the user's requested outcomes can still disappear from successive summaries.
+2. Extend Goals or mirror worker/PR status. This conflates saved user intent with execution/review authorities and repeats the stale-roadmap problem.
+3. Retain a small independent intent list with bounded native inspection and append-only tail observations. This preserves memory without changing existing execution and wake mechanisms.
+
 ## Decision
 
 Retain normalized items and ordered evidence under stable Coordinator identity. One closed native operation union reads and mutates through one service. Trusted call identity supplies retry identity; revision checks prevent stale updates. Evidence append advances an ordered watermark; explicit review acknowledges exactly that watermark. Historical notes cannot appear as ready steps when new evidence exists.

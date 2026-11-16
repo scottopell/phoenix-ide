@@ -233,10 +233,12 @@ fn bounded(value: &str, max: usize, nonblank: bool) -> DbResult<()> {
     }
 }
 fn digest(value: &[u8]) -> String {
-    Sha256::digest(value)
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
+    use std::fmt::Write as _;
+    let mut encoded = String::with_capacity(64);
+    for byte in Sha256::digest(value) {
+        write!(encoded, "{byte:02x}").expect("String formatting cannot fail");
+    }
+    encoded
 }
 
 async fn require_owner(tx: &mut Transaction<'_, Sqlite>, source: &str) -> DbResult<String> {
