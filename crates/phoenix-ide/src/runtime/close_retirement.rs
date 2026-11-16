@@ -9410,10 +9410,13 @@ mod tests {
         stopped_native_retry_fixture_with_worktree_at_g2(live_worktree, false).await
     }
 
+    #[allow(clippy::too_many_lines)] // Keep the supported G1-to-G2 fixture journey together.
     async fn stopped_native_retry_fixture_with_worktree_at_g2(
         live_worktree: Option<&Path>,
         advance_to_successor_inspection: bool,
     ) -> NativeRetryFixture {
+        use std::collections::BTreeSet;
+
         // Keep the initial run running while any successor inspection is recorded.
         let fixture = process_step_fixture_with_worktree(false, live_worktree).await;
         let db = fixture.manager.db();
@@ -9497,12 +9500,12 @@ mod tests {
                             },
                             // These process resources were retired under G1; G2 captures
                             // only the still-live worktree, not already-retired identities.
-                            work_scopes: Default::default(),
-                            bash_process_groups: Default::default(),
-                            tmux_servers: Default::default(),
-                            pty_sessions: Default::default(),
-                            browser_sessions: Default::default(),
-                            equivalent_live_resources: Default::default(),
+                            work_scopes: BTreeSet::default(),
+                            bash_process_groups: BTreeSet::default(),
+                            tmux_servers: BTreeSet::default(),
+                            pty_sessions: BTreeSet::default(),
+                            browser_sessions: BTreeSet::default(),
+                            equivalent_live_resources: BTreeSet::default(),
                         },
                     }
                 })
