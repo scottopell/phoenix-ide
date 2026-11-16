@@ -11,6 +11,127 @@ struct ChildTerminalProjection {
     cause: SubAgentTerminalCause,
 }
 
+#[derive(Debug)]
+struct ParentReconcileSource {
+    transcript_generation: i64,
+    active_turn: Option<(i64, i64)>,
+}
+
+impl ParentReconcileSource {
+    fn from_row(row: &sqlx::sqlite::SqliteRow) -> DbResult<Self> {
+        let active_turn = match (
+            row.try_get::<Option<i64>, _>("turn_id")?,
+            row.try_get::<Option<i64>, _>("turn_generation")?,
+        ) {
+            (Some(turn), Some(generation)) => Some((turn, generation)),
+            (None, None) => None,
+            _ => {
+                return Err(lifecycle_conflict(
+                    "parent reconciliation has a partial turn source",
+                ))
+            }
+        };
+        Ok(Self {
+            transcript_generation: row.try_get("transcript_generation")?,
+            active_turn,
+        })
+    }
+}
+
+impl Database {
+    pub async fn establish_live_parent_reconcile_action(
+        &self,
+        conversation_id: &str,
+    ) -> crate::workflow::LocalAuthorityResult<DbResult<()>> {
+        self.establish_live_parent_reconcile_action_with_cut(
+            conversation_id,
+            TerminalEvidenceTransactionCut::None,
+        )
+        .await
+    }
+
+    async fn establish_live_parent_reconcile_action_with_cut(
+        &self,
+        conversation_id: &str,
+        cut: TerminalEvidenceTransactionCut,
+    ) -> crate::workflow::LocalAuthorityResult<DbResult<()>> {
+        use crate::workflow::LocalAuthorityResult;
+        let mut tx = match self.pool.begin_with("BEGIN IMMEDIATE").await {
+            Ok(tx) => tx,
+            Err(error) => return LocalAuthorityResult::DurableFactEstablished(Err(error.into())),
+        };
+        let prepared = async {
+            let row = sqlx::query(
+                "SELECT c.transcript_generation, t.turn_id, t.generation AS turn_generation
+                 FROM conversations c LEFT JOIN durable_turns t ON t.conversation_id = c.id
+                 AND t.owns_conversation = 1 AND t.terminal_kind IS NULL WHERE c.id = ?1",
+            )
+            .bind(conversation_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or_else(|| DbError::ConversationNotFound(conversation_id.into()))?;
+            let source = ParentReconcileSource::from_row(&row)?;
+            sqlx::query(ESTABLISH_PARENT_RECONCILE_ACTION_SQL)
+                .bind(conversation_id)
+                .bind(Utc::now().to_rfc3339())
+                .execute(&mut *tx)
+                .await?;
+            Ok::<_, DbError>(source)
+        }
+        .await;
+        let source = match prepared {
+            Ok(source) => source,
+            Err(error) => {
+                return match tx.rollback().await {
+                    Ok(()) => LocalAuthorityResult::DurableFactEstablished(Err(error)),
+                    Err(_) => LocalAuthorityResult::DurableFactUnclassified,
+                }
+            }
+        };
+        if cut == TerminalEvidenceTransactionCut::BeforeCommit {
+            return match tx.rollback().await {
+                Ok(()) => LocalAuthorityResult::DurableFactEstablished(Err(
+                    DbError::Serialization("injected parent reconciliation rollback".into()),
+                )),
+                Err(_) => LocalAuthorityResult::DurableFactUnclassified,
+            };
+        }
+        if let Err(error) = cut.commit(tx).await {
+            tracing::warn!(%conversation_id, %error, "classifying parent reconciliation commit");
+            if cut.classifier_unavailable() {
+                self.pool.close().await;
+            }
+            return self
+                .classify_live_parent_reconcile_action(conversation_id, &source)
+                .await;
+        }
+        LocalAuthorityResult::DurableFactEstablished(Ok(()))
+    }
+
+    async fn classify_live_parent_reconcile_action(
+        &self,
+        conversation_id: &str,
+        source: &ParentReconcileSource,
+    ) -> crate::workflow::LocalAuthorityResult<DbResult<()>> {
+        use crate::workflow::LocalAuthorityResult;
+        let observed = sqlx::query_scalar::<_, bool>(
+            "SELECT action = 'Reconcile' AND transcript_generation = ?2
+             AND turn_id IS ?3 AND turn_generation IS ?4
+             FROM startup_parent_actions WHERE conversation_id = ?1",
+        )
+        .bind(conversation_id)
+        .bind(source.transcript_generation)
+        .bind(source.active_turn.map(|(turn, _)| turn))
+        .bind(source.active_turn.map(|(_, generation)| generation))
+        .fetch_optional(&self.pool)
+        .await;
+        match observed {
+            Ok(Some(true)) => LocalAuthorityResult::DurableFactEstablished(Ok(())),
+            Ok(Some(false) | None) | Err(_) => LocalAuthorityResult::DurableFactUnclassified,
+        }
+    }
+}
+
 pub(crate) fn terminal_sub_agent_outcome(
     state: ConvState,
     cause: Option<SubAgentTerminalCause>,
@@ -1987,6 +2108,249 @@ impl Database {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn reconcile_parent(db: &Database, id: &str, active_turn: bool) -> ParentReconcileSource {
+        db.create_conversation(id, id, "/tmp", true, None, None)
+            .await
+            .unwrap();
+        if active_turn {
+            use phoenix_core::domain::sm_event::{
+                PreparedDirectTurnDelivery, PreparedDirectTurnPayload,
+                SubmittedDirectTurnExpansionPolicy, SubmittedDirectTurnIdentity,
+            };
+            use phoenix_workflow::{
+                AcceptedDisposition, ClientTurnKey, ConversationAuthority, PreparedTurn, Timestamp,
+            };
+            let key = format!("{id}-input");
+            let payload = PreparedDirectTurnPayload::from_parts(
+                SubmittedDirectTurnIdentity {
+                    message_id: key.clone(),
+                    origin: InputOrigin::UserApi,
+                    text: "source".into(),
+                    images: vec![],
+                    files: vec![],
+                    user_agent: None,
+                    skill_invocation: None,
+                    expansion_policy: SubmittedDirectTurnExpansionPolicy::LiteralText,
+                },
+                PreparedDirectTurnDelivery {
+                    text: "source".into(),
+                    llm_text: None,
+                    images: vec![],
+                    files: vec![],
+                    user_agent: None,
+                    skill_invocation: None,
+                },
+            );
+            db.workflow_repository()
+                .accept_authoritative_turn(&crate::workflow::AcceptAuthoritativeTurn {
+                    client_key: ClientTurnKey::new(&key).unwrap(),
+                    prepared: PreparedTurn::from_exact_payload(
+                        &ConversationAuthority(id.into()),
+                        payload.to_exact_bytes().unwrap(),
+                    ),
+                    disposition: AcceptedDisposition::Runtime,
+                    accepted_at: Timestamp(1),
+                })
+                .await
+                .established()
+                .unwrap()
+                .unwrap();
+        }
+        let row = sqlx::query(
+            "SELECT c.transcript_generation, t.turn_id, t.generation AS turn_generation
+            FROM conversations c LEFT JOIN durable_turns t ON t.conversation_id=c.id
+            AND t.owns_conversation=1 AND t.terminal_kind IS NULL WHERE c.id=?1",
+        )
+        .bind(id)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        let source = ParentReconcileSource::from_row(&row).unwrap();
+        assert_eq!(source.active_turn.is_some(), active_turn);
+        source
+    }
+
+    #[tokio::test]
+    async fn live_parent_reconcile_preserves_upsert_and_nullable_or_active_source() {
+        for active_turn in [false, true] {
+            let db = Database::open_in_memory().await.unwrap();
+            let source = reconcile_parent(&db, "parent", active_turn).await;
+            db.establish_parent_reconcile_action("parent")
+                .await
+                .unwrap();
+            sqlx::query(
+                "UPDATE startup_parent_actions SET action='Cancel' WHERE conversation_id='parent'",
+            )
+            .execute(db.pool())
+            .await
+            .unwrap();
+            let action_id: i64 = sqlx::query_scalar(
+                "SELECT action_id FROM startup_parent_actions WHERE conversation_id='parent'",
+            )
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+            db.establish_live_parent_reconcile_action("parent")
+                .await
+                .established()
+                .unwrap()
+                .unwrap();
+            assert!(matches!(
+                db.classify_live_parent_reconcile_action("parent", &source)
+                    .await,
+                crate::workflow::LocalAuthorityResult::DurableFactEstablished(Ok(()))
+            ));
+            let current_id: i64 = sqlx::query_scalar(
+                "SELECT action_id FROM startup_parent_actions WHERE conversation_id='parent'",
+            )
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+            assert_eq!(
+                current_id, action_id,
+                "the existing UPSERT must preserve action identity"
+            );
+            let children: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sub_agent_runs")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+            assert_eq!(children, 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn live_parent_reconcile_classifies_real_rollback_and_commit_ack_loss() {
+        for active_turn in [false, true] {
+            for cut in [
+                TerminalEvidenceTransactionCut::BeforeCommit,
+                TerminalEvidenceTransactionCut::AfterCommit,
+            ] {
+                let db = Database::open_in_memory().await.unwrap();
+                reconcile_parent(&db, "parent", active_turn).await;
+                let result = db
+                    .establish_live_parent_reconcile_action_with_cut("parent", cut)
+                    .await;
+                let count: i64 = sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM startup_parent_actions WHERE conversation_id='parent'",
+                )
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+                if cut == TerminalEvidenceTransactionCut::BeforeCommit {
+                    assert!(matches!(
+                        result,
+                        crate::workflow::LocalAuthorityResult::DurableFactEstablished(Err(_))
+                    ));
+                    assert_eq!(count, 0);
+                } else {
+                    assert!(matches!(
+                        result,
+                        crate::workflow::LocalAuthorityResult::DurableFactEstablished(Ok(()))
+                    ));
+                    assert_eq!(count, 1);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn live_parent_reconcile_sql_failure_is_definite_after_acknowledged_rollback() {
+        let db = Database::open_in_memory().await.unwrap();
+        reconcile_parent(&db, "parent", false).await;
+        sqlx::query(
+            "CREATE TRIGGER reject_live_parent_reconcile BEFORE INSERT ON startup_parent_actions
+            BEGIN SELECT RAISE(ABORT, 'parent action denied'); END",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        let result = db
+            .establish_live_parent_reconcile_action("parent")
+            .await
+            .established()
+            .unwrap()
+            .unwrap_err();
+        assert!(result.to_string().contains("parent action denied"));
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM startup_parent_actions")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn live_parent_reconcile_classifier_requires_exact_action_and_source() {
+        for active_turn in [false, true] {
+            let db = Database::open_in_memory().await.unwrap();
+            let source = reconcile_parent(&db, "parent", active_turn).await;
+            let foreign = reconcile_parent(&db, "foreign", true).await;
+            for mutation in [
+                "UPDATE startup_parent_actions SET action='Cancel' WHERE conversation_id='parent'",
+                "UPDATE startup_parent_actions SET transcript_generation=transcript_generation+1 WHERE conversation_id='parent'",
+                "UPDATE startup_parent_actions SET turn_id=?1, turn_generation=?2 WHERE conversation_id='parent'",
+                "DELETE FROM startup_parent_actions WHERE conversation_id='parent'",
+            ] {
+                db.establish_live_parent_reconcile_action("parent").await.established().unwrap().unwrap();
+                let query = sqlx::query(mutation);
+                if mutation.contains("?1") {
+                    let (turn, generation) = foreign.active_turn.unwrap();
+                    query.bind(turn).bind(generation).execute(db.pool()).await.unwrap();
+                } else { query.execute(db.pool()).await.unwrap(); }
+                assert!(matches!(db.classify_live_parent_reconcile_action("parent", &source).await,
+                    crate::workflow::LocalAuthorityResult::DurableFactUnclassified));
+            }
+            if active_turn {
+                db.establish_live_parent_reconcile_action("parent")
+                    .await
+                    .established()
+                    .unwrap()
+                    .unwrap();
+                sqlx::query("UPDATE startup_parent_actions SET turn_generation=turn_generation+1 WHERE conversation_id='parent'")
+                    .execute(db.pool()).await.unwrap();
+                assert!(matches!(
+                    db.classify_live_parent_reconcile_action("parent", &source)
+                        .await,
+                    crate::workflow::LocalAuthorityResult::DurableFactUnclassified
+                ));
+                db.establish_live_parent_reconcile_action("parent")
+                    .await
+                    .established()
+                    .unwrap()
+                    .unwrap();
+                sqlx::query("UPDATE startup_parent_actions SET turn_id=NULL,turn_generation=NULL WHERE conversation_id='parent'")
+                    .execute(db.pool()).await.unwrap();
+                assert!(matches!(
+                    db.classify_live_parent_reconcile_action("parent", &source)
+                        .await,
+                    crate::workflow::LocalAuthorityResult::DurableFactUnclassified
+                ));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn live_parent_reconcile_unknown_read_retains_committed_sqlite_action() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("parent-action.db");
+        let db = Database::open(path.to_str().unwrap()).await.unwrap();
+        reconcile_parent(&db, "parent", true).await;
+        assert!(matches!(
+            db.establish_live_parent_reconcile_action_with_cut(
+                "parent",
+                TerminalEvidenceTransactionCut::AfterCommitLookupUnavailable
+            )
+            .await,
+            crate::workflow::LocalAuthorityResult::DurableFactUnclassified
+        ));
+        assert!(db.pool().is_closed());
+        let reopened = Database::open(path.to_str().unwrap()).await.unwrap();
+        let record: (String, Option<i64>, Option<i64>) = sqlx::query_as(
+            "SELECT action,turn_id,turn_generation FROM startup_parent_actions WHERE conversation_id='parent'")
+            .fetch_one(reopened.pool()).await.unwrap();
+        assert_eq!(record.0, "Reconcile");
+        assert!(record.1.is_some() && record.2.is_some());
+    }
 
     fn native_spawn_state() -> ConvState {
         use phoenix_core::domain::sm_state::{

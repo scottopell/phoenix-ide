@@ -1897,6 +1897,22 @@ enum TerminalEvidenceTransactionCut {
     AfterCommitLookupUnavailable,
 }
 
+const ESTABLISH_PARENT_RECONCILE_ACTION_SQL: &str = "INSERT INTO startup_parent_actions
+         (conversation_id, action, transcript_generation,
+          turn_id, turn_generation, created_at)
+     SELECT c.id, 'Reconcile', c.transcript_generation,
+            t.turn_id, t.generation, ?2
+     FROM conversations AS c
+     LEFT JOIN durable_turns AS t ON t.conversation_id = c.id
+         AND t.owns_conversation = 1 AND t.terminal_kind IS NULL
+     WHERE c.id = ?1
+     ON CONFLICT(conversation_id) DO UPDATE SET
+         action = excluded.action,
+         transcript_generation = excluded.transcript_generation,
+         turn_id = excluded.turn_id,
+         turn_generation = excluded.turn_generation,
+         created_at = excluded.created_at";
+
 impl TerminalEvidenceTransactionCut {
     async fn commit(self, tx: sqlx::Transaction<'_, sqlx::Sqlite>) -> DbResult<()> {
         if self == Self::BeforeCommit {
@@ -13121,27 +13137,11 @@ impl Database {
     ///
     /// Returns an error when the durable action cannot be persisted.
     pub async fn establish_parent_reconcile_action(&self, conversation_id: &str) -> DbResult<()> {
-        sqlx::query(
-            "INSERT INTO startup_parent_actions
-                 (conversation_id, action, transcript_generation,
-                  turn_id, turn_generation, created_at)
-             SELECT c.id, 'Reconcile', c.transcript_generation,
-                    t.turn_id, t.generation, ?2
-             FROM conversations AS c
-             LEFT JOIN durable_turns AS t ON t.conversation_id = c.id
-                 AND t.owns_conversation = 1 AND t.terminal_kind IS NULL
-             WHERE c.id = ?1
-             ON CONFLICT(conversation_id) DO UPDATE SET
-                 action = excluded.action,
-                 transcript_generation = excluded.transcript_generation,
-                 turn_id = excluded.turn_id,
-                 turn_generation = excluded.turn_generation,
-                 created_at = excluded.created_at",
-        )
-        .bind(conversation_id)
-        .bind(Utc::now().to_rfc3339())
-        .execute(&self.pool)
-        .await?;
+        sqlx::query(ESTABLISH_PARENT_RECONCILE_ACTION_SQL)
+            .bind(conversation_id)
+            .bind(Utc::now().to_rfc3339())
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
