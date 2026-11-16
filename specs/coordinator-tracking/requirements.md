@@ -16,6 +16,8 @@ THE SYSTEM SHALL persist stable item identity, title, purpose/current note, hist
 
 THE current Coordinator SHALL have bounded list/read/record/update/retire/reopen operations through one native tool and application service. Source transcript and executing call identity SHALL come from trusted context and be revalidated transactionally. Ordinary conversations, children and predecessor Coordinator transcripts SHALL NOT mutate the list. Mutations SHALL compare expected revisions; exact trusted-call retries SHALL return retained receipts, while changed intent under the same call identity SHALL conflict. Unclassified local SQLite authority SHALL close runtime authority before ordinary publication.
 
+A new native write SHALL validate the exact current call and arguments against the durable `ToolExecuting` round, whose assistant message is not yet checkpointed. It SHALL NOT require or manufacture an earlier assistant-message row. Exact retained replay SHALL revalidate current Coordinator authority and return the saved receipt without applying again.
+
 ### REQ-TRACK-004: Evidence and reconciliation
 
 New source observations SHALL append evidence, not mutate previously reviewed observations. A derived evidence-since-review projection SHALL distinguish historical notes needing reconciliation from an explicitly reconciled resumption point. New evidence SHALL invalidate the ready-next-step projection atomically; identical evidence SHALL not manufacture review work. Explicit reconciliation SHALL compare item and evidence revision, preserving user restrictions. Reviewed is not permission. Scanner append SHALL NOT rewrite notes, advance review, retire/reopen, grant authority or lift a pause.
