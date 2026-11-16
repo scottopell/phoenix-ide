@@ -6798,8 +6798,7 @@ where
             }));
         }
 
-        let parent_worktree_path = self
-            .context
+        let parent_worktree_path = context
             .work_scope_worktree
             .as_ref()
             .map(|path| path.to_string_lossy());

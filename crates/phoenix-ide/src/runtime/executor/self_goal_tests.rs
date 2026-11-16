@@ -1,6 +1,6 @@
 use super::{
     mpsc, Arc, BrowserSessionManager, ContentBlock, ConvContext, ConvState, ConversationRuntime,
-    Effect, Event, MessageContent, ModelRegistry, Path, SseBroadcaster, ToolRoundResult, Utc,
+    Event, MessageContent, ModelRegistry, Path, SseBroadcaster, ToolRoundResult, Utc,
 };
 use crate::runtime::testing::{MockLlmClient, MockToolExecutor};
 use crate::runtime::traits::{ActiveDirectTurn, DatabaseStorage};

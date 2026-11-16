@@ -2308,6 +2308,26 @@ impl MessageStore for InMemoryStorage {
         Err(format!("Message not found: {message_id}"))
     }
 
+    async fn get_work_scope_legacy_conversation_id(
+        &self,
+        _scope: &phoenix_core::work_scope::WorkScopeId,
+    ) -> Result<Option<String>, String> {
+        self.tool_scope_read_gate.wait().await?;
+        Ok(None)
+    }
+
+    async fn prepare_self_goal_tool(
+        &self,
+        _transcript: &str,
+        _turn: &crate::runtime::traits::ActiveDirectTurn,
+        _message_id: &str,
+        _tool_use_id: &str,
+        _operation: phoenix_core::domain::conversation_goal::SelfGoalOperation,
+    ) -> Result<phoenix_core::domain::conversation_goal::PendingSelfGoal, String> {
+        self.self_goal_read_gate.wait().await?;
+        Err("self-goal tools require durable runtime storage".into())
+    }
+
     async fn persist_fork_proposal_with_tool_round(
         &self,
         origin_conv_id: &str,
@@ -2788,26 +2808,6 @@ impl StateStore for InMemoryStorage {
         self.seed_tool_admission_policy(conversation_id, policy.clone());
         Ok(policy)
     }
-    async fn get_work_scope_legacy_conversation_id(
-        &self,
-        _scope: &phoenix_core::work_scope::WorkScopeId,
-    ) -> Result<Option<String>, String> {
-        self.tool_scope_read_gate.wait().await?;
-        Ok(None)
-    }
-
-    async fn prepare_self_goal_tool(
-        &self,
-        _transcript: &str,
-        _turn: &crate::runtime::traits::ActiveDirectTurn,
-        _message_id: &str,
-        _tool_use_id: &str,
-        _operation: phoenix_core::domain::conversation_goal::SelfGoalOperation,
-    ) -> Result<phoenix_core::domain::conversation_goal::PendingSelfGoal, String> {
-        self.self_goal_read_gate.wait().await?;
-        Err("self-goal tools require durable runtime storage".into())
-    }
-
     async fn load_tool_admission_policy(
         &self,
         conversation_id: &str,
