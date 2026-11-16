@@ -943,10 +943,8 @@ export function StateBar({
   const identity = conversation ? getConversationIdentity(conversation) : null;
   const mode = identity?.mode.key ?? conversation?.conv_mode_label?.toLowerCase() ?? 'unknown';
   const isWork = mode === "work";
-  const isExplore = mode === "explore";
   const isBranchMode = mode === "branch";
   const modeLabel = identity?.mode.label ?? null;
-  const modeSuffix = isExplore ? " (read-only)" : "";
   const modeClass = `statebar-mode statebar-mode--${mode}`;
   const modelAbbrev = identity
     ? abbreviateModel(identity.modelLabel ?? "")
@@ -1137,8 +1135,8 @@ export function StateBar({
 
   const cwdSummary = identity?.path.summary ?? '—';
   const displayedPath = identity?.path.full ?? null;
-  const modeHelp = identity?.mode.title ?? 'Full access';
-  const modeDetail = identity?.mode.detail ?? 'Full access';
+  const modeHelp = identity?.mode.title ?? 'Effective access is unavailable';
+  const modeDetail = identity?.mode.detail ?? 'Access unavailable';
 
   const selectorHasContent = Boolean(
     prStatusHandle
@@ -1490,7 +1488,6 @@ export function StateBar({
                     <span className="statebar-mobile-label">Mode</span>
                     <span className={modeClass} title={modeHelp}>
                       {modeLabel}
-                      {modeSuffix}
                     </span>
                     <span className="statebar-mobile-help">{modeDetail}</span>
                   </div>
@@ -1624,7 +1621,6 @@ export function StateBar({
                     title={modeHelp}
                   >
                     {modeLabel}
-                    {modeSuffix}
                   </span>
                 )}
                 <span className="statebar-desktop-heading" title={displayName ?? identity?.title ?? conversation.slug}>
