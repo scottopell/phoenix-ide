@@ -12587,8 +12587,7 @@ impl Database {
                     ..
                 }
             ) {
-                self.update_conversation_state_at(&id, &ConvState::Idle, now)
-                    .await?;
+                self.update_startup_recovered_state(&id, &ConvState::Idle, now).await?;
             }
         }
 
@@ -12603,6 +12602,34 @@ impl Database {
         self.reset_restartable_conversations(&idle_state, now)
             .await?;
 
+        Ok(())
+    }
+
+    async fn update_startup_recovered_state(
+        &self,
+        id: &str,
+        state: &ConvState,
+        now: DateTime<Utc>,
+    ) -> DbResult<()> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let previous_kind: String = sqlx::query_scalar("SELECT state_kind FROM conversations WHERE id = ?1")
+            .bind(id).fetch_one(&mut *tx).await?;
+        coordinator_watches::record_wait_entry_tx(&mut tx, id, state).await?;
+        native_close::recover_native_retry_sources_tx(&mut tx, id, state).await?;
+        sqlx::query(
+            "UPDATE conversations SET state = ?1, state_kind = ?2,
+             state_updated_at = ?3, updated_at = ?3 WHERE id = ?4",
+        )
+        .bind(serde_json::to_string(state).map_err(|error| DbError::Serialization(error.to_string()))?)
+        .bind(conv_state_kind(state))
+        .bind(now.to_rfc3339())
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+        if previous_kind != conv_state_kind(state) {
+            record_initial_execution_outcome_tx(&mut tx, id, state).await?;
+        }
+        tx.commit().await?;
         Ok(())
     }
 
@@ -12680,7 +12707,7 @@ impl Database {
         .fetch_all(&mut *tx)
         .await?;
         for id in &reset_ids {
-            native_close::fence_native_retry_sources_tx(&mut tx, id, &ConvState::Idle).await?;
+            native_close::recover_native_retry_sources_tx(&mut tx, id, &ConvState::Idle).await?;
         }
         let now = now.to_rfc3339();
         for ids in reset_ids.chunks(500) {
@@ -12955,7 +12982,7 @@ impl Database {
                     .execute(&mut *tx)
                     .await?;
                     if updated.rows_affected() == 1 {
-                        native_close::fence_native_retry_sources_tx(
+                        native_close::recover_native_retry_sources_tx(
                             &mut tx,
                             &agent.agent_id,
                             &interrupted,
@@ -13123,7 +13150,7 @@ impl Database {
                 "parent {conversation_id} changed during recovered fan-in"
             )));
         }
-        native_close::fence_native_retry_sources_tx(&mut tx, conversation_id, destination).await?;
+        native_close::recover_native_retry_sources_tx(&mut tx, conversation_id, destination).await?;
         for result in results {
             use phoenix_core::domain::sm_state::SubAgentOutcome;
             let cause = match &result.outcome {
@@ -13430,7 +13457,7 @@ impl Database {
                             error: "Sub-agent interrupted by server restart".to_string(),
                             error_kind: phoenix_core::domain::db_schema::ErrorKind::SubAgentError,
                         };
-                        self.update_conversation_state(&agent.agent_id, &interrupted)
+                        self.update_startup_recovered_state(&agent.agent_id, &interrupted, now)
                             .await?;
                         phoenix_core::domain::sm_state::SubAgentOutcome::Failure {
                             error: "Sub-agent interrupted by server restart".to_string(),
@@ -13540,7 +13567,7 @@ impl Database {
             .execute(&mut *tx)
             .await?;
             if updated.rows_affected() == 1 {
-                native_close::fence_native_retry_sources_tx(
+                native_close::recover_native_retry_sources_tx(
                     &mut tx,
                     conversation_id,
                     &ConvState::Idle,

@@ -5949,6 +5949,10 @@ impl Database {
             tx.commit().await?;
             return Ok(obligation);
         }
+        if let Some(interrupted) = crate::native_close::interrupt_native_retry_tx(&mut tx, run).await? {
+            tx.commit().await?;
+            return Ok(interrupted);
+        }
         let completion_only_running: bool = if run.ordinal == CloseRunOrdinal::INITIAL {
             false
         } else {
@@ -6826,7 +6830,7 @@ impl Database {
         tx: &mut Transaction<'_, Sqlite>,
         fence: crate::native_close::NativeRetrySourceFence,
     ) -> DbResult<CloseObligation> {
-        let run = fence.into_run();
+        let (run, authority, detail) = fence.into_parts();
         let run = &run;
         let native: bool = sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM native_close_retry_plans plan
@@ -6850,14 +6854,14 @@ impl Database {
             failure_occurrence_id: run.failure_occurrence_id(),
             attempt_id: run.attempt_id.clone(),
             source_product_conversation_id: obligation.product_conversation_id().clone(),
-            authority: CloseCleanupFailureAuthority::ExplicitlySuppressed,
+            authority,
             remaining_resources: progress.pending.into_iter().map(|effect| CloseCleanupFailureResource {
                 scope: effect.scope,
                 resource: effect.resource,
                 disposition: CloseCleanupResourceDisposition::Unattempted,
             }).collect(),
             reason: RetirementFailureReason::Interrupted,
-            detail: "source_fenced: exact native retry source stopped or replaced".into(),
+            detail: detail.into(),
             stop_certainty: CloseStopCertainty::ShutdownUncertain,
             occurred_at_us: Utc::now().timestamp_micros(),
         };
@@ -6865,7 +6869,7 @@ impl Database {
             "INSERT INTO close_cleanup_failures
              (failure_occurrence_id, attempt_id, cleanup_run_ordinal, source_product_conversation_id,
               authority_kind, reason, detail, stop_certainty, occurred_at_us)
-             VALUES (?1, ?2, ?3, ?4, 'explicitly_suppressed', 'interrupted', ?5, 'shutdown_uncertain', ?6)",
+             VALUES (?1, ?2, ?3, ?4, ?7, 'interrupted', ?5, 'shutdown_uncertain', ?6)",
         )
         .bind(&request.failure_occurrence_id)
         .bind(run.attempt_id.as_str())
@@ -6873,6 +6877,7 @@ impl Database {
         .bind(request.source_product_conversation_id.as_str())
         .bind(&request.detail)
         .bind(request.occurred_at_us)
+        .bind(request.authority.as_str())
         .execute(&mut **tx)
         .await?;
         for (ordinal, resource) in request.remaining_resources.iter().enumerate() {
@@ -6893,13 +6898,15 @@ impl Database {
             .await?;
         }
         let obligation = Self::finish_close_failure_tx(tx, run, &request, obligation).await?;
-        sqlx::query(
-            "UPDATE close_completion_retry_allowances SET suppressed = 1
-             WHERE attempt_id = ?1 AND suppressed = 0",
-        )
-        .bind(run.attempt_id.as_str())
-        .execute(&mut **tx)
-        .await?;
+        if request.authority == CloseCleanupFailureAuthority::ExplicitlySuppressed {
+            sqlx::query(
+                "UPDATE close_completion_retry_allowances SET suppressed = 1
+                 WHERE attempt_id = ?1 AND suppressed = 0",
+            )
+            .bind(run.attempt_id.as_str())
+            .execute(&mut **tx)
+            .await?;
+        }
         Ok(obligation)
     }
 

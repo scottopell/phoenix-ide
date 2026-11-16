@@ -27,13 +27,13 @@ pub(super) async fn run(pool: &SqlitePool, migration: &Migration) -> DbResult<()
             (
                 "close_cleanup_failures_require_initial_authority",
                 "WHEN NOT EXISTS (",
-                "WHEN NEW.authority_kind <> 'explicitly_suppressed' AND NOT EXISTS (",
+                "WHEN NOT (NEW.authority_kind = 'explicitly_suppressed' OR (NEW.authority_kind = 'attempt_interrupted' AND EXISTS (SELECT 1 FROM native_close_retry_plans plan WHERE plan.attempt_id = NEW.attempt_id AND plan.run_ordinal = NEW.cleanup_run_ordinal))) AND NOT EXISTS (",
                 1,
             ),
             (
                 "close_cleanup_failure_resources_require_authority",
                 "WHEN NOT EXISTS (",
-                "WHEN NOT EXISTS (SELECT 1 FROM close_cleanup_failures WHERE failure_occurrence_id = NEW.failure_occurrence_id AND authority_kind = 'explicitly_suppressed') AND NOT EXISTS (",
+                "WHEN NOT EXISTS (SELECT 1 FROM close_cleanup_failures failure WHERE failure.failure_occurrence_id = NEW.failure_occurrence_id AND (failure.authority_kind = 'explicitly_suppressed' OR (failure.authority_kind = 'attempt_interrupted' AND EXISTS (SELECT 1 FROM native_close_retry_plans plan WHERE plan.attempt_id = failure.attempt_id AND plan.run_ordinal = failure.cleanup_run_ordinal)))) AND NOT EXISTS (",
                 1,
             ),
         ] {

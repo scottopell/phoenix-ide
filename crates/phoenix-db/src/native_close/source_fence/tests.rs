@@ -46,6 +46,17 @@ async fn assert_source_fenced(
     run: &CloseRunRef,
     pending: &[CloseSafeRetryEffect],
 ) {
+    assert_native_retry_stopped(db, assessment, run, pending,
+        CloseCleanupFailureAuthority::ExplicitlySuppressed).await;
+}
+
+async fn assert_native_retry_stopped(
+    db: &Database,
+    assessment: &Assessment,
+    run: &CloseRunRef,
+    pending: &[CloseSafeRetryEffect],
+    authority: CloseCleanupFailureAuthority,
+) {
     assert_eq!(db.get_close_run(run).await.unwrap().status, CloseRunStatus::Stopped);
     let failures = db.list_close_cleanup_failures(run.attempt_id.as_str()).await.unwrap();
     let matching: Vec<_> = failures.iter().filter(|failure| failure.run_ordinal == run.ordinal).collect();
@@ -54,7 +65,7 @@ async fn assert_source_fenced(
     assert_eq!(failure.failure_occurrence_id, run.failure_occurrence_id());
     assert_eq!(failure.attempt_id, run.attempt_id);
     assert_eq!(&failure.source_product_conversation_id, assessment.command.intent().target());
-    assert_eq!(failure.authority, CloseCleanupFailureAuthority::ExplicitlySuppressed);
+    assert_eq!(failure.authority, authority);
     assert_eq!(failure.reason, RetirementFailureReason::Interrupted);
     assert_eq!(failure.stop_certainty, CloseStopCertainty::ShutdownUncertain);
     assert_eq!(failure.stop_certainty.confirmed_at_us(), None);
@@ -417,5 +428,114 @@ async fn rejected_source_state_write_rolls_back_native_fence() {
         assert_eq!(source_fence_allowance(&db, &run).await, Some((0, 0)));
         assert!(!db.pending_coordinator_watch_events(100).await.unwrap().iter()
             .any(|event| event.event_id == run.failure_occurrence_id()));
+    }
+}
+
+async fn set_startup_allowance_bits(db: &Database, run: &CloseRunRef, consumed: i64, suppressed: i64) {
+    sqlx::query(
+        "UPDATE close_completion_retry_allowances SET consumed = ?2, suppressed = ?3 WHERE attempt_id = ?1",
+    )
+    .bind(run.attempt_id.as_str()).bind(consumed).bind(suppressed)
+    .execute(db.pool()).await.unwrap();
+}
+
+#[tokio::test]
+async fn startup_and_observer_interrupt_native_retry_from_original_pending_plan_preserving_allowance() {
+    for observer_only in [false, true] {
+        for consumed in [0_i64, 1_i64] {
+            for suppressed in [0_i64, 1_i64] {
+                let (db, assessment, run) = source_fence_fixture().await;
+                let before = db.close_safe_retry_progress(&run).await.unwrap();
+                assert!(before.pending.len() >= 2);
+                db.record_close_safe_retry_success(&run, &before.pending[0], "retired before interruption")
+                    .await.unwrap();
+                let pending = db.close_safe_retry_progress(&run).await.unwrap().pending;
+                set_startup_allowance_bits(&db, &run, consumed, suppressed).await;
+                let original = db.get_close_obligation(run.attempt_id.as_str()).await.unwrap();
+                if observer_only {
+                    db.classify_interrupted_close_run(&run).await.unwrap();
+                } else {
+                    db.reset_all_to_idle().await.unwrap();
+                    assert_eq!(db.get_conversation(assessment.command.source_transcript_id())
+                        .await.unwrap().state, ConvState::Idle);
+                }
+                assert_native_retry_stopped(&db, &assessment, &run, &pending,
+                    CloseCleanupFailureAuthority::AttemptInterrupted).await;
+                assert_eq!(source_fence_allowance(&db, &run).await, Some((consumed, suppressed)));
+                assert_eq!(db.get_close_obligation(run.attempt_id.as_str()).await.unwrap(), original);
+                db.record_close_safe_retry_success(&run, &before.pending[0], "retired before interruption")
+                    .await.unwrap();
+                let failures = db.list_close_cleanup_failures(run.attempt_id.as_str()).await.unwrap();
+                db.classify_interrupted_close_run(&run).await.unwrap();
+                db.reset_all_to_idle().await.unwrap();
+                assert_eq!(db.list_close_cleanup_failures(run.attempt_id.as_str()).await.unwrap(), failures);
+                assert_native_retry_stopped(&db, &assessment, &run, &pending,
+                    CloseCleanupFailureAuthority::AttemptInterrupted).await;
+                assert_eq!(source_fence_allowance(&db, &run).await, Some((consumed, suppressed)));
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn startup_preserves_initial_and_stopped_native_receipts_and_both_allowance_bits() {
+    for stopped in [false, true] {
+        for consumed in [0_i64, 1_i64] {
+            for suppressed in [0_i64, 1_i64] {
+                let db = Database::open_in_memory().await.unwrap();
+                create_root(&db, "root").await;
+                let command = retry_command(&db, "startup-initial", NativeCloseIntent::Initial {
+                    target: product_id("root"),
+                }).await;
+                let LocalAuthorityResult::DurableFactEstablished(Ok(
+                    crate::native_close::NativeCloseInitialResult::NewlyAdmitted(receipt),
+                )) = db.apply_native_close_initial(&command).await else {
+                    panic!("expected initial native admission");
+                };
+                let run = CloseRunRef::initial(receipt.admitted.attempt_id);
+                if stopped {
+                    db.classify_interrupted_close_run(&run).await.unwrap();
+                }
+                set_startup_allowance_bits(&db, &run, consumed, suppressed).await;
+                let retained_run = db.get_close_run(&run).await.unwrap();
+                let obligation = db.get_close_obligation(run.attempt_id.as_str()).await.unwrap();
+                let failures = db.list_close_cleanup_failures(run.attempt_id.as_str()).await.unwrap();
+                let events = db.pending_coordinator_watch_events(100).await.unwrap();
+                for _ in 0..2 {
+                    db.reset_all_to_idle().await.unwrap();
+                    assert_eq!(source_fence_allowance(&db, &run).await, Some((consumed, suppressed)));
+                    assert_eq!(db.get_close_run(&run).await.unwrap(), retained_run);
+                    assert_eq!(db.get_close_obligation(run.attempt_id.as_str()).await.unwrap(), obligation);
+                    assert_eq!(db.list_close_cleanup_failures(run.attempt_id.as_str()).await.unwrap(), failures);
+                    assert_eq!(db.pending_coordinator_watch_events(100).await.unwrap().len(), events.len());
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn startup_leaves_completed_native_retry_and_allowance_untouched() {
+    for consumed in [0_i64, 1_i64] {
+        for suppressed in [0_i64, 1_i64] {
+            let (db, assessment, run) = source_fence_fixture().await;
+            for effect in db.close_safe_retry_progress(&run).await.unwrap().pending {
+                db.record_close_safe_retry_success(&run, &effect, "retired before completion")
+                    .await.unwrap();
+            }
+            let completed = db.complete_close_safe_retry(&run).await.unwrap();
+            set_startup_allowance_bits(&db, &run, consumed, suppressed).await;
+            let retained_run = db.get_close_run(&run).await.unwrap();
+            let failures = db.list_close_cleanup_failures(run.attempt_id.as_str()).await.unwrap();
+            let events = db.pending_coordinator_watch_events(100).await.unwrap();
+            db.reset_all_to_idle().await.unwrap();
+            assert_eq!(db.get_conversation(assessment.command.source_transcript_id())
+                .await.unwrap().state, ConvState::Idle);
+            assert_eq!(db.get_close_run(&run).await.unwrap(), retained_run);
+            assert_eq!(db.get_close_obligation(run.attempt_id.as_str()).await.unwrap(), completed);
+            assert_eq!(db.list_close_cleanup_failures(run.attempt_id.as_str()).await.unwrap(), failures);
+            assert_eq!(db.pending_coordinator_watch_events(100).await.unwrap().len(), events.len());
+            assert_eq!(source_fence_allowance(&db, &run).await, Some((consumed, suppressed)));
+        }
     }
 }
