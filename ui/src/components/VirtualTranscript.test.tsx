@@ -4,7 +4,7 @@ import type { HistoryScrollCommand } from '../conversation/historyExpansion';
 
 import { act, fireEvent, render, screen } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { GESTURE_STALE_MS, VirtualTranscript, type VirtualTranscriptHandle, type VirtualTranscriptPhysicalSnapshot } from './VirtualTranscript';
+import { GESTURE_STALE_MS, SCROLL_SETTLE_MS, VirtualTranscript, type VirtualTranscriptHandle, type VirtualTranscriptPhysicalSnapshot } from './VirtualTranscript';
 
 interface TestItem {
   id: string;
@@ -127,6 +127,211 @@ beforeEach(() => {
 });
 
 describe('VirtualTranscript', () => {
+  it.each(['baseline', 'unchanged-policy', 'policy-transition'] as const)('holds a settled paragraph through image growth (%s)', mode => {
+    vi.useFakeTimers();
+    const originalRect = HTMLElement.prototype.getBoundingClientRect;
+    try {
+      const ref = { current: null as VirtualTranscriptHandle | null };
+      let scroller: HTMLDivElement | null = null;
+      render(<VirtualTranscript ariaLabel="Transcript" ref={ref}
+        items={[{ id: 'before', label: 'before', height: 200 }, { id: 'reading', label: 'reading', height: 1000 }, ...makeItems(15, 20)]}
+        getKey={item => item.id} estimatedExtent={item => item.height} initialTail={false}
+        overscan={1000} scrollerRef={element => { scroller = element; }}
+        renderItem={item => item.id === 'reading'
+          ? <div data-testid="reading-payload" data-height="1000"><p data-testid="setup-paragraph">Setup above the viewport</p><p data-testid="image-paragraph"><img alt="delayed" /></p><p data-testid="reading-paragraph" data-height="30">Reading here</p></div>
+          : renderRow(item)} />);
+      const viewport = scroller!;
+      const writes: number[] = [];
+      let actualTop = viewport.scrollTop;
+      Object.defineProperty(viewport, 'scrollTop', {
+        configurable: true,
+        get: () => actualTop,
+        set: (value: number) => { writes.push(value); actualTop = value; },
+      });
+      const earlier = document.querySelector<HTMLElement>('[data-virtual-key="before"]')!;
+      const row = document.querySelector<HTMLElement>('[data-virtual-key="reading"]')!;
+      const paragraph = screen.getByTestId('reading-paragraph');
+      const setup = screen.getByTestId('setup-paragraph');
+      const image = screen.getByTestId('image-paragraph');
+      const payload = screen.getByTestId('reading-payload');
+      let imageHeight = 460;
+      let earlierHeight = 200;
+      HTMLElement.prototype.getBoundingClientRect = function () {
+        if (this === viewport || this === earlier || this === row || this === paragraph || this === setup || this === image) {
+          const top = this === viewport ? 0 : this === earlier ? -viewport.scrollTop
+            : this === row ? earlierHeight - viewport.scrollTop
+              : this === setup ? earlierHeight + 385 - viewport.scrollTop
+                : this === image ? earlierHeight + 415 - viewport.scrollTop
+                  : earlierHeight + imageHeight - viewport.scrollTop;
+          const height = this === viewport ? 100 : this === earlier ? earlierHeight
+            : this === paragraph ? 30 : this === setup ? 30 : this === image ? imageHeight - 415
+              : Number(payload.getAttribute('data-height'));
+          return { top, bottom: top + height, left: 0, right: 320, width: 320, height, x: 0, y: top, toJSON: () => ({}) } as DOMRect;
+        }
+        return originalRect.call(this);
+      };
+      // The hit lands in the row gutter, not on the paragraph. The first text
+      // block is clipped; the next block is image-only.
+      Object.defineProperty(document, 'elementFromPoint', { configurable: true, value: () => row });
+      act(() => {
+        viewport.scrollTop = 600;
+        fireEvent.scroll(viewport);
+        ref.current?.setTailFollowAllowed(false);
+      });
+      act(() => vi.advanceTimersByTime(SCROLL_SETTLE_MS + 2));
+      expect(setup.getBoundingClientRect().top).toBe(-15);
+      expect(image.getBoundingClientRect().top).toBe(15);
+      expect(paragraph.getBoundingClientRect().top).toBe(60);
+      imageHeight += 75;
+      payload.setAttribute('data-height', '1075');
+      act(() => resizeObservers[0]!.triggerEntries([[row, 1075]]));
+      expect(viewport.scrollTop).toBe(675);
+      expect(paragraph.getBoundingClientRect().top).toBe(60);
+      if (mode === 'unchanged-policy') act(() => ref.current?.setTailFollowAllowed(false));
+      act(() => vi.advanceTimersByTime(50));
+      earlierHeight += 20;
+      screen.getByTestId('payload-before').setAttribute('data-height', '220');
+      act(() => resizeObservers[0]!.triggerEntries([[earlier, 220]]));
+      expect(viewport.scrollTop).toBe(695);
+      expect(paragraph.getBoundingClientRect().top).toBe(60);
+      earlierHeight += 10;
+      imageHeight += 10;
+      screen.getByTestId('payload-before').setAttribute('data-height', '230');
+      payload.setAttribute('data-height', '1085');
+      writes.length = 0;
+      act(() => resizeObservers[0]!.triggerEntries([[earlier, 230], [row, 1085]]));
+      expect(writes).toEqual([715]);
+      expect(viewport.scrollTop).toBe(715);
+      expect(paragraph.getBoundingClientRect().top).toBe(60);
+      if (mode === 'unchanged-policy') act(() => ref.current?.setTailFollowAllowed(false));
+      act(() => vi.advanceTimersByTime(50));
+      imageHeight += 10;
+      payload.setAttribute('data-height', '1095');
+      act(() => resizeObservers[0]!.triggerEntries([[row, 1095]]));
+      expect(viewport.scrollTop).toBe(725);
+      const below = document.querySelector<HTMLElement>('[data-virtual-key="item-0"]')!;
+      screen.getByTestId('payload-item-0').setAttribute('data-height', '30');
+      act(() => resizeObservers[0]!.triggerEntries([[below, 30]]));
+      expect(viewport.scrollTop).toBe(725);
+      if (mode === 'policy-transition') {
+        act(() => {
+          ref.current?.setTailFollowAllowed(true);
+          ref.current?.setTailFollowAllowed(false);
+        });
+      } else {
+        fireEvent.wheel(viewport);
+      }
+      imageHeight += 30;
+      payload.setAttribute('data-height', '1125');
+      act(() => resizeObservers[0]!.triggerEntries([[row, 1125]]));
+      expect(viewport.scrollTop).toBe(725);
+      act(() => vi.advanceTimersByTime(SCROLL_SETTLE_MS + 2));
+      imageHeight += 10;
+      payload.setAttribute('data-height', '1135');
+      act(() => resizeObservers[0]!.triggerEntries([[row, 1135]]));
+      expect(viewport.scrollTop).toBe(735);
+      act(() => ref.current?.scrollToIndex(1, 'start'));
+      expect(viewport.scrollTop).toBe(230);
+      imageHeight += 20;
+      payload.setAttribute('data-height', '1155');
+      act(() => resizeObservers[0]!.triggerEntries([[row, 1155]]));
+      expect(viewport.scrollTop).toBe(230);
+      act(() => { viewport.scrollTop = 755; fireEvent.scroll(viewport); });
+      act(() => vi.advanceTimersByTime(SCROLL_SETTLE_MS + 2));
+      paragraph.remove();
+      imageHeight += 25;
+      payload.setAttribute('data-height', '1180');
+      act(() => resizeObservers[0]!.triggerEntries([[row, 1180]]));
+      expect(viewport.scrollTop).toBe(755);
+      act(() => {
+        ref.current?.setTailFollowAllowed(true);
+        ref.current?.scrollToTail();
+      });
+      imageHeight += 40;
+      payload.setAttribute('data-height', '1220');
+      const tailTop = viewport.scrollTop;
+      act(() => resizeObservers[0]!.triggerEntries([[row, 1220]]));
+      expect(viewport.scrollTop).toBe(tailTop + 40);
+    } finally {
+      HTMLElement.prototype.getBoundingClientRect = originalRect;
+      Reflect.deleteProperty(document, 'elementFromPoint');
+      vi.useRealTimers();
+    }
+  });
+
+  it('reacquires a replaced paragraph before its next load and after a lost touch lift', () => {
+    vi.useFakeTimers();
+    const originalRect = HTMLElement.prototype.getBoundingClientRect;
+    try {
+      const ref = { current: null as VirtualTranscriptHandle | null };
+      const items = [{ id: 'before', label: 'before', height: 200 }, { id: 'reading', label: 'reading', height: 1000 }, ...makeItems(20, 20)];
+      let paragraphKey = 'first';
+      let imageHeight = 420;
+      const transcript = () => <VirtualTranscript ariaLabel="Transcript" ref={ref}
+        items={items} getKey={item => item.id} estimatedExtent={item => item.height}
+        initialTail={false} overscan={1000} renderItem={item => item.id === 'reading'
+          ? <div data-testid="replacement-payload" data-height="1000"><p key={paragraphKey} data-testid="replacement-paragraph">Reading here</p></div>
+          : renderRow(item)} />;
+      const { rerender } = render(transcript());
+      const viewport = screen.getByRole('region', { name: 'Transcript' }) as HTMLDivElement;
+      const row = document.querySelector<HTMLElement>('[data-virtual-key="reading"]')!;
+      const payload = screen.getByTestId('replacement-payload');
+      HTMLElement.prototype.getBoundingClientRect = function () {
+        if (this === viewport || this === row || this.matches('[data-testid="replacement-paragraph"]')) {
+          const top = this === viewport ? 0 : this === row ? 200 - viewport.scrollTop : 200 + imageHeight - viewport.scrollTop;
+          const height = this === viewport ? 100 : this === row ? 1000 : 30;
+          return { top, bottom: top + height, left: 0, right: 320, width: 320, height, x: 0, y: top, toJSON: () => ({}) } as DOMRect;
+        }
+        return originalRect.call(this);
+      };
+      Object.defineProperty(document, 'elementFromPoint', { configurable: true, value: () => row });
+      act(() => { viewport.scrollTop = 600; fireEvent.scroll(viewport); });
+      act(() => vi.advanceTimersByTime(SCROLL_SETTLE_MS + 2));
+      const previous = screen.getByTestId('replacement-paragraph');
+      paragraphKey = 'second';
+      rerender(transcript());
+      expect(previous.isConnected).toBe(false);
+      const replacement = screen.getByTestId('replacement-paragraph');
+      expect(replacement.getBoundingClientRect().top).toBe(20);
+      imageHeight += 20;
+      payload.setAttribute('data-height', '1020');
+      act(() => resizeObservers[0]!.triggerEntries([[row, 1020]]));
+      expect(viewport.scrollTop).toBe(620);
+      expect(replacement.getBoundingClientRect().top).toBe(20);
+
+      fireEvent.touchStart(row, { touches: [{ identifier: 9 }], changedTouches: [{ identifier: 9 }] });
+      act(() => vi.advanceTimersByTime(SCROLL_SETTLE_MS + 2));
+      imageHeight += 10;
+      payload.setAttribute('data-height', '1030');
+      act(() => resizeObservers[0]!.triggerEntries([[row, 1030]]));
+      expect(viewport.scrollTop).toBe(620);
+      // The detached finger's end is never delivered, but the existing stale
+      // gesture bound lets a new witness be acquired without another event.
+      act(() => vi.advanceTimersByTime(GESTURE_STALE_MS));
+      imageHeight += 10;
+      payload.setAttribute('data-height', '1040');
+      act(() => resizeObservers[0]!.triggerEntries([[row, 1040]]));
+      expect(viewport.scrollTop).toBe(630);
+      expect(replacement.getBoundingClientRect().top).toBe(30);
+      act(() => ref.current?.scrollToIndex(1, 'start', -430, '.target-arriving', 'continuity'));
+      expect(viewport.scrollTop).toBe(630);
+      imageHeight += 10;
+      payload.setAttribute('data-height', '1050');
+      act(() => resizeObservers[0]!.triggerEntries([[row, 1050]]));
+      expect(viewport.scrollTop).toBe(630); // pending target owns the viewport
+      act(() => ref.current?.scrollToIndex(1, 'start'));
+      expect(viewport.scrollTop).toBe(200);
+      imageHeight += 10;
+      payload.setAttribute('data-height', '1060');
+      act(() => resizeObservers[0]!.triggerEntries([[row, 1060]]));
+      expect(viewport.scrollTop).toBe(200);
+    } finally {
+      HTMLElement.prototype.getBoundingClientRect = originalRect;
+      Reflect.deleteProperty(document, 'elementFromPoint');
+      vi.useRealTimers();
+    }
+  });
+
   it('commits active-gesture spacer compensation before the resize callback returns', () => {
     vi.useFakeTimers();
     try {

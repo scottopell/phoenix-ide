@@ -44,6 +44,8 @@ export interface VirtualTranscriptAnchor {
 
 type PhysicalAnchor = VirtualTranscriptAnchor & { intent: 'directional_start' | 'continuity' };
 
+type ContentWitness = { key: string; row: HTMLElement; element: HTMLElement; viewportOffset: number };
+
 export type VirtualTranscriptTarget = string | ((row: HTMLElement) => Range | null);
 
 function resolveTarget(row: HTMLElement | undefined, target: VirtualTranscriptTarget | undefined): Element | Range | null {
@@ -134,6 +136,9 @@ interface PhysicalStore<T> {
   overscan: number;
   revealPublicationPending: boolean;
   activeAnchor: PhysicalAnchor | null;
+  contentWitness: ContentWitness | null;
+  witnessBlockedUntilMs: number;
+  witnessPointerDown: boolean;
   scroller: HTMLDivElement | null;
   headerElement: HTMLDivElement | null;
   rowElements: Map<string, HTMLDivElement>;
@@ -191,6 +196,8 @@ interface StorePublisher<T> {
 
 const DEFAULT_ESTIMATED_EXTENT = 1;
 const PINNED_EPSILON = 1;
+const WITNESS_CANDIDATE_LIMIT = 128;
+const WITNESS_BLOCK = 'p, pre, li, blockquote, h1, h2, h3, h4, h5, h6';
 export const SCROLL_SETTLE_MS = 150;
 /** Bound on how long a touch alone may defer reconciliation (REQ-VT-004). */
 export const GESTURE_STALE_MS = 2000;
@@ -435,6 +442,7 @@ function setScrollerScrollTop<T>(store: PhysicalStore<T>, nextTop: number): bool
 
 function retirePosition<T>(current: PhysicalStore<T>): void {
   current.positionOwner = { kind: 'unowned' };
+  current.contentWitness = null;
   current.pendingTarget = null;
   current.pendingScrollTop = null;
   current.pendingProgrammaticTop = null;
@@ -488,6 +496,7 @@ function positionAtIndex<T>(
   const unit = current.layout.itemAt(index);
   if (!unit) return;
   current.positionOwner = owner;
+  current.contentWitness = null;
   const row = current.rowElements.get(unit.key);
   const targetElement = resolveTarget(row, targetSelector);
   const intraRowOffset = targetElement && row
@@ -544,17 +553,70 @@ function captureTopAnchor<T>(store: PhysicalStore<T>): PhysicalAnchor | null {
   };
 }
 
+function witnessEligible<T>(store: PhysicalStore<T>): boolean {
+  return !!store.scroller && !isLayoutHidden(store.scroller) && !store.initialTailPending
+    && !tailFollows(store) && !scrollIsActive(store)
+    && !store.witnessPointerDown && Date.now() >= store.witnessBlockedUntilMs
+    && store.positionOwner.kind === 'unowned' && store.positioningAuthority.kind === 'absent'
+    && store.activeAnchor?.intent !== 'directional_start' && store.pendingTarget === null && store.pendingScrollTop === null;
+}
+
+function witnessLocalOffset<T>(store: PhysicalStore<T>, witness: ContentWitness): number | null {
+  if (!witness.element.isConnected || store.rowElements.get(witness.key) !== witness.row
+    || !witness.row.contains(witness.element) || store.layout.offsetForKey(witness.key) === undefined) return null;
+  return witness.element.getBoundingClientRect().top - witness.row.getBoundingClientRect().top;
+}
+
+function acquireContentWitness<T>(store: PhysicalStore<T>): void {
+  if (store.contentWitness && witnessLocalOffset(store, store.contentWitness) === null) store.contentWitness = null;
+  if (store.contentWitness || !witnessEligible(store)) return;
+  const anchor = captureTopAnchor(store);
+  const scroller = store.scroller;
+  const row = anchor && store.rowElements.get(anchor.key);
+  if (!anchor || !scroller || !row) return;
+  const rect = scroller.getBoundingClientRect();
+  const viewportTop = rect.top;
+  const viewportBottom = viewportTop + store.viewportExtent;
+  const hit = typeof document.elementFromPoint === 'function'
+    ? document.elementFromPoint(rect.left + Math.min(rect.width / 2, 24), viewportTop + Math.min(store.viewportExtent / 2, 16))
+    : null;
+  const start = hit && row.contains(hit) ? hit : row;
+  const block = start instanceof HTMLElement ? start.closest<HTMLElement>(WITNESS_BLOCK) : null;
+  const walker = document.createTreeWalker(row, NodeFilter.SHOW_ELEMENT);
+  walker.currentNode = block && row.contains(block) ? block : start;
+  for (let visited = 0; visited < WITNESS_CANDIDATE_LIMIT; visited++) {
+    const element = walker.currentNode;
+    if (element instanceof HTMLElement && element.matches(WITNESS_BLOCK)) {
+      const bounds = element.getBoundingClientRect();
+      if (bounds.top >= viewportTop && bounds.top < viewportBottom && bounds.height > 0
+        && element.textContent?.trim()) {
+        store.contentWitness = { key: anchor.key, row, element,
+          viewportOffset: store.headerExtent + (store.layout.offsetForKey(anchor.key) ?? 0) + store.drift
+            + bounds.top - row.getBoundingClientRect().top - settledViewportTop(store) };
+        return;
+      }
+    }
+    if (!walker.nextNode()) break;
+  }
+}
+
 function applyAnchor<T>(store: PhysicalStore<T>, anchor: PhysicalAnchor | null): PhysicalAnchor | null {
   if (!anchor) {
+    store.contentWitness = null;
     setScrollerScrollTop(store, settledViewportTop(store));
     return null;
   }
   const nextOffset = store.layout.offsetForKey(anchor.key);
   if (nextOffset === undefined) {
+    store.contentWitness = null;
     setScrollerScrollTop(store, settledViewportTop(store));
     return null;
   }
-  const target = store.headerExtent + nextOffset + store.drift - anchor.offset;
+  const local = store.contentWitness && store.contentWitness.key === anchor.key
+    && witnessEligible(store) ? witnessLocalOffset(store, store.contentWitness) : null;
+  if (store.contentWitness && local === null) store.contentWitness = null;
+  const effectiveAnchor = local === null ? anchor : { ...anchor, offset: store.contentWitness!.viewportOffset - local };
+  const target = store.headerExtent + nextOffset + store.drift - effectiveAnchor.offset;
   if (anchor.intent === 'directional_start') {
     const index = store.keys.indexOf(anchor.key);
     applyAlignedPosition(store, index, anchor.key, store.headerExtent + nextOffset + store.drift, target, 'start', 'directional');
@@ -569,11 +631,11 @@ function applyAnchor<T>(store: PhysicalStore<T>, anchor: PhysicalAnchor | null):
     const firstOffset = store.range ? store.layout.itemAt(store.range.startIndex)?.offset ?? 0 : 0;
     if (firstOffset + driftNext >= 0) {
       store.drift = driftNext;
-      return anchor;
+      return effectiveAnchor;
     }
   }
   setScrollerScrollTop(store, target);
-  return anchor;
+  return effectiveAnchor;
 }
 
 function recompute<T>(store: PhysicalStore<T>): void {
@@ -609,6 +671,7 @@ function measureMountedExtents<T>(store: PhysicalStore<T>): boolean {
 function applyPhysicalChange<T>(store: PhysicalStore<T>, anchor: PhysicalAnchor | null, wasPinned: boolean): void {
   store.layout = buildStoreLayout(store);
   const followTail = wasPinned && store.tailFollowAllowed;
+  if (followTail || store.initialTailPending) store.contentWitness = null;
   if (resolvePendingTarget(store)) {
     // The resolved selector supplies the new physical anchor.
     anchor = store.activeAnchor;
@@ -724,6 +787,9 @@ function createStore<T>(props: VirtualTranscriptProps<T>): PhysicalStore<T> {
     overscan: clampNonNegative(props.overscan ?? 0),
     revealPublicationPending: false,
     activeAnchor: null,
+    contentWitness: null,
+    witnessBlockedUntilMs: 0,
+    witnessPointerDown: false,
     scroller: null,
     headerElement: null,
     rowElements: new Map(),
@@ -773,6 +839,8 @@ function VirtualTranscriptInner<T>(
     storeRef.current = createStore(props);
   }
   const store = storeRef.current;
+  if (store.positioningViewKey !== (props.positioningViewKey ?? null)
+    || (props.positioningAuthority ?? NO_POSITIONING_AUTHORITY).kind === 'command') store.contentWitness = null;
   store.positioningAuthority = props.positioningAuthority ?? NO_POSITIONING_AUTHORITY;
   store.positioningViewKey = props.positioningViewKey ?? null;
   retireUnauthorizedPosition(store);
@@ -827,6 +895,7 @@ function VirtualTranscriptInner<T>(
       if (!current) return;
       const previous = current.rowElements.get(key) ?? null;
       if (previous && previous !== element) {
+        if (current.contentWitness?.row === previous) current.contentWitness = null;
         unobserveElement(current, previous);
         current.rowElements.delete(key);
       }
@@ -872,6 +941,19 @@ function VirtualTranscriptInner<T>(
   }, [publish]);
 
   const detachTouchListenersRef = useRef<(() => void) | null>(null);
+  const witnessTimerRef = useRef(0);
+  const scheduleWitness = useCallback(() => {
+    const current = storeRef.current;
+    if (current) current.witnessBlockedUntilMs = Date.now() + SCROLL_SETTLE_MS;
+    clearTimeout(witnessTimerRef.current);
+    const staleDelay = current && current.activeTouchIds.size > 0
+      ? Math.max(0, current.lastGestureAtMs + GESTURE_STALE_MS - Date.now()) : 0;
+    witnessTimerRef.current = window.setTimeout(() => {
+      witnessTimerRef.current = 0;
+      const current = storeRef.current;
+      if (current) acquireContentWitness(current);
+    }, Math.max(SCROLL_SETTLE_MS, staleDelay) + 1);
+  }, []);
 
   const scrollerCallback = useCallback((element: HTMLDivElement | null) => {
     const current = storeRef.current;
@@ -882,6 +964,8 @@ function VirtualTranscriptInner<T>(
     detachTouchListenersRef.current?.();
     detachTouchListenersRef.current = null;
     current.activeTouchIds.clear();
+    current.witnessPointerDown = false;
+    current.contentWitness = null;
 
     current.scroller = element;
     if (element) {
@@ -910,11 +994,15 @@ function VirtualTranscriptInner<T>(
           store.activeTouchIds.add(touch.identifier);
         }
         store.lastGestureAtMs = Date.now();
+        store.contentWitness = null;
+        scheduleWitness();
       };
       const onTouchMove = () => {
         const store = storeRef.current;
         if (!store) return;
         store.lastGestureAtMs = Date.now();
+        store.contentWitness = null;
+        scheduleWitness();
       };
       const onTouchStop = (event: TouchEvent) => {
         const store = storeRef.current;
@@ -924,6 +1012,7 @@ function VirtualTranscriptInner<T>(
         }
         pruneToLive(store, event);
         store.lastGestureAtMs = Date.now();
+        scheduleWitness();
       };
       element.addEventListener('touchstart', onTouchStart, { passive: true });
       element.addEventListener('touchmove', onTouchMove, { passive: true });
@@ -938,8 +1027,7 @@ function VirtualTranscriptInner<T>(
     }
     recompute(current);
     scrollerRef?.(element);
-  }, [publish, scrollerRef]);
-
+  }, [publish, scrollerRef, scheduleWitness]);
 
   useLayoutEffect(() => {
     const current = storeRef.current;
@@ -977,6 +1065,8 @@ function VirtualTranscriptInner<T>(
       }
       detachTouchListenersRef.current?.();
       detachTouchListenersRef.current = null;
+      clearTimeout(witnessTimerRef.current);
+      if (current) current.contentWitness = null;
       current?.resizeObserver?.disconnect();
       current?.rowElements.clear();
       if (current) {
@@ -986,6 +1076,10 @@ function VirtualTranscriptInner<T>(
       }
     };
   }, []);
+
+  useLayoutEffect(() => {
+    acquireContentWitness(store);
+  });
 
   useLayoutEffect(() => {
     onRangeChange?.(buildPhysicalSnapshot(store));
@@ -1043,6 +1137,7 @@ function VirtualTranscriptInner<T>(
       const current = storeRef.current;
       if (!current) return;
       current.positionOwner = { kind: 'unowned' };
+      current.contentWitness = null;
       current.pendingTarget = null;
       current.activeAnchor = null;
       setScrollerScrollTop(current, totalPhysicalExtent(current));
@@ -1053,6 +1148,7 @@ function VirtualTranscriptInner<T>(
       const current = storeRef.current;
       if (!current?.scroller || !Number.isFinite(delta) || delta === 0) return;
       current.positionOwner = { kind: 'unowned' };
+      current.contentWitness = null;
       current.pendingTarget = null;
       current.viewportExtent = viewportExtentForScroller(current.scroller);
       setScrollerScrollTop(current, current.scroller.scrollTop + delta);
@@ -1062,7 +1158,12 @@ function VirtualTranscriptInner<T>(
     },
     setTailFollowAllowed(allowed) {
       const current = storeRef.current;
-      if (current) current.tailFollowAllowed = allowed;
+      if (current) {
+        const changed = current.tailFollowAllowed !== allowed;
+        current.tailFollowAllowed = allowed;
+        if (allowed && current.pinned) current.contentWitness = null;
+        else if (!allowed && changed) scheduleWitness();
+      }
     },
     isProgrammaticScroll(scrollTop) {
       const current = storeRef.current;
@@ -1086,6 +1187,7 @@ function VirtualTranscriptInner<T>(
         firstKey: current.keys[0] ?? null,
       };
       current.activeAnchor = null;
+      current.contentWitness = null;
     },
     measureOffsetForIndex(index) {
       const current = storeRef.current;
@@ -1111,7 +1213,7 @@ function VirtualTranscriptInner<T>(
             ...(targetIndex === undefined ? {} : { targetIndex, targetOffset: null, targetMeasured: false }),
           };
     },
-  }), [publish]);
+  }), [publish, scheduleWitness]);
 
   const handleScroll = useCallback(() => {
     const current = storeRef.current;
@@ -1132,7 +1234,8 @@ function VirtualTranscriptInner<T>(
     current.activeAnchor = captureTopAnchor(current);
     recompute(current);
     publish();
-  }, [publish]);
+    scheduleWitness();
+  }, [publish, scheduleWitness]);
 
   const reconcileTimerRef = useRef(0);
 
@@ -1208,6 +1311,12 @@ function VirtualTranscriptInner<T>(
       aria-label={ariaLabel}
       tabIndex={0}
       onScroll={handleScroll}
+      onWheelCapture={() => { store.contentWitness = null; scheduleWitness(); }}
+      onPointerDownCapture={() => { store.contentWitness = null; store.witnessPointerDown = true; clearTimeout(witnessTimerRef.current); }}
+      onPointerUpCapture={() => { store.witnessPointerDown = false; scheduleWitness(); }}
+      onPointerCancelCapture={() => { store.witnessPointerDown = false; scheduleWitness(); }}
+      onPointerLeave={() => { if (store.witnessPointerDown) { store.witnessPointerDown = false; scheduleWitness(); } }}
+      onKeyDownCapture={() => { store.contentWitness = null; scheduleWitness(); }}
     >
       <div className="virtual-transcript__inner" style={{ height: totalExtent }}>
         {header ? (

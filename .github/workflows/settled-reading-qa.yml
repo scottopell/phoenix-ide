@@ -1,0 +1,46 @@
+name: Settled reading browser QA
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'ui/**'
+      - '.github/workflows/settled-reading-qa.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'ui/**'
+      - '.github/workflows/settled-reading-qa.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  delayed-image:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 26
+      - run: corepack enable
+      - run: corepack prepare pnpm@11.0.8 --activate
+      - run: pnpm install --frozen-lockfile
+        working-directory: ui
+      - name: Focused executor and fixture tests
+        working-directory: ui
+        run: pnpm exec vitest run src/components/VirtualTranscript.test.tsx src/fixtures/messageList/scenarios.test.ts
+      - run: pnpm exec playwright install --with-deps chromium
+        working-directory: ui
+      - name: Real delayed image reading and navigation controls
+        working-directory: ui
+        env:
+          PHOENIX_LADLE: '1'
+          CAPTURE_STORIES: delayed-image-scroll
+        run: node scripts/capture-message-list.mjs
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: settled-reading-${{ github.sha }}
+          path: ui/qa-artifacts/
