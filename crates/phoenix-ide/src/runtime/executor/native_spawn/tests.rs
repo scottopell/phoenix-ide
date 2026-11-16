@@ -125,6 +125,42 @@ async fn issue_native_spawn(
 }
 
 #[tokio::test]
+async fn native_admitted_manager_loss_before_closure_write_is_known_failure() {
+    let (manager, mut runtime, request) = pending_native_spawn().await;
+    let control = Arc::clone(&request.control);
+    let manager_task = issue_native_spawn(&manager, request).await;
+    let admission = runtime.observe_native_spawn().await;
+    assert!(matches!(
+        runtime.native_spawn_observed(admission).await.unwrap(),
+        Some(Event::SpawnAgentsComplete { .. })
+    ));
+    manager_task.abort();
+    assert!(manager_task.await.unwrap_err().is_cancelled());
+    cancel(&mut runtime).await;
+    let receipt = runtime
+        .native_spawn_handoff
+        .as_mut()
+        .unwrap()
+        .closure
+        .try_recv()
+        .expect("manager lifetime publishes its known pre-closure-write failure");
+    assert!(matches!(receipt.evidence, NativeSpawnTerminalEvidence::Failed(_)));
+    assert!(runtime
+        .native_spawn_observed(NativeSpawnObservation::Closure(Ok(receipt)))
+        .await
+        .is_err());
+    assert!(matches!(runtime.state, ConvState::Error {
+        error_kind: crate::db::ErrorKind::SubAgentError, ..
+    }));
+    assert!(!manager.fatal_local_authority_fence.is_closed());
+    assert_eq!(control.publication_count(), 1);
+    let owed: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sub_agent_runs WHERE parent_accepted_at_unix_micros IS NULL AND terminal_at_unix_micros IS NULL AND initial_dispatch_claimed_at_unix_micros IS NULL").fetch_one(manager.db().pool()).await.unwrap();
+    assert_eq!(owed, 2);
+    assert!(runtime.tool_executor.recorded_executions().is_empty());
+    assert!(runtime.llm_client.recorded_requests().is_empty());
+}
+
+#[tokio::test]
 async fn native_prewrite_refusal_is_known_without_unknown_authority_or_false_completion() {
     let (manager, mut runtime, request) = pending_native_spawn().await;
     manager
