@@ -4330,6 +4330,71 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn event_evidence_read_preserves_version_expectation_on_later_pages() {
+        use sha2::{Digest, Sha256};
+        let db = crate::db::Database::open_in_memory().await.unwrap();
+        let source = db
+            .create_conversation("event-read", "event-read", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        db.watch_product_conversation(&source.product_conversation_id)
+            .await
+            .unwrap();
+        let content = crate::db::MessageContent::agent(vec![phoenix_llm::ContentBlock::text(
+            format!("{}ending", "a".repeat(5000)),
+        )]);
+        db.add_message("event-read-response", &source.id, &content, None, None)
+            .await
+            .unwrap();
+        let digest = format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(&content.to_json()).unwrap())
+        );
+        let event_id = uuid::Uuid::new_v4().to_string();
+        sqlx::query("INSERT INTO coordinator_watch_events(event_id,watch_id,source_occurrence_kind,source_occurrence_id,source_generation,source_transcript_id,terminal_kind,occurred_at_us) SELECT ?1,id,'creation','pinned-read',0,?2,'completed',1 FROM coordinator_watches WHERE source_product_conversation_id=?3")
+            .bind(&event_id).bind(&source.id).bind(source.product_conversation_id.as_str()).execute(db.pool()).await.unwrap();
+        sqlx::query("INSERT INTO coordinator_watch_ending_evidence(event_id,response_state,response_message_id,digest_version,response_digest,excerpt,prose_bytes,capture_limit) VALUES (?1,'captured','event-read-response',1,?2,?3,5006,1024)")
+            .bind(&event_id).bind(digest).bind("a".repeat(1024)).execute(db.pool()).await.unwrap();
+        let service = GlobalReadService::new(db.clone(), Arc::new(db.fts_retriever()));
+        let reference = format!("@event:{event_id}");
+        let first = service.read_conversation_page(&reference, 0).await.unwrap();
+        assert!(first
+            .content
+            .contains("Occurrence-version-matching evidence"));
+        assert!(first.content.contains(&reference));
+        let cursor = first.next_cursor.unwrap();
+        sqlx::query("UPDATE messages SET content=?1 WHERE message_id='event-read-response'")
+            .bind(
+                serde_json::to_string(
+                    &crate::db::MessageContent::agent(vec![phoenix_llm::ContentBlock::text(
+                        "new current text",
+                    )])
+                    .to_stored_json(),
+                )
+                .unwrap(),
+            )
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let next = service
+            .read_conversation_page(&reference, cursor)
+            .await
+            .unwrap();
+        assert!(next.content.contains("source changed"));
+        assert!(!next.content.contains("new current text"));
+        assert_eq!(next.next_cursor, None);
+        assert!(service
+            .read_conversation("@event:invalid", 0)
+            .await
+            .unwrap_err()
+            .contains("UUID"));
+        assert!(service
+            .read_conversation(&reference, MAX_CONVERSATION_READ_CURSOR + 1)
+            .await
+            .is_err());
+    }
+
     #[test]
     fn conversation_page_end_never_exceeds_the_cursor_cap() {
         assert_eq!(conversation_page_end(0), READ_PAGE_CHARS);
