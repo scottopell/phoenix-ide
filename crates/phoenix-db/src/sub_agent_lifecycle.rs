@@ -271,6 +271,60 @@ pub struct UnactivatedSubAgentTerminal {
     pub outcome: phoenix_core::domain::sm_state::SubAgentOutcome,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubAgentSpawnInvocation {
+    pub parent_conversation_id: String,
+    pub assistant_message_id: String,
+    pub tool_use_id: String,
+    pub batch_id: String,
+}
+
+impl SubAgentSpawnInvocation {
+    pub fn owns_state(&self, state: &ConvState) -> bool {
+        match state {
+            ConvState::ToolExecuting { current_tool, assistant_message, .. } =>
+                current_tool.id == self.tool_use_id && current_tool.name() == "spawn_agents"
+                && assistant_message.message_id == self.assistant_message_id,
+            ConvState::CancellingTool { tool_use_id, assistant_message, .. } =>
+                *tool_use_id == self.tool_use_id && assistant_message.message_id == self.assistant_message_id,
+            _ => false,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct UnactivatedSubAgentMembership {
+    pub invocation: SubAgentSpawnInvocation,
+    pub previous_state: ConvState,
+    pub members: Vec<phoenix_core::domain::sm_state::PendingSubAgent>,
+}
+
+impl UnactivatedSubAgentMembership {
+    pub fn reconciled_state(&self) -> DbResult<ConvState> {
+        if !self.invocation.owns_state(&self.previous_state) {
+            return Err(lifecycle_conflict("unactivated membership lost its exact spawn origin"));
+        }
+        let mut state = self.previous_state.clone();
+        let pending = match &mut state {
+            ConvState::ToolExecuting { pending_sub_agents, .. }
+            | ConvState::CancellingTool { pending_sub_agents, .. } => pending_sub_agents,
+            _ => unreachable!("spawn origin checked"),
+        };
+        let mut seen = std::collections::HashSet::new();
+        for member in &self.members {
+            if !seen.insert(&member.agent_id) {
+                return Err(lifecycle_conflict("duplicate unactivated member"));
+            }
+            match pending.iter().find(|existing| existing.agent_id == member.agent_id) {
+                Some(existing) if existing != member => return Err(lifecycle_conflict("unactivated member differs from parent pending")),
+                Some(_) => {},
+                None => pending.push(member.clone()),
+            }
+        }
+        Ok(state)
+    }
+}
+
 #[derive(PartialEq)]
 struct UnactivatedChildProjection {
     child: String,
@@ -719,6 +773,67 @@ impl Database {
             .await?;
         }
         Ok((tx, SubAgentBatchAdmissionOutcome::Admitted))
+    }
+
+    pub async fn establish_unactivated_sub_agent_membership(
+        &self,
+        membership: &UnactivatedSubAgentMembership,
+        state_updated_at: DateTime<Utc>,
+    ) -> crate::workflow::LocalAuthorityResult<DbResult<ConvState>> {
+        self.establish_unactivated_sub_agent_membership_with_cut(membership, state_updated_at, TerminalEvidenceTransactionCut::None).await
+    }
+
+    async fn establish_unactivated_sub_agent_membership_with_cut(
+        &self,
+        membership: &UnactivatedSubAgentMembership,
+        state_updated_at: DateTime<Utc>,
+        cut: TerminalEvidenceTransactionCut,
+    ) -> crate::workflow::LocalAuthorityResult<DbResult<ConvState>> {
+        use crate::workflow::LocalAuthorityResult;
+        let prepared = async {
+            let state = membership.reconciled_state()?;
+            let origin = &membership.invocation;
+            let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+            let current: String = sqlx::query_scalar("SELECT state FROM conversations WHERE id = ?1")
+                .bind(&origin.parent_conversation_id).fetch_one(&mut *tx).await?;
+            let current: ConvState = serde_json::from_str(&current).map_err(|e| DbError::Serialization(e.to_string()))?;
+            if current != membership.previous_state {
+                return Err(lifecycle_conflict("parent changed before unactivated membership commit"));
+            }
+            let members: Vec<String> = sqlx::query_scalar(
+                "SELECT r.child_conversation_id FROM sub_agent_runs r
+                 JOIN sub_agent_batches b ON b.batch_id = r.batch_id
+                 WHERE b.batch_id = ?1 AND b.parent_conversation_id = ?2
+                   AND r.initial_dispatch_claimed_at_unix_micros IS NULL
+                   AND r.terminal_at_unix_micros IS NOT NULL
+                   AND r.parent_accepted_at_unix_micros IS NULL ORDER BY r.ordinal",
+            ).bind(&origin.batch_id).bind(&origin.parent_conversation_id).fetch_all(&mut *tx).await?;
+            if members.is_empty() || !members.iter().eq(membership.members.iter().map(|member| &member.agent_id)) {
+                return Err(lifecycle_conflict("unactivated membership lacks exact terminal batch"));
+            }
+            let encoded = serde_json::to_string(&state).map_err(|e| DbError::Serialization(e.to_string()))?;
+            sqlx::query("UPDATE conversations SET state = ?2, state_kind = ?3, state_updated_at = ?4, updated_at = ?4 WHERE id = ?1")
+                .bind(&origin.parent_conversation_id).bind(&encoded).bind(crate::conv_state_kind(&state))
+                .bind(state_updated_at.to_rfc3339()).execute(&mut *tx).await?;
+            Ok::<_, DbError>((tx, state, encoded))
+        }.await;
+        let (tx, state, encoded) = match prepared {
+            Ok(prepared) => prepared,
+            Err(error) => return LocalAuthorityResult::DurableFactEstablished(Err(error)),
+        };
+        if let Err(error) = cut.commit(tx).await {
+            let classified = if cut.classifier_unavailable() { Err(sqlx::Error::PoolClosed) } else {
+                sqlx::query_scalar::<_, bool>("SELECT state = ?2 AND state_updated_at = ?3 FROM conversations WHERE id = ?1")
+                    .bind(&membership.invocation.parent_conversation_id).bind(&encoded)
+                    .bind(state_updated_at.to_rfc3339()).fetch_one(&self.pool).await
+            };
+            return match classified {
+                Ok(true) => LocalAuthorityResult::DurableFactEstablished(Ok(state)),
+                Ok(false) => LocalAuthorityResult::DurableFactEstablished(Err(error)),
+                Err(_) => LocalAuthorityResult::DurableFactUnclassified,
+            };
+        }
+        LocalAuthorityResult::DurableFactEstablished(Ok(state))
     }
 
     pub async fn close_live_unactivated_sub_agent_batch(

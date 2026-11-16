@@ -10,6 +10,8 @@
 //! REQ-BED-009: Sub-Agent Isolation
 
 mod agent_execution;
+mod native_spawn;
+pub use native_spawn::{NativeSpawnClosureReceipt, NativeSpawnTerminalEvidence, SubAgentAdmissionReceipt};
 pub(crate) mod close_retirement;
 pub(crate) mod creation_worker;
 pub mod deny_gate;
@@ -230,14 +232,15 @@ pub enum SubAgentAdmissionResponse {
 
 #[derive(Debug)]
 pub struct SubAgentSpawnRequest {
-    pub batch_id: String,
+    pub invocation: phoenix_db::SubAgentSpawnInvocation,
     pub specs: Vec<SubAgentSpec>,
-    pub parent_conversation_id: String,
     pub parent_scope: Option<WorkScopeId>,
     pub parallel_work_qualified: bool,
     pub parent_turn_link: opentelemetry::trace::SpanContext,
-    pub response_tx: oneshot::Sender<SubAgentAdmissionResponse>,
+    pub response_tx: oneshot::Sender<SubAgentAdmissionReceipt>,
     pub activation_rx: oneshot::Receiver<()>,
+    pub cancellation: tokio_util::sync::CancellationToken,
+    pub closure_tx: oneshot::Sender<NativeSpawnClosureReceipt>,
 }
 
 /// Request to cancel sub-agents
@@ -4833,45 +4836,66 @@ impl RuntimeManager {
 
     async fn handle_spawn_request(self: &Arc<Self>, req: SubAgentSpawnRequest) {
         let SubAgentSpawnRequest {
-            batch_id,
+            invocation,
             specs,
-            parent_conversation_id,
             parent_scope,
             parallel_work_qualified,
             parent_turn_link,
             response_tx,
             activation_rx,
+            cancellation,
+            closure_tx,
         } = req;
+        let batch = phoenix_db::SubAgentBatchAdmission {
+            batch_id: invocation.batch_id.clone(),
+            parent_conversation_id: invocation.parent_conversation_id.clone(),
+            parallel_work_qualified,
+            runs: specs.iter().map(|spec| phoenix_db::SubAgentRunAdmission {
+                child_conversation_id: spec.agent_id.clone(),
+                execution_authority: match spec.mode {
+                    SubAgentMode::Explore => phoenix_db::SubAgentExecutionAuthority::ReadOnly,
+                    SubAgentMode::Work => phoenix_db::SubAgentExecutionAuthority::WriteCapable,
+                },
+            }).collect(),
+        };
         match self
             .admit_sub_agent_batch(
-                &batch_id,
+                &invocation.batch_id,
                 &specs,
-                &parent_conversation_id,
+                &invocation.parent_conversation_id,
                 parent_scope,
                 parallel_work_qualified,
             )
             .await
         {
             Ok(()) => {
-                if response_tx
-                    .send(SubAgentAdmissionResponse::Admitted)
-                    .is_err()
-                {
-                    self.abandon_unactivated_sub_agent_batch(&batch_id).await;
-                    return;
+                let response_lost = response_tx.send(SubAgentAdmissionReceipt {
+                    invocation: invocation.clone(), outcome: SubAgentAdmissionResponse::Admitted,
+                }).is_err();
+                let activate = if response_lost { false } else {
+                    tokio::select! {
+                        biased;
+                        () = cancellation.cancelled() => false,
+                        activation = activation_rx => activation.is_ok() && !cancellation.is_cancelled(),
+                    }
+                };
+                if activate {
+                    self.kick_admitted_sub_agent_batch(specs, parent_turn_link);
+                } else {
+                    let evidence = self.close_native_spawn_batch(&batch).await;
+                    if closure_tx.send(NativeSpawnClosureReceipt { invocation, evidence }).is_err() {
+                        tracing::error!(batch_id = %batch.batch_id, "native spawn closure owner disappeared; terminal evidence retained without parent acceptance");
+                    }
                 }
-                if activation_rx.await.is_err() {
-                    self.abandon_unactivated_sub_agent_batch(&batch_id).await;
-                    return;
-                }
-                self.kick_admitted_sub_agent_batch(specs, parent_turn_link);
             }
             Err(error) if error.starts_with("FATAL_LOCAL_AUTHORITY_UNCLASSIFIED:") => {
                 self.signal_fatal_local_authority("sub_agent_batch_admission");
-                let _ = response_tx.send(SubAgentAdmissionResponse::Unclassified);
+                let _ = response_tx.send(SubAgentAdmissionReceipt { invocation: invocation.clone(), outcome: SubAgentAdmissionResponse::Unclassified });
+                let _ = closure_tx.send(NativeSpawnClosureReceipt { invocation, evidence: NativeSpawnTerminalEvidence::Unclassified });
             }
             Err(error) => {
-                let _ = response_tx.send(SubAgentAdmissionResponse::Rejected(error));
+                let _ = response_tx.send(SubAgentAdmissionReceipt { invocation: invocation.clone(), outcome: SubAgentAdmissionResponse::Rejected(error) });
+                let _ = closure_tx.send(NativeSpawnClosureReceipt { invocation, evidence: NativeSpawnTerminalEvidence::NotAdmitted });
             }
         }
     }
@@ -4973,7 +4997,11 @@ impl RuntimeManager {
             parallel_work_qualified,
             children,
         };
-        match self.db.admit_sub_agent_batch_atomically(&admission).await {
+        let owner = self.acquire_local_authority_pass().map_err(|()| "FATAL_LOCAL_AUTHORITY_UNCLASSIFIED: native spawn admission fence closed".to_string())?;
+        let mut authority = native_spawn::NativeSpawnWriteAuthority { owner: Some(owner) };
+        let result = self.db.admit_sub_agent_batch_atomically(&admission).await;
+        authority.owner = None;
+        match result {
             phoenix_db::workflow::LocalAuthorityResult::DurableFactEstablished(result) => {
                 result.map_err(|error| error.to_string())?;
             }
@@ -4983,16 +5011,6 @@ impl RuntimeManager {
         }
 
         Ok(())
-    }
-
-    async fn abandon_unactivated_sub_agent_batch(&self, batch_id: &str) {
-        if let Err(error) = self
-            .db
-            .abandon_unactivated_sub_agent_batch(batch_id, Utc::now())
-            .await
-        {
-            tracing::error!(%batch_id, %error, "failed to terminalize unactivated sub-agent batch");
-        }
     }
 
     fn kick_admitted_sub_agent_batch(
@@ -10828,7 +10846,7 @@ mod scope_liveness_tests {
             async move {
                 manager
                     .handle_spawn_request(SubAgentSpawnRequest {
-                        batch_id: "atomic-subagent-batch".to_string(),
+                        invocation: phoenix_db::SubAgentSpawnInvocation { batch_id: "atomic-subagent-batch".into(), parent_conversation_id: parent.id, assistant_message_id: "assistant".into(), tool_use_id: "spawn".into() },
                         specs: vec![SubAgentSpec {
                             agent_id: agent_id.to_string(),
                             task: "persist all child semantics".to_string(),
@@ -10842,18 +10860,19 @@ mod scope_liveness_tests {
                             agent_name: Some("atomic-test".to_string()),
                             persona: Some("test persona".to_string()),
                         }],
-                        parent_conversation_id: parent.id,
                         parent_scope: None,
                         parallel_work_qualified: false,
                         parent_turn_link: opentelemetry::trace::SpanContext::NONE,
                         response_tx,
                         activation_rx,
+                        cancellation: tokio_util::sync::CancellationToken::new(),
+                        closure_tx: oneshot::channel().0,
                     })
                     .await;
             }
         });
         assert!(matches!(
-            response_rx.await.expect("admission response"),
+            response_rx.await.expect("admission response").outcome,
             SubAgentAdmissionResponse::Admitted
         ));
         assert!(
@@ -10925,13 +10944,14 @@ mod scope_liveness_tests {
         let (response_tx, response_rx) = oneshot::channel();
         manager
             .handle_spawn_request(SubAgentSpawnRequest {
-                batch_id: "cancel-during-materialization-batch".to_string(),
+                invocation: phoenix_db::SubAgentSpawnInvocation { batch_id: "cancel-during-materialization-batch".into(), parent_conversation_id: parent.id.clone(), assistant_message_id: "assistant".into(), tool_use_id: "spawn".into() },
                 specs: vec![spec.clone()],
-                parent_conversation_id: parent.id.clone(),
                 parent_scope: None,
                 parallel_work_qualified: false,
                 parent_turn_link: opentelemetry::trace::SpanContext::NONE,
                 response_tx,
+                cancellation: tokio_util::sync::CancellationToken::new(),
+                closure_tx: oneshot::channel().0,
                 activation_rx: {
                     let (tx, rx) = oneshot::channel();
                     let _ = tx.send(());
@@ -10940,7 +10960,7 @@ mod scope_liveness_tests {
             })
             .await;
         assert!(matches!(
-            response_rx.await.expect("admission response"),
+            response_rx.await.expect("admission response").outcome,
             SubAgentAdmissionResponse::Admitted
         ));
 
