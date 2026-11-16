@@ -71,7 +71,7 @@ runSurfaceCapture({
       if (process.env.SIDEBAR_VISUAL_BASELINE !== '1' && id === 'sidebar-visual-normal') {
         const sweep = [];
         const sidebar = page.locator('.sidebar');
-        for (const width of [160, 180, 200, 220, 230, 236, 237, 238, 239, 240, 260, 280, 320, 500]) {
+        for (const width of [160, 180, 200, ...Array.from({ length: 21 }, (_, i) => 220 + i), 260, 280, 320, 500]) {
           await sidebar.evaluate((el, value) => el.style.setProperty('--sidebar-pane-width', `${value}px`), width);
           const sample = await sidebar.evaluate(el => {
             const bounds = el.getBoundingClientRect();
