@@ -82,16 +82,26 @@ until the cancellation checkpoint succeeds; a rejected checkpoint cannot publish
 an abort or permit a late launch. Native submission and issued parent/admission
 writes retain their separate classified native owner. Actual unclassified SQLite
 authority closes the shared fence before origin checks; an ordinary read diagnostic
-is not a persistence classification.
+is not a persistence classification. Preparation captures its caller's failure
+boundary before reading: a current required-completion follow-up error selects
+that existing command's fail-stop contract and actor exit. Initial caller errors
+retain their existing diagnostic and no-effects cancellation proof. Stale errors
+cannot apply an old boundary to a successor.
 
-Twelve focused regressions pass at `091f2d45b`, including deterministic 100-ms
-virtual-time cancellation with reads held, denial before resources, exact-origin
-clear/deny/error guards, failed cancellation persistence and live catalog release.
-The 249-case owning runtime selection passes at `934b331a5`, including existing
-native activation, forced-notice, required-settlement, goal and policy contracts.
-Its native Bash fixture was built at `091f2d45b`; the intervening delta is test-only.
-These in-memory timing checks do not measure end-to-end SQLite latency. Full
-default, isolated review and hosted qualification remain pending.
+The 48-case focused and 253-case owning selections pass at `d152a1814`, including
+real actor policy/scope failure regressions, catalog refresh, deterministic 100-ms
+read cancellation, denial before resources, native activation, forced notices,
+required settlement, goals and originating policy. The owning run builds its
+native Bash fixture from that same head. In-memory timing checks do not measure
+end-to-end SQLite latency.
+
+The earlier full check at `ab43b4b2c` was red: 4085/4086 Rust tests passed and the
+catalog-cache fixture missed the owned observer; its explicit observer correction
+passes. The other 16 executed checks passed, with four UI path skips. A separate
+automatic-review finding exposed the lost required-follow-up read failure boundary;
+two new actor regressions failed before its typed provenance correction and pass
+afterward. Replacement default, fresh isolated review and hosted qualification
+remain pending.
 
 Forced tool retirement has a distinct `ToolCancellationRetired` event and a
 phase-scoped `ForcedToolRetirement` fact in `CancellingSubAgents`. Nonfinal child
@@ -161,7 +171,7 @@ Startup, completion, and child-backstop commands retain a mutable reborrow of th
 | **REQ-BED-002:** User Message Handling | ✅ Complete | Rejects while busy, accepts from idle/error |
 | **REQ-BED-003:** LLM Response Processing | ✅ Complete | Handles text, tool use, end_turn |
 | **REQ-BED-004:** Tool Execution Coordination | ✅ Complete | Serial execution with state tracking; shared round admission requires unique call/result correspondence without sorting. Provider schedule validation precedes special-tool interception, and per-invocation channels reject misidentified outcomes as concrete errors. Focused coverage includes malformed approval/question/child-terminal responses and expected-invocation completion errors. Bash wait fallback preserves authentic bounded results, aborts only the wait task on healthy expiry, and closes the shared local-authority fence under REQ-BED-033 if authoritative settlement remains indeterminate at its non-renewing persistence cutoff |
-| **REQ-BED-005:** Cancellation Handling | 🚧 Partial | Preparation reads and native submission are selectable with exact ownership; issued parent/admission writes remain classified in the manager. Focused 12/12 and owning 249/249 pass; full qualification is pending |
+| **REQ-BED-005:** Cancellation Handling | 🚧 Partial | Preparation reads and native submission are selectable with exact ownership; issued parent/admission writes remain classified in the manager. Current focused 48/48 and owning 253/253 pass, including required-follow-up read failure settlement; replacement full qualification is pending |
 | **REQ-BED-005a:** Bounded Cancellation Liveness | 🚧 Partial | Forced tool/sub-agent backstops and live forced-notice carry through delayed cooperative drain are implemented. Task 75009 covers ordered exactly-once notice qualification, including inline steering, existing retries and child-deadline overlap. Broader interruption and cancellation-handoff obligations remain unqualified |
 | **REQ-BED-006:** Error Recovery | ✅ Complete | Retry logic with exponential backoff and typed user-resume admission by ErrorKind |
 | **REQ-BED-007:** State Persistence | ✅ Complete | Database persistence; all selected executing/cancelling buffers are validated before any recovery mutation. File-backed reopen coverage includes malformed standalone and parent-first child buffers retaining exact raw state and producing no partial messages; scoped recovery excludes unrelated malformed buffers. Provider-only interruptions resume from idle, active materialized turns with persisted tool results proactively resume under bounded exact-turn ownership, committed steering retains first-response recovery ownership, and durable continuations retain recovery state |
