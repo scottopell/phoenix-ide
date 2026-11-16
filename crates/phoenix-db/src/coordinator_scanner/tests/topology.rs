@@ -174,6 +174,16 @@ async fn scanner_metadata_does_not_decode_irrelevant_runtime_or_handoff_blobs() 
         &InputOrigin::UserApi,
     )
     .await;
+    db.add_message_with_seq(
+        "historical-summary",
+        &first,
+        2,
+        &MessageContent::continuation("Original historical handoff"),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
     let head = continue_head(&db, &first).await;
     let padding = "x".repeat(1024 * 1024);
     sqlx::query("UPDATE conversations SET state=?2,state_kind='tool_executing' WHERE id=?1")
