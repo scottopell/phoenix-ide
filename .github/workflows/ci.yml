@@ -19,7 +19,7 @@ concurrency:
 
 jobs:
   check-worker-budget:
-    name: check worker budget (exact source)
+    name: check early source (exact source)
     runs-on: ubuntu-latest
     timeout-minutes: 5
     env:
@@ -29,11 +29,19 @@ jobs:
       - uses: actions/checkout@v6
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          components: rustfmt
       - uses: astral-sh/setup-uv@e58605a9b6da7c637471fab8847a5e5a6b8df081 # v5
+      - name: Check Rust formatting (no compilation)
+        run: cargo fmt --all -- --check
+      - name: Check migration ledger structure (no compilation)
+        run: uv run --no-project --managed-python --python 3.13 python scripts/check_migration_ledger.py
       - name: Focused command-construction regressions (no compiler)
         run: |
           uv run --no-project --managed-python --python 3.13 python -m unittest discover -s tests/devpy -p test_check_plan.py
           PHOENIX_CHECK_WORKERS=1 uv run --no-project --managed-python --python 3.13 python -m unittest discover -s tests/devpy -p test_check_plan.py
+          uv run --no-project --managed-python --python 3.13 python -m unittest discover -s tests/devpy -p test_check_migration_ledger.py
 
   plan_check:
     name: plan check lanes
@@ -65,10 +73,10 @@ jobs:
 
   check-rust-build:
     name: check (rust build)
-    needs: plan_check
+    needs: [plan_check, check-worker-budget]
     if: ${{ needs.plan_check.outputs.rust == 'true' }}
     runs-on: ubuntu-latest
-    # 10 setup + 20 native + 20 check (15 archive + fmt) + 5 uploads.
+    # 10 setup + 20 native + 20 check (15 archive) + 5 uploads.
     timeout-minutes: 55
     env:
       PYTHONUNBUFFERED: "1"
@@ -265,7 +273,7 @@ jobs:
 
   check-rust-musl:
     name: check (rust musl)
-    needs: plan_check
+    needs: [plan_check, check-worker-budget]
     if: ${{ needs.plan_check.outputs.rust == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -316,7 +324,7 @@ jobs:
 
   check-clippy:
     name: check (clippy)
-    needs: plan_check
+    needs: [plan_check, check-worker-budget]
     if: ${{ needs.plan_check.outputs.clippy == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -360,7 +368,7 @@ jobs:
 
   check-e2e:
     name: check (e2e)
-    needs: plan_check
+    needs: [plan_check, check-worker-budget]
     if: ${{ needs.plan_check.outputs.e2e == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -403,6 +411,7 @@ jobs:
         run: ./dev.py check --lanes e2e
 
   qualify-history-realserver:
+    needs: check-worker-budget
     name: typed codegen and isolated instrumented opening witness (not shipping)
     if: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && (github.head_ref == 'qualification/continuation-opening-codegen' || github.head_ref == 'integration/v013-history-current-main') }}
     runs-on: ubuntu-latest
@@ -756,7 +765,7 @@ jobs:
 
   check-devpy:
     name: check (dev.py tests)
-    needs: plan_check
+    needs: [plan_check, check-worker-budget]
     if: ${{ needs.plan_check.outputs.devpy == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -814,7 +823,7 @@ jobs:
 
   check-ui:
     name: check (ui/specs)
-    needs: plan_check
+    needs: [plan_check, check-worker-budget]
     if: ${{ needs.plan_check.outputs.ui == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -880,7 +889,7 @@ jobs:
 
   check-finalization-geometry:
     name: check (assistant finalization geometry)
-    needs: plan_check
+    needs: [plan_check, check-worker-budget]
     if: ${{ needs.plan_check.outputs.ui == 'true' }}
     runs-on: ubuntu-latest
     # 2 bootstrap + 15 install + 15 qualification + 2 artifacts + 1 post-actions.
@@ -983,7 +992,7 @@ jobs:
 
   check-fast:
     name: check (task validation)
-    needs: plan_check
+    needs: [plan_check, check-worker-budget]
     if: ${{ needs.plan_check.outputs.fast == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -1005,7 +1014,7 @@ jobs:
 
   notify-main-failure:
     name: Open issue on main CI failure
-    needs: [plan_check, check-rust, check-clippy, check-e2e, check-devpy, check-ui, check-finalization-geometry, check-fast]
+    needs: [check-worker-budget, plan_check, check-rust, check-clippy, check-e2e, check-devpy, check-ui, check-finalization-geometry, check-fast]
     if: ${{ always() && github.event_name == 'push' && github.ref == 'refs/heads/main' && contains(join(needs.*.result, ','), 'failure') }}
     runs-on: ubuntu-latest
     permissions:
@@ -1031,7 +1040,7 @@ jobs:
 
   close-main-failure:
     name: Close CI-failure issue on green
-    needs: [plan_check, check-rust, check-clippy, check-e2e, check-devpy, check-ui, check-finalization-geometry, check-fast]
+    needs: [check-worker-budget, plan_check, check-rust, check-clippy, check-e2e, check-devpy, check-ui, check-finalization-geometry, check-fast]
     if: ${{ always() && github.event_name == 'push' && github.ref == 'refs/heads/main' && !contains(join(needs.*.result, ','), 'failure') && !contains(join(needs.*.result, ','), 'cancelled') && !contains(join(needs.*.result, ','), 'skipped') }}
     runs-on: ubuntu-latest
     permissions:
