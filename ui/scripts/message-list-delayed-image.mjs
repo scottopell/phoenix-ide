@@ -31,20 +31,53 @@ export async function captureDelayedImages({ page, id, outDir }) {
       height: element.scrollHeight,
       client: element.clientHeight,
       gap: element.scrollHeight - element.clientHeight - element.scrollTop,
+      scroller: element.getBoundingClientRect().toJSON(),
+      rows: Array.from(element.querySelectorAll('[data-render-unit-key]')).map((row) => ({
+        key: row.getAttribute('data-render-unit-key'),
+        ...row.getBoundingClientRect().toJSON(),
+      })),
       images: Array.from(element.querySelectorAll('img')).map((image) => ({
         id: new URL(image.src).searchParams.get('id'),
         complete: image.complete,
         width: image.naturalWidth,
+        row: image.closest('[data-render-unit-key]')?.getAttribute('data-render-unit-key'),
+        rect: image.getBoundingClientRect().toJSON(),
       })),
     }));
-    const value = { mode, phase, y: await marker.evaluate((element) => element.getBoundingClientRect().top), ...geometry };
+    const reading = await marker.evaluate((element) => {
+      const row = element.closest('[data-render-unit-key]');
+      const rect = element.getBoundingClientRect();
+      return { y: rect.top, marker: rect.toJSON(), markerRow: row?.getAttribute('data-render-unit-key'),
+        localOffset: row ? rect.top - row.getBoundingClientRect().top : null };
+    });
+    const value = { mode, phase, ...reading, ...geometry };
     samples.push(value);
     return value;
   };
   const reader = (value) => assert.ok(Math.abs(value.y - 152) <= 2, `Reader drift: ${JSON.stringify(value)}`);
   const tail = (value) => assert.ok(Math.abs(value.gap) <= 2, `Tail drift: ${JSON.stringify(value)}`);
+  const readingGeometry = (value) => {
+    const earlier = value.rows.find((row) => row.key === value.images.find((image) => image.id === 'earlier')?.row);
+    const anchor = value.rows.find((row) => row.key === value.markerRow);
+    const image = value.images.find((item) => item.id === 'anchor');
+    const detail = JSON.stringify(value);
+    assert.ok(earlier && anchor && image, `Missing reading geometry: ${detail}`);
+    assert.ok(earlier.bottom <= value.scroller.top - 4, `Earlier row must be fully above the viewport: ${detail}`);
+    assert.ok(anchor.top < value.scroller.top && anchor.bottom > value.scroller.top,
+      `The sentence's own row must cross the reading edge: ${detail}`);
+    assert.equal(image.row, value.markerRow, `Delayed image must share the sentence's row: ${detail}`);
+    assert.ok(image.rect.bottom <= value.y, `Same-row image must precede the sentence: ${detail}`);
+    assert.ok(value.marker.top >= value.scroller.top && value.marker.bottom <= value.scroller.bottom,
+      `Whole sentence must be visible: ${detail}`);
+    assert.ok(value.gap > 100, `Reading position must be well away from the tail: ${detail}`);
+  };
   const images = (value, loaded) => {
-    assert.equal(value.images.length, 2, 'Both real image elements must be mounted');
+    const tailAfterGrowth = ['follow-latest', 'end-navigation'].includes(value.mode) && loaded.length === 2;
+    if (tailAfterGrowth) {
+      assert.ok(value.images.some((image) => image.id === 'anchor'), 'The reading row remains mounted at the tail');
+    } else {
+      assert.equal(value.images.length, 2, 'Both real image elements must be mounted');
+    }
     for (const image of value.images) {
       assert.equal(image.complete, loaded.includes(image.id), JSON.stringify(value));
       assert.equal(image.width, loaded.includes(image.id) ? 640 : 0, JSON.stringify(value));
@@ -84,6 +117,10 @@ export async function captureDelayedImages({ page, id, outDir }) {
         const quiet = await sample(mode, 'quiet');
         images(quiet, []);
         (mode === 'follow-latest' ? tail : reader)(quiet);
+        if (mode !== 'follow-latest') {
+          readingGeometry(before);
+          readingGeometry(quiet);
+        }
 
         if (mode === 'end-navigation') {
           await scroller.focus();
@@ -119,6 +156,11 @@ export async function captureDelayedImages({ page, id, outDir }) {
         const after = await sample(mode, 'both-loaded');
         images(after, ['earlier', 'anchor']);
         check(after);
+        if (check === reader) {
+          assert.equal(after.markerRow, before.markerRow, 'Reading row identity must survive both loads');
+          assert.ok(after.localOffset - before.localOffset > 400,
+            `Same-row image must actually move the sentence within its row: ${JSON.stringify({ before, after })}`);
+        }
         assert.ok(after.height - before.height > 500, 'Images must cause substantial real layout growth');
         if (mode === 'concurrent') {
           assert.ok(Math.abs((after.top - before.top) - (after.height - before.height)) <= 2,

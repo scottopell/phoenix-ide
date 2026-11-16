@@ -4,17 +4,12 @@ on:
   workflow_dispatch:
   pull_request:
     paths:
-      - 'ui/src/components/VirtualTranscript*'
-      - 'ui/src/fixtures/messageList/**'
-      - 'ui/src/stories/message-list.stories.tsx'
-      - 'ui/scripts/message-list-delayed-image.mjs'
-      - 'ui/scripts/capture-message-list.mjs'
+      - 'ui/**'
       - '.github/workflows/settled-reading-qa.yml'
   push:
     branches: [main]
     paths:
-      - 'ui/src/components/VirtualTranscript*'
-      - 'ui/scripts/message-list-delayed-image.mjs'
+      - 'ui/**'
       - '.github/workflows/settled-reading-qa.yml'
 
 permissions:

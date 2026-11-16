@@ -30,6 +30,8 @@ This is an ephemeral refinement inside the existing physical authority, not a ne
 
 Focused component and fixture tests pass (91 tests). A disposable full-MessageList Chromium fixture with held HTTP image responses retained the same visible paragraph within 0.5px across four fresh reader runs; earlier-row growth, simultaneous earlier/current-row growth, and follow-latest controls passed. The durable equivalent runs through `capture-message-list.mjs` with `CAPTURE_STORIES=delayed-image-scroll`; hosted validation is pending. A matched three-run 4x-CPU sample observed four layouts for both baseline and candidate across two loads, no recurring idle observer/layout work, and additional script work in the candidate; this is bounded scenario evidence, not universal performance clearance. Physical Safari acceptance remains unverified, and Playwright WebKit coverage is not a substitute for it.
 
+The first hosted delayed-image run failed because preview-mode wrapping left the preceding row crossing the viewport top: the measured sentence was in a different row from the executor's anchor. That overlapping-row case remains outside this bounded fix. The regression now asserts the intended top-row geometry and non-tail headroom before releasing images, rather than inferring them from the sentence's screen position. All seven revised cases pass locally through the actual helper using installed Chrome and existing aliased dependencies; hosted frozen-lock qualification remains pending. The deterministic combined-observer unit case asserts exactly one scroll write. Concurrent browser response release verifies final continuity, not a guaranteed shared observer delivery.
+
 ## Verification matrix
 
 | Requirement | Verification |

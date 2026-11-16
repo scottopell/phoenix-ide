@@ -141,6 +141,13 @@ describe('VirtualTranscript', () => {
           ? <div data-testid="reading-payload" data-height="1000"><p data-testid="setup-paragraph">Setup above the viewport</p><p data-testid="image-paragraph"><img alt="delayed" /></p><p data-testid="reading-paragraph" data-height="30">Reading here</p></div>
           : renderRow(item)} />);
       const viewport = scroller!;
+      const writes: number[] = [];
+      let actualTop = viewport.scrollTop;
+      Object.defineProperty(viewport, 'scrollTop', {
+        configurable: true,
+        get: () => actualTop,
+        set: (value: number) => { writes.push(value); actualTop = value; },
+      });
       const earlier = document.querySelector<HTMLElement>('[data-virtual-key="before"]')!;
       const row = document.querySelector<HTMLElement>('[data-virtual-key="reading"]')!;
       const paragraph = screen.getByTestId('reading-paragraph');
@@ -185,8 +192,10 @@ describe('VirtualTranscript', () => {
       imageHeight += 10;
       screen.getByTestId('payload-before').setAttribute('data-height', '230');
       payload.setAttribute('data-height', '1085');
+      writes.length = 0;
       act(() => resizeObservers[0]!.triggerEntries([[earlier, 230], [row, 1085]]));
-      expect(viewport.scrollTop).toBe(715); // one correction, not one per entry
+      expect(writes).toEqual([715]);
+      expect(viewport.scrollTop).toBe(715);
       expect(paragraph.getBoundingClientRect().top).toBe(60);
       imageHeight += 10;
       payload.setAttribute('data-height', '1095');
