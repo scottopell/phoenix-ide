@@ -2,6 +2,11 @@ use super::{model, prompt};
 use phoenix_core::{
     domain::{
         db_schema::{InputOrigin, SourceToolCall},
+        provider_replay::ProviderReplaySettlement,
+        sm_event::{
+            PreparedDirectTurnDelivery, PreparedDirectTurnPayload,
+            SubmittedDirectTurnExpansionPolicy, SubmittedDirectTurnIdentity,
+        },
         sm_state::{AssistantMessage, ConvState, ToolCall, ToolInput},
     },
     llm_language::LlmLanguage,
@@ -13,10 +18,19 @@ use phoenix_db::{
         ScanProfile, ScanReservation, ScanResult,
     },
     coordinator_tracking::{TrackingKind, TrackingMutation, TrackingRecord, TrackingRetirement},
+    workflow::{
+        AcceptAuthoritativeTurn, ClaimAuthoritativeTurnInput, DirectTurnTerminalObligationInput,
+        MaterializeAuthoritativeTurnInput, MaterializeAuthoritativeTurnOutcome,
+        PersistedConversationProjection, TerminalizeAuthoritativeTurnInput,
+    },
     Database, MessageContent, UserContent,
 };
 use phoenix_llm::{
     ContentBlock, LlmConfig, LlmError, LlmRequest, LlmResponse, LlmService, ModelRegistry,
+};
+use phoenix_workflow::{
+    AcceptedDisposition, ClientTurnKey, ConversationAuthority, LeaseExpiry, PreparedTurn,
+    ProcessIncarnation, Timestamp, TurnCommand, TurnOutcome, TurnTerminal,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -80,6 +94,7 @@ struct PreparedCase {
     input_sha256: String,
     content_bytes: usize,
     aliases: BTreeMap<String, String>,
+    event_aliases: BTreeMap<String, String>,
 }
 
 fn digest(bytes: impl AsRef<[u8]>) -> String {
@@ -154,13 +169,152 @@ async fn native(
         .unwrap();
     receipt
 }
-async fn fixture(db: &Database, case: &Case) -> (String, BTreeMap<String, String>) {
+#[allow(clippy::too_many_lines)]
+async fn watched_event(db: &Database, case: &str, event_text: &str) -> String {
+    let worker = db
+        .create_conversation(
+            &format!("{case}-event-source"),
+            &format!("synthetic-{case}-event-source"),
+            "/tmp",
+            true,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    db.watch_product_conversation(&worker.product_conversation_id)
+        .await
+        .unwrap();
+    let input = "Inspect the synthetic worker checkpoint.";
+    let prepared = PreparedDirectTurnPayload::from_parts(
+        SubmittedDirectTurnIdentity {
+            message_id: format!("{case}-worker-input"),
+            origin: InputOrigin::UserApi,
+            text: input.into(),
+            images: vec![],
+            files: vec![],
+            user_agent: None,
+            skill_invocation: None,
+            expansion_policy: SubmittedDirectTurnExpansionPolicy::LiteralText,
+        },
+        PreparedDirectTurnDelivery {
+            text: input.into(),
+            llm_text: None,
+            images: vec![],
+            files: vec![],
+            user_agent: None,
+            skill_invocation: None,
+        },
+    );
+    let repo = db.workflow_repository();
+    let accepted = repo
+        .accept_authoritative_turn(&AcceptAuthoritativeTurn {
+            client_key: ClientTurnKey::new(format!("{case}-event-input")).unwrap(),
+            prepared: PreparedTurn::from_exact_payload(
+                &ConversationAuthority(worker.id.clone()),
+                prepared.to_exact_bytes().unwrap(),
+            ),
+            disposition: AcceptedDisposition::Runtime,
+            accepted_at: Timestamp(1),
+        })
+        .await
+        .established()
+        .expect("classified worker acceptance")
+        .unwrap();
+    let TurnOutcome::Created { turn_id, .. } = accepted.outcome else {
+        panic!("{case}: expected a new worker turn")
+    };
+    let workflow_id = repo.workflow_id_for_turn(turn_id).await.unwrap().unwrap();
+    let authority = repo
+        .claim_authoritative_turn(&ClaimAuthoritativeTurnInput {
+            turn_id,
+            workflow_id,
+            process_incarnation: ProcessIncarnation(1),
+            now: Timestamp(10),
+            lease_until: LeaseExpiry(100),
+        })
+        .await
+        .unwrap()
+        .authority
+        .expect("real worker claim");
+    let materialized = repo
+        .materialize_authoritative_turn(&MaterializeAuthoritativeTurnInput {
+            turn_id,
+            authority,
+            prepared,
+            sequence_id: 1,
+            created_at: Timestamp(10),
+            accepted_state: ConvState::LlmRequesting { attempt: 1 },
+            state_updated_at: chrono::Utc::now(),
+            now: Timestamp(10),
+        })
+        .await
+        .established()
+        .expect("classified worker materialization");
+    let MaterializeAuthoritativeTurnOutcome::Materialized(materialized) = materialized else {
+        panic!("{case}: actual materialization failed: {materialized:?}")
+    };
+    let projection = PersistedConversationProjection {
+        state: ConvState::Idle,
+        state_updated_at: chrono::Utc::now(),
+    };
+    let obligation = DirectTurnTerminalObligationInput {
+        turn_id,
+        expected_generation: materialized.generation,
+        terminal: TurnTerminal::Completed,
+        projection: projection.clone(),
+        response_message_id: Some(format!("{case}-worker-response")),
+    };
+    db.add_message_with_seq_and_terminal_obligation(
+        &format!("{case}-worker-response"),
+        &worker.id,
+        2,
+        &MessageContent::agent(vec![ContentBlock::text(event_text)]),
+        None,
+        None,
+        &obligation,
+    )
+    .await
+    .unwrap();
+    repo.terminalize_authoritative_turn(&TerminalizeAuthoritativeTurnInput {
+        command: TurnCommand::Complete {
+            turn_id,
+            expected_generation: materialized.generation,
+        },
+        projection: Some(projection),
+        provider_replay_settlement: ProviderReplaySettlement::Preserve,
+    })
+    .await
+    .unwrap();
+    let events = db.pending_coordinator_watch_events(16).await.unwrap();
+    let matching: Vec<_> = events
+        .into_iter()
+        .filter(|event| {
+            event.source_transcript_id == worker.id
+                && event.source_occurrence_kind == "direct_turn"
+                && event.source_occurrence_id == turn_id.0.to_string()
+        })
+        .collect();
+    assert_eq!(
+        matching.len(),
+        1,
+        "{case}: genuine watched completion event must exist"
+    );
+    matching[0].event_id.clone()
+}
+
+#[allow(clippy::too_many_lines)]
+async fn fixture(
+    db: &Database,
+    case: &Case,
+) -> (String, BTreeMap<String, String>, BTreeMap<String, String>) {
     let source = db
         .get_or_create_coordinator(None, LlmLanguage::default())
         .await
         .unwrap()
         .id;
     let mut aliases = BTreeMap::new();
+    let mut event_aliases = BTreeMap::new();
     let seeds = case
         .host_only_candidate_seed
         .as_ref()
@@ -232,6 +386,16 @@ async fn fixture(db: &Database, case: &Case) -> (String, BTreeMap<String, String
             "assistant" => MessageContent::Agent(vec![ContentBlock::text(text)]),
             other => panic!("unsupported source role {other}"),
         };
+        let origin = match &message.origin {
+            InputOrigin::SubscriptionEvent { event_id: logical } => {
+                let actual = watched_event(db, &case.id, text).await;
+                assert!(event_aliases
+                    .insert(logical.clone(), actual.clone())
+                    .is_none());
+                InputOrigin::SubscriptionEvent { event_id: actual }
+            }
+            original => original.clone(),
+        };
         db.add_message_with_seq_and_origin(
             &message.message_id,
             &source,
@@ -239,10 +403,15 @@ async fn fixture(db: &Database, case: &Case) -> (String, BTreeMap<String, String
             &content,
             None,
             None,
-            &message.origin,
+            &origin,
         )
         .await
-        .unwrap();
+        .unwrap_or_else(|error| {
+            panic!(
+                "{} source {} ({origin:?}): {error}",
+                case.id, message.message_id
+            )
+        });
         sqlx::query("UPDATE messages SET created_at=? WHERE message_id=?")
             .bind(&message.created_at)
             .bind(&message.message_id)
@@ -250,7 +419,7 @@ async fn fixture(db: &Database, case: &Case) -> (String, BTreeMap<String, String
             .await
             .unwrap();
     }
-    (source, aliases)
+    (source, aliases, event_aliases)
 }
 async fn prepare(db: &Database, profile: &ScanProfile, now: i64) -> PreparedScanBatch {
     for _ in 0..4 {
@@ -345,7 +514,12 @@ fn raw_proposals(records: &[Value], input: &phoenix_db::coordinator_scanner::Sca
         "scored_independently_of_adapter_or_host_acceptance":true})
 }
 
-fn validate_prepared(case: &Case, batch: &PreparedScanBatch, aliases: &BTreeMap<String, String>) {
+fn validate_prepared(
+    case: &Case,
+    batch: &PreparedScanBatch,
+    aliases: &BTreeMap<String, String>,
+    event_aliases: &BTreeMap<String, String>,
+) {
     assert_eq!(batch.input().scan_context.lane, ScanLane::Historical);
     assert_eq!(
         batch.input().fragments.len(),
@@ -365,7 +539,19 @@ fn validate_prepared(case: &Case, batch: &PreparedScanBatch, aliases: &BTreeMap<
             "actual default bounded projection differs: {}",
             case.id
         );
-        assert_eq!(actual.origin, source.origin);
+        let expected_origin = match &source.origin {
+            InputOrigin::SubscriptionEvent { event_id: logical } => {
+                InputOrigin::SubscriptionEvent {
+                    event_id: event_aliases[logical].clone(),
+                }
+            }
+            original => original.clone(),
+        };
+        assert_eq!(
+            actual.origin, expected_origin,
+            "{} retains actual origin class and normalized event identity",
+            case.id
+        );
         assert_eq!(actual.created_at_us, time(&source.created_at));
     }
     let actual_ids: std::collections::BTreeSet<_> = batch
@@ -420,9 +606,9 @@ async fn scanner_quality_all_real_host_fixtures() {
     let mut aggregate = 0;
     for case in &corpus.cases {
         let db = open(&root.path().join(format!("{}.db", case.id))).await;
-        let (source, aliases) = fixture(&db, case).await;
+        let (source, aliases, event_aliases) = fixture(&db, case).await;
         let batch = prepare(&db, &profile, time(&case.input.scan_context.captured_at)).await;
-        validate_prepared(case, &batch, &aliases);
+        validate_prepared(case, &batch, &aliases, &event_aliases);
         aggregate += model::BoundedRequest::new(prompt::INSTRUCTIONS, batch.input())
             .unwrap()
             .content_bytes();
@@ -476,6 +662,7 @@ fn executable_hash() -> String {
 
 #[tokio::test]
 #[ignore = "opt-in real scanner host/provider qualification; explicit prepare/live mode and retained binary required"]
+#[allow(clippy::too_many_lines)]
 async fn coordinator_scanner_quality() {
     let mode = std::env::var("PHOENIX_SCANNER_QUALITY_MODE").expect("prepare|live");
     assert!(matches!(mode.as_str(), "prepare" | "live"));
@@ -517,10 +704,10 @@ async fn coordinator_scanner_quality() {
             let dir = output.join(&case.id);
             std::fs::create_dir(&dir).unwrap();
             let db = open(&dir.join("source.db")).await;
-            let (source, aliases) = fixture(&db, case).await;
+            let (source, aliases, event_aliases) = fixture(&db, case).await;
             let now_us = time(&case.input.scan_context.captured_at);
             let batch = prepare(&db, &profile, now_us).await;
-            validate_prepared(case, &batch, &aliases);
+            validate_prepared(case, &batch, &aliases, &event_aliases);
             let request = model::BoundedRequest::new(prompt::INSTRUCTIONS, batch.input()).unwrap();
             let input_bytes = serde_json::to_vec(batch.input()).unwrap();
             total_bytes += request.content_bytes();
@@ -533,6 +720,7 @@ async fn coordinator_scanner_quality() {
                 input_sha256: digest(&input_bytes),
                 content_bytes: request.content_bytes(),
                 aliases,
+                event_aliases,
             };
             write(&dir.join("input.json"), batch.input());
             write(

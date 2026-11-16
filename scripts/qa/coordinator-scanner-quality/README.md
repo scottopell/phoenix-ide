@@ -22,7 +22,12 @@ PHOENIX_SCANNER_QUALITY_OUTPUT=/absolute/new-prepared-directory \
 ```
 
 Preparation creates one real migrated file database per case. Source rows retain
-the supplied role/origin and prose. Existing candidates are created/retired via
+the supplied role/origin class and prose. Subscription-event sources first create
+a real watched worker, authoritative materialized input, exact response and
+terminal settlement. The resulting normalized event IDs replace only logical
+fixture event aliases at initial admission; the hash-bound prepared record
+retains those aliases, and actual prepared provenance is checked against them.
+No persisted origin or identity is rewritten. Existing candidates are created/retired via
 the native tracking mutation path, with real generated identities. Timestamp-only
 synthetic fixture adjustments occur before the first scanner preparation to
 preserve the source and retirement chronology. No IDs, origins, frontiers, batch
