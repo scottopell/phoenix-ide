@@ -247,6 +247,8 @@ async fn native_goal_discovery_prepare_apply_read_and_replay_without_dispatch() 
                 "close_completion_allowances_and_native_retry_fence".into()
             ),
             (158, "native_close_initial_receipts".into()),
+            (159, "close_original_retirement_anchors".into()),
+            (160, "native_close_exact_observation_receipts".into()),
         ]
     );
     for name in [

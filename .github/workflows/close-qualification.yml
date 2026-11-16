@@ -95,6 +95,12 @@ jobs:
           grep -E 'test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored;' evidence/native-close-runtime-matcher.log
           cargo test -p phoenix_ide --lib native_close_admission_tests:: -- --nocapture --test-threads=1 2>&1 | tee evidence/native-close-runtime-actor.log
           grep -E 'test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored;' evidence/native-close-runtime-actor.log
+      - name: Qualify Coordinator Goal discovery migration ledger
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p phoenix_ide --lib coordinator_tools::goals::tests:: -- --nocapture --test-threads=1 2>&1 | tee evidence/coordinator-goal-tools.log
+          grep -Eq 'test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored;' evidence/coordinator-goal-tools.log
       - name: Require exact source formatting
         if: success() || failure()
         shell: bash
