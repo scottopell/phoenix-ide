@@ -527,6 +527,7 @@ async fn registered_fresh_upgrade_slack_children_ledger_and_reentry() {
                     (161, "native_close_explicit_retry_admission"),
                     (162, "native_close_source_fence"),
                     (163, "native_close_retry_failure"),
+                    (164, "native_close_retry_dispatch"),
                 ]
             );
             drop(conn);
