@@ -1967,3 +1967,5 @@ async fn scanner_bounded_contention_leaves_pending_then_progresses_when_quiet() 
 mod topology;
 
 mod allowance;
+
+mod engine_memory;
