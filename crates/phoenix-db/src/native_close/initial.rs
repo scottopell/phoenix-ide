@@ -1,13 +1,19 @@
 //! Dormant initial-only acceptance. No cleanup, dispatch, retry or allowance claim.
 
-use phoenix_core::domain::close::{CloseAttemptId, CloseRunOrdinal, TranscriptConversationId};
+use phoenix_core::domain::close::{
+    CloseAttemptId, CloseExpectedRetirementResource, ClosePhase, CloseRunOrdinal,
+    TranscriptConversationId,
+};
 use phoenix_core::domain::product_conversation::ProductConversationId;
 use sqlx::{Row, Sqlite, Transaction};
 use uuid::Uuid;
 
 use super::{NativeCloseCommand, NativeCloseIntent};
 use crate::workflow::LocalAuthorityResult;
-use crate::{Database, DbError, DbResult};
+use crate::{
+    CaptureCloseRetirementInventoryRequest, Database, DbError, DbResult,
+    ReplaceCloseInspectionRequest,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NativeCloseRunRef {
@@ -44,6 +50,95 @@ pub enum NativeCloseInitialSettlement {
 }
 
 impl Database {
+    /// Replaces only the exact source-owned initial inspection; does not dispatch effects.
+    pub async fn replace_native_close_initial_inspection(
+        &self,
+        command: &NativeCloseCommand,
+        receipt: &NativeCloseReceipt,
+        live_source: &phoenix_core::domain::sm_state::ConvState,
+        request: ReplaceCloseInspectionRequest,
+        empty_generation: Option<&str>,
+    ) -> LocalAuthorityResult<DbResult<()>> {
+        let mut tx = match self.pool.begin_with("BEGIN IMMEDIATE").await {
+            Ok(tx) => tx,
+            Err(error) => return LocalAuthorityResult::DurableFactEstablished(Err(error.into())),
+        };
+        let result = async {
+            let (admitted, _) = require_initial_execution_tx(
+                &mut tx,
+                command,
+                receipt,
+                live_source,
+                ClosePhase::AwaitingRetirementInspection,
+            )
+            .await?;
+            if request.attempt_id != admitted.attempt_id {
+                return Err(DbError::CloseFoundationPrecondition(
+                    "initial inspection request does not match the admitted run".into(),
+                ));
+            }
+            self.replace_close_inspection_tx(&mut tx, &request, empty_generation)
+                .await
+        }
+        .await;
+        match result {
+            Ok(()) => match tx.commit().await {
+                Ok(()) => LocalAuthorityResult::DurableFactEstablished(Ok(())),
+                Err(_) => LocalAuthorityResult::DurableFactUnclassified,
+            },
+            Err(error) => match tx.rollback().await {
+                Ok(()) => LocalAuthorityResult::DurableFactEstablished(Err(error)),
+                Err(_) => LocalAuthorityResult::DurableFactUnclassified,
+            },
+        }
+    }
+
+    /// Captures only the exact source-owned initial retirement inventory.
+    pub async fn capture_native_close_initial_retirement_inventory(
+        &self,
+        command: &NativeCloseCommand,
+        receipt: &NativeCloseReceipt,
+        live_source: &phoenix_core::domain::sm_state::ConvState,
+        request: CaptureCloseRetirementInventoryRequest,
+    ) -> LocalAuthorityResult<DbResult<Vec<CloseExpectedRetirementResource>>> {
+        let mut tx = match self.pool.begin_with("BEGIN IMMEDIATE").await {
+            Ok(tx) => tx,
+            Err(error) => return LocalAuthorityResult::DurableFactEstablished(Err(error.into())),
+        };
+        let result = async {
+            let (admitted, _) = require_initial_execution_tx(
+                &mut tx,
+                command,
+                receipt,
+                live_source,
+                ClosePhase::RetirementRequested,
+            )
+            .await?;
+            if request.attempt_id != admitted.attempt_id {
+                return Err(DbError::CloseFoundationPrecondition(
+                    "initial inventory request does not match the admitted run".into(),
+                ));
+            }
+            self.capture_close_retirement_inventory_tx(&mut tx, &request)
+                .await
+        }
+        .await;
+        match result {
+            Ok(resources) => match tx.commit().await {
+                Ok(()) => LocalAuthorityResult::DurableFactEstablished(Ok(resources)),
+                Err(_) => LocalAuthorityResult::DurableFactUnclassified,
+            },
+            Err(error @ DbError::CloseFoundationRepairRequired(_)) => match tx.commit().await {
+                Ok(()) => LocalAuthorityResult::DurableFactEstablished(Err(error)),
+                Err(_) => LocalAuthorityResult::DurableFactUnclassified,
+            },
+            Err(error) => match tx.rollback().await {
+                Ok(()) => LocalAuthorityResult::DurableFactEstablished(Err(error)),
+                Err(_) => LocalAuthorityResult::DurableFactUnclassified,
+            },
+        }
+    }
+
     /// Prepares execution of the one exact newly admitted initial run.
     ///
     /// `live_source` must be the trusted source snapshot held by the source actor;

@@ -1,6 +1,6 @@
 use super::*;
 use crate::workflow::AcceptAuthoritativeTurn;
-use phoenix_core::domain::close::ClosePhase;
+use phoenix_core::domain::close::{ClosePhase, RetiredResourceKind};
 use phoenix_core::domain::db_schema::InputOrigin;
 use phoenix_core::domain::db_schema::SourceToolCall;
 use phoenix_core::domain::llm_types::ContentBlock;
@@ -46,10 +46,11 @@ impl Fixture {
     }
 
     async fn create_target(db: &Database, id: &str) -> ProductConversationId {
-        db.create_conversation(id, id, "/nonexistent", true, None, None)
+        let target = db
+            .create_conversation(id, id, "/tmp", true, None, None)
             .await
-            .unwrap()
-            .product_conversation_id
+            .unwrap();
+        target.product_conversation_id
     }
 
     async fn executing(&self, source: &SourceToolCall, target: &ProductConversationId) {
@@ -262,6 +263,220 @@ async fn initial_phase(f: &Fixture, receipt: &NativeCloseReceipt) -> String {
         .fetch_one(f.db.pool())
         .await
         .unwrap()
+}
+
+async fn initial_inventory_request(
+    f: &Fixture,
+    receipt: &NativeCloseReceipt,
+) -> CaptureCloseRetirementInventoryRequest {
+    let attempt_id = &receipt.admitted.attempt_id;
+    let snapshot = f
+        .db
+        .get_close_obligation(attempt_id.as_str())
+        .await
+        .unwrap()
+        .snapshot()
+        .unwrap()
+        .clone();
+    let scopes = f
+        .db
+        .list_close_attempt_scopes(attempt_id.as_str())
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|scope| {
+            let worktree = match scope.captured_worktree {
+                Some(phoenix_core::domain::close::CapturedWorktreeIdentity::Resolved(identity)) => {
+                    Some(identity)
+                }
+                Some(phoenix_core::domain::close::CapturedWorktreeIdentity::Unresolved { .. }) => {
+                    panic!("fixture scope identity must be resolved")
+                }
+                None => panic!("fixture target must have an allocated worktree"),
+            };
+            crate::CaptureCloseRetirementInventoryScopeRequest {
+                scope: scope.scope,
+                inventory: phoenix_core::domain::close::CloseOwnedResourceInventory {
+                    worktree,
+                    work_scopes: Default::default(),
+                    bash_process_groups: Default::default(),
+                    tmux_servers: Default::default(),
+                    pty_sessions: Default::default(),
+                    browser_sessions: Default::default(),
+                    equivalent_live_resources: Default::default(),
+                },
+            }
+        })
+        .collect();
+    CaptureCloseRetirementInventoryRequest {
+        attempt_id: attempt_id.clone(),
+        snapshot,
+        scopes,
+    }
+}
+
+async fn assert_no_initial_inspection_artifacts(f: &Fixture, receipt: &NativeCloseReceipt) {
+    for sql in [
+        "SELECT COUNT(*) FROM close_retirement_inspections WHERE attempt_id = ?1",
+        "SELECT COUNT(*) FROM close_retirement_inventories WHERE attempt_id = ?1",
+        "SELECT COUNT(*) FROM close_expected_retirement_resources WHERE attempt_id = ?1",
+        "SELECT COUNT(*) FROM close_original_retirement_anchors WHERE attempt_id = ?1",
+    ] {
+        let count: i64 = sqlx::query_scalar(sql)
+            .bind(receipt.admitted.attempt_id.as_str())
+            .fetch_one(f.db.pool())
+            .await
+            .unwrap();
+        assert_eq!(count, 0, "unexpected inspection or inventory artifact: {sql}");
+    }
+}
+
+#[tokio::test]
+async fn initial_inspection_and_inventory_require_exact_live_source_and_receipt() {
+    let f = Fixture::new().await;
+    let target_scope =
+        crate::close_foundation::allocate_scope_worktree(&f.db, "first-target").await;
+    let (command, receipt, live_source) = prepared_initial(&f).await;
+    f.db.settle_native_close_initial(&command, &receipt, &live_source)
+        .await
+        .established()
+        .unwrap()
+        .unwrap();
+    let captured_scopes = f
+        .db
+        .list_close_attempt_scopes(receipt.admitted.attempt_id.as_str())
+        .await
+        .unwrap();
+    assert_eq!(captured_scopes.len(), 1);
+    assert_eq!(captured_scopes[0].scope, target_scope);
+    let inspection = ReplaceCloseInspectionRequest {
+        attempt_id: receipt.admitted.attempt_id.clone(),
+        scopes: vec![crate::ReplaceCloseInspectionScopeRequest {
+            scope: target_scope.clone(),
+            snapshot: phoenix_core::domain::close::CloseRetirementSnapshot::parse(
+                "native-generation-1",
+                "native-fingerprint-1",
+            )
+            .unwrap(),
+            losses: vec![],
+        }],
+    };
+    let mut wrong = receipt.clone();
+    wrong.request_id = Uuid::new_v4();
+    for (proof, source) in [(&wrong, &live_source), (&receipt, &ConvState::Idle)] {
+        assert!(matches!(
+            f.db.replace_native_close_initial_inspection(
+                &command, proof, source, inspection.clone(), None,
+            )
+            .await,
+            LocalAuthorityResult::DurableFactEstablished(Err(DbError::CloseFoundationPrecondition(_)))
+        ));
+        assert_no_initial_inspection_artifacts(&f, &receipt).await;
+        assert_eq!(
+            initial_phase(&f, &receipt).await,
+            ClosePhase::AwaitingRetirementInspection.as_str()
+        );
+    }
+    let mut wrong_inspection = inspection.clone();
+    wrong_inspection.attempt_id = CloseAttemptId::parse("different-initial-attempt").unwrap();
+    assert!(matches!(
+        f.db.replace_native_close_initial_inspection(
+            &command,
+            &receipt,
+            &live_source,
+            wrong_inspection,
+            None,
+        )
+        .await,
+        LocalAuthorityResult::DurableFactEstablished(Err(DbError::CloseFoundationPrecondition(_)))
+    ));
+    assert_no_initial_inspection_artifacts(&f, &receipt).await;
+    f.db.replace_native_close_initial_inspection(
+        &command, &receipt, &live_source, inspection.clone(), None,
+    )
+    .await
+    .established()
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        initial_phase(&f, &receipt).await,
+        ClosePhase::RetirementRequested.as_str()
+    );
+    let inventory = initial_inventory_request(&f, &receipt).await;
+    assert_eq!(inventory.scopes.len(), 1);
+    assert_eq!(inventory.scopes[0].scope, target_scope);
+    assert!(inventory.scopes[0].inventory.worktree.is_some());
+    for (proof, source) in [(&wrong, &live_source), (&receipt, &ConvState::Idle)] {
+        assert!(matches!(
+            f.db.capture_native_close_initial_retirement_inventory(
+                &command, proof, source, inventory.clone(),
+            )
+            .await,
+            LocalAuthorityResult::DurableFactEstablished(Err(DbError::CloseFoundationPrecondition(_)))
+        ));
+        assert_no_initial_inspection_artifacts_after_inspection(&f, &receipt).await;
+    }
+    let mut wrong_attempt = inventory.clone();
+    wrong_attempt.attempt_id = CloseAttemptId::parse("different-initial-attempt").unwrap();
+    assert!(matches!(
+        f.db.capture_native_close_initial_retirement_inventory(
+            &command, &receipt, &live_source, wrong_attempt,
+        )
+        .await,
+        LocalAuthorityResult::DurableFactEstablished(Err(DbError::CloseFoundationPrecondition(_)))
+    ));
+    assert_no_initial_inspection_artifacts_after_inspection(&f, &receipt).await;
+    let captured = f.db.capture_native_close_initial_retirement_inventory(
+        &command, &receipt, &live_source, inventory.clone(),
+    )
+    .await
+    .established()
+    .unwrap()
+    .unwrap();
+    assert_eq!(captured.len(), 2);
+    assert!(captured.iter().all(|resource| resource.scope == target_scope));
+    assert_eq!(
+        captured
+            .iter()
+            .filter(|resource| resource.resource.kind() == RetiredResourceKind::WorkScope)
+            .count(),
+        1,
+    );
+    assert_eq!(
+        captured
+            .iter()
+            .filter(|resource| resource.resource.kind() == RetiredResourceKind::Worktree)
+            .count(),
+        1,
+    );
+    assert_eq!(
+        f.db.capture_native_close_initial_retirement_inventory(
+            &command, &receipt, &live_source, inventory,
+        )
+        .await
+        .established()
+        .unwrap()
+        .unwrap(),
+        captured
+    );
+}
+
+async fn assert_no_initial_inspection_artifacts_after_inspection(
+    f: &Fixture,
+    receipt: &NativeCloseReceipt,
+) {
+    for sql in [
+        "SELECT COUNT(*) FROM close_retirement_inventories WHERE attempt_id = ?1",
+        "SELECT COUNT(*) FROM close_expected_retirement_resources WHERE attempt_id = ?1",
+        "SELECT COUNT(*) FROM close_original_retirement_anchors WHERE attempt_id = ?1",
+    ] {
+        let count: i64 = sqlx::query_scalar(sql)
+            .bind(receipt.admitted.attempt_id.as_str())
+            .fetch_one(f.db.pool())
+            .await
+            .unwrap();
+        assert_eq!(count, 0, "unexpected inventory artifact: {sql}");
+    }
 }
 
 #[tokio::test]

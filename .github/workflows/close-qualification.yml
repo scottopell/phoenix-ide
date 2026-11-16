@@ -199,7 +199,7 @@ jobs:
           set -euo pipefail
           cargo test -p phoenix_ide --lib -- --list 2>&1 | tee evidence/runtime-inventory.log
           grep -E 'native_close_application::tests::.*: test$|native_close_admission_tests::.*: test$' evidence/runtime-inventory.log > evidence/runtime-selected-tests.txt
-          grep -F 'native_close_admission_tests::native_retry_backend_requires_actor_database_authority_not_matching_path: test' evidence/runtime-selected-tests.txt
+          grep -F 'native_close_admission_tests::native_close_backend_requires_actor_database_authority_not_matching_path: test' evidence/runtime-selected-tests.txt
           test -s evidence/runtime-selected-tests.txt
           grep -F 'stopped_live_source_refuses_exact_observe_replay_before_database_lookup: test' evidence/runtime-selected-tests.txt
           cargo test -p phoenix_ide --lib native_close_application::tests:: -- --nocapture --test-threads=1 2>&1 | tee evidence/native-close-runtime-matcher.log
@@ -220,6 +220,7 @@ jobs:
             grep -Eq 'test result: ok\. 1 passed; 0 failed; 0 ignored;' "evidence/$test.log"
           done
       - name: Qualify original-bound native retry assessment
+        if: success() || failure()
         shell: bash
         run: |
           set -euo pipefail

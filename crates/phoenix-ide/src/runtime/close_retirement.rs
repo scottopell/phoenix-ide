@@ -8160,7 +8160,10 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let admitted_plan = super::close_safe_retry_effects(&remaining).unwrap();
-        assert_eq!(admitted_plan, vec![plan[2].clone(), plan[1].clone(), plan[0].clone()]);
+        assert_eq!(
+            admitted_plan,
+            vec![plan[2].clone(), plan[1].clone(), plan[0].clone()]
+        );
         assert_eq!(
             super::close_safe_retry_execution_order(&admitted_plan),
             vec![0, 1, 2]
@@ -9889,7 +9892,10 @@ mod tests {
                 .iter()
                 .map(|effect| effect.resource.kind())
                 .collect::<Vec<_>>(),
-            vec![super::RetiredResourceKind::Worktree, super::RetiredResourceKind::WorkScope]
+            vec![
+                super::RetiredResourceKind::Worktree,
+                super::RetiredResourceKind::WorkScope
+            ]
         );
         for effect in &assessment.remaining_effects {
             assert!(original.resources.iter().any(|resource| {
