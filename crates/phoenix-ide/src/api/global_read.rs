@@ -4341,6 +4341,7 @@ mod tests {
     #[tokio::test]
     async fn event_evidence_read_preserves_version_expectation_on_later_pages() {
         use sha2::{Digest, Sha256};
+        use std::fmt::Write as _;
         let db = crate::db::Database::open_in_memory().await.unwrap();
         let source = db
             .create_conversation("event-read", "event-read", "/tmp", true, None, None)

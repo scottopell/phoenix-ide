@@ -297,6 +297,7 @@ impl Database {
     }
 }
 
+#[cfg(test)]
 pub(crate) async fn record_terminal_event_tx(
     tx: &mut Transaction<'_, Sqlite>,
     turn_id: u64,
