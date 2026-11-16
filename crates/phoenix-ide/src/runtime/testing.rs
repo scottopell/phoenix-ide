@@ -650,6 +650,12 @@ pub struct InMemoryStorage {
     svg_artifacts: Mutex<StoredSvgArtifacts>,
     tool_admission_policies:
         Mutex<HashMap<String, phoenix_core::domain::tool_availability::ToolAvailability>>,
+    tool_policy_read_gate: Mutex<
+        Option<(
+            tokio::sync::oneshot::Sender<()>,
+            tokio::sync::oneshot::Receiver<Result<(), String>>,
+        )>,
+    >,
     messages: Mutex<HashMap<String, Vec<Message>>>,
     states: Mutex<HashMap<String, ConvState>>,
     state_updated_ats: Mutex<HashMap<String, chrono::DateTime<chrono::Utc>>>,
@@ -767,6 +773,18 @@ impl InMemoryStorage {
             .unwrap()
             .insert(conversation_id.to_owned(), policy);
     }
+
+    pub fn hold_next_tool_policy_read(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<Result<(), String>>,
+    ) {
+        let (started, entered) = tokio::sync::oneshot::channel();
+        let (release, wait) = tokio::sync::oneshot::channel();
+        *self.tool_policy_read_gate.lock().unwrap() = Some((started, wait));
+        (entered, release)
+    }
     pub fn gate_tracking_observation(
         &self,
     ) -> (
@@ -788,6 +806,7 @@ impl InMemoryStorage {
             handoff_candidates: Mutex::new(Vec::new()),
             svg_artifacts: Mutex::new(HashMap::new()),
             tool_admission_policies: Mutex::new(HashMap::new()),
+            tool_policy_read_gate: Mutex::new(None),
             messages: Mutex::new(HashMap::new()),
             states: Mutex::new(HashMap::new()),
             state_updated_ats: Mutex::new(HashMap::new()),
@@ -2708,6 +2727,13 @@ impl StateStore for InMemoryStorage {
         &self,
         conversation_id: &str,
     ) -> Result<phoenix_core::domain::tool_availability::ToolAvailability, String> {
+        let gate = self.tool_policy_read_gate.lock().unwrap().take();
+        if let Some((started, release)) = gate {
+            let _ = started.send(());
+            release
+                .await
+                .map_err(|_| "policy read gate disappeared")??;
+        }
         Ok(self
             .tool_admission_policies
             .lock()

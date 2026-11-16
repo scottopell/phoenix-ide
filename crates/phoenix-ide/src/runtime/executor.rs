@@ -34908,6 +34908,149 @@ mod tool_generation_guard_tests {
     }
 
     #[tokio::test]
+    async fn denied_selection_reserves_no_ordinary_call_resources() {
+        let mut rt = runtime_tool_executing("denied");
+        let tools = Arc::new(
+            MockToolExecutor::new().with_tool("bash", crate::tools::ToolOutput::success("unused")),
+        );
+        rt.tool_executor = Arc::new(tools.clone());
+        rt.storage.seed_tool_admission_policy(
+            "conv-tool-gen",
+            phoenix_core::domain::tool_availability::ToolAvailability::all(
+                tools.definitions().await,
+            ),
+        );
+        let denied = ToolCall::new(
+            "denied",
+            ToolInput::from(crate::tools::BashToolInput::run("git add -A")),
+        );
+        if let ConvState::ToolExecuting {
+            current_tool,
+            assistant_message,
+            ..
+        } = &mut rt.state
+        {
+            *current_tool = denied.clone();
+            assistant_message.content = vec![ContentBlock::tool_use(
+                "denied",
+                "bash",
+                denied.input.to_value(),
+            )];
+        }
+        let generation = rt.tool_execution.generation();
+        let mut broadcasts = rt.broadcast_tx.subscribe();
+        rt.execute_effect(Effect::ExecuteTool { tool: denied })
+            .await
+            .unwrap();
+        assert_eq!(
+            rt.tool_execution.generation(),
+            generation,
+            "Layer 0 denial must precede ordinary generation/channel/token admission"
+        );
+        assert_eq!(
+            rt.fatal_local_authority_fence.owner_count(),
+            0,
+            "denial must not create a metrics writer owning local admission"
+        );
+        while let Ok(event) = broadcasts.try_recv() {
+            assert!(
+                !matches!(event, SseEvent::MessageUpdated { display_data: Some(data), .. }
+                if data.get("tool_starts").is_some()),
+                "denied call must have no start publication"
+            );
+        }
+        let (_, outcome) = tokio::time::timeout(Duration::from_secs(60), rt.tool_outcome_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let ToolExecOutcome::Completed(result) = outcome else {
+            panic!("denial must remain an ordinary result")
+        };
+        assert_eq!(result.tool_use_id, "denied");
+        assert!(result.is_error());
+        assert!(result.output().contains("command_safety_rejected"));
+        assert!(tools.recorded_executions().is_empty());
+    }
+
+    #[tokio::test]
+    async fn delayed_policy_read_cannot_queue_run_loop_cancellation() {
+        let mut rt = runtime_tool_executing("before");
+        let tools = Arc::new(
+            MockToolExecutor::new().with_tool("bash", crate::tools::ToolOutput::success("unused")),
+        );
+        rt.tool_executor = Arc::new(tools.clone());
+        rt.storage.seed_tool_admission_policy(
+            "conv-tool-gen",
+            phoenix_core::domain::tool_availability::ToolAvailability::all(
+                tools.definitions().await,
+            ),
+        );
+        let delayed = ToolCall::new(
+            "delayed",
+            ToolInput::from(crate::tools::BashToolInput::run("git status --short")),
+        );
+        if let ConvState::ToolExecuting {
+            current_tool,
+            remaining_tools,
+            assistant_message,
+            ..
+        } = &mut rt.state
+        {
+            *remaining_tools = vec![delayed.clone()];
+            assistant_message.content = [current_tool, &delayed]
+                .into_iter()
+                .map(|call| ContentBlock::tool_use(&call.id, call.name(), call.input.to_value()))
+                .collect();
+        }
+        let (entered, release) = rt.storage.hold_next_tool_policy_read();
+        let (event_tx, event_rx) = mpsc::channel(8);
+        rt.event_tx = event_tx.clone();
+        rt.event_rx = event_rx;
+        let (state_tx, mut states) = watch::channel(rt.state.clone());
+        let task = tokio::spawn(rt.with_state_watcher(state_tx).run());
+        event_tx
+            .send(Event::ToolComplete {
+                tool_use_id: "before".into(),
+                result: ToolResult::success("before".into(), "done".into()),
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(60), entered)
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::pause();
+        event_tx
+            .send(Event::UserCancel {
+                reason: None,
+                cause: crate::state_machine::event::CancelCause::UserRequested,
+            })
+            .await
+            .unwrap();
+        let cancelled_before_release = tokio::time::timeout(
+            Duration::from_millis(100),
+            states.wait_for(|state| matches!(state, ConvState::Idle)),
+        )
+        .await
+        .is_ok();
+        let _ = release.send(Ok(()));
+        tokio::time::resume();
+        event_tx.send(Event::Shutdown).await.unwrap();
+        assert_eq!(
+            task.await.unwrap(),
+            RuntimeExitDisposition::CoordinatedShutdown
+        );
+        assert!(
+            cancelled_before_release,
+            "the owned run loop must settle cancellation within 100ms while its read remains held"
+        );
+        assert!(
+            tools.recorded_executions().is_empty(),
+            "cancelled preparation must never launch after release"
+        );
+    }
+
+    #[tokio::test]
     async fn denied_tool_keeps_current_generation_and_continues_the_round() {
         let mut rt = runtime_tool_executing("denied");
         let tools = Arc::new(
