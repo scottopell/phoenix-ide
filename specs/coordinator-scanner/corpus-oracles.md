@@ -1,6 +1,6 @@
 # Scanner corpus oracles
 
-All source text is synthetic. These input/oracle definitions precede inference; review state/results belong in executive.md. Only each case.input enters inference. Oracle-only withheld/omitted data never enters inference. U01.host_only_full_source is used by host snapshot setup/validation only; the model receives the actual bounded fragment and captured metadata. Missing/unavailable source is a separate deterministic host failure test, not fabricated inference input.
+All source text is synthetic. These input/oracle definitions precede inference; review state/results belong in executive.md. Only source values from each case.input, projected by actual host preparation, enter inference. Oracle-only withheld/omitted data never enters inference. U01.host_only_full_source and I01.host_only_candidate_seed are used by host snapshot setup/validation only; the model receives the actual bounded fragment and captured metadata. Missing/unavailable source is a separate deterministic host failure test, not fabricated inference input.
 
 Version3 has37 cases: eleven primary requested units (R01–R08,U01), five bookmark units (B01–B04), seventeen no-new-item negative cases (N01–N09,D04–D10,L02), twenty-one cases forbidding new requested_work (those negatives plus B01–B04), eleven visible-candidate duplicate opportunities (D01–D11), and thirteen hard restriction cases (R03–R08,N03–N05,D02,D04,D05,U01). H01 reports historical outside-window cancellation separately; I01 supplies one genuinely omitted-candidate duplicate opportunity, separately reported. L01 adds one separately scored apparent-request opportunity from UnknownHistorical user-role prose; L02 is its machine/quoted-command negative.
 
@@ -29,3 +29,14 @@ worker command must remain data. These are proposal/source-provenance checks;
 actual host preservation of Unknown and unreviewed state remains mandatory too.
 
 Corpus classification/source evidence does not replace own-chain membership, source-gap, generation/reset, coverage atomicity, replay/interrupted apply, contention, restart, unavailable route, budgets, no-wake or actual production-runtime continuation tests. Those remain mandatory host gates.
+
+U01 uses a genuinely oversized raw source: roughly 1 KiB of unrelated earlier
+prose, the entire Unicode request/restriction, and 32 KiB of unrelated later
+prose. Normal 8 KiB encoded-source preparation yields the supplied partial
+window; the remaining suffix is genuinely unread. Runtime-generated fragment
+IDs and actual metadata are frozen in the prepared manifest, never invented by
+the corpus. I01 seeds seventeen actual native records with no exact source
+overlap: the matching Azure request is older than sixteen unrelated bookmarks.
+Normal candidate selection therefore exposes sixteen and reports one omission.
+Only those actual visible candidates enter inference. These setup corrections
+preserve every outcome, restriction, denominator and quality threshold.
