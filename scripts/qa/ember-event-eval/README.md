@@ -42,7 +42,13 @@ invented broader completion, new authority and redundant worker nudges.
 Limits: four targeted cases × three variants × one repetition, plus three control
 cases × three variants × three repetitions: 39 trials total. Variant order
 rotates between cases and control repetitions. At most twelve provider calls per trial,
-1,536 output tokens and 60 seconds per call. The per-trial maxima sum to 468 calls,
+with a 60-second client timeout and 1,536 output tokens requested per call. Codex
+omits that output field on the wire; it is not an enforced generation or billing
+cap. The retained manifest's `max_output_tokens` names the requested logical budget.
+All calls reported output usage: the first invocation's observed maximum was 216
+output tokens (6,604 total), and the complete second invocation's maximum was 223
+(6,794 total). Neither invocation had an observed call above 1,536 tokens. These
+measurements do not establish a provider-side ceiling. The per-trial maxima sum to 468 calls,
 but the hard global maximum remains 120, with a stop threshold of two million observed
 input tokens for one invocation. The last returned call may cross that observed
 threshold; it is checked before another call. No automatic retries. Cancellation/error/time
@@ -54,7 +60,7 @@ global cap. The first six-call invocation was partial and unaccepted because all
 three raw-event burst trials reached that limit without a final answer; its
 [complete result report](results-e5ff1b8.md) remains part of the evaluation record.
 The second invocation repeats all 39 trials with the same corpus, independent
-oracles, ordering, model, effort, tools, output/time limits and promotion gates.
+oracles, ordering, model, effort, tools, requested output budget/client timeout and promotion gates.
 It is one explicitly authorized design iteration, with no selected-answer retry.
 
 ## Accepted component result

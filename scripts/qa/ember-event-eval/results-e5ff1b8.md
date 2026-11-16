@@ -15,6 +15,13 @@ and static prompt. A was the raw event, B raw event plus captured evidence, and 
 the production hydrated compact projection. All sources were synthetic and used
 production occurrence capture, hydration and bounded local read tools.
 
+Requests carried a 1,536-output-token logical budget, but Codex omits that field
+on the wire. It was not an enforced generation or billing cap. All 82 calls
+reported output usage: the observed maximum was 216 tokens and the total was
+6,604, with zero calls above 1,536. This retrospective annotation corrects the
+request-versus-provider guarantee; original manifests, records, hashes and
+promotion thresholds are unchanged. The invocation remains partial/unaccepted.
+
 ## Results
 
 All 39 records were retained: 36 final answers and three capped raw-event burst
