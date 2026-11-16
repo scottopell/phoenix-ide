@@ -255,6 +255,10 @@ try {
     const page = await context.newPage();
     if (idleAudit) await page.addInitScript(() => {
       window.reviewIdleCommands = [];
+      window.reviewSetupEvents = [];
+      for (const type of ['pointerdown', 'pointerup', 'touchstart', 'touchend', 'click', 'focusin']) {
+        document.addEventListener(type, event => window.reviewSetupEvents.push({ time: performance.now(), type, target: { tag: event.target.tagName, className: event.target.className }, editorOpen: Boolean(document.querySelector('.annotation-dialog-input')) }), true);
+      }
       for (const [prototype, method] of [[HTMLElement.prototype, 'focus'], [Element.prototype, 'scrollIntoView'], [Element.prototype, 'scrollTo'], [Element.prototype, 'scrollBy']]) {
         const original = prototype[method];
         if (!original) continue;
@@ -363,7 +367,8 @@ try {
       if (exit === 'discard' || exit === 'send') {
         const lineAction = idleAudit ? await viewer.locator('.viewer-content').evaluate(content => {
           const box = content.getBoundingClientRect();
-          return [...content.querySelectorAll('p')].find(p => p.getBoundingClientRect().top >= box.top && p.getBoundingClientRect().bottom <= box.bottom)?.querySelector('.annotatable__btn')?.getAttribute('aria-label');
+          return [...content.querySelectorAll('p')].filter(p => p.getBoundingClientRect().top >= box.top && p.getBoundingClientRect().bottom <= box.bottom)
+            .sort((a, b) => Math.abs((a.getBoundingClientRect().top + a.getBoundingClientRect().bottom) / 2 - innerHeight / 2) - Math.abs((b.getBoundingClientRect().top + b.getBoundingClientRect().bottom) / 2 - innerHeight / 2))[0]?.querySelector('.annotatable__btn')?.getAttribute('aria-label');
         }) : 'Add note to line 1';
         assert(lineAction, 'Annotation action must belong to a visible paragraph');
         if (idleAudit && width === 390) {
@@ -454,6 +459,7 @@ try {
       await page.screenshot({ path: path.join(out, `${id}-error.png`) }).catch(() => {});
     } finally {
       if (idleAudit && !result.error) result.commands = await page.evaluate(() => window.reviewIdleCommands).catch(() => []);
+      if (idleAudit) result.setupEvents = await page.evaluate(() => window.reviewSetupEvents).catch(() => []);
       await context.close();
       await save();
     }
