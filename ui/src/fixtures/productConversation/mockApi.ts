@@ -661,7 +661,7 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
       currentConversation = { ...currentConversation, ...conversation };
       source.emit('conversation_update', { sequence_id: sequenceId, conversation });
     }
-    document.documentElement.dataset.productConversationFixtureReviewProjectionPublishes = '1';
+    document.documentElement.dataset['productConversationFixtureReviewProjectionPublishes'] = '1';
   };
   window.addEventListener('product-conversation-fixture-review-projection', publishReviewProjection);
 
@@ -725,7 +725,7 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
     api.continueConversation = originalContinueConversation;
     api.retryContinuationOpening = originalRetryContinuationOpening;
     window.removeEventListener('product-conversation-fixture-review-projection', publishReviewProjection);
-    delete document.documentElement.dataset.productConversationFixtureReviewProjectionPublishes;
+    delete document.documentElement.dataset['productConversationFixtureReviewProjectionPublishes'];
     window.removeEventListener('product-conversation-fixture-fail-opening-retry', failNextOpeningRetry);
     window.removeEventListener('product-conversation-fixture-release-older', releaseOlderSnapshotResponse);
     globalThis.fetch = originalFetch;
