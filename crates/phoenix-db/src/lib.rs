@@ -2519,6 +2519,7 @@ impl Database {
                      WHERE obligation.attempt_id = ?1
                        AND obligation.topology_sealed = 1
                        AND captured.scope = ?2
+                       AND (obligation.native_managed = 0 OR obligation.phase <> 'completed')
                        AND (obligation.phase <> 'completed' OR (
                            obligation.close_outcome IN ('close_incomplete', 'archived_cleanup_attention')
                            AND EXISTS (SELECT 1 FROM close_runs run JOIN close_run_retry_effects effect
@@ -2586,14 +2587,32 @@ impl Database {
                 )));
             }
         }
+        let outcome =
+            Self::retire_work_scope_lifecycle_tx(&mut tx, precondition, reason, close_attempt_id)
+                .await?;
+        if matches!(outcome, WorkScopeRetirementOutcome::Retired) {
+            tx.commit().await?;
+        } else {
+            tx.rollback().await?;
+        }
+        Ok(outcome)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn retire_work_scope_lifecycle_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        precondition: WorkScopeRetirementPrecondition,
+        reason: &str,
+        close_attempt_id: Option<&CloseAttemptId>,
+    ) -> DbResult<WorkScopeRetirementOutcome> {
+        let scope_id = precondition.scope_id();
         let lifecycle =
             sqlx::query_scalar::<_, String>("SELECT lifecycle FROM work_scopes WHERE id = ?1")
                 .bind(scope_id.as_str())
-                .fetch_optional(&mut *tx)
+                .fetch_optional(&mut **tx)
                 .await?
                 .ok_or_else(|| DbError::Serialization(format!("unknown work scope {scope_id}")))?;
         if lifecycle == "retired" {
-            tx.rollback().await?;
             return Ok(WorkScopeRetirementOutcome::AlreadyRetired);
         }
 
@@ -2607,19 +2626,17 @@ impl Database {
              )",
         )
         .bind(scope_id.as_str())
-        .fetch_one(&mut *tx)
+        .fetch_one(&mut **tx)
         .await?;
         if unresolved_product_ownership {
-            tx.rollback().await?;
             return Ok(WorkScopeRetirementOutcome::Blocked(
                 WorkScopeRetirementBlocker::UnresolvedProductConversationOwnership,
             ));
         }
 
         if let Some(blocker) =
-            Self::conversation_retirement_blocker(&mut tx, scope_id, close_attempt_id).await?
+            Self::conversation_retirement_blocker(tx, scope_id, close_attempt_id).await?
         {
-            tx.rollback().await?;
             return Ok(WorkScopeRetirementOutcome::Blocked(blocker));
         }
 
@@ -2643,11 +2660,10 @@ impl Database {
             if sqlx::query_scalar::<_, i64>(query)
                 .bind(scope_id.as_str())
                 .bind(close_attempt_id.map(CloseAttemptId::as_str))
-                .fetch_one(&mut *tx)
+                .fetch_one(&mut **tx)
                 .await?
                 != 0
             {
-                tx.rollback().await?;
                 return Ok(WorkScopeRetirementOutcome::Blocked(blocker));
             }
         }
@@ -2661,13 +2677,11 @@ impl Database {
         .bind(&now)
         .bind(reason)
         .bind(scope_id.as_str())
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?;
         if result.rows_affected() != 1 {
-            tx.rollback().await?;
             return Ok(WorkScopeRetirementOutcome::AlreadyRetired);
         }
-        tx.commit().await?;
         Ok(WorkScopeRetirementOutcome::Retired)
     }
 

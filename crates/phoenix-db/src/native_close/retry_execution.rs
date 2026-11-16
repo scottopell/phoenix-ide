@@ -4,9 +4,12 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use phoenix_core::domain::close::{
     CloseAttemptScope, CloseExpectedRetirementResource, CloseObligation, CloseRetirementSnapshot,
-    CloseRetirementTarget, CloseRunRef, CloseStopCertainty, RetiredResourceKind,
+    CloseRetirementTarget, CloseRunRef, CloseStopCertainty, LossItemIdentity, RetiredResourceKind,
 };
-use phoenix_core::work_scope::WorkScopeId;
+use phoenix_core::work_scope::{
+    WorkScopeId, WorkScopeRetirementBlocker, WorkScopeRetirementOutcome,
+    WorkScopeRetirementPrecondition,
+};
 use sqlx::{Row, Sqlite, Transaction};
 
 use super::{NativeCloseCommand, NativeCloseIntent, NativeCloseRunRef};
@@ -256,6 +259,132 @@ impl Database {
                 snapshot: plan.snapshot,
                 resource: effect.resource.clone(),
             },
+        )
+        .await
+    }
+
+    /// Retires one pending original WorkScope under the live native retry authority.
+    /// The caller supplies runtime inventory evidence; success is recorded separately.
+    ///
+    /// # Errors
+    /// Refuses stale source, mismatched plan or original identity, incomplete resource
+    /// prerequisites, and empty reasons. Errors are classified after rollback; commit
+    /// or rollback uncertainty returns `DurableFactUnclassified`.
+    pub async fn retire_work_scope_for_native_close_retry(
+        &self,
+        command: &NativeCloseCommand,
+        admitted: &NativeCloseRunRef,
+        effect: &CloseSafeRetryEffect,
+        precondition: WorkScopeRetirementPrecondition,
+        reason: &str,
+    ) -> LocalAuthorityResult<DbResult<WorkScopeRetirementOutcome>> {
+        let mut tx = match self.pool.begin_with("BEGIN IMMEDIATE").await {
+            Ok(tx) => tx,
+            Err(error) => return LocalAuthorityResult::DurableFactEstablished(Err(error.into())),
+        };
+        let result = Self::retire_work_scope_for_native_close_retry_tx(
+            &mut tx, command, admitted, effect, precondition, reason,
+        )
+        .await;
+        let committed = matches!(&result, Ok(WorkScopeRetirementOutcome::Retired));
+        let finalized = if committed {
+            tx.commit().await
+        } else {
+            tx.rollback().await
+        };
+        match finalized {
+            Ok(()) => LocalAuthorityResult::DurableFactEstablished(result),
+            Err(_) => LocalAuthorityResult::DurableFactUnclassified,
+        }
+    }
+
+    async fn retire_work_scope_for_native_close_retry_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        command: &NativeCloseCommand,
+        admitted: &NativeCloseRunRef,
+        effect: &CloseSafeRetryEffect,
+        precondition: WorkScopeRetirementPrecondition,
+        reason: &str,
+    ) -> DbResult<WorkScopeRetirementOutcome> {
+        let plan = Self::require_native_close_retry_plan_identity_tx(tx, command, admitted).await?;
+        if !plan.running {
+            return Err(refused(
+                "native WorkScope retirement requires its latest running plan",
+            ));
+        }
+        let run = CloseRunRef {
+            attempt_id: admitted.attempt_id.clone(),
+            ordinal: admitted.run_ordinal,
+        };
+        let progress = retained_close_retry_progress_tx(tx, &run).await?;
+        if effect.resource.kind() != RetiredResourceKind::WorkScope
+            || !matches!(effect.resource.identity(), LossItemIdentity::Opaque(identity)
+                if identity.as_str() == effect.scope.as_str())
+            || &effect.scope != precondition.scope_id()
+            || i64::try_from(progress.successful.len() + progress.pending.len()).ok()
+                != Some(plan.effect_count)
+            || !progress.pending.contains(effect)
+        {
+            return Err(refused(
+                "native WorkScope retirement requires its pending full identity",
+            ));
+        }
+        let NativeCloseIntent::ExplicitRetry {
+            failed_run_ordinal, ..
+        } = command.intent()
+        else {
+            return Err(refused(
+                "native WorkScope retirement requires explicit retry intent",
+            ));
+        };
+        let original = Self::read_stopped_close_original_retirement_proof_tx(
+            tx,
+            &CloseRunRef {
+                attempt_id: admitted.attempt_id.clone(),
+                ordinal: *failed_run_ordinal,
+            },
+        )
+        .await?;
+        if original.snapshot != plan.snapshot
+            || !original.resources.iter().any(|expected| {
+                expected.scope == effect.scope && expected.resource == effect.resource
+            })
+        {
+            return Err(refused(
+                "native WorkScope retirement requires exact original proof",
+            ));
+        }
+        let pending = super::retry::original_pending_effects_tx(tx, &original).await?;
+        if pending.iter().any(|required| {
+            required.scope == effect.scope
+                && required.resource.kind() != RetiredResourceKind::WorkScope
+                && !progress.successful.contains(required)
+        }) {
+            return Err(refused(
+                "native WorkScope retirement has unresolved original resources",
+            ));
+        }
+        if reason.trim().is_empty() {
+            return Err(DbError::Serialization(
+                "work scope retirement reason must not be empty".to_owned(),
+            ));
+        }
+        let coordinator_owned: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM coordinator_work_scope WHERE work_scope_id = ?1)",
+        )
+        .bind(precondition.scope_id().as_str())
+        .fetch_one(&mut **tx)
+        .await?;
+        if coordinator_owned {
+            return Ok(WorkScopeRetirementOutcome::Blocked(
+                WorkScopeRetirementBlocker::CoordinatorOwned,
+            ));
+        }
+        Self::retire_work_scope_lifecycle_tx(
+            tx,
+            precondition,
+            reason,
+            Some(&admitted.attempt_id),
         )
         .await
     }

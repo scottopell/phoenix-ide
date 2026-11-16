@@ -220,7 +220,7 @@ impl Database {
     }
 }
 
-async fn original_pending_effects_tx(
+pub(super) async fn original_pending_effects_tx(
     tx: &mut Transaction<'_, Sqlite>,
     proof: &StoppedCloseOriginalRetirementProof,
 ) -> DbResult<Vec<CloseSafeRetryEffect>> {

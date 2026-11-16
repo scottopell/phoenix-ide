@@ -108,6 +108,15 @@ jobs:
             grep -F "close_foundation::tests::native_retry::$test: test" evidence/selected-tests.txt
           done
           for test in \
+            native_scope_retirement_requires_g1_worktree_success_and_separate_scope_success \
+            native_scope_retirement_rejects_forged_identity_kind_precondition_and_empty_reason \
+            native_scope_retirement_rechecks_source_before_lifecycle_mutation \
+            generic_scope_retirement_refuses_native_completed_retry_even_with_current_g1 \
+            native_scope_retirement_preserves_unresolved_ownership_repair_blocker \
+            native_scope_retirement_refuses_stopped_latest_run_without_mutation; do
+            grep -F "close_foundation::tests::native_retry::$test: test" evidence/selected-tests.txt
+          done
+          for test in \
             aggregate_component_requires_exact_canonical_byte_lengths_and_unique_scopes \
             original_snapshots_require_matching_captured_scopes_and_nonempty_values; do
             grep -F "native_close::retry_execution::snapshot_tests::$test: test" evidence/selected-tests.txt
@@ -147,6 +156,20 @@ jobs:
             name="${module//::/-}"
             cargo test -p phoenix-db --lib "$module" -- --nocapture --test-threads=1 2>&1 | tee "evidence/$name.log"
             grep -Eq 'test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored;' "evidence/$name.log"
+          done
+      - name: Qualify shared WorkScope lifecycle regression boundaries
+        if: success()
+        shell: bash
+        run: |
+          set -euo pipefail
+          for test in \
+            close_attempt_retires_its_captured_active_user_owner_scope \
+            completed_close_attempt_cannot_authorize_scope_retirement \
+            close_attempt_cannot_authorize_uncaptured_scope_retirement \
+            successful_retirement_preserves_conversation_and_scope_history; do
+            grep -F "tests::$test: test" evidence/db-inventory.log
+            cargo test -p phoenix-db --lib "tests::$test" -- --exact --nocapture --test-threads=1 2>&1 | tee "evidence/$test.log"
+            grep -Eq 'test result: ok\. 1 passed; 0 failed; 0 ignored;' "evidence/$test.log"
           done
       - name: Retain early DB qualification evidence
         if: always()

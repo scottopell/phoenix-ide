@@ -7,6 +7,7 @@ use crate::workflow::LocalAuthorityResult;
 
 include!("migration163_tests.rs");
 include!("execution_tests.rs");
+include!("work_scope_tests.rs");
 include!("dispatch_tests.rs");
 
 fn opaque_resource(kind: RetiredResourceKind, value: &str) -> RetiredResourceIdentity {

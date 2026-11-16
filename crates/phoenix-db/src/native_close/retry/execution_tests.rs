@@ -124,6 +124,8 @@ async fn native_retry_execution_context_refuses_forged_receipt_wrong_failed_run_
     assert!(db.read_native_close_explicit_retry_receipt(&assessment.command).await.unwrap().is_some());
     assert!(db.read_native_close_retry_execution_context(&assessment.command, &receipt.admitted).await.is_err());
     assert_eq!(native_failure_side_effect_counts(&db).await, counts);
+    assert_eq!(migration_163_retained_state(&db).await, retained);
+    assert_eq!(lookup_metadata(&db, &receipt.admitted.attempt_id).await, metadata);
     let wrong_failed = retry_command(&db, "context-wrong-failed", NativeCloseIntent::ExplicitRetry {
         target: receipt.admitted.target.clone(),
         attempt_id: receipt.admitted.attempt_id.clone(),
@@ -132,6 +134,7 @@ async fn native_retry_execution_context_refuses_forged_receipt_wrong_failed_run_
     // Installing another executing source may suppress the existing allowance.
     // Only the reader call below is required to be free of side effects.
     let counts = native_failure_side_effect_counts(&db).await;
+    let metadata = lookup_metadata(&db, &receipt.admitted.attempt_id).await;
     assert!(db.read_native_close_retry_execution_context(&wrong_failed, &receipt.admitted).await.is_err());
     assert_eq!(migration_163_retained_state(&db).await, retained);
     assert_eq!(lookup_metadata(&db, &receipt.admitted.attempt_id).await, metadata);
