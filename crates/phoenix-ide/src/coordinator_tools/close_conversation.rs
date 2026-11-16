@@ -218,7 +218,7 @@ mod tests {
             json!({"action":"explicit_retry","product_conversation_id":"target","attempt_id":"attempt","failed_run_ordinal":0}),
             json!({"action":"explicit_retry","product_conversation_id":"target","attempt_id":"attempt","failed_run_ordinal":-1}),
             json!({"action":"explicit_retry","product_conversation_id":"target","attempt_id":"attempt","failed_run_ordinal":2.0}),
-            json!({"action":"observe","product_conversation_id":"target","attempt_id":"attempt","run_ordinal":18446744073709551615_u64}),
+            json!({"action":"observe","product_conversation_id":"target","attempt_id":"attempt","run_ordinal":u64::MAX}),
             json!({"action":"observe","product_conversation_id":"target","attempt_id":"attempt","run_ordinal":1,"failed_run_ordinal":1}),
         ] {
             assert!(parse(&input).is_err(), "accepted {input}");

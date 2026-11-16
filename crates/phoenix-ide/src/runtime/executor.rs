@@ -16889,7 +16889,13 @@ pub(crate) mod creation_completion_lifecycle_tests {
         let (sender, receiver) = mpsc::channel(1);
         harness.runtime = harness.runtime.with_acknowledged_event_receiver(receiver);
         let task = tokio::spawn(async move {
-            match harness.runtime.acknowledged_event_rx.recv().await {
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(60),
+                harness.runtime.acknowledged_event_rx.recv(),
+            )
+            .await
+            .expect("bounded retry actor did not receive its request")
+            {
                 Some(AcknowledgedRuntimeRequest::ExecuteNativeCloseRetry(request)) => {
                     harness.runtime.handle_native_close_retry(*request).await
                 }
