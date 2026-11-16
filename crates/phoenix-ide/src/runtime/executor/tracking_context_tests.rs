@@ -150,6 +150,7 @@ fn request_text(request: &phoenix_llm::LlmRequest) -> String {
         .join("\n")
 }
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn tracking_production_registry_prompt_prefix_and_real_continuation_recover_manual_intent() {
     let (manager, db, source) = crate::conversation_action_tools::tests::native_runtime().await;
     let request = save(
@@ -457,6 +458,7 @@ mod live {
         source_checkpoint_presence: Arc<Mutex<Vec<bool>>>,
     }
     impl<C: LlmClient + 'static> Fixture<C> {
+        #[allow(clippy::too_many_lines)]
         async fn turn(&self, source: &str, prompt: &str) -> String {
             let mut context =
                 ConvContext::new(source, self.cwd.clone(), &self.model, 200_000, 2048);
@@ -671,6 +673,7 @@ mod live {
     /// two records; quiet arithmetic; summary-independent return; then a due request.
     #[tokio::test]
     #[ignore = "uses an explicitly selected configured model; set PHOENIX_TRACKING_EVAL_MODEL"]
+    #[allow(clippy::too_many_lines)]
     async fn tracking_live_manual_memory_relief_and_quiet_gate() {
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let model = std::env::var("PHOENIX_TRACKING_EVAL_MODEL")
@@ -800,8 +803,7 @@ mod live {
         let denied = fixture.denied.lock().unwrap().clone();
         assert!(
             denied.is_empty(),
-            "model attempted effectful tools: {:?}",
-            denied
+            "model attempted effectful tools: {denied:?}"
         );
         assert_eq!(
             db.list_coordinator_tracking(&successor.id, None, false)

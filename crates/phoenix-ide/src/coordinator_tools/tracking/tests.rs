@@ -30,6 +30,7 @@ fn context(source: &str, with_call: bool) -> ToolContext {
     }
 }
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn tracking_native_registry_and_closed_requests_use_real_application_service() {
     let (runtime, db, source) = native_runtime().await;
     let registry = runtime
