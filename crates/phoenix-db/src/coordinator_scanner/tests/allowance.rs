@@ -217,3 +217,116 @@ async fn scanner_one_allowance_spans_backoff_malformed_members_and_both_lanes() 
     assert_eq!(final_page.summary.pending_live_members, 0);
     assert_eq!(final_page.summary.pending_historical_members, 0);
 }
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn scanner_blocked_exhaustion_rotates_lanes_across_restart_without_new_input() {
+    for blocked_lane in [ScanLane::Live, ScanLane::Historical] {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("blocked-lane.db");
+        let db = Database::open(path.to_str().unwrap()).await.unwrap();
+        crate::run_pending_migrations(db.pool()).await.unwrap();
+        let owner = db
+            .get_or_create_coordinator(None, LlmLanguage::default())
+            .await
+            .unwrap()
+            .id;
+        for sequence in 1..=32 {
+            message(
+                &db,
+                &owner,
+                sequence,
+                "Please retain the historical request.",
+                &InputOrigin::UserApi,
+            )
+            .await;
+        }
+        drop(prepare(&db, 1000).await);
+        for sequence in 33..=64 {
+            message(
+                &db,
+                &owner,
+                sequence,
+                "Please retain the live request.",
+                &InputOrigin::UserApi,
+            )
+            .await;
+        }
+        sqlx::query("UPDATE coordinator_scan_state SET live_streak=?")
+            .bind(if blocked_lane == ScanLane::Historical {
+                3
+            } else {
+                0
+            })
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sqlx::query("UPDATE messages SET content='not-json' WHERE (?1='live' AND sequence_id>32) OR (?1='historical' AND sequence_id<=32)")
+            .bind(source::lane_name(blocked_lane)).execute(db.pool()).await.unwrap();
+        let (blocked, remaining) = observed_prepare(&db, &profile(), 2000).await;
+        assert_eq!(remaining, 0);
+        assert!(matches!(
+            blocked,
+            ScanPreparation::Wait {
+                reason: ScanBlocker::SourceUnavailable,
+                ..
+            }
+        ));
+        let expected_lane = if blocked_lane == ScanLane::Live {
+            ScanLane::Historical
+        } else {
+            ScanLane::Live
+        };
+        let preference: i64 = sqlx::query_scalar("SELECT live_streak FROM coordinator_scan_state")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(
+            preference,
+            if expected_lane == ScanLane::Historical {
+                3
+            } else {
+                0
+            }
+        );
+        db.pool().close().await;
+        let db = Database::open(path.to_str().unwrap()).await.unwrap();
+        let (opposite, remaining) = observed_prepare(&db, &profile(), 3000).await;
+        assert_eq!(remaining, 0);
+        let ScanPreparation::Ready(batch) = opposite else {
+            panic!("healthy opposite lane must progress without another message or kick")
+        };
+        assert_eq!(batch.input.scan_context.lane, expected_lane);
+        let unchanged: i64 = sqlx::query_scalar("SELECT live_streak FROM coordinator_scan_state")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(
+            unchanged, preference,
+            "Ready must leave normal reservation preference updates intact"
+        );
+        let attempt = reserve(&db, batch, 3000).await;
+        let reserved: i64 = sqlx::query_scalar("SELECT live_streak FROM coordinator_scan_state")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(
+            reserved,
+            if expected_lane == ScanLane::Historical {
+                0
+            } else {
+                1
+            }
+        );
+        db.apply_coordinator_scan(
+            &attempt,
+            &ScanResult::Complete { actions: vec![] },
+            metrics(),
+            3001,
+        )
+        .await
+        .established()
+        .unwrap()
+        .unwrap();
+    }
+}

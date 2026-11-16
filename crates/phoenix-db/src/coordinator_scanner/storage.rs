@@ -186,6 +186,7 @@ pub(super) async fn prepare_with_allowance(
         [ScanLane::Live, ScanLane::Historical]
     };
     let mut waiting = None;
+    let mut last_consumed_lane = None;
     for lane in preferred {
         let rows=sqlx::query(chain_query!(" SELECT s.*,m.transcript_generation,m.tail FROM coordinator_scan_members s JOIN members m ON m.id=s.transcript_id WHERE s.generation=m.transcript_generation AND ((?3='live' AND (s.live_message_id IS NOT NULL OR s.live_seq<m.tail)) OR (?3='historical' AND s.historical_seq>0)) ORDER BY s.selected_at_us,s.continuation_ordinal DESC LIMIT 32"))
             .bind(&topology.head).bind(&topology.owner).bind(lane_name(lane)).fetch_all(&mut **tx).await?;
@@ -228,8 +229,12 @@ pub(super) async fn prepare_with_allowance(
             .bind(now)
             .execute(&mut **tx)
             .await?;
-            let captured = match capture(tx, &transcript, generation, lane, &start, allowance).await
-            {
+            let remaining = allowance.remaining();
+            let result = capture(tx, &transcript, generation, lane, &start, allowance).await;
+            if allowance.remaining() < remaining {
+                last_consumed_lane = Some(lane);
+            }
+            let captured = match result {
                 Ok(c) => c,
                 Err(crate::DbError::Serialization(error)) => {
                     tracing::warn!(%transcript,%error,"scanner source remains pending");
@@ -316,6 +321,14 @@ pub(super) async fn prepare_with_allowance(
         }
     }
     if let Some((reason, next_at_us)) = waiting {
+        if allowance.remaining() == 0 {
+            if let Some(lane) = last_consumed_lane {
+                sqlx::query("UPDATE coordinator_scan_state SET live_streak=?1 WHERE singleton=1")
+                    .bind(if lane == ScanLane::Live { 3 } else { 0 })
+                    .execute(&mut **tx)
+                    .await?;
+            }
+        }
         set_blocker(tx, reason, next_at_us, now).await?;
         return Ok(ScanPreparation::Wait { reason, next_at_us });
     }
