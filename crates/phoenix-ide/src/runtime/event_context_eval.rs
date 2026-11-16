@@ -109,6 +109,7 @@ struct World {
     _database_dir: tempfile::TempDir,
 }
 
+#[allow(clippy::too_many_lines)]
 async fn capture_occurrence(
     db: &Database,
     coordinator: &str,
@@ -481,7 +482,7 @@ struct Budget {
     observed_input_tokens: u64,
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn trial(
     world: &World,
     case: &Case,
@@ -656,6 +657,7 @@ fn event_eval_effect_boundary_rejects_mutation_and_remote_routing() {
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn event_eval_fixture_uses_captured_evidence_and_real_read_tools() {
     let corpus: Corpus = serde_json::from_str(CASES).unwrap();
     let models = Arc::new(ModelRegistry::new(&LlmConfig {
