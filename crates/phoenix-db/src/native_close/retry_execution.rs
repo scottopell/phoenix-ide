@@ -263,7 +263,7 @@ impl Database {
         .await
     }
 
-    /// Retires one pending original WorkScope under the live native retry authority.
+    /// Retires one pending original `WorkScope` under the live native retry authority.
     /// The caller supplies runtime inventory evidence; success is recorded separately.
     ///
     /// # Errors
@@ -283,7 +283,12 @@ impl Database {
             Err(error) => return LocalAuthorityResult::DurableFactEstablished(Err(error.into())),
         };
         let result = Self::retire_work_scope_for_native_close_retry_tx(
-            &mut tx, command, admitted, effect, precondition, reason,
+            &mut tx,
+            command,
+            admitted,
+            effect,
+            precondition,
+            reason,
         )
         .await;
         let committed = matches!(&result, Ok(WorkScopeRetirementOutcome::Retired));
@@ -380,13 +385,8 @@ impl Database {
                 WorkScopeRetirementBlocker::CoordinatorOwned,
             ));
         }
-        Self::retire_work_scope_lifecycle_tx(
-            tx,
-            precondition,
-            reason,
-            Some(&admitted.attempt_id),
-        )
-        .await
+        Self::retire_work_scope_lifecycle_tx(tx, precondition, reason, Some(&admitted.attempt_id))
+            .await
     }
 
     /// Records one exact planned success while its native source and successor remain live.
