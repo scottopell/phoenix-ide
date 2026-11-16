@@ -63,6 +63,13 @@ jobs:
           grep -F 'rejected_source_state_write_rolls_back_native_fence: test' evidence/selected-tests.txt
           grep -F 'startup_and_observer_interrupt_native_retry_from_original_pending_plan_preserving_allowance: test' evidence/selected-tests.txt
           grep -F 'migration_159_excludes_legacy_sealed_inventory_and_preserves_shared_g2_capture: test' evidence/selected-tests.txt
+          for test in \
+            explicit_retry_receipt_lookup_returns_none_without_admission_or_outbox_changes \
+            explicit_retry_receipt_lookup_replays_successor_without_predecessor_proof \
+            explicit_retry_receipt_lookup_revalidates_source_before_existing_receipt \
+            explicit_retry_receipt_lookup_refuses_nonretry_and_conflicting_source_binding; do
+            grep -F "native_close::retry::tests::$test: test" evidence/selected-tests.txt
+          done
       - name: Execute complete Close foundation module
         if: success()
         shell: bash

@@ -61,6 +61,24 @@ impl Database {
         }
     }
 
+    /// Reads the durable receipt for an explicit retry without assessing or admitting a retry.
+    /// The source actor must perform its exclusive live source occurrence check before this call;
+    /// this persisted source/receipt check supports that owner and does not replace its authority.
+    /// It does not establish fresh predecessor proof or grant execution/finalization authority.
+    pub async fn read_native_close_explicit_retry_receipt(
+        &self,
+        command: &NativeCloseCommand,
+    ) -> DbResult<Option<NativeCloseRunRef>> {
+        if !matches!(command.intent(), NativeCloseIntent::ExplicitRetry { .. }) {
+            return Err(refused("receipt lookup requires an explicit retry intent"));
+        }
+        let mut tx = self.pool.begin().await?;
+        super::receipts::require_source_and_target_tx(&mut tx, command).await?;
+        let receipt = super::receipts::read_receipt_tx(&mut tx, command).await?;
+        tx.commit().await?;
+        Ok(receipt)
+    }
+
     #[allow(clippy::too_many_lines)] // Keep the atomic admission/replay decision in one transaction.
     async fn apply_native_close_explicit_retry_tx(
         &self,

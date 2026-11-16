@@ -162,6 +162,146 @@ async fn assert_no_admission(db: &Database, attempt: &CloseAttemptId) {
     assert_eq!(counts, (0, 0, 0, 0, 0));
 }
 
+async fn lookup_metadata(
+    db: &Database,
+    attempt: &CloseAttemptId,
+) -> (i64, i64, i64, i64, i64, i64, i64, i64) {
+    sqlx::query_as(
+        "SELECT
+          (SELECT COUNT(*) FROM close_runs WHERE attempt_id = ?1),
+          (SELECT COUNT(*) FROM native_close_initial_receipts WHERE attempt_id = ?1),
+          (SELECT native_managed FROM close_obligations WHERE attempt_id = ?1),
+          (SELECT COUNT(*) FROM native_close_retry_plans WHERE attempt_id = ?1),
+          (SELECT COUNT(*) FROM coordinator_watch_events),
+          (SELECT COUNT(*) FROM close_completion_retry_allowances WHERE attempt_id = ?1),
+          (SELECT consumed FROM close_completion_retry_allowances WHERE attempt_id = ?1),
+          (SELECT suppressed FROM close_completion_retry_allowances WHERE attempt_id = ?1)",
+    )
+    .bind(attempt.as_str())
+    .fetch_one(db.pool())
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn explicit_retry_receipt_lookup_returns_none_without_admission_or_outbox_changes() {
+    let db = Database::open_in_memory().await.unwrap();
+    let failure = fixture(&db, Vec::new(), true).await;
+    let assessment = assess(&db, &failure, "lookup-empty").await;
+    let before = lookup_metadata(&db, &failure.attempt_id).await;
+
+    assert_eq!(
+        db.read_native_close_explicit_retry_receipt(&assessment.command)
+            .await
+            .unwrap(),
+        None
+    );
+
+    let after = lookup_metadata(&db, &failure.attempt_id).await;
+    assert_eq!(after, before);
+}
+
+#[tokio::test]
+async fn explicit_retry_receipt_lookup_replays_successor_without_predecessor_proof() {
+    let db = Database::open_in_memory().await.unwrap();
+    let failure = fixture(&db, Vec::new(), true).await;
+    let assessment = assess(&db, &failure, "lookup-replay").await;
+    let admitted = admitted(db.apply_native_close_explicit_retry(&assessment).await);
+    let before = lookup_metadata(&db, &failure.attempt_id).await;
+    // Admission created run 2, so the predecessor proof used above is no longer fresh. Do not
+    // obtain a new predecessor assessment merely to replay the already durable receipt.
+    let found = db
+        .read_native_close_explicit_retry_receipt(&assessment.command)
+        .await
+        .unwrap();
+    assert_eq!(found, Some(admitted.admitted));
+    let after = lookup_metadata(&db, &failure.attempt_id).await;
+    assert_eq!(after, before);
+    let latest: i64 = sqlx::query_scalar(
+        "SELECT MAX(run_ordinal) FROM close_runs WHERE attempt_id = ?1",
+    )
+    .bind(failure.attempt_id.as_str())
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(latest, 2);
+}
+
+#[tokio::test]
+async fn explicit_retry_receipt_lookup_revalidates_source_before_existing_receipt() {
+    let db = Database::open_in_memory().await.unwrap();
+    let failure = fixture(&db, Vec::new(), true).await;
+    let assessment = assess(&db, &failure, "lookup-stale").await;
+    admitted(db.apply_native_close_explicit_retry(&assessment).await);
+    db.update_conversation_state(
+        assessment.command.source_transcript_id(),
+        &ConvState::Idle,
+    )
+    .await
+    .unwrap();
+    let before = lookup_metadata(&db, &failure.attempt_id).await;
+
+    assert!(db
+        .read_native_close_explicit_retry_receipt(&assessment.command)
+        .await
+        .is_err());
+    let after = lookup_metadata(&db, &failure.attempt_id).await;
+    assert_eq!(after, before);
+    let receipt_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM native_close_initial_receipts WHERE attempt_id = ?1",
+    )
+    .bind(failure.attempt_id.as_str())
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(receipt_count, 1);
+}
+
+#[tokio::test]
+async fn explicit_retry_receipt_lookup_refuses_nonretry_and_conflicting_source_binding() {
+    let db = Database::open_in_memory().await.unwrap();
+    let failure = fixture(&db, Vec::new(), true).await;
+    let nonretry = retry_command(
+        &db,
+        "lookup-nonretry",
+        NativeCloseIntent::Initial {
+            target: failure.source_product_conversation_id.clone(),
+        },
+    )
+    .await;
+    assert!(db
+        .read_native_close_explicit_retry_receipt(&nonretry)
+        .await
+        .is_err());
+    assert_no_admission(&db, &failure.attempt_id).await;
+
+    let receipt_assessment = assess(&db, &failure, "lookup-conflict").await;
+    admitted(db.apply_native_close_explicit_retry(&receipt_assessment).await);
+    let other_failure = fixture(&db, Vec::new(), true).await;
+    let conflicting = retry_command(
+        &db,
+        "lookup-conflict",
+        NativeCloseIntent::ExplicitRetry {
+            target: other_failure.source_product_conversation_id.clone(),
+            attempt_id: other_failure.attempt_id.clone(),
+            failed_run_ordinal: CloseRunOrdinal::INITIAL,
+        },
+    )
+    .await;
+    assert!(matches!(
+        db.read_native_close_explicit_retry_receipt(&conflicting)
+            .await,
+        Err(DbError::CloseFoundationConflict(_))
+    ));
+    let receipt_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM native_close_initial_receipts WHERE source_tool_use_id = 'retry-call-lookup-conflict'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(receipt_count, 1);
+}
+
 #[tokio::test]
 async fn native_retry_atomically_binds_original_plan_and_replays_after_progress() {
     let db = Database::open_in_memory().await.unwrap();
