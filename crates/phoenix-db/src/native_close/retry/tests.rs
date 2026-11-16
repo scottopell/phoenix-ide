@@ -274,7 +274,7 @@ async fn native_retry_requires_complete_exact_scope_identity_and_rejects_process
         }
         let result = db.apply_native_close_explicit_retry(&assessment).await;
         assert!(
-            matches!(result, NativeCloseCommitOutcome::DurableFactEstablished(Err(_))),
+            matches!(result, LocalAuthorityResult::DurableFactEstablished(Err(_))),
             "{mode}: {result:?}"
         );
         assert_no_admission(&db, &failure.attempt_id).await;
