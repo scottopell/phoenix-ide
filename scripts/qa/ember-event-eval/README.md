@@ -41,15 +41,21 @@ invented broader completion, new authority and redundant worker nudges.
 
 Limits: four targeted cases × three variants × one repetition, plus three control
 cases × three variants × three repetitions: 39 trials total. Variant order
-rotates between cases and control repetitions. At most six provider calls per trial,
-1,536 output tokens and 60 seconds per call. The per-trial maxima sum to 234 calls,
+rotates between cases and control repetitions. At most twelve provider calls per trial,
+1,536 output tokens and 60 seconds per call. The per-trial maxima sum to 468 calls,
 but the hard global maximum remains 120, with a stop threshold of two million observed
 input tokens for one invocation. The last returned call may cross that observed
 threshold; it is checked before another call. No automatic retries. Cancellation/error/time
 limits leave partial evidence and cannot qualify promotion. These are invocation
-limits, not a claimed dollar ceiling or exactly-once billing guarantee. The six-call
-per-trial cap accommodates deferred catalog discovery, exact source retrieval,
-an additional evidence page and the final answer without relaxing the global cap.
+limits, not a claimed dollar ceiling or exactly-once billing guarantee. The twelve-call
+per-trial cap applies uniformly to every variant and allows eight separate ending
+reads plus a final answer and bounded catalog discovery. It does not relax the
+global cap. The first six-call invocation was partial and unaccepted because all
+three raw-event burst trials reached that limit without a final answer; its
+[complete result report](results-e5ff1b8.md) remains part of the evaluation record.
+The second invocation repeats all 39 trials with the same corpus, independent
+oracles, ordering, model, effort, tools, output/time limits and promotion gates.
+It is one explicitly authorized design iteration, with no selected-answer retry.
 
 ## Run
 
