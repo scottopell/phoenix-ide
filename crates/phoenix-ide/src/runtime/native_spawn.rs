@@ -1,6 +1,6 @@
 use super::{AdmittedOperation, RuntimeManager, SubAgentAdmissionResponse};
 use chrono::Utc;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
@@ -104,6 +104,19 @@ impl NativeSpawnControl {
         drop(Self::take_reply(&mut gate));
     }
 
+    fn owner_disappeared(&self) {
+        let mut gate = self.gate.lock().expect("native spawn gate poisoned");
+        let evidence = match &*gate {
+            NativeSpawnAdmissionGate::Unissued(_) => NativeSpawnTerminalEvidence::NotAdmitted,
+            NativeSpawnAdmissionGate::Issued(_) => NativeSpawnTerminalEvidence::Failed(
+                "native spawn manager disappeared without classified closure".into(),
+            ),
+            NativeSpawnAdmissionGate::Closed => return,
+        };
+        let reply = Self::take_reply(&mut gate).expect("open gate owns reply");
+        self.send(reply, evidence);
+    }
+
     pub(super) async fn cancelled(&self) {
         self.cancellation.cancelled().await;
     }
@@ -165,6 +178,43 @@ pub(super) struct NativeSpawnWriteAuthority {
     pub(super) owner: Option<AdmittedOperation>,
 }
 
+pub(super) struct NativeSpawnLifecycleOwner {
+    pub(super) control: Arc<NativeSpawnControl>,
+}
+
+impl NativeSpawnLifecycleOwner {
+    pub(super) fn new(control: Arc<NativeSpawnControl>) -> Self {
+        Self { control }
+    }
+
+    pub(super) fn arm_write(
+        &mut self,
+        owner: AdmittedOperation,
+    ) -> NativeSpawnManagerWriteAuthority<'_> {
+        NativeSpawnManagerWriteAuthority {
+            authority: NativeSpawnWriteAuthority { owner: Some(owner) },
+            _lifecycle: self,
+        }
+    }
+}
+
+impl Drop for NativeSpawnLifecycleOwner {
+    fn drop(&mut self) {
+        self.control.owner_disappeared();
+    }
+}
+
+pub(super) struct NativeSpawnManagerWriteAuthority<'a> {
+    authority: NativeSpawnWriteAuthority,
+    _lifecycle: &'a mut NativeSpawnLifecycleOwner,
+}
+
+impl NativeSpawnManagerWriteAuthority<'_> {
+    pub(super) fn classified(mut self) {
+        self.authority.owner = None;
+    }
+}
+
 impl Drop for NativeSpawnWriteAuthority {
     fn drop(&mut self) {
         if let Some(owner) = self.owner.take() {
@@ -177,6 +227,7 @@ impl RuntimeManager {
     pub(super) async fn close_native_spawn_batch(
         &self,
         batch: &phoenix_db::SubAgentBatchAdmission,
+        lifecycle: &mut NativeSpawnLifecycleOwner,
     ) -> NativeSpawnTerminalEvidence {
         let Ok(owner) = self.acquire_local_authority_pass() else {
             return NativeSpawnTerminalEvidence::Failed(
@@ -184,7 +235,7 @@ impl RuntimeManager {
                     .into(),
             );
         };
-        let mut authority = NativeSpawnWriteAuthority { owner: Some(owner) };
+        let authority = lifecycle.arm_write(owner);
         let result = self
             .db
             .close_live_unactivated_sub_agent_batch(batch, Utc::now())
@@ -201,7 +252,7 @@ impl RuntimeManager {
                 NativeSpawnTerminalEvidence::Unclassified
             }
         };
-        authority.owner = None;
+        authority.classified();
         evidence
     }
 }
@@ -217,9 +268,21 @@ mod tests {
         for panic in [false, true] {
             let manager = Arc::new(super::super::scope_liveness_tests::test_manager().await);
             let owner = manager.acquire_local_authority_pass().unwrap();
+            let (reply, mut closure) = oneshot::channel();
+            let control = Arc::new(NativeSpawnControl::new(
+                phoenix_db::SubAgentSpawnInvocation {
+                    parent_conversation_id: "parent".into(),
+                    assistant_message_id: "assistant".into(),
+                    tool_use_id: "spawn".into(),
+                    batch_id: "batch".into(),
+                },
+                reply,
+            ));
+            assert!(control.try_issue());
             let (started, observed) = oneshot::channel();
             let task = tokio::spawn(async move {
-                let _authority = NativeSpawnWriteAuthority { owner: Some(owner) };
+                let mut lifecycle = NativeSpawnLifecycleOwner::new(control);
+                let _authority = lifecycle.arm_write(owner);
                 started.send(()).unwrap();
                 assert!(!panic, "injected native write owner panic");
                 std::future::pending::<()>().await;
@@ -228,8 +291,13 @@ mod tests {
             if !panic {
                 task.abort();
             }
-            assert!(task.await.is_err());
+            let receipt = (&mut closure).await.unwrap();
             assert!(manager.fatal_local_authority_fence.is_closed());
+            assert!(matches!(
+                receipt.evidence,
+                NativeSpawnTerminalEvidence::Failed(_)
+            ));
+            assert!(task.await.is_err());
             assert_eq!(manager.fatal_local_authority_fence.owner_count(), 0);
         }
     }

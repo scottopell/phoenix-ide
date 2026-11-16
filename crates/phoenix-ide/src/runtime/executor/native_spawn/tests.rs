@@ -144,14 +144,21 @@ async fn native_admitted_manager_loss_before_closure_write_is_known_failure() {
         .closure
         .try_recv()
         .expect("manager lifetime publishes its known pre-closure-write failure");
-    assert!(matches!(receipt.evidence, NativeSpawnTerminalEvidence::Failed(_)));
+    assert!(matches!(
+        receipt.evidence,
+        NativeSpawnTerminalEvidence::Failed(_)
+    ));
     assert!(runtime
         .native_spawn_observed(NativeSpawnObservation::Closure(Ok(receipt)))
         .await
         .is_err());
-    assert!(matches!(runtime.state, ConvState::Error {
-        error_kind: crate::db::ErrorKind::SubAgentError, ..
-    }));
+    assert!(matches!(
+        runtime.state,
+        ConvState::Error {
+            error_kind: crate::db::ErrorKind::SubAgentError,
+            ..
+        }
+    ));
     assert!(!manager.fatal_local_authority_fence.is_closed());
     assert_eq!(control.publication_count(), 1);
     let owed: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sub_agent_runs WHERE parent_accepted_at_unix_micros IS NULL AND terminal_at_unix_micros IS NULL AND initial_dispatch_claimed_at_unix_micros IS NULL").fetch_one(manager.db().pool()).await.unwrap();
@@ -186,6 +193,8 @@ async fn native_prewrite_refusal_is_known_without_unknown_authority_or_false_com
         .fatal_authority_loss_is_latched());
 
     let (manager, runtime, request) = pending_native_spawn().await;
+    let mut lifecycle =
+        crate::runtime::native_spawn::NativeSpawnLifecycleOwner::new(Arc::clone(&request.control));
     manager
         .admit_sub_agent_batch(
             &request.invocation.batch_id,
@@ -193,7 +202,7 @@ async fn native_prewrite_refusal_is_known_without_unknown_authority_or_false_com
             &request.invocation.parent_conversation_id,
             request.parent_scope.clone(),
             request.parallel_work_qualified,
-            &request.control,
+            &mut lifecycle,
         )
         .await
         .unwrap();
@@ -214,7 +223,9 @@ async fn native_prewrite_refusal_is_known_without_unknown_authority_or_false_com
         .fatal_local_authority_fence
         .close_for_process_shutdown();
     assert!(matches!(
-        manager.close_native_spawn_batch(&batch).await,
+        manager
+            .close_native_spawn_batch(&batch, &mut lifecycle)
+            .await,
         NativeSpawnTerminalEvidence::Failed(_)
     ));
     let owed: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sub_agent_runs WHERE parent_accepted_at_unix_micros IS NULL AND terminal_at_unix_micros IS NULL AND initial_dispatch_claimed_at_unix_micros IS NULL").fetch_one(manager.db().pool()).await.unwrap();
@@ -640,6 +651,8 @@ async fn native_missing_prewrite_owner_uses_affirmative_no_command_proof() {
 #[tokio::test]
 async fn native_postcommit_activation_receiver_loss_stops_effect_tail_without_fencing() {
     let (manager, mut runtime, request) = pending_native_spawn().await;
+    let mut lifecycle =
+        crate::runtime::native_spawn::NativeSpawnLifecycleOwner::new(Arc::clone(&request.control));
     manager
         .admit_sub_agent_batch(
             &request.invocation.batch_id,
@@ -647,7 +660,7 @@ async fn native_postcommit_activation_receiver_loss_stops_effect_tail_without_fe
             &request.invocation.parent_conversation_id,
             request.parent_scope,
             request.parallel_work_qualified,
-            &request.control,
+            &mut lifecycle,
         )
         .await
         .unwrap();

@@ -4847,6 +4847,7 @@ impl RuntimeManager {
             activation_rx,
             control,
         } = req;
+        let mut lifecycle = native_spawn::NativeSpawnLifecycleOwner::new(Arc::clone(&control));
         let batch = phoenix_db::SubAgentBatchAdmission {
             batch_id: invocation.batch_id.clone(),
             parent_conversation_id: invocation.parent_conversation_id.clone(),
@@ -4869,7 +4870,7 @@ impl RuntimeManager {
                 &invocation.parent_conversation_id,
                 parent_scope,
                 parallel_work_qualified,
-                &control,
+                &mut lifecycle,
             )
             .await
         {
@@ -4893,7 +4894,7 @@ impl RuntimeManager {
                     control.activated();
                     self.kick_admitted_sub_agent_batch(specs, parent_turn_link);
                 } else {
-                    let evidence = self.close_native_spawn_batch(&batch).await;
+                    let evidence = self.close_native_spawn_batch(&batch, &mut lifecycle).await;
                     if !control.publish(evidence) {
                         tracing::error!(batch_id = %batch.batch_id, "native spawn closure owner disappeared; terminal evidence retained without parent acceptance");
                     }
@@ -4936,7 +4937,7 @@ impl RuntimeManager {
         parent_conversation_id: &str,
         parent_scope: Option<WorkScopeId>,
         parallel_work_qualified: bool,
-        control: &NativeSpawnControl,
+        lifecycle: &mut native_spawn::NativeSpawnLifecycleOwner,
     ) -> Result<(), String> {
         let parent = self
             .db
@@ -5019,10 +5020,10 @@ impl RuntimeManager {
             "native spawn admission was not issued because local write admission is closed"
                 .to_string()
         })?;
-        if !control.try_issue() {
+        if !lifecycle.control.try_issue() {
             return Err("native spawn admission was revoked before its database command".into());
         }
-        let mut authority = native_spawn::NativeSpawnWriteAuthority { owner: Some(owner) };
+        let authority = lifecycle.arm_write(owner);
         let result = self.db.admit_sub_agent_batch_atomically(&admission).await;
         if matches!(
             result,
@@ -5030,7 +5031,7 @@ impl RuntimeManager {
         ) {
             self.signal_fatal_local_authority("sub_agent_batch_admission");
         }
-        authority.owner = None;
+        authority.classified();
         match result {
             phoenix_db::workflow::LocalAuthorityResult::DurableFactEstablished(result) => {
                 result.map(|_| ()).map_err(|error| error.to_string())
@@ -10782,16 +10783,20 @@ mod scope_liveness_tests {
             agent_name: None,
             persona: None,
         };
-        let control = NativeSpawnControl::test_for_batch(&parent.id, "trusted-batch");
-        let admit = || {
-            manager.admit_sub_agent_batch(
-                "trusted-batch",
-                std::slice::from_ref(&spec),
-                &parent.id,
-                parent.attached_work_scope_id.clone(),
-                true,
-                &control,
-            )
+        let admit = async || {
+            let mut lifecycle = native_spawn::NativeSpawnLifecycleOwner::new(
+                NativeSpawnControl::test_for_batch(&parent.id, "trusted-batch"),
+            );
+            manager
+                .admit_sub_agent_batch(
+                    "trusted-batch",
+                    std::slice::from_ref(&spec),
+                    &parent.id,
+                    parent.attached_work_scope_id.clone(),
+                    true,
+                    &mut lifecycle,
+                )
+                .await
         };
         assert!(admit().await.unwrap_err().contains("Work authority"));
         assert!(manager.db().get_conversation(&spec.agent_id).await.is_err());
@@ -11142,7 +11147,9 @@ mod scope_liveness_tests {
                 &parent.id,
                 parent.attached_work_scope_id.clone(),
                 false,
-                &NativeSpawnControl::test_for_batch(&parent.id, "cancellation-boundary-batch"),
+                &mut native_spawn::NativeSpawnLifecycleOwner::new(
+                    NativeSpawnControl::test_for_batch(&parent.id, "cancellation-boundary-batch"),
+                ),
             )
             .await
             .unwrap();
@@ -11480,7 +11487,9 @@ mod scope_liveness_tests {
                 "ordinary-parent",
                 owner.work_scope_id().cloned(),
                 false,
-                &NativeSpawnControl::test_for_batch("ordinary-parent", "ordinary-cancel-batch"),
+                &mut native_spawn::NativeSpawnLifecycleOwner::new(
+                    NativeSpawnControl::test_for_batch("ordinary-parent", "ordinary-cancel-batch"),
+                ),
             )
             .await
             .unwrap();
@@ -11643,7 +11652,9 @@ mod scope_liveness_tests {
                     &parent.id,
                     parent.attached_work_scope_id.clone(),
                     false,
-                    &NativeSpawnControl::test_for_batch(&parent.id, "durable-controller-batch"),
+                    &mut native_spawn::NativeSpawnLifecycleOwner::new(
+                        NativeSpawnControl::test_for_batch(&parent.id, "durable-controller-batch"),
+                    ),
                 )
                 .await
                 .unwrap();
