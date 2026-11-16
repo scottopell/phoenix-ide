@@ -40,7 +40,13 @@ pub(crate) async fn fence_native_retry_sources_tx(
     transcript_id: &str,
     next_state: &ConvState,
 ) -> DbResult<()> {
-    fence_native_sources_tx(tx, transcript_id, next_state, NativeSourceLossCause::UserSourceLoss).await
+    fence_native_sources_tx(
+        tx,
+        transcript_id,
+        next_state,
+        NativeSourceLossCause::UserSourceLoss,
+    )
+    .await
 }
 
 /// Startup preserves both allowance bits while stopping admitted native resource retries.
@@ -49,7 +55,13 @@ pub(crate) async fn recover_native_retry_sources_tx(
     transcript_id: &str,
     next_state: &ConvState,
 ) -> DbResult<()> {
-    fence_native_sources_tx(tx, transcript_id, next_state, NativeSourceLossCause::ProcessInterrupted).await
+    fence_native_sources_tx(
+        tx,
+        transcript_id,
+        next_state,
+        NativeSourceLossCause::ProcessInterrupted,
+    )
+    .await
 }
 
 /// Returns None for runs outside the native explicit-retry protocol.
@@ -68,10 +80,15 @@ pub(crate) async fn interrupt_native_retry_tx(
     if !native_plan {
         return Ok(None);
     }
-    Database::terminalize_native_retry_source_fence_tx(tx, NativeRetrySourceFence {
-        run: run.clone(),
-        cause: NativeSourceLossCause::ProcessInterrupted,
-    }).await.map(Some)
+    Database::terminalize_native_retry_source_fence_tx(
+        tx,
+        NativeRetrySourceFence {
+            run: run.clone(),
+            cause: NativeSourceLossCause::ProcessInterrupted,
+        },
+    )
+    .await
+    .map(Some)
 }
 
 async fn fence_native_sources_tx(
@@ -113,8 +130,9 @@ async fn fence_native_sources_tx(
             ordinal: CloseRunOrdinal::parse(row.try_get("run_ordinal")?)
                 .map_err(|error| DbError::Serialization(error.to_string()))?,
         };
-        let target = ProductConversationId::parse(row.try_get::<String, _>("product_conversation_id")?)
-            .map_err(|error| DbError::Serialization(error.to_string()))?;
+        let target =
+            ProductConversationId::parse(row.try_get::<String, _>("product_conversation_id")?)
+                .map_err(|error| DbError::Serialization(error.to_string()))?;
         let explicit_retry = row.try_get::<String, _>("intent")? == "explicit_retry";
         let intent = if explicit_retry {
             NativeCloseIntent::ExplicitRetry {
@@ -129,11 +147,12 @@ async fn fence_native_sources_tx(
         let command = NativeCloseCommand::new(transcript_id.to_owned(), source.clone(), intent)
             .map_err(|error| DbError::Serialization(error.to_string()))?;
         if command.fingerprint() != row.try_get::<String, _>("request_fingerprint")? {
-            return Err(DbError::Serialization("native Close source receipt differs from its intent".into()));
+            return Err(DbError::Serialization(
+                "native Close source receipt differs from its intent".into(),
+            ));
         }
         let input = command.intent().source_input();
-        if require_executing_source(next_state, &source, "close_conversation", &input).is_err()
-        {
+        if require_executing_source(next_state, &source, "close_conversation", &input).is_err() {
             if matches!(cause, NativeSourceLossCause::UserSourceLoss) {
                 sqlx::query(
                     "UPDATE close_completion_retry_allowances SET suppressed = 1

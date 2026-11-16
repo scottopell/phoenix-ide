@@ -5949,7 +5949,9 @@ impl Database {
             tx.commit().await?;
             return Ok(obligation);
         }
-        if let Some(interrupted) = crate::native_close::interrupt_native_retry_tx(&mut tx, run).await? {
+        if let Some(interrupted) =
+            crate::native_close::interrupt_native_retry_tx(&mut tx, run).await?
+        {
             tx.commit().await?;
             return Ok(interrupted);
         }
@@ -6271,7 +6273,9 @@ impl Database {
                 return Self::terminalize_scope_free_interruption_tx(tx, run, request).await;
             }
             CloseCleanupFailureAuthority::ExplicitlySuppressed => {
-                return Err(close_precondition("native source suppression requires the source-state transaction"));
+                return Err(close_precondition(
+                    "native source suppression requires the source-state transaction",
+                ));
             }
             CloseCleanupFailureAuthority::ExpectedResource {
                 scope,
@@ -6846,7 +6850,9 @@ impl Database {
         .fetch_one(&mut **tx)
         .await?;
         if !native {
-            return Err(close_precondition("source fence requires an exact running native successor"));
+            return Err(close_precondition(
+                "source fence requires an exact running native successor",
+            ));
         }
         let obligation = close_obligation_for_update(tx, run.attempt_id.as_str()).await?;
         let progress = close_safe_retry_progress_tx(tx, run).await?;
@@ -6855,11 +6861,15 @@ impl Database {
             attempt_id: run.attempt_id.clone(),
             source_product_conversation_id: obligation.product_conversation_id().clone(),
             authority,
-            remaining_resources: progress.pending.into_iter().map(|effect| CloseCleanupFailureResource {
-                scope: effect.scope,
-                resource: effect.resource,
-                disposition: CloseCleanupResourceDisposition::Unattempted,
-            }).collect(),
+            remaining_resources: progress
+                .pending
+                .into_iter()
+                .map(|effect| CloseCleanupFailureResource {
+                    scope: effect.scope,
+                    resource: effect.resource,
+                    disposition: CloseCleanupResourceDisposition::Unattempted,
+                })
+                .collect(),
             reason: RetirementFailureReason::Interrupted,
             detail: detail.into(),
             stop_certainty: CloseStopCertainty::ShutdownUncertain,
