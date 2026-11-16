@@ -265,6 +265,21 @@ pub struct OwedSubAgentTerminal {
     pub terminal_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct UnactivatedSubAgentTerminal {
+    pub child_conversation_id: String,
+    pub outcome: phoenix_core::domain::sm_state::SubAgentOutcome,
+}
+
+#[derive(PartialEq)]
+struct UnactivatedChildProjection {
+    child: String,
+    state: String,
+    cancellation_at: i64,
+    terminal_at: i64,
+    cause: String,
+}
+
 fn unix_micros_to_datetime(value: i64) -> DbResult<DateTime<Utc>> {
     DateTime::<Utc>::from_timestamp_micros(value).ok_or_else(|| {
         DbError::Serialization(format!("invalid sub-agent lifecycle timestamp {value}"))
@@ -704,6 +719,167 @@ impl Database {
             .await?;
         }
         Ok((tx, SubAgentBatchAdmissionOutcome::Admitted))
+    }
+
+    pub async fn close_live_unactivated_sub_agent_batch(
+        &self,
+        batch: &SubAgentBatchAdmission,
+        cancelled_at: DateTime<Utc>,
+    ) -> crate::workflow::LocalAuthorityResult<DbResult<Vec<UnactivatedSubAgentTerminal>>> {
+        self.close_live_unactivated_sub_agent_batch_with_cut(
+            batch,
+            cancelled_at,
+            TerminalEvidenceTransactionCut::None,
+        )
+        .await
+    }
+
+    async fn close_live_unactivated_sub_agent_batch_with_cut(
+        &self,
+        batch: &SubAgentBatchAdmission,
+        cancelled_at: DateTime<Utc>,
+        cut: TerminalEvidenceTransactionCut,
+    ) -> crate::workflow::LocalAuthorityResult<DbResult<Vec<UnactivatedSubAgentTerminal>>> {
+        use crate::workflow::LocalAuthorityResult;
+        let (tx, projections, outcomes) = match self
+            .prepare_live_unactivated_closure(batch, cancelled_at)
+            .await
+        {
+            Ok(prepared) => prepared,
+            Err(error) => return LocalAuthorityResult::DurableFactEstablished(Err(error)),
+        };
+        if let Err(error) = cut.commit(tx).await {
+            let classified = if cut.classifier_unavailable() {
+                Err(DbError::Serialization(
+                    "unactivated closure classification unavailable".into(),
+                ))
+            } else {
+                self.classify_live_unactivated_closure(batch, &projections)
+                    .await
+            };
+            return match classified {
+                Ok(true) => LocalAuthorityResult::DurableFactEstablished(Ok(outcomes)),
+                Ok(false) => LocalAuthorityResult::DurableFactEstablished(Err(error)),
+                Err(_) => LocalAuthorityResult::DurableFactUnclassified,
+            };
+        }
+        LocalAuthorityResult::DurableFactEstablished(Ok(outcomes))
+    }
+
+    async fn live_unactivated_projection(
+        tx: &mut Transaction<'_, Sqlite>,
+        child: &str,
+    ) -> DbResult<Option<UnactivatedChildProjection>> {
+        let row = sqlx::query(
+            "SELECT c.state, r.cancellation_requested_at_unix_micros,
+                    r.terminal_at_unix_micros, r.terminal_cause
+             FROM sub_agent_runs r JOIN conversations c ON c.id = r.child_conversation_id
+             WHERE r.child_conversation_id = ?1
+               AND r.initial_dispatch_claimed_at_unix_micros IS NULL
+               AND r.parent_accepted_at_unix_micros IS NULL
+               AND r.cancellation_requested_at_unix_micros IS NOT NULL
+               AND r.terminal_at_unix_micros IS NOT NULL",
+        )
+        .bind(child)
+        .fetch_optional(&mut **tx)
+        .await?;
+        row.map(|row| {
+            Ok(UnactivatedChildProjection {
+                child: child.into(),
+                state: row.try_get("state")?,
+                cancellation_at: row.try_get("cancellation_requested_at_unix_micros")?,
+                terminal_at: row.try_get("terminal_at_unix_micros")?,
+                cause: row.try_get("terminal_cause")?,
+            })
+        })
+        .transpose()
+    }
+
+    async fn classify_live_unactivated_closure(
+        &self,
+        batch: &SubAgentBatchAdmission,
+        projections: &[UnactivatedChildProjection],
+    ) -> DbResult<bool> {
+        let mut tx = self.pool.begin_with("BEGIN").await?;
+        let mut matches = existing_batch_matches(&mut tx, batch).await? == Some(true);
+        for projection in projections {
+            matches &= Self::live_unactivated_projection(&mut tx, &projection.child)
+                .await?
+                .as_ref()
+                == Some(projection);
+        }
+        tx.rollback().await?;
+        Ok(matches)
+    }
+
+    async fn prepare_live_unactivated_closure<'a>(
+        &'a self,
+        batch: &SubAgentBatchAdmission,
+        cancelled_at: DateTime<Utc>,
+    ) -> DbResult<(
+        Transaction<'a, Sqlite>,
+        Vec<UnactivatedChildProjection>,
+        Vec<UnactivatedSubAgentTerminal>,
+    )> {
+        validate_batch_input(batch)?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        if existing_batch_matches(&mut tx, batch).await? != Some(true) {
+            return Err(lifecycle_conflict(
+                "live unactivated closure has no exact admitted batch",
+            ));
+        }
+        let state = ConvState::Failed {
+            error: "Sub-agent cancelled before parent activation".into(),
+            error_kind: ErrorKind::Cancelled,
+        };
+        let state =
+            serde_json::to_string(&state).map_err(|e| DbError::Serialization(e.to_string()))?;
+        let mut projections = Vec::with_capacity(batch.runs.len());
+        let mut outcomes = Vec::with_capacity(batch.runs.len());
+        for run in &batch.runs {
+            let child = &run.child_conversation_id;
+            let was_terminal: bool = sqlx::query_scalar(
+                "SELECT terminal_at_unix_micros IS NOT NULL FROM sub_agent_runs WHERE child_conversation_id = ?1",
+            ).bind(child).fetch_one(&mut *tx).await?;
+            let changed = sqlx::query(
+                "UPDATE sub_agent_runs
+                 SET cancellation_requested_at_unix_micros = COALESCE(cancellation_requested_at_unix_micros, ?2),
+                     cancellation_cause = COALESCE(cancellation_cause, 'cancelled'),
+                     terminal_cause = COALESCE(terminal_cause, 'cancelled'),
+                     terminal_at_unix_micros = COALESCE(terminal_at_unix_micros, ?2)
+                 WHERE child_conversation_id = ?1
+                   AND initial_dispatch_claimed_at_unix_micros IS NULL
+                   AND parent_accepted_at_unix_micros IS NULL",
+            ).bind(child).bind(cancelled_at.timestamp_micros())
+                .execute(&mut *tx).await?.rows_affected();
+            if changed != 1 {
+                return Err(lifecycle_conflict(format!(
+                    "live unactivated child {child} was dispatched or accepted"
+                )));
+            }
+            if !was_terminal {
+                sqlx::query("UPDATE conversations SET state = ?2, state_kind = 'failed', state_updated_at = ?3, updated_at = ?3 WHERE id = ?1")
+                    .bind(child).bind(&state).bind(cancelled_at.to_rfc3339()).execute(&mut *tx).await?;
+            }
+            let projection = Self::live_unactivated_projection(&mut tx, child)
+                .await?
+                .ok_or_else(|| {
+                    lifecycle_conflict("live unactivated closure lacks terminal projection")
+                })?;
+            let terminal_state = serde_json::from_str(&projection.state)
+                .map_err(|e| DbError::Serialization(e.to_string()))?;
+            let cause = SubAgentTerminalCause::from_db_str(&projection.cause)?;
+            let outcome =
+                terminal_sub_agent_outcome(terminal_state, Some(cause)).ok_or_else(|| {
+                    lifecycle_conflict("live unactivated child has no authentic terminal outcome")
+                })?;
+            outcomes.push(UnactivatedSubAgentTerminal {
+                child_conversation_id: child.clone(),
+                outcome,
+            });
+            projections.push(projection);
+        }
+        Ok((tx, projections, outcomes))
     }
 
     pub async fn abandon_all_unactivated_sub_agent_batches(
@@ -2001,6 +2177,145 @@ mod tests {
                 SubAgentAcceptanceCommit::Normal => unreachable!(),
             }
         }
+    }
+
+    #[tokio::test]
+    async fn live_unactivated_closure_keeps_children_owed_until_parent_fan_in() {
+        let db = Database::open_in_memory().await.unwrap();
+        let parent_scope = atomic_parent(&db).await;
+        let admission = atomic_batch("batch", parent_scope);
+        db.admit_sub_agent_batch_atomically(&admission)
+            .await
+            .established()
+            .unwrap()
+            .unwrap();
+        let closure = batch(
+            "batch",
+            "parent",
+            false,
+            &[("child", SubAgentExecutionAuthority::WriteCapable)],
+        );
+        let terminals = db
+            .close_live_unactivated_sub_agent_batch(&closure, Utc::now())
+            .await
+            .established()
+            .unwrap()
+            .unwrap();
+        assert_eq!(terminals.len(), 1);
+        assert!(matches!(
+            terminals[0].outcome,
+            phoenix_core::domain::sm_state::SubAgentOutcome::Failure {
+                error_kind: ErrorKind::Cancelled,
+                ..
+            }
+        ));
+        assert!(!db.sub_agent_terminal_is_accepted("child").await.unwrap());
+        assert_eq!(
+            db.owed_sub_agent_terminals("parent").await.unwrap().len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn live_unactivated_closure_classifies_commit_failure_without_acceptance() {
+        for cut in [
+            TerminalEvidenceTransactionCut::BeforeCommit,
+            TerminalEvidenceTransactionCut::AfterCommit,
+            TerminalEvidenceTransactionCut::AfterCommitLookupUnavailable,
+        ] {
+            let db = Database::open_in_memory().await.unwrap();
+            let scope = atomic_parent(&db).await;
+            db.admit_sub_agent_batch_atomically(&atomic_batch("batch", scope))
+                .await
+                .established()
+                .unwrap()
+                .unwrap();
+            let closure = batch(
+                "batch",
+                "parent",
+                false,
+                &[("child", SubAgentExecutionAuthority::WriteCapable)],
+            );
+            let result = db
+                .close_live_unactivated_sub_agent_batch_with_cut(&closure, Utc::now(), cut)
+                .await;
+            match cut {
+                TerminalEvidenceTransactionCut::BeforeCommit => {
+                    assert!(result.established().unwrap().is_err());
+                    assert!(db
+                        .owed_sub_agent_terminals("parent")
+                        .await
+                        .unwrap()
+                        .is_empty());
+                    assert!(matches!(
+                        db.get_conversation("child").await.unwrap().state,
+                        ConvState::Idle
+                    ));
+                }
+                TerminalEvidenceTransactionCut::AfterCommit => {
+                    assert_eq!(result.established().unwrap().unwrap().len(), 1)
+                }
+                TerminalEvidenceTransactionCut::AfterCommitLookupUnavailable => assert!(matches!(
+                    result,
+                    crate::workflow::LocalAuthorityResult::DurableFactUnclassified
+                )),
+                TerminalEvidenceTransactionCut::None => unreachable!(),
+            }
+            assert!(!db.sub_agent_terminal_is_accepted("child").await.unwrap());
+        }
+    }
+
+    #[tokio::test]
+    async fn live_unactivated_closure_preserves_authentic_terminal_and_rejects_wrong_batch() {
+        let db = Database::open_in_memory().await.unwrap();
+        let scope = atomic_parent(&db).await;
+        db.admit_sub_agent_batch_atomically(&atomic_batch("batch", scope))
+            .await
+            .established()
+            .unwrap()
+            .unwrap();
+        let outcome = ConvState::Completed {
+            result: "authentic result".into(),
+        };
+        db.update_child_state_and_record_sub_agent_terminal(
+            "child",
+            &outcome,
+            Utc::now(),
+            SubAgentTerminalCause::SubmitResult,
+            Utc::now(),
+        )
+        .await
+        .established()
+        .unwrap()
+        .unwrap();
+        let mut closure = batch(
+            "batch",
+            "parent",
+            false,
+            &[("child", SubAgentExecutionAuthority::WriteCapable)],
+        );
+        closure.parent_conversation_id = "other-parent".into();
+        assert!(db
+            .close_live_unactivated_sub_agent_batch(&closure, Utc::now())
+            .await
+            .established()
+            .unwrap()
+            .is_err());
+        closure.parent_conversation_id = "parent".into();
+        let terminals = db
+            .close_live_unactivated_sub_agent_batch(&closure, Utc::now())
+            .await
+            .established()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            terminals[0].outcome,
+            phoenix_core::domain::sm_state::SubAgentOutcome::Success {
+                result: "authentic result".into()
+            }
+        );
+        assert_eq!(db.get_conversation("child").await.unwrap().state, outcome);
+        assert!(!db.sub_agent_terminal_is_accepted("child").await.unwrap());
     }
 
     #[tokio::test]
