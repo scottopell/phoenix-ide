@@ -15,7 +15,9 @@ concurrency:
 jobs:
   database:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    # The exact-source DB and runtime suites share this job. Hosted cold builds
+    # and repeated Cargo invocations exceeded 60m before physical actor coverage.
+    timeout-minutes: 120
     env:
       CARGO_TERM_COLOR: never
       CARGO_BUILD_JOBS: '2'

@@ -170,11 +170,9 @@ async fn settle_initial_tx(
         phoenix_core::domain::close::ClosePhase::SettlingActiveWork,
     )
     .await?;
-    let obligation = Database::advance_close_settlement_when_quiescent_tx(
-        tx,
-        admitted.attempt_id.as_str(),
-    )
-    .await?;
+    let obligation =
+        Database::advance_close_settlement_when_quiescent_tx(tx, admitted.attempt_id.as_str())
+            .await?;
     Ok(NativeCloseInitialExecution {
         run: admitted,
         phase: obligation.phase(),

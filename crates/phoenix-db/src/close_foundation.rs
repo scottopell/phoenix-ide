@@ -2627,7 +2627,8 @@ impl Database {
         attempt_id: &str,
     ) -> DbResult<CloseObligation> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        let obligation = Self::advance_close_settlement_when_quiescent_tx(&mut tx, attempt_id).await?;
+        let obligation =
+            Self::advance_close_settlement_when_quiescent_tx(&mut tx, attempt_id).await?;
         tx.commit().await?;
         Ok(obligation)
     }
@@ -2666,12 +2667,7 @@ impl Database {
             .execute(&mut **tx)
             .await?;
         } else {
-            set_close_phase_tx(
-                tx,
-                attempt_id,
-                ClosePhase::AwaitingRetirementInspection,
-            )
-            .await?;
+            set_close_phase_tx(tx, attempt_id, ClosePhase::AwaitingRetirementInspection).await?;
         }
         close_obligation_for_update(tx, attempt_id).await
     }

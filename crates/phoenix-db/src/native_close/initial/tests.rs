@@ -240,16 +240,15 @@ async fn assert_no_settlement_effects(db: &Database, receipt: &NativeCloseReceip
     }
 }
 
-async fn prepared_initial(
-    f: &Fixture,
-) -> (NativeCloseCommand, NativeCloseReceipt, ConvState) {
+async fn prepared_initial(f: &Fixture) -> (NativeCloseCommand, NativeCloseReceipt, ConvState) {
     let command = f.command(f.source.clone(), &f.target);
     let NativeCloseInitialResult::NewlyAdmitted(receipt) = f.apply(&command).await.unwrap() else {
         panic!("expected a new operation");
     };
     let live_source = f.db.get_conversation(&f.coordinator).await.unwrap().state;
     assert!(matches!(
-        f.db.prepare_native_close_initial_execution(&command, &receipt, &live_source).await,
+        f.db.prepare_native_close_initial_execution(&command, &receipt, &live_source)
+            .await,
         LocalAuthorityResult::DurableFactEstablished(Ok(_))
     ));
     (command, receipt, live_source)
@@ -267,17 +266,28 @@ async fn initial_phase(f: &Fixture, receipt: &NativeCloseReceipt) -> String {
 async fn initial_settlement_advances_exact_quiescent_run_without_dispatch() {
     let f = Fixture::new().await;
     let (command, receipt, live_source) = prepared_initial(&f).await;
-    let settled = match f.db.settle_native_close_initial(&command, &receipt, &live_source).await {
+    let settled = match f
+        .db
+        .settle_native_close_initial(&command, &receipt, &live_source)
+        .await
+    {
         LocalAuthorityResult::DurableFactEstablished(result) => result.unwrap(),
         LocalAuthorityResult::DurableFactUnclassified => panic!("settlement outcome unclassified"),
     };
     assert_eq!(settled.run, receipt.admitted);
-    assert_eq!(settled.phase, phoenix_core::domain::close::ClosePhase::AwaitingRetirementInspection);
-    assert_eq!(initial_phase(&f, &receipt).await, "awaiting_retirement_inspection");
+    assert_eq!(
+        settled.phase,
+        phoenix_core::domain::close::ClosePhase::AwaitingRetirementInspection
+    );
+    assert_eq!(
+        initial_phase(&f, &receipt).await,
+        "awaiting_retirement_inspection"
+    );
     assert_one_operation(&f, &receipt, 0).await;
     assert_no_dispatch_effects(&f.db, &receipt).await;
     assert!(matches!(
-        f.db.settle_native_close_initial(&command, &receipt, &live_source).await,
+        f.db.settle_native_close_initial(&command, &receipt, &live_source)
+            .await,
         LocalAuthorityResult::DurableFactEstablished(Err(DbError::CloseFoundationPrecondition(_)))
     ));
 }
@@ -288,7 +298,8 @@ async fn initial_settlement_requires_exact_released_turn_generation_not_latest_i
     let turn = source_turn(&f.db, f.target.as_str(), "settlement-owning-turn").await;
     let (command, receipt, live_source) = prepared_initial(&f).await;
     assert!(matches!(
-        f.db.settle_native_close_initial(&command, &receipt, &live_source).await,
+        f.db.settle_native_close_initial(&command, &receipt, &live_source)
+            .await,
         LocalAuthorityResult::DurableFactEstablished(Err(DbError::CloseFoundationPrecondition(_)))
     ));
     assert_eq!(initial_phase(&f, &receipt).await, "settling_active_work");
@@ -297,18 +308,29 @@ async fn initial_settlement_requires_exact_released_turn_generation_not_latest_i
     sqlx::query("UPDATE durable_turns SET generation = 2, terminal_kind = 'Completed', owns_conversation = 0 WHERE turn_id = ?1")
         .bind(i64::try_from(turn).unwrap()).execute(f.db.pool()).await.unwrap();
     assert!(matches!(
-        f.db.settle_native_close_initial(&command, &receipt, &live_source).await,
+        f.db.settle_native_close_initial(&command, &receipt, &live_source)
+            .await,
         LocalAuthorityResult::DurableFactEstablished(Err(DbError::CloseFoundationPrecondition(_)))
     ));
     sqlx::query("UPDATE durable_turns SET generation = 1 WHERE turn_id = ?1")
-        .bind(i64::try_from(turn).unwrap()).execute(f.db.pool()).await.unwrap();
+        .bind(i64::try_from(turn).unwrap())
+        .execute(f.db.pool())
+        .await
+        .unwrap();
     assert!(matches!(
-        f.db.settle_native_close_initial(&command, &receipt, &live_source).await,
+        f.db.settle_native_close_initial(&command, &receipt, &live_source)
+            .await,
         LocalAuthorityResult::DurableFactEstablished(Ok(_))
     ));
-    assert_eq!(initial_phase(&f, &receipt).await, "awaiting_retirement_inspection");
-    let unsettled = f.db.list_unsettled_close_direct_turn_settlement_targets(receipt.admitted.attempt_id.as_str())
-        .await.unwrap();
+    assert_eq!(
+        initial_phase(&f, &receipt).await,
+        "awaiting_retirement_inspection"
+    );
+    let unsettled = f
+        .db
+        .list_unsettled_close_direct_turn_settlement_targets(receipt.admitted.attempt_id.as_str())
+        .await
+        .unwrap();
     assert!(unsettled.is_empty());
     assert_no_dispatch_effects(&f.db, &receipt).await;
 }
@@ -325,17 +347,24 @@ async fn initial_settlement_rejects_mismatched_receipt_and_live_or_durable_sourc
     wrong_target.admitted.target = Fixture::create_target(&f.db, "settlement-other-target").await;
     for wrong in [&wrong_request, &wrong_run, &wrong_target] {
         assert!(matches!(
-            f.db.settle_native_close_initial(&command, wrong, &live_source).await,
-            LocalAuthorityResult::DurableFactEstablished(Err(DbError::CloseFoundationPrecondition(_)))
+            f.db.settle_native_close_initial(&command, wrong, &live_source)
+                .await,
+            LocalAuthorityResult::DurableFactEstablished(Err(
+                DbError::CloseFoundationPrecondition(_)
+            ))
         ));
     }
     assert!(matches!(
-        f.db.settle_native_close_initial(&command, &receipt, &ConvState::Idle).await,
+        f.db.settle_native_close_initial(&command, &receipt, &ConvState::Idle)
+            .await,
         LocalAuthorityResult::DurableFactEstablished(Err(DbError::CloseFoundationPrecondition(_)))
     ));
-    f.db.update_conversation_state(&f.coordinator, &ConvState::Idle).await.unwrap();
+    f.db.update_conversation_state(&f.coordinator, &ConvState::Idle)
+        .await
+        .unwrap();
     assert!(matches!(
-        f.db.settle_native_close_initial(&command, &receipt, &live_source).await,
+        f.db.settle_native_close_initial(&command, &receipt, &live_source)
+            .await,
         LocalAuthorityResult::DurableFactEstablished(Err(DbError::CloseFoundationPrecondition(_)))
     ));
     assert_eq!(initial_phase(&f, &receipt).await, "settling_active_work");
@@ -351,20 +380,31 @@ async fn initial_settlement_refuses_unprepared_or_cancelled_initial_run() {
     };
     let live_source = f.db.get_conversation(&f.coordinator).await.unwrap().state;
     assert!(matches!(
-        f.db.settle_native_close_initial(&command, &receipt, &live_source).await,
+        f.db.settle_native_close_initial(&command, &receipt, &live_source)
+            .await,
         LocalAuthorityResult::DurableFactEstablished(Err(DbError::CloseFoundationPrecondition(_)))
     ));
-    assert_eq!(initial_phase(&f, &receipt).await, "awaiting_blocker_resolution");
+    assert_eq!(
+        initial_phase(&f, &receipt).await,
+        "awaiting_blocker_resolution"
+    );
     assert!(matches!(
-        f.db.prepare_native_close_initial_execution(&command, &receipt, &live_source).await,
+        f.db.prepare_native_close_initial_execution(&command, &receipt, &live_source)
+            .await,
         LocalAuthorityResult::DurableFactEstablished(Ok(_))
     ));
-    f.db.cancel_close_before_retirement(receipt.admitted.attempt_id.as_str()).await.unwrap();
+    f.db.cancel_close_before_retirement(receipt.admitted.attempt_id.as_str())
+        .await
+        .unwrap();
     assert!(matches!(
-        f.db.settle_native_close_initial(&command, &receipt, &live_source).await,
+        f.db.settle_native_close_initial(&command, &receipt, &live_source)
+            .await,
         LocalAuthorityResult::DurableFactEstablished(Err(DbError::CloseFoundationPrecondition(_)))
     ));
-    assert_eq!(initial_phase(&f, &receipt).await, "cancel_requested_during_settlement");
+    assert_eq!(
+        initial_phase(&f, &receipt).await,
+        "cancel_requested_during_settlement"
+    );
     assert_no_dispatch_effects(&f.db, &receipt).await;
 }
 
@@ -379,14 +419,21 @@ async fn initial_settlement_rolls_back_reconciled_receipts_when_phase_write_fail
         "CREATE TRIGGER fail_initial_settlement_phase BEFORE UPDATE OF phase ON close_obligations
          WHEN NEW.phase = 'awaiting_retirement_inspection'
          BEGIN SELECT RAISE(ABORT, 'injected phase failure after receipt reconciliation'); END",
-    ).execute(f.db.pool()).await.unwrap();
+    )
+    .execute(f.db.pool())
+    .await
+    .unwrap();
     assert!(matches!(
-        f.db.settle_native_close_initial(&command, &receipt, &live_source).await,
+        f.db.settle_native_close_initial(&command, &receipt, &live_source)
+            .await,
         LocalAuthorityResult::DurableFactEstablished(Err(_))
     ));
     assert_eq!(initial_phase(&f, &receipt).await, "settling_active_work");
-    let unsettled = f.db.list_unsettled_close_direct_turn_settlement_targets(receipt.admitted.attempt_id.as_str())
-        .await.unwrap();
+    let unsettled = f
+        .db
+        .list_unsettled_close_direct_turn_settlement_targets(receipt.admitted.attempt_id.as_str())
+        .await
+        .unwrap();
     assert_eq!(unsettled.len(), 1);
     assert_eq!(unsettled[0].turn_id, turn);
     assert_no_dispatch_effects(&f.db, &receipt).await;
@@ -489,7 +536,8 @@ async fn initial_execution_preserves_captured_busy_decision_without_confirming_w
             .await
             .unwrap();
     assert!(matches!(
-        f.db.settle_native_close_initial(&command, &receipt, &live_source).await,
+        f.db.settle_native_close_initial(&command, &receipt, &live_source)
+            .await,
         LocalAuthorityResult::DurableFactEstablished(Err(DbError::CloseFoundationPrecondition(_)))
     ));
     assert_eq!(phase, "awaiting_stop_work_confirmation");
