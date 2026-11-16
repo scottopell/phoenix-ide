@@ -606,6 +606,7 @@ async fn startup_leaves_completed_native_retry_and_allowance_untouched() {
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)] // Keep each corrupted-plan case's full rollback proof together.
 async fn source_fence_refuses_resource_plan_inspection_and_retry_artifact_near_misses_atomically() {
     for near_miss in ["resource_count", "inspection_binding", "retry_evidence"] {
         let (db, assessment, run) = source_fence_fixture().await;
@@ -680,7 +681,7 @@ async fn source_fence_refuses_resource_plan_inspection_and_retry_artifact_near_m
                 .unwrap();
             }
             _ => unreachable!(),
-        };
+        }
 
         assert!(write_source_fence_state(&db, &assessment.command, &ConvState::Idle, false)
             .await
@@ -807,6 +808,7 @@ async fn migration_166_populated_upgrade_preserves_retry_and_adds_initial_source
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)] // Keep the partial-inspection fixture and no-mutation proof together.
 async fn initial_source_fence_refuses_existing_inspection_artifacts_without_mutation() {
     let db = Database::open_in_memory().await.unwrap();
     create_root(&db, "initial-source-fence-inspection").await;

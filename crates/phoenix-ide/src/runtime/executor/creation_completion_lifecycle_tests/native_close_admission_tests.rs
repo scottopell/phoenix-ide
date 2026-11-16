@@ -118,7 +118,7 @@ impl CloseFixture {
         }
     }
 
-    fn backend(&self, db: Database) -> Arc<crate::runtime::RuntimeManager> {
+    fn backend(db: Database) -> Arc<crate::runtime::RuntimeManager> {
         Arc::new(crate::runtime::RuntimeManager::new(
             db,
             Arc::new(phoenix_llm::ModelRegistry::new_empty()),
@@ -238,7 +238,7 @@ fn initial_request(
 ) -> AcknowledgedRuntimeRequest {
     AcknowledgedRuntimeRequest::ExecuteNativeCloseInitial(Box::new(NativeCloseInitialRequest {
         source: fixture.source.clone(),
-        backend: fixture.backend(fixture.db.clone()),
+        backend: CloseFixture::backend(fixture.db.clone()),
         target: fixture.target.clone(),
         admitted,
         target_gate,
@@ -280,7 +280,7 @@ async fn native_close_backend_requires_actor_database_authority_not_matching_pat
 async fn initial_mismatched_backend_refuses_before_database_work_and_releases_owner() {
     let fixture = CloseFixture::new().await;
     let unrelated_db = Database::open_in_memory().await.unwrap();
-    let backend = fixture.backend(unrelated_db.clone());
+    let backend = CloseFixture::backend(unrelated_db.clone());
     let mut harness = fixture.runtime(true);
     let fence = Arc::clone(&harness.runtime.fatal_local_authority_fence);
     let admitted = harness.runtime.admit_authoritative_effect().unwrap();
@@ -571,7 +571,7 @@ async fn aborted_owning_initial_execution_task_latches_authority_before_releasin
     let admitted = harness.runtime.admit_authoritative_effect().unwrap();
     let source = fixture.source.clone();
     let target = fixture.target.clone();
-    let backend = fixture.backend(fixture.db.clone());
+    let backend = CloseFixture::backend(fixture.db.clone());
     let (suspended, reached_boundary) = oneshot::channel();
     let owning_task = tokio::spawn(async move {
         let mut future = Box::pin(
@@ -620,7 +620,7 @@ async fn established_initial_rollback_releases_owner_without_closing_authority()
         harness
             .runtime
             .execute_native_close_initial(
-                &fixture.backend(fixture.db.clone()),
+                &CloseFixture::backend(fixture.db.clone()),
                 fixture.source.clone(),
                 fixture.target.clone(),
                 admitted,
