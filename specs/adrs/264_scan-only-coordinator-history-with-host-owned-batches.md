@@ -1,4 +1,4 @@
-# ADR-263: Scan only Coordinator history through bounded host-owned batches
+# ADR-264: Scan only Coordinator history through bounded host-owned batches
 
 - **Status:** Accepted
 - **Date:** 2026-11-15

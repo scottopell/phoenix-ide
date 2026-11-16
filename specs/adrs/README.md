@@ -44,7 +44,7 @@ Allowing gaps does not approve an ID allocation, decision, or publication.
 
 | ADR | Title | Status | Affects |
 | --- | --- | --- | --- |
-| [263](263_scan-only-coordinator-history-with-host-owned-batches.md) | Scan only Coordinator history through bounded host-owned batches | Accepted | REQ-SCAN-001–008, REQ-TRACK-004–007 |
+| [264](264_scan-only-coordinator-history-with-host-owned-batches.md) | Scan only Coordinator history through bounded host-owned batches | Accepted | REQ-SCAN-001–008, REQ-TRACK-004–007 |
 | [262](262_retire-delivery-roadmap-with-preserved-history.md) | Retire the delivery roadmap while preserving historical evidence | Accepted | REQ-ROADMAP-001–014 |
 | [261](261_completion-events-capture-occurrence-bound-ending-evidence.md) | Completion events capture occurrence-bound ending evidence | Accepted | REQ-CEVT-006–009, REQ-RET-012 |
 | [260](260_coordinator-tracking-retains-intent-at-the-transcript-tail.md) | Retain Coordinator intent independently of continuations | Accepted | REQ-TRACK-001–007, REQ-GR-011 |
