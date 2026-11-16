@@ -396,6 +396,7 @@ async fn native_cancel_persistence_failure_retains_closing_origin_and_stops_queu
     if let Some(event) = runtime.native_spawn_observed(closure).await.unwrap() {
         runtime.process_event(event).await.unwrap();
     }
+    let ordinary_generation_before_teardown = runtime.tool_execution.generation();
     runtime.abort_external_effects_in_memory();
     assert!(
         signalled_before_failed_write,
@@ -408,7 +409,7 @@ async fn native_cancel_persistence_failure_retains_closing_origin_and_stops_queu
             message, ..
         } if message.contains("native cancellation persistence failed")
     ));
-    assert_eq!(runtime.tool_execution.generation(), 0);
+    assert_eq!(ordinary_generation_before_teardown, 0);
     assert!(tools.recorded_executions().is_empty());
     assert!(runtime.llm_client.recorded_requests().is_empty());
     assert!(!manager.fatal_local_authority_fence.is_closed());
