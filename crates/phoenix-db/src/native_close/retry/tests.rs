@@ -74,12 +74,22 @@ async fn retry_command(
     command
 }
 
+fn native_retry_request(
+    failure: &TerminalizeInitialCloseCleanupFailureRequest,
+) -> AdmitCloseSafeRetryRequest {
+    let mut request = safe_retry_request(failure);
+    request
+        .remaining_effects
+        .sort_by_key(|effect| effect.resource.kind() == RetiredResourceKind::WorkScope);
+    request
+}
+
 async fn assess(
     db: &Database,
     failure: &TerminalizeInitialCloseCleanupFailureRequest,
     suffix: &str,
 ) -> Assessment {
-    let request = safe_retry_request(failure);
+    let request = native_retry_request(failure);
     let proof = db
         .read_stopped_close_original_retirement_proof(&request.failed_run)
         .await
@@ -241,7 +251,10 @@ async fn native_retry_requires_complete_exact_scope_identity_and_rejects_process
             "wrong-identity" => {
                 assessment.request.remaining_effects[scope_index].resource = opaque_resource(RetiredResourceKind::WorkScope, "foreign-scope");
             }
-            "wrong-order" => { assessment.request.remaining_effects.swap(0, scope_index); }
+            "wrong-order" => {
+                assert!(scope_index > 0);
+                assessment.request.remaining_effects.swap(0, scope_index);
+            }
             _ => {}
         }
         refused(db.apply_native_close_explicit_retry(&assessment).await);
@@ -281,7 +294,7 @@ async fn native_retry_uses_g1_residuals_not_g2_success() {
         &db, CloseStopCertainty::ShutdownUncertain, Vec::new(),
     ).await;
     let original = current_test_snapshot(&db, failure.attempt_id.as_str()).await;
-    let original_effects = safe_retry_request(&failure).remaining_effects;
+    let original_effects = native_retry_request(&failure).remaining_effects;
     for remaining in &failure.remaining_resources {
         db.record_close_retirement_evidence(RecordCloseRetirementEvidenceRequest {
             attempt_id: failure.attempt_id.clone(),

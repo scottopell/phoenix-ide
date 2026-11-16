@@ -208,7 +208,7 @@ async fn same_source_changed_target_conflicts_instead_of_starting_second_operati
         f.apply(&changed).await,
         Err(DbError::CloseFoundationConflict(message)) if message.contains("request identity conflict")
     ));
-    assert_one_operation(&f, &receipt, 0).await;
+    assert_one_operation(&f, &receipt, 1).await;
 }
 
 #[tokio::test]
