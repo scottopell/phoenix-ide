@@ -9454,10 +9454,20 @@ mod tests {
             .collect::<Vec<_>>();
         if advance_to_successor_inspection {
             let worktree = live_worktree.expect("G2 native retry fixtures need a live worktree");
+            let captured = db
+                .list_close_attempt_scopes(fixture.run.attempt_id.as_str())
+                .await
+                .unwrap();
+            let Some(super::CapturedWorktreeIdentity::Resolved(identity)) =
+                &captured[0].captured_worktree
+            else {
+                panic!("G2 reinspection requires the captured worktree identity");
+            };
+            assert_eq!(super::worktree_path(identity), worktree);
             db.retry_close_retirement(&fixture.run.attempt_id)
                 .await
                 .unwrap();
-            let (g2, losses) = super::inspect_worktree(worktree).await.unwrap();
+            let (g2, losses) = super::inspect_worktree(identity).await.unwrap();
             assert!(losses.is_empty());
             let g2 = super::rotate_inspection_generation(g2, Some("native-retry-G2"))
                 .unwrap();
@@ -9476,10 +9486,6 @@ mod tests {
             })
             .await
             .unwrap();
-            let captured = db
-                .list_close_attempt_scopes(fixture.run.attempt_id.as_str())
-                .await
-                .unwrap();
             let inventories = captured
                 .into_iter()
                 .map(|captured| {
