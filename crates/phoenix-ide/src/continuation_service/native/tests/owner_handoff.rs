@@ -6,9 +6,9 @@ use phoenix_core::domain::sm_state::ToolCall;
 use phoenix_db::coordinator_tracking::{TrackingDetail, TrackingReceipt};
 use phoenix_db::coordinator_watches::{EndingResponse, WatchEndingEvidence};
 use phoenix_llm::{LlmError, LlmRequest, LlmResponse, LlmService};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use tokio::sync::{Semaphore, mpsc};
+use tokio::sync::{mpsc, Semaphore};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -168,13 +168,11 @@ async fn assert_response_matches_saved_agent(
         *content_digest, digest,
         "reference must digest the saved agent row"
     );
-    assert!(
-        agent
-            .content
-            .to_json()
-            .to_string()
-            .contains(excerpt.as_ref().expect("fixture returns prose"))
-    );
+    assert!(agent
+        .content
+        .to_json()
+        .to_string()
+        .contains(excerpt.as_ref().expect("fixture returns prose")));
     assistant_message_id.clone()
 }
 
@@ -439,20 +437,20 @@ async fn native_owner_rejection_continuation_busy_recovery_and_coordinator_reten
         assert_eq!(rejected["outcome"], "rejected");
         assert_eq!(rejected["reason_code"], "invalid_state_for_message");
         assert_eq!(rejected["conversation_id"], f.predecessor);
-        assert!(
-            f.db.product_conversation_client_message_owner(&f.product, &key.to_string())
-                .await
-                .unwrap()
-                .is_none()
-        );
+        assert!(f
+            .db
+            .product_conversation_client_message_owner(&f.product, &key.to_string())
+            .await
+            .unwrap()
+            .is_none());
         assert_no_ending_for_input(&f.db, &format!("{}:{key}", f.predecessor)).await;
         assert_no_saved_user_input(&f.db, &f.predecessor, text).await;
-        assert!(
-            f.db.get_steering_queue(&f.predecessor)
-                .await
-                .unwrap()
-                .is_empty()
-        );
+        assert!(f
+            .db
+            .get_steering_queue(&f.predecessor)
+            .await
+            .unwrap()
+            .is_empty());
     }
     assert_eq!(provider.ordinal.load(Ordering::SeqCst), 1);
     assert_tracking_unchanged(&f.db, &f.source, &tracked).await;
@@ -474,12 +472,12 @@ async fn native_owner_rejection_continuation_busy_recovery_and_coordinator_reten
     assert_eq!(fenced["reason_code"], "continuation_opening_pending");
     assert_no_saved_user_input(&f.db, &successor, RECOVERY).await;
     assert!(f.db.get_messages(&successor).await.unwrap().is_empty());
-    assert!(
-        f.db.get_steering_queue(&successor)
-            .await
-            .unwrap()
-            .is_empty()
-    );
+    assert!(f
+        .db
+        .get_steering_queue(&successor)
+        .await
+        .unwrap()
+        .is_empty());
     assert_eq!(provider.ordinal.load(Ordering::SeqCst), 1);
 
     let continued = continue_owner
@@ -509,12 +507,12 @@ async fn native_owner_rejection_continuation_busy_recovery_and_coordinator_reten
         .unwrap();
     assert_eq!(opening.origin, InputOrigin::SystemGenerated);
     assert!(matches!(&opening.content, MessageContent::Continuation(_)));
-    assert!(
-        f.db.continuation_dispatch_intent(&f.predecessor)
-            .await
-            .unwrap()
-            .is_none()
-    );
+    assert!(f
+        .db
+        .continuation_dispatch_intent(&f.predecessor)
+        .await
+        .unwrap()
+        .is_none());
 
     let queued = native_send(send.as_ref(), &f.source, &target, recovery_key, RECOVERY).await;
     assert_eq!(queued["outcome"], "queued_as_steering");
@@ -589,12 +587,12 @@ async fn native_owner_rejection_continuation_busy_recovery_and_coordinator_reten
     );
     assert_no_saved_user_input(&f.db, &f.predecessor, REJECT_ONLY).await;
     assert_tracking_unchanged(&f.db, &f.source, &tracked).await;
-    assert!(
-        f.db.get_steering_queue(&successor)
-            .await
-            .unwrap()
-            .is_empty()
-    );
+    assert!(f
+        .db
+        .get_steering_queue(&successor)
+        .await
+        .unwrap()
+        .is_empty());
     let successor_inputs = f.db.get_messages(&successor).await.unwrap();
     assert_eq!(successor_inputs.iter().filter(|message| matches!(&message.content, MessageContent::User(content) if content.text==RECOVERY)).count(), 1);
     assert_eq!(
@@ -655,12 +653,10 @@ async fn native_owner_rejection_continuation_busy_recovery_and_coordinator_reten
     assert!(detail_output.is_success(), "{}", detail_output.output());
     let retained: Value = serde_json::from_str(detail_output.output()).unwrap();
     assert_eq!(retained["item"]["disposition"]["state"], "tracking");
-    assert!(
-        retained["item"]["resumption"]["resumption"]
-            .as_str()
-            .unwrap()
-            .contains("explicit user approval")
-    );
+    assert!(retained["item"]["resumption"]["resumption"]
+        .as_str()
+        .unwrap()
+        .contains("explicit user approval"));
     assert_eq!(retained["evidence"][0][1]["quotation"], COMMISSION);
     let mut coordinator_events = f
         .runtime
