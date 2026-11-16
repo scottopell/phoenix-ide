@@ -1,17 +1,17 @@
 use super::*;
 use crate::workflow::AcceptAuthoritativeTurn;
 use phoenix_core::domain::db_schema::InputOrigin;
+use phoenix_core::domain::db_schema::SourceToolCall;
+use phoenix_core::domain::llm_types::ContentBlock;
 use phoenix_core::domain::sm_event::{
     PreparedDirectTurnDelivery, PreparedDirectTurnPayload, SubmittedDirectTurnExpansionPolicy,
     SubmittedDirectTurnIdentity,
 };
+use phoenix_core::domain::sm_state::{AssistantMessage, ConvState, ToolCall, ToolInput};
+use phoenix_core::llm_language::LlmLanguage;
 use phoenix_workflow::{
     AcceptedDisposition, ClientTurnKey, ConversationAuthority, PreparedTurn, Timestamp, TurnOutcome,
 };
-use phoenix_core::domain::db_schema::SourceToolCall;
-use phoenix_core::domain::llm_types::ContentBlock;
-use phoenix_core::domain::sm_state::{AssistantMessage, ConvState, ToolCall, ToolInput};
-use phoenix_core::llm_language::LlmLanguage;
 use serde_json::json;
 
 struct Fixture {
@@ -214,7 +214,11 @@ async fn source_turn(db: &Database, conversation: &str, key: &str) -> u64 {
 async fn assert_turn_unsettled(db: &Database, turn_id: u64) {
     let authority: (i64, bool, Option<String>) = sqlx::query_as(
         "SELECT generation, owns_conversation, terminal_kind FROM durable_turns WHERE turn_id = ?1",
-    ).bind(i64::try_from(turn_id).unwrap()).fetch_one(db.pool()).await.unwrap();
+    )
+    .bind(i64::try_from(turn_id).unwrap())
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
     assert_eq!(authority, (0, true, None));
 }
 
@@ -239,36 +243,53 @@ async fn assert_no_settlement_effects(db: &Database, receipt: &NativeCloseReceip
 #[tokio::test]
 async fn initial_execution_prepares_idle_run_once_without_settlement_effects() {
     let f = Fixture::new().await;
-    let turn_id = source_turn(&f.db, &f.target, "initial-active-turn").await;
+    let turn_id = source_turn(&f.db, f.target.as_str(), "initial-active-turn").await;
     let command = f.command(f.source.clone(), &f.target);
     let NativeCloseInitialResult::NewlyAdmitted(receipt) = f.apply(&command).await.unwrap() else {
         panic!("expected a new operation");
     };
     let live_source = f.db.get_conversation(&f.coordinator).await.unwrap().state;
-    let prepared = match f.db.prepare_native_close_initial_execution(&command, &receipt, &live_source).await {
+    let prepared = match f
+        .db
+        .prepare_native_close_initial_execution(&command, &receipt, &live_source)
+        .await
+    {
         LocalAuthorityResult::DurableFactEstablished(result) => result.unwrap(),
         LocalAuthorityResult::DurableFactUnclassified => panic!("preparation outcome unclassified"),
     };
     assert_eq!(prepared.run, receipt.admitted);
-    assert_eq!(prepared.phase, phoenix_core::domain::close::ClosePhase::SettlingActiveWork);
+    assert_eq!(
+        prepared.phase,
+        phoenix_core::domain::close::ClosePhase::SettlingActiveWork
+    );
     assert_one_operation(&f, &receipt, 0).await;
     assert!(matches!(
-        f.db.prepare_native_close_initial_execution(&command, &receipt, &live_source).await,
+        f.db.prepare_native_close_initial_execution(&command, &receipt, &live_source)
+            .await,
         LocalAuthorityResult::DurableFactEstablished(Err(DbError::CloseFoundationPrecondition(_)))
     ));
-    let phase: String = sqlx::query_scalar("SELECT phase FROM close_obligations WHERE attempt_id = ?1")
-        .bind(receipt.admitted.attempt_id.as_str())
-        .fetch_one(f.db.pool()).await.unwrap();
+    let phase: String =
+        sqlx::query_scalar("SELECT phase FROM close_obligations WHERE attempt_id = ?1")
+            .bind(receipt.admitted.attempt_id.as_str())
+            .fetch_one(f.db.pool())
+            .await
+            .unwrap();
     assert_eq!(phase, "settling_active_work");
     assert_eq!(count(&f.db, "close_runs").await, 1);
     assert_eq!(count(&f.db, "close_completion_retry_allowances").await, 1);
     let captures: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM close_attempt_direct_turn_settlement_captures WHERE attempt_id = ?1",
-    ).bind(receipt.admitted.attempt_id.as_str()).fetch_one(f.db.pool()).await.unwrap();
+    )
+    .bind(receipt.admitted.attempt_id.as_str())
+    .fetch_one(f.db.pool())
+    .await
+    .unwrap();
     assert_eq!(captures, 1);
-    let targets = f.db.list_unsettled_close_direct_turn_settlement_targets(
-        receipt.admitted.attempt_id.as_str(),
-    ).await.unwrap();
+    let targets = f
+        .db
+        .list_unsettled_close_direct_turn_settlement_targets(receipt.admitted.attempt_id.as_str())
+        .await
+        .unwrap();
     assert_eq!(targets.len(), 1);
     assert_eq!(targets[0].turn_id, turn_id);
     assert_eq!(targets[0].expected_generation, 0);
@@ -285,33 +306,52 @@ async fn initial_execution_preserves_captured_busy_decision_without_confirming_w
     )
     .bind(f.target.as_str())
     .fetch_one(f.db.pool()).await.unwrap();
-    f.db.update_conversation_state(&latest, &busy_state).await.unwrap();
+    f.db.update_conversation_state(&latest, &busy_state)
+        .await
+        .unwrap();
     let command = f.command(f.source.clone(), &f.target);
     let NativeCloseInitialResult::NewlyAdmitted(receipt) = f.apply(&command).await.unwrap() else {
         panic!("expected a new operation");
     };
     let live_source = f.db.get_conversation(&f.coordinator).await.unwrap().state;
-    f.db.update_conversation_state(&latest, &ConvState::Idle).await.unwrap();
-    let prepared = match f.db.prepare_native_close_initial_execution(&command, &receipt, &live_source).await {
+    f.db.update_conversation_state(&latest, &ConvState::Idle)
+        .await
+        .unwrap();
+    let prepared = match f
+        .db
+        .prepare_native_close_initial_execution(&command, &receipt, &live_source)
+        .await
+    {
         LocalAuthorityResult::DurableFactEstablished(result) => result.unwrap(),
         LocalAuthorityResult::DurableFactUnclassified => panic!("preparation outcome unclassified"),
     };
     assert_eq!(prepared.run, receipt.admitted);
-    assert_eq!(prepared.phase, phoenix_core::domain::close::ClosePhase::AwaitingStopWorkConfirmation);
-    let phase: String = sqlx::query_scalar("SELECT phase FROM close_obligations WHERE attempt_id = ?1")
-        .bind(receipt.admitted.attempt_id.as_str())
-        .fetch_one(f.db.pool()).await.unwrap();
+    assert_eq!(
+        prepared.phase,
+        phoenix_core::domain::close::ClosePhase::AwaitingStopWorkConfirmation
+    );
+    let phase: String =
+        sqlx::query_scalar("SELECT phase FROM close_obligations WHERE attempt_id = ?1")
+            .bind(receipt.admitted.attempt_id.as_str())
+            .fetch_one(f.db.pool())
+            .await
+            .unwrap();
     assert_eq!(phase, "awaiting_stop_work_confirmation");
     assert_eq!(count(&f.db, "close_runs").await, 1);
     assert_eq!(count(&f.db, "native_close_initial_receipts").await, 1);
     assert_no_settlement_effects(&f.db, &receipt).await;
     assert_no_dispatch_effects(&f.db, &receipt).await;
     assert!(matches!(
-        f.db.prepare_native_close_initial_execution(&command, &receipt, &live_source).await,
+        f.db.prepare_native_close_initial_execution(&command, &receipt, &live_source)
+            .await,
         LocalAuthorityResult::DurableFactEstablished(Err(DbError::CloseFoundationPrecondition(_)))
     ));
-    let repeated_phase: String = sqlx::query_scalar("SELECT phase FROM close_obligations WHERE attempt_id = ?1")
-        .bind(receipt.admitted.attempt_id.as_str()).fetch_one(f.db.pool()).await.unwrap();
+    let repeated_phase: String =
+        sqlx::query_scalar("SELECT phase FROM close_obligations WHERE attempt_id = ?1")
+            .bind(receipt.admitted.attempt_id.as_str())
+            .fetch_one(f.db.pool())
+            .await
+            .unwrap();
     assert_eq!(repeated_phase, "awaiting_stop_work_confirmation");
 }
 
@@ -326,26 +366,38 @@ async fn preparation_requires_the_exact_retained_receipt_and_target() {
     let mut wrong_target = receipt.clone();
     wrong_target.admitted.target = Fixture::create_target(&f.db, "other-target").await;
     assert!(matches!(
-        f.db.prepare_native_close_initial_execution(&command, &wrong_target, &live_source).await,
+        f.db.prepare_native_close_initial_execution(&command, &wrong_target, &live_source)
+            .await,
         LocalAuthorityResult::DurableFactEstablished(Err(DbError::CloseFoundationPrecondition(_)))
     ));
     let mut wrong_request = receipt.clone();
     wrong_request.request_id = uuid::Uuid::new_v4();
     assert!(matches!(
-        f.db.prepare_native_close_initial_execution(&command, &wrong_request, &live_source).await,
+        f.db.prepare_native_close_initial_execution(&command, &wrong_request, &live_source)
+            .await,
         LocalAuthorityResult::DurableFactEstablished(Err(DbError::CloseFoundationPrecondition(_)))
     ));
     let mut unrelated = receipt.clone();
     unrelated.admitted.attempt_id = CloseAttemptId::parse("unrelated-attempt").unwrap();
     assert!(matches!(
-        f.db.prepare_native_close_initial_execution(&command, &unrelated, &live_source).await,
+        f.db.prepare_native_close_initial_execution(&command, &unrelated, &live_source)
+            .await,
         LocalAuthorityResult::DurableFactEstablished(Err(DbError::CloseFoundationPrecondition(_)))
     ));
-    let phase: String = sqlx::query_scalar("SELECT phase FROM close_obligations WHERE attempt_id = ?1")
-        .bind(receipt.admitted.attempt_id.as_str()).fetch_one(f.db.pool()).await.unwrap();
+    let phase: String =
+        sqlx::query_scalar("SELECT phase FROM close_obligations WHERE attempt_id = ?1")
+            .bind(receipt.admitted.attempt_id.as_str())
+            .fetch_one(f.db.pool())
+            .await
+            .unwrap();
     assert_eq!(phase, "awaiting_blocker_resolution");
-    let prepared = f.db.prepare_native_close_initial_execution(&command, &receipt, &live_source).await;
-    assert!(matches!(prepared, LocalAuthorityResult::DurableFactEstablished(Ok(_))));
+    let prepared =
+        f.db.prepare_native_close_initial_execution(&command, &receipt, &live_source)
+            .await;
+    assert!(matches!(
+        prepared,
+        LocalAuthorityResult::DurableFactEstablished(Ok(_))
+    ));
 }
 
 #[tokio::test]
@@ -357,18 +409,25 @@ async fn preparation_rejects_stale_durable_source_with_held_snapshot() {
         panic!("expected a new operation");
     };
     assert!(matches!(
-        f.db.prepare_native_close_initial_execution(&command, &receipt, &ConvState::Idle).await,
+        f.db.prepare_native_close_initial_execution(&command, &receipt, &ConvState::Idle)
+            .await,
         LocalAuthorityResult::DurableFactEstablished(Err(DbError::CloseFoundationPrecondition(_)))
     ));
     f.db.update_conversation_state(&f.coordinator, &ConvState::Idle)
-        .await.unwrap();
+        .await
+        .unwrap();
     assert!(matches!(
-        f.db.prepare_native_close_initial_execution(&command, &receipt, &held_source).await,
+        f.db.prepare_native_close_initial_execution(&command, &receipt, &held_source)
+            .await,
         LocalAuthorityResult::DurableFactEstablished(Err(DbError::CloseFoundationPrecondition(_)))
     ));
     assert_eq!(count(&f.db, "close_obligations").await, 1);
-    let phase: String = sqlx::query_scalar("SELECT phase FROM close_obligations WHERE attempt_id = ?1")
-        .bind(receipt.admitted.attempt_id.as_str()).fetch_one(f.db.pool()).await.unwrap();
+    let phase: String =
+        sqlx::query_scalar("SELECT phase FROM close_obligations WHERE attempt_id = ?1")
+            .bind(receipt.admitted.attempt_id.as_str())
+            .fetch_one(f.db.pool())
+            .await
+            .unwrap();
     assert_eq!(phase, "awaiting_blocker_resolution");
     assert_no_settlement_effects(&f.db, &receipt).await;
 }
@@ -513,7 +572,7 @@ async fn failed_receipt_insert_rolls_back_capture_run_allowance_marker_and_topol
 #[tokio::test]
 async fn idle_preparation_rolls_back_phase_when_late_capture_write_fails() {
     let f = Fixture::new().await;
-    let turn_id = source_turn(&f.db, &f.target, "rollback-active-turn").await;
+    let turn_id = source_turn(&f.db, f.target.as_str(), "rollback-active-turn").await;
     let command = f.command(f.source.clone(), &f.target);
     let NativeCloseInitialResult::NewlyAdmitted(receipt) = f.apply(&command).await.unwrap() else {
         panic!("expected a new operation");
@@ -524,11 +583,16 @@ async fn idle_preparation_rolls_back_phase_when_late_capture_write_fails() {
          BEGIN SELECT RAISE(ABORT, 'injected capture failure'); END",
     ).execute(f.db.pool()).await.unwrap();
     assert!(matches!(
-        f.db.prepare_native_close_initial_execution(&command, &receipt, &live_source).await,
+        f.db.prepare_native_close_initial_execution(&command, &receipt, &live_source)
+            .await,
         LocalAuthorityResult::DurableFactEstablished(Err(_))
     ));
-    let phase: String = sqlx::query_scalar("SELECT phase FROM close_obligations WHERE attempt_id = ?1")
-        .bind(receipt.admitted.attempt_id.as_str()).fetch_one(f.db.pool()).await.unwrap();
+    let phase: String =
+        sqlx::query_scalar("SELECT phase FROM close_obligations WHERE attempt_id = ?1")
+            .bind(receipt.admitted.attempt_id.as_str())
+            .fetch_one(f.db.pool())
+            .await
+            .unwrap();
     assert_eq!(phase, "awaiting_blocker_resolution");
     assert_no_settlement_effects(&f.db, &receipt).await;
     assert_turn_unsettled(&f.db, turn_id).await;

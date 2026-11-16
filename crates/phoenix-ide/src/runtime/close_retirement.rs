@@ -9432,16 +9432,14 @@ mod tests {
             } else {
                 super::RetirementOutcome::Retired
             };
-            db.record_close_retirement_evidence(
-                crate::db::RecordCloseRetirementEvidenceRequest {
-                    attempt_id: fixture.run.attempt_id.clone(),
-                    snapshot: fixture.snapshot.clone(),
-                    scope: target.scope,
-                    resource: target.resource,
-                    outcome,
-                    detail: Some("native retry fixture preserves pending resources".into()),
-                },
-            )
+            db.record_close_retirement_evidence(crate::db::RecordCloseRetirementEvidenceRequest {
+                attempt_id: fixture.run.attempt_id.clone(),
+                snapshot: fixture.snapshot.clone(),
+                scope: target.scope,
+                resource: target.resource,
+                outcome,
+                detail: Some("native retry fixture preserves pending resources".into()),
+            })
             .await
             .unwrap();
         }
@@ -9469,8 +9467,7 @@ mod tests {
                 .unwrap();
             let (g2, losses) = super::inspect_worktree(identity).await.unwrap();
             assert!(losses.is_empty());
-            let g2 = super::rotate_inspection_generation(g2, Some("native-retry-G2"))
-                .unwrap();
+            let g2 = super::rotate_inspection_generation(g2, Some("native-retry-G2")).unwrap();
             db.replace_close_inspection(crate::db::ReplaceCloseInspectionRequest {
                 attempt_id: fixture.run.attempt_id.clone(),
                 scopes: fixture
@@ -9519,11 +9516,13 @@ mod tests {
                 .snapshot()
                 .unwrap()
                 .clone();
-            db.capture_close_retirement_inventory(crate::db::CaptureCloseRetirementInventoryRequest {
-                attempt_id: fixture.run.attempt_id.clone(),
-                snapshot: aggregate_snapshot,
-                scopes: inventories,
-            })
+            db.capture_close_retirement_inventory(
+                crate::db::CaptureCloseRetirementInventoryRequest {
+                    attempt_id: fixture.run.attempt_id.clone(),
+                    snapshot: aggregate_snapshot,
+                    scopes: inventories,
+                },
+            )
             .await
             .unwrap();
         }
@@ -10098,7 +10097,10 @@ mod tests {
             .list_close_retirement_inspections(fixture.run.attempt_id.as_str())
             .await
             .unwrap();
-        assert_eq!(current_inspections_after_actor, current_inspections_before_actor);
+        assert_eq!(
+            current_inspections_after_actor,
+            current_inspections_before_actor
+        );
     }
 
     #[cfg(unix)]
@@ -10135,10 +10137,7 @@ mod tests {
         }));
         assert!(original.outcomes.iter().any(|outcome| {
             outcome.resource == worktree.resource
-                && matches!(
-                    outcome.outcome,
-                    super::RetirementOutcome::Residual { .. }
-                )
+                && matches!(outcome.outcome, super::RetirementOutcome::Residual { .. })
         }));
         let work_scope = effects
             .iter()
@@ -10146,10 +10145,7 @@ mod tests {
             .unwrap();
         assert!(original.outcomes.iter().any(|outcome| {
             outcome.resource == work_scope.resource
-                && matches!(
-                    outcome.outcome,
-                    super::RetirementOutcome::Residual { .. }
-                )
+                && matches!(outcome.outcome, super::RetirementOutcome::Residual { .. })
         }));
 
         // The retained G2 inspection is fresh; drift below is a separate live change.

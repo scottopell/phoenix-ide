@@ -128,10 +128,13 @@ async fn prepare_initial_execution_tx(
     super::receipts::require_source_and_target_tx(tx, command).await?;
     let admitted = super::receipts::read_receipt_tx(tx, command)
         .await?
-        .ok_or_else(|| DbError::CloseFoundationPrecondition(
-            "exact initial Close receipt is missing".into(),
-        ))?;
-    if admitted != receipt.admitted || admitted.target != *target || admitted.run_ordinal != CloseRunOrdinal::INITIAL {
+        .ok_or_else(|| {
+            DbError::CloseFoundationPrecondition("exact initial Close receipt is missing".into())
+        })?;
+    if admitted != receipt.admitted
+        || admitted.target != *target
+        || admitted.run_ordinal != CloseRunOrdinal::INITIAL
+    {
         return Err(DbError::CloseFoundationPrecondition(
             "initial Close receipt does not bind the initial run".into(),
         ));
@@ -176,9 +179,12 @@ async fn prepare_initial_execution_tx(
     let captured_state = captured_state.ok_or_else(|| {
         DbError::CloseFoundationPrecondition("initial Close has no captured latest state".into())
     })?;
-    let busy = phoenix_core::domain::close::CapturedConversationStateKind::from_db_str(&captured_state)
-        .ok_or_else(|| DbError::Serialization("unknown captured conversation state kind".into()))?
-        .is_busy();
+    let busy =
+        phoenix_core::domain::close::CapturedConversationStateKind::from_db_str(&captured_state)
+            .ok_or_else(|| {
+                DbError::Serialization("unknown captured conversation state kind".into())
+            })?
+            .is_busy();
     let next_phase = if busy {
         phoenix_core::domain::close::ClosePhase::AwaitingStopWorkConfirmation
     } else {
@@ -191,11 +197,8 @@ async fn prepare_initial_execution_tx(
     )
     .await?;
     if !busy {
-        Database::capture_close_direct_turn_settlement_targets_tx(
-            tx,
-            admitted.attempt_id.as_str(),
-        )
-        .await?;
+        Database::capture_close_direct_turn_settlement_targets_tx(tx, admitted.attempt_id.as_str())
+            .await?;
     }
     Ok(NativeCloseInitialExecution {
         run: admitted,
