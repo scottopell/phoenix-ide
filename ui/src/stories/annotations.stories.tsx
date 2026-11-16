@@ -34,3 +34,6 @@ export const AfterDelete = stateStory('13-after-delete');
 AfterDelete.storyName = '13-after-delete';
 export const ManyAnnotations = stateStory('14-many-annotations');
 ManyAnnotations.storyName = '14-many-annotations';
+
+export const FocusedAnnotation = stateStory('15-focused-annotation');
+FocusedAnnotation.storyName = '15-focused-annotation';

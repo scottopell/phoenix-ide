@@ -8,7 +8,9 @@ The `ReactionPill` is integrated into ordinary conversation transcripts. It star
 
 ## Requirements Summary
 
-Annotation design iteration has fourteen direct Ladle stories under `Annotations`, seeded through production stores, source navigation, and send actions. `./dev.py qa annotations` uses `phoenix-browser` to generate fifty-six desktop/mobile, light/dark screenshots and a filtered side-by-side gallery with composer-height measurements. The workflow is documented in `docs/qa/annotations.md`; generated artifacts stay under the ignored `ui/qa-artifacts/annotations/` directory.
+Draft annotation strips share the desktop transcript's reading width and show a total count plus counts hidden above/below their bounded scroller. Number markers beside mounted source passages correspond to the stable card numbers; overlapping markers are grouped. Hover, keyboard focus, and modal selection emphasize the exact source range and its matching number without changing source text or native selection. These affordances extend REQ-PF-019.
+
+Annotation design iteration has fifteen direct Ladle stories under `Annotations`, seeded through the conversation-owned production draft, source navigation, and send actions. `./dev.py qa annotations` uses `phoenix-browser` to generate sixty desktop/mobile, light/dark screenshots and a filtered side-by-side gallery with composer-height measurements. The focused-card story exposes exact source emphasis. The workflow is documented in `docs/qa/annotations.md`; generated artifacts stay under the ignored `ui/qa-artifacts/annotations/` directory.
 
 The touch dock places the source preview and actions in a header above a full-width comment editor. Discard confirmation collapses to one compact row while preserving the expanded pill’s top edge and width. Keep restores the editor and its text. The screenshot run checks full editor width below the source, compact confirmation height, unchanged top edge/width, and restored text and geometry.
 

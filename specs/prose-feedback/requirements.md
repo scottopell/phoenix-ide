@@ -483,6 +483,13 @@ AND SHALL give each annotation a stable number, source excerpt, and comment prev
 AND SHALL preserve creation order and existing numbers across additions, edits, and deletions
 AND SHALL bound the stack height with internal scrolling and expose a selectable strip at least 44 CSS pixels tall for each card.
 
+THE SYSTEM SHALL pair visible source passages with their stable annotation numbers
+AND SHALL distinguish the exact source passage and matching number when its card is hovered, keyboard-focused, or open for editing
+AND SHALL group source markers when multiple annotations begin on the same rendered line without obscuring or changing the message text.
+
+THE SYSTEM SHALL show the total number of pending annotations and indicate annotations hidden above or below the scrolling stack
+AND SHALL align the desktop annotation stack with the transcript reading column.
+
 WHEN the user selects an annotation strip
 THE SYSTEM SHALL open a modal showing the complete source quotation and an editable comment while keeping the source passage fixed
 AND SHALL save comment edits to the draft as they are typed

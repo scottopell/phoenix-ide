@@ -103,6 +103,35 @@ try {
       if (measurement.data?.kind !== 'json') throw new Error('Missing screenshot geometry');
       const metrics = measurement.data.value;
       if (metrics.overflow || metrics.composerHeight <= 0) throw new Error(`Invalid geometry for ${story.id}: ${JSON.stringify(metrics)}`);
+      if (story.id === '15-focused-annotation') {
+        const result = await browser('eval', `(()=>{
+          const ranges=[...(CSS.highlights.get('phoenix-focused-annotation')??[])];
+          const expected=document.querySelectorAll('.draft-annotation-source')[1].textContent;
+          const marker=document.querySelector('.annotation-source-marker.is-emphasized');
+          const card=document.querySelector('.draft-annotation.is-emphasized');
+          const row=document.querySelector('.virtual-transcript-row').getBoundingClientRect();
+          return {exact:ranges.length===1 && expected==='“'+ranges[0].toString()+'”',number:marker?.textContent,aligned:Math.abs(card.getBoundingClientRect().left-row.left-8)<1};
+        })()`);
+        const focus = result.data?.value;
+        if (!focus?.exact || focus.number !== '2' || (layout.name === 'desktop' && !focus.aligned)) throw new Error(`Source/card correspondence failed: ${JSON.stringify(focus)}`);
+        metrics.focus = focus;
+      }
+      if (story.id === '14-many-annotations') {
+        const result = await browser('eval', `(async()=>{
+          const heading=document.querySelector('.draft-annotation-heading');
+          const scroller=document.querySelector('.draft-annotation-scroller');
+          const before=heading.textContent;
+          scroller.scrollTop=scroller.scrollHeight;
+          await new Promise(requestAnimationFrame);await new Promise(requestAnimationFrame);
+          const after=heading.textContent;
+          scroller.scrollTop=0;
+          await new Promise(requestAnimationFrame);await new Promise(requestAnimationFrame);
+          return {before,after};
+        })()`);
+        const overflow = result.data?.value;
+        if (!overflow?.before.includes('8 annotations') || !overflow.before.includes('more below') || !overflow.after.includes('above') || overflow.after.includes('more below')) throw new Error(`Missing annotation overflow cues: ${JSON.stringify(overflow)}`);
+        metrics.stackOverflow = overflow;
+      }
       if (story.id === '03-writing') {
         const before = await pillGeometry();
         if (!before || (before.sourceAbove !== null && (!before.sourceAbove || before.inputWidth < before.width - 32))) throw new Error('Source preview squeezed the reaction editor');

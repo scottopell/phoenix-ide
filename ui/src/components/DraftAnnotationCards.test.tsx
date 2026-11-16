@@ -20,6 +20,7 @@ function setup() {
 describe('annotation stack editor', () => {
   it('edits the selected record in a modal, saves on Escape, and restores focus to the same strip', async () => {
     const draft = setup();
+    expect(screen.getByText('2 annotations')).toBeInTheDocument();
     expect(screen.queryByRole('textbox', { name: /Annotation/ })).not.toBeInTheDocument();
     const second = screen.getByRole('button', { name: 'Edit annotation 2' });
     fireEvent.click(second);

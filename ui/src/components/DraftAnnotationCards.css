@@ -1,5 +1,19 @@
 .draft-annotations {
+  box-sizing: border-box;
+  width: 100%;
+  max-width: calc(var(--transcript-column-width) + 16px);
+  margin-inline: auto;
   padding: 4px 12px 0;
+}
+
+.draft-annotation-heading {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 0 4px 4px;
+  color: var(--text-secondary);
+  font-size: 11px;
+  line-height: 18px;
 }
 
 .draft-annotation-scroller {
@@ -38,6 +52,45 @@
   background: var(--bg-hover);
 }
 
+.draft-annotation.is-emphasized {
+  border-left-color: var(--accent-blue);
+  background: color-mix(in srgb, var(--accent-blue) 10%, var(--bg-secondary));
+}
+
+.annotation-source-markers {
+  position: fixed;
+  z-index: 5;
+  inset: 0;
+  pointer-events: none;
+}
+
+.annotation-source-marker {
+  position: absolute;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  border-radius: 4px;
+  background: color-mix(in srgb, #dca72b 22%, var(--bg-primary));
+  color: var(--text-primary);
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+}
+
+.annotation-source-marker sup { font-size: 8px; }
+
+.annotation-source-marker.is-emphasized {
+  background: var(--accent-blue);
+  color: white;
+}
+
+.agent-text-block::highlight(phoenix-focused-annotation) {
+  background-color: color-mix(in srgb, var(--accent-blue) 35%, transparent);
+  text-decoration: underline;
+  text-decoration-color: var(--accent-blue);
+}
+
 .draft-annotation:focus-visible {
   outline: 2px solid var(--accent-blue);
   outline-offset: -3px;
@@ -55,6 +108,11 @@
   color: var(--text-secondary);
   font-size: 11px;
   font-variant-numeric: tabular-nums;
+}
+
+.draft-annotation.is-emphasized .draft-annotation-number {
+  background: var(--accent-blue);
+  color: white;
 }
 
 .draft-annotation-preview {
