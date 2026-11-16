@@ -22,7 +22,7 @@ struct Input {
 }
 #[derive(Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
-enum Read {
+enum ReadRequest {
     Coverage {
         after_member: Option<i64>,
     },
@@ -87,14 +87,14 @@ impl TrackingTool {
                 .lock_product_message_admission(conversation.product_conversation_id.as_str())
                 .await;
             if let Some("list" | "read" | "coverage") = request.get("op").and_then(Value::as_str) {
-                match serde_json::from_value::<Read>(request).map_err(|e| e.to_string())? {
-                    Read::Coverage { after_member } => serde_json::to_value(
+                match serde_json::from_value::<ReadRequest>(request).map_err(|e| e.to_string())? {
+                    ReadRequest::Coverage { after_member } => serde_json::to_value(
                         db.read_coordinator_scan_coverage(&source, after_member)
                             .await
                             .map_err(|e| e.to_string())?,
                     )
                     .map_err(|e| e.to_string()),
-                    Read::List {
+                    ReadRequest::List {
                         after,
                         include_retired,
                     } => serde_json::to_value(
@@ -103,7 +103,7 @@ impl TrackingTool {
                             .map_err(|e| e.to_string())?,
                     )
                     .map_err(|e| e.to_string()),
-                    Read::Read {
+                    ReadRequest::Read {
                         id,
                         after_evidence_ordinal,
                         before_retirement_revision,
