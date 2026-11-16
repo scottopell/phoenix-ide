@@ -12612,15 +12612,21 @@ impl Database {
         now: DateTime<Utc>,
     ) -> DbResult<()> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        let previous_kind: String = sqlx::query_scalar("SELECT state_kind FROM conversations WHERE id = ?1")
-            .bind(id).fetch_one(&mut *tx).await?;
+        let previous_kind: String =
+            sqlx::query_scalar("SELECT state_kind FROM conversations WHERE id = ?1")
+                .bind(id)
+                .fetch_one(&mut *tx)
+                .await?;
         coordinator_watches::record_wait_entry_tx(&mut tx, id, state).await?;
         native_close::recover_native_retry_sources_tx(&mut tx, id, state).await?;
         sqlx::query(
             "UPDATE conversations SET state = ?1, state_kind = ?2,
              state_updated_at = ?3, updated_at = ?3 WHERE id = ?4",
         )
-        .bind(serde_json::to_string(state).map_err(|error| DbError::Serialization(error.to_string()))?)
+        .bind(
+            serde_json::to_string(state)
+                .map_err(|error| DbError::Serialization(error.to_string()))?,
+        )
         .bind(conv_state_kind(state))
         .bind(now.to_rfc3339())
         .bind(id)
@@ -13150,7 +13156,8 @@ impl Database {
                 "parent {conversation_id} changed during recovered fan-in"
             )));
         }
-        native_close::recover_native_retry_sources_tx(&mut tx, conversation_id, destination).await?;
+        native_close::recover_native_retry_sources_tx(&mut tx, conversation_id, destination)
+            .await?;
         for result in results {
             use phoenix_core::domain::sm_state::SubAgentOutcome;
             let cause = match &result.outcome {
