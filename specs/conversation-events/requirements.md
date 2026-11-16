@@ -25,3 +25,38 @@ THE SYSTEM SHALL retain the typed presentation through authenticated initial, li
 WHEN a reader follows an event's conversation link, THE SYSTEM SHALL use the canonical conversation route and preserve the originating Coordinator return context where applicable. Events SHALL remain excluded from human chapter navigation. Presentation SHALL NOT change event delivery, message ordering, grouping, deduplication, history boundaries, scroll policy, or conversation lifecycle semantics. Replay accounting SHALL consume a size-only projection rather than expose a presentation-bypassing wire conversion.
 
 Related contracts: [Conversation UI](../conversation-ui/requirements.md), [Conversation retrieval](../conversation-retrieval/requirements.md).
+
+## REQ-CEVT-006 — Occurrence-bound ending evidence
+
+WHEN a local execution settles with an exact authoritative response carrier, THE
+SYSTEM SHALL atomically capture its exact transcript/message identity, full canonical
+content digest/version, bounded verbatim ending prose and truncation provenance with
+the completion event. Direct and adopted-input occurrences SHALL use the same captured
+response binding before obligation deletion. Replay SHALL retain original evidence or
+explicit absence, never borrow a later response. Settled-input identity/origin/sender
+facts SHALL remain distinguishable from a sole-cause attribution.
+
+## REQ-CEVT-007 — Honest absence and retention
+
+THE SYSTEM SHALL distinguish captured prose, exact response without prose, unavailable
+response, no exact carrier, historical-not-captured and unsupported remote enrichment.
+Captured quotations SHALL remain immutable with their owning event after source edit
+or deletion. Increasing capture bounds SHALL NOT rehydrate old excerpts. Historical
+events SHALL NOT acquire inferred evidence. Source deletion SHALL make further source
+recovery unavailable without altering the recorded outcome.
+
+## REQ-CEVT-008 — Evidence visibility
+
+THE SYSTEM SHALL expose occurrence-bound evidence through existing private event
+inspection and event-bound reads, preserving authentication and redaction. Shared reads
+SHALL NOT acquire private evidence or sender facts. Worker quotations SHALL remain
+untrusted factual evidence, not user requests, authority or proof that a broader
+tracked user outcome is resolved. Remote terminal-fact v1 SHALL remain unchanged.
+
+## REQ-CEVT-009 — Measured noninterference
+
+THE SYSTEM SHALL preserve existing notification frequency, input admission, wait,
+deduplication, suppression and continuation behavior. Compact model projection SHALL
+be qualified against declared source-correctness, authority, retrieval, total-context
+and latency thresholds before activation; packet length alone SHALL NOT establish
+effectiveness.

@@ -1,5 +1,15 @@
 # Conversation Retrieval
 
+## REQ-RET-012 — Event-bound response recovery
+
+WHEN an authenticated caller reads an occurrence-bound event evidence reference, THE
+SYSTEM SHALL validate the captured version/digest against the complete current source
+content and return a bounded page from the same database snapshot. Every continuation
+page SHALL retain the event/version expectation. Changed, deleted, uncaptured or
+unsupported evidence SHALL produce an explicit nonmatching/unavailable result rather
+than silently reading current content. Ordinary exact-message links SHALL remain
+current-source navigation and SHALL NOT imply occurrence-time version recovery.
+
 ## User Story
 
 As a Phoenix user, I ask recall questions about work that happened
