@@ -301,6 +301,7 @@ mod live {
         request_bytes: AtomicUsize,
         output_tokens: AtomicU64,
         reported_input_tokens: AtomicU64,
+        failed_calls: AtomicUsize,
     }
     struct BoundedClient {
         inner: Arc<dyn LlmClient>,
@@ -316,6 +317,7 @@ mod live {
                 .request_bytes
                 .fetch_add(request_bytes, Ordering::SeqCst)
                 + request_bytes;
+            eprintln!("tracking_eval_request model={} attempt={calls} effort={:?} route={:?} max_output={} debug_request_bytes={request_bytes}",self.model,request.effective_effort,self.inner.diagnostic_route().0,request.max_tokens);
             if calls > 15 || bytes > 2_000_000 || request.max_tokens > 2048 {
                 return Err(LlmError::invalid_request(
                     "tracking evaluation budget exhausted",
@@ -324,9 +326,14 @@ mod live {
             Ok(())
         }
         fn record(&self, response: &LlmResponse) {
-            self.budget
-                .reported_input_tokens
-                .fetch_add(response.usage.input_tokens, Ordering::SeqCst);
+            self.budget.reported_input_tokens.fetch_add(
+                response
+                    .usage
+                    .input_tokens
+                    .saturating_add(response.usage.cache_read_tokens)
+                    .saturating_add(response.usage.cache_creation_tokens),
+                Ordering::SeqCst,
+            );
             self.budget
                 .output_tokens
                 .fetch_add(response.usage.output_tokens, Ordering::SeqCst);
@@ -346,7 +353,11 @@ mod live {
         }
         async fn complete(&self, request: &LlmRequest) -> Result<LlmResponse, LlmError> {
             self.admit(request)?;
-            let response = self.inner.complete(request).await?;
+            let response = self.inner.complete(request).await.map_err(|error| {
+                self.budget.failed_calls.fetch_add(1, Ordering::SeqCst);
+                eprintln!("tracking_eval_provider_failure kind={:?}", error.kind);
+                error
+            })?;
             self.record(&response);
             Ok(response)
         }
@@ -356,7 +367,15 @@ mod live {
             chunks: &mpsc::Sender<TokenChunk>,
         ) -> Result<LlmResponse, LlmError> {
             self.admit(request)?;
-            let response = self.inner.complete_streaming(request, chunks).await?;
+            let response = self
+                .inner
+                .complete_streaming(request, chunks)
+                .await
+                .map_err(|error| {
+                    self.budget.failed_calls.fetch_add(1, Ordering::SeqCst);
+                    eprintln!("tracking_eval_provider_failure kind={:?}", error.kind);
+                    error
+                })?;
             self.record(&response);
             Ok(response)
         }
@@ -791,7 +810,7 @@ mod live {
                 .active_count,
             2
         );
-        eprintln!("tracking_live_acceptance model={model} calls={} request_debug_bytes={} reported_input_tokens={} reported_output_tokens={} tool_calls={} external_effects=0",budget.calls.load(Ordering::SeqCst),budget.request_bytes.load(Ordering::SeqCst),budget.reported_input_tokens.load(Ordering::SeqCst),budget.output_tokens.load(Ordering::SeqCst),fixture.calls.lock().unwrap().len());
+        eprintln!("tracking_live_acceptance model={model} calls={} failed_calls={} request_debug_bytes={} reported_total_input_tokens={} reported_output_tokens={} tool_calls={} external_effects=0",budget.calls.load(Ordering::SeqCst),budget.failed_calls.load(Ordering::SeqCst),budget.request_bytes.load(Ordering::SeqCst),budget.reported_input_tokens.load(Ordering::SeqCst),budget.output_tokens.load(Ordering::SeqCst),fixture.calls.lock().unwrap().len());
     }
 }
 
