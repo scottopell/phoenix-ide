@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+
 async fn source_fence_fixture() -> (Database, Assessment, CloseRunRef) {
     let db = Database::open_in_memory().await.unwrap();
     let failure = fixture(&db, Vec::new(), true).await;
@@ -823,10 +825,8 @@ async fn initial_source_fence_retains_exact_sealed_inventory_without_physical_ef
     )) = db.apply_native_close_initial(&command).await else { panic!("expected admission"); };
     let run = CloseRunRef::initial(receipt.admitted.attempt_id.clone());
     let source = db.get_conversation(command.source_transcript_id()).await.unwrap().state;
-    assert!(matches!(db.prepare_native_close_initial_execution(&command, &receipt, &source).await,
-        LocalAuthorityResult::DurableFactEstablished(Ok(_))));
-    assert!(matches!(db.settle_native_close_initial(&command, &receipt, &source).await,
-        LocalAuthorityResult::DurableFactEstablished(Ok(_))));
+    assert!(db.prepare_native_close_initial_execution(&command, &receipt, &source).await.established().unwrap().is_ok());
+    assert!(db.settle_native_close_initial(&command, &receipt, &source).await.established().unwrap().is_ok());
     let snapshot = CloseRetirementSnapshot::parse("sealed-generation", "sealed-fingerprint").unwrap();
     let inspection = crate::ReplaceCloseInspectionRequest {
         attempt_id: run.attempt_id.clone(),
@@ -834,9 +834,8 @@ async fn initial_source_fence_retains_exact_sealed_inventory_without_physical_ef
             scope: scope.clone(), snapshot: snapshot.clone(), losses: vec![],
         }],
     };
-    assert!(matches!(db.replace_native_close_initial_inspection(
-        &command, &receipt, &source, inspection, None).await,
-        LocalAuthorityResult::DurableFactEstablished(Ok(_))));
+    assert!(db.replace_native_close_initial_inspection(
+        &command, &receipt, &source, inspection, None).await.established().unwrap().is_ok());
     let snapshot = CloseRetirementSnapshot::parse(
         encode_aggregate_snapshot_component([(&scope, snapshot.generation())]),
         encode_aggregate_snapshot_component([(&scope, snapshot.fingerprint())]),
@@ -850,16 +849,15 @@ async fn initial_source_fence_retains_exact_sealed_inventory_without_physical_ef
         scopes: vec![crate::CaptureCloseRetirementInventoryScopeRequest {
             scope: scope.clone(),
             inventory: CloseOwnedResourceInventory {
-                worktree: Some(worktree), work_scopes: Default::default(),
-                bash_process_groups: Default::default(), tmux_servers: [tmux.clone()].into(),
-                pty_sessions: Default::default(), browser_sessions: Default::default(),
-                equivalent_live_resources: Default::default(),
+                worktree: Some(worktree), work_scopes: BTreeSet::new(),
+                bash_process_groups: BTreeSet::new(), tmux_servers: [tmux.clone()].into(),
+                pty_sessions: BTreeSet::new(), browser_sessions: BTreeSet::new(),
+                equivalent_live_resources: BTreeSet::new(),
             },
         }],
     };
-    assert!(matches!(db.capture_native_close_initial_retirement_inventory(
-        &command, &receipt, &source, inventory).await,
-        LocalAuthorityResult::DurableFactEstablished(Ok(_))));
+    assert!(db.capture_native_close_initial_retirement_inventory(
+        &command, &receipt, &source, inventory).await.established().unwrap().is_ok());
     let before = source_fence_allowance(&db, &run).await;
     let source_before = db.get_conversation(command.source_transcript_id()).await.unwrap().state;
     let obligation_before = db.get_close_obligation(run.attempt_id.as_str()).await.unwrap();
@@ -919,6 +917,30 @@ async fn initial_source_fence_retains_no_worktree_scope_inventory_and_dispatch()
     let db = Database::open_in_memory().await.unwrap();
     create_root(&db, "fenced-no-worktree").await;
     create_child(&db, "fenced-no-worktree-child", "fenced-no-worktree").await;
+    let now = Utc::now().to_rfc3339();
+    sqlx::query(
+        "INSERT INTO work_scopes (
+            id, authority_kind, lifecycle, environment_kind, cwd,
+            worktree_path, branch_name, base_branch, created_at, updated_at
+         ) VALUES
+            ('fenced-unowned-scope', 'work', 'active', 'unowned_cwd', '/tmp', NULL, NULL, NULL, ?1, ?1),
+            ('fenced-none-scope', 'work', 'active', 'none', NULL, NULL, NULL, NULL, ?1, ?1)",
+    )
+    .bind(&now)
+    .execute(db.pool())
+    .await
+    .unwrap();
+    for (conversation, scope) in [
+        ("fenced-no-worktree", "fenced-unowned-scope"),
+        ("fenced-no-worktree-child", "fenced-none-scope"),
+    ] {
+        sqlx::query("UPDATE conversations SET work_scope_id = ?1 WHERE id = ?2")
+            .bind(scope)
+            .bind(conversation)
+            .execute(db.pool())
+            .await
+            .unwrap();
+    }
     let command = retry_command(&db, "fenced-no-worktree-child", NativeCloseIntent::Initial {
         target: product_id("fenced-no-worktree"),
     }).await;
@@ -930,15 +952,12 @@ async fn initial_source_fence_retains_no_worktree_scope_inventory_and_dispatch()
     let scopes = db.list_close_attempt_scopes(run.attempt_id.as_str()).await.unwrap();
     assert!(!scopes.is_empty());
     assert!(scopes.iter().all(|scope| scope.captured_worktree.is_none()));
-    assert!(matches!(db.prepare_native_close_initial_execution(&command, &receipt, &source).await,
-        LocalAuthorityResult::DurableFactEstablished(Ok(_))));
-    assert!(matches!(db.settle_native_close_initial(&command, &receipt, &source).await,
-        LocalAuthorityResult::DurableFactEstablished(Ok(_))));
-    assert!(matches!(db.replace_native_close_initial_inspection(&command, &receipt, &source,
+    assert!(db.prepare_native_close_initial_execution(&command, &receipt, &source).await.established().unwrap().is_ok());
+    assert!(db.settle_native_close_initial(&command, &receipt, &source).await.established().unwrap().is_ok());
+    assert!(db.replace_native_close_initial_inspection(&command, &receipt, &source,
         crate::ReplaceCloseInspectionRequest {
             attempt_id: run.attempt_id.clone(), scopes: vec![],
-        }, Some("empty-generation-from-writer")).await,
-        LocalAuthorityResult::DurableFactEstablished(Ok(_))));
+        }, Some("empty-generation-from-writer")).await.established().unwrap().is_ok());
     let snapshot = db.get_close_obligation(run.attempt_id.as_str()).await.unwrap()
         .snapshot().cloned().unwrap();
     assert_eq!(snapshot.generation(), "empty-generation-from-writer");
@@ -950,10 +969,10 @@ async fn initial_source_fence_retains_no_worktree_scope_inventory_and_dispatch()
                 scopes: scopes.iter().map(|scope| crate::CaptureCloseRetirementInventoryScopeRequest {
                     scope: scope.scope.clone(),
                     inventory: CloseOwnedResourceInventory {
-                        worktree: None, work_scopes: Default::default(),
-                        bash_process_groups: Default::default(), tmux_servers: Default::default(),
-                        pty_sessions: Default::default(), browser_sessions: Default::default(),
-                        equivalent_live_resources: Default::default(),
+                        worktree: None, work_scopes: BTreeSet::new(),
+                        bash_process_groups: BTreeSet::new(), tmux_servers: BTreeSet::new(),
+                        pty_sessions: BTreeSet::new(), browser_sessions: BTreeSet::new(),
+                        equivalent_live_resources: BTreeSet::new(),
                     },
                 }).collect(),
             }).await else { panic!("expected sealed no-worktree inventory"); };
@@ -995,11 +1014,9 @@ async fn initial_source_or_startup_fence_after_nonempty_loss_inspection_retains_
     )) = db.apply_native_close_initial(&command).await else { panic!("expected admission"); };
     let run = CloseRunRef::initial(receipt.admitted.attempt_id.clone());
     let source = db.get_conversation(command.source_transcript_id()).await.unwrap().state;
-    assert!(matches!(db.prepare_native_close_initial_execution(&command, &receipt, &source).await,
-        LocalAuthorityResult::DurableFactEstablished(Ok(_))));
-    assert!(matches!(db.settle_native_close_initial(&command, &receipt, &source).await,
-        LocalAuthorityResult::DurableFactEstablished(Ok(_))));
-    assert!(matches!(db.replace_native_close_initial_inspection(&command, &receipt, &source,
+    assert!(db.prepare_native_close_initial_execution(&command, &receipt, &source).await.established().unwrap().is_ok());
+    assert!(db.settle_native_close_initial(&command, &receipt, &source).await.established().unwrap().is_ok());
+    assert!(db.replace_native_close_initial_inspection(&command, &receipt, &source,
         crate::ReplaceCloseInspectionRequest {
             attempt_id: run.attempt_id.clone(),
             scopes: vec![crate::ReplaceCloseInspectionScopeRequest {
@@ -1008,7 +1025,7 @@ async fn initial_source_or_startup_fence_after_nonempty_loss_inspection_retains_
                 losses: vec![CloseLossItem::UntrackedNonIgnoredPath(
                     GitPathIdentity::from_bytes(b"untracked.txt".to_vec()))],
             }],
-        }, None).await, LocalAuthorityResult::DurableFactEstablished(Ok(_))));
+        }, None).await.established().unwrap().is_ok());
     let before = db.get_close_obligation(run.attempt_id.as_str()).await.unwrap();
     assert_eq!(before.phase(), ClosePhase::AwaitingLossConfirmation);
     let snapshot = before.snapshot().cloned().unwrap();
@@ -1048,18 +1065,16 @@ async fn initial_source_or_startup_fence_retains_committed_repair_inventory() {
     )) = db.apply_native_close_initial(&command).await else { panic!("expected admission"); };
     let run = CloseRunRef::initial(receipt.admitted.attempt_id.clone());
     let source = db.get_conversation(command.source_transcript_id()).await.unwrap().state;
-    assert!(matches!(db.prepare_native_close_initial_execution(&command, &receipt, &source).await,
-        LocalAuthorityResult::DurableFactEstablished(Ok(_))));
-    assert!(matches!(db.settle_native_close_initial(&command, &receipt, &source).await,
-        LocalAuthorityResult::DurableFactEstablished(Ok(_))));
+    assert!(db.prepare_native_close_initial_execution(&command, &receipt, &source).await.established().unwrap().is_ok());
+    assert!(db.settle_native_close_initial(&command, &receipt, &source).await.established().unwrap().is_ok());
     let scope_snapshot = CloseRetirementSnapshot::parse("repair-gen", "repair-fp").unwrap();
-    assert!(matches!(db.replace_native_close_initial_inspection(&command, &receipt, &source,
+    assert!(db.replace_native_close_initial_inspection(&command, &receipt, &source,
         crate::ReplaceCloseInspectionRequest {
             attempt_id: run.attempt_id.clone(),
             scopes: vec![crate::ReplaceCloseInspectionScopeRequest {
                 scope: scope.clone(), snapshot: scope_snapshot.clone(), losses: vec![],
             }],
-        }, None).await, LocalAuthorityResult::DurableFactEstablished(Ok(_))));
+        }, None).await.established().unwrap().is_ok());
     let snapshot = db.get_close_obligation(run.attempt_id.as_str()).await.unwrap()
         .snapshot().cloned().unwrap();
     let captured = db.list_close_attempt_scopes(run.attempt_id.as_str()).await.unwrap();
@@ -1072,10 +1087,10 @@ async fn initial_source_or_startup_fence_retains_committed_repair_inventory() {
                 scopes: vec![crate::CaptureCloseRetirementInventoryScopeRequest {
                     scope: scope.clone(),
                     inventory: CloseOwnedResourceInventory {
-                        worktree: Some(worktree.clone()), work_scopes: Default::default(),
-                        bash_process_groups: Default::default(), tmux_servers: Default::default(),
-                        pty_sessions: Default::default(), browser_sessions: Default::default(),
-                        equivalent_live_resources: Default::default(),
+                        worktree: Some(worktree.clone()), work_scopes: BTreeSet::new(),
+                        bash_process_groups: BTreeSet::new(), tmux_servers: BTreeSet::new(),
+                        pty_sessions: BTreeSet::new(), browser_sessions: BTreeSet::new(),
+                        equivalent_live_resources: BTreeSet::new(),
                     },
                 }],
             }).await else { panic!("expected inventory"); };
@@ -1130,18 +1145,16 @@ async fn initial_source_fence_preserves_proofs_across_mixed_worktree_scopes() {
     )) = db.apply_native_close_initial(&command).await else { panic!("expected admission"); };
     let run = CloseRunRef::initial(receipt.admitted.attempt_id.clone());
     let source = db.get_conversation(command.source_transcript_id()).await.unwrap().state;
-    assert!(matches!(db.prepare_native_close_initial_execution(&command, &receipt, &source).await,
-        LocalAuthorityResult::DurableFactEstablished(Ok(_))));
-    assert!(matches!(db.settle_native_close_initial(&command, &receipt, &source).await,
-        LocalAuthorityResult::DurableFactEstablished(Ok(_))));
+    assert!(db.prepare_native_close_initial_execution(&command, &receipt, &source).await.established().unwrap().is_ok());
+    assert!(db.settle_native_close_initial(&command, &receipt, &source).await.established().unwrap().is_ok());
     let snapshot = CloseRetirementSnapshot::parse("two-scope-generation", "two-scope-fingerprint").unwrap();
-    assert!(matches!(db.replace_native_close_initial_inspection(&command, &receipt, &source,
+    assert!(db.replace_native_close_initial_inspection(&command, &receipt, &source,
         crate::ReplaceCloseInspectionRequest {
             attempt_id: run.attempt_id.clone(),
             scopes: vec![crate::ReplaceCloseInspectionScopeRequest {
                 scope: root_scope.clone(), snapshot: snapshot.clone(), losses: vec![],
             }],
-        }, None).await, LocalAuthorityResult::DurableFactEstablished(Ok(_))));
+        }, None).await.established().unwrap().is_ok());
     let snapshot = CloseRetirementSnapshot::parse(
         encode_aggregate_snapshot_component([(&root_scope, snapshot.generation())]),
         encode_aggregate_snapshot_component([(&root_scope, snapshot.fingerprint())]),
@@ -1157,12 +1170,12 @@ async fn initial_source_fence_preserves_proofs_across_mixed_worktree_scopes() {
         crate::CaptureCloseRetirementInventoryScopeRequest {
             scope: captured.scope.clone(),
             inventory: CloseOwnedResourceInventory {
-                worktree, work_scopes: Default::default(),
-                bash_process_groups: Default::default(),
+                worktree, work_scopes: BTreeSet::new(),
+                bash_process_groups: BTreeSet::new(),
                 tmux_servers: if captured.scope == child_scope { [tmux.clone()].into() }
-                    else { Default::default() },
-                pty_sessions: Default::default(), browser_sessions: Default::default(),
-                equivalent_live_resources: Default::default(),
+                    else { BTreeSet::new() },
+                pty_sessions: BTreeSet::new(), browser_sessions: BTreeSet::new(),
+                equivalent_live_resources: BTreeSet::new(),
             },
         }
     }).collect();
@@ -1238,18 +1251,16 @@ async fn initial_source_fence_refuses_all_complete_sealed_inventory_without_muta
     )) = db.apply_native_close_initial(&command).await else { panic!("expected admission"); };
     let run = CloseRunRef::initial(receipt.admitted.attempt_id.clone());
     let source = db.get_conversation(command.source_transcript_id()).await.unwrap().state;
-    assert!(matches!(db.prepare_native_close_initial_execution(&command, &receipt, &source).await,
-        LocalAuthorityResult::DurableFactEstablished(Ok(_))));
-    assert!(matches!(db.settle_native_close_initial(&command, &receipt, &source).await,
-        LocalAuthorityResult::DurableFactEstablished(Ok(_))));
+    assert!(db.prepare_native_close_initial_execution(&command, &receipt, &source).await.established().unwrap().is_ok());
+    assert!(db.settle_native_close_initial(&command, &receipt, &source).await.established().unwrap().is_ok());
     let scope_snapshot = CloseRetirementSnapshot::parse("complete-generation", "complete-fingerprint").unwrap();
-    assert!(matches!(db.replace_native_close_initial_inspection(&command, &receipt, &source,
+    assert!(db.replace_native_close_initial_inspection(&command, &receipt, &source,
         crate::ReplaceCloseInspectionRequest {
             attempt_id: run.attempt_id.clone(),
             scopes: vec![crate::ReplaceCloseInspectionScopeRequest {
                 scope: scope.clone(), snapshot: scope_snapshot.clone(), losses: vec![],
             }],
-        }, None).await, LocalAuthorityResult::DurableFactEstablished(Ok(_))));
+        }, None).await.established().unwrap().is_ok());
     let snapshot = CloseRetirementSnapshot::parse(
         encode_aggregate_snapshot_component([(&scope, scope_snapshot.generation())]),
         encode_aggregate_snapshot_component([(&scope, scope_snapshot.fingerprint())]),
@@ -1264,10 +1275,10 @@ async fn initial_source_fence_refuses_all_complete_sealed_inventory_without_muta
                 scopes: vec![crate::CaptureCloseRetirementInventoryScopeRequest {
                     scope: scope.clone(),
                     inventory: CloseOwnedResourceInventory {
-                        worktree: Some(worktree), work_scopes: Default::default(),
-                        bash_process_groups: Default::default(), tmux_servers: Default::default(),
-                        pty_sessions: Default::default(), browser_sessions: Default::default(),
-                        equivalent_live_resources: Default::default(),
+                        worktree: Some(worktree), work_scopes: BTreeSet::new(),
+                        bash_process_groups: BTreeSet::new(), tmux_servers: BTreeSet::new(),
+                        pty_sessions: BTreeSet::new(), browser_sessions: BTreeSet::new(),
+                        equivalent_live_resources: BTreeSet::new(),
                     },
                 }],
             }).await else { panic!("expected sealed inventory"); };
@@ -1306,10 +1317,8 @@ async fn startup_classifies_partial_initial_inspection_without_suppressing_allow
     )) = db.apply_native_close_initial(&command).await else { panic!("expected admission"); };
     let run = CloseRunRef::initial(receipt.admitted.attempt_id.clone());
     let source = db.get_conversation(command.source_transcript_id()).await.unwrap().state;
-    assert!(matches!(db.prepare_native_close_initial_execution(&command, &receipt, &source).await,
-        LocalAuthorityResult::DurableFactEstablished(Ok(_))));
-    assert!(matches!(db.settle_native_close_initial(&command, &receipt, &source).await,
-        LocalAuthorityResult::DurableFactEstablished(Ok(_))));
+    assert!(db.prepare_native_close_initial_execution(&command, &receipt, &source).await.established().unwrap().is_ok());
+    assert!(db.settle_native_close_initial(&command, &receipt, &source).await.established().unwrap().is_ok());
     sqlx::query("INSERT INTO close_retirement_inspections (attempt_id, scope, generation, fingerprint, inspected_at)
                  VALUES (?1, ?2, 'partial-generation', 'partial-fingerprint', '2026-11-16T00:00:00Z')")
         .bind(run.attempt_id.as_str()).bind(scope.as_str()).execute(db.pool()).await.unwrap();
@@ -1358,16 +1367,10 @@ async fn initial_source_fence_classifies_partial_inspection_without_dispatch() {
         .await
         .unwrap()
         .state;
-    assert!(matches!(
-        db.prepare_native_close_initial_execution(&command, &receipt, &live_source)
-            .await,
-        LocalAuthorityResult::DurableFactEstablished(Ok(_))
-    ));
-    assert!(matches!(
-        db.settle_native_close_initial(&command, &receipt, &live_source)
-            .await,
-        LocalAuthorityResult::DurableFactEstablished(Ok(_))
-    ));
+    assert!(db.prepare_native_close_initial_execution(&command, &receipt, &live_source)
+            .await.established().unwrap().is_ok());
+    assert!(db.settle_native_close_initial(&command, &receipt, &live_source)
+            .await.established().unwrap().is_ok());
 
     // Synthetic partial-inspection crash fixture: the aggregate snapshot remains null.
     sqlx::query(

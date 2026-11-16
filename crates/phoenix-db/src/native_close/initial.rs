@@ -1,7 +1,7 @@
 //! Dormant initial-only acceptance. No cleanup, dispatch, retry or allowance claim.
 
 use phoenix_core::domain::close::{
-    CloseAttemptId, CloseExpectedRetirementResource, ClosePhase, CloseRunOrdinal,
+    CloseAttemptId, CloseExpectedRetirementResource, CloseObligation, ClosePhase, CloseRunOrdinal,
     TranscriptConversationId,
 };
 use phoenix_core::domain::product_conversation::ProductConversationId;
@@ -84,6 +84,73 @@ impl Database {
         match result {
             Ok(()) => match tx.commit().await {
                 Ok(()) => LocalAuthorityResult::DurableFactEstablished(Ok(())),
+                Err(_) => LocalAuthorityResult::DurableFactUnclassified,
+            },
+            Err(error) => match tx.rollback().await {
+                Ok(()) => LocalAuthorityResult::DurableFactEstablished(Err(error)),
+                Err(_) => LocalAuthorityResult::DurableFactUnclassified,
+            },
+        }
+    }
+
+    /// Finalizes only the exact live source-owned initial run after its anchored inventory
+    /// has concrete successful retirement proof. This archives; it is not an observation API.
+    pub async fn complete_native_close_initial(
+        &self,
+        command: &NativeCloseCommand,
+        receipt: &NativeCloseReceipt,
+        live_source: &phoenix_core::domain::sm_state::ConvState,
+    ) -> LocalAuthorityResult<DbResult<CloseObligation>> {
+        let mut tx = match self.pool.begin_with("BEGIN IMMEDIATE").await {
+            Ok(tx) => tx,
+            Err(error) => return LocalAuthorityResult::DurableFactEstablished(Err(error.into())),
+        };
+        let result = async {
+            let (admitted, _) = require_initial_execution_tx(
+                &mut tx,
+                command,
+                receipt,
+                live_source,
+                ClosePhase::RetirementRequested,
+            )
+            .await?;
+            let anchored: bool = sqlx::query_scalar(
+                "SELECT EXISTS (
+                    SELECT 1 FROM close_original_retirement_anchors anchor
+                    JOIN close_obligations obligation ON obligation.attempt_id = anchor.attempt_id
+                    WHERE anchor.attempt_id = ?1
+                      AND anchor.inspection_generation = obligation.inspection_generation
+                      AND anchor.inspection_fingerprint = obligation.inspection_fingerprint
+                ) AND NOT EXISTS (
+                    SELECT 1 FROM close_retirement_anchor_exclusions WHERE attempt_id = ?1
+                ) AND NOT EXISTS (
+                    SELECT 1 FROM close_attempt_scopes scope
+                    WHERE scope.attempt_id = ?1 AND NOT EXISTS (
+                        SELECT 1 FROM close_retirement_inventories inventory
+                        JOIN close_obligations obligation ON obligation.attempt_id = inventory.attempt_id
+                        WHERE inventory.attempt_id = scope.attempt_id
+                          AND inventory.scope = scope.scope AND inventory.sealed = 1
+                          AND inventory.inspection_generation = obligation.inspection_generation
+                          AND inventory.inspection_fingerprint = obligation.inspection_fingerprint
+                    )
+                )",
+            )
+            .bind(admitted.attempt_id.as_str())
+            .fetch_one(&mut *tx)
+            .await?;
+            if !anchored {
+                return Err(DbError::CloseFoundationPrecondition(
+                    "initial completion requires its exact anchored sealed retirement inventory".into(),
+                ));
+            }
+            // The completion trigger checks every expected identity for concrete
+            // retired/absence-adopted evidence and rejects residual proofs.
+            Database::complete_close_retirement_tx(&mut tx, &admitted.attempt_id).await
+        }
+        .await;
+        match result {
+            Ok(obligation) => match tx.commit().await {
+                Ok(()) => LocalAuthorityResult::DurableFactEstablished(Ok(obligation)),
                 Err(_) => LocalAuthorityResult::DurableFactUnclassified,
             },
             Err(error) => match tx.rollback().await {

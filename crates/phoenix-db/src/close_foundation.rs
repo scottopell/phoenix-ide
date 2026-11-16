@@ -3065,7 +3065,8 @@ impl Database {
         empty_generation: Option<&str>,
     ) -> DbResult<()> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        self.replace_close_inspection_tx(&mut tx, &request, empty_generation).await?;
+        self.replace_close_inspection_tx(&mut tx, &request, empty_generation)
+            .await?;
         tx.commit().await?;
         Ok(())
     }
@@ -3216,8 +3217,7 @@ impl Database {
             .await?;
         self.clear_retirement_inspection_rows(tx, request.attempt_id.as_str())
             .await?;
-        self.insert_retirement_inspection_rows(tx, request)
-            .await?;
+        self.insert_retirement_inspection_rows(tx, request).await?;
         self.advance_obligation_after_inspection(tx, request, &aggregate_snapshot)
             .await?;
         Ok(())
@@ -3527,7 +3527,9 @@ impl Database {
         request: CaptureCloseRetirementInventoryRequest,
     ) -> DbResult<Vec<CloseExpectedRetirementResource>> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        let result = self.capture_close_retirement_inventory_tx(&mut tx, &request).await;
+        let result = self
+            .capture_close_retirement_inventory_tx(&mut tx, &request)
+            .await;
         match result {
             Ok(resources) => {
                 tx.commit().await?;
@@ -3955,8 +3957,7 @@ impl Database {
             .await?;
         }
         let resources =
-            list_close_expected_retirement_resources_tx(tx, request.attempt_id.as_str())
-                .await?;
+            list_close_expected_retirement_resources_tx(tx, request.attempt_id.as_str()).await?;
         Ok(resources)
     }
 
@@ -7151,7 +7152,9 @@ impl Database {
     ) -> DbResult<CloseObligation> {
         let (run, authority, detail) = fence.into_parts();
         if run.ordinal != CloseRunOrdinal::INITIAL {
-            return Err(close_precondition("initial source fence requires the initial run"));
+            return Err(close_precondition(
+                "initial source fence requires the initial run",
+            ));
         }
         let eligible: bool = sqlx::query_scalar(
             "SELECT EXISTS(
@@ -7201,34 +7204,28 @@ impl Database {
                 inspected_scopes.push(scope.clone());
                 inspection_components.push((scope, generation, fingerprint));
             }
-            let captured_scopes = sqlx::query_scalar::<_, String>(
-                "SELECT scope FROM close_attempt_scopes
-                 WHERE attempt_id = ?1 AND captured_worktree_locator IS NOT NULL
-                 ORDER BY scope",
-            )
-            .bind(run.attempt_id.as_str())
-            .fetch_all(&mut **tx)
-            .await?
-            .into_iter()
-            .map(|scope| {
-                WorkScopeId::parse(scope)
-                    .map_err(|error| close_precondition(error.to_string()))
-            })
-            .collect::<DbResult<Vec<_>>>()?;
+            let captured_scopes = parse_targeted_close_attempt_scopes(tx, run.attempt_id.as_str())
+                .await?
+                .into_iter()
+                .collect::<Vec<_>>();
             let inspection_snapshot_matches = inspected_scopes == captured_scopes;
             let inspected_snapshot = if inspection_snapshot_matches {
                 let generation = if inspection_components.is_empty() {
                     snapshot.generation().to_string()
                 } else {
-                    encode_aggregate_snapshot_component(inspection_components.iter().map(
-                        |(scope, generation, _)| (scope, generation.as_str()),
-                    ))
+                    encode_aggregate_snapshot_component(
+                        inspection_components
+                            .iter()
+                            .map(|(scope, generation, _)| (scope, generation.as_str())),
+                    )
                 };
                 CloseRetirementSnapshot::parse(
                     generation,
-                    encode_aggregate_snapshot_component(inspection_components.iter().map(
-                        |(scope, _, fingerprint)| (scope, fingerprint.as_str()),
-                    )),
+                    encode_aggregate_snapshot_component(
+                        inspection_components
+                            .iter()
+                            .map(|(scope, _, fingerprint)| (scope, fingerprint.as_str())),
+                    ),
                 )
                 .ok()
             } else {
@@ -7267,9 +7264,11 @@ impl Database {
                 let unresolved =
                     unresolved_expected_close_cleanup_resources_tx(tx, run.attempt_id.as_str())
                         .await?;
-                // A complete inventory with no unresolved target needs its own completion-race guard.
+                // Archiving is a new lifecycle write, not source-loss observation.
                 let first = unresolved.first().ok_or_else(|| {
-                    close_precondition("source fence refuses an all-complete initial retirement inventory")
+                    close_precondition(
+                        "all-complete initial retirement requires source-bound completion; source fence cannot archive",
+                    )
                 })?;
                 let remaining_resources = expected_close_cleanup_failure_resources_tx(
                     tx,
@@ -7293,7 +7292,8 @@ impl Database {
                     stop_certainty: retained_interrupted_stop_certainty_tx(tx, &run).await?,
                     occurred_at_us: Utc::now().timestamp_micros(),
                 };
-                let result = Self::terminalize_close_run_cleanup_failure_tx(tx, &run, &request).await?;
+                let result =
+                    Self::terminalize_close_run_cleanup_failure_tx(tx, &run, &request).await?;
                 if authority == CloseCleanupFailureAuthority::ExplicitlySuppressed {
                     sqlx::query("UPDATE close_completion_retry_allowances SET suppressed = 1 WHERE attempt_id = ?1 AND suppressed = 0")
                         .bind(run.attempt_id.as_str()).execute(&mut **tx).await?;
@@ -7325,18 +7325,24 @@ impl Database {
             let scopes = sqlx::query(
                 "SELECT scope, captured_worktree_identity, captured_worktree_fingerprint,
                         captured_worktree_locator FROM close_attempt_scopes
-                 WHERE attempt_id = ?1 ORDER BY scope"
-            ).bind(run.attempt_id.as_str()).fetch_all(&mut **tx).await?;
-            let first = scopes.first().ok_or_else(|| close_precondition(
-                "inspected source fence requires a captured scope"
-            ))?;
+                 WHERE attempt_id = ?1 ORDER BY scope",
+            )
+            .bind(run.attempt_id.as_str())
+            .fetch_all(&mut **tx)
+            .await?;
+            let first = scopes.first().ok_or_else(|| {
+                close_precondition("inspected source fence requires a captured scope")
+            })?;
             let scope = WorkScopeId::parse(first.try_get::<String, _>("scope")?)
                 .map_err(|error| close_precondition(error.to_string()))?;
             let resource = RetiredResourceIdentity::parse(
                 RetiredResourceKind::WorkScope,
-                LossItemIdentity::Opaque(OpaqueIdentity::parse(scope.as_str())
-                    .map_err(|error| close_precondition(error.to_string()))?),
-            ).map_err(|error| close_precondition(error.to_string()))?;
+                LossItemIdentity::Opaque(
+                    OpaqueIdentity::parse(scope.as_str())
+                        .map_err(|error| close_precondition(error.to_string()))?,
+                ),
+            )
+            .map_err(|error| close_precondition(error.to_string()))?;
             let mut remaining_resources = Vec::new();
             for row in scopes {
                 let captured = WorkScopeId::parse(row.try_get::<String, _>("scope")?)
@@ -7345,9 +7351,12 @@ impl Database {
                     scope: captured.clone(),
                     resource: RetiredResourceIdentity::parse(
                         RetiredResourceKind::WorkScope,
-                        LossItemIdentity::Opaque(OpaqueIdentity::parse(captured.as_str())
-                            .map_err(|error| close_precondition(error.to_string()))?),
-                    ).map_err(|error| close_precondition(error.to_string()))?,
+                        LossItemIdentity::Opaque(
+                            OpaqueIdentity::parse(captured.as_str())
+                                .map_err(|error| close_precondition(error.to_string()))?,
+                        ),
+                    )
+                    .map_err(|error| close_precondition(error.to_string()))?,
                     disposition: CloseCleanupResourceDisposition::Unknown,
                 });
                 if let (Some(id), Some(fingerprint), Some(locator)) = (
@@ -7362,12 +7371,15 @@ impl Database {
                             LossItemIdentity::Worktree(WorktreeIdentity::from_parts(
                                 phoenix_core::domain::close::WorktreeId::parse(id)
                                     .map_err(|error| close_precondition(error.to_string()))?,
-                                phoenix_core::domain::close::WorktreeFingerprint::parse(fingerprint)
-                                    .map_err(|error| close_precondition(error.to_string()))?,
+                                phoenix_core::domain::close::WorktreeFingerprint::parse(
+                                    fingerprint,
+                                )
+                                .map_err(|error| close_precondition(error.to_string()))?,
                                 GitPathIdentity::decode_exact(&locator)
                                     .map_err(|error| close_precondition(error.to_string()))?,
                             )),
-                        ).map_err(|error| close_precondition(error.to_string()))?,
+                        )
+                        .map_err(|error| close_precondition(error.to_string()))?,
                         disposition: CloseCleanupResourceDisposition::Unknown,
                     });
                 }
@@ -7389,7 +7401,10 @@ impl Database {
                 let scope = WorkScopeId::parse(row.try_get::<String, _>("scope")?)
                     .map_err(|error| close_precondition(error.to_string()))?;
                 let resource = parse_cleanup_resource_identity(&row)?;
-                if !remaining_resources.iter().any(|item| item.scope == scope && item.resource == resource) {
+                if !remaining_resources
+                    .iter()
+                    .any(|item| item.scope == scope && item.resource == resource)
+                {
                     remaining_resources.push(CloseCleanupFailureResource {
                         scope,
                         resource,
@@ -7408,7 +7423,9 @@ impl Database {
                 authority: CloseCleanupFailureAuthority::CapturedScope { scope, resource },
                 remaining_resources,
                 reason: RetirementFailureReason::Interrupted,
-                detail: format!("{detail}; retained inspection/inventory observed without physical dispatch"),
+                detail: format!(
+                    "{detail}; retained inspection/inventory observed without physical dispatch"
+                ),
                 stop_certainty: CloseStopCertainty::ShutdownUncertain,
                 occurred_at_us: Utc::now().timestamp_micros(),
             };
@@ -7428,7 +7445,9 @@ impl Database {
                     | ClosePhase::AwaitingRetirementInspection
             )
         {
-            return Err(close_precondition("zero-resource source fence requires pre-inspection authority"));
+            return Err(close_precondition(
+                "zero-resource source fence requires pre-inspection authority",
+            ));
         }
         let occurred_at_us = Utc::now().timestamp_micros();
         sqlx::query(
@@ -7672,9 +7691,17 @@ impl Database {
         attempt_id: &CloseAttemptId,
     ) -> DbResult<CloseObligation> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        let obligation = close_obligation_for_update(&mut tx, attempt_id.as_str()).await?;
+        let obligation = Self::complete_close_retirement_tx(&mut tx, attempt_id).await?;
+        tx.commit().await?;
+        Ok(obligation)
+    }
+
+    pub(crate) async fn complete_close_retirement_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        attempt_id: &CloseAttemptId,
+    ) -> DbResult<CloseObligation> {
+        let obligation = close_obligation_for_update(tx, attempt_id.as_str()).await?;
         if obligation.phase() == ClosePhase::Completed {
-            tx.commit().await?;
             return Ok(obligation);
         }
         if obligation.phase() != ClosePhase::RetirementRequested {
@@ -7689,13 +7716,13 @@ impl Database {
              WHERE attempt_id = ?1 AND member_role IN ('latest', 'root_latest')",
         )
         .bind(attempt_id.as_str())
-        .fetch_one(&mut *tx)
+        .fetch_one(&mut **tx)
         .await?;
         let persisted_sequence_max: i64 = sqlx::query_scalar(
             "SELECT COALESCE(MAX(sequence_id), 0) FROM messages WHERE conversation_id = ?1",
         )
         .bind(&aggregate_transcript_id)
-        .fetch_one(&mut *tx)
+        .fetch_one(&mut **tx)
         .await?;
         let outcome_content = MessageContent::system(format!(
             "Close attempt {attempt_id} completed; this conversation is now archived in History."
@@ -7712,7 +7739,7 @@ impl Database {
         .bind(persisted_sequence_max + 1)
         .bind(outcome_content_json)
         .bind(&now)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?;
         sqlx::query(
             "UPDATE conversations
@@ -7723,7 +7750,7 @@ impl Database {
         )
         .bind(attempt_id.as_str())
         .bind(&now)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?;
         sqlx::query(
             "UPDATE product_conversations
@@ -7732,7 +7759,7 @@ impl Database {
                AND kind = 'ordinary'",
         )
         .bind(attempt_id.as_str())
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?;
         let completed = sqlx::query(
             "UPDATE close_obligations
@@ -7742,16 +7769,14 @@ impl Database {
         )
         .bind(attempt_id.as_str())
         .bind(&now)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?;
         if completed.rows_affected() != 1 {
             return Err(close_precondition(format!(
                 "attempt {attempt_id} completion lost retirement authority"
             )));
         }
-        let obligation = close_obligation_for_update(&mut tx, attempt_id.as_str()).await?;
-        tx.commit().await?;
-        Ok(obligation)
+        close_obligation_for_update(tx, attempt_id.as_str()).await
     }
 
     /// Reopens a legacy `NeedsRepair` phase only; stopped runs require fresh-run admission.
