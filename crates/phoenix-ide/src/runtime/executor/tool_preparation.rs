@@ -81,15 +81,6 @@ enum PreparationFailureBoundary {
     Required(super::RequiredSettlementBoundary),
 }
 
-impl PreparationFailureBoundary {
-    fn settle_executor_failure(self, fence: &crate::runtime::FatalLocalAuthorityFence) {
-        match self {
-            Self::Caller => {}
-            Self::Required(boundary) => fence.close(boundary.settlement()),
-        }
-    }
-}
-
 enum PreparationPhase {
     Reading(Mutex<PreparationFuture>),
     Interrupted,
@@ -235,11 +226,16 @@ impl<S: Storage + Clone + 'static, L: LlmClient + 'static, T: ToolExecutor + 'st
             }
             PreparationDisposition::Ready(Ok(prepared)) => prepared,
             PreparationDisposition::Ready(Err(error)) => {
-                pending
-                    .failure_boundary
-                    .settle_executor_failure(&self.fatal_local_authority_fence);
-                pending.phase = PreparationPhase::NoRead;
-                self.tool_preparation = Some(pending);
+                match pending.failure_boundary {
+                    PreparationFailureBoundary::Caller => {
+                        pending.phase = PreparationPhase::NoRead;
+                        self.tool_preparation = Some(pending);
+                    }
+                    PreparationFailureBoundary::Required(boundary) => {
+                        self.fatal_local_authority_fence
+                            .close(boundary.settlement());
+                    }
+                }
                 return Err(error);
             }
         };
