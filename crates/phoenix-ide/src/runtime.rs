@@ -4939,6 +4939,8 @@ impl RuntimeManager {
         parallel_work_qualified: bool,
         lifecycle: &mut native_spawn::NativeSpawnLifecycleOwner,
     ) -> Result<(), String> {
+        use phoenix_db::SubAgentExecutionAuthority::{ReadOnly, WriteCapable};
+
         let parent = self
             .db
             .get_conversation(parent_conversation_id)
@@ -4985,12 +4987,8 @@ impl RuntimeManager {
                     run: phoenix_db::SubAgentRunAdmission {
                         child_conversation_id: spec.agent_id.clone(),
                         execution_authority: match spec.mode {
-                            SubAgentMode::Explore => {
-                                phoenix_db::SubAgentExecutionAuthority::ReadOnly
-                            }
-                            SubAgentMode::Work => {
-                                phoenix_db::SubAgentExecutionAuthority::WriteCapable
-                            }
+                            SubAgentMode::Explore => ReadOnly,
+                            SubAgentMode::Work => WriteCapable,
                         },
                     },
                     slug: format!("sub-{}", spec.agent_id),
