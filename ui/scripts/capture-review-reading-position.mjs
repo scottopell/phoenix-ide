@@ -169,10 +169,32 @@ async function traceIdle(page, result, stage) {
     const identify = node => {
       if (!node) return null;
       if (!ids.has(node)) ids.set(node, ++nextId);
-      return { node: ids.get(node), tag: node.tagName, id: node.id, className: node.className, label: node.getAttribute('aria-label') };
+      return { node: ids.get(node), tag: node.tagName ?? node.nodeName, id: node.id, className: node.className, label: node.getAttribute?.('aria-label') };
+    };
+    const textWalker = document.createTreeWalker(anchor, NodeFilter.SHOW_TEXT);
+    let textNode;
+    while (textWalker.nextNode()) {
+      if (textWalker.currentNode.textContent.trim().length > 32) { textNode = textWalker.currentNode; break; }
+    }
+    if (!textNode) throw new Error('Idle anchor must contain measurable text');
+    const expectedText = anchor.textContent;
+    const expectedSlice = textNode.textContent.slice(0, 32);
+    const textRect = paragraph => {
+      if (!paragraph || paragraph.textContent !== expectedText) return null;
+      const walker = document.createTreeWalker(paragraph, NodeFilter.SHOW_TEXT);
+      while (walker.nextNode()) {
+        const start = walker.currentNode.textContent.indexOf(expectedSlice);
+        if (start < 0) continue;
+        const range = document.createRange(); range.setStart(walker.currentNode, start); range.setEnd(walker.currentNode, start + expectedSlice.length);
+        return [...range.getClientRects()].map(rect => ({ x: rect.x, y: rect.y, width: rect.width, height: rect.height }));
+      }
+      return null;
     };
     const events = [];
-    const onEvent = event => events.push({ time: performance.now(), type: event.type, target: identify(event.target) });
+    const onEvent = event => {
+      const target = event.target === document ? document.scrollingElement : event.target;
+      events.push({ time: performance.now(), type: event.type, target: identify(event.target), focus: identify(document.activeElement), top: target?.scrollTop, left: target?.scrollLeft });
+    };
     for (const name of ['focusin', 'scroll', 'pointerdown', 'touchstart', 'keydown']) document.addEventListener(name, onEvent, true);
     const samples = [];
     const started = performance.now();
@@ -185,6 +207,8 @@ async function traceIdle(page, result, stage) {
         samples.push({
           time: performance.now() - started,
           focus: identify(document.activeElement),
+          textRects: textRect(liveAnchor),
+          highlighted: Boolean(content.querySelector('.annotatable--highlighted')),
           viewerConnected: root.isConnected, contentConnected: content.isConnected, anchorConnected: anchor.isConnected,
           anchor: { text: liveAnchor?.textContent, top: liveAnchor?.getBoundingClientRect().top, height: liveAnchor?.getBoundingClientRect().height, node: identify(liveAnchor)?.node },
           viewport: { x: scrollX, y: scrollY, width: innerWidth, height: innerHeight, visualTop: visualViewport?.offsetTop, visualHeight: visualViewport?.height },
@@ -199,7 +223,20 @@ async function traceIdle(page, result, stage) {
   });
   const trace = result.idle[stage];
   const first = trace.samples[0];
+  assert(first.textRects?.some(rect => rect.width > 0 && rect.height > 0), 'Idle anchor must have visible text geometry');
+  if (stage === 'note-navigation-expiry-idle') {
+    assert(first.highlighted, 'Highlight expired before recording; expiry coverage is inconclusive');
+    assert(!trace.samples.at(-1).highlighted, 'Highlight expiry must occur during recording');
+  }
+  for (const event of trace.events) {
+    if (event.type === 'focusin' && JSON.stringify(event.focus) !== JSON.stringify(first.focus)) mismatch(result.id, stage, 'idle focus event changed focus', first.focus, event);
+    if (event.type === 'scroll') {
+      const original = first.scrollers.find(scroller => scroller.node === event.target?.node || (event.target?.tag === '#document' && scroller.tag === 'HTML'));
+      if (!original || event.top !== original.top || event.left !== original.left) mismatch(result.id, stage, 'idle scroll event changed offset', original, event);
+    }
+  }
   for (const sample of trace.samples) {
+    if (sample.anchor.text !== first.anchor.text || JSON.stringify(sample.textRects) !== JSON.stringify(first.textRects)) mismatch(result.id, stage, 'idle visible text range changed', first.textRects, sample.textRects);
     if (sample.anchor.top === undefined || Math.abs(sample.anchor.top - first.anchor.top) > 2 || !sample.contentConnected || !sample.viewerConnected) mismatch(result.id, stage, 'idle visible viewer text moved/missing', first, sample);
     if (JSON.stringify(sample.focus) !== JSON.stringify(first.focus)) mismatch(result.id, stage, 'idle focus changed', first.focus, sample.focus);
     if (JSON.stringify(sample.viewport) !== JSON.stringify(first.viewport)) mismatch(result.id, stage, 'idle document/visual viewport moved', first.viewport, sample.viewport);
