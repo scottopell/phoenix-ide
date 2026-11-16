@@ -555,6 +555,10 @@
 }
 
 .statebar-mode--direct,
+.statebar-mode--product,
+.statebar-mode--work-child,
+.statebar-mode--approved-task,
+.statebar-mode--coordinator,
 .statebar-mode--unknown {
   background: var(--bg-tertiary);
   color: var(--text-muted);

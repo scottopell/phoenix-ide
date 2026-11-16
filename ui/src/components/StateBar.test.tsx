@@ -1524,7 +1524,7 @@ describe('StateBar mobile layout', () => {
     fireEvent.click(screen.getAllByRole('button', { name: /expand status bar/i })[0]!);
 
     expect(screen.getByTitle(/Explore mode/i)).toHaveTextContent('Explore');
-    expect(screen.getByText(/Read-only git project/i)).toBeInTheDocument();
+    expect(screen.getByText('Approval-scoped access')).toBeInTheDocument();
     expect(screen.getByText('claude-sonnet-5')).toBeInTheDocument();
     expect(screen.getByText('…/projects/phoenix-ide')).toBeInTheDocument();
     expect(screen.getByRole('button', { name: /copy full working directory .*phoenix-ide/i })).toBeInTheDocument();
@@ -1605,6 +1605,51 @@ describe('StateBar mobile layout', () => {
     expect(screen.queryByText('develop')).not.toBeInTheDocument();
   });
 
+  it('reproduces unapproved Product without the former false Full access label', () => {
+    renderStateBar({ conversation: makeConversation({
+      conv_mode_label: 'Product', runtime_role: 'user', task_title: null,
+      branch_name: null, state: { type: 'idle' },
+    }) });
+    fireEvent.click(screen.getAllByRole('button', { name: /expand status bar/i }).at(-1)!);
+    const mode = screen.getByTitle(/Product mode: design\/planning provenance/i);
+    expect(mode).toHaveTextContent('Product');
+    expect(mode.title).toContain('restricted tools; Bash is sandboxed when available');
+    expect(mode.title).toContain('Effective access is not reported here');
+    expect(screen.getByText('Design · approval-scoped')).toBeVisible();
+    expect(screen.queryByText(/full access|read-only/i)).not.toBeInTheDocument();
+  });
+
+  it.each(['Future Mode', '', undefined])('does not claim full access for an unavailable mode: %s', (conv_mode_label) => {
+    renderStateBar({ conversation: makeConversation({ conv_mode_label }) });
+    fireEvent.click(screen.getAllByRole('button', { name: /expand status bar/i }).at(-1)!);
+    expect(screen.queryByText(/full access/i)).not.toBeInTheDocument();
+    if (conv_mode_label) {
+      expect(screen.getByText('Access unavailable')).toBeVisible();
+      expect(screen.getByTitle('Effective access is unavailable for this mode')).toHaveTextContent(/Future mode/i);
+    }
+  });
+
+  it('recomputes mode and role text across Product, Work, retained Explore and Coordinator transitions', () => {
+    const props: ComponentProps<typeof StateBar> = {
+      conversation: makeConversation({ conv_mode_label: 'Product', runtime_role: 'user' }),
+      convState: { type: 'idle' }, contextWindowUsed: 0, modelContextWindow: 200_000,
+    };
+    const { rerender } = render(<StateBar {...props} />, { wrapper: MemoryRouter });
+    fireEvent.click(screen.getAllByRole('button', { name: /expand status bar/i }).at(-1)!);
+    expect(screen.getByText('Design · approval-scoped')).toBeVisible();
+    rerender(<StateBar {...props} conversation={makeConversation({ conv_mode_label: 'Work', runtime_role: 'user' })} />);
+    expect(screen.getByTitle('Work mode: task branch')).toHaveTextContent('Work');
+    expect(screen.queryByText('Design · approval-scoped')).not.toBeInTheDocument();
+    rerender(<StateBar {...props} conversation={makeConversation({ conv_mode_label: 'Explore', runtime_role: 'user', task_title: 'Approved objective', work_scope_id: 'scope-with-approved-authority' })} />);
+    expect(screen.getByText('Approval-scoped access')).toBeVisible();
+    expect(screen.queryByText(/read-only/i)).not.toBeInTheDocument();
+    rerender(<StateBar {...props} conversation={makeConversation({ conv_mode_label: 'Work', runtime_role: 'coordinator' })} />);
+    expect(screen.getByText('Coordinator tools')).toBeVisible();
+    expect(screen.getByTitle(/Coordinator role:/)).toHaveTextContent('Coordinator');
+    expect(screen.queryByText('Approval-scoped access')).not.toBeInTheDocument();
+    expect(screen.queryByText(/full access/i)).not.toBeInTheDocument();
+  });
+
   it('renders direct fallback mode and cwd without separate project name', () => {
     renderStateBar({
       conversation: makeConversation({
@@ -1621,7 +1666,7 @@ describe('StateBar mobile layout', () => {
     fireEvent.click(screen.getAllByRole('button', { name: /expand status bar/i }).at(-1)!);
 
     expect(screen.getByText('Direct')).toBeInTheDocument();
-    expect(screen.getByText(/Full access/i)).toBeInTheDocument();
+    expect(screen.getByText(/Local writes/i)).toBeInTheDocument();
     expect(screen.getByText('…/projects/direct-project')).toBeInTheDocument();
     expect(screen.getByRole('button', { name: /copy full working directory .*direct-project/i })).toBeInTheDocument();
     expect(screen.queryByText('Direct Project')).not.toBeInTheDocument();

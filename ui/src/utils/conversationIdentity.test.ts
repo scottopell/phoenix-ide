@@ -147,6 +147,40 @@ describe('conversationIdentity', () => {
     });
   });
 
+  it.each(['Product', 'Explore'])('does not infer effective permissions from %s provenance or task metadata', (mode) => {
+    const before = getConversationIdentity(makeConversation({ conv_mode_label: mode, runtime_role: 'user', task_title: null }));
+    const after = getConversationIdentity(makeConversation({ conv_mode_label: mode, runtime_role: 'user', task_title: 'Approved objective', work_scope_id: 'approved-scope' }));
+    expect(before.mode).toEqual(after.mode);
+    expect(before.mode.title).toContain('restricted tools; Bash is sandboxed when available');
+    expect(before.mode.title).toContain('may allow writes without changing the mode');
+    expect(before.mode.title).toContain('Effective access is not reported here');
+    expect(JSON.stringify(before.mode)).not.toMatch(/Full access|read-only/i);
+  });
+
+  it.each(['Work', 'Branch', 'Work Child', 'Approved Task', 'Direct'])('identifies known %s provenance without blanket full access', (mode) => {
+    for (const runtime_role of ['user', 'sub_agent'] as const) {
+      const identity = getConversationIdentity(makeConversation({ conv_mode_label: mode, runtime_role }));
+      expect(identity.mode.label).toBe(mode);
+      expect(identity.mode.key).not.toBe('unknown');
+      expect(JSON.stringify(identity.mode)).not.toMatch(/full access/i);
+    }
+  });
+
+  it.each(['Explore', 'Product', 'Work', 'Direct', undefined])('uses Coordinator role instead of %s mode permissions', (mode) => {
+    const { mode: identity } = getConversationIdentity(makeConversation({ conv_mode_label: mode, runtime_role: 'coordinator' }));
+    expect(identity.label).toBe('Coordinator');
+    expect(identity.detail).toBe('Coordinator tools');
+    expect(identity.title).toContain('not the ordinary conversation tool set');
+    expect(identity.title).not.toMatch(/full access|read-only/i);
+  });
+
+  it.each([undefined, '', '   ', 'Future Mode'])('fails conservatively for mode %s', (conv_mode_label) => {
+    const { mode } = getConversationIdentity(makeConversation({ conv_mode_label }));
+    expect(mode.key).toBe('unknown');
+    expect(mode.detail).toBe('Access unavailable');
+    expect(mode.title).toContain('unavailable');
+  });
+
   it('builds a shared typed identity payload for desktop and mobile consumers', () => {
     expect(getConversationIdentity(makeConversation({
       slug: '123e4567-e89b-12d3-a456-426614174000',
