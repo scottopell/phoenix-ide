@@ -7,7 +7,7 @@ export const compactEventTitle = 'Preserve canonical conversation routing and ex
 export const compactEventFailure = 'Exact failure: fixture validation rejected /workspace/source?attempt=2&mode=read-only; no retry was attempted.';
 
 const completed = {
-  status: 'available', event_id: 'fixture-event-completed', product_conversation_id: 'source-member',
+  status: 'available', ending_evidence: 'Historical ending evidence not captured.', event_id: 'fixture-event-completed', product_conversation_id: 'source-member',
   display_name: compactEventTitle, source_transcript_id: 'source-member',
   source_occurrence_kind: 'turn', source_occurrence_id: 'fixture-turn-completed', source_generation: 7,
   occurred_at_us: 1791800000123456, provenance: 'subscription', outcome: { kind: 'turn_finished' },

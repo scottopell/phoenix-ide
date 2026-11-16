@@ -1,4 +1,8 @@
+pub(crate) mod ending_evidence;
 pub(crate) mod goal_facts;
+pub use ending_evidence::{
+    EndingResponse, SettledWatchInput, WatchEndingEvidence, WatchResponsePage,
+};
 mod mandatory_close;
 mod presentation;
 use mandatory_close::decode_route;
@@ -302,6 +306,31 @@ pub(crate) async fn record_terminal_event_tx(
     reason: Option<&str>,
     context_exhausted: bool,
 ) -> DbResult<()> {
+    let response = ending_evidence::capture_turn_response_tx(tx, turn_id, generation).await?;
+    record_terminal_event_with_response_tx(
+        tx,
+        turn_id,
+        generation,
+        transcript_id,
+        terminal_kind,
+        reason,
+        context_exhausted,
+        &response,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn record_terminal_event_with_response_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    turn_id: u64,
+    generation: u64,
+    transcript_id: &str,
+    terminal_kind: &str,
+    reason: Option<&str>,
+    context_exhausted: bool,
+    response: &EndingResponse,
+) -> DbResult<()> {
     let source: Option<String> =
         sqlx::query_scalar("SELECT canonical_message_id FROM durable_turns WHERE turn_id=?1")
             .bind(
@@ -311,18 +340,18 @@ pub(crate) async fn record_terminal_event_tx(
             .fetch_optional(&mut **tx)
             .await?
             .flatten();
-    if let Some(source) = source {
+    if let Some(source) = &source {
         crate::slack_gateway::record_slack_native_outcome_tx(
             tx,
             transcript_id,
-            &source,
+            source,
             &format!("direct:{turn_id}:{generation}"),
             terminal_kind,
             context_exhausted,
         )
         .await?;
     }
-    record_watch_event_tx(
+    record_watch_event_with_response_tx(
         tx,
         "direct_turn",
         &turn_id.to_string(),
@@ -331,6 +360,8 @@ pub(crate) async fn record_terminal_event_tx(
         terminal_kind,
         reason,
         context_exhausted,
+        source.as_deref(),
+        response,
     )
     .await
 }
@@ -371,6 +402,27 @@ pub(crate) async fn record_steering_event_tx(
     category: &str,
     reason: Option<&str>,
 ) -> DbResult<()> {
+    record_steering_event_with_response_tx(
+        tx,
+        source_kind,
+        message_id,
+        transcript_id,
+        category,
+        reason,
+        &EndingResponse::NoCarrier,
+    )
+    .await
+}
+
+pub(crate) async fn record_steering_event_with_response_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    source_kind: MessageExecutionSource,
+    message_id: &str,
+    transcript_id: &str,
+    category: &str,
+    reason: Option<&str>,
+    response: &EndingResponse,
+) -> DbResult<()> {
     crate::slack_gateway::record_slack_native_outcome_tx(
         tx,
         transcript_id,
@@ -380,7 +432,7 @@ pub(crate) async fn record_steering_event_tx(
         reason == Some("context exhausted"),
     )
     .await?;
-    record_watch_event_tx(
+    record_watch_event_with_response_tx(
         tx,
         source_kind.as_str(),
         message_id,
@@ -389,6 +441,8 @@ pub(crate) async fn record_steering_event_tx(
         category,
         reason,
         reason == Some("context exhausted"),
+        Some(message_id),
+        response,
     )
     .await
 }
@@ -545,6 +599,34 @@ async fn record_watch_event_tx(
     reason: Option<&str>,
     context_exhausted: bool,
 ) -> DbResult<()> {
+    record_watch_event_with_response_tx(
+        tx,
+        occurrence_kind,
+        occurrence_id,
+        generation,
+        transcript_id,
+        terminal_kind,
+        reason,
+        context_exhausted,
+        None,
+        &EndingResponse::NoCarrier,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn record_watch_event_with_response_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    occurrence_kind: &str,
+    occurrence_id: &str,
+    generation: u64,
+    transcript_id: &str,
+    terminal_kind: &str,
+    reason: Option<&str>,
+    context_exhausted: bool,
+    input_message_id: Option<&str>,
+    response: &EndingResponse,
+) -> DbResult<()> {
     let cancelled =
         sqlx::query("DELETE FROM execution_cancel_observations WHERE conversation_id = ?1")
             .bind(transcript_id)
@@ -566,6 +648,7 @@ async fn record_watch_event_tx(
         return Ok(());
     }
     let occurred_at_us = Utc::now().timestamp_micros();
+    let event_id = uuid::Uuid::new_v4().to_string();
     sqlx::query("INSERT INTO coordinator_watch_events
         (event_id, watch_id, source_occurrence_kind, source_occurrence_id,
          source_generation, source_transcript_id, terminal_kind, terminal_reason,
@@ -583,7 +666,7 @@ async fn record_watch_event_tx(
           AND c.state_kind NOT IN ('awaiting_continuation', 'handed_off')
         ON CONFLICT(source_occurrence_kind, source_occurrence_id, source_generation, watch_id)
         DO NOTHING")
-        .bind(uuid::Uuid::new_v4().to_string())
+        .bind(&event_id)
         .bind(occurrence_kind)
         .bind(occurrence_id)
         .bind(i64::try_from(generation).map_err(|_| DbError::Serialization("generation overflow".into()))?)
@@ -591,6 +674,9 @@ async fn record_watch_event_tx(
         .bind(occurred_at_us)
         .bind(transcript_id).bind(context_exhausted).execute(&mut **tx).await?;
 
+    ending_evidence::attach_response_tx(tx, &event_id, transcript_id, input_message_id, response)
+        .await?;
+    tracing::debug!("remote terminal-fact v1 does not carry local ending evidence");
     let outcome = match category {
         "completed" => {
             phoenix_core::domain::federation_subscription::TerminalFactOutcome::Completed

@@ -44,6 +44,7 @@ Allowing gaps does not approve an ID allocation, decision, or publication.
 
 | ADR | Title | Status | Affects |
 | --- | --- | --- | --- |
+| [261](261_completion-events-capture-occurrence-bound-ending-evidence.md) | Completion events capture occurrence-bound ending evidence | Accepted | REQ-CEVT-006–009, REQ-RET-012 |
 | [259](259_bounded-resource-recorder-reuses-shared-observations.md) | A bounded resource recorder reuses shared observations | Accepted | REQ-DEPLOY-007a–007d |
 | [258](258_search-hidden-visibility-trusts-fts-index.md) | Ranked search trusts indexed text for hidden-message eligibility | Accepted | REQ-RET-003, REQ-RET-007 |
 | [257](257_watch-list-requests-separate-local-and-remote-shapes.md) | Watch listing separates local and remote request shapes | Accepted | REQ-FED-009 |
