@@ -121,6 +121,12 @@ export function Sidebar({
   const productList = useProductConversationList();
   const productConversations = productList.rows;
   const productConversationsError = productList.error;
+  const productListAvailable = productList.fresh || productList.fromCache;
+  const listAvailability = productListAvailable
+    ? 'available'
+    : productList.error
+      ? 'error'
+      : 'loading';
   const coordinatorUnreadState = coordinatorUnread(productList);
   const productConversationListRevision = useSyncExternalStore(
     subscribeProductConversationListRevision,
@@ -529,7 +535,7 @@ export function Sidebar({
           aria-pressed={!showArchived}
         >
           <span>Open</span>
-          <span className="sidebar-lifecycle-count">{scopedActiveCount}</span>
+          <span className="sidebar-lifecycle-count">{productListAvailable ? scopedActiveCount : '…'}</span>
         </button>
         <button
           type="button"
@@ -538,12 +544,16 @@ export function Sidebar({
           aria-pressed={showArchived}
         >
           <span>History</span>
-          <span className="sidebar-lifecycle-count">{scopedArchivedCount}</span>
+          <span className="sidebar-lifecycle-count">{productListAvailable ? scopedArchivedCount : '…'}</span>
         </button>
       </div>
       {productConversationsError && (
         <div className="sidebar-refresh-error" role="status">
-          <span>Showing cached conversations</span>
+          <span>{productList.fromCache
+            ? 'Showing cached conversations'
+            : productList.fresh
+              ? 'Showing last loaded conversations'
+              : 'Unable to load conversations'}</span>
           <button type="button" onClick={() => void refreshProductConversationList()}>Retry</button>
         </div>
       )}
@@ -562,6 +572,7 @@ export function Sidebar({
           onProductConversationDelete={handleSetProductDeleteTarget}
           activeSlug={activeSlug}
           sidebarMode
+          listAvailability={listAvailability}
         />
       </div>
       <ConfirmDialog

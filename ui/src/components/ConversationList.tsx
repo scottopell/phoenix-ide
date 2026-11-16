@@ -32,6 +32,7 @@ interface ConversationListProps {
   emptyScopeLabel?: string | null;
   footer?: ReactNode;
   coordinatorUnread?: 'marked' | 'new_activity' | null;
+  listAvailability?: 'loading' | 'error' | 'available';
 }
 
 function sidebarFeedbackStatusSuffix(pr: CachedPrSummary): string {
@@ -290,6 +291,7 @@ export function ConversationList({
   emptyScopeLabel,
   footer,
   coordinatorUnread = null,
+  listAvailability = 'available',
 }: ConversationListProps) {
   const navigate = useNavigate();
   const { hasActiveScope } = useFocusScope();
@@ -448,7 +450,7 @@ export function ConversationList({
               className={`archive-toggle-text ${showArchived ? 'active' : ''}`}
               onClick={() => { if (!showArchived) onToggleArchived(); }}
             >
-              History {archivedProductConversations.length}
+              History {listAvailability === 'available' ? archivedProductConversations.length : '…'}
             </button>
             {authChip && <span className="conversation-list-auth-chip">{authChip}</span>}
           </div>
@@ -457,9 +459,13 @@ export function ConversationList({
 
       <ul id="conv-list">
         {isEmpty ? (
-          <li className="empty-state">
-            <p>{`No ${showArchived ? 'History' : 'Open'} conversations${emptyScopeLabel ? ` in ${emptyScopeLabel}` : ''}`}</p>
-          </li>
+          listAvailability === 'loading' ? (
+            <li className="empty-state"><p>Loading conversations</p></li>
+          ) : listAvailability === 'available' ? (
+            <li className="empty-state">
+              <p>{`No ${showArchived ? 'History' : 'Open'} conversations${emptyScopeLabel ? ` in ${emptyScopeLabel}` : ''}`}</p>
+            </li>
+          ) : null
         ) : (
           displayProductList.map((row) => (
             <ProductConversationListRowView
