@@ -6652,10 +6652,6 @@ where
         })
     }
 
-    /// Handle the `spawn_agents` tool specially:
-    /// 1. Parse tasks and generate agent IDs
-    /// 2. Send spawn requests to `RuntimeManager` for each task
-    /// 3. Return `SpawnAgentsComplete` event
     #[allow(clippy::too_many_lines)]
     pub(crate) async fn start_spawn_agents_tool(
         &mut self,
@@ -28371,7 +28367,7 @@ mod steer_drain_detector_tests {
     /// Regression (task 61005): a `SubAgentResult` buffered from an earlier
     /// batch in the same awaiting-round must survive a subsequent
     /// `spawn_agents` dispatch and be delivered when the parent enters
-    /// `AwaitingSubAgents`. The bug: `prepare_spawn_and_wait` reassigned
+    /// `AwaitingSubAgents`. The bug: each spawn dispatch reassigned
     /// `sub_agent_result_buffer = Vec::with_capacity(..)` on every dispatch,
     /// destroying any result buffered while the parent was still running a
     /// prior tool (e.g. tool sequence `[spawn_agents A, bash, spawn_agents B]`,
