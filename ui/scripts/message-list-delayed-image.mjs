@@ -101,7 +101,10 @@ export async function captureDelayedImages({ page, id, outDir }) {
         await page.waitForSelector('[data-message-list-fixture-ready="delayed-image-scroll"]');
         await marker.waitFor();
         await page.waitForFunction(() => document.querySelectorAll('#messages img').length === 2);
-        await settle();
+        // Drain scrollMachine's 3000ms mount-rescue window and 150ms probe cadence
+        // before the programmatic reader setup can race its pending native scroll event.
+        // This is not positioning success: the before/quiet geometry checks below remain required.
+        await page.waitForTimeout(3300);
         assert.deepEqual([...pending.keys()].sort(), ['anchor', 'earlier']);
         if (mode === 'follow-latest') {
           await scroller.evaluate((element) => { element.scrollTop = element.scrollHeight; });
