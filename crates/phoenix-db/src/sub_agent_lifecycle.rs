@@ -2334,6 +2334,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("parent-action.db");
         let db = Database::open(path.to_str().unwrap()).await.unwrap();
+        migrations::run_pending_migrations(db.pool()).await.unwrap();
         reconcile_parent(&db, "parent", true).await;
         assert!(matches!(
             db.establish_live_parent_reconcile_action_with_cut(
