@@ -116,7 +116,7 @@ pub(super) fn decode_route(row: &sqlx::sqlite::SqliteRow) -> DbResult<WatchEvent
                 }
             };
             let authority_kind: String = row.try_get("authority_kind")?;
-            let subject = if authority_kind == "attempt_interrupted" {
+            let subject = if matches!(authority_kind.as_str(), "attempt_interrupted" | "explicitly_suppressed") {
                 MandatoryCloseFailureSubject::Attempt
             } else {
                 MandatoryCloseFailureSubject::Resource {

@@ -585,6 +585,7 @@ pub(crate) async fn persist_continuation_start_tx(
     if updated.rows_affected() == 0 {
         return Ok(ContinuationCommitOutcome::Stale);
     }
+    native_close::fence_native_retry_sources_tx(tx, conversation_id, target_state).await?;
     Ok(ContinuationCommitOutcome::Applied)
 }
 
@@ -668,6 +669,7 @@ pub(crate) async fn commit_continuation_tx(
     if updated.rows_affected() == 0 {
         return Ok(ContinuationCommitOutcome::Stale);
     }
+    native_close::fence_native_retry_sources_tx(tx, conversation_id, completed_state).await?;
     sqlx::query("UPDATE coordinator_watch_events SET delivery_state = 'suppressed', continuation_state = 'suppressed' WHERE source_transcript_id = ?1 AND delivery_state = 'pending' AND terminal_kind = 'failed' AND terminal_reason = 'continuation summary failed'")
         .bind(conversation_id).execute(&mut **tx).await?;
     admit_automatic_continuation_tx(
@@ -787,6 +789,9 @@ pub(crate) async fn reconcile_legacy_half_committed_continuation_tx(
     .bind(persisted_json)
     .execute(&mut **tx)
     .await?;
+    if updated.rows_affected() == 1 {
+        native_close::fence_native_retry_sources_tx(tx, conversation_id, &target).await?;
+    }
     Ok((updated.rows_affected() == 1).then_some(summary))
 }
 
@@ -5976,6 +5981,14 @@ impl Database {
             tx.rollback().await?;
             return Err(DbError::Sqlx(sqlx::Error::RowNotFound));
         }
+        native_close::fence_native_retry_sources_tx(
+            &mut tx,
+            conversation_id,
+            &ConvState::CreationCancelled {
+                job_id: job_id.clone(),
+            },
+        )
+        .await?;
         let state = serde_json::to_string(&ConvState::CreationCancelled {
             job_id: job_id.clone(),
         })
@@ -6131,6 +6144,8 @@ impl Database {
             tx.rollback().await?;
             return Ok(CreationCasOutcome::ClaimLost);
         }
+        native_close::fence_native_retry_sources_tx(&mut tx, conversation_id, &ConvState::Idle)
+            .await?;
         let state_updated = sqlx::query(
             "UPDATE conversations SET state = ?1, state_kind = ?2, state_updated_at = ?3, updated_at = ?3
              WHERE id = ?4",
@@ -6731,6 +6746,16 @@ impl Database {
             )
             .bind(job_id)
             .fetch_one(&mut *tx)
+            .await?;
+            native_close::fence_native_retry_sources_tx(
+                &mut tx,
+                &source,
+                &ConvState::CreationFailed {
+                    job_id: job_id.to_string(),
+                    error: error.to_string(),
+                    error_kind: error_kind.clone(),
+                },
+            )
             .await?;
             crate::coordinator_watches::record_creation_event_tx(
                 &mut tx,
@@ -7756,7 +7781,6 @@ impl Database {
         state: &ConvState,
         state_updated_at: DateTime<Utc>,
     ) -> DbResult<()> {
-        let state_json = serde_json::to_string(state).unwrap();
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let previous_kind: String =
             sqlx::query_scalar("SELECT state_kind FROM conversations WHERE id = ?1")
@@ -7766,20 +7790,7 @@ impl Database {
 
         coordinator_watches::record_wait_entry_tx(&mut tx, id, state).await?;
 
-        let result = sqlx::query(
-            "UPDATE conversations SET state = ?1, state_kind = ?2, state_updated_at = ?3, updated_at = ?4 WHERE id = ?5",
-        )
-        .bind(&state_json)
-        .bind(conv_state_kind(state))
-        .bind(state_updated_at.to_rfc3339())
-        .bind(Utc::now().to_rfc3339())
-        .bind(id)
-        .execute(&mut *tx)
-        .await?;
-
-        if result.rows_affected() == 0 {
-            return Err(DbError::ConversationNotFound(id.to_string()));
-        }
+        write_conversation_state_tx(&mut tx, id, state, state_updated_at).await?;
         if previous_kind != conv_state_kind(state) {
             record_initial_execution_outcome_tx(&mut tx, id, state).await?;
         }
@@ -8245,6 +8256,7 @@ impl Database {
         .bind(conversation_id)
         .execute(&mut *tx)
         .await?;
+        native_close::fence_native_retry_sources_tx(&mut tx, conversation_id, state).await?;
         tx.commit().await?;
         Ok(true)
     }
@@ -8321,6 +8333,7 @@ impl Database {
         .execute(&mut *tx)
         .await?;
         if projection_changed == 1 {
+            native_close::fence_native_retry_sources_tx(&mut tx, conversation_id, state).await?;
             crate::coordinator_watches::record_steering_event_tx(
                 &mut tx,
                 source_kind,
@@ -8381,6 +8394,7 @@ impl Database {
         .bind(conversation_id)
         .execute(&mut *tx)
         .await?;
+        native_close::fence_native_retry_sources_tx(&mut tx, conversation_id, state).await?;
         tx.commit().await?;
         Ok(true)
     }
@@ -8544,6 +8558,7 @@ impl Database {
                 .bind(id).bind(&messages[0].message_id).execute(&mut *tx).await?;
         }
 
+        native_close::fence_native_retry_sources_tx(&mut tx, id, state).await?;
         let updated = sqlx::query(
             "UPDATE conversations
              SET state = ?1, state_kind = ?2, state_updated_at = ?3, updated_at = ?4
@@ -9360,6 +9375,7 @@ impl Database {
             .bind(approval_message.created_at.timestamp_micros())
             .execute(&mut *tx)
             .await?;
+            native_close::fence_native_retry_sources_tx(&mut tx, conversation_id, state).await?;
             let state_json = serde_json::to_string(state).unwrap();
             sqlx::query(
                 "UPDATE conversations SET state = ?1, state_kind = ?2, state_updated_at = ?3, updated_at = ?4 WHERE id = ?5",
@@ -9614,6 +9630,7 @@ impl Database {
         .execute(&mut *tx)
         .await?;
         let source_state = ConvState::Idle;
+        native_close::fence_native_retry_sources_tx(&mut tx, parent_id, &source_state).await?;
         sqlx::query(
             "UPDATE conversations
              SET state = ?1, state_kind = ?2, state_updated_at = ?3, updated_at = ?3
@@ -11437,6 +11454,7 @@ impl Database {
                     "Model replan does not match the retained capacity operation".to_string(),
                 ));
             }
+            native_close::fence_native_retry_sources_tx(&mut tx, id, &next_state).await?;
             sqlx::query("UPDATE conversations SET state = ?1, state_kind = ?2, state_updated_at = ?3 WHERE id = ?4")
                 .bind(serde_json::to_string(&next_state).map_err(|error| DbError::Serialization(error.to_string()))?).bind(conv_state_kind(&next_state)).bind(now.to_rfc3339()).bind(id).execute(&mut *tx).await?;
             record_initial_execution_outcome_tx(&mut tx, id, &next_state).await?;
@@ -12593,8 +12611,9 @@ impl Database {
         idle_state: &str,
         now: DateTime<Utc>,
     ) -> DbResult<()> {
-        sqlx::query(
-            "UPDATE conversations SET state = ?1, state_kind = ?2, state_updated_at = ?3, updated_at = ?3
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let reset_ids: Vec<String> = sqlx::query_scalar(
+            "SELECT id FROM conversations
              WHERE state_kind NOT IN ('idle', 'provisioning', 'completed', 'failed', 'creation_failed', 'creation_cancelled', 'context_exhausted', 'handed_off', 'seeded_llm_requesting', 'server_overload_retrying', 'awaiting_continuation', 'recoverable_continuation_failure', 'awaiting_recovery', 'awaiting_task_approval', 'awaiting_user_response', 'terminal')
                AND NOT EXISTS (
                    SELECT 1
@@ -12658,11 +12677,31 @@ impl Database {
                    )
                )",
         )
-        .bind(idle_state)
-        .bind(conv_state_kind(&ConvState::Idle))
-        .bind(now.to_rfc3339())
-        .execute(&self.pool)
+        .fetch_all(&mut *tx)
         .await?;
+        for id in &reset_ids {
+            native_close::fence_native_retry_sources_tx(&mut tx, id, &ConvState::Idle).await?;
+        }
+        let now = now.to_rfc3339();
+        for ids in reset_ids.chunks(500) {
+            let mut update = sqlx::QueryBuilder::<Sqlite>::new("UPDATE conversations SET state = ");
+            update
+                .push_bind(idle_state)
+                .push(", state_kind = ")
+                .push_bind(conv_state_kind(&ConvState::Idle))
+                .push(", state_updated_at = ")
+                .push_bind(&now)
+                .push(", updated_at = ")
+                .push_bind(&now)
+                .push(" WHERE id IN (");
+            let mut separated = update.separated(", ");
+            for id in ids {
+                separated.push_bind(id);
+            }
+            separated.push_unseparated(")");
+            update.build().execute(&mut *tx).await?;
+        }
+        tx.commit().await?;
         Ok(())
     }
 
@@ -12901,7 +12940,7 @@ impl Database {
                             },
                         });
                 if !sub_agent_outcomes.contains_key(&agent.agent_id) {
-                    sqlx::query(
+                    let updated = sqlx::query(
                         "UPDATE conversations
                          SET state = ?1, state_kind = ?2, state_updated_at = ?3, updated_at = ?3
                          WHERE id = ?4
@@ -12915,6 +12954,14 @@ impl Database {
                     .bind(&agent.agent_id)
                     .execute(&mut *tx)
                     .await?;
+                    if updated.rows_affected() == 1 {
+                        native_close::fence_native_retry_sources_tx(
+                            &mut tx,
+                            &agent.agent_id,
+                            &interrupted,
+                        )
+                        .await?;
+                    }
                 }
                 let lifecycle = sqlx::query(
                     "UPDATE sub_agent_runs
@@ -13076,6 +13123,7 @@ impl Database {
                 "parent {conversation_id} changed during recovered fan-in"
             )));
         }
+        native_close::fence_native_retry_sources_tx(&mut tx, conversation_id, destination).await?;
         for result in results {
             use phoenix_core::domain::sm_state::SubAgentOutcome;
             let cause = match &result.outcome {
@@ -13492,6 +13540,12 @@ impl Database {
             .execute(&mut *tx)
             .await?;
             if updated.rows_affected() == 1 {
+                native_close::fence_native_retry_sources_tx(
+                    &mut tx,
+                    conversation_id,
+                    &ConvState::Idle,
+                )
+                .await?;
                 sqlx::query(
                     "INSERT OR REPLACE INTO startup_parent_actions
                          (conversation_id, action, transcript_generation, turn_id, turn_generation, created_at)
@@ -16630,6 +16684,32 @@ fn initial_steering_execution_outcome(state: &ConvState) -> Option<phoenix_workf
     }
 }
 
+pub(crate) async fn write_conversation_state_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    id: &str,
+    state: &ConvState,
+    state_updated_at: DateTime<Utc>,
+) -> DbResult<()> {
+    native_close::fence_native_retry_sources_tx(tx, id, state).await?;
+    let state_json = serde_json::to_string(state)
+        .map_err(|error| DbError::Serialization(error.to_string()))?;
+    let result = sqlx::query(
+        "UPDATE conversations SET state = ?1, state_kind = ?2, state_updated_at = ?3, updated_at = ?4 WHERE id = ?5",
+    )
+    .bind(&state_json)
+    .bind(conv_state_kind(state))
+    .bind(state_updated_at.to_rfc3339())
+    .bind(Utc::now().to_rfc3339())
+    .bind(id)
+    .execute(&mut **tx)
+    .await?;
+
+    if result.rows_affected() == 0 {
+        return Err(DbError::ConversationNotFound(id.to_string()));
+    }
+    Ok(())
+}
+
 pub(crate) async fn record_initial_execution_outcome_tx(
     tx: &mut Transaction<'_, Sqlite>,
     conversation_id: &str,
@@ -16788,6 +16868,7 @@ async fn update_creation_runtime_state(
     state_updated_at: &str,
     now: &str,
 ) -> DbResult<()> {
+    native_close::fence_native_retry_sources_tx(tx, conversation_id, state).await?;
     let result = sqlx::query(
         "UPDATE conversations
          SET state = ?1, state_kind = ?2, state_updated_at = ?3, updated_at = ?4,

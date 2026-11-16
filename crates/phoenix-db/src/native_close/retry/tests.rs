@@ -109,7 +109,7 @@ async fn fixture(
             panic!("expected inventory authority");
         };
         for remaining in &failure.remaining_resources {
-            insert_receipt(db, &failure.attempt_id, &remaining.scope, snapshot, &remaining.resource, "residual").await;
+            insert_receipt(db, &failure.attempt_id, &remaining.scope, snapshot, &remaining.resource, "residual", &failure.detail).await;
         }
     }
     db.terminalize_initial_close_cleanup_failure(&failure).await.unwrap();
@@ -123,23 +123,28 @@ async fn insert_receipt(
     snapshot: &CloseRetirementSnapshot,
     resource: &RetiredResourceIdentity,
     proof_kind: &str,
+    detail: &str,
 ) {
     sqlx::query("INSERT INTO close_retirement_resources
         (attempt_id, scope, inspection_generation, inspection_fingerprint, resource_kind,
          identity_kind, identity_codec, identity_value, proof_kind, residual_reason, detail, created_at, updated_at)
         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9,
-                CASE WHEN ?9 = 'residual' THEN 'removal_failed' END, 'fixture receipt', datetime('now'), datetime('now'))")
+                CASE WHEN ?9 = 'residual' THEN 'removal_failed' END, ?10, ?11, ?11)")
         .bind(attempt.as_str()).bind(scope.as_str())
         .bind(snapshot.generation()).bind(snapshot.fingerprint())
         .bind(resource.kind().as_str()).bind(resource.identity().identity_kind())
         .bind(resource.identity().codec()).bind(resource.identity().value()).bind(proof_kind)
+        .bind(detail).bind(Utc::now().to_rfc3339())
         .execute(db.pool()).await.unwrap();
 }
 
 fn admitted(result: LocalAuthorityResult<DbResult<NativeCloseRetryResult>>) -> NativeCloseReceipt {
     match result {
         LocalAuthorityResult::DurableFactEstablished(Ok(NativeCloseRetryResult::NewlyAdmitted(receipt))) => receipt,
-        other => panic!("expected classified admission, got {other:?}"),
+        other @ (LocalAuthorityResult::DurableFactEstablished(_)
+        | LocalAuthorityResult::DurableFactUnclassified) => {
+            panic!("expected classified admission, got {other:?}");
+        }
     }
 }
 
@@ -173,7 +178,7 @@ async fn native_retry_atomically_binds_original_plan_and_replays_after_progress(
           (SELECT COUNT(*) FROM native_close_initial_receipts WHERE attempt_id = ?1 AND intent = 'explicit_retry'),
           (SELECT COUNT(*) FROM close_run_retry_effects WHERE attempt_id = ?1 AND run_ordinal = 2)",
     ).bind(failure.attempt_id.as_str()).fetch_one(db.pool()).await.unwrap();
-    assert_eq!(counts, (1, 1, 1, assessment.request.remaining_effects.len() as i64));
+    assert_eq!(counts, (1, 1, 1, i64::try_from(assessment.request.remaining_effects.len()).unwrap()));
     let bound: (String, String, String, String) = sqlx::query_as(
         "SELECT inspection_generation, inspection_fingerprint, request_id, request_fingerprint
          FROM native_close_retry_plans WHERE attempt_id = ?1 AND run_ordinal = 2",
@@ -189,7 +194,10 @@ async fn native_retry_atomically_binds_original_plan_and_replays_after_progress(
     assessment.request.remaining_effects.clear();
     match db.apply_native_close_explicit_retry(&assessment).await {
         LocalAuthorityResult::DurableFactEstablished(Ok(NativeCloseRetryResult::Replay(replay))) => assert_eq!(replay, receipt),
-        other => panic!("expected exact replay, got {other:?}"),
+        other @ (LocalAuthorityResult::DurableFactEstablished(_)
+        | LocalAuthorityResult::DurableFactUnclassified) => {
+            panic!("expected exact replay, got {other:?}");
+        }
     }
     db.update_conversation_state(assessment.command.source_transcript_id(), &ConvState::Idle)
         .await.unwrap();
@@ -333,6 +341,7 @@ async fn native_retry_uses_g1_residuals_not_g2_success() {
     failure.remaining_resources = db.expected_close_cleanup_failure_resources(
         failure.attempt_id.as_str(), &scope, &work_scope,
     ).await.unwrap();
+    failure.detail = "G2 evidence is not original authority".into();
     failure.occurred_at_us = Utc::now().timestamp_micros();
     db.terminalize_initial_close_cleanup_failure(&failure).await.unwrap();
     let mut assessment = assess(&db, &failure, "g2").await;

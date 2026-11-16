@@ -61,6 +61,7 @@ impl Database {
         }
     }
 
+    #[allow(clippy::too_many_lines)] // Keep the atomic admission/replay decision in one transaction.
     async fn apply_native_close_explicit_retry_tx(
         &self,
         tx: &mut Transaction<'_, Sqlite>,

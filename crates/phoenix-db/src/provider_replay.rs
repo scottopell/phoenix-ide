@@ -395,21 +395,7 @@ impl Database {
                 .fetch_one(&mut *tx)
                 .await?;
         crate::coordinator_watches::record_wait_entry_tx(&mut tx, conversation_id, state).await?;
-        let state_json = serde_json::to_string(state)
-            .map_err(|error| DbError::Serialization(error.to_string()))?;
-        let result = sqlx::query(
-            "UPDATE conversations SET state = ?1, state_kind = ?2, state_updated_at = ?3, updated_at = ?4 WHERE id = ?5",
-        )
-        .bind(state_json)
-        .bind(crate::conv_state_kind(state))
-        .bind(state_updated_at.to_rfc3339())
-        .bind(chrono::Utc::now().to_rfc3339())
-        .bind(conversation_id)
-        .execute(&mut *tx)
-        .await?;
-        if result.rows_affected() == 0 {
-            return Err(DbError::ConversationNotFound(conversation_id.to_string()));
-        }
+        crate::write_conversation_state_tx(&mut tx, conversation_id, state, state_updated_at).await?;
         if previous_kind != crate::conv_state_kind(state) {
             crate::record_initial_execution_outcome_tx(&mut tx, conversation_id, state).await?;
         }
@@ -542,13 +528,17 @@ impl Database {
         crate::coordinator_watches::record_wait_entry_tx(&mut tx, conversation_id, state).await?;
         let state_json = serde_json::to_string(state)
             .map_err(|error| DbError::Serialization(error.to_string()))?;
-        sqlx::query("UPDATE conversations SET state = ?1, state_kind = ?2, state_updated_at = ?3 WHERE id = ?4")
+        let updated = sqlx::query("UPDATE conversations SET state = ?1, state_kind = ?2, state_updated_at = ?3 WHERE id = ?4")
             .bind(state_json)
             .bind(crate::conv_state_kind(state))
             .bind(state_updated_at.to_rfc3339())
             .bind(conversation_id)
             .execute(&mut *tx)
             .await?;
+        if updated.rows_affected() > 0 {
+            crate::native_close::fence_native_retry_sources_tx(&mut tx, conversation_id, state)
+                .await?;
+        }
         if matches!(
             content,
             phoenix_core::domain::db_schema::MessageContent::Agent(_)

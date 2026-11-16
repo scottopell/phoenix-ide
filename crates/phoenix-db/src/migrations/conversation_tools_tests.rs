@@ -265,6 +265,7 @@ fn registered_identity_order_and_exact_bodies() {
         (153, "close_writer_observations"),
         (160, "native_close_exact_observation_receipts"),
         (161, "native_close_explicit_retry_admission"),
+        (162, "native_close_source_fence"),
     ];
     for (version, name) in identities {
         let entries = MIGRATIONS
@@ -301,6 +302,7 @@ fn registered_identity_order_and_exact_bodies() {
             include_str!("native_close_explicit_retry_admission.sql"),
             161,
         ),
+        (include_str!("native_close_source_fence.sql"), 162),
     ] {
         let entries = MIGRATIONS
             .iter()
@@ -379,7 +381,7 @@ async fn rename_receipt_retention_migration_preserves_rows_and_rolls_back_atomic
         .execute(&pool)
         .await
         .unwrap();
-    assert_eq!(run_pending_migrations(&pool).await.unwrap(), 14);
+    assert_eq!(run_pending_migrations(&pool).await.unwrap(), 15);
     let foreign_keys: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM pragma_foreign_key_list('product_conversation_rename_receipts')",
     )
@@ -410,7 +412,7 @@ async fn registered_slack_origin_decodes_and_replays_after_upgrade() {
 
     let pool = fixture(142, true).await;
     let db = Database::from_pool_for_tests(pool.clone(), String::new());
-    assert_eq!(run_pending_migrations(&pool).await.unwrap(), 17);
+    assert_eq!(run_pending_migrations(&pool).await.unwrap(), 18);
     let retained = db
         .get_product_creation_job("old-slack")
         .await
@@ -475,7 +477,7 @@ async fn registered_fresh_upgrade_slack_children_ledger_and_reentry() {
             let mut conn = pool.acquire().await.unwrap();
             preserved(&mut conn, &before).await;
             drop(conn);
-            assert_eq!(run_pending_migrations(&pool).await.unwrap(), 10);
+            assert_eq!(run_pending_migrations(&pool).await.unwrap(), 11);
             let mut conn = pool.acquire().await.unwrap();
             let live_images: i64 =
                 sqlx::query_scalar("SELECT COUNT(*) FROM product_creation_job_images")
@@ -521,6 +523,7 @@ async fn registered_fresh_upgrade_slack_children_ledger_and_reentry() {
                     (159, "close_original_retirement_anchors"),
                     (160, "native_close_exact_observation_receipts"),
                     (161, "native_close_explicit_retry_admission"),
+                    (162, "native_close_source_fence"),
                 ]
             );
             drop(conn);
@@ -564,7 +567,7 @@ async fn registered_body_faults_rollback_and_same_connection_retry() {
         let mut conn = pool.acquire().await.unwrap();
         preserved(&mut conn, &before).await;
         drop(conn);
-        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 10);
+        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 11);
         let mut conn = pool.acquire().await.unwrap();
         clean(&mut conn).await;
     }
@@ -585,7 +588,7 @@ async fn registered_ledger_failure_rolls_back_body_then_reenters() {
         .await
         .unwrap();
     drop(conn);
-    assert_eq!(run_pending_migrations(&pool).await.unwrap(), 17);
+    assert_eq!(run_pending_migrations(&pool).await.unwrap(), 18);
 }
 
 #[tokio::test]
@@ -644,7 +647,7 @@ async fn image_retirement_ledger_failure_restores_payload_schema_and_retries() {
         .execute(&pool)
         .await
         .unwrap();
-    assert_eq!(run_pending_migrations(&pool).await.unwrap(), 11);
+    assert_eq!(run_pending_migrations(&pool).await.unwrap(), 12);
     let restored: Vec<(String, i64, String, String)> = sqlx::query_as(
         "SELECT request_id, ordinal, media_type, data FROM product_creation_job_images ORDER BY request_id, ordinal",
     )
@@ -742,7 +745,7 @@ async fn registered_creation_receipt_retention_preserves_jobs_and_children_atomi
         .execute(&pool)
         .await
         .unwrap();
-    assert_eq!(run_pending_migrations(&pool).await.unwrap(), 13);
+    assert_eq!(run_pending_migrations(&pool).await.unwrap(), 14);
     let ledger_entry: (i64, String) =
         sqlx::query_as("SELECT version, name FROM _migrations WHERE version=147")
             .fetch_one(&pool)
