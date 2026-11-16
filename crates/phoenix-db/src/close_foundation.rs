@@ -13358,7 +13358,6 @@ mod tests {
                 .unwrap();
             let request = safe_retry_request(&failure);
             let run = db.admit_close_safe_retry(&request).await.unwrap();
-            let observation = observe_retained_run(&db, &run).await;
             assert_eq!(
                 db.list_close_safe_retry_effects(&run).await.unwrap(),
                 request.remaining_effects
@@ -13437,6 +13436,8 @@ mod tests {
                 db.get_close_run(&request.failed_run).await.unwrap().status,
                 CloseRunStatus::Stopped
             );
+            // Observe adopts native ownership, so finish legacy execution first.
+            let observation = observe_retained_run(&db, &run).await;
             let crate::workflow::LocalAuthorityResult::DurableFactEstablished(Ok(
                 crate::native_close::NativeCloseObserveResult::Replay(replay),
             )) = db.apply_native_close_observe(&observation).await

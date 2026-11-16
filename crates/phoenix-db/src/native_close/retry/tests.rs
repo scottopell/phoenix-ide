@@ -550,9 +550,14 @@ async fn native_retry_finalizes_exact_g1_successes_without_rebinding_current_g2(
     ).fetch_one(db.pool()).await.unwrap();
     assert_eq!(retained, bound);
 
-    // A retired worktree is not retirement of its independently planned WorkScope.
-    assert_eq!(progress.pending.len(), 1);
-    assert_eq!(progress.pending[0].resource, work_scope);
+    // Root and latest have independent scopes; retiring the worktree retires neither.
+    let expected_pending: Vec<_> = assessment.request.remaining_effects.iter()
+        .filter(|planned| *planned != effect).cloned().collect();
+    assert_eq!(progress.pending, expected_pending);
+    assert_eq!(progress.pending.len(), 2);
+    assert!(progress.pending.iter().all(|pending| pending.resource.kind() == RetiredResourceKind::WorkScope));
+    assert_ne!(progress.pending[0].scope, progress.pending[1].scope);
+    assert!(progress.pending.iter().any(|pending| pending.resource == work_scope));
     let incomplete = db.get_close_obligation(failure.attempt_id.as_str()).await.unwrap();
     let before_messages: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages")
         .fetch_one(db.pool()).await.unwrap();
@@ -563,9 +568,21 @@ async fn native_retry_finalizes_exact_g1_successes_without_rebinding_current_g2(
         .fetch_one(db.pool()).await.unwrap();
     assert_eq!(messages, before_messages);
 
-    success_recorded(db.record_native_close_retry_success(
-        &assessment.command, &receipt.admitted, &progress.pending[0], "G1 scope independently retired",
-    ).await);
+    for (index, pending) in progress.pending.iter().enumerate() {
+        success_recorded(db.record_native_close_retry_success(
+            &assessment.command, &receipt.admitted, pending, "G1 scope independently retired",
+        ).await);
+        let remaining = db.close_safe_retry_progress(&run).await.unwrap();
+        assert_eq!(remaining.pending, progress.pending[index + 1..]);
+        if !remaining.pending.is_empty() {
+            completion_refused(db.complete_native_close_retry(&assessment.command, &receipt.admitted).await);
+            assert_eq!(db.get_close_obligation(failure.attempt_id.as_str()).await.unwrap(), incomplete);
+            assert_eq!(db.get_close_run(&run).await.unwrap().status, CloseRunStatus::Running);
+            let messages: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages")
+                .fetch_one(db.pool()).await.unwrap();
+            assert_eq!(messages, before_messages);
+        }
+    }
     assert!(db.close_safe_retry_progress(&run).await.unwrap().pending.is_empty());
     // Even a completely successful native plan cannot use the unfenced legacy entry point.
     assert!(db.complete_close_safe_retry(&run).await.is_err());
