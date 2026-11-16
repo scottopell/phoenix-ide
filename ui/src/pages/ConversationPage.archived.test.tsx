@@ -537,6 +537,10 @@ describe('ConversationPage explicit composer focus', () => {
 
   it.each([false, true])('hands wide fullscreen Send Notes back to the composer, respecting a newer modal (interrupted: %s)', async (interrupted) => {
     const { container, store } = renderPage(makeConversation(), slug, '?viewer=message&presentation=fullscreen&message=1');
+    await screen.findByRole('textbox');
+    // MessageViewer is lazy-loaded after route readiness mounts the composer.
+    await act(async () => { await vi.dynamicImportSettled(); });
+    expect(await screen.findByRole('dialog', { name: 'Message viewer: User message #1' })).toBeInTheDocument();
     fireEvent.click(await screen.findByRole('button', { name: 'Add note to line 1' }));
     fireEvent.change(screen.getByPlaceholderText('Add your note… (Cmd/Ctrl+Enter to save)'), { target: { value: 'Please revise this passage' } });
     fireEvent.click(screen.getByRole('button', { name: 'Add Note' }));
