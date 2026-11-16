@@ -68,6 +68,7 @@ fn bash(id: &str, command: &str) -> ToolCall {
 }
 
 async fn cancellation_while_read_held(mut runtime: TestRuntime, (entered, release): ReadGate) {
+    let active_turn = runtime.active_direct_turn.as_deref().cloned();
     let executor = Arc::clone(&runtime.tool_executor);
     let storage = Arc::clone(&runtime.storage);
     let llm = Arc::clone(&runtime.llm_client);
@@ -113,10 +114,22 @@ async fn cancellation_while_read_held(mut runtime: TestRuntime, (entered, releas
         revoked,
         "the cancelled read continuation must be dropped before cancellation completes"
     );
-    assert!(matches!(
-        storage.get_current_state("conv-tool-gen"),
-        Some(ConvState::Idle)
-    ));
+    if let Some(turn) = active_turn {
+        let obligations = storage.recorded_terminal_obligations();
+        assert_eq!(obligations.len(), 1);
+        assert_eq!(obligations[0].turn_id, turn.turn_id);
+        assert_eq!(obligations[0].expected_generation, turn.generation);
+        assert!(matches!(obligations[0].projection.state, ConvState::Idle));
+        assert_eq!(
+            obligations[0].terminal,
+            phoenix_workflow::TurnTerminal::Cancelled
+        );
+    } else {
+        assert!(matches!(
+            storage.get_current_state("conv-tool-gen"),
+            Some(ConvState::Idle)
+        ));
+    }
     assert!(executor.recorded_executions().is_empty());
     assert!(llm.recorded_requests().is_empty());
 }
@@ -285,7 +298,10 @@ async fn ordinary_read_error_text_is_not_sqlite_authority_and_keeps_positive_can
         diagnostic
     );
     assert!(!runtime.fatal_local_authority_fence.is_closed());
-    assert!(runtime.tool_preparation.as_ref().unwrap().read.is_none());
+    assert!(matches!(
+        runtime.tool_preparation.as_ref().unwrap().phase,
+        PreparationPhase::NoRead
+    ));
     runtime
         .process_event(Event::UserCancel {
             reason: None,
@@ -293,6 +309,13 @@ async fn ordinary_read_error_text_is_not_sqlite_authority_and_keeps_positive_can
         })
         .await
         .unwrap();
+    let interrupted = runtime
+        .observe_tool_preparation_for_test()
+        .await
+        .unwrap()
+        .expect("positive no-effects cancellation");
+    assert!(matches!(interrupted, Event::ToolAborted { .. }));
+    runtime.process_event(interrupted).await.unwrap();
     assert!(matches!(runtime.state, ConvState::Idle));
     assert_eq!(runtime.tool_execution.generation(), 0);
     assert!(runtime.tool_executor.recorded_executions().is_empty());
@@ -303,10 +326,17 @@ async fn rejected_cancel_checkpoint_revokes_read_without_false_completion_or_lat
     let call = bash("cancel-persist", "git status --short");
     let mut runtime = runtime_for(call.clone()).await;
     selected(&mut runtime, "original", call.clone());
+    let (entered, release) = runtime.storage.hold_next_tool_policy_read();
     runtime
         .execute_effect(Effect::ExecuteTool { tool: call })
         .await
         .unwrap();
+    let mut pending = runtime.tool_preparation.take().unwrap();
+    tokio::select! {
+        _ = pending.observe() => panic!("read must remain held"),
+        entered = entered => entered.unwrap(),
+    }
+    runtime.tool_preparation = Some(pending);
     runtime.storage.set_fail_state_update(true);
     let error = runtime
         .process_event(Event::UserCancel {
@@ -317,7 +347,22 @@ async fn rejected_cancel_checkpoint_revokes_read_without_false_completion_or_lat
         .unwrap_err();
     assert!(error.contains("injected state update failure"));
     assert!(matches!(runtime.state, ConvState::ToolExecuting { .. }));
-    assert!(runtime.tool_preparation.as_ref().unwrap().read.is_none());
+    assert!(
+        release.send(Ok(())).is_err(),
+        "read was revoked despite the rejected checkpoint"
+    );
+    assert!(
+        runtime
+            .observe_tool_preparation_for_test()
+            .await
+            .unwrap()
+            .is_none(),
+        "failed cancellation checkpoint cannot publish ToolAborted"
+    );
+    assert!(matches!(
+        runtime.tool_preparation.as_ref().unwrap().phase,
+        PreparationPhase::NoRead
+    ));
     assert!(runtime.storage.recorded_messages().is_empty());
     assert!(!runtime.fatal_local_authority_fence.is_closed());
     assert_eq!(runtime.tool_execution.generation(), 0);
@@ -329,6 +374,13 @@ async fn rejected_cancel_checkpoint_revokes_read_without_false_completion_or_lat
         })
         .await
         .unwrap();
+    let interrupted = runtime
+        .observe_tool_preparation_for_test()
+        .await
+        .unwrap()
+        .expect("retry retains exact no-effects proof");
+    assert!(matches!(interrupted, Event::ToolAborted { .. }));
+    runtime.process_event(interrupted).await.unwrap();
     assert!(matches!(runtime.state, ConvState::Idle));
     assert!(runtime.tool_executor.recorded_executions().is_empty());
     assert!(runtime.llm_client.recorded_requests().is_empty());

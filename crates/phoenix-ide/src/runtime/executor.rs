@@ -8507,8 +8507,8 @@ where
             }
             ControlEffect::AbortTool { tool_use_id } => {
                 tracing::info!(tool_id = %tool_use_id, "Aborting tool execution");
-                if self.cancel_read_only_tool_preparation(&tool_use_id) {
-                    return Ok(Some(Event::ToolAborted { tool_use_id }));
+                if self.interrupt_read_only_tool_preparation(&tool_use_id) {
+                    return Ok(None);
                 }
                 self.tool_execution.request_cancel();
                 if let Some(handoff) = self.native_spawn_handoff.as_mut() {

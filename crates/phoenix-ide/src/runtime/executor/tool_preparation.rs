@@ -71,24 +71,36 @@ type PreparationFuture = Pin<Box<dyn Future<Output = Result<PreparedTool, String
 
 pub(super) struct ToolPreparation {
     selection: Arc<DispatchSelection>,
-    read: Option<Mutex<PreparationFuture>>,
+    phase: PreparationPhase,
+}
+
+enum PreparationPhase {
+    Reading(Mutex<PreparationFuture>),
+    Interrupted,
+    NoRead,
+}
+
+enum PreparationDisposition {
+    Ready(Result<PreparedTool, String>),
+    Interrupted,
 }
 
 pub(super) struct PreparationObservation {
     selection: Arc<DispatchSelection>,
-    result: Result<PreparedTool, String>,
+    result: PreparationDisposition,
 }
 
 impl ToolPreparation {
     pub(super) async fn observe(&mut self) -> PreparationObservation {
-        let result = match self.read.as_mut() {
-            Some(read) => {
+        let result = match &mut self.phase {
+            PreparationPhase::Reading(read) => PreparationDisposition::Ready(
                 read.get_mut()
                     .expect("exclusive tool preparation future")
                     .as_mut()
-                    .await
-            }
-            None => std::future::pending().await,
+                    .await,
+            ),
+            PreparationPhase::Interrupted => PreparationDisposition::Interrupted,
+            PreparationPhase::NoRead => std::future::pending().await,
         };
         PreparationObservation {
             selection: Arc::clone(&self.selection),
@@ -219,7 +231,7 @@ impl<S: Storage + Clone + 'static, L: LlmClient + 'static, T: ToolExecutor + 'st
         };
         self.tool_preparation = Some(ToolPreparation {
             selection,
-            read: Some(Mutex::new(Box::pin(read))),
+            phase: PreparationPhase::Reading(Mutex::new(Box::pin(read))),
         });
         Ok(None)
     }
@@ -248,14 +260,30 @@ impl<S: Storage + Clone + 'static, L: LlmClient + 'static, T: ToolExecutor + 'st
         if !pending
             .selection
             .owns(self.tool_preparation_runtime, &self.state)
-            || !matches!(self.state, ConvState::ToolExecuting { .. })
         {
             return Ok(None);
         }
         let prepared = match observation.result {
-            Ok(prepared) => prepared,
-            Err(error) => {
-                pending.read = None;
+            PreparationDisposition::Interrupted => {
+                if matches!(self.state, ConvState::CancellingTool { .. }) {
+                    return Ok(Some(Event::ToolAborted {
+                        tool_use_id: pending.selection.tool.id.clone(),
+                    }));
+                }
+                pending.phase = PreparationPhase::NoRead;
+                self.tool_preparation = Some(pending);
+                return Ok(None);
+            }
+            PreparationDisposition::Ready(_)
+                if !matches!(self.state, ConvState::ToolExecuting { .. }) =>
+            {
+                return Ok(Some(Event::ToolAborted {
+                    tool_use_id: pending.selection.tool.id.clone(),
+                }));
+            }
+            PreparationDisposition::Ready(Ok(prepared)) => prepared,
+            PreparationDisposition::Ready(Err(error)) => {
+                pending.phase = PreparationPhase::NoRead;
                 self.tool_preparation = Some(pending);
                 return Err(error);
             }
@@ -289,13 +317,13 @@ impl<S: Storage + Clone + 'static, L: LlmClient + 'static, T: ToolExecutor + 'st
                     .owns(self.tool_preparation_runtime, &self.state)
                     && pending.selection.owns(self.tool_preparation_runtime, next)
                 {
-                    pending.read = None;
+                    pending.phase = PreparationPhase::Interrupted;
                 }
             }
         }
     }
 
-    pub(super) fn cancel_read_only_tool_preparation(&mut self, tool_use_id: &str) -> bool {
+    pub(super) fn interrupt_read_only_tool_preparation(&mut self, tool_use_id: &str) -> bool {
         if self.tool_preparation.as_ref().is_some_and(|pending| {
             pending.selection.tool.id == tool_use_id
                 && pending
@@ -303,7 +331,10 @@ impl<S: Storage + Clone + 'static, L: LlmClient + 'static, T: ToolExecutor + 'st
                     .owns(self.tool_preparation_runtime, &self.state)
                 && matches!(self.state, ConvState::CancellingTool { .. })
         }) {
-            self.tool_preparation = None;
+            self.tool_preparation
+                .as_mut()
+                .expect("exact read owner checked")
+                .phase = PreparationPhase::Interrupted;
             return true;
         }
         false

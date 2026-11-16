@@ -863,6 +863,15 @@ impl<T: SvgArtifactRepository + ?Sized> SvgArtifactRepository for Arc<T> {
 
 #[async_trait]
 impl<T: MessageStore + ?Sized> MessageStore for Arc<T> {
+    async fn get_work_scope_legacy_conversation_id(
+        &self,
+        scope_id: &phoenix_core::work_scope::WorkScopeId,
+    ) -> Result<Option<String>, String> {
+        (**self)
+            .get_work_scope_legacy_conversation_id(scope_id)
+            .await
+    }
+
     async fn terminalize_sub_agent_cancellation_backstop(
         &self,
         child_conversation_id: &str,
