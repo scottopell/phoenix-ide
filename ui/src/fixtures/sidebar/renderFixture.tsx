@@ -37,7 +37,7 @@ function SidebarFixtureBody({ scenario }: Props) {
         archivedConversations={sidebarFixtureData.archivedConversations}
         activeSlug={scenario.activeSlug}
         onConversationCreated={() => {}}
-        width={320}
+        width={scenario.sidebarWidth ?? 320}
       />
       <section className="sidebar-fixture-notes" aria-label="Fixture notes">
         <h1 className="sidebar-fixture-title">{scenario.id}</h1>

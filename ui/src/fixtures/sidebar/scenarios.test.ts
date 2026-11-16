@@ -8,6 +8,8 @@ describe('sidebar fixture scenarios', () => {
       'expanded-project-archived',
       'expanded-empty-project',
       'product-actions-continued',
+      'sidebar-visual-normal',
+      'sidebar-visual-narrow',
       'collapsed-overflow',
     ]);
 
@@ -19,7 +21,7 @@ describe('sidebar fixture scenarios', () => {
 
   it('scopes product conversation rows to the continued-actions scenario', () => {
     expect(sidebarFixtureData.productConversations?.['product-actions-continued']).toHaveLength(1);
-    for (const scenario of sidebarScenarios.filter((item) => item.id !== 'product-actions-continued')) {
+    for (const scenario of sidebarScenarios.filter((item) => item.id !== 'product-actions-continued' && !item.id.startsWith('sidebar-visual-'))) {
       expect(sidebarFixtureData.productConversations?.[scenario.id] ?? []).toHaveLength(0);
     }
   });

@@ -1,0 +1,42 @@
+name: Sidebar visual QA
+on:
+  pull_request:
+    paths:
+      - 'ui/**'
+      - '.github/workflows/sidebar-visual-qa.yml'
+permissions:
+  contents: read
+jobs:
+  sidebar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 26
+      - run: corepack enable && corepack prepare pnpm@11.0.8 --activate
+      - run: pnpm install --frozen-lockfile
+        working-directory: ui
+      - name: Typecheck and sidebar regressions
+        working-directory: ui
+        run: |
+          pnpm exec tsc --noEmit
+          pnpm exec vitest run src/fixtures/sidebar/scenarios.test.ts src/components/Sidebar.test.tsx src/components/ConversationList.test.tsx
+      - run: pnpm exec playwright install --with-deps chromium
+        working-directory: ui
+      - name: Capture sidebar geometry
+        working-directory: ui
+        env:
+          PHOENIX_LADLE: '1'
+          CAPTURE_STORIES: sidebar-visual-normal,sidebar-visual-narrow
+          SIDEBAR_VISUAL_BASELINE: '1'
+        run: node scripts/capture-sidebar.mjs
+      - uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: sidebar-visual-qa
+          path: ui/qa-artifacts/sidebar/
+          if-no-files-found: error
