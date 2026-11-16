@@ -954,10 +954,20 @@ async fn initial_source_fence_retains_no_worktree_scope_inventory_and_dispatch()
     assert!(scopes.iter().all(|scope| scope.captured_worktree.is_none()));
     assert!(db.prepare_native_close_initial_execution(&command, &receipt, &source).await.established().unwrap().is_ok());
     assert!(db.settle_native_close_initial(&command, &receipt, &source).await.established().unwrap().is_ok());
-    assert!(db.replace_native_close_initial_inspection(&command, &receipt, &source,
+    db.replace_native_close_initial_inspection(
+        &command,
+        &receipt,
+        &source,
         crate::ReplaceCloseInspectionRequest {
-            attempt_id: run.attempt_id.clone(), scopes: vec![],
-        }, Some("empty-generation-from-writer")).await.established().unwrap().is_ok());
+            attempt_id: run.attempt_id.clone(),
+            scopes: vec![],
+        },
+        Some("empty-generation-from-writer"),
+    )
+    .await
+    .established()
+    .unwrap()
+    .unwrap();
     let snapshot = db.get_close_obligation(run.attempt_id.as_str()).await.unwrap()
         .snapshot().cloned().unwrap();
     assert_eq!(snapshot.generation(), "empty-generation-from-writer");

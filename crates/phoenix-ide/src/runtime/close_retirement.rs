@@ -9812,17 +9812,15 @@ mod tests {
         use phoenix_core::domain::product_conversation::ProductConversationId;
         use phoenix_db::native_close::{NativeCloseIntent, NativeCloseRetryResult};
 
-        async fn join_actor(mut actor: tokio::task::JoinHandle<bool>) {
+        async fn join_actor(mut actor: tokio::task::JoinHandle<bool>) -> bool {
             let result = tokio::time::timeout(std::time::Duration::from_secs(60), &mut actor).await;
             if result.is_err() {
                 actor.abort();
                 let _ = actor.await;
                 panic!("bounded native retry actor did not finish");
             }
-            assert!(
-                !result.unwrap().unwrap(),
-                "retry actor must not exit fatally"
-            );
+            // Inspect the route's durable diagnostics before asserting this flag.
+            result.unwrap().unwrap()
         }
 
         async fn retained_counts(db: &crate::db::Database, attempt: &str) -> Vec<i64> {
@@ -9975,7 +9973,7 @@ mod tests {
             .acknowledged_event_tx = sender;
         // Exercise the production manager route: it owns lock acquisition, backend
         // selection, envelope construction and response classification.
-        let (result, ()) = tokio::join!(
+        let (result, actor_fatal) = tokio::join!(
             manager.apply_native_close_explicit_retry(
                 &source_conversation.id,
                 source.clone(),
@@ -10000,6 +9998,7 @@ mod tests {
                 );
             }
         };
+        assert!(!actor_fatal, "retry actor must not exit fatally");
         let NativeCloseRetryResult::NewlyAdmitted(receipt) = result else {
             panic!("expected fresh explicit retry admission");
         };
@@ -10030,7 +10029,7 @@ mod tests {
             .get_mut(&source_conversation.id)
             .unwrap()
             .acknowledged_event_tx = replay_sender;
-        let (result, ()) = tokio::join!(
+        let (result, actor_fatal) = tokio::join!(
             manager.apply_native_close_explicit_retry(
                 &source_conversation.id,
                 source.clone(),
@@ -10040,6 +10039,7 @@ mod tests {
             ),
             join_actor(replay_actor),
         );
+        assert!(!actor_fatal, "retry replay actor must not exit fatally");
         let NativeCloseRetryResult::Replay(replayed_receipt) = result.unwrap() else {
             panic!("expected exact retry receipt replay");
         };
@@ -10074,7 +10074,7 @@ mod tests {
             .get_mut(&source_conversation.id)
             .unwrap()
             .acknowledged_event_tx = stopped_sender;
-        let (result, ()) = tokio::join!(
+        let (result, actor_fatal) = tokio::join!(
             manager.apply_native_close_explicit_retry(
                 &source_conversation.id,
                 source.clone(),
@@ -10084,6 +10084,7 @@ mod tests {
             ),
             join_actor(stopped_actor),
         );
+        assert!(!actor_fatal, "stopped-source actor must not exit fatally");
         assert_eq!(
             result,
             Err(crate::runtime::NativeCloseApplicationError::SourceRefused)
