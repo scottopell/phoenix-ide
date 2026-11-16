@@ -3334,17 +3334,7 @@ where
                             continue;
                         }
                         AcknowledgedRuntimeRequest::ExecuteNativeCloseRetry(request) => {
-                            let super::native_close_application::NativeCloseRetryRequest {
-                                source, target, attempt_id, failed_run_ordinal, backend,
-                                admitted, target_gate, attempt_gate, response,
-                            } = *request;
-                            let result = self.execute_native_close_retry(
-                                source, target, attempt_id, failed_run_ordinal, backend,
-                                admitted, target_gate, attempt_gate,
-                            ).await;
-                            let fatal = matches!(result, Err(super::native_close_application::NativeCloseApplicationError::FatalAuthority));
-                            let _ = response.send(result);
-                            if fatal {
+                            if self.handle_native_close_retry(*request).await {
                                 return self.fatal_local_authority_exit();
                             }
                             continue;
@@ -16820,7 +16810,7 @@ mod test_git_helpers {
 /// (not a private helper) so the handler's full transition-time behaviour
 /// is exercised end-to-end.
 #[cfg(test)]
-mod creation_completion_lifecycle_tests {
+pub(crate) mod creation_completion_lifecycle_tests {
     use super::*;
     mod native_close_admission_tests;
     mod native_task_admission_tests;
@@ -16878,6 +16868,37 @@ mod creation_completion_lifecycle_tests {
             llm,
             event_tx,
         }
+    }
+
+    pub(crate) fn spawn_bounded_native_close_retry_actor(
+        db: crate::db::Database,
+        source_transcript_id: String,
+        state: ConvState,
+        fatal_local_authority_fence: Arc<crate::runtime::FatalLocalAuthorityFence>,
+    ) -> (
+        mpsc::Sender<AcknowledgedRuntimeRequest>,
+        tokio::task::JoinHandle<bool>,
+    ) {
+        let mut harness = runtime(state);
+        harness.runtime = harness
+            .runtime
+            .with_fatal_local_authority_fence(fatal_local_authority_fence);
+        harness.runtime.context.conversation_id = source_transcript_id;
+        harness.runtime.context.is_coordinator = true;
+        harness.runtime = harness
+            .runtime
+            .with_native_task_admission_database(db);
+        let (sender, receiver) = mpsc::channel(1);
+        harness.runtime = harness.runtime.with_acknowledged_event_receiver(receiver);
+        let task = tokio::spawn(async move {
+            match harness.runtime.acknowledged_event_rx.recv().await {
+                Some(AcknowledgedRuntimeRequest::ExecuteNativeCloseRetry(request)) => {
+                    harness.runtime.handle_native_close_retry(*request).await
+                }
+                _ => false,
+            }
+        });
+        (sender, task)
     }
 
     fn creation_claim() -> phoenix_core::domain::creation_protocol::CreationClaim {

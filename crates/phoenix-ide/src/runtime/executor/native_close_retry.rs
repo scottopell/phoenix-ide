@@ -45,6 +45,50 @@ where
     L: LlmClient + 'static,
     T: ToolExecutor + 'static,
 {
+    /// Execute one queued request and report whether the actor must terminate.
+    /// Both the production event loop and bounded actor tests use this handler.
+    pub(super) async fn handle_native_close_retry(
+        &mut self,
+        request: crate::runtime::native_close_application::NativeCloseRetryRequest,
+    ) -> bool {
+        let crate::runtime::native_close_application::NativeCloseRetryRequest {
+            source,
+            target,
+            attempt_id,
+            failed_run_ordinal,
+            backend,
+            admitted,
+            target_gate,
+            attempt_gate,
+            response,
+        } = request;
+        let result = self
+            .execute_native_close_retry(
+                source,
+                target,
+                attempt_id,
+                failed_run_ordinal,
+                backend,
+                admitted,
+                target_gate,
+                attempt_gate,
+            )
+            .await;
+        let fatal = matches!(
+            result,
+            Err(NativeCloseApplicationError::FatalAuthority)
+        );
+        let _ = response.send(result);
+        fatal
+    }
+}
+
+impl<S, L, T> ConversationRuntime<S, L, T>
+where
+    S: Storage + Clone + 'static,
+    L: LlmClient + 'static,
+    T: ToolExecutor + 'static,
+{
     /// Bind backend work to the actor's installed database handle, not a path or
     /// independently opened pool. Cloned handles preserve this authority identity.
     pub(super) fn check_native_close_retry_backend(
