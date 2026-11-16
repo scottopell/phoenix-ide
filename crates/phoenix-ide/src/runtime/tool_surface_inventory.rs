@@ -3,11 +3,7 @@ use phoenix_agents::{AgentConfig, AgentDefinition, ExecutionCandidate};
 use phoenix_core::llm_language::LlmLanguage;
 use serde_json::json;
 
-#[tokio::test]
-#[ignore = "opt-in synthetic inventory; set PHOENIX_TOOL_INVENTORY_OUTPUT to a JSON output path"]
-async fn export_coordinator_tool_surface_inventory() {
-    let output = std::env::var_os("PHOENIX_TOOL_INVENTORY_OUTPUT")
-        .expect("set PHOENIX_TOOL_INVENTORY_OUTPUT to an output path");
+async fn coordinator_tool_surface_variants() -> Vec<serde_json::Value> {
     let (runtime, _, coordinator) = crate::conversation_action_tools::tests::native_runtime().await;
     let skill_dir = tempfile::tempdir().unwrap();
     phoenix_skills::builtin::extract_to(skill_dir.path()).unwrap();
@@ -81,6 +77,67 @@ async fn export_coordinator_tool_surface_inventory() {
             }
         }
     }
+    variants
+}
+
+#[tokio::test]
+async fn assembled_coordinator_inventory_preserves_catalog_and_spawn_specialization() {
+    let variants = coordinator_tool_surface_variants().await;
+    assert_eq!(variants.len(), LlmLanguage::ALL.len() * 4);
+    for variant in &variants {
+        let definitions = variant["definitions"].as_array().unwrap();
+        let names = definitions
+            .iter()
+            .map(|definition| definition["name"].as_str().unwrap())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(names.len(), definitions.len(), "duplicate installed tool");
+        assert_eq!(
+            names.contains("skill"),
+            variant["authenticated_catalog"].as_bool().unwrap()
+        );
+        for definition in definitions {
+            assert_eq!(definition["input_schema"]["type"], "object", "{definition}");
+            for keyword in ["oneOf", "anyOf", "allOf"] {
+                assert!(
+                    definition["input_schema"].get(keyword).is_none(),
+                    "{definition}"
+                );
+            }
+            assert!(definition["defer_loading"].is_boolean());
+        }
+        let spawn = definitions
+            .iter()
+            .find(|definition| definition["name"] == "spawn_agents")
+            .unwrap();
+        let properties = &spawn["input_schema"]["properties"]["tasks"]["items"]["properties"];
+        if variant["spawn_configuration"] == "generic" {
+            assert!(properties.get("agent_type").is_none());
+        } else {
+            assert_eq!(
+                properties["agent_type"]["enum"],
+                json!(["inventory-worker"])
+            );
+            assert!(properties["execution"]
+                .to_string()
+                .contains("inventory-tier"));
+        }
+        assert!(names.contains("create_conversation"));
+        let watch = definitions
+            .iter()
+            .find(|definition| definition["name"] == "watch_conversation")
+            .unwrap();
+        let description = watch["description"].as_str().unwrap();
+        assert!(description.contains("question or task-approval waits"));
+        assert!(description.contains("selected-peer watches report terminal facts only"));
+    }
+}
+
+#[tokio::test]
+#[ignore = "opt-in synthetic inventory; set PHOENIX_TOOL_INVENTORY_OUTPUT to a JSON output path"]
+async fn export_coordinator_tool_surface_inventory() {
+    let output = std::env::var_os("PHOENIX_TOOL_INVENTORY_OUTPUT")
+        .expect("set PHOENIX_TOOL_INVENTORY_OUTPUT to an output path");
+    let variants = coordinator_tool_surface_variants().await;
     std::fs::write(
         output,
         serde_json::to_vec_pretty(&json!({

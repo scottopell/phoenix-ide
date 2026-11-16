@@ -238,9 +238,14 @@ choices. Every entry includes the actual descriptions, input schemas, deferred
 flags and byte/word measurements. There is no separately maintained tool roster
 or fixed tool count.
 
+An ordinary test assembles these same variants and checks optional authenticated
+skills, configured worker/tier specialization, unique installed names,
+provider-compatible object roots and the corrected watch guidance. The opt-in
+exporter reuses that assembly; neither path dispatches model or action tools.
+
 ```bash
 PHOENIX_TOOL_INVENTORY_OUTPUT=/absolute/path/tool-surface.json \
-  cargo test -p phoenix-ide export_coordinator_tool_surface_inventory -- --ignored
+  cargo test -p phoenix_ide export_coordinator_tool_surface_inventory -- --ignored
 ```
 
 The fixture uses an isolated database and an offline model configuration; it
