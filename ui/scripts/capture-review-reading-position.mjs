@@ -173,6 +173,7 @@ async function traceIdle(page, result, stage) {
     for (const name of ['focusin', 'scroll', 'pointerdown', 'touchstart', 'keydown']) document.addEventListener(name, onEvent, true);
     const samples = [];
     const started = performance.now();
+    const commandStart = window.reviewIdleCommands?.length ?? 0;
     try {
       while (performance.now() - started < 2400) {
         const nodes = new Set([document.scrollingElement, document.querySelector('#messages'), root, content]);
@@ -190,7 +191,7 @@ async function traceIdle(page, result, stage) {
     } finally {
       for (const name of ['focusin', 'scroll', 'pointerdown', 'touchstart', 'keydown']) document.removeEventListener(name, onEvent, true);
     }
-    return { samples, events, windowMs: 2400, anchorText: anchor.textContent };
+    return { samples, events, commands: window.reviewIdleCommands?.slice(commandStart) ?? [], windowMs: 2400, anchorText: anchor.textContent };
   });
   const trace = result.idle[stage];
   const first = trace.samples[0];
@@ -211,6 +212,17 @@ try {
     report.cases.push(result);
     const context = await browser.newContext({ viewport: { width, height: width === 390 ? 844 : 900 }, hasTouch: idleAudit && width === 390 });
     const page = await context.newPage();
+    if (idleAudit) await page.addInitScript(() => {
+      window.reviewIdleCommands = [];
+      for (const [prototype, method] of [[HTMLElement.prototype, 'focus'], [Element.prototype, 'scrollIntoView'], [Element.prototype, 'scrollTo'], [Element.prototype, 'scrollBy']]) {
+        const original = prototype[method];
+        if (!original) continue;
+        prototype[method] = function (...args) {
+          window.reviewIdleCommands.push({ time: performance.now(), method, target: { tag: this.tagName, id: this.id, className: this.className, label: this.getAttribute('aria-label') }, args, stack: new Error().stack });
+          return original.apply(this, args);
+        };
+      }
+    });
     page.setDefaultTimeout(6500);
     page.setDefaultNavigationTimeout(15000);
     page.on('pageerror', error => report.errors.push(`${id}: ${error.message}`));
@@ -308,7 +320,12 @@ try {
         await page.screenshot({ animations: 'disabled', path: path.join(out, `${id}-idle.png`) });
       }
       if (exit === 'discard' || exit === 'send') {
-        await viewer.getByRole('button', { name: 'Add note to line 1', exact: true }).click({ force: true });
+        const lineAction = idleAudit ? await viewer.locator('.viewer-content').evaluate(content => {
+          const box = content.getBoundingClientRect();
+          return [...content.querySelectorAll('p')].find(p => p.getBoundingClientRect().top >= box.top && p.getBoundingClientRect().bottom <= box.bottom)?.querySelector('.annotatable__btn')?.getAttribute('aria-label');
+        }) : 'Add note to line 1';
+        assert(lineAction, 'Annotation action must belong to a visible paragraph');
+        await viewer.getByRole('button', { name: lineAction, exact: true }).click({ force: true });
         const note = `reading-position-note-${id}`;
         await page.locator('.annotation-dialog-input').fill(note);
         if (idleAudit) {
@@ -317,6 +334,11 @@ try {
           await page.screenshot({ animations: 'disabled', path: path.join(out, `${id}-editor-idle.png`) });
         }
         await page.getByRole('button', { name: 'Add Note', exact: true }).click();
+        if (idleAudit) {
+          await settle(page);
+          await traceIdle(page, result, 'saved-note-idle');
+          await page.screenshot({ animations: 'disabled', path: path.join(out, `${id}-saved-idle.png`) });
+        }
         if (exit === 'send') {
           await viewer.getByRole('button', { name: 'Send notes', exact: true }).click();
           const input = page.locator('.product-conversation-page__composer #message-input');
@@ -364,10 +386,12 @@ try {
         report.controls.push({ id, locationBefore, locationAfter, targetVisible: true });
       }
     } catch (error) {
+      if (idleAudit) result.commands = await page.evaluate(() => window.reviewIdleCommands).catch(() => []);
       result.error = String(error);
       report.errors.push(`${id}: ${error}`);
       await page.screenshot({ path: path.join(out, `${id}-error.png`) }).catch(() => {});
     } finally {
+      if (idleAudit && !result.error) result.commands = await page.evaluate(() => window.reviewIdleCommands).catch(() => []);
       await context.close();
       await save();
     }
