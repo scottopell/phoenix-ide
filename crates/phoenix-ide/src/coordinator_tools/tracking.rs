@@ -83,10 +83,8 @@ impl TrackingTool {
             let _gate = runtime
                 .lock_product_message_admission(conversation.product_conversation_id.as_str())
                 .await;
-            match request.get("op").and_then(Value::as_str) {
-                Some("list" | "read") => match serde_json::from_value::<Read>(request)
-                    .map_err(|e| e.to_string())?
-                {
+            if let Some("list" | "read") = request.get("op").and_then(Value::as_str) {
+                match serde_json::from_value::<Read>(request).map_err(|e| e.to_string())? {
                     Read::List {
                         after,
                         include_retired,
@@ -111,21 +109,20 @@ impl TrackingTool {
                         .map_err(|e| e.to_string())?,
                     )
                     .map_err(|e| e.to_string()),
-                },
-                _ => {
-                    let mutation = serde_json::from_value::<TrackingMutation>(request)
-                        .map_err(|e| e.to_string())?;
-                    let owner = runtime
-                        .acquire_local_authority_pass()
-                        .map_err(|()| "Runtime admission closed".to_string())?;
-                    let receipt = WritePass { owner: Some(owner) }
-                        .classify(
-                            db.mutate_coordinator_tracking(&source, &call, &mutation)
-                                .await,
-                        )?
-                        .map_err(|e| e.to_string())?;
-                    serde_json::to_value(receipt).map_err(|e| e.to_string())
                 }
+            } else {
+                let mutation = serde_json::from_value::<TrackingMutation>(request)
+                    .map_err(|e| e.to_string())?;
+                let owner = runtime
+                    .acquire_local_authority_pass()
+                    .map_err(|()| "Runtime admission closed".to_string())?;
+                let receipt = WritePass { owner: Some(owner) }
+                    .classify(
+                        db.mutate_coordinator_tracking(&source, &call, &mutation)
+                            .await,
+                    )?
+                    .map_err(|e| e.to_string())?;
+                serde_json::to_value(receipt).map_err(|e| e.to_string())
             }
         })
         .await
@@ -133,7 +130,9 @@ impl TrackingTool {
     }
 }
 fn object(op: &str, fields: Value, required: &[&str]) -> Value {
-    let mut properties = fields.as_object().expect("schema object").clone();
+    let Value::Object(mut properties) = fields else {
+        unreachable!("schema fields are object literals");
+    };
     properties.insert("op".into(), json!({"type":"string","enum":[op]}));
     let mut required = required.to_vec();
     required.insert(0, "op");

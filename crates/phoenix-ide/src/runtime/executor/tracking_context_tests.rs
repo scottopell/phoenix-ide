@@ -813,6 +813,7 @@ async fn tracking_observation_reservation_blocks_concurrent_input_sequence_alloc
     context.is_coordinator = true;
     let (tx, rx) = mpsc::channel(8);
     let broadcaster = SseBroadcaster::new(32, 0);
+    let mut received = broadcaster.subscribe();
     let mut runtime = ConversationRuntime::new(
         context,
         ConvState::LlmRequesting { attempt: 1 },
@@ -869,11 +870,18 @@ async fn tracking_observation_reservation_blocks_concurrent_input_sequence_alloc
     release.send(()).unwrap();
     dispatch.await.unwrap();
     let writer_sequence = writer.await;
-    let messages = storage.get_all_messages("reservation-test").await.unwrap();
+    let messages = storage.get_all_messages("reservation-test");
     assert_eq!(messages.len(), 2);
     assert_eq!(messages[0].sequence_id, observation_sequence);
     assert_eq!(messages[1].sequence_id, writer_sequence);
     assert!(writer_sequence > observation_sequence);
+    let mut published = vec![];
+    while let Ok(event) = received.try_recv() {
+        if let SseEvent::Message { message, .. } = event {
+            published.push(message.sequence_id);
+        }
+    }
+    assert_eq!(published, vec![observation_sequence, writer_sequence]);
 }
 
 #[tokio::test]
