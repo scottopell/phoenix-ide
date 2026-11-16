@@ -356,6 +356,12 @@ async fn native_owner_rejection_continuation_busy_recovery_and_coordinator_reten
         provider.clone(),
     )))
     .await;
+    let coordinator_product =
+        f.db.get_conversation(&f.source)
+            .await
+            .unwrap()
+            .unwrap()
+            .product_conversation_id;
     f.runtime.start_direct_turn_worker().await.unwrap();
     let mut tools: Vec<_> = f
         .runtime
@@ -465,8 +471,8 @@ async fn native_owner_rejection_continuation_busy_recovery_and_coordinator_reten
     .await
     .unwrap();
     let reservation = f.reserve().await;
-    let opening_message_id = reservation.message_id.as_str().to_string();
     let successor = reservation.successor_conversation_id.clone();
+    let opening_message_id = format!("{successor}:{}", reservation.message_id.as_str());
     let fenced = native_send(send.as_ref(), &f.source, &target, recovery_key, RECOVERY).await;
     assert_eq!(fenced["outcome"], "rejected");
     assert_eq!(fenced["reason_code"], "continuation_opening_pending");
