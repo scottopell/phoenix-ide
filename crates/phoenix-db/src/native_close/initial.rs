@@ -30,7 +30,40 @@ pub enum NativeCloseInitialResult {
     ExistingOperationNeedsExactReference(NativeCloseRunRef),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeCloseInitialExecution {
+    pub run: NativeCloseRunRef,
+    pub phase: phoenix_core::domain::close::ClosePhase,
+}
+
 impl Database {
+    /// Prepares execution of the one exact newly admitted initial run.
+    ///
+    /// `live_source` must be the trusted source snapshot held by the source actor;
+    /// command correlation alone is not authority. This prerequisite deliberately
+    /// performs only the blocker decision phase transition and is not runtime-wired.
+    pub async fn prepare_native_close_initial_execution(
+        &self,
+        command: &NativeCloseCommand,
+        receipt: &NativeCloseReceipt,
+        live_source: &phoenix_core::domain::sm_state::ConvState,
+    ) -> LocalAuthorityResult<DbResult<NativeCloseInitialExecution>> {
+        let mut tx = match self.pool.begin_with("BEGIN IMMEDIATE").await {
+            Ok(tx) => tx,
+            Err(error) => return LocalAuthorityResult::DurableFactEstablished(Err(error.into())),
+        };
+        match prepare_initial_execution_tx(&mut tx, command, receipt, live_source).await {
+            Ok(result) => match tx.commit().await {
+                Ok(()) => LocalAuthorityResult::DurableFactEstablished(Ok(result)),
+                Err(_) => LocalAuthorityResult::DurableFactUnclassified,
+            },
+            Err(error) => match tx.rollback().await {
+                Ok(()) => LocalAuthorityResult::DurableFactEstablished(Err(error)),
+                Err(_) => LocalAuthorityResult::DurableFactUnclassified,
+            },
+        }
+    }
+
     /// Accepts initial Close atomically, with one server-owned operation and receipt.
     ///
     /// `command` is correlation, NOT live source authority. The SOURCE actor must
@@ -60,6 +93,114 @@ impl Database {
             },
         }
     }
+}
+
+async fn prepare_initial_execution_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    command: &NativeCloseCommand,
+    receipt: &NativeCloseReceipt,
+    live_source: &phoenix_core::domain::sm_state::ConvState,
+) -> DbResult<NativeCloseInitialExecution> {
+    let NativeCloseIntent::Initial { target } = command.intent() else {
+        return Err(DbError::CloseFoundationPrecondition(
+            "expected initial Close intent".into(),
+        ));
+    };
+    crate::task_approval_inspection::require_executing_source(
+        live_source,
+        command.source(),
+        "close_conversation",
+        &command.intent().source_input(),
+    )
+    .map_err(|_| {
+        DbError::CloseFoundationPrecondition("Close requires its current executing source".into())
+    })?;
+
+    if receipt.request_id != command.request_id()
+        || receipt.admitted.target != *target
+        || receipt.admitted.run_ordinal != CloseRunOrdinal::INITIAL
+    {
+        return Err(DbError::CloseFoundationPrecondition(
+            "initial Close receipt does not match the command".into(),
+        ));
+    }
+    // Validate durable source/target, then prove the caller's exact receipt was retained.
+    super::receipts::require_source_and_target_tx(tx, command).await?;
+    let admitted = super::receipts::read_receipt_tx(tx, command)
+        .await?
+        .ok_or_else(|| DbError::CloseFoundationPrecondition(
+            "exact initial Close receipt is missing".into(),
+        ))?;
+    if admitted != receipt.admitted || admitted.target != *target || admitted.run_ordinal != CloseRunOrdinal::INITIAL {
+        return Err(DbError::CloseFoundationPrecondition(
+            "initial Close receipt does not bind the initial run".into(),
+        ));
+    }
+
+    let row = sqlx::query(
+        "SELECT o.phase, o.native_managed, r.run_ordinal, r.status,
+                (SELECT MAX(latest.run_ordinal) FROM close_runs latest WHERE latest.attempt_id = o.attempt_id) AS latest_ordinal,
+                (SELECT latest.status FROM close_runs latest WHERE latest.attempt_id = o.attempt_id
+                   ORDER BY latest.run_ordinal DESC LIMIT 1) AS latest_status,
+                (SELECT member.captured_state_kind FROM close_attempt_members member
+                   WHERE member.attempt_id = o.attempt_id AND member.member_role IN ('latest', 'root_latest')) AS captured_state_kind
+         FROM close_obligations o JOIN close_runs r ON r.attempt_id = o.attempt_id AND r.run_ordinal = ?2
+         WHERE o.attempt_id = ?1 AND o.product_conversation_id = ?3",
+    )
+    .bind(admitted.attempt_id.as_str())
+    .bind(CloseRunOrdinal::INITIAL.get())
+    .bind(target.as_str())
+    .fetch_optional(&mut **tx)
+    .await?
+    .ok_or_else(|| DbError::CloseFoundationPrecondition(
+        "exact admitted initial Close run is missing or mismatched".into(),
+    ))?;
+    let phase_raw: String = row.try_get("phase")?;
+    let phase = phoenix_core::domain::close::ClosePhase::from_db_str(&phase_raw)
+        .ok_or_else(|| DbError::Serialization("unknown close phase".into()))?;
+    let managed: i64 = row.try_get("native_managed")?;
+    let run_status: String = row.try_get("status")?;
+    let latest_ordinal: Option<i64> = row.try_get("latest_ordinal")?;
+    let latest_status: Option<String> = row.try_get("latest_status")?;
+    let captured_state: Option<String> = row.try_get("captured_state_kind")?;
+    if managed != 1
+        || phase != phoenix_core::domain::close::ClosePhase::AwaitingBlockerResolution
+        || run_status != "running"
+        || latest_ordinal != Some(CloseRunOrdinal::INITIAL.get())
+        || latest_status.as_deref() != Some("running")
+    {
+        return Err(DbError::CloseFoundationPrecondition(
+            "initial Close operation is stale or has advanced".into(),
+        ));
+    }
+    let captured_state = captured_state.ok_or_else(|| {
+        DbError::CloseFoundationPrecondition("initial Close has no captured latest state".into())
+    })?;
+    let busy = phoenix_core::domain::close::CapturedConversationStateKind::from_db_str(&captured_state)
+        .ok_or_else(|| DbError::Serialization("unknown captured conversation state kind".into()))?
+        .is_busy();
+    let next_phase = if busy {
+        phoenix_core::domain::close::ClosePhase::AwaitingStopWorkConfirmation
+    } else {
+        phoenix_core::domain::close::ClosePhase::SettlingActiveWork
+    };
+    super::super::close_foundation::set_close_phase_tx(
+        tx,
+        admitted.attempt_id.as_str(),
+        next_phase,
+    )
+    .await?;
+    if !busy {
+        Database::capture_close_direct_turn_settlement_targets_tx(
+            tx,
+            admitted.attempt_id.as_str(),
+        )
+        .await?;
+    }
+    Ok(NativeCloseInitialExecution {
+        run: admitted,
+        phase: next_phase,
+    })
 }
 
 #[allow(clippy::too_many_lines)] // Source-before-replay and initial capture share one transaction.

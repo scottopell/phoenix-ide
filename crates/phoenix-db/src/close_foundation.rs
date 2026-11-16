@@ -1613,7 +1613,7 @@ pub(crate) async fn close_obligation_for_update(
     .ok_or_else(|| DbError::CloseFoundationNotFound(attempt_id.to_string()))
 }
 
-async fn set_close_phase_tx(
+pub(crate) async fn set_close_phase_tx(
     tx: &mut Transaction<'_, Sqlite>,
     attempt_id: &str,
     phase: ClosePhase,
@@ -2341,7 +2341,7 @@ impl Database {
         Ok(obligation)
     }
 
-    async fn capture_close_direct_turn_settlement_targets_tx(
+    pub(crate) async fn capture_close_direct_turn_settlement_targets_tx(
         tx: &mut Transaction<'_, Sqlite>,
         attempt_id: &str,
     ) -> DbResult<()> {
