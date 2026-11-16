@@ -1,7 +1,7 @@
 use super::{
     source::{
-        advance, candidates, capture, capture_range, encoded, hash, hex, invalid, lane_name,
-        member, member_page, owner, position, seq, topology, CHAIN,
+        advance, candidates, capture, capture_range, chain_query, encoded, hash, hex, invalid,
+        lane_name, member, member_page, owner, position, seq, topology,
     },
     PreparedScanBatch, ReservedScanAttempt, ScanBlocker, ScanContext, ScanCoveragePage,
     ScanCoverageState, ScanCoverageSummary, ScanFailure, ScanFreshness, ScanInput, ScanLane,
@@ -178,7 +178,7 @@ async fn prepare(
     };
     let mut waiting = None;
     for lane in preferred {
-        let rows=sqlx::query(&format!("{CHAIN} SELECT s.*,m.transcript_generation,m.tail FROM coordinator_scan_members s JOIN members m ON m.id=s.transcript_id WHERE s.generation=m.transcript_generation AND ((?3='live' AND (s.live_message_id IS NOT NULL OR s.live_seq<m.tail)) OR (?3='historical' AND s.historical_seq>0)) ORDER BY s.selected_at_us,s.continuation_ordinal DESC LIMIT 32"))
+        let rows=sqlx::query(chain_query!(" SELECT s.*,m.transcript_generation,m.tail FROM coordinator_scan_members s JOIN members m ON m.id=s.transcript_id WHERE s.generation=m.transcript_generation AND ((?3='live' AND (s.live_message_id IS NOT NULL OR s.live_seq<m.tail)) OR (?3='historical' AND s.historical_seq>0)) ORDER BY s.selected_at_us,s.continuation_ordinal DESC LIMIT 32"))
             .bind(&topology.head).bind(&topology.owner).bind(lane_name(lane)).fetch_all(&mut **tx).await?;
         for row in &rows {
             let transcript: String = row.try_get("transcript_id")?;
@@ -493,7 +493,7 @@ async fn coverage(
     let state = sqlx::query("SELECT * FROM coordinator_scan_state WHERE singleton=1")
         .fetch_optional(&mut **tx)
         .await?;
-    let totals=sqlx::query(&format!("{CHAIN} SELECT COUNT(*) AS total,COUNT(s.transcript_id) AS enrolled,
+    let totals=sqlx::query(chain_query!(" SELECT COUNT(*) AS total,COUNT(s.transcript_id) AS enrolled,
         COALESCE(SUM(s.transcript_id IS NULL OR s.generation<>m.transcript_generation OR s.live_message_id IS NOT NULL OR s.live_seq<m.tail),0) AS live,
         COALESCE(SUM(s.transcript_id IS NULL OR s.generation<>m.transcript_generation OR s.historical_seq>0),0) AS historical,
         COALESCE(SUM(s.transcript_id IS NOT NULL AND s.generation<>m.transcript_generation),0) AS stale
@@ -511,7 +511,7 @@ async fn coverage(
         blocker: None,
         next_resume_at_us: None,
     };
-    let mut rows=sqlx::query(&format!("{CHAIN} SELECT m.*,s.* FROM members m LEFT JOIN coordinator_scan_members s ON s.transcript_id=m.id WHERE m.ordinal>?3 ORDER BY m.ordinal LIMIT 9"))
+    let mut rows=sqlx::query(chain_query!(" SELECT m.*,s.* FROM members m LEFT JOIN coordinator_scan_members s ON s.transcript_id=m.id WHERE m.ordinal>?3 ORDER BY m.ordinal LIMIT 9"))
         .bind(&topology.head).bind(&topology.owner).bind(after.unwrap_or(-1)).fetch_all(&mut **tx).await?;
     let has_more = rows.len() > 8;
     rows.truncate(8);

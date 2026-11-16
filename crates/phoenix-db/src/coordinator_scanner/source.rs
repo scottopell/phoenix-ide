@@ -40,7 +40,7 @@ pub(super) fn lane_name(lane: ScanLane) -> &'static str {
     }
 }
 
-pub(super) const CHAIN: &str = "WITH RECURSIVE chain(id, depth) AS (
+macro_rules! chain_query { ($suffix:literal) => { concat!("WITH RECURSIVE chain(id, depth) AS (
  SELECT id,0 FROM conversations WHERE id=?1 AND product_conversation_id=?2
  AND runtime_role='coordinator' AND parent_conversation_id IS NULL
  UNION ALL SELECT p.id,chain.depth+1 FROM chain JOIN conversations p ON p.continued_in_conv_id=chain.id
@@ -48,7 +48,8 @@ pub(super) const CHAIN: &str = "WITH RECURSIVE chain(id, depth) AS (
 ), members AS (
  SELECT c.id, (SELECT MAX(depth) FROM chain)-chain.depth AS ordinal,c.transcript_generation,
  COALESCE((SELECT MAX(sequence_id) FROM messages WHERE conversation_id=c.id),0) AS tail
- FROM chain JOIN conversations c ON c.id=chain.id) ";
+ FROM chain JOIN conversations c ON c.id=chain.id) ", $suffix) }; }
+pub(super) use chain_query;
 
 pub(super) struct Topology {
     pub owner: String,
@@ -80,7 +81,7 @@ pub(super) async fn topology(tx: &mut Transaction<'_, Sqlite>) -> DbResult<Optio
     let Some((owner, head)) = owner(tx).await? else {
         return Ok(None);
     };
-    let maximum: i64 = sqlx::query_scalar(&format!("{CHAIN} SELECT MAX(ordinal) FROM members"))
+    let maximum: i64 = sqlx::query_scalar(chain_query!(" SELECT MAX(ordinal) FROM members"))
         .bind(&head)
         .bind(&owner)
         .fetch_one(&mut **tx)
@@ -96,8 +97,8 @@ pub(super) async fn member_page(
     topology: &Topology,
     start: i64,
 ) -> DbResult<Vec<Member>> {
-    let rows = sqlx::query(&format!(
-        "{CHAIN} SELECT * FROM members WHERE ordinal>=?3 ORDER BY ordinal LIMIT 8"
+    let rows = sqlx::query(chain_query!(
+        " SELECT * FROM members WHERE ordinal>=?3 ORDER BY ordinal LIMIT 8"
     ))
     .bind(&topology.head)
     .bind(&topology.owner)
@@ -111,7 +112,7 @@ pub(super) async fn member(
     topology: &Topology,
     id: &str,
 ) -> DbResult<Option<Member>> {
-    let row = sqlx::query(&format!("{CHAIN} SELECT * FROM members WHERE id=?3"))
+    let row = sqlx::query(chain_query!(" SELECT * FROM members WHERE id=?3"))
         .bind(&topology.head)
         .bind(&topology.owner)
         .bind(id)
