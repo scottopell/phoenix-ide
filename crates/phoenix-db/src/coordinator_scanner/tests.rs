@@ -3,6 +3,136 @@ use crate::{coordinator_tracking::TrackingResumption, Database, MessageContent, 
 use phoenix_core::llm_language::LlmLanguage;
 use sqlx::Row;
 
+fn chronology_fragment(
+    id: &str,
+    created_at_us: i64,
+    role: ScanRole,
+    origin: InputOrigin,
+) -> ScanFragment {
+    ScanFragment {
+        fragment_id: id.into(),
+        message_id: format!("message-{id}"),
+        role,
+        origin,
+        is_meta: false,
+        created_at_us,
+        part_ordinal: 0,
+        utf8_start: 0,
+        utf8_end: 5,
+        complete_message: true,
+        prose_digest: "digest".into(),
+        text: "prose".into(),
+    }
+}
+
+#[test]
+fn scanner_retirement_relation_is_strict_and_does_not_infer_source_authority() {
+    let fragments = vec![
+        chronology_fragment("older", 9, ScanRole::User, InputOrigin::UserApi),
+        chronology_fragment("equal", 10, ScanRole::User, InputOrigin::UserApi),
+        chronology_fragment(
+            "later-user",
+            11,
+            ScanRole::User,
+            InputOrigin::UnknownHistorical,
+        ),
+        chronology_fragment(
+            "later-event",
+            12,
+            ScanRole::User,
+            InputOrigin::SystemGenerated,
+        ),
+        chronology_fragment(
+            "later-assistant",
+            13,
+            ScanRole::Assistant,
+            InputOrigin::UnknownHistorical,
+        ),
+    ];
+    for disposition in [TrackingRetirement::Resolved, TrackingRetirement::Dismissed] {
+        let state = source::retired_candidate_state(disposition, 10, &fragments);
+        let value = serde_json::to_value(&state).unwrap();
+        assert_eq!(
+            value["later_source_fragment_ids"],
+            serde_json::json!(["later-user", "later-event", "later-assistant"])
+        );
+        assert_eq!(value["status"], "retired");
+        assert!(value.get("retired_at_us").is_none());
+        assert_eq!(
+            serde_json::to_value(source::retired_candidate_state(disposition, 13, &fragments))
+                .unwrap()["later_source_fragment_ids"],
+            serde_json::json!([])
+        );
+    }
+    assert!(serde_json::from_value::<ScanCandidateState>(serde_json::json!({"status":"retired","disposition":"tracking","later_source_fragment_ids":[]})).is_err());
+    assert!(serde_json::from_value::<ScanCandidateState>(
+        serde_json::json!({"status":"tracking","retired_at_us":10})
+    )
+    .is_err());
+}
+
+#[tokio::test]
+async fn scanner_retirement_relations_keep_candidate_byte_bound_and_honest_omissions() {
+    use crate::coordinator_tracking::{TrackingMutation, TrackingRecord};
+    let (db, owner) = setup().await;
+    for n in 0..16 {
+        let receipt = native(
+            &db,
+            &owner,
+            TrackingMutation::Record {
+                record: TrackingRecord {
+                    kind: TrackingKind::RequestedWork,
+                    title: format!("Retired concern{n}"),
+                    note: "prior request".into(),
+                    resumption: "x".repeat(256),
+                    references: vec![],
+                    evidence: vec![],
+                },
+            },
+        )
+        .await;
+        native(
+            &db,
+            &owner,
+            TrackingMutation::Retire {
+                id: receipt.item_id,
+                expected_revision: receipt.item_revision,
+                disposition: TrackingRetirement::Dismissed,
+                reason: "r".repeat(256),
+            },
+        )
+        .await;
+    }
+    let fragments: Vec<_> = (0..32)
+        .map(|n| {
+            chronology_fragment(
+                &format!("{n:064x}"),
+                i64::MAX,
+                ScanRole::Assistant,
+                InputOrigin::SystemGenerated,
+            )
+        })
+        .collect();
+    let mut tx = db.pool().begin().await.unwrap();
+    let (candidates, omitted_active, omitted_retired) =
+        source::candidates(&mut tx, &fragments).await.unwrap();
+    assert!(!candidates.is_empty());
+    assert!(candidates.len() < 16);
+    assert!(serde_json::to_vec(&candidates).unwrap().len() <= 8192);
+    assert_eq!(omitted_active, 0);
+    assert_eq!(omitted_retired, 16 - candidates.len());
+    for candidate in candidates {
+        let ScanCandidateState::Retired {
+            later_source_fragment_ids,
+            ..
+        } = candidate.state
+        else {
+            panic!("retired state lost")
+        };
+        assert_eq!(later_source_fragment_ids.len(), 32);
+    }
+}
+
 fn profile() -> ScanProfile {
     ScanProfile {
         connection: ScanConnection::Codex,
@@ -964,11 +1094,14 @@ async fn scanner_fresh_renewal_stays_visible_without_reopening_retired_record() 
     )
     .await;
     let batch = prepare(&db, 2000).await;
-    assert!(batch
-        .input
-        .candidates
-        .iter()
-        .any(|c| c.id == *old && c.disposition == TrackingDisposition::Dismissed));
+    assert!(batch.input.candidates.iter().any(|c| c.id == *old
+        && matches!(
+            c.state,
+            ScanCandidateState::Retired {
+                disposition: TrackingRetirement::Dismissed,
+                ..
+            }
+        )));
     let output = capture(&batch);
     let attempt = reserve(&db, batch, 2000).await;
     let ScanApplyOutcome::Applied {
@@ -1290,11 +1423,14 @@ async fn scanner_manual_retirement_during_inference_conflicts_then_reconciles_cl
         Some(ScanPosition::Boundary { sequence_id: 1 })
     );
     let next = prepare(&db, 2002).await;
-    assert!(next
-        .input
-        .candidates
-        .iter()
-        .any(|c| c.id == *id && c.disposition == TrackingDisposition::Dismissed));
+    assert!(next.input.candidates.iter().any(|c| c.id == *id
+        && matches!(
+            c.state,
+            ScanCandidateState::Retired {
+                disposition: TrackingRetirement::Dismissed,
+                ..
+            }
+        )));
     let attempt = reserve(&db, next, 2002).await;
     db.apply_coordinator_scan(
         &attempt,

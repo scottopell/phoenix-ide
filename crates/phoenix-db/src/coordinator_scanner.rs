@@ -1,5 +1,5 @@
 //! Bounded own-Coordinator transcript capture. REQ-SCAN-001 through REQ-SCAN-008.
-use crate::coordinator_tracking::{TrackingDisposition, TrackingKind};
+use crate::coordinator_tracking::{TrackingKind, TrackingRetirement};
 use phoenix_core::domain::db_schema::InputOrigin;
 use serde::{Deserialize, Serialize};
 
@@ -98,12 +98,20 @@ pub struct ScanFragment {
 pub struct ScanCandidate {
     pub id: String,
     pub kind: TrackingKind,
-    pub disposition: TrackingDisposition,
+    pub state: ScanCandidateState,
     pub title: String,
     pub title_truncated: bool,
     pub context_hint: String,
     pub context_hint_truncated: bool,
-    pub retired_at_us: Option<i64>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ScanCandidateState {
+    Tracking,
+    Retired {
+        disposition: TrackingRetirement,
+        later_source_fragment_ids: Vec<String>,
+    },
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScanInput {

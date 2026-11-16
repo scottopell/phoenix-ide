@@ -1,6 +1,6 @@
 use super::{
-    InputOrigin, ScanCandidate, ScanFragment, ScanLane, ScanPosition, ScanRole,
-    TrackingDisposition, TrackingKind,
+    InputOrigin, ScanCandidate, ScanCandidateState, ScanFragment, ScanLane, ScanPosition, ScanRole,
+    TrackingKind, TrackingRetirement,
 };
 use crate::{Database, DbError, DbResult, MessageContent};
 use phoenix_core::domain::{
@@ -444,6 +444,21 @@ fn clip(value: &str, limit: usize) -> DbResult<(String, bool)> {
         end < value.len(),
     ))
 }
+pub(super) fn retired_candidate_state(
+    disposition: TrackingRetirement,
+    retired_at_us: i64,
+    fragments: &[ScanFragment],
+) -> ScanCandidateState {
+    ScanCandidateState::Retired {
+        disposition,
+        later_source_fragment_ids: fragments
+            .iter()
+            .filter(|fragment| fragment.created_at_us > retired_at_us)
+            .map(|fragment| fragment.fragment_id.clone())
+            .collect(),
+    }
+}
+
 pub(super) async fn candidates(
     tx: &mut Transaction<'_, Sqlite>,
     fragments: &[ScanFragment],
@@ -464,14 +479,23 @@ pub(super) async fn candidates(
             "bookmark" => TrackingKind::Bookmark,
             _ => return Err(invalid("invalid tracking kind")),
         };
-        let disposition = match row.try_get::<String, _>("disposition")?.as_str() {
-            "tracking" => TrackingDisposition::Tracking,
-            "resolved" => TrackingDisposition::Resolved,
-            "dismissed" => TrackingDisposition::Dismissed,
+        let state = match row.try_get::<String, _>("disposition")?.as_str() {
+            "tracking" => ScanCandidateState::Tracking,
+            "resolved" => retired_candidate_state(
+                TrackingRetirement::Resolved,
+                row.try_get("retired_at_us")?,
+                fragments,
+            ),
+            "dismissed" => retired_candidate_state(
+                TrackingRetirement::Dismissed,
+                row.try_get("retired_at_us")?,
+                fragments,
+            ),
             _ => return Err(invalid("invalid disposition")),
         };
+        let is_tracking = matches!(&state, ScanCandidateState::Tracking);
         let (title, title_truncated) = clip(&row.try_get::<String, _>("title")?, 256)?;
-        let hint = if disposition == TrackingDisposition::Tracking {
+        let hint = if is_tracking {
             row.try_get::<String, _>("resumption")?
         } else {
             row.try_get::<String, _>("reason")?
@@ -480,19 +504,18 @@ pub(super) async fn candidates(
         let candidate = ScanCandidate {
             id: row.try_get("id")?,
             kind,
-            disposition,
+            state,
             title,
             title_truncated,
             context_hint,
             context_hint_truncated,
-            retired_at_us: row.try_get("retired_at_us")?,
         };
         out.push(candidate);
         if encoded(&out)?.len() > 8192 {
             out.pop();
             break;
         }
-        if disposition == TrackingDisposition::Tracking {
+        if is_tracking {
             included_active += 1;
         }
     }

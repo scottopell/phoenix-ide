@@ -14,10 +14,13 @@ use phoenix_core::{
 };
 use phoenix_db::{
     coordinator_scanner::{
-        PreparedScanBatch, ScanAction, ScanApplyOutcome, ScanConnection, ScanLane, ScanPreparation,
+        PreparedScanBatch, ScanAction, ScanApplyOutcome, ScanCandidate, ScanCandidateState,
+        ScanConnection, ScanContext, ScanFragment, ScanInput, ScanLane, ScanPreparation,
         ScanProfile, ScanReservation, ScanResult,
     },
-    coordinator_tracking::{TrackingKind, TrackingMutation, TrackingRecord, TrackingRetirement},
+    coordinator_tracking::{
+        TrackingDisposition, TrackingKind, TrackingMutation, TrackingRecord, TrackingRetirement,
+    },
     workflow::{
         AcceptAuthoritativeTurn, ClaimAuthoritativeTurnInput, DirectTurnTerminalObligationInput,
         MaterializeAuthoritativeTurnInput, MaterializeAuthoritativeTurnOutcome,
@@ -98,6 +101,78 @@ struct PreparedCase {
     message_aliases: BTreeMap<String, String>,
 }
 
+#[derive(Serialize, Deserialize)]
+struct PredecessorCandidate {
+    id: String,
+    kind: TrackingKind,
+    disposition: TrackingDisposition,
+    title: String,
+    title_truncated: bool,
+    context_hint: String,
+    context_hint_truncated: bool,
+    retired_at_us: Option<i64>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PredecessorInput {
+    scan_context: ScanContext,
+    fragments: Vec<ScanFragment>,
+    candidates: Vec<PredecessorCandidate>,
+}
+
+fn expected_predecessor_projection(bytes: &[u8], original_input_sha256: &str) -> ScanInput {
+    let old: PredecessorInput = serde_json::from_slice(bytes).unwrap();
+    assert_eq!(
+        digest(serde_json::to_vec(&old).unwrap()),
+        original_input_sha256
+    );
+    let candidates = old
+        .candidates
+        .into_iter()
+        .map(|candidate| {
+            let state = match candidate.disposition {
+                TrackingDisposition::Tracking => {
+                    assert!(candidate.retired_at_us.is_none());
+                    ScanCandidateState::Tracking
+                }
+                disposition @ (TrackingDisposition::Resolved | TrackingDisposition::Dismissed) => {
+                    let retired = candidate
+                        .retired_at_us
+                        .expect("closed predecessor has retirement time");
+                    let disposition = match disposition {
+                        TrackingDisposition::Resolved => TrackingRetirement::Resolved,
+                        TrackingDisposition::Dismissed => TrackingRetirement::Dismissed,
+                        TrackingDisposition::Tracking => unreachable!(),
+                    };
+                    ScanCandidateState::Retired {
+                        disposition,
+                        later_source_fragment_ids: old
+                            .fragments
+                            .iter()
+                            .filter(|fragment| fragment.created_at_us > retired)
+                            .map(|fragment| fragment.fragment_id.clone())
+                            .collect(),
+                    }
+                }
+            };
+            ScanCandidate {
+                id: candidate.id,
+                kind: candidate.kind,
+                state,
+                title: candidate.title,
+                title_truncated: candidate.title_truncated,
+                context_hint: candidate.context_hint,
+                context_hint_truncated: candidate.context_hint_truncated,
+            }
+        })
+        .collect();
+    ScanInput {
+        scan_context: old.scan_context,
+        fragments: old.fragments,
+        candidates,
+    }
+}
+
 struct PairedSeeds {
     root: PathBuf,
     manifest: Value,
@@ -150,6 +225,18 @@ impl PairedSeeds {
             .unwrap();
         assert_eq!(attempts, 0, "paired seeds must never contain live attempts");
         (db, prepared)
+    }
+
+    fn expected_input(&self, original: &PreparedCase) -> ScanInput {
+        assert_eq!(
+            self.manifest_sha256,
+            "9057badc7ac30f3eab61395569b014d497f2afe24c86e914edf8782daf7e230e",
+            "projection conversion is only for the frozen original qualification artifact"
+        );
+        expected_predecessor_projection(
+            &std::fs::read(self.root.join(&original.id).join("input.json")).unwrap(),
+            &original.input_sha256,
+        )
     }
 }
 
@@ -595,6 +682,7 @@ fn raw_proposals(records: &[Value], input: &phoenix_db::coordinator_scanner::Sca
         "scored_independently_of_adapter_or_host_acceptance":true})
 }
 
+#[allow(clippy::too_many_lines)]
 fn validate_prepared(
     case: &Case,
     batch: &PreparedScanBatch,
@@ -673,6 +761,33 @@ fn validate_prepared(
         "genuine visible selection must match frozen fixture: {}",
         case.id
     );
+    for expected in &case.input.candidates {
+        let actual = batch
+            .input()
+            .candidates
+            .iter()
+            .find(|candidate| candidate.id == aliases[&expected.id])
+            .unwrap();
+        let expected_state = if expected.disposition == "tracking" {
+            json!({"status":"tracking"})
+        } else {
+            let retired = time(expected.retired_at.as_ref().unwrap());
+            let later: Vec<_> = batch
+                .input()
+                .fragments
+                .iter()
+                .filter(|fragment| fragment.created_at_us > retired)
+                .map(|fragment| &fragment.fragment_id)
+                .collect();
+            json!({"status":"retired","disposition":expected.disposition,"later_source_fragment_ids":later})
+        };
+        assert_eq!(
+            serde_json::to_value(&actual.state).unwrap(),
+            expected_state,
+            "{} host-computed retirement relation",
+            case.id
+        );
+    }
     if case.id == "U01" {
         let fragment = &batch.input().fragments[0];
         let full = case.host_only_full_source.as_ref().unwrap()["text"]
@@ -717,6 +832,39 @@ async fn scanner_quality_all_real_host_fixtures() {
         let now_us = time(&case.input.scan_context.captured_at);
         let batch = prepare(&db, &profile, now_us).await;
         validate_prepared(case, &batch, &aliases, &event_aliases, &message_aliases);
+        let predecessor = PredecessorInput {
+            scan_context: batch.input().scan_context.clone(),
+            fragments: batch.input().fragments.clone(),
+            candidates: batch
+                .input()
+                .candidates
+                .iter()
+                .map(|actual| {
+                    let expected = case
+                        .input
+                        .candidates
+                        .iter()
+                        .find(|candidate| aliases[&candidate.id] == actual.id)
+                        .unwrap();
+                    PredecessorCandidate {
+                        id: actual.id.clone(),
+                        kind: actual.kind,
+                        disposition: serde_json::from_value(json!(expected.disposition)).unwrap(),
+                        title: actual.title.clone(),
+                        title_truncated: actual.title_truncated,
+                        context_hint: actual.context_hint.clone(),
+                        context_hint_truncated: actual.context_hint_truncated,
+                        retired_at_us: expected.retired_at.as_deref().map(time),
+                    }
+                })
+                .collect(),
+        };
+        let predecessor = serde_json::to_vec(&predecessor).unwrap();
+        let projected = expected_predecessor_projection(&predecessor, &digest(&predecessor));
+        assert_eq!(
+            serde_json::to_value(projected).unwrap(),
+            serde_json::to_value(batch.input()).unwrap()
+        );
         let content_bytes = model::BoundedRequest::new(prompt::INSTRUCTIONS, batch.input())
             .unwrap()
             .content_bytes();
@@ -893,9 +1041,9 @@ async fn coordinator_scanner_quality() {
             let input_bytes = serde_json::to_vec(batch.input()).unwrap();
             if let Some(original) = &original {
                 assert_eq!(
-                    digest(&input_bytes),
-                    original.input_sha256,
-                    "paired source/candidate projection changed"
+                    serde_json::to_value(batch.input()).unwrap(),
+                    serde_json::to_value(seeds.as_ref().unwrap().expected_input(original)).unwrap(),
+                    "only the exact retirement-relative candidate projection may change"
                 );
             }
             total_bytes += request.content_bytes();

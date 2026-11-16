@@ -36,12 +36,19 @@ PHOENIX_SCANNER_QUALITY_OUTPUT=/absolute/new-paired-prepared-directory \
 This verifies the original manifest, corpus, oracles, prepared records and source
 database hashes, then copies the closed databases into the new directory. Seeds
 must contain zero scanner attempts. The normal preparation API runs with the
-revised prompt profile and must produce byte-identical `ScanInput`, preserving
-source/candidate identities, aliases and clocks. Only the prompt, batch binding,
-composed byte count and recorded provenance change. The new manifest records the
-original seed manifest hash. Prior live results remain separate; no stored IDs,
-attempts or frontiers are rewritten. Independent approval of the new complete
-manifest is still required before another live invocation.
+revised prompt profile, preserving source/candidate identities, aliases and
+clocks. The frozen original qualification artifact is read through a test-only
+predecessor projection: each candidate's raw disposition and retirement timestamp
+become a tagged state with the exact supplied fragment IDs whose source times are
+strictly later than retirement. Equality is excluded. The complete actual input
+must equal that deterministic expected transformation; every other field stays
+identical. This conversion is restricted to the original approved manifest and
+is not a production compatibility path. Source roles and provenance are unchanged;
+the computed timing relation grants no authority or semantic matching guarantee.
+The new manifest records the original seed manifest hash. Prior live results
+remain separate; no stored IDs, attempts or frontiers are rewritten. Independent
+approval of the new complete manifest is still required before another live
+invocation.
 
 Preparation creates one real migrated file database per case. Source rows retain
 the supplied role/origin class and prose. Every scanner-source message receives an
