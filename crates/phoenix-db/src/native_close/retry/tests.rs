@@ -158,6 +158,19 @@ fn success_refused(result: LocalAuthorityResult<DbResult<()>>) {
     assert!(matches!(&result, LocalAuthorityResult::DurableFactEstablished(Err(_))), "{result:?}");
 }
 
+fn retry_completed(result: LocalAuthorityResult<DbResult<CloseObligation>>) -> CloseObligation {
+    let LocalAuthorityResult::DurableFactEstablished(Ok(obligation)) = result else {
+        panic!("expected classified native retry completion: {result:?}");
+    };
+    obligation
+}
+
+fn completion_refused(result: LocalAuthorityResult<DbResult<CloseObligation>>) {
+    assert!(matches!(&result,
+        LocalAuthorityResult::DurableFactEstablished(Err(DbError::CloseFoundationPrecondition(_)))
+    ), "{result:?}");
+}
+
 async fn assert_no_admission(db: &Database, attempt: &CloseAttemptId) {
     let counts: (i64, i64, i64, i64, i64) = sqlx::query_as(
         "SELECT
@@ -454,8 +467,9 @@ async fn native_retry_freezes_header_and_effect_plan_and_keeps_generic_fence() {
     assert!(violations.is_empty());
 }
 
+#[allow(clippy::too_many_lines)]
 #[tokio::test]
-async fn native_retry_uses_g1_residuals_not_g2_success() {
+async fn native_retry_finalizes_exact_g1_successes_without_rebinding_current_g2() {
     let db = Database::open_in_memory().await.unwrap();
     let mut failure = initial_cleanup_failure_fixture_with_resources(
         &db, CloseStopCertainty::ShutdownUncertain, Vec::new(),
@@ -530,6 +544,77 @@ async fn native_retry_uses_g1_residuals_not_g2_success() {
     assert!(!progress.pending.contains(effect));
     let current = current_test_snapshot(&db, failure.attempt_id.as_str()).await;
     assert_ne!(current, original);
+    let retained: (String, String) = sqlx::query_as(
+        "SELECT inspection_generation, inspection_fingerprint FROM native_close_retry_plans",
+    ).fetch_one(db.pool()).await.unwrap();
+    assert_eq!(retained, bound);
+
+    // A retired worktree is not retirement of its independently planned WorkScope.
+    assert_eq!(progress.pending.len(), 1);
+    assert_eq!(progress.pending[0].resource, work_scope);
+    let incomplete = db.get_close_obligation(failure.attempt_id.as_str()).await.unwrap();
+    let before_messages: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages")
+        .fetch_one(db.pool()).await.unwrap();
+    completion_refused(db.complete_native_close_retry(&assessment.command, &receipt.admitted).await);
+    assert_eq!(db.get_close_obligation(failure.attempt_id.as_str()).await.unwrap(), incomplete);
+    assert_eq!(db.get_close_run(&run).await.unwrap().status, CloseRunStatus::Running);
+    let messages: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages")
+        .fetch_one(db.pool()).await.unwrap();
+    assert_eq!(messages, before_messages);
+
+    success_recorded(db.record_native_close_retry_success(
+        &assessment.command, &receipt.admitted, &progress.pending[0], "G1 scope independently retired",
+    ).await);
+    assert!(db.close_safe_retry_progress(&run).await.unwrap().pending.is_empty());
+    // Even a completely successful native plan cannot use the unfenced legacy entry point.
+    assert!(db.complete_close_safe_retry(&run).await.is_err());
+    let predecessor = CloseRunRef::initial(failure.attempt_id.clone());
+    let stopped = db.get_close_run(&predecessor).await.unwrap();
+    let failures = db.list_close_cleanup_failures(failure.attempt_id.as_str()).await.unwrap();
+    let metadata = lookup_metadata(&db, &failure.attempt_id).await;
+    let completed = retry_completed(db.complete_native_close_retry(&assessment.command, &receipt.admitted).await);
+    assert_eq!(completed.attempt_id(), &failure.attempt_id);
+    assert_eq!(completed.close_outcome(), Some(CloseCompletionOutcome::Archived));
+    assert_eq!(completed.snapshot(), Some(&current));
+    assert_eq!(db.get_close_run(&run).await.unwrap().status, CloseRunStatus::Completed);
+    assert_eq!(db.get_close_run(&predecessor).await.unwrap(), stopped);
+    assert_eq!(stopped.status, CloseRunStatus::Stopped);
+    assert_eq!(db.list_close_cleanup_failures(failure.attempt_id.as_str()).await.unwrap(), failures);
+    assert_eq!(lookup_metadata(&db, &failure.attempt_id).await, metadata);
+    let all_archived: bool = sqlx::query_scalar(
+        "SELECT NOT EXISTS (SELECT 1 FROM conversations conversation
+         JOIN close_attempt_participants participant ON participant.conversation_id = conversation.id
+         WHERE participant.attempt_id = ?1 AND conversation.archived != 1)",
+    ).bind(failure.attempt_id.as_str()).fetch_one(db.pool()).await.unwrap();
+    assert!(all_archived);
+    let lifecycle: String = sqlx::query_scalar("SELECT ordinary_lifecycle FROM product_conversations WHERE id = ?1")
+        .bind(failure.source_product_conversation_id.as_str()).fetch_one(db.pool()).await.unwrap();
+    assert_eq!(lifecycle, "history");
+    let message_id = format!("close-run-outcome:{}:{}", run.ordinal.get(), failure.attempt_id);
+    let message: (String, String) = sqlx::query_as(
+        "SELECT conversation_id, content FROM messages WHERE message_id = ?1",
+    ).bind(&message_id).fetch_one(db.pool()).await.unwrap();
+    let latest: String = sqlx::query_scalar(
+        "SELECT conversation_id FROM close_attempt_members
+         WHERE attempt_id = ?1 AND member_role IN ('latest', 'root_latest')",
+    ).bind(failure.attempt_id.as_str()).fetch_one(db.pool()).await.unwrap();
+    assert_eq!(message.0, latest);
+    assert!(message.1.contains("completed; cleanup retired and conversation archived in History"));
+
+    // The historical command receipt is observationally replayable. Finalization is
+    // intentionally not: the completed run is no longer execution authority.
+    assert_eq!(db.read_native_close_explicit_retry_receipt(&assessment.command).await.unwrap(), Some(receipt.admitted.clone()));
+    assert!(matches!(db.apply_native_close_explicit_retry(&assessment).await,
+        LocalAuthorityResult::DurableFactEstablished(Ok(NativeCloseRetryResult::Replay(replay)))
+            if replay.admitted == receipt.admitted));
+    for _ in 0..2 {
+        completion_refused(db.complete_native_close_retry(&assessment.command, &receipt.admitted).await);
+    }
+    assert_eq!(db.get_close_obligation(failure.attempt_id.as_str()).await.unwrap(), completed);
+    assert_eq!(lookup_metadata(&db, &failure.attempt_id).await, metadata);
+    let messages: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages")
+        .fetch_one(db.pool()).await.unwrap();
+    assert_eq!(messages, before_messages + 1);
     let retained: (String, String) = sqlx::query_as(
         "SELECT inspection_generation, inspection_fingerprint FROM native_close_retry_plans",
     ).fetch_one(db.pool()).await.unwrap();

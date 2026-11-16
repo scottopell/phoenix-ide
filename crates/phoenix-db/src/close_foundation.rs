@@ -5898,9 +5898,32 @@ impl Database {
     /// Atomically archives the original outcome after complete exact-run retry proof.
     ///
     /// # Errors
-    /// Rejects incomplete, stopped, stale, or unauthorized scope-free retry runs.
+    /// Rejects native-managed operations and incomplete, stopped, stale, or
+    /// unauthorized scope-free retry runs.
     pub async fn complete_close_safe_retry(&self, run: &CloseRunRef) -> DbResult<CloseObligation> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let native_managed: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM close_obligations
+             WHERE attempt_id = ?1 AND native_managed = 1)",
+        )
+        .bind(run.attempt_id.as_str())
+        .fetch_one(&mut *tx)
+        .await?;
+        if native_managed {
+            return Err(close_precondition("native retry completion requires its live source binding"));
+        }
+        let obligation = Self::complete_close_retry_tx(&mut tx, run).await?;
+        tx.commit().await?;
+        Ok(obligation)
+    }
+
+    // Shared completion mechanics, not an admission authority. Callers must first fence
+    // either non-native access or the exact live native source/receipt/original plan in
+    // this same immediate transaction. This body still requires every planned success.
+    pub(crate) async fn complete_close_retry_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        run: &CloseRunRef,
+    ) -> DbResult<CloseObligation> {
         let eligible: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM close_runs run
             JOIN close_obligations obligation ON obligation.attempt_id = run.attempt_id
             WHERE run.attempt_id = ?1 AND run.run_ordinal = ?2 AND run.run_ordinal > 1
@@ -5925,7 +5948,7 @@ impl Database {
               AND NOT EXISTS (SELECT 1 FROM close_run_retry_effects effect WHERE effect.attempt_id = run.attempt_id
                 AND effect.run_ordinal = run.run_ordinal AND NOT EXISTS (SELECT 1 FROM close_run_retry_successes success
                   WHERE success.attempt_id = effect.attempt_id AND success.run_ordinal = effect.run_ordinal AND success.ordinal = effect.ordinal)))")
-            .bind(run.attempt_id.as_str()).bind(run.ordinal.get()).fetch_one(&mut *tx).await?;
+            .bind(run.attempt_id.as_str()).bind(run.ordinal.get()).fetch_one(&mut **tx).await?;
         if !eligible {
             return Err(close_precondition(
                 "retry completion requires exact running run and complete successful plan",
@@ -5933,12 +5956,12 @@ impl Database {
         }
         let now = Utc::now().to_rfc3339();
         let latest: String = sqlx::query_scalar("SELECT conversation_id FROM close_attempt_members WHERE attempt_id = ?1 AND member_role IN ('latest', 'root_latest')")
-            .bind(run.attempt_id.as_str()).fetch_one(&mut *tx).await?;
+            .bind(run.attempt_id.as_str()).fetch_one(&mut **tx).await?;
         let sequence: i64 = sqlx::query_scalar(
             "SELECT COALESCE(MAX(sequence_id), 0) + 1 FROM messages WHERE conversation_id = ?1",
         )
         .bind(&latest)
-        .fetch_one(&mut *tx)
+        .fetch_one(&mut **tx)
         .await?;
         let content = MessageContent::system(format!(
             "Close retry run {} for attempt {} completed; cleanup retired and conversation archived in History.",
@@ -5950,24 +5973,22 @@ impl Database {
         sqlx::query("INSERT INTO messages (message_id, conversation_id, sequence_id, message_type, content, created_at)
             VALUES (?1, ?2, ?3, 'system', ?4, ?5)")
             .bind(format!("close-run-outcome:{}:{}", run.ordinal.get(), run.attempt_id))
-            .bind(&latest).bind(sequence).bind(content).bind(&now).execute(&mut *tx).await?;
+            .bind(&latest).bind(sequence).bind(content).bind(&now).execute(&mut **tx).await?;
         sqlx::query("UPDATE conversations SET archived = 1, updated_at = ?2
             WHERE id IN (SELECT conversation_id FROM close_attempt_participants WHERE attempt_id = ?1)")
-            .bind(run.attempt_id.as_str()).bind(&now).execute(&mut *tx).await?;
+            .bind(run.attempt_id.as_str()).bind(&now).execute(&mut **tx).await?;
         sqlx::query("UPDATE product_conversations SET ordinary_lifecycle = 'history'
             WHERE id = (SELECT product_conversation_id FROM close_obligations WHERE attempt_id = ?1) AND kind = 'ordinary'")
-            .bind(run.attempt_id.as_str()).execute(&mut *tx).await?;
+            .bind(run.attempt_id.as_str()).execute(&mut **tx).await?;
         let changed = sqlx::query("UPDATE close_obligations SET close_outcome = 'archived', updated_at = ?2
             WHERE attempt_id = ?1 AND phase = 'completed' AND close_outcome IN ('close_incomplete', 'archived_cleanup_attention')")
-            .bind(run.attempt_id.as_str()).bind(&now).execute(&mut *tx).await?;
+            .bind(run.attempt_id.as_str()).bind(&now).execute(&mut **tx).await?;
         if changed.rows_affected() != 1 {
             return Err(close_precondition(
                 "retry completion lost terminal authority",
             ));
         }
-        let obligation = close_obligation_for_update(&mut tx, run.attempt_id.as_str()).await?;
-        tx.commit().await?;
-        Ok(obligation)
+        close_obligation_for_update(tx, run.attempt_id.as_str()).await
     }
 
     /// Records interrupted-run uncertainty and one mandatory event without executing cleanup.

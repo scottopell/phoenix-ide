@@ -64,7 +64,7 @@ jobs:
           grep -F 'startup_and_observer_interrupt_native_retry_from_original_pending_plan_preserving_allowance: test' evidence/selected-tests.txt
           grep -F 'migration_159_excludes_legacy_sealed_inventory_and_preserves_shared_g2_capture: test' evidence/selected-tests.txt
           grep -F 'native_retry_success_requires_exact_live_receipt_effect_and_evidence_before_replay: test' evidence/selected-tests.txt
-          grep -F 'native_retry_uses_g1_residuals_not_g2_success: test' evidence/selected-tests.txt
+          grep -F 'native_retry_finalizes_exact_g1_successes_without_rebinding_current_g2: test' evidence/selected-tests.txt
           grep -F 'retry_interruption_uses_pending_effect_not_successful_prior_resource: test' evidence/selected-tests.txt
           for test in \
             explicit_retry_receipt_lookup_returns_none_without_admission_or_outbox_changes \

@@ -25,6 +25,19 @@ async fn record_source_bound_success(
     db.record_native_close_retry_success(&assessment.command, &admitted, effect, detail).await
 }
 
+async fn complete_source_bound_retry(
+    db: &Database,
+    assessment: &Assessment,
+    run: &CloseRunRef,
+) -> LocalAuthorityResult<DbResult<CloseObligation>> {
+    let admitted = crate::native_close::NativeCloseRunRef {
+        target: assessment.command.intent().target().clone(),
+        attempt_id: run.attempt_id.clone(),
+        run_ordinal: run.ordinal,
+    };
+    db.complete_native_close_retry(&assessment.command, &admitted).await
+}
+
 async fn write_source_fence_state(
     db: &Database,
     command: &NativeCloseCommand,
@@ -73,6 +86,7 @@ async fn assert_native_retry_stopped(
     authority: CloseCleanupFailureAuthority,
 ) {
     assert_eq!(db.get_close_run(run).await.unwrap().status, CloseRunStatus::Stopped);
+    completion_refused(complete_source_bound_retry(db, assessment, run).await);
     let failures = db.list_close_cleanup_failures(run.attempt_id.as_str()).await.unwrap();
     let matching: Vec<_> = failures.iter().filter(|failure| failure.run_ordinal == run.ordinal).collect();
     assert_eq!(matching.len(), 1);
@@ -250,7 +264,7 @@ async fn source_fence_preserves_successes_and_reports_only_exact_pending_effects
     success_refused(record_source_bound_success(
         &db, &assessment, &run, &progress.pending[0], "must not retire an effect after source stop",
     ).await);
-    assert!(db.complete_close_safe_retry(&run).await.is_err());
+    completion_refused(complete_source_bound_retry(&db, &assessment, &run).await);
 }
 
 #[tokio::test]
@@ -279,7 +293,7 @@ async fn empty_pending_source_fence_does_not_invent_allowance_or_failed_resource
         write_source_fence_state(&db, &assessment.command, &ConvState::Idle, replay).await.unwrap();
         assert_source_fenced(&db, &assessment, &run, &[]).await;
         assert_eq!(source_fence_allowance(&db, &run).await, None);
-        assert!(db.complete_close_safe_retry(&run).await.is_err());
+        completion_refused(complete_source_bound_retry(&db, &assessment, &run).await);
     }
 }
 
@@ -293,7 +307,7 @@ async fn finalized_native_retry_only_suppresses_allowance_on_source_loss() {
                 &db, &assessment, &run, effect, "retired before finalization",
             ).await);
         }
-        let completed = db.complete_close_safe_retry(&run).await.unwrap();
+        let completed = retry_completed(complete_source_bound_retry(&db, &assessment, &run).await);
         assert_eq!(completed.close_outcome(), Some(CloseCompletionOutcome::Archived));
         assert_eq!(db.get_close_run(&run).await.unwrap().status, CloseRunStatus::Completed);
         let failures = db.list_close_cleanup_failures(run.attempt_id.as_str()).await.unwrap();
@@ -550,7 +564,7 @@ async fn startup_leaves_completed_native_retry_and_allowance_untouched() {
                     &db, &assessment, &run, &effect, "retired before completion",
                 ).await);
             }
-            let completed = db.complete_close_safe_retry(&run).await.unwrap();
+            let completed = retry_completed(complete_source_bound_retry(&db, &assessment, &run).await);
             set_startup_allowance_bits(&db, &run, consumed, suppressed).await;
             let retained_run = db.get_close_run(&run).await.unwrap();
             let failures = db.list_close_cleanup_failures(run.attempt_id.as_str()).await.unwrap();

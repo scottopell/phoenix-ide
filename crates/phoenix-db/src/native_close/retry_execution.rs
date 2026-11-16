@@ -1,6 +1,6 @@
-//! Source-bound success recording for the exact admitted native resource plan.
+//! Source-bound success recording and finalization of the exact admitted native resource plan.
 
-use phoenix_core::domain::close::CloseRunRef;
+use phoenix_core::domain::close::{CloseObligation, CloseRunRef};
 use sqlx::{Sqlite, Transaction};
 
 use super::{NativeCloseCommand, NativeCloseIntent, NativeCloseRunRef};
@@ -49,6 +49,56 @@ impl Database {
         }
     }
 
+    /// Completes only the exact latest running native retry after every persisted effect
+    /// (including independent WorkScope retirement) has durably succeeded.
+    /// The source actor must first hold and check its exclusive live source occurrence;
+    /// this transactional fence does not itself authorize dispatch.
+    ///
+    /// Historical command receipts remain replayable with a live source, but a second
+    /// finalization deliberately refuses the completed run. It never allocates a run
+    /// or inserts a second outcome message, and does not consume or renew an allowance.
+    ///
+    /// # Errors
+    /// Source, receipt, original-plan, incomplete-proof and storage errors are classified
+    /// only when rollback establishes no mutation committed. Commit or rollback
+    /// uncertainty returns `DurableFactUnclassified`, as for success recording.
+    pub async fn complete_native_close_retry(
+        &self,
+        command: &NativeCloseCommand,
+        admitted: &NativeCloseRunRef,
+    ) -> LocalAuthorityResult<DbResult<CloseObligation>> {
+        let mut tx = match self.pool.begin_with("BEGIN IMMEDIATE").await {
+            Ok(tx) => tx,
+            Err(error) => return LocalAuthorityResult::DurableFactEstablished(Err(error.into())),
+        };
+        let result = Self::complete_native_close_retry_tx(&mut tx, command, admitted).await;
+        match result {
+            Ok(obligation) => match tx.commit().await {
+                Ok(()) => LocalAuthorityResult::DurableFactEstablished(Ok(obligation)),
+                Err(_) => LocalAuthorityResult::DurableFactUnclassified,
+            },
+            Err(error) => match tx.rollback().await {
+                Ok(()) => LocalAuthorityResult::DurableFactEstablished(Err(error)),
+                Err(_) => LocalAuthorityResult::DurableFactUnclassified,
+            },
+        }
+    }
+
+    async fn complete_native_close_retry_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        command: &NativeCloseCommand,
+        admitted: &NativeCloseRunRef,
+    ) -> DbResult<CloseObligation> {
+        Self::require_native_close_retry_plan_tx(tx, command, admitted).await?;
+        let run = CloseRunRef {
+            attempt_id: admitted.attempt_id.clone(),
+            ordinal: admitted.run_ordinal,
+        };
+        // The common storage boundary requires every exact effect's success before
+        // atomically writing the outcome message, History and terminal run disposition.
+        Self::complete_close_retry_tx(tx, &run).await
+    }
+
     async fn record_native_close_retry_success_tx(
         tx: &mut Transaction<'_, Sqlite>,
         command: &NativeCloseCommand,
@@ -56,13 +106,28 @@ impl Database {
         effect: &CloseSafeRetryEffect,
         detail: &str,
     ) -> DbResult<()> {
+        let effect_count = Self::require_native_close_retry_plan_tx(tx, command, admitted).await?;
+        let run = CloseRunRef {
+            attempt_id: admitted.attempt_id.clone(),
+            ordinal: admitted.run_ordinal,
+        };
+        Self::record_native_close_retry_success_effect_tx(tx, &run, effect, detail, effect_count).await
+    }
+
+    // Shared by success recording and finalization; receipt identity never replaces
+    // current source authority, and neither boundary rebinds original G1 to current G2.
+    async fn require_native_close_retry_plan_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        command: &NativeCloseCommand,
+        admitted: &NativeCloseRunRef,
+    ) -> DbResult<i64> {
         // Source authority must precede receipt lookup, even for retained success replay.
         super::receipts::require_source_and_target_tx(tx, command).await?;
         let NativeCloseIntent::ExplicitRetry { failed_run_ordinal, .. } = command.intent() else {
-            return Err(refused("native retry success requires an explicit retry intent"));
+            return Err(refused("native retry execution requires an explicit retry intent"));
         };
         if super::receipts::read_receipt_tx(tx, command).await?.as_ref() != Some(admitted) {
-            return Err(refused("native retry success requires its exact admitted receipt"));
+            return Err(refused("native retry execution requires its exact admitted receipt"));
         }
         // Original G1 authority is deliberate: the obligation may retain a later G2 inspection.
         let effect_count: Option<i64> = sqlx::query_scalar(
@@ -96,12 +161,8 @@ impl Database {
         .fetch_optional(&mut **tx)
         .await?;
         let effect_count = effect_count.ok_or_else(|| {
-            refused("native retry success requires its exact latest running original-bound plan")
+            refused("native retry execution requires its exact latest running original-bound plan")
         })?;
-        let run = CloseRunRef {
-            attempt_id: admitted.attempt_id.clone(),
-            ordinal: admitted.run_ordinal,
-        };
-        Self::record_native_close_retry_success_effect_tx(tx, &run, effect, detail, effect_count).await
+        Ok(effect_count)
     }
 }
