@@ -151,7 +151,8 @@ async fn native_admitted_manager_loss_before_closure_write_is_known_failure() {
     assert!(runtime
         .native_spawn_observed(NativeSpawnObservation::Closure(Ok(receipt)))
         .await
-        .is_err());
+        .unwrap()
+        .is_none());
     assert!(matches!(
         runtime.state,
         ConvState::Error {
