@@ -23,9 +23,9 @@ use crate::runtime::{AdmittedOperation, RuntimeManager};
 mod model;
 mod prompt;
 #[cfg(test)]
-mod tests;
-#[cfg(test)]
 mod quality;
+#[cfg(test)]
+mod tests;
 
 const REVISIT_INTERVAL: Duration = Duration::from_secs(30);
 const PASS_PACE: Duration = Duration::from_secs(1);

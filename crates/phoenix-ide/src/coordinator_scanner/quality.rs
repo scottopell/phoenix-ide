@@ -689,7 +689,8 @@ async fn coordinator_scanner_quality() {
     let identity = identity(service.as_ref(), &profile);
     let static_manifest = json!({"identity":identity,"corpus_sha256":digest(&corpus_bytes),
         "oracles_sha256":digest(&oracle_bytes),"test_binary_sha256":executable_hash(),
-        "source_commit":String::from_utf8(std::process::Command::new("git").args(["rev-parse","HEAD"]).current_dir(root()).output().unwrap().stdout).unwrap().trim(),
+        "compiled_source_commit":env!("PHOENIX_GIT_SHA"),
+        "workspace_commit":String::from_utf8(std::process::Command::new("git").args(["rev-parse","HEAD"]).current_dir(root()).output().unwrap().stdout).unwrap().trim(),
         "oracle_shown_to_model":false,"inference_source":"actual Database::prepare_coordinator_scan ScanInput only",
         "quality_gates":serde_json::from_slice::<Value>(&corpus_bytes).unwrap()["gates"],
         "denominators":serde_json::from_slice::<Value>(&corpus_bytes).unwrap()["denominators"]});

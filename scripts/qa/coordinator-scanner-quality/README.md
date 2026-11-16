@@ -48,7 +48,8 @@ full source/candidate seeds populate the disposable database, and only the real
 bounded projection enters inference. All actual fragment IDs, offsets, roles,
 origins, candidate IDs/omissions, request byte counts, source database hashes and
 bindings are retained. The manifest freezes corpus/oracle hashes, production
-prompt and DTO source hashes, exact executable, code commit, actual outbound
+prompt and DTO source hashes, exact executable, embedded compile-time source commit and preparation workspace
+commit, actual outbound
 model/connection, endpoint hash and limits. No account or credential is printed.
 
 After independent review of that exact manifest and all revised inputs, an
