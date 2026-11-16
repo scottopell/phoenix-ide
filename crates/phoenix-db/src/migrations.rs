@@ -5,7 +5,7 @@
 
 use std::collections::HashSet;
 
-use sqlx::{Connection, Row, Sqlite, SqlitePool, Transaction};
+use sqlx::{Connection,Row,Sqlite,SqlitePool,Transaction};
 
 use phoenix_core::work_scope::WorkScopeId;
 
