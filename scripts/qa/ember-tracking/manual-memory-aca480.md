@@ -23,7 +23,7 @@ The record retained evaluation-only scope and the instruction to await the answe
 - Source: `aca480f4a18de64405add16cbb5df1028725cd1c`; rebased code is unchanged under `7cd519c5d`.
 - Model: `gpt-6-astra`, explicit High effort, logged `CodexAuth` route. The manual harness did not record an endpoint-configuration fingerprint; combined qualification must record it.
 - Actual runtime registry, PhoenixNative instructions, no authenticated skill catalog in this fixture; no canned tracking results.
-- Maximum 15 logical provider requests, 2,000,000 accumulated request Debug bytes, 2,048 output tokens/request, eight tool cycles/turn and 120 seconds/turn. These are execution bounds, not a dollar ceiling.
+- Enforced bounds: 15 logical provider requests, 2,000,000 accumulated request Debug bytes, eight tool cycles/turn and 120 seconds/turn. The request asks for 2,048 output tokens, but Codex omits that unsupported generation-limit field. It is not an enforced Codex generation or billing ceiling; the observed complete run returned 984 reported output tokens in total.
 - Observed: 12 successful requests, seven tool calls, 156,952 reported input tokens including cache, 984 output tokens, 1,842,030 request Debug bytes and 49.71 seconds test wall time. Input counts are additive normalized provider usage, not estimated billing.
 - System-content Debug SHA256: `f9a53859c08db848637225466ccf75ba095b864a013e7cd9de2b3bb904ff3074`.
 - Retained exact executable SHA256: `d4784243bf196891a955690bd317e624b50a32a579c2eb7b757a696b6db3a9b9`.
