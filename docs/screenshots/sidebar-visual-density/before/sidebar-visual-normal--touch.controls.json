@@ -1,0 +1,82 @@
+[
+  {
+    "name": "",
+    "contentFits": true,
+    "x": 12,
+    "right": 40,
+    "width": 28,
+    "height": 28,
+    "sidebarRight": 280,
+    "sidebarLeft": 0
+  },
+  {
+    "name": "Phoenix",
+    "contentFits": true,
+    "x": 48,
+    "right": 124.703125,
+    "width": 76.703125,
+    "height": 32,
+    "sidebarRight": 280,
+    "sidebarLeft": 0
+  },
+  {
+    "name": "+ New",
+    "contentFits": true,
+    "x": 132.703125,
+    "right": 185,
+    "width": 52.296875,
+    "height": 38,
+    "sidebarRight": 280,
+    "sidebarLeft": 0
+  },
+  {
+    "name": "Home terminal",
+    "contentFits": true,
+    "x": 193,
+    "right": 229,
+    "width": 36,
+    "height": 36,
+    "sidebarRight": 280,
+    "sidebarLeft": 0
+  },
+  {
+    "name": "Settings",
+    "contentFits": true,
+    "x": 237,
+    "right": 267,
+    "width": 30,
+    "height": 30,
+    "sidebarRight": 280,
+    "sidebarLeft": 0
+  },
+  {
+    "name": "Open Ember",
+    "contentFits": true,
+    "x": 12,
+    "right": 267,
+    "width": 255,
+    "height": 48,
+    "sidebarRight": 280,
+    "sidebarLeft": 0
+  },
+  {
+    "name": "Open5",
+    "contentFits": true,
+    "x": 12,
+    "right": 137.5,
+    "width": 125.5,
+    "height": 22,
+    "sidebarRight": 280,
+    "sidebarLeft": 0
+  },
+  {
+    "name": "History0",
+    "contentFits": true,
+    "x": 141.5,
+    "right": 267,
+    "width": 125.5,
+    "height": 22,
+    "sidebarRight": 280,
+    "sidebarLeft": 0
+  }
+]

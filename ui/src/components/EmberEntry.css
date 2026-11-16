@@ -108,6 +108,21 @@
   border: 1.5px solid var(--accent-blue, #3b82f6);
 }
 
+.sidebar .ember-entry-copy strong,
+.sidebar .ember-entry-copy small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .ember-entry.unread .ember-entry-copy strong {
   font-weight: 700;
+}
+
+.sidebar .ember-entry {
+  font-family: inherit;
+}
+
+.sidebar .ember-entry-arrow {
+  flex-shrink: 0;
 }

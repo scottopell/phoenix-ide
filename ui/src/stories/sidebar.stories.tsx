@@ -24,3 +24,9 @@ CollapsedOverflow.storyName = 'collapsed-overflow';
 
 export const ProductActionsContinued = storyFor('product-actions-continued');
 ProductActionsContinued.storyName = 'product-actions-continued';
+
+export const VisualNormal = storyFor('sidebar-visual-normal');
+export const VisualNarrow = storyFor('sidebar-visual-narrow');
+
+VisualNormal.storyName = 'sidebar-visual-normal';
+VisualNarrow.storyName = 'sidebar-visual-narrow';

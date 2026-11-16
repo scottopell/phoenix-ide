@@ -1,3 +1,4 @@
+import './SidebarFixture.css';
 import { useEffect, useMemo, useState } from 'react';
 import { MemoryRouter } from 'react-router-dom';
 import { Sidebar } from '../../components/Sidebar';
@@ -37,7 +38,7 @@ function SidebarFixtureBody({ scenario }: Props) {
         archivedConversations={sidebarFixtureData.archivedConversations}
         activeSlug={scenario.activeSlug}
         onConversationCreated={() => {}}
-        width={320}
+        width={scenario.sidebarWidth ?? 320}
       />
       <section className="sidebar-fixture-notes" aria-label="Fixture notes">
         <h1 className="sidebar-fixture-title">{scenario.id}</h1>
