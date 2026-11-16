@@ -7,7 +7,9 @@ use crate::{workflow::LocalAuthorityResult, Database, DbError, DbResult};
 
 pub const TRACKING_PAGE_SIZE: usize = 8;
 pub const TRACKING_REVIEW_INTERVAL_US: i64 = 86_400_000_000;
-const EVIDENCE_PAGE_SIZE: usize = 16;
+const EVIDENCE_PAGE_SIZE: usize = 8;
+const RETIREMENT_PAGE_SIZE: usize = 8;
+pub const TRACKING_DETAIL_BYTES: usize = 96 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -225,6 +227,36 @@ fn invalid(message: &str) -> DbError {
 fn count(value: usize) -> DbResult<i64> {
     i64::try_from(value).map_err(|_| invalid("collection count exceeds storage bounds"))
 }
+fn encoded_limit<T: Serialize + ?Sized>(value: &T, limit: usize, label: &str) -> DbResult<()> {
+    let size = serde_json::to_vec(value)
+        .map_err(|error| invalid(&error.to_string()))?
+        .len();
+    if size > limit {
+        return Err(invalid(&format!(
+            "{label} exceeds {limit} serialized JSON bytes; shorten the saved text or references"
+        )));
+    }
+    Ok(())
+}
+fn editable_fields(
+    kind: TrackingKind,
+    title: &str,
+    note: &str,
+    resumption: &str,
+    references: &[TrackingReference],
+) -> DbResult<()> {
+    bounded(title, 160, true)?;
+    bounded(note, 8192, false)?;
+    bounded(resumption, 4096, false)?;
+    if references.len() > 16 {
+        return Err(invalid("at most 16 references"));
+    }
+    encoded_limit(
+        &(kind, title, note, resumption, references),
+        16 * 1024,
+        "combined title/note/resumption/references",
+    )
+}
 fn bounded(value: &str, max: usize, nonblank: bool) -> DbResult<()> {
     if value.len() > max || (nonblank && value.trim().is_empty()) {
         Err(invalid("blank or oversized text"))
@@ -242,6 +274,7 @@ fn digest(value: &[u8]) -> String {
 }
 
 async fn require_owner(tx: &mut Transaction<'_, Sqlite>, source: &str) -> DbResult<String> {
+    bounded(source, 256, true)?;
     crate::product_conversation_rename::require_current_gc_tx(tx, source).await?;
     let owner: String =
         sqlx::query_scalar("SELECT product_conversation_id FROM conversations WHERE id=?1")
@@ -302,6 +335,7 @@ async fn append_evidence(
         bounded(&evidence.transcript_id, 256, true)?;
         bounded(&evidence.message_id, 256, true)?;
         bounded(&evidence.quotation, 4096, true)?;
+        encoded_limit(evidence, 4096, "complete evidence entry including locators")?;
         let result = sqlx::query("INSERT OR IGNORE INTO coordinator_tracking_evidence(item_id,ordinal,instance_id,transcript_id,message_id,quotation,digest,recorded_at_us) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)")
    .bind(id).bind(ordinal+1).bind(&evidence.instance_id).bind(&evidence.transcript_id).bind(&evidence.message_id).bind(&evidence.quotation).bind(digest(evidence.quotation.as_bytes())).bind(now).execute(&mut **tx).await?;
         if result.rows_affected() == 1 {
@@ -544,12 +578,13 @@ impl Database {
         let now = Utc::now().timestamp_micros();
         let (id, revision, changed) = match mutation {
             TrackingMutation::Record { record } => {
-                bounded(&record.title, 160, true)?;
-                bounded(&record.note, 8192, false)?;
-                bounded(&record.resumption, 4096, false)?;
-                if record.references.len() > 16 {
-                    return Err(invalid("at most 16 references"));
-                }
+                editable_fields(
+                    record.kind,
+                    &record.title,
+                    &record.note,
+                    &record.resumption,
+                    &record.references,
+                )?;
                 let id = uuid::Uuid::new_v4().to_string();
                 sqlx::query("INSERT INTO coordinator_tracking_items(id,kind,title,note,resumption,revision,reviewed_evidence_ordinal,created_at_us,updated_at_us,reviewed_at_us) VALUES(?1,?2,?3,?4,?5,1,0,?6,?6,?6)").bind(&id).bind(record.kind.as_str()).bind(&record.title).bind(&record.note).bind(&record.resumption).bind(now).execute(&mut **tx).await?;
                 for (ordinal, reference) in record.references.iter().enumerate() {
@@ -620,12 +655,7 @@ impl Database {
                         if !active {
                             return Err(invalid("retired item requires explicit reopen"));
                         }
-                        bounded(title, 160, true)?;
-                        bounded(note, 8192, false)?;
-                        bounded(resumption, 4096, false)?;
-                        if references.len() > 16 {
-                            return Err(invalid("at most 16 references"));
-                        }
+                        editable_fields(*kind, title, note, resumption, references)?;
                         let latest = latest_evidence(tx, id).await?;
                         if *reviewed_evidence_ordinal != latest {
                             return Err(invalid(
@@ -654,6 +684,7 @@ impl Database {
                             return Err(invalid("already retired; read retained reason"));
                         }
                         bounded(reason, 4096, true)?;
+                        encoded_limit(reason, 4096, "retirement reason")?;
                         let disposition = match disposition {
                             TrackingRetirement::Resolved => "resolved",
                             TrackingRetirement::Dismissed => "dismissed",
@@ -843,7 +874,7 @@ impl Database {
         }
         let before = before_retirement_revision.unwrap_or(i64::MAX);
         let total:i64=sqlx::query_scalar("SELECT COUNT(*) FROM coordinator_tracking_retirements WHERE item_id=?1 AND item_revision<?2").bind(id).bind(before).fetch_one(&mut *tx).await?;
-        let rows=sqlx::query("SELECT item_revision,disposition,reason,recorded_at_us FROM coordinator_tracking_retirements WHERE item_id=?1 AND item_revision<?2 ORDER BY item_revision DESC LIMIT 16").bind(id).bind(before).fetch_all(&mut *tx).await?;
+        let rows=sqlx::query("SELECT item_revision,disposition,reason,recorded_at_us FROM coordinator_tracking_retirements WHERE item_id=?1 AND item_revision<?2 ORDER BY item_revision DESC LIMIT ?3").bind(id).bind(before).bind(count(RETIREMENT_PAGE_SIZE)?).fetch_all(&mut *tx).await?;
         let retirement_history = rows
             .iter()
             .map(|row| {
@@ -879,7 +910,7 @@ impl Database {
             None
         };
         tx.commit().await?;
-        Ok(TrackingDetail {
+        let detail = TrackingDetail {
             registry_revision: registry,
             item,
             references,
@@ -891,7 +922,9 @@ impl Database {
             next_retirement_revision,
             omitted_retirement_count,
             recorded_by_ember,
-        })
+        };
+        encoded_limit(&detail, TRACKING_DETAIL_BYTES, "complete tracking detail")?;
+        Ok(detail)
     }
 }
 async fn tracking_page_tx(

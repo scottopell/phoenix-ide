@@ -88,6 +88,10 @@ entity TrackingObservation {
         -- At most eight compact entries plus one due request; clipped titles are
         -- explicit. Full notes are read on demand. Counts and page cursors disclose
         -- omitted active and review-required items. Complete observation <=8 KiB.
+        -- Detail reads contain at most eight evidence and eight retirement rows,
+        -- with explicit continuation cursors, and serialize within 96 KiB. The
+        -- writer rejects encoded metadata/evidence/reasons that cannot fit the
+        -- lossless read contract; executor text clipping never supplies pagination.
 }
 
 config {

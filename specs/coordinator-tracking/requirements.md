@@ -26,6 +26,8 @@ New source observations SHALL append evidence, not mutate previously reviewed ob
 
 List/detail results SHALL identify captured registry/item revisions, counts, omissions and continuation pointers. Saved historical notes, new evidence and reviewed resumption points SHALL be visibly distinct. Missing sources SHALL remain explicit uncertainty. Full notes/evidence SHALL be read on demand, with bounded pages. An omitted item SHALL NOT be represented as reviewed, complete or ready.
 
+The writer SHALL reject saved data that cannot be fully inspected through supported reads. Complete serialized detail results SHALL remain below the executor's tool-output clipping limit, preserving valid JSON, lossless accepted notes and honest child pagination even with escaped text.
+
 ### REQ-TRACK-006: Prefix-preserving continuity
 
 At existing admitted Coordinator turn/wakeup boundaries THE SYSTEM SHALL append changed bounded tracking observations to durable transcript tails. It SHALL NOT change system instructions, prepend changing state, rewrite earlier messages or repeatedly append unchanged state during model/tool loops. Current registry data SHALL remain recoverable after continuation independently of its summary. Observations SHALL be labelled captured historical data, never user instructions or current worker status.

@@ -24,6 +24,8 @@ Mutation receipts retain only call fingerprint, item and committed revisions, no
 
 The item carries a nullable current retirement revision pointing to the retained retirement row; current closed disposition and reason derive from that row. Reopening clears the pointer and preserves history. Compact titles are explicitly clipped at 80 UTF-8 bytes; full titles/notes remain in detail reads. The complete appended observation, including its data warning, stays within 8 KiB. A persisted-message reservation spans observation commit/publication. Cues before a later input are historical, not a renewed review request; their global per-item receipts preserve cooldown across continuations without pretending that surfacing was a review.
 
+Detail reads retain eight evidence and eight retirement entries per independently paginated child collection. Writers limit combined editable metadata to 16 KiB of serialized JSON, each complete evidence entry including locators to 4 KiB, and each retirement reason to 4 KiB. Oversized data is rejected before commit; accepted notes are not clipped. The complete serialized detail is guarded at 96 KiB, below the executor's 100 KiB text limit. The remaining space covers current closed-reason projection, recording provenance, integer metadata and JSON structure; a worst-case escaped-text test exercises full child pages and lossless pagination.
+
 ## Consequences
 
 Manual memory can ship before extraction. Goals/events/tracking remain separate authorities. Prompt growth follows existing continuation policies, and compact pages explicitly omit entries. Stored text remains evidence rather than executable instruction. More elaborate ranking, status checkers and dashboards require demonstrated need.

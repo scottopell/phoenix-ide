@@ -596,8 +596,8 @@ async fn tracking_reference_updates_and_retirement_history_paginate_honestly() {
         .read_coordinator_tracking(&source, &receipt.item_id, 0)
         .await
         .unwrap();
-    assert_eq!(detail.retirement_history.len(), 16);
-    assert_eq!(detail.omitted_retirement_count, 1);
+    assert_eq!(detail.retirement_history.len(), 8);
+    assert_eq!(detail.omitted_retirement_count, 9);
     let tail = db
         .read_coordinator_tracking_page(
             &source,
@@ -607,8 +607,14 @@ async fn tracking_reference_updates_and_retirement_history_paginate_honestly() {
         )
         .await
         .unwrap();
-    assert_eq!(tail.retirement_history.len(), 1);
-    assert_eq!(tail.omitted_retirement_count, 0);
+    assert_eq!(tail.retirement_history.len(), 8);
+    assert_eq!(tail.omitted_retirement_count, 1);
+    let last = db
+        .read_coordinator_tracking_page(&source, &receipt.item_id, 0, tail.next_retirement_revision)
+        .await
+        .unwrap();
+    assert_eq!(last.retirement_history.len(), 1);
+    assert_eq!(last.omitted_retirement_count, 0);
     apply(
         &db,
         &source,
@@ -788,5 +794,214 @@ async fn tracking_current_durable_tool_round_authorizes_before_assistant_checkpo
             .unwrap()
             .active_count,
         1
+    );
+}
+
+#[tokio::test]
+async fn tracking_encoded_write_budgets_reject_uninspectable_data_without_partial_writes() {
+    let (db, source) = setup().await;
+    let mut oversized = record(TrackingKind::RequestedWork, "Oversized escaped metadata");
+    if let TrackingMutation::Record { record } = &mut oversized {
+        record.note = "\u{0001}".repeat(3000);
+    }
+    let invocation = call(&db, &source, &oversized).await;
+    assert!(db
+        .mutate_coordinator_tracking(&source, &invocation, &oversized)
+        .await
+        .established()
+        .unwrap()
+        .unwrap_err()
+        .to_string()
+        .contains("serialized JSON bytes"));
+    assert_eq!(
+        db.list_coordinator_tracking(&source, None, false)
+            .await
+            .unwrap()
+            .active_count,
+        0
+    );
+    let mut oversized = record(TrackingKind::Bookmark, "Oversized complete evidence");
+    if let TrackingMutation::Record { record } = &mut oversized {
+        record.evidence = vec![TrackingEvidence {
+            instance_id: "instance".into(),
+            transcript_id: "transcript".into(),
+            message_id: "message".into(),
+            quotation: "\u{0002}".repeat(800),
+        }];
+    }
+    let invocation = call(&db, &source, &oversized).await;
+    assert!(db
+        .mutate_coordinator_tracking(&source, &invocation, &oversized)
+        .await
+        .established()
+        .unwrap()
+        .is_err());
+    assert_eq!(
+        db.list_coordinator_tracking(&source, None, false)
+            .await
+            .unwrap()
+            .active_count,
+        0,
+        "failed evidence validation rolls back item, registry and receipt"
+    );
+    let saved = apply(
+        &db,
+        &source,
+        record(TrackingKind::RequestedWork, "Valid record"),
+    )
+    .await;
+    let oversized = TrackingMutation::Retire {
+        id: saved.item_id.clone(),
+        expected_revision: 1,
+        disposition: TrackingRetirement::Dismissed,
+        reason: "\u{0003}".repeat(800),
+    };
+    let invocation = call(&db, &source, &oversized).await;
+    assert!(db
+        .mutate_coordinator_tracking(&source, &invocation, &oversized)
+        .await
+        .established()
+        .unwrap()
+        .is_err());
+    let detail = db
+        .read_coordinator_tracking(&source, &saved.item_id, 0)
+        .await
+        .unwrap();
+    assert_eq!(detail.item.revision, 1);
+    assert!(matches!(detail.item.disposition, TrackingState::Tracking));
+    assert!(detail.retirement_history.is_empty());
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn tracking_worst_case_escaped_detail_stays_valid_below_executor_clipping_and_pages_losslessly(
+) {
+    let (db, source) = setup().await;
+    let metadata = TrackingRecord {
+        kind: TrackingKind::Bookmark,
+        title: "Escaped detail budget".into(),
+        note: "\u{0001}".repeat(1800),
+        resumption: "\u{0002}".repeat(300),
+        references: (0..16)
+            .map(|_| TrackingReference::Conversation {
+                instance_id: "i".repeat(80),
+                product_id: "p".repeat(80),
+            })
+            .collect(),
+        evidence: vec![],
+    };
+    let saved = apply(
+        &db,
+        &source,
+        TrackingMutation::Record {
+            record: metadata.clone(),
+        },
+    )
+    .await;
+    let mut revision = 1;
+    for index in 0..17 {
+        let retired = apply(
+            &db,
+            &source,
+            TrackingMutation::Retire {
+                id: saved.item_id.clone(),
+                expected_revision: revision,
+                disposition: TrackingRetirement::Dismissed,
+                reason: format!("{}r{index}", "\u{0003}".repeat(650)),
+            },
+        )
+        .await;
+        let reopened = apply(
+            &db,
+            &source,
+            TrackingMutation::Reopen {
+                id: saved.item_id.clone(),
+                expected_revision: retired.item_revision,
+                evidence: vec![TrackingEvidence {
+                    instance_id: db.instance_id().await.unwrap().to_string(),
+                    transcript_id: source.clone(),
+                    message_id: format!("source-{index}"),
+                    quotation: format!("{}e{index}", "\u{0004}".repeat(600)),
+                }],
+            },
+        )
+        .await;
+        revision = reopened.item_revision;
+    }
+    apply(
+        &db,
+        &source,
+        TrackingMutation::Retire {
+            id: saved.item_id.clone(),
+            expected_revision: revision,
+            disposition: TrackingRetirement::Resolved,
+            reason: format!("{}current", "\u{0005}".repeat(650)),
+        },
+    )
+    .await;
+    let first = db
+        .read_coordinator_tracking(&source, &saved.item_id, 0)
+        .await
+        .unwrap();
+    let encoded = serde_json::to_vec(&first).unwrap();
+    assert!(
+        encoded.len() < TRACKING_DETAIL_BYTES,
+        "{} bytes",
+        encoded.len()
+    );
+    assert!(encoded.len() < 100 * 1024);
+    let decoded: TrackingDetail = serde_json::from_slice(&encoded).unwrap();
+    assert_eq!(decoded.item.note, metadata.note);
+    assert_eq!(decoded.references, metadata.references);
+    assert_eq!(decoded.evidence.len(), 8);
+    assert_eq!(decoded.retirement_history.len(), 8);
+    assert!(decoded.next_evidence_ordinal.is_some());
+    assert_eq!(decoded.omitted_retirement_count, 10);
+    let mut evidence = vec![];
+    let mut cursor = 0;
+    loop {
+        let page = db
+            .read_coordinator_tracking(&source, &saved.item_id, cursor)
+            .await
+            .unwrap();
+        let bytes = serde_json::to_vec(&page).unwrap();
+        assert!(bytes.len() < TRACKING_DETAIL_BYTES);
+        evidence.extend(page.evidence);
+        match page.next_evidence_ordinal {
+            Some(next) => cursor = next,
+            None => break,
+        }
+    }
+    assert_eq!(evidence.len(), 17);
+    assert_eq!(
+        evidence
+            .iter()
+            .map(|(ordinal, _)| *ordinal)
+            .collect::<std::collections::HashSet<_>>()
+            .len(),
+        17
+    );
+    let mut history = vec![];
+    let mut cursor = None;
+    loop {
+        let page = db
+            .read_coordinator_tracking_page(&source, &saved.item_id, 17, cursor)
+            .await
+            .unwrap();
+        assert!(serde_json::to_vec(&page).unwrap().len() < TRACKING_DETAIL_BYTES);
+        history.extend(page.retirement_history);
+        match page.next_retirement_revision {
+            Some(next) => cursor = Some(next),
+            None => break,
+        }
+    }
+    assert_eq!(history.len(), 18);
+    assert_eq!(
+        history
+            .iter()
+            .map(|entry| entry.item_revision)
+            .collect::<std::collections::HashSet<_>>()
+            .len(),
+        18
     );
 }
