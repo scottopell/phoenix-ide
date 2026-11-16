@@ -24,6 +24,13 @@ runSurfaceCapture({
       await rows.first().waitFor();
       await page.screenshot({ path: `${outDir}/${id}--${viewport.name}.png`, fullPage: true });
       await page.locator('.sidebar').screenshot({ path: `${outDir}/${id}--${viewport.name}-sidebar.png` });
+      const controls = await page.locator('.sidebar-header button, .sidebar-header a, .sidebar-lifecycle-tab, .ember-entry').evaluateAll(elements => elements.map(el => {
+        const r = el.getBoundingClientRect();
+        const sidebar = el.closest('.sidebar').getBoundingClientRect();
+        return { name: el.getAttribute('aria-label') ?? el.textContent.trim(), x: r.x, right: r.right,
+          width: r.width, height: r.height, sidebarRight: sidebar.right, sidebarLeft: sidebar.x };
+      }));
+      await writeFile(`${outDir}/${id}--${viewport.name}.controls.json`, JSON.stringify(controls, null, 2));
       const geometry = await rows.evaluateAll(elements => elements.map(row => {
         const box = selector => {
           const el = selector ? row.querySelector(selector) : row;
@@ -38,15 +45,25 @@ runSurfaceCapture({
           dot: box('.conv-state-dot'), badge: box('.pr-badge'), menu: box('.conv-item-menu-btn') };
       }));
       await writeFile(`${outDir}/${id}--${viewport.name}.geometry.json`, JSON.stringify(geometry, null, 2));
+      const mediaAfterScreenshot = await page.evaluate(() => ({ coarse: matchMedia('(any-pointer: coarse)').matches, fine: matchMedia('(pointer: fine)').matches }));
+      await writeFile(`${outDir}/${id}--${viewport.name}.media-after-screenshot.json`, JSON.stringify(mediaAfterScreenshot, null, 2));
+      if (mediaAfterScreenshot.coarse !== media.coarse) throw new Error('Screenshot changed pointer media');
       if (geometry.length !== 5) throw new Error('Missing visual state rows');
       if (process.env.SIDEBAR_VISUAL_BASELINE !== '1') {
+        for (const c of controls) {
+          if (c.x < c.sidebarLeft - 1 || c.right > c.sidebarRight + 1) throw new Error('Header control escapes sidebar');
+          if (viewport.hasTouch && (c.width < 44 || c.height < 44)) throw new Error('Header touch target smaller than 44px');
+        }
         for (const g of geometry) {
-          if (!g.title || !g.menu || g.title.width < 24) throw new Error('Title/action allocation missing');
+          if (!g.title || !g.menu || !g.dot || g.title.width < 40) throw new Error('Title/action allocation missing');
           for (const b of [g.main, g.badge, g.menu].filter(Boolean)) {
             if (b.x < g.row.x - 1 || b.right > g.row.right + 1) throw new Error('Row content escapes bounds');
           }
           if (g.badge && g.badge.y < g.main.bottom && g.badge.bottom > g.main.y && g.badge.x < g.main.right - 1) throw new Error('PR overlaps main');
           if (g.badge && g.badge.y < g.menu.bottom && g.badge.bottom > g.menu.y && g.badge.right > g.menu.x + 1) throw new Error('PR overlaps menu');
+          if (g.dot.right > g.title.x || g.dot.x < g.main.x) throw new Error('Status dot overlaps title');
+          if (!viewport.hasTouch && id === 'sidebar-visual-normal' && g.row.height > 40) throw new Error('Mouse row is not compact');
+          if (viewport.hasTouch && g.badge && g.badge.height < 44) throw new Error('PR touch target smaller than 44px');
           if (viewport.hasTouch && (g.menu.width < 44 || g.menu.height < 44 || g.main.height < 44)) throw new Error('Touch target smaller than 44px');
         }
       }
@@ -102,7 +119,7 @@ runSurfaceCapture({
     await page.getByRole('button', { name: 'Cancel' }).click();
     const titleBox = await row.locator('.conv-item-title').boundingBox();
     const actionsBox = await trigger.boundingBox();
-    if (!titleBox || titleBox.width < 24 || !actionsBox || actionsBox.width < 44) {
+    if (!titleBox || titleBox.width < 24 || !actionsBox || actionsBox.width < (viewport.hasTouch ? 44 : 32)) {
       throw new Error(`Product row title/actions are not visibly laid out at ${viewport.name ?? 'default'}`);
     }
     await page.screenshot({ path: `${outDir}/product-actions-continued--${viewport.name ?? 'default'}-verified.png`, fullPage: true });

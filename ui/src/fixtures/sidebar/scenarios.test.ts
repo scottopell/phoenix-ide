@@ -26,6 +26,17 @@ describe('sidebar fixture scenarios', () => {
     }
   });
 
+  it('covers minimum/default widths, every PR state and a long badge-bearing title', () => {
+    const visualScenarios = sidebarScenarios.filter(scenario => scenario.id.startsWith('sidebar-visual-'));
+    expect(visualScenarios.map(scenario => scenario.sidebarWidth)).toEqual([280, 160]);
+    const rows = sidebarFixtureData.productConversations?.['sidebar-visual-normal'] ?? [];
+    expect(rows.map(row => row.cached_pr?.display_state)).toEqual(['open', 'draft', 'merged', 'closed', undefined]);
+    expect(rows[1]?.canonical_root.title?.length).toBeGreaterThan(60);
+    expect(rows.filter(row => row.read_state.state === 'unread')).toHaveLength(2);
+    expect(rows[0]?.presentation.presentation_mode).toBe('working');
+    expect(rows[3]?.presentation.presentation_mode).toBe('error');
+  });
+
   it('keeps every active scenario slug backed by fixture data', () => {
     const slugs = new Set([
       ...sidebarFixtureData.conversations.map((conv) => conv.slug),
