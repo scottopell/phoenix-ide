@@ -1381,6 +1381,29 @@ async fn foreground_question_reply_uses_real_protocol_and_file_reads() {
         .await
         .unwrap()
         .id;
+    let search_source = db
+        .create_conversation(
+            &uuid::Uuid::new_v4().to_string(),
+            "foreground-search-source",
+            home.path().to_str().unwrap(),
+            true,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let search_message_id = uuid::Uuid::new_v4().to_string();
+    db.add_message_with_seq_and_origin(
+        &search_message_id,
+        &search_source.id,
+        1,
+        &MessageContent::user("Synthetic ordinary Cobalt source for the isolated search fixture."),
+        None,
+        None,
+        &phoenix_core::domain::db_schema::InputOrigin::UserApi,
+    )
+    .await
+    .unwrap();
     let mock = Arc::new(MockLlmClient::new("test-model"));
     let fixture = fixture(
         db.clone(),
@@ -1402,11 +1425,18 @@ async fn foreground_question_reply_uses_real_protocol_and_file_reads() {
         .await;
     let item = all_items(&db, &source).await.pop().unwrap();
     mock.queue_response(LlmResponse {
-        content: vec![ContentBlock::ToolUse {
-            id: "actual-file-query".into(),
-            name: "query_database".into(),
-            input: json!({"sql":"SELECT COUNT(*) AS n FROM coordinator_tracking_items"}),
-        }],
+        content: vec![
+            ContentBlock::ToolUse {
+                id: "actual-file-query".into(),
+                name: "query_database".into(),
+                input: json!({"sql":"SELECT COUNT(*) AS n FROM coordinator_tracking_items"}),
+            },
+            ContentBlock::ToolUse {
+                id: "actual-file-search".into(),
+                name: "search_conversations".into(),
+                input: json!({"query":"Cobalt"}),
+            },
+        ],
         end_turn: false,
         ..terminal("")
     });
@@ -1425,6 +1455,18 @@ async fn foreground_question_reply_uses_real_protocol_and_file_reads() {
             |result| result["content"]["tool_use_id"] == "actual-file-query"
                 && result["content"]["is_error"] == false
         ));
+    let search = asked
+        .tool_results
+        .iter()
+        .find(|result| result["content"]["tool_use_id"] == "actual-file-search")
+        .unwrap();
+    assert_eq!(search["content"]["is_error"], false);
+    let search_text = search["content"]["content"].as_str().unwrap();
+    assert!(search_text.contains(&search_source.id) && search_text.contains(&search_message_id));
+    assert!(
+        !search_text.contains(&seed.input_message_id),
+        "global search must keep excluding the Coordinator chain"
+    );
     let before = prefix(&db, &source).await;
     let pause = "Pause until I explicitly say resume.";
     mock.queue_response(LlmResponse{content:vec![ContentBlock::ToolUse{id:"actual-pause-cas".into(),name:"tracking".into(),input:json!({"request":{"op":"update","id":item.id,"expected_revision":item.revision,"kind":"requested_work","title":item.title,"note":pause,"resumption":pause,"reviewed_evidence_ordinal":0,"references":[]}})}],end_turn:false,..terminal("")});
@@ -1452,6 +1494,7 @@ async fn foreground_question_reply_uses_real_protocol_and_file_reads() {
     let quiet = session.input("What is 8+5?").await;
     assert!(quiet_arithmetic(&quiet.visible_text));
     assert!(turn_calls(&quiet).is_empty());
+    assert!(fixture.denied.lock().unwrap().is_empty());
     session.close().await;
     let frozen = home.path().join("frozen.sqlite");
     snapshot(&db, &frozen).await;

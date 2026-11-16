@@ -44,6 +44,9 @@ tool results and model requests are retained for independent review.
 Both journeys preserve the earlier persisted message prefix and coordinator
 identity. External actions are intercepted and recorded as failures; read-only
 local tools, native tracking mutations and the question tool execute normally.
+Global keyword search excludes the Coordinator chain; a deterministic ordinary
+source verifies actual search, while saved own-history primaries use the exact
+`read_conversation` pointer returned by `tracking`.
 These checks exercise real admitted runtime turns and structured reply
 validation, but not HTTP transport, UI interaction, process-crash recovery,
 scanner behavior, remote workers or deployment.

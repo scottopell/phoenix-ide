@@ -441,6 +441,7 @@ mod live {
                 name.as_str(),
                 "tracking"
                     | "query_database"
+                    | "search_conversations"
                     | "read_conversation"
                     | "resolve_reference"
                     | "previous_transcripts"
