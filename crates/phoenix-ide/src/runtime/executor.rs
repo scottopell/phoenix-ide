@@ -22617,6 +22617,11 @@ mod explore_prompt_cache_shape_tests {
         Box::pin(runtime.process_outcome(EffectOutcome::Llm(outcome)))
             .await
             .unwrap();
+        assert!(runtime
+            .observe_tool_preparation_for_test()
+            .await
+            .unwrap()
+            .is_none());
         let (_, outcome) = tokio::time::timeout(
             std::time::Duration::from_secs(5),
             runtime.tool_outcome_rx.recv(),

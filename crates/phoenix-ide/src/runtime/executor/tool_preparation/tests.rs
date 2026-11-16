@@ -451,3 +451,100 @@ async fn ordinary_live_catalog_wait_cannot_launch_after_cancellation() {
         "cancellation must settle before the read releases and prevent any late tool execution"
     );
 }
+
+#[derive(Clone, Copy, Debug)]
+enum RequiredRead {
+    Policy,
+    Scope,
+}
+
+async fn required_read_failure_stops_the_owning_actor(read: RequiredRead) {
+    let failing = bash("failing-read", "git status --short");
+    let mut runtime = runtime_for(failing).await;
+    let never = bash("never-launched", "git diff --stat");
+    if let ConvState::ToolExecuting {
+        remaining_tools,
+        assistant_message,
+        ..
+    } = &mut runtime.state
+    {
+        remaining_tools.push(never.clone());
+        assistant_message.content.push(ContentBlock::tool_use(
+            &never.id,
+            never.name(),
+            never.input.to_value(),
+        ));
+    }
+    let gate = match read {
+        RequiredRead::Policy => runtime.storage.hold_next_tool_policy_read(),
+        RequiredRead::Scope => {
+            runtime.context.resource_scope = phoenix_core::work_scope::ResourceScopeKey::Work(
+                phoenix_core::work_scope::WorkScopeId::new(),
+            );
+            runtime.storage.hold_next_tool_scope_read()
+        }
+    };
+    let (entered, release) = gate;
+    let fence = Arc::clone(&runtime.fatal_local_authority_fence);
+    let tools = Arc::clone(&runtime.tool_executor);
+    let storage = Arc::clone(&runtime.storage);
+    let llm = Arc::clone(&runtime.llm_client);
+    let (events, receiver) = mpsc::channel(4);
+    runtime.event_tx = events.clone();
+    runtime.event_rx = receiver;
+    let mut task = tokio::spawn(runtime.run());
+    events
+        .send(Event::ToolComplete {
+            tool_use_id: "before".into(),
+            result: ToolResult::success("before".into(), "done".into()),
+        })
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(60), entered)
+        .await
+        .unwrap()
+        .unwrap();
+    tokio::time::pause();
+    release
+        .send(Err(format!("{read:?} lookup failed")))
+        .unwrap();
+    let stopped = tokio::time::timeout(Duration::from_millis(100), &mut task)
+        .await
+        .ok()
+        .map(Result::unwrap);
+    tokio::time::resume();
+    if stopped.is_none() {
+        events.send(Event::Shutdown).await.unwrap();
+        assert_eq!(
+            task.await.unwrap(),
+            RuntimeExitDisposition::CoordinatedShutdown
+        );
+    }
+    assert_eq!(
+        stopped,
+        Some(RuntimeExitDisposition::FatalLocalAuthorityLoss)
+    );
+    assert!(fence.fatal_authority_loss_is_latched());
+    assert_eq!(*fence.tx.borrow(), Some("ordinary_tool_outcome_settlement"));
+    assert!(
+        matches!(storage.get_current_state("conv-tool-gen"), Some(ConvState::ToolExecuting {
+        current_tool, remaining_tools, completed_results, ..
+    }) if current_tool.id == "failing-read"
+        && remaining_tools.len() == 1 && remaining_tools[0].id == "never-launched"
+        && completed_results.len() == 1
+        && matches!(&completed_results[0], phoenix_core::domain::conversation_goal::ToolRoundResult::Finalized(result) if result.tool_use_id == "before" && !result.is_error()))
+    );
+    assert!(tools.recorded_executions().is_empty());
+    assert!(llm.recorded_requests().is_empty());
+    assert!(storage.recorded_messages().is_empty());
+}
+
+#[tokio::test]
+async fn later_policy_read_failure_preserves_required_completion_fail_stop() {
+    required_read_failure_stops_the_owning_actor(RequiredRead::Policy).await;
+}
+
+#[tokio::test]
+async fn later_scope_read_failure_preserves_required_completion_fail_stop() {
+    required_read_failure_stops_the_owning_actor(RequiredRead::Scope).await;
+}
