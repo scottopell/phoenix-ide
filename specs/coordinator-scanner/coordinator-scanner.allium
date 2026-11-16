@@ -179,8 +179,10 @@ rule ReserveInferenceAttempt {
         -- sources and retry-backoff candidates. Precheck known spending before prose.
         -- If a fully exhausted preparation ends blocked, durably prefer the
         -- opposite of the last lane that consumed rows on the next revisit.
-        -- Ready/progress outcomes do not rotate preference; successful reservations
-        -- retain the normal3live:1historical preference updates.
+        -- Committed non-prose progress applies the normal3live:1historical lane
+        -- update without charging an inference attempt. Ready leaves the preference
+        -- unchanged until reservation; reservation retains its normal lane update.
+        -- Progress does not clear another source's existing degraded blocker.
 }
 
 rule ResumeExhaustedRetryCycle {

@@ -187,7 +187,7 @@ pub(super) async fn prepare_with_allowance(
     };
     let mut waiting = None;
     let mut last_consumed_lane = None;
-    for lane in preferred {
+    'lanes: for lane in preferred {
         let rows=sqlx::query(chain_query!(" SELECT s.*,m.transcript_generation,m.tail FROM coordinator_scan_members s JOIN members m ON m.id=s.transcript_id WHERE s.generation=m.transcript_generation AND ((?3='live' AND (s.live_message_id IS NOT NULL OR s.live_seq<m.tail)) OR (?3='historical' AND s.historical_seq>0)) ORDER BY s.selected_at_us,s.continuation_ordinal DESC LIMIT 32"))
             .bind(&topology.head).bind(&topology.owner).bind(lane_name(lane)).fetch_all(&mut **tx).await?;
         if rows.is_empty() {
@@ -245,14 +245,12 @@ pub(super) async fn prepare_with_allowance(
             };
             if captured.fragments.is_empty() {
                 advance(tx, &transcript, lane, &captured.end).await?;
+                advance_lane_preference(tx, lane).await?;
                 return Ok(ScanPreparation::Progress);
             }
             let Some(profile) = profile else {
-                set_blocker(tx, ScanBlocker::RouteUnavailable, None, now).await?;
-                return Ok(ScanPreparation::Wait {
-                    reason: ScanBlocker::RouteUnavailable,
-                    next_at_us: None,
-                });
+                waiting = Some((ScanBlocker::RouteUnavailable, None));
+                break 'lanes;
             };
             let (candidates, omitted_active_candidates, omitted_retired_candidates) =
                 candidates(tx, &captured.fragments).await?;
@@ -334,6 +332,10 @@ pub(super) async fn prepare_with_allowance(
     }
     sqlx::query("UPDATE coordinator_scan_state SET last_blocker=NULL,next_resume_at_us=NULL WHERE singleton=1").execute(&mut **tx).await?;
     Ok(ScanPreparation::Idle)
+}
+async fn advance_lane_preference(tx: &mut Transaction<'_, Sqlite>, lane: ScanLane) -> DbResult<()> {
+    sqlx::query("UPDATE coordinator_scan_state SET live_streak=CASE WHEN ?1='historical' THEN 0 ELSE MIN(live_streak+1,3) END WHERE singleton=1").bind(lane_name(lane)).execute(&mut **tx).await?;
+    Ok(())
 }
 async fn budget_pause(
     tx: &mut Transaction<'_, Sqlite>,
@@ -478,7 +480,8 @@ async fn reserve(
             .execute(&mut **tx)
             .await?;
     }
-    sqlx::query("UPDATE coordinator_scan_state SET live_streak=CASE WHEN ?1='historical' THEN 0 ELSE MIN(live_streak+1,3) END,last_blocker=NULL,next_resume_at_us=NULL,observed_at_us=?2 WHERE singleton=1").bind(lane_name(batch.input.scan_context.lane)).bind(now).execute(&mut **tx).await?;
+    advance_lane_preference(tx, batch.input.scan_context.lane).await?;
+    sqlx::query("UPDATE coordinator_scan_state SET last_blocker=NULL,next_resume_at_us=NULL,observed_at_us=?1 WHERE singleton=1").bind(now).execute(&mut **tx).await?;
     Ok(ScanReservation::Reserved(ReservedScanAttempt { id, batch }))
 }
 pub(super) async fn validate_attempt(

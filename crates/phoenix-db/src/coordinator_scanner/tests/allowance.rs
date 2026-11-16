@@ -3,13 +3,13 @@ use sqlx::Connection;
 
 async fn observed_prepare(
     db: &Database,
-    route: &ScanProfile,
+    route: Option<&ScanProfile>,
     now: i64,
 ) -> (ScanPreparation, usize) {
     let mut connection = db.pool().acquire().await.unwrap();
     let mut tx = connection.begin_with("BEGIN IMMEDIATE").await.unwrap();
     let mut allowance = source::SourceReadAllowance::new();
-    let result = storage::prepare_with_allowance(&mut tx, Some(route), now, &mut allowance)
+    let result = storage::prepare_with_allowance(&mut tx, route, now, &mut allowance)
         .await
         .unwrap();
     tx.commit().await.unwrap();
@@ -66,7 +66,7 @@ async fn scanner_paused_spending_loads_no_poisoned_prose_and_recovers_after_wind
             .execute(db.pool())
             .await
             .unwrap();
-        let (paused, remaining) = observed_prepare(&db, &profile(), 3000).await;
+        let (paused, remaining) = observed_prepare(&db, Some(&profile()), 3000).await;
         assert_eq!(
             remaining, 32,
             "known spending pause must precede all source projection"
@@ -82,7 +82,7 @@ async fn scanner_paused_spending_loads_no_poisoned_prose_and_recovers_after_wind
                 ScanBlocker::HistoricalBudgetPaused
             }
         );
-        let (unblocked, remaining) = observed_prepare(&db, &profile(), HOUR + 3000).await;
+        let (unblocked, remaining) = observed_prepare(&db, Some(&profile()), HOUR + 3000).await;
         assert!(remaining < 32);
         assert!(matches!(
             unblocked,
@@ -186,7 +186,7 @@ async fn scanner_one_allowance_spans_backoff_malformed_members_and_both_lanes() 
     .await
     .unwrap();
     let before = db.read_coordinator_scan_coverage(head, None).await.unwrap();
-    let (pending, remaining) = observed_prepare(&db, &profile(), 3000).await;
+    let (pending, remaining) = observed_prepare(&db, Some(&profile()), 3000).await;
     assert_eq!(
         remaining, 0,
         "four live windows consume16 rows, then only16 historical rows may be fetched"
@@ -221,7 +221,12 @@ async fn scanner_one_allowance_spans_backoff_malformed_members_and_both_lanes() 
 #[tokio::test]
 #[allow(clippy::too_many_lines)]
 async fn scanner_blocked_exhaustion_rotates_lanes_across_restart_without_new_input() {
-    for blocked_lane in [ScanLane::Live, ScanLane::Historical] {
+    for (blocked_lane, missing_route) in [
+        (ScanLane::Live, false),
+        (ScanLane::Historical, false),
+        (ScanLane::Live, true),
+        (ScanLane::Historical, true),
+    ] {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("blocked-lane.db");
         let db = Database::open(path.to_str().unwrap()).await.unwrap();
@@ -261,17 +266,25 @@ async fn scanner_blocked_exhaustion_rotates_lanes_across_restart_without_new_inp
             .execute(db.pool())
             .await
             .unwrap();
-        sqlx::query("UPDATE messages SET content='not-json' WHERE (?1='live' AND sequence_id>32) OR (?1='historical' AND sequence_id<=32)")
-            .bind(source::lane_name(blocked_lane)).execute(db.pool()).await.unwrap();
-        let (blocked, remaining) = observed_prepare(&db, &profile(), 2000).await;
+        if !missing_route {
+            sqlx::query("UPDATE messages SET content='not-json' WHERE (?1='live' AND sequence_id>32) OR (?1='historical' AND sequence_id<=32)")
+                .bind(source::lane_name(blocked_lane)).execute(db.pool()).await.unwrap();
+        }
+        let route = profile();
+        let (blocked, remaining) =
+            observed_prepare(&db, if missing_route { None } else { Some(&route) }, 2000).await;
         assert_eq!(remaining, 0);
-        assert!(matches!(
-            blocked,
-            ScanPreparation::Wait {
-                reason: ScanBlocker::SourceUnavailable,
-                ..
+        let ScanPreparation::Wait { reason, .. } = blocked else {
+            panic!("expected blocked source or missing route")
+        };
+        assert_eq!(
+            reason,
+            if missing_route {
+                ScanBlocker::RouteUnavailable
+            } else {
+                ScanBlocker::SourceUnavailable
             }
-        ));
+        );
         let expected_lane = if blocked_lane == ScanLane::Live {
             ScanLane::Historical
         } else {
@@ -291,7 +304,7 @@ async fn scanner_blocked_exhaustion_rotates_lanes_across_restart_without_new_inp
         );
         db.pool().close().await;
         let db = Database::open(path.to_str().unwrap()).await.unwrap();
-        let (opposite, remaining) = observed_prepare(&db, &profile(), 3000).await;
+        let (opposite, remaining) = observed_prepare(&db, Some(&profile()), 3000).await;
         assert_eq!(remaining, 0);
         let ScanPreparation::Ready(batch) = opposite else {
             panic!("healthy opposite lane must progress without another message or kick")
@@ -310,14 +323,7 @@ async fn scanner_blocked_exhaustion_rotates_lanes_across_restart_without_new_inp
             .fetch_one(db.pool())
             .await
             .unwrap();
-        assert_eq!(
-            reserved,
-            if expected_lane == ScanLane::Historical {
-                0
-            } else {
-                1
-            }
-        );
+        assert_eq!(reserved, i64::from(expected_lane != ScanLane::Historical));
         db.apply_coordinator_scan(
             &attempt,
             &ScanResult::Complete { actions: vec![] },
@@ -329,4 +335,102 @@ async fn scanner_blocked_exhaustion_rotates_lanes_across_restart_without_new_inp
         .unwrap()
         .unwrap();
     }
+}
+
+#[tokio::test]
+async fn scanner_historical_tool_progress_yields_to_live_without_inference_charge() {
+    let (db, owner) = setup().await;
+    for sequence in 1..=96 {
+        db.add_message_with_seq(
+            &format!("old-tool-{sequence}"),
+            &owner,
+            sequence,
+            &MessageContent::tool("old-call", "ignored output", false),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    }
+    assert!(matches!(
+        db.prepare_coordinator_scan(Some(&profile()), 1000)
+            .await
+            .established()
+            .unwrap()
+            .unwrap(),
+        ScanPreparation::Progress
+    ));
+    for sequence in 97..=128 {
+        message(
+            &db,
+            &owner,
+            sequence,
+            "Please retain this live request.",
+            &InputOrigin::UserApi,
+        )
+        .await;
+    }
+    sqlx::query("UPDATE coordinator_scan_state SET live_streak=3")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let (historical, remaining) = observed_prepare(&db, Some(&profile()), 2000).await;
+    assert_eq!(remaining, 0);
+    assert!(matches!(historical, ScanPreparation::Progress));
+    let (live, remaining) = observed_prepare(&db, Some(&profile()), 3000).await;
+    assert_eq!(remaining, 0);
+    let ScanPreparation::Ready(batch) = live else {
+        panic!("historical tool backlog must yield after its progress")
+    };
+    assert_eq!(batch.input.scan_context.lane, ScanLane::Live);
+    let charged: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM coordinator_scan_attempts")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(charged, 0);
+}
+
+#[tokio::test]
+async fn scanner_continually_appended_live_tool_progress_yields_history_by_fourth_selection() {
+    let (db, owner) = setup().await;
+    for sequence in 1..=32 {
+        message(
+            &db,
+            &owner,
+            sequence,
+            "Please retain this historical request.",
+            &InputOrigin::UserApi,
+        )
+        .await;
+    }
+    drop(prepare(&db, 1000).await);
+    for window in 0..4 {
+        for sequence in (33 + window * 32)..=(64 + window * 32) {
+            db.add_message_with_seq(
+                &format!("new-tool-{sequence}"),
+                &owner,
+                sequence,
+                &MessageContent::tool("new-call", "ignored output", false),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        }
+        let (selection, remaining) = observed_prepare(&db, Some(&profile()), 2000 + window).await;
+        assert_eq!(remaining, 0);
+        if window < 3 {
+            assert!(matches!(selection, ScanPreparation::Progress));
+        } else {
+            let ScanPreparation::Ready(batch) = selection else {
+                panic!("live tool progress must yield by fourth selection")
+            };
+            assert_eq!(batch.input.scan_context.lane, ScanLane::Historical);
+        }
+    }
+    let charged: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM coordinator_scan_attempts")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(charged, 0);
 }
