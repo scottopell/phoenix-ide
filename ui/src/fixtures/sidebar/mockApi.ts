@@ -1,13 +1,37 @@
 import { api } from '../../api';
-import type { CodexLoginPreflight, ModelsResponse, ProductConversationSnapshotView } from '../../api';
+import type { CodexLoginPreflight, LlmLanguageSetting, ModelsResponse, NotificationSettings, ProductConversationSnapshotView } from '../../api';
 import type { DeploymentInfo } from '../../generated/DeploymentInfo';
 import type { SidebarFixtureData } from './types';
+
+const fixtureNotificationSettings: NotificationSettings = {
+  enabled: true,
+  notify_task_approval: true,
+  notify_question: true,
+  notify_error: true,
+  notify_idle: true,
+  notify_reminder: true,
+};
+
+const fixtureLlmLanguageSetting: LlmLanguageSetting = {
+  language: 'en',
+  available: ['en'],
+  languages: [],
+};
+
+const fixtureVersion = {
+  version: 'fixture',
+  git_sha: 'fixture000000000000000000000000000000000000',
+  socket_activated: false,
+} as const;
 
 export function installSidebarFixtureApi(data: SidebarFixtureData, scenarioId: keyof NonNullable<SidebarFixtureData['productConversations']>) {
   const original = {
     codexLoginPreflight: api.codexLoginPreflight,
     codexQuota: api.codexQuota,
     deploymentInfo: api.deploymentInfo,
+    getNotificationSettings: api.getNotificationSettings,
+    getLlmLanguageSetting: api.getLlmLanguageSetting,
+    getVersion: api.getVersion,
     getLocalServices: api.getLocalServices,
     getProjects: api.getProjects,
     listModels: api.listModels,
@@ -28,6 +52,9 @@ export function installSidebarFixtureApi(data: SidebarFixtureData, scenarioId: k
   });
   api.codexQuota = async () => null;
   api.deploymentInfo = async (): Promise<DeploymentInfo> => ({ local_access: true } as unknown as DeploymentInfo);
+  api.getNotificationSettings = async () => ({ ...fixtureNotificationSettings });
+  api.getLlmLanguageSetting = async () => ({ ...fixtureLlmLanguageSetting });
+  api.getVersion = async () => ({ ...fixtureVersion });
   api.getLocalServices = async () => ({ services: [] });
   api.getProjects = async () => data.projects;
   api.listModels = async (): Promise<ModelsResponse> => ({
@@ -78,6 +105,9 @@ export function installSidebarFixtureApi(data: SidebarFixtureData, scenarioId: k
     api.codexLoginPreflight = original.codexLoginPreflight;
     api.codexQuota = original.codexQuota;
     api.deploymentInfo = original.deploymentInfo;
+    api.getNotificationSettings = original.getNotificationSettings;
+    api.getLlmLanguageSetting = original.getLlmLanguageSetting;
+    api.getVersion = original.getVersion;
     api.getLocalServices = original.getLocalServices;
     api.getProjects = original.getProjects;
     api.listModels = original.listModels;

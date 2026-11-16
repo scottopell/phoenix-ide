@@ -239,7 +239,7 @@
   }
 }
 
-@container sidebar-list (width < 240px) {
+@container sidebar-list (width < 220px) {
   .sidebar-mode .conv-item.product-conversation-list-row {
     grid-template-columns: minmax(0, 1fr) 0 auto;
     column-gap: 2px;

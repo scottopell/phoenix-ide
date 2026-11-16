@@ -48,6 +48,41 @@ describe('sidebar fixture scenarios', () => {
     }
   });
 
+  it('mocks settings and version endpoints and restores their original API methods', async () => {
+    const originals = {
+      getNotificationSettings: api.getNotificationSettings,
+      getLlmLanguageSetting: api.getLlmLanguageSetting,
+      getVersion: api.getVersion,
+    };
+    const restore = installSidebarFixtureApi(sidebarFixtureData, 'product-actions-continued');
+    try {
+      expect(await api.getNotificationSettings()).toEqual({
+        enabled: true,
+        notify_task_approval: true,
+        notify_question: true,
+        notify_error: true,
+        notify_idle: true,
+        notify_reminder: true,
+      });
+      expect(await api.getLlmLanguageSetting()).toEqual({
+        language: 'en',
+        available: ['en'],
+        languages: [],
+      });
+      expect(await api.getVersion()).toEqual({
+        version: 'fixture',
+        git_sha: 'fixture000000000000000000000000000000000000',
+        socket_activated: false,
+      });
+    } finally {
+      restore();
+    }
+
+    expect(api.getNotificationSettings).toBe(originals.getNotificationSettings);
+    expect(api.getLlmLanguageSetting).toBe(originals.getLlmLanguageSetting);
+    expect(api.getVersion).toBe(originals.getVersion);
+  });
+
   it('covers minimum/default widths, every PR state and a long badge-bearing title', () => {
     const visualScenarios = sidebarScenarios.filter(scenario => scenario.id.startsWith('sidebar-visual-'));
     expect(visualScenarios.map(scenario => scenario.sidebarWidth)).toEqual([280, 160]);

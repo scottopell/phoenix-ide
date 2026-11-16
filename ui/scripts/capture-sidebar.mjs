@@ -71,21 +71,22 @@ runSurfaceCapture({
       if (process.env.SIDEBAR_VISUAL_BASELINE !== '1' && id === 'sidebar-visual-normal') {
         const sweep = [];
         const sidebar = page.locator('.sidebar');
-        for (const width of [160, 180, 200, 220, 230, 240, 260, 280, 320, 500]) {
+        for (const width of [160, 180, 200, 220, 230, 236, 237, 238, 239, 240, 260, 280, 320, 500]) {
           await sidebar.evaluate((el, value) => el.style.setProperty('--sidebar-pane-width', `${value}px`), width);
           const sample = await sidebar.evaluate(el => {
             const bounds = el.getBoundingClientRect();
             const rows = [...el.querySelectorAll('.product-conversation-list-row')].map(row => {
+              const bounds = row.getBoundingClientRect();
               const main = row.querySelector('.conv-item-main').getBoundingClientRect();
               const title = row.querySelector('.conv-item-title').getBoundingClientRect();
               const menu = row.querySelector('.conv-item-menu-btn').getBoundingClientRect();
               const badge = row.querySelector('.pr-badge')?.getBoundingClientRect();
-              return { titleWidth: title.width, inside: [main, menu, badge].filter(Boolean).every(r => r.x >= bounds.x && r.right <= bounds.right),
+              return { titleWidth: title.width, mainWidth: main.width, inside: [main, menu, badge].filter(Boolean).every(r => r.x >= bounds.x && r.right <= bounds.right),
                 badgeClear: !badge || badge.top >= main.bottom || badge.right <= menu.x && badge.x >= main.right };
             });
             const controls = [...el.querySelectorAll('.sidebar-header button, .sidebar-lifecycle-tab')].map(control => {
               const r = control.getBoundingClientRect();
-              return { fits: control.scrollWidth <= control.clientWidth, inside: r.x >= bounds.x && r.right <= bounds.right + 1, width: r.width, height: r.height };
+              return { fits: control.scrollWidth <= control.clientWidth, inside: r.x >= bounds.x && r.right <= bounds.right + 1, x: r.x, right: r.right, top: r.top, bottom: r.bottom, width: r.width, height: r.height };
             });
             return { rows, controls };
           });
@@ -94,8 +95,9 @@ runSurfaceCapture({
         await sidebar.evaluate(el => el.style.removeProperty('--sidebar-pane-width'));
         await writeFile(`${outDir}/${id}--${viewport.name}.width-sweep.json`, JSON.stringify(sweep, null, 2));
         for (const sample of sweep) {
-          if (sample.rows.some(row => row.titleWidth < 40 || !row.inside || !row.badgeClear)) throw new Error(`Row allocation failed at sidebar width ${sample.width}`);
+          if (sample.rows.some(row => row.titleWidth < 40 || !row.inside || !row.badgeClear || viewport.hasTouch && row.mainWidth < 44)) throw new Error(`Row allocation failed at sidebar width ${sample.width}`);
           if (sample.controls.some(c => !c.fits || !c.inside || viewport.hasTouch && (c.width < 44 || c.height < 44))) throw new Error(`Header allocation failed at sidebar width ${sample.width}`);
+          if (sample.controls.some((a, i) => sample.controls.slice(i + 1).some(b => a.x < b.right && b.x < a.right && a.top < b.bottom && b.top < a.bottom))) throw new Error(`Header controls overlap at sidebar width ${sample.width}`);
         }
       }
       await page.locator('.sidebar').evaluate(el => { el.tabIndex = -1; el.focus(); });
@@ -115,6 +117,9 @@ runSurfaceCapture({
       await page.getByRole('button', { name: 'Settings', exact: true }).click();
       const settings = page.getByRole('dialog', { name: 'Settings', exact: true });
       await settings.waitFor({ state: 'visible' });
+      await settings.getByRole('radiogroup', { name: 'Model language' }).waitFor();
+      await settings.getByRole('checkbox', { name: 'Disable browser notifications' }).waitFor();
+      if (await settings.locator('.settings-section__error').count()) throw new Error('Settings fixture contains a load error');
       const popup = await settings.evaluate(el => {
         const r = el.getBoundingClientRect();
         const t = document.querySelector('.settings-dropdown-trigger').getBoundingClientRect();
@@ -125,6 +130,10 @@ runSurfaceCapture({
       await writeFile(`${outDir}/${id}--${viewport.name}.settings.json`, JSON.stringify(popup, null, 2));
       await page.screenshot({ path: `${outDir}/${id}--${viewport.name}-settings.png`, fullPage: false });
       if (Math.abs(popup.top - popup.triggerBottom - 6) > 1 || popup.x < 0 || popup.right > popup.viewportWidth || popup.bottom > popup.viewportHeight || !popup.unclipped) throw new Error('Settings popup shifted or clipped');
+      const about = settings.getByRole('button', { name: 'About', exact: true });
+      await about.scrollIntoViewIfNeeded();
+      if (!(await about.evaluate(el => { const r = el.getBoundingClientRect(); return el.contains(document.elementFromPoint(r.x + r.width / 2, r.y + r.height / 2)); }))) throw new Error('Settings bottom control is clipped');
+      await page.screenshot({ path: `${outDir}/${id}--${viewport.name}-settings-bottom.png`, fullPage: false });
       await page.keyboard.press('Escape');
       await settings.waitFor({ state: 'hidden' });
       return true;
