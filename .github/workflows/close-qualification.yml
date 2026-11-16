@@ -98,7 +98,7 @@ jobs:
           for test in \
             native_retry_pre_admission_context_reads_exact_stopped_g1_without_mutation \
             native_retry_pre_admission_context_keeps_historical_stopped_readable_and_rejects_running_successor; do
-            grep -F "native_close::retry::execution_tests::$test: test" evidence/selected-tests.txt
+            grep -F "close_foundation::tests::native_retry::$test: test" evidence/selected-tests.txt
           done
           for test in \
             native_retry_dispatch_uses_original_g1_under_g2_and_replays_without_mutation \

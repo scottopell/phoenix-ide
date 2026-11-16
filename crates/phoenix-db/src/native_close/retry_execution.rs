@@ -15,10 +15,9 @@ use sqlx::{Row, Sqlite, Transaction};
 use super::{NativeCloseCommand, NativeCloseIntent, NativeCloseRunRef};
 use crate::close_foundation::{
     close_obligation_for_update, parse_cleanup_resource_identity, retained_close_retry_progress_tx,
-    StoppedCloseOriginalRetirementProof,
     CloseCleanupFailureAuthority, CloseCleanupFailureResource, CloseCleanupResourceDisposition,
     CloseSafeRetryEffect, CloseSafeRetryProgress, RecordCloseRetirementDispatchRequest,
-    TerminalizeInitialCloseCleanupFailureRequest,
+    StoppedCloseOriginalRetirementProof, TerminalizeInitialCloseCleanupFailureRequest,
 };
 use crate::workflow::LocalAuthorityResult;
 use crate::{Database, DbError, DbResult};
@@ -133,10 +132,14 @@ impl Database {
         failed_run: &CloseRunRef,
     ) -> DbResult<NativeCloseRetryPreAdmissionContext> {
         let mut tx = self.pool.begin().await?;
-        let original = Self::read_stopped_close_original_retirement_proof_tx(&mut tx, failed_run).await?;
+        let original =
+            Self::read_stopped_close_original_retirement_proof_tx(&mut tx, failed_run).await?;
         let worktree_snapshots = original_worktree_snapshots(&original.snapshot, &original.scopes)?;
         tx.commit().await?;
-        Ok(NativeCloseRetryPreAdmissionContext { original, worktree_snapshots })
+        Ok(NativeCloseRetryPreAdmissionContext {
+            original,
+            worktree_snapshots,
+        })
     }
 
     /// Reads the exact latest running resource retry in one read-only transaction.

@@ -10,8 +10,9 @@ use sha2::{Digest, Sha256};
 
 use phoenix_core::domain::close::{
     AbsenceBasis, CapturedWorktreeIdentity, CloseAttemptId, CloseAttemptScope,
-    CloseCompletionOutcome, CloseExpectedRetirementResource, CloseInspection, CloseLossItem,
+    CloseCompletionOutcome, CloseExpectedRetirementResource, CloseLossItem,
     CloseOwnedResourceInventory, ClosePhase, CloseRetiredResource, CloseRetirementSnapshot,
+    CloseRetirementTarget,
     CloseRunOrdinal, CloseRunRef, CloseRunStatus, CloseStopCertainty, GitOidIdentity,
     GitPathIdentity, LossItemIdentity, OpaqueIdentity, RetiredResourceIdentity,
     RetiredResourceKind, RetirementFailureReason, RetirementOutcome, WorktreeIdentity,
@@ -9281,7 +9282,8 @@ mod tests {
             super::CloseRetirementSnapshot::parse(
                 "process-step-generation",
                 "process-step-fingerprint",
-            ).unwrap()
+            )
+            .unwrap()
         };
         db.replace_close_inspection(crate::db::ReplaceCloseInspectionRequest {
             attempt_id: run.attempt_id.clone(),
@@ -9659,15 +9661,19 @@ mod tests {
         let effects =
             super::native_close_retry_remaining_effects(&fixture.run, &original, &snapshots)
                 .unwrap();
-        let worktree = effects.iter().find(|effect| {
-            effect.resource.kind() == super::RetiredResourceKind::Worktree
-        }).unwrap();
+        let worktree = effects
+            .iter()
+            .find(|effect| effect.resource.kind() == super::RetiredResourceKind::Worktree)
+            .unwrap();
         assert_eq!(effects.len(), 2);
         assert_eq!(snapshots.len(), 1);
         assert!(!original.outcomes.iter().any(|outcome| {
             outcome.resource == worktree.resource
-                && matches!(outcome.outcome, super::RetirementOutcome::Retired
-                    | super::RetirementOutcome::AbsenceAdopted { .. })
+                && matches!(
+                    outcome.outcome,
+                    super::RetirementOutcome::Retired
+                        | super::RetirementOutcome::AbsenceAdopted { .. }
+                )
         }));
 
         // Install conflicting retained inspection evidence, not a live filesystem change.
@@ -9675,9 +9681,18 @@ mod tests {
         let g2_generation = "conflicting-g2";
         let g2_fingerprint = "conflicting-g2-fingerprint";
         let g2 = super::CloseRetirementSnapshot::parse(
-            format!("v1{}:{scope}{}:{g2_generation}", scope.len(), g2_generation.len()),
-            format!("v1{}:{scope}{}:{g2_fingerprint}", scope.len(), g2_fingerprint.len()),
-        ).unwrap();
+            format!(
+                "v1{}:{scope}{}:{g2_generation}",
+                scope.len(),
+                g2_generation.len()
+            ),
+            format!(
+                "v1{}:{scope}{}:{g2_fingerprint}",
+                scope.len(),
+                g2_fingerprint.len()
+            ),
+        )
+        .unwrap();
         let mut tx = db.pool().begin().await.unwrap();
         sqlx::query("UPDATE close_retirement_inspections SET generation=?1, fingerprint=?2 WHERE attempt_id=?3 AND scope=?4")
             .bind(g2_generation).bind(g2_fingerprint)
@@ -9688,25 +9703,64 @@ mod tests {
             .bind(fixture.run.attempt_id.as_str())
             .execute(&mut *tx).await.unwrap();
         tx.commit().await.unwrap();
-        let obligation = db.get_close_obligation(fixture.run.attempt_id.as_str()).await.unwrap();
-        let inspections = db.list_close_retirement_inspections(fixture.run.attempt_id.as_str()).await.unwrap();
+        let obligation = db
+            .get_close_obligation(fixture.run.attempt_id.as_str())
+            .await
+            .unwrap();
+        let inspections = db
+            .list_close_retirement_inspections(fixture.run.attempt_id.as_str())
+            .await
+            .unwrap();
         assert_eq!(obligation.snapshot(), Some(&g2));
         assert_ne!(g2, original.snapshot);
-        assert!(db.list_close_retirement_inspections_for_snapshot(
-            fixture.run.attempt_id.as_str(), &original.snapshot,
-        ).await.is_err());
+        assert!(db
+            .list_close_retirement_inspections_for_snapshot(
+                fixture.run.attempt_id.as_str(),
+                &original.snapshot,
+            )
+            .await
+            .is_err());
 
-        let assessment = fixture.manager.assess_native_close_retry(&fixture.run).await.unwrap();
+        let assessment = fixture
+            .manager
+            .assess_native_close_retry(&fixture.run)
+            .await
+            .unwrap();
         assert_eq!(assessment.original, original);
         assert_eq!(assessment.remaining_effects, effects);
         std::fs::write(linked.join("new-unique-data"), "must survive\n").unwrap();
-        let error = fixture.manager.assess_native_close_retry(&fixture.run).await.unwrap_err();
-        assert!(error.contains("not unchanged and reconstructible"), "{error}");
-        assert_eq!(std::fs::read_to_string(linked.join("new-unique-data")).unwrap(), "must survive\n");
+        let error = fixture
+            .manager
+            .assess_native_close_retry(&fixture.run)
+            .await
+            .unwrap_err();
+        assert!(
+            error.contains("not unchanged and reconstructible"),
+            "{error}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(linked.join("new-unique-data")).unwrap(),
+            "must survive\n"
+        );
 
-        assert_eq!(db.get_close_obligation(fixture.run.attempt_id.as_str()).await.unwrap(), obligation);
-        assert_eq!(db.list_close_retirement_inspections(fixture.run.attempt_id.as_str()).await.unwrap(), inspections);
-        assert_eq!(db.read_stopped_close_original_retirement_proof(&fixture.run).await.unwrap(), original);
+        assert_eq!(
+            db.get_close_obligation(fixture.run.attempt_id.as_str())
+                .await
+                .unwrap(),
+            obligation
+        );
+        assert_eq!(
+            db.list_close_retirement_inspections(fixture.run.attempt_id.as_str())
+                .await
+                .unwrap(),
+            inspections
+        );
+        assert_eq!(
+            db.read_stopped_close_original_retirement_proof(&fixture.run)
+                .await
+                .unwrap(),
+            original
+        );
         assert_eq!(db.get_close_run(&fixture.run).await.unwrap(), original.run);
         let successor = super::CloseRunRef {
             attempt_id: fixture.run.attempt_id.clone(),
@@ -9714,9 +9768,15 @@ mod tests {
         };
         assert!(db.get_close_run(&successor).await.is_err());
         for effect in &effects {
-            assert!(!db.close_retirement_resource_was_dispatched(
-                &fixture.run.attempt_id, &effect.scope, &original.snapshot, &effect.resource,
-            ).await.unwrap());
+            assert!(!db
+                .close_retirement_resource_was_dispatched(
+                    &fixture.run.attempt_id,
+                    &effect.scope,
+                    &original.snapshot,
+                    &effect.resource,
+                )
+                .await
+                .unwrap());
         }
     }
 
