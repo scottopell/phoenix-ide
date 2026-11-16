@@ -20,8 +20,14 @@ than six. Eight sequential ending reads plus a final answer need at least nine
 provider calls. The normal route (`gpt-6-astra`, high effort, Codex connection,
 standard service tier), complete real registry, system prompt, corpus, independent
 oracles, ordering and thresholds stayed fixed. The hard global limit stayed
-120 calls and two million observed input tokens, with 1,536 output tokens and
-60 seconds per call. No automatic retries or selected-answer substitutions ran.
+120 calls and two million observed input tokens, with a 60-second client timeout
+and 1,536 output tokens requested per call. Codex omits that output field on the
+wire, so it was not an enforced generation or billing cap. All 88 calls reported
+output usage: the observed maximum was 223 tokens and the total was 6,794, with
+zero calls above 1,536. No automatic retries or selected-answer substitutions ran.
+This retrospective request-versus-provider annotation preserves every original
+manifest, record, hash and pass threshold; observed semantic/input/latency gates
+are unchanged.
 
 All 39 trials reached final answers: 88 provider calls, 1,027,411 input tokens
 including cache reads/writes, no caps, no provider/tool errors and no denied

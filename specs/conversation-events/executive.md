@@ -36,6 +36,10 @@ regression bounds. The [complete comparison report](../../scripts/qa/ember-event
 retains per-case metrics and hashes. The [first six-call invocation](../../scripts/qa/ember-event-eval/results-e5ff1b8.md)
 remains partial/unaccepted; the authorized full second run changed only the
 uniform per-trial cap to twelve while retaining all global limits and gates.
+The 1,536-output-token request budget was not an enforced Codex generation/billing
+cap; all output usages were reported and the observed per-call maxima were 223 in
+the complete run and 216 in the partial first run, with no observed exceedance.
+Original evidence/hashes and the semantic/input/latency gates remain unchanged.
 This is synthetic local component qualification with small samples and uncontrolled
 provider cache/load, not billing savings, deployment, remote parity or combined
 Ember acceptance. Rebase after memory migration 164, exact integrated CI, final
