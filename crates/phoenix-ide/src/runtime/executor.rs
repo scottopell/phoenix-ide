@@ -173,6 +173,9 @@ enum AuthoritativeEffect {
 }
 
 enum ControlEffect {
+    CancellationCompleted {
+        accepted_child: Option<String>,
+    },
     AbortTool {
         tool_use_id: String,
     },
@@ -199,6 +202,9 @@ impl ClassifiedEffect {
     #[allow(clippy::too_many_lines)]
     fn classify(effect: Effect) -> Self {
         match effect {
+            Effect::CancellationCompleted { accepted_child } => {
+                Self::Control(ControlEffect::CancellationCompleted { accepted_child })
+            }
             Effect::BroadcastAssistantMessage { message } => {
                 Self::Authoritative(Box::new(AuthoritativeEffect::BroadcastAssistantMessage {
                     message,
@@ -494,6 +500,15 @@ struct RequiredSettlementScope {
     admission: crate::runtime::AdmittedOperation,
     boundary: RequiredSettlementBoundary,
     backstop_drain: Option<BackstopDrainReceipts>,
+    cancellation_notice: CancellationNoticeReceipt,
+}
+
+enum CancellationNoticeReceipt {
+    NoCommit,
+    ParentStateCommitted,
+    ChildAccepted(String),
+    Ready,
+    Published,
 }
 
 impl RequiredSettlementScope {
@@ -505,6 +520,7 @@ impl RequiredSettlementScope {
             admission,
             boundary,
             backstop_drain: None,
+            cancellation_notice: CancellationNoticeReceipt::NoCommit,
         }
     }
 
@@ -514,15 +530,26 @@ impl RequiredSettlementScope {
             boundary: RequiredSettlementBoundary::ChildBackstop,
             backstop_drain: (!children.is_empty())
                 .then_some(BackstopDrainReceipts::Pending(children)),
+            cancellation_notice: CancellationNoticeReceipt::NoCommit,
         }
     }
 
     fn record_child_acceptance(&mut self, child_id: &str) {
+        self.cancellation_notice = CancellationNoticeReceipt::ChildAccepted(child_id.to_owned());
         if let Some(BackstopDrainReceipts::Pending(children)) = &mut self.backstop_drain {
             children.retain(|pending| pending != child_id);
             if children.is_empty() {
                 self.backstop_drain = Some(BackstopDrainReceipts::Established);
             }
+        }
+    }
+
+    fn record_parent_state_commit(&mut self) {
+        if matches!(
+            self.cancellation_notice,
+            CancellationNoticeReceipt::NoCommit
+        ) {
+            self.cancellation_notice = CancellationNoticeReceipt::ParentStateCommitted;
         }
     }
 }
@@ -3633,6 +3660,10 @@ where
             Ok::<(), String>(())
         }
         .await;
+        let settlement = match settlement {
+            Ok(()) if owns_scope => self.publish_required_cancellation_notice().await,
+            other => other,
+        };
         if owns_scope {
             self.required_settlement_authority = None;
         }
@@ -4170,6 +4201,7 @@ where
                 ) | (
                     ConvState::CancellingTool { .. },
                     Event::ToolAborted { .. }
+                        | Event::ToolCancellationRetired { .. }
                         | Event::ToolComplete { .. }
                         | Event::ToolRoundComplete { .. }
                 )
@@ -4325,6 +4357,55 @@ where
     }
 
     async fn apply_transition_result_with_authority(
+        &mut self,
+        result: crate::state_machine::transition::TransitionResult,
+        ordinary_input_id: Option<&str>,
+        authority: TransitionAuthority,
+    ) -> Result<Vec<Event>, String> {
+        let notice_boundary = result.effects.iter().find_map(|effect| match effect {
+            Effect::CancellationCompleted { accepted_child } => Some(if accepted_child.is_some() {
+                RequiredSettlementBoundary::Child
+            } else {
+                RequiredSettlementBoundary::Tool
+            }),
+            _ => None,
+        });
+        let Some(boundary) =
+            notice_boundary.filter(|_| self.required_settlement_authority.is_none())
+        else {
+            return Box::pin(self.apply_transition_result_with_deadline(
+                result,
+                ordinary_input_id,
+                authority,
+            ))
+            .await;
+        };
+        let mut owner = self.admit_authoritative_effect()?;
+        self.required_settlement_authority =
+            Some(RequiredSettlementScope::new(owner.reborrow(), boundary));
+        let mut notice_authority = RuntimeSettlementAuthority {
+            owner: Some(owner),
+            abandoned_reason: boundary.owner_disappeared(),
+        };
+        let application = Box::pin(self.apply_transition_result_with_deadline(
+            result,
+            ordinary_input_id,
+            authority,
+        ))
+        .await;
+        let application = match application {
+            Ok(events) => self
+                .publish_required_cancellation_notice()
+                .await
+                .map(|()| events),
+            other => other,
+        };
+        self.required_settlement_authority = None;
+        notice_authority.owner = None;
+        application
+    }
+
+    async fn apply_transition_result_with_deadline(
         &mut self,
         result: crate::state_machine::transition::TransitionResult,
         ordinary_input_id: Option<&str>,
@@ -4986,6 +5067,11 @@ where
                 }
                 let effect_result = match effect_result {
                     Ok(effect_result) => {
+                        if is_state_persist {
+                            if let Some(scope) = &mut self.required_settlement_authority {
+                                scope.record_parent_state_commit();
+                            }
+                        }
                         new_turn_input_persisted |= is_new_turn_input;
                         if is_state_persist && new_turn_input_persisted {
                             self.ordinary_turn_context = None;
@@ -5225,7 +5311,14 @@ where
                 Box::pin(self.execute_effect(effect)).await
             };
             let effect_result = match effect_result {
-                Ok(effect_result) => effect_result,
+                Ok(effect_result) => {
+                    if is_private_state_persist || is_checkpoint {
+                        if let Some(scope) = &mut self.required_settlement_authority {
+                            scope.record_parent_state_commit();
+                        }
+                    }
+                    effect_result
+                }
                 Err(error) => {
                     let failed_state = self.state.clone();
                     self.install_live_state(
@@ -6263,19 +6356,58 @@ where
                     Some(BackstopDrainReceipts::Established)
                 )
             });
+        let forced_notice_ready =
+            self.required_settlement_authority
+                .as_ref()
+                .is_some_and(|scope| {
+                    matches!(scope.cancellation_notice, CancellationNoticeReceipt::Ready)
+                });
+        if drain_established
+            && (cause == crate::state_machine::event::CancelCause::UserRequested
+                || forced_notice_ready)
+        {
+            self.required_settlement_authority
+                .as_mut()
+                .expect("backstop owns settlement scope")
+                .cancellation_notice = CancellationNoticeReceipt::Ready;
+            if let Err(error) = self.publish_required_cancellation_notice().await {
+                tracing::warn!(%error, "Failed to publish cancellation completion");
+            }
+        }
         self.required_settlement_authority = enclosing_authority;
         authority.owner = None;
+    }
 
-        if cause == crate::state_machine::event::CancelCause::UserRequested && drain_established {
-            self.broadcast_cancellation_backstop_message().await;
+    async fn publish_required_cancellation_notice(&mut self) -> Result<(), String> {
+        if !self
+            .required_settlement_authority
+            .as_ref()
+            .is_some_and(|scope| {
+                matches!(scope.cancellation_notice, CancellationNoticeReceipt::Ready)
+            })
+        {
+            return Ok(());
         }
+        if let Err(error) = self.broadcast_cancellation_backstop_message().await {
+            let boundary = self
+                .required_settlement_authority
+                .as_ref()
+                .expect("notice scope exists")
+                .boundary;
+            self.fatal_local_authority_fence
+                .close(boundary.settlement());
+            return Err(error);
+        }
+        self.required_settlement_authority
+            .as_mut()
+            .expect("notice scope exists")
+            .cancellation_notice = CancellationNoticeReceipt::Published;
+        Ok(())
     }
 
     /// Persist and broadcast the completed-cancellation notice.
-    async fn broadcast_cancellation_backstop_message(&mut self) {
-        let Ok(mut admitted) = self.admit_authoritative_effect() else {
-            return;
-        };
+    async fn broadcast_cancellation_backstop_message(&mut self) -> Result<(), String> {
+        let mut admitted = self.admit_authoritative_effect()?;
         let msg_id = uuid::Uuid::new_v4().to_string();
         let content = crate::db::MessageContent::system(
             "Cancellation completed. Aborted work may still be reclaiming resources in the \
@@ -6303,27 +6435,13 @@ where
             }
             Err(e) => {
                 tracing::warn!(error = %e, "Failed to persist cancellation backstop system message");
+                return Err(e);
             }
         }
+        Ok(())
     }
 
-    /// Handle the cancellation backstop firing (REQ-BED-005a
-    /// `CancellingToolDeadlineFires`): a tool that never observed its
-    /// cancellation token and never returned has held the conversation in
-    /// `CancellingTool` past the bounded deadline. Force the cancellation to
-    /// completion without waiting for the task.
-    ///
-    /// Dispatched by `handle_deadline_expiry` (which has already cleared the
-    /// deadline). Sequence: WARN, abort the retained tool task to stop the
-    /// orphaned tokio task, inject `Event::ToolAborted { tool_use_id }` — the
-    /// same synthetic-result path the cooperative `CancellingTool + ToolAborted
-    /// -> Idle` arm uses — to settle to Idle, then persist+broadcast the
-    /// user-visible system message. The message is persisted AFTER the
-    /// checkpoint commits so its `sequence_id` is strictly after the cancelled
-    /// tool round it describes (history replays by sequence). A late stale
-    /// outcome from the aborted task is rejected by both the tool generation
-    /// guard and the state machine's id/state gate once we have left
-    /// `CancellingTool`.
+    /// Retire the selected tool after its cancellation deadline expires.
     async fn handle_cancelling_tool_timeout(&mut self) {
         let tool_use_id = if let ConvState::CancellingTool { tool_use_id, .. } = &self.state {
             tool_use_id.clone()
@@ -6348,19 +6466,11 @@ where
         // round that may reuse the same `tool_use_id`.
         self.tool_execution.abort_task_and_invalidate();
 
-        // Drive the cooperative cancellation arm with a synthetic ToolAborted.
-        if let Err(e) = self.process_event(Event::ToolAborted { tool_use_id }).await {
-            tracing::warn!(error = %e, "Failed to process cancellation backstop ToolAborted");
-        }
-
-        // Announce completion only if we actually reached Idle. When the
-        // cancelled round had spawned sub-agents, ToolAborted transitions to
-        // CancellingSubAgents (not Idle) — that path's own backstop announces
-        // completion when it drains to Idle, so broadcasting here would be both
-        // premature (cancellation isn't done) and a duplicate. Persisted AFTER
-        // the checkpoint so its sequence is strictly after the round it describes.
-        if matches!(self.state, ConvState::Idle) {
-            self.broadcast_cancellation_backstop_message().await;
+        if let Err(e) = self
+            .process_event(Event::ToolCancellationRetired { tool_use_id })
+            .await
+        {
+            tracing::warn!(error = %e, "Failed to process cancellation backstop ToolCancellationRetired");
         }
     }
 
@@ -8242,6 +8352,42 @@ where
         effect: ControlEffect,
     ) -> Result<Option<Event>, String> {
         match effect {
+            ControlEffect::CancellationCompleted { accepted_child } => {
+                let scope = self
+                    .required_settlement_authority
+                    .as_ref()
+                    .ok_or("cancellation completion has no settlement owner")?;
+                let boundary = scope.boundary;
+                let established = match (&scope.cancellation_notice, accepted_child.as_deref()) {
+                    (CancellationNoticeReceipt::ChildAccepted(actual), Some(expected)) => {
+                        actual == expected
+                    }
+                    (CancellationNoticeReceipt::ParentStateCommitted, None) => true,
+                    (CancellationNoticeReceipt::ParentStateCommitted, Some(child)) => {
+                        // A terminal retry can resume after the exact child acceptance committed.
+                        self.storage
+                            .sub_agent_terminal_is_accepted(child)
+                            .await
+                            .inspect_err(|_| {
+                                self.fatal_local_authority_fence
+                                    .close(boundary.settlement());
+                            })?
+                    }
+                    _ => false,
+                };
+                if !established {
+                    self.fatal_local_authority_fence
+                        .close(boundary.settlement());
+                    return Err(
+                        "cancellation notice lacks its exact committed settlement receipt".into(),
+                    );
+                }
+                self.required_settlement_authority
+                    .as_mut()
+                    .expect("completion scope exists")
+                    .cancellation_notice = CancellationNoticeReceipt::Ready;
+                Ok(None)
+            }
             ControlEffect::AbortTool { tool_use_id } => {
                 tracing::info!(tool_id = %tool_use_id, "Aborting tool execution");
                 self.tool_execution.request_cancel();
@@ -24770,6 +24916,439 @@ mod steer_drain_detector_tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn forced_tool_notice_follows_sqlite_child_acceptance_and_summary() {
+        use phoenix_db::{
+            SubAgentBatchAdmission, SubAgentExecutionAuthority, SubAgentRunAdmission,
+            SubAgentTerminalCause,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("forced-notice.db");
+        let db = crate::db::Database::open(path.to_str().unwrap())
+            .await
+            .unwrap();
+        crate::db::run_pending_migrations(db.pool()).await.unwrap();
+        let id = "sqlite-forced-notice";
+        db.create_conversation(id, id, "/tmp", true, None, None)
+            .await
+            .unwrap();
+        db.create_conversation("child", "child", "/tmp", false, Some(id), None)
+            .await
+            .unwrap();
+        db.admit_sub_agent_batch(&SubAgentBatchAdmission {
+            batch_id: "batch".into(),
+            parent_conversation_id: id.into(),
+            parallel_work_qualified: false,
+            runs: vec![SubAgentRunAdmission {
+                child_conversation_id: "child".into(),
+                execution_authority: SubAgentExecutionAuthority::ReadOnly,
+            }],
+        })
+        .await
+        .unwrap();
+        let mut initial = ordinary_completion_state();
+        if let ConvState::ToolExecuting {
+            pending_sub_agents, ..
+        } = &mut initial
+        {
+            pending_sub_agents.push(PendingSubAgent {
+                agent_id: "child".into(),
+                task: "task".into(),
+                mode: SubAgentMode::Explore,
+            });
+        }
+        db.update_conversation_state(id, &initial).await.unwrap();
+        let (event_tx, event_rx) = mpsc::channel(16);
+        let mut runtime = ConversationRuntime::new(
+            ConvContext::new(id, PathBuf::from("/tmp"), "test-model", 200_000, 16_384),
+            initial,
+            crate::runtime::traits::DatabaseStorage::new(db.clone()),
+            Arc::new(MockLlmClient::new("test-model")),
+            Arc::new(MockToolExecutor::new()),
+            Arc::new(BrowserSessionManager::default()),
+            Arc::new(crate::tools::BashHandleRegistry::new()),
+            Arc::new(crate::tools::TmuxRegistry::new()),
+            Arc::new(ModelRegistry::new_empty()),
+            crate::terminal::ActiveTerminals::new(),
+            event_rx,
+            event_tx,
+            SseBroadcaster::new(128, 0),
+        );
+        let mut broadcasts = runtime.broadcast_tx.subscribe();
+        runtime
+            .process_event(Event::UserCancel {
+                reason: None,
+                cause: crate::state_machine::event::CancelCause::UserRequested,
+            })
+            .await
+            .unwrap();
+        runtime.handle_cancelling_tool_timeout().await;
+        let at = Utc::now();
+        db.update_child_state_and_record_sub_agent_terminal(
+            "child",
+            &ConvState::Completed {
+                result: "authentic result".into(),
+            },
+            at,
+            SubAgentTerminalCause::SubmitResult,
+            at,
+        )
+        .await
+        .established()
+        .unwrap()
+        .unwrap();
+        // A rejected summary/acceptance transaction must keep the phase's notice owed.
+        sqlx::query("CREATE TRIGGER reject_parent_acceptance BEFORE UPDATE OF parent_accepted_at_unix_micros ON sub_agent_runs BEGIN SELECT RAISE(ABORT, 'injected known acceptance failure'); END").execute(db.pool()).await.unwrap();
+        let child = Event::SubAgentResult {
+            agent_id: "child".into(),
+            outcome: SubAgentOutcome::Success {
+                result: "authentic result".into(),
+            },
+        };
+        runtime.process_event(child.clone()).await.unwrap();
+        assert!(!db.sub_agent_terminal_is_accepted("child").await.unwrap());
+        assert!(matches!(
+            runtime.state,
+            ConvState::CancellingSubAgents { .. }
+        ));
+        assert!(!db.get_messages(id).await.unwrap().iter().any(|message| matches!(&message.content, MessageContent::System(content) if content.text.starts_with("Cancellation completed."))));
+        sqlx::query("DROP TRIGGER reject_parent_acceptance")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        runtime.process_event(child.clone()).await.unwrap();
+        assert!(db.sub_agent_terminal_is_accepted("child").await.unwrap());
+        assert!(matches!(
+            db.get_conversation(id).await.unwrap().state,
+            ConvState::Idle
+        ));
+        let messages = db.get_messages(id).await.unwrap();
+        let notices = messages.iter().filter(|message| matches!(&message.content, MessageContent::System(content) if content.text.starts_with("Cancellation completed."))).collect::<Vec<_>>();
+        assert_eq!(notices.len(), 1);
+        let notice = notices[0];
+        let summary = messages.iter().find(|message| matches!(&message.content, MessageContent::User(content) if content.text.contains("authentic result"))).expect("accepted child summary is persisted");
+        assert!(summary.sequence_id < notice.sequence_id);
+        assert_eq!(messages.last().unwrap().message_id, notice.message_id);
+        assert!(messages
+            .iter()
+            .filter(|message| message.message_id != notice.message_id)
+            .all(|message| message.sequence_id < notice.sequence_id));
+        let notice_id = notice.message_id.clone();
+        let mut published = 0;
+        while let Ok(event) = broadcasts.try_recv() {
+            if matches!(event, SseEvent::Message { ref message, .. } if message.message_id == notice_id)
+            {
+                published += 1;
+            }
+        }
+        assert_eq!(published, 1);
+        runtime.process_event(child).await.unwrap();
+        runtime.handle_cancelling_sub_agents_timeout().await;
+        assert_eq!(
+            serde_json::to_value(db.get_messages(id).await.unwrap()).unwrap(),
+            serde_json::to_value(&messages).unwrap()
+        );
+        drop(runtime);
+        db.pool().close().await;
+        let reopened = crate::db::Database::open(path.to_str().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(reopened.get_messages(id).await.unwrap()).unwrap(),
+            serde_json::to_value(&messages).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn forced_tool_notice_survives_delayed_cooperative_child_drain() {
+        let mut initial = ordinary_completion_state();
+        if let ConvState::ToolExecuting {
+            pending_sub_agents, ..
+        } = &mut initial
+        {
+            for child in ["child-a", "child-b"] {
+                pending_sub_agents.push(PendingSubAgent {
+                    agent_id: child.into(),
+                    task: "task".into(),
+                    mode: SubAgentMode::Work,
+                });
+            }
+        }
+        let id = "forced-tool-delayed-children";
+        let (mut runtime, storage) = build_runtime_with_state_and_queue(id, initial, vec![]);
+        let notices = |storage: &InMemoryStorage| {
+            storage.get_all_messages(id).into_iter().filter(|message| {
+            matches!(&message.content, MessageContent::System(content) if content.text.starts_with("Cancellation completed."))
+        }).collect::<Vec<_>>()
+        };
+        runtime
+            .process_event(Event::UserCancel {
+                reason: None,
+                cause: crate::state_machine::event::CancelCause::UserRequested,
+            })
+            .await
+            .unwrap();
+        runtime.handle_cancelling_tool_timeout().await;
+        assert!(matches!(
+            runtime.state,
+            ConvState::CancellingSubAgents { .. }
+        ));
+        assert!(notices(&storage).is_empty());
+        for child in ["child-a", "child-b"] {
+            runtime
+                .process_event(Event::SubAgentResult {
+                    agent_id: child.into(),
+                    outcome: SubAgentOutcome::Success {
+                        result: "done".into(),
+                    },
+                })
+                .await
+                .unwrap();
+            assert_eq!(notices(&storage).len(), usize::from(child == "child-b"));
+        }
+        assert_eq!(storage.sub_agent_acceptance_count(), 2);
+        assert!(matches!(runtime.state, ConvState::Idle));
+        let messages = storage.get_all_messages(id);
+        assert_eq!(
+            messages.last().unwrap().message_id,
+            notices(&storage)[0].message_id
+        );
+        runtime.handle_cancelling_sub_agents_timeout().await;
+        runtime.handle_cancelling_tool_timeout().await;
+        assert_eq!(notices(&storage).len(), 1);
+    }
+
+    fn cancellation_notice_count(storage: &InMemoryStorage, id: &str) -> usize {
+        storage
+            .get_all_messages(id)
+            .iter()
+            .filter(|message| {
+                matches!(&message.content,
+            MessageContent::System(content) if content.text.starts_with("Cancellation completed."))
+            })
+            .count()
+    }
+
+    #[tokio::test]
+    async fn forced_tool_notice_survives_inline_steering_for_immediate_and_delayed_completion() {
+        for delayed_child in [false, true] {
+            let id = "forced-notice-steering";
+            let mut initial = ordinary_completion_state();
+            if delayed_child {
+                if let ConvState::ToolExecuting {
+                    pending_sub_agents, ..
+                } = &mut initial
+                {
+                    pending_sub_agents.push(PendingSubAgent {
+                        agent_id: "child".into(),
+                        task: "task".into(),
+                        mode: SubAgentMode::Explore,
+                    });
+                }
+            }
+            let (mut runtime, storage) = build_runtime_with_state_and_queue(id, initial, vec![]);
+            let entry = mk_entry("forced-steer", "continue after cancellation");
+            runtime.steering_queue = vec![entry.clone()];
+            storage.set_steering_queue(id, vec![entry]);
+            runtime
+                .process_event(Event::UserCancel {
+                    reason: None,
+                    cause: crate::state_machine::event::CancelCause::UserRequested,
+                })
+                .await
+                .unwrap();
+            runtime.handle_cancelling_tool_timeout().await;
+            if delayed_child {
+                assert_eq!(cancellation_notice_count(&storage, id), 0);
+                runtime
+                    .process_event(Event::SubAgentResult {
+                        agent_id: "child".into(),
+                        outcome: SubAgentOutcome::Success {
+                            result: "done".into(),
+                        },
+                    })
+                    .await
+                    .unwrap();
+            }
+            assert!(matches!(runtime.state, ConvState::LlmRequesting { .. }));
+            assert_eq!(cancellation_notice_count(&storage, id), 1);
+            assert!(storage.get_steering_queue(id).is_empty());
+            let messages = storage.get_all_messages(id);
+            assert!(
+                matches!(&messages.last().unwrap().content, MessageContent::System(content) if content.text.starts_with("Cancellation completed."))
+            );
+            runtime.abort_external_effects().await;
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn forced_tool_notice_survives_existing_terminal_checkpoint_retry() {
+        let id = "forced-notice-terminal-retry";
+        let (mut runtime, storage) =
+            build_runtime_with_state_and_queue(id, ordinary_completion_state(), vec![]);
+        let turn = crate::runtime::traits::ActiveDirectTurn {
+            turn_id: phoenix_workflow::TurnAuthorityId(71),
+            generation: 0,
+        };
+        storage.set_active_direct_turn(Some(turn.clone()));
+        runtime.active_direct_turn = Some(Box::new(turn));
+        storage.set_terminal_obligation_establishment_failures(1);
+        runtime
+            .process_event(Event::UserCancel {
+                reason: None,
+                cause: crate::state_machine::event::CancelCause::UserRequested,
+            })
+            .await
+            .unwrap();
+        runtime.handle_cancelling_tool_timeout().await;
+        assert!(runtime.terminal_transition_retry.is_some());
+        assert!(!runtime.fatal_local_authority_fence.is_closed());
+        assert_eq!(cancellation_notice_count(&storage, id), 0);
+        tokio::time::advance(TERMINAL_SETTLEMENT_RETRY_DELAY).await;
+        runtime.retry_terminal_transition().await;
+        assert!(runtime.terminal_transition_retry.is_none());
+        assert!(runtime.active_direct_turn.is_none());
+        assert!(matches!(runtime.state, ConvState::Idle));
+        assert_eq!(cancellation_notice_count(&storage, id), 1);
+        runtime.handle_cancelling_tool_timeout().await;
+        assert_eq!(cancellation_notice_count(&storage, id), 1);
+    }
+
+    #[tokio::test]
+    async fn forced_tool_notice_and_child_deadline_share_one_completion() {
+        let id = "forced-notice-child-deadline";
+        let (mut runtime, storage) = cancelling_runtime(
+            id,
+            &["child-a", "child-b"],
+            crate::state_machine::event::CancelCause::UserRequested,
+        )
+        .await;
+        if let ConvState::CancellingSubAgents {
+            forced_tool_retirement,
+            ..
+        } = &mut runtime.state
+        {
+            *forced_tool_retirement =
+                phoenix_core::domain::sm_state::ForcedToolRetirement::Observed;
+        }
+        runtime
+            .process_event(Event::SubAgentResult {
+                agent_id: "child-a".into(),
+                outcome: SubAgentOutcome::Success {
+                    result: "done".into(),
+                },
+            })
+            .await
+            .unwrap();
+        assert_eq!(cancellation_notice_count(&storage, id), 0);
+        runtime.handle_cancelling_sub_agents_timeout().await;
+        assert_eq!(storage.sub_agent_acceptance_count(), 2);
+        assert_eq!(cancellation_notice_count(&storage, id), 1);
+        runtime
+            .process_event(Event::SubAgentResult {
+                agent_id: "child-b".into(),
+                outcome: SubAgentOutcome::Success {
+                    result: "late".into(),
+                },
+            })
+            .await
+            .unwrap();
+        runtime.handle_cancelling_sub_agents_timeout().await;
+        assert_eq!(cancellation_notice_count(&storage, id), 1);
+    }
+
+    #[tokio::test]
+    async fn cooperative_tool_and_children_do_not_owe_forced_notice() {
+        let id = "cooperative-no-forced-notice";
+        let mut initial = ordinary_completion_state();
+        if let ConvState::ToolExecuting {
+            pending_sub_agents, ..
+        } = &mut initial
+        {
+            pending_sub_agents.push(PendingSubAgent {
+                agent_id: "child".into(),
+                task: "task".into(),
+                mode: SubAgentMode::Explore,
+            });
+        }
+        let (mut runtime, storage) = build_runtime_with_state_and_queue(id, initial, vec![]);
+        runtime
+            .process_event(Event::UserCancel {
+                reason: None,
+                cause: crate::state_machine::event::CancelCause::UserRequested,
+            })
+            .await
+            .unwrap();
+        runtime
+            .process_event(Event::ToolAborted {
+                tool_use_id: "tool-1".into(),
+            })
+            .await
+            .unwrap();
+        runtime
+            .process_event(Event::SubAgentResult {
+                agent_id: "child".into(),
+                outcome: SubAgentOutcome::Success {
+                    result: "done".into(),
+                },
+            })
+            .await
+            .unwrap();
+        assert!(matches!(runtime.state, ConvState::Idle));
+        assert_eq!(storage.sub_agent_acceptance_count(), 1);
+        assert_eq!(cancellation_notice_count(&storage, id), 0);
+    }
+
+    #[tokio::test]
+    async fn forced_tool_notice_write_failure_closes_required_authority() {
+        let id = "forced-notice-write-failure";
+        let (mut runtime, storage) =
+            build_runtime_with_state_and_queue(id, ordinary_completion_state(), vec![]);
+        runtime
+            .process_event(Event::UserCancel {
+                reason: None,
+                cause: crate::state_machine::event::CancelCause::UserRequested,
+            })
+            .await
+            .unwrap();
+        storage.set_fail_message_add(true);
+        runtime.handle_cancelling_tool_timeout().await;
+        assert!(matches!(runtime.state, ConvState::Idle));
+        assert_eq!(cancellation_notice_count(&storage, id), 0);
+        assert_eq!(
+            *runtime.fatal_local_authority_fence.tx.borrow(),
+            Some("ordinary_tool_outcome_settlement")
+        );
+    }
+
+    #[tokio::test]
+    async fn forced_tool_notice_owner_lives_through_notice_write() {
+        let id = "forced-notice-owner-loss";
+        let (mut runtime, storage) =
+            build_runtime_with_state_and_queue(id, ordinary_completion_state(), vec![]);
+        runtime
+            .process_event(Event::UserCancel {
+                reason: None,
+                cause: crate::state_machine::event::CancelCause::UserRequested,
+            })
+            .await
+            .unwrap();
+        let fence = runtime.fatal_local_authority_fence.clone();
+        let (started, _release) = storage.gate_message_add();
+        let task = tokio::spawn(async move { runtime.handle_cancelling_tool_timeout().await });
+        started.await.unwrap();
+        assert!(fence.owner_count() > 0);
+        assert_eq!(cancellation_notice_count(&storage, id), 0);
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert_eq!(
+            *fence.tx.borrow(),
+            Some("ordinary_tool_outcome_owner_disappeared")
+        );
+        assert_eq!(fence.owner_count(), 0);
+    }
+
+    #[tokio::test]
     async fn child_backstop_does_not_repeat_its_completed_forced_tool_notice() {
         let mut initial = ordinary_completion_state();
         if let ConvState::ToolExecuting {
@@ -26344,12 +26923,18 @@ mod steer_drain_detector_tests {
             completed_results: vec![],
             cause: crate::state_machine::event::CancelCause::UserRequested,
             spawn_tool_id: None,
+
+            forced_tool_retirement:
+                phoenix_core::domain::sm_state::ForcedToolRetirement::NotObserved,
         };
         let cancelling_second = ConvState::CancellingSubAgents {
             pending: vec![],
             completed_results: vec![],
             cause: crate::state_machine::event::CancelCause::UserRequested,
             spawn_tool_id: None,
+
+            forced_tool_retirement:
+                phoenix_core::domain::sm_state::ForcedToolRetirement::NotObserved,
         };
         rt.deadline = Some(original);
         rt.state = cancelling_second;
@@ -27596,6 +28181,9 @@ mod steer_drain_detector_tests {
                 completed_results: vec![],
                 cause: crate::state_machine::event::CancelCause::UserRequested,
                 spawn_tool_id: None,
+
+                forced_tool_retirement:
+                    phoenix_core::domain::sm_state::ForcedToolRetirement::NotObserved,
             },
         ] {
             let (mut rt, storage) =
@@ -27941,6 +28529,9 @@ mod steer_drain_detector_tests {
             completed_results: vec![],
             cause,
             spawn_tool_id: Some("spawn-1".to_string()),
+
+            forced_tool_retirement:
+                phoenix_core::domain::sm_state::ForcedToolRetirement::NotObserved,
         }
     }
 

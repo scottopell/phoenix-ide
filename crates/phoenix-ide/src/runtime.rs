@@ -11607,6 +11607,9 @@ mod scope_liveness_tests {
                 completed_results: vec![],
                 spawn_tool_id: None,
                 cause: phoenix_core::domain::sm_event::CancelCause::UserRequested,
+
+                forced_tool_retirement:
+                    phoenix_core::domain::sm_state::ForcedToolRetirement::NotObserved,
             };
             manager
                 .db()

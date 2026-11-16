@@ -4817,6 +4817,9 @@ mod product_creation_tests {
                     completed_results: vec![],
                     cause: phoenix_core::domain::sm_event::CancelCause::UserRequested,
                     spawn_tool_id: None,
+
+                    forced_tool_retirement:
+                        phoenix_core::domain::sm_state::ForcedToolRetirement::NotObserved,
                 },
             )
             .await

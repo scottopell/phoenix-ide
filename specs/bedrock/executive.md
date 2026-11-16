@@ -76,7 +76,7 @@ late classified error instead of failing a later selection. The existing awaited
 loop prevents those normal late interleavings, while task 75010 owns responsiveness
 and task 75011 owns the required handoff classification/ownership plumbing.
 
-### Cancellation implementation gaps
+### Cancellation implementation and remaining gaps
 
 REQ-PERM-004's no-resource denial is partial at the dispatcher: the existing code
 broadcasts the tool start, allocates a channel/token/generation and constructs a
@@ -92,14 +92,18 @@ This can delay cancellation behind preparation, contrary to the immediate,
 100-ms interruption/nonqueued contract. Task 75010 tracks the separate runtime
 correction; task 14004 covers related global child-materialization races.
 
-REQ-BED-005a is partial: forced tool cancellation publishes its notice only on
-immediate Idle. If pending children instead drain cooperatively, the final result
-does not remember or publish the owed forced-tool notice. Task 75009 tracks that
-correction and exactly-once ordering qualification. Those forced-notice and
-cancellation-responsiveness gaps remain unqualified; the scoped authority and
-backstop-receipt repairs below do not complete them. Requirements are preserved;
-the normative spec does not authorize blocking cancellation or suppressing an
-owed notice.
+Forced tool retirement has a distinct `ToolCancellationRetired` event and a
+phase-scoped `ForcedToolRetirement` fact in `CancellingSubAgents`. Nonfinal child
+acceptance preserves that fact; the final transition consumes it into a
+`CancellationCompleted` intent after persistence. Immediate forced completion
+produces the same intent. Existing terminal-transition retry retains that intent
+when a checkpoint or terminal settlement must retry. `RequiredSettlementScope`
+requires established parent/child commit receipts and defers the one notice until
+the entire owned application, including inline steering, succeeds. The owning
+authority stays alive through the notice write. Ordinary cooperative cancellation
+produces no degraded notice. Task 75009 owns qualification of these residual live
+notice paths; the responsiveness and native cancellation-handoff gaps in tasks
+75010 and 75011 remain separate.
 
 The child-deadline path snapshots pending identities, establishes required child
 terminal evidence, and feeds each result through normal atomic parent acceptance.
@@ -108,18 +112,15 @@ the failed child or reporting a partial drain as complete. The native command
 collects established acceptance receipts for those exact children; its completed
 notice therefore survives inline steering into a new turn. Timeout, retry,
 failed-settlement, and duplicate forced-notice paths do not report completion.
-This qualifies the scoped authority and notice paths, while the remaining
-payload/conflict, interruption, and cancellation-handoff obligations in tasks
-75009 and 75011 remain open; no complete backstop redesign is claimed.
-
-An already-terminal child is another backstop qualification gap. The DB helper
-locks and refuses conflicting terminal evidence rather than overwriting it, but
-does not return that existing authentic payload for delivery; the executor cannot
-deliver the existing authentic result from that conflict. The target atomically
-reuses established raw terminal payload/cause, or establishes cancellation only when nonterminal. Existing
-parent Timeout-to-TimedOut presentation policy is separate and remains intact.
-Task 75009 includes this race alongside classification/drain/notice qualification;
-no source overwrite or new runtime regression is claimed.
+The child deadline and forced-tool final transition share one scoped notice
+disposition, so an overlapping deadline cannot publish a second notice. PR #1031
+already delivered the scoped authority, classified failure, exact acceptance, and
+authentic terminal-race behavior; those are preserved rather than remaining task
+75009 gaps. The database atomically reuses established raw terminal payload/cause
+or establishes cancellation only when the child is nonterminal. The parent's
+Timeout-to-TimedOut presentation policy remains separate and intact. Interruption
+and the native cancellation handoff remain unqualified; no complete cancellation
+redesign is claimed.
 
 The forced-retirement fact is scoped to the current live cancellation chain.
 Generic restart/error recovery interrupts or replaces that chain under
@@ -160,7 +161,7 @@ Startup, completion, and child-backstop commands retain a mutable reborrow of th
 | **REQ-BED-003:** LLM Response Processing | ✅ Complete | Handles text, tool use, end_turn |
 | **REQ-BED-004:** Tool Execution Coordination | ✅ Complete | Serial execution with state tracking; shared round admission requires unique call/result correspondence without sorting. Provider schedule validation precedes special-tool interception, and per-invocation channels reject misidentified outcomes as concrete errors. Focused coverage includes malformed approval/question/child-terminal responses and expected-invocation completion errors. Bash wait fallback preserves authentic bounded results, aborts only the wait task on healthy expiry, and closes the shared local-authority fence under REQ-BED-033 if authoritative settlement remains indeterminate at its non-renewing persistence cutoff |
 | **REQ-BED-005:** Cancellation Handling | 🚧 Partial | Synthetic tool results are implemented; awaited policy/scope preparation and intercepted admission can delay cancellation behind the owned loop. Immediate/nonqueued cancellation remains required; task 75010 tracks the runtime gap |
-| **REQ-BED-005a:** Bounded Cancellation Liveness | 🚧 Partial | Forced tool/sub-agent backstops are implemented. Forced-tool notice carry through a later cooperative child drain is missing; task 75009 tracks exact-once ordered notice delivery. The Allium obligation is normative, not a claim of implemented behavior |
+| **REQ-BED-005a:** Bounded Cancellation Liveness | 🚧 Partial | Forced tool/sub-agent backstops and live forced-notice carry through delayed cooperative drain are implemented. Task 75009 covers ordered exactly-once notice qualification, including inline steering, existing retries and child-deadline overlap. Broader interruption and cancellation-handoff obligations remain unqualified |
 | **REQ-BED-006:** Error Recovery | ✅ Complete | Retry logic with exponential backoff and typed user-resume admission by ErrorKind |
 | **REQ-BED-007:** State Persistence | ✅ Complete | Database persistence; all selected executing/cancelling buffers are validated before any recovery mutation. File-backed reopen coverage includes malformed standalone and parent-first child buffers retaining exact raw state and producing no partial messages; scoped recovery excludes unrelated malformed buffers. Provider-only interruptions resume from idle, active materialized turns with persisted tool results proactively resume under bounded exact-turn ownership, committed steering retains first-response recovery ownership, and durable continuations retain recovery state |
 | **REQ-BED-008:** Sub-Agent Spawning | 🚧 Partial | Atomic admission and normal exact-child fan-in/duplicate acceptance are live. Unactivated-batch cleanup still suppresses parent delivery administratively; classified all-admitted cancellation reconciliation remains incomplete (task 75011). |
