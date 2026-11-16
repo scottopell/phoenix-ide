@@ -226,3 +226,33 @@ Both Coordinator language variants include an explicit outcome-delegation rule a
 The Phoenix-language Coordinator prompt opens with a 524-word / 3,165-character Ember persona block (ceiling 550 words / 3,300 characters, checked separately from the base and delegation sections). It replaces the former one-clause identity and the superseded "Write for a busy user missing history" sentence; all other reporting, silence, security and delegation guidance is unchanged. Caveman, UI labels and internal Coordinator naming are unchanged. Static checks do not demonstrate live voice quality (ADR-214).
 
 The web list navigation presents one pinned compact Ember entry (Global coordinator), outside ordinary conversation lifecycle/counts, on desktop and mobile; the collapsed desktop rail retains an accessible Ember mark. The existing `/global` singleton route is unchanged. Loading and return-navigation identity use Ember. See REQ-GR-023 and ADR-229. Focused UI tests cover web entry navigation and accessibility naming.
+
+## Reproducing the assembled tool inventory
+
+The opt-in `runtime::tool_surface_inventory::export_coordinator_tool_surface_inventory`
+fixture calls `RuntimeManager::coordinator_tool_registry`, then the same
+`SpawnCatalog::resolve`/`tool_definition` used to specialize configured spawn
+choices. It exports both instruction languages, with/without the authenticated
+built-in skill catalog, and generic versus synthetic configured worker/tier
+choices. Every entry includes the actual descriptions, input schemas, deferred
+flags and byte/word measurements. There is no separately maintained tool roster
+or fixed tool count.
+
+```bash
+PHOENIX_TOOL_INVENTORY_OUTPUT=/absolute/path/tool-surface.json \
+  cargo test -p phoenix-ide export_coordinator_tool_surface_inventory -- --ignored
+```
+
+The fixture uses an isolated database and an offline model configuration; it
+performs no provider requests or target mutations. It describes that synthetic
+configuration, not installed production options or a provider's token accounting.
+Final inventory execution must follow integration of newly registered tracking
+tools. Existing create/rename/generated-continuation/Goal capabilities and
+provider-compatible nested schemas remain their owning contracts, not new work
+commissioned by inventory generation.
+
+The watch description distinguishes local question/task-approval wait entries
+from selected-peer v1 terminal facts. A wait is not execution completion. The
+registry composition comment no longer incorrectly claims that host-supplied
+creation tools are absent. These are guidance corrections, not watch timing,
+lifecycle or protocol changes.

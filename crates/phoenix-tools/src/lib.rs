@@ -969,12 +969,8 @@ impl ToolRegistry {
         }
     }
 
-    /// Bounded registry for the global Coordinator. The host supplies global
-    /// read tools, explicitly WorkScope-targeted unsandboxed Bash, and the
-    /// singular cross-conversation text-message action. Browser, MCP, dedicated
-    /// task/project/workspace mutation, creation, approval, and other lifecycle
-    /// tools are absent; the existing skill tool exposes Coordinator-only reference
-    /// material.
+    /// Combine the core Coordinator tools, host-supplied tools, and optional
+    /// authenticated skill catalog.
     #[must_use]
     pub fn coordinator(
         mut global_read_tools: Vec<Arc<dyn Tool>>,

@@ -56,3 +56,21 @@ Existing task 20005 owns instance-routing architecture; task 28007 owns compact 
 Full runtime inventory is reproducible; examples compose actual emitted identities for local read/send/watch, selected-peer query/read/watch, exact generated continuation and operation-specific peer reconciliation. Existing valid inputs and their effects remain unchanged in this slice. Provider schema constraints remain covered. Shared guidance distinguishes exact event evidence, captured memory, authorization, coverage and execution, with contracts owned and gated by their respective feature slices. Relevant spec/registry/provider tests and the supported dev.py lanes pass; live acceptance is reported separately. This task's aggregate completion is not a prerequisite for accepting the event-specific subset.
 
 Out of scope: rebuilding delivered schemas or federation, broad tool consolidation, event runtime implementation, tracking persistence and scanner inference.
+
+## Narrow implementation — 2026-11-16
+
+Corrected the registry composition comment that incorrectly excluded creation,
+and the installed watch description to distinguish local nonterminal question/
+task-approval waits from selected-peer v1 terminal-only facts. Current Coordinator
+instructions already prefer installed native actions and bind public API fallback
+to inspected destination contracts; no redundant system-prompt layer was added.
+
+Added an opt-in synthetic inventory export through the production runtime
+constructor plus production SpawnCatalog specialization. It records actual
+schemas/descriptions/deferred flags, both languages, authenticated catalog on/off,
+and generic/configured worker/tier variants, with bytes/words rather than a token
+claim. It has no fixed list/count. Final execution/qualification follows memory
+integration so new tools cannot be omitted from the reported current surface.
+
+Formatting/whitespace pass. Rust compilation, export readback, schema/provider and
+composed model-recovery qualification remain pending; this task is not done.
