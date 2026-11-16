@@ -29,8 +29,10 @@ actions and latency are retained. Bytes/words are not token or billing estimates
 Provider caches and service load are not controlled; report those limitations
 and do not infer actual savings from packet length alone.
 
-Limits: six cases × three variants; at most four provider calls per trial,
-1,536 output tokens and 60 seconds per call, 72 calls and a stop threshold of two million observed
+Limits: four targeted cases × three variants × one repetition, plus two control
+cases × three variants × three repetitions: 30 trials total. Variant order
+rotates between cases and control repetitions. At most four provider calls per trial,
+1,536 output tokens and 60 seconds per call, 120 calls and a stop threshold of two million observed
 input tokens for one invocation. The last returned call may cross that observed
 threshold; it is checked before another call. No automatic retries. Cancellation/error/time
 limits leave partial evidence and cannot qualify promotion. These are invocation
@@ -40,7 +42,7 @@ limits, not a claimed dollar ceiling or exactly-once billing guarantee.
 
 ```bash
 PHOENIX_EVENT_EVAL_MODE=prepare \
-PHOENIX_EVENT_EVAL_MODEL=<configured-model> \
+PHOENIX_EVENT_EVAL_MODEL=gpt-6-astra \
 PHOENIX_EVENT_EVAL_EFFORT=high \
 PHOENIX_EVENT_EVAL_OUTPUT=/absolute/new/output-directory \
 ./dev.py qa ember-event-eval
