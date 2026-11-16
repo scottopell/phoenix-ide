@@ -33,7 +33,7 @@ describe('SubAgentTaskDetails', () => {
     expect(container.querySelector('.subagent-delegated-task-text')?.textContent).toBe(task);
     expect(container.querySelector('script, img')).toBeNull();
     fireEvent.click(screen.getByRole('button', { name: 'Copy delegated task' }));
-    await waitFor(() => expect(copyToClipboard).toHaveBeenCalledExactlyOnceWith(task));
+    await waitFor(() => expect(copyToClipboard).toHaveBeenCalledExactlyOnceWith(task, expect.any(AbortSignal)));
     expect(details).toHaveAttribute('open');
   });
 
