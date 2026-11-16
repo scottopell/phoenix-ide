@@ -1007,7 +1007,9 @@ pub struct TerminalizeInitialCloseCleanupFailureRequest {
     pub occurred_at_us: i64,
 }
 
-pub(crate) fn parse_cleanup_resource_identity(row: &SqliteRow) -> DbResult<RetiredResourceIdentity> {
+pub(crate) fn parse_cleanup_resource_identity(
+    row: &SqliteRow,
+) -> DbResult<RetiredResourceIdentity> {
     RetiredResourceIdentity::parse(
         parse_retired_resource_kind(&row.try_get::<String, _>("resource_kind")?)?,
         parse_loss_item_identity(
@@ -4412,6 +4414,20 @@ impl Database {
     ) -> DbResult<()> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let current = close_obligation_for_update(&mut tx, request.attempt_id.as_str()).await?;
+        if current.phase() == ClosePhase::Completed {
+            let native_managed: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM close_obligations
+                 WHERE attempt_id = ?1 AND native_managed = 1)",
+            )
+            .bind(request.attempt_id.as_str())
+            .fetch_one(&mut *tx)
+            .await?;
+            if native_managed {
+                return Err(close_precondition(
+                    "generic retry dispatch is unavailable for native-managed Close operations",
+                ));
+            }
+        }
         let identity = request.resource.identity();
         let retry_authorized = if current.phase() == ClosePhase::Completed
             && matches!(
@@ -4451,6 +4467,16 @@ impl Database {
                 request.attempt_id
             )));
         }
+        Self::insert_close_retirement_dispatch_tx(&mut tx, &request).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub(crate) async fn insert_close_retirement_dispatch_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        request: &RecordCloseRetirementDispatchRequest,
+    ) -> DbResult<()> {
+        let identity = request.resource.identity();
         let inserted = sqlx::query(
             "INSERT OR IGNORE INTO close_retirement_resource_dispatches (
                  attempt_id, scope, inspection_generation, inspection_fingerprint,
@@ -4466,7 +4492,7 @@ impl Database {
         .bind(identity.codec())
         .bind(identity.value())
         .bind(Utc::now().timestamp_micros())
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?;
         if inserted.rows_affected() == 0 {
             let exists: bool = sqlx::query_scalar(
@@ -4486,7 +4512,7 @@ impl Database {
             .bind(identity.identity_kind())
             .bind(identity.codec())
             .bind(identity.value())
-            .fetch_one(&mut *tx)
+            .fetch_one(&mut **tx)
             .await?;
             if !exists {
                 return Err(close_precondition(format!(
@@ -4495,7 +4521,6 @@ impl Database {
                 )));
             }
         }
-        tx.commit().await?;
         Ok(())
     }
 
@@ -6789,7 +6814,8 @@ impl Database {
             | CloseCleanupFailureAuthority::ObservedProcessResource { scope, resource } => {
                 (scope, resource, None)
             }
-            _ => {
+            CloseCleanupFailureAuthority::AttemptInterrupted
+            | CloseCleanupFailureAuthority::ExplicitlySuppressed => {
                 return Err(close_precondition(
                     "resource occurrence requires resource authority",
                 ))
@@ -6842,7 +6868,8 @@ impl Database {
             | CloseCleanupFailureAuthority::ObservedProcessResource { scope, resource } => {
                 (scope, resource, None)
             }
-            _ => {
+            CloseCleanupFailureAuthority::AttemptInterrupted
+            | CloseCleanupFailureAuthority::ExplicitlySuppressed => {
                 return Err(close_precondition(
                     "resource occurrence requires resource authority",
                 ))
@@ -13088,7 +13115,7 @@ mod tests {
             crate::migrations::run_pending_migrations(db.pool())
                 .await
                 .unwrap(),
-            4
+            5
         );
         let after: (String, String, String, String, String, String, String, i64) = sqlx::query_as(
             "SELECT request_id, source_transcript_id, source_message_id, source_tool_use_id,

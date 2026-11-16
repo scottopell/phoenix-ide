@@ -14,6 +14,7 @@ use super::{DbError, DbResult, ProjectSeedId};
 mod federated_subscriptions;
 mod goal_execution;
 mod local_goal_watch;
+mod native_close_retry_dispatch;
 mod native_close_retry_failure;
 mod native_close_source_fence;
 mod retire_commission_review;
@@ -848,6 +849,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 163,
         name: "native_close_retry_failure",
         sql: include_str!("migrations/native_close_retry_failure.sql"),
+    },
+    Migration {
+        version: 164,
+        name: "native_close_retry_dispatch",
+        sql: include_str!("migrations/native_close_retry_dispatch.sql"),
     },
 ];
 
@@ -12564,6 +12570,12 @@ async fn run_migration_list(pool: &SqlitePool, migrations: &[Migration]) -> DbRe
             continue;
         }
 
+        if migration.version == 164 {
+            native_close_retry_dispatch::run(pool, migration).await?;
+            applied += 1;
+            continue;
+        }
+
         if migration.version == 163 {
             native_close_retry_failure::run(pool, migration).await?;
             applied += 1;
@@ -15928,7 +15940,7 @@ mod tests {
             .unwrap()
             .is_empty());
         assert_eq!(run_through_for_test(db.pool(), 152).await.unwrap(), 1);
-        assert_eq!(run_pending_migrations(db.pool()).await.unwrap(), 10);
+        assert_eq!(run_pending_migrations(db.pool()).await.unwrap(), 11);
         assert_eq!(run_pending_migrations(db.pool()).await.unwrap(), 0);
         let ledger: Vec<(i64, String)> = sqlx::query_as(
             "SELECT version, name FROM _migrations WHERE version >= 150 ORDER BY version",
@@ -15955,6 +15967,7 @@ mod tests {
                 (161, "native_close_explicit_retry_admission".into()),
                 (162, "native_close_source_fence".into()),
                 (163, "native_close_retry_failure".into()),
+                (164, "native_close_retry_dispatch".into()),
             ]
         );
     }
@@ -15964,6 +15977,7 @@ mod tests {
         let ledger = compiled_migration_ledger();
         assert!(ledger.windows(2).all(|pair| pair[0].0 < pair[1].0));
         let expected_tail = [
+            (164, "native_close_retry_dispatch"),
             (163, "native_close_retry_failure"),
             (162, "native_close_source_fence"),
             (161, "native_close_explicit_retry_admission"),
@@ -20256,6 +20270,7 @@ mod tests {
                 (161, "native_close_explicit_retry_admission"),
                 (162, "native_close_source_fence"),
                 (163, "native_close_retry_failure"),
+                (164, "native_close_retry_dispatch"),
             ]
         );
         let goal = MIGRATIONS
@@ -20269,7 +20284,7 @@ mod tests {
         assert!(goal
             .sql
             .contains("CREATE TABLE conversation_goal_coordinator_receipts"));
-        assert_eq!(MIGRATIONS.len(), 161);
+        assert_eq!(MIGRATIONS.len(), 162);
     }
 
     #[tokio::test]
@@ -20285,7 +20300,7 @@ mod tests {
         }
         sqlx::query("UPDATE product_creation_jobs SET status = 'published', published_product_id = 'deleted-product', published_conversation_id = 'deleted-transcript' WHERE request_id = 'orphan-image'")
             .execute(&pool).await.unwrap();
-        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 14);
+        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 15);
         let identity: Vec<(String, String)> = sqlx::query_as(
             "SELECT request_id, data_sha256 FROM product_creation_image_replay_identity ORDER BY request_id",
         ).fetch_all(&pool).await.unwrap();
@@ -20339,7 +20354,7 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 14);
+        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 15);
         let retained: (String, String, String) = sqlx::query_as(
             "SELECT status, published_product_id, published_conversation_id
              FROM product_creation_jobs WHERE request_id = 'orphan-text'",
@@ -23513,7 +23528,7 @@ mod close_completion_allowance_tests {
             2
         );
 
-        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 5);
+        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 6);
         let migrated: (i64, i64) = sqlx::query_as(
             "SELECT (SELECT COUNT(*) FROM close_original_retirement_anchors WHERE attempt_id = ?1),
                     (SELECT COUNT(*) FROM close_retirement_anchor_exclusions WHERE attempt_id = ?1)"

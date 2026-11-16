@@ -95,6 +95,23 @@ jobs:
             native_retry_execution_context_refuses_forged_receipt_wrong_failed_run_and_stopped_latest; do
             grep -F "close_foundation::tests::native_retry::$test: test" evidence/selected-tests.txt
           done
+          for test in \
+            native_retry_dispatch_uses_original_g1_under_g2_and_replays_without_mutation \
+            native_retry_dispatch_refuses_forged_identity_non_worktree_and_success \
+            native_retry_dispatch_checks_stale_source_before_retained_dispatch_replay \
+            generic_retry_dispatch_refuses_native_current_g1_with_stale_source \
+            native_retry_dispatch_replays_historical_g1_without_retimestamping \
+            native_retry_raw_dispatch_rejects_backdated_new_row \
+            native_retry_raw_dispatch_rejects_g2_and_malformed_plan_without_legacy_fallthrough \
+            migration_164_preserves_populated_163_rows_and_rewrites_only_dispatch_authority \
+            non_native_retry_dispatch_retains_legacy_current_snapshot_authority; do
+            grep -F "close_foundation::tests::native_retry::$test: test" evidence/selected-tests.txt
+          done
+          for test in \
+            aggregate_component_requires_exact_canonical_byte_lengths_and_unique_scopes \
+            original_snapshots_require_matching_captured_scopes_and_nonempty_values; do
+            grep -F "native_close::retry_execution::snapshot_tests::$test: test" evidence/selected-tests.txt
+          done
       - name: Execute migration163 populated upgrade and authority regressions
         if: success()
         shell: bash

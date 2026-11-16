@@ -1,4 +1,11 @@
 async fn migration_163_pending_fixture() -> (Database, Assessment, NativeCloseReceipt) {
+    migration_163_pending_fixture_with_options(true, false).await
+}
+
+async fn migration_163_pending_fixture_with_options(
+    fresh_snapshot: bool,
+    prior_dispatch: bool,
+) -> (Database, Assessment, NativeCloseReceipt) {
     let pool = sqlx::sqlite::SqlitePoolOptions::new()
         .max_connections(1)
         .connect("sqlite::memory:")
@@ -14,6 +21,14 @@ async fn migration_163_pending_fixture() -> (Database, Assessment, NativeCloseRe
     .await;
     let g1 = current_test_snapshot(&db, failure.attempt_id.as_str()).await;
     let effects = native_retry_request(&failure).remaining_effects;
+    if prior_dispatch {
+        let worktree = effects.iter()
+            .find(|effect| effect.resource.kind() == RetiredResourceKind::Worktree).unwrap();
+        db.record_close_retirement_dispatch(RecordCloseRetirementDispatchRequest {
+            attempt_id: failure.attempt_id.clone(), scope: worktree.scope.clone(),
+            snapshot: g1.clone(), resource: worktree.resource.clone(),
+        }).await.unwrap();
+    }
     for pending in &failure.remaining_resources {
         db.record_close_retirement_evidence(RecordCloseRetirementEvidenceRequest {
             attempt_id: failure.attempt_id.clone(),
@@ -28,49 +43,59 @@ async fn migration_163_pending_fixture() -> (Database, Assessment, NativeCloseRe
         .await
         .unwrap();
     }
-    let scope = failure.authority.scope().unwrap().clone();
-    db.retry_close_retirement(&failure.attempt_id).await.unwrap();
-    db.replace_close_inspection(ReplaceCloseInspectionRequest {
-        attempt_id: failure.attempt_id.clone(),
-        scopes: vec![ReplaceCloseInspectionScopeRequest {
-            scope: scope.clone(),
-            snapshot: CloseRetirementSnapshot::parse("migration163-g2", "migration163-g2-fp")
-                .unwrap(),
-            losses: Vec::new(),
-        }],
-    })
-    .await
-    .unwrap();
-    let g2 = current_test_snapshot(&db, failure.attempt_id.as_str()).await;
-    capture_test_inventory(&db, failure.attempt_id.as_str(), &scope, &g2, Vec::new()).await;
-    for pending in &failure.remaining_resources {
-        db.record_close_retirement_evidence(RecordCloseRetirementEvidenceRequest {
+    if fresh_snapshot {
+        let scope = failure.authority.scope().unwrap().clone();
+        db.retry_close_retirement(&failure.attempt_id).await.unwrap();
+        db.replace_close_inspection(ReplaceCloseInspectionRequest {
             attempt_id: failure.attempt_id.clone(),
-            scope: pending.scope.clone(),
-            snapshot: g2.clone(),
-            resource: pending.resource.clone(),
-            outcome: if pending.resource.kind() == RetiredResourceKind::Worktree {
-                RetirementOutcome::Retired
-            } else {
-                RetirementOutcome::Residual {
-                    residual_reason: RetirementFailureReason::RemovalFailed,
-                }
-            },
-            detail: Some("current G2 evidence".into()),
+            scopes: vec![ReplaceCloseInspectionScopeRequest {
+                scope: scope.clone(),
+                snapshot: CloseRetirementSnapshot::parse("migration163-g2", "migration163-g2-fp")
+                    .unwrap(),
+                losses: Vec::new(),
+            }],
         })
         .await
         .unwrap();
+        let g2 = current_test_snapshot(&db, failure.attempt_id.as_str()).await;
+        capture_test_inventory(&db, failure.attempt_id.as_str(), &scope, &g2, Vec::new()).await;
+        for pending in &failure.remaining_resources {
+            db.record_close_retirement_evidence(RecordCloseRetirementEvidenceRequest {
+                attempt_id: failure.attempt_id.clone(),
+                scope: pending.scope.clone(),
+                snapshot: g2.clone(),
+                resource: pending.resource.clone(),
+                outcome: if pending.resource.kind() == RetiredResourceKind::Worktree {
+                    RetirementOutcome::Retired
+                } else {
+                    RetirementOutcome::Residual {
+                        residual_reason: RetirementFailureReason::RemovalFailed,
+                    }
+                },
+                detail: Some("current G2 evidence".into()),
+            })
+            .await
+            .unwrap();
+        }
+        let resource = failure.remaining_resources.iter()
+            .find(|pending| pending.scope == scope && pending.resource.kind() == RetiredResourceKind::WorkScope)
+            .unwrap().resource.clone();
+        failure.remaining_resources = db.expected_close_cleanup_failure_resources(
+            failure.attempt_id.as_str(), &scope, &resource,
+        ).await.unwrap();
+        failure.authority = CloseCleanupFailureAuthority::ExpectedResource {
+            scope, snapshot: g2, resource,
+        };
+        failure.detail = "current G2 evidence".into();
+    } else {
+        let CloseCleanupFailureAuthority::ExpectedResource { scope, resource, .. } = &failure.authority else {
+            panic!("expected original inventory authority");
+        };
+        failure.remaining_resources = db.expected_close_cleanup_failure_resources(
+            failure.attempt_id.as_str(), scope, resource,
+        ).await.unwrap();
+        failure.detail = "original G1 residual".into();
     }
-    let resource = failure.remaining_resources.iter()
-        .find(|pending| pending.scope == scope && pending.resource.kind() == RetiredResourceKind::WorkScope)
-        .unwrap().resource.clone();
-    failure.remaining_resources = db.expected_close_cleanup_failure_resources(
-        failure.attempt_id.as_str(), &scope, &resource,
-    ).await.unwrap();
-    failure.authority = CloseCleanupFailureAuthority::ExpectedResource {
-        scope, snapshot: g2, resource,
-    };
-    failure.detail = "current G2 evidence".into();
     failure.occurred_at_us = Utc::now().timestamp_micros();
     db.terminalize_initial_close_cleanup_failure(&failure).await.unwrap();
     let mut assessment = assess(&db, &failure, "migration163").await;
@@ -175,7 +200,7 @@ async fn migration_163_upgrades_populated_162_without_rebinding_g1_or_g2() {
     let definitions: Vec<(String, String)> = sqlx::query_as(
         "SELECT name, sql FROM sqlite_schema WHERE type = 'trigger' ORDER BY name",
     ).fetch_all(db.pool()).await.unwrap();
-    assert_eq!(crate::migrations::run_pending_migrations(db.pool()).await.unwrap(), 1);
+    assert_eq!(crate::migrations::run_through_for_test(db.pool(), 163).await.unwrap(), 1);
     assert_eq!(migration_163_retained_state(&db).await, before);
     for (name, installed) in definitions {
         let rewritten: String = sqlx::query_scalar("SELECT sql FROM sqlite_schema WHERE name = ?1")
@@ -192,13 +217,13 @@ async fn migration_163_upgrades_populated_162_without_rebinding_g1_or_g2() {
     assert_eq!(latest, 163);
     let run = CloseRunRef { attempt_id: receipt.admitted.attempt_id, ordinal: receipt.admitted.run_ordinal };
     assert_eq!(db.close_safe_retry_progress(&run).await.unwrap().pending.len(), 3);
-    assert_eq!(crate::migrations::run_pending_migrations(db.pool()).await.unwrap(), 0);
+    assert_eq!(crate::migrations::run_through_for_test(db.pool(), 163).await.unwrap(), 0);
 }
 
 #[tokio::test]
 async fn migration_163_g1_failure_guards_preserve_g2_and_exact_pending_children() {
     let (db, _, receipt) = migration_163_pending_fixture().await;
-    crate::migrations::run_pending_migrations(db.pool()).await.unwrap();
+    crate::migrations::run_through_for_test(db.pool(), 163).await.unwrap();
     let before = migration_163_retained_state(&db).await;
     let run = CloseRunRef { attempt_id: receipt.admitted.attempt_id, ordinal: receipt.admitted.run_ordinal };
     let pending = db.close_safe_retry_progress(&run).await.unwrap().pending;
@@ -270,7 +295,7 @@ async fn migration_163_g1_failure_guards_preserve_g2_and_exact_pending_children(
 #[tokio::test]
 async fn migration_163_upgrade_preserves_installed_source_fence_behavior() {
     let (db, assessment, receipt) = migration_163_pending_fixture().await;
-    crate::migrations::run_pending_migrations(db.pool()).await.unwrap();
+    crate::migrations::run_through_for_test(db.pool(), 163).await.unwrap();
     let run = CloseRunRef {
         attempt_id: receipt.admitted.attempt_id,
         ordinal: receipt.admitted.run_ordinal,
@@ -294,7 +319,7 @@ async fn migration_163_unknown_installed_prefix_rolls_back_both_trigger_rewrites
     let before: Vec<(String, String)> = sqlx::query_as("SELECT name, sql FROM sqlite_schema WHERE type = 'trigger' ORDER BY name")
         .fetch_all(db.pool()).await.unwrap();
     let state = migration_163_retained_state(&db).await;
-    assert!(crate::migrations::run_pending_migrations(db.pool()).await.is_err());
+    assert!(crate::migrations::run_through_for_test(db.pool(), 163).await.is_err());
     let after: Vec<(String, String)> = sqlx::query_as("SELECT name, sql FROM sqlite_schema WHERE type = 'trigger' ORDER BY name")
         .fetch_all(db.pool()).await.unwrap();
     assert_eq!(after, before);

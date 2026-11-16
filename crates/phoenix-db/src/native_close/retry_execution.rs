@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use phoenix_core::domain::close::{
     CloseAttemptScope, CloseExpectedRetirementResource, CloseObligation, CloseRetirementSnapshot,
-    CloseRetirementTarget, CloseRunRef, CloseStopCertainty,
+    CloseRetirementTarget, CloseRunRef, CloseStopCertainty, RetiredResourceKind,
 };
 use phoenix_core::work_scope::WorkScopeId;
 use sqlx::{Row, Sqlite, Transaction};
@@ -13,7 +13,8 @@ use super::{NativeCloseCommand, NativeCloseIntent, NativeCloseRunRef};
 use crate::close_foundation::{
     close_obligation_for_update, parse_cleanup_resource_identity, retained_close_retry_progress_tx,
     CloseCleanupFailureAuthority, CloseCleanupFailureResource, CloseCleanupResourceDisposition,
-    CloseSafeRetryEffect, CloseSafeRetryProgress, TerminalizeInitialCloseCleanupFailureRequest,
+    CloseSafeRetryEffect, CloseSafeRetryProgress, RecordCloseRetirementDispatchRequest,
+    TerminalizeInitialCloseCleanupFailureRequest,
 };
 use crate::workflow::LocalAuthorityResult;
 use crate::{Database, DbError, DbResult};
@@ -121,7 +122,8 @@ impl Database {
         admitted: &NativeCloseRunRef,
     ) -> DbResult<NativeCloseRetryExecutionContext> {
         let mut tx = self.pool.begin().await?;
-        let effect_count = Self::require_native_close_retry_plan_tx(&mut tx, command, admitted).await?;
+        let effect_count =
+            Self::require_native_close_retry_plan_tx(&mut tx, command, admitted).await?;
         let NativeCloseIntent::ExplicitRetry {
             failed_run_ordinal, ..
         } = command.intent()
@@ -185,6 +187,73 @@ impl Database {
             resources: original.resources,
             worktree_snapshots,
         })
+    }
+
+    /// Records dispatch of one pending original-generation worktree effect under the
+    /// exact live native command and latest running retry plan. No current inspection
+    /// snapshot is accepted from the caller.
+    ///
+    /// # Errors
+    /// Source, receipt, plan, full-identity and storage errors are classified only
+    /// after rollback. Commit or rollback uncertainty is `DurableFactUnclassified`.
+    pub async fn record_native_close_retry_retirement_dispatch(
+        &self,
+        command: &NativeCloseCommand,
+        admitted: &NativeCloseRunRef,
+        effect: &CloseSafeRetryEffect,
+    ) -> LocalAuthorityResult<DbResult<()>> {
+        let mut tx = match self.pool.begin_with("BEGIN IMMEDIATE").await {
+            Ok(tx) => tx,
+            Err(error) => return LocalAuthorityResult::DurableFactEstablished(Err(error.into())),
+        };
+        let result = Self::record_native_close_retry_retirement_dispatch_tx(
+            &mut tx, command, admitted, effect,
+        )
+        .await;
+        match result {
+            Ok(()) => match tx.commit().await {
+                Ok(()) => LocalAuthorityResult::DurableFactEstablished(Ok(())),
+                Err(_) => LocalAuthorityResult::DurableFactUnclassified,
+            },
+            Err(error) => match tx.rollback().await {
+                Ok(()) => LocalAuthorityResult::DurableFactEstablished(Err(error)),
+                Err(_) => LocalAuthorityResult::DurableFactUnclassified,
+            },
+        }
+    }
+
+    async fn record_native_close_retry_retirement_dispatch_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        command: &NativeCloseCommand,
+        admitted: &NativeCloseRunRef,
+        effect: &CloseSafeRetryEffect,
+    ) -> DbResult<()> {
+        let plan = Self::require_native_close_retry_plan_identity_tx(tx, command, admitted).await?;
+        if !plan.running {
+            return Err(refused("native retry dispatch requires its exact latest running plan"));
+        }
+        let run = CloseRunRef {
+            attempt_id: admitted.attempt_id.clone(),
+            ordinal: admitted.run_ordinal,
+        };
+        let progress = retained_close_retry_progress_tx(tx, &run).await?;
+        if effect.resource.kind() != RetiredResourceKind::Worktree
+            || i64::try_from(progress.successful.len() + progress.pending.len()).ok()
+                != Some(plan.effect_count)
+            || !progress.pending.contains(effect)
+        {
+            return Err(refused("native retry dispatch requires a pending full-identity worktree effect"));
+        }
+        Self::insert_close_retirement_dispatch_tx(
+            tx,
+            &RecordCloseRetirementDispatchRequest {
+                attempt_id: run.attempt_id,
+                scope: effect.scope.clone(),
+                snapshot: plan.snapshot,
+                resource: effect.resource.clone(),
+            },
+        )
+        .await
     }
 
     /// Records one exact planned success while its native source and successor remain live.
@@ -559,12 +628,26 @@ mod snapshot_tests {
         assert_eq!(decoded[&WorkScopeId::parse("a").unwrap()], "é");
         assert_eq!(decoded[&WorkScopeId::parse("b").unwrap()], "x:y");
         for malformed in [
-            "", "v1", "v21:a1:g", "v11:a1:g!", "v11:a1:g1:a1:h",
-            "v11:b1:g1:a1:h", "v11:a2:g", "v11:a1:é", "v11:é1:g",
-            "v199999999999999999999999999999999999999:a1:g", "v101:a1:g",
-            "v1+1:a1:g", "v10:1:g", "v11:a", "v11:a1:g1:b",
+            "",
+            "v1",
+            "v21:a1:g",
+            "v11:a1:g!",
+            "v11:a1:g1:a1:h",
+            "v11:b1:g1:a1:h",
+            "v11:a2:g",
+            "v11:a1:é",
+            "v11:é1:g",
+            "v199999999999999999999999999999999999999:a1:g",
+            "v101:a1:g",
+            "v1+1:a1:g",
+            "v10:1:g",
+            "v11:a",
+            "v11:a1:g1:b",
         ] {
-            assert!(decode_snapshot_component(malformed).is_err(), "{malformed:?}");
+            assert!(
+                decode_snapshot_component(malformed).is_err(),
+                "{malformed:?}"
+            );
         }
     }
 
@@ -580,14 +663,22 @@ mod snapshot_tests {
         };
         let original = CloseRetirementSnapshot::parse("v11:a2:é", "v11:a3:x:y").unwrap();
         let decoded = original_worktree_snapshots(&original, std::slice::from_ref(&scope)).unwrap();
-        assert_eq!(decoded, vec![(
-            CloseRetirementTarget { scope: scope.scope.clone() },
-            CloseRetirementSnapshot::parse("é", "x:y").unwrap(),
-        )]);
+        assert_eq!(
+            decoded,
+            vec![(
+                CloseRetirementTarget {
+                    scope: scope.scope.clone()
+                },
+                CloseRetirementSnapshot::parse("é", "x:y").unwrap(),
+            )]
+        );
         for (generation, fingerprint) in [
-            ("v11:a1:g", "v11:b1:f"), ("v11:b1:g", "v11:b1:f"),
-            ("v11:a0:", "v11:a1:f"), ("v11:a1:g", "v11:a0:"),
-            ("no-worktree", "no-worktree"), ("no-worktree", "v11:a1:f"),
+            ("v11:a1:g", "v11:b1:f"),
+            ("v11:b1:g", "v11:b1:f"),
+            ("v11:a0:", "v11:a1:f"),
+            ("v11:a1:g", "v11:a0:"),
+            ("no-worktree", "no-worktree"),
+            ("no-worktree", "v11:a1:f"),
             ("v11:a1:g", "no-worktree"),
         ] {
             let snapshot = CloseRetirementSnapshot::parse(generation, fingerprint).unwrap();
@@ -596,7 +687,11 @@ mod snapshot_tests {
         let empty = CloseRetirementSnapshot::parse("no-worktree", "no-worktree").unwrap();
         assert!(original_worktree_snapshots(&empty, &[]).unwrap().is_empty());
         scope.captured_worktree = None;
-        assert!(original_worktree_snapshots(&empty, std::slice::from_ref(&scope)).unwrap().is_empty());
+        assert!(
+            original_worktree_snapshots(&empty, std::slice::from_ref(&scope))
+                .unwrap()
+                .is_empty()
+        );
         assert!(original_worktree_snapshots(&original, &[scope]).is_err());
     }
 }

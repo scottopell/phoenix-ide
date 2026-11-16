@@ -334,6 +334,7 @@ async fn goal_preparation_migration_follows_conversation_tool_migrations() {
             (161, "native_close_explicit_retry_admission".into()),
             (162, "native_close_source_fence".into()),
             (163, "native_close_retry_failure".into()),
+            (164, "native_close_retry_dispatch".into()),
         ]
     );
 }
