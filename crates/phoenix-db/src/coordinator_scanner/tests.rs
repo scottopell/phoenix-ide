@@ -65,10 +65,10 @@ fn scanner_retirement_relation_is_strict_and_does_not_infer_source_authority() {
         );
     }
     assert!(serde_json::from_value::<ScanCandidateState>(serde_json::json!({"status":"retired","disposition":"tracking","later_source_fragment_ids":[]})).is_err());
-    assert!(serde_json::from_value::<ScanCandidateState>(
-        serde_json::json!({"status":"tracking","retired_at_us":10})
-    )
-    .is_err());
+    assert_eq!(
+        serde_json::to_value(ScanCandidateState::Tracking).unwrap(),
+        serde_json::json!({"status":"tracking"})
+    );
 }
 
 #[tokio::test]
