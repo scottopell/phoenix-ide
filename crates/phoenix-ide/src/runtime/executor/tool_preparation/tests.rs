@@ -40,7 +40,7 @@ async fn runtime_for(tool: ToolCall) -> TestRuntime {
     runtime
 }
 
-fn selected(runtime: &mut TestRuntime, assistant: &str, tool: ToolCall) {
+fn selected(runtime: &mut TestRuntime, assistant: &str, tool: &ToolCall) {
     let ConvState::ToolExecuting {
         current_tool,
         remaining_tools,
@@ -189,7 +189,7 @@ async fn stale_clear_deny_and_read_error_cannot_touch_same_id_successor() {
         };
         let original = bash("reused", command);
         let mut runtime = runtime_for(original.clone()).await;
-        selected(&mut runtime, "original", original.clone());
+        selected(&mut runtime, "original", &original);
         let (entered, release) = runtime.storage.hold_next_tool_policy_read();
         runtime
             .execute_effect(Effect::ExecuteTool { tool: original })
@@ -212,7 +212,7 @@ async fn stale_clear_deny_and_read_error_cannot_touch_same_id_successor() {
         }
         .await;
         let successor = bash("reused", "git diff --stat");
-        selected(&mut runtime, "successor", successor.clone());
+        selected(&mut runtime, "successor", &successor);
         runtime
             .execute_effect(Effect::ExecuteTool { tool: successor })
             .await
@@ -240,13 +240,13 @@ async fn changed_origin_cannot_adopt_its_own_ready_clear_or_denial() {
     for command in ["git status --short", "git add -A"] {
         let call = bash("reused", command);
         let mut runtime = runtime_for(call.clone()).await;
-        selected(&mut runtime, "original", call.clone());
+        selected(&mut runtime, "original", &call);
         runtime
             .execute_effect(Effect::ExecuteTool { tool: call.clone() })
             .await
             .unwrap();
         let observation = runtime.tool_preparation.as_mut().unwrap().observe().await;
-        selected(&mut runtime, "successor", call);
+        selected(&mut runtime, "successor", &call);
         assert!(runtime
             .accept_tool_preparation(observation)
             .unwrap()
@@ -261,13 +261,13 @@ async fn changed_origin_cannot_adopt_its_own_ready_clear_or_denial() {
 async fn genuine_shared_authority_loss_precedes_stale_read_disposition() {
     let call = bash("reused", "git status --short");
     let mut runtime = runtime_for(call.clone()).await;
-    selected(&mut runtime, "original", call.clone());
+    selected(&mut runtime, "original", &call);
     runtime
         .execute_effect(Effect::ExecuteTool { tool: call.clone() })
         .await
         .unwrap();
     let observation = runtime.tool_preparation.as_mut().unwrap().observe().await;
-    selected(&mut runtime, "successor", call);
+    selected(&mut runtime, "successor", &call);
     runtime
         .fatal_local_authority_fence
         .close("test_unknown_local_write");
@@ -286,7 +286,7 @@ async fn genuine_shared_authority_loss_precedes_stale_read_disposition() {
 async fn ordinary_read_error_text_is_not_sqlite_authority_and_keeps_positive_cancel_proof() {
     let call = bash("read-error", "git status --short");
     let mut runtime = runtime_for(call.clone()).await;
-    selected(&mut runtime, "original", call.clone());
+    selected(&mut runtime, "original", &call);
     let (entered, release) = runtime.storage.hold_next_tool_policy_read();
     let diagnostic = "FATAL_LOCAL_AUTHORITY_UNCLASSIFIED: ordinary read diagnostic";
     runtime
@@ -331,7 +331,7 @@ async fn ordinary_read_error_text_is_not_sqlite_authority_and_keeps_positive_can
 async fn rejected_cancel_checkpoint_revokes_read_without_false_completion_or_late_launch() {
     let call = bash("cancel-persist", "git status --short");
     let mut runtime = runtime_for(call.clone()).await;
-    selected(&mut runtime, "original", call.clone());
+    selected(&mut runtime, "original", &call);
     let (entered, release) = runtime.storage.hold_next_tool_policy_read();
     runtime
         .execute_effect(Effect::ExecuteTool { tool: call })
@@ -396,7 +396,7 @@ async fn rejected_cancel_checkpoint_revokes_read_without_false_completion_or_lat
 async fn ordinary_live_catalog_wait_cannot_launch_after_cancellation() {
     let call = bash("live-catalog", "git status --short");
     let mut runtime = runtime_for(call.clone()).await;
-    selected(&mut runtime, "original", call.clone());
+    selected(&mut runtime, "original", &call);
     let tools = Arc::clone(&runtime.tool_executor);
     let (entered, release) = tools.hold_next_definitions();
     assert!(runtime

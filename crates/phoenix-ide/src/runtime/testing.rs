@@ -209,15 +209,13 @@ impl LlmClient for StreamingMockLlmClient {
 // Mock Tool Executor
 // ============================================================================
 
-#[derive(Default)]
-struct PreparationReadBarrier(
-    Mutex<
-        Option<(
-            tokio::sync::oneshot::Sender<()>,
-            tokio::sync::oneshot::Receiver<Result<(), String>>,
-        )>,
-    >,
+type PreparationReadGate = (
+    tokio::sync::oneshot::Sender<()>,
+    tokio::sync::oneshot::Receiver<Result<(), String>>,
 );
+
+#[derive(Default)]
+struct PreparationReadBarrier(Mutex<Option<PreparationReadGate>>);
 
 impl PreparationReadBarrier {
     fn hold(
@@ -4638,7 +4636,7 @@ mod tests {
         );
 
         let event = runtime
-            .start_spawn_agents_tool(call)
+            .start_spawn_agents_tool(&call)
             .expect("handler must not error out");
 
         match event {

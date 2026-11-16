@@ -90,8 +90,8 @@ clear/deny/error guards, failed cancellation persistence and live catalog releas
 The 249-case owning runtime selection passes at `934b331a5`, including existing
 native activation, forced-notice, required-settlement, goal and policy contracts.
 Its native Bash fixture was built at `091f2d45b`; the intervening delta is test-only.
-These in-memory timing checks do not measure end-to-end SQLite latency. Local
-static/default, isolated review and hosted qualification remain pending.
+These in-memory timing checks do not measure end-to-end SQLite latency. Full
+default, isolated review and hosted qualification remain pending.
 
 Forced tool retirement has a distinct `ToolCancellationRetired` event and a
 phase-scoped `ForcedToolRetirement` fact in `CancellingSubAgents`. Nonfinal child

@@ -6672,7 +6672,7 @@ where
     ) -> Result<Option<Event>, String> {
         let selection = current.into_selection();
         self.start_spawn_agents_tool_from_selection(
-            selection.tool.clone(),
+            &selection.tool,
             &selection.context,
             &selection.assistant_message_id,
         )
@@ -6681,7 +6681,7 @@ where
     #[cfg(test)]
     pub(crate) fn start_spawn_agents_tool(
         &mut self,
-        tool: ToolCall,
+        tool: &ToolCall,
     ) -> Result<Option<Event>, String> {
         let assistant_message_id = match &self.state {
             ConvState::ToolExecuting {
@@ -6699,7 +6699,7 @@ where
     #[allow(clippy::too_many_lines)]
     fn start_spawn_agents_tool_from_selection(
         &mut self,
-        tool: ToolCall,
+        tool: &ToolCall,
         context: &ConvContext,
         expected_assistant_message_id: &str,
     ) -> Result<Option<Event>, String> {
@@ -6988,7 +6988,7 @@ where
                 current_tool,
                 assistant_message,
                 ..
-            } if current_tool == &tool
+            } if current_tool == tool
                 && assistant_message.message_id == expected_assistant_message_id =>
             {
                 assistant_message.message_id.clone()
@@ -9950,12 +9950,13 @@ where
         self.accept_tool_preparation(observed)
     }
 
+    #[allow(clippy::too_many_lines)]
     fn launch_cleared_tool(
         &mut self,
         current: tool_preparation::CurrentSelection,
         cleared: tool_preparation::ClearedOrdinaryCall,
         admitted: &mut crate::runtime::AdmittedOperation,
-    ) -> Result<Option<Event>, String> {
+    ) {
         let selection = current.into_selection();
         let tool = &selection.tool;
         let context = &selection.context;
@@ -10113,8 +10114,6 @@ where
             dispatch_generation,
             tool_outcome_tx,
         ));
-
-        Ok(None)
     }
 
     async fn persist_checkpoint_with_terminal_obligation(
@@ -22948,30 +22947,37 @@ mod steer_drain_detector_tests {
         state
     }
 
+    fn unavailable_completion_chain() -> ConvState {
+        let mut initial = ordinary_completion_state();
+        if let ConvState::ToolExecuting {
+            remaining_tools,
+            assistant_message,
+            ..
+        } = &mut initial
+        {
+            for id in ["unavailable-2", "unavailable-3", "unavailable-4"] {
+                remaining_tools.push(ToolCall::new(
+                    id,
+                    ToolInput::from(crate::tools::BashToolInput::run("true")),
+                ));
+                assistant_message.content.push(ContentBlock::tool_use(
+                    id,
+                    "bash",
+                    serde_json::json!({"op": "run", "cmd": "true"}),
+                ));
+            }
+        }
+        initial
+    }
+
     #[tokio::test]
     async fn ordinary_tool_followup_local_dispatches_do_not_depend_on_event_queue() {
         for path in ["freeze", "cycle", "grace", "unavailable_chain"] {
-            let mut initial = ordinary_completion_state();
-            if path == "unavailable_chain" {
-                if let ConvState::ToolExecuting {
-                    remaining_tools,
-                    assistant_message,
-                    ..
-                } = &mut initial
-                {
-                    for id in ["unavailable-2", "unavailable-3", "unavailable-4"] {
-                        remaining_tools.push(ToolCall::new(
-                            id,
-                            ToolInput::from(crate::tools::BashToolInput::run("true")),
-                        ));
-                        assistant_message.content.push(ContentBlock::tool_use(
-                            id,
-                            "bash",
-                            serde_json::json!({"op": "run", "cmd": "true"}),
-                        ));
-                    }
-                }
-            }
+            let initial = if path == "unavailable_chain" {
+                unavailable_completion_chain()
+            } else {
+                ordinary_completion_state()
+            };
             let (mut runtime, storage) =
                 build_runtime_with_state_and_queue("tool-local-dispatch", initial, vec![]);
             runtime.event_rx.close();

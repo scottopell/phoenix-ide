@@ -85,7 +85,7 @@ async fn pending_native_spawn() -> (Arc<RuntimeManager>, TestRuntime, SubAgentSp
     )
     .with_spawn_channels(spawn_tx, cancel_tx)
     .with_fatal_local_authority_fence(Arc::clone(&manager.fatal_local_authority_fence));
-    assert!(runtime.start_spawn_agents_tool(call).unwrap().is_none());
+    assert!(runtime.start_spawn_agents_tool(&call).unwrap().is_none());
     let request = spawn_rx
         .try_recv()
         .expect("native admission request was submitted");
@@ -185,8 +185,9 @@ async fn native_full_submission_stays_owned_and_cancels_in_the_real_loop() {
     let ConvState::ToolExecuting { current_tool, .. } = &runtime.state else {
         unreachable!()
     };
+    let current_tool = current_tool.clone();
     assert!(runtime
-        .start_spawn_agents_tool(current_tool.clone())
+        .start_spawn_agents_tool(&current_tool)
         .unwrap()
         .is_none());
     let handoff = runtime.native_spawn_handoff.as_mut().unwrap();
@@ -313,9 +314,7 @@ async fn native_parent_write_owner_loss_or_cutoff_cannot_claim_unissued_batch() 
     }
 }
 
-#[tokio::test]
-async fn native_cancel_persistence_failure_retains_closing_origin_and_stops_queued_work() {
-    let (manager, mut runtime, request) = pending_native_spawn().await;
+async fn install_ordinary_tool_policy(runtime: &mut TestRuntime) -> Arc<MockToolExecutor> {
     let tools = Arc::new(
         MockToolExecutor::new()
             .with_tool("bash", crate::tools::ToolOutput::success("must not run")),
@@ -335,6 +334,13 @@ async fn native_cancel_persistence_failure_retains_closing_origin_and_stops_queu
         )
         .await
         .unwrap();
+    tools
+}
+
+#[tokio::test]
+async fn native_cancel_persistence_failure_retains_closing_origin_and_stops_queued_work() {
+    let (manager, mut runtime, request) = pending_native_spawn().await;
+    let tools = install_ordinary_tool_policy(&mut runtime).await;
     let later = ToolCall::new(
         "later",
         ToolInput::from(crate::tools::BashToolInput::run("git status --short")),

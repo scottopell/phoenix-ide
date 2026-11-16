@@ -4935,16 +4935,14 @@ impl RuntimeManager {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    async fn admit_sub_agent_batch(
-        self: &Arc<Self>,
+    async fn prepare_sub_agent_batch_admission(
+        &self,
         batch_id: &str,
         specs: &[SubAgentSpec],
         parent_conversation_id: &str,
         parent_scope: Option<WorkScopeId>,
         parallel_work_qualified: bool,
-        lifecycle: &mut native_spawn::NativeSpawnLifecycleOwner,
-    ) -> Result<(), String> {
+    ) -> Result<phoenix_db::AtomicSubAgentBatchAdmission, String> {
         use phoenix_db::SubAgentExecutionAuthority::{ReadOnly, WriteCapable};
 
         let parent = self
@@ -5013,13 +5011,34 @@ impl RuntimeManager {
                 })
             })
             .collect::<Result<Vec<_>, String>>()?;
-        let admission = phoenix_db::AtomicSubAgentBatchAdmission {
+        Ok(phoenix_db::AtomicSubAgentBatchAdmission {
             batch_id: batch_id.to_string(),
             parent_conversation_id: parent_conversation_id.to_string(),
             parent_scope,
             parallel_work_qualified,
             children,
-        };
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn admit_sub_agent_batch(
+        self: &Arc<Self>,
+        batch_id: &str,
+        specs: &[SubAgentSpec],
+        parent_conversation_id: &str,
+        parent_scope: Option<WorkScopeId>,
+        parallel_work_qualified: bool,
+        lifecycle: &mut native_spawn::NativeSpawnLifecycleOwner,
+    ) -> Result<(), String> {
+        let admission = self
+            .prepare_sub_agent_batch_admission(
+                batch_id,
+                specs,
+                parent_conversation_id,
+                parent_scope,
+                parallel_work_qualified,
+            )
+            .await?;
         #[cfg(test)]
         if let Some(barrier) = self.native_admission_prewrite_barrier.lock().await.take() {
             barrier.wait().await;

@@ -62,9 +62,9 @@ impl ClearedOrdinaryCall {
 }
 
 pub(super) enum PreparedTool {
-    Result(Event),
+    Result(Box<Event>),
     Native(super::super::agent_execution::SpawnCatalog),
-    Ordinary(ClearedOrdinaryCall),
+    Ordinary(Box<ClearedOrdinaryCall>),
 }
 
 type PreparationFuture = Pin<Box<dyn Future<Output = Result<PreparedTool, String>> + Send>>;
@@ -150,85 +150,14 @@ impl<S: Storage + Clone + 'static, L: LlmClient + 'static, T: ToolExecutor + 'st
             .is_builtin_model(&selection.context.model_id);
         let self_goal = self.prepare_self_goal(selection.tool.clone());
         let origin = Arc::clone(&selection);
-        let read = async move {
-            let tool = &origin.tool;
-            let context = &origin.context;
-            let policy = storage
-                .load_tool_admission_policy(&context.conversation_id)
-                .await?;
-            let definition = policy.declarations().iter().find(|definition| {
-                definition.name == tool.name() && policy.is_callable(tool.name())
-            });
-            let Some(definition) = definition else {
-                return Ok(unavailable(
-                    tool,
-                    "tool was unavailable in the originating request policy",
-                ));
-            };
-            let schema = definition.input_schema.clone();
-            if surface == LlmToolSurface::SubAgentTerminal
-                && !matches!(tool.name(), "submit_result" | "submit_error")
-            {
-                return Ok(unavailable(
-                    tool,
-                    "tool is unavailable under the current conversation policy",
-                ));
-            }
-            if matches!(tool.name(), "create_goal" | "enable_auto_continuation") {
-                return self_goal
-                    .await?
-                    .map(PreparedTool::Result)
-                    .ok_or_else(|| "self-goal preparation produced no disposition".into());
-            }
-            if tool.name() == "spawn_agents" {
-                let advertised = executor
-                    .definitions()
-                    .await
-                    .iter()
-                    .any(|definition| definition.name == "spawn_agents");
-                let definition = catalog.tool_definition(
-                    &context.model_id,
-                    builtin_model,
-                    context.is_coordinator,
-                );
-                return Ok(if advertised && definition.input_schema == schema {
-                    PreparedTool::Native(catalog)
-                } else {
-                    unavailable(
-                        tool,
-                        "spawn_agents no longer matches the originating request policy",
-                    )
-                });
-            }
-            let legacy_tmux_conversation_id = match &context.resource_scope {
-                phoenix_core::work_scope::ResourceScopeKey::Work(scope_id) => {
-                    storage
-                        .get_work_scope_legacy_conversation_id(scope_id)
-                        .await?
-                }
-                phoenix_core::work_scope::ResourceScopeKey::Unattached(id) => Some(id.clone()),
-                phoenix_core::work_scope::ResourceScopeKey::Coordinator
-                | phoenix_core::work_scope::ResourceScopeKey::GlobalTerminal => None,
-            };
-            Ok(
-                match DenyGate::check(tool.name().to_owned(), tool.input.to_value()) {
-                    Ok(checked) => PreparedTool::Ordinary(ClearedOrdinaryCall {
-                        checked,
-                        schema,
-                        surface,
-                        legacy_tmux_conversation_id,
-                    }),
-                    Err(denial) => PreparedTool::Result(Event::ToolComplete {
-                        tool_use_id: tool.id.clone(),
-                        result: ToolResult {
-                            tool_use_id: tool.id.clone(),
-                            outcome: super::tool_output_to_outcome(denial.into_tool_output()),
-                            duration_ms: Some(0),
-                        },
-                    }),
-                },
-            )
-        };
+        let read = prepare_selected_tool(
+            storage,
+            executor,
+            origin,
+            surface,
+            (catalog, builtin_model),
+            self_goal,
+        );
         self.tool_preparation = Some(ToolPreparation {
             selection,
             phase: PreparationPhase::Reading(Mutex::new(Box::pin(read))),
@@ -290,14 +219,15 @@ impl<S: Storage + Clone + 'static, L: LlmClient + 'static, T: ToolExecutor + 'st
         };
         let current = CurrentSelection(pending.selection);
         match prepared {
-            PreparedTool::Result(event) => Ok(Some(event)),
+            PreparedTool::Result(event) => Ok(Some(*event)),
             PreparedTool::Native(catalog) => {
                 self.spawn_catalog = Some(catalog);
                 self.start_selected_spawn_agents_tool(current)
             }
             PreparedTool::Ordinary(cleared) => {
                 let mut admitted = self.admit_authoritative_effect()?;
-                self.launch_cleared_tool(current, cleared, &mut admitted)
+                self.launch_cleared_tool(current, *cleared, &mut admitted);
+                Ok(None)
             }
         }
     }
@@ -341,8 +271,97 @@ impl<S: Storage + Clone + 'static, L: LlmClient + 'static, T: ToolExecutor + 'st
     }
 }
 
+async fn prepare_selected_tool<S: Storage, T: ToolExecutor>(
+    storage: S,
+    executor: Arc<T>,
+    origin: Arc<DispatchSelection>,
+    surface: LlmToolSurface,
+    (catalog, builtin_model): (super::super::agent_execution::SpawnCatalog, bool),
+    self_goal: impl Future<Output = Result<Option<Event>, String>> + Send,
+) -> Result<PreparedTool, String> {
+    let tool = &origin.tool;
+    let context = &origin.context;
+    let policy = storage
+        .load_tool_admission_policy(&context.conversation_id)
+        .await?;
+    let definition = policy
+        .declarations()
+        .iter()
+        .find(|definition| definition.name == tool.name() && policy.is_callable(tool.name()));
+    let Some(definition) = definition else {
+        return Ok(unavailable(
+            tool,
+            "tool was unavailable in the originating request policy",
+        ));
+    };
+    let schema = definition.input_schema.clone();
+    if surface == LlmToolSurface::SubAgentTerminal
+        && !matches!(tool.name(), "submit_result" | "submit_error")
+    {
+        return Ok(unavailable(
+            tool,
+            "tool is unavailable under the current conversation policy",
+        ));
+    }
+    if matches!(tool.name(), "create_goal" | "enable_auto_continuation") {
+        return self_goal
+            .await?
+            .map(prepared_result)
+            .ok_or_else(|| "self-goal preparation produced no disposition".into());
+    }
+    if tool.name() == "spawn_agents" {
+        let advertised = executor
+            .definitions()
+            .await
+            .iter()
+            .any(|definition| definition.name == "spawn_agents");
+        let definition =
+            catalog.tool_definition(&context.model_id, builtin_model, context.is_coordinator);
+        return Ok(if advertised && definition.input_schema == schema {
+            PreparedTool::Native(catalog)
+        } else {
+            unavailable(
+                tool,
+                "spawn_agents no longer matches the originating request policy",
+            )
+        });
+    }
+    let legacy_tmux_conversation_id = match &context.resource_scope {
+        phoenix_core::work_scope::ResourceScopeKey::Work(scope_id) => {
+            storage
+                .get_work_scope_legacy_conversation_id(scope_id)
+                .await?
+        }
+        phoenix_core::work_scope::ResourceScopeKey::Unattached(id) => Some(id.clone()),
+        phoenix_core::work_scope::ResourceScopeKey::Coordinator
+        | phoenix_core::work_scope::ResourceScopeKey::GlobalTerminal => None,
+    };
+    Ok(
+        match DenyGate::check(tool.name().to_owned(), tool.input.to_value()) {
+            Ok(checked) => PreparedTool::Ordinary(Box::new(ClearedOrdinaryCall {
+                checked,
+                schema,
+                surface,
+                legacy_tmux_conversation_id,
+            })),
+            Err(denial) => prepared_result(Event::ToolComplete {
+                tool_use_id: tool.id.clone(),
+                result: ToolResult {
+                    tool_use_id: tool.id.clone(),
+                    outcome: super::tool_output_to_outcome(denial.into_tool_output()),
+                    duration_ms: Some(0),
+                },
+            }),
+        },
+    )
+}
+
+fn prepared_result(event: Event) -> PreparedTool {
+    PreparedTool::Result(Box::new(event))
+}
+
 fn unavailable(tool: &ToolCall, message: &str) -> PreparedTool {
-    PreparedTool::Result(Event::ToolComplete {
+    prepared_result(Event::ToolComplete {
         tool_use_id: tool.id.clone(),
         result: ToolResult::error(tool.id.clone(), format!("EUNAVAIL: {message}")),
     })

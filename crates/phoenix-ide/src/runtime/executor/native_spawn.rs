@@ -11,11 +11,12 @@ use crate::runtime::{
 use std::sync::Arc;
 use tokio::sync::oneshot;
 
+type NativeSubmissionFuture =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>>;
+
 pub(super) enum NativeSpawnPhase {
     Submission {
-        send: std::sync::Mutex<
-            std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>>,
-        >,
+        send: std::sync::Mutex<NativeSubmissionFuture>,
         response: oneshot::Receiver<SubAgentAdmissionReceipt>,
         activation: oneshot::Sender<()>,
     },
@@ -593,7 +594,7 @@ where
         let selected_block = assistant_message.content.iter_mut().find(|block| matches!(block, phoenix_llm::ContentBlock::ToolUse { id, .. } if id == &tool.id)).expect("native fixture holds the selected tool use");
         *selected_block =
             phoenix_llm::ContentBlock::tool_use(&tool.id, tool.name(), tool.input.to_value());
-        let event = self.start_spawn_agents_tool(tool)?;
+        let event = self.start_spawn_agents_tool(&tool)?;
         if event.is_some() {
             return Ok(event);
         }
