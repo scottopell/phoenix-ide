@@ -463,7 +463,9 @@ mod live {
             let mut context =
                 ConvContext::new(source, self.cwd.clone(), &self.model, 200_000, 2048);
             context.is_coordinator = true;
-            let state = self.db.get_conversation(source).await.unwrap().state;
+            let conversation = self.db.get_conversation(source).await.unwrap();
+            context.effort = conversation.effort;
+            let state = conversation.state;
             assert!(matches!(state, ConvState::Idle));
             let registry = self
                 .manager
@@ -700,6 +702,17 @@ mod live {
             .await
             .unwrap()
             .id;
+        let effort = phoenix_core::domain::llm_types::ModelEffort::High;
+        assert!(registry.supports_effort(&model, effort));
+        db.update_conversation_model_and_effort(
+            &source,
+            &model,
+            Some(effort),
+            phoenix_core::domain::llm_types::ServiceTier::Standard,
+            &registry.connection_for_model(&model).unwrap(),
+        )
+        .await
+        .unwrap();
         let manager = Arc::new(
             crate::runtime::RuntimeManager::new_with_message_retriever_and_runtime_env(
                 db.clone(),
