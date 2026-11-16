@@ -264,6 +264,7 @@ fn registered_identity_order_and_exact_bodies() {
         (152, "goal_preparation_inflight_source"),
         (153, "close_writer_observations"),
         (160, "native_close_exact_observation_receipts"),
+        (161, "native_close_explicit_retry_admission"),
     ];
     for (version, name) in identities {
         let entries = MIGRATIONS
@@ -295,6 +296,10 @@ fn registered_identity_order_and_exact_bodies() {
         (
             include_str!("native_close_exact_observation_receipts.sql"),
             160,
+        ),
+        (
+            include_str!("native_close_explicit_retry_admission.sql"),
+            161,
         ),
     ] {
         let entries = MIGRATIONS
@@ -515,6 +520,7 @@ async fn registered_fresh_upgrade_slack_children_ledger_and_reentry() {
                     (158, "native_close_initial_receipts"),
                     (159, "close_original_retirement_anchors"),
                     (160, "native_close_exact_observation_receipts"),
+                    (161, "native_close_explicit_retry_admission"),
                 ]
             );
             drop(conn);

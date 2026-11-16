@@ -9,12 +9,12 @@ use std::{
 use sha2::{Digest, Sha256};
 
 use phoenix_core::domain::close::{
-    AbsenceBasis, CapturedWorktreeIdentity, CloseAttemptId, CloseAttemptScope, CloseCompletionOutcome,
-    CloseExpectedRetirementResource, CloseInspection, CloseLossItem, CloseOwnedResourceInventory,
-    ClosePhase, CloseRetiredResource, CloseRetirementSnapshot, CloseRunOrdinal, CloseRunRef,
-    CloseRunStatus, CloseStopCertainty, GitOidIdentity, GitPathIdentity, LossItemIdentity,
-    OpaqueIdentity, RetiredResourceIdentity, RetiredResourceKind, RetirementFailureReason,
-    RetirementOutcome, WorktreeIdentity,
+    AbsenceBasis, CapturedWorktreeIdentity, CloseAttemptId, CloseAttemptScope,
+    CloseCompletionOutcome, CloseExpectedRetirementResource, CloseInspection, CloseLossItem,
+    CloseOwnedResourceInventory, ClosePhase, CloseRetiredResource, CloseRetirementSnapshot,
+    CloseRunOrdinal, CloseRunRef, CloseRunStatus, CloseStopCertainty, GitOidIdentity,
+    GitPathIdentity, LossItemIdentity, OpaqueIdentity, RetiredResourceIdentity,
+    RetiredResourceKind, RetirementFailureReason, RetirementOutcome, WorktreeIdentity,
 };
 use phoenix_core::work_scope::{
     ResourceScopeKey, WorkScopeId, WorkScopeRetirementOutcome, WorkScopeRetirementPrecondition,
@@ -168,20 +168,25 @@ fn native_close_retry_remaining_effects(
                 .iter()
                 .any(|prior| prior.scope == captured.scope)
         {
-            return Err("native retry assessment has duplicate or mismatched captured scopes".into());
+            return Err(
+                "native retry assessment has duplicate or mismatched captured scopes".into(),
+            );
         }
         let scope_targets = proof
             .resources
             .iter()
             .filter(|target| target.scope == captured.scope);
-        let work_scope = opaque_resource(RetiredResourceKind::WorkScope, captured.scope.to_string());
+        let work_scope =
+            opaque_resource(RetiredResourceKind::WorkScope, captured.scope.to_string());
         if scope_targets
             .clone()
             .filter(|target| target.resource == work_scope)
             .count()
             != 1
         {
-            return Err("native retry assessment lacks independent exact WorkScope evidence".into());
+            return Err(
+                "native retry assessment lacks independent exact WorkScope evidence".into(),
+            );
         }
         let worktree_targets = scope_targets
             .filter(|target| target.resource.kind() == RetiredResourceKind::Worktree)
@@ -193,14 +198,18 @@ fn native_close_retry_remaining_effects(
                         == &LossItemIdentity::Worktree(identity.clone()) => {}
             None if worktree_targets.is_empty() => {}
             _ => {
-                return Err("native retry assessment has mismatched captured worktree evidence".into());
+                return Err(
+                    "native retry assessment has mismatched captured worktree evidence".into(),
+                );
             }
         }
         let confirmed = inspections
             .iter()
             .filter(|inspection| inspection.target.scope == captured.scope);
         if confirmed.count() != usize::from(captured.captured_worktree.is_some()) {
-            return Err("native retry assessment lacks a unique original worktree inspection".into());
+            return Err(
+                "native retry assessment lacks a unique original worktree inspection".into(),
+            );
         }
     }
     for inspection in inspections {
@@ -220,11 +229,13 @@ fn native_close_retry_remaining_effects(
                 .scopes
                 .iter()
                 .any(|captured| captured.scope == target.scope)
-            || proof.resources[..index].iter().any(|prior| {
-                prior.scope == target.scope && prior.resource == target.resource
-            })
+            || proof.resources[..index]
+                .iter()
+                .any(|prior| prior.scope == target.scope && prior.resource == target.resource)
         {
-            return Err("native retry assessment has duplicate or mismatched original targets".into());
+            return Err(
+                "native retry assessment has duplicate or mismatched original targets".into(),
+            );
         }
         if target.resource.kind() == RetiredResourceKind::WorkScope
             && target.resource
@@ -236,9 +247,10 @@ fn native_close_retry_remaining_effects(
     for outcome in &proof.outcomes {
         if outcome.attempt_id != run.attempt_id
             || outcome.snapshot != proof.snapshot
-            || !proof.resources.iter().any(|target| {
-                target.scope == outcome.scope && target.resource == outcome.resource
-            })
+            || !proof
+                .resources
+                .iter()
+                .any(|target| target.scope == outcome.scope && target.resource == outcome.resource)
         {
             return Err("native retry assessment has mismatched original outcome evidence".into());
         }
@@ -251,7 +263,10 @@ fn native_close_retry_remaining_effects(
             .filter(|outcome| outcome.scope == target.scope && outcome.resource == target.resource)
             .collect::<Vec<_>>();
         let [receipt] = receipts.as_slice() else {
-            return Err("native retry assessment requires a unique original outcome for every resource".into());
+            return Err(
+                "native retry assessment requires a unique original outcome for every resource"
+                    .into(),
+            );
         };
         match receipt.outcome {
             RetirementOutcome::Retired | RetirementOutcome::AbsenceAdopted { .. } => {}
@@ -2035,12 +2050,14 @@ impl RuntimeManager {
                                     RetirementOutcome::Retired
                                         | RetirementOutcome::AbsenceAdopted { .. }
                                 )
-                        }) || (matches!(receipt_source, CloseRetryReceiptSource::GenericRetryHistory)
-                            && self
-                                .db()
-                                .close_resource_has_retry_success(attempt_id, scope, &target.resource)
-                                .await
-                                .map_err(|error| error.to_string())?);
+                        }) || (matches!(
+                            receipt_source,
+                            CloseRetryReceiptSource::GenericRetryHistory
+                        ) && self
+                            .db()
+                            .close_resource_has_retry_success(attempt_id, scope, &target.resource)
+                            .await
+                            .map_err(|error| error.to_string())?);
                         let dispatched = self
                             .db()
                             .close_retirement_resource_was_dispatched(
@@ -9359,14 +9376,16 @@ mod tests {
             .unwrap();
         for target in targets {
             if target.resource.kind() != super::RetiredResourceKind::WorkScope {
-                db.record_close_retirement_evidence(crate::db::RecordCloseRetirementEvidenceRequest {
-                    attempt_id: fixture.run.attempt_id.clone(),
-                    snapshot: fixture.snapshot.clone(),
-                    scope: target.scope,
-                    resource: target.resource,
-                    outcome: super::RetirementOutcome::Retired,
-                    detail: None,
-                })
+                db.record_close_retirement_evidence(
+                    crate::db::RecordCloseRetirementEvidenceRequest {
+                        attempt_id: fixture.run.attempt_id.clone(),
+                        snapshot: fixture.snapshot.clone(),
+                        scope: target.scope,
+                        resource: target.resource,
+                        outcome: super::RetirementOutcome::Retired,
+                        detail: None,
+                    },
+                )
                 .await
                 .unwrap();
             }
@@ -9443,9 +9462,8 @@ mod tests {
             .iter_mut()
             .find(|target| target.resource.kind() == super::RetiredResourceKind::Worktree)
             .unwrap();
-        let identity = match worktree.resource.identity() {
-            super::LossItemIdentity::Worktree(identity) => identity,
-            _ => panic!("expected worktree identity"),
+        let super::LossItemIdentity::Worktree(identity) = worktree.resource.identity() else {
+            panic!("expected worktree identity");
         };
         let replacement = super::WorktreeIdentity::from_parts(
             identity.id().clone(),
@@ -9468,12 +9486,10 @@ mod tests {
         .is_err());
         let mut wrong_run = fixture.run.clone();
         wrong_run.ordinal = super::CloseRunOrdinal::parse(2).unwrap();
-        assert!(super::native_close_retry_remaining_effects(
-            &wrong_run,
-            &original,
-            &inspections,
-        )
-        .is_err());
+        assert!(
+            super::native_close_retry_remaining_effects(&wrong_run, &original, &inspections,)
+                .is_err()
+        );
     }
 
     #[tokio::test]
@@ -9511,7 +9527,9 @@ mod tests {
         assert!(assess(&wrong_scope_identity).is_err());
 
         let mut duplicate_scope = original.clone();
-        duplicate_scope.scopes.push(duplicate_scope.scopes[0].clone());
+        duplicate_scope
+            .scopes
+            .push(duplicate_scope.scopes[0].clone());
         assert!(assess(&duplicate_scope).is_err());
         let mut wrong_snapshot = original.clone();
         wrong_snapshot.resources[0].snapshot =
@@ -9576,7 +9594,12 @@ mod tests {
             .await
             .is_err());
         assert_eq!(
-            fixture.manager.db().get_close_run(&fixture.run).await.unwrap(),
+            fixture
+                .manager
+                .db()
+                .get_close_run(&fixture.run)
+                .await
+                .unwrap(),
             original.run,
         );
         let successor = super::CloseRunRef {

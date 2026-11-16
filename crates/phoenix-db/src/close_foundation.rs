@@ -5652,6 +5652,17 @@ impl Database {
                 .checked_next()
                 .map_err(|error| close_precondition(error.to_string()))?,
         };
+        Self::insert_close_retry_plan_and_run_tx(tx, request, &run, now).await?;
+        Ok(run)
+    }
+
+    pub(crate) async fn insert_close_retry_plan_and_run_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        request: &AdmitCloseSafeRetryRequest,
+        run: &CloseRunRef,
+        now: i64,
+    ) -> DbResult<()> {
+        let completion_only = request.remaining_effects.is_empty();
         for (ordinal, effect) in request.remaining_effects.iter().enumerate() {
             let identity = effect.resource.identity();
             if let LossItemIdentity::Worktree(worktree) = identity {
@@ -5689,7 +5700,7 @@ impl Database {
             .bind(request.observed_at_us).bind(&request.precondition_resolution).bind(&request.safety_evidence)
             .bind(if completion_only { "verified_completion" } else { "resource_plan" })
             .execute(&mut **tx).await?;
-        Ok(run)
+        Ok(())
     }
 
     /// Reports whether the latest stopped run permits an explicit completion-only retry.
@@ -7245,6 +7256,10 @@ impl Database {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod native_retry {
+        include!("native_close/retry/tests.rs");
+    }
     use phoenix_core::domain::close::{
         AbsenceBasis, CloseLossItem, CloseRetirementSnapshot, GitOidIdentity, GitPathIdentity,
         LossItemIdentity, OpaqueIdentity, RetiredResourceKind, RetirementFailureReason,
@@ -12824,7 +12839,7 @@ mod tests {
             crate::migrations::run_pending_migrations(db.pool())
                 .await
                 .unwrap(),
-            1
+            2
         );
         let after: (String, String, String, String, String, String, String, i64) = sqlx::query_as(
             "SELECT request_id, source_transcript_id, source_message_id, source_tool_use_id,

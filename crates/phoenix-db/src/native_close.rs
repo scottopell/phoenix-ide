@@ -25,13 +25,20 @@ pub enum NativeCloseIntent {
         attempt_id: CloseAttemptId,
         run_ordinal: CloseRunOrdinal,
     },
+    ExplicitRetry {
+        target: ProductConversationId,
+        attempt_id: CloseAttemptId,
+        failed_run_ordinal: CloseRunOrdinal,
+    },
 }
 
 impl NativeCloseIntent {
     #[must_use]
     pub fn target(&self) -> &ProductConversationId {
         match self {
-            Self::Initial { target } | Self::Observe { target, .. } => target,
+            Self::Initial { target }
+            | Self::Observe { target, .. }
+            | Self::ExplicitRetry { target, .. } => target,
         }
     }
 
@@ -50,6 +57,14 @@ impl NativeCloseIntent {
                 "action": "observe", "product_conversation_id": target.as_str(),
                 "attempt_id": attempt_id.as_str(), "run_ordinal": run_ordinal.get()
             }),
+            Self::ExplicitRetry {
+                target,
+                attempt_id,
+                failed_run_ordinal,
+            } => serde_json::json!({
+                "action": "explicit_retry", "product_conversation_id": target.as_str(),
+                "attempt_id": attempt_id.as_str(), "failed_run_ordinal": failed_run_ordinal.get()
+            }),
         }
     }
 
@@ -57,6 +72,7 @@ impl NativeCloseIntent {
         match self {
             Self::Initial { .. } => "initial",
             Self::Observe { .. } => "observe",
+            Self::ExplicitRetry { .. } => "explicit_retry",
         }
     }
 }
@@ -114,6 +130,16 @@ impl NativeCloseCommand {
                 append_field(&mut canonical, attempt_id.as_str().as_bytes());
                 append_field(&mut canonical, &run_ordinal.get().to_be_bytes());
             }
+            NativeCloseIntent::ExplicitRetry {
+                target,
+                attempt_id,
+                failed_run_ordinal,
+            } => {
+                append_field(&mut canonical, b"explicit_retry");
+                append_field(&mut canonical, target.as_str().as_bytes());
+                append_field(&mut canonical, attempt_id.as_str().as_bytes());
+                append_field(&mut canonical, &failed_run_ordinal.get().to_be_bytes());
+            }
         }
         let fingerprint = Sha256::digest(&canonical).iter().fold(
             String::with_capacity(64),
@@ -169,6 +195,8 @@ mod initial;
 pub use initial::{NativeCloseInitialResult, NativeCloseReceipt, NativeCloseRunRef};
 mod observe;
 mod receipts;
+mod retry;
+pub use retry::{NativeCloseRetryResult, NativeCloseRetrySourceAssessment};
 pub use observe::{NativeCloseObservation, NativeCloseObserveReceipt, NativeCloseObserveResult};
 
 #[cfg(test)]
