@@ -105,11 +105,21 @@ struct World {
     catalog: Option<phoenix_skills::AuthenticatedCoordinatorSkillCatalog>,
     packets: [String; 3],
     source: Value,
+    _database_dir: tempfile::TempDir,
 }
 
 impl World {
     async fn new(case: &Case, models: Arc<ModelRegistry>) -> Self {
-        let db = Database::open_in_memory().await.unwrap();
+        let database_dir = tempfile::tempdir().unwrap();
+        let db = Database::open(
+            database_dir
+                .path()
+                .join("event-eval.sqlite")
+                .to_str()
+                .unwrap(),
+        )
+        .await
+        .unwrap();
         let coordinator = db
             .get_or_create_coordinator(None, LlmLanguage::default())
             .await
@@ -323,6 +333,7 @@ impl World {
             ],
             source: json!({"event_id":event.event_id,"source_transcript_id":source.id,
                 "product_conversation_id":source.product_conversation_id,"ending_evidence":evidence}),
+            _database_dir: database_dir,
         }
     }
 
@@ -613,13 +624,13 @@ async fn event_eval_fixture_uses_captured_evidence_and_real_read_tools() {
                 "allowed tool {name} must be installed"
             );
         }
-        let (_, error, denied) = world
+        let (query_output, error, denied) = world
             .dispatch(
                 "query_database",
                 &json!({"sql":"SELECT COUNT(*) AS n FROM coordinator_watch_ending_evidence"}),
             )
             .await;
-        assert!(!error && !denied);
+        assert!(!error && !denied, "{query_output}");
         let (read, error, denied) = world
             .dispatch(
                 "read_event_evidence",
