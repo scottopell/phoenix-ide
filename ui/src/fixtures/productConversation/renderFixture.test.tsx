@@ -388,7 +388,7 @@ describe('ProductConversationFixture', () => {
       expect(dock).toBeInTheDocument();
       expect(reactionInput).not.toHaveFocus();
       fireEvent.change(reactionInput, { target: { value: reaction } });
-      fireEvent.click(screen.getByRole('button', { name: 'Add to draft' }));
+      fireEvent.click(screen.getByRole('button', { name: 'Add to message' }));
     }
     expect(draft).toHaveValue('Let’s keep the first version focused.');
     expect(screen.getByRole('button', { name: 'Edit annotation 2' })).toHaveTextContent('Strong idea; test deterministic state patterns.');
@@ -425,7 +425,7 @@ describe('ProductConversationFixture', () => {
     fireEvent(document, new Event('selectionchange'));
     const reaction = await screen.findByRole('textbox', { name: 'Your reaction' });
     fireEvent.change(reaction, { target: { value: 'Acceptance race regression' } });
-    fireEvent.click(screen.getByRole('button', { name: 'Add to draft' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Add to message' }));
     fireEvent.click(screen.getByRole('button', { name: 'Send message' }));
     if (sendFailure !== 'before-acceptance') {
       await waitFor(() => expect(screen.queryByRole('button', { name: 'Edit annotation 1' })).not.toBeInTheDocument());

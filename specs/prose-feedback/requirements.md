@@ -455,7 +455,7 @@ AND SHALL restore the highlight when the source passage mounts after transcript 
 THE SYSTEM SHALL wrap reaction text and grow the input vertically as soon as it exceeds the visible line width
 AND SHALL shrink the input when text is removed
 AND SHALL bound its height to fit the visible viewport, using vertical scrolling for longer reactions
-AND SHALL provide explicit Add to draft and dismiss controls.
+AND SHALL provide explicit Add to message and dismiss controls.
 
 WHEN the selected passage leaves the transcript viewport or its row unmounts
 THE SYSTEM SHALL retain an unfinished reaction in a compact dock with a reaction preview and Return to passage action.
@@ -473,7 +473,7 @@ AND SHALL keep the touch/coarse-pointer dock directly above the current composer
 
 ### REQ-PF-019: Add Reaction to Draft
 
-WHEN the user activates Add to draft with a non-blank reaction
+WHEN the user activates Add to message with a non-blank reaction
 THE SYSTEM SHALL add one annotation card owning the complete selected quotation, its source identity, and the reaction to the current draft exactly once
 AND SHALL preserve existing draft text, including intervening edits and whitespace
 AND SHALL NOT submit a message, write to the clipboard, or modify the review-note collection.
@@ -482,6 +482,13 @@ THE SYSTEM SHALL present pending annotations as a compact overlapping stack abov
 AND SHALL give each annotation a stable number, source excerpt, and comment preview
 AND SHALL preserve creation order and existing numbers across additions, edits, and deletions
 AND SHALL bound the stack height with internal scrolling and expose a selectable strip at least 44 CSS pixels tall for each card.
+
+THE SYSTEM SHALL pair visible source passages with their stable annotation numbers
+AND SHALL distinguish the exact source passage and matching number when its card is hovered, keyboard-focused, or open for editing
+AND SHALL group source markers when multiple annotations begin on the same rendered line without obscuring or changing the message text.
+
+THE SYSTEM SHALL show the total number of pending annotations and indicate annotations hidden above or below the scrolling stack
+AND SHALL align the desktop annotation stack with the transcript reading column.
 
 WHEN the user selects an annotation strip
 THE SYSTEM SHALL open a modal showing the complete source quotation and an editable comment while keeping the source passage fixed
@@ -519,7 +526,7 @@ WHEN append succeeds
 THE SYSTEM SHALL dismiss and clear the reaction input and acknowledge the addition accessibly
 AND SHALL preserve the transcript reading position without focusing the composer.
 
-THE SYSTEM SHALL label the action Add to draft and use an append-oriented icon
+THE SYSTEM SHALL visibly label the action Add to message and use an append-oriented icon
 AND SHALL support Cmd/Ctrl+Enter to add and IME composition without accidental addition.
 
 WHEN a visible anchored pill is unfocused and the user presses unmodified Enter outside another interactive control

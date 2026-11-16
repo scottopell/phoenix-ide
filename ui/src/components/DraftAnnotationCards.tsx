@@ -1,8 +1,9 @@
-import { useEffect, useId, useRef, useState } from 'react';
+import { useEffect, useId, useLayoutEffect, useRef, useState } from 'react';
 import { ArrowUpRight, ChevronRight } from 'lucide-react';
 import type { AnnotationDraft, DraftAnnotation } from '../conversation/AnnotationDraftStore';
 import { useRegisterFocusScope } from '../hooks/useFocusScope';
 import { SelectionDialog } from './SelectionDialog';
+import { AnnotationSourceMarkers } from './AnnotationSourceMarkers';
 import './DraftAnnotationCards.css';
 
 function AnnotationEditor({ draft, annotation, disabled, onClose, onDelete, restoreFocusRef }: {
@@ -54,17 +55,49 @@ export function DraftAnnotationCards({ draft, annotations, disabled }: {
   disabled: boolean;
 }) {
   const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [hoveredId, setHoveredId] = useState<string | null>(null);
+  const [focusedId, setFocusedId] = useState<string | null>(null);
+  const [overflow, setOverflow] = useState({ above: 0, below: 0 });
   const previewId = useId();
   const restoreFocus = useRef<HTMLElement | null>(null);
   const section = useRef<HTMLElement | null>(null);
+  const scroller = useRef<HTMLDivElement | null>(null);
   const selected = annotations.find(annotation => annotation.id === selectedId);
+  const emphasizedId = selected?.id
+    ?? annotations.find(annotation => annotation.id === hoveredId)?.id
+    ?? annotations.find(annotation => annotation.id === focusedId)?.id
+    ?? null;
+  useLayoutEffect(() => {
+    const element = scroller.current;
+    if (!element) return;
+    const measure = () => {
+      const bounds = element.getBoundingClientRect();
+      const cards = [...element.querySelectorAll('.draft-annotation')];
+      const above = cards.filter(card => card.getBoundingClientRect().top < bounds.top - 1).length;
+      const below = cards.filter(card => card.getBoundingClientRect().top + 44 > bounds.bottom + 1).length;
+      setOverflow(previous => previous.above === above && previous.below === below ? previous : { above, below });
+    };
+    const observer = new ResizeObserver(measure);
+    observer.observe(element);
+    element.addEventListener('scroll', measure, { passive: true });
+    measure();
+    return () => { observer.disconnect(); element.removeEventListener('scroll', measure); };
+  }, [annotations]);
   if (!annotations.length) return null;
   return (
     <section ref={section} className="draft-annotations" aria-label="Annotations">
-      <div className="draft-annotation-scroller">
+      <AnnotationSourceMarkers annotations={annotations} emphasizedId={emphasizedId} />
+      <div className="draft-annotation-heading">
+        <span>{annotations.length} annotation{annotations.length === 1 ? '' : 's'}</span>
+        <span>{[overflow.above > 0 ? `↑ ${overflow.above} above` : '', overflow.below > 0 ? `${overflow.below} more below ↓` : ''].filter(Boolean).join(' · ')}</span>
+      </div>
+      <div ref={scroller} className="draft-annotation-scroller" tabIndex={overflow.above || overflow.below ? 0 : undefined} aria-label="Scroll annotations">
         <div className="draft-annotation-stack">
           {annotations.map(annotation => (
-            <button type="button" className="draft-annotation" key={annotation.id} aria-label={`Edit annotation ${annotation.number}`} aria-haspopup="dialog" aria-describedby={`${previewId}-${annotation.number}`} onClick={event => {
+            <button type="button" className={`draft-annotation${annotation.id === emphasizedId ? ' is-emphasized' : ''}`} key={annotation.id}
+              aria-label={`Edit annotation ${annotation.number}`} aria-haspopup="dialog" aria-describedby={`${previewId}-${annotation.number}`}
+              onPointerEnter={event => { if (event.pointerType !== 'touch') setHoveredId(annotation.id); }} onPointerLeave={() => setHoveredId(null)}
+              onFocus={() => setFocusedId(annotation.id)} onBlur={() => setFocusedId(null)} onClick={event => {
               restoreFocus.current = event.currentTarget;
               setSelectedId(annotation.id);
             }}>

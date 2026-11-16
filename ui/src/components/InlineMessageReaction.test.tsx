@@ -103,7 +103,7 @@ describe('inline message reactions', () => {
     expect(input).not.toHaveFocus();
     fireEvent.change(input, { target: { value: 'Strong idea. Please test cancellation too.' } });
     drafts.dispatch('latest', { type: 'set_draft', text: 'Draft edited while reacting  ' });
-    const add = screen.getByRole('button', { name: 'Add to draft' });
+    const add = screen.getByRole('button', { name: 'Add to message' });
     fireEvent.click(add);
     fireEvent.click(add);
     expect(append).toHaveBeenCalledTimes(1);
@@ -165,7 +165,7 @@ describe('inline message reactions', () => {
     input.focus();
     expect(store.getSnapshot('conversation-a')?.source).toEqual(captured);
     fireEvent.change(input, { target: { value: 'Keep this mobile observation' } });
-    fireEvent.click(screen.getByRole('button', { name: 'Add to draft' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Add to message' }));
     expect(append).toHaveBeenCalledOnce();
     expect(drafts.getSnapshot('latest').draft).toBe('Existing mobile draft');
     expect(append).toHaveBeenCalledWith(expect.objectContaining({ source: captured, body: 'Keep this mobile observation' }));
@@ -611,14 +611,14 @@ describe('inline message reactions', () => {
     await act(async () => { await new Promise(requestAnimationFrame); });
     expect(store.getSnapshot('conversation-a')?.source.messageId).toBe('old');
     view.rerender(<Harness store={store} />);
-    expect(screen.getByRole('button', { name: 'Add to draft' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Add to message' })).toBeDisabled();
     expect(screen.getByRole('textbox')).toHaveValue('Keep this thought');
     view.rerender(<Harness store={store} scope="conversation-b" append={append} />);
     expect(screen.queryByRole('textbox')).not.toBeInTheDocument();
     view.unmount();
     render(<Harness store={store} append={append} />);
     expect(screen.getByRole('textbox')).toHaveValue('Keep this thought');
-    fireEvent.click(screen.getByRole('button', { name: 'Add to draft' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Add to message' }));
     expect(append).toHaveBeenCalledTimes(1);
     expect(append.mock.calls[0]?.[0].source.occurrenceToken).toBe('row-old:old');
   });

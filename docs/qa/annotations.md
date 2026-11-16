@@ -12,7 +12,7 @@ No selection, typing, or submission is needed to inspect a story.
 ```
 
 Requires `phoenix-browser` on PATH. The command reuses the Ladle server on
-port 61123 or starts a temporary one. It captures fourteen states at desktop
+port 61123 or starts a temporary one. It captures fifteen states at desktop
 1440×900 and mobile 390×844, in light and dark themes, using the browser CLI.
 Each story reports readiness after its target state and layout settle.
 Unexpected browser errors and horizontal document overflow fail the capture;
@@ -20,13 +20,17 @@ the failed-send story permits its intentional synthetic rejection. The writing
 state also checks that a touch source preview sits above a full-width editor,
 then clicks Dismiss and Keep to verify compact confirmation, a stable top
 border/width, and restored text and editor geometry.
+The focused-card state checks exact source-range correspondence, the matching
+number marker, and desktop alignment with the transcript. The many-annotation
+state scrolls the stack to verify its above/below counts, then restores the
+initial position for its screenshot.
 
 The output is ignored by Git:
 
 - `ui/qa-artifacts/annotations/index.html` — side-by-side gallery with
   theme/state filters, full-resolution images, live story links, and composer
   height as pixels and a percentage of the viewport.
-- `ui/qa-artifacts/annotations/*.png` — fifty-six screenshots.
+- `ui/qa-artifacts/annotations/*.png` — sixty screenshots.
 - `ui/qa-artifacts/annotations/captures.json` — capture measurements.
 
 Open the HTML file directly, or keep Ladle running with `pnpm --dir ui ladle`
@@ -63,6 +67,7 @@ Ladle groups these under **Annotations**:
 12. `12-editing` — second annotation selected, full quotation and long comment in the modal.
 13. `13-after-delete` — middle annotation deleted; surviving labels stay 1 and 3.
 14. `14-many-annotations` — eight annotations in the bounded scrolling stack.
+15. `15-focused-annotation` — a mid-line phrase focused through its second card; its exact passage is emphasized and its grouped number remains in the gutter, clear of source text.
 
 For example:
 <http://127.0.0.1:61123/?story=annotations--06-several-annotations&mode=preview&fixtureTheme=light>

@@ -7,17 +7,30 @@ import { reactionTextOffset, restoreReactionRange } from '../../components/react
 
 export type AnnotationDesignState =
   | '01-empty' | '02-selected' | '03-writing' | '04-discard' | '05-one-annotation'
-  | '06-several-annotations' | '07-long-comment' | '08-sending' | '09-failed-send' | '10-sent' | '11-two-annotations' | '12-editing' | '13-after-delete' | '14-many-annotations';
+  | '06-several-annotations' | '07-long-comment' | '08-sending' | '09-failed-send' | '10-sent' | '11-two-annotations' | '12-editing' | '13-after-delete' | '14-many-annotations' | '15-focused-annotation';
 
 const shortComment = 'Please cover cancellation in this test.';
 const longComment = 'Please keep the original result and unfinished draft attached to the same conversation. I want to check cancellation before and after completion, and make sure reconnecting never duplicates the result. This needs a concrete test case rather than a timing assumption.';
 
-function sourceFromParagraph(paragraph: HTMLElement): ReactionSource {
+function sourceFromParagraph(paragraph: HTMLElement, phrase?: string): ReactionSource {
   const owner = paragraph.closest<HTMLElement>('[data-inline-reaction-message]')!;
   const block = paragraph.closest<HTMLElement>('.agent-text-block')!;
   const fragmentId = block.closest<HTMLElement>('[data-fragment-id]')!.dataset['fragmentId']!;
   const range = document.createRange();
   range.selectNodeContents(paragraph);
+  if (phrase) {
+    const walker = document.createTreeWalker(paragraph, NodeFilter.SHOW_TEXT);
+    let found = false;
+    for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+      const offset = node.textContent?.indexOf(phrase) ?? -1;
+      if (offset < 0) continue;
+      range.setStart(node, offset);
+      range.setEnd(node, offset + phrase.length);
+      found = true;
+      break;
+    }
+    if (!found) throw new Error(`Annotation fixture phrase is unavailable: ${phrase}`);
+  }
   return {
     messageId: owner.dataset['inlineReactionMessage']!, sequenceId: 2,
     occurrenceToken: owner.dataset['messageOccurrence'], quote: range.toString(),
@@ -28,9 +41,9 @@ function sourceFromParagraph(paragraph: HTMLElement): ReactionSource {
   };
 }
 
-function SeedAnnotationState({ state }: { state: AnnotationDesignState }) {
-  const draft = useAnnotationDraft('reaction-work');
-  const { setDraft } = useDraftActions('reaction-work');
+function SeedAnnotationState({ state, composerScope }: { state: AnnotationDesignState; composerScope: string }) {
+  const draft = useAnnotationDraft(composerScope);
+  const { setDraft } = useDraftActions(composerScope);
   const reactions = useContext(InlineReactionContext)!;
   useEffect(() => {
     let frame = 0;
@@ -67,8 +80,10 @@ function SeedAnnotationState({ state }: { state: AnnotationDesignState }) {
           if (state !== '02-selected') reactions.dispatch('pc-inline-reactions', { type: 'edit', body: longComment });
         } else if (state !== '01-empty') {
           draft.add({ source, body: state === '07-long-comment' ? longComment : shortComment });
-          if (['06-several-annotations', '11-two-annotations', '12-editing', '13-after-delete', '14-many-annotations'].includes(state)) {
-            draft.add({ source: sourceFromParagraph(paragraphs[2] ?? paragraph), body: state === '12-editing' ? longComment : 'Keep this attached to the original conversation.' });
+          if (['06-several-annotations', '11-two-annotations', '12-editing', '13-after-delete', '14-many-annotations', '15-focused-annotation'].includes(state)) {
+            draft.add({ source: state === '15-focused-annotation'
+              ? sourceFromParagraph(paragraph, 'deterministic state patterns')
+              : sourceFromParagraph(paragraphs[2] ?? paragraph), body: state === '12-editing' ? longComment : 'Keep this attached to the original conversation.' });
             if (state !== '11-two-annotations') draft.add({ source: sourceFromParagraph(paragraphs.at(-1)!), body: 'Add one browser journey for this guarantee.' });
             if (state === '13-after-delete') draft.remove(draft.getSnapshot()[1]!.id);
             if (state === '14-many-annotations') for (let index = 4; index <= 8; index++) draft.add({ source, body: `Another concrete check, annotation ${index}.` });
@@ -119,6 +134,14 @@ function SeedAnnotationState({ state }: { state: AnnotationDesignState }) {
         }
         if (!document.querySelector('.annotation-editor[open]')) { frame = requestAnimationFrame(settle); return; }
       }
+      if (state === '15-focused-annotation' && !actionStarted) {
+        const card = document.querySelector<HTMLButtonElement>('[aria-label="Edit annotation 2"]');
+        if (!card) { frame = requestAnimationFrame(settle); return; }
+        actionStarted = true;
+        card.focus({ preventScroll: true });
+        frame = requestAnimationFrame(settle);
+        return;
+      }
       if (state === '09-failed-send' || state === '10-sent') {
         if (!actionStarted) {
           const send = document.querySelector<HTMLButtonElement>('[aria-label="Send message"]');
@@ -159,5 +182,5 @@ export function AnnotationDesignFixture({ state }: { state: AnnotationDesignStat
     ...(state === '09-failed-send' ? { sendFailure: 'before-acceptance' as const } : {}),
     ...(state === '08-sending' ? { latestConversationState: { type: 'awaiting_llm' as const } } : {}),
   }), [state]);
-  return <ProductConversationFixture scenario={scenario}><SeedAnnotationState state={state} /></ProductConversationFixture>;
+  return <ProductConversationFixture scenario={scenario}><SeedAnnotationState state={state} composerScope={`product:${scenario.snapshot.product_conversation_id}`} /></ProductConversationFixture>;
 }

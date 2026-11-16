@@ -577,7 +577,7 @@ export function getProductConversationScenario(id: ProductConversationScenarioId
   return scenario;
 }
 
-export function makeVirtualizedReactionScenario(): OrdinaryProductConversationScenario {
+export function makeVirtualizedReactionScenario(): OrdinaryProductConversationScenario & { snapshot: ProductConversationSnapshotView } {
   const base = getProductConversationScenario('inline-message-reactions');
   const snapshot = base.snapshot!;
   const subjects = ['interrupted tools', 'draft preservation', 'stale completions', 'retry identity', 'continuation boundaries', 'reconnect timing'];
