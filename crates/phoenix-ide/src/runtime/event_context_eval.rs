@@ -89,7 +89,13 @@ enum Mutation {
 }
 
 fn digest(bytes: impl AsRef<[u8]>) -> String {
-    format!("{:x}", Sha256::digest(bytes.as_ref()))
+    use std::fmt::Write as _;
+    Sha256::digest(bytes.as_ref())
+        .iter()
+        .fold(String::with_capacity(64), |mut output, byte| {
+            write!(output, "{byte:02x}").expect("write to String");
+            output
+        })
 }
 
 struct World {

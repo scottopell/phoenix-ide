@@ -3398,7 +3398,7 @@ def cmd_qa_ember_event_eval() -> None:
     env = _resolved_phoenix_env()
     env.setdefault("CARGO_BUILD_JOBS", "2")
     subprocess.run(
-        ["cargo", "test", "-p", "phoenix-ide",
+        ["cargo", "test", "-p", "phoenix_ide",
          "runtime::event_context_eval::ember_event_eval", "--", "--ignored", "--exact", "--nocapture"],
         cwd=ROOT, env=env, check=True,
     )
