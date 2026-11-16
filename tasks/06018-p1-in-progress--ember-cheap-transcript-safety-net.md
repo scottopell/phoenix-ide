@@ -56,3 +56,27 @@ Required post-coverage edit case: fully cover through sequence 100 at generation
 Required missed-pause case: an existing actionable note receives previously missed user-pause evidence, then Ember continues. Index/detail/overflow report reconciliation required, trusted source reconciliation retains the pause, and scanning cannot clear it. No new wakeup or permission is manufactured.
 
 Out of scope: worker/remote corpus discovery, scanner retirement/reopening, foreground inference, expensive default-route fallback, scheduling saved work and perfect semantic deduplication.
+
+
+## Current delivery evidence
+
+Scanner candidate PR #1098 includes migration 166 on merged manual/event migrations
+164/165. At `89ff24d7b`, twenty DB tests passed, including no-append old-source
+restart/reset, actual externally changed prose, exact deduplication, retained
+retirement, live gaps and bounded contention recovery. Eighteen runner/kick tests,
+one actual authoritative-input/two-continuation/pause composition and the actual
+37-case host fixture preparation passed. These prove lifecycle/resource boundaries,
+not semantic model quality.
+
+The [first](../scripts/qa/coordinator-scanner-quality/results-ec570d0f3.md) and
+[paired prompt correction](../scripts/qa/coordinator-scanner-quality/results-db6f2b44f.md)
+37-case Luna/Low runs are independently rejected. The paired run recovered all
+eleven requested outcomes, five bookmarks and thirteen restrictions, with 33 valid
+quotes, but recreated two retired requests. No structural reopen occurred; the
+semantic renewals still fail the unchanged gates. Original sources, oracles,
+raw outputs and failed results remain retained.
+
+The next typed host chronology projection is untested. New exact prepared-input
+review, an accepted semantic trial, final integrated CI/review and merge remain
+mandatory. No scanner activation or production backfill is claimed, and this task
+stays in progress.

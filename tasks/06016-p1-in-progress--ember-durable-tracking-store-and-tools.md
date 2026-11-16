@@ -48,4 +48,15 @@ Out of scope: fresh context/UI projection, scanner inference, new wake policy an
 
 ## Delivery evidence
 
-The manual native-write and usefulness gates are accepted in PR #1093; see the [sanitized qualification report](../scripts/qa/ember-tracking/manual-memory-aca480.md). Final rebased checks/CI and integration with the scanner remain tracked by the parent and phase 8. Task status stays in progress until those delivery checks close.
+Manual native writes and the usefulness gate are accepted, and PR
+[#1093](https://github.com/scottopell/phoenix-ide/pull/1093) merged at `5b0e01c09`
+after component review and green CI. Twelve storage/service tests, the actual
+native registry/service case and four runtime continuity/authority regressions
+passed. The [manual report](../scripts/qa/ember-tracking/manual-memory-aca480.md)
+retains exact model/usage/trace evidence and prior failures.
+
+The candidate scanner composition also passed actual admitted-input, fresh-index,
+missed-pause and two-continuation assertions. Scanner semantic quality is separate:
+both cheap-model trials are rejected. Final program CI/review/merge remains with
+the parent and phase 8; no production deployment or scanner acceptance is implied.
+Filename status is unchanged pending final delivery reconciliation.

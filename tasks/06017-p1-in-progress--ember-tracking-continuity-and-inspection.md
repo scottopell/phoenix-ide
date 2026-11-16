@@ -67,4 +67,22 @@ Out of scope: scanner inference, new periodic review wakeups, a workstream taxon
 
 ## Delivery evidence
 
-PR #1093 qualifies the manual record → detour → real continuation → recovered stopping points → unprompted owed-question journey, including quiet arithmetic and bookmark scope. The [report](../scripts/qa/ember-tracking/manual-memory-aca480.md) retains actual model/usage/trace details and earlier failed/inconclusive experiments. Post-review quiet was not exercised because of the declared byte margin. Two recently reviewed requested items, contextual recovery beyond the small list and scanner composition remain mandatory phase-8 qualification; this task is not marked done prematurely.
+PR [#1093](https://github.com/scottopell/phoenix-ide/pull/1093) merged at `5b0e01c09`
+with the manual record → detour → real continuation → recovered stopping points →
+unprompted owed-question gate accepted. Its [report](../scripts/qa/ember-tracking/manual-memory-aca480.md)
+retains the declared post-review control not-run and earlier failed experiments.
+
+The subsequent [complete foreground qualification](../scripts/qa/ember-foreground-memory/foreground-32ada836a.md)
+closes the post-review quiet/two-recent-items and contextual pagination gates:
+actual structured reply, pause CAS and quiet arithmetic; hidden saved intent
+beyond eight entries and two handoffs recovered through real reads/search and
+original source, followed by its owed question. Root and fresh independent
+full-trace review accepted both fixed journeys. Earlier foreground failures remain
+linked in that report; general reliability or UI/deployment utility is not claimed.
+
+One actual-input scanner composition passed with eighteen runner/kick tests:
+idle capture adds no turn, the next authoritative input sees the fresh index,
+and pause evidence invalidates the old step through two real continuations.
+The final eight-variant inventory is accepted at `89ff24d7b`. Both scanner quality
+trials remain rejected; typed chronology and final candidate CI/review/merge are
+still open. Filename status remains unchanged until final delivery reconciliation.

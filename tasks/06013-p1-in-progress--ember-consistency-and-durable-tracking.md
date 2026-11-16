@@ -221,4 +221,34 @@ Out of scope: broad tool consolidation, new wrappers around every API, already-d
 
 ## Current delivery evidence
 
-Roadmap retirement shipped in #1091. The tool audit and bounded local watch-recovery gate shipped in #1096; final assembled inventory remains phase-8 work. Manual tracking's usefulness gate is accepted in #1093, with final rebased CI still pending; see its [qualification report](../scripts/qa/ember-tracking/manual-memory-aca480.md). Event component C passed the independently reviewed 39-trial comparison in #1092; its first capped experiment remains explicitly unaccepted. Migration ordering requires tracking 164 before event evidence 165, then scanner 166. Scanner implementation and the independently reviewed corpus are active under phase 7; no scanner activation, full combined acceptance or production deployment is claimed.
+| Phase | Verified delivery or candidate evidence | Remaining boundary |
+|---|---|---|
+| 1: Tool consistency | #1096 merged at `e67fb4ec1`; local-watch recovery accepted; final assembled inventory at `89ff24d7b` accepted | Scanner candidate exact final CI/review |
+| 2: Roadmap retirement | #1091 merged at `6cebf545f`; workflow/variables/Issue cutoff independently verified | Complete; historical records retained |
+| 3: Ending evidence | #1092 merged at `3a842c5`; exact settlement/capture/privacy/read regressions and component CI passed | No production deployment claim |
+| 4: Useful event context | #1092 accepted compact C after the complete 39-trial comparison and fixture web checks | First capped experiment remains partial/unaccepted; no general billing or remote-parity claim |
+| 5: Tracking store/tools | #1093 merged at `5b0e01c09`; native/store/authority checks and manual usefulness accepted | Final scanner integration |
+| 6: Continuity and attention | Manual detour/continuation gate accepted; [foreground quiet/contextual recovery](../scripts/qa/ember-foreground-memory/foreground-32ada836a.md) accepted; actual-input scanner composition passed | Supplemental candidate guidance and scanner integration still require final CI/review/merge |
+| 7: Cheap safety net | Twenty DB tests, eighteen runner/kick tests and actual 37-case host fixtures passed; both real-model trials rejected | Typed retirement/source projection is untested; new reviewed inputs and accepted semantic trial required |
+| 8: Combined qualification | Final inventory and actual-input/two-continuation/pause lifecycle composition accepted | Scanner semantic quality, factual closure, exact final CI/review and merge |
+
+The manual [qualification report](../scripts/qa/ember-tracking/manual-memory-aca480.md)
+and complete [event comparison](../scripts/qa/ember-event-eval/results-cfda0b0.md)
+retain their exact configuration, failed earlier experiments and limitations.
+Scanner [first](../scripts/qa/coordinator-scanner-quality/results-ec570d0f3.md)
+and [paired](../scripts/qa/coordinator-scanner-quality/results-db6f2b44f.md)
+37-case runs remain rejected: valid quotes and recall do not excuse omitted
+restrictions or invented renewal of retired work. No scanner activation or full
+program acceptance is claimed from those runs.
+
+The accepted assembled export contains eight language/catalog/spawn variants,
+28 tools without authenticated skills and 29 with them, including tracking's
+eight operations and the local-only event evidence read. Artifact SHA256:
+`d4a4f557a1eeb059c52dafd4b69fd9718d4f3a598492e88ae8e0eef29d2fad7f`.
+These are observed synthetic configurations, not a fixed roster or deployed count.
+
+Migration ordering is manual tracking 164, event evidence 165, scanner 166.
+Merged source, reviewed local candidates and deployed behavior remain distinct.
+No production deployment, physical-phone campaign or live historical backfill
+completion is claimed or newly required by this local qualification record.
+Task filenames remain in progress until their delivery boundaries close.

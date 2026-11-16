@@ -1,49 +1,82 @@
 # Coordinator scanner status
 
-Implementation is authored on the composed manual164/event165 candidate, including
-scanner migration166, bounded DB preparation/reservation/application, native
-coverage inspection and an independent supervised runner. Initial seven DB
-fixtures passed; bounded projection/order repairs, expanded host cases and the
-corrected runner still require combined compilation and qualification. No scanner
-provider call or candidate server activation has occurred. Source presence is not
-an activation, merge or deployment claim.
+Scanner migration 166, bounded host preparation/reservation/application, coverage
+inspection and the supervised background runner are implemented on the composed
+manual-tracking/event candidate. Scanner activation is **not qualified**: both
+complete 37-case real-model trials were independently rejected. A typed
+retirement/source chronology projection is being implemented and remains untested.
+PR #1098, exact final checks/review and merge remain open. No production deployment
+or candidate-server activation is claimed.
 
-| Requirements | Status | Evidence |
+| Requirements | Current evidence | Remaining gate |
 |---|---|---|
-| REQ-SCAN-001–008 | Implementation and qualification in progress | Initial DB7 fixtures pass; full host/runner/source/authority and frozen real-model gates remain pending |
+| REQ-SCAN-001–005: Scope, coverage, source validity, authority and recovery | Twenty actual DB tests passed at `89ff24d7b`, including old-prose generation-only restart, two continuations, exact deduplication, retirement races, live gaps and contention recovery | Typed chronology projection and exact integrated checks/review |
+| REQ-SCAN-006: Bounded resource use | Eighteen runner/kick tests passed; strict catalog/outbound Luna/Low, accepted-output bounds, durable spending/retry limits and no foreground wake are covered | Qualify the revised candidate before activation |
+| REQ-SCAN-007: Bounded inspectability | Native coverage inspection and accepted eight-variant assembled inventory include the closed tracking coverage operation | Exact final integrated CI/review |
+| REQ-SCAN-008: Historical recovery and qualification | Manual/foreground usefulness accepted; actual host fixtures pass; both cheap-model semantic trials rejected | New exact prepared-input review, independently accepted quality trial and final CI/review/merge |
 
-The independently reviewed version3 synthetic corpus has37 cases: eleven primary
-requested units (minimum10), five bookmark units (minimum4), seventeen no-new-item
-negatives, twenty-one cases forbidding new requested_work, eleven visible-candidate
-duplicate opportunities (maximum1), thirteen target-bound hard restrictions, one
-outside-window cancellation and one omitted-candidate opportunity. L01 separately
-requires one apparent-request recovery from UnknownHistorical user-role prose;
-L02 rejects legacy machine/quoted framing. They do not alter the eleven-unit
-known-human recall denominator. Actual origin remains intact and every capture
-is provisional/unreviewed, without new authority.
+The production-runtime composition test passed with the runner/kick suite: an
+idle capture adds no foreground turn/messages; the next actual admitted input
+sees a fresh bounded index; appended pause evidence invalidates the old stopping
+point through two real continuations. This synthetic inference proves lifecycle
+composition, not cheap-model interpretation or general user utility.
 
-Independent source/oracle review accepted JSON SHA256
-`b8ff9e975493e8e49d2e630aac77816d7a4e5a107ee6a303727298bf6582f4ba`
-and oracle SHA256
-`9ead5f83bfc17f202a61876d63e3651c3d9916cedaa5d58586ce554131f493bb`.
-Actual prepared host batches, prompt and route require review before calls; all
-corpus inputs use historical/unverified metadata. Live/frontier/member/coverage,
-reserve-crash/restart, exact deduplication and fresh-renewal visibility remain
-mandatory deterministic host tests.
+The twenty DB tests preserve original/retired evidence through supported file
+restart. The old sequence-5/covered-through-100 case first proves metadata-only
+invalidation and unchanged exact deduplication, then atomically changes valid
+old prose and its generation without appending a row, closes/reopens and recovers
+new exact evidence. That latter fixture models externally changed source; it
+adds no user-edit API or UI capability. Normal history/live fairness, explicit
+source gaps, reserve-crash retry accounting, later recovery and bounded
+contention remain separate assertions.
 
-Host source projection is bounded to32 physical rows/pass and1MiB serialized
+## Frozen quality evidence
+
+The independently reviewed corpus has 37 synthetic cases: eleven primary
+requested units (minimum ten), five bookmark units (minimum four), seventeen
+no-new-item negatives, twenty-one cases forbidding new requested work, eleven
+visible duplicate opportunities (maximum one), thirteen target-bound restrictions,
+one outside-window cancellation and one genuinely omitted matching candidate.
+Unknown apparent intent and machine/quoted framing are scored separately; original
+provenance remains intact and every new capture is historical and unreviewed.
+
+Corpus SHA256:
+`869882606a01834cb2e45a3f45490bba5d2f9ca025551c42f94210e5e5af3ea4`.
+Oracle SHA256:
+`d195c43320a31a452abc110d54ab95df71d1547b84f2870b1e1fb61f30edcb14`.
+The Unicode source is genuinely partial under normal host bounds, the omitted
+candidate is outside sixteen actual native records, and scanner-source IDs are
+UUIDs admitted initially with logical aliases retained only in host review data.
+No oracle, withheld cancellation or hidden candidate text enters inference.
+
+The [first trial](../../scripts/qa/coordinator-scanner-quality/results-ec570d0f3.md)
+made 37 calls and was rejected for six semantic cases despite valid quotations.
+The [paired prompt correction](../../scripts/qa/coordinator-scanner-quality/results-db6f2b44f.md)
+reused all 37 byte-identical source payloads and made 37 calls: eleven requested
+units, five bookmarks, all thirteen restrictions and all 33 quotes passed, but
+two stale retired requests became new active records. Both runs remain rejected;
+zero structural reopen writes does not excuse invented semantic renewal.
+
+The next input projection supplies host-derived fragments strictly later than a
+retired candidate, so inference does not compare long timestamp integers.
+Temporal eligibility is not renewal intent, semantic matching or permission.
+It is not proven by either prior trial. Corpus/oracles/thresholds remain unchanged;
+new exact payloads and quality results require independent review before activation.
+
+## Bounds and limits
+
+Host source projection is bounded to 32 physical rows/pass and 1 MiB serialized
 user/assistant content per row. Larger or malformed rows remain explicitly
-SourceUnavailable/unprocessed without advancing their coverage. Ordinary eligible
-prose is UTF8-fragmented into the8KiB encoded source window; registry context is
-also8KiB and total inference content24KiB. These are resource bounds, not a claim
-that oversized blocked history has been processed.
+SourceUnavailable/unprocessed. Ordinary prose uses an 8 KiB encoded source window,
+registry context 8 KiB, and total inference content 24 KiB, with honest clipping
+and omissions. These limits do not claim blocked or unread history is covered.
 
-Fresh runner review exposed two contract gaps: catalog names did not prove the
-actual outbound model, and Codex omitted the requested generation-token limit.
-The correction requires exact catalog/outbound Luna spelling and validates both
-2,048 reported output tokens and16KiB received text before JSON/application.
-Unknown output usage or nontext/oversize/incomplete output is rejected.
-Official-direct sends the generation limit; Codex has no generation/billing cap.
-Timeout and durable attempt/hour/day/input budgets remain independent. Partial
-usage retains each known metric, with unknown fields absent. Corrected-source
-review and tests remain pending; these statements do not claim qualification.
+The eligible service must expose exact catalog and outbound `gpt-6-luna` at Low
+through Codex or official direct Responses, without an expensive/default fallback.
+Accepted output requires known usage at most 2,048 tokens and 16 KiB UTF8 text;
+nontext, incomplete, unknown-usage and oversized output is rejected before apply.
+Official direct requests the generation limit; Codex has no enforced generation
+or billing ceiling. Timeout, durable attempt/hour/day/input budgets and independently
+observed usage fields remain separate. Scanning grants no authority and creates no foreground
+turn or new review wakeup. Physical-device and deployed-backfill results are not
+claimed by these local synthetic qualifications.

@@ -82,8 +82,13 @@ and limitations are in scripts/qa/ember-watch-recovery/README.md. This proves on
 synthetic model read-selection/registered-dispatch case, not full runtime admission
 or production activation. Exact final-head full CI remains required.
 
-**Mandatory final-composition follow-up:** rerun the assembled inventory after
-tracking/event integration, reconcile their tool/guidance entries and preserve
-actual configuration/language/catalog scope. This remains owned by this task and
-[combined acceptance](./06019-p1-in-progress--ember-coordination-end-to-end-qualificat.md).
-Do not mark phase 1 complete from the pre-integration inventory or this one trial.
+**Final composition readback:** the matrix and exporter each passed at
+`89ff24d7b`, with eight language/catalog/spawn variants, 28 tools without the
+authenticated skill catalog and 29 with it. Tracking includes eight closed
+operations, including coverage; the local-only event evidence tool is installed.
+Export SHA256:
+`d4a4f557a1eeb059c52dafd4b69fd9718d4f3a598492e88ae8e0eef29d2fad7f`.
+This completes the requested inventory rerun after manual/event integration.
+It is synthetic assembled-runtime evidence, not a deployed configuration or a
+new fixed tool authority. Final candidate CI/review and task reconciliation remain
+separate; no status rename is made from this receipt alone.
