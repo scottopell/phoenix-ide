@@ -73,7 +73,7 @@ describe('assistant finalization chrome', () => {
       fireEvent.click(screen.getByRole('button', { name: 'Open message reviewer' }));
       expect(listener.mock.calls[0]![0].detail).toEqual({ sequenceId: 3, messageId: 'finalization', occurrenceToken: 'occurrence-3', presentation: 'pane' });
       await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Copy Phoenix message' })); });
-      expect(copyToClipboard).toHaveBeenCalledWith(text);
+      expect(copyToClipboard).toHaveBeenCalledWith(text, expect.any(AbortSignal));
     } finally {
       window.removeEventListener(OPEN_MESSAGE_VIEWER_EVENT, listener);
     }

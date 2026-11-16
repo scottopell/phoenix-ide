@@ -1299,7 +1299,7 @@ describe('message copy affordances', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Copy input message' }));
 
     await waitFor(() => {
-      expect(copyToClipboard).toHaveBeenCalledWith('Please summarize `src/main.rs`.');
+      expect(copyToClipboard).toHaveBeenCalledWith('Please summarize `src/main.rs`.', expect.any(AbortSignal));
     });
   });
 
@@ -1348,7 +1348,7 @@ describe('message copy affordances', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Copy Phoenix message' }));
 
     await waitFor(() => {
-      expect(copyToClipboard).toHaveBeenCalledWith('First **markdown** block.\n\nSecond block.');
+      expect(copyToClipboard).toHaveBeenCalledWith('First **markdown** block.\n\nSecond block.', expect.any(AbortSignal));
     });
   });
 
@@ -2549,7 +2549,7 @@ describe('finalized code fence highlighting', () => {
     await act(async () => {
       fireEvent.click(screen.getByRole('button', { name: 'Copy Mermaid source' }));
     });
-    expect(copyToClipboard).toHaveBeenCalledWith(mermaidSource);
+    expect(copyToClipboard).toHaveBeenCalledWith(mermaidSource, expect.any(AbortSignal));
   });
 
 
@@ -2745,7 +2745,7 @@ describe('read_file structured result view', () => {
     expect(onOpenFile).toHaveBeenCalledWith('src/lib.rs', new Set(), 40, 64);
 
     fireEvent.click(screen.getByRole('button', { name: /Copy all returned lines/i }));
-    await waitFor(() => expect(copyToClipboard).toHaveBeenCalledWith(lines));
+    await waitFor(() => expect(copyToClipboard).toHaveBeenCalledWith(lines, expect.any(AbortSignal)));
 
     expect(screen.getByText(/5 more returned lines/)).toBeInTheDocument();
     expect(screen.queryByText('fixture line 60')).not.toBeInTheDocument();
@@ -2782,7 +2782,7 @@ describe('read_file structured result view', () => {
     expect(screen.getByRole('button', { name: 'Show preview' })).toHaveAttribute('aria-expanded', 'true');
 
     fireEvent.click(screen.getByRole('button', { name: /Copy all returned lines/i }));
-    await waitFor(() => expect(copyMock).toHaveBeenCalledWith(lines));
+    await waitFor(() => expect(copyMock).toHaveBeenCalledWith(lines, expect.any(AbortSignal)));
   });
 
   it('caps structured previews by characters without truncating copied historical output', async () => {
@@ -2807,7 +2807,7 @@ describe('read_file structured result view', () => {
 
     expect(screen.getByText(/returned line truncated for preview/)).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: /Copy all returned lines/i }));
-    await waitFor(() => expect(copyMock).toHaveBeenCalledWith(`     1\t${longLine}`));
+    await waitFor(() => expect(copyMock).toHaveBeenCalledWith(`     1\t${longLine}`, expect.any(AbortSignal)));
   });
 
   it('preserves literal ellipses and distinguishes an empty range from an empty file', () => {
@@ -3136,7 +3136,7 @@ describe('SubAgentStatus inline activity', () => {
     expect(container.querySelector('.subagent-delegated-task-text')?.textContent).toBe(task);
     expect(container.querySelector('script')).toBeNull();
     fireEvent.click(screen.getByRole('button', { name: 'Copy delegated task' }));
-    await waitFor(() => expect(copyToClipboard).toHaveBeenCalledExactlyOnceWith(task));
+    await waitFor(() => expect(copyToClipboard).toHaveBeenCalledExactlyOnceWith(task, expect.any(AbortSignal)));
     expect(expand).toHaveAttribute('aria-expanded', 'true');
     expect(api.getConversation).toHaveBeenCalledExactlyOnceWith('agent-task');
     await act(async () => resolveSnapshot({ conversation: child, messages: [], agent_working: !completed, presentation_mode: completed ? 'idle' : 'working', context_window_size: 0 }));

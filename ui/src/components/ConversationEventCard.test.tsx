@@ -95,9 +95,9 @@ describe('compact conversation events', () => {
     const { container } = mount();
     container.querySelector('details')!.open = true;
     fireEvent.click(screen.getByRole('button', { name: 'Copy event provenance' }));
-    expect(copyToClipboard).toHaveBeenCalledWith(eventCardFragments(available, available.event_id).provenance);
+    expect(copyToClipboard).toHaveBeenCalledWith(eventCardFragments(available, available.event_id).provenance, expect.any(AbortSignal));
     fireEvent.click(screen.getByRole('button', { name: 'Copy original event text' }));
-    expect(copyToClipboard).toHaveBeenCalledWith(original);
+    expect(copyToClipboard).toHaveBeenCalledWith(original, expect.any(AbortSignal));
     expect(container.querySelector('[data-fragment-id="message-text"]')!.textContent).toBe(original);
   });
   it('keeps the exact ending quotation in inspectable provenance', () => {
