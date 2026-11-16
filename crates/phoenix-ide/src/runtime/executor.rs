@@ -8899,7 +8899,13 @@ where
             }
         }
         if self.context.is_coordinator && self.tracking_observation_pending {
-            let sequence_id = self.broadcast_tx.next_seq();
+            let (reservation, sequences) = self
+                .broadcast_tx
+                .persisted_message_reservation_authority()
+                .await
+                .reserve_next_range(1)
+                .expect("tracking observation reserves one sequence");
+            let sequence_id = sequences[0];
             match self
                 .storage
                 .append_coordinator_tracking_observation(
@@ -8910,11 +8916,24 @@ where
                 .await
             {
                 phoenix_db::workflow::LocalAuthorityResult::DurableFactEstablished(result) => {
-                    if let Some(message) = result? {
-                        let _ = self
-                            .broadcast_tx
-                            .admitted_publication(admitted)
-                            .persisted_message(message);
+                    match result? {
+                        Some(message) => {
+                            let _ = self
+                                .broadcast_tx
+                                .admitted_publication(admitted)
+                                .persisted_message(message);
+                        }
+                        None => {
+                            let _ = self
+                                .broadcast_tx
+                                .admitted_publication(admitted)
+                                .reserved_state_change(
+                                    sequence_id,
+                                    self.state.clone(),
+                                    self.state.presentation_mode().to_string(),
+                                    self.state_updated_at,
+                                );
+                        }
                     }
                     self.tracking_observation_pending = false;
                 }
@@ -8924,6 +8943,7 @@ where
                     return Err("FATAL_LOCAL_AUTHORITY_UNCLASSIFIED: tracking observation".into());
                 }
             }
+            drop(reservation);
         }
         self.refresh_active_prompt_projection().await?;
         let trusted_results = self.pending_trusted_tool_results.clone();

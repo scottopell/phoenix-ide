@@ -16,6 +16,8 @@ Append bounded, revision-labelled observations at existing admitted foreground b
 
 Mutation receipts retain only call fingerprint, item and committed revisions, not a second mutable item copy. Exact replay reports the original committed revision; callers read current state separately. Reusing a call with different intent conflicts. Closed items and reasons persist without age expiry; source references deliberately do not cascade on source deletion.
 
+The item carries a nullable current retirement revision pointing to the retained retirement row; current closed disposition and reason derive from that row. Reopening clears the pointer and preserves history. Compact titles are explicitly clipped at 80 UTF-8 bytes; full titles/notes remain in detail reads. The complete appended observation, including its data warning, stays within 8 KiB. A persisted-message reservation spans observation commit/publication. Cues before a later input are historical, not a renewed review request; their global per-item receipts preserve cooldown across continuations without pretending that surfacing was a review.
+
 ## Consequences
 
 Manual memory can ship before extraction. Goals/events/tracking remain separate authorities. Prompt growth follows existing continuation policies, and compact pages explicitly omit entries. Stored text remains evidence rather than executable instruction. More elaborate ranking, status checkers and dashboards require demonstrated need.

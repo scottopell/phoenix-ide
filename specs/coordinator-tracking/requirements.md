@@ -31,3 +31,5 @@ At existing admitted Coordinator turn/wakeup boundaries THE SYSTEM SHALL append 
 ### REQ-TRACK-007: Useful, quiet attention
 
 THE Coordinator SHALL use normal turns and existing wakeups to recover relevant older intent and occasionally revisit neglected requested outcomes. These paths SHALL share at most one useful cue, often none, and a wall-clock cooldown. A recently reviewed unchanged small list SHALL NOT alternate every turn. No item due SHALL cause no extra recital, worker nudge or wakeup. A bookmark SHALL remain a question/resumption aid rather than a commission. Saving and background scanning SHALL NOT schedule foreground work.
+
+A cue SHALL apply only to the admitted input before its appended observation. A later input SHALL make that retained cue historical rather than renewing a review opportunity. Surfacing SHALL NOT advance explicit review.

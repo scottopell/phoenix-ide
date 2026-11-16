@@ -79,6 +79,13 @@ async fn tracking_call_replay_conflict_and_structural_authority() {
     assert_eq!(first.outcome, TrackingOutcome::Applied);
     assert_eq!(replay.outcome, TrackingOutcome::Replayed);
     assert_eq!(first.item_id, replay.item_id);
+    let saved = db
+        .read_coordinator_tracking(&source, &first.item_id, 0)
+        .await
+        .unwrap();
+    let recording = saved.recorded_by_ember.unwrap();
+    assert_eq!(recording.assistant_message_id, call.message_id);
+    assert!(recording.source_available);
     assert!(db
         .mutate_coordinator_tracking(
             &source,
@@ -120,6 +127,19 @@ async fn tracking_call_replay_conflict_and_structural_authority() {
             .active_count,
         1
     );
+    sqlx::query("DELETE FROM messages WHERE message_id=?1")
+        .bind(&call.message_id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    assert!(
+        !db.read_coordinator_tracking(&source, &first.item_id, 0)
+            .await
+            .unwrap()
+            .recorded_by_ember
+            .unwrap()
+            .source_available
+    );
 }
 #[tokio::test]
 async fn tracking_new_pause_invalidates_step_and_conflicts_stale_reconciliation() {
@@ -154,7 +174,7 @@ async fn tracking_new_pause_invalidates_step_and_conflicts_stale_reconciliation(
         }
     ));
     assert!(matches!(
-        detail.source_availability,
+        detail.page_source_availability,
         TrackingSourceAvailability::SourceMissing
     ));
     let page = db
@@ -231,7 +251,14 @@ async fn tracking_retirement_requires_reason_retains_history_and_source_independ
         .established()
         .unwrap()
         .is_err());
-    assert!(sqlx::query("UPDATE coordinator_tracking_items SET disposition='resolved',retirement_reason=NULL WHERE id=?1").bind(&receipt.item_id).execute(db.pool()).await.is_err());
+    assert!(sqlx::query("INSERT INTO coordinator_tracking_retirements(item_id,item_revision,disposition,reason,recorded_at_us) VALUES(?1,2,'resolved',NULL,1)").bind(&receipt.item_id).execute(db.pool()).await.is_err());
+    assert!(sqlx::query(
+        "UPDATE coordinator_tracking_items SET current_retirement_revision=2 WHERE id=?1"
+    )
+    .bind(&receipt.item_id)
+    .execute(db.pool())
+    .await
+    .is_err());
     apply(
         &db,
         &source,
@@ -356,10 +383,8 @@ async fn tracking_supported_restart_preserves_items_and_explicit_retirement() {
         .read_coordinator_tracking(&source, &receipt.item_id, 0)
         .await
         .unwrap();
-    assert_eq!(detail.item.disposition, TrackingDisposition::Resolved);
-    assert_eq!(
-        detail.item.retirement_reason.as_deref(),
-        Some("User confirmed outcome")
+    assert!(
+        matches!(detail.item.disposition,TrackingState::Resolved{reason} if reason=="User confirmed outcome")
     );
 }
 
@@ -412,8 +437,11 @@ async fn tracking_observations_survive_continuation_without_rewriting_prefix_or_
         .as_str()
         .unwrap()
         .contains("Remember requested release outcome"));
-    let after=db.get_messages(&source).await.unwrap();
-    for (earlier,current) in prefix.iter().zip(&after){assert_eq!(earlier.message_id,current.message_id);assert_eq!(earlier.content,current.content);}
+    let after = db.get_messages(&source).await.unwrap();
+    for (earlier, current) in prefix.iter().zip(&after) {
+        assert_eq!(earlier.message_id, current.message_id);
+        assert_eq!(earlier.content, current.content);
+    }
     for _ in 0..8 {
         input(&db, &source, "Still working on the detour").await;
         assert!(observation(&db, &source, now + 1_000_000).await.is_none());
@@ -573,4 +601,48 @@ async fn tracking_reference_updates_and_retirement_history_paginate_honestly() {
             pr_number: 55
         }]
     );
+}
+
+#[tokio::test]
+async fn tracking_worst_case_escaped_titles_and_due_cue_fit_complete_context_bound() {
+    let (db, source) = setup().await;
+    for index in 0..9 {
+        apply(
+            &db,
+            &source,
+            record(
+                TrackingKind::RequestedWork,
+                &format!("{}x{index}", "\u{0001}".repeat(150)),
+            ),
+        )
+        .await;
+    }
+    sqlx::query(
+        "UPDATE coordinator_tracking_items SET revision=9223372036854775807,reviewed_at_us=0",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+    input(&db, &source, "A normal turn with old requested work due").await;
+    let message = observation(&db, &source, Utc::now().timestamp_micros())
+        .await
+        .unwrap();
+    let text = message.content.to_json()["text"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(
+        text.len() <= 8192,
+        "complete wrapper and payload are bounded: {}",
+        text.len()
+    );
+    let parsed: TrackingObservation =
+        serde_json::from_str(text.split_once('\n').unwrap().1).unwrap();
+    assert!(parsed
+        .captured_registry
+        .items
+        .iter()
+        .all(|item| item.title_truncated));
+    assert_eq!(parsed.captured_registry.omitted_count, 1);
+    assert!(parsed.requested_item_due_for_review.is_some());
 }

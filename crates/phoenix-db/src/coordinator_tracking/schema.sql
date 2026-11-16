@@ -10,15 +10,13 @@ CREATE TABLE coordinator_tracking_items (
  title TEXT NOT NULL CHECK(length(trim(title)) BETWEEN 1 AND 160),
  note TEXT NOT NULL CHECK(length(CAST(note AS BLOB)) <= 8192),
  resumption TEXT NOT NULL CHECK(length(CAST(resumption AS BLOB)) <= 4096),
- disposition TEXT NOT NULL CHECK(disposition IN ('tracking','resolved','dismissed')),
- retirement_reason TEXT,
+ current_retirement_revision INTEGER,
  revision INTEGER NOT NULL CHECK(typeof(revision)='integer' AND revision >= 1),
  reviewed_evidence_ordinal INTEGER NOT NULL CHECK(typeof(reviewed_evidence_ordinal)='integer' AND reviewed_evidence_ordinal >= -1),
  created_at_us INTEGER NOT NULL CHECK(typeof(created_at_us)='integer' AND created_at_us >= 0),
  updated_at_us INTEGER NOT NULL CHECK(typeof(updated_at_us)='integer' AND updated_at_us >= created_at_us),
  reviewed_at_us INTEGER CHECK(reviewed_at_us IS NULL OR (typeof(reviewed_at_us)='integer' AND reviewed_at_us >= 0)),
- CHECK((disposition='tracking' AND retirement_reason IS NULL) OR
-       (disposition IN ('resolved','dismissed') AND retirement_reason IS NOT NULL AND length(trim(retirement_reason)) BETWEEN 1 AND 4096))
+ FOREIGN KEY(id,current_retirement_revision) REFERENCES coordinator_tracking_retirements(item_id,item_revision) DEFERRABLE INITIALLY DEFERRED
 );
 CREATE TABLE coordinator_tracking_references (
  item_id TEXT NOT NULL REFERENCES coordinator_tracking_items(id),
@@ -57,11 +55,13 @@ CREATE TABLE coordinator_tracking_operations (
  source_message_id TEXT NOT NULL,
  source_tool_use_id TEXT NOT NULL,
  fingerprint TEXT NOT NULL,
+ operation_kind TEXT NOT NULL CHECK(operation_kind IN ('record','update','append_evidence','retire','reopen')),
  item_id TEXT NOT NULL REFERENCES coordinator_tracking_items(id),
  item_revision INTEGER NOT NULL,
  registry_revision INTEGER NOT NULL,
  PRIMARY KEY(source_transcript_id, source_message_id, source_tool_use_id)
 );
+CREATE UNIQUE INDEX coordinator_tracking_one_record_call ON coordinator_tracking_operations(item_id) WHERE operation_kind='record';
 CREATE TABLE coordinator_tracking_retirements (
  item_id TEXT NOT NULL REFERENCES coordinator_tracking_items(id),
  item_revision INTEGER NOT NULL CHECK(typeof(item_revision)='integer' AND item_revision > 0),

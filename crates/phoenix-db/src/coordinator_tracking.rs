@@ -72,6 +72,22 @@ pub enum TrackingDisposition {
     Resolved,
     Dismissed,
 }
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum TrackingState {
+    Tracking,
+    Resolved { reason: String },
+    Dismissed { reason: String },
+}
+impl TrackingState {
+    fn disposition(&self) -> TrackingDisposition {
+        match self {
+            Self::Tracking => TrackingDisposition::Tracking,
+            Self::Resolved { .. } => TrackingDisposition::Resolved,
+            Self::Dismissed { .. } => TrackingDisposition::Dismissed,
+        }
+    }
+}
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TrackingOutcome {
@@ -130,8 +146,7 @@ pub struct TrackingItem {
     pub kind: TrackingKind,
     pub title: String,
     pub note: String,
-    pub disposition: TrackingDisposition,
-    pub retirement_reason: Option<String>,
+    pub disposition: TrackingState,
     pub revision: i64,
     pub resumption: TrackingResumption,
     pub created_at_us: i64,
@@ -153,6 +168,7 @@ pub struct TrackingSummary {
     pub id: String,
     pub kind: TrackingKind,
     pub title: String,
+    pub title_truncated: bool,
     pub disposition: TrackingDisposition,
     pub revision: i64,
     pub review_required: bool,
@@ -166,15 +182,24 @@ pub struct TrackingDetail {
     pub evidence: Vec<(i64, TrackingEvidence)>,
     pub next_evidence_ordinal: Option<i64>,
     pub evidence_is_historical: bool,
-    pub source_availability: TrackingSourceAvailability,
+    pub page_source_availability: TrackingSourceAvailability,
     pub retirement_history: Vec<TrackingRetirementRecord>,
     pub next_retirement_revision: Option<i64>,
     pub omitted_retirement_count: i64,
+    pub recorded_by_ember: Option<TrackingRecordingSource>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TrackingRecordingSource {
+    pub instance_id: String,
+    pub transcript_id: String,
+    pub assistant_message_id: String,
+    pub tool_use_id: String,
+    pub source_available: bool,
 }
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TrackingSourceAvailability {
-    NoEvidence,
+    NoEvidenceOnPage,
     LocalSourcesPresent,
     SourceMissing,
     RemoteUnverified,
@@ -217,6 +242,14 @@ async fn require_owner(tx: &mut Transaction<'_, Sqlite>, source: &str) -> DbResu
             .bind(source)
             .fetch_one(&mut **tx)
             .await?;
+    let saved: Option<String> = sqlx::query_scalar(
+        "SELECT owner_product_id FROM coordinator_tracking_registry WHERE singleton=1",
+    )
+    .fetch_optional(&mut **tx)
+    .await?;
+    if saved.as_deref().is_some_and(|saved| saved != owner) {
+        return Err(invalid("singleton owner mismatch"));
+    }
     Ok(owner)
 }
 async fn registry_revision(tx: &mut Transaction<'_, Sqlite>) -> DbResult<i64> {
@@ -341,12 +374,15 @@ fn item(row: &sqlx::sqlite::SqliteRow) -> DbResult<TrackingItem> {
         title: row.try_get("title")?,
         note: row.try_get("note")?,
         disposition: match row.try_get::<String, _>("disposition")?.as_str() {
-            "tracking" => TrackingDisposition::Tracking,
-            "resolved" => TrackingDisposition::Resolved,
-            "dismissed" => TrackingDisposition::Dismissed,
+            "tracking" => TrackingState::Tracking,
+            "resolved" => TrackingState::Resolved {
+                reason: row.try_get("retirement_reason")?,
+            },
+            "dismissed" => TrackingState::Dismissed {
+                reason: row.try_get("retirement_reason")?,
+            },
             _ => return Err(invalid("invalid disposition")),
         },
-        retirement_reason: row.try_get("retirement_reason")?,
         revision: row.try_get("revision")?,
         resumption: if reviewed < latest {
             TrackingResumption::ReviewRequired {
@@ -363,6 +399,25 @@ fn item(row: &sqlx::sqlite::SqliteRow) -> DbResult<TrackingItem> {
         created_at_us: row.try_get("created_at_us")?,
         updated_at_us: row.try_get("updated_at_us")?,
         reviewed_at_us: row.try_get("reviewed_at_us")?,
+    })
+}
+fn summary(row: &sqlx::sqlite::SqliteRow) -> DbResult<TrackingSummary> {
+    let mut item = item(row)?;
+    let title_truncated = item.title.len() > 80;
+    let mut end = item.title.len().min(80);
+    while !item.title.is_char_boundary(end) {
+        end -= 1;
+    }
+    item.title.truncate(end);
+    Ok(TrackingSummary {
+        id: item.id,
+        kind: item.kind,
+        title: item.title,
+        title_truncated,
+        disposition: item.disposition.disposition(),
+        revision: item.revision,
+        review_required: matches!(item.resumption, TrackingResumption::ReviewRequired { .. }),
+        latest_evidence_ordinal: row.try_get("latest_evidence_ordinal")?,
     })
 }
 
@@ -438,7 +493,7 @@ impl Database {
                     return Err(invalid("at most 16 references"));
                 }
                 let id = uuid::Uuid::new_v4().to_string();
-                sqlx::query("INSERT INTO coordinator_tracking_items(id,kind,title,note,resumption,disposition,revision,reviewed_evidence_ordinal,created_at_us,updated_at_us,reviewed_at_us) VALUES(?1,?2,?3,?4,?5,'tracking',1,0,?6,?6,?6)").bind(&id).bind(record.kind.as_str()).bind(&record.title).bind(&record.note).bind(&record.resumption).bind(now).execute(&mut **tx).await?;
+                sqlx::query("INSERT INTO coordinator_tracking_items(id,kind,title,note,resumption,revision,reviewed_evidence_ordinal,created_at_us,updated_at_us,reviewed_at_us) VALUES(?1,?2,?3,?4,?5,1,0,?6,?6,?6)").bind(&id).bind(record.kind.as_str()).bind(&record.title).bind(&record.note).bind(&record.resumption).bind(now).execute(&mut **tx).await?;
                 for (ordinal, reference) in record.references.iter().enumerate() {
                     insert_reference(
                         tx,
@@ -478,7 +533,7 @@ impl Database {
                     TrackingMutation::Record { .. } => unreachable!(),
                 };
                 let row = sqlx::query(
-                    "SELECT revision,disposition FROM coordinator_tracking_items WHERE id=?1",
+                    "SELECT revision,current_retirement_revision FROM coordinator_tracking_items WHERE id=?1",
                 )
                 .bind(id)
                 .fetch_optional(&mut **tx)
@@ -488,7 +543,9 @@ impl Database {
                 if revision != expected {
                     return Err(invalid("revision conflict; read the item again"));
                 }
-                let active = row.try_get::<String, _>("disposition")? == "tracking";
+                let active = row
+                    .try_get::<Option<i64>, _>("current_retirement_revision")?
+                    .is_none();
                 let changed = match other {
                     TrackingMutation::Update {
                         title,
@@ -539,8 +596,8 @@ impl Database {
                             TrackingRetirement::Resolved => "resolved",
                             TrackingRetirement::Dismissed => "dismissed",
                         };
-                        sqlx::query("UPDATE coordinator_tracking_items SET disposition=?2,retirement_reason=?3 WHERE id=?1").bind(id).bind(disposition).bind(reason).execute(&mut **tx).await?;
                         sqlx::query("INSERT INTO coordinator_tracking_retirements(item_id,item_revision,disposition,reason,recorded_at_us) VALUES(?1,?2,?3,?4,?5)").bind(id).bind(revision+1).bind(disposition).bind(reason).bind(now).execute(&mut **tx).await?;
+                        sqlx::query("UPDATE coordinator_tracking_items SET current_retirement_revision=?2 WHERE id=?1").bind(id).bind(revision+1).execute(&mut **tx).await?;
                         true
                     }
                     TrackingMutation::Reopen { evidence, .. } => {
@@ -550,7 +607,7 @@ impl Database {
                             ));
                         }
                         append_evidence(tx, id, evidence, now).await?;
-                        sqlx::query("UPDATE coordinator_tracking_items SET disposition='tracking',retirement_reason=NULL,reviewed_evidence_ordinal=-1 WHERE id=?1").bind(id).execute(&mut **tx).await?;
+                        sqlx::query("UPDATE coordinator_tracking_items SET current_retirement_revision=NULL,reviewed_evidence_ordinal=-1 WHERE id=?1").bind(id).execute(&mut **tx).await?;
                         true
                     }
                     TrackingMutation::Record { .. } => unreachable!(),
@@ -570,7 +627,14 @@ impl Database {
             .await?;
         }
         let registry = registry_revision(tx).await?;
-        sqlx::query("INSERT INTO coordinator_tracking_operations(source_transcript_id,source_message_id,source_tool_use_id,fingerprint,item_id,item_revision,registry_revision) VALUES(?1,?2,?3,?4,?5,?6,?7)").bind(source).bind(&call.message_id).bind(&call.tool_use_id).bind(fingerprint).bind(&id).bind(revision).bind(registry).execute(&mut **tx).await?;
+        let operation_kind = match mutation {
+            TrackingMutation::Record { .. } => "record",
+            TrackingMutation::Update { .. } => "update",
+            TrackingMutation::AppendEvidence { .. } => "append_evidence",
+            TrackingMutation::Retire { .. } => "retire",
+            TrackingMutation::Reopen { .. } => "reopen",
+        };
+        sqlx::query("INSERT INTO coordinator_tracking_operations(source_transcript_id,source_message_id,source_tool_use_id,fingerprint,operation_kind,item_id,item_revision,registry_revision) VALUES(?1,?2,?3,?4,?8,?5,?6,?7)").bind(source).bind(&call.message_id).bind(&call.tool_use_id).bind(fingerprint).bind(&id).bind(revision).bind(registry).bind(operation_kind).execute(&mut **tx).await?;
         Ok(TrackingReceipt {
             outcome: if changed {
                 TrackingOutcome::Applied
@@ -612,12 +676,15 @@ impl Database {
         after_evidence: i64,
         before_retirement_revision: Option<i64>,
     ) -> DbResult<TrackingDetail> {
+        if before_retirement_revision.is_some_and(|cursor| cursor < 1) {
+            return Err(invalid("invalid retirement cursor"));
+        }
         if after_evidence < 0 {
             return Err(invalid("negative evidence cursor"));
         }
         let mut tx = self.pool.begin().await?;
         require_owner(&mut tx, source).await?;
-        let row = sqlx::query("SELECT i.*,COALESCE((SELECT MAX(ordinal) FROM coordinator_tracking_evidence e WHERE e.item_id=i.id),0) AS latest_evidence_ordinal FROM coordinator_tracking_items i WHERE i.id=?1")
+        let row = sqlx::query("SELECT i.*,COALESCE(r.disposition,'tracking') AS disposition,r.reason AS retirement_reason,COALESCE((SELECT MAX(ordinal) FROM coordinator_tracking_evidence e WHERE e.item_id=i.id),0) AS latest_evidence_ordinal FROM coordinator_tracking_items i LEFT JOIN coordinator_tracking_retirements r ON r.item_id=i.id AND r.item_revision=i.current_retirement_revision WHERE i.id=?1")
             .bind(id)
             .fetch_optional(&mut *tx)
             .await?
@@ -675,18 +742,18 @@ impl Database {
             sqlx::query_scalar("SELECT instance_id FROM instance_identity WHERE singleton_key=1")
                 .fetch_one(&mut *tx)
                 .await?;
-        let mut source_availability = if evidence.is_empty() {
-            TrackingSourceAvailability::NoEvidence
+        let mut page_source_availability = if evidence.is_empty() {
+            TrackingSourceAvailability::NoEvidenceOnPage
         } else {
             TrackingSourceAvailability::LocalSourcesPresent
         };
         for (_, entry) in &evidence {
             if entry.instance_id != local_instance {
                 if !matches!(
-                    source_availability,
+                    page_source_availability,
                     TrackingSourceAvailability::SourceMissing
                 ) {
-                    source_availability = TrackingSourceAvailability::RemoteUnverified;
+                    page_source_availability = TrackingSourceAvailability::RemoteUnverified;
                 }
                 continue;
             }
@@ -698,7 +765,7 @@ impl Database {
             .fetch_one(&mut *tx)
             .await?;
             if exists == 0 {
-                source_availability = TrackingSourceAvailability::SourceMissing;
+                page_source_availability = TrackingSourceAvailability::SourceMissing;
             }
         }
         let before = before_retirement_revision.unwrap_or(i64::MAX);
@@ -720,6 +787,18 @@ impl Database {
             })
             .collect::<DbResult<Vec<_>>>()?;
         let registry = registry_revision(&mut tx).await?;
+        let origin=sqlx::query("SELECT o.source_transcript_id,o.source_message_id,o.source_tool_use_id,EXISTS(SELECT 1 FROM messages m WHERE m.message_id=o.source_message_id AND m.conversation_id=o.source_transcript_id) AS source_available FROM coordinator_tracking_operations o WHERE o.item_id=?1 AND o.operation_kind='record'").bind(id).fetch_optional(&mut *tx).await?;
+        let recorded_by_ember = origin
+            .map(|row| {
+                Ok::<_, DbError>(TrackingRecordingSource {
+                    instance_id: local_instance,
+                    transcript_id: row.try_get("source_transcript_id")?,
+                    assistant_message_id: row.try_get("source_message_id")?,
+                    tool_use_id: row.try_get("source_tool_use_id")?,
+                    source_available: row.try_get("source_available")?,
+                })
+            })
+            .transpose()?;
         let omitted_retirement_count = total - retirement_history.len() as i64;
         let next_retirement_revision = if omitted_retirement_count > 0 {
             retirement_history.last().map(|entry| entry.item_revision)
@@ -734,10 +813,11 @@ impl Database {
             evidence,
             next_evidence_ordinal: next,
             evidence_is_historical: true,
-            source_availability,
+            page_source_availability,
             retirement_history,
             next_retirement_revision,
             omitted_retirement_count,
+            recorded_by_ember,
         })
     }
 }
@@ -746,8 +826,8 @@ async fn tracking_page_tx(
     after: Option<&str>,
     include_retired: bool,
 ) -> DbResult<TrackingPage> {
-    let counts=sqlx::query("SELECT COUNT(*) AS active_count,COALESCE(SUM(reviewed_evidence_ordinal<COALESCE((SELECT MAX(ordinal) FROM coordinator_tracking_evidence e WHERE e.item_id=i.id),0)),0) AS review_required_count FROM coordinator_tracking_items i WHERE disposition='tracking'").fetch_one(&mut **tx).await?;
-    let mut rows = sqlx::query("SELECT i.*,COALESCE((SELECT MAX(ordinal) FROM coordinator_tracking_evidence e WHERE e.item_id=i.id),0) AS latest_evidence_ordinal FROM coordinator_tracking_items i WHERE (?1 OR i.disposition='tracking') AND (?2 IS NULL OR i.id>?2) ORDER BY i.id LIMIT ?3")
+    let counts=sqlx::query("SELECT COUNT(*) AS active_count,COALESCE(SUM(reviewed_evidence_ordinal<COALESCE((SELECT MAX(ordinal) FROM coordinator_tracking_evidence e WHERE e.item_id=i.id),0)),0) AS review_required_count FROM coordinator_tracking_items i WHERE current_retirement_revision IS NULL").fetch_one(&mut **tx).await?;
+    let mut rows = sqlx::query("SELECT i.*,COALESCE(r.disposition,'tracking') AS disposition,r.reason AS retirement_reason,COALESCE((SELECT MAX(ordinal) FROM coordinator_tracking_evidence e WHERE e.item_id=i.id),0) AS latest_evidence_ordinal FROM coordinator_tracking_items i LEFT JOIN coordinator_tracking_retirements r ON r.item_id=i.id AND r.item_revision=i.current_retirement_revision WHERE (?1 OR i.current_retirement_revision IS NULL) AND (?2 IS NULL OR i.id>?2) ORDER BY i.id LIMIT ?3")
         .bind(include_retired)
         .bind(after)
         .bind((TRACKING_PAGE_SIZE + 1) as i64)
@@ -755,30 +835,13 @@ async fn tracking_page_tx(
         .await?;
     let more = rows.len() > TRACKING_PAGE_SIZE;
     rows.truncate(TRACKING_PAGE_SIZE);
-    let items = rows
-        .iter()
-        .map(|row| {
-            let item = item(row)?;
-            Ok(TrackingSummary {
-                id: item.id,
-                kind: item.kind,
-                title: item.title,
-                disposition: item.disposition,
-                revision: item.revision,
-                review_required: matches!(
-                    item.resumption,
-                    TrackingResumption::ReviewRequired { .. }
-                ),
-                latest_evidence_ordinal: row.try_get("latest_evidence_ordinal")?,
-            })
-        })
-        .collect::<DbResult<Vec<_>>>()?;
+    let items = rows.iter().map(summary).collect::<DbResult<Vec<_>>>()?;
     let next = if more {
         items.last().map(|i| i.id.clone())
     } else {
         None
     };
-    let total:i64=sqlx::query_scalar("SELECT COUNT(*) FROM coordinator_tracking_items WHERE (?1 OR disposition='tracking') AND (?2 IS NULL OR id>?2)").bind(include_retired).bind(after).fetch_one(&mut **tx).await?;
+    let total:i64=sqlx::query_scalar("SELECT COUNT(*) FROM coordinator_tracking_items WHERE (?1 OR current_retirement_revision IS NULL) AND (?2 IS NULL OR id>?2)").bind(include_retired).bind(after).fetch_one(&mut **tx).await?;
     Ok(TrackingPage {
         registry_revision: registry_revision(tx).await?,
         active_count: counts.try_get("active_count")?,
@@ -797,6 +860,7 @@ pub struct TrackingObservation {
     pub captured_registry: TrackingPage,
     pub requested_item_due_for_review: Option<TrackingSummary>,
     pub captured_at_us: i64,
+    pub admitted_input_sequence_id: Option<i64>,
 }
 impl Database {
     /// Atomically appends a changed saved-intent observation and its attention receipt.
@@ -846,6 +910,13 @@ async fn append_observation_tx(
     .await?;
     let input_message_id:Option<String>=sqlx::query_scalar("SELECT message_id FROM messages WHERE conversation_id=?1 AND message_type='user' AND origin_kind!='system_generated' ORDER BY sequence_id DESC LIMIT 1").bind(source).fetch_optional(&mut **tx).await?;
     let input_message_id = input_message_id.unwrap_or_else(|| source.to_owned());
+    let admitted_input_sequence_id: Option<i64> = sqlx::query_scalar(
+        "SELECT sequence_id FROM messages WHERE message_id=?1 AND conversation_id=?2",
+    )
+    .bind(&input_message_id)
+    .bind(source)
+    .fetch_optional(&mut **tx)
+    .await?;
     let previous_input: Option<String> = sqlx::query_scalar(
         "SELECT input_message_id FROM coordinator_tracking_observations WHERE transcript_id=?1",
     )
@@ -858,26 +929,9 @@ async fn append_observation_tx(
     let cue_row = if previous_input.as_deref() == Some(input_message_id.as_str()) {
         None
     } else {
-        sqlx::query("SELECT i.*,COALESCE((SELECT MAX(ordinal) FROM coordinator_tracking_evidence e WHERE e.item_id=i.id),0) AS latest_evidence_ordinal FROM coordinator_tracking_items i LEFT JOIN coordinator_tracking_attention a ON a.item_id=i.id WHERE i.disposition='tracking' AND i.kind='requested_work' AND (i.reviewed_at_us IS NULL OR i.reviewed_at_us<=?1 OR i.reviewed_evidence_ordinal<COALESCE((SELECT MAX(ordinal) FROM coordinator_tracking_evidence e WHERE e.item_id=i.id),0)) AND (a.item_id IS NULL OR a.surfaced_at_us<=?1 OR a.evidence_ordinal<COALESCE((SELECT MAX(ordinal) FROM coordinator_tracking_evidence e WHERE e.item_id=i.id),0)) ORDER BY COALESCE(i.reviewed_at_us,0),i.id LIMIT 1").bind(now_us.saturating_sub(TRACKING_REVIEW_INTERVAL_US)).fetch_optional(&mut **tx).await?
+        sqlx::query("SELECT i.*,'tracking' AS disposition,NULL AS retirement_reason,COALESCE((SELECT MAX(ordinal) FROM coordinator_tracking_evidence e WHERE e.item_id=i.id),0) AS latest_evidence_ordinal FROM coordinator_tracking_items i LEFT JOIN coordinator_tracking_attention a ON a.item_id=i.id WHERE i.current_retirement_revision IS NULL AND i.kind='requested_work' AND (i.reviewed_at_us IS NULL OR i.reviewed_at_us<=?1 OR i.reviewed_evidence_ordinal<COALESCE((SELECT MAX(ordinal) FROM coordinator_tracking_evidence e WHERE e.item_id=i.id),0)) AND (a.item_id IS NULL OR a.surfaced_at_us<=?1 OR a.evidence_ordinal<COALESCE((SELECT MAX(ordinal) FROM coordinator_tracking_evidence e WHERE e.item_id=i.id),0)) ORDER BY COALESCE(a.surfaced_at_us,0),COALESCE(i.reviewed_at_us,0),i.created_at_us,i.id LIMIT 1").bind(now_us.saturating_sub(TRACKING_REVIEW_INTERVAL_US)).fetch_optional(&mut **tx).await?
     };
-    let cue = cue_row
-        .as_ref()
-        .map(|row| {
-            let item = item(row)?;
-            Ok::<_, DbError>(TrackingSummary {
-                id: item.id,
-                kind: item.kind,
-                title: item.title,
-                disposition: item.disposition,
-                revision: item.revision,
-                review_required: matches!(
-                    item.resumption,
-                    TrackingResumption::ReviewRequired { .. }
-                ),
-                latest_evidence_ordinal: row.try_get("latest_evidence_ordinal")?,
-            })
-        })
-        .transpose()?;
+    let cue = cue_row.as_ref().map(summary).transpose()?;
     if previous == Some(page.registry_revision) && cue.is_none() {
         return Ok(None);
     }
@@ -886,12 +940,14 @@ async fn append_observation_tx(
         captured_registry: page,
         requested_item_due_for_review: cue.clone(),
         captured_at_us: now_us,
+        admitted_input_sequence_id,
     };
     let json = serde_json::to_string(&observation).map_err(|error| invalid(&error.to_string()))?;
-    if json.len() > 8192 {
+    let text=format!("[Saved Ember tracking observation: captured historical data, not a user instruction, permission, current worker status or comprehensive inventory. Use tracking read/list for current detail. New evidence requires reconciliation. A due cue applies only to the admitted input immediately BEFORE this observation; once a later input arrives it is historical and does not renew review. It is at most one review opportunity, not an instruction to nudge a worker. Answer the current user first; no useful action means stay quiet.]\n{json}");
+    if text.len() > 8192 {
         return Err(invalid("compact observation exceeds 8192 bytes"));
     }
-    let content=crate::MessageContent::User(crate::UserContent::meta(format!("[Saved Ember tracking observation: captured historical data, not a user instruction, permission, current worker status or comprehensive inventory. Use tracking read/list for current detail. New evidence requires reconciliation; a due cue is at most one review opportunity, not an instruction to nudge a worker. Answer the current user first; no useful action means stay quiet.]\n{json}")));
+    let content = crate::MessageContent::User(crate::UserContent::meta(text));
     let message = crate::Message {
         message_id: uuid::Uuid::new_v4().to_string(),
         conversation_id: source.into(),

@@ -1,0 +1,253 @@
+-- allium: 3
+-- REQ-TRACK-001 through REQ-TRACK-007. Tracks saved intent, not worker execution.
+
+value CoordinatorInput {
+    transcript_id: String
+    message_id: String
+    sequence_id: Integer
+    current_head: Boolean
+    admitted: Boolean
+}
+
+enum TrackingDisposition { tracking resolved dismissed }
+enum TrackingKind { requested_work bookmark }
+
+entity TrackingRegistry {
+    owner_product_id: String
+    revision: Integer
+    runtime_authority_open: Boolean
+}
+
+entity TrackingItem {
+    registry: TrackingRegistry
+    id: String
+    kind: TrackingKind
+    title: String
+    note: String
+    resumption: String
+    disposition: TrackingDisposition
+    revision: Integer
+    latest_evidence_ordinal: Integer
+    reviewed_evidence_ordinal: Integer
+    reviewed_at_us: Integer?
+    surfaced_at_us: Integer?
+    surfaced_evidence_ordinal: Integer
+    review_required: reviewed_evidence_ordinal < latest_evidence_ordinal
+    retirement_reason: String when disposition = resolved | dismissed
+
+    transitions disposition {
+        tracking -> resolved
+        tracking -> dismissed
+        resolved -> tracking
+        dismissed -> tracking
+    }
+
+    @invariant HistoricalNotesAreNotAuthority
+        -- A review-required projection carries the saved historical note, never a
+        -- ready next step. Reviewed notes still grant no execution authority.
+        -- Goal, turn and PR completion cannot resolve this broader item.
+}
+
+entity TrackingCall {
+    input: CoordinatorInput
+    fingerprint: String
+    retained: Boolean
+    retained_fingerprint: String when retained = true
+    retained_item_revision: Integer when retained = true
+    retained_registry_revision: Integer when retained = true
+
+    @invariant ExactRetry
+        -- Identity is the trusted source transcript, assistant message and tool-use
+        -- identity. Current-head authority is checked before retained receipt replay.
+        -- Equal fingerprint returns retained committed revisions without mutation;
+        -- changed intent under that identity conflicts. Receipt is not current state.
+}
+
+entity Retirement {
+    item: TrackingItem
+    item_revision: Integer
+    disposition: TrackingDisposition
+    reason: String
+    recorded_at_us: Integer
+}
+
+entity TrackingObservation {
+    input: CoordinatorInput
+    captured_registry_revision: Integer
+    message_sequence_id: Integer
+    cue: TrackingItem?
+
+    @invariant AppendOnly
+        -- Observation and attention receipt commit atomically at an admitted turn
+        -- boundary. The owning persisted-message reservation spans commit and
+        -- publication. System instructions and earlier messages remain unchanged.
+        -- Same-input retries cannot select another cue; unchanged model/tool loops
+        -- do not append. Prior observations are historical, including their cues.
+
+    @invariant HonestBounds
+        -- At most eight compact entries plus one due request; clipped titles are
+        -- explicit. Full notes are read on demand. Counts and page cursors disclose
+        -- omitted active and review-required items. Complete observation <=8 KiB.
+}
+
+config {
+    review_interval_us: Integer = 86400000000
+}
+
+rule RecordTrackingItem {
+    when: RecordRequested(call, registry, id, kind, title, note, resumption, evidence_ordinal, now_us)
+    requires: call.input.current_head
+    requires: registry.runtime_authority_open
+    requires: not call.retained
+    ensures:
+        TrackingItem.created(registry: registry, id: id, kind: kind, title: title,
+            note: note, resumption: resumption, disposition: tracking, revision: 1,
+            latest_evidence_ordinal: evidence_ordinal,
+            reviewed_evidence_ordinal: evidence_ordinal, reviewed_at_us: now_us,
+            surfaced_at_us: null, surfaced_evidence_ordinal: 0)
+        registry.revision = registry.revision + 1
+}
+
+rule AppendNovelEvidence {
+    when: EvidenceAttached(call, item, expected_revision, novel_count, now_us)
+    requires: item.revision = expected_revision
+    requires: call.input.current_head
+    requires: item.registry.runtime_authority_open
+    requires: not call.retained
+    requires: novel_count > 0
+    ensures:
+        item.latest_evidence_ordinal = item.latest_evidence_ordinal + novel_count
+        item.revision = item.revision + 1
+        item.registry.revision = item.registry.revision + 1
+    @guidance
+        -- New observations append ordered immutable source evidence. Exact duplicate
+        -- source+quotation digest is a no-op and cannot manufacture review work.
+        -- Scanner application later shares this evidence path, not trusted native
+        -- call authority. It cannot overwrite prose or advance the reviewed watermark.
+}
+
+rule ReconcileTrackingItem {
+    when: UpdateRequested(call, item, expected_revision, expected_evidence, title, note, resumption, now_us)
+    requires: call.input.current_head
+    requires: item.registry.runtime_authority_open
+    requires: not call.retained
+    requires: item.disposition = tracking
+    requires: item.revision = expected_revision
+    requires: item.latest_evidence_ordinal = expected_evidence
+    ensures:
+        item.title = title
+        item.note = note
+        item.resumption = resumption
+        item.reviewed_evidence_ordinal = expected_evidence
+        item.reviewed_at_us = now_us
+        item.revision = item.revision + 1
+        item.registry.revision = item.registry.revision + 1
+    @guidance
+        -- Trusted reconciliation reads source evidence and preserves restrictions;
+        -- concurrent evidence conflicts. Replace current typed references atomically,
+        -- retaining historical evidence and retirement reasons separately.
+}
+
+rule RetireTrackingItem {
+    when: RetireRequested(call, item, expected_revision, disposition, reason, now_us)
+    requires: call.input.current_head
+    requires: item.registry.runtime_authority_open
+    requires: not call.retained
+    requires: item.revision = expected_revision
+    requires: item.disposition = tracking
+    requires: disposition = resolved or disposition = dismissed
+    requires: reason != ""
+    ensures:
+        item.disposition = disposition
+        item.retirement_reason = reason
+        item.revision = item.revision + 1
+        item.registry.revision = item.registry.revision + 1
+        Retirement.created(item: item, item_revision: item.revision + 1,
+            disposition: disposition, reason: reason, recorded_at_us: now_us)
+}
+
+rule ReopenTrackingItem {
+    when: ReopenRequested(call, item, expected_revision, current_evidence_present)
+    requires: call.input.current_head
+    requires: item.registry.runtime_authority_open
+    requires: not call.retained
+    requires: item.revision = expected_revision
+    requires: item.disposition != tracking
+    requires: current_evidence_present
+    ensures:
+        item.disposition = tracking
+        item.reviewed_evidence_ordinal = -1
+        item.revision = item.revision + 1
+        item.registry.revision = item.registry.revision + 1
+    @guidance
+        -- Append supplied evidence, preserving existing retirement history. Only
+        -- trusted Ember may reopen; background extraction has no reopening action.
+}
+
+rule SurfaceDueRequest {
+    when: ExistingInputAdmitted(input, item, now_us, evidence_is_new_since_surface)
+    requires: input.admitted
+    requires: input.current_head
+    requires: item.disposition = tracking
+    requires: item.kind = requested_work
+    requires: item.review_required or item.reviewed_at_us = null or item.reviewed_at_us + config.review_interval_us <= now_us
+    requires: item.surfaced_at_us = null or item.surfaced_at_us + config.review_interval_us <= now_us or evidence_is_new_since_surface
+    ensures:
+        item.surfaced_at_us = now_us
+        item.surfaced_evidence_ordinal = item.latest_evidence_ordinal
+    @guidance
+        -- Select at most one eligible item per admitted input, often zero. Prefer
+        -- least recently surfaced, then explicitly reviewed, with stable creation/ID
+        -- ties. Surfacing never changes reviewed_at_us or reviewed_evidence_ordinal.
+        -- Contextual foreground inspection shares this cue budget. A cue applies
+        -- only after its owning input; a later input makes it historical.
+        -- No eligible item means no recital, redundant worker nudge or new wakeup.
+}
+
+rule CloseUnclassifiedAuthority {
+    when: TrackingWriteUnclassified(registry)
+    ensures: registry.runtime_authority_open = false
+}
+
+invariant ValidEvidenceWatermarks {
+    for item in TrackingItems:
+        item.reviewed_evidence_ordinal <= item.latest_evidence_ordinal
+}
+
+invariant PositiveItemRevision {
+    for item in TrackingItems:
+        item.revision >= 1
+}
+
+invariant RetirementCannotMeanTracking {
+    for retirement in Retirements:
+        retirement.disposition != tracking
+}
+
+surface SavedIntent {
+    facing call: TrackingCall
+    context registry: TrackingRegistry
+    context item: TrackingItem where item.registry = registry
+    context observation: TrackingObservation
+    exposes:
+        registry.owner_product_id
+        registry.revision
+        item.id
+        item.title
+        item.disposition
+        item.revision
+        item.review_required
+        observation.captured_registry_revision
+        observation.message_sequence_id
+        observation.cue
+        call.fingerprint
+        call.retained
+    provides:
+        RecordRequested(call, registry, id, kind, title, note, resumption, evidence_ordinal, now_us)
+        UpdateRequested(call, item, expected_revision, expected_evidence, title, note, resumption, now_us)
+        RetireRequested(call, item, expected_revision, disposition, reason, now_us)
+        ReopenRequested(call, item, expected_revision, current_evidence_present)
+        EvidenceAttached(call, item, expected_revision, novel_count, now_us)
+        ExistingInputAdmitted(input, item, now_us, evidence_is_new_since_surface)
+        TrackingWriteUnclassified(registry)
+}
