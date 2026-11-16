@@ -945,7 +945,7 @@ impl Database {
             .transpose()?;
         let recorded_by_scanner=sqlx::query("SELECT a.reserved_at_us,w.lane,w.source_generation,w.connection,w.prompt_hash,w.endpoint_hash FROM coordinator_scan_item_origins o JOIN coordinator_scan_attempts a ON a.id=o.attempt_id JOIN coordinator_scan_work w ON w.binding_id=a.binding_id WHERE o.item_id=?1").bind(id).fetch_optional(&mut *tx).await?.map(|row|{
             Ok::<_,DbError>(crate::coordinator_scanner::ScanRecordingSource {
-                captured_at_us:row.try_get("reserved_at_us")?,
+                reserved_at_us:row.try_get("reserved_at_us")?,
                 lane:serde_json::from_value(serde_json::Value::String(row.try_get("lane")?)).map_err(|e|invalid(&e.to_string()))?,
                 source_generation:row.try_get("source_generation")?,
                 model:crate::coordinator_scanner::SCAN_MODEL.into(),

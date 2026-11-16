@@ -315,7 +315,7 @@ pub struct ScanEvidenceProvenance {
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScanRecordingSource {
-    pub captured_at_us: i64,
+    pub reserved_at_us: i64,
     pub lane: ScanLane,
     pub source_generation: i64,
     pub model: String,
