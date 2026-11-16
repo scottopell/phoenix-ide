@@ -1,7 +1,7 @@
 # Compiler-enforced Coordinator instance routing
 
 ## Baseline and defect
-At 9c5d471d, watch/unwatch/list-watched-conversations parse instance as Option<String>; exact "local" incorrectly selects the remote branch. The other five optional-instance tools use a shared Local/Remote parser but pass raw selectors or IDs into remote APIs, and registration cannot enforce their common contract. Recheck origin/main and the Federation owner's changes before editing. Roadmap issue #806 was inaccessible in the Explore sandbox; retry when permitted.
+At 9c5d471d, watch/unwatch/list-watched-conversations parse instance as Option<String>; exact "local" incorrectly selects the remote branch. The other five optional-instance tools use a shared Local/Remote parser but pass raw selectors or IDs into remote APIs, and registration cannot enforce their common contract. Recheck origin/main and the Federation owner's changes before editing. Roadmap issue #806 was inaccessible in the original Explore sandbox and is now historical. Use current task/PR ownership and source evidence; no archive preflight or posting duty remains.
 
 ## Scope
 - Make instance-selectable tool registration own selector schema and parsing, preserving omission and exact case-sensitive "local" as local. Reads, including Coordinator SQL, accept explicit null locally; send and the watch family reject null. Non-Coordinator SQL remains local-only, and Authority acquires no selector.

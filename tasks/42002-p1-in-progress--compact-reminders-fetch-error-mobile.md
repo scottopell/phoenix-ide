@@ -23,6 +23,6 @@ On this checkout (`5f72f6178`), `ui/src/reminders/RemindersPanel.tsx` renders th
 
 No reminders scheduling, delivery, persistence, due-feed, HTTP contract, native app, or backend semantics changes; no feature redesign or broad offline framework. Browser poll failure does not prove the conversation connection itself is offline. Do not hide due cards, suppress real mutation errors, or mistake a previously empty successful result for an unloaded failure. Capture the screenshot state and correct route before claiming a visual fix.
 
-Roadmap context: Issue #806 generated body was read (rendered 2026-11-06); it is coordination context only. Follow `specs/roadmap/requirements.md` before posting any roadmap evidence/status.
+Historical roadmap context: Issue #806 generated body was read (rendered 2026-11-06). That archive is no longer maintained; do not post roadmap evidence/status. Use current task/PR ownership and domain evidence.
 
 No source changes or new screenshots were made during read-only exploration; `localhost:8042` was unavailable.

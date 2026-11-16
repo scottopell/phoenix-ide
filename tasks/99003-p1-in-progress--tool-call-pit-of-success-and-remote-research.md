@@ -22,4 +22,4 @@ Coordinate shared tool registration/creation surfaces with Federation76f8afbb an
 ## Starting anchors
 `crates/phoenix-ide/src/coordinator_tools.rs` (`PreviousTranscriptsTool`, `research_tools`, `FederatedQueryDatabase`); `api/global_read.rs::PreviousTranscriptsRequest`; `conversation_action_tools.rs::CreateRequest`/`CreateConversation`; `coordinator_tools/instance.rs::RouteTool`; `runtime.rs` research registry; `system_prompt.rs::build_coordinator_research_prompt`; REQ-RQD-001/010, REQ-FED-001/002, REQ-CCR-013, REQ-RET-009, ADR-051/222.
 
-Roadmap Issue #806 was not fetched in this read-only sandbox; verify its generated body and protocol when network-enabled development starts before posting any record.
+Roadmap Issue #806 was not fetched in the original read-only sandbox and is now historical. Re-ground current task/PR ownership when development starts; do not post roadmap records.
