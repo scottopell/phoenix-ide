@@ -1,5 +1,6 @@
 use super::*;
 use crate::workflow::AcceptAuthoritativeTurn;
+use phoenix_core::domain::close::ClosePhase;
 use phoenix_core::domain::db_schema::InputOrigin;
 use phoenix_core::domain::db_schema::SourceToolCall;
 use phoenix_core::domain::llm_types::ContentBlock;
@@ -286,13 +287,12 @@ async fn prepared_native_initial_is_not_generic_settlement_work() {
 
     // The exact source-owned path remains available; exclusion does not strand
     // this run behind a generic-worker-only advancement API.
-    let established = f
-        .db
-        .settle_native_close_initial(&command, &receipt, &live_source)
-        .await
-        .established()
-        .unwrap()
-        .unwrap();
+    let established =
+        f.db.settle_native_close_initial(&command, &receipt, &live_source)
+            .await
+            .established()
+            .unwrap()
+            .unwrap();
     assert_eq!(established.phase, ClosePhase::AwaitingRetirementInspection);
 }
 
@@ -408,7 +408,18 @@ async fn initial_settlement_rejects_mismatched_receipt_and_live_or_durable_sourc
             .await,
         LocalAuthorityResult::DurableFactEstablished(Err(DbError::CloseFoundationPrecondition(_)))
     ));
-    assert_eq!(initial_phase(&f, &receipt).await, "settling_active_work");
+    assert_eq!(initial_phase(&f, &receipt).await, "completed");
+    let failures = f
+        .db
+        .list_close_cleanup_failures(receipt.admitted.attempt_id.as_str())
+        .await
+        .unwrap();
+    assert_eq!(failures.len(), 1);
+    assert_eq!(
+        failures[0].occurrence.authority,
+        crate::CloseCleanupFailureAuthority::ExplicitlySuppressed
+    );
+    assert!(failures[0].occurrence.remaining_resources.is_empty());
     assert_no_dispatch_effects(&f.db, &receipt).await;
 }
 
@@ -673,7 +684,7 @@ async fn preparation_rejects_stale_durable_source_with_held_snapshot() {
             .fetch_one(f.db.pool())
             .await
             .unwrap();
-    assert_eq!(phase, "awaiting_blocker_resolution");
+    assert_eq!(phase, "completed");
     assert_no_settlement_effects(&f.db, &receipt).await;
 }
 

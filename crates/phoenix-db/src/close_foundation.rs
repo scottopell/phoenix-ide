@@ -2685,7 +2685,8 @@ impl Database {
         .await?;
         rows.into_iter()
             .map(|row| {
-                parse_close_obligation_row(row).map(|obligation| GenericCloseSettlement { obligation })
+                parse_close_obligation_row(row)
+                    .map(|obligation| GenericCloseSettlement { obligation })
             })
             .collect()
     }
@@ -2702,17 +2703,17 @@ impl Database {
             settlement.obligation.product_conversation_id().as_str(),
         )
         .await?;
-        let current = close_obligation_for_update(
-            &mut tx,
-            settlement.obligation.attempt_id().as_str(),
-        )
-        .await?;
+        let current =
+            close_obligation_for_update(&mut tx, settlement.obligation.attempt_id().as_str())
+                .await?;
         tx.commit().await?;
-        Ok(current.product_conversation_id() == settlement.obligation.product_conversation_id()
-            && matches!(
-                current.phase(),
-                ClosePhase::SettlingActiveWork | ClosePhase::CancelRequestedDuringSettlement
-            ))
+        Ok(
+            current.product_conversation_id() == settlement.obligation.product_conversation_id()
+                && matches!(
+                    current.phase(),
+                    ClosePhase::SettlingActiveWork | ClosePhase::CancelRequestedDuringSettlement
+                ),
+        )
     }
 
     pub async fn advance_close_settlement_when_quiescent(
@@ -7115,6 +7116,79 @@ impl Database {
         .execute(&mut **tx)
         .await?;
         Self::finish_close_failure_tx(tx, run, request, obligation).await
+    }
+
+    pub(crate) async fn terminalize_native_initial_source_fence_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        fence: crate::native_close::NativeInitialSourceFence,
+    ) -> DbResult<CloseObligation> {
+        let (run, authority, detail) = fence.into_parts();
+        let eligible: bool = sqlx::query_scalar(
+            "SELECT EXISTS(
+                SELECT 1 FROM close_runs run
+                JOIN close_obligations obligation ON obligation.attempt_id = run.attempt_id
+                JOIN native_close_initial_receipts receipt
+                  ON receipt.attempt_id = run.attempt_id AND receipt.run_ordinal = run.run_ordinal
+                JOIN product_conversations product ON product.id = obligation.product_conversation_id
+                WHERE run.attempt_id = ?1 AND run.run_ordinal = 1 AND run.status = 'running'
+                  AND run.run_ordinal = (SELECT MAX(run_ordinal) FROM close_runs WHERE attempt_id = run.attempt_id)
+                  AND receipt.intent = 'initial' AND receipt.product_conversation_id = obligation.product_conversation_id
+                  AND receipt.request_fingerprint <> ''
+                  AND obligation.native_managed = 1 AND obligation.phase IN
+                    ('awaiting_blocker_resolution', 'awaiting_stop_work_confirmation', 'settling_active_work', 'awaiting_retirement_inspection')
+                  AND obligation.inspection_generation IS NULL AND obligation.inspection_fingerprint IS NULL
+                  AND obligation.topology_sealed = 1
+                  AND product.kind = 'ordinary' AND product.ordinary_lifecycle = 'open'
+                  AND NOT EXISTS (SELECT 1 FROM close_retirement_inspections WHERE attempt_id = run.attempt_id)
+                  AND NOT EXISTS (SELECT 1 FROM close_retirement_inventories WHERE attempt_id = run.attempt_id)
+                  AND NOT EXISTS (SELECT 1 FROM close_retirement_losses WHERE attempt_id = run.attempt_id)
+                  AND NOT EXISTS (SELECT 1 FROM close_expected_retirement_resources WHERE attempt_id = run.attempt_id)
+                  AND NOT EXISTS (SELECT 1 FROM close_retirement_resources WHERE attempt_id = run.attempt_id)
+                  AND NOT EXISTS (SELECT 1 FROM close_retirement_resource_dispatches WHERE attempt_id = run.attempt_id)
+                  AND NOT EXISTS (SELECT 1 FROM close_run_retry_effects WHERE attempt_id = run.attempt_id)
+                  AND NOT EXISTS (SELECT 1 FROM close_run_retry_successes WHERE attempt_id = run.attempt_id)
+                  AND NOT EXISTS (SELECT 1 FROM native_close_retry_plans WHERE attempt_id = run.attempt_id)
+             )",
+        )
+        .bind(run.attempt_id.as_str())
+        .fetch_one(&mut **tx)
+        .await?;
+        if !eligible {
+            return Err(close_precondition("initial source fence requires an exact effect-free native admission"));
+        }
+        let obligation = close_obligation_for_update(tx, run.attempt_id.as_str()).await?;
+        let occurred_at_us = Utc::now().timestamp_micros();
+        sqlx::query(
+            "INSERT INTO close_cleanup_failures
+             (failure_occurrence_id, attempt_id, cleanup_run_ordinal, source_product_conversation_id,
+              authority_kind, reason, detail, stop_certainty, occurred_at_us)
+             VALUES (?1, ?2, 1, ?3, ?4, 'interrupted', ?5, 'shutdown_uncertain', ?6)",
+        )
+        .bind(run.failure_occurrence_id())
+        .bind(run.attempt_id.as_str())
+        .bind(obligation.product_conversation_id().as_str())
+        .bind(authority.as_str())
+        .bind(detail)
+        .bind(occurred_at_us)
+        .execute(&mut **tx)
+        .await?;
+        let request = TerminalizeInitialCloseCleanupFailureRequest {
+            failure_occurrence_id: run.failure_occurrence_id(),
+            attempt_id: run.attempt_id.clone(),
+            source_product_conversation_id: obligation.product_conversation_id().clone(),
+            authority,
+            remaining_resources: Vec::new(),
+            reason: RetirementFailureReason::Interrupted,
+            detail: detail.into(),
+            stop_certainty: CloseStopCertainty::ShutdownUncertain,
+            occurred_at_us,
+        };
+        let result = Self::finish_close_failure_tx(tx, &run, &request, obligation).await?;
+        if request.authority == CloseCleanupFailureAuthority::ExplicitlySuppressed {
+            sqlx::query("UPDATE close_completion_retry_allowances SET suppressed = 1 WHERE attempt_id = ?1 AND suppressed = 0")
+                .bind(run.attempt_id.as_str()).execute(&mut **tx).await?;
+        }
+        Ok(result)
     }
 
     pub(crate) async fn terminalize_native_retry_source_fence_tx(

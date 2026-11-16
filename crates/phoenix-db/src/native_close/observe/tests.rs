@@ -147,11 +147,10 @@ async fn observation_does_not_transfer_generic_settlement_ownership() {
                 .len(),
             1
         );
-        let advanced = f
-            .db
-            .advance_close_settlement_when_quiescent(attempt)
-            .await
-            .unwrap();
+        let advanced =
+            f.db.advance_close_settlement_when_quiescent(attempt)
+                .await
+                .unwrap();
         assert_eq!(advanced.phase(), ClosePhase::AwaitingRetirementInspection);
         assert!(!f
             .db

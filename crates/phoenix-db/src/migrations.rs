@@ -18,6 +18,7 @@ mod native_close_retry_dispatch;
 mod native_close_retry_failure;
 mod native_close_retry_worktree_metadata;
 mod native_close_source_fence;
+mod native_initial_source_fence;
 mod retire_commission_review;
 mod settle_historical_continuation;
 
@@ -860,6 +861,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 165,
         name: "native_close_retry_worktree_metadata",
         sql: include_str!("migrations/native_close_retry_worktree_metadata.sql"),
+    },
+    Migration {
+        version: 166,
+        name: "native_initial_source_fence",
+        sql: include_str!("migrations/native_initial_source_fence.sql"),
     },
 ];
 
@@ -12593,6 +12599,12 @@ async fn run_migration_list(pool: &SqlitePool, migrations: &[Migration]) -> DbRe
             continue;
         }
 
+        if migration.version == 166 {
+            native_initial_source_fence::run(pool, migration).await?;
+            applied += 1;
+            continue;
+        }
+
         if migration.version == 162 {
             native_close_source_fence::run(pool, migration).await?;
             applied += 1;
@@ -15980,6 +15992,7 @@ mod tests {
                 (163, "native_close_retry_failure".into()),
                 (164, "native_close_retry_dispatch".into()),
                 (165, "native_close_retry_worktree_metadata".into()),
+                (166, "native_initial_source_fence".into()),
             ]
         );
     }
@@ -15989,6 +16002,7 @@ mod tests {
         let ledger = compiled_migration_ledger();
         assert!(ledger.windows(2).all(|pair| pair[0].0 < pair[1].0));
         let expected_tail = [
+            (166, "native_initial_source_fence"),
             (165, "native_close_retry_worktree_metadata"),
             (164, "native_close_retry_dispatch"),
             (163, "native_close_retry_failure"),
@@ -20285,6 +20299,7 @@ mod tests {
                 (163, "native_close_retry_failure"),
                 (164, "native_close_retry_dispatch"),
                 (165, "native_close_retry_worktree_metadata"),
+                (166, "native_initial_source_fence"),
             ]
         );
         let goal = MIGRATIONS
@@ -20298,7 +20313,7 @@ mod tests {
         assert!(goal
             .sql
             .contains("CREATE TABLE conversation_goal_coordinator_receipts"));
-        assert_eq!(MIGRATIONS.len(), 163);
+        assert_eq!(MIGRATIONS.len(), 164);
     }
 
     #[tokio::test]

@@ -325,19 +325,14 @@ async fn finalized_native_retry_only_suppresses_allowance_on_source_loss() {
     }
 }
 
-async fn assert_initial_captured_scope_interruption(db: &Database, run: &CloseRunRef) {
+async fn assert_initial_interrupted(db: &Database, run: &CloseRunRef) {
     let failures = db.list_close_cleanup_failures(run.attempt_id.as_str()).await.unwrap();
     assert_eq!(failures.len(), 1);
     let failure = &failures[0].occurrence;
-    let CloseCleanupFailureAuthority::CapturedScope { scope, resource } = &failure.authority else {
-        panic!("initial fixture retains a captured scope: {:?}", failure.authority);
-    };
-    assert_eq!(resource, &opaque_resource(RetiredResourceKind::WorkScope, scope.as_str()));
-    assert!(failure.remaining_resources.contains(&CloseCleanupFailureResource {
-        scope: scope.clone(),
-        resource: resource.clone(),
-        disposition: CloseCleanupResourceDisposition::Failed,
-    }));
+    assert_eq!(failure.authority, CloseCleanupFailureAuthority::AttemptInterrupted);
+    assert_eq!(failure.reason, RetirementFailureReason::Interrupted);
+    assert_eq!(failure.stop_certainty, CloseStopCertainty::ShutdownUncertain);
+    assert!(failure.remaining_resources.is_empty());
 }
 
 #[tokio::test]
@@ -354,13 +349,49 @@ async fn initial_native_source_loss_suppresses_allowance_without_a_successor() {
             panic!("expected initial native admission");
         };
         let run = CloseRunRef::initial(receipt.admitted.attempt_id);
-        db.classify_interrupted_close_run(&run).await.unwrap();
-        assert_initial_captured_scope_interruption(&db, &run).await;
-        let state = db.get_conversation(command.source_transcript_id()).await.unwrap().state;
-        write_source_fence_state(&db, &command, &state, replay).await.unwrap();
-        assert_eq!(source_fence_allowance(&db, &run).await, Some((0, 0)));
+        write_source_fence_state(&db, &command, &ConvState::Idle, replay).await.unwrap();
+        let failures = db.list_close_cleanup_failures(run.attempt_id.as_str()).await.unwrap();
+        assert_eq!(failures.len(), 1);
+        let failure = &failures[0].occurrence;
+        assert_eq!(failure.authority, CloseCleanupFailureAuthority::ExplicitlySuppressed);
+        assert_eq!(failure.reason, RetirementFailureReason::Interrupted);
+        assert_eq!(failure.stop_certainty, CloseStopCertainty::ShutdownUncertain);
+        assert!(failure.remaining_resources.is_empty());
+        assert_eq!(source_fence_allowance(&db, &run).await, Some((0, 1)));
         assert_stopped_source_loss_only_suppresses(&db, &command, &run, replay, 1).await;
     }
+}
+
+#[tokio::test]
+async fn initial_source_fence_rolls_back_and_then_terminalizes_atomically() {
+    let db = Database::open_in_memory().await.unwrap();
+    create_root(&db, "root").await;
+    let command = retry_command(&db, "initial-source-fence-rollback", NativeCloseIntent::Initial {
+        target: product_id("root"),
+    }).await;
+    let LocalAuthorityResult::DurableFactEstablished(Ok(
+        crate::native_close::NativeCloseInitialResult::NewlyAdmitted(receipt),
+    )) = db.apply_native_close_initial(&command).await else {
+        panic!("expected initial native admission");
+    };
+    let run = CloseRunRef::initial(receipt.admitted.attempt_id);
+    let retained_source = db.get_conversation(command.source_transcript_id()).await.unwrap().state;
+    sqlx::raw_sql("CREATE TRIGGER reject_initial_suppression BEFORE UPDATE OF suppressed ON close_completion_retry_allowances WHEN NEW.suppressed = 1 BEGIN SELECT RAISE(ABORT, 'injected rollback'); END;")
+        .execute(db.pool()).await.unwrap();
+
+    assert!(write_source_fence_state(&db, &command, &ConvState::Idle, false).await.is_err());
+    assert_eq!(db.get_conversation(command.source_transcript_id()).await.unwrap().state, retained_source);
+    assert_eq!(db.get_close_run(&run).await.unwrap().status, CloseRunStatus::Running);
+    assert!(db.list_close_cleanup_failures(run.attempt_id.as_str()).await.unwrap().is_empty());
+    assert_eq!(source_fence_allowance(&db, &run).await, Some((0, 0)));
+
+    sqlx::query("DROP TRIGGER reject_initial_suppression").execute(db.pool()).await.unwrap();
+    write_source_fence_state(&db, &command, &ConvState::Idle, false).await.unwrap();
+    let failures = db.list_close_cleanup_failures(run.attempt_id.as_str()).await.unwrap();
+    assert_eq!(failures.len(), 1);
+    assert_eq!(failures[0].occurrence.authority, CloseCleanupFailureAuthority::ExplicitlySuppressed);
+    assert!(failures[0].occurrence.remaining_resources.is_empty());
+    assert_eq!(source_fence_allowance(&db, &run).await, Some((0, 1)));
 }
 
 #[tokio::test]
@@ -522,10 +553,14 @@ async fn startup_preserves_initial_and_stopped_native_receipts_and_both_allowanc
                 };
                 let run = CloseRunRef::initial(receipt.admitted.attempt_id);
                 if stopped {
-                    db.classify_interrupted_close_run(&run).await.unwrap();
-                    assert_initial_captured_scope_interruption(&db, &run).await;
+                    db.reset_all_to_idle().await.unwrap();
+                    assert_initial_interrupted(&db, &run).await;
                 }
                 set_startup_allowance_bits(&db, &run, consumed, suppressed).await;
+                if !stopped {
+                    db.reset_all_to_idle().await.unwrap();
+                    assert_initial_interrupted(&db, &run).await;
+                }
                 let retained_run = db.get_close_run(&run).await.unwrap();
                 let obligation = db.get_close_obligation(run.attempt_id.as_str()).await.unwrap();
                 let failures = db.list_close_cleanup_failures(run.attempt_id.as_str()).await.unwrap();

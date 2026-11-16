@@ -13,6 +13,27 @@ enum NativeSourceLossCause {
     ProcessInterrupted,
 }
 
+pub(crate) struct NativeInitialSourceFence {
+    run: CloseRunRef,
+    cause: NativeSourceLossCause,
+}
+
+impl NativeInitialSourceFence {
+    pub(crate) fn into_parts(self) -> (CloseRunRef, CloseCleanupFailureAuthority, &'static str) {
+        let (authority, detail) = match self.cause {
+            NativeSourceLossCause::UserSourceLoss => (
+                CloseCleanupFailureAuthority::ExplicitlySuppressed,
+                "source_fenced: initial native Close source stopped or replaced",
+            ),
+            NativeSourceLossCause::ProcessInterrupted => (
+                CloseCleanupFailureAuthority::AttemptInterrupted,
+                "process_interrupted: initial native Close admission stopped before effects",
+            ),
+        };
+        (self.run, authority, detail)
+    }
+}
+
 pub(crate) struct NativeRetrySourceFence {
     run: CloseRunRef,
     cause: NativeSourceLossCause,
@@ -78,7 +99,29 @@ pub(crate) async fn interrupt_native_retry_tx(
     .fetch_one(&mut **tx)
     .await?;
     if !native_plan {
-        return Ok(None);
+        let native_initial: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM native_close_initial_receipts receipt
+             JOIN close_runs run ON run.attempt_id = receipt.attempt_id AND run.run_ordinal = receipt.run_ordinal
+             JOIN close_obligations obligation ON obligation.attempt_id = receipt.attempt_id
+             WHERE receipt.attempt_id = ?1 AND receipt.run_ordinal = 1 AND receipt.intent = 'initial'
+               AND receipt.product_conversation_id = obligation.product_conversation_id
+               AND obligation.native_managed = 1 AND run.status = 'running')",
+        )
+        .bind(run.attempt_id.as_str())
+        .fetch_one(&mut **tx)
+        .await?;
+        if !native_initial {
+            return Ok(None);
+        }
+        let obligation = Database::terminalize_native_initial_source_fence_tx(
+            tx,
+            NativeInitialSourceFence {
+                run: run.clone(),
+                cause: NativeSourceLossCause::ProcessInterrupted,
+            },
+        )
+        .await?;
+        return Ok(Some(obligation));
     }
     Database::terminalize_native_retry_source_fence_tx(
         tx,
@@ -164,6 +207,12 @@ async fn fence_native_sources_tx(
             }
             if explicit_retry && row.try_get::<String, _>("status")? == "running" {
                 fences.push(NativeRetrySourceFence { run, cause });
+            } else if !explicit_retry && row.try_get::<String, _>("status")? == "running" {
+                Database::terminalize_native_initial_source_fence_tx(
+                    tx,
+                    NativeInitialSourceFence { run, cause },
+                )
+                .await?;
             }
         }
     }
