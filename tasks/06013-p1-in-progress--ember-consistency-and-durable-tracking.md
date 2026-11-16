@@ -160,7 +160,7 @@ The user selected both recommendations. Remaining model budgets, excerpt tuning 
 | 4 | Useful bounded event context and incremental qualification | [06021](./06021-p1-ready--enrich-ember-event-context-and-measure-f.md) |
 | 5 | Durable tracking store/application service/tools | [06016](./06016-p1-in-progress--ember-durable-tracking-store-and-tools.md) |
 | 6 | Fresh continuity context and inspection | [06017](./06017-p1-in-progress--ember-tracking-continuity-and-inspection.md) |
-| 7 | Cheap origin-aware scanner | [06018](./06018-p1-ready--ember-cheap-transcript-safety-net.md) |
+| 7 | Cheap origin-aware scanner | [06018](./06018-p1-in-progress--ember-cheap-transcript-safety-net.md) |
 | 8 | Final cross-feature acceptance/cutover | [06019](./06019-p1-in-progress--ember-coordination-end-to-end-qualificat.md) |
 
 Dependencies are feature-local: the event-relevant baseline/contract in phase 1 unblocks 3→4; the tracking-relevant subset unblocks 5→6→7. Neither requires all of phase 1 to finish. Phase 3 owns its occurrence/retention/privacy/capture contract, phase 5 its record/native-tool/reconciliation contract, and phase 7 its frontier/invalidation/application/model-budget contract before activation. Scanner design cannot block events or direct tracking. Phase 2 is independently shippable; phase 8 combines delivered slices. Each slice qualifies before integration; event measurements do not wait for the scanner.
@@ -218,3 +218,7 @@ The [incoming adversarial plan review](https://github.com/scottopell/phoenix-ide
 Select checks through ./dev.py check-plan. Run task validation and relevant spec/Rust/fmt/clippy/codegen/UI/native lanes for actual changes; honor existing host resource owners. Forward same-database recovery, historical quotation retention, excerpt budgets and remote capability are feature-scoped contracts; no downgrade, live DB replacement, cross-version or perfect-recall promise is implied.
 
 Out of scope: broad tool consolidation, new wrappers around every API, already-delivered schema/peer repairs, shared trackers, remote corpus scanning, generic schedulers, automatic roadmap import, automatic scanner retirement/reopening, model-written event summaries and unapproved wake-policy changes.
+
+## Current delivery evidence
+
+Roadmap retirement shipped in #1091. The tool audit and bounded local watch-recovery gate shipped in #1096; final assembled inventory remains phase-8 work. Manual tracking's usefulness gate is accepted in #1093, with final rebased CI still pending; see its [qualification report](../scripts/qa/ember-tracking/manual-memory-aca480.md). Event component C passed the independently reviewed 39-trial comparison in #1092; its first capped experiment remains explicitly unaccepted. Migration ordering requires tracking 164 before event evidence 165, then scanner 166. Scanner implementation and the independently reviewed corpus are active under phase 7; no scanner activation, full combined acceptance or production deployment is claimed.

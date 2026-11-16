@@ -45,3 +45,7 @@ Recreate the parent plan's disposable SQL invariants in production tests; its ig
 Test an actionable note followed by appended pause evidence: its projection becomes review-required atomically, survives restart and cannot expose the stale step as reviewed. Test reconciliation racing another append, scanner attempts to clear review state, exact duplicate evidence and trusted creation/reconciliation with its actual evidence watermark.
 
 Out of scope: fresh context/UI projection, scanner inference, new wake policy and completion-event implementation.
+
+## Delivery evidence
+
+The manual native-write and usefulness gates are accepted in PR #1093; see the [sanitized qualification report](../scripts/qa/ember-tracking/manual-memory-aca480.md). Final rebased checks/CI and integration with the scanner remain tracked by the parent and phase 8. Task status stays in progress until those delivery checks close.
