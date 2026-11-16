@@ -77,12 +77,38 @@ pub enum PtyExecPlan {
         config_path: PathBuf,
     },
     Shell,
+    #[cfg(test)]
+    ControlledShell(ControlledShellCommand),
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone)]
+pub struct ControlledShellCommand {
+    executable: CString,
+    argv: Vec<CString>,
+    env: Vec<CString>,
+}
+
+#[cfg(test)]
+impl ControlledShellCommand {
+    pub(crate) fn new(script: &str) -> Self {
+        Self {
+            executable: CString::new("/bin/sh").unwrap(),
+            argv: ["sh", "-c", script]
+                .into_iter()
+                .map(|arg| CString::new(arg).unwrap())
+                .collect(),
+            env: vec![CString::new("TERM=xterm-256color").unwrap()],
+        }
+    }
 }
 
 impl PtyExecPlan {
     fn child_kind(&self) -> TerminalChildKind {
         match self {
             Self::Shell => TerminalChildKind::Shell,
+            #[cfg(test)]
+            Self::ControlledShell(_) => TerminalChildKind::Shell,
             Self::Tmux { .. } => TerminalChildKind::TmuxClient,
         }
     }
@@ -122,6 +148,18 @@ pub fn spawn_pty(
 
     // Set initial window size on the PTY before the child starts (REQ-TERM-005).
     set_winsize_raw(master_raw, initial_dims).map_err(|e| format!("TIOCSWINSZ (initial): {e}"))?;
+
+    #[cfg(test)]
+    let controlled_exec = match &plan {
+        PtyExecPlan::ControlledShell(command) => {
+            let mut argv: Vec<_> = command.argv.iter().map(|arg| arg.as_ptr()).collect();
+            let mut env: Vec<_> = command.env.iter().map(|var| var.as_ptr()).collect();
+            argv.push(std::ptr::null());
+            env.push(std::ptr::null());
+            Some((command.executable.as_ptr(), argv, env))
+        }
+        PtyExecPlan::Tmux { .. } | PtyExecPlan::Shell => None,
+    };
 
     // --- Fork ----------------------------------------------------------------
     // SAFETY: standard POSIX fork + exec pattern.
@@ -172,6 +210,15 @@ pub fn spawn_pty(
                 // Non-fatal: shell will start in an unspecified directory.
             }
 
+            #[cfg(test)]
+            if let Some((executable, argv, env)) = &controlled_exec {
+                // SAFETY: all CString storage and terminated pointer arrays predate fork.
+                unsafe {
+                    libc::execve(*executable, argv.as_ptr(), env.as_ptr());
+                    libc::_exit(127);
+                }
+            }
+
             let shell_path = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_owned());
 
             // The tmux branch builds an env that strips `TMUX` so an
@@ -181,6 +228,10 @@ pub fn spawn_pty(
             let env_pairs = match &plan {
                 PtyExecPlan::Tmux { .. } => build_env_for_tmux(&shell_path, &launch_uuid),
                 PtyExecPlan::Shell => build_env(&shell_path, &launch_uuid),
+                #[cfg(test)]
+                PtyExecPlan::ControlledShell(_) => {
+                    unreachable!("controlled exec already attempted")
+                }
             };
             let env_cstrings: Vec<CString> = env_pairs
                 .iter()
@@ -240,6 +291,10 @@ pub fn spawn_pty(
                     exec_via_path(&tmux_c, &argv, &env_cstrings);
                     eprintln!("execvpe tmux: {}", std::io::Error::last_os_error());
                     unsafe { libc::_exit(1) };
+                }
+                #[cfg(test)]
+                PtyExecPlan::ControlledShell(_) => {
+                    unreachable!("controlled exec already attempted")
                 }
                 PtyExecPlan::Shell => {
                     let shell_c = CString::new(shell_path.clone())
@@ -499,7 +554,7 @@ mod tests {
                 assert!(socket_path.to_string_lossy().contains("conv-test"));
                 assert!(config_path.to_string_lossy().ends_with(".tmux.conf"));
             }
-            PtyExecPlan::Shell => panic!("expected Tmux variant"),
+            PtyExecPlan::Shell | PtyExecPlan::ControlledShell(_) => panic!("expected Tmux variant"),
         }
     }
 
@@ -508,7 +563,9 @@ mod tests {
         let plan = PtyExecPlan::Shell;
         match plan {
             PtyExecPlan::Shell => {}
-            PtyExecPlan::Tmux { .. } => panic!("expected Shell variant"),
+            PtyExecPlan::Tmux { .. } | PtyExecPlan::ControlledShell(_) => {
+                panic!("expected Shell variant");
+            }
         }
     }
 }

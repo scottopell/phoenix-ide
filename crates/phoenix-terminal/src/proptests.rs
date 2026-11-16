@@ -1019,14 +1019,16 @@ async fn failed_wait_with_reused_pid_retires_exact_handle() {
 
 const DETACHED_SHELL_MARKER: &[u8] = b"phoenix-detached-shell-executed";
 
-fn observe_detached_shell_marker(tail: &mut Vec<u8>, chunk: &[u8]) -> bool {
+fn observe_shell_marker(tail: &mut Vec<u8>, chunk: &[u8], marker: &[u8]) -> bool {
     tail.extend_from_slice(chunk);
-    let found = tail
-        .windows(DETACHED_SHELL_MARKER.len())
-        .any(|window| window == DETACHED_SHELL_MARKER);
-    let keep_from = tail.len().saturating_sub(DETACHED_SHELL_MARKER.len() - 1);
+    let found = tail.windows(marker.len()).any(|window| window == marker);
+    let keep_from = tail.len().saturating_sub(marker.len() - 1);
     tail.drain(..keep_from);
     found
+}
+
+fn observe_detached_shell_marker(tail: &mut Vec<u8>, chunk: &[u8]) -> bool {
+    observe_shell_marker(tail, chunk, DETACHED_SHELL_MARKER)
 }
 
 #[test]
@@ -1062,52 +1064,52 @@ fn detached_shell_marker_ignores_command_echo_and_bounds_retained_output() {
 )]
 #[tokio::test]
 async fn detached_direct_shell_exit_is_reaped_without_reconnect_or_close() {
-    use crate::spawn::{set_nonblocking, spawn_pty, PtyExecPlan};
+    use crate::spawn::{set_nonblocking, spawn_pty, ControlledShellCommand, PtyExecPlan};
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
     let _real_child_guard = REAL_CHILD_TEST_LOCK.lock().await;
     let registry = ActiveTerminals::new();
     let scope = ResourceScopeKey::GlobalTerminal;
     registry.reserve_spawn(&scope).unwrap();
+    let plan = PtyExecPlan::ControlledShell(ControlledShellCommand::new(
+        "test -t 0 && test -t 1 && test -t 2 || exit 90; \
+         printf 'phoenix-shell-ready\\n'; IFS= read -r command || exit 91; eval \"$command\"",
+    ));
     let handle = registry
         .insert_reserved(
             scope.clone(),
             spawn_pty(
                 std::path::Path::new("/tmp"),
                 Dims::try_new(80, 24).unwrap(),
-                PtyExecPlan::Shell,
+                plan,
             )
             .expect("spawn direct shell"),
         )
         .unwrap();
     let fd = handle.master_fd_raw().unwrap();
-    // SAFETY: the handle owns this master until natural cleanup; dup creates independent ownership.
-    let drain_fd = unsafe { libc::dup(fd) };
+    // SAFETY: the handle owns this master; fcntl creates a close-on-exec duplicate.
+    let drain_fd = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 3) };
     assert!(drain_fd >= 0, "duplicate master for test I/O");
-    // SAFETY: dup returned a new descriptor owned only by this fixture.
+    // SAFETY: fcntl returned a new descriptor owned only by this fixture.
     let drain_fd = unsafe { OwnedFd::from_raw_fd(drain_fd) };
     set_nonblocking(drain_fd.as_raw_fd()).unwrap();
     let mut drain = crate::relay::PtyMasterIo::new(drain_fd).unwrap();
     // The echoed command does not contain the contiguous execution marker.
-    let command = b"printf '%s%s\\n' 'phoenix-detached-' 'shell-executed'; exit\n";
+    let command = b"printf '%s%s\\n' 'phoenix-detached-' 'shell-executed'; exit 23\n";
+    let cleanup_receipt = handle.child_lifecycle.cleanup_receipt();
     let started = std::time::Instant::now();
-    // SAFETY: this handle still owns the master and the command buffer is valid.
-    assert_eq!(
-        unsafe { libc::write(fd, command.as_ptr().cast(), command.len()) },
-        isize::try_from(command.len()).unwrap()
-    );
     let output_bytes = std::cell::Cell::new(0_u64);
-    let first_output_at = std::cell::Cell::new(None);
+    let ready_at = std::cell::Cell::new(None);
     let marker_at = std::cell::Cell::new(None);
     let eof_at = std::cell::Cell::new(None);
     let drain_error = std::cell::Cell::new(None);
     let receipt_at = std::cell::Cell::new(None);
-    let permit_acquired_at = std::cell::Cell::new(None);
+    let cleanup_at = std::cell::Cell::new(None);
     let mut phases = Box::pin(async {
         // macOS can defer shell exit until pending PTY output is read.
         tokio::join!(
             async {
-                use tokio::io::AsyncReadExt;
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
                 let mut buffer = [0_u8; 4096];
                 let mut tail = Vec::new();
@@ -1119,10 +1121,17 @@ async fn detached_direct_shell_exit_is_reaped_without_reconnect_or_close() {
                         }
                         Ok(count) => {
                             output_bytes.set(output_bytes.get() + count as u64);
-                            if first_output_at.get().is_none() {
-                                first_output_at.set(Some(started.elapsed()));
-                            }
-                            if marker_at.get().is_none()
+                            if ready_at.get().is_none() {
+                                if observe_shell_marker(
+                                    &mut tail,
+                                    &buffer[..count],
+                                    b"phoenix-shell-ready",
+                                ) {
+                                    ready_at.set(Some(started.elapsed()));
+                                    tail.clear();
+                                    drain.write_all(command).await.unwrap();
+                                }
+                            } else if marker_at.get().is_none()
                                 && observe_detached_shell_marker(&mut tail, &buffer[..count])
                             {
                                 marker_at.set(Some(started.elapsed()));
@@ -1140,27 +1149,28 @@ async fn detached_direct_shell_exit_is_reaped_without_reconnect_or_close() {
                 let result = handle.child_lifecycle.receipt().wait().await;
                 receipt_at.set(Some((started.elapsed(), result)));
                 if result.is_ok() {
-                    let _permit = handle.attach_permit.clone().acquire_owned().await.unwrap();
-                    permit_acquired_at.set(Some(started.elapsed()));
+                    cleanup_receipt.wait().await;
+                    cleanup_at.set(Some(started.elapsed()));
                 }
             },
         );
     });
-    let completed = tokio::time::timeout(std::time::Duration::from_secs(2), phases.as_mut()).await;
+    // This is a deadlock guard, not a shell-startup or cleanup latency assertion.
+    let completed = tokio::time::timeout(std::time::Duration::from_secs(30), phases.as_mut()).await;
     // Snapshot before dropping the pending drainer and its duplicate master.
     let diagnostic = format!(
-        "detached shell: elapsed={:?} timeout={} output_bytes={} first_output_at={:?} \
-         marker_at={:?} eof_at={:?} drain_error={:?} receipt_at={:?} permit_acquired_at={:?} \
+        "detached shell: elapsed={:?} timeout={} output_bytes={} ready_at={:?} \
+         marker_at={:?} eof_at={:?} drain_error={:?} receipt_at={:?} cleanup_at={:?} \
          registered={} master_open={}",
         started.elapsed(),
         completed.is_err(),
         output_bytes.get(),
-        first_output_at.get(),
+        ready_at.get(),
         marker_at.get(),
         eof_at.get(),
         drain_error.get(),
         receipt_at.get(),
-        permit_acquired_at.get(),
+        cleanup_at.get(),
         registry.get(&scope).is_some(),
         handle.master_fd_raw().is_some(),
     );
@@ -1170,9 +1180,15 @@ async fn detached_direct_shell_exit_is_reaped_without_reconnect_or_close() {
         completed.is_ok(),
         "natural exit must clean detached shell without another connection; {diagnostic}"
     );
+    assert!(ready_at.get().is_some(), "{diagnostic}");
+    assert!(marker_at.get().is_some(), "{diagnostic}");
+    assert!(eof_at.get().is_some(), "{diagnostic}");
+    assert!(cleanup_at.get().is_some(), "{diagnostic}");
     assert!(drain_error.get().is_none(), "{diagnostic}");
     assert!(
-        receipt_at.get().is_some_and(|(_, result)| result.is_ok()),
+        receipt_at
+            .get()
+            .is_some_and(|(_, result)| result == Ok(TerminalExit::Exited(23))),
         "{diagnostic}"
     );
     assert!(registry.get(&scope).is_none());

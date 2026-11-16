@@ -931,6 +931,30 @@ fn parse_product_creation_job_row(row: SqliteRow) -> Result<ProductCreationJobRe
 }
 
 impl Database {
+    /// # Panics
+    /// Panics if the test clock mutex is poisoned.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn test_set_product_creation_now(&self, now: DateTime<Utc>) {
+        *self.product_creation_test_now.lock().unwrap() = Some(now);
+    }
+
+    /// # Panics
+    /// Panics if the test clock mutex is poisoned.
+    #[cfg(any(test, feature = "test-support"))]
+    #[must_use]
+    pub fn test_product_creation_now(&self) -> Option<DateTime<Utc>> {
+        *self.product_creation_test_now.lock().unwrap()
+    }
+
+    #[cfg_attr(not(any(test, feature = "test-support")), allow(clippy::unused_self))]
+    fn product_creation_fence_now(&self) -> i64 {
+        #[cfg(any(test, feature = "test-support"))]
+        if let Some(now) = self.test_product_creation_now() {
+            return now.timestamp_micros();
+        }
+        unix_micros_now()
+    }
+
     pub async fn product_creation_objective_already_durably_accepted(
         &self,
         request_id: &str,
@@ -1824,7 +1848,7 @@ impl Database {
         stage: ProductCreationProvisioningStage,
     ) -> DbResult<bool> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        let now = unix_micros_now();
+        let now = self.product_creation_fence_now();
         let updated = sqlx::query(
             "UPDATE product_creation_jobs
              SET stage_updated_at_unix_micros = CASE
@@ -1955,7 +1979,7 @@ impl Database {
         request_fingerprint: &str,
     ) -> DbResult<usize> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        let now = unix_micros_now();
+        let now = self.product_creation_fence_now();
         let conversation_id: Option<String> = sqlx::query_scalar(
             "SELECT j.published_conversation_id FROM product_creation_jobs j
              JOIN conversations c ON c.id = j.published_conversation_id
@@ -2488,7 +2512,7 @@ impl Database {
             return Ok(false);
         }
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        let now = unix_micros_now();
+        let now = self.product_creation_fence_now();
         let published_conversation_id: Option<String> = sqlx::query_scalar(
             "SELECT published_conversation_id
              FROM product_creation_jobs
@@ -2536,7 +2560,7 @@ impl Database {
                AND provisioning_stage = 'bootstrap_initial_turn'
                AND stage_updated_at_unix_micros <= ?1",
         )
-        .bind(unix_micros_now())
+        .bind(self.product_creation_fence_now())
         .bind(request_id)
         .bind(claim.generation)
         .bind(&claim.worker_id)
