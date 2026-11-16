@@ -8906,6 +8906,10 @@ where
                 .reserve_next_range(1)
                 .expect("tracking observation reserves one sequence");
             let sequence_id = sequences[0];
+            let mut tracking_authority = RuntimeSettlementAuthority {
+                owner: Some(admitted.reborrow()),
+                abandoned_reason: "coordinator_tracking_observation_owner_disappeared",
+            };
             match self
                 .storage
                 .append_coordinator_tracking_observation(
@@ -8916,6 +8920,7 @@ where
                 .await
             {
                 phoenix_db::workflow::LocalAuthorityResult::DurableFactEstablished(result) => {
+                    tracking_authority.owner = None;
                     match result? {
                         Some(message) => {
                             let _ = self

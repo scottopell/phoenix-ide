@@ -760,3 +760,41 @@ async fn tracking_observation_reservation_blocks_concurrent_input_sequence_alloc
     assert_eq!(messages[1].sequence_id, writer_sequence);
     assert!(writer_sequence > observation_sequence);
 }
+
+#[tokio::test]
+async fn tracking_observation_cancelled_before_classification_closes_local_authority() {
+    use crate::runtime::testing::{InMemoryStorage, MockToolExecutor};
+    let storage = Arc::new(InMemoryStorage::new());
+    let (started, _release) = storage.gate_tracking_observation();
+    let mut context = ConvContext::new(
+        "cancel-observation",
+        PathBuf::from("/tmp"),
+        "test-model",
+        200_000,
+        16_384,
+    );
+    context.is_coordinator = true;
+    let (tx, rx) = mpsc::channel(8);
+    let mut runtime = ConversationRuntime::new(
+        context,
+        ConvState::LlmRequesting { attempt: 1 },
+        storage,
+        Arc::new(MockLlmClient::new("test-model")),
+        Arc::new(MockToolExecutor::new()),
+        Arc::new(BrowserSessionManager::default()),
+        Arc::new(crate::tools::BashHandleRegistry::new()),
+        Arc::new(crate::tools::TmuxRegistry::new()),
+        Arc::new(ModelRegistry::new_empty()),
+        crate::terminal::ActiveTerminals::new(),
+        rx,
+        tx,
+        SseBroadcaster::new(32, 0),
+    );
+    let fence = runtime.fatal_local_authority_fence.clone();
+    let dispatch = tokio::spawn(async move { runtime.execute_effect(Effect::RequestLlm).await });
+    started.await.unwrap();
+    dispatch.abort();
+    assert!(dispatch.await.unwrap_err().is_cancelled());
+    assert!(fence.is_closed());
+    assert!(fence.try_acquire().is_err());
+}
