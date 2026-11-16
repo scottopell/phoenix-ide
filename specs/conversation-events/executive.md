@@ -1,5 +1,37 @@
 # Conversation events — implementation and qualification
 
+## Occurrence-bound ending evidence candidate
+
+Lane B adds normalized immutable ending quotations (1,024 UTF-8 bytes), complete
+typed-response SHA-256 version expectations, and settled-input origin/sender
+snapshots. Direct settlement captures before obligation deletion and shares the
+binding with adopted steering/interaction occurrences. The atomic agent-message /
+selected-state / replay-clear path also supplies its exact response to initial and
+steering outcome capture. State-only, cancellation, failure and other paths without
+an exact carrier report absence instead of searching for the latest response.
+
+Private event details and private prompt hydration consume this evidence. Original
+persisted diagnostic messages remain unchanged, and shared/redacted presentation
+does not acquire the private quotation. Source edits/deletion leave the bounded
+quotation intact, but prevent version-matching recovery of omitted text. Remote
+terminal-fact v1 remains unchanged; its private projection explicitly reports
+`unsupported_remote`.
+
+`read_event_evidence` is a narrowly local-only native tool with a closed UUID/cursor
+request and no peer selector. Existing `read_conversation` remains unchanged. This
+small departure from the original same-tool preference prevents another prose-only
+local/remote distinction; see ADR-261. Every page retains the event identity and
+validates the complete source digest in the same read snapshot.
+
+Candidate validation is in progress. Eight focused DB tests pass, covering frozen
+quotation, digest-guarded pages, rollback/retry, honest absence, historical private
+presentation, unavailable input origins, prefix stability and atomic non-direct
+capture. The direct/adopted settlement/replay regression also passed. Genuine codegen,
+IDE privacy/schema/read composition, full CI and model effectiveness remain open.
+Compact model hydration requires the
+predeclared A/B/C evaluation gate in ADR-261 before merge/activation. No deployment
+acceptance or actual savings are claimed by source implementation alone.
+
 Implemented on the compact-conversation-events branch; not a deployment or merge claim. Durable metadata joins and typed presentation are separate from persisted diagnostic evidence. Available EventPresentation fields are flattened beside `status: available`; unavailable carries event_id/reason. EnrichedMessage.event_presentation is explicitly nullable. Genuine ts-rs exports are checked in, not handwritten.
 
 ## Verification

@@ -16560,6 +16560,21 @@ pub(crate) async fn record_initial_execution_outcome_tx(
     conversation_id: &str,
     state: &ConvState,
 ) -> DbResult<()> {
+    record_initial_execution_outcome_with_response_tx(
+        tx,
+        conversation_id,
+        state,
+        &EndingResponse::NoCarrier,
+    )
+    .await
+}
+
+pub(crate) async fn record_initial_execution_outcome_with_response_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    conversation_id: &str,
+    state: &ConvState,
+    ending_response: &EndingResponse,
+) -> DbResult<()> {
     if let ConvState::RecoverableContinuationFailure { failure } = state {
         return crate::coordinator_watches::record_summary_failure_tx(tx, conversation_id, failure)
             .await;
@@ -16600,13 +16615,14 @@ pub(crate) async fn record_initial_execution_outcome_tx(
                     ("Failed", Some(reason.as_str()))
                 }
             };
-            crate::coordinator_watches::record_steering_event_tx(
+            crate::coordinator_watches::record_steering_event_with_response_tx(
                 tx,
                 source_kind,
                 &message_id,
                 conversation_id,
                 kind,
                 reason,
+                ending_response,
             )
             .await?;
             sqlx::query("DELETE FROM steering_execution_occurrences WHERE conversation_id = ?1")
@@ -16623,12 +16639,13 @@ pub(crate) async fn record_initial_execution_outcome_tx(
         let generation: i64 = job.try_get("generation")?;
         let generation =
             u64::try_from(generation).map_err(|error| DbError::Serialization(error.to_string()))?;
-        classify_creation_watch_outcome(
+        classify_creation_watch_outcome_with_response(
             tx,
             &job.try_get::<String, _>("id")?,
             conversation_id,
             generation,
             state,
+            ending_response,
         )
         .await?;
     }
@@ -16641,6 +16658,25 @@ async fn classify_creation_watch_outcome(
     conversation_id: &str,
     generation: u64,
     state: &ConvState,
+) -> DbResult<()> {
+    classify_creation_watch_outcome_with_response(
+        tx,
+        job_id,
+        conversation_id,
+        generation,
+        state,
+        &EndingResponse::NoCarrier,
+    )
+    .await
+}
+
+async fn classify_creation_watch_outcome_with_response(
+    tx: &mut Transaction<'_, Sqlite>,
+    job_id: &str,
+    conversation_id: &str,
+    generation: u64,
+    state: &ConvState,
+    ending_response: &EndingResponse,
 ) -> DbResult<()> {
     let (terminal_kind, reason) = match state {
         ConvState::Idle | ConvState::Terminal | ConvState::Completed { .. } => ("Completed", None),
@@ -16667,13 +16703,14 @@ async fn classify_creation_watch_outcome(
         | ConvState::AwaitingUserResponse { .. }
         | ConvState::HandedOff { .. } => return Ok(()),
     };
-    crate::coordinator_watches::record_creation_event_tx(
+    crate::coordinator_watches::record_creation_event_with_response_tx(
         tx,
         job_id,
         generation,
         conversation_id,
         terminal_kind,
         reason,
+        ending_response,
     )
     .await
 }

@@ -22,6 +22,9 @@ existing events without more notifications or a separate supervision system.
 
 Choose option 3. Capture from the exact terminal obligation before settlement deletes
 it, threading the same typed response binding into direct and adopted-input events.
+The existing atomic agent-message/state/replay-clear persistence path also provides
+an exact carrier for initial/steering execution. Paths that persist state alone
+continue to report no carrier; no latest-message query fills that gap.
 No exact carrier means explicit absence. Replays reuse original evidence and cannot
 borrow later response text. Keep settled-input origin and sender facts distinct from
 the response; multiple inputs may have contributed.

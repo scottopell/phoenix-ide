@@ -5,6 +5,7 @@ use phoenix_core::domain::{
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use sqlx::{QueryBuilder, Row, Sqlite, Transaction};
+use std::fmt::Write as _;
 
 use crate::{Database, DbError, DbResult};
 
@@ -189,13 +190,12 @@ fn response_content(content: &str) -> DbResult<(String, String)> {
         serde_json::from_str(content).map_err(|e| DbError::Serialization(e.to_string()))?,
     )
     .map_err(DbError::Serialization)?;
-    let digest = format!(
-        "{:x}",
-        Sha256::digest(
-            serde_json::to_vec(&typed.to_json())
-                .map_err(|e| DbError::Serialization(e.to_string()))?
-        )
-    );
+    let mut digest = String::with_capacity(64);
+    for byte in Sha256::digest(
+        serde_json::to_vec(&typed.to_json()).map_err(|e| DbError::Serialization(e.to_string()))?,
+    ) {
+        write!(&mut digest, "{byte:02x}").expect("writing to a String cannot fail");
+    }
     let MessageContent::Agent(blocks) = typed else {
         unreachable!("agent decoder")
     };
@@ -631,6 +631,7 @@ mod tests {
                 message_id: "exact-response".into()
             }
         );
+        tx.rollback().await.unwrap();
         assert_eq!(
             db.coordinator_watch_ending_evidence("old-event")
                 .await
@@ -746,6 +747,49 @@ mod tests {
         assert!(evidence
             .readable(&event)
             .contains("unavailable source origin"));
+    }
+
+    #[tokio::test]
+    async fn atomic_non_direct_agent_message_binds_the_exact_interaction_ending() {
+        let (db, source, _) = fixture("earlier execution").await;
+        db.add_message_with_seq_and_origin(
+            "seeded-input",
+            &source,
+            2,
+            &MessageContent::user("initial commissioned request"),
+            None,
+            None,
+            &InputOrigin::UserApi,
+        )
+        .await
+        .unwrap();
+        db.add_message_and_clear_provider_replay(
+            "initial-response",
+            &source,
+            3,
+            &MessageContent::agent(vec![ContentBlock::text(
+                "Initial execution's exact ending.",
+            )]),
+            None,
+            None,
+            &phoenix_core::domain::sm_state::ConvState::Idle,
+            chrono::Utc::now(),
+        )
+        .await
+        .unwrap();
+        let event:String=sqlx::query_scalar("SELECT event_id FROM coordinator_watch_events WHERE source_occurrence_id='seeded-input'")
+            .fetch_one(db.pool()).await.unwrap();
+        let evidence = db.coordinator_watch_ending_evidence(&event).await.unwrap();
+        assert!(
+            matches!(evidence.response,EndingResponse::Captured {ref message_id,excerpt:Some(ref prose),..} if message_id=="initial-response" && prose=="Initial execution's exact ending.")
+        );
+        assert_eq!(
+            evidence.settled_input,
+            Some(SettledWatchInput {
+                message_id: "seeded-input".into(),
+                origin: Some(InputOrigin::UserApi)
+            })
+        );
     }
 
     #[tokio::test]

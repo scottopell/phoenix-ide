@@ -556,7 +556,28 @@ pub(crate) async fn record_creation_event_tx(
     terminal_kind: &str,
     reason: Option<&str>,
 ) -> DbResult<()> {
-    record_watch_event_tx(
+    record_creation_event_with_response_tx(
+        tx,
+        job_id,
+        generation,
+        transcript_id,
+        terminal_kind,
+        reason,
+        &EndingResponse::NoCarrier,
+    )
+    .await
+}
+
+pub(crate) async fn record_creation_event_with_response_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    job_id: &str,
+    generation: u64,
+    transcript_id: &str,
+    terminal_kind: &str,
+    reason: Option<&str>,
+    response: &EndingResponse,
+) -> DbResult<()> {
+    record_watch_event_with_response_tx(
         tx,
         "creation",
         job_id,
@@ -565,6 +586,8 @@ pub(crate) async fn record_creation_event_tx(
         terminal_kind,
         reason,
         reason == Some("context exhausted"),
+        None,
+        response,
     )
     .await
 }
