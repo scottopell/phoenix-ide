@@ -13383,6 +13383,16 @@ END;
 mod tests {
     use super::*;
 
+    fn registered_after(prefix: u32) -> u32 {
+        u32::try_from(
+            super::MIGRATIONS
+                .iter()
+                .filter(|migration| migration.version > prefix)
+                .count(),
+        )
+        .unwrap()
+    }
+
     #[tokio::test]
     async fn migration_163_seeds_existing_product_conversations_as_read() {
         use phoenix_core::domain::llm_types::ContentBlock;
@@ -13750,7 +13760,10 @@ mod tests {
         .unwrap();
         assert_eq!(before, vec![158]);
 
-        assert_eq!(run_pending_migrations(pool).await.unwrap(), 7);
+        assert_eq!(
+            run_pending_migrations(pool).await.unwrap(),
+            registered_after(155) - 1
+        );
 
         let after: Vec<i64> = sqlx::query_scalar(
             "SELECT version FROM _migrations WHERE version >= 156 ORDER BY version",
@@ -13758,7 +13771,14 @@ mod tests {
         .fetch_all(pool)
         .await
         .unwrap();
-        assert_eq!(after, vec![156, 158, 159, 160, 161, 162, 163, 164]);
+        assert_eq!(
+            after,
+            MIGRATIONS
+                .iter()
+                .filter(|migration| migration.version >= 156)
+                .map(|migration| i64::from(migration.version))
+                .collect::<Vec<_>>()
+        );
         sqlx::query("SELECT enrollment_id FROM conversation_goal_actors LIMIT 0")
             .execute(pool)
             .await
@@ -16247,7 +16267,10 @@ mod tests {
             .unwrap()
             .is_empty());
         assert_eq!(run_through_for_test(db.pool(), 152).await.unwrap(), 1);
-        assert_eq!(run_pending_migrations(db.pool()).await.unwrap(), 9);
+        assert_eq!(
+            run_pending_migrations(db.pool()).await.unwrap(),
+            registered_after(152)
+        );
         assert_eq!(run_pending_migrations(db.pool()).await.unwrap(), 0);
         let ledger: Vec<(i64, String)> = sqlx::query_as(
             "SELECT version, name FROM _migrations WHERE version >= 150 ORDER BY version",
@@ -16256,7 +16279,11 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(
-            ledger,
+            ledger
+                .iter()
+                .filter(|(version, _)| *version <= 163)
+                .cloned()
+                .collect::<Vec<_>>(),
             vec![
                 (150, "federated_subscription_terminal_cancellation".into()),
                 (151, "one_shot_conversation_reminders".into()),
@@ -16270,8 +16297,15 @@ mod tests {
                 (161, "slack_single_trigger_emoji".into()),
                 (162, "slack_saved_capture".into()),
                 (163, "product_conversation_read_state".into()),
-                (164, "coordinator_durable_tracking".into()),
             ]
+        );
+        assert_eq!(
+            ledger,
+            compiled_migration_ledger()
+                .into_iter()
+                .filter(|(version, _)| *version >= 150)
+                .map(|(version, name)| (version, name.to_string()))
+                .collect::<Vec<_>>()
         );
     }
 
@@ -16280,7 +16314,6 @@ mod tests {
         let ledger = compiled_migration_ledger();
         assert!(ledger.windows(2).all(|pair| pair[0].0 < pair[1].0));
         let expected_tail = [
-            (164, "coordinator_durable_tracking"),
             (163, "product_conversation_read_state"),
             (162, "slack_saved_capture"),
             (161, "slack_single_trigger_emoji"),
@@ -16334,6 +16367,7 @@ mod tests {
         assert_eq!(
             ledger
                 .iter()
+                .filter(|(version, _)| *version <= 163)
                 .rev()
                 .take(expected_tail.len())
                 .copied()
@@ -20539,7 +20573,7 @@ mod tests {
     fn goal_tools_registry_contains_real_145_before_retention_tail() {
         let tail: Vec<_> = MIGRATIONS
             .iter()
-            .filter(|migration| migration.version >= 143)
+            .filter(|migration| (143..=163).contains(&migration.version))
             .map(|migration| (migration.version, migration.name))
             .collect();
         assert_eq!(
@@ -20564,7 +20598,6 @@ mod tests {
                 (161, "slack_single_trigger_emoji"),
                 (162, "slack_saved_capture"),
                 (163, "product_conversation_read_state"),
-                (164, "coordinator_durable_tracking"),
             ]
         );
         let goal = MIGRATIONS
@@ -20578,7 +20611,13 @@ mod tests {
         assert!(goal
             .sql
             .contains("CREATE TABLE conversation_goal_coordinator_receipts"));
-        assert_eq!(MIGRATIONS.len(), 160);
+        assert_eq!(
+            MIGRATIONS
+                .iter()
+                .filter(|migration| migration.version <= 163)
+                .count(),
+            160
+        );
     }
 
     #[tokio::test]
@@ -20594,7 +20633,10 @@ mod tests {
         }
         sqlx::query("UPDATE product_creation_jobs SET status = 'published', published_product_id = 'deleted-product', published_conversation_id = 'deleted-transcript' WHERE request_id = 'orphan-image'")
             .execute(&pool).await.unwrap();
-        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 13);
+        assert_eq!(
+            run_pending_migrations(&pool).await.unwrap(),
+            registered_after(148)
+        );
         let identity: Vec<(String, String)> = sqlx::query_as(
             "SELECT request_id, data_sha256 FROM product_creation_image_replay_identity ORDER BY request_id",
         ).fetch_all(&pool).await.unwrap();
@@ -20648,7 +20690,10 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 13);
+        assert_eq!(
+            run_pending_migrations(&pool).await.unwrap(),
+            registered_after(148)
+        );
         let retained: (String, String, String) = sqlx::query_as(
             "SELECT status, published_product_id, published_conversation_id
              FROM product_creation_jobs WHERE request_id = 'orphan-text'",

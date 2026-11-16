@@ -1657,11 +1657,12 @@ async fn prepare_rejects_mismatched_or_non_current_in_flight_source() {
 #[tokio::test]
 async fn goal_preparation_migration_follows_conversation_tool_migrations() {
     let db = fixture().await;
-    let migrations: Vec<(i64, String)> =
-        sqlx::query_as("SELECT version,name FROM _migrations WHERE version>=143 ORDER BY version")
-            .fetch_all(db.pool())
-            .await
-            .unwrap();
+    let migrations: Vec<(i64, String)> = sqlx::query_as(
+        "SELECT version,name FROM _migrations WHERE version BETWEEN 143 AND 163 ORDER BY version",
+    )
+    .fetch_all(db.pool())
+    .await
+    .unwrap();
     assert_eq!(
         migrations,
         vec![

@@ -189,9 +189,10 @@ async fn canonical_goal_tools_prefixes_upgrade_reopen_and_remain_idempotent() {
         .await
         .unwrap();
         assert_eq!(
-            tail,
+            tail.iter().copied().take_while(|version| *version <= 163).collect::<Vec<_>>(),
             vec![143, 144, 145, 146, 147, 148, 149, 150, 151, 152, 153, 155, 156, 158, 159, 160, 161, 162, 163,]
         );
+        assert_eq!(tail, crate::migrations::migration_identities().filter(|(version, _)| *version >= 143).map(|(version, _)| i64::from(version)).collect::<Vec<_>>());
         let before = snapshot(db.pool()).await;
         assert_eq!(
             crate::migrations::run_pending_migrations(db.pool())
