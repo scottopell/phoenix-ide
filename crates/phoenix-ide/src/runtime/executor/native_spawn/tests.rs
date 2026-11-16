@@ -430,6 +430,42 @@ async fn native_definite_closure_failure_is_non_resumable_and_keeps_admission() 
 }
 
 #[tokio::test]
+async fn native_queued_behind_fork_command_cancellation_cutoff_is_not_sqlite_uncertainty() {
+    let (manager, mut runtime, request) = pending_native_spawn().await;
+    let barrier = Arc::new(tokio::sync::Barrier::new(2));
+    *manager.fork_command_barrier.lock().await = Some(Arc::clone(&barrier));
+    manager.start_sub_agent_handler().await;
+    let (reply, reply_rx) = oneshot::channel();
+    manager
+        .fork_cmd_tx
+        .send(crate::runtime::fork_resolve::ForkCommand::Dismiss {
+            proposal_id: "block-native-consumer".into(),
+            reply,
+        })
+        .await
+        .unwrap();
+    barrier.wait().await;
+    manager.spawn_tx.send(request).await.unwrap();
+    cancel(&mut runtime).await;
+    runtime.handle_cancelling_tool_timeout().await;
+    let fenced_without_any_admission = manager
+        .fatal_local_authority_fence
+        .fatal_authority_loss_is_latched();
+    barrier.wait().await;
+    let _dismissal = reply_rx.await.unwrap();
+    assert!(
+        !fenced_without_any_admission,
+        "an exactly owned unissued batch can be revoked without inventing unknown SQLite authority"
+    );
+    assert!(matches!(runtime.state, ConvState::Idle));
+    let admitted: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sub_agent_runs")
+        .fetch_one(manager.db().pool())
+        .await
+        .unwrap();
+    assert_eq!(admitted, 0);
+}
+
+#[tokio::test]
 async fn native_unresolved_backstop_cannot_acknowledge_or_replace_origin() {
     let (manager, mut runtime, request) = pending_native_spawn().await;
     let origin = request.invocation.clone();
