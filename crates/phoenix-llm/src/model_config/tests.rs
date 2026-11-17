@@ -127,6 +127,27 @@ fn invalid_toml_entries_reject_the_whole_section() {
 }
 
 #[test]
+fn unit_effort_forms_reject_extra_metadata() {
+    let base = config();
+    let base = base.split("[models.effort_capabilities]").next().unwrap();
+    for support in ["unknown", "unsupported"] {
+        let valid = format!("{base}[models.effort_capabilities]\nsupport='{support}'\n");
+        assert!(parse_models(&valid).is_ok());
+        for extra in [
+            "unknown_field=true",
+            "levels=['high']",
+            "native_default='high'",
+        ] {
+            let invalid = format!("{valid}{extra}\n");
+            assert!(
+                parse_models(&invalid).is_err(),
+                "accepted {support} with {extra}"
+            );
+        }
+    }
+}
+
+#[test]
 fn fresh_load_reads_edits_without_reusing_a_cached_model_catalog() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("config.toml");

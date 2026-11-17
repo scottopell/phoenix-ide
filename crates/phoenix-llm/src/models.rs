@@ -343,8 +343,8 @@ pub(super) struct ExternalModelSpec {
 #[derive(Debug, serde::Deserialize)]
 #[serde(rename_all = "snake_case", tag = "support", deny_unknown_fields)]
 enum ExternalEffortCapabilities {
-    Unsupported,
-    Unknown,
+    Unsupported {},
+    Unknown {},
     Supported {
         levels: Vec<ModelEffort>,
         native_default: Option<ModelEffort>,
@@ -501,8 +501,8 @@ fn validate_external_effort_capabilities(
         return Ok(EffortCapabilities::unknown());
     };
     match caps {
-        ExternalEffortCapabilities::Unsupported => Ok(EffortCapabilities::unsupported()),
-        ExternalEffortCapabilities::Unknown => Ok(EffortCapabilities::unknown()),
+        ExternalEffortCapabilities::Unsupported {} => Ok(EffortCapabilities::unsupported()),
+        ExternalEffortCapabilities::Unknown {} => Ok(EffortCapabilities::unknown()),
         ExternalEffortCapabilities::Supported {
             levels,
             native_default,
