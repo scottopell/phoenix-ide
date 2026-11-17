@@ -164,6 +164,183 @@ async fn native_catalog_preparation_is_cancellable_before_any_native_owner() {
     cancellation_while_read_held(runtime, gate).await;
 }
 
+#[derive(Clone, Copy)]
+enum RawProviderRead {
+    Policy,
+    Scope,
+    NativeCatalog,
+}
+
+async fn raw_provider_runtime(read: RawProviderRead) -> (TestRuntime, ContentBlock) {
+    let (name, input) = match read {
+        RawProviderRead::Policy | RawProviderRead::Scope => {
+            ("bash", serde_json::json!({"op": "run", "cmd": "pwd"}))
+        }
+        RawProviderRead::NativeCatalog => (
+            "spawn_agents",
+            serde_json::json!({"tasks": [{"task": "read"}]}),
+        ),
+    };
+    let call = ToolCall::new(
+        "raw-provider-call",
+        ToolInput::from_name_and_value(name, input.clone()),
+    );
+    assert_ne!(call.input.to_value(), input);
+    let mut runtime = runtime_for(call).await;
+    runtime.state = ConvState::Idle;
+    if matches!(read, RawProviderRead::Scope) {
+        runtime.context.resource_scope = phoenix_core::work_scope::ResourceScopeKey::Work(
+            phoenix_core::work_scope::WorkScopeId::new(),
+        );
+    }
+    let source = ContentBlock::tool_use("raw-provider-call", name, input);
+    runtime.llm_client.queue_response(phoenix_llm::LlmResponse {
+        provider_replay: None,
+        content: vec![source.clone()],
+        end_turn: false,
+        usage: phoenix_llm::Usage::default(),
+        usage_observation: phoenix_core::domain::llm_types::UsageObservation::default(),
+        stream_telemetry: phoenix_llm::ProviderStreamTelemetry::non_streaming(),
+    });
+    (runtime, source)
+}
+
+async fn raw_provider_read_cancellation(read: RawProviderRead) {
+    let (mut runtime, source) = raw_provider_runtime(read).await;
+    let storage = Arc::clone(&runtime.storage);
+    let tools = Arc::clone(&runtime.tool_executor);
+    let llm = Arc::clone(&runtime.llm_client);
+    let (events, receiver) = mpsc::channel(8);
+    runtime.event_tx = events.clone();
+    runtime.event_rx = receiver;
+    runtime
+        .process_event(Event::UserMessage {
+            text: "inspect".into(),
+            llm_text: None,
+            images: vec![],
+            files: vec![],
+            message_id: "raw-provider-user".into(),
+            user_agent: None,
+            skill_invocation: None,
+        })
+        .await
+        .unwrap();
+    let (entered, release) = match read {
+        RawProviderRead::Policy => storage.hold_next_tool_policy_read(),
+        RawProviderRead::Scope => storage.hold_next_tool_scope_read(),
+        RawProviderRead::NativeCatalog => tools.hold_next_definitions(),
+    };
+    let (state_tx, mut states) = watch::channel(runtime.state.clone());
+    let task = tokio::spawn(runtime.with_state_watcher(state_tx).run());
+    tokio::time::timeout(Duration::from_secs(60), entered)
+        .await
+        .unwrap()
+        .unwrap();
+    let ConvState::ToolExecuting {
+        current_tool,
+        assistant_message,
+        ..
+    } = states.borrow().clone()
+    else {
+        panic!("raw provider response must reach the selected read");
+    };
+    assert_eq!(assistant_message.content, vec![source.clone()]);
+    let ContentBlock::ToolUse { id, name, input } = source else {
+        unreachable!()
+    };
+    assert_eq!(
+        current_tool,
+        ToolCall::new(id, ToolInput::from_name_and_value(&name, input.clone()))
+    );
+    assert_ne!(current_tool.input.to_value(), input);
+    tokio::time::pause();
+    events
+        .send(Event::UserCancel {
+            reason: None,
+            cause: crate::state_machine::event::CancelCause::UserRequested,
+        })
+        .await
+        .unwrap();
+    let cancelled = tokio::time::timeout(
+        Duration::from_millis(100),
+        states.wait_for(|state| matches!(state, ConvState::Idle)),
+    )
+    .await
+    .is_ok();
+    let revoked = release.send(Ok(())).is_err();
+    tokio::time::resume();
+    events.send(Event::Shutdown).await.unwrap();
+    assert_eq!(
+        task.await.unwrap(),
+        RuntimeExitDisposition::CoordinatedShutdown
+    );
+    assert!(
+        cancelled,
+        "raw source identity must settle cancellation within 100ms"
+    );
+    assert!(
+        revoked,
+        "the selected read must be revoked before cancellation completes"
+    );
+    assert!(matches!(
+        storage.get_current_state("conv-tool-gen"),
+        Some(ConvState::Idle)
+    ));
+    assert!(tools.recorded_executions().is_empty());
+    assert_eq!(llm.recorded_requests().len(), 1);
+    assert!(!storage.recorded_messages().iter().any(|message| matches!(
+        &message.content,
+        phoenix_core::domain::db_schema::MessageContent::System(content)
+            if content.text.starts_with("Cancellation completed.")
+    )));
+}
+
+#[tokio::test]
+async fn raw_provider_bash_policy_read_cancels_without_canonicalizing_origin() {
+    raw_provider_read_cancellation(RawProviderRead::Policy).await;
+}
+
+#[tokio::test]
+async fn raw_provider_bash_scope_read_cancels_without_canonicalizing_origin() {
+    raw_provider_read_cancellation(RawProviderRead::Scope).await;
+}
+
+#[tokio::test]
+async fn raw_provider_spawn_catalog_read_cancels_without_canonicalizing_origin() {
+    raw_provider_read_cancellation(RawProviderRead::NativeCatalog).await;
+}
+
+#[tokio::test]
+async fn same_assistant_and_call_ids_cannot_adopt_changed_source() {
+    let call = bash("reused", "git status --short");
+    let mut runtime = runtime_for(call.clone()).await;
+    selected(&mut runtime, "same-assistant", &call);
+    runtime
+        .execute_effect(Effect::ExecuteTool { tool: call })
+        .await
+        .unwrap();
+    let observation = runtime.tool_preparation.as_mut().unwrap().observe().await;
+    let ConvState::ToolExecuting {
+        assistant_message, ..
+    } = &mut runtime.state
+    else {
+        unreachable!()
+    };
+    assistant_message.content = vec![ContentBlock::tool_use(
+        "reused",
+        "bash",
+        serde_json::json!({"op": "run", "cmd": "git status --short"}),
+    )];
+    assert!(runtime
+        .accept_tool_preparation(observation)
+        .unwrap()
+        .is_none());
+    assert_eq!(runtime.tool_execution.generation(), 0);
+    assert!(runtime.tool_executor.recorded_executions().is_empty());
+    assert!(runtime.tool_preparation.is_none());
+    runtime.abort_external_effects_in_memory();
+}
+
 #[tokio::test]
 async fn typed_self_goal_preparation_is_cancellable_before_checkpoint() {
     let call = ToolCall::new(
