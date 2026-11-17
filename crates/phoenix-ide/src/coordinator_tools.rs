@@ -3,6 +3,7 @@ use crate::api::global_read::{
     PreviousTranscriptsRequest,
 };
 
+mod answer_question;
 mod authority;
 mod goals;
 pub(crate) mod instance;
@@ -448,7 +449,10 @@ pub(crate) fn tools(
         db: watch_db,
         peer_db: db.clone(),
     }));
-    tools.push(Arc::new(SafeRetryClose(close_retry)));
+    tools.push(Arc::new(SafeRetryClose(close_retry.clone())));
+    tools.push(Arc::new(answer_question::AnswerConversationQuestion(
+        close_retry,
+    )));
     tools.push(Arc::new(AskUserQuestionTool));
     tools
 }
@@ -3253,6 +3257,7 @@ mod tests {
                 "unwatch_conversation",
                 "list_watched_conversations",
                 "retry_close_safely",
+                "answer_conversation_question",
                 "ask_user_question"
             ]
         );
@@ -3359,6 +3364,7 @@ mod tests {
                 "unwatch_conversation",
                 "list_watched_conversations",
                 "retry_close_safely",
+                "answer_conversation_question",
                 "ask_user_question"
             ]
         );

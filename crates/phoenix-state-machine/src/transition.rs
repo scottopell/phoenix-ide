@@ -2666,7 +2666,17 @@ pub fn transition_parent(
                 .collect::<Vec<_>>()
                 .join("\n");
 
-            let user_text = format!("Here are my answers:\n{answers_text}");
+            let answered_by_conversation = source.as_ref().is_some_and(|source| {
+                matches!(
+                    source.origin,
+                    phoenix_core::domain::db_schema::InputOrigin::InternalConversation { .. }
+                )
+            });
+            let user_text = if answered_by_conversation {
+                format!("The Coordinator answered your questions for the user:\n{answers_text}")
+            } else {
+                format!("Here are my answers:\n{answers_text}")
+            };
 
             Ok(
                 ParentTransitionResult::new(ParentState::Core(CoreState::LlmRequesting {
@@ -9094,6 +9104,69 @@ mod tests {
                 .any(|e| matches!(e, Effect::RequestLlm)),
             "Should have RequestLlm effect"
         );
+    }
+
+    #[test]
+    fn coordinator_answers_are_labelled_as_the_coordinators() {
+        use crate::state::UserQuestion;
+
+        let request_authority = phoenix_core::domain::sm_state::QuestionRequestAuthority::new();
+        let request_id = request_authority.request_id().unwrap().clone();
+        let state = ConvState::AwaitingUserResponse {
+            questions: vec![UserQuestion {
+                question: "Which library?".to_string(),
+                header: "Dependencies".to_string(),
+                options: vec![],
+                multi_select: false,
+            }],
+            tool_use_id: "tool-auq-1".to_string(),
+            request_authority,
+        };
+        let mut answers = std::collections::HashMap::new();
+        answers.insert("Which library?".to_string(), "lodash".to_string());
+        let origin = phoenix_core::domain::db_schema::InputOrigin::InternalConversation {
+            product_conversation_id:
+                phoenix_core::domain::product_conversation::ProductConversationId::parse(
+                    "coordinator",
+                )
+                .unwrap(),
+            transcript_id: "coordinator-transcript".to_string(),
+            source_call: None,
+        };
+
+        let result = transition(
+            &state,
+            &test_context(),
+            Event::UserQuestionResponse {
+                source: Some(phoenix_core::domain::sm_event::QuestionAnswerSource {
+                    message_id: "answer".to_string(),
+                    origin: origin.clone(),
+                }),
+                request_id: Some(request_id),
+                answers,
+                annotations: None,
+            },
+        )
+        .unwrap();
+
+        let persisted = result.effects.iter().find_map(|effect| {
+            if let Effect::PersistUserInputMessage {
+                content, origin: o, ..
+            } = effect
+            {
+                Some((content.clone(), o.clone()))
+            } else {
+                None
+            }
+        });
+        let (content, persisted_origin) = persisted.expect("answer is persisted");
+        assert_eq!(persisted_origin, origin);
+        let text = serde_json::to_string(&content).unwrap();
+        assert!(
+            text.contains("The Coordinator answered your questions for the user"),
+            "{text}"
+        );
+        assert!(!text.contains("Here are my answers"), "{text}");
     }
 
     #[test]
