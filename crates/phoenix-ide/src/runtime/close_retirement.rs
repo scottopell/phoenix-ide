@@ -26,8 +26,8 @@ use phoenix_tools::{
     bash::registry::{BashRetirementOutcome, BashRetirementPermit},
     browser::session::{BrowserRetirementOutcome, BrowserRetirementPermit},
     tmux::registry::{
-        TmuxRetirementOutcome, TmuxRetirementPermit,
-        TmuxRetirementRehydration, TmuxServerInstanceIdentity,
+        PersistentTmuxDiscovery, TmuxRetirementOutcome, TmuxRetirementPermit, TmuxRetirementRehydration,
+        TmuxServerInstanceIdentity,
     },
 };
 
@@ -3826,7 +3826,12 @@ impl RuntimeManager {
         expected: &[RetiredResourceIdentity],
     ) -> Result<(), CloseLeaseFailure> {
         let key = (run.attempt_id.as_str().to_string(), scope.clone());
-        let lease = self.close_retirement_leases.lock().await.complete.remove(&key);
+        let lease = self
+            .close_retirement_leases
+            .lock()
+            .await
+            .complete
+            .remove(&key);
         let Some(lease) = lease else {
             return Err(CloseLeaseFailure::Unavailable);
         };
@@ -3876,7 +3881,11 @@ impl RuntimeManager {
             .await
         }
         .await;
-        self.close_retirement_leases.lock().await.complete.insert(key, lease);
+        self.close_retirement_leases
+            .lock()
+            .await
+            .complete
+            .insert(key, lease);
         result
     }
 }
@@ -8271,7 +8280,12 @@ mod tests {
                 .archived
         );
         assert_close_admission_fenced(&manager, &scope).await;
-        assert!(manager.close_retirement_leases.lock().await.complete.is_empty());
+        assert!(manager
+            .close_retirement_leases
+            .lock()
+            .await
+            .complete
+            .is_empty());
         assert!(matches!(
             receiver.try_recv().unwrap(),
             crate::runtime::SseEvent::ConversationUpdate {
@@ -8510,7 +8524,10 @@ mod tests {
             assert!(!db.get_conversation(id).await.unwrap().archived);
             assert!(receiver.try_recv().is_err());
         }
-        assert_eq!(manager.close_retirement_leases.lock().await.complete.len(), 1);
+        assert_eq!(
+            manager.close_retirement_leases.lock().await.complete.len(),
+            1
+        );
         assert_close_admission_fenced(&manager, &scope).await;
         assert_eq!(
             sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM close_cleanup_failures")
@@ -8581,7 +8598,12 @@ mod tests {
                 ));
                 assert!(receiver.try_recv().is_err());
             }
-            assert!(manager.close_retirement_leases.lock().await.complete.is_empty());
+            assert!(manager
+                .close_retirement_leases
+                .lock()
+                .await
+                .complete
+                .is_empty());
             assert_close_admission_fenced(&manager, &scope).await;
         }
         assert_eq!(
@@ -9043,7 +9065,12 @@ mod tests {
                     ..
                 }
             ));
-            assert!(manager.close_retirement_leases.lock().await.complete.is_empty());
+            assert!(manager
+                .close_retirement_leases
+                .lock()
+                .await
+                .complete
+                .is_empty());
         }
     }
 

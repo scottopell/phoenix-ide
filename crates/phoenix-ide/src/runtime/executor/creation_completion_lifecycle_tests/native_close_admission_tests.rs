@@ -696,7 +696,9 @@ async fn dropped_initial_reply_retains_admission_until_exact_stop_releases_gate(
     let mut actor = ConversationRuntime::new(
         ConvContext::coordinator(&fixture.source_transcript_id, "test-model", 200_000, 16_384),
         fixture.state.clone(),
-        Arc::new(crate::runtime::traits::DatabaseStorage::new(fixture.db.clone())),
+        Arc::new(crate::runtime::traits::DatabaseStorage::new(
+            fixture.db.clone(),
+        )),
         Arc::new(MockLlmClient::new("test-model")),
         Arc::new(MockToolExecutor::new()),
         Arc::new(BrowserSessionManager::default()),
@@ -714,7 +716,9 @@ async fn dropped_initial_reply_retains_admission_until_exact_stop_releases_gate(
     let admitted = actor.admit_authoritative_effect().unwrap();
     let (sender, receiver) = mpsc::channel(4);
     let (watch_tx, _watch_rx) = tokio::sync::watch::channel(actor.state.clone());
-    actor = actor.with_state_watcher(watch_tx).with_acknowledged_event_receiver(receiver);
+    actor = actor
+        .with_state_watcher(watch_tx)
+        .with_acknowledged_event_receiver(receiver);
     let gate = Arc::new(Mutex::new(()));
     let target_gate = Arc::clone(&gate).lock_owned().await;
     let (response, dropped_reply) = oneshot::channel();
