@@ -472,7 +472,7 @@ def _verify_logical_equivalence(source, backup, deadline: float) -> None:
             order = ",".join(quote(column) for _, column in pk)
             identity = []
         else:
-            aliases = {"rowid", "_rowid_", "oid"} - {column.lower() for column in names}
+            aliases = {"rowid", "_rowid_", "oid"} - {text(column[1]).lower() for column in xinfo}
             if not aliases:
                 raise ActivationError(f"cannot verify rowid identity for table shadowing all rowid aliases: {name}")
             rowid = next(alias for alias in ("rowid", "_rowid_", "oid") if alias in aliases)

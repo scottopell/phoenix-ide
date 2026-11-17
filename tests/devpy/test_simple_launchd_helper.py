@@ -189,6 +189,17 @@ class SQLiteLogicalEquivalenceTests(unittest.TestCase):
         with self.assertRaisesRegex(helper.ActivationError, "unsupported SQLite virtual table module"):
             helper._verify_logical_equivalence(source, backup, helper.time.monotonic() + 10)
 
+    def test_virtual_generated_columns_still_shadow_rowid_aliases(self):
+        for alias in ("rowid", "RoWiD", "_rowid_", "OID"):
+            actual = "oid" if alias.lower() != "oid" else "_rowid_"
+            schema = f'CREATE TABLE t (value TEXT, "{alias}" GENERATED ALWAYS AS (42) VIRTUAL);'
+            self.compare(schema + f"INSERT INTO t({actual},value) VALUES (8,'x');",
+                         schema + f"INSERT INTO t({actual},value) VALUES (9,'x');",
+                         expect_difference=True)
+        schema = ('CREATE TABLE t (value TEXT, rowid AS (1), '
+                  '_rowid_ AS (2), oid AS (3));')
+        self.compare(schema, schema, expect_difference=True)
+
     def test_fails_closed_when_all_rowid_aliases_are_shadowed(self):
         self.compare("CREATE TABLE t (ROWID, _RowId_, OID);",
                      "CREATE TABLE t (ROWID, _RowId_, OID);", expect_difference=True)
