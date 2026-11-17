@@ -35,6 +35,22 @@ async fn native_retry_worktree_metadata_is_source_bound_to_pending_original_g1_e
     assert_ne!(current_test_snapshot(&db, receipt.admitted.attempt_id.as_str()).await,
         assessment.proof.snapshot);
 
+    // A fresh plan must not bypass its exact dispatch parent, even with live
+    // native retry authority. The runtime must establish that parent first.
+    let before_dispatch = retry_dispatch_state(&db, &receipt.admitted.attempt_id).await;
+    let without_dispatch = db.record_native_close_retry_worktree_cleanup_plan(
+        &assessment.command, &receipt.admitted, make_request(),
+    ).await;
+    assert!(matches!(without_dispatch,
+        LocalAuthorityResult::DurableFactEstablished(Err(DbError::Sqlx(
+            sqlx::Error::Database(ref error)
+        ))) if error.is_foreign_key_violation()
+    ));
+    assert_eq!(retry_dispatch_state(&db, &receipt.admitted.attempt_id).await, before_dispatch);
+    assert!(db.close_worktree_cleanup_plan(
+        &receipt.admitted.attempt_id, &effect.scope, &assessment.proof.snapshot, &effect.resource,
+    ).await.unwrap().is_none());
+
     success_recorded(db.record_native_close_retry_retirement_dispatch(
         &assessment.command, &receipt.admitted, &effect,
     ).await);

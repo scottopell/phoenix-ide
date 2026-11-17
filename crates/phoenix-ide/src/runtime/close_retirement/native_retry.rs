@@ -359,6 +359,24 @@ impl super::RuntimeManager {
         let root = super::worktree_path(&identity);
         let quarantine = super::worktree_quarantine_path(&identity)
             .map_err(|error| unclassified_native_retry_error("worktree_quarantine_path", &error))?;
+        // Cleanup metadata is a child of this exact dispatch. Establish its
+        // original-generation parent before inserting a fresh plan; neither write
+        // retires the worktree or establishes a successful outcome.
+        match self
+            .db()
+            .record_native_close_retry_retirement_dispatch(command, admitted, effect)
+            .await
+        {
+            LocalAuthorityResult::DurableFactUnclassified => {
+                return Err(NativeRetryExecutionError::Unclassified)
+            }
+            LocalAuthorityResult::DurableFactEstablished(Err(error)) => {
+                return self
+                    .native_retry_failure(command, admitted, context, effect, &error.to_string())
+                    .await
+            }
+            LocalAuthorityResult::DurableFactEstablished(Ok(())) => {}
+        }
         // A retained plan owns the administrative incarnation and final tombstone.
         // Never rediscover and replace it from a later filesystem generation.
         let plan = if let Some(plan) = self
@@ -409,21 +427,6 @@ impl super::RuntimeManager {
                 final_tombstone: None,
             }
         };
-        match self
-            .db()
-            .record_native_close_retry_retirement_dispatch(command, admitted, effect)
-            .await
-        {
-            LocalAuthorityResult::DurableFactUnclassified => {
-                return Err(NativeRetryExecutionError::Unclassified)
-            }
-            LocalAuthorityResult::DurableFactEstablished(Err(error)) => {
-                return self
-                    .native_retry_failure(command, admitted, context, effect, &error.to_string())
-                    .await
-            }
-            LocalAuthorityResult::DurableFactEstablished(Ok(())) => {}
-        }
         let runtime = Handle::current();
         let db = self.db().clone();
         let cmd = command.clone();
