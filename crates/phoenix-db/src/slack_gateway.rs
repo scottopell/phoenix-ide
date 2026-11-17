@@ -330,12 +330,14 @@ impl Database {
                 && prior.get("owner") == config.get("owner")
                 && prior.get("timezone") != config.get("timezone")
             {
-                let initializing: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM slack_gateway_accounts account WHERE workspace=?1 AND owner=?2 AND baseline_complete=0 AND EXISTS(SELECT 1 FROM slack_gateway_discovery scan WHERE scan.workspace=account.workspace AND scan.owner=account.owner)) OR EXISTS(SELECT 1 FROM slack_gateway_channel_inboxes WHERE workspace=?1 AND owner=?2 AND baseline_complete=0 AND scan_in_progress=1)").bind(workspace).bind(owner).fetch_one(&mut *tx).await?;
+                let initializing: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM slack_gateway_accounts account WHERE workspace=?1 AND owner=?2 AND baseline_complete=0 AND EXISTS(SELECT 1 FROM slack_gateway_discovery scan WHERE scan.workspace=account.workspace AND scan.owner=account.owner))").bind(workspace).bind(owner).fetch_one(&mut *tx).await?;
                 if initializing {
                     return Err(DbError::Serialization(
                         "Finish Slack initialization before changing its timezone".into(),
                     ));
                 }
+                sqlx::query("UPDATE slack_gateway_channel_inboxes SET cursor=NULL,after_date=NULL,scan_in_progress=0 WHERE workspace=?1 AND owner=?2 AND baseline_complete=0")
+                    .bind(workspace).bind(owner).execute(&mut *tx).await?;
             }
         }
         let outstanding: bool = sqlx::query_scalar(
@@ -3482,10 +3484,24 @@ mod tests {
         assert_eq!(retained, "2000-01-01");
         let mut changed_timezone = config.clone();
         changed_timezone["timezone"] = serde_json::json!("America/New_York");
-        assert!(db
-            .set_slack_configuration(&changed_timezone.to_string())
+        changed_timezone["inbox_channel"] = serde_json::Value::Null;
+        db.set_slack_configuration(&changed_timezone.to_string())
             .await
-            .is_err());
+            .unwrap();
+        let reset = db
+            .slack_channel_inbox("example.slack.com", "UOWNER", "CCHANNEL")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!reset.baseline_complete && !reset.scan_in_progress && reset.cursor.is_none());
+        changed_timezone["inbox_channel"] = serde_json::json!("CCHANNEL");
+        db.set_slack_configuration(&changed_timezone.to_string())
+            .await
+            .unwrap();
+        assert!(!db
+            .slack_channel_begin_scan("example.slack.com", "UOWNER", "CCHANNEL", "2000-02-01")
+            .await
+            .unwrap());
         db.slack_channel_checkpoint("example.slack.com", "UOWNER", "CCHANNEL", None)
             .await
             .unwrap();

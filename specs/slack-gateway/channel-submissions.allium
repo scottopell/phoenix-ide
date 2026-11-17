@@ -6,6 +6,8 @@ use "./discovery.allium" as discovery
 
 external entity SubmissionPage {
     inbox: SubmissionInbox
+    search_call: discovery/SlackCall
+    position_read: String?
     next_position: String?
     observations: Set<lifecycle/VerifiedObservation>
 }
@@ -43,6 +45,36 @@ entity SubmissionInbox {
     last_error: String?
 }
 
+rule ConfigureSubmissionChannel {
+    when: OwnerSetsSubmissionChannel(controller, channel)
+    requires: controller.active_services.count = 0
+    ensures: controller.gateway.inbox_channel = channel
+    ensures:
+        if channel = null:
+            controller.gateway.inbox_baseline_complete = false
+        else:
+            if not SubmissionInbox.exists(controller: controller, channel: channel):
+                controller.gateway.inbox_baseline_complete = false
+                SubmissionInbox.created(controller: controller, channel: channel,
+                    position: null, baseline_complete: false, scan_in_progress: false,
+                    last_complete_scan_at: null, last_error: null)
+            else:
+                controller.gateway.inbox_baseline_complete = SubmissionInbox{controller: controller, channel: channel}.baseline_complete
+}
+
+rule StartSubmissionSweep {
+    when: EnsureSubmissionProgress(service, queue)
+    requires: service.kind = discovery
+    requires: service.phase = searching
+    requires: service.controller = queue.controller
+    requires: service.controller.gateway.enabled
+    requires: service.controller.gateway.inbox_channel = queue.channel
+    requires: not service.inbox_sweep_completed and not service.inbox_page_failed
+    requires: not queue.scan_in_progress
+    ensures: queue.scan_in_progress = true
+    ensures: queue.position = null
+}
+
 rule GrantSubmissionPageCall {
     when: RequestSubmissionPage(service, queue)
     requires: service.kind = discovery
@@ -51,6 +83,7 @@ rule GrantSubmissionPageCall {
     requires: service.controller = queue.controller
     requires: service.controller.gateway.enabled
     requires: service.controller.gateway.inbox_channel = queue.channel
+    requires: queue.scan_in_progress
     requires: service.next_query = inbox
     requires: not service.inbox_sweep_completed and not service.inbox_page_failed
     requires: service.in_flight_calls.count = 0
@@ -86,19 +119,30 @@ rule AcceptSubmission {
 }
 
 rule CheckpointSubmissionPage {
-    when: SubmissionPageVerified(service, inbox, page)
-    requires: page.inbox = inbox
-    requires: service.controller = inbox.controller
+    when: SubmissionPageVerified(service, queue, page)
+    requires: service.kind = discovery
+    requires: service.phase = searching
+    requires: service.next_query = inbox
+    requires: page.inbox = queue
+    requires: service.controller = queue.controller
+    requires: service.controller.gateway.enabled
+    requires: service.controller.gateway.inbox_channel = queue.channel
+    requires: not service.inbox_sweep_completed and not service.inbox_page_failed
+    requires: page.search_call.service = service
+    requires: page.search_call.purpose = inbox_page
+    requires: page.search_call.state = resolved
+    requires: page.position_read = queue.position
+    requires: page.observations.all(o => o.source_key in service.controller.gateway.handled_sources)
     requires: service.in_flight_calls.count = 0
-    ensures: inbox.position = page.next_position
-    ensures: inbox.scan_in_progress = page.next_position != null
+    ensures: queue.position = page.next_position
+    ensures: queue.scan_in_progress = page.next_position != null
     ensures: service.next_query = prefix
     ensures:
         if page.next_position = null:
-            inbox.baseline_complete = true
-            inbox.controller.gateway.inbox_baseline_complete = true
-            inbox.last_complete_scan_at = now
-            inbox.last_error = null
+            queue.baseline_complete = true
+            queue.controller.gateway.inbox_baseline_complete = true
+            queue.last_complete_scan_at = now
+            queue.last_error = null
             service.inbox_sweep_completed = true
 }
 
@@ -116,21 +160,35 @@ rule RetainSubmissionFailure {
             queue.position = null
 }
 
+rule ResetIncompleteSubmissionBoundary {
+    when: OwnerChangesSubmissionTimezone(owner_controller)
+    requires: owner_controller.active_services.count = 0
+    ensures:
+        for queue in SubmissionInboxes where controller = owner_controller and not baseline_complete:
+            queue.position = null
+            queue.scan_in_progress = false
+}
+
 surface SubmissionBoundary {
     facing inbox: SubmissionInbox
     contracts:
         demands SubmissionPort
     provides:
+        OwnerSetsSubmissionChannel(controller, channel)
+        EnsureSubmissionProgress(service, queue)
         RequestSubmissionPage(service, queue)
         SubmissionVerified(inbox, observation)
-        SubmissionPageVerified(service, inbox, page)
+        SubmissionPageVerified(service, queue, page)
         SubmissionPageFailed(service, queue, reason, restart_query)
+        OwnerChangesSubmissionTimezone(controller)
     @guarantee SharedExecutionAndAllowance
         -- Channel scans run only inside ordinary serialized discovery services,
         -- sharing call allowance, backoff, burst duration and accepted-work reserve.
         -- Enabled searches rotate fairly; a failing channel scan does not reset
         -- emoji or Saved progress. Disabling a channel or restarting preserves its
         -- handled identities; channel-specific retained state controls initialization.
+        -- A timezone change restarts incomplete channel initialization with a new
+        -- calendar boundary, preserving handled identities and accepted work.
     @guarantee PrivateHandoff
         -- Each submission creates fresh native work. The intentional result in
         -- the submission thread includes its Phoenix link. Clarifications use
