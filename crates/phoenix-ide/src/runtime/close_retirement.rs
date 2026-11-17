@@ -110,7 +110,9 @@ pub(crate) async fn collect_native_initial_inspection(
     if obligation.attempt_id() != &attempt_id
         || obligation.phase() != ClosePhase::AwaitingRetirementInspection
     {
-        return Err(Failure::Storage("initial inspection is not awaiting retirement inspection".into()));
+        return Err(Failure::Storage(
+            "initial inspection is not awaiting retirement inspection".into(),
+        ));
     }
     let empty_generation = (obligation.snapshot().is_some())
         .then(|| format!("server_git_status_v2_retry_{}", uuid::Uuid::new_v4()));
@@ -136,30 +138,37 @@ pub(crate) async fn collect_native_initial_inspection(
         let actual_path = match path.try_exists() {
             Ok(true) => path,
             Ok(false) => {
-                let quarantine = worktree_quarantine_path(&identity).map_err(|detail| Failure::Scope {
-                    scope: scope.clone(),
-                    reason: RetirementFailureReason::IdentityNotProven,
-                    detail,
-                })?;
+                let quarantine =
+                    worktree_quarantine_path(&identity).map_err(|detail| Failure::Scope {
+                        scope: scope.clone(),
+                        reason: RetirementFailureReason::IdentityNotProven,
+                        detail,
+                    })?;
                 match quarantine.try_exists() {
                     Ok(true) => quarantine,
-                    Ok(false) => return Err(Failure::Scope {
-                        scope,
-                        reason: RetirementFailureReason::IdentityNotProven,
-                        detail: "captured worktree is absent before inspection".into(),
-                    }),
-                    Err(error) => return Err(Failure::Scope {
-                        scope,
-                        reason: RetirementFailureReason::ManualRepairRequired,
-                        detail: error.to_string(),
-                    }),
+                    Ok(false) => {
+                        return Err(Failure::Scope {
+                            scope,
+                            reason: RetirementFailureReason::IdentityNotProven,
+                            detail: "captured worktree is absent before inspection".into(),
+                        })
+                    }
+                    Err(error) => {
+                        return Err(Failure::Scope {
+                            scope,
+                            reason: RetirementFailureReason::ManualRepairRequired,
+                            detail: error.to_string(),
+                        })
+                    }
                 }
             }
-            Err(error) => return Err(Failure::Scope {
-                scope,
-                reason: RetirementFailureReason::ManualRepairRequired,
-                detail: error.to_string(),
-            }),
+            Err(error) => {
+                return Err(Failure::Scope {
+                    scope,
+                    reason: RetirementFailureReason::ManualRepairRequired,
+                    detail: error.to_string(),
+                })
+            }
         };
         if observe_worktree_fingerprint(&actual_path).as_deref()
             != Some(identity.fingerprint().as_str())
@@ -170,23 +179,31 @@ pub(crate) async fn collect_native_initial_inspection(
                 detail: "captured worktree administrative incarnation changed".into(),
             });
         }
-        let (snapshot, losses) = inspect_worktree_at(&identity, actual_path)
-            .await
-            .map_err(|detail| Failure::Scope {
-                scope: scope.clone(),
-                reason: RetirementFailureReason::ManualRepairRequired,
-                detail,
-            })?;
+        let (snapshot, losses) =
+            inspect_worktree_at(&identity, actual_path)
+                .await
+                .map_err(|detail| Failure::Scope {
+                    scope: scope.clone(),
+                    reason: RetirementFailureReason::ManualRepairRequired,
+                    detail,
+                })?;
         let snapshot = rotate_inspection_generation(snapshot, empty_generation.as_deref())
             .map_err(|detail| Failure::Scope {
                 scope: scope.clone(),
                 reason: RetirementFailureReason::ManualRepairRequired,
                 detail,
             })?;
-        requests.push(ReplaceCloseInspectionScopeRequest { scope, snapshot, losses });
+        requests.push(ReplaceCloseInspectionScopeRequest {
+            scope,
+            snapshot,
+            losses,
+        });
     }
     Ok(NativeInitialInspection {
-        request: ReplaceCloseInspectionRequest { attempt_id, scopes: requests },
+        request: ReplaceCloseInspectionRequest {
+            attempt_id,
+            scopes: requests,
+        },
         empty_generation,
     })
 }

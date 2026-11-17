@@ -2317,8 +2317,9 @@ where
     fatal_local_authority_rx: Option<watch::Receiver<Option<&'static str>>>,
     fatal_external_effect_cancellation: Option<CancellationToken>,
     #[cfg(test)]
-    native_close_phase_observer:
-        Option<tokio::sync::mpsc::UnboundedSender<native_close::NativeCloseInitialContinuationPhase>>,
+    native_close_phase_observer: Option<
+        tokio::sync::mpsc::UnboundedSender<native_close::NativeCloseInitialContinuationPhase>,
+    >,
     #[cfg(test)]
     external_effect_dispatch_barrier: Option<Arc<tokio::sync::Barrier>>,
     #[cfg(test)]
@@ -3242,7 +3243,8 @@ where
         startup_authority.owner = None;
         drop(startup_authority);
 
-        let mut pending_native_close_initial: Option<native_close::NativeCloseInitialContinuation> = None;
+        let mut pending_native_close_initial: Option<native_close::NativeCloseInitialContinuation> =
+            None;
         let mut native_close_step_ready = false;
         // Retain one absolute deadline across select iterations. Recreating a
         // relative sleep lets ordinary request traffic postpone Close forever.
@@ -3275,15 +3277,22 @@ where
         .then(|| tokio::time::Instant::now() + Duration::from_secs(30));
         loop {
             if deferred_native_close_exit.is_some() && pending_native_close_initial.is_none() {
-                return deferred_native_close_exit.take().expect("checked deferred exit");
+                return deferred_native_close_exit
+                    .take()
+                    .expect("checked deferred exit");
             }
             if self.fatal_local_authority_fence.is_closed() {
-                if self.fatal_local_authority_fence.fatal_authority_loss_is_latched() {
+                if self
+                    .fatal_local_authority_fence
+                    .fatal_authority_loss_is_latched()
+                {
                     return self.closed_authority_exit().await;
                 }
                 if deferred_native_close_exit.is_none() {
                     self.abort_external_effects().await;
-                    defer_exit_until_native_close_observed!(RuntimeExitDisposition::CoordinatedShutdown);
+                    defer_exit_until_native_close_observed!(
+                        RuntimeExitDisposition::CoordinatedShutdown
+                    );
                 }
             }
             if deferred_native_close_exit.is_none() {

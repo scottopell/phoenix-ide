@@ -20,19 +20,29 @@ pub(super) fn refuse_during_exit(request: crate::runtime::AcknowledgedRuntimeReq
     use crate::runtime::AcknowledgedRuntimeRequest as Request;
     match request {
         Request::Event(request) => {
-            let _ = request.acknowledgement.send(Err("runtime is exiting".into()));
+            let _ = request
+                .acknowledgement
+                .send(Err("runtime is exiting".into()));
         }
         Request::ExecuteNativeCloseInitial(request) => {
-            let _ = request.response.send(Err(NativeCloseApplicationError::Unavailable));
+            let _ = request
+                .response
+                .send(Err(NativeCloseApplicationError::Unavailable));
         }
         Request::ExecuteNativeCloseObserve(request) => {
-            let _ = request.response.send(Err(NativeCloseApplicationError::Unavailable));
+            let _ = request
+                .response
+                .send(Err(NativeCloseApplicationError::Unavailable));
         }
         Request::ExecuteNativeCloseRetry(request) => {
-            let _ = request.response.send(Err(NativeCloseApplicationError::Unavailable));
+            let _ = request
+                .response
+                .send(Err(NativeCloseApplicationError::Unavailable));
         }
         Request::ExecuteNativeTaskApproval { response, .. } => {
-            let _ = response.send(crate::runtime::task_approval_admission::NativeTaskApprovalOutcome::Unavailable);
+            let _ = response.send(
+                crate::runtime::task_approval_admission::NativeTaskApprovalOutcome::Unavailable,
+            );
         }
         #[cfg(test)]
         Request::InspectNativeTaskApprovalAdmission { response, .. } => {
@@ -56,9 +66,9 @@ pub(super) struct NativeCloseInitialContinuation {
     pub(super) terminal_observation_retry: bool,
     pub(super) authority: RuntimeSettlementAuthority,
     pub(super) _target_gate: tokio::sync::OwnedMutexGuard<()>,
-    pub(super) _response: Option<tokio::sync::oneshot::Sender<
-        Result<NativeCloseInitialResult, NativeCloseApplicationError>,
-    >>,
+    pub(super) _response: Option<
+        tokio::sync::oneshot::Sender<Result<NativeCloseInitialResult, NativeCloseApplicationError>>,
+    >,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -86,7 +96,10 @@ struct NativeInitialInspectionFailureIntent {
 
 pub(super) enum NativeCloseInitialAdmission {
     Finished(NativeCloseInitialResult),
-    Continued { result: NativeCloseInitialResult, continuation: NativeCloseInitialContinuation },
+    Continued {
+        result: NativeCloseInitialResult,
+        continuation: NativeCloseInitialContinuation,
+    },
 }
 
 impl Drop for NativeCloseInitialContinuation {
@@ -179,7 +192,11 @@ impl NativeCloseInitialContinuation {
     }
 
     pub(super) fn next_service_at(&self) -> tokio::time::Instant {
-        let delay_ms = if self.collecting_inspection() { 100 } else { 250 };
+        let delay_ms = if self.collecting_inspection() {
+            100
+        } else {
+            250
+        };
         tokio::time::Instant::now() + std::time::Duration::from_millis(delay_ms)
     }
 
@@ -193,9 +210,14 @@ impl NativeCloseInitialContinuation {
 
     #[cfg(test)]
     pub(super) async fn await_inspection_completion_for_test(&mut self) {
-        let handle = self.inspection.take().expect("inspection must be collecting");
+        let handle = self
+            .inspection
+            .take()
+            .expect("inspection must be collecting");
         let result = handle.await;
-        self.inspection = Some(tokio::spawn(async move { result.expect("collector task must finish") }));
+        self.inspection = Some(tokio::spawn(async move {
+            result.expect("collector task must finish")
+        }));
         // The collector's actual result was awaited above; only schedule the completed
         // replacement handle so the ordinary actor step can consume it unchanged.
         while !self.inspection.as_ref().unwrap().is_finished() {
@@ -204,7 +226,8 @@ impl NativeCloseInitialContinuation {
     }
 
     fn live_source_matches(&self, live_source: &phoenix_core::domain::sm_state::ConvState) -> bool {
-        let phoenix_db::native_close::NativeCloseIntent::Initial { target } = self.command.intent() else {
+        let phoenix_db::native_close::NativeCloseIntent::Initial { target } = self.command.intent()
+        else {
             return false;
         };
         initial_command_from_executing_source(
@@ -212,10 +235,14 @@ impl NativeCloseInitialContinuation {
             self.command.source_transcript_id(),
             self.command.source(),
             target.clone(),
-        ).is_ok_and(|command| command == self.command)
+        )
+        .is_ok_and(|command| command == self.command)
     }
 
-    pub(super) fn abort_inspection_if_source_revoked(&mut self, live_source: &phoenix_core::domain::sm_state::ConvState) {
+    pub(super) fn abort_inspection_if_source_revoked(
+        &mut self,
+        live_source: &phoenix_core::domain::sm_state::ConvState,
+    ) {
         if self.collecting_inspection() && !self.live_source_matches(live_source) {
             if let Some(handle) = self.inspection.take() {
                 handle.abort();
@@ -238,7 +265,11 @@ impl NativeCloseInitialContinuation {
         }
         match self.phase {
             Phase::ClassifyingExitInterruption => {
-                match self.db.interrupt_native_close_initial(&self.command, &self.receipt).await {
+                match self
+                    .db
+                    .interrupt_native_close_initial(&self.command, &self.receipt)
+                    .await
+                {
                     LocalAuthorityResult::DurableFactEstablished(Ok(_)) => {
                         self.phase = Phase::ObservingTerminal;
                         if self.release_if_exactly_stopped().await {
@@ -255,11 +286,19 @@ impl NativeCloseInitialContinuation {
                     }
                 }
             }
-            Phase::Prepare => match self.db.prepare_native_close_initial_execution(&self.command, &self.receipt, live_source).await {
+            Phase::Prepare => match self
+                .db
+                .prepare_native_close_initial_execution(&self.command, &self.receipt, live_source)
+                .await
+            {
                 LocalAuthorityResult::DurableFactEstablished(Ok(execution)) => {
                     self.phase = match execution.phase {
-                        phoenix_core::domain::close::ClosePhase::SettlingActiveWork => Phase::Settle,
-                        phoenix_core::domain::close::ClosePhase::AwaitingStopWorkConfirmation => Phase::AwaitingStopWorkConfirmation,
+                        phoenix_core::domain::close::ClosePhase::SettlingActiveWork => {
+                            Phase::Settle
+                        }
+                        phoenix_core::domain::close::ClosePhase::AwaitingStopWorkConfirmation => {
+                            Phase::AwaitingStopWorkConfirmation
+                        }
                         phase => Phase::ReachedSettlementPhase(phase),
                     };
                     Ok(self.phase)
@@ -268,22 +307,38 @@ impl NativeCloseInitialContinuation {
                     self.phase = Phase::InspectionRequired;
                     Err(NativeCloseApplicationError::Storage)
                 }
-                LocalAuthorityResult::DurableFactUnclassified => Err(NativeCloseApplicationError::FatalAuthority),
-            },
-            Phase::Settle | Phase::WaitingForQuiescence => match self.db.try_settle_native_close_initial(&self.command, &self.receipt, live_source).await {
-                LocalAuthorityResult::DurableFactEstablished(Ok(phoenix_db::native_close::NativeCloseInitialSettlement::WaitingForQuiescence)) => {
-                    self.phase = Phase::WaitingForQuiescence; Ok(self.phase)
+                LocalAuthorityResult::DurableFactUnclassified => {
+                    Err(NativeCloseApplicationError::FatalAuthority)
                 }
-                LocalAuthorityResult::DurableFactEstablished(Ok(phoenix_db::native_close::NativeCloseInitialSettlement::Advanced(execution))) => {
-                    self.phase = Phase::ReachedSettlementPhase(execution.phase); Ok(self.phase)
+            },
+            Phase::Settle | Phase::WaitingForQuiescence => match self
+                .db
+                .try_settle_native_close_initial(&self.command, &self.receipt, live_source)
+                .await
+            {
+                LocalAuthorityResult::DurableFactEstablished(Ok(
+                    phoenix_db::native_close::NativeCloseInitialSettlement::WaitingForQuiescence,
+                )) => {
+                    self.phase = Phase::WaitingForQuiescence;
+                    Ok(self.phase)
+                }
+                LocalAuthorityResult::DurableFactEstablished(Ok(
+                    phoenix_db::native_close::NativeCloseInitialSettlement::Advanced(execution),
+                )) => {
+                    self.phase = Phase::ReachedSettlementPhase(execution.phase);
+                    Ok(self.phase)
                 }
                 LocalAuthorityResult::DurableFactEstablished(Err(_)) => {
                     self.phase = Phase::InspectionRequired;
                     Err(NativeCloseApplicationError::Storage)
                 }
-                LocalAuthorityResult::DurableFactUnclassified => Err(NativeCloseApplicationError::FatalAuthority),
+                LocalAuthorityResult::DurableFactUnclassified => {
+                    Err(NativeCloseApplicationError::FatalAuthority)
+                }
             },
-            Phase::ReachedSettlementPhase(phoenix_core::domain::close::ClosePhase::AwaitingRetirementInspection) => {
+            Phase::ReachedSettlementPhase(
+                phoenix_core::domain::close::ClosePhase::AwaitingRetirementInspection,
+            ) => {
                 if !self.live_source_matches(live_source) {
                     self.phase = Phase::InspectionRequired;
                     return Err(NativeCloseApplicationError::SourceRefused);
@@ -301,15 +356,30 @@ impl NativeCloseInitialContinuation {
                     self.abort_inspection_if_source_revoked(live_source);
                     return Err(NativeCloseApplicationError::SourceRefused);
                 }
-                if !self.inspection.as_ref().is_some_and(tokio::task::JoinHandle::is_finished) {
+                if !self
+                    .inspection
+                    .as_ref()
+                    .is_some_and(tokio::task::JoinHandle::is_finished)
+                {
                     return Ok(self.phase);
                 }
-                let handle = self.inspection.take().expect("collecting inspection has owned handle");
+                let handle = self
+                    .inspection
+                    .take()
+                    .expect("collecting inspection has owned handle");
                 let collected = match handle.await {
                     Ok(Ok(collected)) => collected,
-                    Ok(Err(NativeInitialInspectionFailure::Scope { scope, reason, detail })) => {
+                    Ok(Err(NativeInitialInspectionFailure::Scope {
+                        scope,
+                        reason,
+                        detail,
+                    })) => {
                         tracing::warn!(%scope, ?reason, %detail, "native Close read-only inspection requires durable terminal classification");
-                        self.inspection_failure = Some(NativeInitialInspectionFailureIntent { scope, reason, detail });
+                        self.inspection_failure = Some(NativeInitialInspectionFailureIntent {
+                            scope,
+                            reason,
+                            detail,
+                        });
                         self.phase = Phase::ClassifyingInspectionFailure;
                         return Ok(self.phase);
                     }
@@ -324,13 +394,29 @@ impl NativeCloseInitialContinuation {
                         return Err(NativeCloseApplicationError::Storage);
                     }
                 };
-                let loss_count: usize = collected.request.scopes.iter().map(|scope| scope.losses.len()).sum();
-                match self.db.replace_native_close_initial_inspection(
-                    &self.command, &self.receipt, live_source,
-                    collected.request, collected.empty_generation.as_deref(),
-                ).await {
+                let loss_count: usize = collected
+                    .request
+                    .scopes
+                    .iter()
+                    .map(|scope| scope.losses.len())
+                    .sum();
+                match self
+                    .db
+                    .replace_native_close_initial_inspection(
+                        &self.command,
+                        &self.receipt,
+                        live_source,
+                        collected.request,
+                        collected.empty_generation.as_deref(),
+                    )
+                    .await
+                {
                     LocalAuthorityResult::DurableFactEstablished(Ok(())) => {
-                        let obligation = match self.db.get_close_obligation(self.receipt.admitted.attempt_id.as_str()).await {
+                        let obligation = match self
+                            .db
+                            .get_close_obligation(self.receipt.admitted.attempt_id.as_str())
+                            .await
+                        {
                             Ok(obligation) => obligation,
                             Err(error) => {
                                 tracing::warn!(%error, "initial inspection committed but its resulting phase could not be read");
@@ -347,15 +433,29 @@ impl NativeCloseInitialContinuation {
                         self.phase = Phase::InspectionRequired;
                         Err(NativeCloseApplicationError::Storage)
                     }
-                    LocalAuthorityResult::DurableFactUnclassified => Err(NativeCloseApplicationError::FatalAuthority),
+                    LocalAuthorityResult::DurableFactUnclassified => {
+                        Err(NativeCloseApplicationError::FatalAuthority)
+                    }
                 }
             }
             Phase::ClassifyingInspectionFailure => {
-                let failure = self.inspection_failure.as_ref().expect("classification phase owns typed failure intent").clone();
-                match self.db.terminalize_native_close_initial_inspection_failure(
-                    &self.command, &self.receipt, live_source,
-                    &failure.scope, failure.reason, &failure.detail,
-                ).await {
+                let failure = self
+                    .inspection_failure
+                    .as_ref()
+                    .expect("classification phase owns typed failure intent")
+                    .clone();
+                match self
+                    .db
+                    .terminalize_native_close_initial_inspection_failure(
+                        &self.command,
+                        &self.receipt,
+                        live_source,
+                        &failure.scope,
+                        failure.reason,
+                        &failure.detail,
+                    )
+                    .await
+                {
                     LocalAuthorityResult::DurableFactEstablished(Ok(_obligation)) => {
                         self.inspection_failure = None;
                         self.phase = Phase::ObservingTerminal;
@@ -368,7 +468,9 @@ impl NativeCloseInitialContinuation {
                         tracing::warn!(%error, "native Close failure classification definitely rolled back; retaining owner and retrying classification only");
                         Ok(self.phase)
                     }
-                    LocalAuthorityResult::DurableFactUnclassified => Err(NativeCloseApplicationError::FatalAuthority),
+                    LocalAuthorityResult::DurableFactUnclassified => {
+                        Err(NativeCloseApplicationError::FatalAuthority)
+                    }
                 }
             }
             Phase::ObservingTerminal => {
@@ -401,7 +503,9 @@ where
         target: ProductConversationId,
         admitted: crate::runtime::AdmittedOperation,
         target_gate: tokio::sync::OwnedMutexGuard<()>,
-        response: tokio::sync::oneshot::Sender<Result<NativeCloseInitialResult, NativeCloseApplicationError>>,
+        response: tokio::sync::oneshot::Sender<
+            Result<NativeCloseInitialResult, NativeCloseApplicationError>,
+        >,
     ) -> Result<NativeCloseInitialAdmission, NativeCloseApplicationError> {
         let mut authority = RuntimeSettlementAuthority {
             owner: Some(admitted),
@@ -441,7 +545,9 @@ where
             }
         };
         match db.apply_native_close_initial(&command).await {
-            LocalAuthorityResult::DurableFactEstablished(Ok(NativeCloseInitialResult::NewlyAdmitted(receipt))) => {
+            LocalAuthorityResult::DurableFactEstablished(Ok(
+                NativeCloseInitialResult::NewlyAdmitted(receipt),
+            )) => {
                 let result = NativeCloseInitialResult::NewlyAdmitted(receipt.clone());
                 let continuation = NativeCloseInitialContinuation {
                     command,
@@ -456,7 +562,10 @@ where
                     _target_gate: target_gate,
                     _response: Some(response),
                 };
-                Ok(NativeCloseInitialAdmission::Continued { result, continuation })
+                Ok(NativeCloseInitialAdmission::Continued {
+                    result,
+                    continuation,
+                })
             }
             LocalAuthorityResult::DurableFactEstablished(Ok(result)) => {
                 authority.owner = None;

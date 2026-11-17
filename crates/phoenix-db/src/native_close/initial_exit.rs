@@ -22,20 +22,26 @@ impl Database {
         };
         let result = async {
             let NativeCloseIntent::Initial { target } = command.intent() else {
-                return Err(precondition("process exit requires an initial Close command"));
+                return Err(precondition(
+                    "process exit requires an initial Close command",
+                ));
             };
             if receipt.request_id != command.request_id()
                 || receipt.admitted.target != *target
                 || receipt.admitted.run_ordinal != CloseRunOrdinal::INITIAL
             {
-                return Err(precondition("initial Close receipt does not match the command"));
+                return Err(precondition(
+                    "initial Close receipt does not match the command",
+                ));
             }
 
             let retained = super::receipts::read_receipt_tx(&mut tx, command)
                 .await?
                 .ok_or_else(|| precondition("exact initial Close receipt is missing"))?;
             if retained != receipt.admitted {
-                return Err(precondition("initial Close receipt does not bind the admitted run"));
+                return Err(precondition(
+                    "initial Close receipt does not bind the admitted run",
+                ));
             }
 
             let row = sqlx::query(
@@ -62,7 +68,9 @@ impl Database {
                 || retained_target != target.as_str()
                 || ordinal != CloseRunOrdinal::INITIAL.get()
             {
-                return Err(precondition("receipt does not identify a native initial Close run"));
+                return Err(precondition(
+                    "receipt does not identify a native initial Close run",
+                ));
             }
 
             let run = CloseRunRef {
@@ -71,11 +79,15 @@ impl Database {
             };
             if status == "running" {
                 if latest_ordinal != Some(CloseRunOrdinal::INITIAL.get()) {
-                    return Err(precondition("initial Close run is no longer the latest run"));
+                    return Err(precondition(
+                        "initial Close run is no longer the latest run",
+                    ));
                 }
                 let classified = super::interrupt_native_retry_tx(&mut tx, &run)
                     .await?
-                    .ok_or_else(|| precondition("native initial Close interruption was not classified"))?;
+                    .ok_or_else(|| {
+                        precondition("native initial Close interruption was not classified")
+                    })?;
                 Ok(classified)
             } else {
                 crate::close_foundation::close_obligation_for_update(
@@ -177,14 +189,22 @@ mod tests {
                 )) => receipt,
                 other => panic!("initial admission failed: {other:?}"),
             };
-            Self { db, command, receipt }
+            Self {
+                db,
+                command,
+                receipt,
+            }
         }
     }
 
-    fn established(result: LocalAuthorityResult<DbResult<CloseObligation>>) -> DbResult<CloseObligation> {
+    fn established(
+        result: LocalAuthorityResult<DbResult<CloseObligation>>,
+    ) -> DbResult<CloseObligation> {
         match result {
             LocalAuthorityResult::DurableFactEstablished(result) => result,
-            LocalAuthorityResult::DurableFactUnclassified => panic!("durable result was unclassified"),
+            LocalAuthorityResult::DurableFactUnclassified => {
+                panic!("durable result was unclassified")
+            }
         }
     }
 
@@ -192,7 +212,10 @@ mod tests {
     async fn exact_interruption_replay_retains_one_failure_and_outbox() {
         let fixture = Fixture::new().await;
         assert_eq!(run_status(&fixture).await, "running");
-        assert!(matches!(source_state(&fixture).await, ConvState::ToolExecuting { .. }));
+        assert!(matches!(
+            source_state(&fixture).await,
+            ConvState::ToolExecuting { .. }
+        ));
         let first = established(
             fixture
                 .db
@@ -200,10 +223,11 @@ mod tests {
                 .await,
         )
         .unwrap();
-        let failures_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM close_cleanup_failures")
-            .fetch_one(fixture.db.pool())
-            .await
-            .unwrap();
+        let failures_before: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM close_cleanup_failures")
+                .fetch_one(fixture.db.pool())
+                .await
+                .unwrap();
         let events_before: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM coordinator_watch_events WHERE route_kind = 'mandatory_close_failure'",
         )
@@ -224,9 +248,18 @@ mod tests {
         assert_eq!(events_before, 1);
         assert_eq!(run_status(&fixture).await, "stopped");
         assert_eq!(target_archived(&fixture).await, 0);
-        assert_eq!(sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM close_cleanup_failures").fetch_one(fixture.db.pool()).await.unwrap(), failures_before);
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM close_cleanup_failures")
+                .fetch_one(fixture.db.pool())
+                .await
+                .unwrap(),
+            failures_before
+        );
         assert_eq!(sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM coordinator_watch_events WHERE route_kind = 'mandatory_close_failure'").fetch_one(fixture.db.pool()).await.unwrap(), events_before);
-        assert!(matches!(source_state(&fixture).await, ConvState::ToolExecuting { .. }));
+        assert!(matches!(
+            source_state(&fixture).await,
+            ConvState::ToolExecuting { .. }
+        ));
     }
 
     #[tokio::test]
@@ -237,25 +270,42 @@ mod tests {
         assert_eq!(run_status(&fixture).await, "running");
         assert_eq!(failure_count(&fixture).await, 0);
         assert!(established(
-            fixture.db.interrupt_native_close_initial(&fixture.command, &forged).await,
+            fixture
+                .db
+                .interrupt_native_close_initial(&fixture.command, &forged)
+                .await,
         )
         .is_err());
 
         let wrong_source = NativeCloseCommand::new(
             fixture.command.source_transcript_id().to_owned(),
-            SourceToolCall { message_id: "forged-message".into(), tool_use_id: "forged-tool".into() },
+            SourceToolCall {
+                message_id: "forged-message".into(),
+                tool_use_id: "forged-tool".into(),
+            },
             fixture.command.intent().clone(),
-        ).unwrap();
+        )
+        .unwrap();
         assert!(established(
-            fixture.db.interrupt_native_close_initial(&wrong_source, &fixture.receipt).await,
+            fixture
+                .db
+                .interrupt_native_close_initial(&wrong_source, &fixture.receipt)
+                .await,
         )
         .is_err());
-        let status: String = sqlx::query_scalar("SELECT status FROM close_runs WHERE attempt_id = ?1 AND run_ordinal = 1")
-            .bind(fixture.receipt.admitted.attempt_id.as_str())
-            .fetch_one(fixture.db.pool()).await.unwrap();
+        let status: String = sqlx::query_scalar(
+            "SELECT status FROM close_runs WHERE attempt_id = ?1 AND run_ordinal = 1",
+        )
+        .bind(fixture.receipt.admitted.attempt_id.as_str())
+        .fetch_one(fixture.db.pool())
+        .await
+        .unwrap();
         assert_eq!(status, "running");
         assert_eq!(failure_count(&fixture).await, 0);
-        assert!(matches!(source_state(&fixture).await, ConvState::ToolExecuting { .. }));
+        assert!(matches!(
+            source_state(&fixture).await,
+            ConvState::ToolExecuting { .. }
+        ));
     }
 
     #[tokio::test]
@@ -270,26 +320,46 @@ mod tests {
         .await
         .unwrap();
         let error = established(
-            fixture.db.interrupt_native_close_initial(&fixture.command, &fixture.receipt).await,
+            fixture
+                .db
+                .interrupt_native_close_initial(&fixture.command, &fixture.receipt)
+                .await,
         )
         .unwrap_err();
-        assert!(error.to_string().contains("injected mandatory outbox failure"));
-        let status: String = sqlx::query_scalar("SELECT status FROM close_runs WHERE attempt_id = ?1 AND run_ordinal = 1")
-            .bind(fixture.receipt.admitted.attempt_id.as_str())
-            .fetch_one(fixture.db.pool()).await.unwrap();
+        assert!(error
+            .to_string()
+            .contains("injected mandatory outbox failure"));
+        let status: String = sqlx::query_scalar(
+            "SELECT status FROM close_runs WHERE attempt_id = ?1 AND run_ordinal = 1",
+        )
+        .bind(fixture.receipt.admitted.attempt_id.as_str())
+        .fetch_one(fixture.db.pool())
+        .await
+        .unwrap();
         assert_eq!(status, "running");
-        assert_eq!(sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM close_cleanup_failures").fetch_one(fixture.db.pool()).await.unwrap(), 0);
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM close_cleanup_failures")
+                .fetch_one(fixture.db.pool())
+                .await
+                .unwrap(),
+            0
+        );
         assert_eq!(sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM coordinator_watch_events WHERE route_kind = 'mandatory_close_failure'").fetch_one(fixture.db.pool()).await.unwrap(), 0);
-        assert!(matches!(source_state(&fixture).await, ConvState::ToolExecuting { .. }));
+        assert!(matches!(
+            source_state(&fixture).await,
+            ConvState::ToolExecuting { .. }
+        ));
         assert_eq!(target_archived(&fixture).await, 0);
     }
 
     async fn run_status(fixture: &Fixture) -> String {
-        sqlx::query_scalar("SELECT status FROM close_runs WHERE attempt_id = ?1 AND run_ordinal = 1")
-            .bind(fixture.receipt.admitted.attempt_id.as_str())
-            .fetch_one(fixture.db.pool())
-            .await
-            .unwrap()
+        sqlx::query_scalar(
+            "SELECT status FROM close_runs WHERE attempt_id = ?1 AND run_ordinal = 1",
+        )
+        .bind(fixture.receipt.admitted.attempt_id.as_str())
+        .fetch_one(fixture.db.pool())
+        .await
+        .unwrap()
     }
 
     async fn failure_count(fixture: &Fixture) -> i64 {
