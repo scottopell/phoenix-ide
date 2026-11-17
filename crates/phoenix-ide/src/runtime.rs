@@ -776,6 +776,8 @@ pub struct RuntimeManager {
     #[cfg(test)]
     fork_command_barrier: AsyncMutex<Option<Arc<tokio::sync::Barrier>>>,
     #[cfg(test)]
+    native_admission_prewrite_barrier: AsyncMutex<Option<Arc<tokio::sync::Barrier>>>,
+    #[cfg(test)]
     browser_retirement_barrier: AsyncMutex<Option<Arc<tokio::sync::Barrier>>>,
     #[cfg(test)]
     hard_delete_barrier: AsyncMutex<Option<Arc<tokio::sync::Barrier>>>,
@@ -2713,6 +2715,8 @@ impl RuntimeManager {
             runtime_exit_barriers: AsyncMutex::new(HashMap::new()),
             #[cfg(test)]
             fork_command_barrier: AsyncMutex::new(None),
+            #[cfg(test)]
+            native_admission_prewrite_barrier: AsyncMutex::new(None),
             #[cfg(test)]
             browser_retirement_barrier: AsyncMutex::new(None),
             #[cfg(test)]
@@ -4875,6 +4879,8 @@ impl RuntimeManager {
             .await
         {
             Ok(()) => {
+                #[cfg(test)]
+                control.mark_batch_admitted();
                 let response_lost = response_tx
                     .send(SubAgentAdmissionReceipt {
                         invocation: invocation.clone(),
@@ -4929,16 +4935,14 @@ impl RuntimeManager {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    async fn admit_sub_agent_batch(
-        self: &Arc<Self>,
+    async fn prepare_sub_agent_batch_admission(
+        &self,
         batch_id: &str,
         specs: &[SubAgentSpec],
         parent_conversation_id: &str,
         parent_scope: Option<WorkScopeId>,
         parallel_work_qualified: bool,
-        lifecycle: &mut native_spawn::NativeSpawnLifecycleOwner,
-    ) -> Result<(), String> {
+    ) -> Result<phoenix_db::AtomicSubAgentBatchAdmission, String> {
         use phoenix_db::SubAgentExecutionAuthority::{ReadOnly, WriteCapable};
 
         let parent = self
@@ -5007,21 +5011,73 @@ impl RuntimeManager {
                 })
             })
             .collect::<Result<Vec<_>, String>>()?;
-        let admission = phoenix_db::AtomicSubAgentBatchAdmission {
+        Ok(phoenix_db::AtomicSubAgentBatchAdmission {
             batch_id: batch_id.to_string(),
             parent_conversation_id: parent_conversation_id.to_string(),
             parent_scope,
             parallel_work_qualified,
             children,
-        };
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn admit_sub_agent_batch(
+        self: &Arc<Self>,
+        batch_id: &str,
+        specs: &[SubAgentSpec],
+        parent_conversation_id: &str,
+        parent_scope: Option<WorkScopeId>,
+        parallel_work_qualified: bool,
+        lifecycle: &mut native_spawn::NativeSpawnLifecycleOwner,
+    ) -> Result<(), String> {
+        let admission = self
+            .prepare_sub_agent_batch_admission(
+                batch_id,
+                specs,
+                parent_conversation_id,
+                parent_scope,
+                parallel_work_qualified,
+            )
+            .await?;
+        #[cfg(test)]
+        if let Some(barrier) = self.native_admission_prewrite_barrier.lock().await.take() {
+            barrier.wait().await;
+            barrier.wait().await;
+        }
         let owner = self.acquire_local_authority_pass().map_err(|()| {
             "native spawn admission was not issued because local write admission is closed"
                 .to_string()
         })?;
-        if !lifecycle.control.try_issue() {
+        let control = Arc::clone(&lifecycle.control);
+        if !control.try_issue() {
             return Err("native spawn admission was revoked before its database command".into());
         }
         let authority = lifecycle.arm_write(owner);
+        match self
+            .db
+            .establish_live_parent_reconcile_action(parent_conversation_id)
+            .await
+        {
+            phoenix_db::workflow::LocalAuthorityResult::DurableFactEstablished(Ok(())) => {}
+            phoenix_db::workflow::LocalAuthorityResult::DurableFactEstablished(Err(error)) => {
+                authority.classified();
+                return Err(format!(
+                    "failed to persist parent recovery authority: {error}"
+                ));
+            }
+            phoenix_db::workflow::LocalAuthorityResult::DurableFactUnclassified => {
+                self.signal_fatal_local_authority("native_spawn_parent_reconcile_action");
+                authority.classified();
+                return Err(
+                    "FATAL_LOCAL_AUTHORITY_UNCLASSIFIED: native parent reconciliation authority"
+                        .into(),
+                );
+            }
+        }
+        if self.fatal_local_authority_fence.is_closed() || control.is_cancelled() {
+            authority.classified();
+            return Err("native spawn batch was not issued after parent authority settled because admission closed or cancellation was requested".into());
+        }
         let result = self.db.admit_sub_agent_batch_atomically(&admission).await;
         if matches!(
             result,

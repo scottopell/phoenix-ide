@@ -19,6 +19,8 @@ pub struct NativeSpawnControl {
     #[cfg(test)]
     issue_attempt: tokio::sync::watch::Sender<Option<bool>>,
     #[cfg(test)]
+    batch_admitted: tokio::sync::watch::Sender<bool>,
+    #[cfg(test)]
     publications: std::sync::atomic::AtomicUsize,
 }
 
@@ -33,6 +35,8 @@ impl NativeSpawnControl {
             gate: Mutex::new(NativeSpawnAdmissionGate::Unissued(reply)),
             #[cfg(test)]
             issue_attempt: tokio::sync::watch::channel(None).0,
+            #[cfg(test)]
+            batch_admitted: tokio::sync::watch::channel(false).0,
             #[cfg(test)]
             publications: std::sync::atomic::AtomicUsize::new(0),
         }
@@ -140,6 +144,14 @@ impl NativeSpawnControl {
     #[cfg(test)]
     pub(super) fn subscribe_issue_attempt(&self) -> tokio::sync::watch::Receiver<Option<bool>> {
         self.issue_attempt.subscribe()
+    }
+    #[cfg(test)]
+    pub(super) fn subscribe_batch_admitted(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.batch_admitted.subscribe()
+    }
+    #[cfg(test)]
+    pub(super) fn mark_batch_admitted(&self) {
+        let _ = self.batch_admitted.send_replace(true);
     }
     #[cfg(test)]
     pub(super) fn is_closed(&self) -> bool {

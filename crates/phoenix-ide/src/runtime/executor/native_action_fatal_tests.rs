@@ -135,7 +135,7 @@ async fn assert_native_fatal_sink_is_disposed_without_result(name: &str, input: 
     )
     .with_fatal_local_authority_fence(manager.fatal_local_authority_fence.clone());
     assert!(runtime
-        .execute_effect(Effect::ExecuteTool { tool })
+        .dispatch_tool_for_test(tool)
         .await
         .unwrap()
         .is_none());

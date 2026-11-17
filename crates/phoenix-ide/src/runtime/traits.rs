@@ -490,13 +490,6 @@ pub trait StateStore: Send + Sync {
         Ok(())
     }
 
-    async fn establish_parent_reconcile_action(
-        &self,
-        _conversation_id: &str,
-    ) -> Result<(), String> {
-        Ok(())
-    }
-
     async fn establish_unactivated_sub_agent_membership(
         &self,
         membership: &phoenix_db::UnactivatedSubAgentMembership,
@@ -870,6 +863,15 @@ impl<T: SvgArtifactRepository + ?Sized> SvgArtifactRepository for Arc<T> {
 
 #[async_trait]
 impl<T: MessageStore + ?Sized> MessageStore for Arc<T> {
+    async fn get_work_scope_legacy_conversation_id(
+        &self,
+        scope_id: &phoenix_core::work_scope::WorkScopeId,
+    ) -> Result<Option<String>, String> {
+        (**self)
+            .get_work_scope_legacy_conversation_id(scope_id)
+            .await
+    }
+
     async fn terminalize_sub_agent_cancellation_backstop(
         &self,
         child_conversation_id: &str,
@@ -2754,13 +2756,6 @@ impl StateStore for DatabaseStorage {
         sqlx::query("INSERT INTO execution_cancel_observations(conversation_id) VALUES (?1) ON CONFLICT DO NOTHING")
             .bind(conversation_id).execute(self.db.pool()).await.map_err(|error| error.to_string())?;
         Ok(())
-    }
-
-    async fn establish_parent_reconcile_action(&self, conversation_id: &str) -> Result<(), String> {
-        self.db
-            .establish_parent_reconcile_action(conversation_id)
-            .await
-            .map_err(|error| error.to_string())
     }
 
     async fn update_state(

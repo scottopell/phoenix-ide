@@ -1,7 +1,7 @@
 use super::*;
 use crate::runtime::executor::RuntimeExitDisposition;
 use crate::runtime::testing::{MockLlmClient, MockToolExecutor};
-use crate::runtime::traits::DatabaseStorage;
+use crate::runtime::traits::{DatabaseStorage, StateStore};
 use crate::runtime::{RuntimeManager, SseBroadcaster, SubAgentSpawnRequest};
 use crate::state_machine::ConvContext;
 use crate::tools::BrowserSessionManager;
@@ -85,11 +85,7 @@ async fn pending_native_spawn() -> (Arc<RuntimeManager>, TestRuntime, SubAgentSp
     )
     .with_spawn_channels(spawn_tx, cancel_tx)
     .with_fatal_local_authority_fence(Arc::clone(&manager.fatal_local_authority_fence));
-    assert!(runtime
-        .start_spawn_agents_tool(call)
-        .await
-        .unwrap()
-        .is_none());
+    assert!(runtime.start_spawn_agents_tool(&call).unwrap().is_none());
     let request = spawn_rx
         .try_recv()
         .expect("native admission request was submitted");
@@ -111,17 +107,330 @@ async fn issue_native_spawn(
     manager: &Arc<RuntimeManager>,
     request: SubAgentSpawnRequest,
 ) -> tokio::task::JoinHandle<()> {
-    let mut issued = request.control.subscribe_issue_attempt();
+    let mut admitted = request.control.subscribe_batch_admitted();
     let manager = Arc::clone(manager);
     let task = tokio::spawn(async move { manager.handle_spawn_request(request).await });
     tokio::time::timeout(
         Duration::from_secs(60),
-        issued.wait_for(|issued| *issued == Some(true)),
+        admitted.wait_for(|admitted| *admitted),
     )
     .await
-    .expect("native database command was issued")
+    .expect("the real native batch admission committed")
     .unwrap();
     task
+}
+
+#[tokio::test]
+async fn native_parent_authority_rejection_prevents_child_admission() {
+    let (manager, mut runtime, request) = pending_native_spawn().await;
+    let control = Arc::clone(&request.control);
+    sqlx::query(
+        "CREATE TRIGGER reject_native_parent_action BEFORE INSERT ON startup_parent_actions
+        BEGIN SELECT RAISE(ABORT, 'native parent authority rejected'); END",
+    )
+    .execute(manager.db().pool())
+    .await
+    .unwrap();
+    manager.handle_spawn_request(request).await;
+    let admission = runtime.observe_native_spawn().await;
+    let event = runtime
+        .native_spawn_observed(admission)
+        .await
+        .unwrap()
+        .unwrap();
+    let Event::ToolComplete {
+        tool_use_id,
+        result,
+    } = event
+    else {
+        panic!("known parent-write failure must return its paired rejection")
+    };
+    assert_eq!(tool_use_id, "spawn");
+    assert!(result.is_error() && result.output().contains("native parent authority rejected"));
+    let children: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sub_agent_runs")
+        .fetch_one(manager.db().pool())
+        .await
+        .unwrap();
+    let actions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM startup_parent_actions")
+        .fetch_one(manager.db().pool())
+        .await
+        .unwrap();
+    assert_eq!((children, actions), (0, 0));
+    assert!(!manager.fatal_local_authority_fence.is_closed());
+    assert_eq!(control.publication_count(), 1);
+}
+
+#[tokio::test]
+async fn native_full_submission_stays_owned_and_cancels_in_the_real_loop() {
+    let (manager, mut runtime, filler) = pending_native_spawn().await;
+    runtime
+        .native_spawn_handoff
+        .take()
+        .unwrap()
+        .request_cancel();
+    if let ConvState::ToolExecuting {
+        assistant_message, ..
+    } = &mut runtime.state
+    {
+        assistant_message.message_id = "full-submission-round".into();
+    }
+    manager
+        .db()
+        .update_conversation_state(&runtime.context.conversation_id, &runtime.state)
+        .await
+        .unwrap();
+    let (sender, mut requests) = mpsc::channel(1);
+    sender.try_send(filler).unwrap();
+    runtime.spawn_tx = Some(sender);
+    let ConvState::ToolExecuting { current_tool, .. } = &runtime.state else {
+        unreachable!()
+    };
+    let current_tool = current_tool.clone();
+    assert!(runtime
+        .start_spawn_agents_tool(&current_tool)
+        .unwrap()
+        .is_none());
+    let handoff = runtime.native_spawn_handoff.as_mut().unwrap();
+    let control = Arc::clone(&handoff.control);
+    let NativeSpawnPhase::Submission { send, .. } = &mut handoff.phase else {
+        panic!("the full channel must retain submission")
+    };
+    let future = send.get_mut().unwrap();
+    let original = std::mem::replace(future, Box::pin(std::future::pending()));
+    let (entered, observed) = tokio::sync::oneshot::channel();
+    *future = Box::pin(async move {
+        let _ = entered.send(());
+        original.await
+    });
+    let event_tx = runtime.event_tx.clone();
+    let (state_tx, mut states) = watch::channel(runtime.state.clone());
+    let task = tokio::spawn(runtime.with_state_watcher(state_tx).run());
+    tokio::time::timeout(Duration::from_secs(60), observed)
+        .await
+        .unwrap()
+        .unwrap();
+    tokio::time::pause();
+    event_tx
+        .send(Event::UserCancel {
+            reason: None,
+            cause: crate::state_machine::event::CancelCause::UserRequested,
+        })
+        .await
+        .unwrap();
+    let interrupted = tokio::time::timeout(Duration::from_millis(100), control.cancelled())
+        .await
+        .is_ok();
+    tokio::time::resume();
+    let settled_before_capacity = tokio::time::timeout(
+        Duration::from_secs(60),
+        states.wait_for(|state| matches!(state, ConvState::Idle)),
+    )
+    .await
+    .is_ok();
+    let filler = requests.try_recv().unwrap();
+    let no_late_request = matches!(requests.try_recv(), Err(mpsc::error::TryRecvError::Empty));
+    event_tx.send(Event::Shutdown).await.unwrap();
+    assert_eq!(
+        task.await.unwrap(),
+        RuntimeExitDisposition::CoordinatedShutdown
+    );
+    manager.handle_spawn_request(filler).await;
+    assert!(interrupted, "native interruption must occur within 100ms");
+    assert!(
+        settled_before_capacity,
+        "cancellation must not await bounded send capacity"
+    );
+    assert!(no_late_request);
+    assert!(control.is_closed());
+    assert_eq!(control.publication_count(), 1);
+    assert!(!manager.fatal_local_authority_fence.is_closed());
+    let children: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sub_agent_runs")
+        .fetch_one(manager.db().pool())
+        .await
+        .unwrap();
+    let actions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM startup_parent_actions")
+        .fetch_one(manager.db().pool())
+        .await
+        .unwrap();
+    assert_eq!((children, actions), (0, 0));
+}
+
+#[tokio::test]
+async fn native_parent_write_owner_loss_or_cutoff_cannot_claim_unissued_batch() {
+    for cutoff in [false, true] {
+        let (manager, mut runtime, request) = pending_native_spawn().await;
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        *manager.native_admission_prewrite_barrier.lock().await = Some(Arc::clone(&barrier));
+        let mut issued = request.control.subscribe_issue_attempt();
+        let task = tokio::spawn({
+            let manager = Arc::clone(&manager);
+            async move { manager.handle_spawn_request(request).await }
+        });
+        barrier.wait().await;
+        let held_connection = manager.db().pool().acquire().await.unwrap();
+        barrier.wait().await;
+        tokio::time::timeout(
+            Duration::from_secs(60),
+            issued.wait_for(|issued| *issued == Some(true)),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let next = crate::state_machine::transition(
+            &runtime.state,
+            &runtime.context,
+            Event::UserCancel {
+                reason: None,
+                cause: crate::state_machine::event::CancelCause::UserRequested,
+            },
+        )
+        .unwrap();
+        runtime.state = next.new_state;
+        runtime
+            .native_spawn_handoff
+            .as_mut()
+            .unwrap()
+            .request_cancel();
+        if cutoff {
+            assert!(matches!(
+                runtime.classify_native_spawn_cutoff("spawn").await,
+                NativeSpawnCutoff::Stop
+            ));
+        }
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert!(manager
+            .fatal_local_authority_fence
+            .fatal_authority_loss_is_latched());
+        assert!(runtime.native_spawn_handoff.is_some());
+        assert!(matches!(runtime.state, ConvState::CancellingTool { .. }));
+        drop(held_connection);
+        let children: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sub_agent_runs")
+            .fetch_one(manager.db().pool())
+            .await
+            .unwrap();
+        assert_eq!(children, 0);
+        assert!(runtime.llm_client.recorded_requests().is_empty());
+    }
+}
+
+async fn install_ordinary_tool_policy(runtime: &mut TestRuntime) -> Arc<MockToolExecutor> {
+    let tools = Arc::new(
+        MockToolExecutor::new()
+            .with_tool("bash", crate::tools::ToolOutput::success("must not run")),
+    );
+    runtime.tool_executor = Arc::new(Arc::clone(&tools));
+    let definitions = tools.definitions().await;
+    runtime
+        .storage
+        .prepare_tool_availability(
+            &runtime.context.conversation_id,
+            "native-cancel-failure",
+            None,
+            &definitions,
+            &std::collections::BTreeSet::from(["bash".into()]),
+            &[],
+            &[],
+        )
+        .await
+        .unwrap();
+    tools
+}
+
+#[tokio::test]
+async fn native_cancel_persistence_failure_retains_closing_origin_and_stops_queued_work() {
+    let (manager, mut runtime, request) = pending_native_spawn().await;
+    let tools = install_ordinary_tool_policy(&mut runtime).await;
+    let later = ToolCall::new(
+        "later",
+        ToolInput::from(crate::tools::BashToolInput::run("git status --short")),
+    );
+    if let ConvState::ToolExecuting {
+        remaining_tools,
+        assistant_message,
+        ..
+    } = &mut runtime.state
+    {
+        remaining_tools.push(later.clone());
+        assistant_message.content.push(ContentBlock::tool_use(
+            &later.id,
+            later.name(),
+            later.input.to_value(),
+        ));
+    }
+    manager
+        .db()
+        .update_conversation_state(&runtime.context.conversation_id, &runtime.state)
+        .await
+        .unwrap();
+    let control = Arc::clone(&request.control);
+    let task = issue_native_spawn(&manager, request).await;
+    let admitted = runtime.observe_native_spawn().await;
+    assert!(matches!(
+        &admitted,
+        NativeSpawnObservation::Admission(Ok(SubAgentAdmissionReceipt {
+            outcome: SubAgentAdmissionResponse::Admitted,
+            ..
+        }))
+    ));
+    sqlx::query("CREATE TRIGGER reject_native_cancel_checkpoint BEFORE INSERT ON execution_cancel_observations
+        BEGIN SELECT RAISE(ABORT, 'native cancellation persistence failed'); END")
+        .execute(manager.db().pool()).await.unwrap();
+    let error = runtime
+        .process_event(Event::UserCancel {
+            reason: None,
+            cause: crate::state_machine::event::CancelCause::UserRequested,
+        })
+        .await
+        .unwrap_err();
+    assert!(error.contains("native cancellation persistence failed"));
+    let signalled_before_failed_write = control.is_cancelled();
+    if !signalled_before_failed_write {
+        runtime
+            .native_spawn_handoff
+            .as_mut()
+            .unwrap()
+            .request_cancel();
+    }
+    assert!(runtime
+        .native_spawn_observed(admitted)
+        .await
+        .unwrap()
+        .is_none());
+    task.await.unwrap();
+    let closure = runtime.observe_native_spawn().await;
+    if let Some(event) = runtime.native_spawn_observed(closure).await.unwrap() {
+        runtime.process_event(event).await.unwrap();
+    }
+    let ordinary_generation_before_teardown = runtime.tool_execution.generation();
+    runtime.abort_external_effects_in_memory();
+    assert!(
+        signalled_before_failed_write,
+        "native interruption must precede the failing cancellation evidence write"
+    );
+    assert!(matches!(
+        &runtime.state,
+        ConvState::Error {
+            error_kind: crate::db::ErrorKind::SubAgentError,
+            message, ..
+        } if message.contains("native cancellation persistence failed")
+    ));
+    assert_eq!(ordinary_generation_before_teardown, 0);
+    assert!(tools.recorded_executions().is_empty());
+    assert!(runtime.llm_client.recorded_requests().is_empty());
+    assert!(!manager.fatal_local_authority_fence.is_closed());
+    let owed: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sub_agent_runs WHERE parent_accepted_at_unix_micros IS NULL AND terminal_at_unix_micros IS NOT NULL AND initial_dispatch_claimed_at_unix_micros IS NULL").fetch_one(manager.db().pool()).await.unwrap();
+    assert_eq!(owed, 2);
+    let messages = manager
+        .db()
+        .get_messages(&runtime.context.conversation_id)
+        .await
+        .unwrap();
+    assert!(!messages
+        .iter()
+        .any(|message| serde_json::to_string(&message.content)
+            .unwrap()
+            .contains("Cancellation completed")));
 }
 
 #[tokio::test]
