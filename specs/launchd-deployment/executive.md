@@ -54,8 +54,14 @@ successful disposable launchd commit, partial-write failure, health failure and
 restart after initiator SIGKILL. The current focused helper suite passed 75 tests,
 including typed stored-row, row-identity, FTS5-shadow, quoted-module classification,
 primary-key collation/direction without temporary sorting and fail-closed comparisons.
-The 13.4 GB scale-qualification harness has not produced a hosted success result;
-there is no native-launchd or production qualification claim for these changes.
+Hosted scale run `44017228572` qualified implementation `87e96effb`: a
+13,406,384,128-byte populated database completed backup, full integrity check,
+typed comparison, fsync and full-file proof hashing in 354.674 of 600 seconds
+on macOS ARM64 with SQLite 3.53.1. The fixture has 1,290,000 rows each in an
+ordinary table, a `WITHOUT ROWID` table and FTS5, with persisted FTS5 shadows
+and secondary indexes. This is disposable fixture/runner evidence, not a
+universal throughput guarantee, native-launchd journey or production qualification.
+Exact-head artifacts and broader CI receipts belong with the corresponding PR.
 
 The 6,406-line `test_current_schema_prepared_upgrade.py` and old manifest,
 Activation, schema114/123/128/129, repair, refresh and rollback classes are retired
