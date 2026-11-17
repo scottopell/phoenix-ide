@@ -20,7 +20,7 @@ The dispatcher spec distinguishes early unavailable results, Layer 0 denial
 before call-resource admission, cleared side-effecting preparation, launch-time admission,
 generation/state/identity completion guards, sender-loss settlement, cooperative
 cancellation, and forced task retirement. Preparation reads have a selectable
-owner bound to the runtime, held assistant and exact call. Only a cleared checked
+owner bound to the runtime, original held assistant message and exact parsed call. Only a cleared checked
 call reaches ordinary invocation resources; denial returns a paired ordinary result.
 Focused and owning runtime coverage passes; full qualification remains pending.
 No dispatcher extraction or concurrent tool scheduling is implemented by this
@@ -88,11 +88,19 @@ that existing command's fail-stop contract and actor exit. Initial caller errors
 retain their existing diagnostic and no-effects cancellation proof. Stale errors
 cannot apply an old boundary to a successor.
 
-The 48-case focused and 253-case owning selections pass at `d152a1814`, including
+Preparation retains the original full assistant message for origin validation;
+the parsed call remains its execution payload. Cancellation compares the held
+source directly, without serializing the parsed call back into provider JSON.
+Omitted optional input fields therefore do not break ownership, while a changed
+source with reused assistant/call IDs cannot adopt an earlier preparation.
+
+The 24-case focused and 257-case owning selections pass at `8948f4b77`, including
+raw-provider policy/scope/catalog cancellation, changed-source rejection,
 real actor policy/scope failure regressions, catalog refresh, deterministic 100-ms
 read cancellation, denial before resources, native activation, forced notices,
 required settlement, goals and originating policy. The owning run builds its
-native Bash fixture from that same head. In-memory timing checks do not measure
+native Bash fixture from that same head. The 22 integration replay/owner-handoff
+cases also pass. In-memory timing checks do not measure
 end-to-end SQLite latency.
 
 The earlier full check at `ab43b4b2c` was red: 4085/4086 Rust tests passed and the
@@ -100,8 +108,12 @@ catalog-cache fixture missed the owned observer; its explicit observer correctio
 passes. The other 16 executed checks passed, with four UI path skips. A separate
 automatic-review finding exposed the lost required-follow-up read failure boundary;
 two new actor regressions failed before its typed provenance correction and pass
-afterward. Replacement default, fresh isolated review and hosted qualification
-remain pending.
+afterward. The first replacement at `b5f7778dc` passed its default check (17
+executed checks and four UI path skips), independent reviews and hosted checks.
+Integration review then found raw-provider cancellation identity loss; three
+actor cancellation regressions and one changed-source regression failed before
+the exact source-message correction. Final integrated default, fresh isolated
+review and hosted qualification remain pending.
 
 Forced tool retirement has a distinct `ToolCancellationRetired` event and a
 phase-scoped `ForcedToolRetirement` fact in `CancellingSubAgents`. Nonfinal child
@@ -171,7 +183,7 @@ Startup, completion, and child-backstop commands retain a mutable reborrow of th
 | **REQ-BED-002:** User Message Handling | ✅ Complete | Rejects while busy, accepts from idle/error |
 | **REQ-BED-003:** LLM Response Processing | ✅ Complete | Handles text, tool use, end_turn |
 | **REQ-BED-004:** Tool Execution Coordination | ✅ Complete | Serial execution with state tracking; shared round admission requires unique call/result correspondence without sorting. Provider schedule validation precedes special-tool interception, and per-invocation channels reject misidentified outcomes as concrete errors. Focused coverage includes malformed approval/question/child-terminal responses and expected-invocation completion errors. Bash wait fallback preserves authentic bounded results, aborts only the wait task on healthy expiry, and closes the shared local-authority fence under REQ-BED-033 if authoritative settlement remains indeterminate at its non-renewing persistence cutoff |
-| **REQ-BED-005:** Cancellation Handling | 🚧 Partial | Preparation reads and native submission are selectable with exact ownership; issued parent/admission writes remain classified in the manager. Current focused 48/48 and owning 253/253 pass, including required-follow-up read failure settlement; replacement full qualification is pending |
+| **REQ-BED-005:** Cancellation Handling | 🚧 Partial | Preparation reads and native submission are selectable with exact source ownership; issued parent/admission writes remain classified in the manager. Current focused 24/24 and owning 257/257 pass, including raw-provider cancellation and required-follow-up read failure settlement; integrated replacement full qualification is pending |
 | **REQ-BED-005a:** Bounded Cancellation Liveness | 🚧 Partial | Forced tool/sub-agent backstops and live forced-notice carry through delayed cooperative drain are implemented. Task 75009 covers ordered exactly-once notice qualification, including inline steering, existing retries and child-deadline overlap. Broader interruption and cancellation-handoff obligations remain unqualified |
 | **REQ-BED-006:** Error Recovery | ✅ Complete | Retry logic with exponential backoff and typed user-resume admission by ErrorKind |
 | **REQ-BED-007:** State Persistence | ✅ Complete | Database persistence; all selected executing/cancelling buffers are validated before any recovery mutation. File-backed reopen coverage includes malformed standalone and parent-first child buffers retaining exact raw state and producing no partial messages; scoped recovery excludes unrelated malformed buffers. Provider-only interruptions resume from idle, active materialized turns with persisted tool results proactively resume under bounded exact-turn ownership, committed steering retains first-response recovery ownership, and durable continuations retain recovery state |
