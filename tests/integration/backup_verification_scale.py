@@ -61,6 +61,8 @@ def create_fixture(database: Path, *, minimum_bytes: int, rows_per_table: int | 
                 body TEXT NOT NULL,
                 payload BLOB NOT NULL
             ) WITHOUT ROWID;
+            CREATE INDEX documents_body_prefix ON documents(substr(body, 1, 32));
+            CREATE INDEX keyed_body_prefix ON keyed_records(substr(body, 1, 32));
         """)
         while True:
             if time.monotonic() >= deadline:
@@ -172,6 +174,9 @@ def run(args: argparse.Namespace) -> dict:
         "commit": os.environ.get("GITHUB_SHA") or _git_commit(),
         "runner": {"os": platform.platform(), "machine": platform.machine(),
                    "python": sys.version, "sqlite": sqlite3.sqlite_version},
+        "capacity": {"free_before_generation": free,
+                     "required_before_generation": required_free,
+                     "free_before_backup": free_before_backup},
         "fixture": {**composition, "minimum_source_bytes": target_bytes,
                     "database_file_bytes": source_bytes,
                     "actual_populated_sqlite_file": True,
@@ -211,6 +216,7 @@ def main() -> int:
         failure = {
             "qualification": "large populated SQLite backup verification",
             "status": "failed",
+            "free_disk_bytes": shutil.disk_usage(args.work_dir).free,
             "error": f"{type(exc).__name__}: {exc}",
             "commit": os.environ.get("GITHUB_SHA") or _git_commit(),
             "runner": {"os": platform.platform(), "machine": platform.machine(),

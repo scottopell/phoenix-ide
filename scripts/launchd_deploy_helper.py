@@ -435,10 +435,84 @@ def _verify_logical_equivalence(source, backup, deadline: float) -> None:
 
     def module_for(sql):
         sql = text(sql or b"")
-        match = re.search(r"\bUSING\s+(\"(?:\"\"|[^\"])+\"|`[^`]+`|\[[^]]+\]|[^\s(]+)", sql, re.I)
-        if not match:
+        length = len(sql)
+        position = 0
+
+        def token():
+            nonlocal position
+            while position < length:
+                if sql[position].isspace():
+                    position += 1
+                elif sql.startswith("--", position):
+                    end = sql.find("\n", position + 2)
+                    position = length if end < 0 else end + 1
+                elif sql.startswith("/*", position):
+                    end = sql.find("*/", position + 2)
+                    if end < 0:
+                        return None
+                    position = end + 2
+                else:
+                    break
+            if position >= length:
+                return None
+
+            char = sql[position]
+            if char in ('"', '`', '['):
+                closing = ']' if char == '[' else char
+                position += 1
+                value = []
+                while position < length:
+                    current = sql[position]
+                    position += 1
+                    if current == closing:
+                        if closing != ']' and position < length and sql[position] == closing:
+                            value.append(closing)
+                            position += 1
+                            continue
+                        return ("identifier", "".join(value))
+                    value.append(current)
+                return None
+            if char == '.':
+                position += 1
+                return ("dot", char)
+            start = position
+            while position < length and not sql[position].isspace() and sql[position] not in ".();'\"`[]":
+                if sql.startswith("--", position) or sql.startswith("/*", position):
+                    break
+                position += 1
+            if start == position:
+                return None
+            return ("word", sql[start:position])
+
+        def take_word(expected):
+            item = token()
+            if item is None or item[0] != "word" or item[1].upper() != expected:
+                return False
+            return True
+
+        if not (take_word("CREATE") and take_word("VIRTUAL") and take_word("TABLE")):
             return None
-        return match.group(1).strip('"`[]').replace('""', '"').lower()
+        next_item = token()
+        if next_item is not None and next_item[0] == "word" and next_item[1].upper() == "IF":
+            if not (take_word("NOT") and take_word("EXISTS")):
+                return None
+            next_item = token()
+        if next_item is None or next_item[0] not in ("word", "identifier"):
+            return None
+        after_name = position
+        separator = token()
+        if separator == ("dot", "."):
+            table = token()
+            if table is None or table[0] not in ("word", "identifier"):
+                return None
+        else:
+            position = after_name
+        if not take_word("USING"):
+            return None
+        module = token()
+        if module is None or module[0] not in ("word", "identifier"):
+            return None
+        return module[1].lower()
 
     def typed_value(storage, value):
         storage = text(storage)

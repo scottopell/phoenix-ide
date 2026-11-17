@@ -174,6 +174,33 @@ class SQLiteLogicalEquivalenceTests(unittest.TestCase):
         self.compare("CREATE VIRTUAL TABLE docs USING fts5(body); INSERT INTO docs VALUES ('same token');",
                      "CREATE VIRTUAL TABLE docs USING fts5(body); INSERT INTO docs VALUES ('same token');")
 
+    def test_rtree_module_is_not_spoofed_by_quoted_table_name(self):
+        statements = (
+            'CREATE VIRTUAL TABLE "USING fts5" USING rtree(id, min_x, max_x);',
+            'CREATE VIRTUAL TABLE spatial /* USING fts5 */ USING rtree(id, min_x, max_x);',
+            'CREATE VIRTUAL TABLE spatial USING rtree(id, min_x, max_x);',
+        )
+        try:
+            for sql in statements:
+                with self.subTest(sql=sql):
+                    self.compare(sql, sql, expect_difference=True)
+        except sqlite3.OperationalError as exc:
+            if "no such module" in str(exc).lower():
+                self.skipTest("SQLite was built without RTree")
+            raise
+
+    def test_fts5_module_parsing_ignores_names_and_comments_and_accepts_quotes(self):
+        sql = ('ATTACH DATABASE \':memory:\' AS "odd schema"; '
+               'CREATE VIRTUAL TABLE "odd schema"."USING rtree" '
+               '/* misleading USING rtree */ USING "fts5"(body); '
+               "INSERT INTO \"odd schema\".\"USING rtree\" VALUES ('same token');")
+        try:
+            self.compare(sql, sql)
+        except sqlite3.OperationalError as exc:
+            if "fts5" in str(exc).lower():
+                self.skipTest("SQLite was built without FTS5")
+            raise
+
     def test_fails_closed_for_unrecognized_virtual_table_modules(self):
         source = sqlite3.connect(":memory:")
         backup = sqlite3.connect(":memory:")

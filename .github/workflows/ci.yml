@@ -5,6 +5,11 @@ permissions:
 
 on:
   workflow_dispatch:
+    inputs:
+      backup_verification_scale:
+        description: "Run disposable 13.4 GB SQLite backup qualification"
+        type: boolean
+        default: false
   pull_request:
   push:
     branches:
@@ -1062,8 +1067,8 @@ jobs:
             gh issue close "$number" --repo "$REPO"
           fi
   backup-verification-scale:
-    if: github.event_name == 'workflow_dispatch'
-    runs-on: macos-14
+    if: github.event_name == 'workflow_dispatch' && inputs.backup_verification_scale
+    runs-on: macos-latest
     timeout-minutes: 45
     env:
       PYTHONUNBUFFERED: "1"
