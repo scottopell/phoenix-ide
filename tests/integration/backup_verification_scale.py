@@ -68,8 +68,7 @@ def create_fixture(database: Path, *, minimum_bytes: int, rows_per_table: int | 
             if rows_per_table is None:
                 # Grow in bounded transactions until SQLite's real database file
                 # crosses the qualification threshold; no sparse padding/freelist.
-                bytes_per_pair = 2 * (text_bytes + blob_bytes + 128)
-                limit = min(BATCH_ROWS, max(1, (minimum_bytes - database.stat().st_size) // bytes_per_pair))
+                limit = BATCH_ROWS
                 text_batch = [(_payload(text_rows + i, "text", text_bytes),
                                _payload(text_rows + i, "blob", blob_bytes))
                               for i in range(limit)]
@@ -198,8 +197,8 @@ def main() -> int:
                         help="fixture threshold (small values are intended only for local smoke tests)")
     parser.add_argument("--rows-per-table", type=int,
                         help="fixed row count per table; only for local smoke tests")
-    parser.add_argument("--text-bytes", type=int, default=2_200)
-    parser.add_argument("--blob-bytes", type=int, default=2_200)
+    parser.add_argument("--text-bytes", type=int, default=1_100)
+    parser.add_argument("--blob-bytes", type=int, default=1_100)
     args = parser.parse_args()
     if args.minimum_source_bytes <= 0 or args.text_bytes <= 0 or args.blob_bytes <= 0:
         parser.error("byte and payload sizes must be positive")
