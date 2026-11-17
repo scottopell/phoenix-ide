@@ -121,6 +121,10 @@ candidates keyed by worker name
 AND SHALL use this file as the sole named-worker source
 AND SHALL NOT discover `.claude/agents` or `.agents/agents` definitions
 
+THE SYSTEM SHALL accept the top-level model definitions specified by
+`specs/llm/requirements.md` REQ-LLM-003c alongside named workers and tiers
+AND SHALL leave interpretation of those definitions to model-registry initialization
+
 WHEN the file is absent
 THE SYSTEM SHALL offer anonymous spawning with parent inheritance and no
 configured workers or tiers

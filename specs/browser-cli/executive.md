@@ -10,6 +10,11 @@ The CLI reuses the browser-specific operation boundary from `phoenix-tools` and 
 
 The lifecycle contract is specified in `browser-cli.allium`; browser operation semantics remain in `specs/browser-tool/`.
 
+`active_work_outlives_idle_budget_then_session_expires` qualifies the idle-expiry
+contract with an idle TCP preconnection ahead of navigation. Its fixture waits
+for and drains the complete HTTP page request before releasing the response,
+so accepting a speculative connection cannot stand in for admitted page work.
+
 ## Scenario queue admission and cancellation — focused qualification passed
 
 Exact v27 `c10c96d55b196498e211684e09143b77e839252f` passed strict both-package all-target Clippy and all 56 focused tests on the sole host. Receipt SHA-256 `bdc7b47c8b506a8025a1caeb328a544fc5e6d206dc0d58d331c4fd1abd507dde`; full source/custody attribution is in the [browser-tool executive](../browser-tool/executive.md). All 3392 source hashes matched and custody was released. Hosted successor CI remains separate.

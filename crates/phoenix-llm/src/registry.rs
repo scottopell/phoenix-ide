@@ -3,9 +3,9 @@
 use super::codex_credential::AccountBoundCodexCredential;
 use super::models::RequestModelName;
 use super::{
-    all_models, codex_credential, discover_models, merge_model_specs, parse_external_models,
-    CodexCredential, DiscoveredModels, DiscoveryConfig, LlmService, LlmServiceImpl, LlmTransport,
-    LoggingService, ModelBackend, ModelInfo, ModelSource,
+    all_models, codex_credential, discover_models, merge_model_specs, CodexCredential,
+    DiscoveredModels, DiscoveryConfig, LlmService, LlmServiceImpl, LlmTransport, LoggingService,
+    ModelBackend, ModelInfo, ModelSource,
 };
 use phoenix_core::runtime_env::PhoenixRuntimeEnvironment;
 use serde::de::{Deserialize, Deserializer, MapAccess, Visitor};
@@ -282,7 +282,7 @@ pub struct LlmConfig {
     /// How credential helper output should be sent in HTTP headers.
     /// Parsed from `LLM_AUTH_HEADER` env var at startup.
     pub auth_style: AuthStyle,
-    /// Additional model specs loaded from `PHOENIX_LLM_MODELS` inline JSON.
+    /// Additional model specs loaded from user TOML or `PHOENIX_LLM_MODELS` JSON.
     /// These are additive only; duplicate IDs are ignored when merged with
     /// built-ins.
     pub external_models: Vec<super::ModelSpec>,
@@ -394,7 +394,8 @@ impl Default for LlmConfig {
 impl LlmConfig {
     /// # Panics
     ///
-    /// Panics if `PHOENIX_LLM_REQUEST_MODELS` is set but fails to parse or
+    /// Panics if the user model configuration is invalid or conflicts with
+    /// `PHOENIX_LLM_MODELS`, or if `PHOENIX_LLM_REQUEST_MODELS` fails to parse or
     /// validate (unknown route/model, backend mismatch, blank name, or
     /// duplicate keys). The map is rejected atomically before any
     /// request can use it, so a malformed override must fail startup rather
@@ -440,23 +441,13 @@ impl LlmConfig {
             .map(parse_request_tags)
             .unwrap_or_default();
 
-        let external_models = std::env::var("PHOENIX_LLM_MODELS")
-            .ok()
-            .filter(|raw| !raw.trim().is_empty())
-            .map(|raw| match parse_external_models(&raw) {
-                Ok(models) => {
-                    tracing::info!(count = models.len(), "loaded PHOENIX_LLM_MODELS additions");
-                    models
-                }
-                Err(error) => {
-                    tracing::warn!(
-                        error = %error,
-                        "invalid PHOENIX_LLM_MODELS; ignoring externally configured LLM models"
-                    );
-                    Vec::new()
-                }
-            })
-            .unwrap_or_default();
+        let user_config_path = phoenix_agents::config_path_for(&runtime_env)
+            .unwrap_or_else(|error| panic!("Cannot locate Phoenix config: {error}"));
+        let external_models = super::model_config::load_external_models(
+            &user_config_path,
+            std::env::var("PHOENIX_LLM_MODELS").ok().as_deref(),
+        )
+        .unwrap_or_else(|error| panic!("Cannot load external models: {error}"));
 
         // Resolve Phoenix's native ChatGPT credential at startup.
         let active_auth_path = codex_credential::resolve_active_auth_path(&runtime_env);
@@ -2021,6 +2012,7 @@ pub struct CodexReloadOutcome {
 mod tests {
     use super::*;
     use crate::models::{EffortCapabilities, NativeDefault, ServiceTierCapabilities};
+    use crate::parse_external_models;
     use crate::ModelEffort;
     use std::collections::HashSet;
 

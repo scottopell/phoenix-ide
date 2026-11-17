@@ -33,6 +33,8 @@ pub struct AgentConfig {
 #[serde(deny_unknown_fields)]
 struct ConfigFile {
     version: u32,
+    #[serde(rename = "models")]
+    _models: Option<serde::de::IgnoredAny>,
     #[serde(default)]
     agents: BTreeMap<String, AgentEntry>,
     #[serde(default)]
@@ -144,6 +146,16 @@ pub fn load_config(path: &Path) -> Result<AgentConfig, String> {
 /// Returns an error when the configured location is not absolute.
 pub fn config_path() -> Result<PathBuf, String> {
     let environment = phoenix_core::runtime_env::PhoenixRuntimeEnvironment::detect();
+    config_path_for(&environment)
+}
+
+/// Resolve the user config location using the process's resolved home directory.
+///
+/// # Errors
+/// Returns an error when the configured location is not absolute.
+pub fn config_path_for(
+    environment: &phoenix_core::runtime_env::PhoenixRuntimeEnvironment,
+) -> Result<PathBuf, String> {
     config_path_from(
         std::env::var_os("XDG_CONFIG_HOME")
             .as_deref()

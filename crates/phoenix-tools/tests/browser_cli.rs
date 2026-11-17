@@ -2705,6 +2705,52 @@ fn daemon_releases_descriptors_inherited_from_its_invoking_harness() {
     cli.ok(&["close"]);
 }
 
+fn wait_for_idle_fixture_request(listener: &TcpListener) -> TcpStream {
+    let mut connections = Vec::new();
+    wait_for_observation("initial navigation sent its HTTP request", || {
+        loop {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    stream.set_nonblocking(true).unwrap();
+                    connections.push(stream);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(error) => panic!("navigation listener failed: {error}"),
+            }
+        }
+        for index in 0..connections.len() {
+            let mut request = [0; 8192];
+            let count = match connections[index].peek(&mut request) {
+                Ok(count) => count,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock
+                            | std::io::ErrorKind::ConnectionReset
+                            | std::io::ErrorKind::ConnectionAborted
+                    ) =>
+                {
+                    continue;
+                }
+                Err(error) => panic!("navigation request failed: {error}"),
+            };
+            let Some(end) = request[..count]
+                .windows(4)
+                .position(|part| part == b"\r\n\r\n")
+            else {
+                continue;
+            };
+            assert!(request[..count].starts_with(b"GET / HTTP/1."));
+            let mut stream = connections.swap_remove(index);
+            let mut headers = vec![0; end + 4];
+            stream.read_exact(&mut headers).unwrap();
+            stream.set_nonblocking(false).unwrap();
+            return Some(stream);
+        }
+        None
+    })
+}
+
 #[test]
 fn active_work_outlives_idle_budget_then_session_expires() {
     // REQ-BCLI-004, REQ-BCLI-005, REQ-BCLI-006.
@@ -2714,6 +2760,7 @@ fn active_work_outlives_idle_budget_then_session_expires() {
     let cli = BrowserCli::new();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
+    let _preconnect = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
     let url = format!("http://{}/", listener.local_addr().unwrap());
     let opening = cli
         .command()
@@ -2722,15 +2769,7 @@ fn active_work_outlives_idle_budget_then_session_expires() {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    let mut page_request =
-        wait_for_observation(
-            "initial navigation reached HTTP boundary",
-            || match listener.accept() {
-                Ok((stream, _)) => Some(stream),
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => None,
-                Err(error) => panic!("navigation listener failed: {error}"),
-            },
-        );
+    let mut page_request = wait_for_idle_fixture_request(&listener);
     let queue = |request: Value| {
         let mut stream = UnixStream::connect(cli.socket()).unwrap();
         stream

@@ -2998,6 +2998,7 @@ dependencies = [
  "chrono",
  "futures",
  "httpdate",
+ "phoenix-agents",
  "phoenix-core",
  "proptest",
  "rand 0.10.1",
@@ -3010,6 +3011,7 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tokio-tungstenite",
+ "toml",
  "tracing",
  "uuid",
 ]

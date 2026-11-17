@@ -199,6 +199,13 @@ If none of `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `LLM_API_KEY_HELPER`,
 or a ChatGPT/Codex credential is present, the server starts with no models and
 logs a warning.
 
+External models can also be defined as top-level `[[models]]` entries in
+`$XDG_CONFIG_HOME/phoenix-ide/config.toml` (`$HOME/.config` by default).
+See [TOML model configuration and migration](docs/agents-config.md#external-model-definitions).
+After migrating away from the environment variable, editing that file and
+restarting Phoenix reloads model definitions without rebuilding or redeploying.
+TOML model sections are validated atomically, and defining both sources is an error.
+
 `PHOENIX_LLM_MODELS` is additive. It does not override built-in model IDs; a
 configured duplicate ID is ignored and Phoenix logs a warning while keeping the
 built-in definition. The value is parsed at startup, and invalid JSON or invalid
