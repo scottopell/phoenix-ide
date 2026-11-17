@@ -4,6 +4,9 @@ use super::{
     CancellationToken, ConversationRuntime, LlmClient, RuntimeSettlementAuthority, Storage,
     ToolExecutor,
 };
+use crate::runtime::close_retirement::{
+    collect_native_initial_inspection, NativeInitialInspection, NativeInitialInspectionFailure,
+};
 use crate::runtime::native_close_application::{
     initial_command_from_executing_source, NativeCloseApplicationError,
 };
@@ -11,6 +14,470 @@ use phoenix_core::domain::db_schema::SourceToolCall;
 use phoenix_core::domain::product_conversation::ProductConversationId;
 use phoenix_db::native_close::NativeCloseInitialResult;
 use phoenix_db::workflow::LocalAuthorityResult;
+
+/// Refuse queued work without resuming ordinary actor execution during Close exit.
+pub(super) fn refuse_during_exit(request: crate::runtime::AcknowledgedRuntimeRequest) {
+    use crate::runtime::AcknowledgedRuntimeRequest as Request;
+    match request {
+        Request::Event(request) => {
+            let _ = request.acknowledgement.send(Err("runtime is exiting".into()));
+        }
+        Request::ExecuteNativeCloseInitial(request) => {
+            let _ = request.response.send(Err(NativeCloseApplicationError::Unavailable));
+        }
+        Request::ExecuteNativeCloseObserve(request) => {
+            let _ = request.response.send(Err(NativeCloseApplicationError::Unavailable));
+        }
+        Request::ExecuteNativeCloseRetry(request) => {
+            let _ = request.response.send(Err(NativeCloseApplicationError::Unavailable));
+        }
+        Request::ExecuteNativeTaskApproval { response, .. } => {
+            let _ = response.send(crate::runtime::task_approval_admission::NativeTaskApprovalOutcome::Unavailable);
+        }
+        #[cfg(test)]
+        Request::InspectNativeTaskApprovalAdmission { response, .. } => {
+            let _ = response.send(Err("runtime is exiting".into()));
+        }
+    }
+}
+
+/// One source-owned initial Close continuation. Its authority and target gate
+/// remain live while the event loop advances the exact admitted receipt.
+pub(super) struct NativeCloseInitialContinuation {
+    pub(super) command: phoenix_db::native_close::NativeCloseCommand,
+    pub(super) receipt: phoenix_db::native_close::NativeCloseReceipt,
+    pub(super) admitted_result: NativeCloseInitialResult,
+    pub(super) db: phoenix_db::Database,
+    pub(super) phase: NativeCloseInitialContinuationPhase,
+    inspection: Option<
+        tokio::task::JoinHandle<Result<NativeInitialInspection, NativeInitialInspectionFailure>>,
+    >,
+    inspection_failure: Option<NativeInitialInspectionFailureIntent>,
+    pub(super) terminal_observation_retry: bool,
+    pub(super) authority: RuntimeSettlementAuthority,
+    pub(super) _target_gate: tokio::sync::OwnedMutexGuard<()>,
+    pub(super) _response: Option<tokio::sync::oneshot::Sender<
+        Result<NativeCloseInitialResult, NativeCloseApplicationError>,
+    >>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum NativeCloseInitialContinuationPhase {
+    Prepare,
+    Settle,
+    WaitingForQuiescence,
+    ReachedSettlementPhase(phoenix_core::domain::close::ClosePhase),
+    AwaitingStopWorkConfirmation,
+    CollectingInspection,
+    InspectionRequired,
+    ClassifyingInspectionFailure,
+    ObservingTerminal,
+    ExitObservationOnly,
+    ClassifyingExitInterruption,
+    Finished,
+}
+
+#[derive(Debug, Clone)]
+struct NativeInitialInspectionFailureIntent {
+    scope: phoenix_core::work_scope::WorkScopeId,
+    reason: phoenix_core::domain::close::RetirementFailureReason,
+    detail: String,
+}
+
+pub(super) enum NativeCloseInitialAdmission {
+    Finished(NativeCloseInitialResult),
+    Continued { result: NativeCloseInitialResult, continuation: NativeCloseInitialContinuation },
+}
+
+impl Drop for NativeCloseInitialContinuation {
+    fn drop(&mut self) {
+        if let Some(handle) = self.inspection.take() {
+            handle.abort();
+        }
+    }
+}
+
+impl NativeCloseInitialContinuation {
+    /// Releases the source owner only after exact durable terminal evidence is observed.
+    /// A failed or unrelated read leaves the continuation and its guards untouched.
+    pub(super) async fn release_if_exactly_stopped(&mut self) -> bool {
+        use phoenix_core::domain::close::{ClosePhase, CloseRunRef, CloseRunStatus};
+
+        let run = CloseRunRef {
+            attempt_id: self.receipt.admitted.attempt_id.clone(),
+            ordinal: self.receipt.admitted.run_ordinal,
+        };
+        let command_target_matches = matches!(
+            self.command.intent(),
+            phoenix_db::native_close::NativeCloseIntent::Initial { target }
+                if target == &self.receipt.admitted.target
+        );
+        if self.command.request_id() != self.receipt.request_id || !command_target_matches {
+            return false;
+        }
+        self.terminal_observation_retry = true;
+        let Ok(observed_run) = self.db.get_close_run(&run).await else {
+            return false;
+        };
+        let Ok(obligation) = self.db.get_close_obligation(run.attempt_id.as_str()).await else {
+            return false;
+        };
+        if observed_run.run != run
+            || observed_run.status != CloseRunStatus::Stopped
+            || obligation.attempt_id() != &run.attempt_id
+            || obligation.product_conversation_id() != &self.receipt.admitted.target
+            || obligation.phase() != ClosePhase::Completed
+            || obligation.close_outcome().is_none()
+        {
+            return false;
+        }
+
+        self.terminal_observation_retry = false;
+        self.authority.owner = None;
+        if let Some(response) = self._response.take() {
+            let _ = response.send(Ok(self.admitted_result.clone()));
+        }
+        true
+    }
+
+    pub(super) fn collecting_inspection(&self) -> bool {
+        self.phase == NativeCloseInitialContinuationPhase::CollectingInspection
+    }
+
+    pub(super) fn freeze_for_exit_observation(&mut self) {
+        if let Some(handle) = self.inspection.take() {
+            handle.abort();
+        }
+        self.phase = NativeCloseInitialContinuationPhase::ExitObservationOnly;
+        self.terminal_observation_retry = true;
+    }
+
+    /// Exit settlement is a distinct admitted operation, not permission to
+    /// resume preparation, inspection, retirement, or source-bound completion.
+    pub(super) fn begin_exit_interruption(&mut self) {
+        self.freeze_for_exit_observation();
+        self.phase = NativeCloseInitialContinuationPhase::ClassifyingExitInterruption;
+    }
+
+    pub(super) fn exit_observation_only(&self) -> bool {
+        self.phase == NativeCloseInitialContinuationPhase::ExitObservationOnly
+    }
+
+    pub(super) fn requires_periodic_step(&self) -> bool {
+        matches!(
+            self.phase,
+            NativeCloseInitialContinuationPhase::CollectingInspection
+                | NativeCloseInitialContinuationPhase::WaitingForQuiescence
+                | NativeCloseInitialContinuationPhase::ClassifyingInspectionFailure
+                | NativeCloseInitialContinuationPhase::ObservingTerminal
+                | NativeCloseInitialContinuationPhase::ClassifyingExitInterruption
+        )
+    }
+
+    pub(super) async fn observe_terminal_if_required(&mut self) -> bool {
+        self.terminal_observation_retry && self.release_if_exactly_stopped().await
+    }
+
+    pub(super) fn next_service_at(&self) -> tokio::time::Instant {
+        let delay_ms = if self.collecting_inspection() { 100 } else { 250 };
+        tokio::time::Instant::now() + std::time::Duration::from_millis(delay_ms)
+    }
+
+    pub(super) fn needs_service(&self, step_ready: bool) -> bool {
+        self.terminal_observation_retry || step_ready || self.requires_periodic_step()
+    }
+
+    pub(super) fn should_step(&self, step_ready: bool) -> bool {
+        !self.exit_observation_only() && (step_ready || self.requires_periodic_step())
+    }
+
+    #[cfg(test)]
+    pub(super) async fn await_inspection_completion_for_test(&mut self) {
+        let handle = self.inspection.take().expect("inspection must be collecting");
+        let result = handle.await;
+        self.inspection = Some(tokio::spawn(async move { result.expect("collector task must finish") }));
+        // The collector's actual result was awaited above; only schedule the completed
+        // replacement handle so the ordinary actor step can consume it unchanged.
+        while !self.inspection.as_ref().unwrap().is_finished() {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    fn live_source_matches(&self, live_source: &phoenix_core::domain::sm_state::ConvState) -> bool {
+        let phoenix_db::native_close::NativeCloseIntent::Initial { target } = self.command.intent() else {
+            return false;
+        };
+        initial_command_from_executing_source(
+            live_source,
+            self.command.source_transcript_id(),
+            self.command.source(),
+            target.clone(),
+        ).is_ok_and(|command| command == self.command)
+    }
+
+    pub(super) fn abort_inspection_if_source_revoked(&mut self, live_source: &phoenix_core::domain::sm_state::ConvState) {
+        if self.collecting_inspection() && !self.live_source_matches(live_source) {
+            if let Some(handle) = self.inspection.take() {
+                handle.abort();
+            }
+            self.phase = NativeCloseInitialContinuationPhase::InspectionRequired;
+            tracing::warn!("native Close inspection result invalidated after source revocation; retaining owner for exact terminal classification");
+        }
+    }
+
+    /// Advances one source-owned boundary without sleeping in the actor. The
+    /// read-only collector runs separately; its result is committed only here.
+    #[allow(clippy::too_many_lines)]
+    pub(super) async fn step(
+        &mut self,
+        live_source: &phoenix_core::domain::sm_state::ConvState,
+    ) -> Result<NativeCloseInitialContinuationPhase, NativeCloseApplicationError> {
+        use NativeCloseInitialContinuationPhase as Phase;
+        if self.exit_observation_only() {
+            return Ok(self.phase);
+        }
+        match self.phase {
+            Phase::ClassifyingExitInterruption => {
+                match self.db.interrupt_native_close_initial(&self.command, &self.receipt).await {
+                    LocalAuthorityResult::DurableFactEstablished(Ok(_)) => {
+                        self.phase = Phase::ObservingTerminal;
+                        if self.release_if_exactly_stopped().await {
+                            self.phase = Phase::Finished;
+                        }
+                        Ok(self.phase)
+                    }
+                    LocalAuthorityResult::DurableFactEstablished(Err(error)) => {
+                        tracing::warn!(%error, "native Close exit interruption definitely rolled back; retaining owner and retrying exit settlement only");
+                        Ok(self.phase)
+                    }
+                    LocalAuthorityResult::DurableFactUnclassified => {
+                        Err(NativeCloseApplicationError::FatalAuthority)
+                    }
+                }
+            }
+            Phase::Prepare => match self.db.prepare_native_close_initial_execution(&self.command, &self.receipt, live_source).await {
+                LocalAuthorityResult::DurableFactEstablished(Ok(execution)) => {
+                    self.phase = match execution.phase {
+                        phoenix_core::domain::close::ClosePhase::SettlingActiveWork => Phase::Settle,
+                        phoenix_core::domain::close::ClosePhase::AwaitingStopWorkConfirmation => Phase::AwaitingStopWorkConfirmation,
+                        phase => Phase::ReachedSettlementPhase(phase),
+                    };
+                    Ok(self.phase)
+                }
+                LocalAuthorityResult::DurableFactEstablished(Err(_)) => {
+                    self.phase = Phase::InspectionRequired;
+                    Err(NativeCloseApplicationError::Storage)
+                }
+                LocalAuthorityResult::DurableFactUnclassified => Err(NativeCloseApplicationError::FatalAuthority),
+            },
+            Phase::Settle | Phase::WaitingForQuiescence => match self.db.try_settle_native_close_initial(&self.command, &self.receipt, live_source).await {
+                LocalAuthorityResult::DurableFactEstablished(Ok(phoenix_db::native_close::NativeCloseInitialSettlement::WaitingForQuiescence)) => {
+                    self.phase = Phase::WaitingForQuiescence; Ok(self.phase)
+                }
+                LocalAuthorityResult::DurableFactEstablished(Ok(phoenix_db::native_close::NativeCloseInitialSettlement::Advanced(execution))) => {
+                    self.phase = Phase::ReachedSettlementPhase(execution.phase); Ok(self.phase)
+                }
+                LocalAuthorityResult::DurableFactEstablished(Err(_)) => {
+                    self.phase = Phase::InspectionRequired;
+                    Err(NativeCloseApplicationError::Storage)
+                }
+                LocalAuthorityResult::DurableFactUnclassified => Err(NativeCloseApplicationError::FatalAuthority),
+            },
+            Phase::ReachedSettlementPhase(phoenix_core::domain::close::ClosePhase::AwaitingRetirementInspection) => {
+                if !self.live_source_matches(live_source) {
+                    self.phase = Phase::InspectionRequired;
+                    return Err(NativeCloseApplicationError::SourceRefused);
+                }
+                let db = self.db.clone();
+                let attempt_id = self.receipt.admitted.attempt_id.clone();
+                self.inspection = Some(tokio::spawn(async move {
+                    collect_native_initial_inspection(&db, attempt_id).await
+                }));
+                self.phase = Phase::CollectingInspection;
+                Ok(self.phase)
+            }
+            Phase::CollectingInspection => {
+                if !self.live_source_matches(live_source) {
+                    self.abort_inspection_if_source_revoked(live_source);
+                    return Err(NativeCloseApplicationError::SourceRefused);
+                }
+                if !self.inspection.as_ref().is_some_and(tokio::task::JoinHandle::is_finished) {
+                    return Ok(self.phase);
+                }
+                let handle = self.inspection.take().expect("collecting inspection has owned handle");
+                let collected = match handle.await {
+                    Ok(Ok(collected)) => collected,
+                    Ok(Err(NativeInitialInspectionFailure::Scope { scope, reason, detail })) => {
+                        tracing::warn!(%scope, ?reason, %detail, "native Close read-only inspection requires durable terminal classification");
+                        self.inspection_failure = Some(NativeInitialInspectionFailureIntent { scope, reason, detail });
+                        self.phase = Phase::ClassifyingInspectionFailure;
+                        return Ok(self.phase);
+                    }
+                    Ok(Err(NativeInitialInspectionFailure::Storage(detail))) => {
+                        tracing::error!(%detail, "native Close inspection storage failure has no captured-scope authority; retaining blocked owner without fabricating classification");
+                        self.phase = Phase::InspectionRequired;
+                        return Err(NativeCloseApplicationError::Storage);
+                    }
+                    Err(error) => {
+                        tracing::error!(%error, "native Close inspection worker join failure has no captured-scope authority; retaining blocked owner without fabricating classification");
+                        self.phase = Phase::InspectionRequired;
+                        return Err(NativeCloseApplicationError::Storage);
+                    }
+                };
+                let loss_count: usize = collected.request.scopes.iter().map(|scope| scope.losses.len()).sum();
+                match self.db.replace_native_close_initial_inspection(
+                    &self.command, &self.receipt, live_source,
+                    collected.request, collected.empty_generation.as_deref(),
+                ).await {
+                    LocalAuthorityResult::DurableFactEstablished(Ok(())) => {
+                        let obligation = match self.db.get_close_obligation(self.receipt.admitted.attempt_id.as_str()).await {
+                            Ok(obligation) => obligation,
+                            Err(error) => {
+                                tracing::warn!(%error, "initial inspection committed but its resulting phase could not be read");
+                                self.phase = Phase::InspectionRequired;
+                                return Err(NativeCloseApplicationError::Storage);
+                            }
+                        };
+                        self.phase = Phase::ReachedSettlementPhase(obligation.phase());
+                        tracing::info!(loss_count, ?self.phase, "native Close initial inspection persisted under exact live source; retirement remains pending");
+                        Ok(self.phase)
+                    }
+                    LocalAuthorityResult::DurableFactEstablished(Err(error)) => {
+                        tracing::warn!(%error, "native Close initial inspection replacement rejected; retaining repair-required owner");
+                        self.phase = Phase::InspectionRequired;
+                        Err(NativeCloseApplicationError::Storage)
+                    }
+                    LocalAuthorityResult::DurableFactUnclassified => Err(NativeCloseApplicationError::FatalAuthority),
+                }
+            }
+            Phase::ClassifyingInspectionFailure => {
+                let failure = self.inspection_failure.as_ref().expect("classification phase owns typed failure intent").clone();
+                match self.db.terminalize_native_close_initial_inspection_failure(
+                    &self.command, &self.receipt, live_source,
+                    &failure.scope, failure.reason, &failure.detail,
+                ).await {
+                    LocalAuthorityResult::DurableFactEstablished(Ok(_obligation)) => {
+                        self.inspection_failure = None;
+                        self.phase = Phase::ObservingTerminal;
+                        if self.release_if_exactly_stopped().await {
+                            self.phase = Phase::Finished;
+                        }
+                        Ok(self.phase)
+                    }
+                    LocalAuthorityResult::DurableFactEstablished(Err(error)) => {
+                        tracing::warn!(%error, "native Close failure classification definitely rolled back; retaining owner and retrying classification only");
+                        Ok(self.phase)
+                    }
+                    LocalAuthorityResult::DurableFactUnclassified => Err(NativeCloseApplicationError::FatalAuthority),
+                }
+            }
+            Phase::ObservingTerminal => {
+                if self.release_if_exactly_stopped().await {
+                    self.phase = Phase::Finished;
+                }
+                Ok(self.phase)
+            }
+            Phase::ReachedSettlementPhase(_)
+            | Phase::AwaitingStopWorkConfirmation
+            | Phase::InspectionRequired
+            | Phase::ExitObservationOnly
+            | Phase::Finished => Ok(self.phase),
+        }
+    }
+}
+
+impl<S, L, T> ConversationRuntime<S, L, T>
+where
+    S: Storage + Clone + 'static,
+    L: LlmClient + 'static,
+    T: ToolExecutor + 'static,
+{
+    /// Production admission transfers authority only for a newly admitted receipt.
+    /// Replays and classified errors complete as before and have no continuation.
+    pub(super) async fn admit_native_close_initial(
+        &mut self,
+        backend: &crate::runtime::RuntimeManager,
+        source: SourceToolCall,
+        target: ProductConversationId,
+        admitted: crate::runtime::AdmittedOperation,
+        target_gate: tokio::sync::OwnedMutexGuard<()>,
+        response: tokio::sync::oneshot::Sender<Result<NativeCloseInitialResult, NativeCloseApplicationError>>,
+    ) -> Result<NativeCloseInitialAdmission, NativeCloseApplicationError> {
+        let mut authority = RuntimeSettlementAuthority {
+            owner: Some(admitted),
+            abandoned_reason: "native Close initial continuation owner disappeared",
+        };
+        let preflight = (|| -> Result<_, NativeCloseApplicationError> {
+            self.check_native_close_backend(backend.db())?;
+            if !self.context.is_coordinator
+                || self.context.is_sub_agent
+                || self
+                    .fatal_external_effect_cancellation
+                    .as_ref()
+                    .is_some_and(CancellationToken::is_cancelled)
+            {
+                return Err(NativeCloseApplicationError::SourceRefused);
+            }
+            let command = initial_command_from_executing_source(
+                &self.state,
+                &self.context.conversation_id,
+                &source,
+                target,
+            )
+            .map_err(|_| NativeCloseApplicationError::SourceRefused)?;
+            let db = self
+                .native_task_admission_db
+                .as_ref()
+                .ok_or(NativeCloseApplicationError::Unavailable)?;
+            Ok((command, db))
+        })();
+        let (command, db) = match preflight {
+            Ok(ready) => ready,
+            Err(error) => {
+                authority.owner = None;
+                drop(target_gate);
+                let _ = response.send(Err(error));
+                return Err(error);
+            }
+        };
+        match db.apply_native_close_initial(&command).await {
+            LocalAuthorityResult::DurableFactEstablished(Ok(NativeCloseInitialResult::NewlyAdmitted(receipt))) => {
+                let result = NativeCloseInitialResult::NewlyAdmitted(receipt.clone());
+                let continuation = NativeCloseInitialContinuation {
+                    command,
+                    receipt,
+                    admitted_result: result.clone(),
+                    db: db.clone(),
+                    phase: NativeCloseInitialContinuationPhase::Prepare,
+                    inspection: None,
+                    inspection_failure: None,
+                    terminal_observation_retry: false,
+                    authority,
+                    _target_gate: target_gate,
+                    _response: Some(response),
+                };
+                Ok(NativeCloseInitialAdmission::Continued { result, continuation })
+            }
+            LocalAuthorityResult::DurableFactEstablished(Ok(result)) => {
+                authority.owner = None;
+                drop(target_gate);
+                let _ = response.send(Ok(result.clone()));
+                Ok(NativeCloseInitialAdmission::Finished(result))
+            }
+            LocalAuthorityResult::DurableFactEstablished(Err(_)) => {
+                authority.owner = None;
+                drop(target_gate);
+                let _ = response.send(Err(NativeCloseApplicationError::Storage));
+                Err(NativeCloseApplicationError::Storage)
+            }
+            LocalAuthorityResult::DurableFactUnclassified => {
+                drop(target_gate);
+                let _ = response.send(Err(NativeCloseApplicationError::FatalAuthority));
+                Err(NativeCloseApplicationError::FatalAuthority)
+            }
+        }
+    }
+}
 
 impl<S, L, T> ConversationRuntime<S, L, T>
 where
@@ -40,6 +507,7 @@ where
     /// actor ownership spans live source matching, receipt lookup, actual DB commit
     /// and durable-result classification. Source/target DB authority is rechecked
     /// transactionally, not inferred from the queued request or watch state.
+    #[cfg(test)]
     pub(super) async fn execute_native_close_initial(
         &mut self,
         backend: &crate::runtime::RuntimeManager,

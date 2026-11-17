@@ -79,6 +79,118 @@ enum CloseLeaseFailure {
     },
 }
 
+/// Read-only evidence for the exact source-owned initial inspection adapter.
+pub(crate) struct NativeInitialInspection {
+    pub(crate) request: ReplaceCloseInspectionRequest,
+    pub(crate) empty_generation: Option<String>,
+}
+
+#[derive(Debug)]
+pub(crate) enum NativeInitialInspectionFailure {
+    Storage(String),
+    Scope {
+        scope: WorkScopeId,
+        reason: RetirementFailureReason,
+        detail: String,
+    },
+}
+
+/// Collect evidence without acquiring leases, changing the registry, writing to SQLite,
+/// or interpreting an absent worktree as a successful retirement.
+pub(crate) async fn collect_native_initial_inspection(
+    db: &phoenix_db::Database,
+    attempt_id: CloseAttemptId,
+) -> Result<NativeInitialInspection, NativeInitialInspectionFailure> {
+    use NativeInitialInspectionFailure as Failure;
+
+    let obligation = db
+        .get_close_obligation(attempt_id.as_str())
+        .await
+        .map_err(|error| Failure::Storage(error.to_string()))?;
+    if obligation.attempt_id() != &attempt_id
+        || obligation.phase() != ClosePhase::AwaitingRetirementInspection
+    {
+        return Err(Failure::Storage("initial inspection is not awaiting retirement inspection".into()));
+    }
+    let empty_generation = (obligation.snapshot().is_some())
+        .then(|| format!("server_git_status_v2_retry_{}", uuid::Uuid::new_v4()));
+    let scopes = db
+        .list_close_attempt_scopes(attempt_id.as_str())
+        .await
+        .map_err(|error| Failure::Storage(error.to_string()))?;
+    let mut requests = Vec::with_capacity(scopes.len());
+    for captured in scopes {
+        let scope = captured.scope;
+        let identity = match captured.captured_worktree {
+            None => continue,
+            Some(CapturedWorktreeIdentity::Resolved(identity)) => identity,
+            Some(CapturedWorktreeIdentity::Unresolved { .. }) => {
+                return Err(Failure::Scope {
+                    scope,
+                    reason: RetirementFailureReason::IdentityNotProven,
+                    detail: "captured worktree identity is unresolved".into(),
+                });
+            }
+        };
+        let path = worktree_path(&identity);
+        let actual_path = match path.try_exists() {
+            Ok(true) => path,
+            Ok(false) => {
+                let quarantine = worktree_quarantine_path(&identity).map_err(|detail| Failure::Scope {
+                    scope: scope.clone(),
+                    reason: RetirementFailureReason::IdentityNotProven,
+                    detail,
+                })?;
+                match quarantine.try_exists() {
+                    Ok(true) => quarantine,
+                    Ok(false) => return Err(Failure::Scope {
+                        scope,
+                        reason: RetirementFailureReason::IdentityNotProven,
+                        detail: "captured worktree is absent before inspection".into(),
+                    }),
+                    Err(error) => return Err(Failure::Scope {
+                        scope,
+                        reason: RetirementFailureReason::ManualRepairRequired,
+                        detail: error.to_string(),
+                    }),
+                }
+            }
+            Err(error) => return Err(Failure::Scope {
+                scope,
+                reason: RetirementFailureReason::ManualRepairRequired,
+                detail: error.to_string(),
+            }),
+        };
+        if observe_worktree_fingerprint(&actual_path).as_deref()
+            != Some(identity.fingerprint().as_str())
+        {
+            return Err(Failure::Scope {
+                scope,
+                reason: RetirementFailureReason::IdentityNotProven,
+                detail: "captured worktree administrative incarnation changed".into(),
+            });
+        }
+        let (snapshot, losses) = inspect_worktree_at(&identity, actual_path)
+            .await
+            .map_err(|detail| Failure::Scope {
+                scope: scope.clone(),
+                reason: RetirementFailureReason::ManualRepairRequired,
+                detail,
+            })?;
+        let snapshot = rotate_inspection_generation(snapshot, empty_generation.as_deref())
+            .map_err(|detail| Failure::Scope {
+                scope: scope.clone(),
+                reason: RetirementFailureReason::ManualRepairRequired,
+                detail,
+            })?;
+        requests.push(ReplaceCloseInspectionScopeRequest { scope, snapshot, losses });
+    }
+    Ok(NativeInitialInspection {
+        request: ReplaceCloseInspectionRequest { attempt_id, scopes: requests },
+        empty_generation,
+    })
+}
+
 impl CloseLeaseFailure {
     fn process_epoch(
         kind: RetiredResourceKind,
@@ -4306,6 +4418,7 @@ fn run_bounded_git_status_until(
     let mut command = phoenix_core::git::command_with_config(&[("core.fsmonitor", "false")]);
     bind_git_command_to_worktree(&mut command, repository)?;
     command
+        .env("GIT_OPTIONAL_LOCKS", "0")
         .args([
             "status",
             "--porcelain=v1",

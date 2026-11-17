@@ -192,6 +192,7 @@ fn append_field(bytes: &mut Vec<u8>, value: &[u8]) {
 }
 
 mod initial;
+mod initial_exit;
 pub use initial::{
     NativeCloseInitialExecution, NativeCloseInitialResult, NativeCloseInitialSettlement,
     NativeCloseReceipt, NativeCloseRunRef,

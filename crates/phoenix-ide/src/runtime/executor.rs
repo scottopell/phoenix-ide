@@ -2317,6 +2317,9 @@ where
     fatal_local_authority_rx: Option<watch::Receiver<Option<&'static str>>>,
     fatal_external_effect_cancellation: Option<CancellationToken>,
     #[cfg(test)]
+    native_close_phase_observer:
+        Option<tokio::sync::mpsc::UnboundedSender<native_close::NativeCloseInitialContinuationPhase>>,
+    #[cfg(test)]
     external_effect_dispatch_barrier: Option<Arc<tokio::sync::Barrier>>,
     #[cfg(test)]
     semantic_publication_barrier: Option<Arc<tokio::sync::Barrier>>,
@@ -2566,6 +2569,8 @@ where
             fatal_external_effect_cancellation: Some(
                 fatal_local_authority_fence.external_effect_cancellation(),
             ),
+            #[cfg(test)]
+            native_close_phase_observer: None,
             #[cfg(test)]
             external_effect_dispatch_barrier: None,
             #[cfg(test)]
@@ -3237,6 +3242,26 @@ where
         startup_authority.owner = None;
         drop(startup_authority);
 
+        let mut pending_native_close_initial: Option<native_close::NativeCloseInitialContinuation> = None;
+        let mut native_close_step_ready = false;
+        // Retain one absolute deadline across select iterations. Recreating a
+        // relative sleep lets ordinary request traffic postpone Close forever.
+        let mut next_native_close_service_at = tokio::time::Instant::now();
+        let mut deferred_native_close_exit: Option<RuntimeExitDisposition> = None;
+
+        macro_rules! defer_exit_until_native_close_observed {
+            ($disposition:expr) => {{
+                if let Some(continuation) = pending_native_close_initial.as_mut() {
+                    continuation.begin_exit_interruption();
+                    self.abort_external_effects().await;
+                    deferred_native_close_exit = Some($disposition);
+                    continue;
+                } else {
+                    return $disposition;
+                }
+            }};
+        }
+
         // Process events and outcomes in a loop - no recursion
         // Input sources:
         //   event_rx          — user events + legacy executor events (continuation, sub-agent results)
@@ -3249,15 +3274,31 @@ where
             && matches!(self.state, ConvState::ContextExhausted { .. }))
         .then(|| tokio::time::Instant::now() + Duration::from_secs(30));
         loop {
-            if self.fatal_local_authority_fence.is_closed() {
-                return self.closed_authority_exit().await;
+            if deferred_native_close_exit.is_some() && pending_native_close_initial.is_none() {
+                return deferred_native_close_exit.take().expect("checked deferred exit");
             }
-            if let Some(disposition) = self.recovery_exit_disposition() {
-                tracing::warn!(
-                    conversation_id = %self.context.conversation_id,
-                    "Exiting runtime to reconstruct an uncommitted operation from database truth"
-                );
-                return disposition;
+            if self.fatal_local_authority_fence.is_closed() {
+                if self.fatal_local_authority_fence.fatal_authority_loss_is_latched() {
+                    return self.closed_authority_exit().await;
+                }
+                if deferred_native_close_exit.is_none() {
+                    self.abort_external_effects().await;
+                    defer_exit_until_native_close_observed!(RuntimeExitDisposition::CoordinatedShutdown);
+                }
+            }
+            if deferred_native_close_exit.is_none() {
+                if let Some(disposition) = self.recovery_exit_disposition() {
+                    tracing::warn!(
+                        conversation_id = %self.context.conversation_id,
+                        "Exiting runtime to reconstruct an uncommitted operation from database truth"
+                    );
+                    if let Some(continuation) = pending_native_close_initial.as_mut() {
+                        continuation.begin_exit_interruption();
+                        deferred_native_close_exit = Some(disposition);
+                    } else {
+                        return disposition;
+                    }
+                }
             }
             if self.local_terminal_authority == LocalTerminalAuthority::Fatal {
                 return self.fatal_local_authority_exit();
@@ -3281,13 +3322,98 @@ where
                     tracing::error!(?boundary, "fatal local SQLite authority loss; aborting external runtime effects");
                     return self.fatal_local_authority_exit();
                 }
+                // Process shutdown closes admission without publishing fatal authority
+                // loss. Wake dormant Close phases once; a cancelled token must not
+                // remain an always-ready branch ahead of their classification work.
+                () = wait_for_optional_cancellation(self.fatal_external_effect_cancellation.clone()),
+                    if deferred_native_close_exit.is_none() => {
+                    if self.fatal_local_authority_fence.fatal_authority_loss_is_latched() {
+                        return self.fatal_local_authority_exit();
+                    }
+                    self.abort_external_effects().await;
+                    defer_exit_until_native_close_observed!(RuntimeExitDisposition::CoordinatedShutdown);
+                }
+                // Fatal authority remains first. A due Close service pass gets
+                // priority over traffic, then schedules its next deadline after
+                // the awaited work so overdue ticks cannot starve Stop requests.
+                () = tokio::time::sleep_until(next_native_close_service_at),
+                    if pending_native_close_initial.as_ref().is_some_and(|continuation| continuation.needs_service(native_close_step_ready)) => {
+                    let mut continuation = pending_native_close_initial.take().expect("guarded continuation");
+                    if continuation.observe_terminal_if_required().await {
+                        native_close_step_ready = false;
+                        continue;
+                    }
+                    if !continuation.should_step(native_close_step_ready) {
+                        next_native_close_service_at = continuation.next_service_at();
+                        pending_native_close_initial = Some(continuation);
+                        continue;
+                    }
+                    native_close_step_ready = false;
+                    // Continuation owns the exact admitted database authority; admission
+                    // configuration may change after transfer and is not reconsulted.
+                    let stepped = continuation.step(&self.state).await;
+                    #[cfg(test)]
+                    if let (Some(observer), Ok(phase)) = (&self.native_close_phase_observer, &stepped) {
+                        let _ = observer.send(*phase);
+                    }
+                    next_native_close_service_at = continuation.next_service_at();
+                    match stepped {
+                        Ok(phase @ native_close::NativeCloseInitialContinuationPhase::Settle) => {
+                            tracing::debug!(?phase, "initial Close continuation prepared; scheduling one settlement step");
+                            pending_native_close_initial = Some(continuation);
+                            native_close_step_ready = true;
+                        }
+                        Ok(native_close::NativeCloseInitialContinuationPhase::ReachedSettlementPhase(phase)) => {
+                            tracing::debug!(?phase, "initial Close reached a typed settlement or inspection boundary");
+                            native_close_step_ready = phase == phoenix_core::domain::close::ClosePhase::AwaitingRetirementInspection;
+                            pending_native_close_initial = Some(continuation);
+                        }
+                        Ok(native_close::NativeCloseInitialContinuationPhase::CollectingInspection) => {
+                            pending_native_close_initial = Some(continuation);
+                        }
+                        Ok(native_close::NativeCloseInitialContinuationPhase::AwaitingStopWorkConfirmation) => {
+                            tracing::debug!("initial Close is awaiting Stop work confirmation");
+                            pending_native_close_initial = Some(continuation);
+                        }
+                        Ok(native_close::NativeCloseInitialContinuationPhase::Finished) => {
+                            pending_native_close_initial = None;
+                        }
+                        Ok(native_close::NativeCloseInitialContinuationPhase::InspectionRequired) => {
+                            pending_native_close_initial = Some(continuation);
+                        }
+                        Ok(native_close::NativeCloseInitialContinuationPhase::ExitObservationOnly) => {
+                            pending_native_close_initial = Some(continuation);
+                            native_close_step_ready = false;
+                        }
+                        Ok(native_close::NativeCloseInitialContinuationPhase::ClassifyingInspectionFailure
+                            | native_close::NativeCloseInitialContinuationPhase::ClassifyingExitInterruption
+                            | native_close::NativeCloseInitialContinuationPhase::ObservingTerminal) => {
+                            pending_native_close_initial = Some(continuation);
+                            native_close_step_ready = false;
+                        }
+                        Ok(native_close::NativeCloseInitialContinuationPhase::WaitingForQuiescence) => {
+                            pending_native_close_initial = Some(continuation);
+                        }
+                        Ok(native_close::NativeCloseInitialContinuationPhase::Prepare) => {
+                            pending_native_close_initial = Some(continuation);
+                        }
+                        Err(super::native_close_application::NativeCloseApplicationError::FatalAuthority) => {
+                            drop(continuation);
+                            return self.fatal_local_authority_exit();
+                        }
+                        Err(error) => {
+                            tracing::warn!(%error, "initial Close continuation stopped at classified boundary; retaining source owner for inspection");
+                            pending_native_close_initial = Some(continuation);
+                        }
+                    }
+                }
                 () = async {
                     match exhausted_maintenance_deadline {
                         Some(deadline) => tokio::time::sleep_until(deadline).await,
                         None => std::future::pending().await,
                     }
-                }, if matches!(self.state, ConvState::ContextExhausted { .. }) => {
-                    return RuntimeExitDisposition::CoordinatedShutdown;
+                }, if deferred_native_close_exit.is_none() && matches!(self.state, ConvState::ContextExhausted { .. }) => {
+                    defer_exit_until_native_close_observed!(RuntimeExitDisposition::CoordinatedShutdown);
                 }
                 Some(review) = async {
                     match self.handoff_review_rx.as_mut() {
@@ -3295,28 +3421,46 @@ where
                         None => std::future::pending().await,
                     }
                 } => {
+                    if deferred_native_close_exit.is_some() {
+                        let _ = review.response.send(Err("runtime is exiting".into()));
+                        continue;
+                    }
                     let result = self.review_handoff_input(review.input).await;
                     let _ = review.response.send(result);
                     if self.exhausted_maintenance && matches!(self.state, ConvState::ContextExhausted { .. }) {
-                        return RuntimeExitDisposition::CoordinatedShutdown;
+                        defer_exit_until_native_close_observed!(RuntimeExitDisposition::CoordinatedShutdown);
                     }
                 }
                 Some(request) = self.acknowledged_event_rx.recv() => {
+                    if deferred_native_close_exit.is_some() {
+                        native_close::refuse_during_exit(request);
+                        continue;
+                    }
                     let super::AcknowledgedEventRequest { event, acknowledgement, retirement } = match request {
                         AcknowledgedRuntimeRequest::Event(event) => *event,
                         AcknowledgedRuntimeRequest::ExecuteNativeCloseInitial(request) => {
                             let super::native_close_application::NativeCloseInitialRequest {
                                 source, backend, target, admitted, target_gate, response,
                             } = *request;
-                            // The actual source actor remains exclusively borrowed
-                            // through the whole DB transaction and classification.
-                            // It must not reacquire the transferred target gate.
-                            let result = self
-                                .execute_native_close_initial(&backend, source, target, admitted)
-                                .await;
-                            let fatal = matches!(result, Err(super::native_close_application::NativeCloseApplicationError::FatalAuthority));
-                            drop(target_gate);
-                            let _ = response.send(result);
+                            // Admission runs under the actual source actor. A newly
+                            // admitted receipt transfers both guards into the actor's
+                            // bounded continuation; replay/error paths complete here.
+                            if pending_native_close_initial.is_some() {
+                                drop(admitted);
+                                drop(target_gate);
+                                let _ = response.send(Err(super::native_close_application::NativeCloseApplicationError::SourceRefused));
+                                continue;
+                            }
+                            let result = self.admit_native_close_initial(&backend, source, target, admitted, target_gate, response).await;
+                            let (fatal, continuation) = match result {
+                                Ok(native_close::NativeCloseInitialAdmission::Finished(_)) => (false, None),
+                                Ok(native_close::NativeCloseInitialAdmission::Continued { continuation, .. }) => (false, Some(continuation)),
+                                Err(error) => (matches!(error, super::native_close_application::NativeCloseApplicationError::FatalAuthority), None),
+                            };
+                            if let Some(continuation) = continuation {
+                                pending_native_close_initial = Some(continuation);
+                                native_close_step_ready = true;
+                            }
                             if fatal {
                                 return self.fatal_local_authority_exit();
                             }
@@ -3359,20 +3503,27 @@ where
                         }
                     };
                     let result = self.process_acknowledged_event(event).await;
+                    // The durable source fence is part of the event transaction; optional
+                    // Close observation must not delay its acknowledgement.
+                    let _ = acknowledgement.send(result);
+                    if let Some(continuation) = pending_native_close_initial.as_mut() {
+                        if continuation.release_if_exactly_stopped().await {
+                            pending_native_close_initial = None;
+                        }
+                    }
                     let terminal = matches!(self.state.step_result(), StepResult::Terminal(_));
                     if terminal {
                         self.emit_terminal_lifecycle_event().await;
                     }
-                    let _ = acknowledgement.send(result);
                     if self.creation_settlement_disposition == CreationSettlementDisposition::StaleAuthority {
                         let _ = retirement.await;
-                        return RuntimeExitDisposition::Interrupted;
+                        defer_exit_until_native_close_observed!(RuntimeExitDisposition::Interrupted);
                     }
                     if terminal {
-                        return RuntimeExitDisposition::Terminal;
+                        defer_exit_until_native_close_observed!(RuntimeExitDisposition::Terminal);
                     }
                 }
-                Some(event) = self.event_rx.recv() => {
+                Some(event) = self.event_rx.recv(), if deferred_native_close_exit.is_none() => {
                     // Eviction shutdown signal — exit cleanly so the broadcaster
                     // is dropped and connected SSE clients detect the closed
                     // stream and trigger a reconnect to the new runtime.
@@ -3383,7 +3534,12 @@ where
                             "Runtime shutdown signal received; aborting external effects and exiting executor loop"
                         );
                         self.abort_external_effects().await;
-                        return RuntimeExitDisposition::CoordinatedShutdown;
+                        if let Some(continuation) = pending_native_close_initial.as_mut() {
+                            if continuation.release_if_exactly_stopped().await {
+                                pending_native_close_initial = None;
+                            }
+                        }
+                        defer_exit_until_native_close_observed!(RuntimeExitDisposition::CoordinatedShutdown);
                     }
                     if let Err(e) = self.process_event(event).await {
                         if e.starts_with("FATAL_LOCAL_AUTHORITY_UNCLASSIFIED:") {
@@ -3398,8 +3554,13 @@ where
                     if self.local_terminal_authority == LocalTerminalAuthority::Fatal {
                         return self.fatal_local_authority_exit();
                     }
+                    if let Some(continuation) = pending_native_close_initial.as_mut() {
+                        if continuation.release_if_exactly_stopped().await {
+                            pending_native_close_initial = None;
+                        }
+                    }
                     if self.creation_settlement_disposition == CreationSettlementDisposition::StaleAuthority {
-                        return RuntimeExitDisposition::Interrupted;
+                        defer_exit_until_native_close_observed!(RuntimeExitDisposition::Interrupted);
                     }
                     // FM-5 prevention: terminal states exit the loop explicitly.
                     if let StepResult::Terminal(outcome) = self.state.step_result() {
@@ -3409,10 +3570,10 @@ where
                             "Conversation reached terminal state, exiting executor loop"
                         );
                         self.emit_terminal_lifecycle_event().await;
-                        return RuntimeExitDisposition::Terminal;
+                        defer_exit_until_native_close_observed!(RuntimeExitDisposition::Terminal);
                     }
                 }
-                Some((generation, llm_outcome)) = self.llm_outcome_rx.recv() => {
+                Some((generation, llm_outcome)) = self.llm_outcome_rx.recv(), if deferred_native_close_exit.is_none() => {
                     self.process_generation_tagged_llm_outcome(generation, llm_outcome)
                         .await;
                     // FM-5 prevention: terminal states exit the loop explicitly.
@@ -3423,7 +3584,7 @@ where
                             "Conversation reached terminal state, exiting executor loop"
                         );
                         self.emit_terminal_lifecycle_event().await;
-                        return RuntimeExitDisposition::Terminal;
+                        defer_exit_until_native_close_observed!(RuntimeExitDisposition::Terminal);
                     }
                 }
                 () = async {
@@ -3431,7 +3592,7 @@ where
                         Some(retry_at) => tokio::time::sleep_until(retry_at).await,
                         None => std::future::pending::<()>().await,
                     }
-                }, if terminal_retry_at.is_some() => {
+                }, if deferred_native_close_exit.is_none() && terminal_retry_at.is_some() => {
                     self.retry_terminal_transition().await;
                     if matches!(self.state.step_result(), StepResult::Terminal(_)) {
                         tracing::info!(
@@ -3440,10 +3601,10 @@ where
                             "Conversation reached terminal state, exiting executor loop"
                         );
                         self.emit_terminal_lifecycle_event().await;
-                        return RuntimeExitDisposition::Terminal;
+                        defer_exit_until_native_close_observed!(RuntimeExitDisposition::Terminal);
                     }
                 }
-                Some((generation, tool_outcome)) = self.tool_outcome_rx.recv() => {
+                Some((generation, tool_outcome)) = self.tool_outcome_rx.recv(), if deferred_native_close_exit.is_none() => {
                     // Generation guard for the tool task, mirroring the
                     // `llm_outcome_rx` guard above. A `forward_tool_outcome`
                     // send whose generation has been superseded (by a later
@@ -3472,10 +3633,10 @@ where
                             "Conversation reached terminal state, exiting executor loop"
                         );
                         self.emit_terminal_lifecycle_event().await;
-                        return RuntimeExitDisposition::Terminal;
+                        defer_exit_until_native_close_observed!(RuntimeExitDisposition::Terminal);
                     }
                 }
-                Some((generation, attempt)) = self.retry_outcome_rx.recv() => {
+                Some((generation, attempt)) = self.retry_outcome_rx.recv(), if deferred_native_close_exit.is_none() => {
                     // Generation guard for the retry-backoff timer, mirroring the
                     // LLM-outcome guard above. A fire whose generation has been
                     // superseded (a newer `Effect::ScheduleRetry`, or leaving the
@@ -3504,7 +3665,7 @@ where
                             "Conversation reached terminal state, exiting executor loop"
                         );
                         self.emit_terminal_lifecycle_event().await;
-                        return RuntimeExitDisposition::Terminal;
+                        defer_exit_until_native_close_observed!(RuntimeExitDisposition::Terminal);
                     }
                 }
                 // Unified liveness backstop (REQ-SA-006, REQ-BED-005a): one arm
@@ -3515,7 +3676,7 @@ where
                         Some(d) => tokio::time::sleep_until(d).await,
                         None => std::future::pending::<()>().await,
                     }
-                }, if deadline.is_some() => {
+                }, if deferred_native_close_exit.is_none() && deadline.is_some() => {
                     self.handle_deadline_expiry().await;
                     // FM-5 prevention: terminal states exit the loop explicitly.
                     if let StepResult::Terminal(outcome) = self.state.step_result() {
@@ -3525,7 +3686,7 @@ where
                             "Conversation reached terminal state, exiting executor loop"
                         );
                         self.emit_terminal_lifecycle_event().await;
-                        return RuntimeExitDisposition::Terminal;
+                        defer_exit_until_native_close_observed!(RuntimeExitDisposition::Terminal);
                     }
                 }
                 // REQ-BED-030: credential helper settled while awaiting recovery
@@ -3534,7 +3695,7 @@ where
                         Some(helper) => helper.wait_for_settlement().await,
                         None => std::future::pending::<()>().await,
                     }
-                }, if awaiting_recovery && self.credential_helper.is_some() => {
+                }, if deferred_native_close_exit.is_none() && awaiting_recovery && self.credential_helper.is_some() => {
                     if let Err(error) = self.handle_credential_settlement(TransitionAuthority::ExistingSettlement).await {
                         tracing::error!(%error, "Error handling credential settlement event");
                     }
@@ -3545,7 +3706,7 @@ where
                             "Conversation reached terminal state, exiting executor loop"
                         );
                         self.emit_terminal_lifecycle_event().await;
-                        return RuntimeExitDisposition::Terminal;
+                        defer_exit_until_native_close_observed!(RuntimeExitDisposition::Terminal);
                     }
                 }
                 else => break,
