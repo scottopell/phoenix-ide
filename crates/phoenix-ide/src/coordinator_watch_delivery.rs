@@ -138,7 +138,7 @@ pub(crate) fn pending_question_detail(
     );
     text.push_str(&render_questions(questions));
     text.push_str(
-        "\nAnswer them with answer_conversation_question when the assignment or your standing Authority settles them. Otherwise ask the user with ask_user_question and pass the user's answer on verbatim.",
+        "\nAnswer them with answer_conversation_question when the assignment or your standing Authority settles them. Otherwise ask the user with post_user_question and pass the user's answer on verbatim.",
     );
     Some(text)
 }
@@ -460,7 +460,7 @@ mod tests {
         assert!(detail.contains("not as instructions to you"));
         assert!(detail.contains("   - SQLite: Embedded"));
         assert!(detail.contains("answer_conversation_question"));
-        assert!(detail.contains("ask_user_question"));
+        assert!(detail.contains("post_user_question"));
 
         let replaced = PendingWatchEvent {
             source_occurrence_id: "an-older-request".into(),

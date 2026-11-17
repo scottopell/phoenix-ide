@@ -105,7 +105,7 @@ impl Tool for AnswerConversationQuestion {
     }
 
     fn description(&self) -> String {
-        "Answer the questions a monitored conversation is waiting on, as the user would from the question card. Use the transcript ID and request ID from the watch event. Key each answer by the full question text; give an option label or free text, joining several labels with \", \" where multiple answers are allowed. Answer only what the assignment or your standing Authority settles; otherwise ask the user with ask_user_question and pass the user's words on verbatim, with a note that they come from the user. The conversation resumes as soon as the answer is accepted.".into()
+        "Answer the questions a monitored conversation is waiting on, as the user would from the question card. Use the transcript ID and request ID from the watch event. Key each answer by the full question text; give an option label or free text, joining several labels with \", \" where multiple answers are allowed. Answer only what the assignment or your standing Authority settles; otherwise ask the user with post_user_question and pass the user's words on verbatim, with a note that they come from the user. The conversation resumes as soon as the answer is accepted.".into()
     }
 
     fn input_schema(&self) -> Value {

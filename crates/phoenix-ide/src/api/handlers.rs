@@ -433,6 +433,18 @@ pub fn create_router(state: AppState) -> Router {
             get(list_active_coordinator_watches),
         )
         .route(
+            "/api/coordinator/questions",
+            get(super::coordinator_questions::list),
+        )
+        .route(
+            "/api/coordinator/questions/{request_id}/answer",
+            post(super::coordinator_questions::answer),
+        )
+        .route(
+            "/api/coordinator/questions/{request_id}/dismiss",
+            post(super::coordinator_questions::dismiss),
+        )
+        .route(
             "/api/coordinator/bash/{handle_id}/stop",
             post(stop_live_coordinator_bash_handle),
         )

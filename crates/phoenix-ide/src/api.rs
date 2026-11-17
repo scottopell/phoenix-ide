@@ -9,6 +9,7 @@ pub mod auth;
 mod browser_view;
 mod chains;
 pub mod codex_login;
+mod coordinator_questions;
 pub(crate) mod deployment;
 pub(crate) mod deployment_observations;
 mod discovery;

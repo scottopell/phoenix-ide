@@ -14,6 +14,11 @@ pub use slack_gateway::*;
 mod close_foundation;
 mod coordinator_authority;
 mod coordinator_query;
+mod coordinator_questions;
+pub use coordinator_questions::{
+    CoordinatorQuestion, CoordinatorQuestionReplyKind, CoordinatorQuestionSettlement,
+    UndeliveredCoordinatorQuestionReply,
+};
 pub mod coordinator_scanner;
 pub mod coordinator_tracking;
 mod coordinator_watches;

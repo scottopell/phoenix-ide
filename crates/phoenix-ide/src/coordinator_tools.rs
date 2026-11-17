@@ -8,6 +8,7 @@ mod authority;
 mod goals;
 pub(crate) mod instance;
 mod tracking;
+mod user_questions;
 
 #[cfg(test)]
 use instance::InstanceSelector;
@@ -307,9 +308,8 @@ use crate::send_chat_service::{
     SendChatApplicationService, SendChatRequest, SendChatServiceError, SendChatTarget,
 };
 use crate::tools::{
-    AskUserQuestionTool, BashTool, CoordinatorPresentSvgTool, CoordinatorSvgSourceError,
-    CoordinatorSvgSourceResolver, Tool, ToolContext, ToolOutput, ValidatedBashSpawnTarget,
-    WritingConversationTools,
+    BashTool, CoordinatorPresentSvgTool, CoordinatorSvgSourceError, CoordinatorSvgSourceResolver,
+    Tool, ToolContext, ToolOutput, ValidatedBashSpawnTarget, WritingConversationTools,
 };
 use phoenix_core::domain::bash_types::{BashInvocation, BashSpawnTarget};
 
@@ -453,7 +453,9 @@ pub(crate) fn tools(
     tools.push(Arc::new(answer_question::AnswerConversationQuestion(
         close_retry,
     )));
-    tools.push(Arc::new(AskUserQuestionTool));
+    // REQ-AUQ-010: the Coordinator asks without blocking its own coordination.
+    tools.push(Arc::new(user_questions::PostUserQuestion(db.clone())));
+    tools.push(Arc::new(user_questions::WithdrawUserQuestion(db.clone())));
     tools
 }
 
@@ -3258,7 +3260,8 @@ mod tests {
                 "list_watched_conversations",
                 "retry_close_safely",
                 "answer_conversation_question",
-                "ask_user_question"
+                "post_user_question",
+                "withdraw_user_question"
             ]
         );
         let present_svg = coordinator
@@ -3365,18 +3368,27 @@ mod tests {
                 "list_watched_conversations",
                 "retry_close_safely",
                 "answer_conversation_question",
-                "ask_user_question"
+                "post_user_question",
+                "withdraw_user_question"
             ]
+        );
+        assert!(
+            definitions
+                .iter()
+                .all(|definition| definition.name != "ask_user_question"),
+            "REQ-AUQ-010: the Coordinator never blocks on its own question"
         );
         let question = definitions
             .iter()
-            .find(|definition| definition.name == "ask_user_question")
+            .find(|definition| definition.name == "post_user_question")
             .unwrap();
-        assert_eq!(question.input_schema, AskUserQuestionTool.input_schema());
-        assert_eq!(question.description, AskUserQuestionTool.description());
+        assert_eq!(
+            question.input_schema,
+            crate::tools::AskUserQuestionTool.input_schema()
+        );
         assert!(
             question.defer_loading,
-            "Coordinator AUQ must preserve REQ-AUQ-008 deferred loading"
+            "Coordinator questions must preserve REQ-AUQ-008 deferred loading"
         );
     }
 

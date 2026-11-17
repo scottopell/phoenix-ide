@@ -2637,34 +2637,11 @@ pub fn transition_parent(
                 annotations,
             }),
         ) if request_authority.matches_submitted(request_id.as_ref()) => {
-            let answers_text = questions
-                .iter()
-                .filter_map(|q| {
-                    let a = answers.get(&q.question)?;
-                    let q_text = &q.question;
-                    let mut parts = vec![format!("\"{}\" = \"{}\"", q_text, a)];
-                    let question_data = questions.iter().find(|qq| qq.question == *q_text);
-                    if let Some(qd) = question_data {
-                        let selected_preview = qd
-                            .options
-                            .iter()
-                            .find(|o| o.label == *a)
-                            .and_then(|o| o.preview.as_deref());
-                        if let Some(preview) = selected_preview {
-                            parts.push(format!("selected preview:\n{preview}"));
-                        }
-                    }
-                    if let Some(ref anns) = annotations {
-                        if let Some(ann) = anns.get(q_text.as_str()) {
-                            if let Some(ref notes) = ann.notes {
-                                parts.push(format!("user notes: {notes}"));
-                            }
-                        }
-                    }
-                    Some(parts.join(" "))
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
+            let answers_text = phoenix_core::domain::sm_state::render_question_answers(
+                questions,
+                &answers,
+                annotations.as_ref(),
+            );
 
             let answered_by_conversation = source.as_ref().is_some_and(|source| {
                 matches!(

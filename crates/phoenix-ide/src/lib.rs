@@ -17,6 +17,7 @@ mod conversation_action_tools;
 mod conversation_actions;
 mod conversation_cwd;
 mod coordinator_home;
+mod coordinator_question_delivery;
 mod coordinator_scanner;
 mod coordinator_tools;
 mod coordinator_watch_delivery;

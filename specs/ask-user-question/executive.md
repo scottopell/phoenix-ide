@@ -37,5 +37,8 @@ selected labels, preview content, and user notes.
 | **REQ-AUQ-007:** Real-Time Waiting Feedback | ✅ Complete | `awaiting_user_response` in `ConversationState` SSE union in `ui/src/api.ts` |
 | **REQ-AUQ-008:** Low-Overhead Tool Availability | ✅ Complete | `defer_loading() -> bool { true }` in `ask_user_question.rs` |
 | **REQ-AUQ-009:** Bind Actions to the Current Pending Question | ✅ Complete | Persisted request identity, admission-locked HTTP validation, transition recheck, and request-keyed web panel |
+| **REQ-AUQ-010:** Coordinator Questions Do Not Block Coordination | 🔄 In review | `post_user_question` replaces the blocking tool for the Coordinator; `coordinator_user_questions` table (migration 168); prompt wording. Not deployed. |
+| **REQ-AUQ-011:** Answer Coordinator Questions Outside the Transcript | 🔄 In review | `GET /api/coordinator/questions`, answer/dismiss endpoints, retrying reply delivery in input discovery; `CoordinatorQuestionDock` on Ember's page, Ember entry count, question notifications. Unit and runtime tests; not checked in a browser; not deployed. |
+| **REQ-AUQ-012:** Withdraw Settled Coordinator Questions | 🔄 In review | `withdraw_user_question`; database tests. Not deployed. |
 
-**Progress:** 9 of 9 complete
+**Progress:** 9 of 12 complete; REQ-AUQ-010 to REQ-AUQ-012 in review
