@@ -254,9 +254,7 @@ async fn native_close_backend_requires_actor_database_authority_not_matching_pat
     let unrelated_backend = Database::open_in_memory().await.unwrap();
 
     assert_eq!(
-        harness
-            .runtime
-            .check_native_close_backend(&cloned_backend),
+        harness.runtime.check_native_close_backend(&cloned_backend),
         Ok(())
     );
     assert_eq!(
@@ -267,9 +265,7 @@ async fn native_close_backend_requires_actor_database_authority_not_matching_pat
     );
     harness.runtime.native_task_admission_db = None;
     assert_eq!(
-        harness
-            .runtime
-            .check_native_close_backend(&cloned_backend),
+        harness.runtime.check_native_close_backend(&cloned_backend),
         Err(NativeCloseApplicationError::SourceRefused)
     );
     assert_eq!(count(&fixture.db, "close_runs").await, 0);

@@ -254,6 +254,7 @@ async fn native_goal_discovery_prepare_apply_read_and_replay_without_dispatch() 
             (163, "native_close_retry_failure".into()),
             (164, "native_close_retry_dispatch".into()),
             (165, "native_close_retry_worktree_metadata".into()),
+            (166, "native_initial_source_fence".into()),
         ]
     );
     for name in [

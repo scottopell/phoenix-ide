@@ -31,9 +31,19 @@ pub(super) enum NativeRetryExecutionError {
 }
 
 impl From<String> for NativeRetryExecutionError {
-    fn from(_: String) -> Self {
-        Self::Unclassified
+    fn from(detail: String) -> Self {
+        unclassified_native_retry_error("execution", &detail)
     }
+}
+
+fn unclassified_native_retry_error(
+    stage: &'static str,
+    error: &impl std::fmt::Display,
+) -> NativeRetryExecutionError {
+    tracing::warn!(stage, %error, "native Close retry execution failed without terminal evidence");
+    #[cfg(test)]
+    eprintln!("native Close retry execution failed at {stage}: {error}");
+    NativeRetryExecutionError::Unclassified
 }
 
 fn classify_native_retry_execution(
@@ -71,7 +81,7 @@ impl super::RuntimeManager {
             .db()
             .read_native_close_retry_execution_context(command, admitted)
             .await
-            .map_err(|_| NativeRetryExecutionError::Unclassified)?;
+            .map_err(|error| unclassified_native_retry_error("execution_context", &error))?;
         let run = CloseRunRef {
             attempt_id: admitted.attempt_id.clone(),
             ordinal: admitted.run_ordinal,
@@ -348,7 +358,7 @@ impl super::RuntimeManager {
             .ok_or(NativeRetryExecutionError::Unclassified)?;
         let root = super::worktree_path(&identity);
         let quarantine = super::worktree_quarantine_path(&identity)
-            .map_err(|_| NativeRetryExecutionError::Unclassified)?;
+            .map_err(|error| unclassified_native_retry_error("worktree_quarantine_path", &error))?;
         // A retained plan owns the administrative incarnation and final tombstone.
         // Never rediscover and replace it from a later filesystem generation.
         let plan = if let Some(plan) = self
@@ -360,13 +370,13 @@ impl super::RuntimeManager {
                 &effect.resource,
             )
             .await
-            .map_err(|_| NativeRetryExecutionError::Unclassified)?
+            .map_err(|error| unclassified_native_retry_error("worktree_cleanup_plan", &error))?
         {
             plan
         } else {
             let inspection_path = if root
                 .try_exists()
-                .map_err(|_| NativeRetryExecutionError::Unclassified)?
+                .map_err(|error| unclassified_native_retry_error("worktree_exists", &error))?
             {
                 &root
             } else {
@@ -701,6 +711,22 @@ impl super::RuntimeManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn execution_diagnostics_do_not_establish_terminal_authority() {
+        for stage in [
+            "execution_context",
+            "worktree_quarantine_path",
+            "worktree_cleanup_plan",
+            "worktree_exists",
+        ] {
+            let error = unclassified_native_retry_error(stage, &"injected execution error");
+            assert!(matches!(
+                classify_native_retry_execution(Err(error)),
+                LocalAuthorityResult::DurableFactUnclassified
+            ));
+        }
+    }
 
     #[test]
     fn native_retry_only_terminal_facts_release_settlement_authority() {
