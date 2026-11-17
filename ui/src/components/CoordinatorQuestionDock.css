@@ -1,0 +1,21 @@
+.coordinator-question-dock {
+  flex: none;
+  max-height: 60vh;
+  overflow-y: auto;
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+.coordinator-question-dock__meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  justify-content: space-between;
+  margin: 0;
+  padding: 0.5rem 1rem 0;
+  color: var(--text-secondary);
+  font-size: 0.8125rem;
+}
+
+.coordinator-question-dock__more {
+  font-weight: 600;
+}

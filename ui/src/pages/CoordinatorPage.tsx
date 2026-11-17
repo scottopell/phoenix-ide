@@ -2,6 +2,7 @@ import { lazy, Suspense, useCallback, useEffect, useRef, useState, type ReactNod
 import { Link, useLocation, useNavigate, useParams } from 'react-router-dom';
 import { api, type ActiveCoordinatorWatch, type LiveCoordinatorBashHandle } from '../api';
 import { AutomaticContinuationControl } from '../components/AutomaticContinuationControl';
+import { CoordinatorQuestionDock } from '../components/CoordinatorQuestionDock';
 import { COORDINATOR_QUICK_ACTION } from './coordinatorBriefing';
 import './CoordinatorPage.css';
 import { useConversationViewJourney } from '../hooks/useConversationViewJourney';
@@ -273,6 +274,7 @@ export function CoordinatorPage({ fixtureData }: { fixtureData?: CoordinatorPage
 
 
 
+      {!fixtureData && <CoordinatorQuestionDock />}
       <section className="coordinator-conversation" aria-label="Ember conversation" hidden={!!error || resolvedSourceSelectionKey !== sourceSelectionKey}>
         {resolvedCoordinatorId !== null ? fixtureData?.conversation ?? (
           <Suspense fallback={<div className="coordinator-muted">Loading Ember conversation…</div>}>

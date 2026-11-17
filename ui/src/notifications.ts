@@ -19,7 +19,7 @@ import {
   registerCoordinatorNotificationTarget,
 } from './notifications/store';
 
-import type { SettingsStatus } from './notifications/policy';
+import type { CoordinatorQuestionNotification, SettingsStatus } from './notifications/policy';
 
 export {
   DEFAULT_NOTIFICATION_SETTINGS,
@@ -70,6 +70,10 @@ export function registerCoordinatorForNotifications(conversationId: string): voi
 
 export function notifyReminderFeed(items: readonly ReminderNotification[]): void {
   store.dispatch({ type: 'reminder_feed', items });
+}
+
+export function notifyCoordinatorQuestionFeed(items: readonly CoordinatorQuestionNotification[]): void {
+  store.dispatch({ type: 'coordinator_question_feed', items });
 }
 
 export function notifyCatchUp(conversations: readonly Conversation[]): void {

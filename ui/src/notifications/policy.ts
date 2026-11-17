@@ -14,14 +14,26 @@ import type { ReminderNotification } from '../generated/ReminderNotification';
 import type { ReminderNotificationTarget } from '../generated/ReminderNotificationTarget';
 
 export type NotificationTarget = { id: string; slug: string | null; kind?: 'ordinary' | 'coordinator' };
-export type NotificationDedupeKey = { kind: 'attention'; key: string } | { kind: 'reminder'; id: string } | null;
+export type NotificationDedupeKey =
+  | { kind: 'attention'; key: string }
+  | { kind: 'reminder'; id: string }
+  | { kind: 'coordinator_question'; id: string }
+  | null;
+
+/** An open question Ember posted without stopping (REQ-AUQ-010). */
+export type CoordinatorQuestionNotification = {
+  requestId: string;
+  coordinatorConversationId: string;
+  text: string;
+};
 
 export type NotificationEventType =
   | 'task_approval_needed'
   | 'question_asked'
   | 'agent_error'
   | 'agent_finished'
-  | 'reminder_due';
+  | 'reminder_due'
+  | 'coordinator_question';
 
 export const DEFAULT_NOTIFICATION_SETTINGS: NotificationSettings = {
   enabled: true,
@@ -46,10 +58,11 @@ export type SettingsStatus = 'unloaded' | 'loading' | 'loaded' | 'failed';
 // A notification candidate derived from a conversation's state. Not every
 // candidate is delivered — delivery is gated by `decideDelivery`.
 export type PolicyNotificationEvent = {
-  type: Exclude<NotificationEventType, 'reminder_due'>;
+  type: Exclude<NotificationEventType, 'reminder_due' | 'coordinator_question'>;
   title: string;
   conversation: Conversation;
-} | { type: 'reminder_due'; title: string; conversation: ReminderNotificationTarget; reminderId: string; text: string };
+} | { type: 'reminder_due'; title: string; conversation: ReminderNotificationTarget; reminderId: string; text: string }
+  | { type: 'coordinator_question'; title: string; conversation: NotificationTarget; requestId: string; text: string };
 
 export type NotificationPolicyState = {
   settingsStatus: SettingsStatus;
@@ -76,6 +89,8 @@ export type NotificationPolicyState = {
   attentionSeenByConversationId: Map<string, string>;
   reminderFeedSeeded: boolean;
   reminderSeenIds: Set<string>;
+  coordinatorQuestionFeedSeeded: boolean;
+  coordinatorQuestionSeenIds: Set<string>;
 };
 
 // Ambient browser facts the reducer needs to decide delivery. Supplied by
@@ -101,6 +116,7 @@ export type NotificationPolicyEvent =
   | { type: 'conversation_snapshot_seeded'; conversation: Conversation; state: ConversationState }
   | { type: 'catchup_scan'; conversations: readonly Conversation[] }
   | { type: 'reminder_feed'; items: readonly ReminderNotification[] }
+  | { type: 'coordinator_question_feed'; items: readonly CoordinatorQuestionNotification[] }
   | { type: 'notification_delivery_failed'; conversationId: string; dedupeKey: NotificationDedupeKey }
   | { type: 'permission_cue_consumed' };
 
@@ -133,6 +149,8 @@ export function initialPolicyState(): NotificationPolicyState {
     attentionSeenByConversationId: new Map(),
     reminderFeedSeeded: false,
     reminderSeenIds: new Set(),
+    coordinatorQuestionFeedSeeded: false,
+    coordinatorQuestionSeenIds: new Set(),
   };
 }
 
@@ -144,6 +162,7 @@ function eventTypeEnabled(type: NotificationEventType, settings: NotificationSet
     case 'agent_error': return settings.notify_error;
     case 'agent_finished': return settings.notify_idle;
     case 'reminder_due': return settings.notify_reminder;
+    case 'coordinator_question': return settings.notify_question;
   }
 }
 
@@ -172,7 +191,7 @@ export function eventForState(state: ConversationState, conversation: Conversati
 // completion is independently notification-worthy.
 export function attentionKeyFor(event: PolicyNotificationEvent): string | null {
   if (event.type === 'agent_finished') return null;
-  if (event.type === 'reminder_due') return null;
+  if (event.type === 'reminder_due' || event.type === 'coordinator_question') return null;
   if (event.conversation.state?.type === 'recoverable_continuation_failure') {
     const state = event.conversation.state;
     return `${event.conversation.id}:${event.type}:${state.operation_id}:${state.attempt}`;
@@ -185,6 +204,7 @@ export function attentionKeyFor(event: PolicyNotificationEvent): string | null {
 // by conversation + event.
 export function notificationTagFor(event: PolicyNotificationEvent): string {
   if (event.type === 'reminder_due') return `reminder_due:${event.reminderId}`;
+  if (event.type === 'coordinator_question') return `coordinator_question:${event.requestId}`;
   if (event.type === 'agent_finished') {
     return `${event.type}:${event.conversation.id}:${event.conversation.updated_at}`;
   }
@@ -198,6 +218,9 @@ function shouldSuppressForFocus(env: NotificationEnv, conversation: Notification
 function markAttentionSeen(state: NotificationPolicyState, event: PolicyNotificationEvent): NotificationPolicyState {
   if (event.type === 'reminder_due') {
     return { ...state, reminderSeenIds: new Set([...state.reminderSeenIds, event.reminderId]) };
+  }
+  if (event.type === 'coordinator_question') {
+    return { ...state, coordinatorQuestionSeenIds: new Set([...state.coordinatorQuestionSeenIds, event.requestId]) };
   }
   const key = attentionKeyFor(event);
   if (!key) return state;
@@ -232,6 +255,20 @@ function rememberBusyState(state: NotificationPolicyState, conversation: Convers
   return deleteBusyStartedAt(state, conversation.id);
 }
 
+function notificationBody(event: PolicyNotificationEvent): string {
+  if (event.type === 'reminder_due') {
+    return `${event.conversation.title ?? event.conversation.slug ?? event.conversation.id}\n${event.text}`;
+  }
+  if (event.type === 'coordinator_question') return event.text;
+  return event.conversation.slug ?? event.conversation.id;
+}
+
+function notificationDedupeKey(event: PolicyNotificationEvent, attentionKey: string | null): NotificationDedupeKey {
+  if (event.type === 'reminder_due') return { kind: 'reminder', id: event.reminderId };
+  if (event.type === 'coordinator_question') return { kind: 'coordinator_question', id: event.requestId };
+  return attentionKey === null ? null : { kind: 'attention', key: attentionKey };
+}
+
 // The shared delivery gate: master toggle, per-event toggle, focus
 // suppression, and browser permission. Marks the attention key seen only
 // when delivery actually fired or was intentionally focus-suppressed, so a
@@ -262,12 +299,10 @@ function decideDelivery(state: NotificationPolicyState, env: NotificationEnv, ev
     effects: [{
       type: 'show_browser_notification',
       title: event.title,
-      body: event.type === 'reminder_due' ? `${event.conversation.title ?? event.conversation.slug ?? event.conversation.id}\n${event.text}` : (event.conversation.slug ?? event.conversation.id),
+      body: notificationBody(event),
       tag: notificationTagFor(event),
       conversation: event.conversation,
-      dedupeKey: event.type === 'reminder_due'
-        ? { kind: 'reminder', id: event.reminderId }
-        : attentionKey === null ? null : { kind: 'attention', key: attentionKey },
+      dedupeKey: notificationDedupeKey(event, attentionKey),
     }],
   };
 }
@@ -400,8 +435,37 @@ export function notificationPolicyReducer(
       return { state: next, effects };
     }
 
+    case 'coordinator_question_feed': {
+      // Questions already open when the page loads are shown on Ember's page,
+      // not re-announced; only questions that appear afterwards notify.
+      const currentIds = new Set(event.items.map((item) => item.requestId));
+      if (!state.coordinatorQuestionFeedSeeded) {
+        return { state: { ...state, coordinatorQuestionFeedSeeded: true, coordinatorQuestionSeenIds: currentIds }, effects: [] };
+      }
+      let next = state;
+      const effects: NotificationEffect[] = [];
+      for (const item of event.items) {
+        if (next.coordinatorQuestionSeenIds.has(item.requestId)) continue;
+        const result = decideDelivery(next, env, {
+          type: 'coordinator_question',
+          title: 'Ember asked a question',
+          conversation: { id: item.coordinatorConversationId, slug: null, kind: 'coordinator' },
+          requestId: item.requestId,
+          text: item.text,
+        });
+        next = result.state;
+        effects.push(...result.effects);
+      }
+      return { state: next, effects };
+    }
+
     case 'notification_delivery_failed': {
       if (event.dedupeKey === null) return { state, effects: [] };
+      if (event.dedupeKey.kind === 'coordinator_question') {
+        const coordinatorQuestionSeenIds = new Set(state.coordinatorQuestionSeenIds);
+        coordinatorQuestionSeenIds.delete(event.dedupeKey.id);
+        return { state: { ...state, coordinatorQuestionSeenIds }, effects: [] };
+      }
       if (event.dedupeKey.kind === 'reminder') {
         const reminderSeenIds = new Set(state.reminderSeenIds);
         reminderSeenIds.delete(event.dedupeKey.id);

@@ -549,6 +549,15 @@ export interface QuestionOption {
   preview?: string;
 }
 
+/** An open question Ember posted without stopping its own work (REQ-AUQ-010). */
+export interface CoordinatorQuestion {
+  request_id: string;
+  coordinator_conversation_id: string;
+  /** RFC 3339. */
+  asked_at: string;
+  questions: UserQuestion[];
+}
+
 export interface ContinuationSummaryRequest {
   operation_id: string;
   rejected_tool_calls: ToolCall[];
@@ -2862,6 +2871,34 @@ export const api = {
       body: JSON.stringify({ request_id: requestId, answers, annotations }),
     });
     if (!resp.ok) { const err = await resp.json(); throw new Error(err.error || 'Failed to respond to question'); }
+    return resp.json();
+  },
+
+  async listCoordinatorQuestions(signal?: AbortSignal): Promise<CoordinatorQuestion[]> {
+    const resp = await fetch('/api/coordinator/questions', signal ? { signal } : {});
+    if (!resp.ok) throw new Error('Failed to load Ember questions');
+    return resp.json();
+  },
+
+  async answerCoordinatorQuestion(
+    requestId: string,
+    answers: Record<string, string>,
+    annotations?: Record<string, { notes?: string; preview?: string }>,
+  ): Promise<{ success: boolean }> {
+    const resp = await fetch(`/api/coordinator/questions/${encodeURIComponent(requestId)}/answer`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ answers, annotations }),
+    });
+    if (!resp.ok) { const err = await resp.json(); throw new Error(err.error || 'Failed to answer Ember'); }
+    return resp.json();
+  },
+
+  async dismissCoordinatorQuestion(requestId: string): Promise<{ success: boolean }> {
+    const resp = await fetch(`/api/coordinator/questions/${encodeURIComponent(requestId)}/dismiss`, {
+      method: 'POST',
+    });
+    if (!resp.ok) { const err = await resp.json(); throw new Error(err.error || 'Failed to dismiss question'); }
     return resp.json();
   },
 

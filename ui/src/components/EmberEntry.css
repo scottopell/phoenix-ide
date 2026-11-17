@@ -108,6 +108,18 @@
   border: 1.5px solid var(--accent-blue, #3b82f6);
 }
 
+/* REQ-AUQ-011: Ember is waiting on the user; uses the needs-action colour. */
+.ember-entry-question-dot {
+  position: absolute;
+  top: -2px;
+  right: -2px;
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: var(--accent-purple, #7c3aed);
+  box-shadow: 0 0 0 2px var(--bg-secondary, transparent);
+}
+
 .sidebar .ember-entry-copy strong,
 .sidebar .ember-entry-copy small {
   overflow: hidden;
@@ -125,4 +137,9 @@
 
 .sidebar .ember-entry-arrow {
   flex-shrink: 0;
+}
+
+.ember-entry.has-questions .ember-entry-copy small {
+  color: var(--accent-purple, #7c3aed);
+  font-weight: 600;
 }
