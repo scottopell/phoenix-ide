@@ -180,9 +180,20 @@ currently open.
 THE SYSTEM SHALL show conversations that are not monitored, and the History
 list, exactly as before.
 
-IF the monitored set cannot be read
-THE SYSTEM SHALL keep the last known set and SHALL NOT delay or fail the
-conversation list.
+THE conversation list response SHALL state for each row whether it is
+monitored, so every client derives the same answer from one snapshot.
+
+WHEN the user browses the command palette without a query
+THE SYSTEM SHALL list conversations that are not folded before those that are,
+AND SHALL NOT reorder the results of a search.
+
+WHEN a monitored conversation is open
+THE SYSTEM SHALL show that Ember is handling it, with a way to open Ember.
+
+WHEN a monitored conversation finishes a turn
+THE SYSTEM SHALL NOT raise a completion notification for it.
+Questions, approval requests and errors in a monitored conversation SHALL
+notify as they do for any conversation.
 
 **Rationale:** Monitored conversations are the Coordinator's working set, much
 as sub-agent conversations are an owner's. Listing them beside the user's own

@@ -5,7 +5,7 @@
 // ambient browser facts (permission, focus, active route) into a
 // `NotificationEnv`. The reducer decides; this runs the decision.
 
-import { api, type NotificationSettings } from '../api';
+import { api, type Conversation, type NotificationSettings } from '../api';
 import {
   type BrowserPermission,
   type NotificationEffect,
@@ -49,6 +49,13 @@ function errorMessage(err: unknown, fallback: string): string {
   return err instanceof Error ? err.message : fallback;
 }
 
+let monitoredConversationLookup: (conversation: Conversation) => boolean = () => false;
+
+/** Registers how to tell whether Ember monitors a conversation (owned by the list store). */
+export function setMonitoredConversationLookup(lookup: (conversation: Conversation) => boolean): void {
+  monitoredConversationLookup = lookup;
+}
+
 export class NotificationStore {
   private state = initialPolicyState();
   private listeners = new Set<() => void>();
@@ -79,6 +86,7 @@ export class NotificationStore {
       visible: hasDocument && document.visibilityState === 'visible',
       hasFocus: hasDocument && document.hasFocus(),
       activeSlug: currentActiveSlug(),
+      isMonitored: monitoredConversationLookup,
     };
   }
 

@@ -86,6 +86,8 @@ export type NotificationEnv = {
   visible: boolean;
   hasFocus: boolean;
   activeSlug: string | null;
+  /** True for a conversation Ember monitors; absent means none are. */
+  isMonitored?: (conversation: Conversation) => boolean;
 };
 
 export type NotificationPolicyEvent =
@@ -237,6 +239,11 @@ function rememberBusyState(state: NotificationPolicyState, conversation: Convers
 function decideDelivery(state: NotificationPolicyState, env: NotificationEnv, event: PolicyNotificationEvent): ReduceResult {
   if (state.settingsStatus !== 'loaded') return { state, effects: [] };
   if (!eventTypeEnabled(event.type, state.settings)) return { state, effects: [] };
+  // Routine completions in a conversation Ember monitors are Ember's to read.
+  // Questions, approvals and errors still reach the user.
+  if (event.type === 'agent_finished' && env.isMonitored?.(event.conversation)) {
+    return { state, effects: [] };
+  }
   if (shouldSuppressForFocus(env, event.conversation)) {
     return { state: markAttentionSeen(state, event), effects: [] };
   }
