@@ -239,9 +239,13 @@ function rememberBusyState(state: NotificationPolicyState, conversation: Convers
 function decideDelivery(state: NotificationPolicyState, env: NotificationEnv, event: PolicyNotificationEvent): ReduceResult {
   if (state.settingsStatus !== 'loaded') return { state, effects: [] };
   if (!eventTypeEnabled(event.type, state.settings)) return { state, effects: [] };
-  // Routine completions in a conversation Ember monitors are Ember's to read.
-  // Questions, approvals and errors still reach the user.
-  if (event.type === 'agent_finished' && env.isMonitored?.(event.conversation)) {
+  // Routine completions in a conversation Ember monitors are Ember's to read,
+  // and its questions go to Ember first (REQ-AUTH-009), which asks the user
+  // itself when it cannot answer. Approvals and errors still reach the user.
+  if (
+    (event.type === 'agent_finished' || event.type === 'question_asked')
+    && env.isMonitored?.(event.conversation)
+  ) {
     return { state, effects: [] };
   }
   if (shouldSuppressForFocus(env, event.conversation)) {

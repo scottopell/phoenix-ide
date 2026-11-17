@@ -133,7 +133,7 @@ describe('notification policy reducer', () => {
     expect(finished.effects[0]).toMatchObject({ type: 'show_browser_notification', title: 'Agent finished' });
   });
 
-  it('stays quiet on completion in a conversation Ember monitors, but not on a question', () => {
+  it('stays quiet on completion and questions in a conversation Ember monitors, but not on approvals', () => {
     const conv = conversation();
     const monitored = (now: number) => env({ now, isMonitored: () => true });
     let state = loadedState();
@@ -148,7 +148,17 @@ describe('notification policy reducer', () => {
     const asked = notificationPolicyReducer(loadedState(),
       { type: 'conversation_state_changed', conversation: conv, previousState: { type: 'idle' }, nextState: { type: 'awaiting_user_response' } as never },
       monitored(0));
-    expect(asked.effects[0]).toMatchObject({ type: 'show_browser_notification', title: 'Question asked' });
+    expect(asked.effects).toHaveLength(0);
+
+    const approval = notificationPolicyReducer(loadedState(),
+      { type: 'conversation_state_changed', conversation: conv, previousState: { type: 'idle' }, nextState: { type: 'awaiting_task_approval' } as never },
+      monitored(0));
+    expect(approval.effects[0]).toMatchObject({ type: 'show_browser_notification', title: 'Task approval needed' });
+
+    const ownQuestion = notificationPolicyReducer(loadedState(),
+      { type: 'conversation_state_changed', conversation: conv, previousState: { type: 'idle' }, nextState: { type: 'awaiting_user_response' } as never },
+      env({ now: 0, isMonitored: () => false }));
+    expect(ownQuestion.effects[0]).toMatchObject({ type: 'show_browser_notification', title: 'Question asked' });
   });
 
   it('does not fire agent_finished when leaving awaiting_llm', () => {

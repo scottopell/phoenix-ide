@@ -470,6 +470,10 @@ pub struct ProductConversationListRow {
     pub cached_pr: Option<ProductConversationPrView>,
     /// True while the Coordinator holds an active watch on this conversation.
     pub monitored: bool,
+    /// When the Coordinator was handed this conversation's current question
+    /// (RFC 3339). Set only while a monitored conversation waits on a question
+    /// the watch reported; the Coordinator answers it or asks the user.
+    pub question_with_coordinator_since: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, TS)]

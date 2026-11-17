@@ -63,7 +63,35 @@ export type ProductConversationPresentationIndicator = {
   ariaLabel: string;
 };
 
-export function productConversationPresentationIndicator(row: ProductConversationListRow): ProductConversationPresentationIndicator {
+/**
+ * How long Ember holds a monitored conversation's question before it counts as
+ * the user's again. A stuck Coordinator must not hide a question for good.
+ */
+export const COORDINATOR_QUESTION_GRACE_MS = 30 * 60_000;
+
+/** True while Ember holds this conversation's current question (REQ-AUTH-009). */
+export function questionWithCoordinator(row: ProductConversationListRow, now: number = Date.now()): boolean {
+  const since = row.question_with_coordinator_since;
+  if (!since) return false;
+  const handedAt = Date.parse(since);
+  return !Number.isNaN(handedAt) && now - handedAt < COORDINATOR_QUESTION_GRACE_MS;
+}
+
+/** When a held question becomes the user's again, or null if none is held. */
+export function coordinatorQuestionExpiresAt(row: ProductConversationListRow): number | null {
+  const since = row.question_with_coordinator_since;
+  if (!since) return null;
+  const handedAt = Date.parse(since);
+  return Number.isNaN(handedAt) ? null : handedAt + COORDINATOR_QUESTION_GRACE_MS;
+}
+
+export function productConversationPresentationIndicator(
+  row: ProductConversationListRow,
+  now: number = Date.now(),
+): ProductConversationPresentationIndicator {
+  if (questionWithCoordinator(row, now)) {
+    return { label: 'With Ember', dotClass: 'working', ariaLabel: 'Question with Ember' };
+  }
   if (row.presentation.kind === 'needs_action') {
     return { label: 'Needs action', dotClass: 'awaiting-approval', ariaLabel: 'Needs action' };
   }
@@ -83,8 +111,12 @@ export function productConversationPresentationIndicator(row: ProductConversatio
   }
 }
 
-/** A row the user must act on; never folded away, whoever is monitoring it. */
-export function productConversationNeedsUser(row: ProductConversationListRow): boolean {
+/**
+ * A row the user must act on; never folded away, whoever is monitoring it.
+ * A question Ember holds is Ember's until the grace period runs out.
+ */
+export function productConversationNeedsUser(row: ProductConversationListRow, now: number = Date.now()): boolean {
+  if (questionWithCoordinator(row, now)) return false;
   return row.presentation.kind === 'needs_action'
     || row.presentation.presentation_mode === 'needs_action'
     || row.presentation.presentation_mode === 'error';
@@ -105,12 +137,13 @@ export type MonitoredSplit = {
 export function splitMonitoredProductConversations(
   rows: readonly ProductConversationListRow[],
   pinned: (row: ProductConversationListRow) => boolean = () => false,
+  now: number = Date.now(),
 ): MonitoredSplit {
   if (!rows.some((row) => row.monitored)) return { own: rows, monitored: [] };
   const own: ProductConversationListRow[] = [];
   const monitored: ProductConversationListRow[] = [];
   for (const row of rows) {
-    const folded = row.monitored && !productConversationNeedsUser(row) && !pinned(row);
+    const folded = row.monitored && !productConversationNeedsUser(row, now) && !pinned(row);
     (folded ? monitored : own).push(row);
   }
   return { own, monitored };

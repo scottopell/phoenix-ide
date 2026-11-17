@@ -1,7 +1,9 @@
 import { describe, expect, it } from 'vitest';
 import type { ProductConversationListRow } from '../api';
 import {
+  COORDINATOR_QUESTION_GRACE_MS,
   productConversationDisplayTitle,
+  productConversationPresentationIndicator,
   productConversationOwnsRoute,
   renamedProductConversationLocation,
   splitMonitoredProductConversations,
@@ -23,6 +25,7 @@ function row(overrides: Partial<ProductConversationListRow> = {}): ProductConver
     read_state: { state: 'read' },
     cached_pr: null,
     monitored: false,
+    question_with_coordinator_since: null,
     ...overrides,
   };
 }
@@ -133,6 +136,22 @@ describe('splitMonitoredProductConversations', () => {
     const split = splitMonitoredProductConversations(rows);
     expect(ids(split.own)).toEqual(['ask', 'err', 'kind']);
     expect(ids(split.monitored)).toEqual(['quiet']);
+  });
+
+  it('folds a question Ember holds until its grace period runs out', () => {
+    const handedAt = Date.parse('2026-11-17T10:00:00Z');
+    const asking = {
+      ...row('asking', true, 'needs_action'),
+      question_with_coordinator_since: new Date(handedAt).toISOString(),
+    } as ProductConversationListRow;
+    const held = splitMonitoredProductConversations([asking], () => false, handedAt + 60_000);
+    expect(ids(held.monitored)).toEqual(['asking']);
+    expect(productConversationPresentationIndicator(asking, handedAt + 60_000).label).toBe('With Ember');
+
+    const stale = splitMonitoredProductConversations([asking], () => false, handedAt + COORDINATOR_QUESTION_GRACE_MS);
+    expect(ids(stale.own)).toEqual(['asking']);
+    expect(productConversationPresentationIndicator(asking, handedAt + COORDINATOR_QUESTION_GRACE_MS).label)
+      .toBe('Needs action');
   });
 
   it('keeps a pinned monitored row in the main list', () => {

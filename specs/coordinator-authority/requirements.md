@@ -174,8 +174,8 @@ default, that shows how many it holds
 AND SHALL remember in the browser whether the user opened the group.
 
 THE SYSTEM SHALL keep a monitored conversation in the main list WHILE it needs
-the user (a pending question or approval, or an error) or is the conversation
-currently open.
+the user (a pending approval, an error, or a question the Coordinator does not
+hold under REQ-AUTH-009) or is the conversation currently open.
 
 THE SYSTEM SHALL show conversations that are not monitored, and the History
 list, exactly as before.
@@ -192,12 +192,45 @@ THE SYSTEM SHALL show that Ember is handling it, with a way to open Ember.
 
 WHEN a monitored conversation finishes a turn
 THE SYSTEM SHALL NOT raise a completion notification for it.
-Questions, approval requests and errors in a monitored conversation SHALL
-notify as they do for any conversation.
+Approval requests and errors in a monitored conversation SHALL notify as they
+do for any conversation; questions follow REQ-AUTH-009.
 
 **Rationale:** Monitored conversations are the Coordinator's working set, much
 as sub-agent conversations are an owner's. Listing them beside the user's own
 conversations hides the ones the user is actually driving.
+
+### REQ-AUTH-009: Route Monitored Questions Through the Coordinator
+
+WHEN a monitored conversation asks a question
+THE SYSTEM SHALL deliver the question text, its options, the transcript and the
+request identity to the Coordinator with the watch event, unless the question
+was answered or replaced before delivery.
+
+THE Coordinator SHALL have a tool that answers such a question through the same
+path as the user's question card, accepted only for a conversation under an
+active watch, for the question's current request identity, with every question
+answered once.
+THE answered conversation SHALL record the answer as the Coordinator's, not the
+user's.
+
+THE Coordinator prompt SHALL direct it to answer when the assignment or
+standing Authority settles the question, and otherwise to ask the user with its
+own question tool and pass the user's answer on verbatim.
+
+WHILE the Coordinator holds a monitored conversation's current question
+THE SYSTEM SHALL NOT present it as needing the user and SHALL NOT raise a
+question notification for it,
+AND SHALL present it as needing the user again once 30 minutes pass without an
+answer.
+A question asked before the watch began SHALL remain the user's.
+
+The user SHALL remain able to answer from the conversation's own question card
+at any time; the first accepted answer wins and a later one is refused as
+stale.
+
+**Rationale:** The user has one inbox, the Coordinator, and sees only the
+questions it could not settle, with its context attached. The grace period
+keeps a stuck Coordinator from hiding a worker's question for good.
 
 ## Scope
 
