@@ -16,7 +16,7 @@ use "../conversation_atom/conversation_atom.allium" as native
 enum RequestKind { briefing | explicit_request }
 enum RequestState { accepted | admitted | rejected }
 enum AcknowledgmentState { not_required | pending | attempting | confirmed | unavailable }
-enum TriggerKind { prefix | reaction | saved }
+enum TriggerKind { prefix | reaction | saved | inbox }
 enum ReturnKind { thread_reply | private_notice }
 enum ReturnState { pending | attempting | submitted | confirmed | known_unsent | uncertain | failed }
 enum BindingState { reserved | ready | failed | closed }
@@ -67,6 +67,8 @@ entity Gateway {
     baseline_complete: Boolean
     saved_enabled: Boolean
     saved_baseline_complete: Boolean
+    inbox_channel: String?
+    inbox_baseline_complete: Boolean
     handled_sources: Set<String>
     requests: AcceptedRequest with gateway = this
     returns: ReturnObligation with request.gateway = this
@@ -222,7 +224,8 @@ rule AcceptVerifiedSource {
     when: EligibleSourceObserved(gateway, observation)
     requires: gateway.enabled
     requires: (observation.trigger_kind = saved and gateway.saved_enabled and gateway.saved_baseline_complete)
-        or (observation.trigger_kind != saved and gateway.baseline_complete)
+        or (observation.trigger_kind = inbox and gateway.inbox_channel != null and gateway.inbox_baseline_complete)
+        or (observation.trigger_kind in {prefix, reaction} and gateway.baseline_complete)
     requires: observation.eligible
     requires: observation.trigger_kind != saved or (observation.kind = briefing and observation.instruction = "")
     requires: observation.workspace = gateway.workspace

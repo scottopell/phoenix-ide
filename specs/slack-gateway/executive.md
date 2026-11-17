@@ -2,7 +2,7 @@
 
 ## Scope
 
-One owner's emoji gestures and optional Saved-message captures create or reuse ordinary local Phoenix
+One owner's emoji gestures, optional Saved-message captures, and personal-channel submissions create or reuse ordinary local Phoenix
 conversations through shared native services and the existing Slack MCP connection.
 Explicit requests receive intentional source-thread answers. Other-author reactions
 prepare separate private briefings. Thread reuse and exact reply coverage remain.
@@ -15,6 +15,7 @@ prepare separate private briefings. Thread reuse and exact reply coverage remain
 | REQ-SG-002 | Partial | Implemented; current candidate validation and production limits below. |
 | REQ-SG-018: Configure one trigger emoji | Implemented | Single-string configuration, narrow queries, list removal, and preserving upgrade pass focused checks and local adversarial review. Hosted qualification and deployment remain separate. |
 | REQ-SG-019: Capture a discussion privately with Save for later | Implemented; locally verified | Durable Saved scope/baseline, private outcomes, retained progress and shared polling pass focused tests and local review. Phoenix-owned live qualification and activation remain separate. |
+| REQ-SG-020: Submit work through a personal Slack channel | Implemented; locally verified | Channel initialization, owner-note authority, source deduplication, restart preservation, fresh native conversations and linked thread returns pass local checks. No channel activation is included. |
 | REQ-SG-003 | Partial | Implemented; current candidate validation and production limits below. |
 | REQ-SG-004 | Partial | Implemented; current candidate validation and production limits below. |
 | REQ-SG-005 | Partial | Implemented; current candidate validation and production limits below. |
@@ -32,6 +33,13 @@ prepare separate private briefings. Thread reuse and exact reply coverage remain
 | REQ-SG-017 | Partial | Implemented; current candidate validation and production limits below. |
 
 ## Current behavior
+
+The personal-channel addition follows [ADR-268](../adrs/268_personal-slack-channel-submissions.md):
+owner-authored top-level submissions supply notes as instructions and forwards as
+context. Results return in the submission thread with a Phoenix link; subsequent
+interaction is in Phoenix. Existing channel messages are baseline-only. Tests use
+generalized connector fixtures; private channel identities and content are not
+committed. Implementation and current qualification do not authorize live activation.
 
 [ADR-249](../adrs/249_slack-uses-one-configurable-trigger-emoji.md) replaces
 multi-emoji aliases with one configurable Slack name. Prefix and owner-reaction
@@ -53,26 +61,32 @@ custom-emoji workflows, narrow search terms, baseline changes, and upgrade/reope
 from the published list schema. Upgrade keeps the first saved name, preserves
 single-emoji progress, and discards unsupported multi-emoji query positions.
 Baseline readiness, accepted requests, return coverage, and backoff survive.
-All 63 gateway tests, 31 Slack database tests, 156 migration tests, three
-migration-dependent tests and 36 settings/compatibility tests pass. These include
+The gateway, Slack database and settings/compatibility suites pass. These include
 Saved initialization, any-age/any-author source verification, private failure and
 question outcomes, scope separation, restart continuity, shared allowance and
 provider-ceiling incompleteness. Clippy and the selected static/spec/UI checks
-pass; ast-grep is unavailable locally. Local adversarial review findings are fixed
+pass; ast-grep is unavailable locally. Local review findings are fixed
 and the final focused recheck is clean. Hosted qualification and production
 deployment remain separate.
+
+Channel-specific checks cover the generalized forwarded-message envelope, optional
+channel validation, independent baseline and retained page state, provider ceilings,
+shared allowance, a preserving canonical-schema upgrade, and two fresh native
+conversations with host-added Phoenix links. Read-access inspection stops before
+starting a workflow sample without enough remaining allowance. Clarifications and
+plain follow-ups stay in Phoenix. The original Slack discussion is never the
+automatic return destination.
 
 ## Production boundary
 
 Saved capture is an opt-in addition under [ADR-250](../adrs/250_saved-messages-create-private-any-age-captures.md).
 It accepts any source age, initializes independently, and has no source-message
-acknowledgment or thread response. Neither Saved discovery nor this policy has
-been activated in production.
+acknowledgment or thread response. It has been deployed and an owner-run capture
+has produced a native briefing. The personal-channel addition is not deployed or activated.
 
-Production runs the canonical public schema, with one custom emoji configured as
-an operational workaround for the OR-filter defect. The single-field API and
-storage simplification require a new candidate deployment. No prototype conversion
-is needed. Private configuration, recipients, and operational records stay outside
+Production runs the canonical public schema with the single-emoji and Saved
+features installed. The channel addition requires a preserving schema upgrade.
+Private configuration, recipients, and operational records stay outside
 the public repository.
 
 Discovery remains bounded by the connector's pagination and existing call allowance.
@@ -109,9 +123,10 @@ missing compatibility probe argument; both are corrected with regression coverag
 A follow-up check also retains the workspace-identity argument form, which omits
 that optional argument. Its regression test and final review recheck pass.
 
-Before activation, qualify reads through the Phoenix-owned MCP connection and
-approve a controlled live capture test. The existing read-only checks use the chat
-connector and do not establish Phoenix-owned transport qualification. Local tests
+Production-owned read inspection has demonstrated Saved access. Channel forwarding
+has been checked read-only through the chat connector; that check does not establish
+Phoenix-owned channel transport qualification or authorize activation. Before channel
+activation, qualify the installed transport and approve a controlled live test. Local tests
 exercise any-age and any-author sources, independent scopes, restart continuity,
 private outcomes and shared scheduling. A simulated collection beyond the
 connector's page ceiling must remain visibly incomplete, preserve readiness and

@@ -152,7 +152,7 @@ rule CheckpointSavedPage {
     requires: evidence.position_read = inbox.position
     requires: evidence.observations.all(o => o.source_key in service.controller.gateway.handled_sources)
     ensures: inbox.position = evidence.next_position
-    ensures: service.next_query = prefix
+    ensures: service.next_query = if service.controller.gateway.inbox_channel != null: inbox else: prefix
     ensures:
         if evidence.next_position = null:
             service.controller.gateway.saved_baseline_complete = true
@@ -174,7 +174,7 @@ rule RetainSavedFailure {
     ensures: inbox.scan_state = incomplete
     ensures: inbox.last_error = reason
     ensures: service.saved_page_failed = true
-    ensures: service.next_query = prefix
+    ensures: service.next_query = if service.controller.gateway.inbox_channel != null: inbox else: prefix
     ensures:
         if restart_query:
             inbox.position = null

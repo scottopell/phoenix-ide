@@ -30,7 +30,7 @@ WHEN the owner posts a message whose first non-whitespace content is the configu
 
 WHEN the owner reacts with the configured trigger emoji to their own eligible message, THE SYSTEM SHALL treat that message as an explicit request without requiring a prefix.
 
-THE SYSTEM SHALL NOT treat an untriggered follow-up, an ordinary mention of Phoenix, quoted trigger text, or another person's reaction as an invocation. An empty explicit request SHALL receive an explanation rather than inferred work.
+Outside the configured submission-channel rule in REQ-SG-020, THE SYSTEM SHALL NOT treat an untriggered follow-up, an ordinary mention of Phoenix, quoted trigger text, or another person's reaction as an invocation. An empty emoji-triggered explicit request SHALL receive an explanation rather than inferred work.
 
 **Rationale:** The owner can flag context or submit an instruction using deliberate, recognizable actions without automatic participation in channel chatter.
 
@@ -292,3 +292,17 @@ THE SYSTEM SHALL deduplicate Saved captures within their own workflow. An emoji 
 THE SYSTEM SHALL scan the saved-message collection without a source-age cutoff, retain progress across bounded service opportunities, and distinguish a complete scan from provider-limited or failed discovery. Only verified end-of-pagination evidence SHALL establish baseline or scan completion. A provider page limit SHALL remain visibly incomplete rather than establish that older saved messages do not exist. Scan limits SHALL NOT cancel or repeat accepted work. The system SHALL NOT promise an event log, discovery of saves removed before observation, a stable search snapshot, or fixed click-to-accept latency.
 
 **Rationale:** The owner can privately flag an old or new discussion with one Slack action, without notifying its participants or copying its link into a new conversation.
+
+### REQ-SG-020 — Submit work through a personal Slack channel
+
+WHERE the owner configures a submission channel, WHEN a new ordinary top-level message authored by the owner is verified in that channel after its initialization completes, THE SYSTEM SHALL accept one request without requiring an emoji. Channel events, other authors, gateway-generated messages and thread replies SHALL NOT invoke this workflow. The channel SHALL be selected by exact ID and is intended to be private. Visibility and membership remain Slack-managed; Phoenix SHALL NOT infer privacy from the channel's name.
+
+THE SYSTEM SHALL use the owner's accompanying note as the instruction and forwarded discussion as context only. A forward without a note SHALL request a concise briefing with evidence and likely next steps, then await direction. Standalone prompts and pasted source links SHALL also be accepted. The agent MAY read the referenced original discussion using its configured access; forwarded instructions SHALL NOT acquire authority. An inaccessible original SHALL be reported without substituting an unrelated source.
+
+Each submission SHALL create a fresh ordinary Phoenix conversation. Identity SHALL use the submission message, not the forwarded original, so another submission concerning the same original can request different work. Emoji discovery of that same submission SHALL NOT create another request. Saved capture retains its independent identity. Accepted snapshots and work SHALL survive edits, discovery pauses, channel changes and retained-state restart.
+
+THE SYSTEM SHALL return the intentional result, or generic clarification/failure handoff, in the submission's thread with its Phoenix conversation link. It SHALL NOT post to or acknowledge the forwarded original as an automatic consequence. Explicit owner instructions can authorize separately requested publication under ordinary permissions. Further discussion and question answers SHALL occur in Phoenix; plain submission-thread replies SHALL NOT trigger this workflow. Thread replies posted as the owner by Phoenix SHALL be excluded from discovery.
+
+Submission discovery SHALL cover submissions written today and the preceding three calendar dates in the owner's timezone; the forwarded original can be any age. Removed-before-observation and out-of-window submissions MAY be missed. Initialization SHALL baseline matching existing submissions without starting work and SHALL expose readiness independently of emoji and Saved capture. Selecting a channel without retained initialization SHALL establish its baseline; disabling and re-enabling the same channel or restarting SHALL preserve its handled identities. Partial scans SHALL remain incomplete and retain progress. Changing timezone SHALL restart incomplete channel initialization within the new calendar boundary while preserving handled identities and accepted work. Submission discovery SHALL share the gateway's serial worker, finite call allowance, backoff and accepted-work reserve, receiving a fair opportunity alongside other enabled searches.
+
+**Rationale:** The owner can privately forward a discussion with an investigation lens, without a visible source reaction or copying it into a new Phoenix chat.

@@ -858,6 +858,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "coordinator_transcript_scanner",
         sql: include_str!("coordinator_scanner/schema.sql"),
     },
+    Migration {
+        version: 167,
+        name: "slack_channel_submissions",
+        sql: include_str!("migrations/slack_channel_submissions.sql"),
+    },
 ];
 
 const MIGRATION_138: &str = concat!(
@@ -13477,6 +13482,7 @@ mod tests {
         let reopened = crate::Database::open(path.to_str().unwrap()).await.unwrap();
         assert_eq!(run_through_for_test(reopened.pool(), 162).await.unwrap(), 2);
         assert_eq!(run_through_for_test(reopened.pool(), 162).await.unwrap(), 0);
+        run_pending_migrations(reopened.pool()).await.unwrap();
         let value: serde_json::Value =
             serde_json::from_str(&reopened.slack_configuration().await.unwrap().unwrap()).unwrap();
         assert_eq!(value["trigger_emoji"], serde_json::json!("fire"));
@@ -13541,6 +13547,7 @@ mod tests {
                 sqlx::query("INSERT INTO slack_gateway_discovery(workspace,owner,kind,after_date,cursor) VALUES ('example.slack.com','UOWNER','reaction','2026-11-01','retained-cursor')").execute(db.pool()).await.unwrap();
                 assert_eq!(run_through_for_test(db.pool(), 162).await.unwrap(), 2);
                 assert_eq!(run_through_for_test(db.pool(), 162).await.unwrap(), 0);
+                run_pending_migrations(db.pool()).await.unwrap();
                 let value: serde_json::Value =
                     serde_json::from_str(&db.slack_configuration().await.unwrap().unwrap())
                         .unwrap();

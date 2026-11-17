@@ -14,6 +14,7 @@ use sqlx::Row;
 pub(crate) struct Config {
     pub enabled: bool,
     pub saved_enabled: bool,
+    pub inbox_channel: Option<String>,
     pub mcp_server: String,
     pub owner: String,
     /// Exact Slack permalink host, used to reject other workspaces.
@@ -26,6 +27,10 @@ pub(crate) struct Config {
 }
 impl Config {
     fn normalized(mut self) -> Result<Self, String> {
+        self.inbox_channel = self
+            .inbox_channel
+            .map(|v| v.trim().to_owned())
+            .filter(|v| !v.is_empty());
         self.trigger_emoji = phoenix_db::normalize_slack_trigger_emoji(&self.trigger_emoji)
             .map_err(|e| e.to_string())?;
         self.validate()?;
@@ -33,6 +38,11 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<(), String> {
+        if self.inbox_channel.as_ref().is_some_and(|v| {
+            !v.starts_with('C') || v.len() < 2 || !v.chars().all(|c| c.is_ascii_alphanumeric())
+        }) {
+            return Err("Expected a Slack submission channel ID beginning with C".into());
+        }
         phoenix_db::normalize_slack_trigger_emoji(&self.trigger_emoji)
             .map_err(|e| e.to_string())?;
         if !(self.owner.starts_with('U') || self.owner.starts_with('W'))
@@ -108,6 +118,13 @@ pub(crate) async fn status(
         .slack_saved_inbox(&c.workspace, &c.owner)
         .await
         .map_err(|e| e.to_string())?;
+    let inbox_scan = if let Some(channel) = &c.inbox_channel {
+        db.slack_channel_inbox(&c.workspace, &c.owner, channel)
+            .await
+            .map_err(|e| e.to_string())?
+    } else {
+        None
+    };
     let connection = manager
         .status()
         .await
@@ -128,7 +145,7 @@ pub(crate) async fn status(
                 })
         });
     Ok(
-        serde_json::json!({"config":c,"scan":scan,"saved_scan":saved_scan,"connection":connection,"stale_scan_warning":stale_scan_warning,"requests":db.slack_requests(&c.workspace,&c.owner).await.map_err(|e|e.to_string())?,"returns":db.slack_returns(&c.workspace,&c.owner).await.map_err(|e|e.to_string())?}),
+        serde_json::json!({"config":c,"scan":scan,"saved_scan":saved_scan,"inbox_scan":inbox_scan,"connection":connection,"stale_scan_warning":stale_scan_warning,"requests":db.slack_requests(&c.workspace,&c.owner).await.map_err(|e|e.to_string())?,"returns":db.slack_returns(&c.workspace,&c.owner).await.map_err(|e|e.to_string())?}),
     )
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -136,6 +153,7 @@ pub(super) enum QueryKind {
     Prefix,
     Reaction,
     Saved,
+    Inbox,
 }
 impl QueryKind {
     #[cfg(test)]
@@ -146,11 +164,12 @@ impl QueryKind {
             Self::Prefix
         }
     }
-    pub fn next(self, saved_enabled: bool) -> Self {
+    pub fn next(self, saved_enabled: bool, inbox_enabled: bool) -> Self {
         match self {
             Self::Prefix => Self::Reaction,
             Self::Reaction if saved_enabled => Self::Saved,
-            Self::Reaction | Self::Saved => Self::Prefix,
+            Self::Reaction | Self::Saved if inbox_enabled => Self::Inbox,
+            Self::Reaction | Self::Saved | Self::Inbox => Self::Prefix,
         }
     }
     pub fn trigger(self) -> phoenix_db::SlackTriggerKind {
@@ -158,6 +177,7 @@ impl QueryKind {
             Self::Prefix => phoenix_db::SlackTriggerKind::Prefix,
             Self::Reaction => phoenix_db::SlackTriggerKind::Reaction,
             Self::Saved => phoenix_db::SlackTriggerKind::Saved,
+            Self::Inbox => phoenix_db::SlackTriggerKind::Inbox,
         }
     }
     pub fn as_str(self) -> &'static str {
@@ -165,6 +185,7 @@ impl QueryKind {
             Self::Prefix => "prefix",
             Self::Reaction => "reaction",
             Self::Saved => "saved",
+            Self::Inbox => "inbox",
         }
     }
 }
@@ -255,7 +276,7 @@ pub(crate) fn start(state: crate::api::AppState) {
                 }
             };
             if let Pass::Discovery { first } = pass {
-                next_first = first.next(c.saved_enabled);
+                next_first = first.next(c.saved_enabled, c.inbox_channel.is_some());
             }
             if !recovered {
                 let recovery_result = async {
