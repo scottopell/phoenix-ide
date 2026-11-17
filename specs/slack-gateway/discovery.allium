@@ -145,10 +145,10 @@ contract NativeReconciliationPort {
         -- Disabling discovery does not cancel or suppress accepted native work.
 }
 
-enum SearchKind { prefix | reaction | saved }
+enum SearchKind { prefix | reaction | saved | inbox }
 enum ServiceKind { discovery | delivery | inspection }
 enum ServicePhase { reconciling | searching | finished }
-enum CallPurpose { owner_identity | search_page | saved_page | fresh_prefix_page | candidate_read | acknowledgment | thread_reply | inspection_read }
+enum CallPurpose { owner_identity | search_page | saved_page | inbox_page | fresh_prefix_page | candidate_read | acknowledgment | thread_reply | inspection_read }
 enum CallState { in_flight | resolved }
 
 entity DiscoveryController {
@@ -190,6 +190,8 @@ entity ServiceOpportunity {
     emoji_sweep_completed: Boolean
     saved_sweep_completed: Boolean
     saved_page_failed: Boolean
+    inbox_sweep_completed: Boolean
+    inbox_page_failed: Boolean
     burst_deadline: Timestamp?
     calls: SlackCall with service = this
     in_flight_calls: calls where state = in_flight
@@ -211,7 +213,7 @@ entity SearchProgress {
     page_evidence: PageEvidence with query = this
 
     invariant EmojiQueryOnly {
-        kind != saved
+        kind in {prefix, reaction}
     }
 }
 
@@ -249,7 +251,8 @@ rule BeginServiceOpportunity {
         catchup_first: controller.next_first_query != prefix,
         catchup_opportunity_taken: false,
         emoji_sweep_completed: false, saved_sweep_completed: false,
-        saved_page_failed: false
+        saved_page_failed: false,
+        inbox_sweep_completed: false, inbox_page_failed: false
     )
     ensures:
         if kind != inspection:
@@ -279,7 +282,7 @@ rule GrantSlackCall {
         or service.kind = inspection
     )
     requires: purpose = owner_identity or service.owner_verified
-    requires: purpose not in {fresh_prefix_page, saved_page}
+    requires: purpose not in {fresh_prefix_page, saved_page, inbox_page}
     requires: service.kind != inspection or purpose in {owner_identity, inspection_read}
     requires: purpose != inspection_read or service.kind = inspection
     requires: purpose not in {search_page, candidate_read} or service.phase = searching
@@ -429,7 +432,7 @@ rule CheckpointCompletedPage {
         if evidence.query.kind = prefix:
             service.next_query = reaction
         else:
-            service.next_query = if service.controller.gateway.saved_enabled: saved else: prefix
+            service.next_query = if service.controller.gateway.saved_enabled: saved else: if service.controller.gateway.inbox_channel != null: inbox else: prefix
 }
 
 rule CompleteSweep {
@@ -462,12 +465,18 @@ rule PreferReactionNextInterval {
 rule PreferPrefixNextInterval {
     when: DiscoveryIntervalElapsed(controller)
     requires: controller.next_first_query = reaction
-    ensures: controller.next_first_query = if controller.gateway.saved_enabled: saved else: prefix
+    ensures: controller.next_first_query = if controller.gateway.saved_enabled: saved else: if controller.gateway.inbox_channel != null: inbox else: prefix
 }
 
 rule PreferPrefixAfterSavedInterval {
     when: DiscoveryIntervalElapsed(controller)
     requires: controller.next_first_query = saved
+    ensures: controller.next_first_query = if controller.gateway.inbox_channel != null: inbox else: prefix
+}
+
+rule PreferPrefixAfterInboxInterval {
+    when: DiscoveryIntervalElapsed(controller)
+    requires: controller.next_first_query = inbox
     ensures: controller.next_first_query = prefix
 }
 

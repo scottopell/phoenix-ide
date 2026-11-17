@@ -1,0 +1,142 @@
+-- allium: 3
+-- Scope: owner-authored personal-channel submissions, REQ-SG-020.
+-- Native work and return delivery use the lifecycle contract.
+use "./slack-gateway.allium" as lifecycle
+use "./discovery.allium" as discovery
+
+external entity SubmissionPage {
+    inbox: SubmissionInbox
+    next_position: String?
+    observations: Set<lifecycle/VerifiedObservation>
+}
+
+contract SubmissionPort {
+    read_page: (inbox: SubmissionInbox, position: String?) -> SubmissionPage
+
+    @invariant VerifiedSubmissions
+        -- Search is scoped to the configured exact channel and authenticated
+        -- owner within the current and preceding three calendar dates. Exact
+        -- message reads verify owner authorship and top-level identity. Channel
+        -- events, other authors, replies and gateway outputs are ineligible.
+        -- Search snippets do not supply accepted instructions. The exact read's
+        -- owner note supplies the instruction; the forwarded block supplies
+        -- context only. A missing note means prepare a briefing and await direction.
+        -- A referenced original can be any age. Reading the forwarded preview
+        -- does not establish that its original discussion was read.
+        -- Observations have trigger_kind=inbox and kind=explicit_request so their
+        -- result destination is the submission thread. Source and binding keys
+        -- use the submission identity, never the forwarded original. The source
+        -- key shares emoji deduplication and is separate from Saved capture.
+        -- An eligible submission takes precedence over its emoji interpretation.
+        -- Incomplete identity or page evidence retains progress for retry. Only
+        -- verified provider end-of-pagination completes a scan. A provider ceiling
+        -- remains visibly incomplete and does not expand the allowance.
+}
+
+entity SubmissionInbox {
+    controller: discovery/DiscoveryController
+    channel: String
+    position: String?
+    baseline_complete: Boolean
+    scan_in_progress: Boolean
+    last_complete_scan_at: Timestamp?
+    last_error: String?
+}
+
+rule GrantSubmissionPageCall {
+    when: RequestSubmissionPage(service, queue)
+    requires: service.kind = discovery
+    requires: service.phase = searching
+    requires: service.owner_verified
+    requires: service.controller = queue.controller
+    requires: service.controller.gateway.enabled
+    requires: service.controller.gateway.inbox_channel = queue.channel
+    requires: service.next_query = inbox
+    requires: not service.inbox_sweep_completed and not service.inbox_page_failed
+    requires: service.in_flight_calls.count = 0
+    requires: not service.controller.backoff_active
+    requires: service.burst_deadline > now
+    requires: service.controller.remaining_calls >= discovery/config.maximum_page_calls + discovery/config.work_reserve
+    ensures: service.controller.calls_used = service.controller.calls_used + 1
+    ensures: discovery/SlackCall.created(service: service, purpose: inbox_page, state: in_flight)
+    ensures: service.catchup_opportunity_taken = true
+}
+
+rule BaselineSubmission {
+    when: SubmissionVerified(inbox, observation)
+    requires: inbox.controller.gateway.enabled
+    requires: inbox.controller.gateway.inbox_channel = inbox.channel
+    requires: not inbox.baseline_complete
+    requires: observation.eligible
+    requires: observation.source_key not in inbox.controller.gateway.handled_sources
+    ensures: inbox.controller.gateway.handled_sources = inbox.controller.gateway.handled_sources + {observation.source_key}
+}
+
+rule AcceptSubmission {
+    when: SubmissionVerified(queue, observation)
+    requires: queue.baseline_complete
+    requires: queue.controller.gateway.enabled
+    requires: queue.controller.gateway.inbox_channel = queue.channel
+    requires: observation.eligible
+    requires: observation.trigger_kind = inbox
+    requires: observation.kind = explicit_request
+    requires: observation.actor = queue.controller.gateway.owner
+    requires: observation.author = queue.controller.gateway.owner
+    ensures: lifecycle/EligibleSourceObserved(queue.controller.gateway, observation)
+}
+
+rule CheckpointSubmissionPage {
+    when: SubmissionPageVerified(service, inbox, page)
+    requires: page.inbox = inbox
+    requires: service.controller = inbox.controller
+    requires: service.in_flight_calls.count = 0
+    ensures: inbox.position = page.next_position
+    ensures: inbox.scan_in_progress = page.next_position != null
+    ensures: service.next_query = prefix
+    ensures:
+        if page.next_position = null:
+            inbox.baseline_complete = true
+            inbox.controller.gateway.inbox_baseline_complete = true
+            inbox.last_complete_scan_at = now
+            inbox.last_error = null
+            service.inbox_sweep_completed = true
+}
+
+rule RetainSubmissionFailure {
+    when: SubmissionPageFailed(service, queue, reason, restart_query)
+    requires: service.phase = searching
+    requires: service.controller = queue.controller
+    requires: service.next_query = inbox
+    requires: service.in_flight_calls.count = 0
+    ensures: queue.last_error = reason
+    ensures: service.inbox_page_failed = true
+    ensures: service.next_query = prefix
+    ensures:
+        if restart_query:
+            queue.position = null
+}
+
+surface SubmissionBoundary {
+    facing inbox: SubmissionInbox
+    contracts:
+        demands SubmissionPort
+    provides:
+        RequestSubmissionPage(service, queue)
+        SubmissionVerified(inbox, observation)
+        SubmissionPageVerified(service, inbox, page)
+        SubmissionPageFailed(service, queue, reason, restart_query)
+    @guarantee SharedExecutionAndAllowance
+        -- Channel scans run only inside ordinary serialized discovery services,
+        -- sharing call allowance, backoff, burst duration and accepted-work reserve.
+        -- Enabled searches rotate fairly; a failing channel scan does not reset
+        -- emoji or Saved progress. Disabling a channel or restarting preserves its
+        -- handled identities; channel-specific retained state controls initialization.
+    @guarantee PrivateHandoff
+        -- Each submission creates fresh native work. The intentional result in
+        -- the submission thread includes its Phoenix link. Clarifications use
+        -- the generic native handoff. Follow-ups and question answers occur in
+        -- Phoenix; replies in the submission thread do not invoke this workflow.
+        -- The forwarded original receives no automatic acknowledgment or reply.
+        -- Native permissions govern explicit instructions, including separately
+        -- requested publication. Quoted content never independently authorizes work.
+}

@@ -1,5 +1,6 @@
 //! Normalized Slack acceptance and return evidence (REQ-SG-005/007/011/013).
 #![allow(clippy::missing_errors_doc)]
+mod channel;
 use super::{Database, DbError, DbResult};
 use crate::product_conversation_read::ORDINARY_PRODUCT_ROUTE_PREDICATE;
 use serde::{Deserialize, Serialize};
@@ -58,13 +59,14 @@ pub enum SlackTriggerKind {
     Prefix,
     Reaction,
     Saved,
+    Inbox,
 }
 impl SlackTriggerKind {
     #[must_use]
     pub const fn capture_scope(self) -> &'static str {
         match self {
             Self::Saved => "saved",
-            Self::Prefix | Self::Reaction => "emoji",
+            Self::Prefix | Self::Reaction | Self::Inbox => "emoji",
         }
     }
     fn as_str(self) -> &'static str {
@@ -72,6 +74,7 @@ impl SlackTriggerKind {
             Self::Prefix => "prefix",
             Self::Reaction => "reaction",
             Self::Saved => "saved",
+            Self::Inbox => "inbox",
         }
     }
     fn decode(value: &str) -> Result<Self, sqlx::Error> {
@@ -79,13 +82,14 @@ impl SlackTriggerKind {
             "prefix" => Ok(Self::Prefix),
             "reaction" => Ok(Self::Reaction),
             "saved" => Ok(Self::Saved),
+            "inbox" => Ok(Self::Inbox),
             _ => Err(sqlx::Error::Decode("Invalid Slack trigger kind".into())),
         }
     }
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct SlackSavedInbox {
+pub struct SlackScanProgress {
     pub baseline_complete: bool,
     pub cursor: Option<String>,
     pub scan_in_progress: bool,
@@ -253,10 +257,27 @@ impl Database {
             .as_object_mut()
             .ok_or_else(|| DbError::Serialization("Invalid Slack configuration".into()))?
             .insert("saved_enabled".into(), serde_json::json!(saved));
+        let channel: String = sqlx::query_scalar(
+            "SELECT value FROM app_settings WHERE key='slack_gateway_inbox_channel'",
+        )
+        .fetch_one(&mut *tx)
+        .await?;
+        value
+            .as_object_mut()
+            .ok_or_else(|| DbError::Serialization("Invalid Slack configuration".into()))?
+            .insert(
+                "inbox_channel".into(),
+                serde_json::json!(if channel.is_empty() {
+                    None
+                } else {
+                    Some(channel)
+                }),
+            );
         tx.commit().await?;
         Ok(Some(value.to_string()))
     }
 
+    #[allow(clippy::too_many_lines)] // Keep account checks and the scalar configuration update together.
     pub async fn set_slack_configuration(&self, value: &str) -> DbResult<()> {
         let mut config: serde_json::Value =
             serde_json::from_str(value).map_err(|e| DbError::Serialization(e.to_string()))?;
@@ -277,7 +298,14 @@ impl Database {
             .map(serde_json::from_value::<bool>)
             .transpose()
             .map_err(|e| DbError::Serialization(e.to_string()))?;
-        let stored_value = if name.is_some() || saved.is_some() {
+        let supplied_channel = config
+            .as_object_mut()
+            .and_then(|v| v.remove("inbox_channel"));
+        let channel = supplied_channel
+            .map(serde_json::from_value::<Option<String>>)
+            .transpose()
+            .map_err(|e| DbError::Serialization(e.to_string()))?;
+        let stored_value = if name.is_some() || saved.is_some() || channel.is_some() {
             config.to_string()
         } else {
             value.to_owned()
@@ -302,7 +330,7 @@ impl Database {
                 && prior.get("owner") == config.get("owner")
                 && prior.get("timezone") != config.get("timezone")
             {
-                let initializing: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM slack_gateway_accounts account WHERE workspace=?1 AND owner=?2 AND baseline_complete=0 AND EXISTS(SELECT 1 FROM slack_gateway_discovery scan WHERE scan.workspace=account.workspace AND scan.owner=account.owner))").bind(workspace).bind(owner).fetch_one(&mut *tx).await?;
+                let initializing: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM slack_gateway_accounts account WHERE workspace=?1 AND owner=?2 AND baseline_complete=0 AND EXISTS(SELECT 1 FROM slack_gateway_discovery scan WHERE scan.workspace=account.workspace AND scan.owner=account.owner)) OR EXISTS(SELECT 1 FROM slack_gateway_channel_inboxes WHERE workspace=?1 AND owner=?2 AND baseline_complete=0 AND scan_in_progress=1)").bind(workspace).bind(owner).fetch_one(&mut *tx).await?;
                 if initializing {
                     return Err(DbError::Serialization(
                         "Finish Slack initialization before changing its timezone".into(),
@@ -346,10 +374,20 @@ impl Database {
                 .execute(&mut *tx)
                 .await?;
         }
+        if let Some(channel) = &channel {
+            sqlx::query("UPDATE app_settings SET value=?1 WHERE key='slack_gateway_inbox_channel'")
+                .bind(channel.as_deref().unwrap_or(""))
+                .execute(&mut *tx)
+                .await?;
+        }
         sqlx::query("INSERT INTO slack_gateway_accounts(workspace,owner) VALUES (?1,?2) ON CONFLICT DO NOTHING")
             .bind(workspace).bind(owner).execute(&mut *tx).await?;
         sqlx::query("INSERT INTO slack_gateway_saved_inboxes(workspace,owner) VALUES (?1,?2) ON CONFLICT DO NOTHING")
             .bind(workspace).bind(owner).execute(&mut *tx).await?;
+        if let Some(Some(channel)) = channel {
+            sqlx::query("INSERT INTO slack_gateway_channel_inboxes(workspace,owner,channel) VALUES (?1,?2,?3) ON CONFLICT DO NOTHING")
+                .bind(workspace).bind(owner).bind(channel).execute(&mut *tx).await?;
+        }
         sqlx::query("UPDATE slack_gateway_returns SET state='failed',failure='Private notice skipped because the configured account changed' WHERE destination='private' AND state='pending' AND binding_id IN (SELECT binding_id FROM slack_gateway_bindings WHERE workspace<>?1 OR owner<>?2)")
             .bind(workspace).bind(owner).execute(&mut *tx).await?;
         sqlx::query("INSERT INTO app_settings(key,value) VALUES ('slack_gateway',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value").bind(stored_value).execute(&mut *tx).await?;
@@ -365,10 +403,10 @@ impl Database {
         &self,
         workspace: &str,
         owner: &str,
-    ) -> DbResult<Option<SlackSavedInbox>> {
+    ) -> DbResult<Option<SlackScanProgress>> {
         Ok(sqlx::query("SELECT baseline_complete,cursor,scan_in_progress,last_scan_at_unix_micros,last_error FROM slack_gateway_saved_inboxes WHERE workspace=?1 AND owner=?2")
             .bind(workspace).bind(owner).fetch_optional(self.pool()).await?
-            .map(|row| SlackSavedInbox { baseline_complete: row.get("baseline_complete"), cursor: row.get("cursor"), scan_in_progress: row.get("scan_in_progress"), last_scan_at_unix_micros: row.get("last_scan_at_unix_micros"), last_error: row.get("last_error") }))
+            .map(|row| SlackScanProgress { baseline_complete: row.get("baseline_complete"), cursor: row.get("cursor"), scan_in_progress: row.get("scan_in_progress"), last_scan_at_unix_micros: row.get("last_scan_at_unix_micros"), last_error: row.get("last_error") }))
     }
     pub async fn slack_saved_begin_scan(&self, workspace: &str, owner: &str) -> DbResult<()> {
         self.slack_baseline_complete(workspace, owner).await?;
@@ -469,6 +507,22 @@ impl Database {
             ));
         }
         let mut tx = self.pool().begin_with("BEGIN IMMEDIATE").await?;
+        if source.trigger_kind == SlackTriggerKind::Inbox {
+            let channel: String = sqlx::query_scalar(
+                "SELECT value FROM app_settings WHERE key='slack_gateway_inbox_channel'",
+            )
+            .fetch_one(&mut *tx)
+            .await?;
+            if channel != source.channel {
+                tx.rollback().await?;
+                return Ok(SlackSourceAcceptance::Inactive);
+            }
+            if source.kind != SlackRequestKind::Explicit || source.message_ts != source.thread_ts {
+                return Err(DbError::Serialization(
+                    "Channel submissions must be top-level owner requests".into(),
+                ));
+            }
+        }
         if source.trigger_kind == SlackTriggerKind::Saved {
             let enabled: String = sqlx::query_scalar(
                 "SELECT value FROM app_settings WHERE key='slack_gateway_saved_enabled'",
@@ -3395,6 +3449,88 @@ mod tests {
             db.slack_requests(&s.workspace, &s.owner).await.unwrap()[0].request_id,
             rows[0].request_id
         );
+    }
+    #[tokio::test]
+    async fn channel_submission_progress_identity_and_pause_survive_restart() {
+        // REQ-SG-020: accepted work survives settings changes and restart.
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("channel.db");
+        let mut db = Database::open(path.to_str().unwrap()).await.unwrap();
+        crate::migrations::run_pending_migrations(db.pool())
+            .await
+            .unwrap();
+        let config = serde_json::json!({"enabled":true,"owner":"UOWNER","workspace":"example.slack.com","timezone":"UTC","inbox_channel":"CCHANNEL"});
+        db.set_slack_configuration(&config.to_string())
+            .await
+            .unwrap();
+        assert!(!db
+            .slack_channel_begin_scan("example.slack.com", "UOWNER", "CCHANNEL", "2000-01-01")
+            .await
+            .unwrap());
+        db.slack_channel_checkpoint("example.slack.com", "UOWNER", "CCHANNEL", Some("page2"))
+            .await
+            .unwrap();
+        assert!(!db
+            .slack_channel_begin_scan("example.slack.com", "UOWNER", "CCHANNEL", "2000-02-01")
+            .await
+            .unwrap());
+        let retained: String =
+            sqlx::query_scalar("SELECT after_date FROM slack_gateway_channel_inboxes")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(retained, "2000-01-01");
+        let mut changed_timezone = config.clone();
+        changed_timezone["timezone"] = serde_json::json!("America/New_York");
+        assert!(db
+            .set_slack_configuration(&changed_timezone.to_string())
+            .await
+            .is_err());
+        db.slack_channel_checkpoint("example.slack.com", "UOWNER", "CCHANNEL", None)
+            .await
+            .unwrap();
+        let mut s = source("100.000", SlackRequestKind::Explicit);
+        s.trigger_kind = SlackTriggerKind::Inbox;
+        db.accept_slack_source(&s, false).await.unwrap();
+        let mut emoji = s.clone();
+        emoji.trigger_kind = SlackTriggerKind::Prefix;
+        db.accept_slack_source(&emoji, false).await.unwrap();
+        let mut second = s.clone();
+        second.message_ts = "101.000".into();
+        second.thread_ts = second.message_ts.clone();
+        db.accept_slack_source(&second, false).await.unwrap();
+        let before = db.slack_requests(&s.workspace, &s.owner).await.unwrap();
+        assert_eq!(before.len(), 2);
+        assert_ne!(before[0].binding_id, before[1].binding_id);
+        let mut paused = config.clone();
+        paused["inbox_channel"] = serde_json::Value::Null;
+        db.set_slack_configuration(&paused.to_string())
+            .await
+            .unwrap();
+        second.message_ts = "102.000".into();
+        second.thread_ts = second.message_ts.clone();
+        assert_eq!(
+            db.accept_slack_source(&second, false).await.unwrap(),
+            SlackSourceAcceptance::Inactive
+        );
+        drop(db);
+        db = Database::open(path.to_str().unwrap()).await.unwrap();
+        crate::migrations::run_pending_migrations(db.pool())
+            .await
+            .unwrap();
+        db.set_slack_configuration(&config.to_string())
+            .await
+            .unwrap();
+        assert!(
+            db.slack_channel_inbox(&s.workspace, &s.owner, &s.channel)
+                .await
+                .unwrap()
+                .unwrap()
+                .baseline_complete
+        );
+        let after = db.slack_requests(&s.workspace, &s.owner).await.unwrap();
+        assert_eq!(after.len(), 2);
+        assert_eq!(after[0].request_id, before[0].request_id);
     }
     #[tokio::test]
     async fn baseline_never_becomes_work_and_private_briefing_has_separate_binding() {

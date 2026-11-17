@@ -112,11 +112,20 @@ async fn inspect_reads(
         (chrono::Utc::now().with_timezone(&tz).date_naive() - chrono::Days::new(4)).to_string();
     let mut checks = Vec::new();
     let mut reaction_read_verified = false;
-    let mut queries = vec![super::QueryKind::Prefix, super::QueryKind::Reaction];
+    let mut queries = Vec::new();
+    if c.inbox_channel.is_some() {
+        queries.push(super::QueryKind::Inbox);
+    }
+    queries.extend([super::QueryKind::Prefix, super::QueryKind::Reaction]);
     if c.saved_enabled {
         queries.push(super::QueryKind::Saved);
     }
+    let mut budget_limited = false;
     for kind in queries {
+        if !slack.can_sample() {
+            budget_limited = true;
+            break;
+        }
         let page = slack
             .search(c, kind, None, &after)
             .await
@@ -139,9 +148,47 @@ async fn inspect_reads(
                 }
             }
         }
-        checks.push(serde_json::json!({"query":match kind { super::QueryKind::Prefix => "owner emoji-prefixed messages", super::QueryKind::Reaction => "configured emoji reactions", super::QueryKind::Saved => "Saved messages" },"first_page_hits":page.hits.len(),"verified_sources":verified,"more_pages":page.cursor.is_some()}));
+        checks.push(serde_json::json!({"query":match kind { super::QueryKind::Prefix => "owner emoji-prefixed messages", super::QueryKind::Reaction => "configured emoji reactions", super::QueryKind::Saved => "Saved messages", super::QueryKind::Inbox => "submission channel messages" },"first_page_hits":page.hits.len(),"verified_sources":verified,"more_pages":page.cursor.is_some()}));
     }
     Ok(Json(
-        serde_json::json!({"owner_verified":true,"checks":checks,"reaction_read_verified":reaction_read_verified,"calls":slack.calls.load(std::sync::atomic::Ordering::Relaxed),"gateway_activated":false}),
+        serde_json::json!({"owner_verified":true,"checks":checks,"reaction_read_verified":reaction_read_verified,"calls":slack.calls.load(std::sync::atomic::Ordering::Relaxed),"budget_limited":budget_limited,"gateway_activated":false}),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{
+        atomic::{AtomicU32, Ordering},
+        Arc,
+    };
+
+    #[tokio::test]
+    async fn read_inspection_stops_before_a_partial_workflow_exceeds_shared_allowance() {
+        // REQ-SG-017/020
+        let c:Config=serde_json::from_value(serde_json::json!({"enabled":false,"saved_enabled":true,"inbox_channel":"CINBOX","mcp_server":"fixture","workspace":"fixture.slack.com","owner":"UOWNER","timezone":"UTC","phoenix_url":"https://phoenix.example","trigger_emoji":"fire"})).unwrap();
+        let allowance = Arc::new(AtomicU32::new(12));
+        let mut slack = super::super::slack::Slack::with_budget(
+            Arc::new(phoenix_tools::mcp::McpClientManager::new()),
+            &c,
+            allowance.clone(),
+        );
+        slack.fixture = Some(Arc::new(|tool, args| match tool {
+            "slack_read_user_profile" => {
+                Ok(serde_json::json!({"result":"User ID: UOWNER\nBot: No"}))
+            }
+            "slack_search_public_and_private" if args["filters"] == "after:1970-01-01" => Ok(
+                serde_json::json!({"results":"### Result 1 of 1\nChannel: proof (ID: CPROOF)\nMessage_ts: 100.000001\nPermalink: [link](https://fixture.slack.com/archives/CPROOF/p100000001)\nText: proof","pagination_info":"End of results"}),
+            ),
+            _ => {
+                panic!("Cannot start another workflow sample with only two calls remaining: {tool}")
+            }
+        }));
+        let axum::Json(result) = inspect_reads(&c, &slack).await.unwrap();
+        assert_eq!(result["owner_verified"], true);
+        assert_eq!(result["budget_limited"], true);
+        assert_eq!(result["checks"], serde_json::json!([]));
+        assert_eq!(result["gateway_activated"], false);
+        assert_eq!(allowance.load(Ordering::Relaxed), 14);
+    }
 }

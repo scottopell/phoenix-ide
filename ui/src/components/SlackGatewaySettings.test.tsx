@@ -4,6 +4,28 @@ import { SlackGatewaySettings } from './SlackGatewaySettings';
 
 afterEach(() => { cleanup(); vi.unstubAllGlobals(); });
 
+it('saves an optional submission channel and explains note authority and Phoenix handoff', async () => {
+  const config = { enabled: true, saved_enabled: false, inbox_channel: null as string | null, mcp_server: 'slack', owner: 'UOWNER', workspace: 'example.slack.com', timezone: 'UTC', phoenix_url: 'https://phoenix.example', trigger_emoji: 'fire', notification_command: null };
+  let submitted: typeof config | undefined;
+  vi.stubGlobal('fetch', vi.fn().mockImplementation(async (_url: string, options?: RequestInit) => {
+    if (options?.method === 'PUT') submitted = JSON.parse(String(options.body));
+    return { ok: true, json: async () => ({ config: submitted ?? config, inbox_scan: { baseline_complete: true, scan_in_progress: false, last_scan_at_unix_micros: null, last_error: null }, requests: [], returns: [] }) };
+  }));
+  render(<SlackGatewaySettings standalone />);
+  const channel = await screen.findByLabelText('Submission channel ID');
+  await waitFor(() => expect((channel as HTMLInputElement).value).toBe(''));
+  fireEvent.change(channel, { target: { value: 'CINBOX' } });
+  fireEvent.click(screen.getByRole('button', { name: 'Save settings' }));
+  await screen.findByText('Settings saved.');
+  expect(submitted?.inbox_channel).toBe('CINBOX');
+  expect(screen.getByText(/Your note is the instruction; forwarded text is context/)).toBeTruthy();
+  expect(screen.getByText(/Wait for Ready before posting/)).toBeTruthy();
+  fireEvent.change(channel, { target: { value: '' } });
+  fireEvent.click(screen.getByRole('button', { name: 'Save settings' }));
+  await screen.findByText('Settings saved.');
+  expect(submitted?.inbox_channel).toBeNull();
+});
+
 it('saves one custom emoji name and explains all three workflows', async () => {
   const config = { enabled: true, mcp_server: 'slack', owner: 'UOWNER', workspace: 'example.slack.com', timezone: 'UTC', phoenix_url: 'https://phoenix.example', trigger_emoji: 'fire', notification_command: null };
   let submitted: typeof config | undefined;
