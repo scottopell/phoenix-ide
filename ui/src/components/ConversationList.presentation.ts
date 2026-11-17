@@ -98,21 +98,19 @@ export type MonitoredSplit = {
 };
 
 /**
- * Separate conversations Ember monitors (an active Coordinator watch) from the
- * user's own. `pinned` keeps a row in the main list regardless, e.g. the open one.
+ * Separate conversations Ember monitors (`row.monitored`, an active Coordinator
+ * watch) from the user's own. `pinned` keeps a row in the main list regardless,
+ * e.g. the open one.
  */
 export function splitMonitoredProductConversations(
   rows: readonly ProductConversationListRow[],
-  monitoredIds: ReadonlySet<string>,
   pinned: (row: ProductConversationListRow) => boolean = () => false,
 ): MonitoredSplit {
-  if (monitoredIds.size === 0) return { own: rows, monitored: [] };
+  if (!rows.some((row) => row.monitored)) return { own: rows, monitored: [] };
   const own: ProductConversationListRow[] = [];
   const monitored: ProductConversationListRow[] = [];
   for (const row of rows) {
-    const folded = monitoredIds.has(row.product_conversation_id)
-      && !productConversationNeedsUser(row)
-      && !pinned(row);
+    const folded = row.monitored && !productConversationNeedsUser(row) && !pinned(row);
     (folded ? monitored : own).push(row);
   }
   return { own, monitored };

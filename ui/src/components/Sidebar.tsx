@@ -562,7 +562,6 @@ export function Sidebar({
         <ConversationList
           coordinatorUnread={coordinatorUnreadState}
           productConversations={openProductConversations}
-          monitoredProductConversationIds={productList.monitoredIds}
           archivedProductConversations={archivedProductConversations}
           showArchived={showArchived}
           onToggleArchived={handleToggleArchived}

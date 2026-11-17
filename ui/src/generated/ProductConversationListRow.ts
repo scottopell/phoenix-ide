@@ -5,4 +5,8 @@ import type { ProductConversationPresentationView } from "./ProductConversationP
 import type { ProductConversationReadStateView } from "./ProductConversationReadStateView";
 import type { ProductConversationTranscriptRowView } from "./ProductConversationTranscriptRowView";
 
-export type ProductConversationListRow = { product_conversation_id: string, canonical_route: string, canonical_root: ProductConversationTranscriptRowView, lifecycle: ProductConversationLifecycleView, latest_transcript_row_id: string, updated_at: string, presentation: ProductConversationPresentationView, read_state: ProductConversationReadStateView, cached_pr: ProductConversationPrView | null, };
+export type ProductConversationListRow = { product_conversation_id: string, canonical_route: string, canonical_root: ProductConversationTranscriptRowView, lifecycle: ProductConversationLifecycleView, latest_transcript_row_id: string, updated_at: string, presentation: ProductConversationPresentationView, read_state: ProductConversationReadStateView, cached_pr: ProductConversationPrView | null, 
+/**
+ * True while the Coordinator holds an active watch on this conversation.
+ */
+monitored: boolean, };

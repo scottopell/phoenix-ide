@@ -87,6 +87,7 @@ const productConversation = (title = 'Mobile Product'): ProductConversationListR
   presentation: { kind: 'state', display_name: title, presentation_mode: 'idle' },
   read_state: { state: 'read' },
   cached_pr: null,
+  monitored: false,
 });
 
 function touchActivate(element: HTMLElement): void {

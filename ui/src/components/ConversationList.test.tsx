@@ -144,6 +144,7 @@ const makeProductConversation = (id: string, overrides: Partial<ProductConversat
   presentation: { kind: 'state', display_name: overrides.canonical_root?.title ?? `Root ${id}`, presentation_mode: 'idle' },
   read_state: { state: 'read' },
   cached_pr: null,
+  monitored: false,
   ...overrides,
 });
 
@@ -639,15 +640,14 @@ describe('ConversationList — conversations Ember monitors', () => {
   it('folds monitored rows behind a collapsed group and remembers when it is opened', () => {
     const rows = [
       makeProductConversation('mine'),
-      makeProductConversation('quiet'),
-      makeProductConversation('asking', { presentation: { kind: 'state', display_name: 'Asking', presentation_mode: 'needs_action' } }),
+      makeProductConversation('quiet', { monitored: true }),
+      makeProductConversation('asking', { monitored: true, presentation: { kind: 'state', display_name: 'Asking', presentation_mode: 'needs_action' } }),
     ];
     const list = (
       <MemoryRouter>
         <ConversationList
           {...defaultProps}
           productConversations={rows}
-          monitoredProductConversationIds={new Set(['quiet', 'asking'])}
         />
       </MemoryRouter>
     );
@@ -668,8 +668,9 @@ describe('ConversationList — conversations Ember monitors', () => {
   });
 
   it('shows no group when nothing is monitored and keeps the open row visible', () => {
-    const rows = [makeProductConversation('mine'), makeProductConversation('watched')];
-    const plain = render(<MemoryRouter><ConversationList {...defaultProps} productConversations={rows} /></MemoryRouter>);
+    const unmonitored = [makeProductConversation('mine'), makeProductConversation('watched')];
+    const rows = [makeProductConversation('mine'), makeProductConversation('watched', { monitored: true })];
+    const plain = render(<MemoryRouter><ConversationList {...defaultProps} productConversations={unmonitored} /></MemoryRouter>);
     expect(plain.queryByRole('button', { name: /Ember is handling/ })).toBeNull();
     plain.unmount();
 
@@ -679,7 +680,6 @@ describe('ConversationList — conversations Ember monitors', () => {
           {...defaultProps}
           productConversations={rows}
           activeSlug="watched"
-          monitoredProductConversationIds={new Set(['watched'])}
         />
       </MemoryRouter>,
     );

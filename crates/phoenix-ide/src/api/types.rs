@@ -468,6 +468,8 @@ pub struct ProductConversationListRow {
     pub presentation: ProductConversationPresentationView,
     pub read_state: ProductConversationReadStateView,
     pub cached_pr: Option<ProductConversationPrView>,
+    /// True while the Coordinator holds an active watch on this conversation.
+    pub monitored: bool,
 }
 
 #[derive(Debug, Clone, Serialize, TS)]

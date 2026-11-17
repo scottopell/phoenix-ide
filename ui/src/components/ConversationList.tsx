@@ -34,12 +34,9 @@ interface ConversationListProps {
   footer?: ReactNode;
   coordinatorUnread?: 'marked' | 'new_activity' | null;
   listAvailability?: 'loading' | 'error' | 'available';
-  /** Product conversations Ember monitors; they fold into one group in the Open view. */
-  monitoredProductConversationIds?: ReadonlySet<string>;
 }
 
 const MONITORED_EXPANDED_KEY = 'phoenix:conversation-list:monitored-expanded:v1';
-const NO_MONITORED_IDS: ReadonlySet<string> = new Set();
 
 function readMonitoredExpanded(): boolean {
   try {
@@ -306,7 +303,6 @@ export function ConversationList({
   footer,
   coordinatorUnread = null,
   listAvailability = 'available',
-  monitoredProductConversationIds = NO_MONITORED_IDS,
 }: ConversationListProps) {
   const [monitoredExpanded, setMonitoredExpanded] = useState(readMonitoredExpanded);
   const toggleMonitoredExpanded = useCallback(() => {
@@ -373,14 +369,15 @@ export function ConversationList({
 
   // History is a flat record; only Open work is split into the user's own and Ember's.
   const monitoredSplit = useMemo(
-    () => splitMonitoredProductConversations(
-      showArchived ? archivedProductConversations : productConversations,
-      showArchived ? NO_MONITORED_IDS : monitoredProductConversationIds,
-      (row) => activeSlug === row.product_conversation_id
-        || activeSlug === row.canonical_root.slug
-        || activeSlug === row.canonical_root.transcript_row_id,
-    ),
-    [showArchived, archivedProductConversations, productConversations, monitoredProductConversationIds, activeSlug],
+    () => (showArchived
+      ? { own: archivedProductConversations, monitored: [] }
+      : splitMonitoredProductConversations(
+        productConversations,
+        (row) => activeSlug === row.product_conversation_id
+          || activeSlug === row.canonical_root.slug
+          || activeSlug === row.canonical_root.transcript_row_id,
+      )),
+    [showArchived, archivedProductConversations, productConversations, activeSlug],
   );
   const displayProductList = useMemo(
     () => (monitoredExpanded
