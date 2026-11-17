@@ -760,8 +760,7 @@ pub struct RuntimeManager {
     mcp_manager: Arc<crate::tools::mcp::McpClientManager>,
     /// Active PTY terminal sessions — threaded into `ToolContext` for `read_terminal`.
     pub terminals: crate::terminal::ActiveTerminals,
-    pub(crate) close_retirement_leases:
-        AsyncMutex<HashMap<(String, WorkScopeId), close_retirement::CloseResourceLease>>,
+    pub(crate) close_retirement_leases: AsyncMutex<close_retirement::CloseResourceLeaseStore>,
     /// Isolates fake-tmux lifecycle fixtures from ambient host processes.
     #[cfg(test)]
     clean_close_writer_fixture: bool,
@@ -2707,7 +2706,9 @@ impl RuntimeManager {
             tmux_registry: Arc::new(TmuxRegistry::with_lifecycle_sink(Some(tmux_lifecycle_tx))),
             mcp_manager,
             terminals,
-            close_retirement_leases: AsyncMutex::new(HashMap::new()),
+            close_retirement_leases: AsyncMutex::new(
+                close_retirement::CloseResourceLeaseStore::default(),
+            ),
             #[cfg(test)]
             clean_close_writer_fixture: false,
             close_retirement_execution: ConversationMutexGates::default(),
@@ -10071,6 +10072,7 @@ mod scope_liveness_tests {
             .close_retirement_leases
             .lock()
             .await
+            .complete
             .retain(|(lease_attempt, _), _| lease_attempt != attempt_id.as_str());
         manager.tmux_registry = fake_tmux_registry(socket_dir.path(), &fake);
 

@@ -691,10 +691,30 @@ async fn stopped_live_source_refuses_exact_initial_replay_before_database_lookup
 #[tokio::test]
 async fn dropped_initial_reply_retains_admission_until_exact_stop_releases_gate() {
     let fixture = CloseFixture::new().await;
-    let mut harness = fixture.runtime(true);
-    let original_fence = Arc::clone(&harness.runtime.fatal_local_authority_fence);
-    let admitted = harness.runtime.admit_authoritative_effect().unwrap();
-    let sender = setup_actor_queue(&mut harness);
+    // Stop must persist through the same database authority as native admission.
+    let (event_tx, event_rx) = mpsc::channel(32);
+    let mut actor = ConversationRuntime::new(
+        ConvContext::coordinator(&fixture.source_transcript_id, "test-model", 200_000, 16_384),
+        fixture.state.clone(),
+        Arc::new(crate::runtime::traits::DatabaseStorage::new(fixture.db.clone())),
+        Arc::new(MockLlmClient::new("test-model")),
+        Arc::new(MockToolExecutor::new()),
+        Arc::new(BrowserSessionManager::default()),
+        Arc::new(crate::tools::BashHandleRegistry::new()),
+        Arc::new(crate::tools::TmuxRegistry::new()),
+        Arc::new(ModelRegistry::new_empty()),
+        crate::terminal::ActiveTerminals::new(),
+        event_rx,
+        event_tx.clone(),
+        crate::runtime::SseBroadcaster::new(128, 0),
+    )
+    .with_fatal_local_authority_fence(crate::runtime::FatalLocalAuthorityFence::new())
+    .with_native_task_admission_database(fixture.db.clone());
+    let original_fence = Arc::clone(&actor.fatal_local_authority_fence);
+    let admitted = actor.admit_authoritative_effect().unwrap();
+    let (sender, receiver) = mpsc::channel(4);
+    let (watch_tx, _watch_rx) = tokio::sync::watch::channel(actor.state.clone());
+    actor = actor.with_state_watcher(watch_tx).with_acknowledged_event_receiver(receiver);
     let gate = Arc::new(Mutex::new(()));
     let target_gate = Arc::clone(&gate).lock_owned().await;
     let (response, dropped_reply) = oneshot::channel();
@@ -707,7 +727,7 @@ async fn dropped_initial_reply_retains_admission_until_exact_stop_releases_gate(
     assert!(Arc::clone(&gate).try_lock_owned().is_err());
     assert_eq!(original_fence.owner_count(), 1);
 
-    let running = spawn_actor(&mut harness);
+    let running = tokio::spawn(actor.run());
     // This ACK follows admission in the FIFO, but deliberately precedes optional
     // terminal observation. Gate acquisition below observes actual guard release.
     stop_actor(&sender).await;
@@ -725,7 +745,7 @@ async fn dropped_initial_reply_retains_admission_until_exact_stop_releases_gate(
     .fetch_one(fixture.db.pool())
     .await
     .unwrap();
-    assert_eq!(admitted, (1, 0, 0));
+    assert_eq!(admitted, (1, 0, 1));
     let _released_gate = tokio::time::timeout(
         std::time::Duration::from_secs(20),
         Arc::clone(&gate).lock_owned(),
@@ -742,7 +762,7 @@ async fn dropped_initial_reply_retains_admission_until_exact_stop_releases_gate(
     assert_eq!(terminal, ("stopped".to_string(), "completed".to_string()));
     assert_eq!(original_fence.owner_count(), 0);
 
-    harness.event_tx.send(Event::Shutdown).await.unwrap();
+    event_tx.send(Event::Shutdown).await.unwrap();
     running.await.unwrap();
 }
 

@@ -26,7 +26,7 @@ use phoenix_tools::{
     bash::registry::{BashRetirementOutcome, BashRetirementPermit},
     browser::session::{BrowserRetirementOutcome, BrowserRetirementPermit},
     tmux::registry::{
-        PersistentTmuxDiscovery, TmuxRetirementOutcome, TmuxRetirementPermit,
+        TmuxRetirementOutcome, TmuxRetirementPermit,
         TmuxRetirementRehydration, TmuxServerInstanceIdentity,
     },
 };
@@ -49,6 +49,11 @@ use crate::db::{
     CloseWriterGap, CloseWriterObservation, CloseWriterProcess,
     RecordCloseWriterObservationRequest,
 };
+
+mod lease_custody;
+pub(crate) use lease_custody::CloseResourceLeaseStore;
+
+use lease_custody::LeaseRegistries;
 
 /// Process-local capability retained from inventory sealing through per-resource
 /// teardown. Durable inventory stores only the permit's stable instance identity.
@@ -1244,11 +1249,15 @@ impl RuntimeManager {
         scope: WorkScopeId,
     ) -> Result<Vec<RetiredResourceIdentity>, String> {
         let mut leases = self.close_retirement_leases.lock().await;
-        if let Some(existing) = leases
-            .get(&(attempt_id.as_str().to_string(), scope.clone()))
-            .map(|lease| lease.resources.clone())
-        {
-            return Ok(existing);
+        let lease_key = (attempt_id.as_str().to_string(), scope.clone());
+        if leases.is_reopening(attempt_id.as_str()) {
+            return Err("Close lease reopening is incomplete".to_string());
+        }
+        if let Some(lease) = leases.complete.get(&lease_key) {
+            return Ok(lease.resources.clone());
+        }
+        if leases.has_acquisition(&lease_key) {
+            return leases.finish_acquisition(&lease_key).await;
         }
         let captured = self
             .db()
@@ -1269,170 +1278,41 @@ impl RuntimeManager {
             .get_work_scope_legacy_conversation_id(&scope)
             .await
             .map_err(|error| error.to_string())?;
-        let key = ResourceScopeKey::Work(scope.clone());
-        self.bash_handles().fence_retirement_admission(&key).await;
-        let terminal = self.terminals.begin_retirement(&key);
-        let browser = self.browser_sessions().begin_retirement(&key).await;
-        let tmux_expires = phoenix_tools::tmux::registry::close_deadline();
-        let tmux_discovery = match self
-            .tmux_registry()
-            .discover_persistent_identity(
-                &key,
-                legacy_worktree_path.as_deref(),
-                legacy_conversation_id.as_deref(),
-                tmux_expires,
+        leases
+            .acquire(
+                lease_key,
+                self.close_lease_registries(),
+                legacy_worktree_path,
+                legacy_conversation_id,
             )
             .await
-        {
-            Ok(discovery) => discovery,
-            Err(error) => {
-                self.tmux_registry().fence_retirement_admission(&key).await;
-                return Err(format!("tmux identity discovery failed: {error}"));
-            }
-        };
-        let tmux = match tmux_discovery {
-            discovery @ (PersistentTmuxDiscovery::EndpointAbsent
-            | PersistentTmuxDiscovery::ServerAbsent) => match self
-                .tmux_registry()
-                .begin_retirement_after_discovery(&key, &discovery, tmux_expires)
-                .await
-            {
-                Ok(permit) => permit,
-                Err(outcome) => {
-                    self.tmux_registry().fence_retirement_admission(&key).await;
-                    return Err(format!("tmux retirement fencing failed: {outcome:?}"));
-                }
-            },
-            PersistentTmuxDiscovery::Exact(identity) => {
-                match self
-                    .tmux_registry()
-                    .rehydrate_retirement(&key, &identity, tmux_expires)
-                    .await
-                {
-                    Ok(TmuxRetirementRehydration::Permit(permit)) => permit,
-                    Ok(TmuxRetirementRehydration::AbsenceVerified) => match self
-                        .tmux_registry()
-                        .begin_retirement(&key, None, None, tmux_expires)
-                        .await
-                    {
-                        Ok(permit) => permit,
-                        Err(outcome) => {
-                            self.tmux_registry().fence_retirement_admission(&key).await;
-                            return Err(format!("tmux retirement fencing failed: {outcome:?}"));
-                        }
-                    },
-                    Ok(TmuxRetirementRehydration::Residual { reason }) => {
-                        self.tmux_registry().fence_retirement_admission(&key).await;
-                        return Err(format!("tmux identity is ambiguous: {reason}"));
-                    }
-                    Err(error) => {
-                        self.tmux_registry().fence_retirement_admission(&key).await;
-                        return Err(format!("tmux rehydration failed: {error}"));
-                    }
-                }
-            }
-            PersistentTmuxDiscovery::Ambiguous { reason } => {
-                self.tmux_registry().fence_retirement_admission(&key).await;
-                return Err(format!("tmux identity is ambiguous: {reason}"));
-            }
-        };
-        let bash = self.bash_handles().begin_retirement(&key).await;
-        let mut resources = Vec::new();
-        for target in &bash.exact_process_groups {
-            resources.push(opaque_resource(
-                RetiredResourceKind::BashProcessGroup,
-                target.stable_resource_identity(),
-            ));
+    }
+
+    fn close_lease_registries(&self) -> LeaseRegistries {
+        LeaseRegistries {
+            bash: self.bash_handles().clone(),
+            tmux: self.tmux_registry().clone(),
+            terminal: self.terminals.clone(),
+            browser: self.browser_sessions().clone(),
         }
-        if tmux.had_entry() {
-            resources.push(opaque_resource(
-                RetiredResourceKind::TmuxServer,
-                tmux.instance.stable_identity(),
-            ));
-        }
-        if let Some(instance) = &terminal.instance {
-            resources.push(opaque_resource(
-                RetiredResourceKind::PtySession,
-                instance.stable_identity(),
-            ));
-        }
-        for instance in &browser.instances {
-            resources.push(opaque_resource(
-                RetiredResourceKind::BrowserSession,
-                instance.stable_identity(),
-            ));
-        }
-        leases.insert(
-            (attempt_id.as_str().to_string(), scope),
-            CloseResourceLease {
-                bash,
-                tmux,
-                terminal,
-                browser,
-                resources: resources.clone(),
-            },
-        );
-        Ok(resources)
     }
 
     async fn discard_close_resource_leases(&self, attempt_id: &CloseAttemptId) {
         self.close_retirement_leases
             .lock()
             .await
-            .retain(|(candidate, _), _| candidate != attempt_id.as_str());
+            .discard_completed(attempt_id.as_str());
     }
 
     pub(crate) async fn cancel_close_resource_leases(
         &self,
         attempt_id: &CloseAttemptId,
     ) -> Result<(), String> {
-        let mut leases = self.close_retirement_leases.lock().await;
-        let keys = leases
-            .keys()
-            .filter(|(candidate, _)| candidate == attempt_id.as_str())
-            .cloned()
-            .collect::<Vec<_>>();
-        let mut cancelling = Vec::with_capacity(keys.len());
-        let mut permits = Vec::with_capacity(keys.len());
-        for key in keys {
-            let Some(lease) = leases.remove(&key) else {
-                continue;
-            };
-            let CloseResourceLease {
-                bash,
-                tmux,
-                terminal,
-                browser,
-                resources,
-            } = lease;
-            cancelling.push((key, bash, terminal, browser, resources));
-            permits.push(tmux);
-        }
-        if let Err(error) = self.tmux_registry().cancel_retirement_batch(permits).await {
-            let reason = error.to_string();
-            for ((key, bash, terminal, browser, resources), tmux) in
-                cancelling.into_iter().zip(error.into_permits())
-            {
-                leases.insert(
-                    key,
-                    CloseResourceLease {
-                        bash,
-                        tmux,
-                        terminal,
-                        browser,
-                        resources,
-                    },
-                );
-            }
-            return Err(reason);
-        }
-        drop(leases);
-        for (_, bash, terminal, browser, _) in cancelling {
-            self.bash_handles().cancel_retirement(bash).await;
-            self.terminals.cancel_retirement(terminal);
-            self.browser_sessions().reopen_after_permit(browser).await;
-        }
-        Ok(())
+        self.close_retirement_leases
+            .lock()
+            .await
+            .cancel_attempt(attempt_id.as_str(), self.close_lease_registries())
+            .await
     }
 
     pub(crate) async fn cancel_close_before_retirement(
@@ -1634,6 +1514,7 @@ impl RuntimeManager {
             self.close_retirement_leases
                 .lock()
                 .await
+                .complete
                 .keys()
                 .filter(|(lease_attempt, _)| lease_attempt == attempt_id.as_str())
                 .map(|(_, scope)| scope.clone()),
@@ -1648,6 +1529,7 @@ impl RuntimeManager {
                 .close_retirement_leases
                 .lock()
                 .await
+                .complete
                 .contains_key(&(attempt_id.as_str().to_string(), scope.clone()));
             if !has_lease {
                 for resource in &expected {
@@ -3467,7 +3349,7 @@ impl RuntimeManager {
             .await
             .map_err(|error| error.to_string())?;
         let leases = self.close_retirement_leases.lock().await;
-        for ((lease_attempt, scope), lease) in leases.iter() {
+        for ((lease_attempt, scope), lease) in leases.complete.iter() {
             if lease_attempt != attempt_id.as_str() {
                 continue;
             }
@@ -3944,7 +3826,7 @@ impl RuntimeManager {
         expected: &[RetiredResourceIdentity],
     ) -> Result<(), CloseLeaseFailure> {
         let key = (run.attempt_id.as_str().to_string(), scope.clone());
-        let lease = self.close_retirement_leases.lock().await.remove(&key);
+        let lease = self.close_retirement_leases.lock().await.complete.remove(&key);
         let Some(lease) = lease else {
             return Err(CloseLeaseFailure::Unavailable);
         };
@@ -3994,7 +3876,7 @@ impl RuntimeManager {
             .await
         }
         .await;
-        self.close_retirement_leases.lock().await.insert(key, lease);
+        self.close_retirement_leases.lock().await.complete.insert(key, lease);
         result
     }
 }
@@ -8389,7 +8271,7 @@ mod tests {
                 .archived
         );
         assert_close_admission_fenced(&manager, &scope).await;
-        assert!(manager.close_retirement_leases.lock().await.is_empty());
+        assert!(manager.close_retirement_leases.lock().await.complete.is_empty());
         assert!(matches!(
             receiver.try_recv().unwrap(),
             crate::runtime::SseEvent::ConversationUpdate {
@@ -8628,7 +8510,7 @@ mod tests {
             assert!(!db.get_conversation(id).await.unwrap().archived);
             assert!(receiver.try_recv().is_err());
         }
-        assert_eq!(manager.close_retirement_leases.lock().await.len(), 1);
+        assert_eq!(manager.close_retirement_leases.lock().await.complete.len(), 1);
         assert_close_admission_fenced(&manager, &scope).await;
         assert_eq!(
             sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM close_cleanup_failures")
@@ -8699,7 +8581,7 @@ mod tests {
                 ));
                 assert!(receiver.try_recv().is_err());
             }
-            assert!(manager.close_retirement_leases.lock().await.is_empty());
+            assert!(manager.close_retirement_leases.lock().await.complete.is_empty());
             assert_close_admission_fenced(&manager, &scope).await;
         }
         assert_eq!(
@@ -9063,6 +8945,7 @@ mod tests {
                     .close_retirement_leases
                     .lock()
                     .await
+                    .complete
                     .get_mut(&(attempt_id.as_str().to_string(), scope.clone()))
                     .unwrap()
                     .resources = resources;
@@ -9160,7 +9043,7 @@ mod tests {
                     ..
                 }
             ));
-            assert!(manager.close_retirement_leases.lock().await.is_empty());
+            assert!(manager.close_retirement_leases.lock().await.complete.is_empty());
         }
     }
 

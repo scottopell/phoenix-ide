@@ -208,6 +208,13 @@ jobs:
           grep -F 'native_close_admission_tests::native_close_backend_requires_actor_database_authority_not_matching_path: test' evidence/runtime-selected-tests.txt
           test -s evidence/runtime-selected-tests.txt
           grep -F 'stopped_live_source_refuses_exact_observe_replay_before_database_lookup: test' evidence/runtime-selected-tests.txt
+          grep -E '^runtime::close_retirement::lease_custody::tests::.*: test$' evidence/runtime-inventory.log > evidence/lease-custody-selected-tests.txt
+          test "$(wc -l < evidence/lease-custody-selected-tests.txt | tr -d ' ')" -gt 0
+          grep -F 'runtime::close_retirement::lease_custody::tests::failed_acquisition_retains_partial_permits_without_inventing_tmux_authority: test' evidence/lease-custody-selected-tests.txt
+          grep -F 'runtime::close_retirement::lease_custody::tests::multi_scope_reopen_error_returns_every_exact_permit: test' evidence/lease-custody-selected-tests.txt
+          grep -F 'runtime::close_retirement::lease_custody::tests::unresolved_tmux_retry_keeps_original_partial_custody_and_deadline: test' evidence/lease-custody-selected-tests.txt
+          (cd crates/phoenix-ide && "$PHOENIX_RUNTIME_TEST_BINARY" runtime::close_retirement::lease_custody::tests:: --nocapture --test-threads=1) 2>&1 | tee evidence/lease-custody-execution.log
+          grep -E 'test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored;' evidence/lease-custody-execution.log
           (cd crates/phoenix-ide && "$PHOENIX_RUNTIME_TEST_BINARY" native_close_application::tests:: --nocapture --test-threads=1) 2>&1 | tee evidence/native-close-runtime-matcher.log
           grep -E 'test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored;' evidence/native-close-runtime-matcher.log
           (cd crates/phoenix-ide && "$PHOENIX_RUNTIME_TEST_BINARY" native_close_admission_tests:: --nocapture --test-threads=1) 2>&1 | tee evidence/native-close-runtime-actor.log
