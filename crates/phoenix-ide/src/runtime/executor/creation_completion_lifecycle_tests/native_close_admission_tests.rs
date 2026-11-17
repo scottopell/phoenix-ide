@@ -689,7 +689,7 @@ async fn stopped_live_source_refuses_exact_initial_replay_before_database_lookup
 }
 
 #[tokio::test]
-async fn dropped_initial_reply_settles_queued_admission_and_releases_gate_before_next_ack() {
+async fn dropped_initial_reply_retains_admission_until_exact_stop_releases_gate() {
     let fixture = CloseFixture::new().await;
     let mut harness = fixture.runtime(true);
     let original_fence = Arc::clone(&harness.runtime.fatal_local_authority_fence);
@@ -708,8 +708,8 @@ async fn dropped_initial_reply_settles_queued_admission_and_releases_gate_before
     assert_eq!(original_fence.owner_count(), 1);
 
     let running = spawn_actor(&mut harness);
-    // This ACK follows the owned Close request in the same FIFO. It therefore
-    // proves the source actor classified the transaction despite the lost reply.
+    // This ACK follows admission in the FIFO, but deliberately precedes optional
+    // terminal observation. Gate acquisition below observes actual guard release.
     stop_actor(&sender).await;
     assert_eq!(count(&fixture.db, "native_close_initial_receipts").await, 1);
     assert_eq!(count(&fixture.db, "close_runs").await, 1);
@@ -726,8 +726,20 @@ async fn dropped_initial_reply_settles_queued_admission_and_releases_gate_before
     .await
     .unwrap();
     assert_eq!(admitted, (1, 0, 0));
-    assert!(Arc::clone(&gate).try_lock_owned().is_ok());
-
+    let _released_gate = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        Arc::clone(&gate).lock_owned(),
+    )
+    .await
+    .expect("exact stopped observation must release the owned continuation");
+    let terminal: (String, String) = sqlx::query_as(
+        "SELECT r.status, o.phase FROM close_runs r
+         JOIN close_obligations o ON o.attempt_id = r.attempt_id",
+    )
+    .fetch_one(fixture.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(terminal, ("stopped".to_string(), "completed".to_string()));
     assert_eq!(original_fence.owner_count(), 0);
 
     harness.event_tx.send(Event::Shutdown).await.unwrap();
@@ -1039,7 +1051,9 @@ async fn admit_initial_continuation(
     }
 }
 
-async fn invalid_captured_worktree(
+// All captured identity fields are present: classify an absent resolved path,
+// not an unresolved identity.
+async fn resolved_but_absent_captured_worktree(
     fixture: &CloseFixture,
 ) -> phoenix_core::work_scope::WorkScopeId {
     let scope = fixture
@@ -1526,7 +1540,7 @@ async fn source_owned_initial_inspection_persists_only_normalized_empty_snapshot
 }
 
 #[tokio::test]
-async fn empty_reinspection_collector_rotates_generation_without_writing() {
+async fn empty_reinspection_collector_preserves_canonical_empty_request_without_writing() {
     use phoenix_core::domain::close::ClosePhase;
     let fixture = CloseFixture::new().await;
     let mut continuation = initial_inspection_continuation(&fixture).await;
@@ -1563,7 +1577,9 @@ async fn empty_reinspection_collector_rotates_generation_without_writing() {
         .await
         .unwrap();
     assert_eq!(before.phase(), ClosePhase::AwaitingRetirementInspection);
-    assert_eq!(before.snapshot().unwrap().generation(), "no-worktree");
+    // Ordinary reentry invalidates active inspection authority. Chat-only
+    // inspection uses the canonical no-worktree generation, not a fresh nonce.
+    assert!(before.snapshot().is_none());
     let collected = crate::runtime::close_retirement::collect_native_initial_inspection(
         &fixture.db,
         attempt.clone(),
@@ -1571,11 +1587,7 @@ async fn empty_reinspection_collector_rotates_generation_without_writing() {
     .await
     .unwrap();
     assert!(collected.request.scopes.is_empty());
-    assert!(collected
-        .empty_generation
-        .as_deref()
-        .unwrap()
-        .starts_with("server_git_status_v2_retry_"));
+    assert!(collected.empty_generation.is_none());
     let after = fixture
         .db
         .get_close_obligation(attempt.as_str())
@@ -1730,7 +1742,7 @@ async fn invalid_captured_worktree_failure_is_classified_and_releases_exact_admi
     use phoenix_db::CloseCleanupFailureAuthority;
 
     let fixture = CloseFixture::new().await;
-    let scope = invalid_captured_worktree(&fixture).await;
+    let scope = resolved_but_absent_captured_worktree(&fixture).await;
     let gate = Arc::new(Mutex::new(()));
     let (response, mut reply) = oneshot::channel();
     let (mut continuation, fence) =
@@ -1793,7 +1805,7 @@ async fn invalid_captured_worktree_failure_is_classified_and_releases_exact_admi
     );
     assert_eq!(
         failures[0].occurrence.detail,
-        "captured worktree identity is unresolved"
+        "captured worktree is absent before inspection"
     );
     let outbox_count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM coordinator_watch_events WHERE mandatory_failure_occurrence_id = ?1",
@@ -1831,7 +1843,7 @@ async fn actor_services_initial_close_while_acknowledged_requests_remain_ready()
     use phoenix_core::domain::close::{CloseAttemptId, CloseRunOrdinal};
 
     let fixture = CloseFixture::new().await;
-    invalid_captured_worktree(&fixture).await;
+    resolved_but_absent_captured_worktree(&fixture).await;
     let mut harness = fixture.runtime(true);
     let fence = Arc::clone(&harness.runtime.fatal_local_authority_fence);
     let admitted = harness.runtime.admit_authoritative_effect().unwrap();
@@ -1942,7 +1954,7 @@ async fn failed_inspection_classification_retains_exact_intent_for_classificatio
     use phoenix_core::domain::close::{CloseRunRef, CloseRunStatus, RetirementFailureReason};
 
     let fixture = CloseFixture::new().await;
-    let scope = invalid_captured_worktree(&fixture).await;
+    let scope = resolved_but_absent_captured_worktree(&fixture).await;
     let gate = Arc::new(Mutex::new(()));
     let (response, mut reply) = oneshot::channel();
     let (mut continuation, fence) =
@@ -2029,7 +2041,7 @@ async fn failed_inspection_classification_retains_exact_intent_for_classificatio
     assert_eq!(failures[0].occurrence.authority.scope(), Some(&scope));
     assert_eq!(
         failures[0].occurrence.detail,
-        "captured worktree identity is unresolved"
+        "captured worktree is absent before inspection"
     );
     let outbox_count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM coordinator_watch_events WHERE mandatory_failure_occurrence_id = ?1",
