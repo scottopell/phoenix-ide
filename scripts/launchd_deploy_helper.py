@@ -457,7 +457,7 @@ def _verify_logical_equivalence(source, backup, deadline: float) -> None:
                 return None
 
             char = sql[position]
-            if char in ('"', '`', '['):
+            if char in ("'", '"', '`', '['):
                 closing = ']' if char == '[' else char
                 position += 1
                 value = []
@@ -540,10 +540,16 @@ def _verify_logical_equivalence(source, backup, deadline: float) -> None:
                         if text(row[1]) == name and text(row[0]) == schema)
         without_rowid = bool(list_row[4])
         if without_rowid:
-            pk = sorted((int(row[5]), text(row[1])) for row in xinfo if int(row[5]) > 0)
-            if not pk:
+            indexes = pragma_rows(source, f"PRAGMA {quote(schema)}.index_list({quote(name)})")
+            pk_name = next((text(row[1]) for row in indexes if text(row[3]) == "pk"), None)
+            if pk_name is None:
                 raise ActivationError(f"SQLite WITHOUT ROWID table has no primary key: {name}")
-            order = ",".join(quote(column) for _, column in pk)
+            keys = [row for row in pragma_rows(source, f"PRAGMA {quote(schema)}.index_xinfo({quote(pk_name)})")
+                    if row[5]]
+            if not keys or any(row[1] < 0 or row[2] is None or row[4] is None for row in keys):
+                raise ActivationError(f"cannot identify SQLite primary-key ordering: {name}")
+            order = ",".join(f"{quote(text(row[2]))} COLLATE {quote(text(row[4]))}"
+                             + (" DESC" if row[3] else " ASC") for row in keys)
             identity = []
         else:
             aliases = {"rowid", "_rowid_", "oid"} - {text(column[1]).lower() for column in xinfo}

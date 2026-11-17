@@ -201,6 +201,31 @@ class SQLiteLogicalEquivalenceTests(unittest.TestCase):
                 self.skipTest("SQLite was built without FTS5")
             raise
 
+    def test_single_quoted_fts5_identifiers_are_supported(self):
+        for sql in ("CREATE VIRTUAL TABLE docs USING 'fts5'(body);",
+                    "CREATE VIRTUAL TABLE 'do''cs' USING fts5(body);"):
+            with self.subTest(sql=sql):
+                self.compare(sql, sql)
+
+    def test_without_rowid_uses_primary_key_collation_and_direction_without_sort(self):
+        for key in ('a DESC,b ASC', 'a COLLATE NOCASE,b'):
+            with self.subTest(key=key):
+                source, backup = sqlite3.connect(':memory:'), sqlite3.connect(':memory:')
+                self.addCleanup(source.close)
+                self.addCleanup(backup.close)
+                for database in (source, backup):
+                    database.executescript(f'CREATE TABLE t(a TEXT,b INTEGER,p BLOB, PRIMARY KEY({key})) WITHOUT ROWID;'
+                                           "INSERT INTO t VALUES ('Z',1,X'00'),('a',2,X'01');")
+                queries = []
+                source.set_trace_callback(queries.append)
+                helper._verify_logical_equivalence(source, backup, helper.time.monotonic() + 10)
+                query = next(sql for sql in queries if sql.startswith('SELECT ') and 'FROM "main"."t"' in sql)
+                plan = source.execute('EXPLAIN QUERY PLAN ' + query).fetchall()
+                self.assertFalse(any('TEMP B-TREE' in row[3] for row in plan), plan)
+                backup.execute("UPDATE t SET p=X'02' WHERE a='Z'")
+                with self.assertRaisesRegex(helper.ActivationError, 'row differs'):
+                    helper._verify_logical_equivalence(source, backup, helper.time.monotonic() + 10)
+
     def test_fails_closed_for_unrecognized_virtual_table_modules(self):
         source = sqlite3.connect(":memory:")
         backup = sqlite3.connect(":memory:")

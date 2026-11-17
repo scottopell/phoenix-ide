@@ -51,8 +51,9 @@ retired.
 Earlier focused results (protocol 2, not acceptance of protocol 3): helper 25;
 installer 60; restart 38; harness safety five; ReleaseUpdatePanel 32; and
 successful disposable launchd commit, partial-write failure, health failure and
-restart after initiator SIGKILL. The current focused helper suite passed 73 tests,
-including typed stored-row, row-identity, FTS5-shadow and fail-closed comparisons.
+restart after initiator SIGKILL. The current focused helper suite passed 75 tests,
+including typed stored-row, row-identity, FTS5-shadow, quoted-module classification,
+primary-key collation/direction without temporary sorting and fail-closed comparisons.
 The 13.4 GB scale-qualification harness has not produced a hosted success result;
 there is no native-launchd or production qualification claim for these changes.
 
