@@ -171,7 +171,7 @@ enum RawProviderRead {
     NativeCatalog,
 }
 
-async fn raw_provider_runtime(read: RawProviderRead) -> (TestRuntime, ContentBlock) {
+async fn raw_provider_read_cancellation(read: RawProviderRead) {
     let (name, input) = match read {
         RawProviderRead::Policy | RawProviderRead::Scope => {
             ("bash", serde_json::json!({"op": "run", "cmd": "pwd"}))
@@ -181,113 +181,60 @@ async fn raw_provider_runtime(read: RawProviderRead) -> (TestRuntime, ContentBlo
             serde_json::json!({"tasks": [{"task": "read"}]}),
         ),
     };
-    let call = ToolCall::new(
-        "raw-provider-call",
-        ToolInput::from_name_and_value(name, input.clone()),
-    );
+    let response = phoenix_llm::LlmResponse {
+        provider_replay: None,
+        content: vec![ContentBlock::tool_use(
+            "raw-provider-call",
+            name,
+            input.clone(),
+        )],
+        end_turn: false,
+        usage: phoenix_llm::Usage::default(),
+        usage_observation: phoenix_core::domain::llm_types::UsageObservation::default(),
+        stream_telemetry: phoenix_llm::ProviderStreamTelemetry::non_streaming(),
+    };
+    let calls: Vec<_> = response
+        .tool_uses()
+        .into_iter()
+        .map(|(id, name, input)| {
+            ToolCall::new(id, ToolInput::from_name_and_value(name, input.clone()))
+        })
+        .collect();
+    assert_eq!(calls.len(), 1);
+    let call = calls.into_iter().next().unwrap();
     assert_ne!(call.input.to_value(), input);
-    let mut runtime = runtime_for(call).await;
-    runtime.state = ConvState::Idle;
+    let mut runtime = runtime_for(call.clone()).await;
+    let ConvState::ToolExecuting {
+        assistant_message,
+        remaining_tools,
+        ..
+    } = &mut runtime.state
+    else {
+        unreachable!()
+    };
+    assert_eq!(remaining_tools, &[call]);
+    let selected = assistant_message
+        .content
+        .iter_mut()
+        .find(|block| {
+            matches!(
+                block, ContentBlock::ToolUse { id, .. } if id == "raw-provider-call"
+            )
+        })
+        .unwrap();
+    *selected = response.content.into_iter().next().unwrap();
     if matches!(read, RawProviderRead::Scope) {
         runtime.context.resource_scope = phoenix_core::work_scope::ResourceScopeKey::Work(
             phoenix_core::work_scope::WorkScopeId::new(),
         );
     }
-    let source = ContentBlock::tool_use("raw-provider-call", name, input);
-    runtime.llm_client.queue_response(phoenix_llm::LlmResponse {
-        provider_replay: None,
-        content: vec![source.clone()],
-        end_turn: false,
-        usage: phoenix_llm::Usage::default(),
-        usage_observation: phoenix_core::domain::llm_types::UsageObservation::default(),
-        stream_telemetry: phoenix_llm::ProviderStreamTelemetry::non_streaming(),
-    });
-    (runtime, source)
-}
-
-async fn raw_provider_read_cancellation(read: RawProviderRead) {
-    let (mut runtime, source) = raw_provider_runtime(read).await;
     let storage = Arc::clone(&runtime.storage);
-    let tools = Arc::clone(&runtime.tool_executor);
-    let llm = Arc::clone(&runtime.llm_client);
-    let (events, receiver) = mpsc::channel(8);
-    runtime.event_tx = events.clone();
-    runtime.event_rx = receiver;
-    runtime
-        .process_event(Event::UserMessage {
-            text: "inspect".into(),
-            llm_text: None,
-            images: vec![],
-            files: vec![],
-            message_id: "raw-provider-user".into(),
-            user_agent: None,
-            skill_invocation: None,
-        })
-        .await
-        .unwrap();
-    let (entered, release) = match read {
+    let gate = match read {
         RawProviderRead::Policy => storage.hold_next_tool_policy_read(),
         RawProviderRead::Scope => storage.hold_next_tool_scope_read(),
-        RawProviderRead::NativeCatalog => tools.hold_next_definitions(),
+        RawProviderRead::NativeCatalog => runtime.tool_executor.hold_next_definitions(),
     };
-    let (state_tx, mut states) = watch::channel(runtime.state.clone());
-    let task = tokio::spawn(runtime.with_state_watcher(state_tx).run());
-    tokio::time::timeout(Duration::from_secs(60), entered)
-        .await
-        .unwrap()
-        .unwrap();
-    let ConvState::ToolExecuting {
-        current_tool,
-        assistant_message,
-        ..
-    } = states.borrow().clone()
-    else {
-        panic!("raw provider response must reach the selected read");
-    };
-    assert_eq!(assistant_message.content, vec![source.clone()]);
-    let ContentBlock::ToolUse { id, name, input } = source else {
-        unreachable!()
-    };
-    assert_eq!(
-        current_tool,
-        ToolCall::new(id, ToolInput::from_name_and_value(&name, input.clone()))
-    );
-    assert_ne!(current_tool.input.to_value(), input);
-    tokio::time::pause();
-    events
-        .send(Event::UserCancel {
-            reason: None,
-            cause: crate::state_machine::event::CancelCause::UserRequested,
-        })
-        .await
-        .unwrap();
-    let cancelled = tokio::time::timeout(
-        Duration::from_millis(100),
-        states.wait_for(|state| matches!(state, ConvState::Idle)),
-    )
-    .await
-    .is_ok();
-    let revoked = release.send(Ok(())).is_err();
-    tokio::time::resume();
-    events.send(Event::Shutdown).await.unwrap();
-    assert_eq!(
-        task.await.unwrap(),
-        RuntimeExitDisposition::CoordinatedShutdown
-    );
-    assert!(
-        cancelled,
-        "raw source identity must settle cancellation within 100ms"
-    );
-    assert!(
-        revoked,
-        "the selected read must be revoked before cancellation completes"
-    );
-    assert!(matches!(
-        storage.get_current_state("conv-tool-gen"),
-        Some(ConvState::Idle)
-    ));
-    assert!(tools.recorded_executions().is_empty());
-    assert_eq!(llm.recorded_requests().len(), 1);
+    cancellation_while_read_held(runtime, gate).await;
     assert!(!storage.recorded_messages().iter().any(|message| matches!(
         &message.content,
         phoenix_core::domain::db_schema::MessageContent::System(content)
