@@ -47,6 +47,7 @@ mod discovery;
 mod error;
 mod headers;
 mod mock;
+mod model_config;
 mod models;
 mod openai;
 #[cfg(test)]

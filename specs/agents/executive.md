@@ -19,8 +19,10 @@ expertise.
 ## Technical Summary
 
 [ADR-052](../adrs/052_workers-and-tiers-resolve-usable-model-routes.md) records the
-configuration and model-route boundary. Configuration is loaded once per parent
-runtime; usable routes refresh at request boundaries. The same resolved snapshot
+configuration and model-route boundary. Worker and tier configuration is loaded once per parent
+runtime; external models in the same user TOML are loaded at server startup by
+the LLM registry (REQ-LLM-003c), and the worker reader consumes that section as
+a typed sink. Usable routes refresh at request boundaries. The same resolved snapshot
 renders the tool schema and admits its response. Resolved child persona and
 execution are persisted for runtime recreation, without adding server-restart
 survival guarantees or connection endpoint/account lineage.

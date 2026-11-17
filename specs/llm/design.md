@@ -295,7 +295,7 @@ pub struct ModelSpec {
 
 ## Model Registry (REQ-LLM-003, REQ-SA-007)
 
-The registry starts from built-in model specs and merges valid additive specs from `PHOENIX_LLM_MODELS`. External specs declare a backend and may omit `api_name`, in which case Phoenix sends `id` as the wire model name. `family` independently controls the provider label, while `max_output_tokens` supplies the normal-turn output cap. Duplicate IDs keep the built-in or earlier configured definition.
+The registry starts from built-in model specs and merges additive external models. User TOML source selection, validation, and startup loading are specified by REQ-LLM-003c in [requirements.md](requirements.md); [ADR-269](../adrs/269_external-models-in-user-toml.md) records the decision. `PHOENIX_LLM_MODELS` is available only when the user file has no model section. External specs declare a backend and may omit `api_name`, in which case Phoenix sends `id` as the wire model name. `family` independently controls the provider label, while `max_output_tokens` supplies the normal-turn output cap. Built-in IDs keep the built-in definition. Duplicate external IDs are rejected in TOML; the JSON environment format keeps the earlier configured definition.
 
 ```rust
 pub struct ModelRegistry {

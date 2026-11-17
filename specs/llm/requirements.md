@@ -77,6 +77,38 @@ AND SHALL reject an operator-configured model on a compatible HTTP backend that 
 
 ---
 
+### REQ-LLM-003c: External models in user configuration
+
+WHEN Phoenix initializes its model registry
+THE SYSTEM SHALL read external model definitions from top-level `[[models]]` entries
+in the version-1 user file defined by `specs/agents/requirements.md` REQ-AG-010
+AND SHALL apply the same model metadata and capability validation as external JSON definitions
+AND SHALL require every TOML entry to be valid before accepting that model section
+AND SHALL reject unknown model fields and duplicate external IDs with an actionable diagnostic
+AND SHALL preserve built-in definitions when an external ID duplicates a built-in ID
+
+WHEN the user file contains a `models` section and `PHOENIX_LLM_MODELS` is nonblank
+THE SYSTEM SHALL refuse registry initialization and identify the conflicting sources
+rather than merge or silently override them
+
+WHEN the user file has no `models` section
+THE SYSTEM SHALL accept external models from `PHOENIX_LLM_MODELS`
+
+WHEN the user configuration file cannot be read or parsed, its version is unsupported,
+or its model section is invalid
+THE SYSTEM SHALL refuse registry initialization with a diagnostic identifying the configuration file
+
+WHEN the process starts again after a user-file model edit
+THE SYSTEM SHALL load the edited definitions directly from that file
+AND SHALL NOT require a binary rebuild or deployment environment refresh for that edit
+AND SHALL NOT change the running registry merely because the file is edited
+
+**Rationale:** Operators need to refresh third-party model definitions independently
+of deployment credentials. One explicit source per installation avoids ambiguous
+precedence while startup loading supports a simple edit-and-restart workflow.
+
+---
+
 ### REQ-LLM-003a: Model Discovery
 
 WHEN deriving a model-list URL from a provider-compatible exact endpoint

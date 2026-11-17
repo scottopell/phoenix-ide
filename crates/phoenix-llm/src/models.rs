@@ -323,7 +323,8 @@ pub(crate) enum ApiFormat {
 }
 
 #[derive(Debug, serde::Deserialize)]
-struct ExternalModelSpec {
+#[serde(deny_unknown_fields)]
+pub(super) struct ExternalModelSpec {
     id: String,
     api_name: Option<String>,
     backend: ExternalBackend,
@@ -340,7 +341,7 @@ struct ExternalModelSpec {
 }
 
 #[derive(Debug, serde::Deserialize)]
-#[serde(rename_all = "snake_case", tag = "support")]
+#[serde(rename_all = "snake_case", tag = "support", deny_unknown_fields)]
 enum ExternalEffortCapabilities {
     Unsupported,
     Unknown,
@@ -545,7 +546,7 @@ fn validate_external_effort_capabilities(
     }
 }
 
-fn external_model_spec_from_config(
+pub(super) fn external_model_spec_from_config(
     index: usize,
     spec: ExternalModelSpec,
 ) -> Result<ModelSpec, String> {
@@ -615,7 +616,7 @@ pub fn merge_model_specs(mut builtins: Vec<ModelSpec>, external: &[ModelSpec]) -
         if !ids.insert(spec.id.clone()) {
             tracing::warn!(
                 model_id = %spec.id,
-                "PHOENIX_LLM_MODELS duplicate model id ignored; built-in or earlier configured model kept"
+                "external model duplicate id ignored; built-in or earlier configured model kept"
             );
             continue;
         }
