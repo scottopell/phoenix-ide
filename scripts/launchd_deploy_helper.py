@@ -386,27 +386,146 @@ def _database_size_bytes(database_path: str) -> int:
     return page_count * page_size
 
 
-def _logical_digest(database, deadline: float) -> str:
-    digest = hashlib.sha256()
-    database.set_progress_handler(
-        lambda: 1 if time.monotonic() >= deadline else 0, 1000,
-    )
+def _verify_logical_equivalence(source, backup, deadline: float) -> None:
+    """Compare SQLite metadata and persisted rows without constructing SQL dumps."""
+    import sqlite3
+    import struct
+
+    def check_deadline() -> None:
+        if time.monotonic() >= deadline:
+            raise ActivationError("SQLite logical verification deadline exceeded")
+
+    def text(value) -> str:
+        return value.decode("utf-8") if isinstance(value, bytes) else value
+
+    def quote(identifier: str) -> str:
+        return '"' + identifier.replace('"', '""') + '"'
+
+    def pragma_rows(database, statement: str):
+        check_deadline()
+        rows = database.execute(statement).fetchall()
+        check_deadline()
+        return rows
+
+    def metadata(database):
+        check_deadline()
+        db_list = pragma_rows(database, "PRAGMA database_list")
+        schemas = [text(row[1]) for row in db_list if text(row[1]) != "temp"]
+        info = []
+        for schema in schemas:
+            qschema = quote(schema)
+            schema_rows = pragma_rows(
+                database,
+                f"SELECT type,name,tbl_name,rootpage,sql FROM {qschema}.sqlite_schema ORDER BY type,name,tbl_name",
+            )
+            table_list = pragma_rows(database, f"PRAGMA {qschema}.table_list")
+            table_entries = []
+            for row in table_list:
+                if text(row[0]) != schema:
+                    continue
+                name, kind = text(row[1]), text(row[2])
+                xinfo = pragma_rows(database, f"PRAGMA {qschema}.table_xinfo({quote(name)})")
+                table_entries.append((name, kind, tuple(xinfo)))
+            settings = (pragma_rows(database, f"PRAGMA {qschema}.user_version")[0][0],
+                        pragma_rows(database, f"PRAGMA {qschema}.application_id")[0][0],
+                        text(pragma_rows(database, f"PRAGMA {qschema}.encoding")[0][0]))
+            info.append((schema, tuple(schema_rows), tuple(row for row in table_list if text(row[0]) == schema),
+                         tuple(table_entries), settings))
+        return tuple(info)
+
+    def module_for(sql):
+        sql = text(sql or b"")
+        match = re.search(r"\bUSING\s+(\"(?:\"\"|[^\"])+\"|`[^`]+`|\[[^]]+\]|[^\s(]+)", sql, re.I)
+        if not match:
+            return None
+        return match.group(1).strip('"`[]').replace('""', '"').lower()
+
+    def typed_value(storage, value):
+        storage = text(storage)
+        if storage == "null":
+            return (storage, None)
+        if storage == "integer":
+            return (storage, int(value))
+        if storage == "real":
+            return (storage, struct.pack(">d", float(value)))
+        if storage in ("text", "blob"):
+            if not isinstance(value, bytes):
+                raise ActivationError("SQLite returned a non-byte TEXT/BLOB value during verification")
+            return (storage, value)
+        raise ActivationError(f"unsupported SQLite storage class during verification: {storage!r}")
+
+    def compare_table(source, backup, schema: str, name: str, kind: str, xinfo) -> None:
+        check_deadline()
+        if kind == "virtual":
+            return  # FTS5's persisted shadow tables carry its stored contents.
+        if kind not in ("table", "shadow"):
+            return
+        columns = [(text(row[1]), text(row[2]), int(row[5])) for row in xinfo if int(row[6]) not in (1, 2)]
+        names = [column[0] for column in columns]
+        list_row = next(row for row in pragma_rows(source, f"PRAGMA {quote(schema)}.table_list")
+                        if text(row[1]) == name and text(row[0]) == schema)
+        without_rowid = bool(list_row[4])
+        if without_rowid:
+            pk = sorted((int(row[5]), text(row[1])) for row in xinfo if int(row[5]) > 0)
+            if not pk:
+                raise ActivationError(f"SQLite WITHOUT ROWID table has no primary key: {name}")
+            order = ",".join(quote(column) for _, column in pk)
+            identity = []
+        else:
+            aliases = {"rowid", "_rowid_", "oid"} - {column.lower() for column in names}
+            if not aliases:
+                raise ActivationError(f"cannot verify rowid identity for table shadowing all rowid aliases: {name}")
+            rowid = next(alias for alias in ("rowid", "_rowid_", "oid") if alias in aliases)
+            order = quote(rowid)
+            identity = [quote(rowid)]
+        selected = identity + [part for column in names for part in (f"typeof({quote(column)})", quote(column))]
+        table = f"{quote(schema)}.{quote(name)}"
+        query = f"SELECT {','.join(selected)} FROM {table} ORDER BY {order}"
+        check_deadline()
+        left, right = source.execute(query), backup.execute(query)
+        while True:
+            check_deadline()
+            a, b = left.fetchone(), right.fetchone()
+            check_deadline()
+            if a is None or b is None:
+                if a != b:
+                    raise ActivationError(f"SQLite backup row count differs in table: {name}")
+                break
+            offset = len(identity)
+            if identity and a[0] != b[0]:
+                raise ActivationError(f"SQLite backup rowid differs in table: {name}")
+            for index in range(offset, len(a), 2):
+                if typed_value(a[index], a[index + 1]) != typed_value(b[index], b[index + 1]):
+                    raise ActivationError(f"SQLite backup row differs in table: {name}")
+
+    old_factories = source.text_factory, backup.text_factory
     try:
-        for line in database.iterdump():
-            if time.monotonic() >= deadline:
-                raise ActivationError("SQLite logical verification deadline exceeded")
-            encoded = line.encode("utf-8")
-            digest.update(len(encoded).to_bytes(8, "big"))
-            digest.update(encoded)
-    except Exception as exc:
-        if isinstance(exc, ActivationError):
-            raise
+        source.text_factory = backup.text_factory = bytes
+        handler = lambda: 1 if time.monotonic() >= deadline else 0
+        source.set_progress_handler(handler, 1000)
+        backup.set_progress_handler(handler, 1000)
+        check_deadline()
+        source_metadata = metadata(source)
+        backup_metadata = metadata(backup)
+        if source_metadata != backup_metadata:
+            raise ActivationError("SQLite backup schema or database metadata differs from the stopped source")
+        for schema, _schema_rows, _table_list, tables, _settings in source_metadata:
+            for name, kind, xinfo in tables:
+                if kind == "virtual":
+                    sql = next((row[4] for row in _schema_rows if text(row[0]) == "table" and text(row[1]) == name), None)
+                    if module_for(sql) != "fts5":
+                        raise ActivationError(f"cannot verify unsupported SQLite virtual table module: {name}")
+                    continue
+                compare_table(source, backup, schema, name, kind, xinfo)
+        check_deadline()
+    except sqlite3.Error as exc:
         if time.monotonic() >= deadline:
             raise ActivationError("SQLite logical verification deadline exceeded") from exc
         raise
     finally:
-        database.set_progress_handler(None, 0)
-    return digest.hexdigest()
+        source.text_factory, backup.text_factory = old_factories
+
+
 
 
 @contextlib.contextmanager
@@ -458,8 +577,7 @@ def create_verified_database_backup(database_path: str, directory: Path, *, time
                     raise ActivationError("SQLite integrity verification deadline exceeded")
                 if check != ("ok",):
                     raise ActivationError(f"SQLite backup integrity check failed: {check!r}")
-                if _logical_digest(source, deadline) != _logical_digest(backup, deadline):
-                    raise ActivationError("SQLite backup logical contents differ from the stopped source")
+                _verify_logical_equivalence(source, backup, deadline)
         remaining()
         fd = os.open(backup_path, os.O_RDONLY)
         try:
