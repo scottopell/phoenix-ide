@@ -2,8 +2,9 @@
 
 use phoenix_core::domain::close::{
     CloseAttemptId, CloseExpectedRetirementResource, CloseObligation, ClosePhase, CloseRunOrdinal,
-    GitPathIdentity, RetiredResourceIdentity, RetiredResourceKind, RetirementFailureReason,
-    TranscriptConversationId, WorktreeFingerprint, WorktreeId, WorktreeIdentity,
+    CloseStopCertainty, GitPathIdentity, RetiredResourceIdentity, RetiredResourceKind,
+    RetirementFailureReason, TranscriptConversationId, WorktreeFingerprint, WorktreeId,
+    WorktreeIdentity,
 };
 use phoenix_core::domain::product_conversation::ProductConversationId;
 use phoenix_core::work_scope::WorkScopeId;
@@ -14,8 +15,8 @@ use super::{NativeCloseCommand, NativeCloseIntent};
 use crate::workflow::LocalAuthorityResult;
 use crate::{
     CaptureCloseRetirementInventoryRequest, CloseCleanupFailureAuthority,
-    CloseCleanupFailureResource, CloseCleanupResourceDisposition, CloseStopCertainty, Database,
-    DbError, DbResult, ReplaceCloseInspectionRequest, TerminalizeInitialCloseCleanupFailureRequest,
+    CloseCleanupFailureResource, CloseCleanupResourceDisposition, Database, DbError, DbResult,
+    ReplaceCloseInspectionRequest, TerminalizeInitialCloseCleanupFailureRequest,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]

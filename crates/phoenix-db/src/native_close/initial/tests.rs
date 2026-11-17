@@ -1,7 +1,6 @@
 use super::*;
 use crate::workflow::AcceptAuthoritativeTurn;
-use phoenix_core::domain::close::{ClosePhase, RetirementFailureReason, RetiredResourceKind};
-use phoenix_core::domain::work_scope::WorkScopeId;
+use phoenix_core::domain::close::{ClosePhase, RetiredResourceKind, RetirementFailureReason};
 use phoenix_core::domain::db_schema::InputOrigin;
 use phoenix_core::domain::db_schema::SourceToolCall;
 use phoenix_core::domain::llm_types::ContentBlock;
@@ -10,6 +9,7 @@ use phoenix_core::domain::sm_event::{
     SubmittedDirectTurnIdentity,
 };
 use phoenix_core::domain::sm_state::{AssistantMessage, ConvState, ToolCall, ToolInput};
+use phoenix_core::work_scope::WorkScopeId;
 use phoenix_core::llm_language::LlmLanguage;
 use phoenix_workflow::{
     AcceptedDisposition, ClientTurnKey, ConversationAuthority, PreparedTurn, Timestamp, TurnOutcome,
@@ -858,36 +858,54 @@ async fn initial_inspection_failure_terminalizes_exact_captured_scope_and_outbox
         .established()
         .unwrap()
         .unwrap();
-    let result = f.db.terminalize_native_close_initial_inspection_failure(
-        &command,
-        &receipt,
-        &live_source,
-        &captured_scope,
-        RetirementFailureReason::IdentityNotProven,
-        "worktree identity could not be verified",
-    ).await;
+    let result =
+        f.db.terminalize_native_close_initial_inspection_failure(
+            &command,
+            &receipt,
+            &live_source,
+            &captured_scope,
+            RetirementFailureReason::IdentityNotProven,
+            "worktree identity could not be verified",
+        )
+        .await;
     let obligation = result.established().unwrap().unwrap();
     assert_eq!(obligation.phase(), ClosePhase::Completed);
-    let failures = f.db.list_close_cleanup_failures(receipt.admitted.attempt_id.as_str())
-        .await.unwrap();
+    let failures =
+        f.db.list_close_cleanup_failures(receipt.admitted.attempt_id.as_str())
+            .await
+            .unwrap();
     assert_eq!(failures.len(), 1);
-    assert_eq!(failures[0].occurrence.reason, RetirementFailureReason::IdentityNotProven);
-    assert_eq!(failures[0].occurrence.authority, crate::CloseCleanupFailureAuthority::CapturedScope {
-        scope: captured_scope.clone(),
-        resource: phoenix_core::domain::close::RetiredResourceIdentity::parse(
-            RetiredResourceKind::WorkScope,
-            phoenix_core::domain::close::LossItemIdentity::Opaque(
-                phoenix_core::domain::close::OpaqueIdentity::parse(captured_scope.as_str()).unwrap(),
-            ),
-        ).unwrap(),
-    });
+    assert_eq!(
+        failures[0].occurrence.reason,
+        RetirementFailureReason::IdentityNotProven
+    );
+    assert_eq!(
+        failures[0].occurrence.authority,
+        crate::CloseCleanupFailureAuthority::CapturedScope {
+            scope: captured_scope.clone(),
+            resource: phoenix_core::domain::close::RetiredResourceIdentity::parse(
+                RetiredResourceKind::WorkScope,
+                phoenix_core::domain::close::LossItemIdentity::Opaque(
+                    phoenix_core::domain::close::OpaqueIdentity::parse(captured_scope.as_str())
+                        .unwrap(),
+                ),
+            )
+            .unwrap(),
+        }
+    );
     assert_eq!(failures[0].occurrence.remaining_resources.len(), 2);
-    assert!(failures[0].occurrence.remaining_resources.iter().all(|resource|
-        resource.disposition == crate::CloseCleanupResourceDisposition::Unknown));
+    assert!(failures[0]
+        .occurrence
+        .remaining_resources
+        .iter()
+        .all(|resource| resource.disposition == crate::CloseCleanupResourceDisposition::Unknown));
     let outbox_count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM coordinator_watch_events WHERE mandatory_failure_occurrence_id = ?1",
-    ).bind(failures[0].occurrence.failure_occurrence_id.as_str())
-        .fetch_one(f.db.pool()).await.unwrap();
+    )
+    .bind(failures[0].occurrence.failure_occurrence_id.as_str())
+    .fetch_one(f.db.pool())
+    .await
+    .unwrap();
     assert_eq!(outbox_count, 1);
 }
 
@@ -896,17 +914,27 @@ async fn initial_inspection_unresolved_worktree_keeps_only_captured_scope_unknow
     let f = Fixture::new().await;
     // Capture an allocated worktree whose stable identity is still unresolved.
     // Failure classification must not invent an exact Worktree resource.
-    let scope = f.db.get_conversation("first-target")
-        .await.unwrap().attached_work_scope_id.unwrap();
+    let scope =
+        f.db.get_conversation("first-target")
+            .await
+            .unwrap()
+            .attached_work_scope_id
+            .unwrap();
     sqlx::query(
         "UPDATE work_scopes
          SET environment_kind = 'allocated_worktree', worktree_path = '/tmp/unresolved-worktree',
              worktree_id = NULL, worktree_fingerprint = NULL
          WHERE id = ?1",
-    ).bind(scope.as_str()).execute(f.db.pool()).await.unwrap();
+    )
+    .bind(scope.as_str())
+    .execute(f.db.pool())
+    .await
+    .unwrap();
     let (command, receipt, live_source) = prepared_initial(&f).await;
-    let captured = f.db.list_close_attempt_scopes(receipt.admitted.attempt_id.as_str())
-        .await.unwrap();
+    let captured =
+        f.db.list_close_attempt_scopes(receipt.admitted.attempt_id.as_str())
+            .await
+            .unwrap();
     assert_eq!(captured.len(), 1);
     assert_eq!(captured[0].scope, scope);
     assert!(matches!(
@@ -914,35 +942,64 @@ async fn initial_inspection_unresolved_worktree_keeps_only_captured_scope_unknow
         Some(phoenix_core::domain::close::CapturedWorktreeIdentity::Unresolved { .. })
     ));
     f.db.settle_native_close_initial(&command, &receipt, &live_source)
-        .await.established().unwrap().unwrap();
-    let completed = f.db.terminalize_native_close_initial_inspection_failure(
-        &command, &receipt, &live_source, &scope,
-        RetirementFailureReason::IdentityNotProven,
-        "captured allocated worktree has no resolved identity",
-    ).await.established().unwrap().unwrap();
+        .await
+        .established()
+        .unwrap()
+        .unwrap();
+    let completed =
+        f.db.terminalize_native_close_initial_inspection_failure(
+            &command,
+            &receipt,
+            &live_source,
+            &scope,
+            RetirementFailureReason::IdentityNotProven,
+            "captured allocated worktree has no resolved identity",
+        )
+        .await
+        .established()
+        .unwrap()
+        .unwrap();
     assert_eq!(completed.phase(), ClosePhase::Completed);
-    let failures = f.db.list_close_cleanup_failures(receipt.admitted.attempt_id.as_str())
-        .await.unwrap();
+    let failures =
+        f.db.list_close_cleanup_failures(receipt.admitted.attempt_id.as_str())
+            .await
+            .unwrap();
     assert_eq!(failures.len(), 1);
     let resources = &failures[0].occurrence.remaining_resources;
     assert_eq!(resources.len(), 1);
     assert_eq!(resources[0].scope, scope);
     assert_eq!(resources[0].resource.kind(), RetiredResourceKind::WorkScope);
-    assert_eq!(resources[0].disposition, crate::CloseCleanupResourceDisposition::Unknown);
-    assert!(f.db.terminalize_native_close_initial_inspection_failure(
-        &command, &receipt, &live_source, &scope,
-        RetirementFailureReason::IdentityNotProven,
-        "replayed classification cannot create another occurrence",
-    ).await.established().unwrap().is_err());
+    assert_eq!(
+        resources[0].disposition,
+        crate::CloseCleanupResourceDisposition::Unknown
+    );
+    assert!(f
+        .db
+        .terminalize_native_close_initial_inspection_failure(
+            &command,
+            &receipt,
+            &live_source,
+            &scope,
+            RetirementFailureReason::IdentityNotProven,
+            "replayed classification cannot create another occurrence",
+        )
+        .await
+        .established()
+        .unwrap()
+        .is_err());
     let outbox_count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM coordinator_watch_events WHERE mandatory_failure_occurrence_id = ?1",
-    ).bind(failures[0].occurrence.failure_occurrence_id.as_str())
-        .fetch_one(f.db.pool()).await.unwrap();
+    )
+    .bind(failures[0].occurrence.failure_occurrence_id.as_str())
+    .fetch_one(f.db.pool())
+    .await
+    .unwrap();
     assert_eq!(outbox_count, 1);
 }
 
 #[tokio::test]
-async fn initial_inspection_failure_refuses_wrong_authority_without_writes_and_rolls_back_outbox_failure() {
+async fn initial_inspection_failure_refuses_wrong_authority_without_writes_and_rolls_back_outbox_failure(
+) {
     let f = Fixture::new().await;
     let captured_scope =
         crate::close_foundation::allocate_scope_worktree(&f.db, "first-target").await;
@@ -952,7 +1009,10 @@ async fn initial_inspection_failure_refuses_wrong_authority_without_writes_and_r
         .established()
         .unwrap()
         .unwrap();
-    let wrong_receipt = NativeCloseReceipt { request_id: Uuid::new_v4(), ..receipt.clone() };
+    let wrong_receipt = NativeCloseReceipt {
+        request_id: Uuid::new_v4(),
+        ..receipt.clone()
+    };
     let wrong_scope = WorkScopeId::parse("not-captured-scope").unwrap();
     for (proof, source, scope) in [
         (&receipt, &ConvState::Idle, &captured_scope),
@@ -961,15 +1021,24 @@ async fn initial_inspection_failure_refuses_wrong_authority_without_writes_and_r
     ] {
         assert!(matches!(
             f.db.terminalize_native_close_initial_inspection_failure(
-                &command, proof, source, scope,
-                RetirementFailureReason::IdentityNotProven, "inspection failed",
-            ).await,
-            LocalAuthorityResult::DurableFactEstablished(Err(DbError::CloseFoundationPrecondition(_)))
+                &command,
+                proof,
+                source,
+                scope,
+                RetirementFailureReason::IdentityNotProven,
+                "inspection failed",
+            )
+            .await,
+            LocalAuthorityResult::DurableFactEstablished(Err(
+                DbError::CloseFoundationPrecondition(_)
+            ))
         ));
         assert_eq!(count(&f.db, "close_obligations").await, 1);
         assert_eq!(count(&f.db, "close_runs").await, 1);
-        let failures = f.db.list_close_cleanup_failures(receipt.admitted.attempt_id.as_str())
-            .await.unwrap();
+        let failures =
+            f.db.list_close_cleanup_failures(receipt.admitted.attempt_id.as_str())
+                .await
+                .unwrap();
         assert!(failures.is_empty());
     }
     sqlx::query(
@@ -979,14 +1048,26 @@ async fn initial_inspection_failure_refuses_wrong_authority_without_writes_and_r
     ).execute(f.db.pool()).await.unwrap();
     assert!(matches!(
         f.db.terminalize_native_close_initial_inspection_failure(
-            &command, &receipt, &live_source, &captured_scope,
-            RetirementFailureReason::IdentityNotProven, "inspection failed",
-        ).await,
+            &command,
+            &receipt,
+            &live_source,
+            &captured_scope,
+            RetirementFailureReason::IdentityNotProven,
+            "inspection failed",
+        )
+        .await,
         LocalAuthorityResult::DurableFactEstablished(Err(_))
     ));
-    assert_eq!(initial_phase(&f, &receipt).await, ClosePhase::AwaitingRetirementInspection.as_str());
-    assert!(f.db.list_close_cleanup_failures(receipt.admitted.attempt_id.as_str())
-        .await.unwrap().is_empty());
+    assert_eq!(
+        initial_phase(&f, &receipt).await,
+        ClosePhase::AwaitingRetirementInspection.as_str()
+    );
+    assert!(f
+        .db
+        .list_close_cleanup_failures(receipt.admitted.attempt_id.as_str())
+        .await
+        .unwrap()
+        .is_empty());
     let outbox_count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM coordinator_watch_events WHERE route_kind = 'mandatory_close_failure'",
     ).fetch_one(f.db.pool()).await.unwrap();
