@@ -12,19 +12,32 @@ use std::{
 
 pub(super) struct DispatchSelection {
     runtime: uuid::Uuid,
-    pub(super) assistant_message_id: String,
+    assistant_message: phoenix_core::domain::sm_state::AssistantMessage,
     pub(super) tool: ToolCall,
     pub(super) context: ConvContext,
     pub(super) direct_turn: Option<crate::runtime::traits::ActiveDirectTurn>,
 }
 
 impl DispatchSelection {
+    pub(super) fn assistant_message_id(&self) -> &str {
+        &self.assistant_message.message_id
+    }
+
     fn owns(&self, runtime: uuid::Uuid, state: &ConvState) -> bool {
-        self.runtime == runtime && match state {
-            ConvState::ToolExecuting { current_tool, assistant_message, .. } => current_tool == &self.tool && assistant_message.message_id == self.assistant_message_id,
-            ConvState::CancellingTool { tool_use_id, assistant_message, .. } => tool_use_id == &self.tool.id && assistant_message.message_id == self.assistant_message_id && assistant_message.content.iter().any(|block| matches!(block, phoenix_llm::ContentBlock::ToolUse { id, name, input } if id == &self.tool.id && name == self.tool.name() && input == &self.tool.input.to_value())),
-            _ => false,
-        }
+        self.runtime == runtime
+            && match state {
+                ConvState::ToolExecuting {
+                    current_tool,
+                    assistant_message,
+                    ..
+                } => current_tool == &self.tool && assistant_message == &self.assistant_message,
+                ConvState::CancellingTool {
+                    tool_use_id,
+                    assistant_message,
+                    ..
+                } => tool_use_id == &self.tool.id && assistant_message == &self.assistant_message,
+                _ => false,
+            }
     }
 }
 
@@ -136,7 +149,7 @@ impl<S: Storage + Clone + 'static, L: LlmClient + 'static, T: ToolExecutor + 'st
         }
         let selection = Arc::new(DispatchSelection {
             runtime: self.tool_preparation_runtime,
-            assistant_message_id: assistant_message.message_id.clone(),
+            assistant_message: assistant_message.clone(),
             tool,
             context: self.context.clone(),
             direct_turn: self.active_direct_turn.as_deref().cloned(),

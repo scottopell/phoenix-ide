@@ -6674,7 +6674,7 @@ where
         self.start_spawn_agents_tool_from_selection(
             &selection.tool,
             &selection.context,
-            &selection.assistant_message_id,
+            selection.assistant_message_id(),
         )
     }
 
@@ -9961,7 +9961,7 @@ where
         let tool = &selection.tool;
         let context = &selection.context;
         let (checked, request_schema, surface, legacy_tmux_conversation_id) = cleared.into_parts();
-        self.broadcast_tool_start_timestamp(&selection.assistant_message_id, &tool.id);
+        self.broadcast_tool_start_timestamp(selection.assistant_message_id(), &tool.id);
 
         // Typed oneshot channel: background task gets Sender<ToolExecOutcome>,
         // physically cannot send an LlmOutcome or other type.
@@ -10045,7 +10045,7 @@ where
         ))
         .with_llm_metrics_tx(llm_metrics_tx);
 
-        tool_ctx = tool_ctx.with_svg_assistant_message_id(&selection.assistant_message_id);
+        tool_ctx = tool_ctx.with_svg_assistant_message_id(selection.assistant_message_id());
 
         if let Some(turn) = &selection.direct_turn {
             tool_ctx = tool_ctx.with_direct_turn_id(
