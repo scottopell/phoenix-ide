@@ -98,8 +98,11 @@ value TargetService {
 -- transaction_evidence_retained(transaction) -> Boolean
 --   Manifest, helper, log, private plist and failed candidate evidence remain.
 -- verified_backup_retained(transaction) -> Boolean
---   Native SQLite backup of the stopped source passed integrity and logical
---   comparison, was fsynced and remains available as transaction evidence.
+--   Native SQLite backup of the stopped source passed integrity and lockstep
+--   metadata/stored-row comparison, including FTS5 shadow rows and row identity,
+--   was fsynced and remains available as transaction evidence. Unsupported
+--   virtual-table modules and all-rowid-alias-shadow tables fail closed. Backup,
+--   integrity, comparison, fsync and proof hashing share a 600-second deadline.
 -- first_install_absence_proven(transaction) -> Boolean
 --   Transaction-matched private proof records database_source absent and backup
 --   null only when the database path is absent and no managed predecessor,
@@ -209,7 +212,12 @@ rule VerifyStoppedDatabaseBackup {
     @guidance
         -- Hold a bounded SQLite BEGIN IMMEDIATE writer reservation across
         -- backup verification, proof and durable candidate boundary recording.
-        -- Retain the native backup after success or failure.
+        -- Compare source and backup metadata and stored rows in lockstep, retaining
+        -- storage classes and rowid/primary-key identity; verify FTS5 through its
+        -- persisted shadow rows, and reject unsupported modules or unidentifiable
+        -- rowid tables. Backup, integrity check, comparison, fsync and proof hash
+        -- share the 600-second backup-verification deadline. Retain the native
+        -- backup after success or failure.
 }
 
 rule VerifyFirstInstallAbsence {

@@ -112,6 +112,151 @@ class SQLiteUriPathTests(unittest.TestCase):
         self.assertEqual(set(self.root.iterdir()), {self.parent})
 
 
+class SQLiteLogicalEquivalenceTests(unittest.TestCase):
+    def compare(self, source_sql, backup_sql, *, expect_difference=False):
+        source = sqlite3.connect(":memory:")
+        backup = sqlite3.connect(":memory:")
+        self.addCleanup(source.close)
+        self.addCleanup(backup.close)
+        source.executescript(source_sql)
+        backup.executescript(backup_sql)
+        if expect_difference:
+            with self.assertRaises(helper.ActivationError):
+                helper._verify_logical_equivalence(source, backup, helper.time.monotonic() + 10)
+        else:
+            helper._verify_logical_equivalence(source, backup, helper.time.monotonic() + 10)
+
+    def test_compares_all_sqlite_storage_classes_and_preserves_text_factories(self):
+        source = sqlite3.connect(":memory:")
+        backup = sqlite3.connect(":memory:")
+        self.addCleanup(source.close)
+        self.addCleanup(backup.close)
+        for database in (source, backup):
+            database.execute("CREATE TABLE values_table (id INTEGER PRIMARY KEY, value)")
+        source.executemany("INSERT INTO values_table(value) VALUES (?)", [(1,), (1.25,), ("same",), (b"same",), (None,)])
+        backup.executemany("INSERT INTO values_table(value) VALUES (?)", [(1,), (1.25,), ("same",), (b"same",), (None,)])
+        factories = source.text_factory, backup.text_factory
+        helper._verify_logical_equivalence(source, backup, helper.time.monotonic() + 10)
+        self.assertEqual((source.text_factory, backup.text_factory), factories)
+        backup.execute("UPDATE values_table SET value=1.0 WHERE id=1")
+        with self.assertRaisesRegex(helper.ActivationError, "row differs"):
+            helper._verify_logical_equivalence(source, backup, helper.time.monotonic() + 10)
+
+    def test_compares_rowid_and_without_rowid_primary_key_identity(self):
+        self.compare("CREATE TABLE t (value TEXT); INSERT INTO t(rowid,value) VALUES (8,'x');",
+                     "CREATE TABLE t (value TEXT); INSERT INTO t(rowid,value) VALUES (9,'x');",
+                     expect_difference=True)
+        self.compare("CREATE TABLE t (a TEXT, b INTEGER, PRIMARY KEY (b,a)) WITHOUT ROWID; INSERT INTO t VALUES ('x',1);",
+                     "CREATE TABLE t (a TEXT, b INTEGER, PRIMARY KEY (b,a)) WITHOUT ROWID; INSERT INTO t VALUES ('x',1);")
+        self.compare("CREATE TABLE t (a TEXT, b INTEGER, PRIMARY KEY (b,a)) WITHOUT ROWID; INSERT INTO t VALUES ('x',1);",
+                     "CREATE TABLE t (a TEXT, b INTEGER, PRIMARY KEY (b,a)) WITHOUT ROWID; INSERT INTO t VALUES ('x',2);",
+                     expect_difference=True)
+
+    def test_compares_schema_and_database_metadata(self):
+        self.compare("CREATE TABLE t (value); PRAGMA user_version=4;",
+                     "CREATE TABLE t (value); PRAGMA user_version=5;", expect_difference=True)
+        self.compare("CREATE TABLE t (value); PRAGMA application_id=41;",
+                     "CREATE TABLE t (value); PRAGMA application_id=42;", expect_difference=True)
+        self.compare("CREATE TABLE t (value); CREATE INDEX i ON t(value);",
+                     "CREATE TABLE t (value); CREATE INDEX i ON t(value);")
+        self.compare("CREATE TABLE t (value); CREATE INDEX i ON t(value);",
+                     "CREATE TABLE t (value); CREATE INDEX i ON t(value COLLATE NOCASE);", expect_difference=True)
+
+    def test_fts5_virtual_contents_are_verified_through_persisted_shadow_tables(self):
+        try:
+            self.compare("CREATE VIRTUAL TABLE docs USING fts5(body); INSERT INTO docs VALUES ('source token');",
+                         "CREATE VIRTUAL TABLE docs USING fts5(body); INSERT INTO docs VALUES ('backup token');",
+                         expect_difference=True)
+        except sqlite3.OperationalError as exc:
+            if "fts5" in str(exc).lower():
+                self.skipTest("SQLite was built without FTS5")
+            raise
+        self.compare("CREATE VIRTUAL TABLE docs USING fts5(body); INSERT INTO docs VALUES ('same token');",
+                     "CREATE VIRTUAL TABLE docs USING fts5(body); INSERT INTO docs VALUES ('same token');")
+
+    def test_rtree_module_is_not_spoofed_by_quoted_table_name(self):
+        statements = (
+            'CREATE VIRTUAL TABLE "USING fts5" USING rtree(id, min_x, max_x);',
+            'CREATE VIRTUAL TABLE spatial /* USING fts5 */ USING rtree(id, min_x, max_x);',
+            'CREATE VIRTUAL TABLE spatial USING rtree(id, min_x, max_x);',
+        )
+        try:
+            for sql in statements:
+                with self.subTest(sql=sql):
+                    self.compare(sql, sql, expect_difference=True)
+        except sqlite3.OperationalError as exc:
+            if "no such module" in str(exc).lower():
+                self.skipTest("SQLite was built without RTree")
+            raise
+
+    def test_fts5_module_parsing_ignores_names_and_comments_and_accepts_quotes(self):
+        sql = ('ATTACH DATABASE \':memory:\' AS "odd schema"; '
+               'CREATE VIRTUAL TABLE "odd schema"."USING rtree" '
+               '/* misleading USING rtree */ USING "fts5"(body); '
+               "INSERT INTO \"odd schema\".\"USING rtree\" VALUES ('same token');")
+        try:
+            self.compare(sql, sql)
+        except sqlite3.OperationalError as exc:
+            if "fts5" in str(exc).lower():
+                self.skipTest("SQLite was built without FTS5")
+            raise
+
+    def test_single_quoted_fts5_identifiers_are_supported(self):
+        for sql in ("CREATE VIRTUAL TABLE docs USING 'fts5'(body);",
+                    "CREATE VIRTUAL TABLE 'do''cs' USING fts5(body);"):
+            with self.subTest(sql=sql):
+                self.compare(sql, sql)
+
+    def test_without_rowid_uses_primary_key_collation_and_direction_without_sort(self):
+        for key in ('a DESC,b ASC', 'a COLLATE NOCASE,b'):
+            with self.subTest(key=key):
+                source, backup = sqlite3.connect(':memory:'), sqlite3.connect(':memory:')
+                self.addCleanup(source.close)
+                self.addCleanup(backup.close)
+                for database in (source, backup):
+                    database.executescript(f'CREATE TABLE t(a TEXT,b INTEGER,p BLOB, PRIMARY KEY({key})) WITHOUT ROWID;'
+                                           "INSERT INTO t VALUES ('Z',1,X'00'),('a',2,X'01');")
+                queries = []
+                source.set_trace_callback(queries.append)
+                helper._verify_logical_equivalence(source, backup, helper.time.monotonic() + 10)
+                query = next(sql for sql in queries if sql.startswith('SELECT ') and 'FROM "main"."t"' in sql)
+                plan = source.execute('EXPLAIN QUERY PLAN ' + query).fetchall()
+                self.assertFalse(any('TEMP B-TREE' in row[3] for row in plan), plan)
+                backup.execute("UPDATE t SET p=X'02' WHERE a='Z'")
+                with self.assertRaisesRegex(helper.ActivationError, 'row differs'):
+                    helper._verify_logical_equivalence(source, backup, helper.time.monotonic() + 10)
+
+    def test_fails_closed_for_unrecognized_virtual_table_modules(self):
+        source = sqlite3.connect(":memory:")
+        backup = sqlite3.connect(":memory:")
+        self.addCleanup(source.close)
+        self.addCleanup(backup.close)
+        try:
+            for database in (source, backup):
+                database.execute("CREATE VIRTUAL TABLE spatial USING rtree(id, min_x, max_x)")
+        except sqlite3.OperationalError as exc:
+            if "no such module" in str(exc).lower():
+                self.skipTest("SQLite was built without RTree")
+            raise
+        with self.assertRaisesRegex(helper.ActivationError, "unsupported SQLite virtual table module"):
+            helper._verify_logical_equivalence(source, backup, helper.time.monotonic() + 10)
+
+    def test_virtual_generated_columns_still_shadow_rowid_aliases(self):
+        for alias in ("rowid", "RoWiD", "_rowid_", "OID"):
+            actual = "oid" if alias.lower() != "oid" else "_rowid_"
+            schema = f'CREATE TABLE t (value TEXT, "{alias}" GENERATED ALWAYS AS (42) VIRTUAL);'
+            self.compare(schema + f"INSERT INTO t({actual},value) VALUES (8,'x');",
+                         schema + f"INSERT INTO t({actual},value) VALUES (9,'x');",
+                         expect_difference=True)
+        schema = ('CREATE TABLE t (value TEXT, rowid AS (1), '
+                  '_rowid_ AS (2), oid AS (3));')
+        self.compare(schema, schema, expect_difference=True)
+
+    def test_fails_closed_when_all_rowid_aliases_are_shadowed(self):
+        self.compare("CREATE TABLE t (ROWID, _RowId_, OID);",
+                     "CREATE TABLE t (ROWID, _RowId_, OID);", expect_difference=True)
+
+
 class SimpleLaunchdHelperTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
