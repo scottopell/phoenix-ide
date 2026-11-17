@@ -962,7 +962,8 @@ async fn initial_source_fence_retains_no_worktree_scope_inventory_and_dispatch()
             attempt_id: run.attempt_id.clone(),
             scopes: vec![],
         },
-        Some("empty-generation-from-writer"),
+        // Use the writer's schema-supported namespace, not an arbitrary generation.
+        Some("server_git_status_v2_retry_source_fence_test"),
     )
     .await
     .established()
@@ -970,7 +971,7 @@ async fn initial_source_fence_retains_no_worktree_scope_inventory_and_dispatch()
     .unwrap();
     let snapshot = db.get_close_obligation(run.attempt_id.as_str()).await.unwrap()
         .snapshot().cloned().unwrap();
-    assert_eq!(snapshot.generation(), "empty-generation-from-writer");
+    assert_eq!(snapshot.generation(), "server_git_status_v2_retry_source_fence_test");
     assert_eq!(snapshot.fingerprint(), "no-worktree");
     let LocalAuthorityResult::DurableFactEstablished(Ok(resources)) =
         db.capture_native_close_initial_retirement_inventory(&command, &receipt, &source,

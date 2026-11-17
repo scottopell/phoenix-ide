@@ -7146,6 +7146,8 @@ impl Database {
         Self::finish_close_failure_tx(tx, run, request, obligation).await
     }
 
+    // Keep the complete source-fence classification in one transaction boundary.
+    #[allow(clippy::too_many_lines)]
     pub(crate) async fn terminalize_native_initial_source_fence_tx(
         tx: &mut Transaction<'_, Sqlite>,
         fence: crate::native_close::NativeInitialSourceFence,
