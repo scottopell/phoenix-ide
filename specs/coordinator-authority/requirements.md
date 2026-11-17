@@ -162,6 +162,32 @@ in a message, which their own mode instructions outrank. They declined granted
 merges and re-asked for routine permissions, so the Coordinator performed those
 steps itself. The watch is the existing durable marker of commissioned work.
 
+### REQ-AUTH-008: Present Monitored Conversations Apart
+
+An ordinary conversation is *monitored* while the Coordinator holds an active
+watch on its product conversation. REQ-AUTH-007 and this requirement use that
+one definition.
+
+WHEN the Open conversation list is shown
+THE SYSTEM SHALL fold monitored conversations into a single group, collapsed by
+default, that shows how many it holds
+AND SHALL remember in the browser whether the user opened the group.
+
+THE SYSTEM SHALL keep a monitored conversation in the main list WHILE it needs
+the user (a pending question or approval, or an error) or is the conversation
+currently open.
+
+THE SYSTEM SHALL show conversations that are not monitored, and the History
+list, exactly as before.
+
+IF the monitored set cannot be read
+THE SYSTEM SHALL keep the last known set and SHALL NOT delay or fail the
+conversation list.
+
+**Rationale:** Monitored conversations are the Coordinator's working set, much
+as sub-agent conversations are an owner's. Listing them beside the user's own
+conversations hides the ones the user is actually driving.
+
 ## Scope
 
 This feature is local document persistence, Coordinator-only read/set tools and

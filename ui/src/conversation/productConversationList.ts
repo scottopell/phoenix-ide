@@ -15,6 +15,32 @@ export interface ProductConversationListSnapshot {
   fresh: boolean;
   /** True when rows came from the local cache and no refresh has succeeded yet. */
   fromCache: boolean;
+  /** Product conversations under an active Coordinator watch. Empty until first loaded. */
+  monitoredIds: ReadonlySet<string>;
+}
+
+const NO_MONITORED: ReadonlySet<string> = new Set();
+
+let monitoredRequest = 0;
+
+/**
+ * Reload which conversations Ember monitors, independently of the rows so the
+ * list never waits on it. A failed read keeps the previous set, and only the
+ * latest request may publish.
+ */
+function refreshMonitoredIds(): void {
+  const request = ++monitoredRequest;
+  // Deferred so a throwing or absent reader becomes a rejection, never a failed list refresh.
+  Promise.resolve()
+    .then(() => api.listActiveCoordinatorWatches())
+    .then((watches) => {
+      if (request !== monitoredRequest) return;
+      const next = new Set(watches.map((watch) => watch.product_conversation_id));
+      const previous = snapshot.monitoredIds;
+      if (next.size === previous.size && [...next].every((id) => previous.has(id))) return;
+      publish({ ...snapshot, monitoredIds: next });
+    })
+    .catch(() => { /* keep the previous set */ });
 }
 
 function readCache(): Pick<ProductConversationListSnapshot, 'rows' | 'coordinator'> | null {
@@ -49,6 +75,7 @@ function initialSnapshot(): ProductConversationListSnapshot {
     error: null,
     fresh: false,
     fromCache: cached !== null,
+    monitoredIds: NO_MONITORED,
   };
 }
 
@@ -76,6 +103,7 @@ function fetchProductConversationList(clearError: boolean): Promise<void> {
   if (clearError && snapshot.error !== null) publish({ ...snapshot, error: null });
   const controller = new AbortController();
   const timeout = window.setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+  refreshMonitoredIds();
   const promise = api.listProductConversations(controller.signal)
     .then((response) => {
       if (inFlight?.controller !== controller || inFlight.rowsChanged) return;
@@ -86,6 +114,7 @@ function fetchProductConversationList(clearError: boolean): Promise<void> {
         error: null,
         fresh: true,
         fromCache: false,
+        monitoredIds: snapshot.monitoredIds,
       });
     })
     .catch((error: unknown) => {
@@ -169,6 +198,7 @@ function resetForTests(): void {
   inFlight?.controller.abort();
   inFlight = null;
   refreshAfterCurrent = false;
+  monitoredRequest += 1;
   try { localStorage.removeItem(CACHE_KEY); } catch { /* ignore */ }
   snapshot = initialSnapshot();
 }

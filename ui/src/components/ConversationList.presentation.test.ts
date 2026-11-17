@@ -4,6 +4,7 @@ import {
   productConversationDisplayTitle,
   productConversationOwnsRoute,
   renamedProductConversationLocation,
+  splitMonitoredProductConversations,
 } from './ConversationList.presentation';
 
 function row(overrides: Partial<ProductConversationListRow> = {}): ProductConversationListRow {
@@ -95,5 +96,50 @@ describe('product conversation identity presentation', () => {
     expect(renamedProductConversationLocation(
       '/c/another-conversation', '', '', previous, renamed,
     )).toBeNull();
+  });
+});
+
+describe('splitMonitoredProductConversations', () => {
+  const row = (id: string, mode: string, kind = 'conversation') => ({
+    product_conversation_id: id,
+    canonical_root: { slug: id, transcript_row_id: `t-${id}`, title: id },
+    presentation: { kind, presentation_mode: mode, display_name: id },
+  }) as unknown as ProductConversationListRow;
+
+  it('leaves the list untouched when nothing is monitored', () => {
+    const rows = [row('a', 'working'), row('b', 'idle')];
+    const split = splitMonitoredProductConversations(rows, new Set());
+    expect(split.own).toBe(rows);
+    expect(split.monitored).toEqual([]);
+  });
+
+  it('folds monitored rows and keeps order within each group', () => {
+    const rows = [row('a', 'working'), row('b', 'idle'), row('c', 'working'), row('d', 'done')];
+    const split = splitMonitoredProductConversations(rows, new Set(['a', 'c', 'd']));
+    expect(split.own.map((r) => r.product_conversation_id)).toEqual(['b']);
+    expect(split.monitored.map((r) => r.product_conversation_id)).toEqual(['a', 'c', 'd']);
+  });
+
+  it('never folds a monitored row that needs the user', () => {
+    const rows = [
+      row('ask', 'needs_action'),
+      row('err', 'error'),
+      row('kind', 'working', 'needs_action'),
+      row('quiet', 'working'),
+    ];
+    const split = splitMonitoredProductConversations(rows, new Set(['ask', 'err', 'kind', 'quiet']));
+    expect(split.own.map((r) => r.product_conversation_id)).toEqual(['ask', 'err', 'kind']);
+    expect(split.monitored.map((r) => r.product_conversation_id)).toEqual(['quiet']);
+  });
+
+  it('keeps a pinned monitored row in the main list', () => {
+    const rows = [row('open', 'working'), row('other', 'working')];
+    const split = splitMonitoredProductConversations(
+      rows,
+      new Set(['open', 'other']),
+      (r) => r.product_conversation_id === 'open',
+    );
+    expect(split.own.map((r) => r.product_conversation_id)).toEqual(['open']);
+    expect(split.monitored.map((r) => r.product_conversation_id)).toEqual(['other']);
   });
 });

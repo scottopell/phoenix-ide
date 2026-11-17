@@ -34,7 +34,10 @@ function row(id: string): ProductConversationListRow {
 }
 
 describe('useProductConversationList', () => {
-  beforeEach(() => __testing.reset());
+  beforeEach(() => {
+    __testing.reset();
+    vi.spyOn(api, 'listActiveCoordinatorWatches').mockResolvedValue([]);
+  });
   afterEach(() => {
     __testing.reset();
     vi.useRealTimers();
@@ -53,6 +56,31 @@ describe('useProductConversationList', () => {
     await act(() => refreshProductConversationList());
     expect(result.current.error).toBe('offline');
     expect(result.current.rows.map((r) => r.product_conversation_id)).toEqual(['a']);
+  });
+
+  it('loads which conversations Ember monitors without holding up the rows', async () => {
+    vi.spyOn(api, 'listProductConversations')
+      .mockResolvedValue({ product_conversations: [row('a'), row('b')], coordinator: null });
+    const watches = deferred<Awaited<ReturnType<typeof api.listActiveCoordinatorWatches>>>();
+    const read = vi.spyOn(api, 'listActiveCoordinatorWatches').mockReturnValueOnce(watches.promise);
+    const { result } = renderHook(() => useProductConversationList());
+    await waitFor(() => expect(result.current.rows).toHaveLength(2));
+    expect(result.current.monitoredIds.size).toBe(0);
+
+    await act(async () => watches.resolve([{
+      product_conversation_id: 'b',
+      transcript_id: 'latest-b',
+      transcript_slug: 'b',
+      display_name: 'b',
+      project_path: null,
+      state: 'idle',
+    }]));
+    expect([...result.current.monitoredIds]).toEqual(['b']);
+
+    // A failed read keeps the previous set instead of unfolding the group.
+    read.mockRejectedValueOnce(new Error('offline'));
+    await act(() => refreshProductConversationList());
+    expect([...result.current.monitoredIds]).toEqual(['b']);
   });
 
   it('hydrates from the cache before the server answers', async () => {

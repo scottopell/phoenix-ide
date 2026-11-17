@@ -42,8 +42,9 @@ to keep human approval conversational rather than add an interaction workflow.
 | **REQ-AUTH-005:** Establish Replacement Through Normal Persistence Ownership | ✅ Complete | Owned write follows existing local outcome classification; rollback, simulated lost acknowledgement and cancellation boundary tests pass. |
 | **REQ-AUTH-006:** Apply Grants Within Existing Execution Boundaries | ✅ Complete | Prompt applies saved grants subject to later user constraints and structural restrictions; ordinary/sub-agent capability isolation tested. |
 | **REQ-AUTH-007:** Project Authority to Watched Owners | 🔄 In review | Watch-scoped database read, delegated renderer, live dispatch and inspector wiring; database and renderer tests added. No live-dispatch test; not qualified locally; not deployed. |
+| **REQ-AUTH-008:** Present Monitored Conversations Apart | 🔄 In review | Sidebar folds monitored rows into one collapsed group; needs-the-user and open rows stay visible. Presentation, store and component tests pass locally. Not checked in a browser; not deployed. |
 
-**Progress:** 6 of 7 implemented with bounded local qualification; REQ-AUTH-007 in review; not deployed.
+**Progress:** 6 of 8 implemented with bounded local qualification; REQ-AUTH-007 and REQ-AUTH-008 in review; not deployed.
 
 ## Verification Summary
 

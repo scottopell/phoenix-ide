@@ -8,6 +8,7 @@ import { useFocusScope } from '../hooks/useFocusScope';
 import {
   productConversationDisplayTitle,
   productConversationPresentationIndicator,
+  splitMonitoredProductConversations,
 } from './ConversationList.presentation';
 import './ConversationList.css';
 import { EmberEntry } from './EmberEntry';
@@ -33,6 +34,19 @@ interface ConversationListProps {
   footer?: ReactNode;
   coordinatorUnread?: 'marked' | 'new_activity' | null;
   listAvailability?: 'loading' | 'error' | 'available';
+  /** Product conversations Ember monitors; they fold into one group in the Open view. */
+  monitoredProductConversationIds?: ReadonlySet<string>;
+}
+
+const MONITORED_EXPANDED_KEY = 'phoenix:conversation-list:monitored-expanded:v1';
+const NO_MONITORED_IDS: ReadonlySet<string> = new Set();
+
+function readMonitoredExpanded(): boolean {
+  try {
+    return localStorage.getItem(MONITORED_EXPANDED_KEY) === '1';
+  } catch {
+    return false;
+  }
 }
 
 function sidebarFeedbackStatusSuffix(pr: CachedPrSummary): string {
@@ -292,7 +306,20 @@ export function ConversationList({
   footer,
   coordinatorUnread = null,
   listAvailability = 'available',
+  monitoredProductConversationIds = NO_MONITORED_IDS,
 }: ConversationListProps) {
+  const [monitoredExpanded, setMonitoredExpanded] = useState(readMonitoredExpanded);
+  const toggleMonitoredExpanded = useCallback(() => {
+    setMonitoredExpanded((previous) => {
+      const next = !previous;
+      try {
+        localStorage.setItem(MONITORED_EXPANDED_KEY, next ? '1' : '0');
+      } catch {
+        // Storage may be unavailable; the choice still holds for this page session.
+      }
+      return next;
+    });
+  }, []);
   const navigate = useNavigate();
   const { hasActiveScope } = useFocusScope();
   const [expandedId, setExpandedId] = useState<string | null>(null);
@@ -344,7 +371,25 @@ export function ConversationList({
     };
   }, [expandedId, hasActiveScope]);
 
-  const displayProductList = showArchived ? archivedProductConversations : productConversations;
+  // History is a flat record; only Open work is split into the user's own and Ember's.
+  const monitoredSplit = useMemo(
+    () => splitMonitoredProductConversations(
+      showArchived ? archivedProductConversations : productConversations,
+      showArchived ? NO_MONITORED_IDS : monitoredProductConversationIds,
+      (row) => activeSlug === row.product_conversation_id
+        || activeSlug === row.canonical_root.slug
+        || activeSlug === row.canonical_root.transcript_row_id,
+    ),
+    [showArchived, archivedProductConversations, productConversations, monitoredProductConversationIds, activeSlug],
+  );
+  const displayProductList = useMemo(
+    () => (monitoredExpanded
+      ? [...monitoredSplit.own, ...monitoredSplit.monitored]
+      : monitoredSplit.own),
+    [monitoredExpanded, monitoredSplit],
+  );
+  const monitoredCount = monitoredSplit.monitored.length;
+  const firstMonitoredId = monitoredSplit.monitored[0]?.product_conversation_id;
 
   useLayoutEffect(() => {
     if (expandedId && !menuRef.current) setExpandedId(null);
@@ -396,7 +441,21 @@ export function ConversationList({
     setExpandedId(null);
   }, []);
 
-  const isEmpty = displayProductList.length === 0;
+  const isEmpty = displayProductList.length === 0 && monitoredCount === 0;
+  const monitoredGroupToggle = monitoredCount > 0 ? (
+    <li className="conv-monitored-group" key="monitored-group">
+      <button
+        type="button"
+        className="conv-monitored-toggle"
+        aria-expanded={monitoredExpanded}
+        onClick={toggleMonitoredExpanded}
+      >
+        <span aria-hidden="true">{monitoredExpanded ? '▾' : '▸'}</span>
+        <span>Ember is handling</span>
+        <span className="conv-monitored-count">{monitoredCount}</span>
+      </button>
+    </li>
+  ) : null;
 
   return (
     <section ref={listRootRef} id="conversation-list" className={`view active ${isSidebarLayout ? 'sidebar-mode' : ''} ${isMobileList ? 'mobile-list-density' : ''}`}>
@@ -467,7 +526,8 @@ export function ConversationList({
             </li>
           ) : null
         ) : (
-          displayProductList.map((row) => (
+          displayProductList.map((row) => [
+            row.product_conversation_id === firstMonitoredId && monitoredExpanded ? monitoredGroupToggle : null,
             <ProductConversationListRowView
               key={row.product_conversation_id}
               row={row}
@@ -485,9 +545,10 @@ export function ConversationList({
               {...(onProductConversationClose ? { onProductConversationClose } : {})}
               {...(onProductConversationDelete ? { onProductConversationDelete } : {})}
               {...(onProductConversationRename ? { onProductConversationRename } : {})}
-            />
-          ))
+            />,
+          ])
         )}
+        {!isEmpty && !monitoredExpanded ? monitoredGroupToggle : null}
       </ul>
       {footer && <div className="conversation-list-footer">{footer}</div>}
     </section>
