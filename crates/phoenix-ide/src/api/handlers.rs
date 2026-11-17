@@ -5204,7 +5204,7 @@ async fn get_system_prompt(
         let tasks_dir_name = taskmd_core::discover::discover_or_default(&cwd)
             .to_string_lossy()
             .into_owned();
-        crate::system_prompt::build_system_prompt(
+        let mut prompt = crate::system_prompt::build_system_prompt(
             &cwd,
             &tasks_dir_name,
             is_sub_agent,
@@ -5212,7 +5212,27 @@ async fn get_system_prompt(
             conversation.llm_language,
             persona.as_deref(),
             explore_bash,
-        )
+        );
+        if !is_sub_agent {
+            // REQ-AUTH-007: inspection shows the same delegated projection as live dispatch.
+            let delegated = state
+                .runtime
+                .db()
+                .delegated_coordinator_authority(&conversation.id)
+                .await
+                .map_err(|error| {
+                    AppError::Internal(format!(
+                        "Failed to read delegated Coordinator Authority: {error}"
+                    ))
+                })?;
+            if let Some(authority) = delegated {
+                prompt.push_str("\n\n");
+                prompt.push_str(&crate::system_prompt::render_delegated_authority(
+                    &authority,
+                ));
+            }
+        }
+        prompt
     };
 
     Ok(Json(SystemPromptResponse { system_prompt }))

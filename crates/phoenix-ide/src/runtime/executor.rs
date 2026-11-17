@@ -10859,6 +10859,18 @@ where
                 &mut system_prompt,
                 self.storage.coordinator_home_scope().await,
             );
+        } else if !is_sub_agent {
+            // REQ-AUTH-007: an owner the Coordinator watches works under the same saved grants.
+            if let Some(authority) = self
+                .storage
+                .delegated_coordinator_authority(&self.context.conversation_id)
+                .await?
+            {
+                system_prompt.push_str("\n\n");
+                system_prompt.push_str(&crate::system_prompt::render_delegated_authority(
+                    &authority,
+                ));
+            }
         }
         if is_sub_agent
             && matches!(

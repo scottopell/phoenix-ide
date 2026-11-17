@@ -124,8 +124,41 @@ Authority SHALL NOT override deterministic tool denials, WorkScope targeting,
 destination authorization or other structural capability boundaries.
 
 Authority SHALL NOT itself commission new work, schedule a turn, resume paused
-execution, supply authority to ordinary conversations or synchronize grants to
-another Phoenix instance.
+execution, supply authority to ordinary conversations other than as
+REQ-AUTH-007 provides, or synchronize grants to another Phoenix instance.
+
+### REQ-AUTH-007: Project Authority to Watched Owners
+
+WHEN an ordinary top-level conversation dispatches a model request
+AND the Coordinator holds an active watch on its product conversation
+AND the saved document is not empty
+THE SYSTEM SHALL read the current saved document and append its complete text to
+that request's instructions as delegated Authority for work commissioned there.
+
+THE delegated context SHALL direct the owner to apply saved grants without
+redundant permission requests, SHALL treat a saved grant of necessary merges as
+the user's approval where mode instructions otherwise leave merging to the user,
+and SHALL preserve hard tool restrictions, the worktree boundary and later user
+restrictions, pauses and Stop instructions.
+
+THE SYSTEM SHALL NOT supply the document to sub-agents, to ordinary
+conversations without an active watch, or to another Phoenix instance,
+AND SHALL NOT give any ordinary conversation the read or set tools.
+
+WHEN the watch ends or the document is cleared
+THE next model request SHALL omit the delegated context.
+
+IF reading delegated Authority fails
+THE SYSTEM SHALL surface the failure and SHALL NOT dispatch with it silently
+omitted.
+
+THE prompt-inspection surface SHALL show the same delegated context as live
+request construction.
+
+**Rationale:** Owners previously received grants only as Coordinator paraphrase
+in a message, which their own mode instructions outrank. They declined granted
+merges and re-asked for routine permissions, so the Coordinator performed those
+steps itself. The watch is the existing durable marker of commissioned work.
 
 ## Scope
 
