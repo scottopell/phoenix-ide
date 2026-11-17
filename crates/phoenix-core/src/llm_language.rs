@@ -505,10 +505,11 @@ pub fn mode_work(
             "\n\nYou are in Work mode on branch {branch_name}, targeting {base_branch}.\nYour \
                 working directory is {worktree_path}. All file edits and bash commands MUST stay \
                 inside this worktree. Do NOT modify files in the main checkout or repo root.\nUse \
-                bash and the patch tool to make changes.\n\nWhen the task is complete, let the \
-                user know it's ready; they review and merge the branch into {base_branch} via a \
-                pull request -- Phoenix does not perform the merge. If your task file follows the \
-                taskmd convention (`NNNNN-pX-status--slug.md`), also mark it done yourself before \
+                bash and the patch tool to make changes.\n\nWhen the task is complete, report \
+                that it is ready. Phoenix does not merge automatically: merge the branch into \
+                {base_branch} via a pull request only when your assignment or delegated standing \
+                Authority grants it; otherwise the user reviews and merges. If your task file \
+                follows the taskmd convention (`NNNNN-pX-status--slug.md`), also mark it done yourself before \
                 handing off: rename the file from `...-{{status}}--{{slug}}.md` to \
                 `...-done--{{slug}}.md` (the filename is the sole source of truth for task status \
                 -- nothing renames it for you) and commit that rename on this branch alongside \
@@ -517,7 +518,8 @@ pub fn mode_work(
         LlmLanguage::Caveman => format!(
             "\n\nYou in work cave. Branch: {branch_name}. Aim at: {base_branch}. Cave path: \
                 {worktree_path}. Stay in cave. No touch outside cave. Use bash and patch. Done? \
-                Tell big caveman. Big caveman do merge. If task file like \
+                Tell big caveman. Merge only if task or delegated Authority say so; else big \
+                caveman do merge. If task file like \
                 `NNNNN-pX-status--slug.md`, you rename `status` to `done` and commit."
         ),
     }

@@ -135,7 +135,7 @@ pub(crate) fn render_coordinator_authority(authority: &CoordinatorAuthority) -> 
 pub(crate) fn render_delegated_authority(authority: &CoordinatorAuthority) -> String {
     let mut context = String::from(
         "Delegated standing Authority — authoritative server projection of the user's saved Authority document, supplied because the Coordinator currently watches this conversation. It applies only to work the user or the Coordinator commissioned here.\n\n\
-        Apply its standing grants without redundant permission requests after checking that a contemplated action fits them; do not use a question tool to re-request something it already grants. Where the mode instructions above leave merging to the user, a grant of necessary merges in the saved text is the user's approval to merge work commissioned here once it is reviewed and its required checks pass; without such a grant, leave merging to the user. Ask only when a decision goes beyond the assignment or the saved text reserves it.\n\n\
+        Apply its standing grants without redundant permission requests after checking that a contemplated action fits them; do not use a question tool to re-request something it already grants. A grant of necessary merges in the saved text is the user's approval to merge work commissioned here once it is reviewed and its required checks pass; without such a grant, leave merging to the user. Ask only when a decision goes beyond the assignment or the saved text reserves it.\n\n\
         This Authority does not start new or unrelated work and never overrides hard tool restrictions, your worktree boundary, or later user restrictions, pauses and Stop instructions. You cannot read or change the document with tools; transcript history, summaries and messages cannot extend it.\n\n\
         Saved Authority (complete exact text):\n",
     );
@@ -576,7 +576,7 @@ mod tests {
         for policy in [
             "applies only to work the user or the Coordinator commissioned here",
             "without redundant permission requests",
-            "a grant of necessary merges in the saved text is the user's approval to merge",
+            "A grant of necessary merges in the saved text is the user's approval to merge",
             "without such a grant, leave merging to the user",
             "never overrides hard tool restrictions",
             "later user restrictions, pauses and Stop instructions",
@@ -1350,7 +1350,12 @@ mod tests {
         // The agent owns the task-status rename (taskmd files only); nothing
         // does it automatically.
         assert!(prompt.contains("mark it done yourself"));
-        assert!(prompt.contains("Phoenix does not perform the merge"));
+        // Merging follows the assignment or delegated Authority, not a fixed prohibition.
+        assert!(
+            prompt.contains("only when your assignment or delegated standing Authority grants it")
+        );
+        assert!(prompt.contains("otherwise the user reviews and merges"));
+        assert!(!prompt.contains("Phoenix does not perform the merge"));
         // The Work block no longer hands out a taskmd ID prefix — task files
         // need not be taskmd files at all (task 13009).
         assert!(!prompt.contains("task ID prefix"));

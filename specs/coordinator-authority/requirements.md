@@ -137,8 +137,7 @@ that request's instructions as delegated Authority for work commissioned there.
 
 THE delegated context SHALL direct the owner to apply saved grants without
 redundant permission requests, SHALL treat a saved grant of necessary merges as
-the user's approval where mode instructions otherwise leave merging to the user,
-and SHALL preserve hard tool restrictions, the worktree boundary and later user
+the user's approval to merge commissioned work, and SHALL preserve hard tool restrictions, the worktree boundary and later user
 restrictions, pauses and Stop instructions.
 
 THE SYSTEM SHALL NOT supply the document to sub-agents, to ordinary
@@ -154,6 +153,9 @@ omitted.
 
 THE prompt-inspection surface SHALL show the same delegated context as live
 request construction.
+
+Work-mode instructions SHALL leave merging to the user unless the assignment or
+delegated Authority grants it, and SHALL NOT state that merging is unavailable.
 
 **Rationale:** Owners previously received grants only as Coordinator paraphrase
 in a message, which their own mode instructions outrank. They declined granted
