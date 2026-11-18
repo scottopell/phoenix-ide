@@ -156,6 +156,14 @@ impl ConversationEventSender {
     }
 
     #[cfg(test)]
+    pub(crate) fn is_closed(&self) -> bool {
+        match &self.0 {
+            EventDestination::Runtime { ordinary, .. }
+            | EventDestination::TestReceiver(ordinary) => ordinary.is_closed(),
+        }
+    }
+
+    #[cfg(test)]
     pub(crate) async fn closed(&self) {
         match &self.0 {
             EventDestination::Runtime { ordinary, .. } => ordinary.closed().await,
