@@ -2,7 +2,7 @@
 
 ## Requirements Summary
 
-Bedrock provides the core conversation state machine for PhoenixIDE. Users interact with an LLM agent through a reliable, predictable execution model: messages move through explicit idle, LLM, tool, cancellation, error, continuation, and approval states; tools execute serially; cancellation synthesizes tool results when needed to preserve transcript/API integrity; retryable versus non-retryable failures stay distinct; and committed transcript history survives restarts.
+Bedrock provides the core conversation state machine for PhoenixIDE. Users interact with an LLM agent through a reliable, predictable execution model: messages move through explicit idle, LLM, tool, cancellation, error, continuation, and approval states; ordinary foreground tools can overlap under a four-owner bound while lifecycle-containing responses remain serial; cancellation synthesizes tool results when needed to preserve transcript/API integrity; retryable versus non-retryable failures stay distinct; and committed transcript history survives restarts.
 
 Current normative authority is `requirements.md` for timeless rules and `bedrock.allium` for precise lifecycle/state-machine behavior. Persisted provider prompts use one strict, generation-fenced database projection per current transcript member; continuation freezes that same authority before provider work. ADR-026 records lifecycle-versus-WorkScope ownership; ADR-031 records first-class ProductConversation persistence and its staged single-authority cutover; ADR-032 retires Project authority and leaves repository context derived through the attached WorkScope; ADR-036 records process fail-stop when local SQLite authority cannot be established.
 
@@ -12,19 +12,25 @@ The implementation still retains legacy Project/mode and terminal compatibility 
 
 ## Technical Summary
 
-The serial dispatch boundary is specified in `tool-dispatch.allium`, composed
-with Bedrock's round admission, the LLM originating-request/schema contract,
-the narrow permission checked-call contract, and sub-agent admission rules.
-Bedrock represents one active call separately from its ordered remaining queue.
-The dispatcher spec distinguishes early unavailable results, Layer 0 denial
-before call-resource admission, cleared side-effecting preparation, launch-time admission,
-generation/state/identity completion guards, sender-loss settlement, cooperative
-cancellation, and forced task retirement. Preparation reads have a selectable
-owner bound to the runtime, original held assistant message and exact parsed call. Only a cleared checked
-call reaches ordinary invocation resources; denial returns a paired ordinary result.
-Focused and owning runtime coverage passes; full qualification remains pending.
-No dispatcher extraction or concurrent tool scheduling is implemented by this
-specification work. Permission counters/escalation remain outside this boundary.
+The foreground dispatch boundary is specified in `tool-dispatch.allium`, composed
+with Bedrock round admission, the LLM originating-request/schema contract,
+permission checked-call authority, and native sub-agent admission. The source
+candidate has exclusive Serial/OrdinaryBatch ownership. The canonical core fields
+retain all unresolved calls and accepted receipts; per-call process-local owners
+retain preparation reads, checked payloads, tasks and one-shot outcomes through
+owning commit. At most four preparing/running/ready/settling ordinary owners are
+retained. Lifecycle calls anywhere in the original response keep its whole source
+serial. The model chooses independence, including Bash and patch; there is no
+conflict inference or background execution feature.
+
+The normative alignment covers source-ordered complete-round checkpoints,
+independent sibling errors, exact full-source ownership, cancellation snapshots
+before signals, all-owner drain and retirement, child Failed + NotifyParent,
+per-call Bash-wait cutoffs and existing startup interruption materialization.
+Implementation and final qualification are in progress. Earlier serial-path test
+receipts below do not qualify the concurrent candidate; no final source, hosted,
+browser, native-client or production acceptance is claimed here. Permission
+counters/escalation remain outside this boundary.
 
 The dispatcher uses one shared process-wide authority fence, including when a
 wait invocation has already retired before its hard persistence cutoff. Spawn
@@ -181,12 +187,12 @@ Startup, completion, and child-backstop commands retain a mutable reborrow of th
 |-------------|--------|-------|
 | **REQ-BED-001:** Pure State Transitions | ✅ Complete | Core state machine module in src/state_machine/transition.rs |
 | **REQ-BED-002:** User Message Handling | ✅ Complete | Rejects while busy, accepts from idle/error |
-| **REQ-BED-003:** LLM Response Processing | ✅ Complete | Handles text, tool use, end_turn |
-| **REQ-BED-004:** Tool Execution Coordination | ✅ Complete | Serial execution with state tracking; shared round admission requires unique call/result correspondence without sorting. Provider schedule validation precedes special-tool interception, and per-invocation channels reject misidentified outcomes as concrete errors. Focused coverage includes malformed approval/question/child-terminal responses and expected-invocation completion errors. Bash wait fallback preserves authentic bounded results, aborts only the wait task on healthy expiry, and closes the shared local-authority fence under REQ-BED-033 if authoritative settlement remains indeterminate at its non-renewing persistence cutoff |
-| **REQ-BED-005:** Cancellation Handling | 🚧 Partial | Preparation reads and native submission are selectable with exact source ownership; issued parent/admission writes remain classified in the manager. Current focused 24/24 and owning 257/257 pass, including raw-provider cancellation and required-follow-up read failure settlement; integrated replacement full qualification is pending |
-| **REQ-BED-005a:** Bounded Cancellation Liveness | 🚧 Partial | Forced tool/sub-agent backstops and live forced-notice carry through delayed cooperative drain are implemented. Task 75009 covers ordered exactly-once notice qualification, including inline steering, existing retries and child-deadline overlap. Broader interruption and cancellation-handoff obligations remain unqualified |
+| **REQ-BED-003:** LLM Response Processing | Qualification pending | Native multi-call identity/order retained; concurrent foreground source candidate is in progress |
+| **REQ-BED-004:** Tool Execution Coordination | Qualification pending | Four-owner ordinary source candidate, whole-response lifecycle serial policy, source-ordered complete barrier and per-call wait cutoffs are specified; final source tests and integration checks remain pending |
+| **REQ-BED-005:** Cancellation Handling | Qualification pending | Exact-source preparation and native admission contracts remain; concurrent typed-receipt snapshot, all-running signals and all-sibling drain require final candidate qualification |
+| **REQ-BED-005a:** Bounded Cancellation Liveness | Qualification pending | One absolute aggregate deadline and affirmative all-owner retirement precede forced settlement; existing child fan-in and forced-notice policy remain. Earlier serial coverage does not qualify the concurrent candidate |
 | **REQ-BED-006:** Error Recovery | ✅ Complete | Retry logic with exponential backoff and typed user-resume admission by ErrorKind |
-| **REQ-BED-007:** State Persistence | ✅ Complete | Database persistence; all selected executing/cancelling buffers are validated before any recovery mutation. File-backed reopen coverage includes malformed standalone and parent-first child buffers retaining exact raw state and producing no partial messages; scoped recovery excludes unrelated malformed buffers. Provider-only interruptions resume from idle, active materialized turns with persisted tool results proactively resume under bounded exact-turn ownership, committed steering retains first-response recovery ownership, and durable continuations retain recovery state |
+| **REQ-BED-007:** State Persistence | Qualification pending for concurrent rounds | Existing validated startup interruption policy remains. Concurrent materialization must preserve accepted/synthetic source order and metadata by exact identity; no new replay or external-effect guarantee is introduced |
 | **REQ-BED-008:** Sub-Agent Spawning | ✅ Complete | Atomic admission, activation after committed membership, classified live unactivated reconciliation and exact atomic fan-in are implemented. Interrupted/restart ownership is unqualified; historical startup abandonment is unchanged |
 | **REQ-BED-009:** Sub-Agent Isolation | ✅ Complete | Tool set restriction defined |
 | **REQ-BED-010:** Fixed Working Directory | ✅ Complete | Set at creation, passed to tools |

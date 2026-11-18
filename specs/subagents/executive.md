@@ -47,6 +47,16 @@ command results before submission and keeping persistent services with parent or
 ordinary Work ownership. Focused runtime and hosted Linux signaling
 coverage are recorded in the Global Coordinator and Bash executive summaries.
 
+## Concurrent Foreground Round Qualification
+
+Child ordinary foreground rounds use the same four-owner bound and complete
+source-ordered checkpoint barrier as parents, retaining existing read-only or
+write-capable authority. Cancellation must drain every sibling before the child
+reaches Failed and notifies its parent; parent pending membership remains owed
+until actual terminal acceptance. The source implementation is in progress and
+final child cancellation, timeout and parent fan-in qualification are pending.
+No new startup recovery or external-effect replay policy is claimed.
+
 ## Technical Summary
 
 The detailed state-machine and spawn-layer behaviour is normative in
@@ -108,7 +118,7 @@ only the architectural seams.
 | **REQ-SA-002:** Sub-Agent Isolation | ✅ Complete | Tool registries exclude `spawn_agents`, `ask_user_question`, `skill`, `propose_task`; sub-agents tagged `user_initiated = false` |
 | **REQ-SA-003:** Result Submission | ✅ Complete | Terminal evidence precedes addressed parent delivery; acceptance is idempotent and atomic with parent state persistence |
 | **REQ-SA-004:** Parent Fan-In | ✅ Complete | Live unactivated closure retains every exact child as owed, commits parent pending membership and drains authentic outcomes through normal atomic acceptance. Duplicates converge without a second result; interrupted/restart ownership remains unqualified |
-| **REQ-SA-005:** Cancellation Propagation | Partially implemented | Submitted native admission has retained selectable ownership; cancellation and late/lost responses join one classified reconciliation before abort acknowledgement. Activation remains gated on committed membership. Inline preparation priority remains task 75010 |
+| **REQ-SA-005:** Cancellation Propagation | Qualification pending for concurrent rounds | Native admission/activation and exact parent acceptance remain authoritative. Child ordinary siblings share the aggregate drain and complete checkpoint before Failed + NotifyParent; final source qualification is pending |
 | **REQ-SA-006:** Timeout Enforcement | ✅ Complete | `DEFAULT_SUBAGENT_TIMEOUT = 20 min`; deadline races in executor `select!` |
 | **REQ-SA-007:** Model Selection | ✅ Complete | `generic_omission_inherits_parent_execution`, `override_replaces_execution_and_keeps_persona`, and `explicit_connection_is_exact_and_never_falls_back`; persisted selection verified by `unattached_sub_agent_persists_selection_without_parent_effort_leak` |
 | **REQ-SA-008:** Context Injection via Read-First | ❌ Not Started | `read_first` field not yet on `SubAgentTask`; deferred |

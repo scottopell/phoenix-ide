@@ -124,6 +124,8 @@ AND SHALL NOT show partial or duplicate content from the interrupted stream
 WHEN client reconnects during a tool round before its checkpoint persists
 THE SYSTEM SHALL include the in-flight assistant message (containing the LLM's text and any pending tool_use blocks) in the init payload
 AND SHALL surface the current tool execution state via the state_change event delivered in init's pending_events
+AND SHALL preserve accepted sibling output available before the whole round checkpoint
+AND SHALL scope tool activity and output to the exact owning assistant message when a provider reuses a tool ID
 SO THAT the user sees the active tool render in the main message list rather than a blank gap until the tool round completes
 
 **Rationale:** Users expect real-time feedback during agent execution. Token streaming provides immediate evidence that the system is working. The event cursor enables seamless reconnection without a separate fetch request, while transcript generation proves whether existing client coverage can be preserved. Exact coverage keeps lazy older-history loading correct. The in-flight-assistant-message coverage on reconnect closes the symmetric gap during tool execution: without it, a reconnect between "LLM finished, tool started" and "tool finished, checkpoint persisted" would blank out the assistant's message and the tool card.
@@ -138,9 +140,14 @@ AND include the state name and relevant state_data
 
 WHEN state is `tool_executing`
 THE SYSTEM SHALL include in state_data:
-- current_tool: {name, id} of the tool being executed
-- remaining_count: number of tools queued after current
-- completed_count: number of tools already completed this turn
+- current_tool: {name, id} of the representative unresolved call
+- remaining_count: number of other unresolved calls, including ordinary siblings already running
+- completed_count: number of accepted tool results this turn
+
+WHEN ordinary foreground siblings overlap
+THE SYSTEM SHALL retain these state fields and the existing SSE event shapes
+AND SHALL report genuine per-call starts through the existing tool-start observations
+AND SHALL NOT present unresolved membership alone as proof that a call has started.
 
 WHEN state is `llm_requesting`
 THE SYSTEM SHALL include in state_data:
@@ -151,7 +158,7 @@ THE SYSTEM SHALL include in state_data:
 - pending_count: number of sub-agents still running
 - completed_count: number of sub-agents finished
 
-**Rationale:** Mobile UI displays state machine visualization as primary feedback mechanism. Users need to see exactly which tool is executing and queue depth to have confidence the system is progressing.
+**Rationale:** Users need accurate progress while several calls overlap. Unresolved membership, genuine starts, and accepted results communicate different facts without treating the representative call as the only running tool.
 
 ---
 

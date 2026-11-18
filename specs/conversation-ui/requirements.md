@@ -261,7 +261,14 @@ WHEN state is `llm_requesting`
 THE SYSTEM SHALL show "thinking..." with retry attempt number if retrying
 
 WHEN state is `tool_executing`
-THE SYSTEM SHALL show tool name and queue depth: "bash (+2 queued)"
+THE SYSTEM SHALL show the representative unresolved tool and the count of other unresolved calls
+AND SHALL distinguish pending, genuinely started, and settled calls within the owning assistant round
+AND SHALL NOT label a running sibling as queued solely because it follows the representative call in unresolved membership.
+
+WHEN accepted sibling output is available before the whole round checkpoint
+THE SYSTEM SHALL display that output without waiting for earlier unresolved siblings
+AND SHALL correlate activity and output by the owning assistant message and tool identity
+AND SHALL keep a later assistant round with a reused provider tool ID separate.
 
 WHEN state is `awaiting_sub_agents`
 THE SYSTEM SHALL show sub-agent progress: "sub-agents (2/3 done)"
