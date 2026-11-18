@@ -131,14 +131,14 @@ variant OrdinaryBatch : ForegroundDispatch {
     closing: Boolean
     cancellation_deadline: Timestamp when closing = true
     owners: BatchCallOwner with batch = this
-    retained: owners where phase in { preparing, running, ready, settling }
+    retained: owners where phase in { preparing, running, ready, settling, forced_retired }
 }
 
 entity BatchCallOwner {
     batch: OrdinaryBatch
     selection: DispatchSelection
     failure_boundary: caller | required
-    phase: unissued | preparing | running | ready | settling | retired | no_read
+    phase: unissued | preparing | running | ready | settling | forced_retired | retired | no_read
     outcome: InvocationOutcome when phase = ready | settling
 
     transitions phase {
@@ -151,9 +151,11 @@ entity BatchCallOwner {
         running -> ready
         running -> settling
         running -> retired
+        running -> forced_retired
         ready -> settling
         ready -> retired
         settling -> retired
+        forced_retired -> retired
         no_read -> ready
         no_read -> retired
         terminal: retired
@@ -335,6 +337,31 @@ rule CancelEveryOrdinaryOwnerBeforePersistenceWait {
         -- alone is not proof that a read or external effect was never issued.
 }
 
+rule ObserveCancellationWhileBatchCommitIsIssued {
+    when: BatchCommitCancellationObserved(conversation)
+    requires: process_authority.open
+    requires: has_ordinary_batch(conversation)
+    let batch = ordinary_batch_for(conversation)
+    ensures: CancellationDeliveryRetained(conversation)
+    ensures: AvailableTypedReceiptsSnapshottedBeforeSignals(batch)
+    ensures: EveryRunningSiblingSignalled(batch)
+    ensures: batch.closing = true
+
+    @guidance
+        -- Both acknowledged and addressed cancellation use the same concrete
+        -- bounded control inbox. Retain the exact request and its acknowledgement
+        -- custody once, outside dispatch-mode replacement. Bias a ready Cancel
+        -- ahead of a ready write result. Keep the same pinned issued state,
+        -- complete-round checkpoint or cancellation-evidence write until classified;
+        -- do not recurse into reducer settlement, drop, reissue or infer its result.
+        -- Service resource-only deadlines while waiting. Once classification is
+        -- established, apply the retained semantic Cancel before refill or model
+        -- dispatch, keeping its original absolute cutoff. A selected uncommitted
+        -- steering drain restores its exact entries; the ordinary post-Cancel
+        -- boundary owns their later delivery. Closed inboxes cannot spin; fatal
+        -- shutdown releases a retained acknowledgement with an honest error.
+}
+
 rule RetireEveryRemainingBatchOwnerAtAggregateDeadline {
     when: bedrock/ToolCancellationRetirementRequested(conversation)
     requires: process_authority.open
@@ -345,7 +372,14 @@ rule RetireEveryRemainingBatchOwnerAtAggregateDeadline {
 
     @guidance
         -- Use the one original aggregate deadline, never a renewed per-sibling
-        -- wait. Abort all remaining owners before acknowledging forced settlement.
+        -- wait, including while another sibling's write remains issued. Snapshot
+        -- all available typed receipts again before aborting remaining Running
+        -- tasks. Retain each actual forced retirement as an affine forced_retired
+        -- owner, with its old outcome/publication authority revoked. Never retire
+        -- the Settling owner whose write is still awaiting classification.
+        -- Consume the resource timer once, and defer semantic retirement until
+        -- the existing safe actor boundary. Abort remaining owners before
+        -- acknowledging forced settlement.
         -- Retain accepted outcomes, synthesize only unresolved results in source
         -- order, and checkpoint the whole held round before parent Idle or child
         -- Failed + NotifyParent. Carry one forced-retirement notice through the
@@ -353,7 +387,7 @@ rule RetireEveryRemainingBatchOwnerAtAggregateDeadline {
 }
 
 rule AggregateRetirementAcknowledgedAfterAllOwners {
-    when: AllRemainingBatchOwnersRetired(batch)
+    when: BatchSafeSettlementBoundaryReached(batch)
     requires: process_authority.open
     requires: all_batch_owners_affirmatively_retired(batch)
     ensures: bedrock/ToolCancellationRetired(batch.runtime.conversation)
@@ -369,13 +403,18 @@ rule BatchBashWaitFallbackRetiresOnlyItsExactTask {
     requires: owner.phase = running
     requires: bedrock/is_bash_wait(call)
     ensures: BatchWaitTaskOnlyAbortRequested(owner)
-    ensures: owner.phase = settling
+    ensures: owner.phase = ready
     ensures: owner.outcome = failed_wait_outcome(owner)
     ensures: bedrock/ToolTaskRetired(conversation, call)
 
     @guidance
         -- Arm each selected wait from its own supported duration plus execution
-        -- grace and absolute persistence cutoff. Abort only that owner's wait
+        -- grace and absolute persistence cutoff. Snapshot its receiver first;
+        -- preserve an available typed receipt instead of manufacturing failure.
+        -- While another sibling's write is issued, retain a Ready failed receipt
+        -- without reducer recursion, publication or another write. Once closing,
+        -- the aggregate cancellation cutoff supersedes this execution fallback.
+        -- Abort only that owner's wait
         -- task, without signalling its token or cancelling the represented process,
         -- handles or unrelated jobs. Retain the owner through its owning commit;
         -- retired task output cannot replace the one synthetic Failed receipt.
@@ -1255,6 +1294,14 @@ surface RuntimeAuthorityObservations {
 --   Preserve authentic snapshotted ready receipts in their owning complete-round
 --   checkpoint; do not replace them with synthetic cancellation. This is in-memory
 --   resource retirement, not a fabricated persistence receipt.
+-- BatchCommitCancellationObserved(conversation): the exact owned cancellation
+--   delivery is received while an ordinary batch write remains issued.
+-- CancellationDeliveryRetained(conversation): affine process-local request,
+--   acknowledgement/retirement custody and original cutoff retained through the
+--   issued write's classification, then consumed by normal semantic processing.
+-- BatchSafeSettlementBoundaryReached(batch): the actor resumes normal settlement
+--   after classifying the issued write; actual forced-retirement proofs remain
+--   owned until the aggregate retirement commit consumes them.
 -- OrdinaryBatchResourcesRetired(runtime): if this runtime owns OrdinaryBatch,
 --   close refill, interrupt reads, signal and abort every retained invocation in
 --   memory. Fenced teardown makes no database-backed cleanup or settlement claim.
