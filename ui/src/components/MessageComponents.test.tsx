@@ -1,3 +1,4 @@
+import { getToolActivity } from '../conversation/toolActivity';
 import { bashLaunchOutcomes, bashLaunchReleaseUnknown } from '../testFixtures/bashLaunchOutcomes';
 import { SvgArtifactAccessContext } from '../contexts/SvgArtifactAccessContext';
 import mermaid from 'mermaid';
@@ -420,6 +421,37 @@ describe('historical retired tool rendering', () => {
 });
 
 describe('inline tool timers', () => {
+  it.each(['full', 'compact'] as const)('shows simultaneous calls and a settled sibling before the full checkpoint (%s)', (density) => {
+    mockDensity = density;
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-01-01T00:00:10Z'));
+    const calls = ['one', 'two', 'three', 'four', 'five'].map((id) => ({
+      id, name: 'read_file', input: { path: `${id}.md` },
+    }));
+    const agent = agentMessage('concurrent-round', calls.map((call) => ({ type: 'tool_use', ...call })));
+    agent.display_data = { tool_starts: { one: 1000, two: 1000, three: 1000, four: 1000 } };
+    const activity = getToolActivity({
+      type: 'tool_executing', current_tool: calls[0]!, remaining_tools: [calls[1]!, calls[2]!, calls[4]!],
+      assistant_message: { message_id: agent.message_id },
+      completed_results: [{ tool_use_id: 'four', outcome: { type: 'error', output: 'Read failed' }, duration_ms: 400 }],
+    });
+    render(<MemoryRouter><AgentMessage message={agent} toolResults={new Map()} toolActivity={activity} /></MemoryRouter>);
+    if (density === 'full') {
+      expect(document.querySelectorAll('.tool-block-elapsed')).toHaveLength(3);
+      expect(document.querySelector('[data-tool-id="four"]')).toHaveTextContent('Read failed');
+      expect(document.querySelector('[data-tool-id="four"] .tool-block-elapsed')).toBeNull();
+      expect(document.querySelector('[data-tool-id="five"]')).toHaveTextContent('Pending');
+      expect(document.querySelector('[data-tool-id="five"] .tool-block-elapsed')).toBeNull();
+    } else {
+      const cards = Array.from(document.querySelectorAll('.compact-tool-card'));
+      expect(cards.map((card) => card.getAttribute('data-tool-id'))).toEqual(['one', 'two', 'three', 'four', 'five']);
+      expect(document.querySelector('[data-tool-id="four"]')).toHaveTextContent('failed');
+      expect(document.querySelector('[data-tool-id="five"]')).toHaveTextContent('queued');
+      expect(screen.getAllByText(/^running · /)).toHaveLength(3);
+    }
+    expect(screen.queryByText('result not received')).not.toBeInTheDocument();
+  });
+
   it('renders a visible waiting state when a tool_use has no matching result', () => {
     const debugSpy = vi.spyOn(console, 'debug').mockImplementation(() => {});
 
@@ -485,7 +517,7 @@ describe('inline tool timers', () => {
           message={initialTurn.agent}
           toolResults={initialTurn.toolResultsByUseId}
           onOpenFile={undefined}
-          activeToolUseId="tool-read"
+          toolActivity={getToolActivity({ type: 'tool_executing', current_tool: { id: 'tool-read', name: 'read_file', input: {} }, remaining_tools: [], assistant_message: { message_id: 'agent-tool-timer' } })}
         />
       </MemoryRouter>,
     );
@@ -514,7 +546,7 @@ describe('inline tool timers', () => {
           message={liveTurn.agent}
           toolResults={liveTurn.toolResultsByUseId}
           onOpenFile={undefined}
-          activeToolUseId="tool-read"
+          toolActivity={getToolActivity({ type: 'tool_executing', current_tool: { id: 'tool-read', name: 'read_file', input: {} }, remaining_tools: [], assistant_message: { message_id: 'agent-tool-timer' } })}
         />
       </MemoryRouter>,
     );
@@ -567,7 +599,7 @@ describe('inline tool timers', () => {
           message={agent}
           toolResults={new Map()}
           onOpenFile={undefined}
-          activeToolUseId="tool-read"
+          toolActivity={getToolActivity({ type: 'tool_executing', current_tool: { id: 'tool-read', name: 'read_file', input: {} }, remaining_tools: [], assistant_message: { message_id: agent.message_id } })}
         />
       </MemoryRouter>,
     );
@@ -593,7 +625,7 @@ describe('inline tool timers', () => {
           message={agent}
           toolResults={new Map()}
           onOpenFile={undefined}
-          activeToolUseId="tool-read-a"
+          toolActivity={getToolActivity({ type: 'tool_executing', current_tool: { id: 'tool-read-a', name: 'read_file', input: {} }, remaining_tools: [{ id: 'tool-read-b', name: 'read_file', input: {} }], assistant_message: { message_id: agent.message_id } })}
           isLatestAgentMessage={true}
         />
       </MemoryRouter>,

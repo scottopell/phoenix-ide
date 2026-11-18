@@ -50,7 +50,7 @@ enum ConversationState: Equatable {
     /// display purposes).
     case llmRequesting(attempt: Int)
     case serverOverloadRetrying(attempt: Int, maxAttempts: Int, retryAt: String?, continuationTarget: Bool)
-    case toolExecuting(toolName: String, remainingCount: Int, completedCount: Int)
+    case toolExecuting(toolName: String, pendingCount: Int, completedCount: Int)
     case awaitingSubAgents(pendingCount: Int, completedCount: Int)
     case awaitingContinuation
     case awaitingUserResponse(questions: [UserQuestion], requestId: String?)
@@ -95,7 +95,7 @@ enum ConversationState: Equatable {
         case "tool_executing":
             return .toolExecuting(
                 toolName: json["current_tool"]?["name"]?.stringValue ?? "tool",
-                remainingCount: json["remaining_tools"]?.arrayValue?.count ?? 0,
+                pendingCount: (json["remaining_tools"]?.arrayValue?.count ?? 0) + (json["current_tool"] == nil ? 0 : 1),
                 completedCount: json["completed_results"]?.arrayValue?.count ?? 0)
         case "awaiting_sub_agents":
             return .awaitingSubAgents(

@@ -60,7 +60,7 @@ import { useReactionSourceReturn } from './useReactionSourceReturn';
 import { MessageReviewEnabledContext } from './MessageReviewAction';
 import { FilePathContextMenu } from './FilePathContextMenu';
 import { useStreamingBuffer } from '../conversation/useConversationAtom';
-import { activeToolUseIdFromState } from '../conversation/toolActivity';
+import { getToolActivity, type ToolActivity } from '../conversation/toolActivity';
 import {
   buildHistoricalUnits,
   findHistoricalUnitIndexByMessageId,
@@ -302,7 +302,7 @@ function renderHistoricalUnit(
   onRetry: (localId: string) => void,
   onCancelSteering: ((localId: string) => void) | undefined,
   workScopeKey: string | undefined,
-  activeToolUseId: string | undefined,
+  toolActivity: ToolActivity | undefined,
   slug: string | null,
   isLatestAgentMessage: boolean,
   revealRequest: AgentTextRevealRequest | null,
@@ -354,7 +354,7 @@ function renderHistoricalUnit(
           onOpenFile={onOpenFile}
           filePathRootDir={filePathRootDir}
           workScopeKey={workScopeKey}
-          activeToolUseId={activeToolUseId}
+          toolActivity={toolActivity}
           isFirstInTurn={unit.isFirstInTurn}
           forceExpandedText={isLatestAgentMessage}
           isLatestAgentMessage={isLatestAgentMessage}
@@ -372,7 +372,7 @@ function renderHistoricalUnit(
           onOpenFile={onOpenFile}
           filePathRootDir={filePathRootDir}
           workScopeKey={workScopeKey}
-          activeToolUseId={activeToolUseId}
+          toolActivity={toolActivity}
           isLatestAgentMessage={isLatestAgentMessage}
           unitKey={unit.key}
           {...(revealRequest ? { revealRequest } : {})}
@@ -471,7 +471,7 @@ function renderUnit(
   onRetry: (localId: string) => void,
   onCancelSteering: ((localId: string) => void) | undefined,
   workScopeKey: string | undefined,
-  activeToolUseId: string | undefined,
+  toolActivity: ToolActivity | undefined,
   isLatestAgentMessage: boolean,
   revealRequest: AgentTextRevealRequest | null,
   activeHighlight: ConversationHighlight | null,
@@ -490,7 +490,7 @@ function renderUnit(
     onRetry,
     onCancelSteering,
     workScopeKey,
-    activeToolUseId,
+    toolActivity,
     slug ?? null,
     isLatestAgentMessage,
     revealRequest,
@@ -850,7 +850,7 @@ function MessageListImpl({
   }, [chapters]);
 
   const isEmpty = allUnits.length === 0;
-  const activeToolUseId = activeToolUseIdFromState(convState);
+  const toolActivity = useMemo(() => getToolActivity(convState), [convState]);
 
   const detachGestureListenersRef = useRef<(() => void) | null>(null);
   const retainedStopRef = useRef<(receipt: OwnedTouchStop) => void>(() => {});
@@ -1916,7 +1916,7 @@ function MessageListImpl({
           onRetry,
           onCancelSteering,
           workScopeKey,
-          activeToolUseId,
+          toolActivity,
           unit.kind !== 'sub_agent_status'
             && unit.kind !== 'streaming_agent'
             && agentTurnsInHistoricalUnit(unit).some((member) => member.key === latestAgentKey),
@@ -1944,7 +1944,7 @@ function MessageListImpl({
         )}
       </div>
     ),
-    [slug, onOpenFile, filePathRootDir, onRetry, onCancelSteering, workScopeKey, activeToolUseId, latestAgentKey, sourceRevealRequest, pendingRevealRequest, activeFindHighlight, activeFindRevealTarget, handleRevealHandled, pulseMountedRow],
+    [slug, onOpenFile, filePathRootDir, onRetry, onCancelSteering, workScopeKey, toolActivity, latestAgentKey, sourceRevealRequest, pendingRevealRequest, activeFindHighlight, activeFindRevealTarget, handleRevealHandled, pulseMountedRow],
   );
 
   const computeItemKey = useCallback(

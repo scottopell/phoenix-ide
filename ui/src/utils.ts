@@ -11,7 +11,7 @@ import type {
   UserQuestion,
 } from './api';
 import { getErrorPresentation } from './errorPresentation';
-import { getToolActivity } from './conversation/toolActivity';
+import { unresolvedTools } from './conversation/toolActivity';
 import type { ErrorKind } from './generated/ErrorKind';
 
 /** Format a keyboard shortcut for the current platform (Cmd on macOS, Ctrl elsewhere) */
@@ -126,14 +126,9 @@ export function getStateDescription(state: ConversationState): string {
       // `turnRetryContext` for retry surfacing.
       return 'starting...';
     case 'tool_executing': case 'cancelling_tool': {
-      const activity = getToolActivity(state);
-      if (activity.type === 'cancelling') return 'cancelling...';
-      if (activity.type === 'executing') {
-        const tool = activity.activeTool?.name || 'tool';
-        const remaining = activity.queued?.length ?? 0;
-        return remaining > 0 ? `${tool} (+${remaining} queued)` : tool;
-      }
-      return 'tool';
+      if (state.type === 'cancelling_tool') return 'cancelling...';
+      const tools = unresolvedTools(state);
+      return tools.length === 1 ? `${tools[0]?.name || 'tool'} (pending)` : `${tools.length} tools pending`;
     }
     case 'awaiting_sub_agents': {
       const pending = state.pending.length;
@@ -320,9 +315,16 @@ export function parseConversationState(raw: unknown): ConversationState {
         type: 'tool_executing',
         current_tool: obj['current_tool'] as ToolCall,
         remaining_tools: (obj['remaining_tools'] as ToolCall[]) ?? [],
+        assistant_message: obj['assistant_message'] as { message_id: string } | undefined,
+        completed_results: obj['completed_results'] as import('./api').ToolRoundState['completed_results'],
       };
     case 'cancelling_tool':
-      return { type: 'cancelling_tool', current_tool: obj['current_tool'] as ToolCall };
+      return {
+        type: 'cancelling_tool', tool_use_id: obj['tool_use_id'] as string,
+        skipped_tools: (obj['skipped_tools'] as ToolCall[]) ?? [],
+        assistant_message: obj['assistant_message'] as { message_id: string } | undefined,
+        completed_results: obj['completed_results'] as import('./api').ToolRoundState['completed_results'],
+      };
     case 'awaiting_sub_agents':
       return {
         type: 'awaiting_sub_agents',
