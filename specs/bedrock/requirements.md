@@ -205,7 +205,7 @@ AND persist the response for display
 
 WHEN LLM responds with tool use requests
 THE SYSTEM SHALL transition to tool executing state
-AND queue tools for serial execution in request order
+AND retain their original order and exact owning assistant identity
 
 WHEN LLM responds with text only and end_turn=false
 THE SYSTEM SHALL continue awaiting additional LLM content
@@ -216,13 +216,25 @@ THE SYSTEM SHALL continue awaiting additional LLM content
 
 ### REQ-BED-004: Tool Execution Coordination
 
-WHEN multiple tools are requested in a single LLM response
-THE SYSTEM SHALL execute tools serially in the order requested
-AND complete each tool before starting the next
+WHEN a single LLM response requests only ordinary foreground tools
+THE SYSTEM SHALL permit independent calls from that response to execute concurrently
+AND SHALL bound retained preparation and execution owners to four per conversation
+AND SHALL let the model choose call independence without adding conflict detection or dependency inference
+AND SHALL apply each call's existing permissions, originating policy, schema and resource authority independently before admitting its resources.
+
+WHEN a response contains a lifecycle-owned special call
+THE SYSTEM SHALL retain serial execution of that complete response in request order
+AND SHALL preserve its native admission, approval, question, goal and terminal constraints.
+
+WHEN an ordinary sibling completes
+THE SYSTEM SHALL accept its exact result independently of earlier unresolved siblings
+AND SHALL preserve each result's complete payload and metadata
+AND SHALL retain one authoritative set of unresolved calls and accepted results.
 
 WHEN all tools complete
 THE SYSTEM SHALL transition to awaiting LLM response
-AND send all tool results to LLM
+AND send all tool results to LLM in original assistant call order
+AND SHALL NOT dispatch that next model step while any foreground sibling remains unresolved.
 
 THE SYSTEM SHALL bind each persisted tool-result identity to both its owning assistant message and its provider tool ID
 AND SHALL preserve that identity when materializing an interrupted tool round
@@ -259,7 +271,7 @@ WHEN any tool fails
 THE SYSTEM SHALL include the error in results sent to LLM
 AND allow LLM to handle the error
 
-**Rationale:** Serial execution respects LLM's intended order and prevents resource conflicts between tools.
+**Rationale:** A model can request independent ordinary operations together and avoid serial latency. Lifecycle-owned calls retain their ordered boundary; concurrency neither infers dependencies nor creates another execution or recovery authority.
 
 ---
 
@@ -271,11 +283,20 @@ AND transition to idle state
 AND NOT persist any partial LLM response
 
 WHEN user requests cancellation during tool execution
-THE SYSTEM SHALL interrupt the running tool immediately (within 100ms)
+THE SYSTEM SHALL interrupt every admitted ordinary sibling immediately (within 100ms)
 AND terminate any spawned subprocesses
 AND record a synthetic tool result indicating cancellation
 AND skip remaining queued tools with synthetic cancelled results
-AND transition to idle state
+AND SHALL prevent queued preparation or execution from starting after cancellation
+AND SHALL retain an already-typed completed outcome available to its owning receiver when cancellation is selected
+AND SHALL drain every foreground sibling before the parent's final idle transition or a sub-agent's terminal notification.
+
+WHEN an ordinary tool return has not yet become a typed outcome before cancellation
+THE SYSTEM SHALL retain the tool executor's cancellation classification.
+
+WHEN a sub-agent's ordinary batch is cancelled
+THE SYSTEM SHALL retain its existing failed terminal destination
+AND SHALL notify its parent only after all ordinary sibling owners have settled or been retired.
 
 WHEN cancellation is requested
 THE SYSTEM SHALL NOT queue the cancel behind completion of current operation
