@@ -289,13 +289,12 @@ export function useConversationSelectors(slug: string) {
   const [atom, dispatch] = useConversationAtom(slug);
 
   const activity = getToolActivity(atom.phase);
-  const currentTool = activity.type === 'none' ? null : activity.activeTool;
 
   return {
     atom,
     dispatch,
     isAgentWorking: isAgentWorking(atom.phase),
-    currentTool,
+    toolActivity: activity,
     streamingText: atom.streamingBuffer?.text ?? null,
   };
 }

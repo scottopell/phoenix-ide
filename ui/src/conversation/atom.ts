@@ -22,6 +22,7 @@ import {
   SseWorkScopeUpdateDataSchema,
   SseErrorDataSchema,
 } from '../sseSchemas';
+import { getToolActivity } from './toolActivity';
 import { parseConversationState } from '../utils';
 
 export interface StreamingBuffer {
@@ -810,6 +811,12 @@ function applyWireActionBody(atom: ConversationAtom, action: SSEAction): Convers
         phase,
         phaseLastAppliedEventSeq: action.sequenceId,
         phaseStateUpdatedAt: action.stateUpdatedAt,
+        liveBashProgress: (() => {
+          const previous = getToolActivity(atom.phase);
+          const current = getToolActivity(phase);
+          return current.type !== 'none' && (previous.type === 'none' || current.assistantMessageId !== previous.assistantMessageId)
+            ? {} : atom.liveBashProgress;
+        })(),
         firstByteRequestId: null,
         turnRetryContext: phaseIsTerminalFailure(phase) ? null : atom.turnRetryContext,
         toolExecutingStartedAt: action.phase.type === 'tool_executing' ? Date.now() : null,
