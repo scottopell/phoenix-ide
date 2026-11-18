@@ -29,6 +29,10 @@ pub struct McpTool {
 
 #[async_trait]
 impl Tool for McpTool {
+    fn foreground_execution(&self) -> crate::ForegroundExecution {
+        crate::ForegroundExecution::Concurrent
+    }
+
     fn name(&self) -> &str {
         &self.full_name
     }

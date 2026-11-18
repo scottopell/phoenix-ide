@@ -1382,6 +1382,10 @@ mod tests {
 
     #[async_trait]
     impl Tool for NamedTool {
+        fn foreground_execution(&self) -> crate::ForegroundExecution {
+            crate::ForegroundExecution::Serial
+        }
+
         fn name(&self) -> &'static str {
             self.0
         }

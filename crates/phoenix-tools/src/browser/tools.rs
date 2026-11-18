@@ -96,6 +96,10 @@ pub struct BrowserNavigateTool;
 
 #[async_trait]
 impl Tool for BrowserNavigateTool {
+    fn foreground_execution(&self) -> crate::ForegroundExecution {
+        crate::ForegroundExecution::Concurrent
+    }
+
     fn name(&self) -> &'static str {
         "browser_navigate"
     }
@@ -212,6 +216,10 @@ pub struct BrowserEvalTool;
 
 #[async_trait]
 impl Tool for BrowserEvalTool {
+    fn foreground_execution(&self) -> crate::ForegroundExecution {
+        crate::ForegroundExecution::Concurrent
+    }
+
     fn name(&self) -> &'static str {
         "browser_eval"
     }
@@ -549,6 +557,10 @@ pub struct BrowserTakeScreenshotTool;
 
 #[async_trait]
 impl Tool for BrowserTakeScreenshotTool {
+    fn foreground_execution(&self) -> crate::ForegroundExecution {
+        crate::ForegroundExecution::Concurrent
+    }
+
     // clearable: re-queryable read — see specs/stale-tool-results (REQ-STR-002).
     fn clearable(&self) -> bool {
         true
@@ -712,6 +724,10 @@ pub struct BrowserRecentConsoleLogsTool;
 
 #[async_trait]
 impl Tool for BrowserRecentConsoleLogsTool {
+    fn foreground_execution(&self) -> crate::ForegroundExecution {
+        crate::ForegroundExecution::Concurrent
+    }
+
     // clearable: re-queryable read — see specs/stale-tool-results (REQ-STR-002).
     fn clearable(&self) -> bool {
         true
@@ -813,6 +829,10 @@ pub struct BrowserClearConsoleLogsTool;
 
 #[async_trait]
 impl Tool for BrowserClearConsoleLogsTool {
+    fn foreground_execution(&self) -> crate::ForegroundExecution {
+        crate::ForegroundExecution::Concurrent
+    }
+
     fn name(&self) -> &'static str {
         "browser_clear_console_logs"
     }
@@ -872,6 +892,10 @@ pub struct BrowserResizeTool;
 
 #[async_trait]
 impl Tool for BrowserResizeTool {
+    fn foreground_execution(&self) -> crate::ForegroundExecution {
+        crate::ForegroundExecution::Concurrent
+    }
+
     fn name(&self) -> &'static str {
         "browser_resize"
     }
@@ -970,6 +994,10 @@ pub struct BrowserWaitForSelectorTool;
 
 #[async_trait]
 impl Tool for BrowserWaitForSelectorTool {
+    fn foreground_execution(&self) -> crate::ForegroundExecution {
+        crate::ForegroundExecution::Concurrent
+    }
+
     fn name(&self) -> &'static str {
         "browser_wait_for_selector"
     }
@@ -1131,6 +1159,10 @@ pub struct BrowserClickTool;
 
 #[async_trait]
 impl Tool for BrowserClickTool {
+    fn foreground_execution(&self) -> crate::ForegroundExecution {
+        crate::ForegroundExecution::Concurrent
+    }
+
     fn name(&self) -> &'static str {
         "browser_click"
     }
@@ -1318,6 +1350,10 @@ async fn focus_element_until(
 
 #[async_trait]
 impl Tool for BrowserTypeTool {
+    fn foreground_execution(&self) -> crate::ForegroundExecution {
+        crate::ForegroundExecution::Concurrent
+    }
+
     fn name(&self) -> &'static str {
         "browser_type"
     }
@@ -1603,6 +1639,10 @@ pub struct BrowserKeyPressTool;
 
 #[async_trait::async_trait]
 impl Tool for BrowserKeyPressTool {
+    fn foreground_execution(&self) -> crate::ForegroundExecution {
+        crate::ForegroundExecution::Concurrent
+    }
+
     fn name(&self) -> &'static str {
         "browser_key_press"
     }

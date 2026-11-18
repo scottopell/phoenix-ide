@@ -201,6 +201,10 @@ fn text_schema() -> Value {
 
 #[async_trait]
 impl super::instance::RoutedTool for GoalTool {
+    fn foreground_execution(&self) -> phoenix_tools::ForegroundExecution {
+        phoenix_tools::ForegroundExecution::Serial
+    }
+
     fn name(&self) -> &'static str {
         match self.operation {
             Operation::Prepare => "prepare_goal",
@@ -269,6 +273,10 @@ impl super::instance::RoutedTool for GoalTool {
 
 #[async_trait]
 impl super::instance::RoutedTool for ReadGoalTool {
+    fn foreground_execution(&self) -> phoenix_tools::ForegroundExecution {
+        phoenix_tools::ForegroundExecution::Serial
+    }
+
     fn name(&self) -> &'static str {
         "read_goal"
     }

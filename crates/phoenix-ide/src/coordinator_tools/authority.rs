@@ -188,6 +188,10 @@ struct BoundaryObservation {
 
 #[async_trait]
 impl Tool for AuthorityTool {
+    fn foreground_execution(&self) -> phoenix_tools::ForegroundExecution {
+        phoenix_tools::ForegroundExecution::Serial
+    }
+
     fn name(&self) -> &'static str {
         match self.mode {
             Mode::Read => "read_authority",

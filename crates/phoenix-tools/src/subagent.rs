@@ -21,6 +21,10 @@ struct SubmitResultInput {
 
 #[async_trait]
 impl Tool for SubmitResultTool {
+    fn foreground_execution(&self) -> crate::ForegroundExecution {
+        crate::ForegroundExecution::Serial
+    }
+
     fn name(&self) -> &'static str {
         "submit_result"
     }
@@ -66,6 +70,10 @@ struct SubmitErrorInput {
 
 #[async_trait]
 impl Tool for SubmitErrorTool {
+    fn foreground_execution(&self) -> crate::ForegroundExecution {
+        crate::ForegroundExecution::Serial
+    }
+
     fn name(&self) -> &'static str {
         "submit_error"
     }
@@ -185,6 +193,10 @@ impl SpawnAgentsTool {
 
 #[async_trait]
 impl Tool for SpawnAgentsTool {
+    fn foreground_execution(&self) -> crate::ForegroundExecution {
+        crate::ForegroundExecution::Serial
+    }
+
     fn name(&self) -> &'static str {
         "spawn_agents"
     }
