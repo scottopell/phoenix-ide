@@ -436,7 +436,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn restart_keeps_promoted_svg_before_unfinished_call() {
+    async fn restart_keeps_promoted_svg_in_source_order_with_unfinished_call() {
         use crate::MessageContent;
         use phoenix_core::domain::llm_types::ContentBlock;
         use phoenix_core::domain::sm_state::{ThinkInput, ToolCall, ToolInput};
@@ -472,30 +472,62 @@ mod tests {
             ),
         );
         db.update_conversation_state("owner", &state).await.unwrap();
-        db.publish_svg_artifact(
-            "owner",
-            &SvgInvocationId::new("current-assistant", "svg"),
-            &SvgPresentationMetadata::new("Chart", "Retained").unwrap(),
-            &validated(),
-        )
-        .await
-        .established()
-        .unwrap()
-        .unwrap();
+        let published = db
+            .publish_svg_artifact(
+                "owner",
+                &SvgInvocationId::new("current-assistant", "svg"),
+                &SvgPresentationMetadata::new("Chart", "Retained").unwrap(),
+                &validated(),
+            )
+            .await
+            .established()
+            .unwrap()
+            .unwrap();
 
         db.reset_all_to_idle().await.unwrap();
         let messages = db.get_messages("owner").await.unwrap();
-        let tool_ids: Vec<_> = messages
+        let tools: Vec<_> = messages
             .iter()
             .filter_map(|message| {
                 if let MessageContent::Tool(content) = &message.content {
-                    Some(content.tool_use_id.as_str())
+                    Some(content)
                 } else {
                     None
                 }
             })
             .collect();
-        assert_eq!(tool_ids, ["done", "svg", "unfinished"]);
+        assert_eq!(
+            tools
+                .iter()
+                .map(|tool| tool.tool_use_id.as_str())
+                .collect::<Vec<_>>(),
+            ["done", "unfinished", "svg"]
+        );
+        let find_tool = |id| {
+            tools
+                .iter()
+                .copied()
+                .find(|tool| tool.tool_use_id == id)
+                .unwrap()
+        };
+        let done = find_tool("done");
+        assert_eq!(done.content, "Ready");
+        assert!(!done.is_error);
+        let unfinished = find_tool("unfinished");
+        assert!(unfinished.is_error);
+        assert!(unfinished.content.contains("interrupted by server restart"));
+        let svg = find_tool("svg");
+        assert!(!svg.is_error);
+        let reference: phoenix_svg::SvgArtifactReference =
+            serde_json::from_str(&svg.content).unwrap();
+        assert_eq!(reference, published.clone().into_reference());
+        assert!(!svg.content.contains("<svg"));
+        assert_eq!(
+            db.svg_artifact("owner", &reference.artifact_id)
+                .await
+                .unwrap(),
+            Some(published)
+        );
     }
 
     #[tokio::test]
