@@ -137,7 +137,10 @@ impl<S: Storage + Clone + 'static, L: LlmClient + 'static, T: ToolExecutor + 'st
         tokio::pin!(write);
         loop {
             let observe = self.foreground_dispatch.has_open_batch_controls()
-                && matches!(self.cancellation_custody, CancellationCustody::Idle)
+                && matches!(
+                    self.cancellation_custody,
+                    CancellationCustody::Idle | CancellationCustody::Closing(_)
+                )
                 && self.cancellation_input_rx.is_some();
             let cancellation_cutoff = self.cancellation_custody.pending_cutoff();
             let resource_deadline =
