@@ -51,4 +51,32 @@ describe('foreground batch activity', () => {
     const activity = getToolActivity({ ...state, completed_results: [{ pending_self_goal: {} }, { pending_goal_report: {} }] });
     expect(projectToolRound(owner, new Map(), activity).size).toBe(0);
   });
+  it('projects trusted instructions as the canonical opaque transcript receipt', () => {
+    const sentinel = 'SYNTHETIC_PRIVATE_SKILL_SENTINEL_DO_NOT_RENDER';
+    const trusted: FinalizedToolRoundResult = {
+      tool_use_id: 'skill', outcome: { type: 'trusted_instructions', output: sentinel }, duration_ms: 42,
+    };
+    const projected = projectToolRound(owner, new Map(), getToolActivity({ ...state, completed_results: [trusted] }));
+    expect(projected.get('skill')?.content).toEqual({
+      tool_use_id: 'skill',
+      content: 'Authenticated built-in skill instructions were delivered for this live request.',
+      is_error: false,
+    });
+    expect(JSON.stringify([...projected.values()])).not.toContain(sentinel);
+    expect(projected.get('skill')?.display_data).toMatchObject({ duration_ms: 42 });
+  });
+
+  it('keeps live and finalized cancellation transcript dispositions equivalent', () => {
+    const cancelled: FinalizedToolRoundResult = {
+      tool_use_id: 'cancelled', outcome: { type: 'cancelled', message: 'Cancelled by user' }, duration_ms: 17,
+    };
+    const canonical = { tool_use_id: 'cancelled', content: 'Cancelled by user', is_error: false };
+    const activity = getToolActivity({ ...state, completed_results: [cancelled] });
+    const live = projectToolRound(owner, new Map(), activity).get('cancelled');
+    expect(live?.content).toEqual(canonical);
+    expect(live?.display_data).toMatchObject({ duration_ms: 17 });
+    const finalized: Message = { ...owner, message_id: 'canonical-tool-result', message_type: 'tool', content: canonical };
+    expect(projectToolRound(owner, new Map([['cancelled', finalized]]), activity).get('cancelled')).toBe(finalized);
+  });
+
 });

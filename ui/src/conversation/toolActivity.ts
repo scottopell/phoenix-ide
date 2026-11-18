@@ -29,6 +29,18 @@ export function ownsToolActivity(activity: ToolActivity | undefined, message: Me
   return activity !== undefined && activity.type !== 'none' && activity.assistantMessageId === message.message_id;
 }
 
+function transcriptOutput(outcome: FinalizedToolRoundResult['outcome']): string {
+  switch (outcome.type) {
+    case 'trusted_instructions':
+      return 'Authenticated built-in skill instructions were delivered for this live request.';
+    case 'cancelled':
+      return outcome.message;
+    case 'success':
+    case 'error':
+      return outcome.output;
+  }
+}
+
 export function projectToolRound(
   message: Message,
   results: ReadonlyMap<string, Message>,
@@ -45,8 +57,8 @@ export function projectToolRound(
       message_type: 'tool',
       content: {
         tool_use_id: result.tool_use_id,
-        content: outcome.type === 'cancelled' ? outcome.message : outcome.output,
-        is_error: outcome.type === 'error' || outcome.type === 'cancelled',
+        content: transcriptOutput(outcome),
+        is_error: outcome.type === 'error',
         ...('images' in outcome && outcome.images ? { images: outcome.images } : {}),
       },
       display_data: {
