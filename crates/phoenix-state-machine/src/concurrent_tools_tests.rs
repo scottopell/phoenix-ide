@@ -1,5 +1,5 @@
 use crate::state::{AssistantMessage, ToolCall, ToolInput};
-use crate::{transition, ConvContext, ConvState, Effect, Event};
+use crate::{transition, CheckpointData, ConvContext, ConvState, Effect, Event};
 use phoenix_core::domain::db_schema::ToolResult;
 use phoenix_core::domain::llm_types::ContentBlock;
 use std::path::PathBuf;
@@ -99,4 +99,87 @@ fn child_cancellation_waits_for_every_ordinary_sibling_before_notifying_parent()
         .effects
         .iter()
         .any(|effect| matches!(effect, Effect::NotifyParent { .. })));
+    let completed = transition(
+        &partial.new_state,
+        &context,
+        Event::ToolComplete {
+            tool_use_id: "fast".into(),
+            result: ToolResult::success("fast".into(), "ready before cancellation".into()),
+        },
+    )
+    .unwrap();
+    assert!(matches!(completed.new_state, ConvState::Failed { .. }));
+    assert_eq!(
+        completed
+            .effects
+            .iter()
+            .filter(|effect| matches!(effect, Effect::NotifyParent { .. }))
+            .count(),
+        1
+    );
+    assert!(
+        completed
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::PersistCheckpoint { .. })),
+        "child terminal notification must retain its complete sibling round"
+    );
+}
+
+#[test]
+fn final_cancellation_preserves_source_order_for_every_last_receipt_kind() {
+    let context = context();
+    let cancelling = transition(
+        &batch(),
+        &context,
+        Event::UserCancel {
+            reason: None,
+            cause: crate::event::CancelCause::UserRequested,
+        },
+    )
+    .unwrap();
+    let mut authentic = ToolResult::success("fast".into(), "authentic fast sibling".into());
+    authentic.duration_ms = Some(17);
+    let partial = transition(
+        &cancelling.new_state,
+        &context,
+        Event::ToolComplete {
+            tool_use_id: "fast".into(),
+            result: authentic.clone(),
+        },
+    )
+    .unwrap();
+    for last in [
+        Event::ToolAborted {
+            tool_use_id: "slow".into(),
+        },
+        Event::ToolComplete {
+            tool_use_id: "slow".into(),
+            result: ToolResult::error("slow".into(), "failed slow sibling".into()),
+        },
+        Event::ToolCancellationRetired {
+            tool_use_id: "slow".into(),
+        },
+    ] {
+        let settled = transition(&partial.new_state, &context, last).unwrap();
+        let round = settled
+            .effects
+            .iter()
+            .find_map(|effect| match effect {
+                Effect::PersistCheckpoint {
+                    data: CheckpointData::ToolRound(round),
+                } => Some(round),
+                _ => None,
+            })
+            .expect("the final member must checkpoint the complete round");
+        assert_eq!(
+            round
+                .results()
+                .iter()
+                .map(|result| result.tool_use_id())
+                .collect::<Vec<_>>(),
+            ["slow", "fast"]
+        );
+        assert_eq!(round.results()[1].finalized(), Some(&authentic));
+    }
 }
