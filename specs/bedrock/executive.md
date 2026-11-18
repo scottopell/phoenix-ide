@@ -34,8 +34,8 @@ isolation, and suppress the old checkpoint model tail while delivering queued
 instructions after cancellation. The same issued write and authority guard remain
 owned until classification; this is not a database latency guarantee. A real
 registered Bash overlap journey and expanded native provider fixtures also pass.
-Final owning/static/default qualification and independent full-range review are
-pending. Earlier serial-path test
+The expanded owning selection passes 479/479 with a fresh native fixture.
+Final static/default qualification and independent full-range review are pending. Earlier serial-path test
 receipts below do not qualify the concurrent candidate; no final source, hosted,
 browser, native-client or production acceptance is claimed here. Permission
 counters/escalation remain outside this boundary.
