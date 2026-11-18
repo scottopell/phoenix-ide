@@ -589,7 +589,7 @@ impl<S: Storage + Clone + 'static, L: LlmClient + 'static, T: ToolExecutor + 'st
                         .selection
                         .owns(self.tool_preparation_runtime, &self.state)
             })
-            .take(4_usize.saturating_sub(active))
+            .take(8_usize.saturating_sub(active))
             .map(|call| (Arc::clone(&call.selection), call.boundary))
             .collect();
         for (selection, boundary) in selections {

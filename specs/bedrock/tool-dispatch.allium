@@ -62,7 +62,7 @@ contract ForegroundToolDispatch {
         -- completed_results own accepted receipts. The batch owns affine
         -- preparation/execution resources and unaccepted outcomes only; it is
         -- not another semantic pending authority or durable queue. Serial owns
-        -- one generation/token/task; a batch retains at most four call owners
+        -- one generation/token/task; a batch retains at most eight call owners
         -- in preparing/running/ready/settling, including ready outcomes awaiting
         -- their owning commit. Unissued/no-read/retired proofs admit no execution.
         -- A generation is process-local; neither it nor a handle
@@ -114,7 +114,7 @@ entity ToolInvocation {
 }
 
 config {
-    ordinary_owner_limit: Integer = 4
+    ordinary_owner_limit: Integer = 8
 }
 
 -- These entities describe affine live resources, never persisted scheduling.
@@ -292,7 +292,9 @@ rule OwningCommitRetiresReceiptThenRefills {
 
     @guidance
         -- Establish the owning core-state commit before releasing resources or
-        -- reusing capacity. A rejected/unknown commit does not retire a receipt
+        -- reusing capacity. Refill each released slot from canonical unissued
+        -- membership without waiting for any other running sibling.
+        -- A rejected/unknown commit does not retire a receipt
         -- as successfully accepted. Closing prevents this refill from launching.
 }
 

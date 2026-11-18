@@ -2,7 +2,7 @@
 
 ## Requirements Summary
 
-Bedrock provides the core conversation state machine for PhoenixIDE. Users interact with an LLM agent through a reliable, predictable execution model: messages move through explicit idle, LLM, tool, cancellation, error, continuation, and approval states; ordinary foreground tools can overlap under a four-owner bound while lifecycle-containing responses remain serial; cancellation synthesizes tool results when needed to preserve transcript/API integrity; retryable versus non-retryable failures stay distinct; and committed transcript history survives restarts.
+Bedrock provides the core conversation state machine for PhoenixIDE. Users interact with an LLM agent through a reliable, predictable execution model: messages move through explicit idle, LLM, tool, cancellation, error, continuation, and approval states; ordinary foreground tools can overlap under a eight-owner bound while lifecycle-containing responses remain serial; cancellation synthesizes tool results when needed to preserve transcript/API integrity; retryable versus non-retryable failures stay distinct; and committed transcript history survives restarts.
 
 Current normative authority is `requirements.md` for timeless rules and `bedrock.allium` for precise lifecycle/state-machine behavior. Persisted provider prompts use one strict, generation-fenced database projection per current transcript member; continuation freezes that same authority before provider work. ADR-026 records lifecycle-versus-WorkScope ownership; ADR-031 records first-class ProductConversation persistence and its staged single-authority cutover; ADR-032 retires Project authority and leaves repository context derived through the attached WorkScope; ADR-036 records process fail-stop when local SQLite authority cannot be established.
 
@@ -18,7 +18,7 @@ permission checked-call authority, and native sub-agent admission. The source
 candidate has exclusive Serial/OrdinaryBatch ownership. The canonical core fields
 retain all unresolved calls and accepted receipts; per-call process-local owners
 retain preparation reads, checked payloads, tasks and one-shot outcomes through
-owning commit. At most four preparing/running/ready/settling ordinary owners are
+owning commit. At most eight preparing/running/ready/settling ordinary owners are
 retained. Lifecycle calls anywhere in the original response keep its whole source
 serial. The model chooses independence, including Bash and patch; there is no
 conflict inference or background execution feature.
@@ -197,7 +197,7 @@ Startup, completion, and child-backstop commands retain a mutable reborrow of th
 | **REQ-BED-001:** Pure State Transitions | ✅ Complete | Core state machine module in src/state_machine/transition.rs |
 | **REQ-BED-002:** User Message Handling | ✅ Complete | Rejects while busy, accepts from idle/error |
 | **REQ-BED-003:** LLM Response Processing | Qualification pending | Native multi-call identity/order retained; concurrent foreground source candidate is in progress |
-| **REQ-BED-004:** Tool Execution Coordination | Qualification pending | Four-owner ordinary source candidate, whole-response lifecycle serial policy, source-ordered complete barrier and per-call wait cutoffs are specified; final source tests and integration checks remain pending |
+| **REQ-BED-004:** Tool Execution Coordination | Qualification pending | Eight-owner ordinary source candidate, whole-response lifecycle serial policy, source-ordered complete barrier and per-call wait cutoffs are specified; final source tests and integration checks remain pending |
 | **REQ-BED-005:** Cancellation Handling | Qualification pending | Exact-source preparation and native admission contracts remain; concurrent typed-receipt snapshot, all-running signals and all-sibling drain require final candidate qualification |
 | **REQ-BED-005a:** Bounded Cancellation Liveness | Qualification pending | One absolute aggregate deadline and affirmative all-owner retirement precede forced settlement; existing child fan-in and forced-notice policy remain. Earlier serial coverage does not qualify the concurrent candidate |
 | **REQ-BED-006:** Error Recovery | ✅ Complete | Retry logic with exponential backoff and typed user-resume admission by ErrorKind |

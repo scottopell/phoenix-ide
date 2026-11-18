@@ -2,7 +2,7 @@
 
 The user authorized a current provider audit, an adversarially reviewed bounded design, implementation, and a separate PR through green CI. The verified implementation base is `9b8b33a3398605db9dbde0cb2de69fbf355d362c` on `codex/concurrent-tool-batches`.
 
-A native provider response containing only independent ordinary calls forms one foreground batch. The model chooses independence. Bash and patch may overlap under existing permissions and Work admission. No conflict detection, locks, dependency graph, external retry/replay, backgrounding, or new crash/exactly-once guarantee is included. Any lifecycle-owned special call keeps the whole response on the existing serial path. The initial per-conversation bound is four retained preparation/execution owners.
+A native provider response containing only independent ordinary calls forms one foreground batch. The model chooses independence. Bash and patch may overlap under existing permissions and Work admission. No conflict detection, locks, dependency graph, external retry/replay, backgrounding, or new crash/exactly-once guarantee is included. Any lifecycle-owned special call keeps the whole response on the existing serial path. The per-conversation bound is eight retained preparation/execution owners, refilled as individual results commit while other calls remain running.
 
 ## Reviewed design
 
@@ -22,7 +22,7 @@ The independent adversarial design review sealed v2 as workable after requiring 
 
 ## Acceptance and qualification
 
-- Deterministic held first call permits later siblings to start and finish; cap four and refill are exact.
+- Deterministic held first call permits later siblings to start and finish; cap eight and eager refill are exact.
 - Same-name distinct IDs, out-of-order success/error, complete pairing and one final model continuation.
 - Policy/scope/catalog cancellation, no pre-gate resources, no late launch or queued start after Cancel.
 - Typed ready result versus Cancel race, duplicate/stale/reused IDs, sender loss and exact source ownership.
@@ -34,6 +34,10 @@ The independent adversarial design review sealed v2 as workable after requiring 
 - Provider route request/normalization/history tests and truthful web/iOS multi-call activity/reconnect tests.
 
 Validation uses deterministic barriers, managed Python 3.13/dev.py helpers, Bash, original TMPDIR, workers four, CARGO_INCREMENTAL=0 and unique `/tmp/08500-*` logs. Focused/owning/static checks precede an immutable candidate, repeated independent full-range reviews and one explicit-base normal default check. The root coordinator owns remote PR/CI work. Implementation is present; this task remains in-progress pending final qualification and review.
+
+## Eight-owner window
+
+The user selected a cap increase from four to eight after the initial candidate was qualified. ADR-271 changes only the numeric bound; ADR-270 remains the historical initial decision. The same sliding window admits the ninth member of a ten-call response after a later sibling commits while the first source call remains held. Eight-active/two-unissued fixtures cover cooperative and forced cancellation, held reads/writes, known cancellation rejection and actual SQLite settlement rejection. Verification worker budget remains four. Earlier receipts below belong to the four-owner candidate; they are not eight-owner validation. Focused cap-eight, whole concurrent-tools module, applicable static checks, repeated full-range reviews and fresh hosted checks qualify this change without repeating the full broad run solely for the numeric bound.
 
 ## Evidence ledger
 
