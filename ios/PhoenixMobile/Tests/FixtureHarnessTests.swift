@@ -73,11 +73,11 @@ final class FixtureHarnessTests: XCTestCase {
     func testNormalFixtureUsesShippedToolExecutingPayloadShape() {
         let state = ConversationState.parse(FixtureScenario.scenario(for: .normal).screen.statePayload)
 
-        guard case .toolExecuting(let name, let remaining, let completed) = state else {
+        guard case .toolExecuting(let name, let pendingCount, let completed) = state else {
             return XCTFail("expected tool_executing state")
         }
         XCTAssertEqual(name, "bash")
-        XCTAssertEqual(remaining, 1)
+        XCTAssertEqual(pendingCount, 2)
         XCTAssertEqual(completed, 2)
     }
 
