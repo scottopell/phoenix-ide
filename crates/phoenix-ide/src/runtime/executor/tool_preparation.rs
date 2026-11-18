@@ -159,13 +159,7 @@ impl<S: Storage + Clone + 'static, L: LlmClient + 'static, T: ToolExecutor + 'st
         if current_tool != &tool {
             return Err("tool preparation does not own the selected call".into());
         }
-        let selection = Arc::new(DispatchSelection {
-            runtime: self.tool_preparation_runtime,
-            assistant_message: Arc::new(assistant_message.clone()),
-            tool,
-            context: self.context.clone(),
-            direct_turn: self.active_direct_turn.as_deref().cloned(),
-        });
+        let selection = self.own_serial_selection(&tool)?;
         let failure_boundary = self
             .required_settlement_authority
             .as_ref()
@@ -449,4 +443,4 @@ fn unavailable(tool: &ToolCall, message: &str) -> PreparedTool {
 mod tests;
 
 mod batch;
-pub(super) use batch::{ForegroundDispatch, SerialDispatch};
+pub(super) use batch::ForegroundDispatch;

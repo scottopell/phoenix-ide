@@ -206,3 +206,50 @@ async fn fast_sibling_commits_while_first_foreground_call_is_held() {
 async fn ordinary_sibling_error_preserves_peer_and_the_model_barrier() {
     held_first_actor_journey(true).await;
 }
+
+#[tokio::test]
+async fn completed_special_member_keeps_the_whole_source_round_serial() {
+    let directory = tempfile::tempdir().unwrap();
+    let (mut runtime, _, _, _) = runtime(directory.path(), false);
+    let calls: Vec<_> = ["first", "second"]
+        .into_iter()
+        .map(|id| {
+            ToolCall::new(
+                id,
+                ToolInput::from_name_and_value("bash", serde_json::json!({"op":"run", "cmd":id})),
+            )
+        })
+        .collect();
+    let source = crate::state_machine::AssistantMessage {
+        message_id: "mixed-source".into(),
+        content: vec![
+            ContentBlock::tool_use("native", "spawn_agents", serde_json::json!({"tasks":[]})),
+            ContentBlock::tool_use(
+                "first",
+                "bash",
+                serde_json::json!({"op":"run", "cmd":"first"}),
+            ),
+            ContentBlock::tool_use(
+                "second",
+                "bash",
+                serde_json::json!({"op":"run", "cmd":"second"}),
+            ),
+        ],
+        ..Default::default()
+    };
+    runtime.state = ConvState::ToolExecuting {
+        current_tool: calls[0].clone(),
+        remaining_tools: vec![calls[1].clone()],
+        completed_results: vec![ToolResult::success("native".into(), "no children".into()).into()],
+        assistant_message: source,
+        pending_sub_agents: vec![],
+    };
+    runtime.begin_tool_preparation(calls[0].clone()).unwrap();
+    assert!(
+        matches!(
+            runtime.foreground_dispatch,
+            tool_preparation::ForegroundDispatch::Serial(_)
+        ),
+        "a completed special call still determines the entire original response's serial policy"
+    );
+}

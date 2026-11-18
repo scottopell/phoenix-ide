@@ -3433,7 +3433,9 @@ impl ToolExecutor for ToolRegistryExecutor {
             .foreground_execution(name);
         registered.unwrap_or_else(|| {
             if self.mcp_manager.is_some()
-                && name.split_once("__").is_some_and(|(server, tool)| !server.is_empty() && !tool.is_empty())
+                && name
+                    .split_once("__")
+                    .is_some_and(|(server, tool)| !server.is_empty() && !tool.is_empty())
             {
                 crate::tools::ForegroundExecution::Concurrent
             } else {

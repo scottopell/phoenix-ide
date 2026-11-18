@@ -3377,7 +3377,6 @@ where
                     if self.tool_outcome_is_stale(generation) {
                         tracing::debug!(
                             outcome_generation = generation,
-                            current_generation = self.serial_dispatch().execution.generation(),
                             state = self.state.variant_name(),
                             "Ignoring stale tool outcome — task superseded (abort/new dispatch)"
                         );
@@ -3621,7 +3620,12 @@ where
     }
 
     fn tool_outcome_is_stale(&self, generation: u64) -> bool {
-        self.serial_dispatch().execution.is_stale(generation)
+        match &self.foreground_dispatch {
+            tool_preparation::ForegroundDispatch::Serial(serial) => {
+                serial.execution.is_stale(generation)
+            }
+            tool_preparation::ForegroundDispatch::OrdinaryBatch(_) => true,
+        }
     }
 
     /// Whether a forwarded `RetryTimeout` stamped with `generation` belongs to a
@@ -3836,6 +3840,7 @@ where
         } else {
             self.apply_transition_result(result).await?
         };
+        self.commit_foreground_membership();
         for event in generated_events.into_iter().rev() {
             self.event_tx
                 .send(event)
@@ -7183,7 +7188,6 @@ where
     }
 
     fn abort_external_effects_in_memory(&mut self) {
-        self.foreground_dispatch.abort();
         self.abort_active_llm_task();
         self.retry_generation = self.retry_generation.wrapping_add(1);
         if let Some(handle) = self.retry_timer_handle.take() {
@@ -7197,7 +7201,6 @@ where
     }
 
     async fn abort_external_effects(&mut self) {
-        self.foreground_dispatch.abort();
         self.abort_active_llm_task();
         self.retry_generation = self.retry_generation.wrapping_add(1);
         if let Some(handle) = self.retry_timer_handle.take() {
@@ -10119,6 +10122,7 @@ where
         match &mut self.foreground_dispatch {
             tool_preparation::ForegroundDispatch::Serial(serial) => {
                 serial.publication = Some(publication);
+                serial.running = Some(selection);
                 serial.execution.retain_task(tool_task);
                 tokio::spawn(forward_tool_outcome(
                     tool_rx,

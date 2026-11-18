@@ -10,6 +10,13 @@ pub(super) struct ToolExecutionSlot {
 }
 
 impl ToolExecutionSlot {
+    pub(super) fn after_generation(generation: u64) -> Self {
+        Self {
+            generation,
+            ..Self::default()
+        }
+    }
+
     pub(super) fn begin_dispatch(&mut self, cancel_token: CancellationToken) -> u64 {
         self.generation = self.generation.wrapping_add(1);
         self.cancel_token = Some(cancel_token);
