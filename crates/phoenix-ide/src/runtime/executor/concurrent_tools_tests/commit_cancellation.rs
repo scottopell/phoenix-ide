@@ -178,11 +178,14 @@ async fn addressed_cancel_interrupts_running_siblings_during_held_commit() {
 
 #[tokio::test]
 async fn cancellation_during_final_atomic_checkpoint_prevents_model_tail() {
-    let (runtime, mut starts, _directory) = prepared_batch(calls(2, "fast-command")).await;
+    let directory = tempfile::tempdir().unwrap();
+    let (runtime, events, mut starts, _) =
+        runtime_with_calls(directory.path(), false, calls(2, "fast-command"));
     let llm = Arc::clone(&runtime.llm_client);
     let storage = Arc::clone(&runtime.storage);
     let (write_entered, release_write) = storage.gate_tool_round_persist();
     let (manager, handle, actor, mut states) = register_actor(runtime).await;
+    send_user(&events).await;
     tokio::time::timeout(Duration::from_secs(60), write_entered)
         .await
         .unwrap()
@@ -196,7 +199,8 @@ async fn cancellation_during_final_atomic_checkpoint_prevents_model_tail() {
     deliver_cancel(manager.clone(), Route::Addressed)
         .await
         .unwrap();
-    assert!(llm.recorded_requests().is_empty());
+    assert_eq!(llm.recorded_requests().len(), 1);
+    assert_eq!(storage.capacity_plans.lock().unwrap().len(), 1);
     release_write.send(()).unwrap();
     tokio::time::timeout(
         Duration::from_secs(60),
@@ -208,6 +212,6 @@ async fn cancellation_during_final_atomic_checkpoint_prevents_model_tail() {
     handle.event_tx.send(Event::Shutdown).await.unwrap();
     actor.await.unwrap();
     manager.runtimes.write().await.remove("ordinary-batch");
-    assert!(llm.recorded_requests().is_empty(), "observed cancellation must precede RequestLlm after the actual atomic checkpoint, even when Batch ownership has retired");
-    assert_eq!(llm.frozen_request_count(), 0, "no model request may be frozen or launched before deferred cancellation, even if its task would be aborted before its first poll");
+    assert_eq!(llm.recorded_requests().len(), 1, "observed cancellation must precede the next provider request after the actual atomic checkpoint");
+    assert_eq!(storage.capacity_plans.lock().unwrap().len(), 1, "no second model request may be admitted, even if its task would be aborted before its first poll");
 }
