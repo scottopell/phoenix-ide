@@ -31067,6 +31067,22 @@ mod goal_report_cancellation_checkpoint_tests {
             },
         )
         .unwrap();
+        assert!(matches!(
+            settled.new_state,
+            ConvState::CancellingTool { .. }
+        ));
+        let settled = crate::state_machine::transition::transition(
+            &settled.new_state,
+            &context,
+            Event::ToolComplete {
+                tool_use_id: "skipped-report".into(),
+                result: ToolResult::cancelled(
+                    "skipped-report".into(),
+                    "Skipped due to cancellation",
+                ),
+            },
+        )
+        .unwrap();
         let selected_state = settled.new_state;
         if has_pending_sub_agents {
             assert!(matches!(
