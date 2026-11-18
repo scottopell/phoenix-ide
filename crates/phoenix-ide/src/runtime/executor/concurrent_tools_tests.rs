@@ -9,6 +9,7 @@ struct ControlledOrdinaryTools {
     started: mpsc::UnboundedSender<String>,
     release_first: Arc<Semaphore>,
     fail_fast: bool,
+    tokens: std::sync::Mutex<Vec<(String, CancellationToken)>>,
 }
 
 #[async_trait::async_trait]
@@ -24,9 +25,13 @@ impl ToolExecutor for ControlledOrdinaryTools {
     ) -> Option<ToolOutput> {
         let (name, input) = call.into_parts();
         assert_eq!(name, "bash");
-        let command = input["cmd"].as_str().unwrap();
+        let command = input["cmd"].as_str().unwrap_or("held-wait");
+        self.tokens
+            .lock()
+            .unwrap()
+            .push((command.into(), context.cancel.clone()));
         self.started.send(command.into()).unwrap();
-        if command == "slow-command" {
+        if matches!(command, "slow-command" | "held-wait") {
             tokio::select! {
                 () = context.cancel.cancelled() => return Some(ToolOutput::error("cancelled")),
                 permit = self.release_first.acquire() => permit.unwrap().forget(),
@@ -61,6 +66,34 @@ fn runtime(
     mpsc::UnboundedReceiver<String>,
     Arc<Semaphore>,
 ) {
+    runtime_with_calls(
+        directory,
+        fail_fast,
+        vec![
+            ContentBlock::tool_use(
+                "slow",
+                "bash",
+                serde_json::json!({"op":"run","cmd":"slow-command"}),
+            ),
+            ContentBlock::tool_use(
+                "fast",
+                "bash",
+                serde_json::json!({"op":"run","cmd":"fast-command"}),
+            ),
+        ],
+    )
+}
+
+fn runtime_with_calls(
+    directory: &std::path::Path,
+    fail_fast: bool,
+    calls: Vec<ContentBlock>,
+) -> (
+    BatchRuntime,
+    mpsc::Sender<Event>,
+    mpsc::UnboundedReceiver<String>,
+    Arc<Semaphore>,
+) {
     let (events, receiver) = mpsc::channel(16);
     let (started, observations) = mpsc::unbounded_channel();
     let release_first = Arc::new(Semaphore::new(0));
@@ -68,24 +101,11 @@ fn runtime(
         started,
         release_first: Arc::clone(&release_first),
         fail_fast,
+        tokens: std::sync::Mutex::default(),
     });
     let llm = Arc::new(MockLlmClient::new("test-model"));
     for (content, end_turn) in [
-        (
-            vec![
-                ContentBlock::tool_use(
-                    "slow",
-                    "bash",
-                    serde_json::json!({"op":"run","cmd":"slow-command"}),
-                ),
-                ContentBlock::tool_use(
-                    "fast",
-                    "bash",
-                    serde_json::json!({"op":"run","cmd":"fast-command"}),
-                ),
-            ],
-            false,
-        ),
+        (calls, false),
         (vec![ContentBlock::text("complete batch observed")], true),
     ] {
         llm.queue_response(LlmResponse {
@@ -252,4 +272,523 @@ async fn completed_special_member_keeps_the_whole_source_round_serial() {
         ),
         "a completed special call still determines the entire original response's serial policy"
     );
+}
+
+fn calls(count: usize, command: &str) -> Vec<ContentBlock> {
+    (0..count)
+        .map(|ordinal| {
+            ContentBlock::tool_use(
+                format!("call-{ordinal}"),
+                "bash",
+                serde_json::json!({"op":"run","cmd":command}),
+            )
+        })
+        .collect()
+}
+
+async fn send_user(events: &mpsc::Sender<Event>) {
+    events
+        .send(Event::UserMessage {
+            text: "independent foreground batch".into(),
+            llm_text: None,
+            images: vec![],
+            files: vec![],
+            message_id: "batch-input".into(),
+            user_agent: None,
+            skill_invocation: None,
+        })
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn cap_four_refills_only_after_a_sibling_commit() {
+    let directory = tempfile::tempdir().unwrap();
+    let (runtime, events, mut starts, release) =
+        runtime_with_calls(directory.path(), false, calls(6, "slow-command"));
+    let llm = Arc::clone(&runtime.llm_client);
+    let storage = Arc::clone(&runtime.storage);
+    let (state_tx, mut states) = watch::channel(ConvState::Idle);
+    let task = tokio::spawn(runtime.with_state_watcher(state_tx).run());
+    send_user(&events).await;
+    for _ in 0..4 {
+        tokio::time::timeout(Duration::from_secs(60), starts.recv())
+            .await
+            .unwrap()
+            .unwrap();
+    }
+    tokio::time::pause();
+    let extra = tokio::time::timeout(Duration::from_millis(100), starts.recv()).await;
+    tokio::time::resume();
+    release.add_permits(1);
+    tokio::time::timeout(Duration::from_secs(60), starts.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let before_release = llm.recorded_requests().len();
+    release.add_permits(5);
+    tokio::time::timeout(
+        Duration::from_secs(60),
+        states.wait_for(|state| matches!(state, ConvState::Idle)),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    events.send(Event::Shutdown).await.unwrap();
+    task.await.unwrap();
+    assert!(
+        extra.is_err(),
+        "unissued siblings cannot exceed four retained preparation/execution owners"
+    );
+    assert_eq!(before_release, 1);
+    assert_eq!(llm.recorded_requests().len(), 2);
+    let ids: Vec<_> = storage
+        .get_all_messages("ordinary-batch")
+        .into_iter()
+        .filter_map(|message| match message.content {
+            MessageContent::Tool(result) => Some(result.tool_use_id),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        ids,
+        (0..6)
+            .map(|ordinal| format!("call-{ordinal}"))
+            .collect::<Vec<_>>()
+    );
+}
+
+async fn prepared_batch(
+    content: Vec<ContentBlock>,
+) -> (
+    BatchRuntime,
+    mpsc::UnboundedReceiver<String>,
+    tempfile::TempDir,
+) {
+    let directory = tempfile::tempdir().unwrap();
+    let (mut runtime, _, starts, _) = runtime_with_calls(directory.path(), false, content.clone());
+    runtime.storage.seed_tool_admission_policy(
+        "ordinary-batch",
+        phoenix_core::domain::tool_availability::ToolAvailability::all(
+            runtime.tool_executor.definitions().await,
+        ),
+    );
+    let mut calls = content
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::ToolUse { id, name, input } => Some(ToolCall::new(
+                id,
+                ToolInput::from_name_and_value(name, input.clone()),
+            )),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let current_tool = calls.remove(0);
+    runtime.state = ConvState::ToolExecuting {
+        current_tool: current_tool.clone(),
+        remaining_tools: calls,
+        completed_results: vec![],
+        pending_sub_agents: vec![],
+        assistant_message: crate::state_machine::AssistantMessage::new(
+            "direct-batch-source".into(),
+            content,
+            None,
+            None,
+        ),
+    };
+    runtime.begin_tool_preparation(current_tool).unwrap();
+    (runtime, starts, directory)
+}
+
+async fn launch_preparations(runtime: &mut BatchRuntime, count: usize) {
+    for _ in 0..count {
+        let observation = runtime.foreground_dispatch.observe().await;
+        assert!(runtime
+            .accept_foreground_observation(observation)
+            .await
+            .unwrap()
+            .is_none());
+    }
+}
+
+async fn drain_cancelled_batch(runtime: &mut BatchRuntime) {
+    while !matches!(runtime.state, ConvState::Idle) {
+        let observation = tokio::time::timeout(
+            Duration::from_secs(60),
+            runtime.foreground_dispatch.observe(),
+        )
+        .await
+        .unwrap();
+        if let Some(event) = runtime
+            .accept_foreground_observation(observation)
+            .await
+            .unwrap()
+        {
+            runtime.process_event(event).await.unwrap();
+        }
+    }
+}
+
+fn user_cancel() -> Event {
+    Event::UserCancel {
+        reason: None,
+        cause: crate::state_machine::event::CancelCause::UserRequested,
+    }
+}
+
+#[tokio::test]
+async fn ready_typed_outcome_survives_when_cancel_is_selected_first() {
+    let content = vec![
+        ContentBlock::tool_use(
+            "slow",
+            "bash",
+            serde_json::json!({"op":"run","cmd":"slow-command"}),
+        ),
+        ContentBlock::tool_use(
+            "fast",
+            "bash",
+            serde_json::json!({"op":"run","cmd":"fast-command"}),
+        ),
+    ];
+    let (mut runtime, mut starts, _directory) = prepared_batch(content).await;
+    launch_preparations(&mut runtime, 2).await;
+    for _ in 0..2 {
+        starts.recv().await.unwrap();
+    }
+    runtime.join_batch_call_for_test("fast").await;
+    runtime.process_event(user_cancel()).await.unwrap();
+    drain_cancelled_batch(&mut runtime).await;
+    let tokens = runtime.tool_executor.tokens.lock().unwrap();
+    assert!(tokens
+        .iter()
+        .find(|(name, _)| name == "slow-command")
+        .unwrap()
+        .1
+        .is_cancelled());
+    assert!(
+        !tokens
+            .iter()
+            .find(|(name, _)| name == "fast-command")
+            .unwrap()
+            .1
+            .is_cancelled(),
+        "accepting an already completed receipt must not cancel its returned handle"
+    );
+    let messages = runtime.storage.get_all_messages("ordinary-batch");
+    let results: Vec<_> = messages
+        .iter()
+        .filter_map(|message| match &message.content {
+            MessageContent::Tool(result) => Some(result),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        results
+            .iter()
+            .map(|result| result.tool_use_id.as_str())
+            .collect::<Vec<_>>(),
+        ["slow", "fast"]
+    );
+    assert!(results[0].is_error);
+    assert!(!results[1].is_error);
+    assert!(results[1].content.contains("completed fast-command"));
+    assert!(results[1].duration_ms.is_some());
+    assert!(runtime.llm_client.recorded_requests().is_empty());
+    assert!(messages.iter().all(|message| !matches!(&message.content, MessageContent::System(text) if text.contains("Cancellation completed"))));
+}
+
+#[tokio::test]
+async fn nonrepresentative_wait_keeps_its_cutoff_and_retires_only_its_task() {
+    let content = vec![
+        ContentBlock::tool_use(
+            "slow",
+            "bash",
+            serde_json::json!({"op":"run","cmd":"slow-command"}),
+        ),
+        ContentBlock::tool_use(
+            "wait",
+            "bash",
+            serde_json::json!({"op":"wait","handle":"separate-process", "wait_seconds":0}),
+        ),
+        ContentBlock::tool_use(
+            "fast",
+            "bash",
+            serde_json::json!({"op":"run","cmd":"fast-command"}),
+        ),
+    ];
+    let (mut runtime, mut starts, _directory) = prepared_batch(content).await;
+    launch_preparations(&mut runtime, 3).await;
+    for _ in 0..3 {
+        starts.recv().await.unwrap();
+    }
+    runtime.join_batch_call_for_test("fast").await;
+    let cutoff = runtime.foreground_dispatch.batch_deadline().unwrap();
+    let observation = runtime.foreground_dispatch.observe().await;
+    let event = runtime
+        .accept_foreground_observation(observation)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        runtime.bash_wait_transition_remaining(&runtime.state),
+        None,
+        "a sibling receipt cannot inherit the wait's cutoff"
+    );
+    runtime.process_event(event).await.unwrap();
+    assert_eq!(runtime.foreground_dispatch.batch_deadline(), Some(cutoff));
+    assert_eq!(runtime.deadline, None);
+    tokio::time::pause();
+    tokio::time::advance(cutoff.saturating_duration_since(tokio::time::Instant::now())).await;
+    runtime.expire_batch_waits().await.unwrap();
+    tokio::time::resume();
+    assert!(runtime.foreground_dispatch.batch_deadline().is_none());
+    {
+        let tokens = runtime.tool_executor.tokens.lock().unwrap();
+        assert!(
+            tokens.iter().all(|(_, token)| !token.is_cancelled()),
+            "task-only wait timeout cannot cancel either process/controller token"
+        );
+    }
+    let ConvState::ToolExecuting {
+        completed_results, ..
+    } = &runtime.state
+    else {
+        panic!("slow call remains owned")
+    };
+    assert!(completed_results
+        .iter()
+        .any(|result| result.tool_use_id() == "wait"));
+    runtime.process_event(user_cancel()).await.unwrap();
+    drain_cancelled_batch(&mut runtime).await;
+}
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[tokio::test]
+async fn registered_bash_fast_sibling_finishes_before_held_foreground_call() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    const CONVERSATION: &str = "registered-bash-batch";
+    const GUARD: Duration = Duration::from_secs(60);
+    let executable = std::path::PathBuf::from(
+        std::env::var_os("PHOENIX_BASH_LAUNCH_TEST_EXE")
+            .expect("run with dev.py's built native Bash launcher fixture"),
+    );
+    assert!(executable.is_absolute() && executable.is_file());
+    let directory = tempfile::tempdir().unwrap();
+    let fifo = |name: &str| {
+        let path = directory.path().join(name);
+        nix::unistd::mkfifo(
+            &path,
+            nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+        )
+        .unwrap();
+        let receiver = tokio::net::unix::pipe::OpenOptions::new()
+            .open_receiver(&path)
+            .unwrap();
+        // The keeper prevents EOF before the child opens its writer.
+        let sender = tokio::net::unix::pipe::OpenOptions::new()
+            .open_sender(&path)
+            .unwrap();
+        (receiver, sender)
+    };
+    let (mut held_started, _held_start_keeper) = fifo("held-started");
+    let (mut fast_finished, _fast_finish_keeper) = fifo("fast-finished");
+    let (_release_receiver, mut release_held) = fifo("release-held");
+
+    let registry = crate::tools::ToolRegistry::direct(vec![]);
+    let storage = Arc::new(InMemoryStorage::new());
+    storage.seed_tool_admission_policy(
+        CONVERSATION,
+        phoenix_core::domain::tool_availability::ToolAvailability::all(registry.definitions()),
+    );
+    let tools = crate::runtime::traits::ToolRegistryExecutor::builtin_only(registry, Arc::from([]));
+    let handles = Arc::new(crate::tools::BashHandleRegistry::new());
+    let llm = Arc::new(MockLlmClient::new("test-model"));
+    for (content, end_turn) in [
+        (
+            vec![
+                ContentBlock::tool_use(
+                    "held",
+                    "bash",
+                    serde_json::json!({
+                        "op":"run",
+                        "cmd":"printf h > held-started; IFS= read -r release < release-held || exit 97; printf 'held-result\\n'",
+                        "wait_seconds":900,
+                        "label":"held-first"
+                    }),
+                ),
+                ContentBlock::tool_use(
+                    "fast",
+                    "bash",
+                    serde_json::json!({
+                        "op":"run",
+                        "cmd":"printf 'fast-result\\n'; printf f > fast-finished",
+                        "wait_seconds":900,
+                        "label":"independent-fast"
+                    }),
+                ),
+            ],
+            false,
+        ),
+        (vec![ContentBlock::text("complete batch observed")], true),
+    ] {
+        llm.queue_response(LlmResponse {
+            provider_replay: None,
+            content,
+            end_turn,
+            usage: Usage::default(),
+            usage_observation: phoenix_core::domain::llm_types::UsageObservation::default(),
+            stream_telemetry: phoenix_llm::ProviderStreamTelemetry::non_streaming(),
+        });
+    }
+    let (events, receiver) = mpsc::channel(16);
+    let (state_tx, mut states) = watch::channel(ConvState::Idle);
+    let runtime = ConversationRuntime::new(
+        ConvContext::new(
+            CONVERSATION,
+            directory.path().to_path_buf(),
+            "test-model",
+            200_000,
+            16_384,
+        ),
+        ConvState::Idle,
+        Arc::clone(&storage),
+        Arc::clone(&llm),
+        tools,
+        Arc::new(BrowserSessionManager::default()),
+        Arc::clone(&handles),
+        Arc::new(crate::tools::TmuxRegistry::new()),
+        Arc::new(ModelRegistry::new_empty()),
+        crate::terminal::ActiveTerminals::new(),
+        receiver,
+        events.clone(),
+        SseBroadcaster::new(128, 0),
+    );
+    let mut actor = tokio::spawn(runtime.with_state_watcher(state_tx).run());
+    events
+        .send(Event::UserMessage {
+            text: "run the two independent commands".into(),
+            llm_text: None,
+            images: vec![],
+            files: vec![],
+            message_id: "registered-bash-input".into(),
+            user_agent: None,
+            skill_invocation: None,
+        })
+        .await
+        .unwrap();
+
+    // Capture observations without asserting until after release: the old
+    // serial implementation must also release its held native child on failure.
+    let before_release = tokio::time::timeout(GUARD, async {
+        let mut started = [0];
+        held_started
+            .read_exact(&mut started)
+            .await
+            .map_err(|error| error.to_string())?;
+        let mut finished = [0];
+        fast_finished
+            .read_exact(&mut finished)
+            .await
+            .map_err(|error| error.to_string())?;
+        let partial = states
+            .wait_for(|state| {
+                matches!(state, ConvState::ToolExecuting { completed_results, .. }
+                    if completed_results.iter().any(|result| result.tool_use_id() == "fast"))
+            })
+            .await
+            .map_err(|error| error.to_string())?
+            .clone();
+        Ok::<_, String>((
+            started,
+            finished,
+            partial,
+            llm.recorded_requests().len(),
+            handles.snapshot_live_pgids().await.len(),
+        ))
+    })
+    .await;
+
+    release_held.write_all(b"release\n").await.unwrap();
+    let idle = tokio::time::timeout(
+        GUARD,
+        states.wait_for(|state| matches!(state, ConvState::Idle)),
+    )
+    .await
+    .map(|result| result.map(|_| ()));
+    let _ = events.send(Event::Shutdown).await;
+    let stopped = tokio::time::timeout(GUARD, &mut actor).await;
+    if stopped.is_err() {
+        actor.abort();
+    }
+
+    let (started, finished, partial, requests_while_held, live_while_held) = before_release
+        .expect("fast registered Bash sibling must complete while first command is FIFO-held")
+        .expect("native markers and state observer must remain available");
+    idle.expect("released batch must reach Idle")
+        .expect("state watcher must remain available until shutdown");
+    assert_eq!(
+        stopped.expect("actor shutdown must complete").unwrap(),
+        RuntimeExitDisposition::CoordinatedShutdown
+    );
+    assert_eq!(started, *b"h");
+    assert_eq!(finished, *b"f");
+    let ConvState::ToolExecuting {
+        completed_results, ..
+    } = partial
+    else {
+        panic!("held first command keeps this batch open");
+    };
+    assert_eq!(
+        completed_results
+            .iter()
+            .map(|result| result.tool_use_id())
+            .collect::<Vec<_>>(),
+        ["fast"]
+    );
+    assert_eq!(requests_while_held, 1, "model must await the full batch");
+    assert_eq!(live_while_held, 1, "held command must remain alive");
+    assert!(handles.snapshot_live_pgids().await.is_empty());
+
+    let messages = storage.get_all_messages(CONVERSATION);
+    let results: Vec<_> = messages
+        .iter()
+        .filter_map(|message| match &message.content {
+            MessageContent::Tool(result) => Some(result),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        results
+            .iter()
+            .map(|result| result.tool_use_id.as_str())
+            .collect::<Vec<_>>(),
+        ["held", "fast"]
+    );
+    for (result, (expected_output, label)) in results.iter().zip([
+        ("held-result", "held-first"),
+        ("fast-result", "independent-fast"),
+    ]) {
+        assert!(!result.is_error);
+        let output: serde_json::Value = serde_json::from_str(&result.content).unwrap();
+        assert_eq!(output["status"], "exited");
+        assert_eq!(output["exit_code"], 0);
+        assert_eq!(output["label"], label);
+        assert!(result.content.contains(expected_output));
+    }
+    let requests = llm.recorded_requests();
+    assert_eq!(requests.len(), 2);
+    let model_results: Vec<_> = requests[1]
+        .messages
+        .iter()
+        .flat_map(|message| &message.content)
+        .filter_map(|block| match block {
+            ContentBlock::ToolResult {
+                tool_use_id,
+                is_error,
+                ..
+            } => Some((tool_use_id.as_str(), *is_error)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(model_results, [("held", false), ("fast", false)]);
 }
