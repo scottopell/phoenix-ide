@@ -10,7 +10,7 @@ pub(in super::super) struct SerialDispatch {
     pub(in super::super) preparation: Option<ToolPreparation>,
     pub(in super::super) execution: ToolExecutionSlot,
     pub(in super::super) publication: Option<Arc<()>>,
-    pub(super) running: Option<Arc<DispatchSelection>>,
+    pub(in super::super) running: Option<Arc<DispatchSelection>>,
     pub(super) round: Option<SerialRound>,
 }
 
@@ -168,9 +168,10 @@ impl OrdinaryBatch {
                     match execution.receiver.try_recv() {
                         Ok(outcome) => {
                             let old = std::mem::replace(&mut call.phase, CallPhase::Retired);
-                            let CallPhase::Running(execution) = old else {
+                            let CallPhase::Running(mut execution) = old else {
                                 unreachable!()
                             };
+                            execution.cancel_on_drop = false;
                             call.phase = CallPhase::Ready {
                                 outcome,
                                 execution: Some(execution),
@@ -179,9 +180,10 @@ impl OrdinaryBatch {
                         Err(oneshot::error::TryRecvError::Closed) => {
                             let outcome = dropped_outcome(&call.selection.tool.id);
                             let old = std::mem::replace(&mut call.phase, CallPhase::Retired);
-                            let CallPhase::Running(execution) = old else {
+                            let CallPhase::Running(mut execution) = old else {
                                 unreachable!()
                             };
+                            execution.cancel_on_drop = false;
                             call.phase = CallPhase::Ready {
                                 outcome,
                                 execution: Some(execution),
@@ -649,9 +651,10 @@ impl<S: Storage + Clone + 'static, L: LlmClient + 'static, T: ToolExecutor + 'st
             ForegroundObservation::Outcome { outcome, .. } => {
                 if matches!(call.phase, CallPhase::Running(_)) {
                     let old = std::mem::replace(&mut call.phase, CallPhase::Retired);
-                    let CallPhase::Running(execution) = old else {
+                    let CallPhase::Running(mut execution) = old else {
                         unreachable!()
                     };
+                    execution.cancel_on_drop = false;
                     call.phase = CallPhase::Settling(Some(execution));
                 } else if !matches!(call.phase, CallPhase::Settling(_)) {
                     return Ok(None);

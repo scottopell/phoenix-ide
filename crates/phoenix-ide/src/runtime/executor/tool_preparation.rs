@@ -148,12 +148,7 @@ impl<S: Storage + Clone + 'static, L: LlmClient + 'static, T: ToolExecutor + 'st
         if self.begin_ordinary_batch(&tool)? {
             return Ok(None);
         }
-        let ConvState::ToolExecuting {
-            current_tool,
-            assistant_message,
-            ..
-        } = &self.state
-        else {
+        let ConvState::ToolExecuting { current_tool, .. } = &self.state else {
             return Err("tool preparation outside executing state".into());
         };
         if current_tool != &tool {

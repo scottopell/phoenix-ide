@@ -3257,6 +3257,7 @@ where
                 .map(|retry| retry.retry_at);
             // Copy deadline before select to avoid borrow conflict
             let deadline = self.deadline;
+            let batch_deadline = self.foreground_dispatch.batch_deadline();
             let awaiting_recovery = matches!(self.state, ConvState::AwaitingRecovery { .. });
 
             tokio::select! {
@@ -3374,6 +3375,16 @@ where
                         );
                         self.emit_terminal_lifecycle_event().await;
                         return RuntimeExitDisposition::Terminal;
+                    }
+                }
+                () = async {
+                    match batch_deadline {
+                        Some(deadline) => tokio::time::sleep_until(deadline).await,
+                        None => std::future::pending().await,
+                    }
+                }, if batch_deadline.is_some() => {
+                    if let Err(error) = self.expire_batch_waits().await {
+                        tracing::error!(%error, "batch wait deadline settlement failed");
                     }
                 }
                 observation = self.foreground_dispatch.observe() => {
@@ -6222,6 +6233,13 @@ where
     }
 
     fn bash_wait_transition_remaining(&self, next_state: &ConvState) -> Option<Duration> {
+        if matches!(
+            self.foreground_dispatch,
+            tool_preparation::ForegroundDispatch::OrdinaryBatch(_)
+        ) {
+            return self.foreground_dispatch.batch_settlement_remaining();
+        }
+
         let current_is_bash_wait = Self::deadline_for(&self.state).is_some()
             && matches!(self.state, ConvState::ToolExecuting { .. });
         let (state, entered_at) = if current_is_bash_wait {
@@ -6276,6 +6294,14 @@ where
                     phoenix_core::domain::bash_types::BashInvocation::Wait { .. }
                 )) && old_state != &self.state
         );
+        if matches!(
+            self.foreground_dispatch,
+            tool_preparation::ForegroundDispatch::OrdinaryBatch(_)
+        ) && matches!(self.state, ConvState::ToolExecuting { .. })
+        {
+            self.deadline = None;
+            return;
+        }
         let now = Utc::now();
         let remaining = overload_recovery_deadline_for(&self.state, now).or_else(|| {
             Self::scheduler_deadline_for(&self.state).map(|duration| {
@@ -6573,6 +6599,13 @@ where
 
     /// Retire the selected tool after its cancellation deadline expires.
     async fn handle_cancelling_tool_timeout(&mut self) {
+        let batch = match self.drain_ready_before_forced_retirement().await {
+            Ok(batch) => batch,
+            Err(error) => {
+                tracing::error!(%error, "failed to drain ready batch receipts at cancellation cutoff");
+                return;
+            }
+        };
         let tool_use_id = if let ConvState::CancellingTool { tool_use_id, .. } = &self.state {
             tool_use_id.clone()
         } else {
@@ -6601,9 +6634,11 @@ where
         // Bump the tool generation so the aborted task's forwarded outcome is
         // stale and discarded by the select loop rather than applied to a later
         // round that may reuse the same `tool_use_id`.
-        self.serial_dispatch_mut()
-            .execution
-            .abort_task_and_invalidate();
+        if !batch {
+            self.serial_dispatch_mut()
+                .execution
+                .abort_task_and_invalidate();
+        }
 
         if let Err(e) = self
             .process_event(Event::ToolCancellationRetired { tool_use_id })
