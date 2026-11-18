@@ -47,6 +47,7 @@ struct BatchCall {
 
 enum CallPhase {
     Unissued,
+    Cleared,
     Preparing(ToolPreparation),
     Running(RunningCall),
     Ready {
@@ -195,7 +196,7 @@ impl OrdinaryBatch {
                 CallPhase::Preparing(preparation) => {
                     preparation.phase = PreparationPhase::Interrupted
                 }
-                CallPhase::Unissued | CallPhase::NoRead => {
+                CallPhase::Unissued | CallPhase::Cleared | CallPhase::NoRead => {
                     call.phase = CallPhase::Ready {
                         outcome: ToolExecOutcome::Completed(ToolResult::cancelled(
                             call.selection.tool.id.clone(),
@@ -250,6 +251,7 @@ impl OrdinaryBatch {
                         })
                     }
                     CallPhase::Unissued
+                    | CallPhase::Cleared
                     | CallPhase::Settling(_)
                     | CallPhase::Retired
                     | CallPhase::NoRead => None,
@@ -276,7 +278,7 @@ impl OrdinaryBatch {
             .iter_mut()
             .find(|call| Arc::ptr_eq(&call.selection, &selection))
             .expect("only the gate-cleared owned call can launch");
-        assert!(matches!(call.phase, CallPhase::Preparing(_)));
+        assert!(matches!(call.phase, CallPhase::Cleared));
         call.phase = CallPhase::Running(RunningCall {
             cancel,
             task,
@@ -635,6 +637,7 @@ impl<S: Storage + Clone + 'static, L: LlmClient + 'static, T: ToolExecutor + 'st
                         Ok(Some(*event))
                     }
                     PreparationDisposition::Ready(Ok(PreparedTool::Ordinary(cleared))) => {
+                        call.phase = CallPhase::Cleared;
                         let mut admitted = self.admit_authoritative_effect()?;
                         self.launch_cleared_tool(
                             CurrentSelection(selection),
