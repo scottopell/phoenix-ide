@@ -27,7 +27,15 @@ The normative alignment covers source-ordered complete-round checkpoints,
 independent sibling errors, exact full-source ownership, cancellation snapshots
 before signals, all-owner drain and retirement, child Failed + NotifyParent,
 per-call Bash-wait cutoffs and existing startup interruption materialization.
-Implementation and final qualification are in progress. Earlier serial-path test
+Five deterministic held-write actor probes pass on the bounded cancellation
+inbox/retirement slice: both actual routes interrupt resources and retire tasks
+before write release, preserve the original cutoff/forced notice and wait-token
+isolation, and suppress the old checkpoint model tail while delivering queued
+instructions after cancellation. The same issued write and authority guard remain
+owned until classification; this is not a database latency guarantee. A real
+registered Bash overlap journey and expanded native provider fixtures also pass.
+Final owning/static/default qualification and independent full-range review are
+pending. Earlier serial-path test
 receipts below do not qualify the concurrent candidate; no final source, hosted,
 browser, native-client or production acceptance is claimed here. Permission
 counters/escalation remain outside this boundary.

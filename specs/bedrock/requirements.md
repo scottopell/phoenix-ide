@@ -266,6 +266,10 @@ AND SHALL continue the same conversation without rerunning the waited command or
 THE SYSTEM SHALL bind each selected Bash `wait` invocation to its own absolute execution and persistence cutoffs
 AND SHALL NOT renew or replace them because another sibling progresses or becomes the representative unresolved call.
 
+WHEN another sibling's owning write remains outstanding as a Bash wait execution cutoff expires
+THE SYSTEM SHALL retire only the expired wait task and retain its concrete receipt and original persistence cutoff
+AND SHALL NOT apply that wait's cutoff to the other sibling's issued write.
+
 WHEN that authoritative settlement remains indeterminate at its original absolute persistence cutoff
 THE SYSTEM SHALL apply the process-wide local-authority fail-stop behavior in REQ-BED-033
 AND MAY record no tool result
@@ -300,6 +304,15 @@ THE SYSTEM SHALL snapshot typed outcomes already available to their owning recei
 AND SHALL preserve their authentic completed payloads
 AND SHALL signal every running sibling before waiting for cancellation persistence.
 
+WHEN an ordinary sibling's state or complete-round checkpoint write is outstanding
+THE SYSTEM SHALL continue observing cancellation and interrupting other admitted resources within the cancellation window
+AND SHALL retain that exact issued write until its authority is classified
+AND SHALL apply the retained cancellation before any subsequent ordinary launch, refill or model request.
+
+WHEN cancellation is observed before a selected steering drain commits
+THE SYSTEM SHALL retain the undelivered instructions for the existing cancellation-boundary steering policy
+AND SHALL NOT consume them as an abandoned ordinary-round continuation.
+
 WHEN an ordinary tool return has not yet become a typed outcome before cancellation
 THE SYSTEM SHALL retain the tool executor's cancellation classification.
 
@@ -331,6 +344,11 @@ WHEN cancellation is requested during tool execution
 THE SYSTEM SHALL establish one absolute deadline for the aggregate foreground drain
 AND SHALL NOT renew that deadline when a sibling progresses
 AND SHALL retain each preparation, execution or ready-outcome owner until its owning state commit establishes settlement or its resources are affirmatively retired.
+
+WHEN the aggregate cancellation deadline expires while an owning persistence command remains outstanding
+THE SYSTEM SHALL snapshot available typed receipts again before retiring remaining running resources
+AND SHALL retain affirmative forced-retirement evidence through the later safe settlement boundary
+AND SHALL NOT retire the issued write, renew the deadline, or acknowledge semantic cancellation before its authority is classified.
 
 WHEN every foreground owner settles within the cooperative window (REQ-BED-005, within 100ms)
 THE SYSTEM SHALL preserve authentic retained outcomes and pair all other calls with cancellation results
