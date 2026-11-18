@@ -51,7 +51,14 @@ fn restart_orders_out_of_order_sibling_results_by_source_identity() {
         .iter()
         .map(|message| match &message.content {
             MessageContent::Tool(content) => content,
-            _ => panic!("materialization must produce paired tool results"),
+            MessageContent::User(_)
+            | MessageContent::Agent(_)
+            | MessageContent::System(_)
+            | MessageContent::Error(_)
+            | MessageContent::Continuation(_)
+            | MessageContent::Skill(_) => {
+                panic!("materialization must produce paired tool results")
+            }
         })
         .collect();
     assert_eq!(
