@@ -482,7 +482,6 @@ async fn launch_preparations(runtime: &mut BatchRuntime, count: usize) {
         let observation = runtime.foreground_dispatch.observe().await;
         assert!(runtime
             .accept_foreground_observation(observation)
-            .await
             .unwrap()
             .is_none());
     }
@@ -496,11 +495,7 @@ async fn drain_cancelled_batch(runtime: &mut BatchRuntime) {
         )
         .await
         .unwrap();
-        if let Some(event) = runtime
-            .accept_foreground_observation(observation)
-            .await
-            .unwrap()
-        {
+        if let Some(event) = runtime.accept_foreground_observation(observation).unwrap() {
             runtime.process_event(event).await.unwrap();
         }
     }
@@ -537,11 +532,7 @@ async fn ready_typed_outcome_survives_when_cancel_is_selected_first() {
     let mut observed_slow_cancellation = false;
     while !matches!(runtime.state, ConvState::Idle) {
         let observation = runtime.foreground_dispatch.observe().await;
-        if let Some(event) = runtime
-            .accept_foreground_observation(observation)
-            .await
-            .unwrap()
-        {
+        if let Some(event) = runtime.accept_foreground_observation(observation).unwrap() {
             observed_slow_cancellation |=
                 matches!(&event, Event::ToolAborted { tool_use_id } if tool_use_id == "slow");
             runtime.process_event(event).await.unwrap();
@@ -624,7 +615,6 @@ async fn nonrepresentative_wait_keeps_its_cutoff_and_retires_only_its_task() {
     let observation = runtime.foreground_dispatch.observe().await;
     let event = runtime
         .accept_foreground_observation(observation)
-        .await
         .unwrap()
         .unwrap();
     assert_eq!(
@@ -658,237 +648,6 @@ async fn nonrepresentative_wait_keeps_its_cutoff_and_retires_only_its_task() {
         .any(|result| result.tool_use_id() == "wait"));
     runtime.process_event(user_cancel()).await.unwrap();
     drain_cancelled_batch(&mut runtime).await;
-}
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-#[tokio::test]
-async fn registered_bash_fast_sibling_finishes_before_held_foreground_call() {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-    const CONVERSATION: &str = "registered-bash-batch";
-    const GUARD: Duration = Duration::from_secs(60);
-    let executable = std::path::PathBuf::from(
-        std::env::var_os("PHOENIX_BASH_LAUNCH_TEST_EXE")
-            .expect("run with dev.py's built native Bash launcher fixture"),
-    );
-    assert!(executable.is_absolute() && executable.is_file());
-    let directory = tempfile::tempdir().unwrap();
-    let fifo = |name: &str| {
-        let path = directory.path().join(name);
-        nix::unistd::mkfifo(
-            &path,
-            nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
-        )
-        .unwrap();
-        let receiver = tokio::net::unix::pipe::OpenOptions::new()
-            .open_receiver(&path)
-            .unwrap();
-        // The keeper prevents EOF before the child opens its writer.
-        let sender = tokio::net::unix::pipe::OpenOptions::new()
-            .open_sender(&path)
-            .unwrap();
-        (receiver, sender)
-    };
-    let (mut held_started, _held_start_keeper) = fifo("held-started");
-    let (mut fast_finished, _fast_finish_keeper) = fifo("fast-finished");
-    let (_release_receiver, mut release_held) = fifo("release-held");
-
-    let registry = crate::tools::ToolRegistry::direct(vec![]);
-    let storage = Arc::new(InMemoryStorage::new());
-    storage.seed_tool_admission_policy(
-        CONVERSATION,
-        phoenix_core::domain::tool_availability::ToolAvailability::all(registry.definitions()),
-    );
-    let tools = crate::runtime::traits::ToolRegistryExecutor::builtin_only(registry, Arc::from([]));
-    let handles = Arc::new(crate::tools::BashHandleRegistry::new());
-    let llm = Arc::new(MockLlmClient::new("test-model"));
-    for (content, end_turn) in [
-        (
-            vec![
-                ContentBlock::tool_use(
-                    "held",
-                    "bash",
-                    serde_json::json!({
-                        "op":"run",
-                        "cmd":"printf h > held-started; IFS= read -r release < release-held || exit 97; printf 'held-result\\n'",
-                        "wait_seconds":900,
-                        "label":"held-first"
-                    }),
-                ),
-                ContentBlock::tool_use(
-                    "fast",
-                    "bash",
-                    serde_json::json!({
-                        "op":"run",
-                        "cmd":"printf 'fast-result\\n'; printf f > fast-finished",
-                        "wait_seconds":900,
-                        "label":"independent-fast"
-                    }),
-                ),
-            ],
-            false,
-        ),
-        (vec![ContentBlock::text("complete batch observed")], true),
-    ] {
-        llm.queue_response(LlmResponse {
-            provider_replay: None,
-            content,
-            end_turn,
-            usage: Usage::default(),
-            usage_observation: phoenix_core::domain::llm_types::UsageObservation::default(),
-            stream_telemetry: phoenix_llm::ProviderStreamTelemetry::non_streaming(),
-        });
-    }
-    let (events, receiver) = mpsc::channel(16);
-    let (state_tx, mut states) = watch::channel(ConvState::Idle);
-    let runtime = ConversationRuntime::new(
-        ConvContext::new(
-            CONVERSATION,
-            directory.path().to_path_buf(),
-            "test-model",
-            200_000,
-            16_384,
-        ),
-        ConvState::Idle,
-        Arc::clone(&storage),
-        Arc::clone(&llm),
-        tools,
-        Arc::new(BrowserSessionManager::default()),
-        Arc::clone(&handles),
-        Arc::new(crate::tools::TmuxRegistry::new()),
-        Arc::new(ModelRegistry::new_empty()),
-        crate::terminal::ActiveTerminals::new(),
-        receiver,
-        events.clone(),
-        SseBroadcaster::new(128, 0),
-    );
-    let mut actor = tokio::spawn(runtime.with_state_watcher(state_tx).run());
-    events
-        .send(Event::UserMessage {
-            text: "run the two independent commands".into(),
-            llm_text: None,
-            images: vec![],
-            files: vec![],
-            message_id: "registered-bash-input".into(),
-            user_agent: None,
-            skill_invocation: None,
-        })
-        .await
-        .unwrap();
-
-    // Capture observations without asserting until after release: the old
-    // serial implementation must also release its held native child on failure.
-    let before_release = tokio::time::timeout(GUARD, async {
-        let mut started = [0];
-        held_started
-            .read_exact(&mut started)
-            .await
-            .map_err(|error| error.to_string())?;
-        let mut finished = [0];
-        fast_finished
-            .read_exact(&mut finished)
-            .await
-            .map_err(|error| error.to_string())?;
-        let partial = states
-            .wait_for(|state| {
-                matches!(state, ConvState::ToolExecuting { completed_results, .. }
-                    if completed_results.iter().any(|result| result.tool_use_id() == "fast"))
-            })
-            .await
-            .map_err(|error| error.to_string())?
-            .clone();
-        Ok::<_, String>((
-            started,
-            finished,
-            partial,
-            llm.recorded_requests().len(),
-            handles.snapshot_live_pgids().await.len(),
-        ))
-    })
-    .await;
-
-    release_held.write_all(b"release\n").await.unwrap();
-    let idle = tokio::time::timeout(
-        GUARD,
-        states.wait_for(|state| matches!(state, ConvState::Idle)),
-    )
-    .await
-    .map(|result| result.map(|_| ()));
-    let _ = events.send(Event::Shutdown).await;
-    let stopped = tokio::time::timeout(GUARD, &mut actor).await;
-    if stopped.is_err() {
-        actor.abort();
-    }
-
-    let (started, finished, partial, requests_while_held, live_while_held) = before_release
-        .expect("fast registered Bash sibling must complete while first command is FIFO-held")
-        .expect("native markers and state observer must remain available");
-    idle.expect("released batch must reach Idle")
-        .expect("state watcher must remain available until shutdown");
-    assert_eq!(
-        stopped.expect("actor shutdown must complete").unwrap(),
-        RuntimeExitDisposition::CoordinatedShutdown
-    );
-    assert_eq!(started, *b"h");
-    assert_eq!(finished, *b"f");
-    let ConvState::ToolExecuting {
-        completed_results, ..
-    } = partial
-    else {
-        panic!("held first command keeps this batch open");
-    };
-    assert_eq!(
-        completed_results
-            .iter()
-            .map(|result| result.tool_use_id())
-            .collect::<Vec<_>>(),
-        ["fast"]
-    );
-    assert_eq!(requests_while_held, 1, "model must await the full batch");
-    assert_eq!(live_while_held, 1, "held command must remain alive");
-    assert!(handles.snapshot_live_pgids().await.is_empty());
-
-    let messages = storage.get_all_messages(CONVERSATION);
-    let results: Vec<_> = messages
-        .iter()
-        .filter_map(|message| match &message.content {
-            MessageContent::Tool(result) => Some(result),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(
-        results
-            .iter()
-            .map(|result| result.tool_use_id.as_str())
-            .collect::<Vec<_>>(),
-        ["held", "fast"]
-    );
-    for (result, (expected_output, label)) in results.iter().zip([
-        ("held-result", "held-first"),
-        ("fast-result", "independent-fast"),
-    ]) {
-        assert!(!result.is_error);
-        let output: serde_json::Value = serde_json::from_str(&result.content).unwrap();
-        assert_eq!(output["status"], "exited");
-        assert_eq!(output["exit_code"], 0);
-        assert_eq!(output["label"], label);
-        assert!(result.content.contains(expected_output));
-    }
-    let requests = llm.recorded_requests();
-    assert_eq!(requests.len(), 2);
-    let model_results: Vec<_> = requests[1]
-        .messages
-        .iter()
-        .flat_map(|message| &message.content)
-        .filter_map(|block| match block {
-            ContentBlock::ToolResult {
-                tool_use_id,
-                is_error,
-                ..
-            } => Some((tool_use_id.as_str(), *is_error)),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(model_results, [("held", false), ("fast", false)]);
 }
 
 #[tokio::test]
@@ -1112,7 +871,6 @@ async fn batch_denial_precedes_every_call_resource_and_preserves_sibling() {
     let observation = runtime.foreground_dispatch.observe().await;
     let event = runtime
         .accept_foreground_observation(observation)
-        .await
         .unwrap()
         .unwrap();
     assert!(
@@ -1148,7 +906,6 @@ async fn stale_batch_preparation_cannot_adopt_changed_source_with_reused_ids() {
     );
     assert!(runtime
         .accept_foreground_observation(observation)
-        .await
         .unwrap()
         .is_none());
     assert!(runtime.tool_executor.tokens.lock().unwrap().is_empty());
@@ -1171,7 +928,6 @@ async fn shared_unknown_authority_precedes_stale_batch_selection() {
         .close("test_genuine_unknown_local_write");
     assert!(runtime
         .accept_foreground_observation(observation)
-        .await
         .unwrap_err()
         .contains("fatal local authority loss"));
     assert!(runtime.tool_executor.tokens.lock().unwrap().is_empty());
@@ -1287,7 +1043,6 @@ async fn child_batch_notifies_parent_only_after_all_owners_and_full_checkpoint()
     let observation = runtime.foreground_dispatch.observe().await;
     let event = runtime
         .accept_foreground_observation(observation)
-        .await
         .unwrap()
         .unwrap();
     runtime.process_event(event).await.unwrap();
@@ -1402,7 +1157,6 @@ async fn lost_batch_task_settles_one_exact_error_without_cancelling_its_sibling(
     let observation = runtime.foreground_dispatch.observe().await;
     let event = runtime
         .accept_foreground_observation(observation)
-        .await
         .unwrap()
         .unwrap();
     assert!(
@@ -1429,23 +1183,54 @@ async fn lost_batch_task_settles_one_exact_error_without_cancelling_its_sibling(
     drain_cancelled_batch(&mut runtime).await;
 }
 
-#[tokio::test]
-async fn sqlite_rejects_sibling_commit_without_refill_publication_or_model_advance() {
-    let directory = tempfile::tempdir().unwrap();
-    let db = crate::db::Database::open(directory.path().join("batch-commit.db").to_str().unwrap())
+async fn sqlite_batch_database(directory: &std::path::Path) -> crate::db::Database {
+    let db = crate::db::Database::open(directory.join("batch-commit.db").to_str().unwrap())
         .await
         .unwrap();
     crate::db::run_pending_migrations(db.pool()).await.unwrap();
     db.create_conversation(
         "ordinary-batch",
         "ordinary-batch",
-        directory.path().to_str().unwrap(),
+        directory.to_str().unwrap(),
         true,
         None,
         None,
     )
     .await
     .unwrap();
+    db
+}
+
+fn sqlite_batch_state(content: Vec<ContentBlock>) -> ConvState {
+    let mut calls = content
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::ToolUse { id, name, input } => Some(ToolCall::new(
+                id,
+                ToolInput::from_name_and_value(name, input.clone()),
+            )),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let current_tool = calls.remove(0);
+    ConvState::ToolExecuting {
+        current_tool: current_tool.clone(),
+        remaining_tools: calls,
+        completed_results: vec![],
+        pending_sub_agents: vec![],
+        assistant_message: crate::state_machine::AssistantMessage::new(
+            "sqlite-batch-owner".into(),
+            content,
+            None,
+            None,
+        ),
+    }
+}
+
+#[tokio::test]
+async fn sqlite_rejects_sibling_commit_without_refill_publication_or_model_advance() {
+    let directory = tempfile::tempdir().unwrap();
+    let db = sqlite_batch_database(directory.path()).await;
     let mut content = calls(6, "slow-command");
     content[1] = ContentBlock::tool_use(
         "call-1",
@@ -1472,29 +1257,11 @@ async fn sqlite_rejects_sibling_commit_without_refill_publication_or_model_advan
     )
     .await
     .unwrap();
-    let mut calls = content
-        .iter()
-        .filter_map(|block| match block {
-            ContentBlock::ToolUse { id, name, input } => Some(ToolCall::new(
-                id,
-                ToolInput::from_name_and_value(name, input.clone()),
-            )),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    let current_tool = calls.remove(0);
-    let initial = ConvState::ToolExecuting {
-        current_tool: current_tool.clone(),
-        remaining_tools: calls,
-        completed_results: vec![],
-        pending_sub_agents: vec![],
-        assistant_message: crate::state_machine::AssistantMessage::new(
-            "sqlite-batch-owner".into(),
-            content,
-            None,
-            None,
-        ),
+    let initial = sqlite_batch_state(content);
+    let ConvState::ToolExecuting { current_tool, .. } = &initial else {
+        unreachable!()
     };
+    let current_tool = current_tool.clone();
     db.update_conversation_state("ordinary-batch", &initial)
         .await
         .unwrap();
@@ -1521,7 +1288,6 @@ async fn sqlite_rejects_sibling_commit_without_refill_publication_or_model_advan
         let observation = runtime.foreground_dispatch.observe().await;
         assert!(runtime
             .accept_foreground_observation(observation)
-            .await
             .unwrap()
             .is_none());
     }
@@ -1537,7 +1303,6 @@ async fn sqlite_rejects_sibling_commit_without_refill_publication_or_model_advan
     let observation = runtime.foreground_dispatch.observe().await;
     let event = runtime
         .accept_foreground_observation(observation)
-        .await
         .unwrap()
         .unwrap();
     let error = runtime.process_event(event).await.unwrap_err();
@@ -1572,3 +1337,6 @@ async fn sqlite_rejects_sibling_commit_without_refill_publication_or_model_advan
 }
 
 mod commit_cancellation;
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod native_bash;

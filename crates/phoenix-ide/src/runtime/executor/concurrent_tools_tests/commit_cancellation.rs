@@ -66,6 +66,39 @@ async fn deliver_cancel(manager: Arc<RuntimeManager>, route: Route) -> Result<()
     }
 }
 
+async fn enqueue_cancel(
+    manager: &Arc<RuntimeManager>,
+    handle: &ConversationHandle,
+    route: Route,
+) -> Option<tokio::task::JoinHandle<Result<(), String>>> {
+    match route {
+        Route::Addressed => {
+            deliver_cancel(manager.clone(), route).await.unwrap();
+            None
+        }
+        Route::Acknowledged => {
+            let (acknowledgement, accepted) = oneshot::channel();
+            let (retirement, retired) = oneshot::channel();
+            handle
+                .acknowledged_event_tx
+                .send(AcknowledgedEventRequest {
+                    event: user_cancel(),
+                    acknowledgement,
+                    retirement: retired,
+                })
+                .await
+                .unwrap();
+            Some(tokio::spawn(async move {
+                let _retirement = retirement;
+                accepted
+                    .await
+                    .map_err(|error| error.to_string())?
+                    .map(|_| ())
+            }))
+        }
+    }
+}
+
 async fn cancellation_interrupts_held_sibling_commit(route: Route) {
     let mut content = calls(6, "stubborn-command");
     content[1] = ContentBlock::tool_use(
@@ -101,32 +134,7 @@ async fn cancellation_interrupts_held_sibling_commit(route: Route) {
         .map(|(_, token)| token.clone())
         .collect();
     assert_eq!(tokens.len(), 3);
-    let cancellation = match route {
-        Route::Addressed => {
-            deliver_cancel(manager.clone(), route).await.unwrap();
-            None
-        }
-        Route::Acknowledged => {
-            let (acknowledgement, accepted) = oneshot::channel();
-            let (retirement, retired) = oneshot::channel();
-            handle
-                .acknowledged_event_tx
-                .send(AcknowledgedEventRequest {
-                    event: user_cancel(),
-                    acknowledgement,
-                    retirement: retired,
-                })
-                .await
-                .unwrap();
-            Some(tokio::spawn(async move {
-                let _retirement = retirement;
-                accepted
-                    .await
-                    .map_err(|error| error.to_string())?
-                    .map(|_| ())
-            }))
-        }
-    };
+    let cancellation = enqueue_cancel(&manager, &handle, route).await;
     tokio::time::pause();
     let interrupted_before_write_receipt = tokio::time::timeout(
         Duration::from_millis(100),
@@ -203,6 +211,36 @@ async fn addressed_cancel_interrupts_running_siblings_during_held_commit() {
     cancellation_interrupts_held_sibling_commit(Route::Addressed).await;
 }
 
+async fn queue_instruction(manager: &Arc<RuntimeManager>, storage: &InMemoryStorage) {
+    let entry = phoenix_core::domain::sm_event::SteerEntry {
+        origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
+        text: "keep this instruction".into(),
+        llm_text: None,
+        images: vec![],
+        files: vec![],
+        message_id: "queued-instruction".into(),
+        user_agent: None,
+        skill_invocation: None,
+    };
+    storage.set_steering_queue("ordinary-batch", vec![entry.clone()]);
+    manager
+        .send_acknowledged_event(
+            "ordinary-batch",
+            Event::SteerMessage {
+                origin: entry.origin,
+                text: entry.text,
+                llm_text: entry.llm_text,
+                images: entry.images,
+                files: entry.files,
+                message_id: entry.message_id,
+                user_agent: entry.user_agent,
+                skill_invocation: entry.skill_invocation,
+            },
+        )
+        .await
+        .unwrap();
+}
+
 async fn final_checkpoint_cancellation(queued_steer: bool) {
     let directory = tempfile::tempdir().unwrap();
     let (runtime, events, mut starts, _) =
@@ -222,33 +260,7 @@ async fn final_checkpoint_cancellation(queued_steer: bool) {
             .unwrap();
     }
     if queued_steer {
-        let entry = phoenix_core::domain::sm_event::SteerEntry {
-            origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
-            text: "keep this instruction".into(),
-            llm_text: None,
-            images: vec![],
-            files: vec![],
-            message_id: "queued-instruction".into(),
-            user_agent: None,
-            skill_invocation: None,
-        };
-        storage.set_steering_queue("ordinary-batch", vec![entry.clone()]);
-        manager
-            .send_acknowledged_event(
-                "ordinary-batch",
-                Event::SteerMessage {
-                    origin: entry.origin,
-                    text: entry.text,
-                    llm_text: entry.llm_text,
-                    images: entry.images,
-                    files: entry.files,
-                    message_id: entry.message_id,
-                    user_agent: entry.user_agent,
-                    skill_invocation: entry.skill_invocation,
-                },
-            )
-            .await
-            .unwrap();
+        queue_instruction(&manager, &storage).await;
     }
     fast_release.add_permits(2);
     tokio::time::timeout(Duration::from_secs(60), write_entered)
