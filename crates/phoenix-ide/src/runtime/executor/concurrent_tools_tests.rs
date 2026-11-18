@@ -385,8 +385,21 @@ async fn prepared_batch_for_scope(
     mpsc::UnboundedReceiver<String>,
     tempfile::TempDir,
 ) {
+    prepared_batch_for_role(content, work_scope, false).await
+}
+
+async fn prepared_batch_for_role(
+    content: Vec<ContentBlock>,
+    work_scope: bool,
+    child: bool,
+) -> (
+    BatchRuntime,
+    mpsc::UnboundedReceiver<String>,
+    tempfile::TempDir,
+) {
     let directory = tempfile::tempdir().unwrap();
     let (mut runtime, _, starts, _) = runtime_with_calls(directory.path(), false, content.clone());
+    runtime.context.is_sub_agent = child;
     if work_scope {
         runtime.context.resource_scope = phoenix_core::work_scope::ResourceScopeKey::Work(
             phoenix_core::work_scope::WorkScopeId::new(),
@@ -482,7 +495,23 @@ async fn ready_typed_outcome_survives_when_cancel_is_selected_first() {
     }
     runtime.join_batch_call_for_test("fast").await;
     runtime.process_event(user_cancel()).await.unwrap();
-    drain_cancelled_batch(&mut runtime).await;
+    let mut observed_slow_cancellation = false;
+    while !matches!(runtime.state, ConvState::Idle) {
+        let observation = runtime.foreground_dispatch.observe().await;
+        if let Some(event) = runtime
+            .accept_foreground_observation(observation)
+            .await
+            .unwrap()
+        {
+            observed_slow_cancellation |=
+                matches!(&event, Event::ToolAborted { tool_use_id } if tool_use_id == "slow");
+            runtime.process_event(event).await.unwrap();
+        }
+    }
+    assert!(
+        observed_slow_cancellation,
+        "the unfinished call retains its typed cancellation disposition"
+    );
     let tokens = runtime.tool_executor.tokens.lock().unwrap();
     assert!(tokens
         .iter()
@@ -514,7 +543,11 @@ async fn ready_typed_outcome_survives_when_cancel_is_selected_first() {
             .collect::<Vec<_>>(),
         ["slow", "fast"]
     );
-    assert!(results[0].is_error);
+    assert_eq!(results[0].content, "Cancelled");
+    assert!(
+        !results[0].is_error,
+        "Cancelled retains its existing transcript wire disposition"
+    );
     assert!(!results[1].is_error);
     assert!(results[1].content.contains("completed fast-command"));
     assert!(messages.iter().find(|message| matches!(&message.content, MessageContent::Tool(result) if result.tool_use_id == "fast"))
@@ -1190,4 +1223,130 @@ async fn retired_progress_cannot_publish_into_a_later_round_reusing_call_ids() {
         partial: Some("late old output".into()),
     });
     assert!(events.try_recv().is_err(), "a retired invocation loses its progress publication capability even if its provider ID recurs");
+}
+
+#[tokio::test]
+async fn child_batch_notifies_parent_only_after_all_owners_and_full_checkpoint() {
+    let mut content = calls(2, "slow-command");
+    content[1] = ContentBlock::tool_use(
+        "call-1",
+        "bash",
+        serde_json::json!({"op":"run","cmd":"stubborn-command"}),
+    );
+    let (mut runtime, mut starts, _directory) = prepared_batch_for_role(content, false, true).await;
+    let (parent, mut notifications) = mpsc::channel(4);
+    runtime.parent_dispatch = Some((
+        "parent".into(),
+        Arc::new(crate::runtime::TestConversationEventDispatcher::new(parent)),
+    ));
+    launch_preparations(&mut runtime, 2).await;
+    for _ in 0..2 {
+        starts.recv().await.unwrap();
+    }
+    runtime.process_event(user_cancel()).await.unwrap();
+    runtime.join_batch_call_for_test("call-0").await;
+    let observation = runtime.foreground_dispatch.observe().await;
+    let event = runtime
+        .accept_foreground_observation(observation)
+        .await
+        .unwrap()
+        .unwrap();
+    runtime.process_event(event).await.unwrap();
+    assert!(matches!(runtime.state, ConvState::CancellingTool { .. }));
+    assert!(
+        notifications.try_recv().is_err(),
+        "a child cannot notify parent while a sibling still owns an invocation"
+    );
+    let deadline = runtime.deadline.unwrap();
+    tokio::time::pause();
+    tokio::time::advance(deadline.saturating_duration_since(tokio::time::Instant::now())).await;
+    runtime.handle_cancelling_tool_timeout().await;
+    tokio::time::resume();
+    assert!(matches!(runtime.state, ConvState::Failed { .. }));
+    assert!(matches!(
+        runtime.storage.get_current_state("ordinary-batch"),
+        Some(ConvState::Failed { .. })
+    ));
+    let event = notifications
+        .try_recv()
+        .expect("complete child barrier notifies parent");
+    assert!(
+        matches!(event, Event::SubAgentResult { agent_id, .. } if agent_id == "ordinary-batch")
+    );
+    assert!(notifications.try_recv().is_err());
+    let results: Vec<_> = runtime
+        .storage
+        .get_all_messages("ordinary-batch")
+        .into_iter()
+        .filter_map(|message| match message.content {
+            MessageContent::Tool(result) => Some(result.tool_use_id),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(results, ["call-0", "call-1"]);
+    assert!(runtime.llm_client.recorded_requests().is_empty());
+}
+
+#[tokio::test]
+async fn serial_special_source_cancellation_drains_affirmative_unissued_tail() {
+    let content = vec![
+        ContentBlock::tool_use("native", "spawn_agents", serde_json::json!({"tasks":[]})),
+        ContentBlock::tool_use(
+            "first",
+            "bash",
+            serde_json::json!({"op":"run","cmd":"slow-command"}),
+        ),
+        ContentBlock::tool_use(
+            "second",
+            "bash",
+            serde_json::json!({"op":"run","cmd":"slow-command"}),
+        ),
+    ];
+    let directory = tempfile::tempdir().unwrap();
+    let (mut runtime, _, _, _) = runtime_with_calls(directory.path(), false, content.clone());
+    let first = ToolCall::new(
+        "first",
+        ToolInput::from_name_and_value(
+            "bash",
+            serde_json::json!({"op":"run","cmd":"slow-command"}),
+        ),
+    );
+    let second = ToolCall::new("second", first.input.clone());
+    runtime.state = ConvState::ToolExecuting {
+        current_tool: first.clone(),
+        remaining_tools: vec![second],
+        completed_results: vec![ToolResult::success(
+            "native".into(),
+            "authentic native completion".into(),
+        )
+        .into()],
+        pending_sub_agents: vec![],
+        assistant_message: crate::state_machine::AssistantMessage::new(
+            "mixed-owner".into(),
+            content,
+            None,
+            None,
+        ),
+    };
+    runtime.begin_tool_preparation(first).unwrap();
+    runtime.process_event(user_cancel()).await.unwrap();
+    drain_cancelled_batch(&mut runtime).await;
+    assert!(runtime.tool_executor.tokens.lock().unwrap().is_empty());
+    let messages = runtime.storage.get_all_messages("ordinary-batch");
+    let results: Vec<_> = messages
+        .iter()
+        .filter_map(|message| match &message.content {
+            MessageContent::Tool(result) => Some(result),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        results
+            .iter()
+            .map(|result| result.tool_use_id.as_str())
+            .collect::<Vec<_>>(),
+        ["native", "first", "second"]
+    );
+    assert_eq!(results[0].content, "authentic native completion");
+    assert_eq!(results[2].content, "Skipped due to cancellation");
 }
