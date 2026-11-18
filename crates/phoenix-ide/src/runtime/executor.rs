@@ -4257,11 +4257,10 @@ where
                         | ConvState::CancellingSubAgents { .. }
                 )
             {
-                if let Err(error) = self
-                    .storage
-                    .record_execution_cancel(&self.context.conversation_id)
-                    .await
-                {
+                let storage = self.storage.clone();
+                let conversation_id = self.context.conversation_id.clone();
+                let write = async move { storage.record_execution_cancel(&conversation_id).await };
+                if let Err(error) = self.await_ordinary_batch_commit(write).await {
                     self.observe_native_cancel_persistence_failure(&terminal_event, &error);
                     return Err(error);
                 }
@@ -6595,6 +6594,9 @@ where
 
     /// Retire the selected tool after its cancellation deadline expires.
     async fn handle_cancelling_tool_timeout(&mut self) {
+        if !matches!(self.state, ConvState::CancellingTool { .. }) {
+            return;
+        }
         let batch = match self.drain_ready_before_forced_retirement().await {
             Ok(batch) => batch,
             Err(error) => {

@@ -155,14 +155,6 @@ impl ConversationEventSender {
         }
     }
 
-    pub fn is_closed(&self) -> bool {
-        match &self.0 {
-            EventDestination::Runtime { ordinary, .. } => ordinary.is_closed(),
-            #[cfg(test)]
-            EventDestination::TestReceiver(sender) => sender.is_closed(),
-        }
-    }
-
     #[cfg(test)]
     pub(crate) async fn closed(&self) {
         match &self.0 {
@@ -188,14 +180,6 @@ impl ConversationEventSender {
                 sender.same_channel(other)
             }
             _ => false,
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn capacity(&self) -> usize {
-        match &self.0 {
-            EventDestination::Runtime { ordinary, .. } => ordinary.capacity(),
-            EventDestination::TestReceiver(sender) => sender.capacity(),
         }
     }
 
@@ -256,14 +240,6 @@ impl AcknowledgedEventSender {
             }
             #[cfg(test)]
             AcknowledgedDestination::TestReceiver(sender) => sender.send(request).await,
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn capacity(&self) -> usize {
-        match &self.0 {
-            AcknowledgedDestination::Runtime { ordinary, .. } => ordinary.capacity(),
-            AcknowledgedDestination::TestReceiver(sender) => sender.capacity(),
         }
     }
 

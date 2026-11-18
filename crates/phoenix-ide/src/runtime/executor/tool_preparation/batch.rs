@@ -55,6 +55,9 @@ enum CallPhase {
         execution: Option<RunningCall>,
     },
     Settling(Option<RunningCall>),
+    ForcedRetired {
+        _execution: RunningCall,
+    },
     Retired,
     NoRead,
 }
@@ -63,7 +66,7 @@ struct RunningCall {
     cancel: CancellationToken,
     task: JoinHandle<()>,
     receiver: oneshot::Receiver<ToolExecOutcome>,
-    _publication: Arc<()>,
+    publication: Option<Arc<()>>,
     cutoff: Option<tokio::time::Instant>,
     cancel_on_drop: bool,
 }
@@ -74,6 +77,29 @@ impl Drop for RunningCall {
             self.cancel.cancel();
         }
         self.task.abort();
+    }
+}
+
+impl BatchCall {
+    fn capture_ready(&mut self) {
+        let CallPhase::Running(execution) = &mut self.phase else {
+            return;
+        };
+        let outcome = match execution.receiver.try_recv() {
+            Ok(outcome) => outcome,
+            Err(oneshot::error::TryRecvError::Closed) => dropped_outcome(&self.selection.tool.id),
+            Err(oneshot::error::TryRecvError::Empty) => return,
+        };
+        let CallPhase::Running(mut execution) =
+            std::mem::replace(&mut self.phase, CallPhase::Retired)
+        else {
+            unreachable!()
+        };
+        execution.cancel_on_drop = false;
+        self.phase = CallPhase::Ready {
+            outcome,
+            execution: Some(execution),
+        };
     }
 }
 
@@ -88,6 +114,69 @@ pub(in super::super) enum ForegroundObservation {
 }
 
 impl ForegroundDispatch {
+    pub(in super::super) fn retire_expired_wait_resources(&mut self) {
+        let Self::OrdinaryBatch(batch) = self else {
+            return;
+        };
+        if batch.closing {
+            return;
+        }
+        let now = tokio::time::Instant::now();
+        for call in &mut batch.calls {
+            let expired = matches!(&call.phase, CallPhase::Running(execution)
+                if execution.cutoff.is_some_and(|cutoff| cutoff - (super::super::BASH_WAIT_SETTLEMENT_GRACE - super::super::BASH_WAIT_EXECUTION_GRACE) <= now));
+            if !expired {
+                continue;
+            }
+            call.capture_ready();
+            if !matches!(call.phase, CallPhase::Running(_)) {
+                continue;
+            }
+            let CallPhase::Running(mut execution) =
+                std::mem::replace(&mut call.phase, CallPhase::Retired)
+            else {
+                unreachable!()
+            };
+            execution.cancel_on_drop = false;
+            execution.receiver.close();
+            execution.publication = None;
+            execution.task.abort();
+            call.phase = CallPhase::Ready {
+                outcome: ToolExecOutcome::Failed {
+                    tool_use_id: call.selection.tool.id.clone(),
+                    error: "bash wait exceeded its bounded settlement deadline".into(),
+                },
+                execution: Some(execution),
+            };
+        }
+    }
+
+    pub(in super::super) fn force_retire_batch_resources(&mut self) {
+        let Self::OrdinaryBatch(batch) = self else {
+            return;
+        };
+        for call in &mut batch.calls {
+            call.capture_ready();
+        }
+        for call in &mut batch.calls {
+            if !matches!(call.phase, CallPhase::Running(_)) {
+                continue;
+            }
+            let CallPhase::Running(mut execution) =
+                std::mem::replace(&mut call.phase, CallPhase::Retired)
+            else {
+                unreachable!()
+            };
+            execution.cancel_on_drop = false;
+            execution.receiver.close();
+            execution.publication = None;
+            execution.task.abort();
+            call.phase = CallPhase::ForcedRetired {
+                _execution: execution,
+            };
+        }
+    }
+
     pub(in super::super) fn has_open_batch_controls(&self) -> bool {
         matches!(self, Self::OrdinaryBatch(batch) if !batch.closing)
     }
@@ -167,44 +256,7 @@ impl OrdinaryBatch {
     fn cancel(&mut self) {
         self.closing = true;
         for call in &mut self.calls {
-            match &mut call.phase {
-                CallPhase::Running(execution) => {
-                    // The typed receipt is checked before signalling cancellation.
-                    match execution.receiver.try_recv() {
-                        Ok(outcome) => {
-                            let old = std::mem::replace(&mut call.phase, CallPhase::Retired);
-                            let CallPhase::Running(mut execution) = old else {
-                                unreachable!()
-                            };
-                            execution.cancel_on_drop = false;
-                            call.phase = CallPhase::Ready {
-                                outcome,
-                                execution: Some(execution),
-                            };
-                        }
-                        Err(oneshot::error::TryRecvError::Closed) => {
-                            let outcome = dropped_outcome(&call.selection.tool.id);
-                            let old = std::mem::replace(&mut call.phase, CallPhase::Retired);
-                            let CallPhase::Running(mut execution) = old else {
-                                unreachable!()
-                            };
-                            execution.cancel_on_drop = false;
-                            call.phase = CallPhase::Ready {
-                                outcome,
-                                execution: Some(execution),
-                            };
-                        }
-                        Err(oneshot::error::TryRecvError::Empty) => {}
-                    }
-                }
-                CallPhase::Unissued
-                | CallPhase::Cleared
-                | CallPhase::Preparing(_)
-                | CallPhase::NoRead
-                | CallPhase::Ready { .. }
-                | CallPhase::Settling(_)
-                | CallPhase::Retired => {}
-            }
+            call.capture_ready();
         }
         for call in &mut self.calls {
             match &mut call.phase {
@@ -221,7 +273,10 @@ impl OrdinaryBatch {
                         execution: None,
                     };
                 }
-                CallPhase::Ready { .. } | CallPhase::Settling(_) | CallPhase::Retired => {}
+                CallPhase::Ready { .. }
+                | CallPhase::Settling(_)
+                | CallPhase::ForcedRetired { .. }
+                | CallPhase::Retired => {}
             }
         }
     }
@@ -269,6 +324,7 @@ impl OrdinaryBatch {
                     CallPhase::Unissued
                     | CallPhase::Cleared
                     | CallPhase::Settling(_)
+                    | CallPhase::ForcedRetired { .. }
                     | CallPhase::Retired
                     | CallPhase::NoRead => None,
                 };
@@ -299,7 +355,7 @@ impl OrdinaryBatch {
             cancel,
             task,
             receiver,
-            _publication: publication,
+            publication: Some(publication),
             cutoff: invocation_wait_bound(&selection.tool)
                 .map(|bound| tokio::time::Instant::now() + bound),
             cancel_on_drop: true,
@@ -470,6 +526,7 @@ impl<S: Storage + Clone + 'static, L: LlmClient + 'static, T: ToolExecutor + 'st
                         | CallPhase::Running(_)
                         | CallPhase::Ready { .. }
                         | CallPhase::Settling(_)
+                        | CallPhase::ForcedRetired { .. }
                 )
             })
             .count();
@@ -699,37 +756,18 @@ impl<S: Storage + Clone + 'static, L: LlmClient + 'static, T: ToolExecutor + 'st
     }
 
     pub(in super::super) async fn expire_batch_waits(&mut self) -> Result<(), String> {
-        let now = tokio::time::Instant::now();
-        let observation = {
-            let ForegroundDispatch::OrdinaryBatch(batch) = &mut self.foreground_dispatch else {
-                return Ok(());
-            };
-            let Some(call) = batch.calls.iter_mut().find(|call| matches!(&call.phase, CallPhase::Running(execution)
-                if execution.cutoff.is_some_and(|cutoff| cutoff - (super::super::BASH_WAIT_SETTLEMENT_GRACE - super::super::BASH_WAIT_EXECUTION_GRACE) <= now))) else { return Ok(()) };
-            let CallPhase::Running(execution) = &mut call.phase else {
-                unreachable!()
-            };
-            let outcome = match execution.receiver.try_recv() {
-                Ok(outcome) => outcome,
-                Err(oneshot::error::TryRecvError::Closed) => {
-                    dropped_outcome(&call.selection.tool.id)
-                }
-                Err(oneshot::error::TryRecvError::Empty) => {
-                    execution.cancel_on_drop = false;
-                    execution.task.abort();
-                    ToolExecOutcome::Failed {
-                        tool_use_id: call.selection.tool.id.clone(),
-                        error: "bash wait exceeded its bounded settlement deadline".into(),
-                    }
-                }
-            };
-            ForegroundObservation::Outcome {
-                selection: Arc::clone(&call.selection),
-                outcome,
+        self.foreground_dispatch.retire_expired_wait_resources();
+        use futures::FutureExt as _;
+        while let Some(observation) = self.foreground_dispatch.observe().now_or_never() {
+            if let Some(event) = self.accept_foreground_observation(observation).await? {
+                self.process_event(event).await?;
             }
-        };
-        if let Some(event) = self.accept_foreground_observation(observation).await? {
-            self.process_event(event).await?;
+            if !matches!(
+                self.foreground_dispatch,
+                ForegroundDispatch::OrdinaryBatch(_)
+            ) {
+                break;
+            }
         }
         Ok(())
     }
@@ -744,6 +782,7 @@ impl<S: Storage + Clone + 'static, L: LlmClient + 'static, T: ToolExecutor + 'st
         ) {
             return Ok(false);
         }
+        self.foreground_dispatch.force_retire_batch_resources();
         loop {
             let Some(observation) = self.foreground_dispatch.observe().now_or_never() else {
                 break;
@@ -756,13 +795,6 @@ impl<S: Storage + Clone + 'static, L: LlmClient + 'static, T: ToolExecutor + 'st
                 ForegroundDispatch::OrdinaryBatch(_)
             ) {
                 return Ok(true);
-            }
-        }
-        if let ForegroundDispatch::OrdinaryBatch(batch) = &mut self.foreground_dispatch {
-            for call in &mut batch.calls {
-                if let CallPhase::Running(execution) = &mut call.phase {
-                    execution.task.abort();
-                }
             }
         }
         Ok(true)

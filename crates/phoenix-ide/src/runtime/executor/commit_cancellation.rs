@@ -7,7 +7,7 @@ pub(super) struct ObservedCancellation {
     cutoff: Option<CancellationCutoff>,
 }
 
-struct CancellationCutoff {
+pub(super) struct CancellationCutoff {
     at: tokio::time::Instant,
     phase: CutoffPhase,
 }
@@ -26,6 +26,26 @@ pub(super) enum CancellationCustody {
 }
 
 impl CancellationCustody {
+    fn pending_cutoff(&self) -> Option<tokio::time::Instant> {
+        let cutoff = match self {
+            Self::Pending(observed) => observed.cutoff.as_ref(),
+            Self::Applying(cutoff) => cutoff.as_ref(),
+            Self::Idle => None,
+        }?;
+        matches!(cutoff.phase, CutoffPhase::Pending).then_some(cutoff.at)
+    }
+
+    fn mark_cutoff_serviced(&mut self) {
+        let cutoff = match self {
+            Self::Pending(observed) => observed.cutoff.as_mut(),
+            Self::Applying(cutoff) => cutoff.as_mut(),
+            Self::Idle => None,
+        };
+        if let Some(cutoff) = cutoff {
+            cutoff.phase = CutoffPhase::Serviced;
+        }
+    }
+
     pub(super) fn take_pending(&mut self) -> Option<ObservedCancellation> {
         if !matches!(self, Self::Pending(_)) {
             return None;
@@ -74,12 +94,25 @@ impl<S: Storage + Clone + 'static, L: LlmClient + 'static, T: ToolExecutor + 'st
             let observe = self.foreground_dispatch.has_open_batch_controls()
                 && matches!(self.cancellation_custody, CancellationCustody::Idle)
                 && self.cancellation_input_rx.is_some();
+            let cancellation_cutoff = self.cancellation_custody.pending_cutoff();
+            let resource_deadline =
+                cancellation_cutoff.or_else(|| self.foreground_dispatch.batch_deadline());
             tokio::select! {
                 biased;
                 input = async { self.cancellation_input_rx.as_mut().expect("open cancellation inbox").recv().await }, if observe => {
                     match input {
                         Some(input) => self.cancellation_custody = CancellationCustody::Pending(self.observe_cancellation_input(input)),
                         None => self.cancellation_input_rx = None,
+                    }
+                }
+                () = async {
+                    tokio::time::sleep_until(resource_deadline.expect("owned resource deadline")).await;
+                }, if resource_deadline.is_some() => {
+                    if cancellation_cutoff.is_some() {
+                        self.foreground_dispatch.force_retire_batch_resources();
+                        self.cancellation_custody.mark_cutoff_serviced();
+                    } else {
+                        self.foreground_dispatch.retire_expired_wait_resources();
                     }
                 }
                 result = &mut write => return result,
