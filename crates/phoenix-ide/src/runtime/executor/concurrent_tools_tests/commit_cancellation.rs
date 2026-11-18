@@ -25,12 +25,18 @@ async fn register_actor(
         .await
         .unwrap();
     let (acknowledged_event_tx, acknowledged_event_rx) = mpsc::channel(32);
+    let (event_tx, acknowledged_event_tx, cancellation_input_rx) =
+        crate::runtime::cancellation_inbox::channel(
+            runtime.event_tx.clone(),
+            acknowledged_event_tx,
+        );
+    runtime = runtime.with_cancellation_input_receiver(cancellation_input_rx);
     runtime = runtime
         .with_acknowledged_event_receiver(acknowledged_event_rx)
         .with_fatal_local_authority_fence(manager.fatal_local_authority_fence.clone());
     let (state_tx, state_rx) = watch::channel(runtime.state.clone());
     let handle = ConversationHandle {
-        event_tx: runtime.event_tx.clone(),
+        event_tx,
         acknowledged_event_tx,
         handoff_review_tx: None,
         turn_trigger: runtime.turn_trigger_slot(),

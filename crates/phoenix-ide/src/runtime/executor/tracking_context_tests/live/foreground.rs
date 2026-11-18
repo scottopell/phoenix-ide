@@ -130,8 +130,11 @@ impl Session {
         .with_state_watcher(state_tx)
         .with_fatal_local_authority_fence(fixture.manager.fatal_local_authority_fence.clone());
         let handle = crate::runtime::ConversationHandle {
-            event_tx,
-            acknowledged_event_tx: ack_tx,
+            event_tx: crate::runtime::ConversationEventSender::for_test_receiver(event_tx),
+            acknowledged_event_tx:
+                crate::runtime::cancellation_inbox::AcknowledgedEventSender::for_test_receiver(
+                    ack_tx,
+                ),
             handoff_review_tx: None,
             turn_trigger: runtime.turn_trigger_slot(),
             broadcast_tx: broadcast,
