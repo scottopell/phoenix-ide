@@ -402,10 +402,11 @@ rule BatchBashWaitFallbackRetiresOnlyItsExactTask {
     requires: batch_owner_is_current(owner)
     requires: owner.phase = running
     requires: bedrock/is_bash_wait(call)
+    requires: not batch_owner_has_available_typed_receipt(owner)
     ensures: BatchWaitTaskOnlyAbortRequested(owner)
     ensures: owner.phase = ready
     ensures: owner.outcome = failed_wait_outcome(owner)
-    ensures: bedrock/ToolTaskRetired(conversation, call)
+    ensures: BatchWaitRetirementRetained(owner)
 
     @guidance
         -- Arm each selected wait from its own supported duration plus execution
@@ -418,6 +419,19 @@ rule BatchBashWaitFallbackRetiresOnlyItsExactTask {
         -- task, without signalling its token or cancelling the represented process,
         -- handles or unrelated jobs. Retain the owner through its owning commit;
         -- retired task output cannot replace the one synthetic Failed receipt.
+}
+rule BatchWaitAcknowledgedAtSafeReceiptSelection {
+    when: BatchReadyReceiptSelected(owner)
+    requires: process_authority.open
+    requires: batch_owner_is_current(owner)
+    requires: owner.phase = ready
+    requires: owner.outcome = failed_wait_outcome(owner)
+    ensures: bedrock/ToolTaskRetired(owner.batch.runtime.conversation, owner.selection.call)
+
+    @guidance
+        -- This is the same selected Failed receipt submitted by
+        -- SubmitOneExactBatchReceipt, not another completion authority. An
+        -- outstanding sibling write must classify before normal receipt selection.
 }
 
 invariant BoundedRetainedOrdinaryOwners {
@@ -1294,6 +1308,11 @@ surface RuntimeAuthorityObservations {
 --   Preserve authentic snapshotted ready receipts in their owning complete-round
 --   checkpoint; do not replace them with synthetic cancellation. This is in-memory
 --   resource retirement, not a fabricated persistence receipt.
+-- batch_owner_has_available_typed_receipt(owner) -> Boolean: try the exact
+--   retained receiver before choosing a synthetic wait failure.
+-- BatchWaitRetirementRetained(owner): task-only retirement has revoked the old
+--   producer and retained one Ready failed receipt with its original cutoff;
+--   this resource fact does not submit a reducer event or a persistence command.
 -- BatchCommitCancellationObserved(conversation): the exact owned cancellation
 --   delivery is received while an ordinary batch write remains issued.
 -- CancellationDeliveryRetained(conversation): affine process-local request,
