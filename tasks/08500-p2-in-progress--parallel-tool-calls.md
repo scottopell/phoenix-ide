@@ -39,6 +39,8 @@ Validation uses deterministic barriers, managed Python 3.13/dev.py helpers, Bash
 
 The user selected a cap increase from four to eight after the initial candidate was qualified. ADR-271 changes only the numeric bound; ADR-270 remains the historical initial decision. The same sliding window admits the ninth member of a ten-call response after a later sibling commits while the first source call remains held. Eight-active/two-unissued fixtures cover cooperative and forced cancellation, held reads/writes, known cancellation rejection and actual SQLite settlement rejection. Verification worker budget remains four. Earlier receipts below belong to the four-owner candidate; they are not eight-owner validation. Focused cap-eight, whole concurrent-tools module, applicable static checks, repeated full-range reviews and fresh hosted checks qualify this change without repeating the full broad run solely for the numeric bound.
 
+Cap-eight local qualification at `f323ac403`: `/tmp/08500-cap8-focused-owning-01.log` records 13/13 focused passes (3.186s), then the complete concurrent-tools module 28/28 passes (5.798s), combined exit 0 / 300.290s with a freshly built native fixture. The production delta is one numeric limit; current static gates and new exact-head hosted checks remain pending. Existing four-owner receipts stay historical evidence.
+
 ## Evidence ledger
 
 - Initial pure regressions: three intended failures for out-of-order reducer admission, child drain and restart source order; corrected core/DB owning selection later passed 224/224.
