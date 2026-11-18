@@ -403,7 +403,7 @@ async fn native_cancel_persistence_failure_retains_closing_origin_and_stops_queu
     if let Some(event) = runtime.native_spawn_observed(closure).await.unwrap() {
         runtime.process_event(event).await.unwrap();
     }
-    let ordinary_generation_before_teardown = runtime.tool_execution.generation();
+    let ordinary_generation_before_teardown = runtime.serial_dispatch().execution.generation();
     runtime.abort_external_effects_in_memory();
     assert!(
         signalled_before_failed_write,

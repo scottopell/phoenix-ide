@@ -12,7 +12,7 @@ use std::{
 
 pub(super) struct DispatchSelection {
     runtime: uuid::Uuid,
-    assistant_message: phoenix_core::domain::sm_state::AssistantMessage,
+    assistant_message: Arc<phoenix_core::domain::sm_state::AssistantMessage>,
     pub(super) tool: ToolCall,
     pub(super) context: ConvContext,
     pub(super) direct_turn: Option<crate::runtime::traits::ActiveDirectTurn>,
@@ -28,14 +28,23 @@ impl DispatchSelection {
             && match state {
                 ConvState::ToolExecuting {
                     current_tool,
+                    remaining_tools,
                     assistant_message,
                     ..
-                } => current_tool == &self.tool && assistant_message == &self.assistant_message,
+                } => {
+                    (current_tool == &self.tool || remaining_tools.contains(&self.tool))
+                        && assistant_message == self.assistant_message.as_ref()
+                }
                 ConvState::CancellingTool {
                     tool_use_id,
+                    skipped_tools,
                     assistant_message,
                     ..
-                } => tool_use_id == &self.tool.id && assistant_message == &self.assistant_message,
+                } => {
+                    (tool_use_id == &self.tool.id
+                        || skipped_tools.iter().any(|tool| tool.id == self.tool.id))
+                        && assistant_message == self.assistant_message.as_ref()
+                }
                 _ => false,
             }
     }
@@ -136,6 +145,9 @@ impl<S: Storage + Clone + 'static, L: LlmClient + 'static, T: ToolExecutor + 'st
         &mut self,
         tool: ToolCall,
     ) -> Result<Option<Event>, String> {
+        if self.begin_ordinary_batch(&tool)? {
+            return Ok(None);
+        }
         let ConvState::ToolExecuting {
             current_tool,
             assistant_message,
@@ -149,7 +161,7 @@ impl<S: Storage + Clone + 'static, L: LlmClient + 'static, T: ToolExecutor + 'st
         }
         let selection = Arc::new(DispatchSelection {
             runtime: self.tool_preparation_runtime,
-            assistant_message: assistant_message.clone(),
+            assistant_message: Arc::new(assistant_message.clone()),
             tool,
             context: self.context.clone(),
             direct_turn: self.active_direct_turn.as_deref().cloned(),
@@ -160,6 +172,16 @@ impl<S: Storage + Clone + 'static, L: LlmClient + 'static, T: ToolExecutor + 'st
             .map_or(PreparationFailureBoundary::Caller, |scope| {
                 PreparationFailureBoundary::Required(scope.boundary)
             });
+        let preparation = self.make_tool_preparation(selection, failure_boundary);
+        self.serial_dispatch_mut().preparation = Some(preparation);
+        Ok(None)
+    }
+
+    fn make_tool_preparation(
+        &self,
+        selection: Arc<DispatchSelection>,
+        failure_boundary: PreparationFailureBoundary,
+    ) -> ToolPreparation {
         let storage = self.storage.clone();
         let executor = self.tool_executor.clone();
         let surface = if selection.context.is_sub_agent && self.grace_turn_granted {
@@ -184,12 +206,11 @@ impl<S: Storage + Clone + 'static, L: LlmClient + 'static, T: ToolExecutor + 'st
             (catalog, builtin_model),
             self_goal,
         );
-        self.tool_preparation = Some(ToolPreparation {
+        ToolPreparation {
             selection,
             failure_boundary,
             phase: PreparationPhase::Reading(Mutex::new(Box::pin(read))),
-        });
-        Ok(None)
+        }
     }
 
     pub(super) fn accept_tool_preparation(
@@ -203,14 +224,16 @@ impl<S: Storage + Clone + 'static, L: LlmClient + 'static, T: ToolExecutor + 'st
             return Err("runtime processing closed after fatal local authority loss".into());
         }
         if !self
-            .tool_preparation
+            .serial_dispatch_mut()
+            .preparation
             .as_ref()
             .is_some_and(|pending| Arc::ptr_eq(&pending.selection, &observation.selection))
         {
             return Ok(None);
         }
         let mut pending = self
-            .tool_preparation
+            .serial_dispatch_mut()
+            .preparation
             .take()
             .expect("exact observed preparation remains owned");
         if !pending
@@ -227,7 +250,7 @@ impl<S: Storage + Clone + 'static, L: LlmClient + 'static, T: ToolExecutor + 'st
                     }));
                 }
                 pending.phase = PreparationPhase::NoRead;
-                self.tool_preparation = Some(pending);
+                self.serial_dispatch_mut().preparation = Some(pending);
                 return Ok(None);
             }
             PreparationDisposition::Ready(_)
@@ -242,7 +265,7 @@ impl<S: Storage + Clone + 'static, L: LlmClient + 'static, T: ToolExecutor + 'st
                 match pending.failure_boundary {
                     PreparationFailureBoundary::Caller => {
                         pending.phase = PreparationPhase::NoRead;
-                        self.tool_preparation = Some(pending);
+                        self.serial_dispatch_mut().preparation = Some(pending);
                     }
                     PreparationFailureBoundary::Required(boundary) => {
                         self.fatal_local_authority_fence
@@ -272,31 +295,51 @@ impl<S: Storage + Clone + 'static, L: LlmClient + 'static, T: ToolExecutor + 'st
         event: &Event,
         next: &ConvState,
     ) {
+        if !matches!(self.foreground_dispatch, ForegroundDispatch::Serial(_)) {
+            return;
+        }
         if matches!(event, Event::UserCancel { .. })
             && matches!(self.state, ConvState::ToolExecuting { .. })
             && matches!(next, ConvState::CancellingTool { .. })
         {
-            if let Some(pending) = self.tool_preparation.as_mut() {
-                if pending
-                    .selection
-                    .owns(self.tool_preparation_runtime, &self.state)
-                    && pending.selection.owns(self.tool_preparation_runtime, next)
-                {
-                    pending.phase = PreparationPhase::Interrupted;
-                }
+            let owns = self
+                .serial_dispatch()
+                .preparation
+                .as_ref()
+                .is_some_and(|pending| {
+                    pending
+                        .selection
+                        .owns(self.tool_preparation_runtime, &self.state)
+                        && pending.selection.owns(self.tool_preparation_runtime, next)
+                });
+            if owns {
+                self.serial_dispatch_mut()
+                    .preparation
+                    .as_mut()
+                    .expect("checked read owner")
+                    .phase = PreparationPhase::Interrupted;
             }
         }
     }
 
     pub(super) fn interrupt_read_only_tool_preparation(&mut self, tool_use_id: &str) -> bool {
-        if self.tool_preparation.as_ref().is_some_and(|pending| {
-            pending.selection.tool.id == tool_use_id
-                && pending
-                    .selection
-                    .owns(self.tool_preparation_runtime, &self.state)
-                && matches!(self.state, ConvState::CancellingTool { .. })
-        }) {
-            self.tool_preparation
+        if !matches!(self.foreground_dispatch, ForegroundDispatch::Serial(_)) {
+            return false;
+        }
+        if self
+            .serial_dispatch()
+            .preparation
+            .as_ref()
+            .is_some_and(|pending| {
+                pending.selection.tool.id == tool_use_id
+                    && pending
+                        .selection
+                        .owns(self.tool_preparation_runtime, &self.state)
+                    && matches!(self.state, ConvState::CancellingTool { .. })
+            })
+        {
+            self.serial_dispatch_mut()
+                .preparation
                 .as_mut()
                 .expect("exact read owner checked")
                 .phase = PreparationPhase::Interrupted;
@@ -404,3 +447,6 @@ fn unavailable(tool: &ToolCall, message: &str) -> PreparedTool {
 
 #[cfg(test)]
 mod tests;
+
+mod batch;
+pub(super) use batch::{ForegroundDispatch, SerialDispatch};
