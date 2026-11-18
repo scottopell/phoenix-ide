@@ -6147,7 +6147,18 @@ mod tests {
             .iter()
             .filter_map(|block| match block {
                 ContentBlock::ToolUse { id, .. } => Some(id.as_str()),
-                _ => None,
+                ContentBlock::Text { .. }
+                | ContentBlock::Image { .. }
+                | ContentBlock::ToolResult { .. }
+                | ContentBlock::ServerToolUse { .. }
+                | ContentBlock::ToolSearchToolResult { .. }
+                | ContentBlock::WebSearchToolResult { .. }
+                | ContentBlock::WebFetchToolResult { .. }
+                | ContentBlock::CodeExecutionToolResult { .. }
+                | ContentBlock::BashCodeExecutionToolResult { .. }
+                | ContentBlock::TextEditorCodeExecutionToolResult { .. }
+                | ContentBlock::McpToolUse { .. }
+                | ContentBlock::McpToolResult { .. } => None,
             })
             .collect();
         assert_eq!(calls, ids);
@@ -8580,7 +8591,18 @@ mod tests {
             ContentBlock::ToolUse { id, name, input } => Some(serde_json::json!({
                 "id":id,"type":"function","function":{"name":name,"arguments":serde_json::to_string(input).unwrap()}
             })),
-            _ => None,
+            ContentBlock::Text { .. }
+                | ContentBlock::Image { .. }
+                | ContentBlock::ToolResult { .. }
+                | ContentBlock::ServerToolUse { .. }
+                | ContentBlock::ToolSearchToolResult { .. }
+                | ContentBlock::WebSearchToolResult { .. }
+                | ContentBlock::WebFetchToolResult { .. }
+                | ContentBlock::CodeExecutionToolResult { .. }
+                | ContentBlock::BashCodeExecutionToolResult { .. }
+                | ContentBlock::TextEditorCodeExecutionToolResult { .. }
+                | ContentBlock::McpToolUse { .. }
+                | ContentBlock::McpToolResult { .. } => None,
         }).collect();
         assert_eq!(assistant["tool_calls"], serde_json::json!(expected));
         let results: Vec<_> = messages

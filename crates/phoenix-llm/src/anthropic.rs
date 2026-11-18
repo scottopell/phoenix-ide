@@ -3417,7 +3417,18 @@ mod tests {
             .iter()
             .filter_map(|block| match block {
                 ContentBlock::ToolUse { id, .. } => Some(id.as_str()),
-                _ => None,
+                ContentBlock::Text { .. }
+                | ContentBlock::Image { .. }
+                | ContentBlock::ToolResult { .. }
+                | ContentBlock::ServerToolUse { .. }
+                | ContentBlock::ToolSearchToolResult { .. }
+                | ContentBlock::WebSearchToolResult { .. }
+                | ContentBlock::WebFetchToolResult { .. }
+                | ContentBlock::CodeExecutionToolResult { .. }
+                | ContentBlock::BashCodeExecutionToolResult { .. }
+                | ContentBlock::TextEditorCodeExecutionToolResult { .. }
+                | ContentBlock::McpToolUse { .. }
+                | ContentBlock::McpToolResult { .. } => None,
             })
             .collect();
         assert_eq!(calls, ids);
@@ -3467,7 +3478,18 @@ mod tests {
                 ContentBlock::ToolUse { id, name, input } => {
                     Some(serde_json::json!({"type":"tool_use","id":id,"name":name,"input":input}))
                 }
-                _ => None,
+                ContentBlock::Text { .. }
+                | ContentBlock::Image { .. }
+                | ContentBlock::ToolResult { .. }
+                | ContentBlock::ServerToolUse { .. }
+                | ContentBlock::ToolSearchToolResult { .. }
+                | ContentBlock::WebSearchToolResult { .. }
+                | ContentBlock::WebFetchToolResult { .. }
+                | ContentBlock::CodeExecutionToolResult { .. }
+                | ContentBlock::BashCodeExecutionToolResult { .. }
+                | ContentBlock::TextEditorCodeExecutionToolResult { .. }
+                | ContentBlock::McpToolUse { .. }
+                | ContentBlock::McpToolResult { .. } => None,
             })
             .collect();
         assert_eq!(serde_json::json!(calls), serde_json::json!(expected_calls));
