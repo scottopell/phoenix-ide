@@ -1350,3 +1350,180 @@ async fn serial_special_source_cancellation_drains_affirmative_unissued_tail() {
     assert_eq!(results[0].content, "authentic native completion");
     assert_eq!(results[2].content, "Skipped due to cancellation");
 }
+
+#[tokio::test]
+async fn lost_batch_task_settles_one_exact_error_without_cancelling_its_sibling() {
+    use futures::FutureExt as _;
+    let (mut runtime, mut starts, _directory) = prepared_batch(calls(2, "slow-command")).await;
+    launch_preparations(&mut runtime, 2).await;
+    for _ in 0..2 {
+        starts.recv().await.unwrap();
+    }
+    runtime.abort_batch_call_for_test("call-1").await;
+    let observation = runtime.foreground_dispatch.observe().await;
+    let event = runtime
+        .accept_foreground_observation(observation)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(&event, Event::ToolComplete { tool_use_id, result } if tool_use_id == "call-1" && result.is_error() && result.output().contains("aborted or panicked"))
+    );
+    runtime.process_event(event).await.unwrap();
+    assert!(
+        runtime
+            .foreground_dispatch
+            .observe()
+            .now_or_never()
+            .is_none(),
+        "the lost sender owns exactly one failure receipt"
+    );
+    assert!(runtime
+        .tool_executor
+        .tokens
+        .lock()
+        .unwrap()
+        .iter()
+        .all(|(_, token)| !token.is_cancelled()));
+    assert!(runtime.llm_client.recorded_requests().is_empty());
+    runtime.process_event(user_cancel()).await.unwrap();
+    drain_cancelled_batch(&mut runtime).await;
+}
+
+#[tokio::test]
+async fn sqlite_rejects_sibling_commit_without_refill_publication_or_model_advance() {
+    let directory = tempfile::tempdir().unwrap();
+    let db = crate::db::Database::open(directory.path().join("batch-commit.db").to_str().unwrap())
+        .await
+        .unwrap();
+    crate::db::run_pending_migrations(db.pool()).await.unwrap();
+    db.create_conversation(
+        "ordinary-batch",
+        "ordinary-batch",
+        directory.path().to_str().unwrap(),
+        true,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    let mut content = calls(6, "slow-command");
+    content[1] = ContentBlock::tool_use(
+        "call-1",
+        "bash",
+        serde_json::json!({"op":"run","cmd":"fast-command"}),
+    );
+    let (ram, events, mut starts, _) = runtime_with_calls(directory.path(), false, content.clone());
+    let tools = ram.tool_executor.as_ref().clone();
+    let llm = ram.llm_client.as_ref().clone();
+    let definitions = tools.definitions().await;
+    db.prepare_tool_availability(
+        "ordinary-batch",
+        "batch-commit-test",
+        None,
+        &definitions,
+        &definitions
+            .iter()
+            .map(|definition| definition.name.clone())
+            .collect(),
+        &[],
+        &[],
+    )
+    .await
+    .unwrap();
+    let mut calls = content
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::ToolUse { id, name, input } => Some(ToolCall::new(
+                id,
+                ToolInput::from_name_and_value(name, input.clone()),
+            )),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let current_tool = calls.remove(0);
+    let initial = ConvState::ToolExecuting {
+        current_tool: current_tool.clone(),
+        remaining_tools: calls,
+        completed_results: vec![],
+        pending_sub_agents: vec![],
+        assistant_message: crate::state_machine::AssistantMessage::new(
+            "sqlite-batch-owner".into(),
+            content,
+            None,
+            None,
+        ),
+    };
+    db.update_conversation_state("ordinary-batch", &initial)
+        .await
+        .unwrap();
+    let (_, receiver) = mpsc::channel(16);
+    let (watcher, observed) = watch::channel(initial.clone());
+    let mut runtime = ConversationRuntime::new(
+        ram.context.clone(),
+        initial.clone(),
+        crate::runtime::traits::DatabaseStorage::new(db.clone()),
+        llm.clone(),
+        tools.clone(),
+        ram.browser_sessions.clone(),
+        ram.bash_handles.clone(),
+        ram.tmux_registry.clone(),
+        ram.llm_registry.clone(),
+        ram.terminals.clone(),
+        receiver,
+        events,
+        SseBroadcaster::new(128, 0),
+    )
+    .with_state_watcher(watcher);
+    runtime.begin_tool_preparation(current_tool).unwrap();
+    for _ in 0..4 {
+        let observation = runtime.foreground_dispatch.observe().await;
+        assert!(runtime
+            .accept_foreground_observation(observation)
+            .await
+            .unwrap()
+            .is_none());
+    }
+    for _ in 0..4 {
+        starts.recv().await.unwrap();
+    }
+    runtime.join_batch_call_for_test("call-1").await;
+    sqlx::query("CREATE TRIGGER reject_batch_state BEFORE UPDATE OF state ON conversations BEGIN SELECT RAISE(ABORT, 'batch sibling state commit rejected'); END")
+        .execute(db.pool()).await.unwrap();
+    let mut publications = runtime.broadcast_tx.subscribe();
+    let observation = runtime.foreground_dispatch.observe().await;
+    let event = runtime
+        .accept_foreground_observation(observation)
+        .await
+        .unwrap()
+        .unwrap();
+    let error = runtime.process_event(event).await.unwrap_err();
+    assert!(
+        error.contains("batch sibling state commit rejected"),
+        "{error}"
+    );
+    assert!(runtime
+        .fatal_local_authority_fence
+        .fatal_authority_loss_is_latched());
+    assert_eq!(*observed.borrow(), initial);
+    assert_eq!(
+        db.get_conversation("ordinary-batch").await.unwrap().state,
+        initial
+    );
+    assert!(db.get_messages("ordinary-batch").await.unwrap().is_empty());
+    assert!(publications.try_recv().is_err());
+    assert!(starts.try_recv().is_err());
+    assert_eq!(tools.tokens.lock().unwrap().len(), 4);
+    assert!(llm.recorded_requests().is_empty());
+    assert_eq!(
+        Box::pin(runtime.run()).await,
+        RuntimeExitDisposition::FatalLocalAuthorityLoss
+    );
+    assert!(tools
+        .tokens
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(command, _)| command == "slow-command")
+        .all(|(_, token)| token.is_cancelled()));
+}
