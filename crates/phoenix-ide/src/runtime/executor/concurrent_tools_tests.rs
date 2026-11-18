@@ -1539,3 +1539,5 @@ async fn sqlite_rejects_sibling_commit_without_refill_publication_or_model_advan
         .filter(|(command, _)| command == "slow-command")
         .all(|(_, token)| token.is_cancelled()));
 }
+
+mod commit_cancellation;
