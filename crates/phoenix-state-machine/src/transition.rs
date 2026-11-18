@@ -1202,6 +1202,21 @@ fn source_order_results(assistant: &AssistantMessage, results: &mut [ToolRoundRe
     });
 }
 
+fn source_order_checkpoint(
+    assistant: &AssistantMessage,
+    mut completed: Vec<ToolRoundResult>,
+    tail: impl IntoIterator<Item = impl Into<ToolRoundResult>>,
+) -> Result<CheckpointData, ToolRoundError> {
+    completed.extend(tail.into_iter().map(Into::into));
+    source_order_results(assistant, &mut completed);
+    ToolRoundAssembly::new(
+        assistant.clone(),
+        completed,
+        std::iter::empty::<ToolRoundResult>(),
+    )
+    .map(CheckpointData::ToolRound)
+}
+
 fn complete_ordinary_sibling(
     state: &CoreState,
     tool_use_id: &str,
@@ -1532,12 +1547,11 @@ fn handle_core_cancellation(
             let cancellation_results =
                 build_cancellation_results(tool_use_id, "Cancelled by user", skipped_tools);
 
-            let checkpoint = ToolRoundAssembly::new(
-                assistant_message.clone(),
+            let checkpoint = source_order_checkpoint(
+                assistant_message,
                 completed_results.clone(),
                 cancellation_results,
-            )
-            .map(CheckpointData::ToolRound)?;
+            )?;
 
             if pending_sub_agents.is_empty() {
                 let mut result = CoreTransitionResult::new(CoreState::Idle)
@@ -1578,12 +1592,11 @@ fn handle_core_cancellation(
                 result,
             },
         ) if *tool_use_id == completed_id => {
-            let checkpoint = ToolRoundAssembly::new(
-                assistant_message.clone(),
+            let checkpoint = source_order_checkpoint(
+                assistant_message,
                 completed_results.clone(),
                 std::iter::once(result),
-            )
-            .map(CheckpointData::ToolRound)?;
+            )?;
 
             if pending_sub_agents.is_empty() {
                 Ok(CoreTransitionResult::new(CoreState::Idle)
@@ -3834,30 +3847,29 @@ pub fn transition_sub_agent(
         // ============================================================
         // Sub-agent CancellingTool + ToolAborted/ToolComplete -> Failed
         // ============================================================
-        // The in-flight tool the sub-agent aborted has now settled. A cancelled
-        // sub-agent ends terminally Failed (the parent's analogous arm goes to
-        // Idle to resume the user's turn — wrong here, where the sub-agent has
-        // no turn of its own to resume) and notifies the parent so fan-in
-        // accounting stays correct. The tool result is discarded: the round is
-        // being cancelled, not checkpointed. Guarded on id match so a stale
-        // outcome for a different tool_use does not settle the wrong round.
+        // Partial sibling receipts are handled before this terminal arm.
         (
             SubAgentState::Core(CoreState::CancellingTool {
-                tool_use_id, cause, ..
+                tool_use_id,
+                cause,
+                skipped_tools,
+                completed_results,
+                assistant_message,
+                ..
             }),
             SubAgentEvent::Core(
-                CoreEvent::ToolAborted {
-                    tool_use_id: settled_id,
+                ref settled @ (CoreEvent::ToolAborted {
+                    tool_use_id: ref settled_id,
                 }
                 | CoreEvent::ToolCancellationRetired {
-                    tool_use_id: settled_id,
+                    tool_use_id: ref settled_id,
                 }
                 | CoreEvent::ToolComplete {
-                    tool_use_id: settled_id,
+                    tool_use_id: ref settled_id,
                     ..
-                },
+                }),
             ),
-        ) if *tool_use_id == settled_id => {
+        ) if tool_use_id == settled_id => {
             let (error, error_kind, outcome) = match cause {
                 CancelCause::Timeout => (
                     "Sub-agent timed out".to_string(),
@@ -3876,8 +3888,21 @@ pub fn transition_sub_agent(
                     )
                 }
             };
+            let tail: Vec<ToolRoundResult> = match settled {
+                CoreEvent::ToolComplete { result, .. } => vec![result.clone()],
+                CoreEvent::ToolAborted { .. } | CoreEvent::ToolCancellationRetired { .. } => {
+                    build_cancellation_results(tool_use_id, "Cancelled by parent", skipped_tools)
+                        .into_iter()
+                        .map(Into::into)
+                        .collect()
+                }
+                _ => unreachable!("terminal cancellation receipt matched above"),
+            };
+            let checkpoint =
+                source_order_checkpoint(assistant_message, completed_results.clone(), tail)?;
             Ok(
                 SubAgentTransitionResult::new(SubAgentState::Failed { error, error_kind })
+                    .with_effect(Effect::PersistCheckpoint { data: checkpoint })
                     .with_effect(Effect::PersistState)
                     .with_effect(Effect::NotifyParent { outcome }),
             )
@@ -7497,6 +7522,21 @@ mod tests {
         )
         .unwrap();
 
+        assert!(matches!(
+            result2.new_state,
+            ConvState::CancellingTool { .. }
+        ));
+        let mut result2 = result2;
+        for id in ["tool-2", "tool-3"] {
+            result2 = transition(
+                &result2.new_state,
+                &test_context(),
+                Event::ToolAborted {
+                    tool_use_id: id.into(),
+                },
+            )
+            .unwrap();
+        }
         assert!(matches!(result2.new_state, ConvState::Idle));
         assert!(
             result2

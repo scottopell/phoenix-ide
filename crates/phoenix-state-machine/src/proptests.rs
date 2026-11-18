@@ -44,6 +44,20 @@ pub(crate) fn assistant_message_for_tools(tool_ids: &[&str]) -> AssistantMessage
     AssistantMessage::new(uuid::Uuid::new_v4().to_string(), content_blocks, None, None)
 }
 
+fn drain_unissued_cancellations(mut step: TransitionResult) -> TransitionResult {
+    while let ConvState::CancellingTool { tool_use_id, .. } = &step.new_state {
+        step = transition(
+            &step.new_state,
+            &test_context(),
+            Event::ToolAborted {
+                tool_use_id: tool_use_id.clone(),
+            },
+        )
+        .unwrap();
+    }
+    step
+}
+
 // ============================================================================
 // Arbitrary Generators
 // ============================================================================
@@ -1022,6 +1036,10 @@ proptest! {
         prop_assert!(result.is_ok());
 
         let tr = result.unwrap();
+        if !skipped.is_empty() {
+            prop_assert!(matches!(tr.new_state, ConvState::CancellingTool { .. }));
+        }
+        let tr = drain_unissued_cancellations(tr);
         prop_assert!(matches!(tr.new_state, ConvState::Idle));
 
         // Should have PersistCheckpoint with correct count
@@ -1037,9 +1055,9 @@ proptest! {
         }
     }
 
-    // Invariant 17: CancellingTool + ToolComplete (racing) -> Idle with synthetic (not actual) results
+    // Invariant 17: an authentic typed completion survives the cancellation drain
     #[test]
-    fn prop_cancelling_tool_complete_uses_synthetic(
+    fn prop_cancelling_tool_complete_preserves_authentic_receipt(
         tool_use_id in "[a-z]{8}",
         skipped in proptest::collection::vec(arb_tool_call(), 0..3),
     ) {
@@ -1069,10 +1087,10 @@ proptest! {
             pending_sub_agents: vec![],
         };
 
-        // Tool completes naturally before abort takes effect
+        // This receipt is already typed before the cancellation drain.
         let actual_result = ToolResult::success(
             tool_use_id.clone(),
-            "actual output that should be discarded".to_string(),
+            "authentic typed output ready before cancellation".to_string(),
         );
 
         let result = transition(
@@ -1080,22 +1098,28 @@ proptest! {
             &test_context(),
             Event::ToolComplete {
                 tool_use_id: tool_use_id.clone(),
-                result: actual_result,
+                result: actual_result.clone(),
             },
         );
         prop_assert!(result.is_ok());
 
         let tr = result.unwrap();
+        if !skipped.is_empty() {
+            prop_assert!(matches!(tr.new_state, ConvState::CancellingTool { .. }));
+        }
+        let tr = drain_unissued_cancellations(tr);
         prop_assert!(matches!(tr.new_state, ConvState::Idle));
 
-        // Should still use synthetic results (all failed), not the actual success
+        // The source result stays authentic; unissued siblings get cancellation results.
         if let Some(Effect::PersistCheckpoint { data }) = tr.effects.iter().find(|e| matches!(e, Effect::PersistCheckpoint { .. })) {
             let CheckpointData::ToolRound(round) = data;
             let tool_results: Vec<_> = round.results().iter().map(|entry| entry.finalized().expect("finalized-only test round").clone()).collect();
-            // Find the result for our tool - it should be marked as cancelled, not successful
+            // Select by exact identity so source ordering cannot mask lost payloads.
             let our_result = tool_results.iter().find(|r| r.tool_use_id == tool_use_id);
             prop_assert!(our_result.is_some());
-            prop_assert!(!our_result.unwrap().is_success(), "Cancelled tool should not show as successful");
+            prop_assert_eq!(our_result.unwrap(), &actual_result);
+            prop_assert_eq!(tool_results.len(), 1 + skipped.len());
+            prop_assert!(tool_results.iter().filter(|result| result.tool_use_id != tool_use_id).all(|result| !result.is_success()));
         }
     }
 
@@ -1535,6 +1559,11 @@ fn test_cancel_mid_tool_chain() {
     )
     .unwrap();
 
+    assert!(matches!(
+        result2.new_state,
+        ConvState::CancellingTool { .. }
+    ));
+    let result2 = drain_unissued_cancellations(result2);
     assert!(matches!(result2.new_state, ConvState::Idle));
 
     // Should have PersistCheckpoint with all results

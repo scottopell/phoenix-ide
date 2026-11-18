@@ -72,7 +72,7 @@ fn restart_orders_out_of_order_sibling_results_by_source_identity() {
 }
 
 #[test]
-fn restart_preserves_completed_metadata_and_interrupted_tail_order() {
+fn restart_preserves_completed_metadata_and_source_order() {
     let assistant = assistant(&[
         ("done", "read_image"),
         ("unfinished", "think"),
@@ -124,7 +124,6 @@ fn restart_preserves_completed_metadata_and_interrupted_tail_order() {
             vec![image],
             Some(serde_json::json!({"duration_ms":17,"detail":[1,2]})),
         ),
-        ("promoted", "retained reference", false, vec![], None),
         (
             "unfinished",
             "[Tool execution interrupted by server restart]",
@@ -132,6 +131,7 @@ fn restart_preserves_completed_metadata_and_interrupted_tail_order() {
             vec![],
             None,
         ),
+        ("promoted", "retained reference", false, vec![], None),
     ];
     assert_eq!(rows.len(), expected.len());
     for (ordinal, (row, (id, output, is_error, images, display))) in
