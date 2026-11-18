@@ -115,10 +115,7 @@ async fn cancellation_interrupts_held_sibling_commit(route: Route) {
     let (write_entered, release_write) = storage.gate_state_update();
     let (manager, handle, actor, mut states) = register_actor(runtime).await;
     for _ in 0..4 {
-        tokio::time::timeout(Duration::from_secs(60), starts.recv())
-            .await
-            .unwrap()
-            .unwrap();
+        next_started(&mut starts).await;
     }
     release_fast.add_permits(1);
     tokio::time::timeout(Duration::from_secs(60), write_entered)
@@ -254,10 +251,7 @@ async fn final_checkpoint_cancellation(queued_steer: bool) {
     let (manager, handle, actor, mut states) = register_actor(runtime).await;
     send_user(&events).await;
     for _ in 0..2 {
-        tokio::time::timeout(Duration::from_secs(60), starts.recv())
-            .await
-            .unwrap()
-            .unwrap();
+        next_started(&mut starts).await;
     }
     if queued_steer {
         queue_instruction(&manager, &storage).await;
@@ -387,10 +381,7 @@ async fn expired_wait_retires_only_its_task_while_a_sibling_commit_is_held() {
     let (entered, release_write) = storage.gate_state_update();
     let (manager, handle, actor, mut states) = register_actor(runtime).await;
     for _ in 0..3 {
-        tokio::time::timeout(Duration::from_secs(60), starts.recv())
-            .await
-            .unwrap()
-            .unwrap();
+        next_started(&mut starts).await;
     }
     release_fast.add_permits(1);
     tokio::time::timeout(Duration::from_secs(60), entered)
