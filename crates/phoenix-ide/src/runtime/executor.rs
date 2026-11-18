@@ -3312,6 +3312,11 @@ where
                         return RuntimeExitDisposition::CoordinatedShutdown;
                     }
                 }
+                () = async {
+                    tokio::time::sleep_until(cancellation_resource_cutoff.expect("retained resource cutoff")).await;
+                }, if cancellation_resource_cutoff.is_some() => {
+                    self.service_cancellation_resource_cutoff();
+                }
                 cancellation = async {
                     self.cancellation_input_rx.as_mut().expect("open cancellation inbox").recv().await
                 }, if self.cancellation_input_rx.is_some() => {
@@ -3322,11 +3327,6 @@ where
                         }
                         None => self.cancellation_input_rx = None,
                     }
-                }
-                () = async {
-                    tokio::time::sleep_until(cancellation_resource_cutoff.expect("retained resource cutoff")).await;
-                }, if cancellation_resource_cutoff.is_some() => {
-                    self.service_cancellation_resource_cutoff();
                 }
                 Some(AcknowledgedEventRequest { event, acknowledgement, retirement }) = self.acknowledged_event_rx.recv() => {
                     let result = self.process_acknowledged_event(event).await;
