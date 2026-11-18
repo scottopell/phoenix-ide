@@ -29,6 +29,7 @@ use std::sync::{Arc, Mutex};
 pub struct MockLlmClient {
     responses: Mutex<VecDeque<Result<LlmResponse, LlmError>>>,
     freeze_failure: Mutex<Option<LlmError>>,
+    frozen_request_count: AtomicUsize,
     model_id: String,
     /// Record of all requests made
     pub requests: Mutex<Vec<LlmRequest>>,
@@ -42,6 +43,7 @@ impl MockLlmClient {
         Self {
             responses: Mutex::new(VecDeque::new()),
             freeze_failure: Mutex::new(None),
+            frozen_request_count: AtomicUsize::new(0),
             model_id: model_id.into(),
             requests: Mutex::new(Vec::new()),
             request_count_tx,
@@ -67,6 +69,10 @@ impl MockLlmClient {
         self.requests.lock().unwrap().clone()
     }
 
+    pub fn frozen_request_count(&self) -> usize {
+        self.frozen_request_count.load(Ordering::SeqCst)
+    }
+
     pub fn subscribe_request_count(&self) -> tokio::sync::watch::Receiver<u64> {
         self.request_count_tx.subscribe()
     }
@@ -75,6 +81,7 @@ impl MockLlmClient {
 #[async_trait]
 impl LlmClient for MockLlmClient {
     fn freeze_for_request(self: Arc<Self>) -> Result<Arc<dyn LlmClient>, LlmError> {
+        self.frozen_request_count.fetch_add(1, Ordering::SeqCst);
         let failure = self.freeze_failure.lock().unwrap().take();
         if let Some(error) = failure {
             return Err(error);
@@ -4285,7 +4292,10 @@ mod tests {
                 &context,
                 Event::ToolComplete {
                     tool_use_id: id.into(),
-                    result: crate::db::ToolResult::cancelled(id.into(), "Skipped due to cancellation"),
+                    result: crate::db::ToolResult::cancelled(
+                        id.into(),
+                        "Skipped due to cancellation",
+                    ),
                 },
             )
             .unwrap();
