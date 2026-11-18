@@ -431,3 +431,102 @@ async fn expired_wait_retires_only_its_task_while_a_sibling_commit_is_held() {
         "resource-only retirement cannot publish an uncommitted result"
     );
 }
+
+#[tokio::test]
+async fn rejected_cancel_retains_original_resource_cutoff_without_retry() {
+    let (runtime, mut starts, _directory) = prepared_batch(calls(6, "stubborn-command")).await;
+    let storage = Arc::clone(&runtime.storage);
+    let tools = Arc::clone(&runtime.tool_executor);
+    let llm = Arc::clone(&runtime.llm_client);
+    let (entered, release) = storage.gate_state_update();
+    storage.fail_gated_state_update_once();
+    let (manager, handle, actor, mut states) = register_actor(runtime).await;
+    for _ in 0..4 {
+        next_started(&mut starts).await;
+    }
+    let tokens: Vec<_> = tools
+        .tokens
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(_, token)| token.clone())
+        .collect();
+    tokio::time::pause();
+    let rejected = enqueue_cancel(&manager, &handle, Route::Acknowledged)
+        .await
+        .unwrap();
+    let signalled = tokio::time::timeout(
+        Duration::from_millis(100),
+        futures::future::join_all(tokens.iter().map(CancellationToken::cancelled)),
+    )
+    .await
+    .is_ok();
+    tokio::time::timeout(Duration::from_secs(60), entered)
+        .await
+        .unwrap()
+        .unwrap();
+    release.send(()).unwrap();
+    let diagnostic = rejected.await.unwrap().unwrap_err();
+    tokio::time::advance(CANCELLATION_DEADLINE + Duration::from_millis(1)).await;
+    let retired_without_retry = tokio::time::timeout(
+        Duration::from_millis(100),
+        wait_for_finished(&tools, "stubborn-command", 4),
+    )
+    .await
+    .is_ok();
+    let no_semantic_success = matches!(*states.borrow(), ConvState::ToolExecuting { .. })
+        && storage.get_all_messages("ordinary-batch").is_empty();
+    let fence_remained_open = !manager
+        .fatal_local_authority_fence
+        .fatal_authority_loss_is_latched();
+    let no_refill = starts.try_recv().is_err() && tools.tokens.lock().unwrap().len() == 4;
+    let retry = enqueue_cancel(&manager, &handle, Route::Acknowledged)
+        .await
+        .unwrap();
+    let retry_kept_cutoff = tokio::time::timeout(
+        Duration::from_millis(100),
+        states.wait_for(|state| matches!(state, ConvState::Idle)),
+    )
+    .await
+    .is_ok();
+    if !retry_kept_cutoff {
+        tokio::time::advance(CANCELLATION_DEADLINE).await;
+        tokio::time::timeout(
+            Duration::from_secs(60),
+            states.wait_for(|state| matches!(state, ConvState::Idle)),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    }
+    tokio::time::resume();
+    retry.await.unwrap().unwrap();
+    handle.event_tx.send(Event::Shutdown).await.unwrap();
+    assert_eq!(
+        actor.await.unwrap(),
+        RuntimeExitDisposition::CoordinatedShutdown
+    );
+    manager.runtimes.write().await.remove("ordinary-batch");
+    assert!(
+        diagnostic.contains("injected gated state update failure"),
+        "{diagnostic}"
+    );
+    assert!(
+        signalled,
+        "a rejected cancel still interrupts every admitted resource immediately"
+    );
+    assert!(retired_without_retry, "the original resource cutoff must survive a known cancellation rejection without requiring another request");
+    assert!(
+        no_semantic_success,
+        "resource retirement cannot fabricate a successful rejected cancellation"
+    );
+    assert!(
+        fence_remained_open,
+        "the observed rejection must not be reclassified as unknown local authority"
+    );
+    assert!(no_refill && llm.recorded_requests().is_empty());
+    assert!(
+        retry_kept_cutoff,
+        "an explicit retry must join the same close and original cutoff"
+    );
+}
