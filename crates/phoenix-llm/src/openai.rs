@@ -2102,17 +2102,8 @@ fn translate_to_responses_request_for_model(
         .responses_request_value()
         .map(str::to_string),
         tool_choice,
-        // `parallel_tool_calls: true` lets the model emit multiple ToolUse
-        // blocks in one assistant message. Phoenix's executor runs tools
-        // serially (state.rs `ToolExecuting { current_tool, remaining_tools }`),
-        // so we don't gain parallelism — but we do save (N-1) LLM round-trips
-        // when the model recognises a batch as safely-parallel ("read these
-        // three files"). Tradeoff: the model commits to all N tools without
-        // seeing intermediate results, so a bad batch wastes the unused
-        // calls. Modern models are decent at not batching dependent tools,
-        // so on balance the round-trip savings win. Revisit if Phoenix gains
-        // a parallel executor (then this becomes a true no-brainer) or if we
-        // see the model batching too aggressively in practice.
+        // Allows multiple native calls in one response; runtime batch admission
+        // determines which foreground calls may execute concurrently.
         parallel_tool_calls: if has_tools { Some(true) } else { None },
         include: if official_openai_route || use_codex_backend {
             vec!["reasoning.encrypted_content".to_string()]
@@ -6551,6 +6542,96 @@ mod tests {
         ]})
     }
 
+    fn batch_continuation_request(response: &LlmResponse, ids: &[&str]) -> LlmRequest {
+        assert!(!response.end_turn);
+        let calls: Vec<_> = response
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::ToolUse { id, .. } => Some(id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(calls, ids);
+        let mut request = restricted_request(&["bash"]);
+        request.messages = vec![
+            LlmMessage {
+                source_message_id: Some("batch-owner".into()),
+                role: MessageRole::Assistant,
+                content: response.content.clone(),
+            },
+            LlmMessage {
+                source_message_id: None,
+                role: MessageRole::User,
+                content: ids
+                    .iter()
+                    .enumerate()
+                    .map(|(index, id)| ContentBlock::ToolResult {
+                        tool_use_id: (*id).into(),
+                        content: format!("result-{index}"),
+                        is_error: index == 1,
+                        images: vec![],
+                    })
+                    .collect(),
+            },
+        ];
+        request
+    }
+
+    fn assert_responses_batch_continuation(response: &LlmResponse, wire: &serde_json::Value) {
+        assert_eq!(response.content.len(), 3, "private reasoning stays private");
+        let mut request = batch_continuation_request(response, &["c1", "c2"]);
+        let Some(ProviderReplayUpdate::Responses(set)) = &response.provider_replay else {
+            panic!("batch must retain private continuation");
+        };
+        assert_eq!(set.output_items, wire["output"].as_array().unwrap().clone());
+        assert_eq!(set.response_id, wire["id"].as_str().unwrap());
+        assert_eq!(set.model, wire["model"].as_str().unwrap());
+        request
+            .responses_replay
+            .push(set.clone().with_owner_message_id("batch-owner".into()));
+        let model = wire["model"].as_str().unwrap();
+        validate_responses_replay(&request, model).unwrap();
+        let mut expected = wire["output"].as_array().unwrap().clone();
+        expected.extend([
+            serde_json::json!({"type":"function_call_output","call_id":"c1","output":"result-0"}),
+            serde_json::json!({"type":"function_call_output","call_id":"c2","output":"Error: result-1"}),
+        ]);
+        for codex in [false, true] {
+            let next =
+                serde_json::to_value(translate_to_backend_request(model, &request, codex, true))
+                    .unwrap();
+            let input = next["input"].as_array().unwrap();
+            if codex {
+                assert_eq!(next["parallel_tool_calls"], false);
+                assert_eq!(&input[2..], expected.as_slice());
+            } else {
+                assert_eq!(input, &expected);
+            }
+        }
+    }
+
+    #[test]
+    fn responses_batch_normalization_preserves_calls_and_complete_lite_history() {
+        let mut wire = reasoning_response("batch-response", "c1");
+        wire["model"] = serde_json::json!("gpt-6.1-sol");
+        wire["output"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "type":"function_call","id":"item-c2","call_id":"c2",
+                "name":"bash","arguments":"{\"cmd\":\"pwd\"}","status":"completed"
+            }));
+        let response =
+            normalize_responses_api_response(serde_json::from_value(wire.clone()).unwrap())
+                .unwrap();
+        assert!(
+            matches!(&response.content[2], ContentBlock::ToolUse { name, input, .. }
+            if name == "bash" && input["cmd"] == "pwd")
+        );
+        assert_responses_batch_continuation(&response, &wire);
+    }
+
     #[test]
     fn commentary_without_reasoning_then_reasoning_round_replays_full_envelopes() {
         let mut request = restricted_request(&["bash"]);
@@ -6729,8 +6810,16 @@ mod tests {
     async fn streaming_replay_retains_terminal_encrypted_reasoning_and_output_order() {
         let mut acc = ResponsesStreamAccumulator::new(Instant::now(), &empty_request());
         let (tx, _rx) = tokio::sync::mpsc::channel(8);
-        let wire = reasoning_response("r1", "c1");
-        for index in [2, 0, 1] {
+        let mut wire = reasoning_response("r1", "c1");
+        wire["model"] = serde_json::json!("gpt-6.1-sol");
+        wire["output"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "type":"function_call","id":"item-c2","call_id":"c2",
+                "name":"bash","arguments":"{\"cmd\":\"pwd\"}","status":"completed"
+            }));
+        for index in [3, 2, 0, 1] {
             let mut item = wire["output"][index].clone();
             if index == 0 {
                 item.as_object_mut().unwrap().remove("encrypted_content");
@@ -6745,11 +6834,7 @@ mod tests {
             .await
             .unwrap();
         let response = acc.into_response().unwrap();
-        let Some(ProviderReplayUpdate::Responses(set)) = response.provider_replay else {
-            panic!("missing private continuation");
-        };
-        assert_eq!(set.output_items, wire["output"].as_array().unwrap().clone());
-        assert_eq!(response.content.len(), 2);
+        assert_responses_batch_continuation(&response, &wire);
     }
 
     #[test]
@@ -8996,6 +9081,42 @@ mod tests {
         assert_eq!(explicit["reasoning_effort"], "high");
     }
 
+    fn assert_chat_batch_continuation(response: &LlmResponse, ids: &[&str]) {
+        assert_eq!(response.content.len(), ids.len());
+        let request = batch_continuation_request(response, ids);
+        let wire =
+            serde_json::to_value(translate_to_chat_request("compatible-chat-model", &request))
+                .unwrap();
+        let messages = wire["messages"].as_array().unwrap();
+        let assistant = messages
+            .iter()
+            .find(|message| message["role"] == "assistant")
+            .unwrap();
+        let expected: Vec<_> = response.content.iter().filter_map(|block| match block {
+            ContentBlock::ToolUse { id, name, input } => Some(serde_json::json!({
+                "id":id,"type":"function","function":{"name":name,"arguments":serde_json::to_string(input).unwrap()}
+            })),
+            _ => None,
+        }).collect();
+        assert_eq!(assistant["tool_calls"], serde_json::json!(expected));
+        let results: Vec<_> = messages
+            .iter()
+            .filter(|message| message["role"] == "tool")
+            .collect();
+        assert_eq!(results.len(), ids.len());
+        for (index, (result, id)) in results.iter().zip(ids).enumerate() {
+            assert_eq!(result["tool_call_id"], *id);
+            assert_eq!(
+                result["content"],
+                if index == 1 {
+                    "Error: result-1"
+                } else {
+                    "result-0"
+                }
+            );
+        }
+    }
+
     #[test]
     fn chat_normalization_preserves_tool_id_and_cached_usage() {
         let response = ChatCompletionsResponse {
@@ -9005,15 +9126,26 @@ mod tests {
                     reasoning_content: Some("private reasoning".to_string()),
                     content: None,
                     refusal: None,
-                    tool_calls: Some(vec![ChatToolCall {
-                        extra_content: None,
-                        id: "call-7".to_string(),
-                        r#type: "function".to_string(),
-                        function: ChatFunctionCall {
-                            name: "read_file".to_string(),
-                            arguments: r#"{"path":"README.md"}"#.to_string(),
+                    tool_calls: Some(vec![
+                        ChatToolCall {
+                            extra_content: None,
+                            id: "call-7".to_string(),
+                            r#type: "function".to_string(),
+                            function: ChatFunctionCall {
+                                name: "read_file".to_string(),
+                                arguments: r#"{"path":"README.md"}"#.to_string(),
+                            },
                         },
-                    }]),
+                        ChatToolCall {
+                            extra_content: None,
+                            id: "call-8".to_string(),
+                            r#type: "function".to_string(),
+                            function: ChatFunctionCall {
+                                name: "read_file".to_string(),
+                                arguments: r#"{"path":"Cargo.toml"}"#.to_string(),
+                            },
+                        },
+                    ]),
                 },
                 finish_reason: Some("tool_calls".to_string()),
             }],
@@ -9026,7 +9158,11 @@ mod tests {
             }),
         };
         let normalized = normalize_chat_response(response, "compatible-chat-model").unwrap();
-        assert!(!normalized.end_turn);
+        assert_chat_batch_continuation(&normalized, &["call-7", "call-8"]);
+        assert!(
+            matches!(&normalized.content[1], ContentBlock::ToolUse { name, input, .. }
+            if name == "read_file" && input["path"] == "Cargo.toml")
+        );
         assert_eq!(normalized.usage.input_tokens, 200);
         assert_eq!(normalized.usage.cache_read_tokens, 800);
         assert!(matches!(
@@ -9421,21 +9557,26 @@ mod tests {
         let (tx, _rx) = tokio::sync::mpsc::channel(8);
         let mut acc = ChatStreamAccumulator::new(Instant::now(), &request);
         acc.process_event(
-            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-9","function":{"name":"bash","arguments":""}}]}}]}"#,
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-9","function":{"name":"bash","arguments":"{\"cmd\":"}},{"index":1,"id":"call-10","function":{"name":"bash","arguments":"{\"cmd\":"}}]}}]}"#,
             &tx,
         )
         .await
         .unwrap();
         acc.process_event(
-            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"cmd\":\"pwd\"}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":10,"completion_tokens":2}}"#,
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":1,"function":{"arguments":"\"ls\"}"}},{"index":0,"function":{"arguments":"\"pwd\"}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":10,"completion_tokens":2}}"#,
             &tx,
         )
         .await
         .unwrap();
         let response = acc.into_response().unwrap();
+        assert_chat_batch_continuation(&response, &["call-9", "call-10"]);
+        assert!(
+            matches!(&response.content[1], ContentBlock::ToolUse { name, input, .. }
+            if name == "bash" && input["cmd"] == "ls")
+        );
         assert_eq!(response.usage.input_tokens, 10);
         assert_eq!(response.usage.output_tokens, 2);
-        assert_eq!(response.stream_telemetry.generation_event_count, 2);
+        assert_eq!(response.stream_telemetry.generation_event_count, 4);
         assert!(response.stream_telemetry.completed);
         assert!(matches!(
             &response.content[0],
