@@ -1037,7 +1037,7 @@ proptest! {
 
         let tr = result.unwrap();
         if !skipped.is_empty() {
-            prop_assert!(matches!(tr.new_state, ConvState::CancellingTool { .. }));
+            prop_assert!(matches!(tr.new_state, ConvState::CancellingTool { .. }), "other members still require cancellation receipts");
         }
         let tr = drain_unissued_cancellations(tr);
         prop_assert!(matches!(tr.new_state, ConvState::Idle));
@@ -1105,7 +1105,7 @@ proptest! {
 
         let tr = result.unwrap();
         if !skipped.is_empty() {
-            prop_assert!(matches!(tr.new_state, ConvState::CancellingTool { .. }));
+            prop_assert!(matches!(tr.new_state, ConvState::CancellingTool { .. }), "other members still require cancellation receipts");
         }
         let tr = drain_unissued_cancellations(tr);
         prop_assert!(matches!(tr.new_state, ConvState::Idle));
