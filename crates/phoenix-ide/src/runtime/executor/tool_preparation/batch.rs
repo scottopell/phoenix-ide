@@ -148,6 +148,17 @@ pub(in super::super) enum ForegroundObservation {
 }
 
 impl ForegroundDispatch {
+    pub(in super::super) fn open_batch_origin(&self) -> Option<Arc<AssistantMessage>> {
+        match self {
+            Self::OrdinaryBatch(batch) if !batch.closing => Some(Arc::clone(&batch.origin)),
+            Self::OrdinaryBatch(_) | Self::Serial(_) => None,
+        }
+    }
+
+    pub(in super::super) fn owns_batch_origin(&self, origin: &Arc<AssistantMessage>) -> bool {
+        matches!(self, Self::OrdinaryBatch(batch) if Arc::ptr_eq(&batch.origin, origin))
+    }
+
     pub(in super::super) fn retire_expired_wait_resources(&mut self) {
         let Self::OrdinaryBatch(batch) = self else {
             return;
@@ -847,6 +858,8 @@ impl<S: Storage + Clone + 'static, L: LlmClient + 'static, T: ToolExecutor + 'st
             if !matches!(&self.state, ConvState::ToolExecuting { assistant_message, .. } | ConvState::CancellingTool { assistant_message, .. } if assistant_message == batch.origin.as_ref())
             {
                 let execution = ToolExecutionSlot::after_generation(batch.serial_generation);
+                self.cancellation_custody
+                    .release_closing_origin(&batch.origin);
                 self.foreground_dispatch = ForegroundDispatch::Serial(SerialDispatch {
                     execution,
                     ..SerialDispatch::default()

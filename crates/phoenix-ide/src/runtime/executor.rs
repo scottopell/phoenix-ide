@@ -3278,6 +3278,7 @@ where
             // Copy deadline before select to avoid borrow conflict
             let deadline = self.deadline;
             let batch_deadline = self.foreground_dispatch.batch_deadline();
+            let cancellation_resource_cutoff = self.cancellation_custody.pending_cutoff();
             let awaiting_recovery = matches!(self.state, ConvState::AwaitingRecovery { .. });
 
             tokio::select! {
@@ -3321,6 +3322,11 @@ where
                         }
                         None => self.cancellation_input_rx = None,
                     }
+                }
+                () = async {
+                    tokio::time::sleep_until(cancellation_resource_cutoff.expect("retained resource cutoff")).await;
+                }, if cancellation_resource_cutoff.is_some() => {
+                    self.service_cancellation_resource_cutoff();
                 }
                 Some(AcknowledgedEventRequest { event, acknowledgement, retirement }) = self.acknowledged_event_rx.recv() => {
                     let result = self.process_acknowledged_event(event).await;

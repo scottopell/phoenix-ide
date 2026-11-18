@@ -4,7 +4,8 @@ use super::{
     ToolExecutor, CANCELLATION_DEADLINE,
 };
 use crate::runtime::cancellation_inbox::{CancellationInput, CancellationReceipt};
-use std::future::Future;
+use phoenix_core::domain::sm_state::AssistantMessage;
+use std::{future::Future, sync::Arc};
 use tokio::sync::mpsc;
 
 pub(super) struct ObservedCancellation {
@@ -13,6 +14,7 @@ pub(super) struct ObservedCancellation {
 }
 
 pub(super) struct CancellationCutoff {
+    origin: Arc<AssistantMessage>,
     at: tokio::time::Instant,
     phase: CutoffPhase,
 }
@@ -28,27 +30,43 @@ pub(super) enum CancellationCustody {
     Idle,
     Pending(ObservedCancellation),
     Applying(Option<CancellationCutoff>),
+    Closing(CancellationCutoff),
 }
 
 impl CancellationCustody {
-    fn pending_cutoff(&self) -> Option<tokio::time::Instant> {
+    pub(super) fn release_closing_origin(&mut self, origin: &Arc<AssistantMessage>) {
+        if matches!(self, Self::Closing(cutoff) if Arc::ptr_eq(&cutoff.origin, origin)) {
+            *self = Self::Idle;
+        }
+    }
+
+    pub(super) fn pending_cutoff(&self) -> Option<tokio::time::Instant> {
         let cutoff = match self {
             Self::Pending(observed) => observed.cutoff.as_ref(),
             Self::Applying(cutoff) => cutoff.as_ref(),
+            Self::Closing(cutoff) => Some(cutoff),
             Self::Idle => None,
         }?;
         matches!(cutoff.phase, CutoffPhase::Pending).then_some(cutoff.at)
     }
 
-    fn mark_cutoff_serviced(&mut self) {
-        let cutoff = match self {
+    fn cutoff_mut(&mut self) -> Option<&mut CancellationCutoff> {
+        match self {
             Self::Pending(observed) => observed.cutoff.as_mut(),
             Self::Applying(cutoff) => cutoff.as_mut(),
+            Self::Closing(cutoff) => Some(cutoff),
             Self::Idle => None,
-        };
-        if let Some(cutoff) = cutoff {
-            cutoff.phase = CutoffPhase::Serviced;
         }
+    }
+
+    fn take_closing(&mut self) -> Option<CancellationCutoff> {
+        if !matches!(self, Self::Closing(_)) {
+            return None;
+        }
+        let Self::Closing(cutoff) = std::mem::take(self) else {
+            unreachable!()
+        };
+        Some(cutoff)
     }
 
     pub(super) fn take_pending(&mut self) -> Option<ObservedCancellation> {
@@ -77,17 +95,39 @@ impl<S: Storage + Clone + 'static, L: LlmClient + 'static, T: ToolExecutor + 'st
         &mut self,
         input: CancellationInput,
     ) -> ObservedCancellation {
-        let cutoff = if self.foreground_dispatch.has_open_batch_controls() {
-            let cutoff = tokio::time::Instant::now() + CANCELLATION_DEADLINE;
+        let retained = self.cancellation_custody.take_closing().filter(|cutoff| {
+            let current = self.foreground_dispatch.owns_batch_origin(&cutoff.origin);
+            if !current {
+                tracing::error!("retained cancellation resource origin was replaced");
+            }
+            current
+        });
+        let cutoff = retained.or_else(|| {
+            let origin = self.foreground_dispatch.open_batch_origin()?;
+            let at = tokio::time::Instant::now() + CANCELLATION_DEADLINE;
             self.cancel_ordinary_batch();
             Some(CancellationCutoff {
-                at: cutoff,
+                origin,
+                at,
                 phase: CutoffPhase::Pending,
             })
-        } else {
-            None
-        };
+        });
         ObservedCancellation { input, cutoff }
+    }
+
+    pub(super) fn service_cancellation_resource_cutoff(&mut self) {
+        let Some(cutoff) = self.cancellation_custody.cutoff_mut() else {
+            return;
+        };
+        if !matches!(cutoff.phase, CutoffPhase::Pending) {
+            return;
+        }
+        if self.foreground_dispatch.owns_batch_origin(&cutoff.origin) {
+            self.foreground_dispatch.force_retire_batch_resources();
+        } else {
+            tracing::error!("cancellation resource cutoff lost its exact batch origin");
+        }
+        cutoff.phase = CutoffPhase::Serviced;
     }
 
     pub(super) async fn await_ordinary_batch_commit(
@@ -114,8 +154,7 @@ impl<S: Storage + Clone + 'static, L: LlmClient + 'static, T: ToolExecutor + 'st
                     tokio::time::sleep_until(resource_deadline.expect("owned resource deadline")).await;
                 }, if resource_deadline.is_some() => {
                     if cancellation_cutoff.is_some() {
-                        self.foreground_dispatch.force_retire_batch_resources();
-                        self.cancellation_custody.mark_cutoff_serviced();
+                        self.service_cancellation_resource_cutoff();
                     } else {
                         self.foreground_dispatch.retire_expired_wait_resources();
                     }
@@ -151,9 +190,9 @@ impl<S: Storage + Clone + 'static, L: LlmClient + 'static, T: ToolExecutor + 'st
         else {
             unreachable!("one semantic cancellation owns its custody")
         };
-        let cutoff = cutoff.map(|cutoff| cutoff.at);
-        self.retain_original_cancellation_cutoff(cutoff);
-        if cutoff.is_some_and(|cutoff| cutoff <= tokio::time::Instant::now())
+        let original_cutoff = cutoff.as_ref().map(|cutoff| cutoff.at);
+        self.retain_original_cancellation_cutoff(original_cutoff);
+        if original_cutoff.is_some_and(|cutoff| cutoff <= tokio::time::Instant::now())
             && matches!(self.state, ConvState::CancellingTool { .. })
             && !self
                 .fatal_local_authority_fence
@@ -167,6 +206,13 @@ impl<S: Storage + Clone + 'static, L: LlmClient + 'static, T: ToolExecutor + 'st
             || self.local_terminal_authority == LocalTerminalAuthority::Fatal;
         if fatal && result.is_ok() {
             result = Err("runtime processing closed after fatal local authority loss".into());
+        }
+        if !fatal {
+            if let Some(cutoff) =
+                cutoff.filter(|cutoff| self.foreground_dispatch.owns_batch_origin(&cutoff.origin))
+            {
+                self.cancellation_custody = CancellationCustody::Closing(cutoff);
+            }
         }
         let terminal = matches!(self.state.step_result(), StepResult::Terminal(_));
         if terminal && !fatal {
