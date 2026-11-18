@@ -199,26 +199,46 @@ async fn addressed_cancel_interrupts_running_siblings_during_held_commit() {
     cancellation_interrupts_held_sibling_commit(Route::Addressed).await;
 }
 
-#[tokio::test]
-async fn cancellation_during_final_atomic_checkpoint_prevents_model_tail() {
+async fn final_checkpoint_cancellation(queued_steer: bool) {
     let directory = tempfile::tempdir().unwrap();
     let (runtime, events, mut starts, _) =
         runtime_with_calls(directory.path(), false, calls(2, "fast-command"));
+    let fast_release = Arc::new(Semaphore::new(0));
+    *runtime.tool_executor.fast_release.lock().unwrap() = Some(fast_release.clone());
     let llm = Arc::clone(&runtime.llm_client);
     let storage = Arc::clone(&runtime.storage);
     let (write_entered, release_write) = storage.gate_tool_round_persist();
     let (manager, handle, actor, mut states) = register_actor(runtime).await;
     send_user(&events).await;
+    for _ in 0..2 {
+        tokio::time::timeout(Duration::from_secs(60), starts.recv())
+            .await
+            .unwrap()
+            .unwrap();
+    }
+    if queued_steer {
+        manager
+            .send_acknowledged_event(
+                "ordinary-batch",
+                Event::SteerMessage {
+                    origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
+                    text: "keep this instruction".into(),
+                    llm_text: None,
+                    images: vec![],
+                    files: vec![],
+                    message_id: "queued-instruction".into(),
+                    user_agent: None,
+                    skill_invocation: None,
+                },
+            )
+            .await
+            .unwrap();
+    }
+    fast_release.add_permits(2);
     tokio::time::timeout(Duration::from_secs(60), write_entered)
         .await
         .unwrap()
         .unwrap();
-    for _ in 0..2 {
-        assert!(
-            starts.try_recv().is_ok(),
-            "both calls executed before their atomic checkpoint"
-        );
-    }
     deliver_cancel(manager.clone(), Route::Addressed)
         .await
         .unwrap();
@@ -237,6 +257,16 @@ async fn cancellation_during_final_atomic_checkpoint_prevents_model_tail() {
     manager.runtimes.write().await.remove("ordinary-batch");
     assert_eq!(llm.recorded_requests().len(), 1, "observed cancellation must precede the next provider request after the actual atomic checkpoint");
     assert_eq!(storage.capacity_plans.lock().unwrap().len(), 1, "no second model request may be admitted, even if its task would be aborted before its first poll");
+}
+
+#[tokio::test]
+async fn cancellation_during_final_atomic_checkpoint_prevents_model_tail() {
+    final_checkpoint_cancellation(false).await;
+}
+
+#[tokio::test]
+async fn cancellation_during_final_checkpoint_with_queued_steer_prevents_model_tail() {
+    final_checkpoint_cancellation(true).await;
 }
 
 async fn wait_for_finished(tools: &ControlledOrdinaryTools, command: &str, count: usize) {
