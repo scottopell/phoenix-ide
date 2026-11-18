@@ -218,7 +218,7 @@ THE SYSTEM SHALL continue awaiting additional LLM content
 
 WHEN a single LLM response requests only ordinary foreground tools
 THE SYSTEM SHALL permit independent calls from that response to execute concurrently
-AND SHALL bound retained preparation and execution owners to four per conversation
+AND SHALL bound retained preparation and execution owners to eight per conversation
 AND SHALL let the model choose call independence without adding conflict detection or dependency inference
 AND SHALL apply each call's existing permissions, originating policy, schema and resource authority independently before admitting its resources.
 
@@ -231,6 +231,10 @@ WHEN an ordinary sibling completes
 THE SYSTEM SHALL accept its exact result independently of earlier unresolved siblings
 AND SHALL preserve each result's complete payload and metadata
 AND SHALL retain one authoritative set of unresolved calls and accepted results.
+
+WHEN an ordinary sibling's owning state commit establishes its settlement
+THE SYSTEM SHALL refill the released capacity from the next unissued call without waiting for other running siblings
+AND SHALL preserve the eight-owner bound and complete-round model barrier.
 
 WHEN all tools complete
 THE SYSTEM SHALL transition to awaiting LLM response

@@ -181,7 +181,7 @@ contract SpawnParentAdoption {
 
     @invariant ForegroundCancellationRetainsChildTerminalAuthority
         -- REQ-SA-005 / REQ-BED-004 / REQ-BED-005: ordinary calls within one
-        -- child assistant response share the parent's bounded four-owner dispatch
+        -- child assistant response share the parent's bounded eight-owner dispatch
         -- and complete source-ordered result barrier, while preserving this child's
         -- existing execution authority. Cancellation closes refill, snapshots
         -- already-available typed receipts before signalling every running sibling,

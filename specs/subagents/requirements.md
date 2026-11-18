@@ -135,7 +135,7 @@ THE SYSTEM SHALL atomically choose either cancellation-before-start or one initi
 AND SHALL NOT perform initial work more than once
 
 WHEN a child is executing ordinary foreground siblings from one assistant response
-THE SYSTEM SHALL apply the same four-owner bound, per-call authority checks, source-ordered complete result barrier and exact-origin cancellation drain as a parent
+THE SYSTEM SHALL apply the same eight-owner bound, per-call authority checks, source-ordered complete result barrier and exact-origin cancellation drain as a parent
 AND SHALL preserve its read-only or write-capable execution authority and parent pending membership.
 
 WHEN that child's foreground round is cancelled

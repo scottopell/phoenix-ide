@@ -49,7 +49,7 @@ coverage are recorded in the Global Coordinator and Bash executive summaries.
 
 ## Concurrent Foreground Round Qualification
 
-Child ordinary foreground rounds use the same four-owner bound and complete
+Child ordinary foreground rounds use the same eight-owner bound and complete
 source-ordered checkpoint barrier as parents, retaining existing read-only or
 write-capable authority. Cancellation must drain every sibling before the child
 reaches Failed and notifies its parent; parent pending membership remains owed

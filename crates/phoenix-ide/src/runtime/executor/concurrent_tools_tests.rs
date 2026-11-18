@@ -350,31 +350,43 @@ async fn send_user(events: &mpsc::Sender<Event>) {
 }
 
 #[tokio::test]
-async fn cap_four_refills_only_after_a_sibling_commit() {
+async fn cap_eight_refills_after_a_later_sibling_commits_while_first_stays_held() {
     let directory = tempfile::tempdir().unwrap();
+    let mut content = calls(10, "slow-command");
+    content[1] = ContentBlock::tool_use(
+        "call-1",
+        "bash",
+        serde_json::json!({"op":"run","cmd":"fast-command"}),
+    );
     let (runtime, events, mut starts, release) =
-        runtime_with_calls(directory.path(), false, calls(6, "slow-command"));
+        runtime_with_calls(directory.path(), false, content);
+    let tools = Arc::clone(&runtime.tool_executor);
+    let release_fast = Arc::new(Semaphore::new(0));
+    *tools.fast_release.lock().unwrap() = Some(Arc::clone(&release_fast));
     let llm = Arc::clone(&runtime.llm_client);
     let storage = Arc::clone(&runtime.storage);
     let (state_tx, mut states) = watch::channel(ConvState::Idle);
     let task = tokio::spawn(runtime.with_state_watcher(state_tx).run());
     send_user(&events).await;
-    for _ in 0..4 {
-        tokio::time::timeout(Duration::from_secs(60), starts.recv())
-            .await
-            .unwrap()
-            .unwrap();
+    for _ in 0..8 {
+        next_started(&mut starts).await;
     }
     tokio::time::pause();
-    let extra = tokio::time::timeout(Duration::from_millis(100), starts.recv()).await;
-    tokio::time::resume();
-    release.add_permits(1);
-    tokio::time::timeout(Duration::from_secs(60), starts.recv())
+    let ninth_started_early = tokio::time::timeout(Duration::from_millis(100), starts.recv())
         .await
-        .unwrap()
-        .unwrap();
-    let before_release = llm.recorded_requests().len();
-    release.add_permits(5);
+        .is_ok();
+    tokio::time::resume();
+    release_fast.add_permits(1);
+    let ninth = next_started(&mut starts).await;
+    let after_refill = states.borrow().clone();
+    let finished_before_slow_release = tools.finished.lock().unwrap().clone();
+    tokio::time::pause();
+    let tenth_started_early = tokio::time::timeout(Duration::from_millis(100), starts.recv())
+        .await
+        .is_ok();
+    tokio::time::resume();
+    let requests_before_slow_release = llm.recorded_requests().len();
+    release.add_permits(9);
     tokio::time::timeout(
         Duration::from_secs(60),
         states.wait_for(|state| matches!(state, ConvState::Idle)),
@@ -385,11 +397,30 @@ async fn cap_four_refills_only_after_a_sibling_commit() {
     events.send(Event::Shutdown).await.unwrap();
     task.await.unwrap();
     assert!(
-        extra.is_err(),
-        "unissued siblings cannot exceed four retained preparation/execution owners"
+        !ninth_started_early && !tenth_started_early,
+        "at most eight unaccepted owners may be retained"
     );
-    assert_eq!(before_release, 1);
+    assert_eq!(ninth, "slow-command");
+    let ConvState::ToolExecuting {
+        current_tool,
+        completed_results,
+        ..
+    } = after_refill
+    else {
+        panic!("the source-first call must remain held")
+    };
+    assert_eq!(current_tool.id, "call-0");
+    assert_eq!(
+        completed_results
+            .iter()
+            .map(ToolRoundResult::tool_use_id)
+            .collect::<Vec<_>>(),
+        ["call-1"]
+    );
+    assert_eq!(finished_before_slow_release, ["fast-command"]);
+    assert_eq!(requests_before_slow_release, 1);
     assert_eq!(llm.recorded_requests().len(), 2);
+    assert_eq!(tools.tokens.lock().unwrap().len(), 10);
     let ids: Vec<_> = storage
         .get_all_messages("ordinary-batch")
         .into_iter()
@@ -400,7 +431,7 @@ async fn cap_four_refills_only_after_a_sibling_commit() {
         .collect();
     assert_eq!(
         ids,
-        (0..6)
+        (0..10)
             .map(|ordinal| format!("call-{ordinal}"))
             .collect::<Vec<_>>()
     );
@@ -651,17 +682,17 @@ async fn nonrepresentative_wait_keeps_its_cutoff_and_retires_only_its_task() {
 }
 
 #[tokio::test]
-async fn cancel_stops_all_four_active_calls_and_never_starts_unissued_tail() {
+async fn cancel_stops_all_eight_active_calls_and_never_starts_unissued_tail() {
     let directory = tempfile::tempdir().unwrap();
     let (runtime, events, mut starts, _) =
-        runtime_with_calls(directory.path(), false, calls(6, "slow-command"));
+        runtime_with_calls(directory.path(), false, calls(10, "slow-command"));
     let tools = Arc::clone(&runtime.tool_executor);
     let storage = Arc::clone(&runtime.storage);
     let llm = Arc::clone(&runtime.llm_client);
     let (state_tx, mut states) = watch::channel(ConvState::Idle);
     let task = tokio::spawn(runtime.with_state_watcher(state_tx).run());
     send_user(&events).await;
-    for _ in 0..4 {
+    for _ in 0..8 {
         next_started(&mut starts).await;
     }
     tokio::time::pause();
@@ -684,7 +715,7 @@ async fn cancel_stops_all_four_active_calls_and_never_starts_unissued_tail() {
         "queued source members must never launch after Cancel"
     );
     let tokens = tools.tokens.lock().unwrap();
-    assert_eq!(tokens.len(), 4);
+    assert_eq!(tokens.len(), 8);
     assert!(tokens.iter().all(|(_, token)| token.is_cancelled()));
     assert_eq!(llm.recorded_requests().len(), 1);
     let messages = storage.get_all_messages("ordinary-batch");
@@ -695,24 +726,24 @@ async fn cancel_stops_all_four_active_calls_and_never_starts_unissued_tail() {
             _ => None,
         })
         .collect();
-    assert_eq!(results.len(), 6);
+    assert_eq!(results.len(), 10);
     assert_eq!(
         results
             .iter()
             .map(|result| result.tool_use_id.clone())
             .collect::<Vec<_>>(),
-        (0..6)
+        (0..10)
             .map(|ordinal| format!("call-{ordinal}"))
             .collect::<Vec<_>>()
     );
-    assert!(results[4..]
+    assert!(results[8..]
         .iter()
         .all(|result| result.content.contains("Skipped due to cancellation")));
 }
 
 async fn cancellation_during_batch_read(work_scope: bool) {
     let (runtime, mut starts, _directory) =
-        prepared_batch_for_scope(calls(6, "slow-command"), work_scope).await;
+        prepared_batch_for_scope(calls(10, "slow-command"), work_scope).await;
     let (entered, release) = if work_scope {
         runtime.storage.hold_next_tool_scope_read()
     } else {
@@ -748,7 +779,7 @@ async fn cancellation_during_batch_read(work_scope: bool) {
     );
     let executed = tools.tokens.lock().unwrap();
     assert!(
-        executed.len() <= 3,
+        executed.len() <= 7,
         "held read and unissued tail cannot launch late"
     );
     assert!(executed.iter().all(|(_, token)| token.is_cancelled()));
@@ -772,9 +803,9 @@ async fn batch_scope_read_is_selected_with_immediate_cancellation() {
 #[tokio::test]
 async fn rejected_cancel_checkpoint_signals_all_controls_and_keeps_queued_proofs() {
     use futures::FutureExt as _;
-    let (mut runtime, mut starts, _directory) = prepared_batch(calls(6, "slow-command")).await;
-    launch_preparations(&mut runtime, 4).await;
-    for _ in 0..4 {
+    let (mut runtime, mut starts, _directory) = prepared_batch(calls(10, "slow-command")).await;
+    launch_preparations(&mut runtime, 8).await;
+    for _ in 0..8 {
         next_started(&mut starts).await;
     }
     runtime.storage.set_fail_state_update(true);
@@ -804,7 +835,7 @@ async fn rejected_cancel_checkpoint_signals_all_controls_and_keeps_queued_proofs
     runtime.storage.set_fail_state_update(false);
     runtime.process_event(user_cancel()).await.unwrap();
     drain_cancelled_batch(&mut runtime).await;
-    assert_eq!(runtime.tool_executor.tokens.lock().unwrap().len(), 4);
+    assert_eq!(runtime.tool_executor.tokens.lock().unwrap().len(), 8);
 }
 
 async fn required_sibling_read_failure(work_scope: bool) {
@@ -936,15 +967,15 @@ async fn shared_unknown_authority_precedes_stale_batch_selection() {
 
 #[tokio::test]
 async fn forced_batch_retirement_drains_ready_receipts_and_retires_every_owner_once() {
-    let mut content = calls(6, "stubborn-command");
+    let mut content = calls(10, "stubborn-command");
     content[1] = ContentBlock::tool_use(
         "call-1",
         "bash",
         serde_json::json!({"op":"run","cmd":"fast-command"}),
     );
     let (mut runtime, mut starts, _directory) = prepared_batch(content).await;
-    launch_preparations(&mut runtime, 4).await;
-    for _ in 0..4 {
+    launch_preparations(&mut runtime, 8).await;
+    for _ in 0..8 {
         next_started(&mut starts).await;
     }
     runtime.join_batch_call_for_test("call-1").await;
@@ -964,13 +995,13 @@ async fn forced_batch_retirement_drains_ready_receipts_and_retires_every_owner_o
             _ => None,
         })
         .collect();
-    assert_eq!(results.len(), 6);
+    assert_eq!(results.len(), 10);
     assert_eq!(
         results
             .iter()
             .map(|result| result.tool_use_id.clone())
             .collect::<Vec<_>>(),
-        (0..6)
+        (0..10)
             .map(|ordinal| format!("call-{ordinal}"))
             .collect::<Vec<_>>()
     );
@@ -1248,7 +1279,7 @@ async fn seed_sqlite_tool_policy(db: &crate::db::Database, definitions: &[ToolDe
 async fn sqlite_rejects_sibling_commit_without_refill_publication_or_model_advance() {
     let directory = tempfile::tempdir().unwrap();
     let db = sqlite_batch_database(directory.path()).await;
-    let mut content = calls(6, "slow-command");
+    let mut content = calls(10, "slow-command");
     content[1] = ContentBlock::tool_use(
         "call-1",
         "bash",
@@ -1288,14 +1319,14 @@ async fn sqlite_rejects_sibling_commit_without_refill_publication_or_model_advan
     )
     .with_state_watcher(watcher);
     runtime.begin_tool_preparation(&current_tool).unwrap();
-    for _ in 0..4 {
+    for _ in 0..8 {
         let observation = runtime.foreground_dispatch.observe().await;
         assert!(runtime
             .accept_foreground_observation(observation)
             .unwrap()
             .is_none());
     }
-    for _ in 0..4 {
+    for _ in 0..8 {
         next_started(&mut starts).await;
     }
     sqlx::query("CREATE TRIGGER reject_batch_state BEFORE UPDATE OF state ON conversations BEGIN SELECT RAISE(ABORT, 'batch sibling state commit rejected'); END")
@@ -1325,7 +1356,7 @@ async fn sqlite_rejects_sibling_commit_without_refill_publication_or_model_advan
     assert!(db.get_messages("ordinary-batch").await.unwrap().is_empty());
     assert!(publications.try_recv().is_err());
     assert!(starts.try_recv().is_err());
-    assert_eq!(tools.tokens.lock().unwrap().len(), 4);
+    assert_eq!(tools.tokens.lock().unwrap().len(), 8);
     assert!(llm.recorded_requests().is_empty());
     assert_eq!(
         Box::pin(runtime.run()).await,

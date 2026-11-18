@@ -100,7 +100,7 @@ async fn enqueue_cancel(
 }
 
 async fn cancellation_interrupts_held_sibling_commit(route: Route) {
-    let mut content = calls(6, "stubborn-command");
+    let mut content = calls(10, "stubborn-command");
     content[1] = ContentBlock::tool_use(
         "call-1",
         "bash",
@@ -114,7 +114,7 @@ async fn cancellation_interrupts_held_sibling_commit(route: Route) {
     *tools.fast_release.lock().unwrap() = Some(release_fast.clone());
     let (write_entered, release_write) = storage.gate_state_update();
     let (manager, handle, actor, mut states) = register_actor(runtime).await;
-    for _ in 0..4 {
+    for _ in 0..8 {
         next_started(&mut starts).await;
     }
     release_fast.add_permits(1);
@@ -130,7 +130,7 @@ async fn cancellation_interrupts_held_sibling_commit(route: Route) {
         .filter(|(command, _)| command == "stubborn-command")
         .map(|(_, token)| token.clone())
         .collect();
-    assert_eq!(tokens.len(), 3);
+    assert_eq!(tokens.len(), 7);
     let cancellation = enqueue_cancel(&manager, &handle, route).await;
     tokio::time::pause();
     let interrupted_before_write_receipt = tokio::time::timeout(
@@ -147,7 +147,7 @@ async fn cancellation_interrupts_held_sibling_commit(route: Route) {
     tokio::time::advance(CANCELLATION_DEADLINE + Duration::from_millis(1)).await;
     let retired_before_write_receipt = tokio::time::timeout(
         Duration::from_millis(100),
-        wait_for_finished(&tools, "stubborn-command", 3),
+        wait_for_finished(&tools, "stubborn-command", 7),
     )
     .await
     .is_ok();
@@ -194,7 +194,7 @@ async fn cancellation_interrupts_held_sibling_commit(route: Route) {
     assert_eq!(storage.get_all_messages("ordinary-batch").iter().filter(|message| {
         matches!(&message.content, MessageContent::System(content) if content.text.starts_with("Cancellation completed."))
     }).count(), 1, "actual resource retirement must retain its one degraded-cancellation notice through deferred settlement");
-    assert_eq!(tools.tokens.lock().unwrap().len(), 4);
+    assert_eq!(tools.tokens.lock().unwrap().len(), 8);
     assert!(llm.recorded_requests().is_empty());
 }
 
@@ -434,14 +434,14 @@ async fn expired_wait_retires_only_its_task_while_a_sibling_commit_is_held() {
 
 #[tokio::test]
 async fn rejected_cancel_retains_original_resource_cutoff_without_retry() {
-    let (runtime, mut starts, _directory) = prepared_batch(calls(6, "stubborn-command")).await;
+    let (runtime, mut starts, _directory) = prepared_batch(calls(10, "stubborn-command")).await;
     let storage = Arc::clone(&runtime.storage);
     let tools = Arc::clone(&runtime.tool_executor);
     let llm = Arc::clone(&runtime.llm_client);
     let (entered, release) = storage.gate_state_update();
     storage.fail_gated_state_update_once();
     let (manager, handle, actor, mut states) = register_actor(runtime).await;
-    for _ in 0..4 {
+    for _ in 0..8 {
         next_started(&mut starts).await;
     }
     let tokens: Vec<_> = tools
@@ -470,7 +470,7 @@ async fn rejected_cancel_retains_original_resource_cutoff_without_retry() {
     tokio::time::advance(CANCELLATION_DEADLINE + Duration::from_millis(1)).await;
     let retired_without_retry = tokio::time::timeout(
         Duration::from_millis(100),
-        wait_for_finished(&tools, "stubborn-command", 4),
+        wait_for_finished(&tools, "stubborn-command", 8),
     )
     .await
     .is_ok();
@@ -479,7 +479,7 @@ async fn rejected_cancel_retains_original_resource_cutoff_without_retry() {
     let fence_remained_open = !manager
         .fatal_local_authority_fence
         .fatal_authority_loss_is_latched();
-    let no_refill = starts.try_recv().is_err() && tools.tokens.lock().unwrap().len() == 4;
+    let no_refill = starts.try_recv().is_err() && tools.tokens.lock().unwrap().len() == 8;
     let retry = enqueue_cancel(&manager, &handle, Route::Acknowledged)
         .await
         .unwrap();
