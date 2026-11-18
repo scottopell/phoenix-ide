@@ -1,5 +1,6 @@
 use crate::state::{AssistantMessage, ToolCall, ToolInput};
 use crate::{transition, CheckpointData, ConvContext, ConvState, Effect, Event};
+use phoenix_core::domain::conversation_goal::ToolRoundResult;
 use phoenix_core::domain::db_schema::ToolResult;
 use phoenix_core::domain::llm_types::ContentBlock;
 use std::path::PathBuf;
@@ -169,14 +170,43 @@ fn final_cancellation_preserves_source_order_for_every_last_receipt_kind() {
                 Effect::PersistCheckpoint {
                     data: CheckpointData::ToolRound(round),
                 } => Some(round),
-                _ => None,
+                Effect::PersistMessage { .. }
+                | Effect::PersistUserInputMessage { .. }
+                | Effect::PersistAuthoritativeUserMessage { .. }
+                | Effect::PersistState
+                | Effect::CancellationCompleted { .. }
+                | Effect::RequestLlm
+                | Effect::CompleteCreation { .. }
+                | Effect::MaterializeCreation { .. }
+                | Effect::ExecuteTool { .. }
+                | Effect::BroadcastAssistantMessage { .. }
+                | Effect::AbortTool { .. }
+                | Effect::AbortLlm
+                | Effect::CancelSubAgents { .. }
+                | Effect::NotifyParent { .. }
+                | Effect::NotifyStateChange
+                | Effect::NotifyAgentDone
+                | Effect::ScheduleRetry { .. }
+                | Effect::PersistCheckpoint { .. }
+                | Effect::PersistToolResults { .. }
+                | Effect::PersistHiddenSystemMarker { .. }
+                | Effect::PersistSubAgentResults { .. }
+                | Effect::RequestContinuation { .. }
+                | Effect::BeginContinuation { .. }
+                | Effect::ContinuationCommit { .. }
+                | Effect::NotifyContextExhausted { .. }
+                | Effect::ApproveTask { .. }
+                | Effect::ApproveTaskFreshHandoff { .. }
+                | Effect::PersistForkProposal { .. }
+                | Effect::ResolveTask { .. }
+                | Effect::CommitSteeringDrain { .. } => None,
             })
             .expect("the final member must checkpoint the complete round");
         assert_eq!(
             round
                 .results()
                 .iter()
-                .map(|result| result.tool_use_id())
+                .map(ToolRoundResult::tool_use_id)
                 .collect::<Vec<_>>(),
             ["slow", "fast"]
         );
