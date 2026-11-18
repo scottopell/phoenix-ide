@@ -10,6 +10,7 @@ struct ControlledOrdinaryTools {
     release_first: Arc<Semaphore>,
     fail_fast: bool,
     tokens: std::sync::Mutex<Vec<(String, CancellationToken)>>,
+    progress: std::sync::Mutex<Vec<Arc<dyn BashProgressSink>>>,
 }
 
 #[async_trait::async_trait]
@@ -30,7 +31,14 @@ impl ToolExecutor for ControlledOrdinaryTools {
             .lock()
             .unwrap()
             .push((command.into(), context.cancel.clone()));
+        self.progress
+            .lock()
+            .unwrap()
+            .push(context.bash_progress_sink().unwrap());
         self.started.send(command.into()).unwrap();
+        if command == "stubborn-command" {
+            self.release_first.acquire().await.unwrap().forget();
+        }
         if matches!(command, "slow-command" | "held-wait") {
             tokio::select! {
                 () = context.cancel.cancelled() => return Some(ToolOutput::error("cancelled")),
@@ -102,6 +110,7 @@ fn runtime_with_calls(
         release_first: Arc::clone(&release_first),
         fail_fast,
         tokens: std::sync::Mutex::default(),
+        progress: std::sync::Mutex::default(),
     });
     let llm = Arc::new(MockLlmClient::new("test-model"));
     for (content, end_turn) in [
@@ -365,8 +374,24 @@ async fn prepared_batch(
     mpsc::UnboundedReceiver<String>,
     tempfile::TempDir,
 ) {
+    prepared_batch_for_scope(content, false).await
+}
+
+async fn prepared_batch_for_scope(
+    content: Vec<ContentBlock>,
+    work_scope: bool,
+) -> (
+    BatchRuntime,
+    mpsc::UnboundedReceiver<String>,
+    tempfile::TempDir,
+) {
     let directory = tempfile::tempdir().unwrap();
     let (mut runtime, _, starts, _) = runtime_with_calls(directory.path(), false, content.clone());
+    if work_scope {
+        runtime.context.resource_scope = phoenix_core::work_scope::ResourceScopeKey::Work(
+            phoenix_core::work_scope::WorkScopeId::new(),
+        );
+    }
     runtime.storage.seed_tool_admission_policy(
         "ordinary-batch",
         phoenix_core::domain::tool_availability::ToolAvailability::all(
@@ -492,9 +517,10 @@ async fn ready_typed_outcome_survives_when_cancel_is_selected_first() {
     assert!(results[0].is_error);
     assert!(!results[1].is_error);
     assert!(results[1].content.contains("completed fast-command"));
-    assert!(results[1].duration_ms.is_some());
+    assert!(messages.iter().find(|message| matches!(&message.content, MessageContent::Tool(result) if result.tool_use_id == "fast"))
+        .unwrap().display_data.as_ref().unwrap()["duration_ms"].is_number());
     assert!(runtime.llm_client.recorded_requests().is_empty());
-    assert!(messages.iter().all(|message| !matches!(&message.content, MessageContent::System(text) if text.contains("Cancellation completed"))));
+    assert!(messages.iter().all(|message| !matches!(&message.content, MessageContent::System(text) if text.text.contains("Cancellation completed"))));
 }
 
 #[tokio::test]
@@ -791,4 +817,377 @@ async fn registered_bash_fast_sibling_finishes_before_held_foreground_call() {
         })
         .collect();
     assert_eq!(model_results, [("held", false), ("fast", false)]);
+}
+
+#[tokio::test]
+async fn cancel_stops_all_four_active_calls_and_never_starts_unissued_tail() {
+    let directory = tempfile::tempdir().unwrap();
+    let (runtime, events, mut starts, _) =
+        runtime_with_calls(directory.path(), false, calls(6, "slow-command"));
+    let tools = Arc::clone(&runtime.tool_executor);
+    let storage = Arc::clone(&runtime.storage);
+    let llm = Arc::clone(&runtime.llm_client);
+    let (state_tx, mut states) = watch::channel(ConvState::Idle);
+    let task = tokio::spawn(runtime.with_state_watcher(state_tx).run());
+    send_user(&events).await;
+    for _ in 0..4 {
+        starts.recv().await.unwrap();
+    }
+    tokio::time::pause();
+    events.send(user_cancel()).await.unwrap();
+    let timely = tokio::time::timeout(
+        Duration::from_millis(100),
+        states.wait_for(|state| matches!(state, ConvState::Idle)),
+    )
+    .await
+    .is_ok();
+    tokio::time::resume();
+    events.send(Event::Shutdown).await.unwrap();
+    task.await.unwrap();
+    assert!(
+        timely,
+        "batch cancellation must settle within 100ms under the RAM fixture"
+    );
+    assert!(
+        starts.try_recv().is_err(),
+        "queued source members must never launch after Cancel"
+    );
+    let tokens = tools.tokens.lock().unwrap();
+    assert_eq!(tokens.len(), 4);
+    assert!(tokens.iter().all(|(_, token)| token.is_cancelled()));
+    assert_eq!(llm.recorded_requests().len(), 1);
+    let messages = storage.get_all_messages("ordinary-batch");
+    let results: Vec<_> = messages
+        .iter()
+        .filter_map(|message| match &message.content {
+            MessageContent::Tool(result) => Some(result),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(results.len(), 6);
+    assert_eq!(
+        results
+            .iter()
+            .map(|result| result.tool_use_id.clone())
+            .collect::<Vec<_>>(),
+        (0..6)
+            .map(|ordinal| format!("call-{ordinal}"))
+            .collect::<Vec<_>>()
+    );
+    assert!(results[4..]
+        .iter()
+        .all(|result| result.content.contains("Skipped due to cancellation")));
+}
+
+async fn cancellation_during_batch_read(work_scope: bool) {
+    let (runtime, mut starts, _directory) =
+        prepared_batch_for_scope(calls(6, "slow-command"), work_scope).await;
+    let (entered, release) = if work_scope {
+        runtime.storage.hold_next_tool_scope_read()
+    } else {
+        runtime.storage.hold_next_tool_policy_read()
+    };
+    let tools = Arc::clone(&runtime.tool_executor);
+    let (events, receiver) = mpsc::channel(8);
+    let mut runtime = runtime;
+    runtime.event_tx = events.clone();
+    runtime.event_rx = receiver;
+    let (state_tx, mut states) = watch::channel(runtime.state.clone());
+    let task = tokio::spawn(runtime.with_state_watcher(state_tx).run());
+    tokio::time::timeout(Duration::from_secs(60), entered)
+        .await
+        .unwrap()
+        .unwrap();
+    tokio::time::pause();
+    events.send(user_cancel()).await.unwrap();
+    let timely = tokio::time::timeout(
+        Duration::from_millis(100),
+        states.wait_for(|state| matches!(state, ConvState::Idle)),
+    )
+    .await
+    .is_ok();
+    let revoked = release.send(Ok(())).is_err();
+    tokio::time::resume();
+    events.send(Event::Shutdown).await.unwrap();
+    task.await.unwrap();
+    assert!(timely, "a held batch read cannot queue Cancel beyond 100ms");
+    assert!(
+        revoked,
+        "cancel revokes the held read before its checkpoint completes"
+    );
+    let executed = tools.tokens.lock().unwrap();
+    assert!(
+        executed.len() <= 3,
+        "held read and unissued tail cannot launch late"
+    );
+    assert!(executed.iter().all(|(_, token)| token.is_cancelled()));
+    let mut count = 0;
+    while starts.try_recv().is_ok() {
+        count += 1;
+    }
+    assert_eq!(count, executed.len());
+}
+
+#[tokio::test]
+async fn batch_policy_read_is_selected_with_immediate_cancellation() {
+    cancellation_during_batch_read(false).await;
+}
+
+#[tokio::test]
+async fn batch_scope_read_is_selected_with_immediate_cancellation() {
+    cancellation_during_batch_read(true).await;
+}
+
+#[tokio::test]
+async fn rejected_cancel_checkpoint_signals_all_controls_and_keeps_queued_proofs() {
+    use futures::FutureExt as _;
+    let (mut runtime, mut starts, _directory) = prepared_batch(calls(6, "slow-command")).await;
+    launch_preparations(&mut runtime, 4).await;
+    for _ in 0..4 {
+        starts.recv().await.unwrap();
+    }
+    runtime.storage.set_fail_state_update(true);
+    assert!(runtime
+        .process_event(user_cancel())
+        .await
+        .unwrap_err()
+        .contains("injected state update failure"));
+    assert!(matches!(runtime.state, ConvState::ToolExecuting { .. }));
+    assert!(runtime
+        .tool_executor
+        .tokens
+        .lock()
+        .unwrap()
+        .iter()
+        .all(|(_, token)| token.is_cancelled()));
+    assert!(
+        runtime
+            .foreground_dispatch
+            .observe()
+            .now_or_never()
+            .is_none(),
+        "uncommitted cancellation cannot publish aborts or ordinary advancement"
+    );
+    assert!(starts.try_recv().is_err());
+    assert!(runtime.llm_client.recorded_requests().is_empty());
+    runtime.storage.set_fail_state_update(false);
+    runtime.process_event(user_cancel()).await.unwrap();
+    drain_cancelled_batch(&mut runtime).await;
+    assert_eq!(runtime.tool_executor.tokens.lock().unwrap().len(), 4);
+}
+
+async fn required_sibling_read_failure(work_scope: bool) {
+    let (mut runtime, mut starts, _directory) =
+        prepared_batch_for_scope(calls(2, "slow-command"), work_scope).await;
+    launch_preparations(&mut runtime, 1).await;
+    starts.recv().await.unwrap();
+    let (entered, release) = if work_scope {
+        runtime.storage.hold_next_tool_scope_read()
+    } else {
+        runtime.storage.hold_next_tool_policy_read()
+    };
+    let tools = Arc::clone(&runtime.tool_executor);
+    let llm = Arc::clone(&runtime.llm_client);
+    let fence = runtime.fatal_local_authority_fence.clone();
+    let task = tokio::spawn(runtime.run());
+    tokio::time::timeout(Duration::from_secs(60), entered)
+        .await
+        .unwrap()
+        .unwrap();
+    release
+        .send(Err("required sibling authority read failed".into()))
+        .unwrap();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(60), task)
+            .await
+            .unwrap()
+            .unwrap(),
+        RuntimeExitDisposition::FatalLocalAuthorityLoss
+    );
+    assert!(fence.fatal_authority_loss_is_latched());
+    let tokens = tools.tokens.lock().unwrap();
+    assert_eq!(tokens.len(), 1);
+    assert!(tokens[0].1.is_cancelled());
+    assert!(llm.recorded_requests().is_empty());
+}
+
+#[tokio::test]
+async fn concurrent_required_sibling_policy_error_keeps_its_settlement_boundary() {
+    required_sibling_read_failure(false).await;
+}
+
+#[tokio::test]
+async fn concurrent_required_sibling_scope_error_keeps_its_settlement_boundary() {
+    required_sibling_read_failure(true).await;
+}
+
+#[tokio::test]
+async fn batch_denial_precedes_every_call_resource_and_preserves_sibling() {
+    let content = vec![
+        ContentBlock::tool_use(
+            "denied",
+            "bash",
+            serde_json::json!({"op":"run", "cmd":"git add -A"}),
+        ),
+        ContentBlock::tool_use(
+            "held",
+            "bash",
+            serde_json::json!({"op":"run", "cmd":"slow-command"}),
+        ),
+    ];
+    let (mut runtime, mut starts, _directory) = prepared_batch(content).await;
+    let mut events = runtime.broadcast_tx.subscribe();
+    let observation = runtime.foreground_dispatch.observe().await;
+    let event = runtime
+        .accept_foreground_observation(observation)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(&event, Event::ToolComplete { tool_use_id, result } if tool_use_id == "denied" && result.is_error())
+    );
+    assert!(runtime.tool_executor.tokens.lock().unwrap().is_empty());
+    assert!(
+        events.try_recv().is_err(),
+        "denial cannot publish ordinary start resources"
+    );
+    runtime.process_event(event).await.unwrap();
+    launch_preparations(&mut runtime, 1).await;
+    starts.recv().await.unwrap();
+    assert_eq!(runtime.tool_executor.tokens.lock().unwrap().len(), 1);
+    runtime.process_event(user_cancel()).await.unwrap();
+    drain_cancelled_batch(&mut runtime).await;
+}
+
+#[tokio::test]
+async fn stale_batch_preparation_cannot_adopt_changed_source_with_reused_ids() {
+    let (mut runtime, _, _directory) = prepared_batch(calls(2, "slow-command")).await;
+    let observation = runtime.foreground_dispatch.observe().await;
+    let ConvState::ToolExecuting {
+        assistant_message, ..
+    } = &mut runtime.state
+    else {
+        unreachable!()
+    };
+    assistant_message.content[0] = ContentBlock::tool_use(
+        "call-0",
+        "bash",
+        serde_json::json!({"op":"run","cmd":"changed-source"}),
+    );
+    assert!(runtime
+        .accept_foreground_observation(observation)
+        .await
+        .unwrap()
+        .is_none());
+    assert!(runtime.tool_executor.tokens.lock().unwrap().is_empty());
+    runtime.abort_external_effects_in_memory();
+}
+
+#[tokio::test]
+async fn shared_unknown_authority_precedes_stale_batch_selection() {
+    let (mut runtime, _, _directory) = prepared_batch(calls(2, "slow-command")).await;
+    let observation = runtime.foreground_dispatch.observe().await;
+    let ConvState::ToolExecuting {
+        assistant_message, ..
+    } = &mut runtime.state
+    else {
+        unreachable!()
+    };
+    assistant_message.message_id = "successor".into();
+    runtime
+        .fatal_local_authority_fence
+        .close("test_genuine_unknown_local_write");
+    assert!(runtime
+        .accept_foreground_observation(observation)
+        .await
+        .unwrap_err()
+        .contains("fatal local authority loss"));
+    assert!(runtime.tool_executor.tokens.lock().unwrap().is_empty());
+    runtime.abort_external_effects_in_memory();
+}
+
+#[tokio::test]
+async fn forced_batch_retirement_drains_ready_receipts_and_retires_every_owner_once() {
+    let mut content = calls(6, "stubborn-command");
+    content[1] = ContentBlock::tool_use(
+        "call-1",
+        "bash",
+        serde_json::json!({"op":"run","cmd":"fast-command"}),
+    );
+    let (mut runtime, mut starts, _directory) = prepared_batch(content).await;
+    launch_preparations(&mut runtime, 4).await;
+    for _ in 0..4 {
+        starts.recv().await.unwrap();
+    }
+    runtime.join_batch_call_for_test("call-1").await;
+    runtime.process_event(user_cancel()).await.unwrap();
+    let deadline = runtime.deadline.unwrap();
+    tokio::time::pause();
+    tokio::time::advance(deadline.saturating_duration_since(tokio::time::Instant::now())).await;
+    runtime.handle_cancelling_tool_timeout().await;
+    tokio::time::resume();
+    assert!(matches!(runtime.state, ConvState::Idle));
+    assert!(starts.try_recv().is_err());
+    let messages = runtime.storage.get_all_messages("ordinary-batch");
+    let results: Vec<_> = messages
+        .iter()
+        .filter_map(|message| match &message.content {
+            MessageContent::Tool(result) => Some(result),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(results.len(), 6);
+    assert_eq!(
+        results
+            .iter()
+            .map(|result| result.tool_use_id.clone())
+            .collect::<Vec<_>>(),
+        (0..6)
+            .map(|ordinal| format!("call-{ordinal}"))
+            .collect::<Vec<_>>()
+    );
+    assert!(!results[1].is_error);
+    assert!(results[1].content.contains("completed fast-command"));
+    assert_eq!(messages.iter().filter(|message| matches!(&message.content, MessageContent::System(system) if system.text.contains("Cancellation completed"))).count(), 1);
+    assert!(runtime.llm_client.recorded_requests().is_empty());
+}
+
+#[tokio::test]
+async fn retired_progress_cannot_publish_into_a_later_round_reusing_call_ids() {
+    let (mut runtime, mut starts, _directory) = prepared_batch(calls(2, "slow-command")).await;
+    launch_preparations(&mut runtime, 2).await;
+    for _ in 0..2 {
+        starts.recv().await.unwrap();
+    }
+    let old_sink = runtime.tool_executor.progress.lock().unwrap()[0].clone();
+    runtime.process_event(user_cancel()).await.unwrap();
+    drain_cancelled_batch(&mut runtime).await;
+    let mut events = runtime.broadcast_tx.subscribe();
+    runtime.state = ConvState::ToolExecuting {
+        current_tool: ToolCall::new(
+            "call-0",
+            ToolInput::from_name_and_value(
+                "bash",
+                serde_json::json!({"op":"run","cmd":"successor"}),
+            ),
+        ),
+        remaining_tools: vec![],
+        completed_results: vec![],
+        pending_sub_agents: vec![],
+        assistant_message: crate::state_machine::AssistantMessage::new(
+            "new-assistant".into(),
+            calls(1, "successor"),
+            None,
+            None,
+        ),
+    };
+    old_sink.emit(phoenix_core::domain::bash_progress::BashToolProgress {
+        handle: "retired-handle".into(),
+        start_offset: 0,
+        end_offset: 0,
+        truncated_before: false,
+        lines: vec![],
+        partial: Some("late old output".into()),
+    });
+    assert!(events.try_recv().is_err(), "a retired invocation loses its progress publication capability even if its provider ID recurs");
 }
