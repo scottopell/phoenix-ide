@@ -1420,7 +1420,7 @@ fn handle_core_tool_complete(
             let checkpoint = ToolRoundAssembly::new(
                 assistant_message.clone(),
                 completed_results.clone(),
-                std::iter::once(settle_cancelled_receipt(result, "Cancelled by user")),
+                std::iter::once(result),
             )
             .map(CheckpointData::ToolRound)?;
 
@@ -1609,7 +1609,7 @@ fn handle_core_cancellation(
             let checkpoint = source_order_checkpoint(
                 assistant_message,
                 completed_results.clone(),
-                std::iter::once(result),
+                std::iter::once(settle_cancelled_receipt(result, "Cancelled by user")),
             )?;
 
             if pending_sub_agents.is_empty() {
