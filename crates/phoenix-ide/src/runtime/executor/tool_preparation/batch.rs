@@ -794,3 +794,25 @@ impl<S: Storage + Clone + 'static, L: LlmClient + 'static, T: ToolExecutor + 'st
         }
     }
 }
+
+#[cfg(test)]
+impl<S: Storage + Clone + 'static, L: LlmClient + 'static, T: ToolExecutor + 'static>
+    ConversationRuntime<S, L, T>
+{
+    pub(in super::super) async fn join_batch_call_for_test(&mut self, id: &str) {
+        let ForegroundDispatch::OrdinaryBatch(batch) = &mut self.foreground_dispatch else {
+            panic!("batch fixture")
+        };
+        let call = batch
+            .calls
+            .iter_mut()
+            .find(|call| call.selection.tool.id == id)
+            .unwrap();
+        let CallPhase::Running(execution) = &mut call.phase else {
+            panic!("running fixture")
+        };
+        (&mut execution.task)
+            .await
+            .expect("tool task completed with its typed receipt");
+    }
+}
