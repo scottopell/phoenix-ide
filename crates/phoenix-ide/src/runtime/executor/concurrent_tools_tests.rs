@@ -12,6 +12,24 @@ struct ControlledOrdinaryTools {
     tokens: std::sync::Mutex<Vec<(String, CancellationToken)>>,
     progress: std::sync::Mutex<Vec<Arc<dyn BashProgressSink>>>,
     fast_release: std::sync::Mutex<Option<Arc<Semaphore>>>,
+    finished: std::sync::Mutex<Vec<String>>,
+    execution_finished: tokio::sync::Notify,
+}
+
+struct ExecutionDrop<'a> {
+    tools: &'a ControlledOrdinaryTools,
+    command: &'a str,
+}
+
+impl Drop for ExecutionDrop<'_> {
+    fn drop(&mut self) {
+        self.tools
+            .finished
+            .lock()
+            .unwrap()
+            .push(self.command.into());
+        self.tools.execution_finished.notify_one();
+    }
 }
 
 #[async_trait::async_trait]
@@ -28,6 +46,10 @@ impl ToolExecutor for ControlledOrdinaryTools {
         let (name, input) = call.into_parts();
         assert_eq!(name, "bash");
         let command = input["cmd"].as_str().unwrap_or("held-wait");
+        let _execution = ExecutionDrop {
+            tools: self,
+            command,
+        };
         self.tokens
             .lock()
             .unwrap()
@@ -119,6 +141,8 @@ fn runtime_with_calls(
         tokens: std::sync::Mutex::default(),
         progress: std::sync::Mutex::default(),
         fast_release: std::sync::Mutex::default(),
+        finished: std::sync::Mutex::default(),
+        execution_finished: tokio::sync::Notify::new(),
     });
     let llm = Arc::new(MockLlmClient::new("test-model"));
     for (content, end_turn) in [

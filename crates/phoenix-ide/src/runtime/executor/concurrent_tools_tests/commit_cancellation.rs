@@ -100,25 +100,32 @@ async fn cancellation_interrupts_held_sibling_commit(route: Route) {
         .map(|(_, token)| token.clone())
         .collect();
     assert_eq!(tokens.len(), 3);
-    let capacity = match route {
-        Route::Acknowledged => handle.acknowledged_event_tx.capacity(),
-        Route::Addressed => handle.event_tx.capacity(),
-    };
-    let cancellation = tokio::spawn(deliver_cancel(manager.clone(), route));
-    tokio::time::timeout(Duration::from_secs(60), async {
-        loop {
-            let remaining = match route {
-                Route::Acknowledged => handle.acknowledged_event_tx.capacity(),
-                Route::Addressed => handle.event_tx.capacity(),
-            };
-            if remaining < capacity || tokens.iter().all(CancellationToken::is_cancelled) {
-                break;
-            }
-            tokio::task::yield_now().await;
+    let cancellation = match route {
+        Route::Addressed => {
+            deliver_cancel(manager.clone(), route).await.unwrap();
+            None
         }
-    })
-    .await
-    .expect("actual route enqueues its request or already interrupts the active controls");
+        Route::Acknowledged => {
+            let (acknowledgement, accepted) = oneshot::channel();
+            let (retirement, retired) = oneshot::channel();
+            handle
+                .acknowledged_event_tx
+                .send(AcknowledgedEventRequest {
+                    event: user_cancel(),
+                    acknowledgement,
+                    retirement: retired,
+                })
+                .await
+                .unwrap();
+            Some(tokio::spawn(async move {
+                let _retirement = retirement;
+                accepted
+                    .await
+                    .map_err(|error| error.to_string())?
+                    .map(|_| ())
+            }))
+        }
+    };
     tokio::time::pause();
     let interrupted_before_write_receipt = tokio::time::timeout(
         Duration::from_millis(100),
@@ -126,11 +133,18 @@ async fn cancellation_interrupts_held_sibling_commit(route: Route) {
     )
     .await
     .is_ok();
-    let acknowledged_before_receipt =
-        matches!(route, Route::Acknowledged) && cancellation.is_finished();
+    let acknowledged_before_receipt = cancellation
+        .as_ref()
+        .is_some_and(tokio::task::JoinHandle::is_finished);
     let launched_while_held = starts.try_recv().is_ok();
     let requests_while_held = llm.recorded_requests().len();
     tokio::time::advance(CANCELLATION_DEADLINE + Duration::from_millis(1)).await;
+    let retired_before_write_receipt = tokio::time::timeout(
+        Duration::from_millis(100),
+        wait_for_finished(&tools, "stubborn-command", 3),
+    )
+    .await
+    .is_ok();
     release_write.send(()).unwrap();
     let settled_without_renewed_grace = tokio::time::timeout(
         Duration::from_millis(100),
@@ -149,11 +163,13 @@ async fn cancellation_interrupts_held_sibling_commit(route: Route) {
         .unwrap();
     }
     tokio::time::resume();
-    tokio::time::timeout(Duration::from_secs(60), cancellation)
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap();
+    if let Some(cancellation) = cancellation {
+        tokio::time::timeout(Duration::from_secs(60), cancellation)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
     handle.event_tx.send(Event::Shutdown).await.unwrap();
     assert_eq!(
         actor.await.unwrap(),
@@ -162,6 +178,7 @@ async fn cancellation_interrupts_held_sibling_commit(route: Route) {
     manager.runtimes.write().await.remove("ordinary-batch");
     assert!(interrupted_before_write_receipt, "actual Cancel must signal every running sibling within 100ms while its owning commit remains held");
     assert!(!acknowledged_before_receipt, "resource interruption cannot acknowledge semantic cancellation before write classification");
+    assert!(retired_before_write_receipt, "uncooperative tasks must retire at the original cutoff while the issued write remains held");
     assert!(!launched_while_held);
     assert_eq!(requests_while_held, 0);
     assert!(
@@ -220,4 +237,103 @@ async fn cancellation_during_final_atomic_checkpoint_prevents_model_tail() {
     manager.runtimes.write().await.remove("ordinary-batch");
     assert_eq!(llm.recorded_requests().len(), 1, "observed cancellation must precede the next provider request after the actual atomic checkpoint");
     assert_eq!(storage.capacity_plans.lock().unwrap().len(), 1, "no second model request may be admitted, even if its task would be aborted before its first poll");
+}
+
+async fn wait_for_finished(tools: &ControlledOrdinaryTools, command: &str, count: usize) {
+    loop {
+        let finished = tools.execution_finished.notified();
+        if tools
+            .finished
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|name| name.as_str() == command)
+            .count()
+            >= count
+        {
+            return;
+        }
+        finished.await;
+    }
+}
+
+#[tokio::test]
+async fn expired_wait_retires_only_its_task_while_a_sibling_commit_is_held() {
+    let content = vec![
+        ContentBlock::tool_use(
+            "slow",
+            "bash",
+            serde_json::json!({"op":"run","cmd":"slow-command"}),
+        ),
+        ContentBlock::tool_use(
+            "fast",
+            "bash",
+            serde_json::json!({"op":"run","cmd":"fast-command"}),
+        ),
+        ContentBlock::tool_use(
+            "wait",
+            "bash",
+            serde_json::json!({"op":"wait","handle":"independent-process","wait_seconds":0}),
+        ),
+    ];
+    let (runtime, mut starts, _directory) = prepared_batch(content).await;
+    let storage = runtime.storage.clone();
+    let tools = runtime.tool_executor.clone();
+    let release_fast = Arc::new(Semaphore::new(0));
+    *tools.fast_release.lock().unwrap() = Some(release_fast.clone());
+    let (entered, release_write) = storage.gate_state_update();
+    let (manager, handle, actor, mut states) = register_actor(runtime).await;
+    for _ in 0..3 {
+        tokio::time::timeout(Duration::from_secs(60), starts.recv())
+            .await
+            .unwrap()
+            .unwrap();
+    }
+    release_fast.add_permits(1);
+    tokio::time::timeout(Duration::from_secs(60), entered)
+        .await
+        .unwrap()
+        .unwrap();
+    tokio::time::pause();
+    tokio::time::advance(BASH_WAIT_EXECUTION_GRACE + Duration::from_millis(1)).await;
+    let wait_retired = tokio::time::timeout(
+        Duration::from_millis(100),
+        wait_for_finished(&tools, "held-wait", 1),
+    )
+    .await
+    .is_ok();
+    let no_tokens_cancelled = tools
+        .tokens
+        .lock()
+        .unwrap()
+        .iter()
+        .all(|(_, token)| !token.is_cancelled());
+    let no_premature_result = matches!(&*states.borrow(), ConvState::ToolExecuting { completed_results, .. } if completed_results.is_empty());
+    release_write.send(()).unwrap();
+    deliver_cancel(manager.clone(), Route::Addressed)
+        .await
+        .unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(60),
+        states.wait_for(|state| matches!(state, ConvState::Idle)),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    tokio::time::resume();
+    handle.event_tx.send(Event::Shutdown).await.unwrap();
+    actor.await.unwrap();
+    manager.runtimes.write().await.remove("ordinary-batch");
+    assert!(
+        wait_retired,
+        "expired Wait task must retire while the other invocation's exact write remains pinned"
+    );
+    assert!(
+        no_tokens_cancelled,
+        "wait fallback cannot cancel its process token or an independent call"
+    );
+    assert!(
+        no_premature_result,
+        "resource-only retirement cannot publish an uncommitted result"
+    );
 }
