@@ -224,7 +224,8 @@ AND SHALL apply each call's existing permissions, originating policy, schema and
 
 WHEN a response contains a lifecycle-owned special call
 THE SYSTEM SHALL retain serial execution of that complete response in request order
-AND SHALL preserve its native admission, approval, question, goal and terminal constraints.
+AND SHALL preserve its native admission, approval, question, goal and terminal constraints
+AND SHALL determine this policy from the complete original response, including already-completed calls, without upgrading an ordinary tail to concurrent execution.
 
 WHEN an ordinary sibling completes
 THE SYSTEM SHALL accept its exact result independently of earlier unresolved siblings
@@ -262,6 +263,9 @@ THE SYSTEM SHALL abort only that wait task
 AND SHALL record exactly one concrete tool error for the existing tool invocation identity
 AND SHALL continue the same conversation without rerunning the waited command or cancelling the represented process or independent jobs.
 
+THE SYSTEM SHALL bind each selected Bash `wait` invocation to its own absolute execution and persistence cutoffs
+AND SHALL NOT renew or replace them because another sibling progresses or becomes the representative unresolved call.
+
 WHEN that authoritative settlement remains indeterminate at its original absolute persistence cutoff
 THE SYSTEM SHALL apply the process-wide local-authority fail-stop behavior in REQ-BED-033
 AND MAY record no tool result
@@ -270,6 +274,7 @@ AND SHALL NOT fabricate a persistence receipt, retry the ambiguous write, admit 
 WHEN any tool fails
 THE SYSTEM SHALL include the error in results sent to LLM
 AND allow LLM to handle the error
+AND SHALL continue independent ordinary siblings without cancelling them merely because that tool failed.
 
 **Rationale:** A model can request independent ordinary operations together and avoid serial latency. Lifecycle-owned calls retain their ordered boundary; concurrency neither infers dependencies nor creates another execution or recovery authority.
 
@@ -285,11 +290,15 @@ AND NOT persist any partial LLM response
 WHEN user requests cancellation during tool execution
 THE SYSTEM SHALL interrupt every admitted ordinary sibling immediately (within 100ms)
 AND terminate any spawned subprocesses
-AND record a synthetic tool result indicating cancellation
-AND skip remaining queued tools with synthetic cancelled results
+AND record a cancellation result for each unresolved call without an authentic retained outcome
+AND skip calls proven unissued with synthetic cancelled results
 AND SHALL prevent queued preparation or execution from starting after cancellation
 AND SHALL retain an already-typed completed outcome available to its owning receiver when cancellation is selected
 AND SHALL drain every foreground sibling before the parent's final idle transition or a sub-agent's terminal notification.
+
+THE SYSTEM SHALL snapshot typed outcomes already available to their owning receivers before signalling cancellation
+AND SHALL preserve their authentic completed payloads
+AND SHALL signal every running sibling before waiting for cancellation persistence.
 
 WHEN an ordinary tool return has not yet become a typed outcome before cancellation
 THE SYSTEM SHALL retain the tool executor's cancellation classification.
@@ -319,26 +328,32 @@ THE SYSTEM SHALL preserve all conversation history including synthetic results
 ### REQ-BED-005a: Bounded Cancellation Liveness
 
 WHEN cancellation is requested during tool execution
-THE SYSTEM SHALL abort the tool's executing task rather than relying solely on a cooperative interrupt token
-AND SHALL reap any subprocesses spawned by that tool (process-group kill)
+THE SYSTEM SHALL establish one absolute deadline for the aggregate foreground drain
+AND SHALL NOT renew that deadline when a sibling progresses
+AND SHALL retain each preparation, execution or ready-outcome owner until its owning state commit establishes settlement or its resources are affirmatively retired.
 
-WHEN a tool observes its cancellation and returns within the cooperative window (REQ-BED-005, within 100ms)
-THE SYSTEM SHALL record synthetic results and transition to idle by the cooperative path
+WHEN every foreground owner settles within the cooperative window (REQ-BED-005, within 100ms)
+THE SYSTEM SHALL preserve authentic retained outcomes and pair all other calls with cancellation results
+AND SHALL reach the parent's idle state or the sub-agent's failed terminal state through its ordinary cancellation path
 AND SHALL NOT surface any warning or degraded-cancellation message
 
 WHEN a tool neither observes its cancellation token nor returns within a bounded cancellation deadline
 THE SYSTEM SHALL force the cancellation to completion without waiting for the tool task
-AND SHALL record synthetic cancelled results for the current and remaining tools
-AND SHALL transition the conversation to idle (parent) — the same terminal-direction state a cooperative cancel reaches
+AND SHALL abort every remaining owned task and reap its spawned subprocesses
+AND SHALL submit aggregate forced settlement only after every remaining owner is affirmatively retired
+AND SHALL retain accepted outcomes and record synthetic cancelled results for the unresolved calls
+AND SHALL transition the parent toward idle or the sub-agent to failed after the complete source-ordered round checkpoint
 AND SHALL log a warning recording that the deadline backstop fired
-AND SHALL inject a user-visible system message noting that cancellation completed and that aborted work may still be reclaiming resources in the background
+AND SHALL preserve the forced-retirement notice policy through the aggregate drain
 
 THE SYSTEM SHALL bound the time from a cancellation request to a terminal-direction state, and this bound SHALL NOT depend on tool cooperation
 
-WHEN forced teardown reaches idle via the deadline backstop
+WHEN forced parent teardown reaches idle via the deadline backstop
 THE SYSTEM SHALL NOT transition to error state — a cancellation the user requested and that succeeded from their view must not be presented as a failure
+AND SHALL inject one user-visible system message noting that cancellation completed and that aborted work may still be reclaiming resources in the background
+AND SHALL publish that notice after the round checkpoint and any remaining child cancellation drain
 
-**Rationale:** `CancellingTool` and `CancellingSubAgents` are otherwise states whose only exit is the running task returning; a tool that ignores its cancellation token and blocks would wedge the conversation in cancellation forever — a liveness hole. Cooperative interrupt (REQ-BED-005) is the happy path and is effectively immediate; the bounded deadline backstop covers only the pathological case where a tool never observes its token or never returns. Reaching idle (not error) preserves the user's mental model: they asked to cancel, cancellation happened. The OS child process is reaped regardless of task cooperation; the deadline backstop covers the in-process "task never returns" case. The user-visible message keeps the user oriented — work may still be releasing resources after the conversation has already returned to idle. This is the same liveness family as the sub-agent deadline in `specs/subagents/` REQ-SA-006: a wedged worker must not be able to hold its supervising conversation indefinitely.
+**Rationale:** One uncooperative sibling must not hold cancellation indefinitely. A single drain deadline bounds the wait, authentic completed work remains visible, and parent and child conversations retain their own terminal destinations. The retirement notice explains why resource cleanup may outlast semantic settlement. The same supervising principle governs the sub-agent deadline in `specs/subagents/` REQ-SA-006.
 
 ---
 
@@ -417,6 +432,11 @@ WHEN startup cannot decode or validate a buffered executing or cancelling tool r
 THE SYSTEM SHALL reject startup before resetting that buffered state
 AND SHALL retain its persisted assistant and completed-result evidence unchanged
 AND SHALL NOT replay its in-flight or unknown-effect tools.
+
+WHEN startup materializes a valid interrupted foreground tool round
+THE SYSTEM SHALL pair accepted and synthetic interruption results to the exact original assistant calls
+AND SHALL restore original call order while preserving accepted payloads and metadata by identity
+AND SHALL NOT infer permission to repeat an external tool effect from a missing result or process-local owner.
 
 THE SYSTEM SHALL decode and validate all selected buffered tool rounds before recovery mutates any selected round or its pending-child state
 AND SHALL NOT overwrite an invalid child's buffered evidence while settling its parent.
