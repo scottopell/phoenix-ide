@@ -1,4 +1,5 @@
 use super::*;
+use crate::runtime::traits::MessageStore;
 use crate::runtime::{
     AddressedConversationEventDispatcher, ConversationEventDispatcher, ConversationHandle,
     RuntimeManager,
