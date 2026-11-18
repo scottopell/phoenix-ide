@@ -1,5 +1,6 @@
 use super::super::{RequiredSettlementBoundary, ToolExecOutcome, ToolExecutionSlot};
 use super::*;
+use futures::FutureExt as _;
 use phoenix_core::domain::sm_state::AssistantMessage;
 use std::task::Poll;
 use tokio::{sync::oneshot, task::JoinHandle};
@@ -81,6 +82,34 @@ impl Drop for RunningCall {
 }
 
 impl BatchCall {
+    fn accept_outcome(&mut self, outcome: ToolExecOutcome) -> Option<Event> {
+        if matches!(self.phase, CallPhase::Running(_)) {
+            let old = std::mem::replace(&mut self.phase, CallPhase::Retired);
+            let CallPhase::Running(mut execution) = old else {
+                unreachable!()
+            };
+            execution.cancel_on_drop = false;
+            self.phase = CallPhase::Settling(Some(execution));
+        } else if !matches!(self.phase, CallPhase::Settling(_)) {
+            return None;
+        }
+        let outcome = outcome.for_invocation(&self.selection.tool.id);
+        let event = match outcome {
+            ToolExecOutcome::Completed(result) => Event::ToolComplete {
+                tool_use_id: self.selection.tool.id.clone(),
+                result,
+            },
+            ToolExecOutcome::Failed { error, .. } => Event::ToolComplete {
+                tool_use_id: self.selection.tool.id.clone(),
+                result: ToolResult::error(self.selection.tool.id.clone(), error),
+            },
+            ToolExecOutcome::Aborted { .. } => Event::ToolAborted {
+                tool_use_id: self.selection.tool.id.clone(),
+            },
+        };
+        Some(event)
+    }
+
     fn capture_ready(&mut self) {
         let CallPhase::Running(execution) = &mut self.phase else {
             return;
@@ -124,7 +153,7 @@ impl ForegroundDispatch {
         let now = tokio::time::Instant::now();
         for call in &mut batch.calls {
             let expired = matches!(&call.phase, CallPhase::Running(execution)
-                if execution.cutoff.is_some_and(|cutoff| cutoff - (super::super::BASH_WAIT_SETTLEMENT_GRACE - super::super::BASH_WAIT_EXECUTION_GRACE) <= now));
+                if execution.cutoff.is_some_and(|cutoff| wait_execution_cutoff(cutoff) <= now));
             if !expired {
                 continue;
             }
@@ -208,11 +237,7 @@ impl ForegroundDispatch {
             .calls
             .iter()
             .filter_map(|call| match &call.phase {
-                CallPhase::Running(execution) => execution.cutoff.map(|cutoff| {
-                    cutoff
-                        - (super::super::BASH_WAIT_SETTLEMENT_GRACE
-                            - super::super::BASH_WAIT_EXECUTION_GRACE)
-                }),
+                CallPhase::Running(execution) => execution.cutoff.map(wait_execution_cutoff),
                 _ => None,
             })
             .min()
@@ -262,13 +287,13 @@ impl OrdinaryBatch {
             match &mut call.phase {
                 CallPhase::Running(execution) => execution.cancel.cancel(),
                 CallPhase::Preparing(preparation) => {
-                    preparation.phase = PreparationPhase::Interrupted
+                    preparation.phase = PreparationPhase::Interrupted;
                 }
                 CallPhase::Unissued | CallPhase::Cleared | CallPhase::NoRead => {
                     call.phase = CallPhase::Ready {
                         outcome: ToolExecOutcome::Completed(ToolResult::cancelled(
                             call.selection.tool.id.clone(),
-                            "Skipped due to cancellation".into(),
+                            "Skipped due to cancellation",
                         )),
                         execution: None,
                     };
@@ -339,7 +364,7 @@ impl OrdinaryBatch {
 
     pub(in super::super) fn retain_execution(
         &mut self,
-        selection: Arc<DispatchSelection>,
+        selection: &Arc<DispatchSelection>,
         cancel: CancellationToken,
         task: JoinHandle<()>,
         receiver: oneshot::Receiver<ToolExecOutcome>,
@@ -348,7 +373,7 @@ impl OrdinaryBatch {
         let call = self
             .calls
             .iter_mut()
-            .find(|call| Arc::ptr_eq(&call.selection, &selection))
+            .find(|call| Arc::ptr_eq(&call.selection, selection))
             .expect("only the gate-cleared owned call can launch");
         assert!(matches!(call.phase, CallPhase::Cleared));
         call.phase = CallPhase::Running(RunningCall {
@@ -361,6 +386,15 @@ impl OrdinaryBatch {
             cancel_on_drop: true,
         });
     }
+}
+
+fn wait_execution_cutoff(settlement_cutoff: tokio::time::Instant) -> tokio::time::Instant {
+    let settlement_only_grace = super::super::BASH_WAIT_SETTLEMENT_GRACE
+        .checked_sub(super::super::BASH_WAIT_EXECUTION_GRACE)
+        .expect("execution grace precedes settlement grace");
+    settlement_cutoff
+        .checked_sub(settlement_only_grace)
+        .expect("launch plus settlement bound includes execution grace")
 }
 
 fn invocation_wait_bound(tool: &ToolCall) -> Option<std::time::Duration> {
@@ -423,7 +457,7 @@ impl<S: Storage + Clone + 'static, L: LlmClient + 'static, T: ToolExecutor + 'st
             if batch.origin.as_ref() != assistant_message {
                 return Err("ordinary batch origin was replaced before settlement".into());
             }
-            self.fill_ordinary_batch()?;
+            self.fill_ordinary_batch();
             return Ok(true);
         }
         let calls: Vec<_> = std::iter::once(current_tool)
@@ -505,16 +539,16 @@ impl<S: Storage + Clone + 'static, L: LlmClient + 'static, T: ToolExecutor + 'st
             closing: false,
             cancellation_committed: false,
         });
-        self.fill_ordinary_batch()?;
+        self.fill_ordinary_batch();
         Ok(true)
     }
 
-    pub(in super::super) fn fill_ordinary_batch(&mut self) -> Result<(), String> {
+    pub(in super::super) fn fill_ordinary_batch(&mut self) {
         let ForegroundDispatch::OrdinaryBatch(batch) = &self.foreground_dispatch else {
-            return Ok(());
+            return;
         };
         if batch.closing {
-            return Ok(());
+            return;
         }
         let active = batch
             .calls
@@ -554,7 +588,6 @@ impl<S: Storage + Clone + 'static, L: LlmClient + 'static, T: ToolExecutor + 'st
                 .expect("unissued capability remains owned");
             call.phase = CallPhase::Preparing(preparation);
         }
-        Ok(())
     }
 
     pub(super) fn own_serial_selection(
@@ -629,7 +662,7 @@ impl<S: Storage + Clone + 'static, L: LlmClient + 'static, T: ToolExecutor + 'st
         }
     }
 
-    pub(in super::super) async fn accept_foreground_observation(
+    pub(in super::super) fn accept_foreground_observation(
         &mut self,
         observation: ForegroundObservation,
     ) -> Result<Option<Event>, String> {
@@ -650,7 +683,7 @@ impl<S: Storage + Clone + 'static, L: LlmClient + 'static, T: ToolExecutor + 'st
                     tool_use_id: selection.tool.id.clone(),
                     result: ToolResult::cancelled(
                         selection.tool.id.clone(),
-                        "Skipped due to cancellation".into(),
+                        "Skipped due to cancellation",
                     ),
                 }));
             }
@@ -724,42 +757,15 @@ impl<S: Storage + Clone + 'static, L: LlmClient + 'static, T: ToolExecutor + 'st
                     }
                 }
             }
-            ForegroundObservation::Outcome { outcome, .. } => {
-                if matches!(call.phase, CallPhase::Running(_)) {
-                    let old = std::mem::replace(&mut call.phase, CallPhase::Retired);
-                    let CallPhase::Running(mut execution) = old else {
-                        unreachable!()
-                    };
-                    execution.cancel_on_drop = false;
-                    call.phase = CallPhase::Settling(Some(execution));
-                } else if !matches!(call.phase, CallPhase::Settling(_)) {
-                    return Ok(None);
-                }
-                let outcome = outcome.for_invocation(&selection.tool.id);
-                let event = match outcome {
-                    ToolExecOutcome::Completed(result) => Event::ToolComplete {
-                        tool_use_id: selection.tool.id.clone(),
-                        result,
-                    },
-                    ToolExecOutcome::Failed { error, .. } => Event::ToolComplete {
-                        tool_use_id: selection.tool.id.clone(),
-                        result: ToolResult::error(selection.tool.id.clone(), error),
-                    },
-                    ToolExecOutcome::Aborted { .. } => Event::ToolAborted {
-                        tool_use_id: selection.tool.id.clone(),
-                    },
-                };
-                Ok(Some(event))
-            }
+            ForegroundObservation::Outcome { outcome, .. } => Ok(call.accept_outcome(outcome)),
             ForegroundObservation::Serial(_) | ForegroundObservation::Unissued(_) => unreachable!(),
         }
     }
 
     pub(in super::super) async fn expire_batch_waits(&mut self) -> Result<(), String> {
         self.foreground_dispatch.retire_expired_wait_resources();
-        use futures::FutureExt as _;
         while let Some(observation) = self.foreground_dispatch.observe().now_or_never() {
-            if let Some(event) = self.accept_foreground_observation(observation).await? {
+            if let Some(event) = self.accept_foreground_observation(observation)? {
                 self.process_event(event).await?;
             }
             if !matches!(
@@ -775,7 +781,6 @@ impl<S: Storage + Clone + 'static, L: LlmClient + 'static, T: ToolExecutor + 'st
     pub(in super::super) async fn drain_ready_before_forced_retirement(
         &mut self,
     ) -> Result<bool, String> {
-        use futures::FutureExt as _;
         if !matches!(
             self.foreground_dispatch,
             ForegroundDispatch::OrdinaryBatch(_)
@@ -787,7 +792,7 @@ impl<S: Storage + Clone + 'static, L: LlmClient + 'static, T: ToolExecutor + 'st
             let Some(observation) = self.foreground_dispatch.observe().now_or_never() else {
                 break;
             };
-            if let Some(event) = self.accept_foreground_observation(observation).await? {
+            if let Some(event) = self.accept_foreground_observation(observation)? {
                 self.process_event(event).await?;
             }
             if !matches!(

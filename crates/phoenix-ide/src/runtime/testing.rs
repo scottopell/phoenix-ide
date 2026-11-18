@@ -4189,23 +4189,10 @@ mod tests {
         // Build AssistantMessage with tool_use blocks for all 3 tools
         let assistant_message = AssistantMessage::new(
             uuid::Uuid::new_v4().to_string(),
-            vec![
-                ContentBlock::ToolUse {
-                    id: "t1".to_string(),
-                    name: "bash".to_string(),
-                    input: serde_json::json!({}),
-                },
-                ContentBlock::ToolUse {
-                    id: "t2".to_string(),
-                    name: "bash".to_string(),
-                    input: serde_json::json!({}),
-                },
-                ContentBlock::ToolUse {
-                    id: "t3".to_string(),
-                    name: "bash".to_string(),
-                    input: serde_json::json!({}),
-                },
-            ],
+            ["t1", "t2", "t3"]
+                .into_iter()
+                .map(|id| ContentBlock::tool_use(id, "bash", serde_json::json!({})))
+                .collect(),
             None,
             None,
         );

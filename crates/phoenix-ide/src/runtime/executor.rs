@@ -844,6 +844,26 @@ fn finalized_round_results(results: Vec<ToolRoundResult>) -> Result<Vec<ToolResu
         .collect()
 }
 
+fn finalized_round_messages(
+    assistant: &crate::db::Message,
+    tool_results: Vec<ToolResult>,
+    sequence_ids: impl IntoIterator<Item = i64>,
+) -> Vec<FinalizedToolResult> {
+    tool_results
+        .into_iter()
+        .zip(sequence_ids)
+        .map(|(result, sequence_id)| {
+            FinalizedToolResult::new(
+                &assistant.message_id,
+                &assistant.conversation_id,
+                sequence_id,
+                Utc::now(),
+                &result,
+            )
+        })
+        .collect()
+}
+
 fn trusted_tool_results<'a>(
     assistant_message_id: &str,
     results: impl IntoIterator<Item = &'a ToolResult>,
@@ -2124,6 +2144,34 @@ struct PendingSubAgentActivation {
     sender: oneshot::Sender<()>,
 }
 
+impl PendingSubAgentActivation {
+    fn validate_membership(&self, state: &ConvState) -> Result<(), String> {
+        let pending = match state {
+            ConvState::ToolExecuting {
+                pending_sub_agents, ..
+            } => pending_sub_agents,
+            ConvState::AwaitingSubAgents { pending, .. }
+            | ConvState::CancellingSubAgents { pending, .. } => pending,
+            _ => {
+                return Err(
+                    "sub-agent activation persist omitted admitted parent membership".to_string(),
+                )
+            }
+        };
+        if !self.child_ids.iter().all(|child_id| {
+            pending
+                .iter()
+                .any(|pending_child| pending_child.agent_id == *child_id)
+        }) {
+            return Err(
+                "sub-agent activation persist did not contain its exact admitted membership"
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
+}
+
 #[allow(clippy::struct_excessive_bools)] // independent runtime concerns; conversation lifecycle is ConvState
 pub struct ConversationRuntime<S, L, T>
 where
@@ -3371,7 +3419,7 @@ where
                     }
                 }
                 observation = self.foreground_dispatch.observe() => {
-                    match self.accept_foreground_observation(observation).await {
+                    match self.accept_foreground_observation(observation) {
                         Ok(Some(event)) => {
                             if let Err(error) = self.process_event(event).await {
                                 tracing::error!(%error, "failed to settle prepared tool");
@@ -4334,7 +4382,7 @@ where
                 self.handoff_completion_timestamp = None;
             }
             self.commit_foreground_membership();
-            self.fill_ordinary_batch()?;
+            self.fill_ordinary_batch();
             events_to_process.extend(generated);
         }
 
@@ -5562,29 +5610,7 @@ where
     ) -> Result<Option<Event>, String> {
         let activation = self.take_native_spawn_activation();
         if let Some(activation) = &activation {
-            let pending = match &self.state {
-                ConvState::ToolExecuting {
-                    pending_sub_agents, ..
-                } => pending_sub_agents,
-                ConvState::AwaitingSubAgents { pending, .. }
-                | ConvState::CancellingSubAgents { pending, .. } => pending,
-                _ => {
-                    return Err(
-                        "sub-agent activation persist omitted admitted parent membership"
-                            .to_string(),
-                    )
-                }
-            };
-            if !activation.child_ids.iter().all(|child_id| {
-                pending
-                    .iter()
-                    .any(|pending_child| pending_child.agent_id == *child_id)
-            }) {
-                return Err(
-                    "sub-agent activation persist did not contain its exact admitted membership"
-                        .to_string(),
-                );
-            }
+            activation.validate_membership(&self.state)?;
         }
         let state_persisted = if let Some(cause) = self.pending_sub_agent_terminal.take() {
             self.storage
@@ -10048,7 +10074,7 @@ where
     ) -> Result<Option<Event>, String> {
         self.begin_tool_preparation(tool)?;
         let observed = self.foreground_dispatch.observe().await;
-        self.accept_foreground_observation(observed).await
+        self.accept_foreground_observation(observed)
     }
 
     #[allow(clippy::too_many_lines)]
@@ -10218,7 +10244,7 @@ where
                 ));
             }
             tool_preparation::ForegroundDispatch::OrdinaryBatch(batch) => {
-                batch.retain_execution(selection, cancel_token, tool_task, tool_rx, publication);
+                batch.retain_execution(&selection, cancel_token, tool_task, tool_rx, publication);
             }
         }
     }
@@ -10377,19 +10403,11 @@ where
                     created_at: assistant_message.created_at,
                 };
 
-                let tool_msgs: Vec<FinalizedToolResult> = tool_results
-                    .into_iter()
-                    .zip(reserved_seqs.into_iter().skip(1))
-                    .map(|(result, sequence_id)| {
-                        FinalizedToolResult::new(
-                            &agent_msg.message_id,
-                            &conv_id,
-                            sequence_id,
-                            Utc::now(),
-                            &result,
-                        )
-                    })
-                    .collect();
+                let tool_msgs = finalized_round_messages(
+                    &agent_msg,
+                    tool_results,
+                    reserved_seqs.into_iter().skip(1),
+                );
 
                 // Persist the assistant message and every tool result in one
                 // transaction: either the full round is durable or none of it
