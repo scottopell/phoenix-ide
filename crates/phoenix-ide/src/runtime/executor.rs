@@ -8294,7 +8294,7 @@ where
                 Ok(None)
             }
 
-            AuthoritativeEffect::ExecuteTool { tool } => self.begin_tool_preparation(tool),
+            AuthoritativeEffect::ExecuteTool { tool } => self.begin_tool_preparation(&tool),
 
             AuthoritativeEffect::ScheduleRetry {
                 delay,
@@ -10072,7 +10072,7 @@ where
         tool: ToolCall,
         _admitted: &mut crate::runtime::AdmittedOperation,
     ) -> Result<Option<Event>, String> {
-        self.begin_tool_preparation(tool)?;
+        self.begin_tool_preparation(&tool)?;
         let observed = self.foreground_dispatch.observe().await;
         self.accept_foreground_observation(observed)
     }

@@ -103,8 +103,8 @@ pub(crate) fn channel(
 }
 
 impl ConversationEventSender {
-    pub fn try_send(&self, event: Event) -> Result<(), mpsc::error::TrySendError<Event>> {
-        match &self.0 {
+    pub fn try_send(&self, event: Event) -> Result<(), Box<mpsc::error::TrySendError<Event>>> {
+        let result = match &self.0 {
             EventDestination::Runtime {
                 ordinary,
                 cancellation,
@@ -127,7 +127,8 @@ impl ConversationEventSender {
             },
             #[cfg(test)]
             EventDestination::TestReceiver(sender) => sender.try_send(event),
-        }
+        };
+        result.map_err(Box::new)
     }
 
     pub async fn send(&self, event: Event) -> Result<(), mpsc::error::SendError<Event>> {

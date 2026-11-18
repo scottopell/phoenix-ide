@@ -312,7 +312,7 @@ async fn completed_special_member_keeps_the_whole_source_round_serial() {
         assistant_message: source,
         pending_sub_agents: vec![],
     };
-    runtime.begin_tool_preparation(calls[0].clone()).unwrap();
+    runtime.begin_tool_preparation(&calls[0]).unwrap();
     assert!(
         matches!(
             runtime.foreground_dispatch,
@@ -473,7 +473,7 @@ async fn prepared_batch_for_role(
             None,
         ),
     };
-    runtime.begin_tool_preparation(current_tool).unwrap();
+    runtime.begin_tool_preparation(&current_tool).unwrap();
     (runtime, starts, directory)
 }
 
@@ -1122,7 +1122,7 @@ async fn serial_special_source_cancellation_drains_affirmative_unissued_tail() {
             None,
         ),
     };
-    runtime.begin_tool_preparation(first).unwrap();
+    runtime.begin_tool_preparation(&first).unwrap();
     runtime.process_event(user_cancel()).await.unwrap();
     drain_cancelled_batch(&mut runtime).await;
     assert!(runtime.tool_executor.tokens.lock().unwrap().is_empty());
@@ -1227,6 +1227,23 @@ fn sqlite_batch_state(content: Vec<ContentBlock>) -> ConvState {
     }
 }
 
+async fn seed_sqlite_tool_policy(db: &crate::db::Database, definitions: &[ToolDefinition]) {
+    db.prepare_tool_availability(
+        "ordinary-batch",
+        "batch-commit-test",
+        None,
+        definitions,
+        &definitions
+            .iter()
+            .map(|definition| definition.name.clone())
+            .collect(),
+        &[],
+        &[],
+    )
+    .await
+    .unwrap();
+}
+
 #[tokio::test]
 async fn sqlite_rejects_sibling_commit_without_refill_publication_or_model_advance() {
     let directory = tempfile::tempdir().unwrap();
@@ -1243,20 +1260,7 @@ async fn sqlite_rejects_sibling_commit_without_refill_publication_or_model_advan
     let release_fast = Arc::new(Semaphore::new(0));
     *tools.fast_release.lock().unwrap() = Some(release_fast.clone());
     let definitions = tools.definitions().await;
-    db.prepare_tool_availability(
-        "ordinary-batch",
-        "batch-commit-test",
-        None,
-        &definitions,
-        &definitions
-            .iter()
-            .map(|definition| definition.name.clone())
-            .collect(),
-        &[],
-        &[],
-    )
-    .await
-    .unwrap();
+    seed_sqlite_tool_policy(&db, &definitions).await;
     let initial = sqlite_batch_state(content);
     let ConvState::ToolExecuting { current_tool, .. } = &initial else {
         unreachable!()
@@ -1283,7 +1287,7 @@ async fn sqlite_rejects_sibling_commit_without_refill_publication_or_model_advan
         SseBroadcaster::new(128, 0),
     )
     .with_state_watcher(watcher);
-    runtime.begin_tool_preparation(current_tool).unwrap();
+    runtime.begin_tool_preparation(&current_tool).unwrap();
     for _ in 0..4 {
         let observation = runtime.foreground_dispatch.observe().await;
         assert!(runtime

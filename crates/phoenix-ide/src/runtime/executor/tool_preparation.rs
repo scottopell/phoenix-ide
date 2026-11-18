@@ -143,18 +143,18 @@ impl<S: Storage + Clone + 'static, L: LlmClient + 'static, T: ToolExecutor + 'st
 {
     pub(super) fn begin_tool_preparation(
         &mut self,
-        tool: ToolCall,
+        tool: &ToolCall,
     ) -> Result<Option<Event>, String> {
-        if self.begin_ordinary_batch(&tool)? {
+        if self.begin_ordinary_batch(tool)? {
             return Ok(None);
         }
         let ConvState::ToolExecuting { current_tool, .. } = &self.state else {
             return Err("tool preparation outside executing state".into());
         };
-        if current_tool != &tool {
+        if current_tool != tool {
             return Err("tool preparation does not own the selected call".into());
         }
-        let selection = self.own_serial_selection(&tool)?;
+        let selection = self.own_serial_selection(tool)?;
         let failure_boundary = self
             .required_settlement_authority
             .as_ref()
