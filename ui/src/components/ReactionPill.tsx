@@ -10,6 +10,7 @@ export function ReactionPill({ source, sourceRange, touchDocked = false, capture
   const { activeScope } = useFocusScope();
   const [sourceDocked, setSourceDocked] = useState(false);
   const docked = touchDocked || sourceDocked;
+  const compactReturn = sourceDocked && !touchDocked && available;
   const hidden = Boolean(activeScope && activeScope !== scopeId);
   const dockActive = touchDocked && !hidden;
   const [discardTop, setDiscardTop] = useState<number | null>(null);
@@ -265,7 +266,7 @@ export function ReactionPill({ source, sourceRange, touchDocked = false, capture
         </div>
       )}
       <div className="reaction-pill-content" hidden={discard}>
-        {sourceDocked && !touchDocked && available ? (
+        {compactReturn ? (
           <button type="button" className="reaction-pill-return" onPointerDown={captureSource} onClick={returnToPassage} disabled={returnPending} title={error || source.quote}>
             <ArrowUpRight size={18} aria-hidden="true" />
             <span>{returnPending ? 'Returning to passage…' : error || `Return to passage · ${body || source.quote}`}</span>
@@ -297,13 +298,17 @@ export function ReactionPill({ source, sourceRange, touchDocked = false, capture
                 }
               }}
             />
+          </>
+        )}
+        <div className="reaction-pill-actions">
+          {!compactReturn && (
             <button type="button" className="reaction-pill-add" aria-label="Add to message" title={available ? 'Add to message (Cmd/Ctrl+Enter)' : 'Draft unavailable. Your reaction is retained.'} disabled={!available || !body.trim()} onClick={onAdd}>
               <ListPlus size={20} aria-hidden="true" />
               <span>Add to message</span>
             </button>
-          </>
-        )}
-        <button type="button" aria-label="Dismiss reaction" title="Dismiss reaction" onClick={requestClose}><X size={16} aria-hidden="true" /></button>
+          )}
+          <button type="button" aria-label="Dismiss reaction" title="Dismiss reaction" onClick={requestClose}><X size={16} aria-hidden="true" /></button>
+        </div>
       </div>
       {(error || !available) && <span className="reaction-pill-sr" role="status">{error || 'Draft unavailable. Your reaction is retained.'}</span>}
     </div>

@@ -8,6 +8,8 @@ The `ReactionPill` is integrated into ordinary conversation transcripts. It star
 
 ## Requirements Summary
 
+Floating reactions keep empty and short entries on one compact row. As text outgrows the space beside the labeled action, the editor uses the full pill width and the grouped Add to message/dismiss controls move below it. Shortening the comment restores the compact row. Browser capture assertions exercise full-width expansion, shrinking and re-expansion, and the retained discard/Keep geometry on desktop as well as the touch layout.
+
 Draft annotation strips share the desktop transcript's reading width and show a total count plus counts hidden above/below their bounded scroller. Number markers beside mounted source passages correspond to the stable card numbers; overlapping markers are grouped. Hover, keyboard focus, and modal selection emphasize the exact source range and its matching number without changing source text or native selection. These affordances extend REQ-PF-019.
 
 Annotation design iteration has fifteen direct Ladle stories under `Annotations`, seeded through the conversation-owned production draft, source navigation, and send actions. `./dev.py qa annotations` uses `phoenix-browser` to generate sixty desktop/mobile, light/dark screenshots and a filtered side-by-side gallery with composer-height measurements. The focused-card story exposes exact source emphasis. The workflow is documented in `docs/qa/annotations.md`; generated artifacts stay under the ignored `ui/qa-artifacts/annotations/` directory.
