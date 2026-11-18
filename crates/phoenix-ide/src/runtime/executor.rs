@@ -58,6 +58,8 @@ use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
 mod capacity;
+#[cfg(test)]
+mod concurrent_tools_tests;
 mod continuation;
 mod native_spawn;
 use native_spawn::{NativeSpawnCutoff, NativeSpawnHandoff, NativeSpawnPhase};
