@@ -25,12 +25,21 @@
 
 .reaction-pill-content {
   flex: 1;
+  flex-wrap: wrap;
+  justify-content: flex-end;
   min-width: 0;
+}
+
+.reaction-pill-actions {
+  display: flex;
+  flex-shrink: 0;
+  align-items: center;
+  gap: 2px;
 }
 
 .reaction-pill-content:has(.reaction-pill-source) {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto auto;
+  grid-template-columns: minmax(0, 1fr) auto;
   align-items: center;
 }
 
@@ -39,10 +48,11 @@
 .reaction-pill-confirmation { flex: 1; }
 
 .reaction-pill textarea {
-  flex: 1;
+  flex: 1 1 auto;
   box-sizing: border-box;
   min-width: 0;
-  width: 0;
+  width: auto;
+  max-width: 100%;
   min-height: 36px;
   max-height: min(240px, 40dvh);
   padding: 8px 4px;
@@ -57,7 +67,10 @@
   overflow-wrap: anywhere;
 }
 
-.reaction-pill textarea:placeholder-shown { white-space: pre; }
+.reaction-pill textarea:placeholder-shown {
+  flex-basis: 0;
+  white-space: pre;
+}
 
 .reaction-pill textarea:focus { outline: none; }
 

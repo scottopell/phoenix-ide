@@ -28,9 +28,11 @@ async function pillGeometry() {
     const pill=document.querySelector('.reaction-pill');
     const input=pill?.querySelector('textarea');
     const source=pill?.querySelector('.reaction-pill-source');
+    const actions=pill?.querySelector('.reaction-pill-actions');
     return pill ? { ...pill.getBoundingClientRect().toJSON(),
       text:input?.value,
       inputWidth:input?.getBoundingClientRect().width,
+      actionsBelow:actions && input && !input.closest('[hidden]') ? actions.getBoundingClientRect().top>=input.getBoundingClientRect().bottom-1 : null,
       sourceAbove:source && input && !input.closest('[hidden]') ? source.getBoundingClientRect().bottom<=input.getBoundingClientRect().top : null
     } : null;
   })()`);
@@ -134,9 +136,14 @@ try {
         if (!overflow?.before.includes('8 annotations') || !overflow.before.includes('more below') || !overflow.after.includes('above') || overflow.after.includes('more below')) throw new Error(`Missing annotation overflow cues: ${JSON.stringify(overflow)}`);
         metrics.stackOverflow = overflow;
       }
+      if (story.id === '02-selected' && layout.name === 'desktop') {
+        const empty = await pillGeometry();
+        if (!empty || empty.height > 64 || empty.actionsBelow) throw new Error('An empty floating reaction must remain one compact row');
+      }
       if (story.id === '03-writing') {
         const before = await pillGeometry();
-        if (!before || (before.sourceAbove !== null && (!before.sourceAbove || before.inputWidth < before.width - 32))) throw new Error('Source preview squeezed the reaction editor');
+        if (!before || before.sourceAbove === false || before.inputWidth < before.width - 32) throw new Error('Reaction editor must use the full pill width when writing a long comment');
+        if (before.sourceAbove === null && !before.actionsBelow) throw new Error('Floating reaction actions must sit together below a long comment');
         await browser('click', '[aria-label="Dismiss reaction"]');
         await browser('wait', '.reaction-pill-confirmation');
         const confirmation = await pillGeometry();
@@ -145,6 +152,15 @@ try {
         await browser('wait', '.reaction-pill-content:not([hidden]) textarea');
         const restored = await pillGeometry();
         if (!restored || restored.text !== before.text || Math.abs(restored.top - before.top) > 1 || Math.abs(restored.height - before.height) > 1) throw new Error('Keep must restore reaction text and geometry');
+        if (layout.name === 'desktop') {
+          await browser('type', '[aria-label="Your reaction"]', 'ok', '--clear');
+          const short = await pillGeometry();
+          if (!short || short.height > 64 || short.actionsBelow) throw new Error('A shortened reaction must return to one compact row');
+          await browser('type', '[aria-label="Your reaction"]', before.text, '--clear');
+          const expanded = await pillGeometry();
+          if (!expanded || expanded.inputWidth < expanded.width - 32 || !expanded.actionsBelow) throw new Error('A restored long reaction must expand to full width again');
+          metrics.reactionShrink = { short, expanded };
+        }
         metrics.reaction = { before, confirmation, restored };
       }
       const logs = await browser('console', '--limit', '100');

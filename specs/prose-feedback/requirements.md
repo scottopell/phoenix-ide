@@ -457,6 +457,13 @@ AND SHALL shrink the input when text is removed
 AND SHALL bound its height to fit the visible viewport, using vertical scrolling for longer reactions
 AND SHALL provide explicit Add to message and dismiss controls.
 
+WHEN floating reaction text no longer fits beside its action controls
+THE SYSTEM SHALL give the comment editor the full pill width above the controls
+AND SHALL keep the Add to message and dismiss controls together on one row.
+
+WHEN floating reaction text fits beside its controls again
+THE SYSTEM SHALL return to the compact single-line presentation.
+
 WHEN the selected passage leaves the transcript viewport or its row unmounts
 THE SYSTEM SHALL retain an unfinished reaction in a compact dock with a reaction preview and Return to passage action.
 

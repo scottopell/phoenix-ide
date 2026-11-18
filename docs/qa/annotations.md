@@ -17,9 +17,12 @@ port 61123 or starts a temporary one. It captures fifteen states at desktop
 Each story reports readiness after its target state and layout settle.
 Unexpected browser errors and horizontal document overflow fail the capture;
 the failed-send story permits its intentional synthetic rejection. The writing
-state also checks that a touch source preview sits above a full-width editor,
-then clicks Dismiss and Keep to verify compact confirmation, a stable top
-border/width, and restored text and editor geometry.
+state checks a full-width editor on desktop and mobile, with floating action
+controls grouped beneath long comments and the touch source preview above the
+editor. It clicks Dismiss and Keep to verify compact confirmation, a stable top
+border/width, and restored text and editor geometry. Desktop checks also shorten
+and restore the comment to verify the pill returns to one row and expands again;
+the empty selected state verifies the initial floating pill stays compact.
 The focused-card state checks exact source-range correspondence, the matching
 number marker, and desktop alignment with the transcript. The many-annotation
 state scrolls the stack to verify its above/below counts, then restores the
