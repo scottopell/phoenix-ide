@@ -1283,9 +1283,20 @@ fn complete_ordinary_sibling(
     Ok(next)
 }
 
+fn settle_cancelled_receipt(result: ToolRoundResult, message: &str) -> ToolRoundResult {
+    match result {
+        finalized @ ToolRoundResult::Finalized(_) => finalized,
+        pending @ (ToolRoundResult::PendingSelfGoal { .. }
+        | ToolRoundResult::PendingGoalReport { .. }) => {
+            ToolResult::cancelled(pending.tool_use_id().to_owned(), message).into()
+        }
+    }
+}
+
 fn cancel_ordinary_sibling(
     state: &CoreState,
     event: &CoreEvent,
+    cancellation_message: &str,
 ) -> Option<Result<CoreTransitionResult, TransitionError>> {
     let CoreState::CancellingTool {
         tool_use_id,
@@ -1305,10 +1316,13 @@ fn cancel_ordinary_sibling(
         CoreEvent::ToolComplete {
             tool_use_id,
             result,
-        } => (tool_use_id, result.clone()),
+        } => (
+            tool_use_id,
+            settle_cancelled_receipt(result.clone(), cancellation_message),
+        ),
         CoreEvent::ToolAborted { tool_use_id } => (
             tool_use_id,
-            ToolResult::cancelled(tool_use_id.clone(), "Cancelled by user").into(),
+            ToolResult::cancelled(tool_use_id.clone(), cancellation_message).into(),
         ),
         _ => return None,
     };
@@ -1406,7 +1420,7 @@ fn handle_core_tool_complete(
             let checkpoint = ToolRoundAssembly::new(
                 assistant_message.clone(),
                 completed_results.clone(),
-                std::iter::once(result),
+                std::iter::once(settle_cancelled_receipt(result, "Cancelled by user")),
             )
             .map(CheckpointData::ToolRound)?;
 
@@ -1453,7 +1467,7 @@ fn handle_core_cancellation(
     state: &CoreState,
     event: CoreEvent,
 ) -> Result<CoreTransitionResult, TransitionError> {
-    if let Some(partial) = cancel_ordinary_sibling(state, &event) {
+    if let Some(partial) = cancel_ordinary_sibling(state, &event, "Cancelled by user") {
         return partial;
     }
     let forced_tool_retirement = if matches!(event, CoreEvent::ToolCancellationRetired { .. }) {
@@ -3752,7 +3766,7 @@ pub fn transition_sub_agent(
         });
     }
     if let (SubAgentState::Core(core), SubAgentEvent::Core(event)) = (state, &event) {
-        if let Some(partial) = cancel_ordinary_sibling(core, event) {
+        if let Some(partial) = cancel_ordinary_sibling(core, event, "Cancelled by parent") {
             return partial.map(|partial| SubAgentTransitionResult {
                 new_state: SubAgentState::Core(partial.new_state),
                 effects: partial.effects,
@@ -3902,7 +3916,10 @@ pub fn transition_sub_agent(
                 }
             };
             let tail: Vec<ToolRoundResult> = match settled {
-                CoreEvent::ToolComplete { result, .. } => vec![result.clone()],
+                CoreEvent::ToolComplete { result, .. } => vec![settle_cancelled_receipt(
+                    result.clone(),
+                    "Cancelled by parent",
+                )],
                 CoreEvent::ToolAborted { .. } | CoreEvent::ToolCancellationRetired { .. } => {
                     build_cancellation_results(tool_use_id, "Cancelled by parent", skipped_tools)
                         .into_iter()

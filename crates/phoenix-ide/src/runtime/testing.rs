@@ -4255,7 +4255,7 @@ mod tests {
         );
 
         // Phase 2: ToolAborted -> Idle with PersistCheckpoint (atomic)
-        let result2 = transition(
+        let mut result2 = transition(
             &result.new_state,
             &context,
             Event::ToolAborted {
@@ -4263,6 +4263,22 @@ mod tests {
             },
         )
         .unwrap();
+
+        assert!(matches!(
+            result2.new_state,
+            ConvState::CancellingTool { .. }
+        ));
+        for id in ["t2", "t3"] {
+            result2 = transition(
+                &result2.new_state,
+                &context,
+                Event::ToolComplete {
+                    tool_use_id: id.into(),
+                    result: ToolResult::cancelled(id.into(), "Skipped due to cancellation"),
+                },
+            )
+            .unwrap();
+        }
 
         assert!(matches!(result2.new_state, ConvState::Idle));
 
