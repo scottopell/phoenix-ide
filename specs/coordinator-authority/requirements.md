@@ -203,13 +203,14 @@ conversations hides the ones the user is actually driving.
 
 WHEN a monitored conversation asks a question
 THE SYSTEM SHALL deliver the question text, its options, the transcript and the
-request identity to the Coordinator with the watch event, unless the question
-was answered or replaced before delivery.
+request identity to the Coordinator with the watch event, marked as text the
+conversation's agent wrote, unless the question was answered or replaced before
+delivery, in which case the event SHALL say so.
 
 THE Coordinator SHALL have a tool that answers such a question through the same
 path as the user's question card, accepted only for a conversation under an
-active watch, for the question's current request identity, with every question
-answered once.
+active watch, for a question the Coordinator holds, for the question's current
+request identity, with every question answered once.
 THE answered conversation SHALL record the answer as the Coordinator's, not the
 user's.
 
@@ -222,7 +223,9 @@ THE SYSTEM SHALL NOT present it as needing the user and SHALL NOT raise a
 question notification for it,
 AND SHALL present it as needing the user again once 30 minutes pass without an
 answer.
-A question asked before the watch began SHALL remain the user's.
+The Coordinator holds a question once it has accepted the watch event that
+reported it. A question asked before the watch began, or whose event the
+Coordinator has not yet accepted, SHALL remain the user's.
 
 The user SHALL remain able to answer from the conversation's own question card
 at any time; the first accepted answer wins and a later one is refused as

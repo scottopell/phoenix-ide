@@ -238,10 +238,12 @@ impl Database {
     }
 
     /// Product conversations under an active watch, each with the newest
-    /// question wait the watch reported to the Coordinator.
+    /// question wait the Coordinator has accepted from the watch.
     ///
     /// A caller compares the question's request id with the conversation's
     /// current wait: only a match means the Coordinator holds that question.
+    /// A question event still pending delivery does not count: the Coordinator
+    /// has not seen it, so the question stays the user's.
     ///
     /// # Errors
     /// Returns an error if a database operation fails.
@@ -250,13 +252,15 @@ impl Database {
     ) -> DbResult<std::collections::HashMap<String, MonitoredProductConversation>> {
         let rows = sqlx::query(
             "SELECT w.source_product_conversation_id AS product_conversation_id,
-                    (SELECT e.source_occurrence_id FROM coordinator_watch_events e
-                     WHERE e.watch_id = w.id AND e.source_occurrence_kind = 'question_request'
-                     ORDER BY e.occurred_at_us DESC LIMIT 1) AS question_request_id,
-                    (SELECT e.occurred_at_us FROM coordinator_watch_events e
-                     WHERE e.watch_id = w.id AND e.source_occurrence_kind = 'question_request'
-                     ORDER BY e.occurred_at_us DESC LIMIT 1) AS question_reported_at_us
+                    e.source_occurrence_id AS question_request_id,
+                    e.occurred_at_us AS question_reported_at_us
              FROM coordinator_watches w
+             LEFT JOIN coordinator_watch_events e ON e.event_id = (
+                 SELECT latest.event_id FROM coordinator_watch_events latest
+                 WHERE latest.watch_id = w.id
+                   AND latest.source_occurrence_kind = 'question_request'
+                   AND latest.delivery_state = 'accepted'
+                 ORDER BY latest.occurred_at_us DESC LIMIT 1)
              WHERE w.ended_at_us IS NULL",
         )
         .fetch_all(&self.pool)
@@ -1417,12 +1421,28 @@ mod tests {
                 .await
                 .unwrap();
         }
-        let monitored = db.monitored_product_conversations().await.unwrap();
-        let latest = monitored[watched.product_conversation_id.as_str()]
+        let latest_question = || async {
+            db.monitored_product_conversations().await.unwrap()
+                [watched.product_conversation_id.as_str()]
             .latest_question
             .clone()
-            .expect("the watch reported a question");
-        assert_eq!(latest.request_id, asked[1]);
+            .map(|question| question.request_id)
+        };
+        // Pending events have not reached the Coordinator, so it holds nothing yet.
+        assert_eq!(latest_question().await, None);
+        let accept = |request_id: String| {
+            sqlx::query(
+                "UPDATE coordinator_watch_events
+                 SET delivery_state = 'accepted', accepted_transcript_id = 'coordinator'
+                 WHERE source_occurrence_kind = 'question_request' AND source_occurrence_id = ?1",
+            )
+            .bind(request_id)
+            .execute(db.pool())
+        };
+        accept(asked[0].clone()).await.unwrap();
+        assert_eq!(latest_question().await, Some(asked[0].clone()));
+        accept(asked[1].clone()).await.unwrap();
+        assert_eq!(latest_question().await, Some(asked[1].clone()));
         assert_eq!(
             db.monitored_product_conversation_ids().await.unwrap(),
             std::iter::once(watched.product_conversation_id.to_string()).collect()

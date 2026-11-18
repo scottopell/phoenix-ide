@@ -12,8 +12,9 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+use crate::coordinator_watch_delivery::render_questions;
 use crate::send_chat_service::SendChatApplicationService;
-use crate::state_machine::state::{QuestionAnnotation, QuestionRequestId, UserQuestion};
+use crate::state_machine::state::{QuestionAnnotation, QuestionRequestId};
 use crate::state_machine::ConvState;
 use crate::tools::{Tool, ToolContext, ToolOutput};
 
@@ -34,6 +35,7 @@ struct AnswerInput {
 pub(super) enum Refusal {
     SelfTarget,
     NotMonitored,
+    NotHandedOver,
     NotWaiting,
     StaleRequest { current: String, questions: String },
     AnswersMismatch { questions: String },
@@ -44,6 +46,7 @@ impl Refusal {
         match self {
             Self::SelfTarget => "answer_conversation_question cannot answer this conversation's own question.".into(),
             Self::NotMonitored => "That conversation is not under an active watch. Only monitored conversations route their questions to the Coordinator; the user answers the rest.".into(),
+            Self::NotHandedOver => "That question was not handed to the Coordinator: it was asked before the watch began, or its watch event has not been delivered yet. The user answers it.".into(),
             Self::NotWaiting => "That conversation is not waiting on a question. It may already have been answered.".into(),
             Self::StaleRequest { current, questions } => format!(
                 "That question is no longer current. The conversation now waits on request ID {current}:{questions}"
@@ -53,24 +56,6 @@ impl Refusal {
             ),
         }
     }
-}
-
-fn render_questions(questions: &[UserQuestion]) -> String {
-    let mut text = String::new();
-    for question in questions {
-        text.push_str("\n- ");
-        text.push_str(&question.question);
-        if !question.options.is_empty() {
-            let labels: Vec<&str> = question
-                .options
-                .iter()
-                .map(|option| option.label.as_str())
-                .collect();
-            text.push_str(" Options: ");
-            text.push_str(&labels.join(" | "));
-        }
-    }
-    text
 }
 
 /// Check an answer against the conversation's current wait.
@@ -120,7 +105,7 @@ impl Tool for AnswerConversationQuestion {
     }
 
     fn description(&self) -> String {
-        "Answer the questions a monitored conversation is waiting on, as the user would from the question card. Use the transcript ID and request ID from the watch event. Key each answer by the full question text; give an option label or free text. Answer only what the assignment or your standing Authority settles; otherwise ask the user with ask_user_question and pass the user's words on verbatim, with a note that they come from the user. The conversation resumes as soon as the answer is accepted.".into()
+        "Answer the questions a monitored conversation is waiting on, as the user would from the question card. Use the transcript ID and request ID from the watch event. Key each answer by the full question text; give an option label or free text, joining several labels with \", \" where multiple answers are allowed. Answer only what the assignment or your standing Authority settles; otherwise ask the user with ask_user_question and pass the user's words on verbatim, with a note that they come from the user. The conversation resumes as soon as the answer is accepted.".into()
     }
 
     fn input_schema(&self) -> Value {
@@ -158,11 +143,13 @@ impl Tool for AnswerConversationQuestion {
             Ok(conversation) => conversation,
             Err(error) => return ToolOutput::error(format!("conversation unavailable: {error}")),
         };
-        match db.monitored_product_conversations().await {
-            Ok(monitored) if monitored.contains_key(target.product_conversation_id.as_str()) => {}
-            Ok(_) => return ToolOutput::error(Refusal::NotMonitored.message()),
+        let monitored = match db.monitored_product_conversations().await {
+            Ok(mut monitored) => monitored.remove(target.product_conversation_id.as_str()),
             Err(error) => return ToolOutput::error(format!("watch lookup failed: {error}")),
-        }
+        };
+        let Some(monitored) = monitored else {
+            return ToolOutput::error(Refusal::NotMonitored.message());
+        };
         let request_id = match check_answer(
             &target.state,
             &parsed.request_id,
@@ -172,6 +159,14 @@ impl Tool for AnswerConversationQuestion {
             Ok(request_id) => request_id,
             Err(refusal) => return ToolOutput::error(refusal.message()),
         };
+        // Only a question the Coordinator was handed is the Coordinator's to
+        // answer; the product list shows every other wait as the user's.
+        let handed_over = monitored
+            .latest_question
+            .is_some_and(|reported| reported.request_id == request_id.as_str());
+        if !handed_over {
+            return ToolOutput::error(Refusal::NotHandedOver.message());
+        }
         let source = match self.0.source_conversation(&ctx.conversation_id).await {
             Ok(source) => source,
             Err(error) => {
@@ -233,7 +228,7 @@ impl Tool for AnswerConversationQuestion {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state_machine::state::{QuestionOption, QuestionRequestAuthority};
+    use crate::state_machine::state::{QuestionOption, QuestionRequestAuthority, UserQuestion};
 
     fn waiting() -> (ConvState, QuestionRequestId) {
         let request_authority = QuestionRequestAuthority::new();
@@ -303,7 +298,7 @@ mod tests {
             panic!("expected stale request, got {refusal:?}");
         };
         assert_eq!(current, request.as_str());
-        assert!(questions.contains("Which database? Options: Postgres | SQLite"));
+        assert!(questions.contains("1. Which database?\n   - Postgres\n   - SQLite"));
     }
 
     #[test]
