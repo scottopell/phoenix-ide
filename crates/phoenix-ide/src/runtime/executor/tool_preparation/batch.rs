@@ -10,6 +10,14 @@ pub(in super::super) struct SerialDispatch {
     pub(in super::super) preparation: Option<ToolPreparation>,
     pub(in super::super) execution: ToolExecutionSlot,
     pub(in super::super) publication: Option<Arc<()>>,
+    pub(super) running: Option<Arc<DispatchSelection>>,
+    pub(super) round: Option<SerialRound>,
+}
+
+pub(super) struct SerialRound {
+    origin: Arc<AssistantMessage>,
+    unissued: Vec<Arc<DispatchSelection>>,
+    cancelling: bool,
 }
 
 pub(in super::super) enum ForegroundDispatch {
@@ -25,6 +33,7 @@ impl Default for ForegroundDispatch {
 
 pub(in super::super) struct OrdinaryBatch {
     origin: Arc<AssistantMessage>,
+    serial_generation: u64,
     calls: Vec<BatchCall>,
     closing: bool,
     cancellation_committed: bool,
@@ -55,17 +64,21 @@ struct RunningCall {
     receiver: oneshot::Receiver<ToolExecOutcome>,
     _publication: Arc<()>,
     cutoff: Option<tokio::time::Instant>,
+    cancel_on_drop: bool,
 }
 
 impl Drop for RunningCall {
     fn drop(&mut self) {
-        self.cancel.cancel();
+        if self.cancel_on_drop {
+            self.cancel.cancel();
+        }
         self.task.abort();
     }
 }
 
 pub(in super::super) enum ForegroundObservation {
     Serial(PreparationObservation),
+    Unissued(Arc<DispatchSelection>),
     Prepared(PreparationObservation),
     Outcome {
         selection: Arc<DispatchSelection>,
@@ -80,6 +93,8 @@ impl ForegroundDispatch {
                 serial.preparation = None;
                 serial.execution.cancel_and_abort();
                 serial.publication = None;
+                serial.round = None;
+                serial.running = None;
             }
             Self::OrdinaryBatch(batch) => {
                 batch.closing = true;
@@ -88,12 +103,56 @@ impl ForegroundDispatch {
         }
     }
 
+    pub(in super::super) fn batch_deadline(&self) -> Option<tokio::time::Instant> {
+        let Self::OrdinaryBatch(batch) = self else {
+            return None;
+        };
+        if batch.closing {
+            return None;
+        }
+        batch
+            .calls
+            .iter()
+            .filter_map(|call| match &call.phase {
+                CallPhase::Running(execution) => execution.cutoff.map(|cutoff| {
+                    cutoff
+                        - (super::super::BASH_WAIT_SETTLEMENT_GRACE
+                            - super::super::BASH_WAIT_EXECUTION_GRACE)
+                }),
+                _ => None,
+            })
+            .min()
+    }
+
+    pub(in super::super) fn batch_settlement_remaining(&self) -> Option<std::time::Duration> {
+        let Self::OrdinaryBatch(batch) = self else {
+            return None;
+        };
+        batch
+            .calls
+            .iter()
+            .filter_map(|call| match &call.phase {
+                CallPhase::Settling(Some(execution)) => execution
+                    .cutoff
+                    .map(|cutoff| cutoff.saturating_duration_since(tokio::time::Instant::now())),
+                _ => None,
+            })
+            .min()
+    }
+
     pub(in super::super) async fn observe(&mut self) -> ForegroundObservation {
         match self {
-            Self::Serial(serial) => match &mut serial.preparation {
-                Some(preparation) => ForegroundObservation::Serial(preparation.observe().await),
-                None => std::future::pending().await,
-            },
+            Self::Serial(serial) => {
+                if let Some(round) = &mut serial.round {
+                    if round.cancelling && !round.unissued.is_empty() {
+                        return ForegroundObservation::Unissued(round.unissued.remove(0));
+                    }
+                }
+                match &mut serial.preparation {
+                    Some(preparation) => ForegroundObservation::Serial(preparation.observe().await),
+                    None => std::future::pending().await,
+                }
+            }
             Self::OrdinaryBatch(batch) => batch.observe().await,
         }
     }
@@ -221,9 +280,30 @@ impl OrdinaryBatch {
             task,
             receiver,
             _publication: publication,
-            cutoff: None,
+            cutoff: invocation_wait_bound(&selection.tool)
+                .map(|bound| tokio::time::Instant::now() + bound),
+            cancel_on_drop: true,
         });
     }
+}
+
+fn invocation_wait_bound(tool: &ToolCall) -> Option<std::time::Duration> {
+    let super::super::ToolInput::Bash(phoenix_core::domain::bash_types::BashInvocation::Wait {
+        wait_seconds,
+        ..
+    }) = &tool.input
+    else {
+        return None;
+    };
+    let seconds = wait_seconds
+        .unwrap_or(
+            i64::try_from(super::super::BASH_WAIT_DEFAULT_SECONDS).expect("supported default"),
+        )
+        .clamp(0, 900);
+    Some(
+        std::time::Duration::from_secs(u64::try_from(seconds).expect("clamped nonnegative wait"))
+            + super::super::BASH_WAIT_SETTLEMENT_GRACE,
+    )
 }
 
 fn dropped_outcome(id: &str) -> ToolExecOutcome {
@@ -274,10 +354,26 @@ impl<S: Storage + Clone + 'static, L: LlmClient + 'static, T: ToolExecutor + 'st
             .chain(remaining_tools)
             .cloned()
             .collect();
+        let source_calls: Vec<_> = assistant_message
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                super::super::ContentBlock::ToolUse { id, name, .. } => Some((id, name)),
+                _ => None,
+            })
+            .collect();
+        if self
+            .serial_dispatch()
+            .round
+            .as_ref()
+            .is_some_and(|round| round.origin.as_ref() == assistant_message)
+        {
+            return Ok(false);
+        }
         if calls.len() < 2
-            || !calls.iter().all(|call| {
+            || !source_calls.iter().all(|(_, name)| {
                 !matches!(
-                    call.name(),
+                    name.as_str(),
                     "spawn_agents"
                         | "create_goal"
                         | "enable_auto_continuation"
@@ -285,42 +381,50 @@ impl<S: Storage + Clone + 'static, L: LlmClient + 'static, T: ToolExecutor + 'st
                         | "submit_error"
                         | "ask_user_question"
                         | "propose_task"
-                ) && self.tool_executor.foreground_execution(call.name())
+                ) && self.tool_executor.foreground_execution(name)
                     == crate::tools::ForegroundExecution::Concurrent
             })
         {
             return Ok(false);
         }
         let serial = self.serial_dispatch();
-        if serial.preparation.is_some() {
+        if serial.preparation.is_some() || serial.running.is_some() {
             return Err("ordinary batch overlaps a serial preparation".into());
         }
         let origin = Arc::new(assistant_message.clone());
         let calls = calls
             .into_iter()
-            .enumerate()
-            .map(|(ordinal, tool)| BatchCall {
-                selection: Arc::new(DispatchSelection {
-                    runtime: self.tool_preparation_runtime,
-                    assistant_message: Arc::clone(&origin),
-                    tool,
-                    context: self.context.clone(),
-                    direct_turn: self.active_direct_turn.as_deref().cloned(),
-                }),
-                boundary: if ordinal == 0 {
-                    self.required_settlement_authority
-                        .as_ref()
-                        .map_or(PreparationFailureBoundary::Caller, |scope| {
-                            PreparationFailureBoundary::Required(scope.boundary)
-                        })
-                } else {
-                    PreparationFailureBoundary::Required(RequiredSettlementBoundary::Tool)
-                },
-                phase: CallPhase::Unissued,
+            .map(|tool| {
+                let ordinal = source_calls
+                    .iter()
+                    .position(|(id, _)| *id == &tool.id)
+                    .expect("call belongs to accepted assistant source");
+                BatchCall {
+                    selection: Arc::new(DispatchSelection {
+                        runtime: self.tool_preparation_runtime,
+                        assistant_message: Arc::clone(&origin),
+                        tool,
+                        context: self.context.clone(),
+                        direct_turn: self.active_direct_turn.as_deref().cloned(),
+                    }),
+                    boundary: if ordinal == 0 {
+                        self.required_settlement_authority
+                            .as_ref()
+                            .map_or(PreparationFailureBoundary::Caller, |scope| {
+                                PreparationFailureBoundary::Required(scope.boundary)
+                            })
+                    } else {
+                        PreparationFailureBoundary::Required(RequiredSettlementBoundary::Tool)
+                    },
+                    phase: CallPhase::Unissued,
+                }
             })
             .collect();
+        let serial_generation = self.serial_dispatch().execution.generation();
+        self.deadline = None;
         self.foreground_dispatch = ForegroundDispatch::OrdinaryBatch(OrdinaryBatch {
             origin,
+            serial_generation,
             calls,
             closing: false,
             cancellation_committed: false,
@@ -376,6 +480,57 @@ impl<S: Storage + Clone + 'static, L: LlmClient + 'static, T: ToolExecutor + 'st
         Ok(())
     }
 
+    pub(super) fn own_serial_selection(
+        &mut self,
+        tool: &ToolCall,
+    ) -> Result<Arc<DispatchSelection>, String> {
+        let ConvState::ToolExecuting {
+            current_tool,
+            remaining_tools,
+            assistant_message,
+            ..
+        } = &self.state
+        else {
+            return Err("serial selection outside executing state".into());
+        };
+        if self
+            .serial_dispatch()
+            .round
+            .as_ref()
+            .is_none_or(|round| round.origin.as_ref() != assistant_message)
+        {
+            let origin = Arc::new(assistant_message.clone());
+            let unissued = std::iter::once(current_tool)
+                .chain(remaining_tools)
+                .map(|tool| {
+                    Arc::new(DispatchSelection {
+                        runtime: self.tool_preparation_runtime,
+                        assistant_message: Arc::clone(&origin),
+                        tool: tool.clone(),
+                        context: self.context.clone(),
+                        direct_turn: self.active_direct_turn.as_deref().cloned(),
+                    })
+                })
+                .collect();
+            self.serial_dispatch_mut().round = Some(SerialRound {
+                origin,
+                unissued,
+                cancelling: false,
+            });
+        }
+        let round = self
+            .serial_dispatch_mut()
+            .round
+            .as_mut()
+            .expect("round admitted");
+        let index = round
+            .unissued
+            .iter()
+            .position(|selection| &selection.tool == tool)
+            .ok_or("serial invocation was already issued")?;
+        Ok(round.unissued.remove(index))
+    }
+
     pub(in super::super) fn cancel_ordinary_batch(&mut self) -> bool {
         if let ForegroundDispatch::OrdinaryBatch(batch) = &mut self.foreground_dispatch {
             batch.cancel();
@@ -411,12 +566,23 @@ impl<S: Storage + Clone + 'static, L: LlmClient + 'static, T: ToolExecutor + 'st
             ForegroundObservation::Serial(observation) => {
                 return self.accept_tool_preparation(observation)
             }
+            ForegroundObservation::Unissued(selection) => {
+                return Ok((selection.owns(self.tool_preparation_runtime, &self.state)
+                    && matches!(self.state, ConvState::CancellingTool { .. }))
+                .then(|| Event::ToolComplete {
+                    tool_use_id: selection.tool.id.clone(),
+                    result: ToolResult::cancelled(
+                        selection.tool.id.clone(),
+                        "Skipped due to cancellation".into(),
+                    ),
+                }));
+            }
             observation => observation,
         };
         let selection = match &observation {
             ForegroundObservation::Prepared(observation) => Arc::clone(&observation.selection),
             ForegroundObservation::Outcome { selection, .. } => Arc::clone(selection),
-            ForegroundObservation::Serial(_) => unreachable!(),
+            ForegroundObservation::Serial(_) | ForegroundObservation::Unissued(_) => unreachable!(),
         };
         let ForegroundDispatch::OrdinaryBatch(batch) = &mut self.foreground_dispatch else {
             return Ok(None);
@@ -506,11 +672,102 @@ impl<S: Storage + Clone + 'static, L: LlmClient + 'static, T: ToolExecutor + 'st
                 };
                 Ok(Some(event))
             }
-            ForegroundObservation::Serial(_) => unreachable!(),
+            ForegroundObservation::Serial(_) | ForegroundObservation::Unissued(_) => unreachable!(),
         }
     }
 
+    pub(in super::super) async fn expire_batch_waits(&mut self) -> Result<(), String> {
+        let now = tokio::time::Instant::now();
+        let observation = {
+            let ForegroundDispatch::OrdinaryBatch(batch) = &mut self.foreground_dispatch else {
+                return Ok(());
+            };
+            let Some(call) = batch.calls.iter_mut().find(|call| matches!(&call.phase, CallPhase::Running(execution)
+                if execution.cutoff.is_some_and(|cutoff| cutoff - (super::super::BASH_WAIT_SETTLEMENT_GRACE - super::super::BASH_WAIT_EXECUTION_GRACE) <= now))) else { return Ok(()) };
+            let CallPhase::Running(execution) = &mut call.phase else {
+                unreachable!()
+            };
+            let outcome = match execution.receiver.try_recv() {
+                Ok(outcome) => outcome,
+                Err(oneshot::error::TryRecvError::Closed) => {
+                    dropped_outcome(&call.selection.tool.id)
+                }
+                Err(oneshot::error::TryRecvError::Empty) => {
+                    execution.cancel_on_drop = false;
+                    execution.task.abort();
+                    ToolExecOutcome::Failed {
+                        tool_use_id: call.selection.tool.id.clone(),
+                        error: "bash wait exceeded its bounded settlement deadline".into(),
+                    }
+                }
+            };
+            ForegroundObservation::Outcome {
+                selection: Arc::clone(&call.selection),
+                outcome,
+            }
+        };
+        if let Some(event) = self.accept_foreground_observation(observation).await? {
+            self.process_event(event).await?;
+        }
+        Ok(())
+    }
+
+    pub(in super::super) async fn drain_ready_before_forced_retirement(
+        &mut self,
+    ) -> Result<bool, String> {
+        use futures::FutureExt as _;
+        if !matches!(
+            self.foreground_dispatch,
+            ForegroundDispatch::OrdinaryBatch(_)
+        ) {
+            return Ok(false);
+        }
+        loop {
+            let Some(observation) = self.foreground_dispatch.observe().now_or_never() else {
+                break;
+            };
+            if let Some(event) = self.accept_foreground_observation(observation).await? {
+                self.process_event(event).await?;
+            }
+            if !matches!(
+                self.foreground_dispatch,
+                ForegroundDispatch::OrdinaryBatch(_)
+            ) {
+                return Ok(true);
+            }
+        }
+        if let ForegroundDispatch::OrdinaryBatch(batch) = &mut self.foreground_dispatch {
+            for call in &mut batch.calls {
+                if let CallPhase::Running(execution) = &mut call.phase {
+                    execution.task.abort();
+                }
+            }
+        }
+        Ok(true)
+    }
+
     pub(in super::super) fn commit_foreground_membership(&mut self) {
+        if let ForegroundDispatch::Serial(serial) = &mut self.foreground_dispatch {
+            if serial.running.as_ref().is_some_and(|selection| {
+                !selection.owns(self.tool_preparation_runtime, &self.state)
+            }) {
+                serial.running = None;
+                serial.publication = None;
+                serial.execution.release_task();
+            }
+            if let Some(round) = &mut serial.round {
+                round
+                    .unissued
+                    .retain(|selection| selection.owns(self.tool_preparation_runtime, &self.state));
+                if matches!(&self.state, ConvState::CancellingTool { assistant_message, .. } if assistant_message == round.origin.as_ref())
+                {
+                    round.cancelling = true;
+                } else if !matches!(&self.state, ConvState::ToolExecuting { assistant_message, .. } if assistant_message == round.origin.as_ref())
+                {
+                    serial.round = None;
+                }
+            }
+        }
         if let ForegroundDispatch::OrdinaryBatch(batch) = &mut self.foreground_dispatch {
             if matches!(self.state, ConvState::CancellingTool { .. }) {
                 batch.cancellation_committed = true;
@@ -525,7 +782,11 @@ impl<S: Storage + Clone + 'static, L: LlmClient + 'static, T: ToolExecutor + 'st
             }
             if !matches!(&self.state, ConvState::ToolExecuting { assistant_message, .. } | ConvState::CancellingTool { assistant_message, .. } if assistant_message == batch.origin.as_ref())
             {
-                self.foreground_dispatch = ForegroundDispatch::default();
+                let execution = ToolExecutionSlot::after_generation(batch.serial_generation);
+                self.foreground_dispatch = ForegroundDispatch::Serial(SerialDispatch {
+                    execution,
+                    ..SerialDispatch::default()
+                });
             }
         }
     }
