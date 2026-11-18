@@ -16307,6 +16307,20 @@ fn build_sub_agent_fan_in(
     (llm_content, display_data)
 }
 
+enum MaterializedToolResult<'a> {
+    Recorded(&'a ToolResult),
+    Interrupted(ToolResult),
+}
+
+impl MaterializedToolResult<'_> {
+    fn result(&self) -> &ToolResult {
+        match self {
+            Self::Recorded(result) => result,
+            Self::Interrupted(result) => result,
+        }
+    }
+}
+
 /// Build the materialized message rows for an in-flight tool round recovered
 /// from a `ToolExecuting` or `CancellingTool` state on restart: the assistant
 /// message followed by one tool-result row per `tool_use`, in round order.
@@ -16335,20 +16349,6 @@ fn build_sub_agent_fan_in(
 /// `subagent_summary` `display_data`), so the recovered chain reflects "agents
 /// spawned, interrupted by restart" rather than a dangling spawn.
 #[allow(clippy::too_many_arguments)]
-enum MaterializedToolResult<'a> {
-    Recorded(&'a ToolResult),
-    Interrupted(ToolResult),
-}
-
-impl MaterializedToolResult<'_> {
-    fn result(&self) -> &ToolResult {
-        match self {
-            Self::Recorded(result) => result,
-            Self::Interrupted(result) => result,
-        }
-    }
-}
-
 fn build_materialized_tool_round(
     conv_id: &str,
     start_seq: i64,
