@@ -5,6 +5,13 @@ use crate::tools::{ToolContext, ToolOutput};
 use phoenix_llm::{LlmResponse, ToolDefinition, Usage};
 use tokio::sync::Semaphore;
 
+async fn next_started(starts: &mut mpsc::UnboundedReceiver<String>) -> String {
+    tokio::time::timeout(Duration::from_secs(60), starts.recv())
+        .await
+        .expect("owned tool start must become observable")
+        .expect("the owning tool task retains its start sender")
+}
+
 struct ControlledOrdinaryTools {
     started: mpsc::UnboundedSender<String>,
     release_first: Arc<Semaphore>,
@@ -523,7 +530,7 @@ async fn ready_typed_outcome_survives_when_cancel_is_selected_first() {
     let (mut runtime, mut starts, _directory) = prepared_batch(content).await;
     launch_preparations(&mut runtime, 2).await;
     for _ in 0..2 {
-        starts.recv().await.unwrap();
+        next_started(&mut starts).await;
     }
     runtime.join_batch_call_for_test("fast").await;
     runtime.process_event(user_cancel()).await.unwrap();
@@ -610,7 +617,7 @@ async fn nonrepresentative_wait_keeps_its_cutoff_and_retires_only_its_task() {
     let (mut runtime, mut starts, _directory) = prepared_batch(content).await;
     launch_preparations(&mut runtime, 3).await;
     for _ in 0..3 {
-        starts.recv().await.unwrap();
+        next_started(&mut starts).await;
     }
     runtime.join_batch_call_for_test("fast").await;
     let cutoff = runtime.foreground_dispatch.batch_deadline().unwrap();
@@ -896,7 +903,7 @@ async fn cancel_stops_all_four_active_calls_and_never_starts_unissued_tail() {
     let task = tokio::spawn(runtime.with_state_watcher(state_tx).run());
     send_user(&events).await;
     for _ in 0..4 {
-        starts.recv().await.unwrap();
+        next_started(&mut starts).await;
     }
     tokio::time::pause();
     events.send(user_cancel()).await.unwrap();
@@ -1009,7 +1016,7 @@ async fn rejected_cancel_checkpoint_signals_all_controls_and_keeps_queued_proofs
     let (mut runtime, mut starts, _directory) = prepared_batch(calls(6, "slow-command")).await;
     launch_preparations(&mut runtime, 4).await;
     for _ in 0..4 {
-        starts.recv().await.unwrap();
+        next_started(&mut starts).await;
     }
     runtime.storage.set_fail_state_update(true);
     assert!(runtime
@@ -1045,7 +1052,7 @@ async fn required_sibling_read_failure(work_scope: bool) {
     let (mut runtime, mut starts, _directory) =
         prepared_batch_for_scope(calls(2, "slow-command"), work_scope).await;
     launch_preparations(&mut runtime, 1).await;
-    starts.recv().await.unwrap();
+    next_started(&mut starts).await;
     let (entered, release) = if work_scope {
         runtime.storage.hold_next_tool_scope_read()
     } else {
@@ -1118,7 +1125,7 @@ async fn batch_denial_precedes_every_call_resource_and_preserves_sibling() {
     );
     runtime.process_event(event).await.unwrap();
     launch_preparations(&mut runtime, 1).await;
-    starts.recv().await.unwrap();
+    next_started(&mut starts).await;
     assert_eq!(runtime.tool_executor.tokens.lock().unwrap().len(), 1);
     runtime.process_event(user_cancel()).await.unwrap();
     drain_cancelled_batch(&mut runtime).await;
@@ -1182,7 +1189,7 @@ async fn forced_batch_retirement_drains_ready_receipts_and_retires_every_owner_o
     let (mut runtime, mut starts, _directory) = prepared_batch(content).await;
     launch_preparations(&mut runtime, 4).await;
     for _ in 0..4 {
-        starts.recv().await.unwrap();
+        next_started(&mut starts).await;
     }
     runtime.join_batch_call_for_test("call-1").await;
     runtime.process_event(user_cancel()).await.unwrap();
@@ -1222,7 +1229,7 @@ async fn retired_progress_cannot_publish_into_a_later_round_reusing_call_ids() {
     let (mut runtime, mut starts, _directory) = prepared_batch(calls(2, "slow-command")).await;
     launch_preparations(&mut runtime, 2).await;
     for _ in 0..2 {
-        starts.recv().await.unwrap();
+        next_started(&mut starts).await;
     }
     let old_sink = runtime.tool_executor.progress.lock().unwrap()[0].clone();
     runtime.process_event(user_cancel()).await.unwrap();
@@ -1273,7 +1280,7 @@ async fn child_batch_notifies_parent_only_after_all_owners_and_full_checkpoint()
     ));
     launch_preparations(&mut runtime, 2).await;
     for _ in 0..2 {
-        starts.recv().await.unwrap();
+        next_started(&mut starts).await;
     }
     runtime.process_event(user_cancel()).await.unwrap();
     runtime.join_batch_call_for_test("call-0").await;
@@ -1389,7 +1396,7 @@ async fn lost_batch_task_settles_one_exact_error_without_cancelling_its_sibling(
     let (mut runtime, mut starts, _directory) = prepared_batch(calls(2, "slow-command")).await;
     launch_preparations(&mut runtime, 2).await;
     for _ in 0..2 {
-        starts.recv().await.unwrap();
+        next_started(&mut starts).await;
     }
     runtime.abort_batch_call_for_test("call-1").await;
     let observation = runtime.foreground_dispatch.observe().await;
@@ -1519,7 +1526,7 @@ async fn sqlite_rejects_sibling_commit_without_refill_publication_or_model_advan
             .is_none());
     }
     for _ in 0..4 {
-        starts.recv().await.unwrap();
+        next_started(&mut starts).await;
     }
     sqlx::query("CREATE TRIGGER reject_batch_state BEFORE UPDATE OF state ON conversations BEGIN SELECT RAISE(ABORT, 'batch sibling state commit rejected'); END")
         .execute(db.pool()).await.unwrap();
