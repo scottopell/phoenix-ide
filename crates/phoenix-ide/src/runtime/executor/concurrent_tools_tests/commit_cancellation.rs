@@ -178,7 +178,7 @@ async fn addressed_cancel_interrupts_running_siblings_during_held_commit() {
 
 #[tokio::test]
 async fn cancellation_during_final_atomic_checkpoint_prevents_model_tail() {
-    let (runtime, _, _directory) = prepared_batch(calls(2, "fast-command")).await;
+    let (runtime, mut starts, _directory) = prepared_batch(calls(2, "fast-command")).await;
     let llm = Arc::clone(&runtime.llm_client);
     let storage = Arc::clone(&runtime.storage);
     let (write_entered, release_write) = storage.gate_tool_round_persist();
@@ -187,6 +187,12 @@ async fn cancellation_during_final_atomic_checkpoint_prevents_model_tail() {
         .await
         .unwrap()
         .unwrap();
+    for _ in 0..2 {
+        assert!(
+            starts.try_recv().is_ok(),
+            "both calls executed before their atomic checkpoint"
+        );
+    }
     deliver_cancel(manager.clone(), Route::Addressed)
         .await
         .unwrap();
@@ -203,4 +209,5 @@ async fn cancellation_during_final_atomic_checkpoint_prevents_model_tail() {
     actor.await.unwrap();
     manager.runtimes.write().await.remove("ordinary-batch");
     assert!(llm.recorded_requests().is_empty(), "observed cancellation must precede RequestLlm after the actual atomic checkpoint, even when Batch ownership has retired");
+    assert_eq!(llm.frozen_request_count(), 0, "no model request may be frozen or launched before deferred cancellation, even if its task would be aborted before its first poll");
 }
