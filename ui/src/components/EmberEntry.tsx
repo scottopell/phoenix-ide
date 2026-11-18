@@ -1,4 +1,4 @@
-import { useCoordinatorQuestions } from '../coordinator/coordinatorQuestions';
+import { useCoordinatorQuestionCount } from '../coordinator/coordinatorQuestions';
 import './EmberEntry.css';
 
 export function EmberEntry({
@@ -15,7 +15,7 @@ export function EmberEntry({
 }) {
   const unreadLabel = unread === 'marked' ? 'Marked unread' : unread === 'new_activity' ? 'New activity' : null;
   // REQ-AUQ-011: an open question from Ember is something the user owes.
-  const openQuestions = useCoordinatorQuestions().questions.length;
+  const openQuestions = useCoordinatorQuestionCount();
   const questionLabel = openQuestions === 0
     ? null
     : `${openQuestions} question${openQuestions === 1 ? '' : 's'} for you`;

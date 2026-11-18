@@ -11,7 +11,7 @@ use serde_json::{json, Value};
 
 use crate::state_machine::state::AskUserQuestionInput;
 use crate::tools::{AskUserQuestionTool, Tool, ToolContext, ToolOutput};
-use phoenix_db::CoordinatorQuestionSettlement;
+use phoenix_db::{CoordinatorQuestionClose, CoordinatorQuestionSettlement};
 
 pub(super) struct PostUserQuestion(pub(super) crate::db::Database);
 pub(super) struct WithdrawUserQuestion(pub(super) crate::db::Database);
@@ -47,7 +47,7 @@ impl Tool for PostUserQuestion {
         if let Err(error) = parsed.validate_and_normalize() {
             return ToolOutput::error(error);
         }
-        let request_id = uuid::Uuid::new_v4().to_string();
+        let request_id = crate::state_machine::state::QuestionRequestId::new().to_string();
         if let Err(error) = self
             .0
             .post_coordinator_question(
@@ -105,8 +105,9 @@ impl Tool for WithdrawUserQuestion {
         };
         match self
             .0
-            .withdraw_coordinator_question(
+            .settle_coordinator_question(
                 &parsed.request_id,
+                CoordinatorQuestionClose::Withdrawn,
                 chrono::Utc::now().timestamp_micros(),
             )
             .await

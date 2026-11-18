@@ -83,13 +83,8 @@ pub(super) fn check_answer(
             questions: render_questions(questions),
         });
     }
-    let answered_all = answers.len() == questions.len()
-        && questions.iter().all(|question| {
-            answers
-                .get(&question.question)
-                .is_some_and(|a| !a.trim().is_empty())
-        })
-        && notes.keys().all(|key| answers.contains_key(key));
+    let answered_all =
+        phoenix_core::domain::sm_state::answers_cover_questions(questions, answers, Some(notes));
     if !answered_all {
         return Err(Refusal::AnswersMismatch {
             questions: render_questions(questions),

@@ -16,7 +16,7 @@ mod coordinator_authority;
 mod coordinator_query;
 mod coordinator_questions;
 pub use coordinator_questions::{
-    CoordinatorQuestion, CoordinatorQuestionReplyKind, CoordinatorQuestionSettlement,
+    CoordinatorQuestion, CoordinatorQuestionClose, CoordinatorQuestionSettlement,
     UndeliveredCoordinatorQuestionReply,
 };
 pub mod coordinator_scanner;

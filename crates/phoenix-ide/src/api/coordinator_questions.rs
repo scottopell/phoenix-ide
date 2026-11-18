@@ -6,10 +6,14 @@ use axum::{
     Json,
 };
 use phoenix_core::domain::sm_state::{QuestionAnnotation, UserQuestion};
-use phoenix_db::{CoordinatorQuestionReplyKind, CoordinatorQuestionSettlement};
+use phoenix_db::{CoordinatorQuestionClose, CoordinatorQuestionSettlement};
 use serde::{Deserialize, Serialize};
 
-use super::{handlers::AppError, types::ConflictErrorResponse, AppState};
+use super::{
+    handlers::AppError,
+    types::{ConflictErrorResponse, SuccessResponse},
+    AppState,
+};
 
 /// An open question from the Coordinator, as the client renders it.
 #[derive(Debug, Serialize)]
@@ -27,11 +31,6 @@ pub(super) struct AnswerCoordinatorQuestionRequest {
     answers: HashMap<String, String>,
     #[serde(default)]
     annotations: Option<HashMap<String, QuestionAnnotation>>,
-}
-
-#[derive(Debug, Serialize)]
-pub(super) struct CoordinatorQuestionReplyResponse {
-    success: bool,
 }
 
 fn internal(error: impl std::fmt::Display) -> AppError {
@@ -64,11 +63,9 @@ pub(super) async fn list(
 
 fn settlement_result(
     settlement: CoordinatorQuestionSettlement,
-) -> Result<Json<CoordinatorQuestionReplyResponse>, AppError> {
+) -> Result<Json<SuccessResponse>, AppError> {
     match settlement {
-        CoordinatorQuestionSettlement::Settled => {
-            Ok(Json(CoordinatorQuestionReplyResponse { success: true }))
-        }
+        CoordinatorQuestionSettlement::Settled => Ok(Json(SuccessResponse { success: true })),
         CoordinatorQuestionSettlement::NotFound => {
             Err(AppError::NotFound("Question not found".into()))
         }
@@ -81,44 +78,32 @@ fn settlement_result(
     }
 }
 
+/// The direct-turn worker's input discovery delivers stored replies.
 fn deliver_soon(state: &AppState) {
-    let runtime = state.runtime.clone();
-    tokio::spawn(async move {
-        crate::coordinator_question_delivery::deliver_pass(&runtime).await;
-    });
+    state.runtime.kick_direct_turn_worker();
 }
 
 pub(super) async fn answer(
     State(state): State<AppState>,
     Path(request_id): Path<String>,
     Json(request): Json<AnswerCoordinatorQuestionRequest>,
-) -> Result<Json<CoordinatorQuestionReplyResponse>, AppError> {
-    let Some(question) = state
+) -> Result<Json<SuccessResponse>, AppError> {
+    let question = match state
         .db
         .open_coordinator_question(&request_id)
         .await
         .map_err(internal)?
-    else {
-        let status = state
-            .db
-            .coordinator_question_status(&request_id)
-            .await
-            .map_err(internal)?;
-        return settlement_result(
-            status.map_or(CoordinatorQuestionSettlement::NotFound, |status| {
-                CoordinatorQuestionSettlement::AlreadySettled { status }
-            }),
-        );
+    {
+        Ok(question) => question,
+        Err(closed) => return settlement_result(closed),
     };
-    let answered_all = question.questions.iter().all(|q| {
-        request
-            .answers
-            .get(&q.question)
-            .is_some_and(|answer| !answer.trim().is_empty())
-    });
-    if !answered_all {
+    if !phoenix_core::domain::sm_state::answers_cover_questions(
+        &question.questions,
+        &request.answers,
+        request.annotations.as_ref(),
+    ) {
         return Err(AppError::BadRequest(
-            "Answer every question before submitting.".into(),
+            "Answer every question exactly once, keyed by its full text, before submitting.".into(),
         ));
     }
     let reply = crate::coordinator_question_delivery::answer_reply(
@@ -129,10 +114,9 @@ pub(super) async fn answer(
     );
     let settlement = state
         .db
-        .reply_to_coordinator_question(
+        .settle_coordinator_question(
             &request_id,
-            CoordinatorQuestionReplyKind::Answered,
-            &reply,
+            CoordinatorQuestionClose::Answered { reply: &reply },
             chrono::Utc::now().timestamp_micros(),
         )
         .await
@@ -145,13 +129,13 @@ pub(super) async fn answer(
 pub(super) async fn dismiss(
     State(state): State<AppState>,
     Path(request_id): Path<String>,
-) -> Result<Json<CoordinatorQuestionReplyResponse>, AppError> {
+) -> Result<Json<SuccessResponse>, AppError> {
+    let reply = crate::coordinator_question_delivery::dismissal_reply(&request_id);
     let settlement = state
         .db
-        .reply_to_coordinator_question(
+        .settle_coordinator_question(
             &request_id,
-            CoordinatorQuestionReplyKind::Dismissed,
-            &crate::coordinator_question_delivery::dismissal_reply(&request_id),
+            CoordinatorQuestionClose::Dismissed { reply: &reply },
             chrono::Utc::now().timestamp_micros(),
         )
         .await

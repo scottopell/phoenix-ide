@@ -19,18 +19,21 @@ pub struct CoordinatorQuestion {
     pub asked_at_us: i64,
 }
 
-/// How the user settled a question.
+/// How an open question closes. Answers and dismissals carry the reply the
+/// Coordinator receives; a withdrawal delivers nothing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CoordinatorQuestionReplyKind {
-    Answered,
-    Dismissed,
+pub enum CoordinatorQuestionClose<'a> {
+    Answered { reply: &'a str },
+    Dismissed { reply: &'a str },
+    Withdrawn,
 }
 
-impl CoordinatorQuestionReplyKind {
-    fn status(self) -> &'static str {
+impl<'a> CoordinatorQuestionClose<'a> {
+    fn status_and_reply(self) -> (&'static str, Option<&'a str>) {
         match self {
-            Self::Answered => "answered",
-            Self::Dismissed => "dismissed",
+            Self::Answered { reply } => ("answered", Some(reply)),
+            Self::Dismissed { reply } => ("dismissed", Some(reply)),
+            Self::Withdrawn => ("withdrawn", None),
         }
     }
 }
@@ -107,100 +110,66 @@ impl Database {
         rows.iter().map(decode_question).collect()
     }
 
-    /// One open question by request id.
+    /// One open question by request id, or why it is not open.
     ///
     /// # Errors
     /// Returns an error if the read fails or the stored question cannot be decoded.
     pub async fn open_coordinator_question(
         &self,
         request_id: &str,
-    ) -> DbResult<Option<CoordinatorQuestion>> {
+    ) -> DbResult<Result<CoordinatorQuestion, CoordinatorQuestionSettlement>> {
         let row = sqlx::query(
-            "SELECT request_id, coordinator_conversation_id, questions, asked_at_us
-             FROM coordinator_user_questions WHERE request_id = ?1 AND status = 'open'",
+            "SELECT request_id, coordinator_conversation_id, questions, asked_at_us, status
+             FROM coordinator_user_questions WHERE request_id = ?1",
         )
         .bind(request_id)
         .fetch_optional(&self.pool)
         .await?;
-        row.as_ref().map(decode_question).transpose()
+        let Some(row) = row else {
+            return Ok(Err(CoordinatorQuestionSettlement::NotFound));
+        };
+        let status: String = row.try_get("status")?;
+        if status != "open" {
+            return Ok(Err(CoordinatorQuestionSettlement::AlreadySettled {
+                status,
+            }));
+        }
+        decode_question(&row).map(Ok)
     }
 
-    /// Settle an open question with the user's reply. Only the first
-    /// settlement wins.
+    /// Close an open question. Only the first close wins.
     ///
     /// # Errors
     /// Returns an error if a database operation fails.
-    pub async fn reply_to_coordinator_question(
+    pub async fn settle_coordinator_question(
         &self,
         request_id: &str,
-        kind: CoordinatorQuestionReplyKind,
-        reply: &str,
+        close: CoordinatorQuestionClose<'_>,
         now_us: i64,
     ) -> DbResult<CoordinatorQuestionSettlement> {
+        let (status, reply) = close.status_and_reply();
         let updated = sqlx::query(
             "UPDATE coordinator_user_questions
              SET status = ?2, reply = ?3, settled_at_us = ?4
              WHERE request_id = ?1 AND status = 'open'",
         )
         .bind(request_id)
-        .bind(kind.status())
+        .bind(status)
         .bind(reply)
         .bind(now_us)
         .execute(&self.pool)
         .await?
         .rows_affected();
-        self.settlement_outcome(request_id, updated).await
-    }
-
-    /// Withdraw an open question the Coordinator no longer needs answered.
-    ///
-    /// # Errors
-    /// Returns an error if a database operation fails.
-    pub async fn withdraw_coordinator_question(
-        &self,
-        request_id: &str,
-        now_us: i64,
-    ) -> DbResult<CoordinatorQuestionSettlement> {
-        let updated = sqlx::query(
-            "UPDATE coordinator_user_questions
-             SET status = 'withdrawn', settled_at_us = ?2
-             WHERE request_id = ?1 AND status = 'open'",
-        )
-        .bind(request_id)
-        .bind(now_us)
-        .execute(&self.pool)
-        .await?
-        .rows_affected();
-        self.settlement_outcome(request_id, updated).await
-    }
-
-    /// Stored status of a question, if it exists.
-    ///
-    /// # Errors
-    /// Returns an error if the read fails.
-    pub async fn coordinator_question_status(&self, request_id: &str) -> DbResult<Option<String>> {
-        Ok(sqlx::query_scalar(
-            "SELECT status FROM coordinator_user_questions WHERE request_id = ?1",
-        )
-        .bind(request_id)
-        .fetch_optional(&self.pool)
-        .await?)
-    }
-
-    async fn settlement_outcome(
-        &self,
-        request_id: &str,
-        updated: u64,
-    ) -> DbResult<CoordinatorQuestionSettlement> {
         if updated > 0 {
             return Ok(CoordinatorQuestionSettlement::Settled);
         }
-        let status = self.coordinator_question_status(request_id).await?;
-        Ok(
-            status.map_or(CoordinatorQuestionSettlement::NotFound, |status| {
-                CoordinatorQuestionSettlement::AlreadySettled { status }
-            }),
-        )
+        Ok(self
+            .open_coordinator_question(request_id)
+            .await?
+            .err()
+            // An open question would have been updated, so the lookup says
+            // why this one is not open.
+            .unwrap_or(CoordinatorQuestionSettlement::NotFound))
     }
 
     /// Replies not yet delivered to the Coordinator, oldest first.
@@ -240,8 +209,7 @@ impl Database {
     ) -> DbResult<()> {
         sqlx::query(
             "UPDATE coordinator_user_questions SET delivered_at_us = ?2
-             WHERE request_id = ?1 AND delivered_at_us IS NULL
-               AND status IN ('answered', 'dismissed')",
+             WHERE request_id = ?1 AND delivered_at_us IS NULL",
         )
         .bind(request_id)
         .bind(now_us)
@@ -303,10 +271,9 @@ mod tests {
         assert_eq!(open[0].questions, questions());
 
         assert_eq!(
-            db.reply_to_coordinator_question(
+            db.settle_coordinator_question(
                 "q-1",
-                CoordinatorQuestionReplyKind::Answered,
-                "Yes",
+                CoordinatorQuestionClose::Answered { reply: "Yes" },
                 30
             )
             .await
@@ -314,10 +281,9 @@ mod tests {
             CoordinatorQuestionSettlement::Settled
         );
         assert_eq!(
-            db.reply_to_coordinator_question(
+            db.settle_coordinator_question(
                 "q-1",
-                CoordinatorQuestionReplyKind::Dismissed,
-                "late",
+                CoordinatorQuestionClose::Dismissed { reply: "late" },
                 31
             )
             .await
@@ -327,18 +293,17 @@ mod tests {
             }
         );
         assert_eq!(
-            db.reply_to_coordinator_question(
+            db.settle_coordinator_question(
                 "missing",
-                CoordinatorQuestionReplyKind::Answered,
-                "Yes",
+                CoordinatorQuestionClose::Answered { reply: "Yes" },
                 31
             )
             .await
             .unwrap(),
             CoordinatorQuestionSettlement::NotFound
         );
-        assert!(db.open_coordinator_question("q-1").await.unwrap().is_none());
-        assert!(db.open_coordinator_question("q-2").await.unwrap().is_some());
+        assert!(db.open_coordinator_question("q-1").await.unwrap().is_err());
+        assert!(db.open_coordinator_question("q-2").await.unwrap().is_ok());
 
         let undelivered = db
             .undelivered_coordinator_question_replies(16)
@@ -369,7 +334,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            db.withdraw_coordinator_question("q-1", 20).await.unwrap(),
+            db.settle_coordinator_question("q-1", CoordinatorQuestionClose::Withdrawn, 20)
+                .await
+                .unwrap(),
             CoordinatorQuestionSettlement::Settled
         );
         assert!(db.open_coordinator_questions().await.unwrap().is_empty());
@@ -379,10 +346,9 @@ mod tests {
             .unwrap()
             .is_empty());
         assert_eq!(
-            db.reply_to_coordinator_question(
+            db.settle_coordinator_question(
                 "q-1",
-                CoordinatorQuestionReplyKind::Answered,
-                "Yes",
+                CoordinatorQuestionClose::Answered { reply: "Yes" },
                 30
             )
             .await

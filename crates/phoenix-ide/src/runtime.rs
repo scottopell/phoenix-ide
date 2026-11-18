@@ -16343,10 +16343,9 @@ mod scope_liveness_tests {
         );
         manager
             .db()
-            .reply_to_coordinator_question(
+            .settle_coordinator_question(
                 request_id,
-                phoenix_db::CoordinatorQuestionReplyKind::Answered,
-                &reply,
+                phoenix_db::CoordinatorQuestionClose::Answered { reply: &reply },
                 20,
             )
             .await
