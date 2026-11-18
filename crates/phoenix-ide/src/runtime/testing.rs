@@ -4285,7 +4285,7 @@ mod tests {
                 &context,
                 Event::ToolComplete {
                     tool_use_id: id.into(),
-                    result: ToolResult::cancelled(id.into(), "Skipped due to cancellation"),
+                    result: crate::db::ToolResult::cancelled(id.into(), "Skipped due to cancellation"),
                 },
             )
             .unwrap();
