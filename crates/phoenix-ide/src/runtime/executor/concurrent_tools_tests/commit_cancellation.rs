@@ -218,18 +218,29 @@ async fn final_checkpoint_cancellation(queued_steer: bool) {
             .unwrap();
     }
     if queued_steer {
+        let entry = phoenix_core::domain::sm_event::SteerEntry {
+            origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
+            text: "keep this instruction".into(),
+            llm_text: None,
+            images: vec![],
+            files: vec![],
+            message_id: "queued-instruction".into(),
+            user_agent: None,
+            skill_invocation: None,
+        };
+        storage.set_steering_queue("ordinary-batch", vec![entry.clone()]);
         manager
             .send_acknowledged_event(
                 "ordinary-batch",
                 Event::SteerMessage {
-                    origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
-                    text: "keep this instruction".into(),
-                    llm_text: None,
-                    images: vec![],
-                    files: vec![],
-                    message_id: "queued-instruction".into(),
-                    user_agent: None,
-                    skill_invocation: None,
+                    origin: entry.origin,
+                    text: entry.text,
+                    llm_text: entry.llm_text,
+                    images: entry.images,
+                    files: entry.files,
+                    message_id: entry.message_id,
+                    user_agent: entry.user_agent,
+                    skill_invocation: entry.skill_invocation,
                 },
             )
             .await
@@ -245,7 +256,21 @@ async fn final_checkpoint_cancellation(queued_steer: bool) {
         .unwrap();
     assert_eq!(llm.recorded_requests().len(), 1);
     assert_eq!(storage.capacity_plans.lock().unwrap().len(), 1);
+    let cancellation_commit = queued_steer.then(|| storage.gate_state_update());
+    assert!(storage
+        .load_active_direct_turn("ordinary-batch")
+        .await
+        .unwrap()
+        .is_none());
     release_write.send(()).unwrap();
+    let before_cancellation_commit = if let Some((entered, release)) = cancellation_commit {
+        let entered = tokio::time::timeout(Duration::from_secs(60), entered).await;
+        let plans = storage.capacity_plans.lock().unwrap().len();
+        let _ = release.send(());
+        Some((matches!(entered, Ok(Ok(()))), plans))
+    } else {
+        None
+    };
     let idle = tokio::time::timeout(
         Duration::from_secs(60),
         states.wait_for(|state| matches!(state, ConvState::Idle)),
@@ -269,8 +294,26 @@ async fn final_checkpoint_cancellation(queued_steer: bool) {
             "required steering commit must preserve the instruction in history"
         );
     }
-    assert_eq!(llm.recorded_requests().len(), 1, "observed cancellation must precede the next provider request after the actual atomic checkpoint");
-    assert_eq!(storage.capacity_plans.lock().unwrap().len(), 1, "no second model request may be admitted, even if its task would be aborted before its first poll");
+    if let Some((entered, plans)) = before_cancellation_commit {
+        assert!(
+            entered,
+            "the legacy Cancel owning state write must be observed"
+        );
+        assert_eq!(
+            plans, 1,
+            "no old-round model tail may be admitted before the pending Cancel commits"
+        );
+    }
+    let expected_requests = if queued_steer { 2 } else { 1 };
+    assert_eq!(
+        llm.recorded_requests().len(),
+        expected_requests,
+        "only the legitimate post-Cancel queued instruction may request another response"
+    );
+    assert_eq!(
+        storage.capacity_plans.lock().unwrap().len(),
+        expected_requests
+    );
 }
 
 #[tokio::test]
