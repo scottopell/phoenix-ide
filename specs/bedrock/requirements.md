@@ -350,6 +350,12 @@ THE SYSTEM SHALL snapshot available typed receipts again before retiring remaini
 AND SHALL retain affirmative forced-retirement evidence through the later safe settlement boundary
 AND SHALL NOT retire the issued write, renew the deadline, or acknowledge semantic cancellation before its authority is classified.
 
+WHEN a cancellation attempt returns a caller-level persistence diagnostic while ordinary resources remain owned
+THE SYSTEM SHALL return that diagnostic without claiming semantic cancellation success
+AND SHALL retain and service the original resource close and cutoff without requiring another request
+AND SHALL let an explicit cancellation retry join that same close without renewing its deadline
+AND SHALL NOT infer unknown SQLite authority from the diagnostic or automatically retry its write.
+
 WHEN every foreground owner settles within the cooperative window (REQ-BED-005, within 100ms)
 THE SYSTEM SHALL preserve authentic retained outcomes and pair all other calls with cancellation results
 AND SHALL reach the parent's idle state or the sub-agent's failed terminal state through its ordinary cancellation path

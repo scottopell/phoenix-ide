@@ -360,6 +360,14 @@ rule ObserveCancellationWhileBatchCommitIsIssued {
         -- steering drain restores its exact entries; the ordinary post-Cancel
         -- boundary owns their later delivery. Closed inboxes cannot spin; fatal
         -- shutdown releases a retained acknowledgement with an honest error.
+        -- A Caller diagnostic consumes that request/acknowledgement once but
+        -- retains resource-only Closing custody and the same original cutoff.
+        -- The normal actor boundary services it without another request, write,
+        -- semantic result or forced notice. An explicit retry joins that close.
+        -- Keep resource custody during an accepted cancellation's later receipt
+        -- writes too; release it only when that exact batch retires. Scope the
+        -- timer to the retained source owner so it cannot retire a successor.
+        -- No diagnostic implies Unknown, and no write is automatically retried.
 }
 
 rule RetireEveryRemainingBatchOwnerAtAggregateDeadline {

@@ -102,3 +102,10 @@ The pre-fix actual-source browser diagnostic (`/tmp/input-focus-diag/results.jso
 ## Opening contract integration gate
 
 REQ-CONV-026 backend snapshots replace `latest_opening_pending` with `latest_opening`; SSE init/message/message_updated envelopes carry a nullable typed `opening` observation. Backend regression sources cover authority/content distinctions and live committed acceptance without aggregate GET. Hand-authored UI consumers, generated types, and valibot schemas intentionally remain unchanged in this backend-only unit; genuine hosted codegen and consumer reconciliation are required before integration. UI stale-pending-versus-accepted ordering and refresh-failure acceptance remain unqualified, not passed.
+
+Live accepted tool-result projection preserves the canonical transcript disposition:
+trusted skill instructions render as the opaque authenticated-delivery receipt,
+and cancellation retains `is_error=false`. Synthetic sentinel and live/finalized
+equivalence regressions pass alongside the 738-test owning UI selection; current
+typecheck/eslint/stylelint pass. Final integrated default/hosted qualification is
+pending; these receipts do not establish native-client or browser acceptance.
