@@ -11,6 +11,7 @@ struct ControlledOrdinaryTools {
     fail_fast: bool,
     tokens: std::sync::Mutex<Vec<(String, CancellationToken)>>,
     progress: std::sync::Mutex<Vec<Arc<dyn BashProgressSink>>>,
+    fast_release: std::sync::Mutex<Option<Arc<Semaphore>>>,
 }
 
 #[async_trait::async_trait]
@@ -36,6 +37,12 @@ impl ToolExecutor for ControlledOrdinaryTools {
             .unwrap()
             .push(context.bash_progress_sink().unwrap());
         self.started.send(command.into()).unwrap();
+        let fast_release = (command == "fast-command")
+            .then(|| self.fast_release.lock().unwrap().clone())
+            .flatten();
+        if let Some(release) = fast_release {
+            release.acquire().await.unwrap().forget();
+        }
         if command == "stubborn-command" {
             self.release_first.acquire().await.unwrap().forget();
         }
@@ -111,6 +118,7 @@ fn runtime_with_calls(
         fail_fast,
         tokens: std::sync::Mutex::default(),
         progress: std::sync::Mutex::default(),
+        fast_release: std::sync::Mutex::default(),
     });
     let llm = Arc::new(MockLlmClient::new("test-model"));
     for (content, end_turn) in [
@@ -1413,9 +1421,11 @@ async fn sqlite_rejects_sibling_commit_without_refill_publication_or_model_advan
         "bash",
         serde_json::json!({"op":"run","cmd":"fast-command"}),
     );
-    let (ram, events, mut starts, _) = runtime_with_calls(directory.path(), false, content.clone());
+    let (ram, _, mut starts, _) = runtime_with_calls(directory.path(), false, content.clone());
     let tools = ram.tool_executor.as_ref().clone();
     let llm = ram.llm_client.as_ref().clone();
+    let release_fast = Arc::new(Semaphore::new(0));
+    *tools.fast_release.lock().unwrap() = Some(release_fast.clone());
     let definitions = tools.definitions().await;
     db.prepare_tool_availability(
         "ordinary-batch",
@@ -1457,7 +1467,7 @@ async fn sqlite_rejects_sibling_commit_without_refill_publication_or_model_advan
     db.update_conversation_state("ordinary-batch", &initial)
         .await
         .unwrap();
-    let (_, receiver) = mpsc::channel(16);
+    let (events, receiver) = mpsc::channel(16);
     let (watcher, observed) = watch::channel(initial.clone());
     let mut runtime = ConversationRuntime::new(
         ram.context.clone(),
@@ -1487,9 +1497,11 @@ async fn sqlite_rejects_sibling_commit_without_refill_publication_or_model_advan
     for _ in 0..4 {
         starts.recv().await.unwrap();
     }
-    runtime.join_batch_call_for_test("call-1").await;
     sqlx::query("CREATE TRIGGER reject_batch_state BEFORE UPDATE OF state ON conversations BEGIN SELECT RAISE(ABORT, 'batch sibling state commit rejected'); END")
         .execute(db.pool()).await.unwrap();
+    release_fast.add_permits(1);
+    runtime.join_batch_call_for_test("call-1").await;
+
     let mut publications = runtime.broadcast_tx.subscribe();
     let observation = runtime.foreground_dispatch.observe().await;
     let event = runtime

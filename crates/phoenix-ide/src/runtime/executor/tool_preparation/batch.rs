@@ -190,9 +190,21 @@ impl OrdinaryBatch {
                                 execution: Some(execution),
                             };
                         }
-                        Err(oneshot::error::TryRecvError::Empty) => execution.cancel.cancel(),
+                        Err(oneshot::error::TryRecvError::Empty) => {}
                     }
                 }
+                CallPhase::Unissued
+                | CallPhase::Cleared
+                | CallPhase::Preparing(_)
+                | CallPhase::NoRead
+                | CallPhase::Ready { .. }
+                | CallPhase::Settling(_)
+                | CallPhase::Retired => {}
+            }
+        }
+        for call in &mut self.calls {
+            match &mut call.phase {
+                CallPhase::Running(execution) => execution.cancel.cancel(),
                 CallPhase::Preparing(preparation) => {
                     preparation.phase = PreparationPhase::Interrupted
                 }

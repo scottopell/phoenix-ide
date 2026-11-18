@@ -10047,14 +10047,8 @@ where
         _admitted: &mut crate::runtime::AdmittedOperation,
     ) -> Result<Option<Event>, String> {
         self.begin_tool_preparation(tool)?;
-        let observed = self
-            .serial_dispatch_mut()
-            .preparation
-            .as_mut()
-            .expect("preparation installed")
-            .observe()
-            .await;
-        self.accept_tool_preparation(observed)
+        let observed = self.foreground_dispatch.observe().await;
+        self.accept_foreground_observation(observed).await
     }
 
     #[allow(clippy::too_many_lines)]
