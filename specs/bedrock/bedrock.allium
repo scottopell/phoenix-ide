@@ -3318,6 +3318,10 @@ rule ModeChangeNotification {
 --       ordered by call identity in the original held assistant source.
 --   cancelled_result(tool_use_id) -> ToolResult: this identity's synthetic
 --       cancellation result, preserving cancellation rather than ordinary failure.
+--   retained_cancellation_receipt_matches(runtime, conversation, tool_use_id):
+--       the exact retained runtime/full-assistant/call selection owns this existing
+--       abort receipt or affirmative no-call-effects proof; native admission uses
+--       its classified reconciliation rather than inferring effects from absence.
 --   ToolAbortedSibling(conversation, tool_use_id): the partial-round view of the
 --       existing exact ToolAborted event. Its call identity is retained; the final
 --       receipt uses ToolAborted(conversation). No new wire event is introduced.
@@ -4028,6 +4032,32 @@ surface ToolRetirementAcknowledgements {
         -- advance the conversation. Batch acknowledgement requires affirmative
         -- retirement of every remaining owner, never just the representative.
         -- An intercepted call retains its native admission proof separately.
+}
+
+surface RuntimeToolAbortObservations {
+    facing runtime: RuntimeExecutor
+    context conversation: Conversation
+
+    provides:
+        ToolAbortedSibling(conversation, tool_use_id)
+            when executor_owns_conversation(runtime, conversation)
+                 and conversation.core_status = cancelling_tool
+                 and conversation.skipped_tools.count > 0
+                 and unresolved_tool_id(conversation, tool_use_id)
+                 and retained_cancellation_receipt_matches(runtime, conversation, tool_use_id)
+        ToolAborted(conversation)
+            when executor_owns_conversation(runtime, conversation)
+                 and conversation.core_status = cancelling_tool
+                 and conversation.skipped_tools.count = 0
+                 and retained_cancellation_receipt_matches(runtime, conversation, conversation.cancelling_tool_use_id)
+
+    @guarantee ExistingExactAbortReceipt
+        -- These are partial/final views of the existing ToolAborted event, not
+        -- new wire events or an independent completion authority. The retained
+        -- full-source/call owner supplies its typed Aborted receipt or affirmative
+        -- unissued/read-only interruption proof. Native closure retains its
+        -- separate classified reconciliation before acknowledging an abort.
+        -- Missing memory alone cannot mint a receipt or settle another origin.
 }
 
 surface RuntimeChildResultObservations {

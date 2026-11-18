@@ -1324,7 +1324,23 @@ fn cancel_ordinary_sibling(
             tool_use_id,
             ToolResult::cancelled(tool_use_id.clone(), cancellation_message).into(),
         ),
-        _ => return None,
+        CoreEvent::UserMessage { .. }
+        | CoreEvent::AuthoritativeUserMessage { .. }
+        | CoreEvent::UserCancel { .. }
+        | CoreEvent::LlmResponse { .. }
+        | CoreEvent::LlmError { .. }
+        | CoreEvent::ServerOverloaded { .. }
+        | CoreEvent::ContinuationServerOverloaded { .. }
+        | CoreEvent::OverloadRetryDeadlineExpired
+        | CoreEvent::RetryTimeout { .. }
+        | CoreEvent::SpawnAgentsComplete { .. }
+        | CoreEvent::SubAgentResult { .. }
+        | CoreEvent::ContinuationResponse { .. }
+        | CoreEvent::ContinuationFailed { .. }
+        | CoreEvent::ContinuationError { .. }
+        | CoreEvent::UserTriggerContinuation { .. }
+        | CoreEvent::SteerDrainedUserMessages { .. }
+        | CoreEvent::ToolCancellationRetired { .. } => return None,
     };
     if settled_id != tool_use_id && !skipped_tools.iter().any(|call| call.id == *settled_id) {
         return Some(Err(TransitionError::InvalidTransition {
@@ -3926,7 +3942,24 @@ pub fn transition_sub_agent(
                         .map(Into::into)
                         .collect()
                 }
-                _ => unreachable!("terminal cancellation receipt matched above"),
+                CoreEvent::UserMessage { .. }
+                | CoreEvent::AuthoritativeUserMessage { .. }
+                | CoreEvent::UserCancel { .. }
+                | CoreEvent::LlmResponse { .. }
+                | CoreEvent::LlmError { .. }
+                | CoreEvent::ServerOverloaded { .. }
+                | CoreEvent::ContinuationServerOverloaded { .. }
+                | CoreEvent::OverloadRetryDeadlineExpired
+                | CoreEvent::RetryTimeout { .. }
+                | CoreEvent::SpawnAgentsComplete { .. }
+                | CoreEvent::SubAgentResult { .. }
+                | CoreEvent::ContinuationResponse { .. }
+                | CoreEvent::ContinuationFailed { .. }
+                | CoreEvent::ContinuationError { .. }
+                | CoreEvent::UserTriggerContinuation { .. }
+                | CoreEvent::SteerDrainedUserMessages { .. } => {
+                    unreachable!("terminal cancellation receipt matched above")
+                }
             };
             let checkpoint =
                 source_order_checkpoint(assistant_message, completed_results.clone(), tail)?;
