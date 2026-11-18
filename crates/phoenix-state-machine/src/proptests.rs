@@ -49,8 +49,9 @@ fn drain_unissued_cancellations(mut step: TransitionResult) -> TransitionResult 
         step = transition(
             &step.new_state,
             &test_context(),
-            Event::ToolAborted {
+            Event::ToolComplete {
                 tool_use_id: tool_use_id.clone(),
+                result: ToolResult::cancelled(tool_use_id.clone(), "Skipped due to cancellation"),
             },
         )
         .unwrap();
