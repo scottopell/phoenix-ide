@@ -187,7 +187,6 @@ fn final_cancellation_preserves_source_order_for_every_last_receipt_kind() {
                 | Effect::NotifyStateChange
                 | Effect::NotifyAgentDone
                 | Effect::ScheduleRetry { .. }
-                | Effect::PersistCheckpoint { .. }
                 | Effect::PersistToolResults { .. }
                 | Effect::PersistHiddenSystemMarker { .. }
                 | Effect::PersistSubAgentResults { .. }
