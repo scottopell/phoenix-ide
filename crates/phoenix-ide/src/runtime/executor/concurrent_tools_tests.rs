@@ -543,7 +543,7 @@ async fn ready_typed_outcome_survives_when_cancel_is_selected_first() {
             .collect::<Vec<_>>(),
         ["slow", "fast"]
     );
-    assert_eq!(results[0].content, "Cancelled");
+    assert_eq!(results[0].content, "Cancelled by user");
     assert!(
         !results[0].is_error,
         "Cancelled retains its existing transcript wire disposition"
