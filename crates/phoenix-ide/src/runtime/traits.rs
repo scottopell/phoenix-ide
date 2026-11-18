@@ -3662,6 +3662,10 @@ mod tool_registry_executor_tests {
 
     #[async_trait]
     impl Tool for NamedMarker {
+        fn foreground_execution(&self) -> crate::tools::ForegroundExecution {
+            crate::tools::ForegroundExecution::Serial
+        }
+
         fn name(&self) -> &'static str {
             self.0
         }

@@ -207,6 +207,10 @@ impl Default for PatchTool {
 
 #[async_trait]
 impl Tool for PatchTool {
+    fn foreground_execution(&self) -> crate::ForegroundExecution {
+        crate::ForegroundExecution::Concurrent
+    }
+
     fn name(&self) -> &'static str {
         "patch"
     }

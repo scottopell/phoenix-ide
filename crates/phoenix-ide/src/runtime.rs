@@ -8431,6 +8431,10 @@ mod approved_objective_registry_tests {
 
     #[async_trait]
     impl crate::tools::Tool for WritingMarker {
+        fn foreground_execution(&self) -> crate::tools::ForegroundExecution {
+            crate::tools::ForegroundExecution::Serial
+        }
+
         fn name(&self) -> &'static str {
             self.0
         }

@@ -108,6 +108,10 @@ impl ContinueConversation {
 
 #[async_trait]
 impl RoutedTool for ContinueConversation {
+    fn foreground_execution(&self) -> phoenix_tools::ForegroundExecution {
+        phoenix_tools::ForegroundExecution::Serial
+    }
+
     fn name(&self) -> &'static str {
         "continue_conversation"
     }

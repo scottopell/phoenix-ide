@@ -13,6 +13,10 @@ struct ControlledOrdinaryTools {
 
 #[async_trait::async_trait]
 impl ToolExecutor for ControlledOrdinaryTools {
+    fn foreground_execution(&self, _: &str) -> crate::tools::ForegroundExecution {
+        crate::tools::ForegroundExecution::Concurrent
+    }
+
     async fn execute(
         &self,
         call: crate::runtime::deny_gate::CheckedToolCall,
