@@ -193,7 +193,11 @@ impl<S: Storage + Clone + 'static, L: LlmClient + 'static, T: ToolExecutor + 'st
     }
 
     pub(super) fn cancellation_defers_dispatch(&self, effect: &Effect) -> bool {
-        matches!(self.cancellation_custody, CancellationCustody::Pending(_))
+        self.has_pending_cancellation()
             && matches!(effect, Effect::ExecuteTool { .. } | Effect::RequestLlm)
+    }
+
+    pub(super) fn has_pending_cancellation(&self) -> bool {
+        matches!(self.cancellation_custody, CancellationCustody::Pending(_))
     }
 }

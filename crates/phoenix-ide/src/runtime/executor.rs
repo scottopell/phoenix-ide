@@ -5522,6 +5522,12 @@ where
             }
         }
 
+        if self.has_pending_cancellation() {
+            self.steering_queue = drained_entries;
+            drop(projection_guard);
+            return Ok(());
+        }
+
         let Event::SteerDrainedUserMessages { entries } = drain_event else {
             unreachable!("maybe_drain_steering_queue returns only SteerDrainedUserMessages")
         };
@@ -7392,6 +7398,14 @@ where
         admitted: &mut crate::runtime::AdmittedOperation,
         task_approval_execution: Option<TaskApprovalExecution>,
     ) -> Result<Option<Event>, String> {
+        if self.has_pending_cancellation()
+            && matches!(
+                effect,
+                AuthoritativeEffect::RequestLlm | AuthoritativeEffect::ExecuteTool { .. }
+            )
+        {
+            return Ok(None);
+        }
         #[cfg(test)]
         if matches!(
             effect,

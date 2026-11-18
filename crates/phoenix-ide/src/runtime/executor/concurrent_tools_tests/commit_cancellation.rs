@@ -186,6 +186,9 @@ async fn cancellation_interrupts_held_sibling_commit(route: Route) {
         settled_without_renewed_grace,
         "classifying a slow write cannot renew the original cancellation drain cutoff"
     );
+    assert_eq!(storage.get_all_messages("ordinary-batch").iter().filter(|message| {
+        matches!(&message.content, MessageContent::System(content) if content.text.starts_with("Cancellation completed."))
+    }).count(), 1, "actual resource retirement must retain its one degraded-cancellation notice through deferred settlement");
     assert_eq!(tools.tokens.lock().unwrap().len(), 4);
     assert!(llm.recorded_requests().is_empty());
 }
