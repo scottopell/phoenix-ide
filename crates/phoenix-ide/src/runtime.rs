@@ -10,6 +10,9 @@
 //! REQ-BED-009: Sub-Agent Isolation
 
 mod agent_execution;
+mod cancellation_inbox;
+use cancellation_inbox::AcknowledgedEventSender;
+pub use cancellation_inbox::ConversationEventSender;
 mod native_spawn;
 pub use native_spawn::{
     NativeSpawnClosureReceipt, NativeSpawnControl, NativeSpawnTerminalEvidence,
@@ -950,8 +953,8 @@ type SharedStartupLlmRecoveryReceipt = Arc<AsyncMutex<Option<StartupLlmRecoveryR
 /// Handle to interact with a running conversation
 #[derive(Clone)]
 pub struct ConversationHandle {
-    pub event_tx: mpsc::Sender<Event>,
-    pub(crate) acknowledged_event_tx: mpsc::Sender<AcknowledgedEventRequest>,
+    pub event_tx: ConversationEventSender,
+    pub(crate) acknowledged_event_tx: AcknowledgedEventSender,
     handoff_review_tx: Option<mpsc::Sender<HandoffReviewRequest>>,
     /// Turn-trigger slot shared with this conversation's executor (see
     /// [`TurnTriggerSlot`]). Event senders deposit the ambient span here so
@@ -6733,7 +6736,10 @@ impl RuntimeManager {
             event_tx.clone(),
             broadcaster.clone(),
         );
+        let (event_tx, acknowledged_event_tx, cancellation_input_rx) =
+            cancellation_inbox::channel(event_tx, acknowledged_event_tx);
         let runtime = runtime
+            .with_cancellation_input_receiver(cancellation_input_rx)
             .with_acknowledged_event_receiver(acknowledged_event_rx)
             .with_handoff_review_receiver(handoff_review_rx);
 
@@ -7006,8 +7012,11 @@ impl RuntimeManager {
         self.runtimes.write().await.insert(
             conv_id.to_string(),
             ConversationHandle {
-                event_tx,
-                acknowledged_event_tx,
+                event_tx: crate::runtime::ConversationEventSender::for_test_receiver(event_tx),
+                acknowledged_event_tx:
+                    crate::runtime::cancellation_inbox::AcknowledgedEventSender::for_test_receiver(
+                        acknowledged_event_tx,
+                    ),
                 handoff_review_tx: None,
                 turn_trigger: TurnTriggerSlot::default(),
                 broadcast_tx: SseBroadcaster::new(SSE_BROADCAST_CAPACITY, 0),
@@ -7032,8 +7041,11 @@ impl RuntimeManager {
         self.runtimes.write().await.insert(
             conv_id.to_string(),
             ConversationHandle {
-                event_tx,
-                acknowledged_event_tx,
+                event_tx: crate::runtime::ConversationEventSender::for_test_receiver(event_tx),
+                acknowledged_event_tx:
+                    crate::runtime::cancellation_inbox::AcknowledgedEventSender::for_test_receiver(
+                        acknowledged_event_tx,
+                    ),
                 handoff_review_tx: None,
                 turn_trigger: TurnTriggerSlot::default(),
                 broadcast_tx: SseBroadcaster::new(SSE_BROADCAST_CAPACITY, 0),
@@ -11254,8 +11266,11 @@ mod scope_liveness_tests {
         manager.runtimes.write().await.insert(
             conversation_id.into(),
             ConversationHandle {
-                event_tx,
-                acknowledged_event_tx,
+                event_tx: crate::runtime::ConversationEventSender::for_test_receiver(event_tx),
+                acknowledged_event_tx:
+                    crate::runtime::cancellation_inbox::AcknowledgedEventSender::for_test_receiver(
+                        acknowledged_event_tx,
+                    ),
                 handoff_review_tx: None,
                 turn_trigger: TurnTriggerSlot::default(),
                 broadcast_tx: SseBroadcaster::new(SSE_BROADCAST_CAPACITY, 0),
@@ -12673,8 +12688,11 @@ mod scope_liveness_tests {
         manager.runtimes.write().await.insert(
             conversation_id.to_string(),
             ConversationHandle {
-                event_tx,
-                acknowledged_event_tx,
+                event_tx: crate::runtime::ConversationEventSender::for_test_receiver(event_tx),
+                acknowledged_event_tx:
+                    crate::runtime::cancellation_inbox::AcknowledgedEventSender::for_test_receiver(
+                        acknowledged_event_tx,
+                    ),
                 handoff_review_tx: None,
                 turn_trigger: TurnTriggerSlot::default(),
                 broadcast_tx: SseBroadcaster::new(SSE_BROADCAST_CAPACITY, 0),
@@ -13061,8 +13079,11 @@ mod scope_liveness_tests {
         manager.runtimes.write().await.insert(
             "full-fatal-channel".to_string(),
             ConversationHandle {
-                event_tx,
-                acknowledged_event_tx,
+                event_tx: crate::runtime::ConversationEventSender::for_test_receiver(event_tx),
+                acknowledged_event_tx:
+                    crate::runtime::cancellation_inbox::AcknowledgedEventSender::for_test_receiver(
+                        acknowledged_event_tx,
+                    ),
                 handoff_review_tx: None,
                 turn_trigger: TurnTriggerSlot::default(),
                 broadcast_tx: SseBroadcaster::new(SSE_BROADCAST_CAPACITY, 0),
@@ -13283,8 +13304,11 @@ mod scope_liveness_tests {
         manager.runtimes.write().await.insert(
             conversation_id.to_string(),
             ConversationHandle {
-                event_tx,
-                acknowledged_event_tx,
+                event_tx: crate::runtime::ConversationEventSender::for_test_receiver(event_tx),
+                acknowledged_event_tx:
+                    crate::runtime::cancellation_inbox::AcknowledgedEventSender::for_test_receiver(
+                        acknowledged_event_tx,
+                    ),
                 handoff_review_tx: None,
                 turn_trigger: TurnTriggerSlot::default(),
                 broadcast_tx: SseBroadcaster::new(SSE_BROADCAST_CAPACITY, 0)
@@ -14649,8 +14673,11 @@ mod scope_liveness_tests {
         mgr.runtimes.write().await.insert(
             conv_id.to_string(),
             ConversationHandle {
-                event_tx,
-                acknowledged_event_tx,
+                event_tx: crate::runtime::ConversationEventSender::for_test_receiver(event_tx),
+                acknowledged_event_tx:
+                    crate::runtime::cancellation_inbox::AcknowledgedEventSender::for_test_receiver(
+                        acknowledged_event_tx,
+                    ),
                 handoff_review_tx: None,
                 turn_trigger: TurnTriggerSlot::default(),
                 broadcast_tx: SseBroadcaster::new(SSE_BROADCAST_CAPACITY, 0),

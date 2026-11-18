@@ -58,6 +58,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
 mod capacity;
+mod commit_cancellation;
 #[cfg(test)]
 mod concurrent_tools_tests;
 mod continuation;
@@ -2240,6 +2241,8 @@ where
     event_rx: mpsc::Receiver<Event>,
     event_tx: mpsc::Sender<Event>,
     acknowledged_event_rx: mpsc::Receiver<AcknowledgedEventRequest>,
+    cancellation_input_rx: Option<mpsc::Receiver<super::cancellation_inbox::CancellationInput>>,
+    cancellation_custody: commit_cancellation::CancellationCustody,
     handoff_review_rx: Option<mpsc::Receiver<super::HandoffReviewRequest>>,
     exhausted_maintenance: bool,
     broadcast_tx: SseBroadcaster,
@@ -2566,6 +2569,8 @@ where
             event_tx,
             broadcast_tx,
             acknowledged_event_rx,
+            cancellation_input_rx: None,
+            cancellation_custody: commit_cancellation::CancellationCustody::default(),
             handoff_review_rx: None,
             exhausted_maintenance: false,
             llm_task_handle: None,
@@ -3251,6 +3256,18 @@ where
             if self.local_terminal_authority == LocalTerminalAuthority::Fatal {
                 return self.fatal_local_authority_exit();
             }
+            if self
+                .fatal_local_authority_fence
+                .fatal_authority_loss_is_latched()
+            {
+                return self.fatal_local_authority_exit();
+            }
+            if let Some(observed) = self.cancellation_custody.take_pending() {
+                if let Some(exit) = self.settle_cancellation_input(observed).await {
+                    return exit;
+                }
+                continue;
+            }
             let terminal_retry_at = self
                 .terminal_transition_retry
                 .as_ref()
@@ -3289,6 +3306,17 @@ where
                     let _ = review.response.send(result);
                     if self.exhausted_maintenance && matches!(self.state, ConvState::ContextExhausted { .. }) {
                         return RuntimeExitDisposition::CoordinatedShutdown;
+                    }
+                }
+                cancellation = async {
+                    self.cancellation_input_rx.as_mut().expect("open cancellation inbox").recv().await
+                }, if self.cancellation_input_rx.is_some() => {
+                    match cancellation {
+                        Some(input) => {
+                            let observed = self.observe_cancellation_input(input);
+                            if let Some(exit) = self.settle_cancellation_input(observed).await { return exit; }
+                        }
+                        None => self.cancellation_input_rx = None,
                     }
                 }
                 Some(AcknowledgedEventRequest { event, acknowledgement, retirement }) = self.acknowledged_event_rx.recv() => {
@@ -4543,6 +4571,9 @@ where
                     .to_string());
             };
             for effect in downstream_dispatch {
+                if self.cancellation_defers_dispatch(&effect) {
+                    continue;
+                }
                 if authority.requires_committed_state() {
                     self.publish_live_state()?;
                 }
@@ -4871,6 +4902,9 @@ where
             let mut state_committed = false;
             let mut new_turn_input_persisted = false;
             for (effect_index, effect) in result.effects.into_iter().enumerate() {
+                if self.cancellation_defers_dispatch(&effect) {
+                    continue;
+                }
                 if authority.requires_committed_state()
                     && matches!(effect, Effect::RequestLlm | Effect::ExecuteTool { .. })
                 {
@@ -5631,24 +5665,31 @@ where
             self.settle_pending_direct_turn(turn, Box::new(terminal))
                 .await?;
         } else if !state_persisted {
-            if let Some(update) = self.pending_provider_replay_update.take() {
-                self.storage
-                    .update_state_and_provider_replay(
-                        &self.context.conversation_id,
-                        &self.state,
-                        self.state_updated_at,
-                        &update,
-                    )
-                    .await?;
-            } else {
-                self.storage
-                    .update_state(
-                        &self.context.conversation_id,
-                        &self.state,
-                        self.state_updated_at,
-                    )
-                    .await?;
-            }
+            let storage = self.storage.clone();
+            let conversation_id = self.context.conversation_id.clone();
+            let state = self.state.clone();
+            let state_updated_at = self.state_updated_at;
+            let update = self.pending_provider_replay_update.take();
+            let write = async {
+                match update {
+                    Some(update) => {
+                        storage
+                            .update_state_and_provider_replay(
+                                &conversation_id,
+                                &state,
+                                state_updated_at,
+                                &update,
+                            )
+                            .await
+                    }
+                    None => {
+                        storage
+                            .update_state(&conversation_id, &state, state_updated_at)
+                            .await
+                    }
+                }
+            };
+            self.await_ordinary_batch_commit(write).await?;
         }
         if let Some(activation) = activation {
             self.release_native_spawn_activation(activation);
@@ -10395,28 +10436,38 @@ where
                 // transaction: either the full round is durable or none of it
                 // is. A partial write would leave an unpaired `tool_use` that
                 // 400s every later LLM request (REQ-BED-007, FM-2 Prevention).
-                if let Some(update) = self.pending_provider_replay_update.take() {
-                    self.storage
-                        .persist_tool_round_state_and_provider_replay(
-                            &conv_id,
-                            &agent_msg,
-                            &tool_msgs,
-                            &self.state,
-                            self.state_updated_at,
-                            &update,
-                        )
-                        .await?;
-                } else {
-                    self.storage
-                        .persist_tool_round_and_state(
-                            &conv_id,
-                            &agent_msg,
-                            &tool_msgs,
-                            &self.state,
-                            self.state_updated_at,
-                        )
-                        .await?;
-                }
+                let storage = self.storage.clone();
+                let state = self.state.clone();
+                let state_updated_at = self.state_updated_at;
+                let update = self.pending_provider_replay_update.take();
+                let write = async {
+                    match update {
+                        Some(update) => {
+                            storage
+                                .persist_tool_round_state_and_provider_replay(
+                                    &conv_id,
+                                    &agent_msg,
+                                    &tool_msgs,
+                                    &state,
+                                    state_updated_at,
+                                    &update,
+                                )
+                                .await
+                        }
+                        None => {
+                            storage
+                                .persist_tool_round_and_state(
+                                    &conv_id,
+                                    &agent_msg,
+                                    &tool_msgs,
+                                    &state,
+                                    state_updated_at,
+                                )
+                                .await
+                        }
+                    }
+                };
+                self.await_ordinary_batch_commit(write).await?;
 
                 merge_trusted_tool_results(
                     &mut self.pending_trusted_tool_results,

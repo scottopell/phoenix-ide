@@ -88,6 +88,10 @@ pub(in super::super) enum ForegroundObservation {
 }
 
 impl ForegroundDispatch {
+    pub(in super::super) fn has_open_batch_controls(&self) -> bool {
+        matches!(self, Self::OrdinaryBatch(batch) if !batch.closing)
+    }
+
     pub(in super::super) fn abort(&mut self) {
         match self {
             Self::Serial(serial) => {
