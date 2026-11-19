@@ -9,7 +9,7 @@ import { useCallback, useSyncExternalStore } from 'react';
 import { api } from '../api';
 import type { CoordinatorQuestion } from '../api';
 import { notifyCoordinatorQuestionFeed } from '../notifications';
-import { usePolledRefresh } from '../hooks/usePolledRefresh';
+import { useReminderRefresh } from '../reminders/useReminderRefresh';
 
 let questions: readonly CoordinatorQuestion[] = [];
 const listeners = new Set<() => void>();
@@ -69,7 +69,7 @@ const ignoreFailure = () => undefined;
 /** Mount once in the app shell: keeps the snapshot and notifications current. */
 export function useCoordinatorQuestionFeed(): void {
   const load = useCallback((signal: AbortSignal) => api.listCoordinatorQuestions(signal), []);
-  usePolledRefresh(load, receiveCoordinatorQuestions, ignoreFailure);
+  useReminderRefresh(load, receiveCoordinatorQuestions, ignoreFailure);
 }
 
 export function resetCoordinatorQuestionsForTest(): void {

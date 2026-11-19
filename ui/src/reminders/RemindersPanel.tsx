@@ -1,7 +1,7 @@
 import { useCallback, useRef, useState } from 'react';
 import { api, ApiResponseError } from '../api';
 import type { Reminder } from '../generated/Reminder';
-import { usePolledRefresh } from '../hooks/usePolledRefresh';
+import { useReminderRefresh } from './useReminderRefresh';
 import './RemindersPanel.css';
 import { formatReminderTime, normalizeReminderLocalInput, reminderLocalInput, reminderLocalTimeHasUniqueInstant } from './reminderTime';
 
@@ -47,7 +47,7 @@ function OwnedRemindersPanel({ conversationId, readOnly }: { conversationId: str
     })));
   }, []);
   const fail = useCallback((failure: unknown) => { setLoadError(failure instanceof Error ? failure.message : 'Failed to load reminders'); }, []);
-  const refresh = usePolledRefresh(load, receive, fail);
+  const refresh = useReminderRefresh(load, receive, fail);
 
   const manage = async (reminder: Reminder, operation: 'cancel' | 'reschedule') => {
     setSaving(true);
