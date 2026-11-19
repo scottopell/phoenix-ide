@@ -43,8 +43,9 @@ to keep human approval conversational rather than add an interaction workflow.
 | **REQ-AUTH-006:** Apply Grants Within Existing Execution Boundaries | ✅ Complete | Prompt applies saved grants subject to later user constraints and structural restrictions; ordinary/sub-agent capability isolation tested. |
 | **REQ-AUTH-007:** Project Authority to Watched Owners | 🔄 In review | Watch-scoped database read, delegated renderer, live dispatch and inspector wiring; database and renderer tests added. No live-dispatch test; not qualified locally; not deployed. |
 | **REQ-AUTH-008:** Present Monitored Conversations Apart | 🔄 In review | Server marks list rows monitored; desktop and mobile lists fold them; palette browsing orders them last; header badge; completion notifications suppressed. UI tests pass locally. Unread state is unchanged. Not checked in a browser; not deployed. |
+| **REQ-AUTH-009:** Route Monitored Questions Through the Coordinator | 🔄 In review | Watch events carry the pending questions; `answer_conversation_question` answers through the question-card path with Coordinator attribution; list rows report `question_with_coordinator_since`; sidebar folds held questions for 30 minutes; question notifications quiet for monitored conversations. Unit tests only; no end-to-end run; not deployed. |
 
-**Progress:** 6 of 8 implemented with bounded local qualification; REQ-AUTH-007 and REQ-AUTH-008 in review; not deployed.
+**Progress:** 6 of 9 implemented with bounded local qualification; REQ-AUTH-007, REQ-AUTH-008 and REQ-AUTH-009 in review; not deployed.
 
 ## Verification Summary
 

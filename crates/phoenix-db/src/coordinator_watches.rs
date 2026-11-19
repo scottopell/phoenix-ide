@@ -87,6 +87,20 @@ impl WatchOutcome {
     }
 }
 
+/// An active watch's view of its ordinary conversation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MonitoredProductConversation {
+    /// Newest question wait reported to the Coordinator, if any.
+    pub latest_question: Option<ReportedQuestion>,
+}
+
+/// One question wait the Coordinator was told about.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReportedQuestion {
+    pub request_id: String,
+    pub reported_at_us: i64,
+}
+
 #[derive(Debug, Clone)]
 pub struct PendingWatchEvent {
     pub route: WatchEventRoute,
@@ -216,13 +230,68 @@ impl Database {
     pub async fn monitored_product_conversation_ids(
         &self,
     ) -> DbResult<std::collections::HashSet<String>> {
-        let ids: Vec<String> = sqlx::query_scalar(
-            "SELECT DISTINCT source_product_conversation_id FROM coordinator_watches
-             WHERE ended_at_us IS NULL",
+        Ok(self
+            .monitored_product_conversations()
+            .await?
+            .into_keys()
+            .collect())
+    }
+
+    /// Product conversations under an active watch, each with the newest
+    /// question wait the Coordinator has accepted from the watch.
+    ///
+    /// A caller compares the question's request id with the conversation's
+    /// current wait: only a match means the Coordinator holds that question.
+    /// A question event still pending delivery does not count: the Coordinator
+    /// has not seen it, so the question stays the user's.
+    ///
+    /// # Errors
+    /// Returns an error if a database operation fails.
+    pub async fn monitored_product_conversations(
+        &self,
+    ) -> DbResult<std::collections::HashMap<String, MonitoredProductConversation>> {
+        let rows = sqlx::query(
+            "SELECT w.source_product_conversation_id AS product_conversation_id,
+                    e.source_occurrence_id AS question_request_id,
+                    e.occurred_at_us AS question_reported_at_us
+             FROM coordinator_watches w
+             LEFT JOIN coordinator_watch_events e ON e.event_id = (
+                 SELECT latest.event_id FROM coordinator_watch_events latest
+                 WHERE latest.watch_id = w.id
+                   AND latest.source_occurrence_kind = 'question_request'
+                   AND latest.delivery_state = 'accepted'
+                 ORDER BY latest.occurred_at_us DESC LIMIT 1)
+             WHERE w.ended_at_us IS NULL",
         )
         .fetch_all(&self.pool)
         .await?;
-        Ok(ids.into_iter().collect())
+        let mut monitored = std::collections::HashMap::new();
+        for row in rows {
+            let id: String = row.try_get("product_conversation_id")?;
+            let request_id: Option<String> = row.try_get("question_request_id")?;
+            let reported_at_us: Option<i64> = row.try_get("question_reported_at_us")?;
+            let latest_question =
+                request_id
+                    .zip(reported_at_us)
+                    .map(|(request_id, reported_at_us)| ReportedQuestion {
+                        request_id,
+                        reported_at_us,
+                    });
+            let entry = monitored.entry(id).or_insert(MonitoredProductConversation {
+                latest_question: None,
+            });
+            let newer = match (&entry.latest_question, &latest_question) {
+                (None, Some(_)) => true,
+                (Some(current), Some(candidate)) => {
+                    candidate.reported_at_us > current.reported_at_us
+                }
+                _ => false,
+            };
+            if newer {
+                entry.latest_question = latest_question;
+            }
+        }
+        Ok(monitored)
     }
 
     /// List active watches with their current transcript snapshots.
@@ -1298,6 +1367,86 @@ mod tests {
             .await
             .unwrap()
             .is_empty());
+    }
+
+    #[tokio::test]
+    async fn monitored_conversations_carry_the_newest_reported_question() {
+        use phoenix_core::domain::sm_state::{QuestionRequestAuthority, UserQuestion};
+        let db = Database::open_in_memory().await.unwrap();
+        let watched = db
+            .create_conversation(
+                "monitored-question",
+                "monitored-question",
+                "/tmp",
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let unwatched = db
+            .create_conversation("own-question", "own-question", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        db.watch_product_conversation(&watched.product_conversation_id)
+            .await
+            .unwrap();
+        let monitored = db.monitored_product_conversations().await.unwrap();
+        assert_eq!(
+            monitored.get(watched.product_conversation_id.as_str()),
+            Some(&MonitoredProductConversation {
+                latest_question: None
+            })
+        );
+        assert!(!monitored.contains_key(unwatched.product_conversation_id.as_str()));
+
+        let mut asked = Vec::new();
+        for _ in 0..2 {
+            let request_authority = QuestionRequestAuthority::new();
+            asked.push(request_authority.request_id().unwrap().to_string());
+            let waiting = ConvState::AwaitingUserResponse {
+                tool_use_id: "tool".into(),
+                request_authority,
+                questions: vec![UserQuestion {
+                    question: "Choose".into(),
+                    header: "Choice".into(),
+                    options: vec![],
+                    multi_select: false,
+                }],
+            };
+            db.update_conversation_state(&watched.id, &waiting)
+                .await
+                .unwrap();
+            db.update_conversation_state(&watched.id, &ConvState::Idle)
+                .await
+                .unwrap();
+        }
+        let latest_question = || async {
+            db.monitored_product_conversations().await.unwrap()
+                [watched.product_conversation_id.as_str()]
+            .latest_question
+            .clone()
+            .map(|question| question.request_id)
+        };
+        // Pending events have not reached the Coordinator, so it holds nothing yet.
+        assert_eq!(latest_question().await, None);
+        let accept = |request_id: String| {
+            sqlx::query(
+                "UPDATE coordinator_watch_events
+                 SET delivery_state = 'accepted', accepted_transcript_id = 'coordinator'
+                 WHERE source_occurrence_kind = 'question_request' AND source_occurrence_id = ?1",
+            )
+            .bind(request_id)
+            .execute(db.pool())
+        };
+        accept(asked[0].clone()).await.unwrap();
+        assert_eq!(latest_question().await, Some(asked[0].clone()));
+        accept(asked[1].clone()).await.unwrap();
+        assert_eq!(latest_question().await, Some(asked[1].clone()));
+        assert_eq!(
+            db.monitored_product_conversation_ids().await.unwrap(),
+            std::iter::once(watched.product_conversation_id.to_string()).collect()
+        );
     }
 
     #[tokio::test]

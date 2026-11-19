@@ -6,6 +6,7 @@ import { prReviewState } from './prReviewState';
 import { useKeyboardNav } from '../hooks';
 import { useFocusScope } from '../hooks/useFocusScope';
 import {
+  coordinatorQuestionExpiresAt,
   productConversationDisplayTitle,
   productConversationPresentationIndicator,
   splitMonitoredProductConversations,
@@ -14,6 +15,28 @@ import './ConversationList.css';
 import { EmberEntry } from './EmberEntry';
 import { markProductConversationRead, markProductConversationUnread } from '../conversation/readState';
 
+
+/**
+ * The time the list was last re-evaluated, advanced when a question Ember
+ * holds runs out its grace period, so the row returns to the user on time.
+ */
+function useCoordinatorQuestionClock(rows: readonly ProductConversationListRow[]): number {
+  const [now, setNow] = useState(() => Date.now());
+  const nextExpiry = useMemo(() => {
+    let next: number | null = null;
+    for (const row of rows) {
+      const expiresAt = coordinatorQuestionExpiresAt(row);
+      if (expiresAt !== null && expiresAt > now && (next === null || expiresAt < next)) next = expiresAt;
+    }
+    return next;
+  }, [rows, now]);
+  useEffect(() => {
+    if (nextExpiry === null) return undefined;
+    const timer = window.setTimeout(() => setNow(Date.now()), Math.max(0, nextExpiry - Date.now()) + 1);
+    return () => window.clearTimeout(timer);
+  }, [nextExpiry]);
+  return now;
+}
 
 interface ConversationListProps {
   productConversations?: readonly ProductConversationListRow[];
@@ -134,8 +157,11 @@ const ProductConversationListRowView = memo(function ProductConversationListRowV
   onCloseMenu,
   menuRef,
   isMobileList = false,
+  now,
 }: {
   isMobileList?: boolean;
+  /** List clock; re-renders the row when a question Ember holds returns to the user. */
+  now: number;
   isMenuOpen: boolean;
   onToggleMenu: (event: React.MouseEvent, id: string) => void;
   onCloseMenu: () => void;
@@ -160,7 +186,7 @@ const ProductConversationListRowView = memo(function ProductConversationListRowV
     'product-conversation-list-row',
   ].filter(Boolean).join(' ');
   const displayTitle = productConversationDisplayTitle(row);
-  const indicator = productConversationPresentationIndicator(row);
+  const indicator = productConversationPresentationIndicator(row, now);
   const statusTitle = indicator.label;
   const closeAction = row.lifecycle.state === 'open' ? row.lifecycle.close_action : null;
   const closeUnavailableReason = closeAction?.availability === 'unavailable'
@@ -367,6 +393,7 @@ export function ConversationList({
     };
   }, [expandedId, hasActiveScope]);
 
+  const questionClock = useCoordinatorQuestionClock(productConversations);
   // History is a flat record; only Open work is split into the user's own and Ember's.
   const monitoredSplit = useMemo(
     () => (showArchived
@@ -376,8 +403,9 @@ export function ConversationList({
         (row) => activeSlug === row.product_conversation_id
           || activeSlug === row.canonical_root.slug
           || activeSlug === row.canonical_root.transcript_row_id,
+        questionClock,
       )),
-    [showArchived, archivedProductConversations, productConversations, activeSlug],
+    [showArchived, archivedProductConversations, productConversations, activeSlug, questionClock],
   );
   const displayProductList = useMemo(
     () => (monitoredExpanded
@@ -528,6 +556,7 @@ export function ConversationList({
             <ProductConversationListRowView
               key={row.product_conversation_id}
               row={row}
+              now={questionClock}
               isMobileList={isMobileList}
               isMenuOpen={expandedId === row.product_conversation_id}
               onToggleMenu={toggleActions}

@@ -31,6 +31,7 @@ function row(id: string): ProductConversationListRow {
     read_state: { state: 'read' },
     cached_pr: null,
     monitored: false,
+    question_with_coordinator_since: null,
   };
 }
 

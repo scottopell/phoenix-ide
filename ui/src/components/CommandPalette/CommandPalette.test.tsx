@@ -150,6 +150,7 @@ describe('CommandPalette lifecycle availability', () => {
               read_state: { state: 'read' },
               cached_pr: null,
               monitored: false,
+              question_with_coordinator_since: null,
             }]}
             activeConversation={latest}
           />
@@ -177,6 +178,7 @@ describe('CommandPalette lifecycle availability', () => {
               read_state: { state: 'read' },
               cached_pr: null,
               monitored: false,
+              question_with_coordinator_since: null,
             }]}
             activeConversation={latest}
           />
@@ -210,6 +212,7 @@ describe('CommandPalette lifecycle availability', () => {
               read_state: { state: 'read' },
               cached_pr: null,
               monitored: false,
+              question_with_coordinator_since: null,
             }]}
             activeConversation={latest}
           />
@@ -243,6 +246,7 @@ describe('CommandPalette lifecycle availability', () => {
               read_state: { state: 'read' },
               cached_pr: null,
               monitored: false,
+              question_with_coordinator_since: null,
             }]}
             activeConversation={latest}
           />
@@ -274,6 +278,7 @@ describe('CommandPalette lifecycle availability', () => {
               read_state: { state: 'read' },
               cached_pr: null,
               monitored: false,
+              question_with_coordinator_since: null,
             }]}
             activeConversation={active}
           />
@@ -305,6 +310,7 @@ describe('CommandPalette lifecycle availability', () => {
               read_state: { state: 'read' },
               cached_pr: null,
               monitored: false,
+              question_with_coordinator_since: null,
             }]}
             activeConversation={latest}
           />
@@ -332,6 +338,7 @@ describe('CommandPalette lifecycle availability', () => {
               read_state: { state: 'read' },
               cached_pr: null,
               monitored: false,
+              question_with_coordinator_since: null,
             }]}
             activeConversation={latest}
           />

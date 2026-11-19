@@ -361,7 +361,7 @@ pub async fn list_product_conversations(
     let cached_prs = cached_prs_for_projections(&state, &projections).await?;
     let monitored = state
         .db
-        .monitored_product_conversation_ids()
+        .monitored_product_conversations()
         .await
         .map_err(db_to_app)?;
     let rows = projections
@@ -379,7 +379,7 @@ pub async fn list_product_conversations(
                 projection,
                 read_state,
                 cached_pr,
-                monitored.contains(projection.product_conversation_id.as_str()),
+                monitored.get(projection.product_conversation_id.as_str()),
             )
         })
         .collect();
@@ -426,11 +426,15 @@ async fn single_list_row(
         .and_then(|scope| cached_prs.get(&work_scope_key(scope)));
     let monitored = state
         .db
-        .monitored_product_conversation_ids()
+        .monitored_product_conversations()
         .await
-        .map_err(db_to_app)?
-        .contains(projection.product_conversation_id.as_str());
-    Ok(list_row(projection, read_state, cached_pr, monitored))
+        .map_err(db_to_app)?;
+    Ok(list_row(
+        projection,
+        read_state,
+        cached_pr,
+        monitored.get(projection.product_conversation_id.as_str()),
+    ))
 }
 
 async fn product_read_state(
@@ -888,7 +892,7 @@ pub(crate) fn list_row(
     projection: &ProductConversationListProjection,
     read_state: phoenix_db::ProductConversationReadState,
     cached_pr: Option<&ProductConversationPrView>,
-    monitored: bool,
+    monitored: Option<&phoenix_db::MonitoredProductConversation>,
 ) -> ProductConversationListRow {
     ProductConversationListRow {
         product_conversation_id: projection.product_conversation_id.to_string(),
@@ -920,8 +924,34 @@ pub(crate) fn list_row(
         ),
         read_state: read_state.into(),
         cached_pr: cached_pr.cloned(),
-        monitored,
+        monitored: monitored.is_some(),
+        question_with_coordinator_since: monitored.and_then(|monitored| {
+            question_with_coordinator_since(monitored, &projection.latest_state)
+        }),
     }
+}
+
+/// When the Coordinator was handed the conversation's current question.
+///
+/// `None` unless the latest transcript waits on a question whose request the
+/// watch reported; a question asked before the watch began stays the user's.
+fn question_with_coordinator_since(
+    monitored: &phoenix_db::MonitoredProductConversation,
+    latest_state: &crate::state_machine::ConvState,
+) -> Option<String> {
+    let crate::state_machine::ConvState::AwaitingUserResponse {
+        request_authority, ..
+    } = latest_state
+    else {
+        return None;
+    };
+    let current = request_authority.request_id()?;
+    let reported = monitored.latest_question.as_ref()?;
+    if reported.request_id != current.to_string() {
+        return None;
+    }
+    chrono::DateTime::<chrono::Utc>::from_timestamp_micros(reported.reported_at_us)
+        .map(|at| at.to_rfc3339())
 }
 
 fn close_action_view(
@@ -3582,7 +3612,7 @@ mod tests {
                 &projection,
                 phoenix_db::ProductConversationReadState::Read,
                 None,
-                false
+                None
             ))
             .unwrap()
         );

@@ -281,7 +281,10 @@ pub fn coordinator_prompt(lang: LlmLanguage) -> &'static str {
                 installed create_conversation/rename_conversation/continue_conversation/read_automatic_continuation/set_automatic_continuation and prepare_goal/apply_goal metadata. Act on user \
                 turns and factual \
                 events from explicit watches; ordinary watches follow \
-                continuations until removed/closed.\n\n\
+                continuations until removed/closed. A watched conversation's question comes to \
+                you first: answer it with answer_conversation_question when its assignment or \
+                your standing Authority settles it; otherwise ask the user with \
+                ask_user_question and pass the user's answer on verbatim.\n\n\
                 Delegate outcomes, not attempts. \
                 State the result, required evidence, and established boundaries; let the owner \
                 choose and revise methods. In-scope command fixes, fixture repairs, and reruns \
@@ -348,7 +351,9 @@ pub fn coordinator_prompt(lang: LlmLanguage) -> &'static str {
                 Bash and explicit active work_scope_id. No dedicated \
                 project/task/workspace/approval/lifecycle mutation tools except installed \
                 create_conversation/rename_conversation/continue_conversation/read_automatic_continuation/set_automatic_continuation and prepare_goal/apply_goal metadata. Act on user turns and \
-                factual watch events; ordinary watches follow continuations until removed/closed.\n\n\
+                factual watch events; ordinary watches follow continuations until removed/closed. \
+                Watched conversation question come to you first: answer_conversation_question when \
+                task or Authority settle it; else ask_user_question, pass user answer verbatim.\n\n\
                 Delegate outcomes, not attempts. \
                 State the result, required evidence, and established boundaries; let the owner \
                 choose and revise methods. In-scope command fixes, fixture repairs, and reruns \
@@ -852,8 +857,8 @@ mod tests {
     #[test]
     fn coordinator_prompts_fit_baselines_and_teach_clear_recovery() {
         const BASELINES: [(LlmLanguage, usize, usize); 2] = [
-            (LlmLanguage::PhoenixNative, 626, 4742),
-            (LlmLanguage::Caveman, 509, 3716),
+            (LlmLanguage::PhoenixNative, 626, 4835),
+            (LlmLanguage::Caveman, 509, 3871),
         ];
         for (language, baseline_words, baseline_chars) in BASELINES {
             let prompt = coordinator_prompt(language);
@@ -870,8 +875,11 @@ mod tests {
             let (base, delegation) = base_and_delegation
                 .split_once("\n\nDelegate outcomes, not attempts.")
                 .expect("outcome delegation guidance");
-            assert!(base.split_whitespace().count() <= baseline_words);
-            assert!(base.chars().count() <= baseline_chars);
+            let (words, chars) = (base.split_whitespace().count(), base.chars().count());
+            assert!(
+                words <= baseline_words && chars <= baseline_chars,
+                "{language:?} base prompt is {words} words / {chars} chars"
+            );
             for required in [
                 "untrusted evidence",
                 "authentic primary user messages",
@@ -893,6 +901,7 @@ mod tests {
                 "Phoenix accepted the resume request",
                 "each target's delivered/queued/rejected result",
                 "ask_user_question",
+                "answer_conversation_question",
                 "verified standing authority",
                 "cwd/worktree_path",
                 "@conv",

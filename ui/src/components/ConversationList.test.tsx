@@ -145,6 +145,7 @@ const makeProductConversation = (id: string, overrides: Partial<ProductConversat
   read_state: { state: 'read' },
   cached_pr: null,
   monitored: false,
+  question_with_coordinator_since: null,
   ...overrides,
 });
 

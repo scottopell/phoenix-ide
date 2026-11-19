@@ -75,6 +75,7 @@ const makeProductConversation = (id: string, overrides: Partial<ProductConversat
   read_state: { state: 'read' },
   cached_pr: null,
   monitored: false,
+  question_with_coordinator_since: null,
   ...overrides,
 });
 
@@ -289,6 +290,7 @@ describe('Sidebar — ProductConversation navigation', () => {
       read_state: { state: 'read' },
       cached_pr: null,
       monitored: false,
+      question_with_coordinator_since: null,
     });
     apiMock.renameProductConversation.mockResolvedValue({
       ...row,
@@ -297,6 +299,7 @@ describe('Sidebar — ProductConversation navigation', () => {
       read_state: { state: 'read' },
       cached_pr: null,
       monitored: false,
+      question_with_coordinator_since: null,
     });
     const listRevisionListener = vi.fn();
     const unsubscribe = subscribeProductConversationListRevision(listRevisionListener);

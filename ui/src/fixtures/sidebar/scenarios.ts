@@ -143,6 +143,7 @@ const visualProductRows: ProductConversationListRow[] = ([
   updated_at: isoAgo(index + 1),
   presentation: { kind: 'state', display_name: title, presentation_mode: presentationMode },
   monitored: false,
+  question_with_coordinator_since: null,
   read_state: readState === 'unread' ? { state: 'unread', reason: 'new_activity' } : { state: 'read' },
   cached_pr: prState === null ? null : {
     number: 48100 + index,
@@ -170,6 +171,7 @@ const productConversations: Partial<Record<SidebarScenario['id'], ProductConvers
       updated_at: isoAgo(3),
       presentation: { kind: 'state', display_name: 'Fixture Product Root', presentation_mode: 'working' },
       monitored: false,
+      question_with_coordinator_since: null,
       read_state: { state: 'read' },
       cached_pr: null,
     },
