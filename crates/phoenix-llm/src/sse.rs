@@ -52,6 +52,9 @@ pub struct SseParser {
     current_event: String,
     /// Accumulated `data:` lines for the current event (joined with `\n`).
     current_data: String,
+    /// The previous chunk ended in `\r`, so a leading `\n` in the next chunk
+    /// completes a `\r\n` pair rather than starting a new (blank) line.
+    skip_leading_lf: bool,
     chunk_count: usize,
     bytes_received: usize,
 }
@@ -62,6 +65,7 @@ impl SseParser {
             buf: Vec::new(),
             current_event: String::new(),
             current_data: String::new(),
+            skip_leading_lf: false,
             chunk_count: 0,
             bytes_received: 0,
         }
@@ -76,9 +80,17 @@ impl SseParser {
         self.buf.extend_from_slice(bytes);
         let mut events = Vec::new();
 
+        if self.skip_leading_lf && !self.buf.is_empty() {
+            if self.buf[0] == b'\n' {
+                self.buf.remove(0);
+            }
+            self.skip_leading_lf = false;
+        }
+
         while let Some(eol_pos) = self.buf.iter().position(|&b| b == b'\n' || b == b'\r') {
             // Determine how many bytes the line ending consumes.
-            let eol_len = if self.buf[eol_pos] == b'\r' {
+            let line_ended_with_cr = self.buf[eol_pos] == b'\r';
+            let eol_len = if line_ended_with_cr {
                 // \r\n counts as one line ending; bare \r also counts.
                 if self.buf.get(eol_pos + 1) == Some(&b'\n') {
                     2
@@ -99,6 +111,9 @@ impl SseParser {
 
             // Drain consumed bytes (line content + line ending).
             self.buf.drain(..eol_pos + eol_len);
+            // A `\r` that is the last buffered byte may be the first half of a
+            // `\r\n` split across chunks.
+            self.skip_leading_lf = self.buf.is_empty() && eol_len == 1 && line_ended_with_cr;
 
             if line.is_empty() {
                 // Blank line → dispatch accumulated event (if any data present).
@@ -256,6 +271,19 @@ mod tests {
         let events = p.push(b"data: hello\n\n");
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].event_type, "");
+    }
+
+    #[test]
+    fn crlf_split_between_cr_and_lf() {
+        // A chunk boundary falling between \r and \n must not produce a blank
+        // line that dispatches the event early.
+        let mut p = SseParser::new();
+        let mut events = p.push(b"event: test\r\ndata: a\r");
+        events.extend(p.push(b"\ndata: b\r\n\r"));
+        events.extend(p.push(b"\n"));
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, "test");
+        assert_eq!(events[0].data, "a\nb");
     }
 
     #[test]

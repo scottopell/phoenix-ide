@@ -163,7 +163,7 @@ impl ReadFileTool {
 
         // Convert 1-based offset to 0-based index
         let start_idx = (offset - 1).min(total_lines);
-        let end_idx = (start_idx + limit).min(total_lines);
+        let end_idx = start_idx.saturating_add(limit).min(total_lines);
 
         if cancel.is_cancelled() {
             return ToolOutput::error("Cancelled");
@@ -250,6 +250,22 @@ mod tests {
         assert!(result.output().contains("line1"));
         assert!(result.output().contains("line2"));
         assert!(result.output().contains("line3"));
+    }
+
+    #[tokio::test]
+    async fn test_read_file_huge_limit_does_not_overflow() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("test.txt"), "a\nb\nc\nd\ne\n").unwrap();
+
+        let result = ReadFileTool
+            .run(
+                json!({"path": "test.txt", "offset": 3, "limit": u64::MAX}),
+                test_context(dir.path().to_path_buf()),
+            )
+            .await;
+        assert!(result.is_success());
+        assert!(result.output().contains("c"));
+        assert!(result.output().contains("e"));
     }
 
     #[tokio::test]
