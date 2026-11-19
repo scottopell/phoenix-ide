@@ -27,6 +27,26 @@ fn is_within_viewer_roots(file: &Path, working_dir: &Path) -> bool {
         .any(|root| file.starts_with(root))
 }
 
+/// A half-open window of line indices into a file of `total` lines.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LineWindow {
+    start: usize,
+    end: usize,
+}
+
+impl LineWindow {
+    /// `offset` is 1-based; `0` is treated as `1`.
+    fn new(total: usize, offset: usize, limit: usize) -> Self {
+        let start = offset.saturating_sub(1).min(total);
+        let end = start.saturating_add(limit).min(total);
+        Self { start, end }
+    }
+
+    fn range(self) -> std::ops::Range<usize> {
+        self.start..self.end
+    }
+}
+
 /// Read a file's contents with line numbers.
 pub struct ReadFileTool;
 
@@ -161,16 +181,15 @@ impl ReadFileTool {
         let lines: Vec<&str> = text.lines().collect();
         let total_lines = lines.len();
 
-        // Convert 1-based offset to 0-based index
-        let start_idx = (offset - 1).min(total_lines);
-        let end_idx = (start_idx + limit).min(total_lines);
+        let window = LineWindow::new(total_lines, offset, limit);
+        let (start_idx, end_idx) = (window.start, window.end);
 
         if cancel.is_cancelled() {
             return ToolOutput::error("Cancelled");
         }
 
         let mut output = String::new();
-        for (i, line) in lines[start_idx..end_idx].iter().enumerate() {
+        for (i, line) in lines[window.range()].iter().enumerate() {
             let line_num = start_idx + i + 1; // 1-based line number
             let _ = writeln!(output, "{line_num:>6}\t{line}");
         }
@@ -250,6 +269,57 @@ mod tests {
         assert!(result.output().contains("line1"));
         assert!(result.output().contains("line2"));
         assert!(result.output().contains("line3"));
+    }
+
+    mod window_props {
+        use super::super::LineWindow;
+        use proptest::prelude::*;
+
+        /// Full-range `usize` inputs, weighted toward the extremes where
+        /// naive `start + limit` arithmetic wraps.
+        fn arb_usize() -> impl Strategy<Value = usize> {
+            prop_oneof![
+                3 => 0usize..64,
+                1 => (usize::MAX - 64)..=usize::MAX,
+                1 => any::<usize>(),
+            ]
+        }
+
+        proptest! {
+            /// The window is always sliceable and equals the exact (unbounded
+            /// precision) answer.
+            #[test]
+            fn window_is_in_bounds_and_exact(
+                total in 0usize..200,
+                offset in arb_usize(),
+                limit in arb_usize(),
+            ) {
+                let w = LineWindow::new(total, offset, limit);
+                let lines: Vec<usize> = (0..total).collect();
+                let got = &lines[w.range()];
+
+                let start = (offset.max(1) as u128 - 1).min(total as u128);
+                let end = (start + limit as u128).min(total as u128);
+                let expected: Vec<usize> = (start as usize..end as usize).collect();
+                prop_assert_eq!(got, expected.as_slice());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_read_file_huge_limit_does_not_overflow() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("test.txt"), "a\nb\nc\nd\ne\n").unwrap();
+
+        let result = ReadFileTool
+            .run(
+                json!({"path": "test.txt", "offset": 3, "limit": u64::MAX}),
+                test_context(dir.path().to_path_buf()),
+            )
+            .await;
+        assert!(result.is_success());
+        assert!(result.output().contains('c'));
+        assert!(result.output().contains('e'));
     }
 
     #[tokio::test]

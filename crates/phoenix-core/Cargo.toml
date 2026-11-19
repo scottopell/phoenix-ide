@@ -39,6 +39,7 @@ rustls = { workspace = true, features = ["default"] }
 x509-cert = { workspace = true }
 
 [dev-dependencies]
+proptest = { workspace = true }
 tempfile = { workspace = true }
 phoenix-tls = { workspace = true }
 rcgen = { workspace = true, features = ["pem", "aws_lc_rs"] }

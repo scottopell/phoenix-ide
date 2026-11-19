@@ -46,6 +46,7 @@ uuid = { workspace = true, features = ["v4"] }
 tracing = { workspace = true }
 
 [dev-dependencies]
+proptest = { workspace = true }
 tempfile = { workspace = true }
 futures = { workspace = true }
 # test-util enables tokio::time::{pause, advance} for the deterministic
