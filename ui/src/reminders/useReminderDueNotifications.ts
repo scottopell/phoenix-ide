@@ -2,7 +2,7 @@ import { api } from '../api';
 import type { ReminderFeedCursor } from '../generated/ReminderFeedCursor';
 import type { ReminderNotification } from '../generated/ReminderNotification';
 import { loadNotificationSettings, notifyReminderFeed } from '../notifications';
-import { useReminderRefresh } from './useReminderRefresh';
+import { usePolledRefresh } from '../hooks/usePolledRefresh';
 
 async function loadDueFeed(signal: AbortSignal): Promise<ReminderNotification[]> {
   await loadNotificationSettings();
@@ -21,5 +21,5 @@ async function loadDueFeed(signal: AbortSignal): Promise<ReminderNotification[]>
 const ignoreFeedFailure = () => undefined;
 
 export function useReminderDueNotifications(): void {
-  useReminderRefresh(loadDueFeed, notifyReminderFeed, ignoreFeedFailure);
+  usePolledRefresh(loadDueFeed, notifyReminderFeed, ignoreFeedFailure);
 }
