@@ -149,6 +149,7 @@ describe('CommandPalette lifecycle availability', () => {
               presentation: { kind: 'state', display_name: 'Product', presentation_mode: 'idle' },
               read_state: { state: 'read' },
               cached_pr: null,
+              monitored: false,
             }]}
             activeConversation={latest}
           />
@@ -175,6 +176,7 @@ describe('CommandPalette lifecycle availability', () => {
               presentation: { kind: 'state', display_name: 'Product', presentation_mode: 'idle' },
               read_state: { state: 'read' },
               cached_pr: null,
+              monitored: false,
             }]}
             activeConversation={latest}
           />
@@ -207,6 +209,7 @@ describe('CommandPalette lifecycle availability', () => {
               presentation: { kind: 'state', display_name: 'Product', presentation_mode: 'idle' },
               read_state: { state: 'read' },
               cached_pr: null,
+              monitored: false,
             }]}
             activeConversation={latest}
           />
@@ -239,6 +242,7 @@ describe('CommandPalette lifecycle availability', () => {
               presentation: { kind: 'state', display_name: 'Product', presentation_mode: 'idle' },
               read_state: { state: 'read' },
               cached_pr: null,
+              monitored: false,
             }]}
             activeConversation={latest}
           />
@@ -269,6 +273,7 @@ describe('CommandPalette lifecycle availability', () => {
               presentation: { kind: 'state', display_name: 'Product', presentation_mode: 'idle' },
               read_state: { state: 'read' },
               cached_pr: null,
+              monitored: false,
             }]}
             activeConversation={active}
           />
@@ -299,6 +304,7 @@ describe('CommandPalette lifecycle availability', () => {
               presentation: { kind: 'state', display_name: 'Product', presentation_mode: 'idle' },
               read_state: { state: 'read' },
               cached_pr: null,
+              monitored: false,
             }]}
             activeConversation={latest}
           />
@@ -325,6 +331,7 @@ describe('CommandPalette lifecycle availability', () => {
               presentation: { kind: 'state', display_name: 'Product', presentation_mode: 'idle' },
               read_state: { state: 'read' },
               cached_pr: null,
+              monitored: false,
             }]}
             activeConversation={latest}
           />

@@ -144,6 +144,7 @@ const makeProductConversation = (id: string, overrides: Partial<ProductConversat
   presentation: { kind: 'state', display_name: overrides.canonical_root?.title ?? `Root ${id}`, presentation_mode: 'idle' },
   read_state: { state: 'read' },
   cached_pr: null,
+  monitored: false,
   ...overrides,
 });
 
@@ -629,3 +630,60 @@ describe('ConversationList — product row behaviour', () => {
   });
 });
 
+
+describe('ConversationList — conversations Ember monitors', () => {
+  const ids = (container: HTMLElement) => [...container.querySelectorAll('[data-product-conversation-id]')]
+    .map((element) => element.getAttribute('data-product-conversation-id'));
+
+  beforeEach(() => localStorage.clear());
+
+  it('folds monitored rows behind a collapsed group and remembers when it is opened', () => {
+    const rows = [
+      makeProductConversation('mine'),
+      makeProductConversation('quiet', { monitored: true }),
+      makeProductConversation('asking', { monitored: true, presentation: { kind: 'state', display_name: 'Asking', presentation_mode: 'needs_action' } }),
+    ];
+    const list = (
+      <MemoryRouter>
+        <ConversationList
+          {...defaultProps}
+          productConversations={rows}
+        />
+      </MemoryRouter>
+    );
+    const first = render(list);
+    // The monitored row that needs the user stays visible; the quiet one is folded.
+    expect(ids(first.container)).toEqual(['mine', 'asking']);
+    const toggle = first.getByRole('button', { name: /Ember is handling/ });
+    expect(toggle).toHaveAttribute('aria-expanded', 'false');
+    expect(toggle).toHaveTextContent('1');
+
+    fireEvent.click(toggle);
+    expect(ids(first.container)).toEqual(['mine', 'asking', 'quiet']);
+    expect(first.getByRole('button', { name: /Ember is handling/ })).toHaveAttribute('aria-expanded', 'true');
+    first.unmount();
+
+    const second = render(list);
+    expect(ids(second.container)).toEqual(['mine', 'asking', 'quiet']);
+  });
+
+  it('shows no group when nothing is monitored and keeps the open row visible', () => {
+    const unmonitored = [makeProductConversation('mine'), makeProductConversation('watched')];
+    const rows = [makeProductConversation('mine'), makeProductConversation('watched', { monitored: true })];
+    const plain = render(<MemoryRouter><ConversationList {...defaultProps} productConversations={unmonitored} /></MemoryRouter>);
+    expect(plain.queryByRole('button', { name: /Ember is handling/ })).toBeNull();
+    plain.unmount();
+
+    const open = render(
+      <MemoryRouter>
+        <ConversationList
+          {...defaultProps}
+          productConversations={rows}
+          activeSlug="watched"
+        />
+      </MemoryRouter>,
+    );
+    expect(ids(open.container)).toEqual(['mine', 'watched']);
+    expect(open.queryByRole('button', { name: /Ember is handling/ })).toBeNull();
+  });
+});

@@ -1,3 +1,4 @@
+import { splitMonitoredProductConversations } from '../../ConversationList.presentation';
 import { getConvDisplayState } from '../../../api';
 import type { Conversation, ProductConversationListRow } from '../../../api';
 import type { PaletteSource, PaletteItem } from '../types';
@@ -24,9 +25,14 @@ export function createConversationSource(
     search(query: string): Promise<PaletteItem[]> {
       if (productConversations.length > 0) {
         const sorted = productConversations.toSorted((a, b) => b.updated_at.localeCompare(a.updated_at));
-        return Promise.resolve((query
-          ? fuzzyMatch(sorted, query, row => row.presentation.display_name)
-          : sorted).map(toProductItem));
+        if (query) {
+          return Promise.resolve(
+            fuzzyMatch(sorted, query, row => row.presentation.display_name).map(toProductItem),
+          );
+        }
+        // Browsing: the user's own conversations first, then the ones Ember is handling.
+        const { own, monitored } = splitMonitoredProductConversations(sorted);
+        return Promise.resolve([...own, ...monitored].map(toProductItem));
       }
       const sorted = conversations.toSorted(
         (a, b) => new Date(b.updated_at).getTime() - new Date(a.updated_at).getTime(),

@@ -11,6 +11,7 @@ import {
 } from "react";
 import { Link } from "react-router-dom";
 import { useLastSseEventAtRef } from "../conversation/useConversationAtom";
+import { useProductConversationList } from "../conversation/productConversationList";
 import { FolderTree, TerminalSquare } from "lucide-react";
 import type { TerminalPanelStatus } from "./TerminalPanel";
 import {
@@ -238,6 +239,23 @@ interface ModelSelectionBaseline {
   model: string;
   effort: ModelEffort | null;
   serviceTier: ServiceTier;
+}
+
+/** Shown while Ember (the Coordinator) holds an active watch on this conversation. */
+function StateBarMonitoredBadge({ productConversationId }: { productConversationId: string | undefined }) {
+  const { rows } = useProductConversationList();
+  const monitored = productConversationId !== undefined
+    && rows.some((row) => row.product_conversation_id === productConversationId && row.monitored);
+  if (!monitored) return null;
+  return (
+    <Link
+      to="/global"
+      className="statebar-monitored"
+      title="Ember is monitoring this conversation and directs its work. Open Ember."
+    >
+      Ember is handling this
+    </Link>
+  );
 }
 
 function StateBarPrBadge({ pr }: { pr: PrStatusResponse }) {
@@ -1150,6 +1168,7 @@ export function StateBar({
   );
   const prStatusContent = (
     <>
+      <StateBarMonitoredBadge productConversationId={conversation?.product_conversation_id} />
       {prStatus && prStatus.found && prStatus.url && <StateBarPrBadge pr={prStatus} />}
       {!workActionsPrRailOwnsSelection && prStatusHandle && (
         <ActivePrSelector key={conversation?.id} handle={prStatusHandle} />

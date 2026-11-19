@@ -82,3 +82,36 @@ export function productConversationPresentationIndicator(row: ProductConversatio
         : { label: 'Open', dotClass: 'idle', ariaLabel: 'Open' };
   }
 }
+
+/** A row the user must act on; never folded away, whoever is monitoring it. */
+export function productConversationNeedsUser(row: ProductConversationListRow): boolean {
+  return row.presentation.kind === 'needs_action'
+    || row.presentation.presentation_mode === 'needs_action'
+    || row.presentation.presentation_mode === 'error';
+}
+
+export type MonitoredSplit = {
+  /** Rows shown in the main list: the user's own, plus monitored rows that need the user. */
+  own: readonly ProductConversationListRow[];
+  /** Rows Ember is monitoring that need nothing from the user right now. */
+  monitored: readonly ProductConversationListRow[];
+};
+
+/**
+ * Separate conversations Ember monitors (`row.monitored`, an active Coordinator
+ * watch) from the user's own. `pinned` keeps a row in the main list regardless,
+ * e.g. the open one.
+ */
+export function splitMonitoredProductConversations(
+  rows: readonly ProductConversationListRow[],
+  pinned: (row: ProductConversationListRow) => boolean = () => false,
+): MonitoredSplit {
+  if (!rows.some((row) => row.monitored)) return { own: rows, monitored: [] };
+  const own: ProductConversationListRow[] = [];
+  const monitored: ProductConversationListRow[] = [];
+  for (const row of rows) {
+    const folded = row.monitored && !productConversationNeedsUser(row) && !pinned(row);
+    (folded ? monitored : own).push(row);
+  }
+  return { own, monitored };
+}

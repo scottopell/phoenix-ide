@@ -190,3 +190,49 @@ async fn coordinator_authority_failed_write_rolls_back_and_lost_ack_is_unclassif
     ));
     assert_eq!(db.coordinator_authority().await.unwrap(), committed);
 }
+
+#[tokio::test]
+async fn delegated_authority_follows_the_active_watch_of_an_ordinary_conversation() {
+    let db = Database::open_in_memory().await.unwrap();
+    let source = coordinator(&db).await;
+    let owner = db
+        .create_conversation("delegated-owner", "owner", "/tmp", true, None, None)
+        .await
+        .unwrap();
+    let product = owner.product_conversation_id.clone();
+
+    // Watched, but nothing saved: no delegated grants.
+    db.watch_product_conversation(&product).await.unwrap();
+    assert_eq!(
+        db.delegated_coordinator_authority(&owner.id).await.unwrap(),
+        None
+    );
+
+    let value = instructions("Necessary merges are allowed.");
+    db.set_coordinator_authority(&source, &value)
+        .await
+        .established()
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        db.delegated_coordinator_authority(&owner.id).await.unwrap(),
+        Some(value)
+    );
+
+    // The Coordinator's own transcript and unknown ids are not delegates.
+    assert_eq!(
+        db.delegated_coordinator_authority(&source).await.unwrap(),
+        None
+    );
+    assert_eq!(
+        db.delegated_coordinator_authority("missing").await.unwrap(),
+        None
+    );
+
+    // Ending the watch withdraws the projection on the next read.
+    assert!(db.unwatch_product_conversation(&product).await.unwrap());
+    assert_eq!(
+        db.delegated_coordinator_authority(&owner.id).await.unwrap(),
+        None
+    );
+}

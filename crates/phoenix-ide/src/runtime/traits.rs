@@ -137,6 +137,16 @@ pub trait MessageStore: Send + Sync {
         &self,
     ) -> Result<phoenix_core::domain::coordinator_authority::CoordinatorAuthority, String>;
 
+    /// Current Authority for an ordinary conversation under an active Coordinator watch.
+    /// `None` means no delegated grants apply to that conversation.
+    async fn delegated_coordinator_authority(
+        &self,
+        _conversation_id: &str,
+    ) -> Result<Option<phoenix_core::domain::coordinator_authority::CoordinatorAuthority>, String>
+    {
+        Ok(None)
+    }
+
     async fn save_continuation_handoff_candidate(
         &self,
         candidate: &crate::db::ContinuationHandoffCandidate,
@@ -917,6 +927,16 @@ impl<T: MessageStore + ?Sized> MessageStore for Arc<T> {
         &self,
     ) -> Result<phoenix_core::domain::coordinator_authority::CoordinatorAuthority, String> {
         (**self).coordinator_authority().await
+    }
+
+    async fn delegated_coordinator_authority(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Option<phoenix_core::domain::coordinator_authority::CoordinatorAuthority>, String>
+    {
+        (**self)
+            .delegated_coordinator_authority(conversation_id)
+            .await
     }
 
     async fn append_coordinator_tracking_observation(
@@ -1834,6 +1854,17 @@ impl MessageStore for DatabaseStorage {
             .coordinator_authority()
             .await
             .map_err(|error| format!("Failed to read current Coordinator Authority: {error}"))
+    }
+
+    async fn delegated_coordinator_authority(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Option<phoenix_core::domain::coordinator_authority::CoordinatorAuthority>, String>
+    {
+        self.db
+            .delegated_coordinator_authority(conversation_id)
+            .await
+            .map_err(|error| format!("Failed to read delegated Coordinator Authority: {error}"))
     }
 
     async fn save_continuation_handoff_candidate(

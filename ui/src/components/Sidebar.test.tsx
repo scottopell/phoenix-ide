@@ -74,6 +74,7 @@ const makeProductConversation = (id: string, overrides: Partial<ProductConversat
   presentation: { kind: 'state', display_name: overrides.canonical_root?.title ?? `Root ${id}`, presentation_mode: 'idle' },
   read_state: { state: 'read' },
   cached_pr: null,
+  monitored: false,
   ...overrides,
 });
 
@@ -287,6 +288,7 @@ describe('Sidebar — ProductConversation navigation', () => {
       presentation: { kind: 'state', display_name: 'Generated Name', presentation_mode: 'idle' },
       read_state: { state: 'read' },
       cached_pr: null,
+      monitored: false,
     });
     apiMock.renameProductConversation.mockResolvedValue({
       ...row,
@@ -294,6 +296,7 @@ describe('Sidebar — ProductConversation navigation', () => {
       presentation: { kind: 'state', display_name: 'Renamed Product Title', presentation_mode: 'idle' },
       read_state: { state: 'read' },
       cached_pr: null,
+      monitored: false,
     });
     const listRevisionListener = vi.fn();
     const unsubscribe = subscribeProductConversationListRevision(listRevisionListener);

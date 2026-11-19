@@ -124,8 +124,80 @@ Authority SHALL NOT override deterministic tool denials, WorkScope targeting,
 destination authorization or other structural capability boundaries.
 
 Authority SHALL NOT itself commission new work, schedule a turn, resume paused
-execution, supply authority to ordinary conversations or synchronize grants to
-another Phoenix instance.
+execution, supply authority to ordinary conversations other than as
+REQ-AUTH-007 provides, or synchronize grants to another Phoenix instance.
+
+### REQ-AUTH-007: Project Authority to Watched Owners
+
+WHEN an ordinary top-level conversation dispatches a model request
+AND the Coordinator holds an active watch on its product conversation
+AND the saved document is not empty
+THE SYSTEM SHALL read the current saved document and append its complete text to
+that request's instructions as delegated Authority for work commissioned there.
+
+THE delegated context SHALL direct the owner to apply saved grants without
+redundant permission requests, SHALL treat a saved grant of necessary merges as
+the user's approval to merge commissioned work, and SHALL preserve hard tool restrictions, the worktree boundary and later user
+restrictions, pauses and Stop instructions.
+
+THE SYSTEM SHALL NOT supply the document to sub-agents, to ordinary
+conversations without an active watch, or to another Phoenix instance,
+AND SHALL NOT give any ordinary conversation the read or set tools.
+
+WHEN the watch ends or the document is cleared
+THE next model request SHALL omit the delegated context.
+
+IF reading delegated Authority fails
+THE SYSTEM SHALL surface the failure and SHALL NOT dispatch with it silently
+omitted.
+
+THE prompt-inspection surface SHALL show the same delegated context as live
+request construction.
+
+Work-mode instructions SHALL leave merging to the user unless the assignment or
+delegated Authority grants it, and SHALL NOT state that merging is unavailable.
+
+**Rationale:** Owners previously received grants only as Coordinator paraphrase
+in a message, which their own mode instructions outrank. They declined granted
+merges and re-asked for routine permissions, so the Coordinator performed those
+steps itself. The watch is the existing durable marker of commissioned work.
+
+### REQ-AUTH-008: Present Monitored Conversations Apart
+
+An ordinary conversation is *monitored* while the Coordinator holds an active
+watch on its product conversation. REQ-AUTH-007 and this requirement use that
+one definition.
+
+WHEN the Open conversation list is shown
+THE SYSTEM SHALL fold monitored conversations into a single group, collapsed by
+default, that shows how many it holds
+AND SHALL remember in the browser whether the user opened the group.
+
+THE SYSTEM SHALL keep a monitored conversation in the main list WHILE it needs
+the user (a pending question or approval, or an error) or is the conversation
+currently open.
+
+THE SYSTEM SHALL show conversations that are not monitored, and the History
+list, exactly as before.
+
+THE conversation list response SHALL state for each row whether it is
+monitored, so every client derives the same answer from one snapshot.
+
+WHEN the user browses the command palette without a query
+THE SYSTEM SHALL list conversations that are not folded before those that are,
+AND SHALL NOT reorder the results of a search.
+
+WHEN a monitored conversation is open
+THE SYSTEM SHALL show that Ember is handling it, with a way to open Ember.
+
+WHEN a monitored conversation finishes a turn
+THE SYSTEM SHALL NOT raise a completion notification for it.
+Questions, approval requests and errors in a monitored conversation SHALL
+notify as they do for any conversation.
+
+**Rationale:** Monitored conversations are the Coordinator's working set, much
+as sub-agent conversations are an owner's. Listing them beside the user's own
+conversations hides the ones the user is actually driving.
 
 ## Scope
 

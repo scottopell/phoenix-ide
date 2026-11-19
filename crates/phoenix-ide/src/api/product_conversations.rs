@@ -359,6 +359,11 @@ pub async fn list_product_conversations(
             .map(|entry| (entry.product_conversation_id.as_str(), entry.read_state))
             .collect();
     let cached_prs = cached_prs_for_projections(&state, &projections).await?;
+    let monitored = state
+        .db
+        .monitored_product_conversation_ids()
+        .await
+        .map_err(db_to_app)?;
     let rows = projections
         .iter()
         .map(|projection| {
@@ -370,7 +375,12 @@ pub async fn list_product_conversations(
                 .latest_work_scope_id
                 .as_ref()
                 .and_then(|scope| cached_prs.get(&work_scope_key(scope)));
-            list_row(projection, read_state, cached_pr)
+            list_row(
+                projection,
+                read_state,
+                cached_pr,
+                monitored.contains(projection.product_conversation_id.as_str()),
+            )
         })
         .collect();
     Ok(Json(ProductConversationListResponse {
@@ -414,7 +424,13 @@ async fn single_list_row(
         .latest_work_scope_id
         .as_ref()
         .and_then(|scope| cached_prs.get(&work_scope_key(scope)));
-    Ok(list_row(projection, read_state, cached_pr))
+    let monitored = state
+        .db
+        .monitored_product_conversation_ids()
+        .await
+        .map_err(db_to_app)?
+        .contains(projection.product_conversation_id.as_str());
+    Ok(list_row(projection, read_state, cached_pr, monitored))
 }
 
 async fn product_read_state(
@@ -872,6 +888,7 @@ pub(crate) fn list_row(
     projection: &ProductConversationListProjection,
     read_state: phoenix_db::ProductConversationReadState,
     cached_pr: Option<&ProductConversationPrView>,
+    monitored: bool,
 ) -> ProductConversationListRow {
     ProductConversationListRow {
         product_conversation_id: projection.product_conversation_id.to_string(),
@@ -903,6 +920,7 @@ pub(crate) fn list_row(
         ),
         read_state: read_state.into(),
         cached_pr: cached_pr.cloned(),
+        monitored,
     }
 }
 
@@ -3563,7 +3581,8 @@ mod tests {
             serde_json::to_value(list_row(
                 &projection,
                 phoenix_db::ProductConversationReadState::Read,
-                None
+                None,
+                false
             ))
             .unwrap()
         );

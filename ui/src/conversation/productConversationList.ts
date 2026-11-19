@@ -1,7 +1,7 @@
 import { useSyncExternalStore } from 'react';
 import { api } from '../api';
 import type { CoordinatorListEntryView, ProductConversationListResponse, ProductConversationListRow } from '../api';
-import { subscribeProductConversationListRevision } from '../notifications';
+import { setMonitoredConversationLookup, subscribeProductConversationListRevision } from '../notifications';
 
 const CACHE_KEY = 'phoenix:product-conversation-list:v1';
 const REQUEST_TIMEOUT_MS = 15_000;
@@ -54,6 +54,14 @@ function initialSnapshot(): ProductConversationListSnapshot {
 
 let snapshot: ProductConversationListSnapshot = initialSnapshot();
 const listeners = new Set<() => void>();
+
+// Notifications ask this list whether Ember monitors a conversation.
+setMonitoredConversationLookup((conversation) => (
+  conversation.product_conversation_id !== undefined
+  && snapshot.rows.some((row) => (
+    row.product_conversation_id === conversation.product_conversation_id && row.monitored
+  ))
+));
 let inFlight: { controller: AbortController; promise: Promise<void>; rowsChanged: boolean } | null = null;
 let stopRevisionSubscription: (() => void) | null = null;
 let refreshAfterCurrent = false;

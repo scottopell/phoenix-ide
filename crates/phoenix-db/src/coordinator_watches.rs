@@ -209,6 +209,22 @@ impl Database {
         Ok(())
     }
 
+    /// Product conversations under an active watch: the monitored set.
+    ///
+    /// # Errors
+    /// Returns an error if a database operation fails.
+    pub async fn monitored_product_conversation_ids(
+        &self,
+    ) -> DbResult<std::collections::HashSet<String>> {
+        let ids: Vec<String> = sqlx::query_scalar(
+            "SELECT DISTINCT source_product_conversation_id FROM coordinator_watches
+             WHERE ended_at_us IS NULL",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(ids.into_iter().collect())
+    }
+
     /// List active watches with their current transcript snapshots.
     ///
     /// # Errors

@@ -30,6 +30,7 @@ function row(id: string): ProductConversationListRow {
     presentation: { kind: 'state', display_name: id, presentation_mode: 'idle' },
     read_state: { state: 'read' },
     cached_pr: null,
+    monitored: false,
   };
 }
 

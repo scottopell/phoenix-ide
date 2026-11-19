@@ -153,6 +153,7 @@ function productRow(conversation: Conversation): ProductConversationListRow {
     presentation: conversation.presentation_mode === 'needs_action'
       ? { kind: 'needs_action', display_name: conversation.task_title ?? conversation.slug }
       : { kind: 'state', display_name: conversation.task_title ?? conversation.slug, presentation_mode: conversation.presentation_mode ?? 'idle' },
+    monitored: false,
     read_state: unreadFixtureIds.get(conversation.id) ?? { state: 'read' },
     cached_pr: conversation.cached_pr
       ? { ...conversation.cached_pr, feedback_status: conversation.cached_pr.feedback_status ?? 'open' }

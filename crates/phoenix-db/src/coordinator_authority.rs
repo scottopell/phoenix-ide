@@ -32,6 +32,35 @@ impl Database {
         read_on(&mut connection).await
     }
 
+    /// Reads Authority for an ordinary conversation the Coordinator currently watches.
+    ///
+    /// Returns `None` when `conversation_id` is not an ordinary top-level transcript whose
+    /// product conversation has an active watch, or when the saved document is empty.
+    ///
+    /// # Errors
+    /// Returns storage errors and rejects an invalid saved document.
+    pub async fn delegated_coordinator_authority(
+        &self,
+        conversation_id: &str,
+    ) -> DbResult<Option<CoordinatorAuthority>> {
+        let mut connection = self.pool.acquire().await?;
+        let watched: Option<i64> = sqlx::query_scalar(
+            "SELECT 1 FROM conversations c
+             JOIN coordinator_watches w
+               ON w.source_product_conversation_id = c.product_conversation_id
+             WHERE c.id = ?1 AND c.runtime_role = 'user' AND w.ended_at_us IS NULL
+             LIMIT 1",
+        )
+        .bind(conversation_id)
+        .fetch_optional(&mut *connection)
+        .await?;
+        if watched.is_none() {
+            return Ok(None);
+        }
+        let authority = read_on(&mut connection).await?;
+        Ok((!authority.is_empty()).then_some(authority))
+    }
+
     /// Reads Authority only for the persisted current Coordinator transcript.
     ///
     /// # Errors
