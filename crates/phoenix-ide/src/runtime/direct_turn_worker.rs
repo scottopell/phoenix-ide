@@ -183,8 +183,7 @@ impl<D: DirectTurnDispatcher + TerminalObligationDispatcher, C: DirectTurnClock>
 
     async fn discover_inputs(&self) {
         if let Some(manager) = &self.input_discovery {
-            crate::coordinator_watch_delivery::deliver_pass(manager).await;
-            crate::coordinator_question_delivery::deliver_pass(manager).await;
+            crate::coordinator_delivery::deliver_pass(manager).await;
             if let Ok(now) = phoenix_core::domain::reminder::ReminderTimestampUs::parse(
                 chrono::Utc::now().timestamp_micros(),
             ) {

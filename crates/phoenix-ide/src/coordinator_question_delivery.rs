@@ -11,10 +11,8 @@ use std::sync::Arc;
 use phoenix_core::domain::db_schema::InputOrigin;
 use phoenix_core::domain::sm_state::{render_question_answers, QuestionAnnotation, UserQuestion};
 
+use crate::coordinator_delivery::{CoordinatorSend, CoordinatorSender};
 use crate::runtime::RuntimeManager;
-use crate::send_chat_service::{
-    MessageExpansionPolicy, SendChatApplicationService, SendChatOutcome, SendChatRequest,
-};
 
 /// The Coordinator-facing text for an answered question.
 pub(crate) fn answer_reply(
@@ -37,7 +35,7 @@ pub(crate) fn dismissal_reply(request_id: &str) -> String {
 }
 
 /// Deliver stored replies to the current Coordinator transcript.
-pub(crate) async fn deliver_pass(runtime: &Arc<RuntimeManager>) {
+pub(crate) async fn deliver_pass(runtime: &Arc<RuntimeManager>, sender: &CoordinatorSender) {
     let db = runtime.db();
     let replies = match db.undelivered_coordinator_question_replies(16).await {
         Ok(replies) => replies,
@@ -46,38 +44,12 @@ pub(crate) async fn deliver_pass(runtime: &Arc<RuntimeManager>) {
             return;
         }
     };
-    if replies.is_empty() {
-        return;
-    }
-    let target = match db.coordinator_watch_target().await {
-        Ok(Some(target)) => target,
-        Ok(None) => {
-            tracing::debug!("coordinator question replies awaiting coordinator transcript");
-            return;
-        }
-        Err(error) => {
-            tracing::warn!(%error, "coordinator question reply target lookup failed; retrying");
-            return;
-        }
-    };
-    let service = SendChatApplicationService::new(db.clone(), runtime.clone());
     for reply in replies {
-        let request = SendChatRequest {
-            conversation_id: target.clone(),
-            origin: InputOrigin::UserApi,
-            text: reply.reply,
-            message_id: reply.request_id.clone(),
-            images: Vec::new(),
-            files: Vec::new(),
-            user_agent: None,
-            expansion_policy: MessageExpansionPolicy::LiteralText,
-        };
-        match service.send(request).await {
-            Ok(
-                SendChatOutcome::Delivered
-                | SendChatOutcome::AlreadyPersisted
-                | SendChatOutcome::QueuedAsSteering,
-            ) => {
+        match sender
+            .send(InputOrigin::UserApi, reply.reply, reply.request_id.clone())
+            .await
+        {
+            CoordinatorSend::Accepted => {
                 let now = chrono::Utc::now().timestamp_micros();
                 if let Err(error) = db
                     .mark_coordinator_question_reply_delivered(&reply.request_id, now)
@@ -86,10 +58,10 @@ pub(crate) async fn deliver_pass(runtime: &Arc<RuntimeManager>) {
                     tracing::warn!(request_id = %reply.request_id, %error, "coordinator question reply delivered but not marked; the next pass is idempotent");
                 }
             }
-            Ok(SendChatOutcome::Rejected { message, code }) => {
+            CoordinatorSend::Rejected { code, message } => {
                 tracing::warn!(request_id = %reply.request_id, code, %message, "coordinator question reply not accepted; retrying");
             }
-            Err(error) => {
+            CoordinatorSend::Failed(error) => {
                 tracing::warn!(request_id = %reply.request_id, %error, "coordinator question reply delivery failed; retrying");
             }
         }

@@ -16351,8 +16351,8 @@ mod scope_liveness_tests {
             .await
             .unwrap();
 
-        crate::coordinator_question_delivery::deliver_pass(&manager).await;
-        crate::coordinator_question_delivery::deliver_pass(&manager).await;
+        crate::coordinator_delivery::deliver_pass(&manager).await;
+        crate::coordinator_delivery::deliver_pass(&manager).await;
 
         // Accepted input is a durable turn keyed by the client message id.
         let delivered: i64 = sqlx::query_scalar(
@@ -16426,7 +16426,7 @@ mod scope_liveness_tests {
             .await
             .unwrap()
             .remove(0);
-        crate::coordinator_watch_delivery::deliver_pass(&manager).await;
+        crate::coordinator_delivery::deliver_pass(&manager).await;
         let handle = manager.get_or_create(&global.id).await.unwrap();
         let mut states = handle.state_rx.clone();
         manager.dispatch_standalone_turn(&global.id).await.unwrap();
@@ -16451,7 +16451,7 @@ mod scope_liveness_tests {
                 .state,
             waiting
         );
-        crate::coordinator_watch_delivery::deliver_pass(&manager).await;
+        crate::coordinator_delivery::deliver_pass(&manager).await;
         manager.dispatch_standalone_turn(&global.id).await.unwrap();
         assert_eq!(llm.requests.load(std::sync::atomic::Ordering::SeqCst), 1);
         let terminal: String = sqlx::query_scalar(
