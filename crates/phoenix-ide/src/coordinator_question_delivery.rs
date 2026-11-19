@@ -3,7 +3,9 @@
 //! The reply is stored first and delivered to the current Coordinator
 //! transcript by a retrying pass, so an answer given while the Coordinator is
 //! busy, between transcripts, or before restart is never lost. The question's
-//! request id doubles as the message id, so a repeated pass cannot duplicate it.
+//! request id doubles as the message id; the transcript accepting that message
+//! marks the reply delivered in the same transaction, so no later transcript
+//! receives it again.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -49,15 +51,8 @@ pub(crate) async fn deliver_pass(runtime: &Arc<RuntimeManager>, sender: &Coordin
             .send(InputOrigin::UserApi, reply.reply, reply.request_id.clone())
             .await
         {
-            CoordinatorSend::Accepted => {
-                let now = chrono::Utc::now().timestamp_micros();
-                if let Err(error) = db
-                    .mark_coordinator_question_reply_delivered(&reply.request_id, now)
-                    .await
-                {
-                    tracing::warn!(request_id = %reply.request_id, %error, "coordinator question reply delivered but not marked; the next pass is idempotent");
-                }
-            }
+            // Acceptance marks the reply delivered in the same insert.
+            CoordinatorSend::Accepted => {}
             CoordinatorSend::Rejected { code, message } => {
                 tracing::warn!(request_id = %reply.request_id, code, %message, "coordinator question reply not accepted; retrying");
             }

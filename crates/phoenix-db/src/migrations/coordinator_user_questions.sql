@@ -41,3 +41,29 @@ BEGIN
     SET status = 'withdrawn', settled_at_us = CAST(unixepoch('subsec') * 1000000 AS INTEGER)
     WHERE coordinator_product_conversation_id = OLD.id AND status = 'open';
 END;
+
+-- A reply is delivered when the Coordinator transcript accepts it: as a direct
+-- turn or as queued steering, under the question's request id. Marking it in
+-- the accepting insert means a later Coordinator transcript never receives it
+-- again.
+CREATE TRIGGER coordinator_question_reply_accept_turn AFTER INSERT ON durable_turns
+WHEN NEW.origin_kind = 'user_api'
+BEGIN
+    UPDATE coordinator_user_questions
+    SET delivered_at_us = CAST(unixepoch('subsec') * 1000000 AS INTEGER)
+    WHERE request_id = NEW.client_turn_key AND delivered_at_us IS NULL
+      AND status IN ('answered', 'dismissed')
+      AND coordinator_product_conversation_id =
+          (SELECT product_conversation_id FROM conversations WHERE id = NEW.conversation_id);
+END;
+
+CREATE TRIGGER coordinator_question_reply_accept_steering AFTER INSERT ON steering_messages
+WHEN NEW.origin_kind = 'user_api'
+BEGIN
+    UPDATE coordinator_user_questions
+    SET delivered_at_us = CAST(unixepoch('subsec') * 1000000 AS INTEGER)
+    WHERE request_id = NEW.message_id AND delivered_at_us IS NULL
+      AND status IN ('answered', 'dismissed')
+      AND coordinator_product_conversation_id =
+          (SELECT product_conversation_id FROM conversations WHERE id = NEW.conversation_id);
+END;
