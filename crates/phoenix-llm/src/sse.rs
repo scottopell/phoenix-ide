@@ -24,7 +24,7 @@
 //!    `\r\n` pair split across chunks.
 //! 5. **Trailing whitespace tolerance** — the gateway may pad `data:` lines.
 
-use phoenix_core::sse_lines::LineSplitter;
+use phoenix_core::sse_lines::{LineSplitter, SseLimitExceeded};
 
 /// A fully assembled SSE event ready for dispatch.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -44,27 +44,66 @@ pub struct SseDiagnostics {
     pub pending_data_len: usize,
 }
 
+/// Largest single SSE line accepted from a provider. Generous, because a
+/// completed Responses-API event carries the whole response on one line; it
+/// only has to stop unbounded growth.
+pub const MAX_SSE_LINE_BYTES: usize = 16 * 1024 * 1024;
+
+/// Largest event (event type plus all data lines) accepted from a provider.
+pub const MAX_SSE_EVENT_BYTES: usize = 16 * 1024 * 1024;
+
 /// Accumulates fields of the event currently being built.
-#[derive(Default)]
 struct EventAssembler {
     event_type: String,
     data_lines: Vec<String>,
+    pending_bytes: usize,
+    max_event_bytes: usize,
 }
 
 impl EventAssembler {
-    fn push_line(&mut self, line: &str) -> Option<SseEvent> {
+    fn new(max_event_bytes: usize) -> Self {
+        Self {
+            event_type: String::new(),
+            data_lines: Vec::new(),
+            pending_bytes: 0,
+            max_event_bytes,
+        }
+    }
+
+    fn push_line(&mut self, line: &str) -> Result<Option<SseEvent>, SseLimitExceeded> {
         if line.is_empty() {
-            return self.dispatch();
+            return Ok(self.dispatch());
         }
         let (name, value) = line.split_once(':').unwrap_or((line, ""));
         let value = value.strip_prefix(' ').unwrap_or(value);
         match name {
-            "data" => self.data_lines.push(value.to_string()),
-            "event" => self.event_type = value.to_string(),
+            "data" => {
+                self.pending_bytes = self.pending_bytes.saturating_add(value.len());
+                self.data_lines.push(value.to_string());
+            }
+            "event" => {
+                self.pending_bytes = self
+                    .pending_bytes
+                    .saturating_sub(self.event_type.len())
+                    .saturating_add(value.len());
+                self.event_type = value.to_string();
+            }
             // a comment line (empty name) and unknown fields are ignored.
             _ => {}
         }
-        None
+        if self.pending_bytes > self.max_event_bytes {
+            self.clear();
+            return Err(SseLimitExceeded::Event {
+                limit: self.max_event_bytes,
+            });
+        }
+        Ok(None)
+    }
+
+    fn clear(&mut self) {
+        self.event_type = String::new();
+        self.data_lines = Vec::new();
+        self.pending_bytes = 0;
     }
 
     /// The event type resets on every dispatch attempt. An event whose data
@@ -72,6 +111,7 @@ impl EventAssembler {
     fn dispatch(&mut self) -> Option<SseEvent> {
         let event_type = std::mem::take(&mut self.event_type);
         let lines = std::mem::take(&mut self.data_lines);
+        self.pending_bytes = 0;
         lines.iter().any(|line| !line.is_empty()).then(|| SseEvent {
             event_type,
             data: lines.join("\n"),
@@ -86,19 +126,26 @@ impl EventAssembler {
 /// Incremental SSE parser.
 ///
 /// Feed it arbitrary byte slices via [`push`]; it buffers incomplete lines
-/// internally and emits complete [`SseEvent`]s.
+/// internally and emits complete [`SseEvent`]s. A peer that exceeds the line
+/// or event cap fails the parser permanently.
 pub struct SseParser {
     splitter: LineSplitter,
     assembler: EventAssembler,
+    failed: Option<SseLimitExceeded>,
     chunk_count: usize,
     bytes_received: usize,
 }
 
 impl SseParser {
     pub fn new() -> Self {
+        Self::with_limits(MAX_SSE_LINE_BYTES, MAX_SSE_EVENT_BYTES)
+    }
+
+    pub fn with_limits(max_line_bytes: usize, max_event_bytes: usize) -> Self {
         Self {
-            splitter: LineSplitter::new(),
-            assembler: EventAssembler::default(),
+            splitter: LineSplitter::with_limit(max_line_bytes),
+            assembler: EventAssembler::new(max_event_bytes),
+            failed: None,
             chunk_count: 0,
             bytes_received: 0,
         }
@@ -107,19 +154,39 @@ impl SseParser {
     /// Feed a chunk of bytes into the parser.
     ///
     /// Returns zero or more complete events extracted from the buffered data.
-    pub fn push(&mut self, bytes: &[u8]) -> Vec<SseEvent> {
+    ///
+    /// # Errors
+    /// [`SseLimitExceeded`] when a line or event outgrows its cap; every later
+    /// call returns the same error.
+    pub fn push(&mut self, bytes: &[u8]) -> Result<Vec<SseEvent>, SseLimitExceeded> {
+        if let Some(error) = self.failed {
+            return Err(error);
+        }
         self.chunk_count = self.chunk_count.saturating_add(1);
         self.bytes_received = self.bytes_received.saturating_add(bytes.len());
         let mut events = Vec::new();
+        let mut event_error = None;
         let assembler = &mut self.assembler;
-        self.splitter.push(bytes, |line| {
+        let split = self.splitter.push(bytes, |line| {
+            if event_error.is_some() {
+                return;
+            }
             // Invalid UTF-8 (a gateway bug) is decoded lossily rather than
             // dropping the whole line.
-            if let Some(event) = assembler.push_line(&String::from_utf8_lossy(line)) {
-                events.push(event);
+            match assembler.push_line(&String::from_utf8_lossy(line)) {
+                Ok(Some(event)) => events.push(event),
+                Ok(None) => {}
+                Err(error) => event_error = Some(error),
             }
         });
-        events
+        match event_error.map_or(split, Err) {
+            Ok(()) => Ok(events),
+            Err(error) => {
+                self.failed = Some(error);
+                self.assembler.clear();
+                Err(error)
+            }
+        }
     }
 
     /// Content-free parser counters safe for operational logging.
@@ -142,13 +209,25 @@ impl SseParser {
 }
 
 #[cfg(test)]
+trait PushOk {
+    fn push_ok(&mut self, bytes: &[u8]) -> Vec<SseEvent>;
+}
+
+#[cfg(test)]
+impl PushOk for SseParser {
+    fn push_ok(&mut self, bytes: &[u8]) -> Vec<SseEvent> {
+        self.push(bytes).expect("limits not exceeded")
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn basic_event() {
         let mut p = SseParser::new();
-        let events = p.push(b"event: ping\ndata: {\"type\": \"ping\"}\n\n");
+        let events = p.push_ok(b"event: ping\ndata: {\"type\": \"ping\"}\n\n");
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].event_type, "ping");
         assert_eq!(events[0].data, "{\"type\": \"ping\"}");
@@ -157,7 +236,7 @@ mod tests {
     #[test]
     fn multi_data_lines_joined() {
         let mut p = SseParser::new();
-        let events = p.push(b"data: line1\ndata: line2\n\n");
+        let events = p.push_ok(b"data: line1\ndata: line2\n\n");
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].data, "line1\nline2");
     }
@@ -165,7 +244,7 @@ mod tests {
     #[test]
     fn crlf_line_endings() {
         let mut p = SseParser::new();
-        let events = p.push(b"event: test\r\ndata: hello\r\n\r\n");
+        let events = p.push_ok(b"event: test\r\ndata: hello\r\n\r\n");
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].event_type, "test");
         assert_eq!(events[0].data, "hello");
@@ -174,10 +253,10 @@ mod tests {
     #[test]
     fn split_across_chunks() {
         let mut p = SseParser::new();
-        assert!(p.push(b"event: te").is_empty());
-        assert!(p.push(b"st\nda").is_empty());
-        assert!(p.push(b"ta: hello\n").is_empty());
-        let events = p.push(b"\n");
+        assert!(p.push_ok(b"event: te").is_empty());
+        assert!(p.push_ok(b"st\nda").is_empty());
+        assert!(p.push_ok(b"ta: hello\n").is_empty());
+        let events = p.push_ok(b"\n");
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].event_type, "test");
         assert_eq!(events[0].data, "hello");
@@ -190,11 +269,11 @@ mod tests {
         // First chunk: "data: hello " + first byte of em-dash (0xE2)
         let mut chunk1 = b"data: hello ".to_vec();
         chunk1.push(0xE2);
-        assert!(p.push(&chunk1).is_empty());
+        assert!(p.push_ok(&chunk1).is_empty());
         // Second chunk: remaining bytes of em-dash (0x80, 0x94) + " world\n\n"
         let mut chunk2 = vec![0x80, 0x94];
         chunk2.extend_from_slice(b" world\n\n");
-        let events = p.push(&chunk2);
+        let events = p.push_ok(&chunk2);
         let all_data: String = events.iter().map(|e| e.data.clone()).collect();
         assert!(
             all_data.contains('\u{2014}'),
@@ -206,7 +285,7 @@ mod tests {
     #[test]
     fn data_no_space_after_colon() {
         let mut p = SseParser::new();
-        let events = p.push(b"data:hello\n\n");
+        let events = p.push_ok(b"data:hello\n\n");
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].data, "hello");
     }
@@ -214,7 +293,7 @@ mod tests {
     #[test]
     fn gateway_trailing_whitespace() {
         let mut p = SseParser::new();
-        let events = p.push(b"data: {\"type\":\"ping\"}     \n\n");
+        let events = p.push_ok(b"data: {\"type\":\"ping\"}     \n\n");
         assert_eq!(events.len(), 1);
         // Trailing whitespace is kept (JSON parser handles it fine)
         assert!(events[0].data.starts_with("{\"type\":\"ping\"}"));
@@ -223,7 +302,7 @@ mod tests {
     #[test]
     fn finish_flushes_unterminated_event() {
         let mut p = SseParser::new();
-        assert!(p.push(b"data: partial\n").is_empty());
+        assert!(p.push_ok(b"data: partial\n").is_empty());
         let events = p.finish();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].data, "partial");
@@ -232,7 +311,7 @@ mod tests {
     #[test]
     fn no_event_type_defaults_to_empty() {
         let mut p = SseParser::new();
-        let events = p.push(b"data: hello\n\n");
+        let events = p.push_ok(b"data: hello\n\n");
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].event_type, "");
     }
@@ -242,9 +321,9 @@ mod tests {
         // A chunk boundary falling between \r and \n must not produce a blank
         // line that dispatches the event early.
         let mut p = SseParser::new();
-        let mut events = p.push(b"event: test\r\ndata: a\r");
-        events.extend(p.push(b"\ndata: b\r\n\r"));
-        events.extend(p.push(b"\n"));
+        let mut events = p.push_ok(b"event: test\r\ndata: a\r");
+        events.extend(p.push_ok(b"\ndata: b\r\n\r"));
+        events.extend(p.push_ok(b"\n"));
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].event_type, "test");
         assert_eq!(events[0].data, "a\nb");
@@ -253,7 +332,7 @@ mod tests {
     #[test]
     fn event_type_resets_after_dataless_event() {
         let mut p = SseParser::new();
-        let events = p.push(b"event: ping\n\ndata: x\n\n");
+        let events = p.push_ok(b"event: ping\n\ndata: x\n\n");
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].event_type, "");
     }
@@ -261,22 +340,22 @@ mod tests {
     #[test]
     fn all_empty_data_lines_are_not_dispatched() {
         let mut p = SseParser::new();
-        assert!(p.push(b"data:\ndata:\n\ndata\n\n").is_empty());
-        let events = p.push(b"data:\ndata: x\n\n");
+        assert!(p.push_ok(b"data:\ndata:\n\ndata\n\n").is_empty());
+        let events = p.push_ok(b"data:\ndata: x\n\n");
         assert_eq!(events[0].data, "\nx");
     }
 
     #[test]
     fn finish_discards_torn_final_line() {
         let mut p = SseParser::new();
-        assert!(p.push(b"event: e\ndata: {\"te").is_empty());
+        assert!(p.push_ok(b"event: e\ndata: {\"te").is_empty());
         assert!(p.finish().is_empty());
     }
 
     #[test]
     fn finish_flushes_complete_data_line_with_cr_tail() {
         let mut p = SseParser::new();
-        assert!(p.push(b"data: a\r").is_empty());
+        assert!(p.push_ok(b"data: a\r").is_empty());
         let events = p.finish();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].data, "a");
@@ -286,7 +365,7 @@ mod tests {
     fn bare_cr_line_endings() {
         let mut p = SseParser::new();
         // Bare \r as line ending (WHATWG SSE spec requires this)
-        let events = p.push(b"event: test\rdata: hello\r\r");
+        let events = p.push_ok(b"event: test\rdata: hello\r\r");
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].event_type, "test");
         assert_eq!(events[0].data, "hello");
@@ -296,7 +375,7 @@ mod tests {
     fn bare_cr_mixed_with_lf() {
         let mut p = SseParser::new();
         // Mix of bare \r and \n
-        let events = p.push(b"event: test\rdata: hello\n\n");
+        let events = p.push_ok(b"event: test\rdata: hello\n\n");
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].event_type, "test");
         assert_eq!(events[0].data, "hello");
@@ -306,7 +385,7 @@ mod tests {
     fn bare_cr_between_events() {
         // Simulates the exact corruption pattern: two events separated only by \r
         let mut p = SseParser::new();
-        let events = p.push(b"data: {\"text\":\"hello\"}\r\rdata: {\"text\":\"world\"}\r\r");
+        let events = p.push_ok(b"data: {\"text\":\"hello\"}\r\rdata: {\"text\":\"world\"}\r\r");
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].data, "{\"text\":\"hello\"}");
         assert_eq!(events[1].data, "{\"text\":\"world\"}");
@@ -315,7 +394,7 @@ mod tests {
     #[test]
     fn multiple_events_in_one_chunk() {
         let mut p = SseParser::new();
-        let events = p.push(b"data: one\n\ndata: two\n\n");
+        let events = p.push_ok(b"data: one\n\ndata: two\n\n");
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].data, "one");
         assert_eq!(events[1].data, "two");
@@ -390,7 +469,7 @@ mod proptests {
         ) {
             // Reference: feed all at once
             let mut ref_parser = SseParser::new();
-            let ref_events = ref_parser.push(&bytes);
+            let ref_events = ref_parser.push_ok(&bytes);
 
             // Split at arbitrary points (deterministic from seed)
             let split_points = {
@@ -414,11 +493,11 @@ mod proptests {
             let mut prev = 0;
             for &sp in &split_points {
                 if sp > prev {
-                    chunked_events.extend(chunked_parser.push(&bytes[prev..sp]));
+                    chunked_events.extend(chunked_parser.push_ok(&bytes[prev..sp]));
                     prev = sp;
                 }
             }
-            chunked_events.extend(chunked_parser.push(&bytes[prev..]));
+            chunked_events.extend(chunked_parser.push_ok(&bytes[prev..]));
 
             prop_assert_eq!(
                 &ref_events, &chunked_events,
@@ -455,8 +534,8 @@ mod proptests {
             for split_at in 0..raw_bytes.len() {
                 let mut p = SseParser::new();
                 let mut events: Vec<SseEvent> = Vec::new();
-                events.extend(p.push(&raw_bytes[..split_at]));
-                events.extend(p.push(&raw_bytes[split_at..]));
+                events.extend(p.push_ok(&raw_bytes[..split_at]));
+                events.extend(p.push_ok(&raw_bytes[split_at..]));
 
                 prop_assert_eq!(
                     events.len(), 1,
@@ -494,7 +573,7 @@ mod proptests {
             raw.push('\n'); // blank line terminates
 
             let mut p = SseParser::new();
-            let events = p.push(raw.as_bytes());
+            let events = p.push_ok(raw.as_bytes());
 
             prop_assert_eq!(events.len(), 1);
             prop_assert_eq!(&events[0].data, &expected_data);
@@ -524,10 +603,10 @@ mod proptests {
             }
 
             let mut lf_parser = SseParser::new();
-            let lf_events = lf_parser.push(&lf_bytes);
+            let lf_events = lf_parser.push_ok(&lf_bytes);
 
             let mut crlf_parser = SseParser::new();
-            let crlf_events = crlf_parser.push(&crlf_bytes);
+            let crlf_events = crlf_parser.push_ok(&crlf_bytes);
 
             prop_assert_eq!(
                 &lf_events, &crlf_events,
@@ -554,10 +633,10 @@ mod proptests {
             let cr_bytes: Vec<u8> = lf_bytes.iter().map(|&b| if b == b'\n' { b'\r' } else { b }).collect();
 
             let mut lf_parser = SseParser::new();
-            let lf_events = lf_parser.push(&lf_bytes);
+            let lf_events = lf_parser.push_ok(&lf_bytes);
 
             let mut cr_parser = SseParser::new();
-            let cr_events = cr_parser.push(&cr_bytes);
+            let cr_events = cr_parser.push_ok(&cr_bytes);
 
             prop_assert_eq!(
                 &lf_events, &cr_events,
@@ -572,7 +651,7 @@ mod proptests {
         let secret = "Bearer SECRET_SENTINEL prompt and tool schema";
         let wire = format!("event: error\ndata: {secret}");
         let mut parser = SseParser::new();
-        parser.push(wire.as_bytes());
+        parser.push_ok(wire.as_bytes());
 
         let diagnostics = parser.diagnostics();
         assert_eq!(diagnostics.chunk_count, 1);
@@ -608,7 +687,7 @@ mod proptests {
 
             // Feed as a single chunk (reference)
             let mut ref_parser = SseParser::new();
-            let ref_events = ref_parser.push(&raw_bytes);
+            let ref_events = ref_parser.push_ok(&raw_bytes);
             prop_assert_eq!(ref_events.len(), 1);
 
             // Verify the data parses as valid JSON
@@ -623,8 +702,8 @@ mod proptests {
             // Now split at every byte and verify identical output
             for split_at in 0..raw_bytes.len() {
                 let mut p = SseParser::new();
-                let mut events = p.push(&raw_bytes[..split_at]);
-                events.extend(p.push(&raw_bytes[split_at..]));
+                let mut events = p.push_ok(&raw_bytes[..split_at]);
+                events.extend(p.push_ok(&raw_bytes[split_at..]));
 
                 prop_assert_eq!(
                     events.len(), 1,
@@ -744,7 +823,7 @@ mod model_proptests {
 
     fn feed(chunks: &[&[u8]]) -> Vec<SseEvent> {
         let mut p = SseParser::new();
-        chunks.iter().flat_map(|c| p.push(c)).collect()
+        chunks.iter().flat_map(|c| p.push_ok(c)).collect()
     }
 
     proptest! {
@@ -786,6 +865,76 @@ mod model_proptests {
             let (bytes, expected) = render(&script);
             let chunks: Vec<&[u8]> = bytes.chunks(1).collect();
             prop_assert_eq!(feed(&chunks), expected);
+        }
+    }
+}
+
+#[cfg(test)]
+mod limit_tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    #[test]
+    fn oversized_line_fails_loudly_and_stays_failed() {
+        let mut p = SseParser::with_limits(8, 1024);
+        let error = SseLimitExceeded::Line { limit: 8 };
+        assert_eq!(p.push(b"data: 0123456789"), Err(error));
+        assert_eq!(p.push(b"\n\n"), Err(error));
+        assert_eq!(p.diagnostics().buffered_bytes, 0);
+    }
+
+    #[test]
+    fn many_small_lines_hit_the_event_cap() {
+        let mut p = SseParser::with_limits(64, 10);
+        assert_eq!(p.push(b"data: abcd\ndata: efgh\n"), Ok(vec![]));
+        assert_eq!(
+            p.push(b"data: ijk\n"),
+            Err(SseLimitExceeded::Event { limit: 10 })
+        );
+        assert_eq!(p.diagnostics().pending_data_len, 0);
+    }
+
+    #[test]
+    fn event_cap_counts_type_and_data_and_allows_exact_fit() {
+        let mut p = SseParser::with_limits(64, 4);
+        let events = p.push(b"event: e\ndata: abc\n\n").unwrap();
+        assert_eq!(events.len(), 1);
+        let mut p = SseParser::with_limits(64, 4);
+        assert_eq!(
+            p.push(b"event: e\ndata: abcd\n\n"),
+            Err(SseLimitExceeded::Event { limit: 4 })
+        );
+    }
+
+    proptest! {
+        /// For any caps and chunking, buffered bytes never exceed the line cap
+        /// and pending event bytes never exceed the event cap.
+        #[test]
+        fn memory_stays_bounded(
+            bytes in proptest::collection::vec(
+                prop_oneof![Just(b'a'), Just(b':'), Just(b' '), Just(b'\n'), Just(b'\r')],
+                0..200,
+            ),
+            line_cap in 1usize..20,
+            event_cap in 1usize..30,
+            cuts in proptest::collection::vec(any::<prop::sample::Index>(), 0..8),
+        ) {
+            let mut points: Vec<usize> =
+                cuts.iter().map(|i| i.index(bytes.len() + 1)).collect();
+            points.sort_unstable();
+            let mut p = SseParser::with_limits(line_cap, event_cap);
+            let mut prev = 0;
+            for end in points.into_iter().chain([bytes.len()]) {
+                let result = p.push(&bytes[prev..end]);
+                let d = p.diagnostics();
+                prop_assert!(d.buffered_bytes <= line_cap);
+                prop_assert!(d.pending_data_len + d.pending_event_type_len <= event_cap);
+                if result.is_err() {
+                    prop_assert!(p.push(b"x").is_err());
+                    break;
+                }
+                prev = end;
+            }
         }
     }
 }

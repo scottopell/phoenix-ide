@@ -1,20 +1,53 @@
 //! Line framing for Server-Sent Events streams (`\n`, `\r\n` or bare `\r`).
 
+/// A configured SSE size cap was exceeded by the peer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum SseLimitExceeded {
+    #[error("SSE line exceeded {limit} bytes")]
+    Line { limit: usize },
+    #[error("SSE event exceeded {limit} bytes")]
+    Event { limit: usize },
+}
+
 /// Splits a byte stream into lines, independent of how it is chunked.
-#[derive(Debug, Default)]
+///
+/// There is no unlimited constructor: every caller picks a cap. Once the cap
+/// is exceeded the splitter stays failed and rejects further input.
+#[derive(Debug)]
 pub struct LineSplitter {
     line: Vec<u8>,
     after_cr: bool,
+    max_line_bytes: usize,
+    failed: Option<SseLimitExceeded>,
 }
 
 impl LineSplitter {
     #[must_use]
-    pub fn new() -> Self {
-        Self::default()
+    pub fn with_limit(max_line_bytes: usize) -> Self {
+        Self {
+            line: Vec::new(),
+            after_cr: false,
+            max_line_bytes,
+            failed: None,
+        }
     }
 
     /// Feed bytes, calling `emit` once per completed line (terminator excluded).
-    pub fn push(&mut self, bytes: &[u8], mut emit: impl FnMut(&[u8])) {
+    ///
+    /// Lines completed before an oversized one in the same call are still
+    /// emitted.
+    ///
+    /// # Errors
+    /// [`SseLimitExceeded::Line`] when a line grows past the cap; every later
+    /// call returns the same error.
+    pub fn push(
+        &mut self,
+        bytes: &[u8],
+        mut emit: impl FnMut(&[u8]),
+    ) -> Result<(), SseLimitExceeded> {
+        if let Some(error) = self.failed {
+            return Err(error);
+        }
         for &b in bytes {
             match b {
                 // The `\n` half of a `\r\n` pair whose `\r` already ended a line.
@@ -26,10 +59,19 @@ impl LineSplitter {
                 }
                 _ => {
                     self.after_cr = false;
+                    if self.line.len() >= self.max_line_bytes {
+                        let error = SseLimitExceeded::Line {
+                            limit: self.max_line_bytes,
+                        };
+                        self.failed = Some(error);
+                        self.line = Vec::new();
+                        return Err(error);
+                    }
                     self.line.push(b);
                 }
             }
         }
+        Ok(())
     }
 
     /// Take the unterminated final line, if any (end of stream acts as its
@@ -68,10 +110,10 @@ mod tests {
     }
 
     fn split(chunks: &[&[u8]]) -> Vec<Vec<u8>> {
-        let mut s = LineSplitter::new();
+        let mut s = LineSplitter::with_limit(usize::MAX);
         let mut out = Vec::new();
         for c in chunks {
-            s.push(c, |l| out.push(l.to_vec()));
+            s.push(c, |l| out.push(l.to_vec())).unwrap();
         }
         out
     }
@@ -125,5 +167,52 @@ mod tests {
             split(&[b"a\r", b"\nb\n"]),
             vec![b"a".to_vec(), b"b".to_vec()]
         );
+    }
+
+    proptest! {
+        /// For any cap and chunking, the splitter either yields exactly the
+        /// lines of the stream or fails with `Line`, and it never buffers more
+        /// than the cap.
+        #[test]
+        fn limit_is_enforced_exactly(
+            lines in proptest::collection::vec("[a-z]{0,12}", 0..10),
+            limit in 0usize..16,
+            cuts in proptest::collection::vec(any::<prop::sample::Index>(), 0..6),
+        ) {
+            let bytes: Vec<u8> = lines.iter().flat_map(|l| format!("{l}\n").into_bytes()).collect();
+            let mut points: Vec<usize> =
+                cuts.iter().map(|i| i.index(bytes.len() + 1)).collect();
+            points.sort_unstable();
+            let mut s = LineSplitter::with_limit(limit);
+            let mut out: Vec<Vec<u8>> = Vec::new();
+            let mut result = Ok(());
+            let mut prev = 0;
+            for p in points.into_iter().chain([bytes.len()]) {
+                result = s.push(&bytes[prev..p], |l| out.push(l.to_vec()));
+                prop_assert!(s.buffered_len() <= limit);
+                if result.is_err() {
+                    break;
+                }
+                prev = p;
+            }
+            let fits = lines.iter().all(|l| l.len() <= limit);
+            prop_assert_eq!(result.is_ok(), fits);
+            if fits {
+                let expected: Vec<Vec<u8>> = lines.iter().map(|l| l.as_bytes().to_vec()).collect();
+                prop_assert_eq!(out, expected);
+            }
+        }
+    }
+
+    #[test]
+    fn failure_is_sticky() {
+        let mut s = LineSplitter::with_limit(2);
+        let error = SseLimitExceeded::Line { limit: 2 };
+        assert_eq!(s.push(b"abc", |_| {}), Err(error));
+        assert_eq!(
+            s.push(b"\n", |_| panic!("no lines after failure")),
+            Err(error)
+        );
+        assert_eq!(s.buffered_len(), 0);
     }
 }

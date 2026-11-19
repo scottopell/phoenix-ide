@@ -1767,7 +1767,10 @@ pub async fn complete_streaming(
 
     'outer: while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|e| LlmError::network(format!("Stream error: {e}")))?;
-        for event in sse.push(&chunk) {
+        let events = sse
+            .push(&chunk)
+            .map_err(|e| LlmError::invalid_response(format!("SSE stream rejected: {e}")))?;
+        for event in events {
             if let Err(e) = acc
                 .process_event(&event.event_type, &event.data, chunk_tx)
                 .await
@@ -3532,7 +3535,10 @@ pub async fn complete_streaming_chat(
 
     'outer: while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|e| LlmError::network(format!("Stream error: {e}")))?;
-        for event in sse.push(&chunk) {
+        let events = sse
+            .push(&chunk)
+            .map_err(|e| LlmError::invalid_response(format!("SSE stream rejected: {e}")))?;
+        for event in events {
             if let Err(e) = acc.process_event(&event.data, chunk_tx).await {
                 tracing::error!(
                     data_len = event.data.len(),

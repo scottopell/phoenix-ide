@@ -11,6 +11,7 @@
 use crate::{HttpAuth, McpTransport, ServerMessageSink, SharedBearer, StaticCred, TransportError};
 use async_trait::async_trait;
 use futures::StreamExt;
+use phoenix_core::sse_lines::{LineSplitter, SseLimitExceeded};
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue, ACCEPT, AUTHORIZATION};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -443,12 +444,15 @@ impl HttpTransport {
         let result = if content_type.starts_with("text/event-stream") {
             // A stream of JSON-RPC messages delivered as SSE events; the
             // correlated reply ends the wait (REQ-MCP-004).
-            let mut framer = SseFramer::default();
+            let mut framer = SseFramer::new();
             let mut stream = response.bytes_stream();
             let mut outcome = None;
             'read: while let Some(chunk) = stream.next().await {
                 let chunk = chunk.map_err(|e| Self::classify_request_error(e, method))?;
-                for data in framer.push(&chunk) {
+                let payloads = framer.push(&chunk).map_err(|e| {
+                    TransportError::Protocol(format!("SSE stream for '{method}' rejected: {e}"))
+                })?;
+                for data in payloads {
                     if let Some(found) = self.dispatch_sse_data(&data, id, method, sink) {
                         outcome = Some(found);
                         break 'read;
@@ -456,7 +460,10 @@ impl HttpTransport {
                 }
             }
             if outcome.is_none() {
-                if let Some(data) = framer.finish() {
+                let last = framer.finish().map_err(|e| {
+                    TransportError::Protocol(format!("SSE stream for '{method}' rejected: {e}"))
+                })?;
+                if let Some(data) = last {
                     outcome = self.dispatch_sse_data(&data, id, method, sink);
                 }
             }
@@ -823,31 +830,37 @@ impl ServerStream {
     ) -> StreamOutcome {
         let started = Instant::now();
         let mut delivered = false;
-        let mut framer = SseFramer::default();
+        let mut framer = SseFramer::new();
         let mut stream = response.bytes_stream();
         let reason = loop {
             match stream.next().await {
-                Some(Ok(chunk)) => {
-                    for data in framer.push(&chunk) {
-                        self.dispatch(&data);
-                        delivered = true;
+                Some(Ok(chunk)) => match framer.push(&chunk) {
+                    Ok(payloads) => {
+                        for data in payloads {
+                            self.dispatch(&data);
+                            delivered = true;
+                        }
                     }
-                }
+                    Err(e) => break format!("GET stream rejected: {e}"),
+                },
                 Some(Err(e)) => break format!("GET stream read error: {e}"),
-                None => {
-                    if let Some(data) = framer.finish() {
-                        self.dispatch(&data);
-                        delivered = true;
+                None => match framer.finish() {
+                    Ok(last) => {
+                        if let Some(data) = last {
+                            self.dispatch(&data);
+                            delivered = true;
+                        }
+                        break "GET stream closed by server".to_string();
                     }
-                    break "GET stream closed by server".to_string();
-                }
+                    Err(e) => break format!("GET stream rejected: {e}"),
+                },
             }
         };
-        last_event_id.clone_from(&framer.last_id);
+        last_event_id.clone_from(&framer.last_id().cloned());
         StreamOutcome::Disconnected {
             productive: delivered || started.elapsed() >= Self::HEALTHY_AFTER,
             reason,
-            retry_after: framer.retry,
+            retry_after: framer.retry(),
         }
     }
 
@@ -898,88 +911,163 @@ impl ServerStream {
 /// field sets the reconnection time; the server-initiated GET stream reads both
 /// off the framer to resume and pace reconnects (REQ-MCP-006). The POST reply
 /// path consumes only the data payloads.
-#[derive(Default)]
 struct SseFramer {
-    splitter: phoenix_core::sse_lines::LineSplitter,
+    splitter: LineSplitter,
+    fields: SseFields,
+    failed: Option<SseLimitExceeded>,
+}
+
+/// Largest single SSE line accepted from an MCP server. Generous, because a
+/// JSON-RPC result (tool output, base64 content) arrives on one `data:` line.
+const MAX_SSE_LINE_BYTES: usize = 64 * 1024 * 1024;
+
+/// Largest event (all `data:` lines together) accepted from an MCP server.
+const MAX_SSE_EVENT_BYTES: usize = 64 * 1024 * 1024;
+
+/// Field state of the event being framed, plus the stream-level `id`/`retry`.
+struct SseFields {
     data_lines: Vec<String>,
+    pending_bytes: usize,
+    max_event_bytes: usize,
     last_id: Option<String>,
     retry: Option<Duration>,
 }
 
-impl SseFramer {
-    /// Feed a chunk; returns the data payloads of the events completed by it.
-    fn push(&mut self, chunk: &[u8]) -> Vec<String> {
-        let mut events = Vec::new();
-        let Self {
-            splitter,
-            data_lines,
-            last_id,
-            retry,
-        } = self;
-        splitter.push(chunk, |line| {
-            if let Some(event) = Self::apply_line(data_lines, last_id, retry, line) {
-                events.push(event);
-            }
-        });
-        events
-    }
-
+impl SseFields {
     /// Apply one complete line; returns the payload if it dispatched an event.
-    fn apply_line(
-        data_lines: &mut Vec<String>,
-        last_id: &mut Option<String>,
-        retry: &mut Option<Duration>,
-        line: &[u8],
-    ) -> Option<String> {
+    fn apply(&mut self, line: &[u8]) -> Result<Option<String>, SseLimitExceeded> {
         let line = String::from_utf8_lossy(line);
         if line.is_empty() {
             // An event with only empty data lines (e.g. a priming event that
             // just carries an `id`) has no JSON-RPC message to deliver.
-            let payload = data_lines
+            let payload = self
+                .data_lines
                 .iter()
                 .any(|line| !line.is_empty())
-                .then(|| data_lines.join("\n"));
-            data_lines.clear();
-            return payload;
+                .then(|| self.data_lines.join("\n"));
+            self.data_lines.clear();
+            self.pending_bytes = 0;
+            return Ok(payload);
         }
         // A line with no colon is a field name with an empty value.
         let (name, value) = line.split_once(':').unwrap_or((&line, ""));
         let value = value.strip_prefix(' ').unwrap_or(value);
         match name {
-            "data" => data_lines.push(value.to_string()),
+            "data" => {
+                self.pending_bytes = self.pending_bytes.saturating_add(value.len());
+                if self.pending_bytes > self.max_event_bytes {
+                    self.data_lines = Vec::new();
+                    self.pending_bytes = 0;
+                    return Err(SseLimitExceeded::Event {
+                        limit: self.max_event_bytes,
+                    });
+                }
+                self.data_lines.push(value.to_string());
+            }
             // The `id` field sets the persistent last event id. An empty value
             // resets it so the next reconnect omits Last-Event-ID; a NUL value
             // is ignored per the SSE spec.
             "id" if !value.contains('\0') => {
-                *last_id = (!value.is_empty()).then(|| value.to_string());
+                self.last_id = (!value.is_empty()).then(|| value.to_string());
             }
             // A `retry:` value is the reconnection time in integer
             // milliseconds; a non-integer value is ignored.
             "retry" if !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit()) => {
                 if let Ok(ms) = value.parse::<u64>() {
-                    *retry = Some(Duration::from_millis(ms));
+                    self.retry = Some(Duration::from_millis(ms));
                 }
             }
             _ => {}
         }
-        None
+        Ok(None)
+    }
+}
+
+impl SseFramer {
+    fn new() -> Self {
+        Self::with_limits(MAX_SSE_LINE_BYTES, MAX_SSE_EVENT_BYTES)
+    }
+
+    fn with_limits(max_line_bytes: usize, max_event_bytes: usize) -> Self {
+        Self {
+            splitter: LineSplitter::with_limit(max_line_bytes),
+            fields: SseFields {
+                data_lines: Vec::new(),
+                pending_bytes: 0,
+                max_event_bytes,
+                last_id: None,
+                retry: None,
+            },
+            failed: None,
+        }
+    }
+
+    fn last_id(&self) -> Option<&String> {
+        self.fields.last_id.as_ref()
+    }
+
+    fn retry(&self) -> Option<Duration> {
+        self.fields.retry
+    }
+
+    fn fail(&mut self, error: SseLimitExceeded) -> SseLimitExceeded {
+        self.failed = Some(error);
+        self.fields.data_lines = Vec::new();
+        self.fields.pending_bytes = 0;
+        error
+    }
+
+    /// Feed a chunk; returns the data payloads of the events completed by it.
+    ///
+    /// # Errors
+    /// [`SseLimitExceeded`] when a line or event outgrows its cap; every later
+    /// call returns the same error.
+    fn push(&mut self, chunk: &[u8]) -> Result<Vec<String>, SseLimitExceeded> {
+        if let Some(error) = self.failed {
+            return Err(error);
+        }
+        let mut events = Vec::new();
+        let mut event_error = None;
+        let fields = &mut self.fields;
+        let split = self.splitter.push(chunk, |line| {
+            if event_error.is_some() {
+                return;
+            }
+            match fields.apply(line) {
+                Ok(Some(event)) => events.push(event),
+                Ok(None) => {}
+                Err(error) => event_error = Some(error),
+            }
+        });
+        match event_error.map_or(split, Err) {
+            Ok(()) => Ok(events),
+            Err(error) => Err(self.fail(error)),
+        }
     }
 
     /// Flush a final event not terminated by a blank line before EOF. EOF
     /// acts as the missing line terminator too: a server may close the
     /// response immediately after the last `data:` line, without a trailing
     /// newline, and that line must not be lost.
-    fn finish(&mut self) -> Option<String> {
-        let Self {
-            splitter,
-            data_lines,
-            last_id,
-            retry,
-        } = self;
-        if let Some(line) = splitter.take_partial() {
-            Self::apply_line(data_lines, last_id, retry, &line);
+    ///
+    /// # Errors
+    /// The cap error if the framer already failed or the final line overflows
+    /// the event cap.
+    fn finish(&mut self) -> Result<Option<String>, SseLimitExceeded> {
+        if let Some(error) = self.failed {
+            return Err(error);
         }
-        Self::apply_line(data_lines, last_id, retry, b"")
+        if let Some(line) = self.splitter.take_partial() {
+            self.fields.apply(&line).map_err(|e| self.fail(e))?;
+        }
+        self.fields.apply(b"").map_err(|e| self.fail(e))
+    }
+}
+
+#[cfg(test)]
+impl SseFramer {
+    fn push_ok(&mut self, chunk: &[u8]) -> Vec<String> {
+        self.push(chunk).expect("limits not exceeded")
     }
 }
 
@@ -3537,79 +3625,84 @@ mod tests {
 
     #[test]
     fn sse_framer_priming_event_updates_id_without_dispatching() {
-        let mut framer = SseFramer::default();
-        assert!(framer.push(b"id: 1\ndata:\n\nid: 2\ndata\n\n").is_empty());
-        assert_eq!(framer.last_id.as_deref(), Some("2"));
-        assert_eq!(framer.push(b"data: {\"a\":1}\r\n\r\n"), vec!["{\"a\":1}"]);
+        let mut framer = SseFramer::new();
+        assert!(framer
+            .push_ok(b"id: 1\ndata:\n\nid: 2\ndata\n\n")
+            .is_empty());
+        assert_eq!(framer.last_id().map(String::as_str), Some("2"));
+        assert_eq!(
+            framer.push_ok(b"data: {\"a\":1}\r\n\r\n"),
+            vec!["{\"a\":1}"]
+        );
     }
 
     #[test]
     fn sse_framer_yields_event_per_blank_line() {
-        let mut framer = SseFramer::default();
-        let events = framer.push(b"data: {\"a\":1}\n\ndata: {\"b\":2}\n\n");
+        let mut framer = SseFramer::new();
+        let events = framer.push_ok(b"data: {\"a\":1}\n\ndata: {\"b\":2}\n\n");
         assert_eq!(events, vec!["{\"a\":1}", "{\"b\":2}"]);
     }
 
     #[test]
     fn sse_framer_handles_split_chunks_and_crlf() {
-        let mut framer = SseFramer::default();
-        assert!(framer.push(b"event: message\r\ndata: {\"a\"").is_empty());
-        let events = framer.push(b":1}\r\n\r\n");
+        let mut framer = SseFramer::new();
+        assert!(framer.push_ok(b"event: message\r\ndata: {\"a\"").is_empty());
+        let events = framer.push_ok(b":1}\r\n\r\n");
         assert_eq!(events, vec!["{\"a\":1}"]);
     }
 
     #[test]
     fn sse_framer_joins_multiline_data_and_flushes_on_finish() {
-        let mut framer = SseFramer::default();
-        assert!(framer.push(b"data: line1\ndata: line2\n").is_empty());
-        assert_eq!(framer.finish(), Some("line1\nline2".to_string()));
-        assert!(framer.finish().is_none());
+        let mut framer = SseFramer::new();
+        assert!(framer.push_ok(b"data: line1\ndata: line2\n").is_empty());
+        assert_eq!(framer.finish(), Ok(Some("line1\nline2".to_string())));
+        assert_eq!(framer.finish(), Ok(None));
     }
 
     #[test]
     fn sse_framer_flushes_an_unterminated_final_data_line() {
         // A server may close the response right after the last data line,
         // with no trailing newline; EOF must act as the terminator.
-        let mut framer = SseFramer::default();
-        assert!(framer.push(b"data: {\"a\":1}").is_empty());
-        assert_eq!(framer.finish(), Some("{\"a\":1}".to_string()));
-        assert!(framer.finish().is_none());
+        let mut framer = SseFramer::new();
+        assert!(framer.push_ok(b"data: {\"a\":1}").is_empty());
+        assert_eq!(framer.finish(), Ok(Some("{\"a\":1}".to_string())));
+        assert_eq!(framer.finish(), Ok(None));
     }
 
     #[test]
     fn sse_framer_tracks_id_and_retry_and_ignores_comments() {
         // `id:` sets the persistent last event id buffer and `retry:` the
         // reconnect hint (REQ-MCP-006); comments are ignored.
-        let mut framer = SseFramer::default();
-        let events = framer.push(b": keepalive\nid: 7\nretry: 100\ndata: x\n\n");
+        let mut framer = SseFramer::new();
+        let events = framer.push_ok(b": keepalive\nid: 7\nretry: 100\ndata: x\n\n");
         assert_eq!(events, vec!["x"]);
-        assert_eq!(framer.last_id.as_deref(), Some("7"));
-        assert_eq!(framer.retry, Some(Duration::from_millis(100)));
+        assert_eq!(framer.last_id().map(String::as_str), Some("7"));
+        assert_eq!(framer.retry(), Some(Duration::from_millis(100)));
         // The id persists across later events until the server changes it.
-        framer.push(b"data: y\n\n");
-        assert_eq!(framer.last_id.as_deref(), Some("7"));
+        framer.push_ok(b"data: y\n\n");
+        assert_eq!(framer.last_id().map(String::as_str), Some("7"));
     }
 
     #[test]
     fn sse_framer_empty_or_bare_id_resets_the_cursor() {
         // An empty or bare `id` resets the last-event-id buffer (SSE spec), so
         // the next reconnect omits Last-Event-ID rather than resuming stale.
-        let mut framer = SseFramer::default();
-        framer.push(b"id: 7\ndata: x\n\n");
-        assert_eq!(framer.last_id.as_deref(), Some("7"));
-        framer.push(b"id:\ndata: y\n\n");
-        assert_eq!(framer.last_id, None, "empty id: resets");
-        framer.push(b"id: 9\ndata: z\n\n");
-        assert_eq!(framer.last_id.as_deref(), Some("9"));
-        framer.push(b"id\ndata: w\n\n");
-        assert_eq!(framer.last_id, None, "bare id resets");
+        let mut framer = SseFramer::new();
+        framer.push_ok(b"id: 7\ndata: x\n\n");
+        assert_eq!(framer.last_id().map(String::as_str), Some("7"));
+        framer.push_ok(b"id:\ndata: y\n\n");
+        assert_eq!(framer.last_id(), None, "empty id: resets");
+        framer.push_ok(b"id: 9\ndata: z\n\n");
+        assert_eq!(framer.last_id().map(String::as_str), Some("9"));
+        framer.push_ok(b"id\ndata: w\n\n");
+        assert_eq!(framer.last_id(), None, "bare id resets");
     }
 
     #[test]
     fn sse_framer_ignores_non_integer_retry() {
-        let mut framer = SseFramer::default();
-        framer.push(b"retry: soon\ndata: x\n\n");
-        assert_eq!(framer.retry, None);
+        let mut framer = SseFramer::new();
+        framer.push_ok(b"retry: soon\ndata: x\n\n");
+        assert_eq!(framer.retry(), None);
     }
 
     // -----------------------------------------------------------------------
@@ -7404,9 +7497,9 @@ mod sse_framer_model_tests {
     }
 
     fn run(chunks: &[&[u8]]) -> (Vec<String>, Option<String>, Option<Duration>) {
-        let mut f = SseFramer::default();
-        let events = chunks.iter().flat_map(|c| f.push(c)).collect();
-        (events, f.last_id, f.retry)
+        let mut f = SseFramer::new();
+        let events = chunks.iter().flat_map(|c| f.push_ok(c)).collect();
+        (events, f.last_id().cloned(), f.retry())
     }
 
     proptest! {
@@ -7437,5 +7530,42 @@ mod sse_framer_model_tests {
             let chunks: Vec<&[u8]> = r.bytes.chunks(1).collect();
             prop_assert_eq!(run(&chunks), (r.events, r.last_id, r.retry));
         }
+    }
+}
+
+#[cfg(test)]
+mod sse_framer_limit_tests {
+    use super::*;
+
+    #[test]
+    fn oversized_line_fails_and_stays_failed() {
+        let mut f = SseFramer::with_limits(8, 1024);
+        let error = SseLimitExceeded::Line { limit: 8 };
+        assert_eq!(f.push(b"data: 0123456789"), Err(error));
+        assert_eq!(f.push(b"\n\n"), Err(error));
+        assert_eq!(f.finish(), Err(error));
+    }
+
+    #[test]
+    fn many_small_data_lines_hit_the_event_cap() {
+        let mut f = SseFramer::with_limits(64, 10);
+        assert_eq!(f.push(b"data: abcd\ndata: efgh\n"), Ok(vec![]));
+        assert_eq!(
+            f.push(b"data: ijk\n"),
+            Err(SseLimitExceeded::Event { limit: 10 })
+        );
+    }
+
+    #[test]
+    fn event_exactly_at_cap_is_delivered() {
+        let mut f = SseFramer::with_limits(64, 4);
+        assert_eq!(f.push(b"data: abcd\n\n"), Ok(vec!["abcd".to_string()]));
+    }
+
+    #[test]
+    fn finish_overflowing_the_event_cap_errors() {
+        let mut f = SseFramer::with_limits(64, 4);
+        assert_eq!(f.push(b"data: abc\ndata: de"), Ok(vec![]));
+        assert_eq!(f.finish(), Err(SseLimitExceeded::Event { limit: 4 }));
     }
 }
