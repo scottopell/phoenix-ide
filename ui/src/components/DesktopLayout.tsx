@@ -233,11 +233,18 @@ export function DesktopLayout({ children }: DesktopLayoutProps) {
   const liveWorkScope = useWorkScope(activeSlug);
   const { conversationId: readinessConversationId, confirmedLive } = useConversationReadiness();
 
+  // Ember's question notifications are keyed on its ProductConversation.
+  const activeCoordinatorProductId = globalMatch ? activeConversation?.product_conversation_id : undefined;
   useEffect(() => {
     if (activeConversationId) {
       closeNotificationsForConversation(activeConversationId);
     }
   }, [activeConversationId]);
+  useEffect(() => {
+    if (activeCoordinatorProductId) {
+      closeNotificationsForConversation(activeCoordinatorProductId);
+    }
+  }, [activeCoordinatorProductId]);
 
   const activeConversationReadOnly = activeConversation !== null
     && (readinessConversationId !== activeConversation.id || !confirmedLive);

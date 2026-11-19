@@ -32,7 +32,7 @@ function CoordinatorQuestionCard({
       </p>
       <QuestionPanel
         questions={question.questions}
-        conversationId={question.coordinator_conversation_id}
+        conversationId={question.coordinator_product_conversation_id}
         requestId={question.request_id}
         showToast={showToast}
         submitAnswers={(answers, annotations) => api.answerCoordinatorQuestion(question.request_id, answers, annotations)}

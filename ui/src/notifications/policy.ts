@@ -23,7 +23,7 @@ export type NotificationDedupeKey =
 /** An open question Ember posted without stopping (REQ-AUQ-010). */
 export type CoordinatorQuestionNotification = {
   requestId: string;
-  coordinatorConversationId: string;
+  coordinatorProductConversationId: string;
   text: string;
 };
 
@@ -101,6 +101,8 @@ export type NotificationEnv = {
   visible: boolean;
   hasFocus: boolean;
   activeSlug: string | null;
+  /** True while Ember's page is showing, whichever transcript it shows. */
+  onCoordinatorPage: boolean;
   /** True for a conversation Ember monitors; absent means none are. */
   isMonitored?: (conversation: Conversation) => boolean;
 };
@@ -212,7 +214,9 @@ export function notificationTagFor(event: PolicyNotificationEvent): string {
 }
 
 function shouldSuppressForFocus(env: NotificationEnv, conversation: NotificationTarget): boolean {
-  return env.visible && env.hasFocus && env.activeSlug !== null && (env.activeSlug === conversation.slug || env.activeSlug === conversation.id);
+  if (!env.visible || !env.hasFocus) return false;
+  if (conversation.kind === 'coordinator') return env.onCoordinatorPage;
+  return env.activeSlug !== null && (env.activeSlug === conversation.slug || env.activeSlug === conversation.id);
 }
 
 function markAttentionSeen(state: NotificationPolicyState, event: PolicyNotificationEvent): NotificationPolicyState {
@@ -449,7 +453,7 @@ export function notificationPolicyReducer(
         const result = decideDelivery(next, env, {
           type: 'coordinator_question',
           title: 'Ember asked a question',
-          conversation: { id: item.coordinatorConversationId, slug: null, kind: 'coordinator' },
+          conversation: { id: item.coordinatorProductConversationId, slug: null, kind: 'coordinator' },
           requestId: item.requestId,
           text: item.text,
         });

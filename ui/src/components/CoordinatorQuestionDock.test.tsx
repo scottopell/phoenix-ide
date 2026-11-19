@@ -12,7 +12,7 @@ import { EmberEntry } from './EmberEntry';
 function open(requestId: string, text: string): CoordinatorQuestion {
   return {
     request_id: requestId,
-    coordinator_conversation_id: 'ember-1',
+    coordinator_product_conversation_id: 'ember-1',
     asked_at: new Date().toISOString(),
     questions: [{
       question: text,

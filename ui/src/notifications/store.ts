@@ -27,8 +27,13 @@ export function registerCoordinatorNotificationTarget(conversationId: string): v
   coordinatorConversationIds.add(conversationId);
 }
 
+/**
+ * A `coordinator` target names Ember's stable ProductConversation, so it opens
+ * Ember's page on whichever transcript is current.
+ */
 export function notificationRoute(conversation: { id: string; slug?: string | null; kind?: 'ordinary' | 'coordinator' }): string {
-  return conversation.kind === 'coordinator' || coordinatorConversationIds.has(conversation.id)
+  if (conversation.kind === 'coordinator') return '/global';
+  return coordinatorConversationIds.has(conversation.id)
     ? `/global/${conversation.id}`
     : `/c/${conversation.slug ?? conversation.id}`;
 }
@@ -43,6 +48,10 @@ function currentActiveSlug(): string | null {
   if (typeof window === 'undefined') return null;
   const match = window.location.pathname.match(/^\/(?:c|global)\/([^/?#]+)/);
   return match?.[1] ? decodeURIComponent(match[1]) : null;
+}
+
+function onCoordinatorPage(): boolean {
+  return typeof window !== 'undefined' && /^\/global(?:\/|$)/.test(window.location.pathname);
 }
 
 function errorMessage(err: unknown, fallback: string): string {
@@ -86,6 +95,7 @@ export class NotificationStore {
       visible: hasDocument && document.visibilityState === 'visible',
       hasFocus: hasDocument && document.hasFocus(),
       activeSlug: currentActiveSlug(),
+      onCoordinatorPage: onCoordinatorPage(),
       isMonitored: monitoredConversationLookup,
     };
   }

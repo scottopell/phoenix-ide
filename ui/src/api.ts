@@ -552,7 +552,8 @@ export interface QuestionOption {
 /** An open question Ember posted without stopping its own work (REQ-AUQ-010). */
 export interface CoordinatorQuestion {
   request_id: string;
-  coordinator_conversation_id: string;
+  /** Ember's stable ProductConversation; survives continuation. */
+  coordinator_product_conversation_id: string;
   /** RFC 3339. */
   asked_at: string;
   questions: UserQuestion[];
