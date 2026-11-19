@@ -1,12 +1,12 @@
-use std::{fmt::Write as _, sync::Arc};
+use std::fmt::Write as _;
 
 use phoenix_core::domain::db_schema::InputOrigin;
 use phoenix_db::{
     CloseFailureStop, MandatoryCloseFailureSubject, PendingWatchEvent, WatchEventRoute,
 };
 
-use crate::coordinator_delivery::{CoordinatorSend, CoordinatorSender};
-use crate::runtime::RuntimeManager;
+use crate::coordinator_delivery::CoordinatorSender;
+use crate::send_chat_service::SendChatOutcome;
 
 pub(crate) fn notification(event: &PendingWatchEvent) -> String {
     let label = match &event.route {
@@ -141,15 +141,9 @@ pub(crate) fn pending_question_detail(
     Some(text)
 }
 
-pub(crate) async fn deliver_pass(runtime: &Arc<RuntimeManager>, sender: &CoordinatorSender) {
-    let db = runtime.db();
-    let events = match db.pending_coordinator_watch_events(16).await {
-        Ok(events) => events,
-        Err(error) => {
-            tracing::warn!(%error, "coordinator watch event discovery failed; retrying");
-            return;
-        }
-    };
+/// Send pending watch events to the current Coordinator transcript.
+pub(crate) async fn deliver(sender: &CoordinatorSender, events: Vec<PendingWatchEvent>) {
+    let db = sender.db();
     for event in events {
         let mut text = notification(&event);
         if event.outcome == phoenix_db::WatchOutcome::AwaitingUserResponse {
@@ -167,11 +161,15 @@ pub(crate) async fn deliver_pass(runtime: &Arc<RuntimeManager>, sender: &Coordin
             event_id: event.event_id.clone(),
         };
         match sender.send(origin, text, event.event_id.clone()).await {
-            CoordinatorSend::Accepted => {}
-            CoordinatorSend::Rejected { code, message } => {
+            Ok(
+                SendChatOutcome::Delivered
+                | SendChatOutcome::AlreadyPersisted
+                | SendChatOutcome::QueuedAsSteering,
+            ) => {}
+            Ok(SendChatOutcome::Rejected { message, code }) => {
                 tracing::warn!(event_id = %event.event_id, code, %message, "coordinator watch event not accepted; retrying");
             }
-            CoordinatorSend::Failed(error) => {
+            Err(error) => {
                 tracing::warn!(event_id = %event.event_id, %error, "coordinator watch event delivery failed; retrying");
                 if let Err(suppression_error) = db.suppress_stale_watch_event(&event.event_id).await
                 {
@@ -185,10 +183,12 @@ pub(crate) async fn deliver_pass(runtime: &Arc<RuntimeManager>, sender: &Coordin
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime::RuntimeManager;
     use crate::send_chat_service::{
-        MessageExpansionPolicy, SendChatApplicationService, SendChatOutcome, SendChatRequest,
+        MessageExpansionPolicy, SendChatApplicationService, SendChatRequest,
     };
     use phoenix_core::domain::product_conversation::ProductConversationId;
+    use std::sync::Arc;
 
     #[tokio::test]
     async fn persisted_wait_pass_admits_once_through_real_send_service() {

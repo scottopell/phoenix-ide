@@ -245,13 +245,12 @@ mod tests {
     #[tokio::test]
     async fn a_question_belongs_to_the_coordinator_product_conversation() {
         let db = Database::open_in_memory().await.unwrap();
-        let ember = coordinator(&db).await;
-        let product: String =
-            sqlx::query_scalar("SELECT product_conversation_id FROM conversations WHERE id = ?1")
-                .bind(&ember)
-                .fetch_one(&db.pool)
-                .await
-                .unwrap();
+        let ember = db
+            .get_or_create_coordinator(None, phoenix_core::llm_language::LlmLanguage::default())
+            .await
+            .unwrap();
+        let product = ember.product_conversation_id.as_str().to_string();
+        let ember = ember.id;
         db.post_coordinator_question("q-1", &ember, &questions(), 10)
             .await
             .unwrap();

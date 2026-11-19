@@ -1,6 +1,5 @@
 import { api } from '../api';
-
-export type QuestionAnnotations = Record<string, { notes?: string; preview?: string }>;
+import type { QuestionAnnotations } from '../api';
 
 /** What submitting or dismissing the panel does, and how it is worded. */
 export interface QuestionPanelActions {

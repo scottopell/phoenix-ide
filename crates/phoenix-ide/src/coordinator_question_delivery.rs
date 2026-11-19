@@ -3,18 +3,17 @@
 //! The reply is stored first and delivered to the current Coordinator
 //! transcript by a retrying pass, so an answer given while the Coordinator is
 //! busy, between transcripts, or before restart is never lost. The question's
-//! request id doubles as the message id; the transcript accepting that message
-//! marks the reply delivered in the same transaction, so no later transcript
-//! receives it again.
+//! request id is the message id.
 
 use std::collections::HashMap;
-use std::sync::Arc;
 
 use phoenix_core::domain::db_schema::InputOrigin;
 use phoenix_core::domain::sm_state::{render_question_answers, QuestionAnnotation, UserQuestion};
 
-use crate::coordinator_delivery::{CoordinatorSend, CoordinatorSender};
-use crate::runtime::RuntimeManager;
+use phoenix_db::UndeliveredCoordinatorQuestionReply;
+
+use crate::coordinator_delivery::CoordinatorSender;
+use crate::send_chat_service::SendChatOutcome;
 
 /// The Coordinator-facing text for an answered question.
 pub(crate) fn answer_reply(
@@ -36,28 +35,26 @@ pub(crate) fn dismissal_reply(request_id: &str) -> String {
     )
 }
 
-/// Deliver stored replies to the current Coordinator transcript.
-pub(crate) async fn deliver_pass(runtime: &Arc<RuntimeManager>, sender: &CoordinatorSender) {
-    let db = runtime.db();
-    let replies = match db.undelivered_coordinator_question_replies(16).await {
-        Ok(replies) => replies,
-        Err(error) => {
-            tracing::warn!(%error, "coordinator question reply discovery failed; retrying");
-            return;
-        }
-    };
+/// Send stored replies to the current Coordinator transcript.
+pub(crate) async fn deliver(
+    sender: &CoordinatorSender,
+    replies: Vec<UndeliveredCoordinatorQuestionReply>,
+) {
     for reply in replies {
+        let request_id = reply.request_id;
         match sender
-            .send(InputOrigin::UserApi, reply.reply, reply.request_id.clone())
+            .send(InputOrigin::UserApi, reply.reply, request_id.clone())
             .await
         {
-            // Acceptance marks the reply delivered in the same insert.
-            CoordinatorSend::Accepted => {}
-            CoordinatorSend::Rejected { code, message } => {
-                tracing::warn!(request_id = %reply.request_id, code, %message, "coordinator question reply not accepted; retrying");
+            Ok(SendChatOutcome::Delivered | SendChatOutcome::QueuedAsSteering) => {}
+            Ok(SendChatOutcome::AlreadyPersisted) => {
+                tracing::warn!(%request_id, "coordinator transcript already holds this message id without recording the reply delivered");
             }
-            CoordinatorSend::Failed(error) => {
-                tracing::warn!(request_id = %reply.request_id, %error, "coordinator question reply delivery failed; retrying");
+            Ok(SendChatOutcome::Rejected { message, code }) => {
+                tracing::warn!(%request_id, code, %message, "coordinator question reply not accepted; retrying");
+            }
+            Err(error) => {
+                tracing::warn!(%request_id, %error, "coordinator question reply delivery failed; retrying");
             }
         }
     }

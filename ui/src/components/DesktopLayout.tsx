@@ -1,7 +1,7 @@
 import { useCoordinatorQuestionFeed } from '../coordinator/coordinatorQuestions';
 import { useReminderDueNotifications } from '../reminders/useReminderDueNotifications';
 import { useDesktopRouteOwner } from './useDesktopRouteOwner';
-import { extractProductRouteReference } from './desktopRouteReference';
+import { extractProductRouteReference, isCoordinatorRoute } from './desktopRouteReference';
 import { conversationGroundingContext } from './FileExplorer/groundingContext';
 import { useLocation } from 'react-router-dom';
 import { lazy, Suspense, useEffect, useLayoutEffect, useCallback, useMemo, useRef, useState } from 'react';
@@ -35,6 +35,7 @@ import {
   useDocumentViewportOwnership,
 } from './viewportRoutes';
 import {
+  closeCoordinatorNotifications,
   closeNotificationsForConversation,
   consumeNotificationPermissionCue,
   loadNotificationSettingsAndCatchUp,
@@ -233,18 +234,11 @@ export function DesktopLayout({ children }: DesktopLayoutProps) {
   const liveWorkScope = useWorkScope(activeSlug);
   const { conversationId: readinessConversationId, confirmedLive } = useConversationReadiness();
 
-  // Ember's question notifications are keyed on its ProductConversation.
-  const activeCoordinatorProductId = globalMatch ? activeConversation?.product_conversation_id : undefined;
+  const onCoordinatorPage = isCoordinatorRoute(location.pathname);
   useEffect(() => {
-    if (activeConversationId) {
-      closeNotificationsForConversation(activeConversationId);
-    }
-  }, [activeConversationId]);
-  useEffect(() => {
-    if (activeCoordinatorProductId) {
-      closeNotificationsForConversation(activeCoordinatorProductId);
-    }
-  }, [activeCoordinatorProductId]);
+    if (onCoordinatorPage) closeCoordinatorNotifications();
+    if (activeConversationId) closeNotificationsForConversation(activeConversationId);
+  }, [onCoordinatorPage, activeConversationId]);
 
   const activeConversationReadOnly = activeConversation !== null
     && (readinessConversationId !== activeConversation.id || !confirmedLive);

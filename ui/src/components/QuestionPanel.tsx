@@ -10,7 +10,7 @@
  */
 
 import { useState, useCallback, useEffect, useLayoutEffect, useRef } from 'react';
-import type { UserQuestion } from '../api';
+import type { QuestionAnnotations, UserQuestion } from '../api';
 import {
   ArrowLeft,
   ArrowRight,
@@ -78,7 +78,7 @@ export function QuestionPanel({
   });
   const [otherTexts, setOtherTexts] = useState<Record<string, string>>({});
   const [annotations, setAnnotations] = useState<
-    Record<string, { notes?: string; preview?: string }>
+    QuestionAnnotations
   >({});
   const [submitting, setSubmitting] = useState(false);
   const [focusedPreviews, setFocusedPreviews] = useState<
@@ -209,9 +209,9 @@ export function QuestionPanel({
   }, [questions, answers, otherTexts, multiSelections]);
 
   const buildAnnotations = useCallback(():
-    | Record<string, { notes?: string; preview?: string }>
+    | QuestionAnnotations
     | undefined => {
-    const result: Record<string, { notes?: string; preview?: string }> = {};
+    const result: QuestionAnnotations = {};
     let hasAny = false;
 
     for (const q of questions) {

@@ -204,9 +204,6 @@ THE question SHALL stay open until the user answers or dismisses it or the
 Coordinator withdraws it, across Coordinator turns, continuations, restarts and
 deletion of the transcript that asked it.
 
-IF the Coordinator conversation itself is deleted
-THEN its open questions SHALL close as withdrawn.
-
 Ordinary conversations SHALL keep the blocking question tool unchanged.
 
 **Rationale:** The Coordinator serves many conversations. Parking all of them

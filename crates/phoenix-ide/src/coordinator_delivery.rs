@@ -6,15 +6,35 @@ use std::sync::Arc;
 
 use phoenix_core::domain::db_schema::InputOrigin;
 
+use crate::db::Database;
 use crate::runtime::RuntimeManager;
 use crate::send_chat_service::{
     MessageExpansionPolicy, SendChatApplicationService, SendChatOutcome, SendChatRequest,
     SendChatServiceError,
 };
 
-/// Run every Coordinator input pass against one resolved Coordinator transcript.
+/// Deliver pending watch events and question replies to the current
+/// Coordinator transcript.
 pub(crate) async fn deliver_pass(runtime: &Arc<RuntimeManager>) {
-    let target = match runtime.db().coordinator_watch_target().await {
+    let db = runtime.db();
+    let events = db
+        .pending_coordinator_watch_events(16)
+        .await
+        .unwrap_or_else(|error| {
+            tracing::warn!(%error, "coordinator watch event discovery failed; retrying");
+            Vec::new()
+        });
+    let replies = db
+        .undelivered_coordinator_question_replies(16)
+        .await
+        .unwrap_or_else(|error| {
+            tracing::warn!(%error, "coordinator question reply discovery failed; retrying");
+            Vec::new()
+        });
+    if events.is_empty() && replies.is_empty() {
+        return;
+    }
+    let target = match db.coordinator_watch_target().await {
         Ok(Some(target)) => target,
         Ok(None) => {
             tracing::debug!("coordinator inputs awaiting a coordinator transcript");
@@ -25,34 +45,25 @@ pub(crate) async fn deliver_pass(runtime: &Arc<RuntimeManager>) {
             return;
         }
     };
-    let sender = CoordinatorSender::new(runtime, target);
-    crate::coordinator_watch_delivery::deliver_pass(runtime, &sender).await;
-    crate::coordinator_question_delivery::deliver_pass(runtime, &sender).await;
-}
-
-/// How the Coordinator transcript answered one input.
-#[derive(Debug)]
-pub(crate) enum CoordinatorSend {
-    /// Accepted directly, queued as steering, or already present.
-    Accepted,
-    /// Refused by admission; the input stays pending.
-    Rejected { code: &'static str, message: String },
-    /// The send itself failed.
-    Failed(SendChatServiceError),
+    let sender = CoordinatorSender {
+        service: SendChatApplicationService::new(db.clone(), runtime.clone()),
+        db: db.clone(),
+        target,
+    };
+    crate::coordinator_watch_delivery::deliver(&sender, events).await;
+    crate::coordinator_question_delivery::deliver(&sender, replies).await;
 }
 
 /// Sends literal-text inputs to one Coordinator transcript.
 pub(crate) struct CoordinatorSender {
     service: SendChatApplicationService,
+    db: Database,
     target: String,
 }
 
 impl CoordinatorSender {
-    fn new(runtime: &Arc<RuntimeManager>, target: String) -> Self {
-        Self {
-            service: SendChatApplicationService::new(runtime.db().clone(), runtime.clone()),
-            target,
-        }
+    pub(crate) fn db(&self) -> &Database {
+        &self.db
     }
 
     pub(crate) async fn send(
@@ -60,27 +71,18 @@ impl CoordinatorSender {
         origin: InputOrigin,
         text: String,
         message_id: String,
-    ) -> CoordinatorSend {
-        let request = SendChatRequest {
-            conversation_id: self.target.clone(),
-            origin,
-            text,
-            message_id,
-            images: Vec::new(),
-            files: Vec::new(),
-            user_agent: None,
-            expansion_policy: MessageExpansionPolicy::LiteralText,
-        };
-        match self.service.send(request).await {
-            Ok(
-                SendChatOutcome::Delivered
-                | SendChatOutcome::AlreadyPersisted
-                | SendChatOutcome::QueuedAsSteering,
-            ) => CoordinatorSend::Accepted,
-            Ok(SendChatOutcome::Rejected { message, code }) => {
-                CoordinatorSend::Rejected { code, message }
-            }
-            Err(error) => CoordinatorSend::Failed(error),
-        }
+    ) -> Result<SendChatOutcome, SendChatServiceError> {
+        self.service
+            .send(SendChatRequest {
+                conversation_id: self.target.clone(),
+                origin,
+                text,
+                message_id,
+                images: Vec::new(),
+                files: Vec::new(),
+                user_agent: None,
+                expansion_policy: MessageExpansionPolicy::LiteralText,
+            })
+            .await
     }
 }
