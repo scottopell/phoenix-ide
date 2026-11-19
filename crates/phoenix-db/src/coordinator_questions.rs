@@ -369,59 +369,87 @@ mod tests {
         );
     }
 
-    fn steer(message_id: &str) -> phoenix_core::domain::sm_event::SteerEntry {
+    fn reply(request_id: &str) -> phoenix_core::domain::sm_event::SteerEntry {
         phoenix_core::domain::sm_event::SteerEntry {
-            origin: phoenix_core::domain::db_schema::InputOrigin::UserApi,
+            origin: phoenix_core::domain::db_schema::InputOrigin::CoordinatorQuestionReply,
             text: "Answer".into(),
             llm_text: None,
             images: Vec::new(),
             files: Vec::new(),
-            message_id: message_id.into(),
+            message_id: phoenix_core::domain::db_schema::coordinator_question_reply_message_id(
+                request_id,
+            ),
             user_agent: None,
             skill_invocation: None,
         }
     }
 
     #[tokio::test]
-    async fn the_coordinator_accepting_a_reply_marks_it_delivered() {
+    async fn only_a_deliverable_reply_is_accepted_and_acceptance_marks_it_delivered() {
         let db = Database::open_in_memory().await.unwrap();
         let ember = coordinator(&db).await;
         let ordinary = db
             .create_conversation("ordinary", "ordinary", "/tmp", true, None, None)
             .await
             .unwrap();
-        for request_id in ["q-open", "q-elsewhere", "q-ember"] {
-            db.post_coordinator_question(request_id, &ember, &questions(), 10)
+        db.post_coordinator_question("q-1", &ember, &questions(), 10)
+            .await
+            .unwrap();
+        let fingerprint = "0".repeat(64);
+
+        assert!(
+            db.append_steering_entry(&ember, &reply("q-1"), &fingerprint)
                 .await
-                .unwrap();
-        }
-        // An open question has no reply to deliver yet.
-        db.append_steering_entry(&ember, &steer("q-open"), &"0".repeat(64))
+                .is_err(),
+            "an open question has no reply to accept"
+        );
+        db.settle_coordinator_question(
+            "q-1",
+            CoordinatorQuestionClose::Answered { reply: "Yes" },
+            20,
+        )
+        .await
+        .unwrap();
+        assert!(
+            db.append_steering_entry(&ordinary.id, &reply("q-1"), &fingerprint)
+                .await
+                .is_err(),
+            "only the question's Coordinator accepts its reply"
+        );
+        assert_eq!(
+            db.undelivered_coordinator_question_replies(16)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+
+        db.append_steering_entry(&ember, &reply("q-1"), &fingerprint)
             .await
             .unwrap();
-        for request_id in ["q-open", "q-elsewhere", "q-ember"] {
-            db.settle_coordinator_question(
-                request_id,
-                CoordinatorQuestionClose::Answered { reply: "Yes" },
-                20,
-            )
-            .await
-            .unwrap();
-        }
-        // The same id outside the Coordinator is not delivery.
-        db.append_steering_entry(&ordinary.id, &steer("q-elsewhere"), &"1".repeat(64))
-            .await
-            .unwrap();
-        db.append_steering_entry(&ember, &steer("q-ember"), &"2".repeat(64))
-            .await
-            .unwrap();
-        let undelivered: Vec<String> = db
+        assert!(db
             .undelivered_coordinator_question_replies(16)
             .await
             .unwrap()
-            .into_iter()
-            .map(|reply| reply.request_id)
-            .collect();
-        assert_eq!(undelivered, ["q-elsewhere", "q-open"]);
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_reply_message_round_trips_its_origin() {
+        let db = Database::open_in_memory().await.unwrap();
+        let ember = coordinator(&db).await;
+        let origin = phoenix_core::domain::db_schema::InputOrigin::CoordinatorQuestionReply;
+        db.add_message_with_seq_and_origin(
+            "reply-message",
+            &ember,
+            1,
+            &crate::MessageContent::user("Answer"),
+            None,
+            None,
+            &origin,
+        )
+        .await
+        .unwrap();
+        assert_eq!(db.get_messages(&ember).await.unwrap()[0].origin, origin);
     }
 }

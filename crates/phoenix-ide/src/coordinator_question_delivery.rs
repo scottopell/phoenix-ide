@@ -2,12 +2,11 @@
 //!
 //! The reply is stored first and delivered to the current Coordinator
 //! transcript by a retrying pass, so an answer given while the Coordinator is
-//! busy, between transcripts, or before restart is never lost. The question's
-//! request id is the message id.
+//! busy, between transcripts, or before restart is never lost.
 
 use std::collections::HashMap;
 
-use phoenix_core::domain::db_schema::InputOrigin;
+use phoenix_core::domain::db_schema::{coordinator_question_reply_message_id, InputOrigin};
 use phoenix_core::domain::sm_state::{render_question_answers, QuestionAnnotation, UserQuestion};
 
 use phoenix_db::UndeliveredCoordinatorQuestionReply;
@@ -43,13 +42,18 @@ pub(crate) async fn deliver(
     for reply in replies {
         let request_id = reply.request_id;
         match sender
-            .send(InputOrigin::UserApi, reply.reply, request_id.clone())
+            .send(
+                InputOrigin::CoordinatorQuestionReply,
+                reply.reply,
+                coordinator_question_reply_message_id(&request_id),
+            )
             .await
         {
-            Ok(SendChatOutcome::Delivered | SendChatOutcome::QueuedAsSteering) => {}
-            Ok(SendChatOutcome::AlreadyPersisted) => {
-                tracing::warn!(%request_id, "coordinator transcript already holds this message id without recording the reply delivered");
-            }
+            Ok(
+                SendChatOutcome::Delivered
+                | SendChatOutcome::AlreadyPersisted
+                | SendChatOutcome::QueuedAsSteering,
+            ) => {}
             Ok(SendChatOutcome::Rejected { message, code }) => {
                 tracing::warn!(%request_id, code, %message, "coordinator question reply not accepted; retrying");
             }
