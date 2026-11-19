@@ -5,11 +5,11 @@
  * Step-by-step wizard showing one question at a time with full keyboard
  * navigation (arrow keys, space, enter, tab, escape).
  *
- * Submit calls api.respondToQuestion; Dismiss calls api.dismissQuestion.
+ * Where answers and dismissals go is the caller's `actions`: a conversation's
+ * blocking wait (`blockingQuestionActions`) or an open Ember question.
  */
 
 import { useState, useCallback, useEffect, useLayoutEffect, useRef } from 'react';
-import { api } from '../api';
 import type { UserQuestion } from '../api';
 import {
   ArrowLeft,
@@ -22,12 +22,12 @@ import ReactMarkdown from 'react-markdown';
 import { ConfirmDialog } from './ConfirmDialog';
 import { useRegisterFocusScope } from '../hooks/useFocusScope';
 import { formatShortcut } from '../utils';
+import type { QuestionPanelActions } from './questionPanelActions';
 import './QuestionPanel.css';
 
 export interface QuestionPanelProps {
   questions: UserQuestion[];
-  conversationId: string;
-  requestId?: string;
+  actions: QuestionPanelActions;
   showToast: (message: string, duration?: number) => void;
   /** Called after a successful respond/dismiss POST. The parent uses this to
    *  optimistically advance the local phase out of awaiting_user_response so
@@ -38,18 +38,6 @@ export interface QuestionPanelProps {
   onAnswered: () => void;
   onDismissed: () => void;
   readOnly?: boolean;
-  /** Sends the answers somewhere other than this conversation's wait, e.g. an
-   *  open Ember question (REQ-AUQ-010). Defaults to the conversation endpoint. */
-  submitAnswers?: (
-    answers: Record<string, string>,
-    annotations: Record<string, { notes?: string; preview?: string }> | undefined,
-  ) => Promise<unknown>;
-  /** Dismisses somewhere other than this conversation's wait. */
-  submitDismiss?: () => Promise<unknown>;
-  /** Toast after a dismissal; defaults to the blocking-question hint. */
-  dismissedMessage?: string;
-  /** Body of the dismiss confirmation; defaults to the blocking-question warning. */
-  dismissConfirmMessage?: string;
 }
 
 const OTHER_SENTINEL = '__other__';
@@ -65,16 +53,11 @@ function optionCount(q: UserQuestion): number {
 
 export function QuestionPanel({
   questions,
-  conversationId,
+  actions,
   showToast,
-  requestId,
   onAnswered,
   onDismissed,
   readOnly = false,
-  submitAnswers,
-  submitDismiss,
-  dismissedMessage = 'Question dismissed. Type a message to continue.',
-  dismissConfirmMessage = 'The question panel will close. No answer will be sent, and the agent will not continue until you type a message.',
 }: QuestionPanelProps) {
   useRegisterFocusScope('question-panel');
 
@@ -263,16 +246,7 @@ export function QuestionPanel({
     setSubmitting(true);
     setFeedback(null);
     try {
-      if (submitAnswers) {
-        await submitAnswers(buildAnswerMap(), buildAnnotations());
-      } else {
-        await api.respondToQuestion(
-          conversationId,
-          requestId,
-          buildAnswerMap(),
-          buildAnnotations()
-        );
-      }
+      await actions.submitAnswers(buildAnswerMap(), buildAnnotations());
       if (mountedRef.current) {
         onAnswered();
         showToast('Response sent', 3000);
@@ -288,13 +262,11 @@ export function QuestionPanel({
     readOnly,
     allAnswered,
     submitting,
-    conversationId,
-    requestId,
+    actions,
     buildAnswerMap,
     buildAnnotations,
     onAnswered,
     showToast,
-    submitAnswers,
   ]);
 
   const handleDismissClick = useCallback(() => {
@@ -308,11 +280,10 @@ export function QuestionPanel({
     setSubmitting(true);
     setFeedback(null);
     try {
-      if (submitDismiss) await submitDismiss();
-      else await api.dismissQuestion(conversationId, requestId);
+      await actions.dismiss();
       if (mountedRef.current) {
         onDismissed();
-        showToast(dismissedMessage, 3000);
+        showToast(actions.dismissedMessage, 3000);
       }
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Failed to dismiss';
@@ -320,7 +291,7 @@ export function QuestionPanel({
     } finally {
       setSubmitting(false);
     }
-  }, [readOnly, submitting, conversationId, requestId, onDismissed, showToast, submitDismiss, dismissedMessage]);
+  }, [readOnly, submitting, actions, onDismissed, showToast]);
 
   // --- Navigation ---
   const goToStep = useCallback(
@@ -659,7 +630,7 @@ export function QuestionPanel({
         <ConfirmDialog
           visible={showConfirmDismiss}
           title="Dismiss structured questions?"
-          message={dismissConfirmMessage}
+          message={actions.dismissConfirmMessage}
           confirmText="Dismiss"
           cancelText="Cancel"
           danger

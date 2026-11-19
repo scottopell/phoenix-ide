@@ -11,8 +11,18 @@ import { forgetCoordinatorQuestion, useCoordinatorQuestions } from '../coordinat
 import { useToast } from '../hooks/useToast';
 import { formatRelativeTime } from '../utils';
 import { QuestionPanel } from './QuestionPanel';
+import type { QuestionPanelActions } from './questionPanelActions';
 import { Toast } from './Toast';
 import './CoordinatorQuestionDock.css';
+
+function coordinatorQuestionActions(requestId: string): QuestionPanelActions {
+  return {
+    submitAnswers: (answers, annotations) => api.answerCoordinatorQuestion(requestId, answers, annotations),
+    dismiss: () => api.dismissCoordinatorQuestion(requestId),
+    dismissedMessage: 'Question dismissed. Ember will be told.',
+    dismissConfirmMessage: 'No answer will be sent. Ember is told you dismissed it and keeps working without it.',
+  };
+}
 
 function CoordinatorQuestionCard({
   question,
@@ -32,13 +42,8 @@ function CoordinatorQuestionCard({
       </p>
       <QuestionPanel
         questions={question.questions}
-        conversationId={question.coordinator_product_conversation_id}
-        requestId={question.request_id}
+        actions={coordinatorQuestionActions(question.request_id)}
         showToast={showToast}
-        submitAnswers={(answers, annotations) => api.answerCoordinatorQuestion(question.request_id, answers, annotations)}
-        submitDismiss={() => api.dismissCoordinatorQuestion(question.request_id)}
-        dismissedMessage="Question dismissed. Ember will be told."
-        dismissConfirmMessage="No answer will be sent. Ember is told you dismissed it and keeps working without it."
         onAnswered={forget}
         onDismissed={forget}
       />
