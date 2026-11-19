@@ -20,8 +20,11 @@
 //!    corrupt or drop data.
 //! 3. **Multi-line `data:`** — consecutive `data:` lines before a blank line
 //!    are joined with `\n` (per the SSE spec).
-//! 4. **`\r\n` and `\n`** — both line endings work.
+//! 4. **`\r\n`, `\n` and bare `\r`** — all line endings work, including a
+//!    `\r\n` pair split across chunks.
 //! 5. **Trailing whitespace tolerance** — the gateway may pad `data:` lines.
+
+use phoenix_core::sse_lines::LineSplitter;
 
 /// A fully assembled SSE event ready for dispatch.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,20 +44,54 @@ pub struct SseDiagnostics {
     pub pending_data_len: usize,
 }
 
+/// Accumulates fields of the event currently being built.
+///
+/// `data_lines` is a `Vec` rather than a joined `String` so "no `data:` line
+/// seen" and "a `data:` line with an empty value" are distinct states.
+#[derive(Default)]
+struct EventAssembler {
+    event_type: String,
+    data_lines: Vec<String>,
+}
+
+impl EventAssembler {
+    fn push_line(&mut self, line: &str) -> Option<SseEvent> {
+        if line.is_empty() {
+            return self.dispatch();
+        }
+        let (name, value) = line.split_once(':').unwrap_or((line, ""));
+        let value = value.strip_prefix(' ').unwrap_or(value);
+        match name {
+            "data" => self.data_lines.push(value.to_string()),
+            "event" => self.event_type = value.to_string(),
+            // a comment line (empty name) and unknown fields are ignored.
+            _ => {}
+        }
+        None
+    }
+
+    /// Finish the current event. The event type resets on every dispatch
+    /// attempt; an event whose joined payload is empty carries nothing for any
+    /// consumer and is not emitted.
+    fn dispatch(&mut self) -> Option<SseEvent> {
+        let event_type = std::mem::take(&mut self.event_type);
+        let lines = std::mem::take(&mut self.data_lines);
+        let data = lines.join("\n");
+        (!data.is_empty()).then_some(SseEvent { event_type, data })
+    }
+
+    fn pending_data_len(&self) -> usize {
+        self.data_lines.iter().map(String::len).sum()
+    }
+}
+
 /// Incremental SSE parser.
 ///
 /// Feed it arbitrary byte slices via [`push`]; it buffers incomplete lines
 /// internally and emits complete [`SseEvent`]s.
 pub struct SseParser {
-    /// Bytes received but not yet consumed as a full line.
-    buf: Vec<u8>,
-    /// Accumulated `event:` value for the current event.
-    current_event: String,
-    /// Accumulated `data:` lines for the current event (joined with `\n`).
-    current_data: String,
-    /// The previous chunk ended in `\r`, so a leading `\n` in the next chunk
-    /// completes a `\r\n` pair rather than starting a new (blank) line.
-    skip_leading_lf: bool,
+    splitter: LineSplitter,
+    assembler: EventAssembler,
     chunk_count: usize,
     bytes_received: usize,
 }
@@ -62,10 +99,8 @@ pub struct SseParser {
 impl SseParser {
     pub fn new() -> Self {
         Self {
-            buf: Vec::new(),
-            current_event: String::new(),
-            current_data: String::new(),
-            skip_leading_lf: false,
+            splitter: LineSplitter::new(),
+            assembler: EventAssembler::default(),
             chunk_count: 0,
             bytes_received: 0,
         }
@@ -77,77 +112,15 @@ impl SseParser {
     pub fn push(&mut self, bytes: &[u8]) -> Vec<SseEvent> {
         self.chunk_count = self.chunk_count.saturating_add(1);
         self.bytes_received = self.bytes_received.saturating_add(bytes.len());
-        self.buf.extend_from_slice(bytes);
         let mut events = Vec::new();
-
-        if self.skip_leading_lf && !self.buf.is_empty() {
-            if self.buf[0] == b'\n' {
-                self.buf.remove(0);
+        let assembler = &mut self.assembler;
+        self.splitter.push(bytes, |line| {
+            // Invalid UTF-8 (a gateway bug) is decoded lossily rather than
+            // dropping the whole line.
+            if let Some(event) = assembler.push_line(&String::from_utf8_lossy(line)) {
+                events.push(event);
             }
-            self.skip_leading_lf = false;
-        }
-
-        while let Some(eol_pos) = self.buf.iter().position(|&b| b == b'\n' || b == b'\r') {
-            // Determine how many bytes the line ending consumes.
-            let line_ended_with_cr = self.buf[eol_pos] == b'\r';
-            let eol_len = if line_ended_with_cr {
-                // \r\n counts as one line ending; bare \r also counts.
-                if self.buf.get(eol_pos + 1) == Some(&b'\n') {
-                    2
-                } else {
-                    1
-                }
-            } else {
-                1 // bare \n
-            };
-
-            // Extract the line *as bytes* (excluding the line ending).
-            let line_bytes = &self.buf[..eol_pos];
-
-            // Decode UTF-8. If the slice is invalid (should not happen with
-            // well-formed SSE, but guard against gateway bugs), use lossy
-            // conversion so we never silently drop an entire line.
-            let line = String::from_utf8_lossy(line_bytes).into_owned();
-
-            // Drain consumed bytes (line content + line ending).
-            self.buf.drain(..eol_pos + eol_len);
-            // A `\r` that is the last buffered byte may be the first half of a
-            // `\r\n` split across chunks.
-            self.skip_leading_lf = self.buf.is_empty() && eol_len == 1 && line_ended_with_cr;
-
-            if line.is_empty() {
-                // Blank line → dispatch accumulated event (if any data present).
-                if !self.current_data.is_empty() {
-                    events.push(SseEvent {
-                        event_type: std::mem::take(&mut self.current_event),
-                        data: std::mem::take(&mut self.current_data),
-                    });
-                }
-            } else if let Some(data) = line.strip_prefix("data: ") {
-                // SSE spec: multiple data lines are joined with \n.
-                if self.current_data.is_empty() {
-                    self.current_data = data.to_string();
-                } else {
-                    self.current_data.push('\n');
-                    self.current_data.push_str(data);
-                }
-            } else if let Some(data) = line.strip_prefix("data:") {
-                // `data:` with no space — also valid per SSE spec.
-                if self.current_data.is_empty() {
-                    self.current_data = data.to_string();
-                } else {
-                    self.current_data.push('\n');
-                    self.current_data.push_str(data);
-                }
-            } else if let Some(event) = line.strip_prefix("event: ") {
-                self.current_event = event.to_string();
-            } else if let Some(event) = line.strip_prefix("event:") {
-                self.current_event = event.to_string();
-            }
-            // Lines starting with `:` are comments — ignored per SSE spec.
-            // Unknown prefixes are also ignored.
-        }
-
+        });
         events
     }
 
@@ -156,24 +129,20 @@ impl SseParser {
         SseDiagnostics {
             chunk_count: self.chunk_count,
             bytes_received: self.bytes_received,
-            buffered_bytes: self.buf.len(),
-            pending_event_type_len: self.current_event.len(),
-            pending_data_len: self.current_data.len(),
+            buffered_bytes: self.splitter.buffered_len(),
+            pending_event_type_len: self.assembler.event_type.len(),
+            pending_data_len: self.assembler.pending_data_len(),
         }
     }
 
-    /// Signal end-of-stream. Flushes any pending event even without a trailing
-    /// blank line (lenient — some servers omit the final blank).
+    /// Signal end-of-stream. Treats EOF as the missing line terminator and
+    /// flushes any pending event even without a trailing blank line (lenient —
+    /// some servers omit the final blank).
     pub fn finish(mut self) -> Vec<SseEvent> {
-        // If there's an unterminated event, emit it.
-        let mut events = Vec::new();
-        if !self.current_data.is_empty() {
-            events.push(SseEvent {
-                event_type: std::mem::take(&mut self.current_event),
-                data: std::mem::take(&mut self.current_data),
-            });
+        if let Some(line) = self.splitter.take_partial() {
+            self.assembler.push_line(&String::from_utf8_lossy(&line));
         }
-        events
+        self.assembler.dispatch().into_iter().collect()
     }
 }
 
@@ -641,6 +610,158 @@ mod proptests {
                     split_at,
                 );
             }
+        }
+    }
+}
+
+/// Model-based properties: a random *script* of logical SSE lines is rendered
+/// to bytes with mixed `\n` / `\r\n` / `\r` terminators, and the expected
+/// events are computed from the script itself (never by re-parsing bytes).
+#[cfg(test)]
+mod model_proptests {
+    use super::*;
+    use proptest::prelude::*;
+
+    #[derive(Debug, Clone)]
+    enum Line {
+        Event(String),
+        Data(String),
+        Comment(String),
+        Unknown(String),
+        Blank,
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum Term {
+        Lf,
+        CrLf,
+        Cr,
+    }
+
+    impl Term {
+        fn bytes(self) -> &'static [u8] {
+            match self {
+                Term::Lf => b"\n",
+                Term::CrLf => b"\r\n",
+                Term::Cr => b"\r",
+            }
+        }
+    }
+
+    /// Field values never contain line terminators and never start with a
+    /// space (the single optional space after the colon is rendered separately).
+    fn arb_value() -> impl Strategy<Value = String> {
+        prop_oneof![
+            Just(String::new()),
+            "[a-zA-Z0-9_.!?,{}\":]{1,20}",
+            "[a-z\u{00e9}\u{2014}\u{1f600}][a-z \u{00e9}\u{2014}\u{1f600}]{0,10}",
+        ]
+    }
+
+    fn arb_line() -> impl Strategy<Value = (Line, bool, Term)> {
+        let line = prop_oneof![
+            3 => arb_value().prop_map(Line::Data),
+            2 => arb_value().prop_map(Line::Event),
+            1 => arb_value().prop_map(Line::Comment),
+            1 => arb_value().prop_map(Line::Unknown),
+            3 => Just(Line::Blank),
+        ];
+        let term = prop_oneof![Just(Term::Lf), Just(Term::CrLf), Just(Term::Cr)];
+        (line, any::<bool>(), term)
+    }
+
+    /// Render the script; returns the wire bytes and the expected events.
+    fn render(script: &[(Line, bool, Term)]) -> (Vec<u8>, Vec<SseEvent>) {
+        let mut bytes = Vec::new();
+        let mut expected = Vec::new();
+        let mut event_type = String::new();
+        let mut data: Vec<String> = Vec::new();
+        let mut prev_cr = false;
+        for (line, space, term) in script {
+            let sp = if *space { " " } else { "" };
+            let (text, is_blank) = match line {
+                Line::Event(v) => (format!("event:{sp}{v}"), false),
+                Line::Data(v) => (format!("data:{sp}{v}"), false),
+                Line::Comment(v) => (format!(":{v}"), false),
+                Line::Unknown(v) => (format!("x-unknown:{sp}{v}"), false),
+                Line::Blank => (String::new(), true),
+            };
+            // `\r` directly followed by an empty line's `\n` is, on the wire,
+            // one `\r\n` — unrepresentable as two lines, so avoid generating it.
+            let term = if is_blank && prev_cr && matches!(term, Term::Lf) {
+                Term::CrLf
+            } else {
+                *term
+            };
+            bytes.extend_from_slice(text.as_bytes());
+            bytes.extend_from_slice(term.bytes());
+            prev_cr = matches!(term, Term::Cr);
+            match line {
+                Line::Event(v) => event_type.clone_from(v),
+                Line::Data(v) => data.push(v.clone()),
+                Line::Blank => {
+                    let payload = data.join("\n");
+                    // Contract: an event whose payload is empty carries nothing
+                    // and is not dispatched; the event type resets regardless.
+                    if !payload.is_empty() {
+                        expected.push(SseEvent {
+                            event_type: event_type.clone(),
+                            data: payload,
+                        });
+                    }
+                    event_type.clear();
+                    data.clear();
+                }
+                Line::Comment(_) | Line::Unknown(_) => {}
+            }
+        }
+        (bytes, expected)
+    }
+
+    fn feed(chunks: &[&[u8]]) -> Vec<SseEvent> {
+        let mut p = SseParser::new();
+        chunks.iter().flat_map(|c| p.push(c)).collect()
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(500))]
+
+        /// Whole-stream parse equals the script's logical events.
+        #[test]
+        fn prop_matches_model(script in proptest::collection::vec(arb_line(), 0..24)) {
+            let (bytes, expected) = render(&script);
+            prop_assert_eq!(feed(&[&bytes]), expected);
+        }
+
+        /// Any chunking — including a split inside `\r\n` or a codepoint —
+        /// yields the same events as the model.
+        #[test]
+        fn prop_chunking_is_unobservable(
+            script in proptest::collection::vec(arb_line(), 0..24),
+            cuts in proptest::collection::vec(any::<prop::sample::Index>(), 0..12),
+        ) {
+            let (bytes, expected) = render(&script);
+            let mut points: Vec<usize> = cuts
+                .iter()
+                .map(|i| if bytes.is_empty() { 0 } else { i.index(bytes.len() + 1) })
+                .collect();
+            points.sort_unstable();
+            let mut chunks: Vec<&[u8]> = Vec::new();
+            let mut prev = 0;
+            for p in points {
+                chunks.push(&bytes[prev..p]);
+                prev = p;
+            }
+            chunks.push(&bytes[prev..]);
+            prop_assert_eq!(feed(&chunks), expected);
+        }
+
+        /// Worst-case chunking: one byte at a time.
+        #[test]
+        fn prop_byte_at_a_time(script in proptest::collection::vec(arb_line(), 0..24)) {
+            let (bytes, expected) = render(&script);
+            let chunks: Vec<&[u8]> = bytes.chunks(1).collect();
+            prop_assert_eq!(feed(&chunks), expected);
         }
     }
 }

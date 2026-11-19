@@ -900,7 +900,7 @@ impl ServerStream {
 /// path consumes only the data payloads.
 #[derive(Default)]
 struct SseFramer {
-    buf: Vec<u8>,
+    splitter: phoenix_core::sse_lines::LineSplitter,
     data_lines: Vec<String>,
     last_id: Option<String>,
     retry: Option<Duration>,
@@ -910,41 +910,56 @@ impl SseFramer {
     /// Feed a chunk; returns the data payloads of the events completed by it.
     fn push(&mut self, chunk: &[u8]) -> Vec<String> {
         let mut events = Vec::new();
-        self.buf.extend_from_slice(chunk);
-        while let Some(newline) = self.buf.iter().position(|&b| b == b'\n') {
-            let line_bytes: Vec<u8> = self.buf.drain(..=newline).collect();
-            let line = String::from_utf8_lossy(&line_bytes);
-            let line = line.trim_end_matches(['\n', '\r']);
-            if line.is_empty() {
-                if !self.data_lines.is_empty() {
-                    events.push(self.data_lines.join("\n"));
-                    self.data_lines.clear();
-                }
-            } else if let Some(rest) = line.strip_prefix("data:") {
-                self.data_lines
-                    .push(rest.strip_prefix(' ').unwrap_or(rest).to_string());
-            } else if line == "id" || line.starts_with("id:") {
-                // The `id` field sets the persistent last event id. An empty
-                // value (a bare `id` or `id:`) resets it so the next reconnect
-                // omits Last-Event-ID; a NUL value is ignored per the SSE spec.
-                let value = line
-                    .strip_prefix("id:")
-                    .map_or("", |rest| rest.strip_prefix(' ').unwrap_or(rest));
-                if !value.contains('\0') {
-                    self.last_id = (!value.is_empty()).then(|| value.to_string());
-                }
-            } else if let Some(rest) = line.strip_prefix("retry:") {
-                // Per the SSE spec a `retry:` value is the reconnection time in
-                // integer milliseconds; a non-integer value is ignored.
-                let value = rest.strip_prefix(' ').unwrap_or(rest);
-                if !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit()) {
-                    if let Ok(ms) = value.parse::<u64>() {
-                        self.retry = Some(Duration::from_millis(ms));
-                    }
+        let Self {
+            splitter,
+            data_lines,
+            last_id,
+            retry,
+        } = self;
+        splitter.push(chunk, |line| {
+            if let Some(event) = Self::apply_line(data_lines, last_id, retry, line) {
+                events.push(event);
+            }
+        });
+        events
+    }
+
+    /// Apply one complete line; returns the payload if it dispatched an event.
+    fn apply_line(
+        data_lines: &mut Vec<String>,
+        last_id: &mut Option<String>,
+        retry: &mut Option<Duration>,
+        line: &[u8],
+    ) -> Option<String> {
+        let line = String::from_utf8_lossy(line);
+        if line.is_empty() {
+            return (!data_lines.is_empty()).then(|| {
+                let payload = data_lines.join("\n");
+                data_lines.clear();
+                payload
+            });
+        }
+        // A line with no colon is a field name with an empty value.
+        let (name, value) = line.split_once(':').unwrap_or((&line, ""));
+        let value = value.strip_prefix(' ').unwrap_or(value);
+        match name {
+            "data" => data_lines.push(value.to_string()),
+            // The `id` field sets the persistent last event id. An empty value
+            // resets it so the next reconnect omits Last-Event-ID; a NUL value
+            // is ignored per the SSE spec.
+            "id" if !value.contains('\0') => {
+                *last_id = (!value.is_empty()).then(|| value.to_string());
+            }
+            // A `retry:` value is the reconnection time in integer
+            // milliseconds; a non-integer value is ignored.
+            "retry" if !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit()) => {
+                if let Ok(ms) = value.parse::<u64>() {
+                    *retry = Some(Duration::from_millis(ms));
                 }
             }
+            _ => {}
         }
-        events
+        None
     }
 
     /// Flush a final event not terminated by a blank line before EOF. EOF
@@ -952,7 +967,16 @@ impl SseFramer {
     /// response immediately after the last `data:` line, without a trailing
     /// newline, and that line must not be lost.
     fn finish(&mut self) -> Option<String> {
-        self.push(b"\n\n").into_iter().next()
+        let Self {
+            splitter,
+            data_lines,
+            last_id,
+            retry,
+        } = self;
+        if let Some(line) = splitter.take_partial() {
+            Self::apply_line(data_lines, last_id, retry, &line);
+        }
+        Self::apply_line(data_lines, last_id, retry, b"")
     }
 }
 
@@ -7255,6 +7279,152 @@ mod tests {
         let current_url = pending_auth_url(&manager).await;
         if result.unchanged == vec!["remote"] {
             assert_eq!(current_url.as_deref(), Some(old_url.as_str()));
+        }
+    }
+}
+
+/// Model-based properties for [`SseFramer`]: a script of logical lines is
+/// rendered with mixed terminators and arbitrary chunking, and payloads,
+/// `last_id` and `retry` are computed from the script, never from the bytes.
+#[cfg(test)]
+mod sse_framer_model_tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    #[derive(Debug, Clone)]
+    enum Line {
+        Data(String),
+        BareData,
+        Id(String),
+        Retry(String),
+        Comment(String),
+        Blank,
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum Term {
+        Lf,
+        CrLf,
+        Cr,
+    }
+
+    fn arb_value() -> impl Strategy<Value = String> {
+        prop_oneof![
+            Just(String::new()),
+            "[a-zA-Z0-9_.{}\":]{1,12}",
+            "[a-z\u{00e9}\u{2014}][a-z \u{00e9}]{0,6}",
+        ]
+    }
+
+    fn arb_line() -> impl Strategy<Value = (Line, bool, Term)> {
+        let line = prop_oneof![
+            4 => arb_value().prop_map(Line::Data),
+            1 => Just(Line::BareData),
+            2 => arb_value().prop_map(Line::Id),
+            2 => prop_oneof![
+                "[0-9]{1,6}".prop_map(Line::Retry),
+                "[a-z]{1,4}".prop_map(Line::Retry),
+                Just(Line::Retry(String::new())),
+            ],
+            1 => arb_value().prop_map(Line::Comment),
+            3 => Just(Line::Blank),
+        ];
+        let term = prop_oneof![Just(Term::Lf), Just(Term::CrLf), Just(Term::Cr)];
+        (line, any::<bool>(), term)
+    }
+
+    struct Rendered {
+        bytes: Vec<u8>,
+        events: Vec<String>,
+        last_id: Option<String>,
+        retry: Option<Duration>,
+    }
+
+    fn render(script: &[(Line, bool, Term)]) -> Rendered {
+        let mut r = Rendered {
+            bytes: Vec::new(),
+            events: Vec::new(),
+            last_id: None,
+            retry: None,
+        };
+        let mut data: Vec<String> = Vec::new();
+        let mut prev_cr = false;
+        for (line, space, term) in script {
+            let sp = if *space { " " } else { "" };
+            let text = match line {
+                Line::Data(v) => format!("data:{sp}{v}"),
+                Line::BareData => "data".to_string(),
+                Line::Id(v) => format!("id:{sp}{v}"),
+                Line::Retry(v) => format!("retry:{sp}{v}"),
+                Line::Comment(v) => format!(":{v}"),
+                Line::Blank => String::new(),
+            };
+            let term = if text.is_empty() && prev_cr && matches!(term, Term::Lf) {
+                Term::CrLf
+            } else {
+                *term
+            };
+            r.bytes.extend_from_slice(text.as_bytes());
+            r.bytes.extend_from_slice(match term {
+                Term::Lf => b"\n".as_slice(),
+                Term::CrLf => b"\r\n",
+                Term::Cr => b"\r",
+            });
+            prev_cr = matches!(term, Term::Cr);
+            match line {
+                Line::Data(v) => data.push(v.clone()),
+                Line::BareData => data.push(String::new()),
+                Line::Id(v) => r.last_id = (!v.is_empty()).then(|| v.clone()),
+                Line::Retry(v) => {
+                    if !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()) {
+                        r.retry = v.parse().ok().map(Duration::from_millis);
+                    }
+                }
+                Line::Blank => {
+                    if !data.is_empty() {
+                        r.events.push(data.join("\n"));
+                        data.clear();
+                    }
+                }
+                Line::Comment(_) => {}
+            }
+        }
+        r
+    }
+
+    fn run(chunks: &[&[u8]]) -> (Vec<String>, Option<String>, Option<Duration>) {
+        let mut f = SseFramer::default();
+        let events = chunks.iter().flat_map(|c| f.push(c)).collect();
+        (events, f.last_id, f.retry)
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(500))]
+
+        #[test]
+        fn matches_model_under_any_chunking(
+            script in proptest::collection::vec(arb_line(), 0..24),
+            cuts in proptest::collection::vec(any::<prop::sample::Index>(), 0..12),
+        ) {
+            let r = render(&script);
+            let mut points: Vec<usize> =
+                cuts.iter().map(|i| i.index(r.bytes.len() + 1)).collect();
+            points.sort_unstable();
+            let mut chunks: Vec<&[u8]> = Vec::new();
+            let mut prev = 0;
+            for p in points {
+                chunks.push(&r.bytes[prev..p]);
+                prev = p;
+            }
+            chunks.push(&r.bytes[prev..]);
+            prop_assert_eq!(run(&chunks), (r.events, r.last_id, r.retry));
+        }
+
+        #[test]
+        fn byte_at_a_time_matches_model(script in proptest::collection::vec(arb_line(), 0..24)) {
+            let r = render(&script);
+            let chunks: Vec<&[u8]> = r.bytes.chunks(1).collect();
+            prop_assert_eq!(run(&chunks), (r.events, r.last_id, r.retry));
         }
     }
 }
