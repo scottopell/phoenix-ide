@@ -28,10 +28,6 @@ fn is_within_viewer_roots(file: &Path, working_dir: &Path) -> bool {
 }
 
 /// A half-open window of line indices into a file of `total` lines.
-///
-/// `start <= end <= total` holds for every `offset`/`limit`, including values
-/// near `usize::MAX`, because the fields are private and only [`Self::new`]
-/// builds them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct LineWindow {
     start: usize,

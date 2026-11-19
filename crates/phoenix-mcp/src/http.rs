@@ -933,11 +933,14 @@ impl SseFramer {
     ) -> Option<String> {
         let line = String::from_utf8_lossy(line);
         if line.is_empty() {
-            return (!data_lines.is_empty()).then(|| {
-                let payload = data_lines.join("\n");
-                data_lines.clear();
-                payload
-            });
+            // An event with only empty data lines (e.g. a priming event that
+            // just carries an `id`) has no JSON-RPC message to deliver.
+            let payload = data_lines
+                .iter()
+                .any(|line| !line.is_empty())
+                .then(|| data_lines.join("\n"));
+            data_lines.clear();
+            return payload;
         }
         // A line with no colon is a field name with an empty value.
         let (name, value) = line.split_once(':').unwrap_or((&line, ""));
@@ -3530,6 +3533,14 @@ mod tests {
             *transport.session_id.lock().unwrap(),
             Some("sess-1".to_string())
         );
+    }
+
+    #[test]
+    fn sse_framer_priming_event_updates_id_without_dispatching() {
+        let mut framer = SseFramer::default();
+        assert!(framer.push(b"id: 1\ndata:\n\nid: 2\ndata\n\n").is_empty());
+        assert_eq!(framer.last_id.as_deref(), Some("2"));
+        assert_eq!(framer.push(b"data: {\"a\":1}\r\n\r\n"), vec!["{\"a\":1}"]);
     }
 
     #[test]
@@ -7381,10 +7392,10 @@ mod sse_framer_model_tests {
                     }
                 }
                 Line::Blank => {
-                    if !data.is_empty() {
+                    if data.iter().any(|d| !d.is_empty()) {
                         r.events.push(data.join("\n"));
-                        data.clear();
                     }
+                    data.clear();
                 }
                 Line::Comment(_) => {}
             }

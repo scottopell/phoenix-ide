@@ -1,13 +1,6 @@
-//! Line framing for Server-Sent Events streams.
-//!
-//! Lines end in `\n`, `\r\n` or a bare `\r`. [`LineSplitter`] is the only
-//! owner of line-ending state, so every SSE parser built on it treats a
-//! `\r\n` pair split across two network chunks as one terminator.
+//! Line framing for Server-Sent Events streams (`\n`, `\r\n` or bare `\r`).
 
 /// Splits a byte stream into lines, independent of how it is chunked.
-///
-/// A line is surfaced only once its terminator has arrived, so a multi-byte
-/// codepoint split across chunks is never handed out half-built.
 #[derive(Debug, Default)]
 pub struct LineSplitter {
     line: Vec<u8>,

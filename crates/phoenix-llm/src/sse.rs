@@ -45,9 +45,6 @@ pub struct SseDiagnostics {
 }
 
 /// Accumulates fields of the event currently being built.
-///
-/// `data_lines` is a `Vec` rather than a joined `String` so "no `data:` line
-/// seen" and "a `data:` line with an empty value" are distinct states.
 #[derive(Default)]
 struct EventAssembler {
     event_type: String,
@@ -70,14 +67,15 @@ impl EventAssembler {
         None
     }
 
-    /// Finish the current event. The event type resets on every dispatch
-    /// attempt; an event whose joined payload is empty carries nothing for any
-    /// consumer and is not emitted.
+    /// The event type resets on every dispatch attempt. An event whose data
+    /// lines are all empty is not emitted (consumers parse the payload as JSON).
     fn dispatch(&mut self) -> Option<SseEvent> {
         let event_type = std::mem::take(&mut self.event_type);
         let lines = std::mem::take(&mut self.data_lines);
-        let data = lines.join("\n");
-        (!data.is_empty()).then_some(SseEvent { event_type, data })
+        lines.iter().any(|line| !line.is_empty()).then(|| SseEvent {
+            event_type,
+            data: lines.join("\n"),
+        })
     }
 
     fn pending_data_len(&self) -> usize {
@@ -135,13 +133,10 @@ impl SseParser {
         }
     }
 
-    /// Signal end-of-stream. Treats EOF as the missing line terminator and
-    /// flushes any pending event even without a trailing blank line (lenient —
-    /// some servers omit the final blank).
+    /// Signal end-of-stream. Flushes a pending event even without a trailing
+    /// blank line (lenient — some servers omit the final blank). An
+    /// unterminated final line is a torn read and is discarded.
     pub fn finish(mut self) -> Vec<SseEvent> {
-        if let Some(line) = self.splitter.take_partial() {
-            self.assembler.push_line(&String::from_utf8_lossy(&line));
-        }
         self.assembler.dispatch().into_iter().collect()
     }
 }
@@ -253,6 +248,38 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].event_type, "test");
         assert_eq!(events[0].data, "a\nb");
+    }
+
+    #[test]
+    fn event_type_resets_after_dataless_event() {
+        let mut p = SseParser::new();
+        let events = p.push(b"event: ping\n\ndata: x\n\n");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, "");
+    }
+
+    #[test]
+    fn all_empty_data_lines_are_not_dispatched() {
+        let mut p = SseParser::new();
+        assert!(p.push(b"data:\ndata:\n\ndata\n\n").is_empty());
+        let events = p.push(b"data:\ndata: x\n\n");
+        assert_eq!(events[0].data, "\nx");
+    }
+
+    #[test]
+    fn finish_discards_torn_final_line() {
+        let mut p = SseParser::new();
+        assert!(p.push(b"event: e\ndata: {\"te").is_empty());
+        assert!(p.finish().is_empty());
+    }
+
+    #[test]
+    fn finish_flushes_complete_data_line_with_cr_tail() {
+        let mut p = SseParser::new();
+        assert!(p.push(b"data: a\r").is_empty());
+        let events = p.finish();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].data, "a");
     }
 
     #[test]
@@ -700,13 +727,10 @@ mod model_proptests {
                 Line::Event(v) => event_type.clone_from(v),
                 Line::Data(v) => data.push(v.clone()),
                 Line::Blank => {
-                    let payload = data.join("\n");
-                    // Contract: an event whose payload is empty carries nothing
-                    // and is not dispatched; the event type resets regardless.
-                    if !payload.is_empty() {
+                    if data.iter().any(|d| !d.is_empty()) {
                         expected.push(SseEvent {
                             event_type: event_type.clone(),
-                            data: payload,
+                            data: data.join("\n"),
                         });
                     }
                     event_type.clear();
