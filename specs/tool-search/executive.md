@@ -37,11 +37,23 @@ streaming and non-streaming modes, restoring signed private envelopes for
 continuation. Actual adapter hosted search and continuation passed on the
 configured Responses gateway in both modes, including a new tool turn after
 private-envelope settlement. Codex native client behavior has official-source
-and deterministic-fixture evidence; live bridge qualification is unavailable
-without Phoenix-native credentials. Full broad checks and independent review
-remain pending. See
+and actual mock HTTP/SSE/WebSocket exchange evidence; all 509 LLM library tests
+pass. Native-client WebSocket continuation retains the leading tool prefix and
+sends the authenticated schema only in its search-result suffix. Review caught
+and verified the fix for missing withdrawal notices alongside historical native
+schemas. Live bridge qualification is unavailable without Phoenix-native
+credentials.
+
+The broad check reported one failed check (Rust tests); other executed checks,
+including end-to-end and static checks, passed. UI lanes were unchanged and
+skipped; optional ast-grep/cargo-deny were unavailable. The Rust stage passed
+6,339 of 6,342 tests. The replay migration fixture was fixed
+and all five owning tests pass. Both browser lifecycle failures passed isolated
+reruns and the complete Chrome-enabled integration file (37/37); their original
+cause remains unproven (task 41021). Task 41022 tracks preserving the original
+failure diagnostics. See
 [ADR-273](../adrs/273_native-openai-and-shared-local-tool-discovery.md).
 
-| Requirement | Status | Verification needed |
+| Requirement | Status | Verification and limits |
 | --- | --- | --- |
-| REQ-LLM-004n | Implemented; qualification in progress | Full broad checks and independent review pending; Codex live unavailable. Focused runtime, persistence, schema accounting, policy, hosted gateway, and 12 shared-fallback live cases pass. |
+| REQ-LLM-004n | Complete | Runtime, persistence, accounting, policy, hosted gateway, 12 fallback live cases, and native HTTP/SSE/WebSocket tests pass. Review finding fixed; broad-run exceptions classified above. Codex live unavailable. |
