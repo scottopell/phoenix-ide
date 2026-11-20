@@ -3442,7 +3442,7 @@ pub(crate) struct ResponsesApiUsage {
 /// Complete using the `OpenAI` Chat Completions API (non-streaming).
 #[allow(clippy::too_many_arguments)]
 pub async fn complete_chat(
-    _spec: &ModelSpec,
+    spec: &ModelSpec,
     request_name: &RequestModelName,
     api_key: &str,
     base_url_override: Option<&str>,
@@ -3455,7 +3455,7 @@ pub async fn complete_chat(
     let mut chat_request = translate_to_chat_request_with_route(
         request_name.as_str(),
         request,
-        base_url_override.is_none_or(|url| url == "https://api.openai.com/v1/chat/completions"),
+        ChatRoute::for_model(spec, base_url_override),
     );
     if !request_tags.is_empty() {
         chat_request.tags = Some(request_tags.clone());
@@ -3512,7 +3512,7 @@ pub async fn complete_chat(
 /// Complete using the `OpenAI` Chat Completions API (streaming).
 #[allow(clippy::too_many_arguments)]
 pub async fn complete_streaming_chat(
-    _spec: &ModelSpec,
+    spec: &ModelSpec,
     request_name: &RequestModelName,
     api_key: &str,
     base_url_override: Option<&str>,
@@ -3528,7 +3528,7 @@ pub async fn complete_streaming_chat(
     let mut chat_request = translate_to_chat_request_with_route(
         request_name.as_str(),
         request,
-        base_url_override.is_none_or(|url| url == "https://api.openai.com/v1/chat/completions"),
+        ChatRoute::for_model(spec, base_url_override),
     );
     chat_request.stream = Some(true);
     chat_request.stream_options = Some(ChatStreamOptions {
@@ -3606,17 +3606,45 @@ pub async fn complete_streaming_chat(
     acc.into_response_for_model(request_name.as_str())
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ChatRoute {
+    OpenAi,
+    Gemini,
+    Compatible,
+}
+
+impl ChatRoute {
+    fn for_model(spec: &ModelSpec, endpoint: Option<&str>) -> Self {
+        if endpoint.is_none_or(|url| url == "https://api.openai.com/v1/chat/completions") {
+            Self::OpenAi
+        } else if spec.source == super::models::ModelSource::BuiltIn
+            && spec.backend == super::models::ModelBackend::OpenAIChatCompletions
+            && matches!(
+                spec.id.as_str(),
+                "google/gemini-4-neon"
+                    | "google/gemini-4-hydrogen"
+                    | "google/gemini-4-carbon"
+                    | "google/gemini-4-argon"
+            )
+        {
+            Self::Gemini
+        } else {
+            Self::Compatible
+        }
+    }
+}
+
 /// Translate `LlmRequest` to `ChatCompletionsRequest`.
 #[cfg(test)]
 fn translate_to_chat_request(api_name: &str, request: &LlmRequest) -> ChatCompletionsRequest {
-    translate_to_chat_request_with_route(api_name, request, false)
+    translate_to_chat_request_with_route(api_name, request, ChatRoute::Compatible)
 }
 
 #[allow(clippy::too_many_lines)]
 fn translate_to_chat_request_with_route(
     api_name: &str,
     request: &LlmRequest,
-    official_route: bool,
+    route: ChatRoute,
 ) -> ChatCompletionsRequest {
     use super::types::ImageSource;
 
@@ -3638,7 +3666,7 @@ fn translate_to_chat_request_with_route(
         });
     }
 
-    if !official_route {
+    if route != ChatRoute::OpenAi {
         let mut advisory = None;
         append_advisory(&mut advisory, request);
         if let Some(text) = advisory {
@@ -3778,20 +3806,9 @@ fn translate_to_chat_request_with_route(
                 is_error,
             } = block
             {
-                if !images.is_empty() {
-                    tracing::debug!(
-                        n = images.len(),
-                        "dropping images from chat completions tool result \
-                         — unsupported by this wire format"
-                    );
-                }
                 messages.push(ChatMessage {
                     role: "tool".to_string(),
-                    content: Some(ChatContent::Text(if *is_error {
-                        format!("Error: {content}")
-                    } else {
-                        content.clone()
-                    })),
+                    content: Some(chat_tool_result_content(content, *is_error, images, route)),
                     tool_calls: None,
                     tool_call_id: Some(tool_use_id.clone()),
                 });
@@ -3828,9 +3845,50 @@ fn translate_to_chat_request_with_route(
         reasoning_effort: request.effective_effort.explicit_level(),
         stream: None,
         stream_options: None,
-        tool_choice: chat_tool_choice(request, official_route),
+        tool_choice: chat_tool_choice(request, route == ChatRoute::OpenAi),
         parallel_tool_calls: if has_tools { Some(true) } else { None },
         tags: None,
+    }
+}
+
+fn chat_tool_result_content(
+    content: &str,
+    is_error: bool,
+    images: &[super::types::ImageSource],
+    route: ChatRoute,
+) -> ChatContent {
+    let text = if is_error {
+        format!("Error: {content}")
+    } else {
+        content.to_owned()
+    };
+    if images.is_empty() {
+        return ChatContent::Text(text);
+    }
+    match route {
+        ChatRoute::Gemini => {
+            let mut parts = Vec::with_capacity(images.len() + 1);
+            if !text.is_empty() {
+                parts.push(ChatContentPart::Text { text });
+            }
+            parts.extend(images.iter().map(|source| {
+                let super::types::ImageSource::Base64 { media_type, data } = source;
+                ChatContentPart::ImageUrl {
+                    image_url: ChatImageUrl {
+                        url: format!("data:{media_type};base64,{data}"),
+                    },
+                }
+            }));
+            ChatContent::Parts(parts)
+        }
+        ChatRoute::OpenAi | ChatRoute::Compatible => {
+            tracing::debug!(
+                n = images.len(),
+                ?route,
+                "dropping images from chat completions tool result — unsupported on this route"
+            );
+            ChatContent::Text(text)
+        }
     }
 }
 
@@ -6360,7 +6418,9 @@ mod tests {
             serde_json::json!(["reasoning.encrypted_content"])
         );
         let chat = serde_json::to_value(translate_to_chat_request_with_route(
-            "gpt-6", &request, true,
+            "gpt-6",
+            &request,
+            ChatRoute::OpenAi,
         ))
         .unwrap();
         assert_eq!(
@@ -6377,7 +6437,9 @@ mod tests {
             .unwrap()
             .contains("propose_plan"));
         let unknown_chat = serde_json::to_value(translate_to_chat_request_with_route(
-            "proxy", &request, false,
+            "proxy",
+            &request,
+            ChatRoute::Compatible,
         ))
         .unwrap();
         assert_eq!(unknown_chat["tool_choice"], "auto");
@@ -8731,6 +8793,103 @@ mod tests {
         let json = serde_json::to_value(wire).unwrap();
         assert_eq!(json["stream"], true);
         assert_eq!(json["stream_options"]["include_usage"], true);
+    }
+
+    #[test]
+    fn gemini_chat_preserves_tool_result_images_in_place() {
+        let mut request = empty_request();
+        request.messages.push(LlmMessage {
+            source_message_id: None,
+            role: MessageRole::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: "original-call".into(),
+                content: "partial screenshot".into(),
+                is_error: true,
+                images: vec![
+                    super::super::types::ImageSource::Base64 {
+                        media_type: "image/png".into(),
+                        data: "first-image".into(),
+                    },
+                    super::super::types::ImageSource::Base64 {
+                        media_type: "image/jpeg".into(),
+                        data: "second-image".into(),
+                    },
+                ],
+            }],
+        });
+        let expected = serde_json::json!({
+            "role":"tool", "tool_call_id":"original-call", "content":[
+                {"type":"text", "text":"Error: partial screenshot"},
+                {"type":"image_url", "image_url":{"url":"data:image/png;base64,first-image"}},
+                {"type":"image_url", "image_url":{"url":"data:image/jpeg;base64,second-image"}}
+            ]
+        });
+        let models = crate::all_models()
+            .into_iter()
+            .filter(|spec| spec.family == "Google")
+            .collect::<Vec<_>>();
+        assert_eq!(models.len(), 4);
+        for spec in models {
+            let route =
+                ChatRoute::for_model(&spec, Some("https://gateway.example/v1/chat/completions"));
+            assert_eq!(route, ChatRoute::Gemini);
+            let wire = serde_json::to_value(translate_to_chat_request_with_route(
+                "custom-wire-alias",
+                &request,
+                route,
+            ))
+            .unwrap();
+            assert_eq!(wire["messages"][0], expected);
+        }
+        for route in [ChatRoute::OpenAi, ChatRoute::Compatible] {
+            let wire = serde_json::to_value(translate_to_chat_request_with_route(
+                "google/gemini-4-neon",
+                &request,
+                route,
+            ))
+            .unwrap();
+            assert_eq!(wire["messages"][0]["content"], "Error: partial screenshot");
+        }
+    }
+
+    #[test]
+    fn gemini_image_only_tool_result_omits_empty_text_parts() {
+        let images = [super::super::types::ImageSource::Base64 {
+            media_type: "image/png".into(),
+            data: "image-data".into(),
+        }];
+        assert_eq!(
+            serde_json::to_value(chat_tool_result_content(
+                "",
+                false,
+                &images,
+                ChatRoute::Gemini
+            ))
+            .unwrap(),
+            serde_json::json!([{"type":"image_url","image_url":{"url":"data:image/png;base64,image-data"}}])
+        );
+        assert_eq!(
+            serde_json::to_value(chat_tool_result_content("", false, &[], ChatRoute::Gemini))
+                .unwrap(),
+            serde_json::json!("")
+        );
+    }
+
+    #[test]
+    fn gemini_tool_image_support_does_not_follow_family_or_request_spelling() {
+        let mut spec = crate::all_models()
+            .into_iter()
+            .find(|spec| spec.id == "google/gemini-4-neon")
+            .unwrap();
+        for endpoint in [None, Some("https://api.openai.com/v1/chat/completions")] {
+            assert_eq!(ChatRoute::for_model(&spec, endpoint), ChatRoute::OpenAi);
+        }
+        let custom = Some("https://gateway.example/v1/chat/completions");
+        spec.source = ModelSource::External;
+        assert_eq!(ChatRoute::for_model(&spec, custom), ChatRoute::Compatible);
+        spec.source = ModelSource::BuiltIn;
+        spec.id = "another-chat-model".into();
+        assert_eq!(ChatRoute::for_model(&spec, custom), ChatRoute::Compatible);
     }
 
     #[test]
