@@ -111,7 +111,7 @@ async fn adhd_language_migration_preserves_jobs_and_children() {
         .fetch_one(&pool)
         .await
         .unwrap();
-    assert_eq!(run_pending_migrations(&pool).await.unwrap(), 1);
+    assert_eq!(run_through_for_test(&pool, 168).await.unwrap(), 1);
     let after: Vec<(String, String)> = sqlx::query_as(
         "SELECT request_id, llm_language FROM product_creation_jobs ORDER BY request_id",
     )
@@ -138,7 +138,11 @@ async fn adhd_language_migration_preserves_jobs_and_children() {
     .execute(&pool)
     .await
     .is_err());
-    assert_eq!(run_pending_migrations(&pool).await.unwrap(), 0);
+    assert_eq!(run_through_for_test(&pool, 168).await.unwrap(), 0);
+    assert_eq!(
+        run_pending_migrations(&pool).await.unwrap(),
+        registered_after(168)
+    );
     assert_eq!(
         sqlx::query_scalar::<_, i64>("PRAGMA foreign_keys")
             .fetch_one(&pool)
