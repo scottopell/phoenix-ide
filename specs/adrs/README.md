@@ -44,6 +44,7 @@ Allowing gaps does not approve an ID allocation, decision, or publication.
 
 | ADR | Title | Status | Affects |
 | --- | --- | --- | --- |
+| [270](270_prefer-sol-6-2-for-new-conversations.md) | Prefer Sol 6.2 for new conversations | Accepted | REQ-LLM-003 |
 | [269](269_external-models-in-user-toml.md) | Load external model definitions from user TOML at startup | Accepted | REQ-LLM-003c, REQ-AG-010 |
 | [264](264_scan-only-coordinator-history-with-host-owned-batches.md) | Scan only Coordinator history through bounded host-owned batches | Accepted | REQ-SCAN-001–008, REQ-TRACK-004–007 |
 | [263](263_verify-native-backup-and-bound-predecessor-recovery-for-macos-deploy.md) | Verify a native backup and bound predecessor recovery for macOS deploy | Accepted; qualifies ADR-230 | REQ-LDD-002/004/009/029–031, REQ-PD-010, REQ-COMP-021 |

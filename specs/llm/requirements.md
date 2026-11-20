@@ -49,7 +49,7 @@ WHEN client requests model list
 THE SYSTEM SHALL return only models that are currently available
 
 WHEN selecting a product default without an available explicit `DEFAULT_MODEL` override
-THE SYSTEM SHALL prefer exact `gpt-6.1-sol` when registered
+THE SYSTEM SHALL prefer exact `gpt-6.2-sol` when registered
 AND SHALL retain available provider fallback choices when that model is unavailable
 AND SHALL NOT replace explicit conversation, task, or specialized worker choices
 

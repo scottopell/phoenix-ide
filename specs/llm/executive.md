@@ -4,7 +4,7 @@
 
 Built-ins include GPT-6.2 Astra, GPT-6.2 Sol, GPT-6.1 Terra, Claude Fable 5.2,
 and Claude Haiku 5.5. Opus 5.5, Sonnet 5.5, and GPT-6 Luna were already present.
-The product default remains GPT-6.1 Sol. OpenAI additions use Responses on direct
+The product default is GPT-6.2 Sol. OpenAI additions use Responses on direct
 routes and Responses Lite on Codex, with route-gated Fast and prompt caching.
 Fable and Haiku use adaptive thinking binding on the official Anthropic route;
 Fable also exposes Fast. New-model native tool changes are not advertised.
