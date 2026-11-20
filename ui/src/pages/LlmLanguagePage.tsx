@@ -48,7 +48,6 @@ export function LlmLanguagePage() {
   const navigate = useNavigate();
   const [setting, setSetting] = useState<LlmLanguageSetting | null>(null);
   const [loading, setLoading] = useState(true);
-  const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -60,15 +59,6 @@ export function LlmLanguagePage() {
     return () => { cancelled = true; };
   }, []);
 
-  const select = useCallback((language: string) => {
-    if (!setting || setting.language === language) return;
-    setSaving(true);
-    setError(null);
-    api.updateLlmLanguageSetting(language)
-      .then((saved) => setSetting(saved))
-      .catch((e) => setError(e instanceof Error ? e.message : 'Failed to save LLM language'))
-      .finally(() => setSaving(false));
-  }, [setting]);
 
   return (
     <div id="app" className="list-page">
@@ -84,32 +74,9 @@ export function LlmLanguagePage() {
           </div>
 
           <section className="settings-section">
-            <h3 className="settings-section__title">Default for new conversations</h3>
             <div className="settings-section__hint">
-              Changing this affects new conversations only. Existing conversations stay pinned to the language they were created with.
+              Choose a language when starting each conversation. Existing conversations keep their selected language.
             </div>
-            {setting && (
-              <div className="settings-theme-row" role="radiogroup" aria-label="LLM language">
-                {setting.languages.map((lang) => {
-                  const active = setting.language === lang.id;
-                  return (
-                    <button
-                      key={lang.id}
-                      type="button"
-                      role="radio"
-                      aria-checked={active}
-                      className={`settings-theme-btn${active ? ' active' : ''}`}
-                      onClick={() => select(lang.id)}
-                      disabled={saving}
-                      title={lang.description}
-                    >
-                      {lang.label}
-                    </button>
-                  );
-                })}
-              </div>
-            )}
-            {saving && <div className="settings-section__hint">Saving…</div>}
             {error && <div className="settings-section__error">{error}</div>}
             {!setting && loading && <div className="settings-section__hint">Loading…</div>}
           </section>
@@ -118,7 +85,6 @@ export function LlmLanguagePage() {
             <section key={language.id} className="settings-section llm-language-card">
               <div className="llm-language-card__title-row">
                 <h3 className="settings-section__title">{language.label}</h3>
-                {setting.language === language.id && <span className="llm-language-card__current">current default</span>}
               </div>
               <div className="settings-section__hint">{language.description}</div>
               <div className="llm-prompt-grid">
