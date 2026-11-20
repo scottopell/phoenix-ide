@@ -58,7 +58,6 @@ import {
 } from '../hooks';
 import { useToast } from '../hooks/useToast';
 import { useFocusScope } from '../hooks/useFocusScope';
-import { beginNewProductConversationIntent } from '../hooks/useCreateConversation';
 import { Toast } from '../components/Toast';
 import { useAppMachine } from '../hooks/useAppMachine';
 import { ConnectedStateBar } from '../components/StateBar';
@@ -1939,7 +1938,6 @@ function ConversationPageContent({
         // ignore — non-fatal
       }
     }
-    beginNewProductConversationIntent();
     navigate('/new');
   }, [creationFailedDraft, navigate]);
   const handleDeleteProvisioningConversation = useCallback(async () => {

@@ -586,7 +586,7 @@ impl RoutedTool for CreateConversation {
                     "objective":{"type":"string","minLength":1,"description":"Nonblank literal objective; never a user commission or slash command."},
                     "start":{"const":"submit_objective"},"model":{"type":"string"},
                     "effort":{"type":"string","enum":["none","minimal","low","medium","high","xhigh","max"]},
-                    "llm_language":{"type":"string","enum":["phoenix-native","caveman"]}
+                    "llm_language":{"type":"string","enum":LlmLanguage::ALL.iter().map(|language| language.as_str()).collect::<Vec<_>>()}
                 }}
             ]}
 

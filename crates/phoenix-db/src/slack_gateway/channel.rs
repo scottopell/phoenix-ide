@@ -77,7 +77,7 @@ mod tests {
           INSERT INTO slack_gateway_return_coverage(return_id,request_id) VALUES ('return','request');")
             .execute(db.pool()).await.unwrap();
         assert_eq!(
-            crate::migrations::run_pending_migrations(db.pool())
+            crate::migrations::run_through_for_test(db.pool(), 167)
                 .await
                 .unwrap(),
             1
@@ -110,6 +110,9 @@ mod tests {
                 .unwrap(),
             "emoji"
         );
+        crate::migrations::run_pending_migrations(db.pool())
+            .await
+            .unwrap();
         drop(db);
         let reopened = Database::open(path.to_str().unwrap()).await.unwrap();
         assert_eq!(
