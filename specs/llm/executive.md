@@ -1,5 +1,23 @@
 # LLM Provider - Executive Summary
 
+## Model catalog verification (2026-11-20)
+
+Built-ins include GPT-6.2 Astra, GPT-6.2 Sol, GPT-6.1 Terra, Claude Fable 5.2,
+and Claude Haiku 5.5. Opus 5.5, Sonnet 5.5, and GPT-6 Luna were already present.
+The product default remains GPT-6.1 Sol. OpenAI additions use Responses on direct
+routes and Responses Lite on Codex, with route-gated Fast and prompt caching.
+Fable and Haiku use adaptive thinking binding on the official Anthropic route;
+Fable also exposes Fast. New-model native tool changes are not advertised.
+
+Metadata is sourced from the [OpenAI model catalog](https://developers.openai.com/api/docs/models),
+[GPT-6.2 guide](https://developers.openai.com/api/docs/guides/latest-model),
+and [Claude model catalog](https://platform.claude.com/docs/en/models/overview).
+GPT-6.2 native effort defaults remain unknown in metadata because the checked
+documentation establishes accepted levels but does not establish native defaults.
+Provider defaults are preserved by omitting an unset effort override.
+Model-contract, registry-registration, and provider-wire fixtures cover these
+additions; they do not establish account entitlement or live provider acceptance.
+
 ## Requirements Summary
 
 The LLM provider abstracts communication with multiple LLM APIs behind a common interface. Users select their preferred model while the system handles backend-specific translation internally. Phoenix supports built-in Anthropic/OpenAI models plus additive user TOML `[[models]]` entries or `PHOENIX_LLM_MODELS` entries that declare a backend (`anthropic`, `openai_responses`, or `openai_chat_completions`), optional wire model name, user-facing family, and output cap. Base URL overrides are exact endpoints, not gateway roots; Phoenix does not append hidden provider path suffixes. With credential-helper auth and base URL overrides, Phoenix can opportunistically query derived `/v1/models` endpoints to filter the configured model set; if listing is unavailable, Phoenix falls back to configured models. In direct API mode, only models with configured API keys or a credential helper are registered. Requests use a common format (system prompt, messages, tools) that gets translated per backend. Model specs also classify reasoning-effort capability as known-native, unknown, or unsupported; explicit per-conversation overrides persist independently from provider-native defaults and are translated only when explicitly selected. Responses are normalized to text blocks, tool use requests, end-of-turn indicators, and usage statistics. Errors are classified into exhaustive named categories plus explicit policies for automatic runtime retry and user-triggered resume. Network failures, transient rate-limit throttles, server errors, and timeouts are auto-retryable; auth failures are not auto-retryable but are user-resumable after credentials are refreshed. Quota exhaustion remains non-auto-retryable but user-resumable after its reset window; context exhaustion remains a non-resumable terminal path. Request observability includes provider-centric TTFT measured from request transmission or dispatch to the first generation-bearing provider event, excluding acknowledgements, pings, metadata-only events, usage-only events, and terminal events. TTFT remains content-free and privacy-preserving, and aggregate analysis keeps provider, model, and transport as first-class dimensions. When traffic routes through the codex backend, Phoenix uses only its native Codex login credential. Authoritative account usage supplies current, weekly, additional-family, credit, and spend-control quota state; 429 responses carrying structured quota state are parsed into a plan-aware terminal error rather than an opaque retryable message.

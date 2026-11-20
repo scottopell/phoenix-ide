@@ -2165,7 +2165,15 @@ mod tests {
             ModelRegistry::new_with_codex_catalog(&config, None),
             ModelRegistry::new_with_codex_catalog(&config, Some(&unrelated)),
         ] {
-            for id in ["gpt-6-astra", "gpt-6.1-sol", "gpt-6-sol", "gpt-6-luna"] {
+            for id in [
+                "gpt-6.2-astra",
+                "gpt-6.2-sol",
+                "gpt-6.1-terra",
+                "gpt-6-astra",
+                "gpt-6.1-sol",
+                "gpt-6-sol",
+                "gpt-6-luna",
+            ] {
                 assert!(
                     registry.get(id).is_some(),
                     "missing supported built-in {id}"
@@ -3287,7 +3295,15 @@ mod tests {
         );
 
         assert!(outcome.credential_loaded);
-        for id in ["gpt-6-astra", "gpt-6.1-sol", "gpt-6-sol", "gpt-6-luna"] {
+        for id in [
+            "gpt-6.2-astra",
+            "gpt-6.2-sol",
+            "gpt-6.1-terra",
+            "gpt-6-astra",
+            "gpt-6.1-sol",
+            "gpt-6-sol",
+            "gpt-6-luna",
+        ] {
             assert!(
                 registry.get(id).is_some(),
                 "missing supported built-in {id}"

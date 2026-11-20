@@ -1838,6 +1838,15 @@ fn translate_to_responses_request_for_model(
         append_advisory(&mut instructions, request);
     }
 
+    if !use_codex_backend && matches!(spec.id.as_str(), "gpt-6.2-astra" | "gpt-6.2-sol") {
+        if let Some(text) = instructions.take() {
+            input_items.push(ResponsesApiInputItem::InputMessage {
+                role: InputMessageRole::Developer,
+                content: InputMessageContent::Text(text),
+            });
+        }
+    }
+
     // Process each message as a unit to allow grouping text + images
     for msg in &request.messages {
         if let Some(replay) = request.responses_replay.iter().find(|set| {
@@ -2353,7 +2362,13 @@ fn translate_to_backend_request(
 fn is_known_gpt_6(spec: &ModelSpec) -> bool {
     matches!(
         spec.id.as_str(),
-        "gpt-6-astra" | "gpt-6.1-sol" | "gpt-6-sol" | "gpt-6-luna"
+        "gpt-6.2-astra"
+            | "gpt-6.2-sol"
+            | "gpt-6.1-terra"
+            | "gpt-6-astra"
+            | "gpt-6.1-sol"
+            | "gpt-6-sol"
+            | "gpt-6-luna"
     )
 }
 
@@ -6436,36 +6451,52 @@ mod tests {
     }
 
     #[test]
-    fn gpt_61_sol_uses_supported_responses_routes_and_effort() {
+    fn current_models_use_supported_responses_routes_and_effort() {
+        for model in [
+            "gpt-6.1-sol",
+            "gpt-6.2-astra",
+            "gpt-6.2-sol",
+            "gpt-6.1-terra",
+        ] {
+            let mut request = empty_request();
+            request.service_tier = phoenix_core::domain::llm_types::EffectiveServiceTier::Fast;
+            request.effective_effort =
+                phoenix_core::domain::llm_types::EffectiveEffort::explicit(ModelEffort::Max);
+            let direct =
+                serde_json::to_value(translate_to_backend_request(model, &request, false, true))
+                    .unwrap();
+            assert_eq!(direct["model"], model);
+            assert_eq!(direct["reasoning"]["effort"], "max");
+            assert_eq!(direct["service_tier"], "priority");
+            assert!(direct.get("prompt_cache_options").is_some());
+            assert!(matches!(
+                translate_to_backend_request(model, &request, true, false),
+                ResponsesBackendRequest::CodexLite(_)
+            ));
+            assert!(supports_responses_lite(&test_model_spec(model)));
+            let custom =
+                serde_json::to_value(translate_to_backend_request(model, &request, false, false))
+                    .unwrap();
+            assert!(custom.get("service_tier").is_none());
+            assert!(custom.get("prompt_cache_options").is_none());
+        }
+    }
+
+    #[test]
+    fn gpt_62_keeps_stable_instructions_at_the_start_of_input() {
         let mut request = empty_request();
-        request.service_tier = phoenix_core::domain::llm_types::EffectiveServiceTier::Fast;
-        request.effective_effort =
-            phoenix_core::domain::llm_types::EffectiveEffort::explicit(ModelEffort::Max);
-        let direct = serde_json::to_value(translate_to_backend_request(
-            "gpt-6.1-sol",
-            &request,
-            false,
-            true,
-        ))
-        .unwrap();
-        assert_eq!(direct["model"], "gpt-6.1-sol");
-        assert_eq!(direct["reasoning"]["effort"], "max");
-        assert_eq!(direct["service_tier"], "priority");
-        assert!(direct.get("prompt_cache_options").is_some());
-        assert!(matches!(
-            translate_to_backend_request("gpt-6.1-sol", &request, true, false),
-            ResponsesBackendRequest::CodexLite(_)
-        ));
-        assert!(supports_responses_lite(&test_model_spec("gpt-6.1-sol")));
-        let custom = serde_json::to_value(translate_to_backend_request(
-            "gpt-6.1-sol",
-            &request,
-            false,
-            false,
-        ))
-        .unwrap();
-        assert!(custom.get("service_tier").is_none());
-        assert!(custom.get("prompt_cache_options").is_none());
+        request.system = vec![crate::types::SystemContent {
+            text: "Stable guidance".into(),
+            cache: false,
+        }];
+        for model in ["gpt-6.2-astra", "gpt-6.2-sol"] {
+            let wire =
+                serde_json::to_value(translate_to_backend_request(model, &request, false, true))
+                    .unwrap();
+            assert!(wire.get("instructions").is_none());
+            assert_eq!(wire["input"][0]["role"], "developer");
+            assert_eq!(wire["input"][0]["content"], "Stable guidance");
+        }
     }
 
     #[test]

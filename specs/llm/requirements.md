@@ -53,9 +53,11 @@ THE SYSTEM SHALL prefer exact `gpt-6.1-sol` when registered
 AND SHALL retain available provider fallback choices when that model is unavailable
 AND SHALL NOT replace explicit conversation, task, or specialized worker choices
 
-THE built-in OpenAI Responses catalog SHALL contain `gpt-5.6-luna`, `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-6-astra`, `gpt-6.1-sol`, `gpt-6-luna`, and `gpt-6-sol`
+THE built-in OpenAI Responses catalog SHALL contain `gpt-5.6-luna`, `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-6-astra`, `gpt-6.1-sol`, `gpt-6.1-terra`, `gpt-6.2-astra`, `gpt-6.2-sol`, `gpt-6-luna`, and `gpt-6-sol`
 AND SHALL NOT contain `gpt-5.4-mini`, `gpt-5.4`, or `gpt-5.5`
 AND provider discovery SHALL NOT introduce a model that is absent from both the built-in and operator-configured catalogs
+
+THE built-in Anthropic catalog SHALL include `claude-fable-5-2`, `claude-opus-5-5`, `claude-sonnet-5-5`, and `claude-haiku-5-5`
 
 WHEN an exact operator-configured route uses an identifier that is also a legacy built-in identifier
 THE SYSTEM SHALL preserve the exact operator-configured route rather than replace its identifier

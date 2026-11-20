@@ -687,14 +687,16 @@ pub(crate) fn is_official_anthropic_route(base_url_override: Option<&str>) -> bo
 /// effective service tier is Fast, the model supports Fast, and the route is
 /// the official Claude API. Effort and speed are independent.
 fn is_fast_mode(spec: &ModelSpec, base_url_override: Option<&str>, request: &LlmRequest) -> bool {
-    spec.id == "claude-opus-5-5"
+    matches!(spec.id.as_str(), "claude-opus-5-5" | "claude-fable-5-2")
         && request.service_tier == super::types::EffectiveServiceTier::Fast
         && is_official_anthropic_route(base_url_override)
 }
 
 fn supports_thinking_binding(spec: &ModelSpec, base_url_override: Option<&str>) -> bool {
-    matches!(spec.id.as_str(), "claude-opus-5-5" | "claude-sonnet-5-5")
-        && is_official_anthropic_route(base_url_override)
+    matches!(
+        spec.id.as_str(),
+        "claude-opus-5-5" | "claude-sonnet-5-5" | "claude-fable-5-2" | "claude-haiku-5-5"
+    ) && is_official_anthropic_route(base_url_override)
 }
 
 const INLINE_TOOLS_BETA: &str = "inline-tools-2026-09-15";
@@ -2577,7 +2579,7 @@ mod tests {
     }
 
     #[test]
-    fn sonnet_55_uses_adaptive_binding_without_opus_fast() {
+    fn current_anthropic_models_use_route_specific_binding_and_fast() {
         let sonnet = crate::models::all_models()
             .into_iter()
             .find(|spec| spec.id == "claude-sonnet-5-5")
@@ -2590,9 +2592,17 @@ mod tests {
             .into_iter()
             .find(|spec| spec.id == "claude-sonnet-5")
             .unwrap();
+        let fable = crate::models::all_models()
+            .into_iter()
+            .find(|spec| spec.id == "claude-fable-5-2")
+            .unwrap();
+        let haiku = crate::models::all_models()
+            .into_iter()
+            .find(|spec| spec.id == "claude-haiku-5-5")
+            .unwrap();
         let mut request = test_request_with_tools();
         request.service_tier = phoenix_core::domain::llm_types::EffectiveServiceTier::Fast;
-        for spec in [&sonnet, &opus, &old] {
+        for spec in [&sonnet, &opus, &old, &fable, &haiku] {
             for route in [
                 None,
                 Some(OFFICIAL_ANTHROPIC_URL),
@@ -2607,7 +2617,8 @@ mod tests {
                 assert_eq!(binding, supported);
                 assert_eq!(
                     fast,
-                    spec.id == "claude-opus-5-5" && is_official_anthropic_route(route)
+                    matches!(spec.id.as_str(), "claude-opus-5-5" | "claude-fable-5-2")
+                        && is_official_anthropic_route(route)
                 );
                 assert_eq!(
                     wire.pointer("/thinking/type").and_then(|v| v.as_str()),
