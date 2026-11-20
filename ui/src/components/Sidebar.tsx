@@ -30,7 +30,6 @@ import {
   subscribeProductConversationClosed,
   subscribeProductConversationListRevision,
 } from '../notifications';
-import { beginNewProductConversationIntent } from '../hooks/useCreateConversation';
 
 function projectProductConversationHistory(
   rows: readonly ProductConversationListRow[],
@@ -260,7 +259,6 @@ export function Sidebar({
   }, [activeSlug, activeProductRouteIdentity, archivedConversations, archivedProductConversations, conversations, openProductConversations, showArchived]);
 
   const handleNewClick = useCallback(() => {
-    beginNewProductConversationIntent();
     navigate('/new');
   }, [navigate]);
 

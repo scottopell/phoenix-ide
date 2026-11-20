@@ -22,12 +22,6 @@ const NEW_CONVERSATION_DRAFT_KEY = 'phoenix-new-conversation-draft';
 const DRAFT_LLM_LANGUAGE_KEY = 'phoenix-create-llm-language';
 const CREATION_OBSERVATION_INTERVAL_MS = 2000;
 
-export function beginNewProductConversationIntent(): void {
-  try {
-    localStorage.removeItem(DRAFT_LLM_LANGUAGE_KEY);
-  } catch { /* best effort */ }
-}
-
 function effortSupportedByModel(models: ModelsResponse | null, modelId: string | null, effort: ModelEffort | null): boolean {
   if (!effort) return true;
   const capabilities = models?.models.find((model) => model.id === modelId)?.effort_capabilities;
@@ -172,6 +166,7 @@ export function useCreateConversation(navigate: (path: string) => void) {
         }
         activeRequestRef.current = pending;
         if (pending.kind === 'uncertain') {
+          setSelectedLlmLanguage(pending.request.llm_language ?? 'phoenix-native');
           replayIntentRef.current = immutableCreationIntent(pending.request);
         }
         setObservedRequest(pending);
@@ -535,7 +530,7 @@ export function useCreateConversation(navigate: (path: string) => void) {
     homeDir,
     cwd,
     setCwd,
-    selectedLlmLanguage: selectedLlmLanguage,
+    selectedLlmLanguage,
     setSelectedLlmLanguage: (language: string) => {
       setSelectedLlmLanguage(language);
       try { localStorage.setItem(DRAFT_LLM_LANGUAGE_KEY, language); } catch { /* selection remains in memory */ }
