@@ -133,7 +133,7 @@ describe('Sidebar — ProductConversation navigation', () => {
       </MemoryRouter>,
     );
     await waitFor(() => expect(apiMock.listProductConversations).toHaveBeenCalled());
-    fireEvent.click(getByRole('button', { name: '+ New', exact: true }));
+    fireEvent.click(getByRole('button', { name: '+ New' }));
     expect(getByTestId('new-location')).toHaveTextContent('/new');
     expect(localStorage.getItem('phoenix-new-conversation-draft')).toBe('Resume this draft');
     expect(localStorage.getItem('phoenix-create-llm-language')).toBe('adhd');
