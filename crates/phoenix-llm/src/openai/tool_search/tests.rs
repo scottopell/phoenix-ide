@@ -480,6 +480,183 @@ async fn codex_transport_carries_authenticated_native_search_continuation() {
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn codex_websocket_native_search_continues_with_only_authenticated_result_suffix() {
+    use axum::{
+        extract::ws::{Message, WebSocketUpgrade},
+        routing::get,
+        Router,
+    };
+    use phoenix_core::domain::provider_replay::ProviderReplayUpdate;
+    use std::{collections::BTreeMap, sync::Arc, time::Duration};
+    use tokio::sync::Mutex;
+
+    let captured = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let raw_search = json!({"type":"tool_search_call","id":"search-item","execution":"client","call_id":"search-call","status":"in_progress","arguments":{"query":"issues"},"encrypted_content":"opaque-native-search"});
+    let outputs = vec![
+        ("r-search", raw_search.clone()),
+        (
+            "r-function",
+            json!({"type":"function_call","call_id":"issue-call","name":"lookup_issue","arguments":"{\"id\":42}"}),
+        ),
+        (
+            "r-final",
+            json!({"type":"message","role":"assistant","content":[{"type":"output_text","text":"OK"}]}),
+        ),
+    ];
+    let app = Router::new().route("/responses", get({
+        let captured = Arc::clone(&captured);
+        move |upgrade: WebSocketUpgrade| {
+            let captured = Arc::clone(&captured);
+            let outputs = outputs.clone();
+            async move { upgrade.on_upgrade(move |mut socket| async move {
+                for (response_id, output) in outputs {
+                    let Some(Ok(Message::Text(text))) = tokio::time::timeout(Duration::from_secs(30), socket.recv()).await.unwrap() else {
+                        panic!("native WebSocket fixture receives each create request");
+                    };
+                    captured.lock().await.push(serde_json::from_str(&text).unwrap());
+                    socket.send(Message::Text(json!({"type":"response.completed","response":{
+                        "id":response_id,"model":"gpt-6.2-sol","status":"completed","output":[output],"usage":{"input_tokens":10,"output_tokens":5}
+                    }}).to_string().into())).await.unwrap();
+                }
+            }) }
+        }
+    }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/responses", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let spec = super::super::test_model_spec("gpt-6.2-sol");
+    let model = crate::models::RequestModelName::from("gpt-6.2-sol");
+    let sessions = Arc::new(Mutex::new(super::super::CodexWsSessions::default()));
+    let (tx, rx) = tokio::sync::mpsc::channel(1);
+    drop(rx);
+    let mut request = request(ToolDiscoveryMode::OpenAiClient);
+    request.tool_availability = ToolAvailability::all(vec![tool_search_definition()])
+        .with_discovery(ToolDiscoveryMode::OpenAiClient, vec![])
+        .unwrap()
+        .with_continuation_id("native-search-context".into())
+        .unwrap();
+    request.messages.push(LlmMessage {
+        source_message_id: Some("initial-user".into()),
+        role: MessageRole::User,
+        content: vec![ContentBlock::text("Find issue 42.")],
+    });
+    for round in 0..3 {
+        let response = tokio::time::timeout(
+            Duration::from_secs(30),
+            super::super::complete_streaming(
+                &spec,
+                &model,
+                "fixture",
+                Some(&url),
+                &[],
+                &BTreeMap::new(),
+                &request,
+                &tx,
+                true,
+                Some(&sessions),
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        if round == 2 {
+            assert!(response.end_turn);
+            assert!(matches!(
+                response.provider_replay,
+                Some(ProviderReplayUpdate::Clear)
+            ));
+            assert!(matches!(&response.content[..], [ContentBlock::Text { text }] if text=="OK"));
+            break;
+        }
+        assert!(!response.end_turn);
+        let Some(ProviderReplayUpdate::Responses(set)) = response.provider_replay else {
+            panic!("native and function calls retain private output");
+        };
+        let (owner, result, call) = if round == 0 {
+            assert_eq!(set.output_items, vec![raw_search.clone()]);
+            assert!(
+                matches!(&response.content[..], [ContentBlock::ToolUse { id, name, input }] if id=="search-call" && name==TOOL_SEARCH_NAME && input==&json!({"query":"issues"}))
+            );
+            ("search-owner", "search-result", "search-call")
+        } else {
+            assert!(
+                matches!(&response.content[..], [ContentBlock::ToolUse { id, name, input }] if id=="issue-call" && name=="lookup_issue" && input==&json!({"id":42}))
+            );
+            ("function-owner", "function-result", "issue-call")
+        };
+        request.messages.push(LlmMessage {
+            source_message_id: Some(owner.into()),
+            role: MessageRole::Assistant,
+            content: response.content,
+        });
+        request
+            .output_replay
+            .push(set.with_owner_message_id(owner.into()).into());
+        request.messages.push(LlmMessage {
+            source_message_id: Some(result.into()),
+            role: MessageRole::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: call.into(),
+                content: if round == 0 {
+                    phoenix_core::domain::tool_discovery::tool_search_result_text(&[deferred()])
+                } else {
+                    "Issue 42".into()
+                },
+                images: vec![],
+                is_error: false,
+            }],
+        });
+        if round == 0 {
+            request.tool_availability =
+                ToolAvailability::all(vec![tool_search_definition(), deferred()])
+                    .with_discovery(
+                        ToolDiscoveryMode::OpenAiClient,
+                        vec![ToolDiscoveryResult {
+                            owner_message_id: owner.into(),
+                            tool_call_id: call.into(),
+                            result_message_id: result.into(),
+                            protocol: ToolDiscoveryProtocol::OpenAiClient,
+                            tools: vec![deferred()],
+                        }],
+                    )
+                    .unwrap()
+                    .with_continuation_id("native-search-context".into())
+                    .unwrap();
+        }
+    }
+    let requests = captured.lock().await;
+    assert_eq!(requests.len(), 3);
+    let first = &requests[0];
+    assert!(first.get("previous_response_id").is_none());
+    assert_eq!(first["input"][0]["type"], "additional_tools");
+    assert_eq!(first["input"][0]["tools"].as_array().unwrap().len(), 1);
+    assert_eq!(first["input"][0]["tools"][0]["type"], "tool_search");
+    assert_eq!(first["input"][0]["tools"][0]["execution"], "client");
+    for request in requests.iter() {
+        assert_eq!(request["type"], "response.create");
+        assert!(request.get("tools").is_none());
+        assert_eq!(
+            request["client_metadata"]["ws_request_header_x_openai_internal_codex_responses_lite"],
+            "true"
+        );
+    }
+    assert_eq!(requests[1]["previous_response_id"], "r-search");
+    assert_eq!(
+        requests[1]["input"],
+        json!([{"type":"tool_search_output","call_id":"search-call","execution":"client","status":"completed","tools":[{
+            "type":"function","name":"lookup_issue","description":deferred().description,"parameters":deferred().input_schema,"defer_loading":true
+        }]}])
+    );
+    assert_eq!(requests[2]["previous_response_id"], "r-function");
+    assert_eq!(
+        requests[2]["input"],
+        json!([{"type":"function_call_output","call_id":"issue-call","output":"Issue 42"}])
+    );
+    server.abort();
+}
+
+#[tokio::test]
 async fn streamed_client_search_is_an_executable_tool_call_with_private_replay() {
     let request = request(ToolDiscoveryMode::OpenAiClient);
     let mut acc =
