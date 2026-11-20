@@ -19,12 +19,12 @@ import { generateUUID } from '../utils/uuid';
 const LAST_CWD_KEY = 'phoenix-last-cwd';
 const LAST_MODEL_KEY = 'phoenix-last-model';
 const NEW_CONVERSATION_DRAFT_KEY = 'phoenix-new-conversation-draft';
-const RECOVERED_LLM_LANGUAGE_KEY = 'phoenix-create-llm-language';
+const DRAFT_LLM_LANGUAGE_KEY = 'phoenix-create-llm-language';
 const CREATION_OBSERVATION_INTERVAL_MS = 2000;
 
 export function beginNewProductConversationIntent(): void {
   try {
-    localStorage.removeItem(RECOVERED_LLM_LANGUAGE_KEY);
+    localStorage.removeItem(DRAFT_LLM_LANGUAGE_KEY);
   } catch { /* best effort */ }
 }
 
@@ -107,8 +107,8 @@ export function useCreateConversation(navigate: (path: string) => void) {
   }, []);
   const [initialActiveRequestId] = useState(activeProductCreationRequestId);
   const [requestId, setRequestId] = useState(() => initialActiveRequestId ?? generateUUID());
-  const [recoveredLlmLanguage, setRecoveredLlmLanguage] = useState<string | null>(() => {
-    try { return localStorage.getItem(RECOVERED_LLM_LANGUAGE_KEY); } catch { return null; }
+  const [selectedLlmLanguage, setSelectedLlmLanguage] = useState<string>(() => {
+    try { return localStorage.getItem(DRAFT_LLM_LANGUAGE_KEY) ?? 'phoenix-native'; } catch { return 'phoenix-native'; }
   });
   const replayIntentRef = useRef<string | null>(null);
   const [homeDir, setHomeDir] = useState<string>('');
@@ -305,10 +305,10 @@ export function useCreateConversation(navigate: (path: string) => void) {
           setDraft('');
           setImages([]);
           setFiles([]);
-          setRecoveredLlmLanguage(null);
+          setSelectedLlmLanguage('phoenix-native');
           clearNewConversationDraft();
           try {
-            localStorage.removeItem(RECOVERED_LLM_LANGUAGE_KEY);
+            localStorage.removeItem(DRAFT_LLM_LANGUAGE_KEY);
           } catch { /* publication is already durable */ }
           navigateRef.current(result.canonical_route);
           return;
@@ -454,7 +454,7 @@ export function useCreateConversation(navigate: (path: string) => void) {
         objective: trimmed,
         model: selectedModel,
         effort: selectedEffort,
-        llm_language: recoveredLlmLanguage,
+        llm_language: selectedLlmLanguage,
         images,
       });
       let activeRequestId = requestId;
@@ -469,7 +469,7 @@ export function useCreateConversation(navigate: (path: string) => void) {
         objective: trimmed,
         model: selectedModel,
         effort: selectedEffort,
-        llm_language: recoveredLlmLanguage,
+        llm_language: selectedLlmLanguage,
         ...(images.length > 0 ? { images: images.map((image) => ({ ...image })) } : {}),
       };
       const uncertain: Extract<PendingCreationRequest, { kind: 'uncertain' }> = { version: 3, kind: 'uncertain', request: createRequest };
@@ -514,14 +514,14 @@ export function useCreateConversation(navigate: (path: string) => void) {
         setDraft(creation.objective);
         setImages(creation.images ?? []);
         setFiles([]);
-        setRecoveredLlmLanguage(creation.llm_language);
+        setSelectedLlmLanguage(creation.llm_language ?? 'phoenix-native');
         selectModel(creation.model);
         selectEffort(creation.effort);
         try {
           if (creation.llm_language) {
-            localStorage.setItem(RECOVERED_LLM_LANGUAGE_KEY, creation.llm_language);
+            localStorage.setItem(DRAFT_LLM_LANGUAGE_KEY, creation.llm_language);
           } else {
-            localStorage.removeItem(RECOVERED_LLM_LANGUAGE_KEY);
+            localStorage.removeItem(DRAFT_LLM_LANGUAGE_KEY);
           }
         } catch { /* replay still retains the pinned language in memory */ }
         setError(null);
@@ -535,6 +535,11 @@ export function useCreateConversation(navigate: (path: string) => void) {
     homeDir,
     cwd,
     setCwd,
+    selectedLlmLanguage: selectedLlmLanguage,
+    setSelectedLlmLanguage: (language: string) => {
+      setSelectedLlmLanguage(language);
+      try { localStorage.setItem(DRAFT_LLM_LANGUAGE_KEY, language); } catch { /* selection remains in memory */ }
+    },
     dirStatus,
     setDirStatus,
     isGitDir,

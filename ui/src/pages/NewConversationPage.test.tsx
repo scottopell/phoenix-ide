@@ -10,6 +10,14 @@ import { ApiResponseError } from '../api';
 const { apiMock, creationStoreMock, creationStoreState } = vi.hoisted(() => ({
   apiMock: {
     listModels: vi.fn().mockResolvedValue({ models: [{ id: 'claude-3-5-sonnet' }], default: 'claude-3-5-sonnet', llm_configured: true }),
+    getLlmLanguageSetting: vi.fn().mockResolvedValue({
+      language: 'caveman',
+      languages: [
+        { id: 'phoenix-native', label: 'Phoenix', description: 'Default Phoenix prose' },
+        { id: 'caveman', label: 'Caveman', description: 'Terse' },
+        { id: 'adhd', label: 'ADHD', description: 'Action first' },
+      ],
+    }),
     getEnv: vi.fn().mockResolvedValue({ home_dir: '/home/user' }),
     listRecentManagementRootSuggestions: vi.fn().mockResolvedValue({ suggestions: [] }),
     getProjects: vi.fn().mockResolvedValue([]),
@@ -156,6 +164,23 @@ describe('NewConversationPage', () => {
         .every((select) => !select.disabled)).toBe(true);
     });
   }
+
+  it('chooses a language per conversation without inheriting the global default', async () => {
+    renderPage();
+    await settleInitialPageWork();
+    const picker = screen.getAllByRole('combobox', { name: /Language/ })[0]!;
+    expect(picker).toHaveValue('phoenix-native');
+    fireEvent.change(picker, { target: { value: 'adhd' } });
+    expect(screen.getAllByRole('combobox', { name: /Language/ })[1]).toHaveValue('adhd');
+    fireEvent.change(screen.getAllByPlaceholderText('What would you like to work on?')[0]!, {
+      target: { value: 'Explain this code' },
+    });
+    await waitFor(() => expect(screen.getAllByRole('button', { name: 'Send' })[0]).toBeEnabled());
+    fireEvent.click(screen.getAllByRole('button', { name: 'Send' })[0]!);
+    await waitFor(() => expect(apiMock.createProductConversation).toHaveBeenCalledWith(
+      expect.objectContaining({ llm_language: 'adhd' }),
+    ));
+  });
 
   it('does not show checking status on initial render when cwd is saved', async () => {
     const { container } = renderPage();

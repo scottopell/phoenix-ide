@@ -5,7 +5,7 @@ import { ConversationSettings } from '../components/ConversationSettings';
 import { VoiceRecorder } from '../components/VoiceInput/VoiceRecorder';
 import { PaneDivider } from '../components/PaneDivider';
 import { SUPPORTED_IMAGE_TYPES } from '../utils/images';
-import { ExpansionError, api, type ProductConversationCreationAllowedActionView, type ProductConversationCreationRecoveryRow } from '../api';
+import { ExpansionError, api, type LlmLanguageCatalogEntry, type ProductConversationCreationAllowedActionView, type ProductConversationCreationRecoveryRow } from '../api';
 import { useCreateConversation } from '../hooks/useCreateConversation';
 import './NewConversationPage.css';
 import { recoveryDiscoveryDelay } from './recoveryPolling';
@@ -165,6 +165,16 @@ interface NewConversationPageProps {
 export function NewConversationPage({ desktopMode }: NewConversationPageProps = {}) {
   const navigate = useNavigate();
   const conv = useCreateConversation(navigate);
+  const [languages, setLanguages] = useState<LlmLanguageCatalogEntry[]>([]);
+  const [languageError, setLanguageError] = useState<string | null>(null);
+  useEffect(() => {
+    let active = true;
+    api.getLlmLanguageSetting()
+      .then((catalog) => { if (active) setLanguages(catalog.languages); })
+      .catch(() => { if (active) setLanguageError('Language choices could not load. Phoenix is available; reload to choose another.'); });
+    return () => { active = false; };
+  }, []);
+
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
@@ -534,6 +544,11 @@ export function NewConversationPage({ desktopMode }: NewConversationPageProps = 
             error={conv.error}
             recentPaths={conv.recentManagementRootSuggestions.map((suggestion) => suggestion.path)}
             rootFreshness={null}
+            languages={languages}
+            selectedLanguage={conv.selectedLlmLanguage}
+            setSelectedLanguage={conv.setSelectedLlmLanguage}
+            languageError={languageError}
+            languageDisabled={conv.creating}
           />
 
           {/* Main input — hidden until an LLM is configured */}
@@ -615,6 +630,11 @@ export function NewConversationPage({ desktopMode }: NewConversationPageProps = 
             error={conv.error}
             recentPaths={conv.recentManagementRootSuggestions.map((suggestion) => suggestion.path)}
             rootFreshness={null}
+            languages={languages}
+            selectedLanguage={conv.selectedLlmLanguage}
+            setSelectedLanguage={conv.setSelectedLlmLanguage}
+            languageError={languageError}
+            languageDisabled={conv.creating}
           />
         </div>
       </main>

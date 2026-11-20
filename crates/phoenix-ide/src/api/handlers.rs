@@ -2565,49 +2565,47 @@ mod product_creation_acceptance_tests {
     async fn replay_preserves_default_language_but_rejects_explicit_language_change() {
         use phoenix_core::llm_language::LlmLanguage;
 
-        let state = hard_delete_cascade_tests::make_test_state().await;
-        state
-            .db
-            .set_default_llm_language(LlmLanguage::Caveman)
-            .await
-            .unwrap();
-        let directory = tempfile::tempdir().unwrap();
-        let app = create_router(state.clone());
-        let request_id = uuid::Uuid::new_v4().to_string();
-        let body = request_body(&request_id, directory.path().to_str().unwrap());
-        let first = post_creation(&app, &body).await;
-        assert_eq!(first.status(), StatusCode::ACCEPTED);
-        let receipt = json_body(first).await;
+        for language in [LlmLanguage::Caveman, LlmLanguage::Adhd] {
+            let state = hard_delete_cascade_tests::make_test_state().await;
+            state.db.set_default_llm_language(language).await.unwrap();
+            let directory = tempfile::tempdir().unwrap();
+            let app = create_router(state.clone());
+            let request_id = uuid::Uuid::new_v4().to_string();
+            let body = request_body(&request_id, directory.path().to_str().unwrap());
+            let first = post_creation(&app, &body).await;
+            assert_eq!(first.status(), StatusCode::ACCEPTED);
+            let receipt = json_body(first).await;
 
-        state
-            .db
-            .set_default_llm_language(LlmLanguage::PhoenixNative)
-            .await
-            .unwrap();
-        let replay = post_creation(&app, &body).await;
-        assert_eq!(replay.status(), StatusCode::ACCEPTED);
-        assert_eq!(json_body(replay).await, receipt);
+            state
+                .db
+                .set_default_llm_language(LlmLanguage::PhoenixNative)
+                .await
+                .unwrap();
+            let replay = post_creation(&app, &body).await;
+            assert_eq!(replay.status(), StatusCode::ACCEPTED);
+            assert_eq!(json_body(replay).await, receipt);
 
-        let mut explicit = body;
-        explicit["llm_language"] = serde_json::json!("caveman");
-        let same_language = post_creation(&app, &explicit).await;
-        assert_eq!(same_language.status(), StatusCode::ACCEPTED);
-        assert_eq!(json_body(same_language).await, receipt);
+            let mut explicit = body;
+            explicit["llm_language"] = serde_json::json!(language.as_str());
+            let same_language = post_creation(&app, &explicit).await;
+            assert_eq!(same_language.status(), StatusCode::ACCEPTED);
+            assert_eq!(json_body(same_language).await, receipt);
 
-        explicit["llm_language"] = serde_json::json!("phoenix-native");
-        let conflict = post_creation(&app, &explicit).await;
-        assert_eq!(conflict.status(), StatusCode::CONFLICT);
-        assert_eq!(
-            json_body(conflict).await["error_type"],
-            "product_creation_request_conflict"
-        );
-        let job = state
-            .db
-            .get_product_creation_job(&request_id)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(job.intent.llm_language, LlmLanguage::Caveman);
+            explicit["llm_language"] = serde_json::json!("phoenix-native");
+            let conflict = post_creation(&app, &explicit).await;
+            assert_eq!(conflict.status(), StatusCode::CONFLICT);
+            assert_eq!(
+                json_body(conflict).await["error_type"],
+                "product_creation_request_conflict"
+            );
+            let job = state
+                .db
+                .get_product_creation_job(&request_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(job.intent.llm_language, language);
+        }
     }
 
     #[tokio::test]

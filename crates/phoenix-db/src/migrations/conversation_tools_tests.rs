@@ -98,6 +98,61 @@ async fn fixture(prefix: u32, populated: bool) -> SqlitePool {
     pool
 }
 
+#[tokio::test]
+async fn adhd_language_migration_preserves_jobs_and_children() {
+    let pool = fixture(167, true).await;
+    let before: Vec<(String, String)> = sqlx::query_as(
+        "SELECT request_id, llm_language FROM product_creation_jobs ORDER BY request_id",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    let images: i64 = sqlx::query_scalar("SELECT count(*) FROM product_creation_job_images")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(run_pending_migrations(&pool).await.unwrap(), 1);
+    let after: Vec<(String, String)> = sqlx::query_as(
+        "SELECT request_id, llm_language FROM product_creation_jobs ORDER BY request_id",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(before, after);
+    assert_eq!(
+        images,
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM product_creation_job_images")
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+    );
+    sqlx::query(
+        "UPDATE product_creation_jobs SET llm_language = 'adhd' WHERE request_id = 'old-user'",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    assert!(sqlx::query(
+        "UPDATE product_creation_jobs SET llm_language = 'unknown' WHERE request_id = 'old-user'"
+    )
+    .execute(&pool)
+    .await
+    .is_err());
+    assert_eq!(run_pending_migrations(&pool).await.unwrap(), 0);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("PRAGMA foreign_keys")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        1
+    );
+    assert!(sqlx::query("PRAGMA foreign_key_check")
+        .fetch_all(&pool)
+        .await
+        .unwrap()
+        .is_empty());
+}
+
 async fn seed(pool: &SqlitePool, prefix: u32) {
     for (id, origin) in [
         ("old-user", "user_api"),
