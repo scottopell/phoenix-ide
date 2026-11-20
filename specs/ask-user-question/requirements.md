@@ -236,10 +236,15 @@ when it is mid-turn; storing the reply before delivery means no answer is lost.
 
 ---
 
-### REQ-AUQ-012: Withdraw Settled Coordinator Questions
+### REQ-AUQ-012: Withdraw and List Coordinator Questions
 
 WHEN the Coordinator settles an open question another way
 THE Coordinator SHALL be able to withdraw it, which closes it without a reply
 AND SHALL be refused once the user has answered or dismissed it.
+
+THE Coordinator SHALL be able to list its open questions with their request
+identities, oldest first,
+AND its prompt SHALL direct it to check that list before asking and after a
+continuation, so it does not ask again what is already open.
 
 **Rationale:** A question that no longer matters should not wait for the user.

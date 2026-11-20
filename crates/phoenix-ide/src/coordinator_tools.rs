@@ -456,6 +456,7 @@ pub(crate) fn tools(
     // REQ-AUQ-010: the Coordinator asks without blocking its own coordination.
     tools.push(Arc::new(user_questions::PostUserQuestion(db.clone())));
     tools.push(Arc::new(user_questions::WithdrawUserQuestion(db.clone())));
+    tools.push(Arc::new(user_questions::ListUserQuestions(db.clone())));
     tools
 }
 
@@ -3261,7 +3262,8 @@ mod tests {
                 "retry_close_safely",
                 "answer_conversation_question",
                 "post_user_question",
-                "withdraw_user_question"
+                "withdraw_user_question",
+                "list_user_questions"
             ]
         );
         let present_svg = coordinator
@@ -3369,7 +3371,8 @@ mod tests {
                 "retry_close_safely",
                 "answer_conversation_question",
                 "post_user_question",
-                "withdraw_user_question"
+                "withdraw_user_question",
+                "list_user_questions"
             ]
         );
         assert!(

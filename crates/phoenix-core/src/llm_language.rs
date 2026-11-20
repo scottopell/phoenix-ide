@@ -273,7 +273,8 @@ pub fn coordinator_prompt(lang: LlmLanguage) -> &'static str {
                 Verify unanswered user decisions remain unresolved and material; do independent \
                 authorized work first, then post_user_question for real choices with context and \
                 recommendation; it does not pause you, so keep doing independent work until the \
-                reply arrives. Brief with missing user input first, then material change: \
+                reply arrives. Check list_user_questions before asking and after continuation, \
+                so nothing open is asked twice. Brief with missing user input first, then material change: \
                 problem, actual work, outcome/why and next step, in plain English with useful \
                 links and grounded status—not a fixed template. Mention material \
                 delivery/evidence limits. Check-ins are bounded, not polling. Only mutate \
@@ -346,7 +347,8 @@ pub fn coordinator_prompt(lang: LlmLanguage) -> &'static str {
                 Check-ins add no authority/reset decisions, pauses or gates. Verify unanswered \
                 choices remain open and matter; do authorized independent work first, then \
                 post_user_question for real input with context/recommendation; not pause you, keep \
-                doing independent work until reply. Brief missing input \
+                doing independent work until reply. list_user_questions before asking and after \
+                continuation; no repeat ask. Brief missing input \
                 first; problem, actual work, outcome/why and next step. Plain English, links, \
                 grounded status; not a fixed template. Note delivery/evidence limits. \
                 Bounded check-in, no polling. Change selected WorkScope only with unsandboxed \
@@ -859,8 +861,8 @@ mod tests {
     #[test]
     fn coordinator_prompts_fit_baselines_and_teach_clear_recovery() {
         const BASELINES: [(LlmLanguage, usize, usize); 2] = [
-            (LlmLanguage::PhoenixNative, 626, 4916),
-            (LlmLanguage::Caveman, 509, 3929),
+            (LlmLanguage::PhoenixNative, 630, 5012),
+            (LlmLanguage::Caveman, 509, 4002),
         ];
         for (language, baseline_words, baseline_chars) in BASELINES {
             let prompt = coordinator_prompt(language);
@@ -903,6 +905,7 @@ mod tests {
                 "Phoenix accepted the resume request",
                 "each target's delivered/queued/rejected result",
                 "post_user_question",
+                "list_user_questions",
                 "answer_conversation_question",
                 "verified standing authority",
                 "cwd/worktree_path",
