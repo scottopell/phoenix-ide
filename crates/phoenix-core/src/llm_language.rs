@@ -12,8 +12,8 @@
 //! - `Adhd` — standard operational instructions with action-first response guidance.
 //!
 //! The language is stored per-conversation (column `conversations.llm_language`)
-//! and is fixed at conversation creation from the global app default
-//! (`app_settings.default_llm_language`). Chain continuations and sub-agent
+//! and is fixed at creation from the explicit selection or the API default.
+//! Chain continuations and sub-agent
 //! conversations inherit their parent's language.
 
 use crate::domain::sm_state::ExploreBashCapability;

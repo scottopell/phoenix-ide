@@ -1,6 +1,5 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import {
-  beginNewProductConversationIntent,
   reconcileSubscribedModelSelection,
 } from './useCreateConversation';
 
@@ -74,13 +73,4 @@ describe('reconcileSubscribedModelSelection', () => {
       .toEqual({ selectedModel: 'gpt-6-astra', selectedEffort: 'high' });
   });
 
-  it('preserves this tab recovery identity when navigation begins a new intent', () => {
-    sessionStorage.setItem('phoenix-active-product-create-request', 'req-pending');
-    localStorage.setItem('phoenix-create-llm-language', 'Japanese');
-
-    beginNewProductConversationIntent();
-
-    expect(sessionStorage.getItem('phoenix-active-product-create-request')).toBe('req-pending');
-    expect(localStorage.getItem('phoenix-create-llm-language')).toBeNull();
-  });
 });

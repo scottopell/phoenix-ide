@@ -9,7 +9,6 @@ import {
   useConversationsRefresh,
 } from '../conversation';
 import { NewConversationPage } from './NewConversationPage';
-import { beginNewProductConversationIntent } from '../hooks/useCreateConversation';
 import { ConversationList } from '../components/ConversationList';
 import { coordinatorUnread } from '../conversation/readState';
 import {
@@ -276,7 +275,6 @@ export function ConversationListPage() {
   }, [navigate, saveScrollPosition]);
 
   const handleNewConversation = () => {
-    beginNewProductConversationIntent();
     navigate('/new');
   };
 

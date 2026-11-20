@@ -182,6 +182,21 @@ describe('NewConversationPage', () => {
     ));
   });
 
+  it('keeps a draft language when leaving and returning through New', async () => {
+    const page = renderPage();
+    await settleInitialPageWork();
+    fireEvent.change(screen.getAllByRole('combobox', { name: /Language/ })[0]!, { target: { value: 'adhd' } });
+    fireEvent.change(screen.getAllByPlaceholderText('What would you like to work on?')[0]!, {
+      target: { value: 'Resume this unsent draft' },
+    });
+    page.unmount();
+
+    renderPage();
+    await settleInitialPageWork();
+    expect(screen.getAllByPlaceholderText('What would you like to work on?')[0]).toHaveValue('Resume this unsent draft');
+    expect(screen.getAllByRole('combobox', { name: /Language/ })[0]).toHaveValue('adhd');
+  });
+
   it('does not show checking status on initial render when cwd is saved', async () => {
     const { container } = renderPage();
     expect(container.querySelectorAll('.status-checking').length).toBe(0);
