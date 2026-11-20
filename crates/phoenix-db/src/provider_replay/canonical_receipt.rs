@@ -53,6 +53,13 @@ impl CanonicalReceipt {
                 "responses",
                 Some(command_hash(b"canonical-tool-round/responses/v1\0", set)?),
             ),
+            Some(ProviderReplayUpdate::ChatCompletions(set)) => (
+                "chat_completions",
+                Some(command_hash(
+                    b"canonical-tool-round/chat-completions/v1\0",
+                    set,
+                )?),
+            ),
         };
         Ok(Self {
             checkpoint_hash: command_hash(
@@ -258,5 +265,44 @@ mod tests {
             command_hash(b"test", &vec![1, 2]).unwrap(),
             command_hash(b"test", &vec![2, 1]).unwrap()
         );
+    }
+
+    #[test]
+    fn chat_receipt_binds_exact_signature_and_public_witness() {
+        use phoenix_core::domain::{
+            llm_types::ContentBlock,
+            responses_replay::{ChatResponseSet, ChatToolSignature},
+        };
+        let state = ConvState::LlmRequesting { attempt: 1 };
+        let timestamp = Utc::now();
+        let mut set = ChatResponseSet {
+            response_id: "response".into(),
+            model: "google/gemini-4-neon".into(),
+            owner_message_id: "assistant".into(),
+            public_content: vec![ContentBlock::ToolUse {
+                id: "call".into(),
+                name: "report_number".into(),
+                input: serde_json::json!({"number":7}),
+            }],
+            tool_signatures: vec![ChatToolSignature {
+                tool_call_id: "call".into(),
+                signature: "opaque".into(),
+            }],
+        };
+        let first = CanonicalReceipt::new(
+            &state,
+            timestamp,
+            Some(&ProviderReplayUpdate::ChatCompletions(set.clone())),
+        )
+        .unwrap();
+        assert_eq!(first.replay_kind, "chat_completions");
+        set.tool_signatures[0].signature = "changed".into();
+        let changed = CanonicalReceipt::new(
+            &state,
+            timestamp,
+            Some(&ProviderReplayUpdate::ChatCompletions(set)),
+        )
+        .unwrap();
+        assert_ne!(first, changed);
     }
 }

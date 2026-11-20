@@ -507,7 +507,7 @@ mod tests {
             "revision 1"
         );
         assert_eq!(changed.declarations()[0].description, "revision 2");
-        sqlx::query("INSERT INTO active_responses_replay_sets (conversation_id,response_id,ordinal,model,owner_message_id,public_content) VALUES ('policy','response',0,'gpt','owner','[]')").execute(db.pool()).await.unwrap();
+        sqlx::query("INSERT INTO active_responses_replay_sets (conversation_id,response_id,ordinal,model,owner_message_id,public_content,api_format) VALUES ('policy','response',0,'gpt','owner','[]','responses')").execute(db.pool()).await.unwrap();
         sqlx::query("INSERT INTO active_responses_replay_items (conversation_id,response_id,ordinal,payload) VALUES ('policy','response',0,'{}')").execute(db.pool()).await.unwrap();
         db.update_conversation_model_and_effort(
             "policy",
@@ -696,7 +696,7 @@ mod tests {
         .await
         .unwrap();
         sqlx::query("INSERT INTO active_provider_replay_state (conversation_id,provider,model,response_id,payload) VALUES ('policy','anthropic','model','response','{}')").execute(db.pool()).await.unwrap();
-        sqlx::query("INSERT INTO active_responses_replay_sets (conversation_id,response_id,ordinal,model,owner_message_id,public_content) VALUES ('policy','response',0,'gpt','owner','[]')").execute(db.pool()).await.unwrap();
+        sqlx::query("INSERT INTO active_responses_replay_sets (conversation_id,response_id,ordinal,model,owner_message_id,public_content,api_format) VALUES ('policy','response',0,'gpt','owner','[]','responses')").execute(db.pool()).await.unwrap();
         let old: String = sqlx::query_scalar(
             "SELECT continuation_id FROM conversation_tool_contexts WHERE conversation_id='policy'",
         )

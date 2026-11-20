@@ -18,6 +18,37 @@ Provider defaults are preserved by omitting an unset effort override.
 Model-contract, registry-registration, and provider-wire fixtures cover these
 additions; they do not establish account entitlement or live provider acceptance.
 
+## Google gateway verification (2026-11-20)
+
+Gemini 4 Neon, Hydrogen, Carbon, and Argon register under Google when a Chat
+Completions endpoint is configured. Their `google/` request spellings and
+1,048,576 context / 65,536 synchronous output limits match the checked gateway
+catalog, maintained gateway route reference, and Google model documentation.
+The common low/medium/high effort controls are exposed with unknown native
+defaults; extended effort names differ between the Google and gateway contracts
+and are not inferred. Sol 6.2 is the product default; explicit choices remain intact.
+
+The original Neon probe completed its first tool call but failed continuation
+with HTTP 400 after dropping `extra_content.google.thought_signature`. Exact
+signature replay made that exchange succeed. Phoenix's real adapter then passed
+complete tool rounds for all four models in both streaming and non-streaming
+modes. The opt-in `gemini_gateway` integration test reproduces that qualification
+with synthetic tool data and configured credentials; it is ignored in ordinary
+checks to avoid accidental provider charges. No private response payload is saved
+as a fixture. These small probes establish tool exchange compatibility, not
+long-session quality, long decode, every thinking level, or production activation.
+
+Typed Chat replay shares the existing normalized output-replay persistence with
+an explicit protocol discriminator. Signature rows retain exact assistant/call
+ownership and public-content witnesses, survive reopen/retry, participate in
+canonical receipts, and retire with the exchange. Migration 169 preserves the
+existing Responses rows and canonical receipt hashes/timestamps. Provider unit
+fixtures cover late streaming signatures, immutable metadata, rewritten-owner
+rejection, and accounting for separately reported Gemini reasoning tokens.
+Database regressions cover reopen, immutable replay, migration, receipts, and
+settlement. [ADR-271](../adrs/271_preserve-gemini-tool-signatures-through-chat-completions.md)
+records the integration decision.
+
 ## Requirements Summary
 
 The LLM provider abstracts communication with multiple LLM APIs behind a common interface. Users select their preferred model while the system handles backend-specific translation internally. Phoenix supports built-in Anthropic/OpenAI models plus additive user TOML `[[models]]` entries or `PHOENIX_LLM_MODELS` entries that declare a backend (`anthropic`, `openai_responses`, or `openai_chat_completions`), optional wire model name, user-facing family, and output cap. Base URL overrides are exact endpoints, not gateway roots; Phoenix does not append hidden provider path suffixes. With credential-helper auth and base URL overrides, Phoenix can opportunistically query derived `/v1/models` endpoints to filter the configured model set; if listing is unavailable, Phoenix falls back to configured models. In direct API mode, only models with configured API keys or a credential helper are registered. Requests use a common format (system prompt, messages, tools) that gets translated per backend. Model specs also classify reasoning-effort capability as known-native, unknown, or unsupported; explicit per-conversation overrides persist independently from provider-native defaults and are translated only when explicitly selected. Responses are normalized to text blocks, tool use requests, end-of-turn indicators, and usage statistics. Errors are classified into exhaustive named categories plus explicit policies for automatic runtime retry and user-triggered resume. Network failures, transient rate-limit throttles, server errors, and timeouts are auto-retryable; auth failures are not auto-retryable but are user-resumable after credentials are refreshed. Quota exhaustion remains non-auto-retryable but user-resumable after its reset window; context exhaustion remains a non-resumable terminal path. Request observability includes provider-centric TTFT measured from request transmission or dispatch to the first generation-bearing provider event, excluding acknowledgements, pings, metadata-only events, usage-only events, and terminal events. TTFT remains content-free and privacy-preserving, and aggregate analysis keeps provider, model, and transport as first-class dimensions. When traffic routes through the codex backend, Phoenix uses only its native Codex login credential. Authoritative account usage supplies current, weekly, additional-family, credit, and spend-control quota state; 429 responses carrying structured quota state are parsed into a plan-aware terminal error rather than an opaque retryable message.

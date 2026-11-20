@@ -54,7 +54,7 @@ fn request(
         system: vec![SystemContent::new(system)],
         messages,
         provider_replay: None,
-        responses_replay: Vec::new(),
+        output_replay: Vec::new(),
         tool_availability: phoenix_core::domain::tool_availability::ToolAvailability::all(vec![]),
         max_tokens: OUTPUT,
         effective_effort: registry.effective_effort(model, None),

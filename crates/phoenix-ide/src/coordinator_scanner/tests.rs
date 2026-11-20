@@ -54,7 +54,7 @@ fn scanner_request_bounds_full_serialized_content_and_contains_no_tools() {
         phoenix_llm::EffectiveEffort::explicit(model::EFFORT)
     );
     assert!(request.provider_replay.is_none());
-    assert!(request.responses_replay.is_empty());
+    assert!(request.output_replay.is_empty());
     assert!(request.tool_availability.declarations().is_empty());
     assert!(request.tool_availability.callable_names().is_empty());
     assert_eq!(

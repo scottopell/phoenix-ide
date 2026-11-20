@@ -15,7 +15,9 @@ use futures::{SinkExt, StreamExt};
 use phoenix_core::domain::llm_types::ProviderRequestTier;
 use phoenix_core::domain::llm_types::UsageObservation;
 use phoenix_core::domain::provider_replay::ProviderReplayUpdate;
-use phoenix_core::domain::responses_replay::ResponsesResponseSet;
+use phoenix_core::domain::responses_replay::{
+    ChatResponseSet, ChatToolSignature, ProviderResponseSet, ResponsesResponseSet,
+};
 use reqwest::header::HeaderMap;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -1849,11 +1851,16 @@ fn translate_to_responses_request_for_model(
 
     // Process each message as a unit to allow grouping text + images
     for msg in &request.messages {
-        if let Some(replay) = request.responses_replay.iter().find(|set| {
-            msg.source_message_id.as_deref() == Some(set.owner_message_id.as_str())
-                && msg.content == set.public_content
-                && set.model == api_name
-        }) {
+        if let Some(replay) = request
+            .output_replay
+            .iter()
+            .filter_map(ProviderResponseSet::as_responses)
+            .find(|set| {
+                msg.source_message_id.as_deref() == Some(set.owner_message_id.as_str())
+                    && msg.content == set.public_content
+                    && set.model == api_name
+            })
+        {
             input_items.extend(
                 replay
                     .output_items
@@ -2248,32 +2255,54 @@ fn bind_responses_model(
 }
 
 fn validate_responses_replay(request: &LlmRequest, api_name: &str) -> Result<(), LlmError> {
+    validate_output_replay(
+        request,
+        api_name,
+        request
+            .output_replay
+            .iter()
+            .filter(|set| matches!(set, ProviderResponseSet::Responses(_))),
+    )
+}
+
+fn validate_chat_replay(request: &LlmRequest, api_name: &str) -> Result<(), LlmError> {
+    validate_output_replay(
+        request,
+        api_name,
+        request
+            .output_replay
+            .iter()
+            .filter(|set| matches!(set, ProviderResponseSet::ChatCompletions(_))),
+    )
+}
+
+fn validate_output_replay<'a>(
+    request: &LlmRequest,
+    api_name: &str,
+    sets: impl Iterator<Item = &'a ProviderResponseSet>,
+) -> Result<(), LlmError> {
     let mut owners_seen = std::collections::BTreeSet::new();
-    for set in &request.responses_replay {
-        if !owners_seen.insert(&set.owner_message_id) {
-            return Err(LlmError::invalid_request(
-                "duplicate Responses replay owner",
-            ));
+    for set in sets {
+        if !owners_seen.insert(set.owner_message_id()) {
+            return Err(LlmError::invalid_request("duplicate provider replay owner"));
         }
         set.validate().map_err(LlmError::invalid_request)?;
-        if set.model != api_name {
+        if set.model() != api_name {
             return Err(LlmError::invalid_request(
-                "Responses replay belongs to another model",
+                "provider replay belongs to another model",
             ));
         }
         let owners: Vec<_> = request
             .messages
             .iter()
-            .filter(|message| {
-                message.source_message_id.as_deref() == Some(set.owner_message_id.as_str())
-            })
+            .filter(|message| message.source_message_id.as_deref() == Some(set.owner_message_id()))
             .collect();
         if owners.len() != 1
             || owners[0].role != MessageRole::Assistant
-            || owners[0].content != set.public_content
+            || owners[0].content != set.public_content()
         {
             return Err(LlmError::invalid_request(
-                "Responses replay owner was removed or rewritten",
+                "provider replay owner was removed or rewritten",
             ));
         }
     }
@@ -3421,6 +3450,7 @@ pub async fn complete_chat(
     request_tags: &BTreeMap<String, String>,
     request: &LlmRequest,
 ) -> Result<LlmResponse, LlmError> {
+    validate_chat_replay(request, request_name.as_str())?;
     let url = resolve_chat_endpoint(base_url_override);
     let mut chat_request = translate_to_chat_request_with_route(
         request_name.as_str(),
@@ -3493,6 +3523,7 @@ pub async fn complete_streaming_chat(
 ) -> Result<LlmResponse, LlmError> {
     use futures::StreamExt;
 
+    validate_chat_replay(request, request_name.as_str())?;
     let url = resolve_chat_endpoint(base_url_override);
     let mut chat_request = translate_to_chat_request_with_route(
         request_name.as_str(),
@@ -3572,7 +3603,7 @@ pub async fn complete_streaming_chat(
         acc.process_event(&event.data, chunk_tx).await?;
     }
 
-    acc.into_response()
+    acc.into_response_for_model(request_name.as_str())
 }
 
 /// Translate `LlmRequest` to `ChatCompletionsRequest`.
@@ -3621,6 +3652,16 @@ fn translate_to_chat_request_with_route(
     }
 
     for msg in &request.messages {
+        let replay = request
+            .output_replay
+            .iter()
+            .filter_map(ProviderResponseSet::as_chat)
+            .find(|set| {
+                msg.source_message_id.as_deref() == Some(set.owner_message_id.as_str())
+                    && msg.content == set.public_content
+                    && set.model == api_name
+            });
+
         let role = match msg.role {
             MessageRole::User => "user",
             MessageRole::Assistant => "assistant",
@@ -3655,6 +3696,18 @@ fn translate_to_chat_request_with_route(
                 }
                 super::types::ContentBlock::ToolUse { id, name, input } => {
                     tool_calls.push(ChatToolCall {
+                        extra_content: replay
+                            .and_then(|set| {
+                                set.tool_signatures
+                                    .iter()
+                                    .find(|signature| signature.tool_call_id == *id)
+                            })
+                            .map(|signature| ChatExtraContent {
+                                google: Some(ChatGoogleContent {
+                                    thought_signature: signature.signature.clone(),
+                                }),
+                            }),
+
                         id: id.clone(),
                         r#type: "function".to_string(),
                         function: ChatFunctionCall {
@@ -3829,7 +3882,7 @@ fn normalize_chat_response(
         }
         _ => {}
     }
-    chat_message_to_response(choice.message, resp.usage, model)
+    chat_message_to_response(choice.message, resp.usage, model, resp.id.as_deref())
 }
 
 fn log_chat_completion_length(model: &str, reasoning_tokens: Option<u32>) {
@@ -3853,8 +3906,10 @@ fn chat_message_to_response(
     message: ChatResponseMessage,
     usage: Option<ChatUsage>,
     model: &str,
+    response_id: Option<&str>,
 ) -> Result<LlmResponse, LlmError> {
     let mut content = Vec::new();
+    let mut tool_signatures = Vec::new();
     if let Some(reasoning) = message.reasoning_content {
         log_dropped_reasoning_content(model, &reasoning);
     }
@@ -3892,6 +3947,17 @@ fn chat_message_to_response(
             );
             LlmError::invalid_response("Chat completions returned malformed tool arguments")
         })?;
+        if let Some(google) = call.extra_content.and_then(|extra| extra.google) {
+            if google.thought_signature.is_empty() {
+                return Err(LlmError::invalid_response(
+                    "Chat Completions returned an empty tool signature",
+                ));
+            }
+            tool_signatures.push(ChatToolSignature {
+                tool_call_id: call.id.clone(),
+                signature: google.thought_signature,
+            });
+        }
         content.push(ContentBlock::ToolUse {
             id: call.id,
             name: call.function.name,
@@ -3913,17 +3979,31 @@ fn chat_message_to_response(
         ));
     }
     let cached = u64::from(usage.prompt_tokens_details.cached_tokens);
-    Ok(LlmResponse::non_streaming(
+    let output_tokens = usage.output_tokens()?;
+    let mut response = LlmResponse::non_streaming(
         content,
         !has_tool_calls,
         Usage {
             input_tokens: u64::from(usage.prompt_tokens).saturating_sub(cached),
-            output_tokens: u64::from(usage.completion_tokens),
+            output_tokens,
             cache_creation_tokens: 0,
             cache_read_tokens: cached,
             reasoning_tokens: usage.reasoning_tokens().map(u64::from),
         },
-    ))
+    );
+    if !tool_signatures.is_empty() {
+        let response_id = response_id.filter(|id| !id.is_empty()).ok_or_else(|| {
+            LlmError::invalid_response("Signed Chat Completions response omitted its identity")
+        })?;
+        response.provider_replay = Some(ProviderReplayUpdate::ChatCompletions(ChatResponseSet {
+            response_id: response_id.into(),
+            model: model.into(),
+            owner_message_id: String::new(),
+            public_content: response.content.clone(),
+            tool_signatures,
+        }));
+    }
+    Ok(response)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -3933,6 +4013,7 @@ enum ChatVisibleKind {
 }
 
 struct ChatStreamAccumulator {
+    response_id: Option<String>,
     usage_observation: UsageObservation,
     content: String,
     visible_kind: Option<ChatVisibleKind>,
@@ -3998,6 +4079,7 @@ fn openai_http_error(status_code: u16, status_display: &str, body: &str) -> LlmE
 impl ChatStreamAccumulator {
     fn new(dispatch_at: Instant, request: &LlmRequest) -> Self {
         Self {
+            response_id: None,
             content: String::new(),
             visible_kind: None,
             usage_observation: UsageObservation::default(),
@@ -4042,7 +4124,20 @@ impl ChatStreamAccumulator {
                 .unwrap_or_else(|| "gateway returned error chunk".to_string());
             return Err(classify_chat_stream_error(err.code.as_ref(), &msg));
         }
+        if let Some(id) = event.id {
+            if self
+                .response_id
+                .as_ref()
+                .is_some_and(|existing| existing != &id)
+            {
+                return Err(LlmError::invalid_response(
+                    "Chat Completions stream changed response identity",
+                ));
+            }
+            self.response_id = Some(id);
+        }
         self.usage = event.usage.or(self.usage.take());
+
         let reasoning_tokens = self.usage.as_ref().and_then(ChatUsage::reasoning_tokens);
         if event.choices.len() > 1 {
             return Err(LlmError::invalid_response(
@@ -4143,6 +4238,19 @@ impl ChatStreamAccumulator {
                     self.tool_calls.push(ChatToolCallBuilder::default());
                 }
                 let builder = &mut self.tool_calls[index];
+                if let Some(extra) = tool_delta.extra_content {
+                    if builder
+                        .extra_content
+                        .as_ref()
+                        .is_some_and(|existing| existing != &extra)
+                    {
+                        return Err(LlmError::invalid_response(
+                            "Chat Completions tool signature changed while streaming",
+                        ));
+                    }
+                    builder.extra_content = Some(extra);
+                }
+
                 if let Some(tool_type) = tool_delta.r#type {
                     if tool_type != "function" {
                         return Err(LlmError::invalid_response(
@@ -4176,7 +4284,12 @@ impl ChatStreamAccumulator {
         Ok(())
     }
 
+    #[cfg(test)]
     fn into_response(self) -> Result<LlmResponse, LlmError> {
+        self.into_response_for_model("<streaming-chat-completions>")
+    }
+
+    fn into_response_for_model(self, model: &str) -> Result<LlmResponse, LlmError> {
         if !self.done && !self.terminal_finish_seen {
             return Err(LlmError::invalid_response(
                 "Chat completions stream ended before a terminal finish_reason or [DONE] sentinel",
@@ -4209,7 +4322,7 @@ impl ChatStreamAccumulator {
             },
         };
         let mut response =
-            chat_message_to_response(message, self.usage, "<streaming-chat-completions>")?;
+            chat_message_to_response(message, self.usage, model, self.response_id.as_deref())?;
         response.usage_observation = self.usage_observation;
         telemetry.attach_success(&mut response);
         Ok(response)
@@ -4218,6 +4331,7 @@ impl ChatStreamAccumulator {
 
 #[derive(Default)]
 struct ChatToolCallBuilder {
+    extra_content: Option<ChatExtraContent>,
     id: String,
     name: String,
     arguments: String,
@@ -4231,6 +4345,7 @@ impl ChatToolCallBuilder {
             ));
         }
         Ok(ChatToolCall {
+            extra_content: self.extra_content,
             id: self.id,
             r#type: "function".to_string(),
             function: ChatFunctionCall {
@@ -4297,8 +4412,21 @@ struct ChatImageUrl {
     url: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct ChatExtraContent {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    google: Option<ChatGoogleContent>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct ChatGoogleContent {
+    thought_signature: String,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct ChatToolCall {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    extra_content: Option<ChatExtraContent>,
     id: String,
     r#type: String,
     function: ChatFunctionCall,
@@ -4330,6 +4458,8 @@ struct ChatStreamOptions {
 
 #[derive(Debug, Deserialize)]
 struct ChatCompletionsResponse {
+    #[serde(default)]
+    id: Option<String>,
     choices: Vec<ChatChoice>,
     #[serde(default)]
     usage: Option<ChatUsage>,
@@ -4362,6 +4492,8 @@ struct ChatResponseMessage {
 /// code rather than reporting an empty-stream error.
 #[derive(Debug, Deserialize)]
 struct ChatStreamChunk {
+    #[serde(default)]
+    id: Option<String>,
     #[serde(default)]
     choices: Vec<ChatStreamChoice>,
     #[serde(default)]
@@ -4403,6 +4535,8 @@ struct ChatDelta {
 #[derive(Debug, Deserialize)]
 struct ChatToolCallDelta {
     #[serde(default)]
+    extra_content: Option<ChatExtraContent>,
+    #[serde(default)]
     index: Option<usize>,
     #[serde(default)]
     r#type: Option<String>,
@@ -4432,6 +4566,8 @@ struct ChatPromptTokensDetails {
 #[derive(Debug, Default, Deserialize)]
 struct ChatUsage {
     #[serde(default)]
+    total_tokens: Option<u64>,
+    #[serde(default)]
     prompt_tokens: u32,
     #[serde(default)]
     completion_tokens: u32,
@@ -4450,6 +4586,20 @@ struct ChatCompletionTokensDetails {
 }
 
 impl ChatUsage {
+    fn output_tokens(&self) -> Result<u64, LlmError> {
+        Ok(match self.total_tokens {
+            Some(total) => total
+                .checked_sub(u64::from(self.prompt_tokens))
+                .filter(|output| *output >= u64::from(self.completion_tokens))
+                .ok_or_else(|| {
+                    LlmError::invalid_response(
+                        "Chat Completions total tokens contradict prompt and completion counts",
+                    )
+                })?,
+            None => u64::from(self.completion_tokens),
+        })
+    }
+
     fn reasoning_tokens(&self) -> Option<u32> {
         self.completion_tokens_details.reasoning_tokens
     }
@@ -4708,7 +4858,7 @@ mod tests {
                 })
                 .collect(),
             provider_replay: None,
-            responses_replay: vec![],
+            output_replay: vec![],
             tool_availability: phoenix_core::domain::tool_availability::ToolAvailability::all(
                 vec![],
             ),
@@ -4718,6 +4868,81 @@ mod tests {
             telemetry: None,
             cache_key: PromptCacheKey::stable("integration"),
         }
+    }
+
+    #[test]
+    fn chat_total_usage_includes_separately_reported_gemini_reasoning_once() {
+        for completion in [20, 70] {
+            let raw = serde_json::json!({"id":"r","choices":[{"finish_reason":"stop","message":{"content":"OK"}}],"usage":{"prompt_tokens":113,"completion_tokens":completion,"total_tokens":183,"completion_tokens_details":{"reasoning_tokens":50}}});
+            let response = normalize_chat_response(
+                serde_json::from_value(raw).unwrap(),
+                "google/gemini-4-neon",
+            )
+            .unwrap();
+            assert_eq!(response.usage.output_tokens, 70);
+            assert_eq!(response.usage.reasoning_tokens, Some(50));
+            assert_eq!(response.usage.context_window_used(), 183);
+        }
+    }
+
+    #[test]
+    fn gemini_signature_replay_is_private_and_bound_to_the_exact_tool_turn() {
+        let wire = serde_json::json!({"id":"chat-1","choices":[{"finish_reason":"tool_calls","message":{"role":"assistant","tool_calls":[{"id":"call-1","type":"function","function":{"name":"report_number","arguments":"{\"number\":7}"},"extra_content":{"google":{"thought_signature":"opaque-signature"}}}]}}]});
+        let response = normalize_chat_response(
+            serde_json::from_value(wire).unwrap(),
+            "google/gemini-4-neon",
+        )
+        .unwrap();
+        assert!(!serde_json::to_string(&response.content)
+            .unwrap()
+            .contains("opaque-signature"));
+        let Some(ProviderReplayUpdate::ChatCompletions(set)) = response.provider_replay else {
+            panic!("signed replay must be retained")
+        };
+        let set = set.with_owner_message_id("owner".into());
+        let mut request = empty_request();
+        request.messages.push(LlmMessage {
+            source_message_id: Some("owner".into()),
+            role: MessageRole::Assistant,
+            content: response.content,
+        });
+        request.output_replay.push(set.into());
+        validate_chat_replay(&request, "google/gemini-4-neon").unwrap();
+        let replayed =
+            serde_json::to_value(translate_to_chat_request("google/gemini-4-neon", &request))
+                .unwrap();
+        assert_eq!(
+            replayed["messages"][0]["tool_calls"][0]["extra_content"]["google"]
+                ["thought_signature"],
+            "opaque-signature"
+        );
+        assert!(validate_chat_replay(&request, "google/gemini-4-hydrogen").is_err());
+        if let ContentBlock::ToolUse { input, .. } = &mut request.messages[0].content[0] {
+            *input = serde_json::json!({"number":8});
+        }
+        assert!(validate_chat_replay(&request, "google/gemini-4-neon").is_err());
+    }
+
+    #[tokio::test]
+    async fn gemini_stream_retains_late_signature_and_rejects_rewritten_metadata() {
+        let mut acc = ChatStreamAccumulator::new(Instant::now(), &empty_request());
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let first = serde_json::json!({"id":"chat-1","choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-1","type":"function","function":{"name":"report_number","arguments":"{\"number\":"}}]}}]});
+        let last = serde_json::json!({"id":"chat-1","choices":[{"finish_reason":"tool_calls","delta":{"tool_calls":[{"index":0,"function":{"arguments":"7}"},"extra_content":{"google":{"thought_signature":"opaque-signature"}}}]}}]});
+        acc.process_event(&first.to_string(), &tx).await.unwrap();
+        acc.process_event(&last.to_string(), &tx).await.unwrap();
+        let response = acc.into_response_for_model("google/gemini-4-neon").unwrap();
+        let Some(ProviderReplayUpdate::ChatCompletions(set)) = response.provider_replay else {
+            panic!("stream signature retained")
+        };
+        assert_eq!(set.response_id, "chat-1");
+        assert_eq!(set.model, "google/gemini-4-neon");
+        assert_eq!(set.tool_signatures[0].signature, "opaque-signature");
+        let mut acc = ChatStreamAccumulator::new(Instant::now(), &empty_request());
+        acc.process_event(&first.to_string(), &tx).await.unwrap();
+        acc.process_event(&last.to_string(), &tx).await.unwrap();
+        let rewrite = serde_json::json!({"id":"chat-1","choices":[{"delta":{"tool_calls":[{"index":0,"extra_content":{"google":{"thought_signature":"rewritten"}}}]}}]});
+        assert!(acc.process_event(&rewrite.to_string(), &tx).await.is_err());
     }
 
     #[test]
@@ -5023,7 +5248,7 @@ mod tests {
                 role: MessageRole::Assistant,
                 content: set.public_content.clone(),
             });
-            next.responses_replay.push(restored);
+            next.output_replay.push(restored.into());
             validate_responses_replay(&next, alias.as_str()).unwrap();
             assert!(validate_responses_replay(&next, "physical-B").is_err());
         }
@@ -5145,8 +5370,8 @@ mod tests {
                 content: set.public_content.clone(),
             });
             request
-                .responses_replay
-                .push(set.with_owner_message_id(owner));
+                .output_replay
+                .push(set.with_owner_message_id(owner).into());
             request.messages.push(LlmMessage {
                 source_message_id: None,
                 role: MessageRole::User,
@@ -5179,15 +5404,24 @@ mod tests {
             assert_eq!(requests[round].1["prompt_cache_key"], "integration");
         }
         assert_eq!(
-            request.responses_replay[0].output_items[0]["phase"],
+            request.output_replay[0]
+                .as_responses()
+                .unwrap()
+                .output_items[0]["phase"],
             "commentary"
         );
         assert_eq!(
-            request.responses_replay[1].output_items[0]["encrypted_content"],
+            request.output_replay[1]
+                .as_responses()
+                .unwrap()
+                .output_items[0]["encrypted_content"],
             "opaque"
         );
         assert_eq!(
-            request.responses_replay[1].output_items[0]["unexpected"],
+            request.output_replay[1]
+                .as_responses()
+                .unwrap()
+                .output_items[0]["unexpected"],
             serde_json::Value::Null
         );
     }
@@ -6038,7 +6272,7 @@ mod tests {
             system: vec![],
             messages: vec![],
             provider_replay: None,
-            responses_replay: vec![],
+            output_replay: vec![],
             tool_availability: phoenix_core::domain::tool_availability::ToolAvailability::all(
                 vec![],
             ),
@@ -6199,7 +6433,7 @@ mod tests {
                 role: MessageRole::Assistant,
                 content: set.public_content.clone(),
             });
-            request.responses_replay.push(set);
+            request.output_replay.push(set.into());
             request.messages.push(super::super::types::LlmMessage {
                 source_message_id: None,
                 role: MessageRole::User,
@@ -8520,12 +8754,14 @@ mod tests {
     #[test]
     fn chat_normalization_preserves_tool_id_and_cached_usage() {
         let response = ChatCompletionsResponse {
+            id: None,
             choices: vec![ChatChoice {
                 message: ChatResponseMessage {
                     reasoning_content: Some("private reasoning".to_string()),
                     content: None,
                     refusal: None,
                     tool_calls: Some(vec![ChatToolCall {
+                        extra_content: None,
                         id: "call-7".to_string(),
                         r#type: "function".to_string(),
                         function: ChatFunctionCall {
@@ -8537,6 +8773,7 @@ mod tests {
                 finish_reason: Some("tool_calls".to_string()),
             }],
             usage: Some(ChatUsage {
+                total_tokens: None,
                 prompt_tokens: 1_000,
                 completion_tokens: 50,
                 prompt_tokens_details: ChatPromptTokensDetails { cached_tokens: 800 },
@@ -8558,6 +8795,7 @@ mod tests {
     fn chat_normalization_preserves_literal_angle_bracket_and_refusal() {
         let literal = normalize_chat_response(
             ChatCompletionsResponse {
+                id: None,
                 choices: vec![ChatChoice {
                     message: ChatResponseMessage {
                         reasoning_content: None,
@@ -8579,6 +8817,7 @@ mod tests {
 
         let refusal = normalize_chat_response(
             ChatCompletionsResponse {
+                id: None,
                 choices: vec![ChatChoice {
                     message: ChatResponseMessage {
                         reasoning_content: None,
@@ -8696,12 +8935,14 @@ mod tests {
     #[test]
     fn chat_normalization_rejects_malformed_tools_and_usage() {
         let malformed_tool = ChatCompletionsResponse {
+            id: None,
             choices: vec![ChatChoice {
                 message: ChatResponseMessage {
                     reasoning_content: None,
                     content: None,
                     refusal: None,
                     tool_calls: Some(vec![ChatToolCall {
+                        extra_content: None,
                         id: "call-1".to_string(),
                         r#type: "function".to_string(),
                         function: ChatFunctionCall {
@@ -8722,6 +8963,7 @@ mod tests {
         );
 
         let invalid_usage = ChatCompletionsResponse {
+            id: None,
             choices: vec![ChatChoice {
                 message: ChatResponseMessage {
                     reasoning_content: None,
@@ -8732,6 +8974,7 @@ mod tests {
                 finish_reason: Some("stop".to_string()),
             }],
             usage: Some(ChatUsage {
+                total_tokens: None,
                 prompt_tokens: 10,
                 completion_tokens: 1,
                 prompt_tokens_details: ChatPromptTokensDetails { cached_tokens: 11 },
@@ -8753,12 +8996,14 @@ mod tests {
     #[test]
     fn chat_json_length_with_malformed_tool_call_is_exhausted_not_invalid() {
         let truncated = ChatCompletionsResponse {
+            id: None,
             choices: vec![ChatChoice {
                 message: ChatResponseMessage {
                     reasoning_content: None,
                     content: None,
                     refusal: None,
                     tool_calls: Some(vec![ChatToolCall {
+                        extra_content: None,
                         id: "call-1".to_string(),
                         r#type: "function".to_string(),
                         function: ChatFunctionCall {

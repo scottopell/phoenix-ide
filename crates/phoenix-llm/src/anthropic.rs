@@ -2029,7 +2029,7 @@ mod tests {
             system: vec![],
             messages: vec![],
             provider_replay: None,
-            responses_replay: vec![],
+            output_replay: vec![],
             tool_availability: ToolAvailability::all(vec![
                 ToolDefinition {
                     name: "bash".into(),
@@ -2057,7 +2057,7 @@ mod tests {
             system: vec![],
             messages: vec![],
             provider_replay: None,
-            responses_replay: vec![],
+            output_replay: vec![],
             tool_availability: ToolAvailability::all(vec![]),
             max_tokens: 16_384,
             effective_effort: phoenix_core::domain::llm_types::EffectiveEffort::native_unknown(),
@@ -2817,7 +2817,7 @@ mod tests {
                 }],
             }],
             provider_replay: None,
-            responses_replay: vec![],
+            output_replay: vec![],
             tool_availability: ToolAvailability::all(vec![]),
             max_tokens: 16_384,
             effective_effort: phoenix_core::domain::llm_types::EffectiveEffort::native_unknown(),

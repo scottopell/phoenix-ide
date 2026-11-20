@@ -56,7 +56,7 @@ at the repo)
 Rust backend serves the API and, in production, embeds the React frontend via `rust-embed`.
 SQLite persists conversations and messages. A bedrock state machine drives the conversation
 lifecycle (Idle → Processing → ToolExecuting → …). Tools are modular and LLM-invokable.
-Multi-provider LLM support: the Anthropic and OpenAI APIs, a ChatGPT/Codex bridge, or provider-compatible base URLs.
+Multi-provider LLM support: the Anthropic and OpenAI APIs, Google Gemini through a compatible gateway, a ChatGPT/Codex bridge, or provider-compatible base URLs.
 
 ## Philosophy
 
@@ -254,6 +254,17 @@ OPENAI_CHAT_COMPLETIONS_BASE_URL=https://provider.example/v1/chat/completions
 DEFAULT_MODEL=example/chat-model
 PHOENIX_LLM_MODELS=[{"id":"example/chat-model","api_name":"provider/example/chat-model","backend":"openai_chat_completions","family":"Google","description":"Example Chat Completions-compatible POC","context_window":128000,"max_output_tokens":8192,"recommended":false,"supports_tool_search":false}]
 ```
+
+The built-in Google gateway models are `google/gemini-4-neon`,
+`google/gemini-4-hydrogen`, `google/gemini-4-carbon`, and `google/gemini-4-argon`.
+They require `OPENAI_CHAT_COMPLETIONS_BASE_URL` and the existing API-key or
+credential-helper authentication for that endpoint. Their request names match
+Datadog AI Gateway discovery; no separate proxy or external model definitions
+are needed on that route. The picker lists them under Google. Each declares a
+1,048,576-token unified context and 65,536-token synchronous output maximum.
+Phoenix preserves Google's private tool signatures across streaming, retries,
+and restart. Low, medium, and high effort are exposed; extended effort mappings,
+Fast mode, native Google authentication, and Gemini-only tools are not advertised.
 
 `PHOENIX_LLM_REQUEST_MODELS` remaps the wire spelling Phoenix sends for a
 model without changing its Phoenix ID, picker entry, persisted history, or

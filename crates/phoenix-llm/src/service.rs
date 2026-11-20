@@ -568,7 +568,7 @@ mod tests {
             system: vec![],
             messages: vec![],
             provider_replay: None,
-            responses_replay: Vec::new(),
+            output_replay: Vec::new(),
             tool_availability: phoenix_core::domain::tool_availability::ToolAvailability::all(
                 vec![],
             ),

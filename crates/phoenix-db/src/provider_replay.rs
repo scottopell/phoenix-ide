@@ -57,6 +57,9 @@ pub(crate) fn validate_goal_round_replay(
         ProviderReplayUpdate::Responses(set) => {
             set.owner_message_id == assistant.message_id && &set.public_content == blocks
         }
+        ProviderReplayUpdate::ChatCompletions(set) => {
+            set.owner_message_id == assistant.message_id && &set.public_content == blocks
+        }
         ProviderReplayUpdate::Clear => true,
     };
     if !matches {
@@ -647,7 +650,24 @@ pub(crate) async fn apply_replay_tx(
                 .await?;
         }
         ProviderReplayUpdate::Responses(response) => {
-            crate::responses_replay::append_tx(tx, conversation_id, response).await?;
+            crate::responses_replay::append_tx(
+                tx,
+                conversation_id,
+                &phoenix_core::domain::responses_replay::ProviderResponseSet::Responses(
+                    response.clone(),
+                ),
+            )
+            .await?;
+        }
+        ProviderReplayUpdate::ChatCompletions(response) => {
+            crate::responses_replay::append_tx(
+                tx,
+                conversation_id,
+                &phoenix_core::domain::responses_replay::ProviderResponseSet::ChatCompletions(
+                    response.clone(),
+                ),
+            )
+            .await?;
         }
         ProviderReplayUpdate::Clear => {
             sqlx::query("DELETE FROM active_responses_replay_sets WHERE conversation_id = ?1")

@@ -1144,6 +1144,17 @@ impl ModelRegistry {
         spec: &super::ModelSpec,
         config: &LlmConfig,
     ) -> Option<Arc<dyn LlmService>> {
+        if spec.backend == ModelBackend::OpenAIChatCompletions
+            && spec.source == ModelSource::BuiltIn
+            && config
+                .openai_chat_completions_base_url
+                .as_deref()
+                .is_none_or(|url| url == "https://api.openai.com/v1/chat/completions")
+        {
+            tracing::debug!(model = %spec.id, "skipping built-in gateway model without a Chat Completions endpoint");
+            return None;
+        }
+
         if spec.backend == ModelBackend::OpenAIResponses && openai_config_is_chat_only(config) {
             tracing::debug!(
                 model = %spec.id,
@@ -2016,6 +2027,33 @@ mod tests {
     use crate::parse_external_models;
     use crate::ModelEffort;
     use std::collections::HashSet;
+
+    #[test]
+    fn gemini_builtins_require_a_configured_gateway_and_keep_google_identity() {
+        let mut config = LlmConfig {
+            openai_api_key: Some("test-key".into()),
+            ..Default::default()
+        };
+        let without_endpoint = ModelRegistry::new(&config);
+        config.openai_chat_completions_base_url =
+            Some("https://api.openai.com/v1/chat/completions".into());
+        let openai_endpoint = ModelRegistry::new(&config);
+        config.openai_chat_completions_base_url =
+            Some("https://gateway.example/v1/chat/completions".into());
+        let registry = ModelRegistry::new(&config);
+        for model in [
+            "google/gemini-4-neon",
+            "google/gemini-4-hydrogen",
+            "google/gemini-4-carbon",
+            "google/gemini-4-argon",
+        ] {
+            assert!(without_endpoint.get(model).is_none());
+            assert!(openai_endpoint.get(model).is_none());
+            assert!(registry.get(model).is_some());
+            assert_eq!(registry.context_window(model), 1_048_576);
+            assert_eq!(registry.provider_display_name(model), "Google");
+        }
+    }
 
     #[test]
     fn actual_outbound_model_name_survives_registry_logging_and_request_overrides() {
