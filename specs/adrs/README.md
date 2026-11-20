@@ -49,6 +49,7 @@ Allowing gaps does not approve an ID allocation, decision, or publication.
 | [272](272_bound-exhaustive-backup-verification-to-fifteen-minutes.md) | Bound exhaustive backup verification to fifteen minutes | Accepted; qualifies ADR-263 | REQ-LDD-029, REQ-LDD-031 |
 | [271](271_gate-ordinary-publication-on-exact-source-ci.md) | Gate ordinary publication on exact merged-source CI | Accepted | REQ-DESKTOP-REL-015 |
 | [270](270_publish-fixed-rc8-through-rebuilt-release-path.md) | Publish fixed RC8 through the rebuilt release path | Accepted | REQ-DESKTOP-REL-002/010/014 |
+| [273](273_native-openai-and-shared-local-tool-discovery.md) | Use native OpenAI discovery with a shared local selector | Accepted | REQ-LLM-004i/004j/004m/004n, REQ-LLM-005 |
 | [272](272_preserve-gemini-tool-result-images.md) | Preserve Gemini tool-result images | Accepted | REQ-LLM-004, REQ-BT-003, REQ-BT-006 |
 | [271](271_preserve-gemini-tool-signatures-through-chat-completions.md) | Preserve Gemini tool signatures through Chat Completions | Accepted | REQ-LLM-002–005, REQ-LLM-007 |
 | [270](270_prefer-sol-6-2-for-new-conversations.md) | Prefer Sol 6.2 for new conversations | Accepted | REQ-LLM-003 |

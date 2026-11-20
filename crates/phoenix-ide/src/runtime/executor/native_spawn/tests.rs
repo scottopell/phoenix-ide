@@ -331,6 +331,7 @@ async fn install_ordinary_tool_policy(runtime: &mut TestRuntime) -> Arc<MockTool
             &std::collections::BTreeSet::from(["bash".into()]),
             &[],
             &[],
+            phoenix_core::domain::tool_discovery::ToolDiscoveryMode::Eager,
         )
         .await
         .unwrap();

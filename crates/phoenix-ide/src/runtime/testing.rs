@@ -2798,13 +2798,24 @@ impl StateStore for InMemoryStorage {
         callable_names: &std::collections::BTreeSet<String>,
         _visible_messages: &[phoenix_core::domain::tool_availability::ToolPolicyMessage],
         _historical_tool_references: &[(String, String)],
+        discovery_mode: phoenix_core::domain::tool_discovery::ToolDiscoveryMode,
     ) -> Result<phoenix_core::domain::tool_availability::ToolAvailability, String> {
+        if discovery_mode.uses_local_search() {
+            return Err("local tool discovery requires the durable SQLite test store".into());
+        }
         let policy = phoenix_core::domain::tool_availability::ToolAvailability::new(
             live_definitions.to_vec(),
             callable_names.clone(),
-        )?;
+        )?
+        .with_discovery(discovery_mode, vec![])?;
         self.seed_tool_admission_policy(conversation_id, policy.clone());
         Ok(policy)
+    }
+    async fn load_tool_search_catalog(
+        &self,
+        _conversation_id: &str,
+    ) -> Result<Vec<phoenix_llm::ToolDefinition>, String> {
+        Err("local tool discovery requires the durable SQLite test store".into())
     }
     async fn load_tool_admission_policy(
         &self,

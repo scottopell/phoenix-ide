@@ -56,6 +56,7 @@ mod product_creation;
 mod provider_replay;
 mod responses_replay;
 mod tool_availability;
+mod tool_discovery;
 pub use product_creation::*;
 mod prompt_projection;
 pub use prompt_projection::{
@@ -10517,6 +10518,8 @@ impl Database {
         for msg in tool_results {
             insert_message_tx(&mut tx, msg).await?;
         }
+
+        tool_discovery::record_round_tx(&mut tx, assistant, tool_results, false).await?;
 
         // Mirror `add_message_with_seq`'s side-effect: bump the conversation's
         // `updated_at` so list-ordering stays current.

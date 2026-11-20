@@ -18,6 +18,7 @@ use phoenix_core::domain::provider_replay::ProviderReplayUpdate;
 use phoenix_core::domain::responses_replay::{
     ChatResponseSet, ChatToolSignature, ProviderResponseSet, ResponsesResponseSet,
 };
+use phoenix_core::domain::tool_discovery::ToolDiscoveryMode;
 use reqwest::header::HeaderMap;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -27,6 +28,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use tokio_tungstenite::{connect_async, tungstenite};
+
+mod tool_search;
 
 // ---------------------------------------------------------------------------
 // Endpoint resolution
@@ -108,6 +111,7 @@ fn count_input_body(
     request_name: &RequestModelName,
     request: &LlmRequest,
 ) -> Result<serde_json::Value, LlmError> {
+    tool_search::validate_mode(spec, request, false, None)?;
     validate_responses_replay(request, request_name.as_str())?;
     let wire =
         translate_to_responses_request_for_model(spec, request_name.as_str(), request, false, true);
@@ -166,6 +170,7 @@ pub async fn complete(
     request: &LlmRequest,
     use_codex_backend: bool,
 ) -> Result<LlmResponse, LlmError> {
+    tool_search::validate_mode(spec, request, use_codex_backend, base_url_override)?;
     validate_responses_replay(request, request_name.as_str())?;
     if use_codex_backend {
         // Non-streaming callers do not consume deltas. Close the receiver so
@@ -465,7 +470,7 @@ fn has_streamed_visible_output(event_type: &str, event: &serde_json::Value) -> b
 
 fn output_item_has_non_reasoning_output(item: &serde_json::Value) -> bool {
     match item.get("type").and_then(serde_json::Value::as_str) {
-        Some("function_call") => true,
+        Some("function_call" | "tool_search_call") => true,
         Some("message") => item
             .get("content")
             .and_then(serde_json::Value::as_array)
@@ -562,8 +567,10 @@ impl ResponsesStreamAccumulator {
                 self.observed_non_reasoning_output = true;
             }
             "response.output_item.added" => {
-                let observed_tool = v.pointer("/item/type").and_then(serde_json::Value::as_str)
-                    == Some("function_call");
+                let observed_tool = matches!(
+                    v.pointer("/item/type").and_then(serde_json::Value::as_str),
+                    Some("function_call" | "tool_search_call")
+                );
                 let observed_text = has_streamed_visible_output(dispatch_type, &v);
                 if observed_tool {
                     self.telemetry
@@ -586,7 +593,7 @@ impl ResponsesStreamAccumulator {
                                 "responses_api output item collected"
                             );
                             match output.output_type() {
-                                "function_call" => self
+                                "function_call" | "tool_search_call" => self
                                     .telemetry
                                     .record_generation_event_at(now, GenerationKind::Tool),
                                 "reasoning" => self
@@ -1086,6 +1093,10 @@ fn canonical_server_output(output: Vec<serde_json::Value>) -> Option<Vec<serde_j
                     "name":item.get("name")?,
                     "arguments":item.get("arguments")?
                 })),
+                Some("tool_search_call" | "tool_search_output") => {
+                    tool_search::project_output(&item).ok().flatten()?;
+                    Some(item)
+                }
                 unsupported => {
                     tracing::debug!(output_type = ?unsupported,
                     "disabling Codex WebSocket continuation: server output is not representable");
@@ -1615,6 +1626,7 @@ pub async fn complete_streaming(
     use_codex_backend: bool,
     ws_sessions: Option<&Arc<Mutex<CodexWsSessions>>>,
 ) -> Result<LlmResponse, LlmError> {
+    tool_search::validate_mode(spec, request, use_codex_backend, base_url_override)?;
     validate_responses_replay(request, request_name.as_str())?;
     let url = resolve_endpoint(base_url_override);
     let mut responses_request = translate_to_backend_request_for_model(
@@ -1973,6 +1985,10 @@ fn translate_to_responses_request_for_model(
         // Emit FunctionCall items
         for block in tool_calls {
             if let ContentBlock::ToolUse { id, name, input } = block {
+                if let Some(native) = tool_search::translate_call(request, msg, id, name, input) {
+                    input_items.push(native);
+                    continue;
+                }
                 input_items.push(ResponsesApiInputItem::FunctionCall {
                     call_id: id.clone(),
                     name: name.clone(),
@@ -1990,6 +2006,12 @@ fn translate_to_responses_request_for_model(
                 is_error,
             } = block
             {
+                if let Some(native) =
+                    tool_search::translate_result(request, msg, tool_use_id, content, *is_error)
+                {
+                    input_items.extend(native);
+                    continue;
+                }
                 let text = if *is_error {
                     format!("Error: {content}")
                 } else {
@@ -2015,24 +2037,7 @@ fn translate_to_responses_request_for_model(
         }
     }
 
-    let tools: Option<Vec<ResponsesApiTool>> =
-        if request.tool_availability.declarations().is_empty() {
-            None
-        } else {
-            Some(
-                request
-                    .tool_availability
-                    .declarations()
-                    .iter()
-                    .map(|t| ResponsesApiTool {
-                        r#type: "function".to_string(),
-                        name: t.name.clone(),
-                        description: t.description.clone(),
-                        parameters: t.input_schema.clone(),
-                    })
-                    .collect(),
-            )
-        };
+    let tools = tool_search::request_tools(request);
 
     let explicit_cache_supported =
         !use_codex_backend && official_openai_route && supports_explicit_prompt_cache(spec);
@@ -2040,7 +2045,17 @@ fn translate_to_responses_request_for_model(
         place_explicit_cache_breakpoints(&mut input_items);
     }
 
-    let has_tools = !request.tool_availability.declarations().is_empty();
+    let has_tools = tools.as_ref().is_some_and(|tools| !tools.is_empty());
+    let tool_choice =
+        if request.tool_availability.discovery_mode() == ToolDiscoveryMode::OpenAiHosted {
+            Some(ResponsesToolChoice::Mode(if has_tools {
+                ToolChoiceMode::Auto
+            } else {
+                ToolChoiceMode::None
+            }))
+        } else {
+            responses_tool_choice(request, official_openai_route && !use_codex_backend)
+        };
     ResponsesApiRequest {
         model: api_name.to_string(),
         input: input_items,
@@ -2076,7 +2091,7 @@ fn translate_to_responses_request_for_model(
         )
         .responses_request_value()
         .map(str::to_string),
-        tool_choice: responses_tool_choice(request, official_openai_route && !use_codex_backend),
+        tool_choice,
         // `parallel_tool_calls: true` lets the model emit multiple ToolUse
         // blocks in one assistant message. Phoenix's executor runs tools
         // serially (state.rs `ToolExecuting { current_tool, remaining_tools }`),
@@ -2262,7 +2277,16 @@ fn validate_responses_replay(request: &LlmRequest, api_name: &str) -> Result<(),
             .output_replay
             .iter()
             .filter(|set| matches!(set, ProviderResponseSet::Responses(_))),
-    )
+    )?;
+    tool_search::validate_results(request)
+}
+
+pub(crate) fn native_tool_search_mode(
+    spec: &ModelSpec,
+    use_codex_backend: bool,
+    base_url_override: Option<&str>,
+) -> ToolDiscoveryMode {
+    tool_search::native_mode(spec, use_codex_backend, base_url_override)
 }
 
 fn validate_chat_replay(request: &LlmRequest, api_name: &str) -> Result<(), LlmError> {
@@ -2446,6 +2470,8 @@ fn place_explicit_cache_breakpoints(items: &mut [ResponsesApiInputItem]) {
         .filter_map(|item| match item {
             ResponsesApiInputItem::InputMessage { content, .. } => Some(content),
             ResponsesApiInputItem::AssistantMessage { .. }
+            | ResponsesApiInputItem::ToolSearchCall { .. }
+            | ResponsesApiInputItem::ToolSearchOutput { .. }
             | ResponsesApiInputItem::AdditionalTools { .. }
             | ResponsesApiInputItem::FunctionCall { .. }
             | ResponsesApiInputItem::FunctionCallOutput { .. }
@@ -2589,6 +2615,9 @@ fn normalize_responses_api_response_with_evidence(
     let mut content = Vec::new();
 
     for output in resp.output {
+        if tool_search::append_projection(&output.0, &mut content)? {
+            continue;
+        }
         let output: ResponsesOutputView = serde_json::from_value(output.0).map_err(|_| {
             tracing::debug!("malformed Responses API output item");
             LlmError::invalid_response("Failed to parse Responses API output item")
@@ -3003,6 +3032,19 @@ impl PromptCacheBreakpoint {
 #[derive(Debug, Serialize)]
 #[serde(tag = "type")]
 pub(crate) enum ResponsesApiInputItem {
+    #[serde(rename = "tool_search_call")]
+    ToolSearchCall {
+        call_id: String,
+        execution: tool_search::ClientExecution,
+        arguments: serde_json::Value,
+    },
+    #[serde(rename = "tool_search_output")]
+    ToolSearchOutput {
+        call_id: String,
+        execution: tool_search::ClientExecution,
+        status: tool_search::CompletedStatus,
+        tools: Vec<ResponsesApiTool>,
+    },
     #[serde(rename = "additional_tools")]
     AdditionalTools {
         role: String,
@@ -3141,11 +3183,31 @@ pub(crate) enum ResponsesApiFunctionOutputPart {
 }
 
 #[derive(Debug, Serialize)]
-pub(crate) struct ResponsesApiTool {
-    r#type: String,
-    name: String,
-    description: String,
-    parameters: serde_json::Value,
+#[serde(tag = "type")]
+pub(crate) enum ResponsesApiTool {
+    #[serde(rename = "function")]
+    Function {
+        name: String,
+        description: String,
+        parameters: serde_json::Value,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        defer_loading: Option<bool>,
+    },
+    #[serde(rename = "tool_search")]
+    Search {
+        #[serde(flatten)]
+        execution: NativeToolSearchExecution,
+    },
+}
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "execution", rename_all = "snake_case")]
+pub(crate) enum NativeToolSearchExecution {
+    Server,
+    Client {
+        description: String,
+        parameters: serde_json::Value,
+    },
 }
 
 #[derive(Debug, Deserialize)]

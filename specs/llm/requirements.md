@@ -882,3 +882,57 @@ AND SHALL identify the deliberate change in request diagnostics
 AND SHALL NOT promise provider cache residency, hit rate, or cross-model reuse.
 
 For Codex-auth, direct API, and compatible gateway routes, cache controls SHALL be selected from that route's verified capabilities rather than inferred from protocol name alone.
+
+### REQ-LLM-004n: Route-Qualified Tool Discovery
+
+WHEN a request has tools eligible for deferred discovery
+THE SYSTEM SHALL select a discovery mode from the resolved model, provider route, and installed tool surface
+AND SHALL distinguish eager loading, native Anthropic search, OpenAI hosted search, OpenAI client-executed search, and local function-based search
+AND SHALL use eager loading when the selected surface cannot execute the required search mechanism rather than hide tools behind an unavailable search.
+
+WHEN an OpenAI direct API or qualified Responses-compatible route supports hosted tool search
+THE SYSTEM SHALL declare native `tool_search` with deferred eligible function definitions
+AND SHALL preserve hosted search output in the accepted exchange's private Responses envelopes
+AND SHALL NOT execute hosted search as a local function.
+
+WHEN a Codex bridge route uses native client-executed tool search
+THE SYSTEM SHALL execute the lookup through the shared local discovery engine
+AND SHALL return typed selected schemas in native `tool_search_output` at their discovery position
+AND SHALL NOT insert newly discovered deferred schemas into the leading Codex declaration prefix.
+
+WHEN a compatible Chat Completions route uses local discovery
+THE SYSTEM SHALL expose an eager ordinary `tool_search` function and withhold undiscovered deferred schemas
+AND SHALL add authenticated selected schemas to subsequent request declarations
+AND SHALL keep the public search result a compact names-only summary rather than duplicate full schemas in public tool text.
+
+WHEN local or native client-executed search runs
+THE SYSTEM SHALL validate and bound its query and result count
+AND SHALL deterministically search the permitted catalog frozen for its originating provider request
+AND SHALL NOT use a mutable process-local index or arbitrary public result JSON as catalog or execution authority.
+
+WHEN an owned tool round accepts a search result
+THE SYSTEM SHALL atomically persist its protocol identity and selected schema rows with the canonical tool-result message and execution state
+AND SHALL validate successful selections against the originating query, frozen catalog, and derived public summary
+AND SHALL retain a parent record for empty or failed results so their function or native-client protocol remains distinguishable
+AND SHALL preserve immutable selections across duplicate adoption, retry, and restart.
+
+WHEN preparing or executing a discovered tool
+THE SYSTEM SHALL keep full permission policy separate from the actual advertised-name snapshot
+AND SHALL require the originating request's permission, advertisement, and authentic schema as well as current execution authority
+AND SHALL revoke stale selections when their tool is removed, disabled, or has a different schema
+AND SHALL preserve authentic historical call/result pairing without inventing missing declarations.
+
+WHEN native Codex client search restores history from another discovery mode
+THE SYSTEM SHALL admit deferred tools only from current-schema native-client loading records
+AND SHALL NOT promote ordinary function-search records or historical-only deferred names into native-loaded execution authority
+AND SHALL preserve the ordinary records' original function-call protocol while allowing a new native search to load those tools.
+
+WHEN local function discovery prepares a request
+THE SYSTEM MAY reuse authentic selections from either stored protocol and authentic historical declarations
+PROVIDED THAT the schemas are physically advertised and still satisfy current policy and schema validation.
+
+WHEN estimating or counting a discovery-enabled request
+THE SYSTEM SHALL account for schemas at their actual provider-visible placement
+AND SHALL NOT count a hidden local catalog as if every schema were advertised.
+
+**Rationale:** Large tool catalogs should consume model context only as needed, while discovery preserves provider-native caching, durable conversation evidence, and independent execution permissions.

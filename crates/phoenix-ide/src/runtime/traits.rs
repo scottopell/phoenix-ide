@@ -640,7 +640,12 @@ pub trait StateStore: Send + Sync {
         callable_names: &std::collections::BTreeSet<String>,
         visible_messages: &[phoenix_core::domain::tool_availability::ToolPolicyMessage],
         historical_tool_references: &[(String, String)],
+        discovery_mode: phoenix_core::domain::tool_discovery::ToolDiscoveryMode,
     ) -> Result<phoenix_core::domain::tool_availability::ToolAvailability, String>;
+    async fn load_tool_search_catalog(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Vec<phoenix_llm::ToolDefinition>, String>;
     async fn load_tool_admission_policy(
         &self,
         conversation_id: &str,
@@ -732,6 +737,11 @@ pub trait StateStore: Send + Sync {
 /// Client for making LLM requests
 #[async_trait]
 pub trait LlmClient: Send + Sync {
+    fn tool_discovery_mode(
+        &self,
+    ) -> Result<phoenix_core::domain::tool_discovery::ToolDiscoveryMode, LlmError> {
+        Ok(phoenix_core::domain::tool_discovery::ToolDiscoveryMode::Eager)
+    }
     async fn count_input(
         &self,
         _request: &LlmRequest,
@@ -1495,6 +1505,7 @@ impl<T: StateStore + ?Sized> StateStore for Arc<T> {
         callable_names: &std::collections::BTreeSet<String>,
         visible_messages: &[phoenix_core::domain::tool_availability::ToolPolicyMessage],
         historical_tool_references: &[(String, String)],
+        discovery_mode: phoenix_core::domain::tool_discovery::ToolDiscoveryMode,
     ) -> Result<phoenix_core::domain::tool_availability::ToolAvailability, String> {
         (**self)
             .prepare_tool_availability(
@@ -1505,8 +1516,15 @@ impl<T: StateStore + ?Sized> StateStore for Arc<T> {
                 callable_names,
                 visible_messages,
                 historical_tool_references,
+                discovery_mode,
             )
             .await
+    }
+    async fn load_tool_search_catalog(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Vec<phoenix_llm::ToolDefinition>, String> {
+        (**self).load_tool_search_catalog(conversation_id).await
     }
     async fn load_tool_admission_policy(
         &self,
@@ -1649,6 +1667,11 @@ impl<T: StateStore + ?Sized> StateStore for Arc<T> {
 
 #[async_trait]
 impl<T: LlmClient + ?Sized> LlmClient for Arc<T> {
+    fn tool_discovery_mode(
+        &self,
+    ) -> Result<phoenix_core::domain::tool_discovery::ToolDiscoveryMode, LlmError> {
+        (**self).tool_discovery_mode()
+    }
     async fn count_input(
         &self,
         request: &LlmRequest,
@@ -3042,6 +3065,7 @@ impl StateStore for DatabaseStorage {
         callable_names: &std::collections::BTreeSet<String>,
         visible_messages: &[phoenix_core::domain::tool_availability::ToolPolicyMessage],
         historical_tool_references: &[(String, String)],
+        discovery_mode: phoenix_core::domain::tool_discovery::ToolDiscoveryMode,
     ) -> Result<phoenix_core::domain::tool_availability::ToolAvailability, String> {
         self.db
             .prepare_tool_availability(
@@ -3052,7 +3076,17 @@ impl StateStore for DatabaseStorage {
                 callable_names,
                 visible_messages,
                 historical_tool_references,
+                discovery_mode,
             )
+            .await
+            .map_err(|error| error.to_string())
+    }
+    async fn load_tool_search_catalog(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Vec<phoenix_llm::ToolDefinition>, String> {
+        self.db
+            .load_tool_search_catalog(conversation_id)
             .await
             .map_err(|error| error.to_string())
     }
@@ -3261,6 +3295,11 @@ impl RegistryLlmClient {
 
 #[async_trait]
 impl LlmClient for RegistryLlmClient {
+    fn tool_discovery_mode(
+        &self,
+    ) -> Result<phoenix_core::domain::tool_discovery::ToolDiscoveryMode, LlmError> {
+        self.service().map(|service| service.tool_discovery_mode())
+    }
     fn freeze_for_request(self: Arc<Self>) -> Result<Arc<dyn LlmClient>, LlmError> {
         Ok(Arc::new(FrozenServiceClient {
             service: self.service()?,
@@ -3309,6 +3348,11 @@ struct FrozenServiceClient {
 
 #[async_trait]
 impl LlmClient for FrozenServiceClient {
+    fn tool_discovery_mode(
+        &self,
+    ) -> Result<phoenix_core::domain::tool_discovery::ToolDiscoveryMode, LlmError> {
+        Ok(self.service.tool_discovery_mode())
+    }
     async fn count_input(
         &self,
         request: &LlmRequest,
@@ -3777,6 +3821,7 @@ mod registry_llm_client_tests {
                 &std::collections::BTreeSet::new(),
                 &[],
                 &[],
+                phoenix_core::domain::tool_discovery::ToolDiscoveryMode::Eager,
             )
             .await
             .unwrap();
@@ -3849,6 +3894,7 @@ mod registry_llm_client_tests {
                 &std::collections::BTreeSet::new(),
                 &[],
                 &[],
+                phoenix_core::domain::tool_discovery::ToolDiscoveryMode::Eager,
             )
             .await
             .unwrap();
@@ -3913,6 +3959,7 @@ mod registry_llm_client_tests {
                 &std::collections::BTreeSet::new(),
                 &[],
                 &[],
+                phoenix_core::domain::tool_discovery::ToolDiscoveryMode::Eager,
             )
             .await
             .unwrap();
@@ -3942,6 +3989,7 @@ mod registry_llm_client_tests {
                 &std::collections::BTreeSet::new(),
                 &[],
                 &[],
+                phoenix_core::domain::tool_discovery::ToolDiscoveryMode::Eager,
             )
             .await
             .unwrap();

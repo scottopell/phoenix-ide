@@ -203,6 +203,9 @@ impl ProviderInputCount {
 /// Common interface for LLM providers
 #[async_trait]
 pub trait LlmService: Send + Sync {
+    fn tool_discovery_mode(&self) -> phoenix_core::domain::tool_discovery::ToolDiscoveryMode {
+        phoenix_core::domain::tool_discovery::ToolDiscoveryMode::Eager
+    }
     /// Complete provider-rendered input occupancy, without a generation attempt.
     async fn count_input(
         &self,
@@ -468,6 +471,9 @@ impl LoggingService {
 
 #[async_trait]
 impl LlmService for LoggingService {
+    fn tool_discovery_mode(&self) -> phoenix_core::domain::tool_discovery::ToolDiscoveryMode {
+        self.inner.tool_discovery_mode()
+    }
     async fn count_input(
         &self,
         request: &LlmRequest,

@@ -13,6 +13,8 @@ use phoenix_core::domain::provider_replay::{
 use phoenix_llm::{LlmError, LlmResponse};
 use std::sync::Mutex;
 
+mod discovery;
+
 const CONVERSATION: &str = "provider-tool-withdrawal";
 const MCP_TOOL: &str = "mcp__slack__read_thread";
 
@@ -196,6 +198,7 @@ async fn dispatch_cannot_expand_or_reinterpret_the_persisted_request_policy() {
             &callable_names,
             &[],
             &[],
+            phoenix_core::domain::tool_discovery::ToolDiscoveryMode::Eager,
         )
         .await
         .unwrap();

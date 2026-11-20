@@ -5,11 +5,12 @@ use phoenix_core::domain::llm_types::ToolDefinition;
 use phoenix_core::domain::tool_availability::{
     PositionedToolChange, ToolAvailability, ToolChange, ToolPolicyMessage,
 };
+use phoenix_core::domain::tool_discovery::{ToolDiscoveryMode, TOOL_SEARCH_NAME};
 use sqlx::Row;
 
 use crate::{Database, DbError, DbResult};
 
-fn definition(row: &sqlx::sqlite::SqliteRow) -> DbResult<ToolDefinition> {
+pub(crate) fn definition(row: &sqlx::sqlite::SqliteRow) -> DbResult<ToolDefinition> {
     Ok(ToolDefinition {
         name: row.try_get("name")?,
         description: row.try_get("description")?,
@@ -322,7 +323,7 @@ impl Database {
             .map(definition)
             .collect::<DbResult<Vec<_>>>()?;
         let callable_names = sqlx::query_scalar(
-            "SELECT name FROM conversation_callable_tools WHERE conversation_id=?1 ORDER BY name",
+            "SELECT c.name FROM conversation_callable_tools c JOIN conversation_advertised_tools a USING(conversation_id,name) WHERE c.conversation_id=?1 ORDER BY c.name",
         )
         .bind(conversation_id)
         .fetch_all(&mut *tx)
@@ -347,10 +348,16 @@ impl Database {
         callable_names: &BTreeSet<String>,
         visible_messages: &[ToolPolicyMessage],
         historical_tool_references: &[(String, String)],
+        discovery_mode: ToolDiscoveryMode,
     ) -> DbResult<ToolAvailability> {
         let mut tx = self.pool().begin_with("BEGIN IMMEDIATE").await?;
+        let callable_names = callable_names
+            .iter()
+            .filter(|name| discovery_mode.uses_local_search() || name.as_str() != TOOL_SEARCH_NAME)
+            .cloned()
+            .collect::<BTreeSet<_>>();
         let policy =
-            retain_policy(&mut tx, conversation_id, live_definitions, callable_names).await?;
+            retain_policy(&mut tx, conversation_id, live_definitions, &callable_names).await?;
         establish_context(
             &mut tx,
             conversation_id,
@@ -360,26 +367,33 @@ impl Database {
             historical_tool_references,
         )
         .await?;
-        let NativePolicyState {
-            initial,
-            mut changes,
-            pending,
-        } = reconcile_native_policy(
-            &mut tx,
-            conversation_id,
-            policy.declarations(),
-            callable_names,
-        )
-        .await?;
-        append_native_changes(
-            &mut tx,
-            conversation_id,
-            anchor_message_id,
-            visible_messages,
-            &mut changes,
-            pending,
-        )
-        .await?;
+        let policy = if discovery_mode.uses_local_search() {
+            policy
+        } else {
+            let NativePolicyState {
+                initial,
+                mut changes,
+                pending,
+            } = reconcile_native_policy(
+                &mut tx,
+                conversation_id,
+                policy.declarations(),
+                &callable_names,
+            )
+            .await?;
+            append_native_changes(
+                &mut tx,
+                conversation_id,
+                anchor_message_id,
+                visible_messages,
+                &mut changes,
+                pending,
+            )
+            .await?;
+            policy
+                .with_anthropic_context(initial, changes)
+                .map_err(DbError::Serialization)?
+        };
         let continuation_id: String = sqlx::query_scalar(
             "SELECT continuation_id FROM conversation_tool_contexts WHERE conversation_id=?1",
         )
@@ -387,9 +401,16 @@ impl Database {
         .fetch_one(&mut *tx)
         .await?;
         let snapshot = policy
-            .with_anthropic_context(initial, changes)
-            .and_then(|snapshot| snapshot.with_continuation_id(continuation_id))
+            .with_continuation_id(continuation_id)
             .map_err(DbError::Serialization)?;
+        let snapshot = crate::tool_discovery::project_tx(
+            &mut tx,
+            conversation_id,
+            discovery_mode,
+            snapshot,
+            visible_messages,
+        )
+        .await?;
         tx.commit().await?;
         Ok(snapshot)
     }
@@ -444,6 +465,7 @@ mod tests {
         db
     }
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn withdrawal_retry_schema_change_and_switch_preserve_definitions() {
         let db = database().await;
         let first = db
@@ -455,6 +477,7 @@ mod tests {
                 &BTreeSet::from(["bash".into(), "plan".into()]),
                 &visible(),
                 &[],
+                phoenix_core::domain::tool_discovery::ToolDiscoveryMode::Eager,
             )
             .await
             .unwrap();
@@ -468,6 +491,7 @@ mod tests {
                 &BTreeSet::from(["bash".into()]),
                 &visible(),
                 &[],
+                phoenix_core::domain::tool_discovery::ToolDiscoveryMode::Eager,
             )
             .await
             .unwrap();
@@ -485,6 +509,7 @@ mod tests {
                 &BTreeSet::from(["bash".into()]),
                 &visible(),
                 &[],
+                phoenix_core::domain::tool_discovery::ToolDiscoveryMode::Eager,
             )
             .await
             .unwrap();
@@ -498,6 +523,7 @@ mod tests {
                 &BTreeSet::from(["bash".into()]),
                 &visible(),
                 &[],
+                phoenix_core::domain::tool_discovery::ToolDiscoveryMode::Eager,
             )
             .await
             .unwrap();
@@ -534,6 +560,7 @@ mod tests {
                 &BTreeSet::from(["bash".into()]),
                 &visible(),
                 &[],
+                phoenix_core::domain::tool_discovery::ToolDiscoveryMode::Eager,
             )
             .await
             .unwrap();
@@ -555,6 +582,7 @@ mod tests {
             &BTreeSet::from(["a".into()]),
             &visible(),
             &[],
+            phoenix_core::domain::tool_discovery::ToolDiscoveryMode::Eager,
         )
         .await
         .unwrap();
@@ -567,6 +595,7 @@ mod tests {
                 &BTreeSet::new(),
                 &visible(),
                 &[],
+                phoenix_core::domain::tool_discovery::ToolDiscoveryMode::Eager,
             )
             .await
             .unwrap();
@@ -585,6 +614,7 @@ mod tests {
                 &BTreeSet::new(),
                 &visible(),
                 &[],
+                phoenix_core::domain::tool_discovery::ToolDiscoveryMode::Eager,
             )
             .await
             .unwrap();
@@ -620,6 +650,7 @@ mod tests {
             &BTreeSet::from(["a".into()]),
             &visible(),
             &[],
+            phoenix_core::domain::tool_discovery::ToolDiscoveryMode::Eager,
         )
         .await
         .unwrap();
@@ -631,6 +662,7 @@ mod tests {
             &BTreeSet::new(),
             &visible(),
             &[],
+            phoenix_core::domain::tool_discovery::ToolDiscoveryMode::Eager,
         )
         .await
         .unwrap();
@@ -651,6 +683,7 @@ mod tests {
                 &BTreeSet::new(),
                 &visible(),
                 &[],
+                phoenix_core::domain::tool_discovery::ToolDiscoveryMode::Eager,
             )
             .await
             .unwrap();
@@ -681,6 +714,7 @@ mod tests {
             &BTreeSet::from(["a".into()]),
             &visible(),
             &[],
+            phoenix_core::domain::tool_discovery::ToolDiscoveryMode::Eager,
         )
         .await
         .unwrap();
@@ -692,6 +726,7 @@ mod tests {
             &BTreeSet::new(),
             &visible(),
             &[],
+            phoenix_core::domain::tool_discovery::ToolDiscoveryMode::Eager,
         )
         .await
         .unwrap();
@@ -716,6 +751,7 @@ mod tests {
                 &BTreeSet::new(),
                 &projected,
                 &[],
+                phoenix_core::domain::tool_discovery::ToolDiscoveryMode::Eager,
             )
             .await
             .unwrap();
@@ -741,6 +777,7 @@ mod tests {
                 &BTreeSet::new(),
                 &projected,
                 &[],
+                phoenix_core::domain::tool_discovery::ToolDiscoveryMode::Eager,
             )
             .await
             .unwrap();
@@ -760,6 +797,7 @@ mod tests {
             &BTreeSet::new(),
             &projected,
             &[],
+            phoenix_core::domain::tool_discovery::ToolDiscoveryMode::Eager,
         )
         .await
         .unwrap();
@@ -774,7 +812,8 @@ mod tests {
                 &[tool("a", 2)],
                 &BTreeSet::new(),
                 &projected,
-                &[]
+                &[],
+                phoenix_core::domain::tool_discovery::ToolDiscoveryMode::Eager,
             )
             .await
             .is_err());
@@ -791,6 +830,7 @@ mod tests {
             &BTreeSet::from(["a".into()]),
             &visible(),
             &[],
+            phoenix_core::domain::tool_discovery::ToolDiscoveryMode::Eager,
         )
         .await
         .unwrap();
@@ -815,6 +855,7 @@ mod tests {
                 &BTreeSet::from(["bash".into()]),
                 &visible(),
                 &references,
+                phoenix_core::domain::tool_discovery::ToolDiscoveryMode::Eager,
             )
             .await
             .unwrap();
@@ -837,6 +878,7 @@ mod tests {
                 &BTreeSet::from(["bash".into(), "slack".into()]),
                 &visible(),
                 &references,
+                phoenix_core::domain::tool_discovery::ToolDiscoveryMode::Eager,
             )
             .await
             .unwrap();
@@ -860,6 +902,7 @@ mod tests {
             &BTreeSet::from(["bash".into(), "slack".into()]),
             &visible(),
             &references,
+            phoenix_core::domain::tool_discovery::ToolDiscoveryMode::Eager,
         )
         .await
         .unwrap();
@@ -882,6 +925,7 @@ mod tests {
             &BTreeSet::from(["bash".into()]),
             &visible(),
             &[],
+            phoenix_core::domain::tool_discovery::ToolDiscoveryMode::Eager,
         )
         .await
         .unwrap();
@@ -893,6 +937,7 @@ mod tests {
             &BTreeSet::from(["bash".into(), "slack".into()]),
             &visible(),
             &[],
+            phoenix_core::domain::tool_discovery::ToolDiscoveryMode::Eager,
         )
         .await
         .unwrap();
@@ -912,6 +957,7 @@ mod tests {
                 &BTreeSet::from(["bash".into(), "slack".into()]),
                 &visible(),
                 &refs,
+                phoenix_core::domain::tool_discovery::ToolDiscoveryMode::Eager,
             )
             .await
             .unwrap();
@@ -963,6 +1009,7 @@ mod tests {
             &BTreeSet::from(["a".into()]),
             &first,
             &[],
+            phoenix_core::domain::tool_discovery::ToolDiscoveryMode::Eager,
         )
         .await
         .unwrap();
@@ -975,6 +1022,7 @@ mod tests {
                 &BTreeSet::new(),
                 &first,
                 &[],
+                phoenix_core::domain::tool_discovery::ToolDiscoveryMode::Eager,
             )
             .await
             .unwrap();
@@ -999,6 +1047,7 @@ mod tests {
                 &BTreeSet::new(),
                 &revised,
                 &[],
+                phoenix_core::domain::tool_discovery::ToolDiscoveryMode::Eager,
             )
             .await
             .unwrap();
@@ -1022,6 +1071,7 @@ mod tests {
                 &BTreeSet::new(),
                 &revised,
                 &[],
+                phoenix_core::domain::tool_discovery::ToolDiscoveryMode::Eager,
             )
             .await
             .unwrap();
@@ -1039,6 +1089,7 @@ mod tests {
             &BTreeSet::from(["a".into()]),
             &visible(),
             &[],
+            phoenix_core::domain::tool_discovery::ToolDiscoveryMode::Eager,
         )
         .await
         .unwrap();
@@ -1050,7 +1101,8 @@ mod tests {
                 &[tool("a", 2)],
                 &BTreeSet::new(),
                 &visible(),
-                &[]
+                &[],
+                phoenix_core::domain::tool_discovery::ToolDiscoveryMode::Eager,
             )
             .await
             .is_err());
@@ -1063,6 +1115,7 @@ mod tests {
                 &BTreeSet::from(["a".into()]),
                 &visible(),
                 &[],
+                phoenix_core::domain::tool_discovery::ToolDiscoveryMode::Eager,
             )
             .await
             .unwrap();
@@ -1076,7 +1129,8 @@ mod tests {
                 &[],
                 &BTreeSet::from(["missing".into()]),
                 &visible(),
-                &[]
+                &[],
+                phoenix_core::domain::tool_discovery::ToolDiscoveryMode::Eager,
             )
             .await
             .is_err());
