@@ -1848,7 +1848,10 @@ fn translate_to_responses_request_for_model(
         )
     };
 
-    if !official_openai_route || use_codex_backend {
+    if !official_openai_route
+        || use_codex_backend
+        || request.tool_availability.discovery_mode() == ToolDiscoveryMode::OpenAiHosted
+    {
         append_advisory(&mut instructions, request);
     }
 
@@ -2230,16 +2233,27 @@ fn chat_tool_choice(request: &LlmRequest, supported: bool) -> Option<ChatToolCho
 pub(crate) fn tool_advisory_text(
     availability: &phoenix_core::domain::tool_availability::ToolAvailability,
 ) -> Option<String> {
-    let unavailable: Vec<_> = availability
+    let unavailable: std::collections::BTreeSet<_> = availability
         .declarations()
         .iter()
+        .chain(
+            availability
+                .discovery_results()
+                .iter()
+                .filter(|result| {
+                    availability.discovery_mode() == ToolDiscoveryMode::OpenAiClient
+                        && result.protocol
+                            == phoenix_core::domain::tool_discovery::ToolDiscoveryProtocol::OpenAiClient
+                })
+                .flat_map(|result| &result.tools),
+        )
         .filter(|tool| !availability.is_callable(&tool.name))
         .map(|tool| tool.name.as_str())
         .collect();
     if unavailable.is_empty() {
         return None;
     }
-    Some(format!("\n\nThese tools are unavailable for new calls: {}. Their definitions are retained for historical context. Choose available tools instead.", unavailable.join(", ")))
+    Some(format!("\n\nThese tools are unavailable for new calls: {}. Their definitions are retained for historical context. Choose available tools instead.", unavailable.into_iter().collect::<Vec<_>>().join(", ")))
 }
 
 fn append_advisory(instructions: &mut Option<String>, request: &LlmRequest) {
@@ -2249,7 +2263,7 @@ fn append_advisory(instructions: &mut Option<String>, request: &LlmRequest) {
             .push_str(&advisory);
         tracing::debug!(
             provider = "openai",
-            "using advisory tool restriction on route without native support"
+            "communicating current tool restrictions through an advisory"
         );
     }
 }

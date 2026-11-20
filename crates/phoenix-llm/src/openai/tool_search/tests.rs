@@ -287,6 +287,112 @@ fn active_native_call_keeps_opaque_envelope_and_requires_its_authenticated_resul
     assert!(super::super::validate_responses_replay(&request, "gpt-6.2-sol").is_err());
 }
 
+#[test]
+fn withdrawn_native_client_schema_remains_historical_with_an_explicit_restriction() {
+    let mut request = discovered_request();
+    let records = request.tool_availability.discovery_results().to_vec();
+    request.tool_availability = ToolAvailability::all(vec![tool_search_definition()])
+        .with_discovery(ToolDiscoveryMode::OpenAiClient, records)
+        .unwrap();
+    super::super::validate_responses_replay(&request, "gpt-6.2-sol").unwrap();
+    let wire = serde_json::to_value(super::super::translate_to_backend_request(
+        "gpt-6.2-sol",
+        &request,
+        true,
+        true,
+    ))
+    .unwrap();
+    assert!(wire["input"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|item| item["type"] == "tool_search_output"
+            && item["tools"][0]["name"] == "lookup_issue"));
+    assert!(wire["input"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|item| item["role"] == "developer"
+            && item["content"][0]["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("unavailable for new calls: lookup_issue"))));
+    assert!(crate::tool_availability_advisory_chars(&request.tool_availability) > 0);
+    assert!(!request.tool_availability.is_callable("lookup_issue"));
+}
+
+#[test]
+fn official_hosted_history_keeps_withdrawn_schema_and_communicates_current_policy() {
+    use phoenix_core::domain::responses_replay::ResponsesResponseSet;
+    let mut request = request(ToolDiscoveryMode::OpenAiHosted);
+    request.tool_availability = ToolAvailability::new(
+        vec![
+            deferred(),
+            ToolDefinition {
+                name: "another_issue_tool".into(),
+                ..deferred()
+            },
+        ],
+        ["another_issue_tool".into()].into(),
+    )
+    .unwrap()
+    .with_discovery(ToolDiscoveryMode::OpenAiHosted, vec![])
+    .unwrap();
+    let public = vec![ContentBlock::ToolUse {
+        id: "old-call".into(),
+        name: "lookup_issue".into(),
+        input: json!({"id":7}),
+    }];
+    let loaded = json!({"type":"tool_search_output","execution":"server","call_id":null,"status":"completed","tools":[{"type":"function","name":"lookup_issue","parameters":deferred().input_schema}]});
+    request.messages = vec![
+        LlmMessage {
+            source_message_id: Some("hosted-owner".into()),
+            role: MessageRole::Assistant,
+            content: public.clone(),
+        },
+        LlmMessage {
+            source_message_id: Some("hosted-result".into()),
+            role: MessageRole::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: "old-call".into(),
+                content: "Issue 7".into(),
+                images: vec![],
+                is_error: false,
+            }],
+        },
+    ];
+    request.output_replay.push(ResponsesResponseSet {
+        response_id: "hosted-response".into(), model: "gpt-6.2-sol".into(), owner_message_id: "hosted-owner".into(), public_content: public,
+        output_items: vec![
+            json!({"type":"tool_search_call","execution":"server","call_id":null,"arguments":{"paths":["lookup_issue"]}}),
+            loaded.clone(),
+            json!({"type":"function_call","call_id":"old-call","name":"lookup_issue","arguments":"{\"id\":7}"}),
+        ],
+    }.into());
+    super::super::validate_responses_replay(&request, "gpt-6.2-sol").unwrap();
+    let wire = serde_json::to_value(super::super::translate_to_backend_request(
+        "gpt-6.2-sol",
+        &request,
+        false,
+        true,
+    ))
+    .unwrap();
+    assert_eq!(wire["tool_choice"], "auto");
+    assert!(wire["input"].as_array().unwrap().contains(&loaded));
+    assert!(wire["input"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|item| item["role"] == "developer"
+            && item["content"]
+                .as_str()
+                .is_some_and(|text| text.contains("unavailable for new calls: lookup_issue"))));
+    assert!(wire["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|tool| tool["name"] != "lookup_issue"));
+}
+
 #[tokio::test]
 async fn codex_transport_carries_authenticated_native_search_continuation() {
     use axum::{extract::State, http::HeaderMap, routing::post, Json, Router};
