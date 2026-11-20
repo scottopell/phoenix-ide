@@ -5853,11 +5853,11 @@ mod model_resolution_tests {
         });
         assert_eq!(
             resolve_creation_model(&registry, None).unwrap(),
-            "gpt-6.1-sol"
+            "gpt-6.2-sol"
         );
         assert_ne!(
-            registry.cheap_model_id_for_provider("gpt-6.1-sol"),
-            "gpt-6.1-sol"
+            registry.cheap_model_id_for_provider("gpt-6.2-sol"),
+            "gpt-6.2-sol"
         );
     }
 
