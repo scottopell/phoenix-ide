@@ -1,0 +1,11 @@
+# Wait for the requested turn before drive-turn reports Idle
+
+The one-shot `drive-turn` QA runner can return `outcome.type=idle` while its result contains only the newly persisted user input, before a requested tool/assistant turn has completed. Do not treat that result as successful provider qualification.
+
+Observed on 2026-11-20 at source 638be88a4fac2e5d88b026f6eb0d617d76d05b36 with a disposable in-memory database, empty temporary cwd, google/gemini-4-neon, and the prompt: “Use the bash tool once to run printf PHOENIX_GEMINI_OK. Then reply with the exact output. Do not edit files or invoke any other tools.” The configured gateway credential helper was resolved in advance into the probe child's process environment, with the same endpoint and custom headers, to avoid confusing this result with initial credential recovery. Result was Idle after 4557 ms with message_count=1 and message_types=[user]. The raw local probe artifacts are /tmp/phoenix-gemini-runtime-result.json and /tmp/phoenix-gemini-runtime.log; they are ephemeral evidence, not repository fixtures. Separate live signed tool-round tests passed for all four Gemini 4 models and both streaming modes; this issue does not establish a Google adapter failure.
+
+`crates/phoenix-ide/src/drive_turn.rs` calls `dispatch_standalone_turn`, then `wait_for_stable_turn`. Its Idle admission condition uses `turn_has_persisted_input`, which only checks that any user message exists. That predicate does not establish completion of the exact dispatched user occurrence and can accept the initial Idle state.
+
+Resolve the completion contract using the authoritative admission/turn outcome for the exact requested input. Preserve legitimate recovery/approval/user-response boundaries and timeout cancellation. Do not substitute sleeps or require an arbitrary assistant row if canonical completion is represented elsewhere.
+
+Acceptance: a gated deterministic provider/runtime test proves the runner stays pending after user persistence while provider work is outstanding; after release it returns the exact stable outcome with the tool/answer evidence. Verify stale Idle from initial state or another occurrence cannot satisfy the wait. Exercise the existing driver tests and a bounded real one-shot tool exchange.
