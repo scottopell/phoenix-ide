@@ -78,8 +78,9 @@ enum ResponsesPartSurface { message_content | function_call_output }
 --   message       — assistant text, carried as `output_text` parts
 --   function_call — a tool call the model wants Phoenix to run
 --   reasoning     — provider-private continuation item, never public answer text
+--   tool_search_call / tool_search_output — native discovery protocol items
 --   other         — any unrecognised item type; ignored with a debug log
-enum ResponsesOutputKind { message | function_call | reasoning | other }
+enum ResponsesOutputKind { message | function_call | reasoning | tool_search_call | tool_search_output | other }
 
 ------------------------------------------------------------
 -- Value Types
@@ -92,7 +93,8 @@ enum ResponsesOutputKind { message | function_call | reasoning | other }
 -- `has_output_items` records whether the terminal carried any item, including
 -- private reasoning. `has_output_content` is true iff at least one content
 -- block resulted (non-empty message text — an output_text or a refusal part —
--- or a function_call). It is false when every output item was private-only or
+-- a function_call, or a client-executed native search call). It is false when
+-- every output item was private-only or
 -- empty; the terminal guard pairs it with item presence and raw_output_tokens.
 value ResponsesRawResponse {
     status: String
@@ -101,6 +103,7 @@ value ResponsesRawResponse {
     cached_tokens: Integer
     cache_write_tokens: Integer
     has_function_call: Boolean
+    has_client_tool_search_call: Boolean
     has_output_items: Boolean
     has_output_content: Boolean
     has_proven_quiet_terminal: Boolean
@@ -264,6 +267,10 @@ contract ResponsesToolContinuation {
         -- monotonically, nor a requirement to delete history when it shrinks.
         -- This contract does not assert that every historical tool name may
         -- be omitted from declarations on every route without validation.
+        -- Hosted native search instead declares only qualified permitted
+        -- candidates and uses auto/none; allowed_tools must not enumerate
+        -- deferred functions by name. Existing history and independent
+        -- execution admission remain intact under that projection.
 
     @invariant AllowedToolsWireShape
         -- A restricted nonempty subset uses tool_choice =
@@ -290,6 +297,19 @@ contract ResponsesToolContinuation {
         -- Do not synthesize phase or reconstruct envelopes from visible text.
         -- Final settlement clears this active-exchange private continuation.
 
+    @invariant NativeSearchHasRouteSpecificExecution
+        -- Qualified direct Responses routes use hosted tool_search with
+        -- defer_loading. Hosted tool_search_call/tool_search_output items remain
+        -- in accepted private output envelopes and are not local ToolUse calls.
+        -- Codex bridge uses native execution:client: its search call becomes an
+        -- executable shared lookup, whose typed canonical selection returns as
+        -- tool_search_output. Deferred schemas are emitted at that result's
+        -- position, not newly prepended into the Codex declaration prefix.
+        -- Client output must match the authentic owner/call/result receipt.
+        -- Stored Function/OpenAiClient identity selects historical result
+        -- encoding even for failed/empty results after active replay retires.
+        -- These obligations are refined in tool-discovery.allium.
+
     @invariant ReasoningItemsContinuePrivately
         -- For reasoning models, reasoning items returned with function calls
         -- are passed back with the function outputs. Preserve the opaque items
@@ -315,6 +335,9 @@ contract ResponsesToolContinuation {
 -- Rules — private continuation and current tool selection
 ------------------------------------------------------------
 
+-- hosted_search_active(availability: llm/ToolAvailability) -> Boolean means
+-- discovery_mode=openai_hosted and at least one deferred permitted candidate.
+
 rule ResponsesToolRoundOutputItemRetained {
     when: AcceptResponsesToolRoundOutputItem(owner_message_id, item)
     ensures: ResponsesPrivateOutputItem.created(owner_message_id: owner_message_id, item: item)
@@ -329,6 +352,7 @@ rule ResponsesToolRoundOutputItemRetained {
 rule ResponsesToolChoiceSelected {
     when: SelectResponsesTools(availability, support)
     requires: support = supported
+    requires: not hosted_search_active(availability)
     ensures:
         if availability.callable_names.count = 0:
             ResponsesNoTools.created(availability: availability)
@@ -339,9 +363,20 @@ rule ResponsesToolChoiceSelected {
                 ResponsesAllowedTools.created(availability: availability, allowed_names: availability.callable_names)
 }
 
+rule ResponsesHostedSearchToolChoiceSelected {
+    when: SelectResponsesTools(availability, support)
+    requires: hosted_search_active(availability)
+    ensures:
+        if availability.callable_names.count = 0:
+            ResponsesNoTools.created(availability: availability)
+        else:
+            ResponsesAutoTools.created(availability: availability)
+}
+
 rule ResponsesAdvisoryToolChoiceSelected {
     when: SelectResponsesTools(availability, support)
     requires: support in { unsupported, unknown }
+    requires: not hosted_search_active(availability)
     ensures: ResponsesAdvisoryTools.created(availability: availability)
 }
 
@@ -627,8 +662,9 @@ rule ResponsesServerBlockDropped {
 --      synthetic public text.
 --   3. Otherwise a normalized llm/LlmResponse. Output items map:
 --      message -> text content (both output_text and refusal parts),
---      function_call -> tool_use, reasoning -> private continuation, other ->
---      ignored. end_turn holds iff the status is "completed" AND no
+--      function_call -> tool_use, reasoning -> private continuation, native
+--      hosted search -> private continuation, native client search -> executable
+--      shared lookup, other -> ignored. end_turn holds iff the status is "completed" AND no
 --      tool call is pending.
 --
 -- Token accounting de-duplicates both cache detail subsets: OpenAI's
@@ -639,7 +675,7 @@ rule ResponsesServerBlockDropped {
 rule ResponsesResponseNormalized {
     when: NormalizeResponsesResponse(raw)
 
-    let end_turn = raw.status = "completed" and not raw.has_function_call
+    let end_turn = raw.status = "completed" and not raw.has_function_call and not raw.has_client_tool_search_call
 
     ensures:
         if not raw.has_output_content and (raw.has_output_items or raw.raw_output_tokens > 0) and not raw.has_proven_quiet_terminal:

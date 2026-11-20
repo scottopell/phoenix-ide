@@ -873,6 +873,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "chat_completions_signature_replay",
         sql: include_str!("migrations/chat_completions_signature_replay.sql"),
     },
+    Migration {
+        version: 170,
+        name: "tool_discovery",
+        sql: include_str!("migrations/tool_discovery.sql"),
+    },
 ];
 
 async fn run_migration_168(pool: &SqlitePool, migration: &Migration) -> DbResult<()> {

@@ -7,7 +7,7 @@ and Claude Haiku 5.5. Opus 5.5, Sonnet 5.5, and GPT-6 Luna were already present.
 The product default is GPT-6.2 Sol. OpenAI additions use Responses on direct
 routes and Responses Lite on Codex, with route-gated Fast and prompt caching.
 Fable and Haiku use adaptive thinking binding on the official Anthropic route;
-Fable also exposes Fast. New-model native tool changes are not advertised.
+Fable also exposes Fast. Other new-model native tool changes are not advertised.
 
 Metadata is sourced from the [OpenAI model catalog](https://developers.openai.com/api/docs/models),
 [GPT-6.2 guide](https://developers.openai.com/api/docs/guides/latest-model),
@@ -17,6 +17,42 @@ documentation establishes accepted levels but does not establish native defaults
 Provider defaults are preserved by omitting an unset effort override.
 Model-contract, registry-registration, and provider-wire fixtures cover these
 additions; they do not establish account entitlement or live provider acceptance.
+
+## Tool discovery integration (2026-11-20)
+
+REQ-LLM-004n and [the discovery contract](tool-discovery.allium) distinguish eager
+loading, native Anthropic search, OpenAI hosted search, OpenAI client-executed
+search on the Codex bridge, and shared function-based search for Chat routes such
+as GLM and gateway Gemini. A surface without an executable local search tool
+keeps eager loading. Anthropic's native mechanism remains separate.
+
+The shared selector uses a frozen permitted request catalog. Canonical result
+admission validates the query and public names-only summary, then commits typed
+schema selections as normalized rows with the owned tool message/state. Full
+permissions and actual advertisement remain separate execution checks. Native
+Codex result placement avoids adding newly loaded schemas to the leading prefix;
+Chat requests add authenticated selected schemas to their function declarations.
+Codex native admission requires native-client loading evidence; ordinary search
+history remains ordinary and can require a new native search after a mode switch.
+[ADR-273](../adrs/273_native-openai-and-shared-local-tool-discovery.md) records the
+choice and its costs.
+
+Integration qualification has focused and live evidence. The actual Phoenix
+adapter passed hosted search, function execution/continuation, and full
+private-envelope replay on the configured Responses gateway in streaming and
+non-streaming modes, including a new tool turn after private-envelope settlement.
+The shared fallback passed 12 live cases: GLM 5.3, GLM 5.3 Flash, and all four
+Gemini 4 models in both modes, with signed private envelopes restored for
+continuation. These probes establish configured gateway behavior, not
+public-platform entitlement.
+
+Real SQLite/runtime tests passed local and native-client search through tool
+execution and reopen/retry, along with schema accounting and all five
+`provider_tool_policy_tests`. Focused core, tool-context, registry, and persistence
+tests also pass. Codex bridge protocol evidence comes from official upstream code
+and deterministic fixtures; Phoenix-native Codex credentials were unavailable
+for a live bridge probe and no other app's credentials were borrowed. Full broad
+checks and independent review remain pending. No production activation is claimed.
 
 ## Google gateway verification (2026-11-20)
 
@@ -81,6 +117,7 @@ Tool availability is separated from retained declarations and historical calls. 
 | **REQ-LLM-003a:** Model Discovery | ✅ Complete | Opportunistic backend-scoped `/v1/models` discovery, falls back to configured models |
 | **REQ-LLM-003b:** Typed Model Effort Capability Registry | ✅ Complete | Constructor-validated known-native, unknown, unsupported, and supported-level capability states |
 | **REQ-LLM-004:** Request Format | ✅ Complete | LlmRequest with system, messages, tools |
+| **REQ-LLM-004n:** Route-Qualified Tool Discovery | Implemented; qualification in progress | Hosted gateway and 12 shared-fallback live cases pass; local/native-client SQLite runtime, reopen/retry, accounting, and provider-policy tests pass. Full broad checks and independent review pending; Codex live unavailable. |
 | **REQ-LLM-004a–004e:** Reasoning Effort Lifecycle | ✅ Complete | Native omission, explicit overrides, atomic switches, subagent inheritance, and provider translation |
 | **REQ-LLM-004f:** Output Budget Resolution and Reservation | Implemented; qualification in progress | Concrete model output maxima flow through runtime context, ordinary and continuation requests, provider serialization, and reservation. External HTTP definitions require `max_output_tokens`; no effort-based cap or 4k continuation override. Native Codex retains wire omission. |
 | **REQ-LLM-004g:** Fast Request Speed | ✅ Complete | Capability-gated per-conversation Standard/Fast selection maps to each supported route's native control: Responses `priority` or direct Anthropic `speed: fast` with its feature header. Effective speed is persisted per turn for historical pricing, successful Anthropic responses must confirm Fast, continuations preserve it, and subagents default to Standard. |

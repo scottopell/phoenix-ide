@@ -1012,6 +1012,15 @@ where
             error: "EUNAVAIL: tool is unavailable under the current conversation policy".into(),
         };
     }
+    let tool_ctx = if tool_name == phoenix_core::domain::tool_discovery::TOOL_SEARCH_NAME {
+        let catalog = match storage.load_tool_search_catalog(&conv_id).await {
+            Ok(catalog) => catalog,
+            Err(error) => return ToolExecOutcome::Failed { tool_use_id, error },
+        };
+        tool_ctx.with_tool_search_catalog(catalog)
+    } else {
+        tool_ctx
+    };
     let output = tool_executor
         .execute(checked.with_input_schema(request_schema), tool_ctx)
         .instrument(span.clone())
@@ -1966,6 +1975,40 @@ impl LlmToolSurface {
                 .collect(),
         }
     }
+}
+
+fn discovery_mode_for_tools(
+    requested: phoenix_core::domain::tool_discovery::ToolDiscoveryMode,
+    callable_tools: &[phoenix_llm::ToolDefinition],
+) -> phoenix_core::domain::tool_discovery::ToolDiscoveryMode {
+    if requested.uses_local_search()
+        && !callable_tools
+            .iter()
+            .any(|tool| tool.name == phoenix_core::domain::tool_discovery::TOOL_SEARCH_NAME)
+    {
+        tracing::debug!(
+            ?requested,
+            "tool surface has no local search; retaining eager declarations"
+        );
+        phoenix_core::domain::tool_discovery::ToolDiscoveryMode::Eager
+    } else {
+        requested
+    }
+}
+
+fn fresh_discovery_availability(
+    mut tools: Vec<phoenix_llm::ToolDefinition>,
+    requested: phoenix_core::domain::tool_discovery::ToolDiscoveryMode,
+) -> phoenix_core::domain::tool_availability::ToolAvailability {
+    let mode = discovery_mode_for_tools(requested, &tools);
+    if mode.uses_local_search() {
+        tools.retain(|tool| !tool.defer_loading);
+    } else {
+        tools.retain(|tool| tool.name != phoenix_core::domain::tool_discovery::TOOL_SEARCH_NAME);
+    }
+    phoenix_core::domain::tool_availability::ToolAvailability::all(tools)
+        .with_discovery(mode, vec![])
+        .expect("empty discovery results are valid")
 }
 
 /// Default cap on consecutive LLM requests within a single parent-conversation
@@ -9336,12 +9379,23 @@ where
         // Freeze the complete provider request before any provider or forwarding
         // task is spawned. Tool definitions, AGENTS-backed system prompt, and the
         // provider context are request authority, not task-local inputs.
-        let (system_prompt, available_tools) = self.prepare_ordinary_overhead().await?;
-        let callable_names = request_tool_surface
-            .callable_tools(available_tools.clone())
+        let (system_prompt, mut available_tools) = self.prepare_ordinary_overhead().await?;
+        let callable_tools = request_tool_surface.callable_tools(available_tools.clone());
+        let discovery_mode = discovery_mode_for_tools(
+            llm_client
+                .tool_discovery_mode()
+                .map_err(|error| error.to_string())?,
+            &callable_tools,
+        );
+        let mut callable_names = callable_tools
             .into_iter()
             .map(|tool| tool.name)
             .collect::<std::collections::BTreeSet<_>>();
+        if !discovery_mode.uses_local_search() {
+            available_tools
+                .retain(|tool| tool.name != phoenix_core::domain::tool_discovery::TOOL_SEARCH_NAME);
+            callable_names.remove(phoenix_core::domain::tool_discovery::TOOL_SEARCH_NAME);
+        }
         let anchor = frozen_messages
             .last()
             .filter(|message| message.role == MessageRole::User)
@@ -9388,6 +9442,7 @@ where
                     )
                     .collect::<Vec<_>>(),
                 &historical_tool_references,
+                discovery_mode,
             )
             .await?;
         let provider_replay = self.storage.load_provider_replay_state(&conv_id).await?;
@@ -11046,14 +11101,18 @@ where
             .clone()
             .freeze_for_request()
             .map_err(|error| error.to_string())?;
+        let tool_availability = fresh_discovery_availability(
+            tools,
+            client
+                .tool_discovery_mode()
+                .map_err(|error| error.to_string())?,
+        );
         let projection_request = LlmRequest {
             system: vec![SystemContent::cached(&system)],
             messages: vec![],
             provider_replay: None,
             output_replay: vec![],
-            tool_availability: phoenix_core::domain::tool_availability::ToolAvailability::all(
-                tools.clone(),
-            ),
+            tool_availability: tool_availability.clone(),
             max_tokens: u32::try_from(self.context.output_budget)
                 .map_err(|error| error.to_string())?,
             effective_effort: self
@@ -11068,11 +11127,8 @@ where
         let mut counting = CountingBudget::new();
         let capacity = SuccessorCapacity {
             context_window: self.context.context_window,
-            ordinary_overhead_tokens: estimate_fixed_request_tokens(
-                &system,
-                &phoenix_core::domain::tool_availability::ToolAvailability::all(tools),
-            )
-            .saturating_add(MESSAGE_OVERHEAD_TOKENS),
+            ordinary_overhead_tokens: estimate_fixed_request_tokens(&system, &tool_availability)
+                .saturating_add(MESSAGE_OVERHEAD_TOKENS),
             output_tokens: self.context.output_budget,
         };
         let describe = |text: &str, authority: phoenix_core::domain::product_conversation::ContinuationOpeningAuthority| {
@@ -11426,14 +11482,18 @@ where
             }
         };
         let (ordinary_system, ordinary_tools) = self.prepare_successor_overhead().await?;
+        let tool_availability = fresh_discovery_availability(
+            ordinary_tools,
+            llm_client
+                .tool_discovery_mode()
+                .map_err(|error| error.to_string())?,
+        );
         let successor_request = LlmRequest {
             system: vec![SystemContent::cached(&ordinary_system)],
             messages: vec![],
             provider_replay: None,
             output_replay: vec![],
-            tool_availability: phoenix_core::domain::tool_availability::ToolAvailability::all(
-                ordinary_tools.clone(),
-            ),
+            tool_availability: tool_availability.clone(),
             max_tokens: output_token_limit,
             effective_effort,
             service_tier: effective_service_tier,
@@ -11445,7 +11505,7 @@ where
             context_window,
             ordinary_overhead_tokens: estimate_fixed_request_tokens(
                 &ordinary_system,
-                &phoenix_core::domain::tool_availability::ToolAvailability::all(ordinary_tools),
+                &tool_availability,
             )
             .saturating_add(MESSAGE_OVERHEAD_TOKENS),
             output_tokens: self.context.output_budget,
@@ -13335,16 +13395,49 @@ fn estimate_fixed_request_tokens(
     system_prompt: &str,
     availability: &phoenix_core::domain::tool_availability::ToolAvailability,
 ) -> usize {
-    estimate_text_tokens(system_prompt)
-        + phoenix_llm::tool_availability_advisory_chars(availability)
-            .div_ceil(CHARS_PER_TOKEN_ESTIMATE)
-        + availability
-            .declarations()
+    use phoenix_core::domain::tool_discovery::ToolDiscoveryMode;
+    let mode = availability.discovery_mode();
+    let schema_tokens = availability.declarations().iter().filter_map(|tool| {
+        if (mode == ToolDiscoveryMode::OpenAiHosted && (!availability.is_callable(&tool.name) || tool.name == phoenix_core::domain::tool_discovery::TOOL_SEARCH_NAME)) || (mode == ToolDiscoveryMode::OpenAiClient && tool.defer_loading) {
+            None
+        } else if mode == ToolDiscoveryMode::OpenAiHosted && tool.defer_loading {
+            Some(estimate_text_tokens(&serde_json::json!({"name":tool.name,"description":tool.description,"defer_loading":true}).to_string()))
+        } else {
+            Some(estimate_text_tokens(&serde_json::to_string(tool).expect("tool schema serializes")))
+        }
+    }).sum::<usize>();
+    let discovered_tokens = if mode == ToolDiscoveryMode::OpenAiClient {
+        availability
+            .discovery_results()
             .iter()
+            .filter(|result| {
+                result.protocol
+                    == phoenix_core::domain::tool_discovery::ToolDiscoveryProtocol::OpenAiClient
+            })
+            .flat_map(|result| &result.tools)
             .map(|tool| {
                 estimate_text_tokens(&serde_json::to_string(tool).expect("tool schema serializes"))
             })
-            .sum::<usize>()
+            .sum()
+    } else {
+        0
+    };
+    let hosted_search_tokens = if mode == ToolDiscoveryMode::OpenAiHosted
+        && availability
+            .declarations()
+            .iter()
+            .any(|tool| tool.defer_loading && availability.is_callable(&tool.name))
+    {
+        estimate_text_tokens(r#"{"type":"tool_search","execution":"server"}"#)
+    } else {
+        0
+    };
+    estimate_text_tokens(system_prompt)
+        + phoenix_llm::tool_availability_advisory_chars(availability)
+            .div_ceil(CHARS_PER_TOKEN_ESTIMATE)
+        + schema_tokens
+        + discovered_tokens
+        + hosted_search_tokens
 }
 
 #[cfg(test)]
@@ -31499,6 +31592,7 @@ mod work_subagent_cwd_guard_tests {
                 &["spawn_agents".into()].into_iter().collect(),
                 &[],
                 &[],
+                phoenix_core::domain::tool_discovery::ToolDiscoveryMode::Eager,
             )
             .await
             .unwrap();
