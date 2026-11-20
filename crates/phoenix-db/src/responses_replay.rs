@@ -180,6 +180,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn complete_tool_round_envelopes_survive_reopen_retry_and_settlement() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("replay.db");
@@ -365,6 +366,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn chat_signatures_survive_reopen_retry_and_settle_atomically() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("gemini-replay.db");

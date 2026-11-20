@@ -1141,7 +1141,7 @@ fn adopt_qa_replay(
                 .provider_replay
                 .take()
                 .map_or_else(Vec::new, |p| p.response_sets);
-            sets.push(response.with_owner_message_id(owner_id).into());
+            sets.push(response.with_owner_message_id(owner_id));
             request.provider_replay =
                 Some(AnthropicReplayPayload::new(sets).map_err(|e| e.to_string())?);
         }
