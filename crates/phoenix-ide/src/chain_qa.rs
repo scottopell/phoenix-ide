@@ -383,7 +383,7 @@ impl ChainQa {
             );
             let mut request = request;
             request.provider_replay = provider_replay.clone();
-            request.responses_replay = responses_replay.clone();
+            request.output_replay = responses_replay.clone();
             planning_requests += 1;
             let resp = prep
                 .service
@@ -415,7 +415,7 @@ impl ChainQa {
                 partial_answer: None,
             })?;
             provider_replay = request.provider_replay.take();
-            responses_replay = std::mem::take(&mut request.responses_replay);
+            responses_replay = std::mem::take(&mut request.output_replay);
 
             // Execute the tools and feed results back. Re-resolve the chain's
             // members live so a continuation added mid-run is in scope
@@ -512,7 +512,7 @@ impl ChainQa {
         &self,
         messages: &[LlmMessage],
         provider_replay: Option<phoenix_core::domain::provider_replay::AnthropicReplayPayload>,
-        responses_replay: Vec<phoenix_core::domain::responses_replay::ResponsesResponseSet>,
+        output_replay: Vec<phoenix_core::domain::responses_replay::ProviderResponseSet>,
         search_enabled: bool,
         remaining_turns: usize,
         prep: &PreparedInvocation,
@@ -528,7 +528,7 @@ impl ChainQa {
         );
         let mut request = request;
         request.provider_replay = provider_replay;
-        request.responses_replay = responses_replay;
+        request.output_replay = output_replay;
         let mut partial = String::new();
         for turn in 0..remaining_turns {
             let (chunk_tx, mut chunk_rx) = mpsc::channel::<TokenChunk>(256);
@@ -881,7 +881,7 @@ fn build_agent_request(
         )],
         messages: messages.to_vec(),
         provider_replay: None,
-        responses_replay: Vec::new(),
+        output_replay: Vec::new(),
         tool_availability,
         max_tokens: max_output_tokens
             .map_or(ANSWER_MAX_TOKENS, |limit| limit.min(ANSWER_MAX_TOKENS)),
@@ -1141,18 +1141,23 @@ fn adopt_qa_replay(
                 .provider_replay
                 .take()
                 .map_or_else(Vec::new, |p| p.response_sets);
-            sets.push(response.with_owner_message_id(owner_id));
+            sets.push(response.with_owner_message_id(owner_id).into());
             request.provider_replay =
                 Some(AnthropicReplayPayload::new(sets).map_err(|e| e.to_string())?);
         }
         Some(ProviderReplayUpdate::Responses(response)) => {
             request
-                .responses_replay
-                .push(response.with_owner_message_id(owner_id));
+                .output_replay
+                .push(response.with_owner_message_id(owner_id).into());
+        }
+        Some(ProviderReplayUpdate::ChatCompletions(response)) => {
+            request
+                .output_replay
+                .push(response.with_owner_message_id(owner_id).into());
         }
         Some(ProviderReplayUpdate::Clear) => {
             request.provider_replay = None;
-            request.responses_replay.clear();
+            request.output_replay.clear();
         }
         None => {}
     }
@@ -1183,16 +1188,16 @@ mod tool_policy_tests {
             let round = self
                 .rounds
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            assert_eq!(request.responses_replay.len(), round);
-            for set in &request.responses_replay {
+            assert_eq!(request.output_replay.len(), round);
+            for set in &request.output_replay {
                 let owner = request
                     .messages
                     .iter()
                     .find(|message| {
-                        message.source_message_id.as_deref() == Some(set.owner_message_id.as_str())
+                        message.source_message_id.as_deref() == Some(set.owner_message_id())
                     })
                     .unwrap();
-                assert_eq!(owner.content, set.public_content);
+                assert_eq!(owner.content, set.public_content());
             }
             let mut response = phoenix_llm::LlmResponse::non_streaming(
                 vec![ContentBlock::text("ready")],
@@ -1230,23 +1235,26 @@ mod tool_policy_tests {
             tx: &mpsc::Sender<TokenChunk>,
         ) -> Result<phoenix_llm::LlmResponse, LlmError> {
             assert_eq!(
-                request.responses_replay.len(),
+                request.output_replay.len(),
                 2,
                 "discarded planning terminal must not settle adopted tool history"
             );
             assert!(request.tool_availability.callable_names().is_empty());
             assert!(!request.tool_availability.declarations().is_empty());
-            for (round, set) in request.responses_replay.iter().enumerate() {
-                assert_eq!(set.owner_message_id, format!("chain-qa-{round}"));
-                assert_eq!(set.output_items[0]["encrypted_content"], "private");
+            for (round, set) in request.output_replay.iter().enumerate() {
+                assert_eq!(set.owner_message_id(), format!("chain-qa-{round}"));
+                assert_eq!(
+                    set.as_responses().unwrap().output_items[0]["encrypted_content"],
+                    "private"
+                );
                 let owner = request
                     .messages
                     .iter()
                     .find(|message| {
-                        message.source_message_id.as_deref() == Some(set.owner_message_id.as_str())
+                        message.source_message_id.as_deref() == Some(set.owner_message_id())
                     })
                     .unwrap();
-                assert_eq!(owner.content, set.public_content);
+                assert_eq!(owner.content, set.public_content());
             }
             tx.send(TokenChunk::Text("final answer".into()))
                 .await
@@ -1333,19 +1341,22 @@ mod tool_policy_tests {
                 .anthropic_changes()
                 .iter()
                 .all(|change| change.after_message_id == "chain-qa-question"));
-            assert_eq!(request.responses_replay.len(), turn);
+            assert_eq!(request.output_replay.len(), turn);
             for prior in 0..turn {
-                let set = &request.responses_replay[prior];
-                assert_eq!(set.owner_message_id, format!("chain-qa-final-{prior}"));
-                assert_eq!(set.output_items[0]["encrypted_content"], "private-final");
+                let set = &request.output_replay[prior];
+                assert_eq!(set.owner_message_id(), format!("chain-qa-final-{prior}"));
+                assert_eq!(
+                    set.as_responses().unwrap().output_items[0]["encrypted_content"],
+                    "private-final"
+                );
                 let owner = request
                     .messages
                     .iter()
                     .find(|message| {
-                        message.source_message_id.as_deref() == Some(set.owner_message_id.as_str())
+                        message.source_message_id.as_deref() == Some(set.owner_message_id())
                     })
                     .unwrap();
-                assert_eq!(owner.content, set.public_content);
+                assert_eq!(owner.content, set.public_content());
                 let results: Vec<_> = request
                     .messages
                     .iter()

@@ -9393,7 +9393,7 @@ where
             )
             .await?;
         let provider_replay = self.storage.load_provider_replay_state(&conv_id).await?;
-        let responses_replay = self.storage.load_responses_replay_state(&conv_id).await?;
+        let responses_replay = self.storage.load_output_replay_state(&conv_id).await?;
         let fixed_tokens = estimate_fixed_request_tokens(&system_prompt, &tool_availability)
             .saturating_add(estimate_private_replay_overhead(
                 &frozen_messages,
@@ -9428,7 +9428,7 @@ where
             system: vec![SystemContent::cached(&system_prompt)],
             messages: frozen_messages.clone(),
             provider_replay: provider_replay.clone(),
-            responses_replay: responses_replay.clone(),
+            output_replay: responses_replay.clone(),
             tool_availability: tool_availability.clone(),
             max_tokens: request_output_tokens,
             effective_effort,
@@ -11052,7 +11052,7 @@ where
             system: vec![SystemContent::cached(&system)],
             messages: vec![],
             provider_replay: None,
-            responses_replay: vec![],
+            output_replay: vec![],
             tool_availability: phoenix_core::domain::tool_availability::ToolAvailability::all(
                 tools.clone(),
             ),
@@ -11150,7 +11150,7 @@ where
             messages,
             system: vec![SystemContent::new(system)],
             provider_replay: None,
-            responses_replay: vec![],
+            output_replay: vec![],
             tool_availability: phoenix_core::domain::tool_availability::ToolAvailability::all(
                 vec![],
             ),
@@ -11432,7 +11432,7 @@ where
             system: vec![SystemContent::cached(&ordinary_system)],
             messages: vec![],
             provider_replay: None,
-            responses_replay: vec![],
+            output_replay: vec![],
             tool_availability: phoenix_core::domain::tool_availability::ToolAvailability::all(
                 ordinary_tools.clone(),
             ),
@@ -11590,7 +11590,7 @@ where
             messages: complete_messages,
             system: vec![SystemContent::new(system_prompt)],
             provider_replay: None,
-            responses_replay: vec![],
+            output_replay: vec![],
             tool_availability: phoenix_core::domain::tool_availability::ToolAvailability::all(
                 vec![],
             ),
@@ -11752,7 +11752,7 @@ where
             messages,
             system: vec![SystemContent::new(system_prompt)],
             provider_replay: None,
-            responses_replay: Vec::new(),
+            output_replay: Vec::new(),
             tool_availability: phoenix_core::domain::tool_availability::ToolAvailability::all(
                 vec![],
             ), // No tools for continuation
@@ -13288,26 +13288,29 @@ fn estimate_messages_tokens(messages: &[LlmMessage]) -> usize {
 fn estimate_private_replay_overhead(
     messages: &[LlmMessage],
     anthropic: Option<&phoenix_core::domain::provider_replay::AnthropicReplayPayload>,
-    responses: &[phoenix_core::domain::responses_replay::ResponsesResponseSet],
+    responses: &[phoenix_core::domain::responses_replay::ProviderResponseSet],
 ) -> usize {
     messages
         .iter()
         .filter(|message| message.role == MessageRole::Assistant)
         .map(|message| {
             let public_tokens = estimate_message_tokens(message);
-            let responses_extra = responses
-                .iter()
-                .find(|set| {
-                    message.source_message_id.as_deref() == Some(&set.owner_message_id)
-                        && message.content == set.public_content
-                })
-                .map_or(0, |set| {
-                    estimate_text_tokens(
-                        &serde_json::to_string(&set.output_items).expect("replay items serialize"),
-                    )
-                    .saturating_add(MESSAGE_OVERHEAD_TOKENS)
-                    .saturating_sub(public_tokens)
-                });
+let responses_extra = responses
+    .iter()
+    .find(|set| {
+        message.source_message_id.as_deref() == Some(set.owner_message_id())
+            && message.content == set.public_content()
+    })
+    .map_or(0, |set| match set {
+        phoenix_core::domain::responses_replay::ProviderResponseSet::Responses(set) => {
+            estimate_text_tokens(&serde_json::to_string(&set.output_items).expect("replay items serialize"))
+                .saturating_add(MESSAGE_OVERHEAD_TOKENS)
+                .saturating_sub(public_tokens)
+        }
+        phoenix_core::domain::responses_replay::ProviderResponseSet::ChatCompletions(set) => {
+            estimate_text_tokens(&serde_json::to_string(&set.tool_signatures).expect("tool signatures serialize"))
+        }
+    });
             let anthropic_extra = anthropic
                 .and_then(|payload| {
                     payload.response_sets.iter().find(|set| {
@@ -16310,6 +16313,8 @@ mod dispatch_context_budget_tests {
                 serde_json::json!({"type":"reasoning","encrypted_content":"x".repeat(8_000)}),
             ],
         };
+        let response =
+            phoenix_core::domain::responses_replay::ProviderResponseSet::Responses(response);
         let anthropic =
             AnthropicReplayPayload::new(vec![AnthropicResponseSet::with_public_content(
                 AnthropicResponseIdentity {

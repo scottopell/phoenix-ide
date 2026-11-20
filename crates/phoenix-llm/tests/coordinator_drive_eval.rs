@@ -407,7 +407,7 @@ async fn run_trial(
                         .expect("valid provider replay"),
                 )
             },
-            responses_replay: responses_sets.clone(),
+            output_replay: responses_sets.clone(),
             tool_availability: ToolAvailability::all(tools()),
             max_tokens: OUTPUT_TOKENS,
             effective_effort: phoenix_llm::EffectiveEffort::explicit(effort),
@@ -447,12 +447,13 @@ async fn run_trial(
             .clone()
             .map(|update| update.with_owner_message_id(owner_id.clone()));
         let results = dispatch_response(&mut world, scenario, &response);
-        step["response"] = json!({"content":response.content,"end_turn":response.end_turn,"usage":response.usage,"provider_replay_kind":match replay_update {Some(ProviderReplayUpdate::Anthropic(_))=>"anthropic",Some(ProviderReplayUpdate::Responses(_))=>"responses",Some(ProviderReplayUpdate::Clear)=>"clear",None=>"none"}});
+        step["response"] = json!({"content":response.content,"end_turn":response.end_turn,"usage":response.usage,"provider_replay_kind":match replay_update {Some(ProviderReplayUpdate::Anthropic(_))=>"anthropic",Some(ProviderReplayUpdate::Responses(_))=>"responses",Some(ProviderReplayUpdate::ChatCompletions(_))=>"chat_completions",Some(ProviderReplayUpdate::Clear)=>"clear",None=>"none"}});
         step["tool_results"] = json!(results);
         append_turn(&mut messages, &response, &results, owner_id);
         match replay_update {
             Some(ProviderReplayUpdate::Anthropic(set)) => anthropic_sets.push(set),
-            Some(ProviderReplayUpdate::Responses(set)) => responses_sets.push(set),
+            Some(ProviderReplayUpdate::Responses(set)) => responses_sets.push(set.into()),
+            Some(ProviderReplayUpdate::ChatCompletions(set)) => responses_sets.push(set.into()),
             Some(ProviderReplayUpdate::Clear) => {
                 anthropic_sets.clear();
                 responses_sets.clear();

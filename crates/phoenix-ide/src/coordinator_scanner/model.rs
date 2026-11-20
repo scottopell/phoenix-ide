@@ -68,7 +68,7 @@ impl BoundedRequest {
                     content: vec![ContentBlock::text(input)],
                 }],
                 provider_replay: None,
-                responses_replay: vec![],
+                output_replay: vec![],
                 tool_availability: ToolAvailability::all(vec![]),
                 max_tokens: MAX_OUTPUT_TOKENS,
                 effective_effort: EffectiveEffort::explicit(EFFORT),

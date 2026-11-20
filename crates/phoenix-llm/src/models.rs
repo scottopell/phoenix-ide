@@ -793,6 +793,78 @@ pub fn all_models() -> Vec<ModelSpec> {
             effort_capabilities: EffortCapabilities::unsupported(),
             service_tier_capabilities: ServiceTierCapabilities::Unsupported,
         },
+        ModelSpec {
+            id: "google/gemini-4-neon".into(),
+            default_request_name: "google/gemini-4-neon".into(),
+            backend: ModelBackend::OpenAIChatCompletions,
+            family: "Google".into(),
+            description: "Gemini 4 Neon (frontier coding and reasoning)".into(),
+            context_window: 1_048_576,
+            max_output_tokens: 65_536,
+            recommended: true,
+            supports_tool_search: false,
+            source: ModelSource::BuiltIn,
+            effort_capabilities: EffortCapabilities::supported_unknown(&[
+                ModelEffort::Low,
+                ModelEffort::Medium,
+                ModelEffort::High,
+            ]),
+            service_tier_capabilities: ServiceTierCapabilities::Unsupported,
+        },
+        ModelSpec {
+            id: "google/gemini-4-hydrogen".into(),
+            default_request_name: "google/gemini-4-hydrogen".into(),
+            backend: ModelBackend::OpenAIChatCompletions,
+            family: "Google".into(),
+            description: "Gemini 4 Hydrogen (fast, efficient agentic work)".into(),
+            context_window: 1_048_576,
+            max_output_tokens: 65_536,
+            recommended: true,
+            supports_tool_search: false,
+            source: ModelSource::BuiltIn,
+            effort_capabilities: EffortCapabilities::supported_unknown(&[
+                ModelEffort::Low,
+                ModelEffort::Medium,
+                ModelEffort::High,
+            ]),
+            service_tier_capabilities: ServiceTierCapabilities::Unsupported,
+        },
+        ModelSpec {
+            id: "google/gemini-4-carbon".into(),
+            default_request_name: "google/gemini-4-carbon".into(),
+            backend: ModelBackend::OpenAIChatCompletions,
+            family: "Google".into(),
+            description: "Gemini 4 Carbon (most capable Gemini reasoning)".into(),
+            context_window: 1_048_576,
+            max_output_tokens: 65_536,
+            recommended: true,
+            supports_tool_search: false,
+            source: ModelSource::BuiltIn,
+            effort_capabilities: EffortCapabilities::supported_unknown(&[
+                ModelEffort::Low,
+                ModelEffort::Medium,
+                ModelEffort::High,
+            ]),
+            service_tier_capabilities: ServiceTierCapabilities::Unsupported,
+        },
+        ModelSpec {
+            id: "google/gemini-4-argon".into(),
+            default_request_name: "google/gemini-4-argon".into(),
+            backend: ModelBackend::OpenAIChatCompletions,
+            family: "Google".into(),
+            description: "Gemini 4 Argon (efficient frontier reasoning)".into(),
+            context_window: 1_048_576,
+            max_output_tokens: 65_536,
+            recommended: true,
+            supports_tool_search: false,
+            source: ModelSource::BuiltIn,
+            effort_capabilities: EffortCapabilities::supported_unknown(&[
+                ModelEffort::Low,
+                ModelEffort::Medium,
+                ModelEffort::High,
+            ]),
+            service_tier_capabilities: ServiceTierCapabilities::Unsupported,
+        },
         // OpenAI models
         // Context windows here are the platform-API ceilings. The codex bridge
         // caps every built-in OpenAI Responses model at 272K regardless — that
@@ -979,6 +1051,8 @@ mod tests {
         for model in all_models() {
             let expected = if model.id == "claude-haiku-4-5" {
                 64_000
+            } else if model.backend == ModelBackend::OpenAIChatCompletions {
+                65_536
             } else {
                 128_000
             };

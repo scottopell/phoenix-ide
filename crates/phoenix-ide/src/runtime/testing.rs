@@ -2821,10 +2821,10 @@ impl StateStore for InMemoryStorage {
                 phoenix_core::domain::tool_availability::ToolAvailability::all(vec![])
             }))
     }
-    async fn load_responses_replay_state(
+    async fn load_output_replay_state(
         &self,
         _conversation_id: &str,
-    ) -> Result<Vec<phoenix_core::domain::responses_replay::ResponsesResponseSet>, String> {
+    ) -> Result<Vec<phoenix_core::domain::responses_replay::ProviderResponseSet>, String> {
         Ok(Vec::new())
     }
     async fn load_provider_replay_state(
@@ -3289,7 +3289,7 @@ mod tests {
 
         let request = LlmRequest {
             provider_replay: None,
-            responses_replay: Vec::new(),
+            output_replay: Vec::new(),
             system: vec![],
             messages: vec![],
             tool_availability: phoenix_core::domain::tool_availability::ToolAvailability::all(

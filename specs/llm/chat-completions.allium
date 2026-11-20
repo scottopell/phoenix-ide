@@ -42,6 +42,7 @@ value ChatUsage {
     prompt_tokens: Integer
     completion_tokens: Integer
     cached_prompt_tokens: Integer
+    total_tokens: Integer?
 }
 
 value ChatToolCall {
@@ -173,6 +174,18 @@ contract ChatToolContinuation {
         -- describing the restriction, and enforce unavailable results locally.
         -- Use verified basic tool_choice controls where available; do not send
         -- allowed_tools speculatively, or erase history to conceal rejection.
+
+@invariant SignedGoogleToolCallsStayPrivateAndDurable
+    -- Retain extra_content.google.thought_signature separately from public
+    -- ToolUse content and tool arguments. Bind each signature to its exact
+    -- call ID and durable assistant-message identity plus public-content
+    -- witness. Persist signatures as ordered child rows with the accepted
+    -- execution transition before executing tools. Retry and restart restore
+    -- them unchanged only to the authenticated owning tool calls. A removed,
+    -- duplicated, malformed, or rewritten owner fails before provider I/O.
+    -- Streaming signatures may arrive after argument fragments. Assemble
+    -- them before accepting the response; reject changed signature or response
+    -- identity. Keep replay until settlement or authoritative abandonment.
 
     @invariant ReasoningContractIsRouteSpecific
         -- First-party Chat Completions does not use the Responses reasoning-item
@@ -347,6 +360,11 @@ rule ToolResultImagesLoggedAndDropped {
 ------------------------------------------------------------
 -- Rules — response normalization
 ------------------------------------------------------------
+
+-- A supplied total_tokens is prompt plus all generated tokens. Output usage
+-- equals total_tokens minus prompt_tokens; without a total, completion_tokens
+-- supplies output usage. A total below prompt plus completion is invalid.
+-- reasoning_tokens is an informational subset of normalized output usage.
 
 rule ChatTextNormalized {
     when: NormalizeChatResponse(response)

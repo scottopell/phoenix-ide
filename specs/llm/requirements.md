@@ -57,6 +57,10 @@ THE built-in OpenAI Responses catalog SHALL contain `gpt-5.6-luna`, `gpt-5.6-sol
 AND SHALL NOT contain `gpt-5.4-mini`, `gpt-5.4`, or `gpt-5.5`
 AND provider discovery SHALL NOT introduce a model that is absent from both the built-in and operator-configured catalogs
 
+THE built-in Google gateway catalog SHALL include `google/gemini-4-neon`, `google/gemini-4-hydrogen`, `google/gemini-4-carbon`, and `google/gemini-4-argon`
+AND SHALL use an explicitly configured OpenAI Chat Completions-compatible endpoint with Google provider-family metadata
+AND SHALL NOT register these gateway models against the default OpenAI API endpoint
+
 THE built-in Anthropic catalog SHALL include `claude-fable-5-2`, `claude-opus-5-5`, `claude-sonnet-5-5`, and `claude-haiku-5-5`
 
 WHEN an exact operator-configured route uses an identifier that is also a legacy built-in identifier
@@ -395,6 +399,11 @@ AND SHALL replay each block unchanged at its validated original ordinal
 AND SHALL retain all required private response sets until the exchange settles or is authoritatively abandoned
 AND SHALL reject missing, rewritten, malformed, unknown, unsigned, or incorrectly positioned replay state before provider I/O
 
+WHEN a Chat Completions tool call carries a Google thought signature
+THE SYSTEM SHALL retain the signature privately with its exact tool-call identity and owning assistant-message witness
+AND SHALL restore it as `extra_content.google.thought_signature` only on that validated tool call
+AND SHALL preserve it across streaming assembly, retry, and restart without adding it to tool arguments or public transcript content
+
 WHEN the accepted response starts or extends private replay
 THE SYSTEM SHALL persist replay mutation with the active execution-state transition before tool execution
 AND SHALL apply replay mutation only after stale-generation and reducer admission checks
@@ -416,6 +425,10 @@ AND SHALL preserve final text and tool calls
 
 WHEN a Chat Completions response reports cached prompt tokens
 THE SYSTEM SHALL split cached tokens from uncached input tokens without double counting
+
+WHEN a Chat Completions response reports total prompt-and-generation token usage
+THE SYSTEM SHALL include separately reported reasoning in normalized output usage exactly once
+AND SHALL reject totals smaller than the reported prompt plus completion counts
 
 **Rationale:** Normalized responses enable provider-agnostic state machine logic.
 
