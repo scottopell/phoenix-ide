@@ -442,13 +442,18 @@ impl ModelSpec {
         let openai_fast = service.uses_codex_bridge()
             || (matches!(
                 self.id.as_str(),
-                "gpt-6-astra" | "gpt-6.1-sol" | "gpt-6-sol" | "gpt-6-luna"
+                "gpt-6.2-astra"
+                    | "gpt-6.2-sol"
+                    | "gpt-6.1-terra"
+                    | "gpt-6-astra"
+                    | "gpt-6.1-sol"
+                    | "gpt-6-sol"
+                    | "gpt-6-luna"
             ) && service.uses_official_openai_responses());
-        // Anthropic Fast mode is a research-preview capability of the official
-        // direct Claude API only. A compatible/proxy base URL or a cloud route
+        // Anthropic Fast mode is exposed on the official direct Claude API only. A compatible/proxy base URL or a cloud route
         // must not advertise it, so gate on the official-Anthropic route.
         let anthropic_fast = self.backend == ModelBackend::Anthropic
-            && self.id == "claude-opus-5-5"
+            && matches!(self.id.as_str(), "claude-opus-5-5" | "claude-fable-5-2")
             && service.uses_official_anthropic();
         if openai_fast || anthropic_fast {
             self.service_tier_capabilities
@@ -637,6 +642,20 @@ pub fn all_models() -> Vec<ModelSpec> {
         // retired April 30, 2026 and is no longer required (or accepted on
         // older models). See migration 009 for legacy `-1m` id rewrite.
         ModelSpec {
+            id: "claude-fable-5-2".into(),
+            default_request_name: "claude-fable-5-2".into(),
+            backend: ModelBackend::Anthropic,
+            family: "Anthropic".into(),
+            description: "Claude Fable 5.2 (frontier reasoning, adaptive thinking)".into(),
+            context_window: 1_000_000,
+            max_output_tokens: 128_000,
+            recommended: true,
+            supports_tool_search: true,
+            source: ModelSource::BuiltIn,
+            effort_capabilities: effort_anthropic_xhigh(),
+            service_tier_capabilities: ServiceTierCapabilities::Supported,
+        },
+        ModelSpec {
             id: "claude-opus-5-5".into(),
             default_request_name: "claude-opus-5-5".into(),
             backend: ModelBackend::Anthropic,
@@ -743,6 +762,23 @@ pub fn all_models() -> Vec<ModelSpec> {
             service_tier_capabilities: ServiceTierCapabilities::Unsupported,
         },
         ModelSpec {
+            id: "claude-haiku-5-5".into(),
+            default_request_name: "claude-haiku-5-5".into(),
+            backend: ModelBackend::Anthropic,
+            family: "Anthropic".into(),
+            description: "Claude Haiku 5.5 (fast, efficient, adaptive thinking)".into(),
+            context_window: 1_000_000,
+            max_output_tokens: 128_000,
+            recommended: true,
+            supports_tool_search: true,
+            source: ModelSource::BuiltIn,
+            effort_capabilities: EffortCapabilities::supported_known(
+                EFFORT_LEVELS_ANTHROPIC_XHIGH,
+                ModelEffort::Medium,
+            ),
+            service_tier_capabilities: ServiceTierCapabilities::Unsupported,
+        },
+        ModelSpec {
             id: "claude-haiku-4-5".into(),
             default_request_name: "claude-haiku-4-5-20251001".into(),
             backend: ModelBackend::Anthropic,
@@ -763,6 +799,48 @@ pub fn all_models() -> Vec<ModelSpec> {
         // override is applied at registration time in `registry.rs` when the
         // bridge path is selected, so this spec's value reaches the runtime
         // only for direct/provider-compatible routes.
+        ModelSpec {
+            id: "gpt-6.2-astra".into(),
+            default_request_name: "gpt-6.2-astra".into(),
+            backend: ModelBackend::OpenAIResponses,
+            family: "OpenAI".into(),
+            description: "GPT-6.2 Astra (most capable)".into(),
+            context_window: 1_050_000,
+            max_output_tokens: 128_000,
+            recommended: true,
+            supports_tool_search: false,
+            source: ModelSource::BuiltIn,
+            effort_capabilities: EffortCapabilities::supported_unknown(EFFORT_LEVELS_GPT_6_ASTRA),
+            service_tier_capabilities: ServiceTierCapabilities::Supported,
+        },
+        ModelSpec {
+            id: "gpt-6.2-sol".into(),
+            default_request_name: "gpt-6.2-sol".into(),
+            backend: ModelBackend::OpenAIResponses,
+            family: "OpenAI".into(),
+            description: "GPT-6.2 Sol (balanced speed and intelligence)".into(),
+            context_window: 1_050_000,
+            max_output_tokens: 128_000,
+            recommended: true,
+            supports_tool_search: false,
+            source: ModelSource::BuiltIn,
+            effort_capabilities: EffortCapabilities::supported_unknown(EFFORT_LEVELS_GPT_6_ASTRA),
+            service_tier_capabilities: ServiceTierCapabilities::Supported,
+        },
+        ModelSpec {
+            id: "gpt-6.1-terra".into(),
+            default_request_name: "gpt-6.1-terra".into(),
+            backend: ModelBackend::OpenAIResponses,
+            family: "OpenAI".into(),
+            description: "GPT-6.1 Terra (visual reasoning, fast and efficient)".into(),
+            context_window: 1_050_000,
+            max_output_tokens: 128_000,
+            recommended: true,
+            supports_tool_search: false,
+            source: ModelSource::BuiltIn,
+            effort_capabilities: effort_gpt_6_sol_luna_direct(),
+            service_tier_capabilities: ServiceTierCapabilities::Supported,
+        },
         ModelSpec {
             id: "gpt-6-astra".into(),
             default_request_name: "gpt-6-astra".into(),
@@ -1033,11 +1111,67 @@ mod tests {
                 "gpt-5.6-sol",
                 "gpt-5.6-terra",
                 "gpt-6.1-sol",
+                "gpt-6.1-terra",
+                "gpt-6.2-astra",
+                "gpt-6.2-sol",
                 "gpt-6-astra",
                 "gpt-6-luna",
                 "gpt-6-sol",
             ])
         );
+    }
+
+    #[test]
+    fn flagship_additions_have_verified_capabilities() {
+        let models = all_models();
+        for (id, context, effort, fast) in [
+            (
+                "gpt-6.2-astra",
+                1_050_000,
+                EffortCapabilities::supported_unknown(EFFORT_LEVELS_GPT_6_ASTRA),
+                ServiceTierCapabilities::Supported,
+            ),
+            (
+                "gpt-6.2-sol",
+                1_050_000,
+                EffortCapabilities::supported_unknown(EFFORT_LEVELS_GPT_6_ASTRA),
+                ServiceTierCapabilities::Supported,
+            ),
+            (
+                "gpt-6.1-terra",
+                1_050_000,
+                effort_gpt_6_sol_luna_direct(),
+                ServiceTierCapabilities::Supported,
+            ),
+            (
+                "claude-fable-5-2",
+                1_000_000,
+                effort_anthropic_xhigh(),
+                ServiceTierCapabilities::Supported,
+            ),
+            (
+                "claude-haiku-5-5",
+                1_000_000,
+                EffortCapabilities::supported_known(
+                    EFFORT_LEVELS_ANTHROPIC_XHIGH,
+                    ModelEffort::Medium,
+                ),
+                ServiceTierCapabilities::Unsupported,
+            ),
+        ] {
+            let model = models.iter().find(|model| model.id == id).unwrap();
+            assert_eq!(model.default_request_name.as_str(), id);
+            assert_eq!(model.context_window, context, "{id}");
+            assert_eq!(model.output_token_limit(), 128_000, "{id}");
+            assert_eq!(model.effort_capabilities, effort, "{id}");
+            assert_eq!(model.service_tier_capabilities, fast, "{id}");
+            assert!(model.recommended);
+            assert!(model.effort_capabilities.supports(ModelEffort::Max));
+            assert_eq!(
+                model.effort_capabilities.supports(ModelEffort::None),
+                id == "gpt-6.1-terra"
+            );
+        }
     }
 
     #[test]
