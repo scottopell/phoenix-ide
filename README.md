@@ -262,8 +262,9 @@ credential-helper authentication for that endpoint. Their request names match
 Datadog AI Gateway discovery; no separate proxy or external model definitions
 are needed on that route. The picker lists them under Google. Each declares a
 1,048,576-token unified context and 65,536-token synchronous output maximum.
-Phoenix preserves Google's private tool signatures across streaming, retries,
-and restart. Low, medium, and high effort are exposed; extended effort mappings,
+Phoenix preserves Google's private tool signatures and images returned by tools
+across streaming, retries, and restart. Low, medium, and high effort are exposed;
+extended effort mappings,
 Fast mode, native Google authentication, and Gemini-only tools are not advertised.
 
 `PHOENIX_LLM_REQUEST_MODELS` remaps the wire spelling Phoenix sends for a

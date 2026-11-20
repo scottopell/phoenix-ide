@@ -45,6 +45,15 @@ canonical receipts, and retire with the exchange. Migration 169 preserves the
 existing Responses rows and canonical receipt hashes/timestamps. Provider unit
 fixtures cover late streaming signatures, immutable metadata, rewritten-owner
 rejection, and accounting for separately reported Gemini reasoning tokens.
+The built-in Gemini Chat route preserves images returned by screenshot and
+read-image tools in the owning tool-role message. Route-selection and wire
+regressions cover image ordering, error text, remapped model names, and unchanged
+text-only behavior for unqualified Chat routes; the opt-in gateway image test
+exercises the real adapter with synthetic image content and restored private replay.
+The opt-in image exchange covers both image-only and text-plus-image results in
+streaming and non-streaming modes across all four models.
+The SQLite runtime regression also checks that image-bearing error results retain
+their call identity, text, and pixels in follow-up requests after reopen and retry.
 Database regressions cover reopen, immutable replay, migration, receipts, and
 settlement. [ADR-271](../adrs/271_preserve-gemini-tool-signatures-through-chat-completions.md)
 records the integration decision.
@@ -67,7 +76,7 @@ Tool availability is separated from retained declarations and historical calls. 
 |-------------|--------|-------|
 | **REQ-LLM-001:** Provider Abstraction | ✅ Complete | LlmService trait with async complete() |
 | **REQ-LLM-002:** Backend-Compatible Endpoint Support | ✅ Complete | Exact base URL overrides, no hidden suffix append |
-| **REQ-LLM-003:** Model Registry | ✅ Complete | Product default prefers registered GPT-6.1 Sol unless an available explicit DEFAULT_MODEL overrides it. Available-only catalog including direct Claude Sonnet 5.5 and exact GPT-6.1 Sol, GPT-6 Astra/Sol/Luna, and GPT-5.6 Sol/Luna/Terra OpenAI built-ins, discovery bounded by configured specs, exact custom-route precedence, and fail-closed legacy pin mappings |
+| **REQ-LLM-003:** Model Registry | ✅ Complete | Product default prefers registered GPT-6.2 Sol unless an available explicit DEFAULT_MODEL overrides it. Available-only catalog including direct Claude Sonnet 5.5 and exact GPT-6.1 Sol, GPT-6 Astra/Sol/Luna, and GPT-5.6 Sol/Luna/Terra OpenAI built-ins, discovery bounded by configured specs, exact custom-route precedence, and fail-closed legacy pin mappings |
 | **REQ-LLM-003c:** External models in user configuration | ✅ Complete | Startup reads XDG TOML directly; shared model validation, atomic TOML rejection, explicit source-conflict diagnostics, edit/reload and worker coexistence tests in `model_config::tests`, plus process-level startup/restart/conflict coverage in `tests/user_model_config.rs`. Migration and macOS restart workflow documented in `docs/agents-config.md`; ADR-269 records source ownership. |
 | **REQ-LLM-003a:** Model Discovery | ✅ Complete | Opportunistic backend-scoped `/v1/models` discovery, falls back to configured models |
 | **REQ-LLM-003b:** Typed Model Effort Capability Registry | ✅ Complete | Constructor-validated known-native, unknown, unsupported, and supported-level capability states |

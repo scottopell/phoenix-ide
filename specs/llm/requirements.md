@@ -171,6 +171,11 @@ WHEN request includes images
 THE SYSTEM SHALL encode appropriately for provider
 AND respect provider's image size limits
 
+WHEN a built-in Google gateway model receives images in a tool result
+THE SYSTEM SHALL preserve those images in the owning tool-role message
+AND SHALL preserve the original call identity, error text, and image order
+AND SHALL NOT infer multimodal tool-result support for other compatible routes
+
 **Rationale:** Consistent request format enables the state machine to work with any provider.
 
 ---

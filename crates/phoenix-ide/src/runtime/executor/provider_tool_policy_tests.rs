@@ -494,7 +494,7 @@ impl ToolExecutor for ReplayCheckingTools {
 
 #[tokio::test]
 #[allow(clippy::too_many_lines)]
-async fn sqlite_runtime_chat_signature_is_durable_before_tool_and_restored_after_reopen() {
+async fn sqlite_runtime_chat_images_and_signature_survive_reopen() {
     use phoenix_core::domain::responses_replay::{
         ChatResponseSet, ChatToolSignature, ProviderResponseSet,
     };
@@ -541,9 +541,21 @@ async fn sqlite_runtime_chat_signature_is_durable_before_tool_and_restored_after
     response.provider_replay = Some(ProviderReplayUpdate::ChatCompletions(replay));
     let client = Arc::new(MockLlmClient::new("gemini-4-neon"));
     client.queue_response(response);
+    let image = crate::tools::ToolImage {
+        media_type: "image/png".into(),
+        data: "iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAIAAAAlC+aJAAAAdklEQVR4nO3PQQkAMAzAwPo33Yno4xgEIuAyO/t1wwUNaEEDWtCAFjSgBQ1oQQNa0IAWNKAFDWhBA1rQgBY0oAUNaEEDWtCAFjSgBQ1oQQNa0IAWNKAFDWhBA1rQgBY0oAUNaEEDWtCAFjSgBQ1oQQNa0IAWHHtBp+HSthEAJgAAAABJRU5ErkJggg==".into(),
+    };
     let tools = Arc::new(ReplayCheckingTools {
         db: db.clone(),
-        tools: DeferredMcpCatalog::new(true),
+        tools: DeferredMcpCatalog(MockToolExecutor::new().with_tool(
+            MCP_TOOL,
+            ToolOutput::Error {
+                output: "Session expired".into(),
+                images: vec![image.clone()],
+                display_data: None,
+                llm_usage: None,
+            },
+        )),
     });
     let mut first = runtime(db.clone(), directory.path(), client.clone(), tools.clone());
     dispatch(&mut first).await;
@@ -620,6 +632,37 @@ async fn sqlite_runtime_chat_signature_is_durable_before_tool_and_restored_after
             })
             .unwrap();
         assert_eq!(owner.content, public);
+        let results = request
+            .messages
+            .iter()
+            .flat_map(|message| &message.content)
+            .filter_map(|block| {
+                if let ContentBlock::ToolResult {
+                    tool_use_id,
+                    content,
+                    is_error,
+                    images,
+                } = block
+                {
+                    Some((tool_use_id, content, is_error, images))
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        let [(call_id, content, is_error, images)] = results.as_slice() else {
+            panic!("one authentic image-bearing tool result survives reopen and retry")
+        };
+        assert_eq!(call_id.as_str(), "signed-call");
+        assert_eq!(content.as_str(), "Session expired");
+        assert!(**is_error);
+        assert_eq!(
+            images.as_slice(),
+            &[phoenix_core::domain::llm_types::ImageSource::Base64 {
+                media_type: image.media_type.clone(),
+                data: image.data.clone(),
+            }]
+        );
     }
     drop(resumed);
     reopened.pool().close().await;
