@@ -510,7 +510,12 @@ mod tests {
             .bind(&set.response_id).bind(i64::try_from(ordinal).unwrap()).bind(serde_json::to_string(item).unwrap())
             .execute(db.pool()).await.unwrap();
         }
-        assert_eq!(crate::run_pending_migrations(db.pool()).await.unwrap(), 1);
+        assert_eq!(
+            crate::migrations::run_through_for_test(db.pool(), 169)
+                .await
+                .unwrap(),
+            1
+        );
         let receipt: (Vec<u8>, i64, String, Vec<u8>) = sqlx::query_as("SELECT selected_checkpoint_sha256,selected_state_updated_at_us,replay_kind,replay_payload_sha256 FROM canonical_tool_round_receipts WHERE assistant_message_id='legacy-assistant'")
     .fetch_one(db.pool()).await.unwrap();
         assert_eq!(
@@ -535,7 +540,12 @@ mod tests {
                 .is_err()
         );
         assert!(sqlx::query("INSERT INTO active_responses_replay_sets(conversation_id,response_id,ordinal,model,owner_message_id,public_content) VALUES('replay','missing-format',1,'model','owner','[]')").execute(db.pool()).await.is_err());
-        assert_eq!(crate::run_pending_migrations(db.pool()).await.unwrap(), 0);
+        assert_eq!(
+            crate::migrations::run_through_for_test(db.pool(), 169)
+                .await
+                .unwrap(),
+            0
+        );
     }
     #[tokio::test]
     async fn chat_goal_round_replay_requires_exact_public_owner() {
