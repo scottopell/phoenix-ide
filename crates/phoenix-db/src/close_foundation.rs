@@ -7777,6 +7777,29 @@ impl Database {
         tx: &mut Transaction<'_, Sqlite>,
         attempt_id: &CloseAttemptId,
     ) -> DbResult<CloseObligation> {
+        let native_initial: bool = sqlx::query_scalar(
+            "SELECT EXISTS (
+                SELECT 1 FROM native_close_initial_receipts receipt
+                JOIN close_obligations obligation ON obligation.attempt_id = receipt.attempt_id
+                WHERE receipt.attempt_id = ?1 AND receipt.intent = 'initial'
+                  AND receipt.run_ordinal = 1 AND obligation.native_managed = 1
+            )",
+        )
+        .bind(attempt_id.as_str())
+        .fetch_one(&mut **tx)
+        .await?;
+        if native_initial {
+            return Err(close_precondition(
+                "native initial Close completion requires exact source-bound finalization",
+            ));
+        }
+        Self::complete_close_retirement_core_tx(tx, attempt_id).await
+    }
+
+    pub(crate) async fn complete_close_retirement_core_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        attempt_id: &CloseAttemptId,
+    ) -> DbResult<CloseObligation> {
         let obligation = close_obligation_for_update(tx, attempt_id.as_str()).await?;
         if obligation.phase() == ClosePhase::Completed {
             return Ok(obligation);
@@ -17536,6 +17559,12 @@ mod tests {
             &scope,
             &snapshot,
             Vec::new(),
+        )
+        .await;
+        // Observe may adopt legacy ownership without denying generic completion.
+        observe_retained_run(
+            &db,
+            &CloseRunRef::initial(CloseAttemptId::parse("attempt-replay-complete").unwrap()),
         )
         .await;
         for expected in db

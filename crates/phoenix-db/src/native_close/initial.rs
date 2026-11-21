@@ -507,7 +507,8 @@ impl Database {
     }
 
     /// Finalizes only the exact live source-owned initial run after its anchored inventory
-    /// has concrete successful retirement proof. This archives; it is not an observation API.
+    /// has concrete successful retirement proof, or reads its exact completed result.
+    /// Live and durable source authority are required before fresh completion and replay.
     pub async fn complete_native_close_initial(
         &self,
         command: &NativeCloseCommand,
@@ -519,6 +520,35 @@ impl Database {
             Err(error) => return LocalAuthorityResult::DurableFactEstablished(Err(error.into())),
         };
         let result = async {
+            let admitted = require_initial_identity_tx(&mut tx, command, receipt, live_source).await?;
+            let retained_success: bool = sqlx::query_scalar(
+                "SELECT EXISTS (
+                    SELECT 1 FROM close_obligations obligation
+                    JOIN close_runs run ON run.attempt_id = obligation.attempt_id AND run.run_ordinal = 1
+                    JOIN product_conversations product ON product.id = obligation.product_conversation_id
+                    JOIN close_attempt_members member ON member.attempt_id = obligation.attempt_id
+                      AND member.member_role IN ('latest', 'root_latest')
+                    JOIN messages outcome ON outcome.message_id = 'close-outcome:' || obligation.attempt_id
+                      AND outcome.conversation_id = member.conversation_id
+                    WHERE obligation.attempt_id = ?1 AND obligation.product_conversation_id = ?2
+                      AND obligation.native_managed = 1 AND obligation.phase = 'completed'
+                      AND obligation.close_outcome = 'archived' AND run.status = 'completed'
+                      AND run.run_ordinal = (SELECT MAX(run_ordinal) FROM close_runs WHERE attempt_id = obligation.attempt_id)
+                      AND product.kind = 'ordinary' AND product.ordinary_lifecycle = 'history'
+                      AND EXISTS (SELECT 1 FROM conversations archived WHERE archived.id = member.conversation_id AND archived.archived = 1)
+                )",
+            )
+            .bind(admitted.attempt_id.as_str())
+            .bind(receipt.admitted.target.as_str())
+            .fetch_one(&mut *tx)
+            .await?;
+            if retained_success {
+                return crate::close_foundation::close_obligation_for_update(
+                    &mut tx,
+                    admitted.attempt_id.as_str(),
+                )
+                .await;
+            }
             let (admitted, _) = require_initial_execution_tx(
                 &mut tx,
                 command,
@@ -556,9 +586,33 @@ impl Database {
                     "initial completion requires its exact anchored sealed retirement inventory".into(),
                 ));
             }
+            let dispatched: bool = sqlx::query_scalar(
+                "SELECT NOT EXISTS (
+                    SELECT 1 FROM close_expected_retirement_resources expected
+                    WHERE expected.attempt_id = ?1 AND NOT EXISTS (
+                        SELECT 1 FROM close_retirement_resource_dispatches dispatch
+                        WHERE dispatch.attempt_id = expected.attempt_id
+                          AND dispatch.scope = expected.scope
+                          AND dispatch.inspection_generation = expected.inspection_generation
+                          AND dispatch.inspection_fingerprint = expected.inspection_fingerprint
+                          AND dispatch.resource_kind = expected.resource_kind
+                          AND dispatch.identity_kind = expected.identity_kind
+                          AND dispatch.identity_codec = expected.identity_codec
+                          AND dispatch.identity_value = expected.identity_value
+                    )
+                )",
+            )
+            .bind(admitted.attempt_id.as_str())
+            .fetch_one(&mut *tx)
+            .await?;
+            if !dispatched {
+                return Err(DbError::CloseFoundationPrecondition(
+                    "initial completion requires dispatch authority for every expected resource".into(),
+                ));
+            }
             // The completion trigger checks every expected identity for concrete
             // retired/absence-adopted evidence and rejects residual proofs.
-            Database::complete_close_retirement_tx(&mut tx, &admitted.attempt_id).await
+            Database::complete_close_retirement_core_tx(&mut tx, &admitted.attempt_id).await
         }
         .await;
         match result {

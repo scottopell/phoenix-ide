@@ -324,6 +324,14 @@ AND partial repair and copied inventory writes SHALL NOT originate original-anch
 AND persistence SHALL refuse a supported fresh capture's anchor unless its exact captured scope set has a sealed inventory and matching expected resources, including each scope's WorkScope identity
 AND this supported-writer transaction guarantee and schema shape SHALL NOT claim a temporal guarantee against arbitrary future SQL writers
 
+WHEN a native initial Close finalizes successful retirement or replays its retained successful completion
+THE SYSTEM SHALL verify the exact live and durable source, retained initial request, original run, and target before returning either result
+AND fresh finalization SHALL require the anchored sealed original inventory, exact typed dispatch authority, and successful retirement or exact absence-adoption proof for every expected resource
+AND successful replay SHALL read only the same latest completed initial run and its retained archived History outcome without rewriting evidence, terminal timestamps, messages, or lifecycle
+AND generic legacy completion ingress SHALL NOT bypass native initial source authority, including on completed replay
+AND legacy completion authority SHALL remain available to operations adopted only through observation, without treating native management alone as an initial-request binding
+AND stopped, cancelled, mismatched, or superseded initial runs SHALL NOT qualify as successful completion replay.
+
 WHEN a native initial Close records a resource failure or observes its exact stopped failure again
 THE SYSTEM SHALL verify the same live and durable source, retained initial request, original run, and target before accepting either a fresh failure or its replay
 AND SHALL bind the failed resource to the complete sealed original inventory and exact inspection snapshot, preserve every successful prefix, and retain exactly the unresolved resource tail with the primary resource Failed and other remaining resources Unattempted

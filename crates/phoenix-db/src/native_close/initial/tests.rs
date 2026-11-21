@@ -1218,6 +1218,7 @@ async fn initial_completion_writes(
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn initial_completion_requires_source_receipt_and_all_concrete_proofs() {
     let f = Fixture::new().await;
     let (command, receipt, live_source, expected) = captured_initial_retirement(&f).await;
@@ -1233,6 +1234,24 @@ async fn initial_completion_requires_source_receipt_and_all_concrete_proofs() {
     assert_eq!(work_scope.scope, worktree.scope);
     assert_eq!(work_scope.snapshot, worktree.snapshot);
     let before = initial_completion_writes(&f, &receipt).await;
+    let mut finalization_before = initial_finalization_snapshot(&f, &receipt).await;
+    assert!(matches!(
+        f.db.complete_close_retirement(&receipt.admitted.attempt_id)
+            .await,
+        Err(DbError::CloseFoundationPrecondition(_))
+    ));
+    let mut generic_tx = f.db.pool().begin_with("BEGIN IMMEDIATE").await.unwrap();
+    assert!(matches!(
+        crate::Database::complete_close_retirement_tx(&mut generic_tx, &receipt.admitted.attempt_id)
+            .await,
+        Err(DbError::CloseFoundationPrecondition(_))
+    ));
+    generic_tx.rollback().await.unwrap();
+    assert_eq!(initial_completion_writes(&f, &receipt).await, before);
+    assert_eq!(
+        initial_finalization_snapshot(&f, &receipt).await,
+        finalization_before
+    );
     assert_eq!(before.0, ClosePhase::RetirementRequested.as_str());
     assert_eq!(before.1, 0);
     assert_eq!(before.2, 0);
@@ -1250,6 +1269,10 @@ async fn initial_completion_requires_source_receipt_and_all_concrete_proofs() {
             ))
         ));
         assert_eq!(initial_completion_writes(&f, &receipt).await, before);
+        assert_eq!(
+            initial_finalization_snapshot(&f, &receipt).await,
+            finalization_before
+        );
     }
     assert!(matches!(
         f.db.complete_native_close_initial(&command, &receipt, &ConvState::Idle)
@@ -1257,20 +1280,54 @@ async fn initial_completion_requires_source_receipt_and_all_concrete_proofs() {
         LocalAuthorityResult::DurableFactEstablished(Err(DbError::CloseFoundationPrecondition(_)))
     ));
     assert_eq!(initial_completion_writes(&f, &receipt).await, before);
+    assert_eq!(
+        initial_finalization_snapshot(&f, &receipt).await,
+        finalization_before
+    );
     assert!(matches!(
         f.db.complete_native_close_initial(&command, &receipt, &live_source)
             .await,
         LocalAuthorityResult::DurableFactEstablished(Err(_))
     ));
     assert_eq!(initial_completion_writes(&f, &receipt).await, before);
+    assert_eq!(
+        initial_finalization_snapshot(&f, &receipt).await,
+        finalization_before
+    );
     record_initial_retirement(&f, &command, &receipt, &live_source, worktree).await;
+    finalization_before = initial_finalization_snapshot(&f, &receipt).await;
     assert!(matches!(
         f.db.complete_native_close_initial(&command, &receipt, &live_source)
             .await,
         LocalAuthorityResult::DurableFactEstablished(Err(_))
     ));
     assert_eq!(initial_completion_writes(&f, &receipt).await, before);
+    assert_eq!(
+        initial_finalization_snapshot(&f, &receipt).await,
+        finalization_before
+    );
     record_initial_retirement(&f, &command, &receipt, &live_source, work_scope).await;
+    finalization_before = initial_finalization_snapshot(&f, &receipt).await;
+    assert!(matches!(
+        f.db.complete_close_retirement(&receipt.admitted.attempt_id)
+            .await,
+        Err(DbError::CloseFoundationPrecondition(_))
+    ));
+    assert_eq!(
+        initial_finalization_snapshot(&f, &receipt).await,
+        finalization_before
+    );
+    let mut generic_tx = f.db.pool().begin_with("BEGIN IMMEDIATE").await.unwrap();
+    assert!(matches!(
+        crate::Database::complete_close_retirement_tx(&mut generic_tx, &receipt.admitted.attempt_id)
+            .await,
+        Err(DbError::CloseFoundationPrecondition(_))
+    ));
+    generic_tx.rollback().await.unwrap();
+    assert_eq!(
+        initial_finalization_snapshot(&f, &receipt).await,
+        finalization_before
+    );
     let completed =
         f.db.complete_native_close_initial(&command, &receipt, &live_source)
             .await
@@ -1297,19 +1354,68 @@ async fn initial_completion_requires_source_receipt_and_all_concrete_proofs() {
         .status,
         phoenix_core::domain::close::CloseRunStatus::Completed
     );
+    let replay_before = initial_finalization_snapshot(&f, &receipt).await;
+    let mut wrong_target = receipt.clone();
+    wrong_target.admitted.target = ProductConversationId::parse("foreign-completed-target").unwrap();
+    let mut wrong_attempt = receipt.clone();
+    wrong_attempt.admitted.attempt_id = CloseAttemptId::parse("foreign-completed-attempt").unwrap();
+    for invalid_receipt in [&wrong_target, &wrong_attempt] {
+        assert!(matches!(
+            f.db.complete_native_close_initial(&command, invalid_receipt, &live_source)
+                .await,
+            LocalAuthorityResult::DurableFactEstablished(Err(DbError::CloseFoundationPrecondition(_)))
+        ));
+        assert_eq!(initial_finalization_snapshot(&f, &receipt).await, replay_before);
+    }
+    let conflicting_command = f.command(f.source.clone(), &wrong_target.admitted.target);
+    assert_eq!(conflicting_command.request_id(), command.request_id());
+    assert_ne!(conflicting_command.fingerprint(), command.fingerprint());
+    assert!(matches!(
+        f.db.complete_native_close_initial(&conflicting_command, &receipt, &live_source)
+            .await,
+        LocalAuthorityResult::DurableFactEstablished(Err(DbError::CloseFoundationPrecondition(_)))
+    ));
+    assert_eq!(initial_finalization_snapshot(&f, &receipt).await, replay_before);
+    let mut wrong_receipt = receipt.clone();
+    wrong_receipt.request_id = Uuid::new_v4();
+    assert!(matches!(
+        f.db.complete_native_close_initial(&command, &wrong_receipt, &live_source)
+            .await,
+        LocalAuthorityResult::DurableFactEstablished(Err(DbError::CloseFoundationPrecondition(_)))
+    ));
+    assert_eq!(initial_finalization_snapshot(&f, &receipt).await, replay_before);
+    assert!(matches!(
+        f.db.complete_native_close_initial(&command, &receipt, &ConvState::Idle)
+            .await,
+        LocalAuthorityResult::DurableFactEstablished(Err(DbError::CloseFoundationPrecondition(_)))
+    ));
+    assert_eq!(initial_finalization_snapshot(&f, &receipt).await, replay_before);
+    assert!(matches!(
+        f.db.complete_close_retirement(&receipt.admitted.attempt_id)
+            .await,
+        Err(DbError::CloseFoundationPrecondition(_))
+    ));
+    assert_eq!(initial_finalization_snapshot(&f, &receipt).await, replay_before);
+    let replay =
+        f.db.complete_native_close_initial(&command, &receipt, &live_source)
+            .await
+            .established()
+            .unwrap()
+            .unwrap();
+    assert_eq!(replay, completed);
+    assert_eq!(initial_finalization_snapshot(&f, &receipt).await, replay_before);
+    f.db.update_conversation_state(&f.coordinator, &ConvState::Idle)
+        .await
+        .unwrap();
+    let after_source_loss = initial_finalization_snapshot(&f, &receipt).await;
     assert!(matches!(
         f.db.complete_native_close_initial(&command, &receipt, &live_source)
             .await,
         LocalAuthorityResult::DurableFactEstablished(Err(DbError::CloseFoundationPrecondition(_)))
     ));
     assert_eq!(
-        initial_completion_writes(&f, &receipt).await,
-        (
-            ClosePhase::Completed.as_str().to_owned(),
-            1,
-            1,
-            "history".into()
-        )
+        initial_finalization_snapshot(&f, &receipt).await,
+        after_source_loss
     );
 }
 
@@ -2296,6 +2402,27 @@ async fn try_settle_rejects_stale_source_and_wrong_receipt_before_waiting_classi
     ));
 }
 
+async fn initial_finalization_snapshot(f: &Fixture, receipt: &NativeCloseReceipt) -> Vec<String> {
+    let attempt = receipt.admitted.attempt_id.as_str();
+    let mut snapshot = failure_boundary_snapshot(&f.db, attempt).await;
+    for (sql, bind) in [
+        ("SELECT json_group_array(json_array(scope, inspection_generation, inspection_fingerprint, resource_kind, identity_kind, identity_codec, identity_value, dispatched_at_us)) FROM (SELECT scope, inspection_generation, inspection_fingerprint, resource_kind, identity_kind, identity_codec, identity_value, dispatched_at_us FROM close_retirement_resource_dispatches WHERE attempt_id = ?1 ORDER BY scope, resource_kind, identity_value)", attempt),
+        ("SELECT json_group_array(json_array(id, archived, updated_at)) FROM (SELECT id, archived, updated_at FROM conversations WHERE id IN (SELECT conversation_id FROM close_attempt_participants WHERE attempt_id = ?1) ORDER BY id)", attempt),
+        ("SELECT json_group_array(json_array(message_id, conversation_id, sequence_id, message_type, content, created_at)) FROM messages WHERE message_id = 'close-outcome:' || ?1", attempt),
+        ("SELECT json_group_array(json_array(scope, resource_kind, identity_kind, identity_codec, identity_value, created_at, updated_at)) FROM (SELECT scope, resource_kind, identity_kind, identity_codec, identity_value, created_at, updated_at FROM close_retirement_resources WHERE attempt_id = ?1 ORDER BY scope, resource_kind, identity_kind, identity_codec, identity_value)", attempt),
+        ("SELECT json_group_array(json_array(id, ordinary_lifecycle)) FROM product_conversations WHERE id = ?1", f.target.as_str()),
+    ] {
+        snapshot.push(
+            sqlx::query_scalar(sql)
+                .bind(bind)
+                .fetch_one(f.db.pool())
+                .await
+                .unwrap(),
+        );
+    }
+    snapshot
+}
+
 async fn failure_boundary_snapshot(db: &Database, attempt: &str) -> Vec<String> {
     let queries = [
         "SELECT json_group_array(json_array(phase, close_outcome, inspection_generation, inspection_fingerprint, created_at, updated_at, completed_at, native_managed)) FROM close_obligations WHERE attempt_id = ?1",
@@ -2537,6 +2664,13 @@ async fn check_initial_resource_failure(failed_index: usize) {
     .established()
     .unwrap()
     .unwrap();
+    let stopped_before = initial_finalization_snapshot(&f, &receipt).await;
+    assert!(matches!(
+        f.db.complete_native_close_initial(&command, &receipt, &live_source)
+            .await,
+        LocalAuthorityResult::DurableFactEstablished(Err(DbError::CloseFoundationPrecondition(_)))
+    ));
+    assert_eq!(initial_finalization_snapshot(&f, &receipt).await, stopped_before);
     let after_replay = failure_boundary_snapshot(&f.db, receipt.admitted.attempt_id.as_str()).await;
     assert_eq!(before_replay, after_replay);
     assert!(matches!(
