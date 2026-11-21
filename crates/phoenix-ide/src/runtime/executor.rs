@@ -3245,6 +3245,15 @@ where
 
         let mut pending_native_close_initial: Option<native_close::NativeCloseInitialContinuation> =
             None;
+        // Fatal authority exits must not release a continuation's source authority
+        // or target gate while its owned preparation worker is still running.
+        macro_rules! join_pending_native_close_before_fatal {
+            () => {
+                if let Some(mut continuation) = pending_native_close_initial.take() {
+                    continuation.abort_and_join_inventory_preparation().await;
+                }
+            };
+        }
         let mut native_close_step_ready = false;
         // Retain one absolute deadline across select iterations. Recreating a
         // relative sleep lets ordinary request traffic postpone Close forever.
@@ -3286,6 +3295,7 @@ where
                     .fatal_local_authority_fence
                     .fatal_authority_loss_is_latched()
                 {
+                    join_pending_native_close_before_fatal!();
                     return self.closed_authority_exit().await;
                 }
                 if deferred_native_close_exit.is_none() {
@@ -3310,6 +3320,7 @@ where
                 }
             }
             if self.local_terminal_authority == LocalTerminalAuthority::Fatal {
+                join_pending_native_close_before_fatal!();
                 return self.fatal_local_authority_exit();
             }
             let terminal_retry_at = self
@@ -3329,6 +3340,7 @@ where
                     }
                 }, if self.fatal_local_authority_rx.is_some() => {
                     tracing::error!(?boundary, "fatal local SQLite authority loss; aborting external runtime effects");
+                    join_pending_native_close_before_fatal!();
                     return self.fatal_local_authority_exit();
                 }
                 // Process shutdown closes admission without publishing fatal authority
@@ -3337,6 +3349,7 @@ where
                 () = wait_for_optional_cancellation(self.fatal_external_effect_cancellation.clone()),
                     if deferred_native_close_exit.is_none() => {
                     if self.fatal_local_authority_fence.fatal_authority_loss_is_latched() {
+                        join_pending_native_close_before_fatal!();
                         return self.fatal_local_authority_exit();
                     }
                     self.abort_external_effects().await;
@@ -3380,6 +3393,13 @@ where
                         Ok(native_close::NativeCloseInitialContinuationPhase::CollectingInspection) => {
                             pending_native_close_initial = Some(continuation);
                         }
+                        Ok(native_close::NativeCloseInitialContinuationPhase::PreparingInventory) => {
+                            pending_native_close_initial = Some(continuation);
+                        }
+                        Ok(native_close::NativeCloseInitialContinuationPhase::Captured) => {
+                            pending_native_close_initial = Some(continuation);
+                            native_close_step_ready = false;
+                        }
                         Ok(native_close::NativeCloseInitialContinuationPhase::AwaitingStopWorkConfirmation) => {
                             tracing::debug!("initial Close is awaiting Stop work confirmation");
                             pending_native_close_initial = Some(continuation);
@@ -3407,7 +3427,9 @@ where
                             pending_native_close_initial = Some(continuation);
                         }
                         Err(super::native_close_application::NativeCloseApplicationError::FatalAuthority) => {
+                            continuation.abort_and_join_inventory_preparation().await;
                             drop(continuation);
+                            join_pending_native_close_before_fatal!();
                             return self.fatal_local_authority_exit();
                         }
                         Err(error) => {
@@ -3471,6 +3493,7 @@ where
                                 native_close_step_ready = true;
                             }
                             if fatal {
+                                join_pending_native_close_before_fatal!();
                                 return self.fatal_local_authority_exit();
                             }
                             continue;
@@ -3484,12 +3507,14 @@ where
                             drop(target_gate);
                             let _ = response.send(result);
                             if fatal {
+                                join_pending_native_close_before_fatal!();
                                 return self.fatal_local_authority_exit();
                             }
                             continue;
                         }
                         AcknowledgedRuntimeRequest::ExecuteNativeCloseRetry(request) => {
                             if self.handle_native_close_retry(*request).await {
+                                join_pending_native_close_before_fatal!();
                                 return self.fatal_local_authority_exit();
                             }
                             continue;
@@ -3500,6 +3525,7 @@ where
                             let result = self.execute_native_task_approval(*command).await;
                             let _ = response.send(result);
                             if self.fatal_local_authority_fence.fatal_authority_loss_is_latched() {
+                                join_pending_native_close_before_fatal!();
                                 return self.fatal_local_authority_exit();
                             }
                             continue;
@@ -3516,6 +3542,10 @@ where
                     // Close observation must not delay its acknowledgement.
                     let _ = acknowledgement.send(result);
                     if let Some(continuation) = pending_native_close_initial.as_mut() {
+                        continuation.abort_inspection_if_source_revoked(&self.state);
+                        if continuation.phase == native_close::NativeCloseInitialContinuationPhase::InspectionRequired {
+                            continuation.abort_and_join_inventory_preparation().await;
+                        }
                         if continuation.release_if_exactly_stopped().await {
                             pending_native_close_initial = None;
                         }
@@ -3553,6 +3583,7 @@ where
                     if let Err(e) = self.process_event(event).await {
                         if e.starts_with("FATAL_LOCAL_AUTHORITY_UNCLASSIFIED:") {
                             tracing::error!(error = %e, "fatal local SQLite authority loss");
+                            join_pending_native_close_before_fatal!();
                             return self.fatal_local_authority_exit();
                         }
                         // process_event already broadcast a typed
@@ -3561,9 +3592,14 @@ where
                         tracing::error!(error = %e, "Error handling event");
                     }
                     if self.local_terminal_authority == LocalTerminalAuthority::Fatal {
+                        join_pending_native_close_before_fatal!();
                         return self.fatal_local_authority_exit();
                     }
                     if let Some(continuation) = pending_native_close_initial.as_mut() {
+                        continuation.abort_inspection_if_source_revoked(&self.state);
+                        if continuation.phase == native_close::NativeCloseInitialContinuationPhase::InspectionRequired {
+                            continuation.abort_and_join_inventory_preparation().await;
+                        }
                         if continuation.release_if_exactly_stopped().await {
                             pending_native_close_initial = None;
                         }

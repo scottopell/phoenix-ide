@@ -20,6 +20,45 @@ use tokio::sync::{mpsc, oneshot, Mutex};
 
 const TARGET_ID: &str = "native-close-target";
 
+async fn assert_native_resource_admission_fenced(
+    backend: &crate::runtime::RuntimeManager,
+    scope: &phoenix_core::work_scope::WorkScopeId,
+) {
+    let key = phoenix_core::work_scope::ResourceScopeKey::Work(scope.clone());
+    assert!(matches!(
+        backend.bash_handles().reserve_spawn(&key).await,
+        Err(phoenix_tools::bash::registry::BashHandleError::SpawnFenced)
+    ));
+    assert!(matches!(
+        backend.terminals.reserve_spawn(&key),
+        Err(phoenix_terminal::session::ActiveTerminalInsertError::RetirementFenced)
+    ));
+    assert!(matches!(
+        backend.browser_sessions().get_session(&key).await,
+        Err(phoenix_tools::browser::session::BrowserError::RetirementFenced { .. })
+    ));
+    assert!(matches!(
+        backend.tmux_registry().ensure_live(&key, std::path::Path::new("/tmp"), None, None).await,
+        Err(phoenix_tools::tmux::registry::TmuxError::RetirementFenced { .. })
+    ));
+}
+
+async fn await_native_close_phase(
+    phases: &mut mpsc::UnboundedReceiver<native_close::NativeCloseInitialContinuationPhase>,
+    expected: native_close::NativeCloseInitialContinuationPhase,
+) {
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while let Some(phase) = phases.recv().await {
+            if phase == expected {
+                return;
+            }
+        }
+        panic!("native Close phase observer closed before {expected:?}");
+    })
+    .await
+    .unwrap_or_else(|_| panic!("native Close did not reach {expected:?}"));
+}
+
 struct CloseFixture {
     db: Database,
     source_transcript_id: String,
@@ -236,9 +275,19 @@ fn initial_request(
     target_gate: tokio::sync::OwnedMutexGuard<()>,
     response: oneshot::Sender<Result<NativeCloseInitialResult, NativeCloseApplicationError>>,
 ) -> AcknowledgedRuntimeRequest {
+    initial_request_with_backend(admitted, fixture, target_gate, response, CloseFixture::backend(fixture.db.clone()))
+}
+
+fn initial_request_with_backend(
+    admitted: crate::runtime::AdmittedOperation,
+    fixture: &CloseFixture,
+    target_gate: tokio::sync::OwnedMutexGuard<()>,
+    response: oneshot::Sender<Result<NativeCloseInitialResult, NativeCloseApplicationError>>,
+    backend: Arc<crate::runtime::RuntimeManager>,
+) -> AcknowledgedRuntimeRequest {
     AcknowledgedRuntimeRequest::ExecuteNativeCloseInitial(Box::new(NativeCloseInitialRequest {
         source: fixture.source.clone(),
-        backend: CloseFixture::backend(fixture.db.clone()),
+        backend,
         target: fixture.target.clone(),
         admitted,
         target_gate,
@@ -1495,6 +1544,126 @@ async fn assert_actor_exit_from_dormant_close(process_shutdown: bool) {
 }
 
 #[tokio::test]
+async fn process_shutdown_after_inventory_capture_retains_resource_admission_fences() {
+    use native_close::NativeCloseInitialContinuationPhase as Phase;
+    use phoenix_core::domain::close::{ClosePhase, CloseRunRef, CloseRunStatus};
+
+    let fixture = CloseFixture::new().await;
+    let mut harness = fixture.runtime(true);
+    let (phase_tx, mut phases) = mpsc::unbounded_channel();
+    harness.runtime.native_close_phase_observer = Some(phase_tx);
+    let fence = Arc::clone(&harness.runtime.fatal_local_authority_fence);
+    let admitted = harness.runtime.admit_authoritative_effect().unwrap();
+    let sender = setup_actor_queue(&mut harness);
+    let backend = CloseFixture::backend(fixture.db.clone());
+    let gate = Arc::new(Mutex::new(()));
+    let (response, mut result) = oneshot::channel();
+    sender
+        .send(initial_request_with_backend(
+            admitted,
+            &fixture,
+            Arc::clone(&gate).lock_owned().await,
+            response,
+            Arc::clone(&backend),
+        ))
+        .await
+        .unwrap();
+    let running = spawn_actor(&mut harness);
+
+    await_native_close_phase(&mut phases, Phase::Captured).await;
+    assert_eq!(fence.owner_count(), 1);
+    assert!(Arc::clone(&gate).try_lock_owned().is_err());
+    assert!(matches!(
+        result.try_recv(),
+        Err(oneshot::error::TryRecvError::Empty)
+    ));
+    let attempt: String = sqlx::query_scalar(
+        "SELECT attempt_id FROM native_close_initial_receipts WHERE request_id = ?1",
+    )
+    .bind(fixture.command.request_id())
+    .fetch_one(fixture.db.pool())
+    .await
+    .unwrap();
+    let sealed_inventory_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM close_retirement_inventories
+         WHERE attempt_id = ?1 AND sealed = 1",
+    )
+    .bind(&attempt)
+    .fetch_one(fixture.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(sealed_inventory_count, 1);
+    let expected_resources: Vec<(String, String)> = sqlx::query_as(
+        "SELECT scope, resource_kind FROM close_expected_retirement_resources WHERE attempt_id = ?1",
+    )
+    .bind(&attempt)
+    .fetch_all(fixture.db.pool())
+    .await
+    .unwrap();
+    let scope = fixture.db.get_conversation(TARGET_ID).await.unwrap().attached_work_scope_id.unwrap();
+    assert_eq!(expected_resources, vec![(scope.as_str().to_owned(), "work_scope".to_owned())],
+        "a no-worktree scope still owns its WorkScope resource");
+    assert_native_resource_admission_fenced(&backend, &scope).await;
+
+    fence.close_for_process_shutdown();
+    await_native_close_phase(&mut phases, Phase::ClassifyingExitInterruption).await;
+    let receipt = match tokio::time::timeout(std::time::Duration::from_secs(10), result)
+        .await
+        .expect("exact stopped owner must settle its original response")
+        .unwrap()
+        .unwrap()
+    {
+        NativeCloseInitialResult::NewlyAdmitted(receipt) => receipt,
+        other => panic!("fresh initial Close must retain its original receipt: {other:?}"),
+    };
+    let exit = tokio::time::timeout(std::time::Duration::from_secs(10), running)
+        .await
+        .expect("process shutdown must join the exact source actor")
+        .unwrap();
+    assert_eq!(exit, RuntimeExitDisposition::CoordinatedShutdown);
+
+    let run = CloseRunRef {
+        attempt_id: receipt.admitted.attempt_id.clone(),
+        ordinal: receipt.admitted.run_ordinal,
+    };
+    assert_eq!(fixture.db.get_close_run(&run).await.unwrap().status, CloseRunStatus::Stopped);
+    assert_eq!(
+        fixture
+            .db
+            .get_close_obligation(receipt.admitted.attempt_id.as_str())
+            .await
+            .unwrap()
+            .phase(),
+        ClosePhase::Completed
+    );
+    assert_eq!(fence.owner_count(), 0);
+    assert!(!fence.fatal_authority_loss_is_latched());
+    assert!(Arc::clone(&gate).try_lock_owned().is_ok());
+    assert_native_resource_admission_fenced(&backend, &scope).await;
+    assert!(
+        !fixture
+            .db
+            .get_conversation(TARGET_ID)
+            .await
+            .unwrap()
+            .archived
+    );
+    for table in [
+        "close_retirement_resource_dispatches",
+        "close_retirement_resources",
+        "close_worktree_cleanup_plans",
+    ] {
+        let sql = format!("SELECT COUNT(*) FROM {table} WHERE attempt_id = ?1");
+        let count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(sql.as_str()))
+            .bind(receipt.admitted.attempt_id.as_str())
+            .fetch_one(fixture.db.pool())
+            .await
+            .unwrap();
+        assert_eq!(count, 0, "process shutdown must not write {table}");
+    }
+}
+
+#[tokio::test]
 async fn source_owned_initial_inspection_persists_only_normalized_empty_snapshot() {
     use phoenix_core::domain::close::ClosePhase;
     let fixture = CloseFixture::new().await;
@@ -1560,6 +1729,262 @@ async fn source_owned_initial_inspection_persists_only_normalized_empty_snapshot
             count, 0,
             "inspection must not dispatch or inventory {table}"
         );
+    }
+}
+
+#[tokio::test]
+async fn stale_source_aborts_joined_inventory_worker_before_owner_cleanup() {
+    use native_close::NativeCloseInitialContinuationPhase as Phase;
+    use phoenix_core::domain::close::ClosePhase;
+
+    let fixture = CloseFixture::new().await;
+    let gate = Arc::new(Mutex::new(()));
+    let (response, mut reply) = oneshot::channel();
+    let (mut continuation, fence) =
+        admit_initial_continuation(&fixture, Arc::clone(&gate), response).await;
+    let attempt = continuation.receipt.admitted.attempt_id.as_str().to_owned();
+
+    assert_eq!(continuation.step(&fixture.state).await.unwrap(), Phase::Settle);
+    assert_eq!(
+        continuation.step(&fixture.state).await.unwrap(),
+        Phase::ReachedSettlementPhase(ClosePhase::AwaitingRetirementInspection)
+    );
+    assert_eq!(
+        continuation.step(&fixture.state).await.unwrap(),
+        Phase::CollectingInspection
+    );
+    continuation.await_inspection_completion_for_test().await;
+    assert_eq!(
+        continuation.step(&fixture.state).await.unwrap(),
+        Phase::ReachedSettlementPhase(ClosePhase::RetirementRequested)
+    );
+
+    let (entered_tx, entered) = oneshot::channel();
+    let (release, release_rx) = oneshot::channel();
+    let (exited_tx, exited) = oneshot::channel();
+    continuation.set_inventory_preparation_test_barrier(entered_tx, release_rx, exited_tx);
+    assert_eq!(
+        continuation.step(&fixture.state).await.unwrap(),
+        Phase::PreparingInventory
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(10), entered)
+        .await
+        .expect("inventory worker must reach its pre-manager barrier")
+        .expect("inventory worker must report entry");
+    assert_eq!(fence.owner_count(), 2);
+    assert!(Arc::clone(&gate).try_lock_owned().is_err());
+
+    let stale_step = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        continuation.step(&ConvState::Idle),
+    )
+    .await
+    .expect("stale source must abort and join inventory preparation");
+    assert_eq!(stale_step, Err(NativeCloseApplicationError::SourceRefused));
+    tokio::time::timeout(std::time::Duration::from_secs(10), exited)
+        .await
+        .expect("aborted inventory worker must report exit")
+        .expect("inventory worker lifecycle sender must remain live until exit");
+    assert!(release.send(()).is_err(), "joined worker must drop its barrier receiver");
+    assert_eq!(continuation.phase, Phase::InspectionRequired);
+    assert_eq!(fence.owner_count(), 1);
+    assert!(Arc::clone(&gate).try_lock_owned().is_err());
+    assert!(matches!(
+        reply.try_recv(),
+        Err(oneshot::error::TryRecvError::Empty)
+    ));
+    assert_eq!(
+        fixture.db.get_close_obligation(&attempt).await.unwrap().phase(),
+        ClosePhase::RetirementRequested
+    );
+    for table in [
+        "close_retirement_inventories",
+        "close_expected_retirement_resources",
+        "close_retirement_resource_dispatches",
+        "close_retirement_resources",
+        "close_worktree_cleanup_plans",
+    ] {
+        let sql = format!("SELECT COUNT(*) FROM {table} WHERE attempt_id = ?1");
+        let count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(sql.as_str()))
+            .bind(&attempt)
+            .fetch_one(fixture.db.pool())
+            .await
+            .unwrap();
+        assert_eq!(count, 0, "stale worker must not write {table}");
+    }
+
+    drop(continuation);
+    assert_eq!(fence.owner_count(), 0);
+    assert!(Arc::clone(&gate).try_lock_owned().is_ok());
+    assert!(reply.await.is_err());
+}
+
+#[tokio::test]
+async fn fatal_authority_during_inventory_preparation_joins_worker_before_owner_cleanup() {
+    use native_close::NativeCloseInitialContinuationPhase as Phase;
+    use phoenix_core::domain::close::ClosePhase;
+
+    let fixture = CloseFixture::new().await;
+    let gate = Arc::new(Mutex::new(()));
+    let (response, mut reply) = oneshot::channel();
+    let (mut continuation, fence) =
+        admit_initial_continuation(&fixture, Arc::clone(&gate), response).await;
+    let attempt = continuation.receipt.admitted.attempt_id.as_str().to_owned();
+
+    assert_eq!(continuation.step(&fixture.state).await.unwrap(), Phase::Settle);
+    assert_eq!(
+        continuation.step(&fixture.state).await.unwrap(),
+        Phase::ReachedSettlementPhase(ClosePhase::AwaitingRetirementInspection)
+    );
+    assert_eq!(
+        continuation.step(&fixture.state).await.unwrap(),
+        Phase::CollectingInspection
+    );
+    continuation.await_inspection_completion_for_test().await;
+    assert_eq!(
+        continuation.step(&fixture.state).await.unwrap(),
+        Phase::ReachedSettlementPhase(ClosePhase::RetirementRequested)
+    );
+
+    let (entered_tx, entered) = oneshot::channel();
+    let (release, release_rx) = oneshot::channel();
+    let (exited_tx, exited) = oneshot::channel();
+    continuation.set_inventory_preparation_test_barrier(entered_tx, release_rx, exited_tx);
+    assert_eq!(
+        continuation.step(&fixture.state).await.unwrap(),
+        Phase::PreparingInventory
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(10), entered)
+        .await
+        .expect("inventory worker must reach its pre-manager barrier")
+        .expect("inventory worker must report entry");
+    assert_eq!(fence.owner_count(), 2);
+    assert!(Arc::clone(&gate).try_lock_owned().is_err());
+    let mut exited = exited;
+
+    fence.close("native_close_fatal_during_inventory_preparation_test");
+    let fatal_step = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        continuation.step(&fixture.state),
+    )
+    .await
+    .expect("fatal authority must abort and join inventory preparation");
+    assert_eq!(fatal_step, Err(NativeCloseApplicationError::FatalAuthority));
+    assert_eq!(
+        exited.try_recv(),
+        Ok(()),
+        "the awaited fatal step must already have joined the worker"
+    );
+    assert!(release.send(()).is_err(), "joined worker must drop its barrier receiver");
+    assert_eq!(fence.owner_count(), 1);
+    assert!(Arc::clone(&gate).try_lock_owned().is_err());
+    assert!(matches!(
+        reply.try_recv(),
+        Err(oneshot::error::TryRecvError::Empty)
+    ));
+
+    drop(continuation);
+    assert_eq!(fence.owner_count(), 0);
+    assert!(Arc::clone(&gate).try_lock_owned().is_ok());
+    assert!(reply.await.is_err());
+    assert_eq!(
+        fixture.db.get_close_obligation(&attempt).await.unwrap().phase(),
+        ClosePhase::RetirementRequested
+    );
+    for table in [
+        "close_retirement_inventories",
+        "close_expected_retirement_resources",
+        "close_retirement_resource_dispatches",
+        "close_retirement_resources",
+        "close_worktree_cleanup_plans",
+    ] {
+        let sql = format!("SELECT COUNT(*) FROM {table} WHERE attempt_id = ?1");
+        let count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(sql.as_str()))
+            .bind(&attempt)
+            .fetch_one(fixture.db.pool())
+            .await
+            .unwrap();
+        assert_eq!(count, 0, "fatal preparation must not write {table}");
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn dropping_continuation_during_inventory_preparation_retains_worker_custody_until_exit() {
+    use native_close::NativeCloseInitialContinuationPhase as Phase;
+    use phoenix_core::domain::close::ClosePhase;
+
+    let fixture = CloseFixture::new().await;
+    let gate = Arc::new(Mutex::new(()));
+    let (response, mut reply) = oneshot::channel();
+    let (mut continuation, fence) =
+        admit_initial_continuation(&fixture, Arc::clone(&gate), response).await;
+    let attempt = continuation.receipt.admitted.attempt_id.as_str().to_owned();
+
+    assert_eq!(continuation.step(&fixture.state).await.unwrap(), Phase::Settle);
+    assert_eq!(
+        continuation.step(&fixture.state).await.unwrap(),
+        Phase::ReachedSettlementPhase(ClosePhase::AwaitingRetirementInspection)
+    );
+    assert_eq!(
+        continuation.step(&fixture.state).await.unwrap(),
+        Phase::CollectingInspection
+    );
+    continuation.await_inspection_completion_for_test().await;
+    assert_eq!(
+        continuation.step(&fixture.state).await.unwrap(),
+        Phase::ReachedSettlementPhase(ClosePhase::RetirementRequested)
+    );
+
+    let (entered_tx, entered) = oneshot::channel();
+    let (release, release_rx) = oneshot::channel();
+    let (exited_tx, exited) = oneshot::channel();
+    continuation.set_inventory_preparation_test_barrier(entered_tx, release_rx, exited_tx);
+    assert_eq!(
+        continuation.step(&fixture.state).await.unwrap(),
+        Phase::PreparingInventory
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(10), entered)
+        .await
+        .expect("inventory worker must reach its pre-manager barrier")
+        .expect("inventory worker must report entry");
+    assert_eq!(fence.owner_count(), 2);
+    assert!(Arc::clone(&gate).try_lock_owned().is_err());
+    assert!(matches!(
+        reply.try_recv(),
+        Err(oneshot::error::TryRecvError::Empty)
+    ));
+
+    drop(continuation);
+    // This current-thread runtime cannot poll the aborted worker until we yield.
+    // The reborrow and exact target gate must outlive the dropped continuation.
+    assert_eq!(fence.owner_count(), 1);
+    assert!(Arc::clone(&gate).try_lock_owned().is_err());
+    tokio::time::timeout(std::time::Duration::from_secs(20), exited)
+        .await
+        .expect("dropped continuation must abort its paused inventory worker")
+        .expect("worker lifecycle sender must remain live until its future is dropped");
+    assert!(release.send(()).is_err(), "aborted worker must drop its barrier receiver");
+    assert_eq!(fence.owner_count(), 0);
+    assert!(Arc::clone(&gate).try_lock_owned().is_ok());
+    assert!(reply.await.is_err());
+    assert_eq!(
+        fixture.db.get_close_obligation(&attempt).await.unwrap().phase(),
+        ClosePhase::RetirementRequested
+    );
+    for table in [
+        "close_retirement_inventories",
+        "close_expected_retirement_resources",
+        "close_retirement_resource_dispatches",
+        "close_retirement_resources",
+        "close_worktree_cleanup_plans",
+    ] {
+        let sql = format!("SELECT COUNT(*) FROM {table} WHERE attempt_id = ?1");
+        let count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(sql.as_str()))
+            .bind(&attempt)
+            .fetch_one(fixture.db.pool())
+            .await
+            .unwrap();
+        assert_eq!(count, 0, "dropped preparation must not write {table}");
     }
 }
 

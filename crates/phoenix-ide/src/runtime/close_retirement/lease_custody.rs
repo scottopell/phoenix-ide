@@ -136,6 +136,8 @@ pub(crate) struct CloseResourceLeaseStore {
     pub(super) reopening_hook: Option<ReopeningHook>,
     #[cfg(test)]
     pub(super) retry_hook: Option<RetryHook>,
+    #[cfg(test)]
+    pub(super) completion_hook: Option<CompletionHook>,
 }
 
 impl CloseResourceLeaseStore {
@@ -551,6 +553,14 @@ pub(super) struct AcquisitionHook {
     pub(super) entered: Arc<tokio::sync::Notify>,
     pub(super) release: Arc<tokio::sync::Notify>,
     pub(super) fail: bool,
+}
+
+/// Pauses the live completion wrapper after it obtains the original lease.
+#[cfg(test)]
+#[derive(Clone)]
+pub(super) struct CompletionHook {
+    pub(super) entered: Arc<tokio::sync::Notify>,
+    pub(super) release: Arc<tokio::sync::Notify>,
 }
 
 #[cfg(test)]

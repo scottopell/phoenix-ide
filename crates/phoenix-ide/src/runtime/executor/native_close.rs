@@ -4,8 +4,10 @@ use super::{
     CancellationToken, ConversationRuntime, LlmClient, RuntimeSettlementAuthority, Storage,
     ToolExecutor,
 };
+use crate::db::CaptureCloseRetirementInventoryRequest;
 use crate::runtime::close_retirement::{
-    collect_native_initial_inspection, NativeInitialInspection, NativeInitialInspectionFailure,
+    collect_native_initial_inspection, CloseRetirementInventoryPreparationError,
+    NativeInitialInspection, NativeInitialInspectionFailure,
 };
 use crate::runtime::native_close_application::{
     initial_command_from_executing_source, NativeCloseApplicationError,
@@ -62,10 +64,14 @@ pub(super) struct NativeCloseInitialContinuation {
     inspection: Option<
         tokio::task::JoinHandle<Result<NativeInitialInspection, NativeInitialInspectionFailure>>,
     >,
+    inventory: InventoryCapture,
+    backend: std::sync::Arc<crate::runtime::RuntimeManager>,
+    #[cfg(test)]
+    inventory_preparation_test_barrier: Option<InventoryPreparationTestBarrier>,
     inspection_failure: Option<NativeInitialInspectionFailureIntent>,
     pub(super) terminal_observation_retry: bool,
     pub(super) authority: RuntimeSettlementAuthority,
-    pub(super) _target_gate: tokio::sync::OwnedMutexGuard<()>,
+    pub(super) _target_gate: std::sync::Arc<tokio::sync::OwnedMutexGuard<()>>,
     pub(super) _response: Option<
         tokio::sync::oneshot::Sender<Result<NativeCloseInitialResult, NativeCloseApplicationError>>,
     >,
@@ -77,6 +83,8 @@ pub(super) enum NativeCloseInitialContinuationPhase {
     Settle,
     WaitingForQuiescence,
     ReachedSettlementPhase(phoenix_core::domain::close::ClosePhase),
+    PreparingInventory,
+    Captured,
     AwaitingStopWorkConfirmation,
     CollectingInspection,
     InspectionRequired,
@@ -94,6 +102,39 @@ struct NativeInitialInspectionFailureIntent {
     detail: String,
 }
 
+enum InventoryCapture {
+    NotStarted,
+    Preparing(tokio::task::JoinHandle<Result<CaptureCloseRetirementInventoryRequest, CloseRetirementInventoryPreparationError>>),
+    Held,
+}
+
+#[cfg(test)]
+struct InventoryPreparationTestBarrier {
+    entered: tokio::sync::oneshot::Sender<()>,
+    release: tokio::sync::oneshot::Receiver<()>,
+    exited: tokio::sync::oneshot::Sender<()>,
+}
+
+#[cfg(test)]
+struct InventoryPreparationWorkerExit(Option<tokio::sync::oneshot::Sender<()>>);
+
+#[cfg(test)]
+impl Drop for InventoryPreparationWorkerExit {
+    fn drop(&mut self) {
+        if let Some(exited) = self.0.take() {
+            let _ = exited.send(());
+        }
+    }
+}
+
+impl InventoryCapture {
+    fn abort_owned_worker(&mut self) {
+        if let Self::Preparing(handle) = self {
+            handle.abort();
+        }
+    }
+}
+
 pub(super) enum NativeCloseInitialAdmission {
     Finished(NativeCloseInitialResult),
     Continued {
@@ -107,6 +148,7 @@ impl Drop for NativeCloseInitialContinuation {
         if let Some(handle) = self.inspection.take() {
             handle.abort();
         }
+        self.inventory.abort_owned_worker();
     }
 }
 
@@ -145,6 +187,7 @@ impl NativeCloseInitialContinuation {
             return false;
         }
 
+        self.abort_and_join_inventory_preparation().await;
         self.terminal_observation_retry = false;
         self.authority.owner = None;
         if let Some(response) = self._response.take() {
@@ -153,12 +196,31 @@ impl NativeCloseInitialContinuation {
         true
     }
 
+    /// Only the preparation task belongs to this continuation. Its acquired
+    /// resource permits belong to the manager and remain fenced after a failed Close.
+    pub(super) async fn abort_and_join_inventory_preparation(&mut self) {
+        if let InventoryCapture::Preparing(handle) = &self.inventory {
+            handle.abort();
+        }
+        if matches!(self.inventory, InventoryCapture::Preparing(_)) {
+            let InventoryCapture::Preparing(handle) =
+                std::mem::replace(&mut self.inventory, InventoryCapture::NotStarted)
+            else {
+                unreachable!();
+            };
+            let _ = handle.await;
+        }
+    }
+
     pub(super) fn collecting_inspection(&self) -> bool {
         self.phase == NativeCloseInitialContinuationPhase::CollectingInspection
     }
 
     pub(super) fn freeze_for_exit_observation(&mut self) {
         if let Some(handle) = self.inspection.take() {
+            handle.abort();
+        }
+        if let InventoryCapture::Preparing(handle) = &self.inventory {
             handle.abort();
         }
         self.phase = NativeCloseInitialContinuationPhase::ExitObservationOnly;
@@ -181,6 +243,8 @@ impl NativeCloseInitialContinuation {
             self.phase,
             NativeCloseInitialContinuationPhase::CollectingInspection
                 | NativeCloseInitialContinuationPhase::WaitingForQuiescence
+                | NativeCloseInitialContinuationPhase::ReachedSettlementPhase(phoenix_core::domain::close::ClosePhase::RetirementRequested)
+                | NativeCloseInitialContinuationPhase::PreparingInventory
                 | NativeCloseInitialContinuationPhase::ClassifyingInspectionFailure
                 | NativeCloseInitialContinuationPhase::ObservingTerminal
                 | NativeCloseInitialContinuationPhase::ClassifyingExitInterruption
@@ -192,7 +256,9 @@ impl NativeCloseInitialContinuation {
     }
 
     pub(super) fn next_service_at(&self) -> tokio::time::Instant {
-        let delay_ms = if self.collecting_inspection() {
+        let delay_ms = if self.collecting_inspection()
+            || self.phase == NativeCloseInitialContinuationPhase::PreparingInventory
+        {
             100
         } else {
             250
@@ -225,6 +291,20 @@ impl NativeCloseInitialContinuation {
         }
     }
 
+    #[cfg(test)]
+    pub(super) fn set_inventory_preparation_test_barrier(
+        &mut self,
+        entered: tokio::sync::oneshot::Sender<()>,
+        release: tokio::sync::oneshot::Receiver<()>,
+        exited: tokio::sync::oneshot::Sender<()>,
+    ) {
+        self.inventory_preparation_test_barrier = Some(InventoryPreparationTestBarrier {
+            entered,
+            release,
+            exited,
+        });
+    }
+
     fn live_source_matches(&self, live_source: &phoenix_core::domain::sm_state::ConvState) -> bool {
         let phoenix_db::native_close::NativeCloseIntent::Initial { target } = self.command.intent()
         else {
@@ -243,8 +323,11 @@ impl NativeCloseInitialContinuation {
         &mut self,
         live_source: &phoenix_core::domain::sm_state::ConvState,
     ) {
-        if self.collecting_inspection() && !self.live_source_matches(live_source) {
+        if (self.collecting_inspection() || matches!(self.inventory, InventoryCapture::Preparing(_))) && !self.live_source_matches(live_source) {
             if let Some(handle) = self.inspection.take() {
+                handle.abort();
+            }
+            if let InventoryCapture::Preparing(handle) = &self.inventory {
                 handle.abort();
             }
             self.phase = NativeCloseInitialContinuationPhase::InspectionRequired;
@@ -260,11 +343,19 @@ impl NativeCloseInitialContinuation {
         live_source: &phoenix_core::domain::sm_state::ConvState,
     ) -> Result<NativeCloseInitialContinuationPhase, NativeCloseApplicationError> {
         use NativeCloseInitialContinuationPhase as Phase;
+        if self.authority.owner.as_ref()
+            .and_then(|owner| owner.fence.as_ref())
+            .is_some_and(|fence| fence.fatal_authority_loss_is_latched())
+        {
+            self.abort_and_join_inventory_preparation().await;
+            return Err(NativeCloseApplicationError::FatalAuthority);
+        }
         if self.exit_observation_only() {
             return Ok(self.phase);
         }
-        match self.phase {
+        let result = match self.phase {
             Phase::ClassifyingExitInterruption => {
+                self.abort_and_join_inventory_preparation().await;
                 match self
                     .db
                     .interrupt_native_close_initial(&self.command, &self.receipt)
@@ -336,6 +427,111 @@ impl NativeCloseInitialContinuation {
                     Err(NativeCloseApplicationError::FatalAuthority)
                 }
             },
+            Phase::ReachedSettlementPhase(phoenix_core::domain::close::ClosePhase::RetirementRequested) => {
+                if !self.live_source_matches(live_source) {
+                    self.phase = Phase::InspectionRequired;
+                    return Err(NativeCloseApplicationError::SourceRefused);
+                }
+                let obligation = match self.db.get_close_obligation(self.receipt.admitted.attempt_id.as_str()).await {
+                    Ok(obligation) => obligation,
+                    Err(error) => {
+                        tracing::warn!(%error, "native Close retirement obligation lookup failed; parking source owner");
+                        self.phase = Phase::InspectionRequired;
+                        return Err(NativeCloseApplicationError::Storage);
+                    }
+                };
+                let Some(snapshot) = obligation.snapshot().cloned() else {
+                    tracing::warn!("native Close retirement obligation has no inventory snapshot; parking source owner");
+                    self.phase = Phase::InspectionRequired;
+                    return Err(NativeCloseApplicationError::Storage);
+                };
+                let backend = std::sync::Arc::clone(&self.backend);
+                let attempt = self.receipt.admitted.attempt_id.clone();
+                #[cfg(test)]
+                let test_barrier = self.inventory_preparation_test_barrier.take();
+                // The worker shares the already-admitted authority and exact gate.
+                // Even if the actor itself is cancelled, aborting its JoinHandle
+                // cannot release either boundary before the worker future is dropped.
+                let worker_owner = self.authority.owner.as_mut()
+                    .expect("inventory preparation requires retained source authority")
+                    .reborrow();
+                let worker_gate = std::sync::Arc::clone(&self._target_gate);
+                self.inventory = InventoryCapture::Preparing(tokio::spawn(async move {
+                    let _custody = (worker_owner, worker_gate);
+                    #[cfg(test)]
+                    let _worker_exit = if let Some(barrier) = test_barrier {
+                        let InventoryPreparationTestBarrier {
+                            entered,
+                            release,
+                            exited,
+                        } = barrier;
+                        let worker_exit = InventoryPreparationWorkerExit(Some(exited));
+                        let _ = entered.send(());
+                        release
+                            .await
+                            .expect("inventory preparation test barrier must be released");
+                        Some(worker_exit)
+                    } else {
+                        None
+                    };
+                    backend
+                        .prepare_close_retirement_inventory(attempt, snapshot)
+                        .await
+                }));
+                self.phase = Phase::PreparingInventory;
+                Ok(self.phase)
+            }
+            Phase::PreparingInventory => {
+                if !self.live_source_matches(live_source) {
+                    self.abort_inspection_if_source_revoked(live_source);
+                    self.abort_and_join_inventory_preparation().await;
+                    self.phase = Phase::InspectionRequired;
+                    return Err(NativeCloseApplicationError::SourceRefused);
+                }
+                match &self.inventory {
+                    InventoryCapture::Preparing(handle) if handle.is_finished() => {}
+                    _ => return Ok(self.phase),
+                }
+                let old = std::mem::replace(&mut self.inventory, InventoryCapture::NotStarted);
+                let request = match old {
+                    InventoryCapture::Preparing(handle) => match handle.await {
+                        Ok(Ok(request)) => request,
+                        Ok(Err(CloseRetirementInventoryPreparationError::CapturedScopeIdentity { scope, reason, detail })) => {
+                            // The existing source-bound failure boundary accepts only
+                            // AwaitingRetirementInspection, not RetirementRequested.
+                            // Keep this exact scope evidence blocked, without forging
+                            // an inspection failure in the wrong DB phase.
+                            tracing::warn!(%scope, ?reason, %detail, "native Close inventory preparation blocked at retirement boundary");
+                            self.phase = Phase::InspectionRequired;
+                            return Err(NativeCloseApplicationError::Storage);
+                        }
+                        Ok(Err(CloseRetirementInventoryPreparationError::BackendStorageOrUnattributed { detail })) => {
+                            tracing::error!(%detail, "native Close inventory preparation failed without scope evidence");
+                            self.phase = Phase::InspectionRequired;
+                            return Err(NativeCloseApplicationError::Storage);
+                        }
+                        Err(error) => {
+                            tracing::error!(%error, "native Close inventory preparation worker failed");
+                            self.phase = Phase::InspectionRequired;
+                            return Err(NativeCloseApplicationError::Storage);
+                        }
+                    },
+                    _ => unreachable!("preparing phase owns preparation worker"),
+                };
+                match self.db.capture_native_close_initial_retirement_inventory(&self.command, &self.receipt, live_source, request).await {
+                    LocalAuthorityResult::DurableFactEstablished(Ok(_resources)) => {
+                        self.inventory = InventoryCapture::Held;
+                        self.phase = Phase::Captured;
+                        Ok(self.phase)
+                    }
+                    LocalAuthorityResult::DurableFactEstablished(Err(error)) => {
+                        tracing::warn!(%error, "native Close inventory capture rejected; retaining lease custody and source owner");
+                        self.phase = Phase::InspectionRequired;
+                        Err(NativeCloseApplicationError::Storage)
+                    }
+                    LocalAuthorityResult::DurableFactUnclassified => Err(NativeCloseApplicationError::FatalAuthority),
+                }
+            }
             Phase::ReachedSettlementPhase(
                 phoenix_core::domain::close::ClosePhase::AwaitingRetirementInspection,
             ) => {
@@ -480,11 +676,16 @@ impl NativeCloseInitialContinuation {
                 Ok(self.phase)
             }
             Phase::ReachedSettlementPhase(_)
+            | Phase::Captured
             | Phase::AwaitingStopWorkConfirmation
             | Phase::InspectionRequired
             | Phase::ExitObservationOnly
             | Phase::Finished => Ok(self.phase),
+        };
+        if matches!(&result, Err(NativeCloseApplicationError::FatalAuthority)) {
+            self.abort_and_join_inventory_preparation().await;
         }
+        result
     }
 }
 
@@ -498,7 +699,7 @@ where
     /// Replays and classified errors complete as before and have no continuation.
     pub(super) async fn admit_native_close_initial(
         &mut self,
-        backend: &crate::runtime::RuntimeManager,
+        backend: &std::sync::Arc<crate::runtime::RuntimeManager>,
         source: SourceToolCall,
         target: ProductConversationId,
         admitted: crate::runtime::AdmittedOperation,
@@ -556,10 +757,14 @@ where
                     db: db.clone(),
                     phase: NativeCloseInitialContinuationPhase::Prepare,
                     inspection: None,
+                    inventory: InventoryCapture::NotStarted,
+                    backend: std::sync::Arc::clone(backend),
+                    #[cfg(test)]
+                    inventory_preparation_test_barrier: None,
                     inspection_failure: None,
                     terminal_observation_retry: false,
                     authority,
-                    _target_gate: target_gate,
+                    _target_gate: std::sync::Arc::new(target_gate),
                     _response: Some(response),
                 };
                 Ok(NativeCloseInitialAdmission::Continued {
