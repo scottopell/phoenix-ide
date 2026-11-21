@@ -1,10 +1,8 @@
--- Questions the Coordinator posts to the user without stopping its own work
--- (REQ-AUQ-010). A question stays open until the user answers or dismisses it,
--- or the Coordinator withdraws it. An answer or dismissal is delivered back to
--- the Coordinator transcript exactly once; delivered_at_us records that.
+-- REQ-AUQ-010..012: questions the Coordinator posts without stopping its work.
 CREATE TABLE coordinator_user_questions (
     request_id TEXT PRIMARY KEY NOT NULL CHECK (length(trim(request_id)) > 0),
-    coordinator_conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    coordinator_product_conversation_id TEXT NOT NULL
+        REFERENCES product_conversations(id) ON DELETE CASCADE,
     questions TEXT NOT NULL CHECK (json_valid(questions) AND json_type(questions) = 'array'),
     asked_at_us INTEGER NOT NULL,
     status TEXT NOT NULL DEFAULT 'open'
@@ -24,3 +22,26 @@ CREATE INDEX coordinator_user_questions_open
 CREATE INDEX coordinator_user_questions_undelivered
     ON coordinator_user_questions (settled_at_us)
     WHERE status IN ('answered', 'dismissed') AND delivered_at_us IS NULL;
+
+-- REQ-AUQ-011: a reply is delivered by the insert that accepts it.
+CREATE TRIGGER coordinator_question_reply_accept_turn AFTER INSERT ON durable_turns
+WHEN NEW.origin_kind = 'user_api'
+BEGIN
+    UPDATE coordinator_user_questions
+    SET delivered_at_us = CAST(unixepoch('subsec') * 1000000 AS INTEGER)
+    WHERE request_id = NEW.client_turn_key AND delivered_at_us IS NULL
+      AND status IN ('answered', 'dismissed')
+      AND coordinator_product_conversation_id =
+          (SELECT product_conversation_id FROM conversations WHERE id = NEW.conversation_id);
+END;
+
+CREATE TRIGGER coordinator_question_reply_accept_steering AFTER INSERT ON steering_messages
+WHEN NEW.origin_kind = 'user_api'
+BEGIN
+    UPDATE coordinator_user_questions
+    SET delivered_at_us = CAST(unixepoch('subsec') * 1000000 AS INTEGER)
+    WHERE request_id = NEW.message_id AND delivered_at_us IS NULL
+      AND status IN ('answered', 'dismissed')
+      AND coordinator_product_conversation_id =
+          (SELECT product_conversation_id FROM conversations WHERE id = NEW.conversation_id);
+END;

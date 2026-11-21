@@ -19,7 +19,7 @@ use super::{
 #[derive(Debug, Serialize)]
 pub(super) struct CoordinatorQuestionView {
     request_id: String,
-    coordinator_conversation_id: String,
+    coordinator_product_conversation_id: String,
     /// RFC 3339.
     asked_at: String,
     questions: Vec<UserQuestion>,
@@ -49,7 +49,7 @@ pub(super) async fn list(
         open.into_iter()
             .map(|question| CoordinatorQuestionView {
                 request_id: question.request_id,
-                coordinator_conversation_id: question.coordinator_conversation_id,
+                coordinator_product_conversation_id: question.coordinator_product_conversation_id,
                 asked_at: chrono::DateTime::<chrono::Utc>::from_timestamp_micros(
                     question.asked_at_us,
                 )

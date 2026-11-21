@@ -1,14 +1,12 @@
-use std::{fmt::Write as _, sync::Arc};
+use std::fmt::Write as _;
 
 use phoenix_core::domain::db_schema::InputOrigin;
 use phoenix_db::{
     CloseFailureStop, MandatoryCloseFailureSubject, PendingWatchEvent, WatchEventRoute,
 };
 
-use crate::runtime::RuntimeManager;
-use crate::send_chat_service::{
-    MessageExpansionPolicy, SendChatApplicationService, SendChatOutcome, SendChatRequest,
-};
+use crate::coordinator_delivery::CoordinatorSender;
+use crate::send_chat_service::SendChatOutcome;
 
 pub(crate) fn notification(event: &PendingWatchEvent) -> String {
     let label = match &event.route {
@@ -143,29 +141,9 @@ pub(crate) fn pending_question_detail(
     Some(text)
 }
 
-pub(crate) async fn deliver_pass(runtime: &Arc<RuntimeManager>) {
-    let db = runtime.db();
-    let events = match db.pending_coordinator_watch_events(16).await {
-        Ok(events) => events,
-        Err(error) => {
-            tracing::warn!(%error, "coordinator watch event discovery failed; retrying");
-            return;
-        }
-    };
-    if events.is_empty() {
-        return;
-    }
-    let Some(target) = (match db.coordinator_watch_target().await {
-        Ok(target) => target,
-        Err(error) => {
-            tracing::warn!(%error, "coordinator watch target lookup failed; retrying");
-            return;
-        }
-    }) else {
-        tracing::debug!("coordinator watch delivery awaiting coordinator transcript");
-        return;
-    };
-    let service = SendChatApplicationService::new(db.clone(), runtime.clone());
+/// Send pending watch events to the current Coordinator transcript.
+pub(crate) async fn deliver(sender: &CoordinatorSender, events: Vec<PendingWatchEvent>) {
+    let db = sender.db();
     for event in events {
         let mut text = notification(&event);
         if event.outcome == phoenix_db::WatchOutcome::AwaitingUserResponse {
@@ -179,19 +157,10 @@ pub(crate) async fn deliver_pass(runtime: &Arc<RuntimeManager>) {
                 }
             }
         }
-        let request = SendChatRequest {
-            conversation_id: target.clone(),
-            origin: InputOrigin::SubscriptionEvent {
-                event_id: event.event_id.clone(),
-            },
-            text,
-            message_id: event.event_id.clone(),
-            images: Vec::new(),
-            files: Vec::new(),
-            user_agent: None,
-            expansion_policy: MessageExpansionPolicy::LiteralText,
+        let origin = InputOrigin::SubscriptionEvent {
+            event_id: event.event_id.clone(),
         };
-        match service.send(request).await {
+        match sender.send(origin, text, event.event_id.clone()).await {
             Ok(
                 SendChatOutcome::Delivered
                 | SendChatOutcome::AlreadyPersisted
@@ -214,7 +183,12 @@ pub(crate) async fn deliver_pass(runtime: &Arc<RuntimeManager>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime::RuntimeManager;
+    use crate::send_chat_service::{
+        MessageExpansionPolicy, SendChatApplicationService, SendChatRequest,
+    };
     use phoenix_core::domain::product_conversation::ProductConversationId;
+    use std::sync::Arc;
 
     #[tokio::test]
     async fn persisted_wait_pass_admits_once_through_real_send_service() {
@@ -244,7 +218,7 @@ mod tests {
             Arc::new(McpClientManager::new()),
             None,
         ));
-        deliver_pass(&runtime).await;
+        crate::coordinator_delivery::deliver_pass(&runtime).await;
         let before: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM durable_turns WHERE origin_subscription_event_id IS NOT NULL",
         )
@@ -263,8 +237,8 @@ mod tests {
             .unwrap();
         let events = db.pending_coordinator_watch_events(16).await.unwrap();
         assert_eq!(events.len(), 1);
-        deliver_pass(&runtime).await;
-        deliver_pass(&runtime).await;
+        crate::coordinator_delivery::deliver_pass(&runtime).await;
+        crate::coordinator_delivery::deliver_pass(&runtime).await;
         let recipients: Vec<String> = sqlx::query_scalar(
             "SELECT conversation_id FROM durable_turns WHERE origin_subscription_event_id = ?1",
         )
@@ -287,7 +261,7 @@ mod tests {
         db.unwatch_product_conversation(&source.product_conversation_id)
             .await
             .unwrap();
-        deliver_pass(&runtime).await;
+        crate::coordinator_delivery::deliver_pass(&runtime).await;
         let after: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM durable_turns WHERE origin_subscription_event_id IS NOT NULL",
         )
@@ -381,7 +355,7 @@ mod tests {
             db.pending_coordinator_watch_events(16).await.unwrap().len(),
             1
         );
-        deliver_pass(&runtime).await;
+        crate::coordinator_delivery::deliver_pass(&runtime).await;
         let accepted: String = sqlx::query_scalar(
             "SELECT accepted_transcript_id FROM coordinator_watch_events WHERE event_id = ?1",
         )

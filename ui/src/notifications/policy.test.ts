@@ -34,6 +34,7 @@ function env(overrides: Partial<NotificationEnv> = {}): NotificationEnv {
     visible: false,
     hasFocus: false,
     activeSlug: null,
+    onCoordinatorPage: false,
     ...overrides,
   };
 }
@@ -436,7 +437,7 @@ describe('connected reminder notifications', () => {
 });
 
 describe('Ember question notifications (REQ-AUQ-011)', () => {
-  const item = (requestId: string) => ({ requestId, coordinatorConversationId: 'ember-1', text: 'Merge the cleanup PR?' });
+  const item = (requestId: string) => ({ requestId, coordinatorProductConversationId: 'ember-1', text: 'Merge the cleanup PR?' });
   const seed = () => notificationPolicyReducer(loadedState(), { type: 'coordinator_question_feed', items: [] }, env()).state;
 
   it('baselines questions open at load and announces each new one once', () => {
@@ -460,5 +461,11 @@ describe('Ember question notifications (REQ-AUQ-011)', () => {
     const sent = notificationPolicyReducer(seed(), { type: 'coordinator_question_feed', items: [item('new')] }, env());
     const failed = notificationPolicyReducer(sent.state, { type: 'notification_delivery_failed', conversationId: 'ember-1', dedupeKey: { kind: 'coordinator_question', id: 'new' } }, env());
     expect(notificationPolicyReducer(failed.state, { type: 'coordinator_question_feed', items: [item('new')] }, env()).effects).toHaveLength(1);
+  });
+
+  it('stays quiet while Ember\'s page is focused, whichever transcript it shows', () => {
+    const focused = { visible: true, hasFocus: true, activeSlug: 'ember-transcript-2' };
+    expect(notificationPolicyReducer(seed(), { type: 'coordinator_question_feed', items: [item('new')] }, env({ ...focused, onCoordinatorPage: true })).effects).toEqual([]);
+    expect(notificationPolicyReducer(seed(), { type: 'coordinator_question_feed', items: [item('new')] }, env({ ...focused, activeSlug: 'ember-1', onCoordinatorPage: false })).effects).toHaveLength(1);
   });
 });

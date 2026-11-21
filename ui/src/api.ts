@@ -550,9 +550,13 @@ export interface QuestionOption {
 }
 
 /** An open question Ember posted without stopping its own work (REQ-AUQ-010). */
+/** Per-question notes and chosen preview, keyed by question text. */
+export type QuestionAnnotations = Record<string, { notes?: string; preview?: string }>;
+
 export interface CoordinatorQuestion {
   request_id: string;
-  coordinator_conversation_id: string;
+  /** Ember's stable ProductConversation; survives continuation. */
+  coordinator_product_conversation_id: string;
   /** RFC 3339. */
   asked_at: string;
   questions: UserQuestion[];
@@ -2863,7 +2867,7 @@ export const api = {
     convId: string,
     requestId: string | undefined,
     answers: Record<string, string>,
-    annotations?: Record<string, { notes?: string; preview?: string }>,
+    annotations?: QuestionAnnotations,
   ): Promise<{ success: boolean }> {
     const resp = await fetch(`/api/conversations/${convId}/respond`, {
       method: 'POST',
@@ -2883,7 +2887,7 @@ export const api = {
   async answerCoordinatorQuestion(
     requestId: string,
     answers: Record<string, string>,
-    annotations?: Record<string, { notes?: string; preview?: string }>,
+    annotations?: QuestionAnnotations,
   ): Promise<{ success: boolean }> {
     const resp = await fetch(`/api/coordinator/questions/${encodeURIComponent(requestId)}/answer`, {
       method: 'POST',

@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { api } from '../api';
 import type { UserQuestion } from '../api';
 import { QuestionPanel } from './QuestionPanel';
+import { blockingQuestionActions } from './questionPanelActions';
 
 function question(text: string): UserQuestion {
   return {
@@ -32,8 +33,7 @@ function RequestBoundPanel({ requestId, text }: { requestId: string; text: strin
     <QuestionPanel
       key={requestId}
       questions={[question(text)]}
-      conversationId="conversation"
-      requestId={requestId}
+      actions={blockingQuestionActions('conversation', requestId)}
       showToast={() => {}}
       onAnswered={() => setClosed(true)}
       onDismissed={() => setClosed(true)}
@@ -55,8 +55,7 @@ describe('QuestionPanel focus lifecycle', () => {
       <button>Outside</button>
       <QuestionPanel
         questions={questions}
-        conversationId="conversation"
-        requestId="request-q1"
+        actions={blockingQuestionActions('conversation', 'request-q1')}
         showToast={() => {}}
         onAnswered={() => {}}
         onDismissed={() => {}}
@@ -207,8 +206,7 @@ describe('QuestionPanel request identity', () => {
     const { container } = render(
       <QuestionPanel
         questions={[question('Q1?'), question('Q2?'), question('Q3?')]}
-        conversationId="conversation"
-        requestId="request-q1"
+        actions={blockingQuestionActions('conversation', 'request-q1')}
         showToast={() => {}}
         onAnswered={() => {}}
         onDismissed={() => {}}
@@ -239,8 +237,7 @@ describe('QuestionPanel request identity', () => {
     const { container } = render(
       <QuestionPanel
         questions={[question('Q1?')]}
-        conversationId="conversation"
-        requestId="request-q1"
+        actions={blockingQuestionActions('conversation', 'request-q1')}
         showToast={() => {}}
         onAnswered={() => {}}
         onDismissed={() => {}}
@@ -266,8 +263,7 @@ describe('QuestionPanel request identity', () => {
     render(
       <QuestionPanel
         questions={[question('Q1?')]}
-        conversationId="conversation"
-        requestId="request-q1"
+        actions={blockingQuestionActions('conversation', 'request-q1')}
         showToast={() => {}}
         onAnswered={onAnswered}
         onDismissed={() => {}}
@@ -308,8 +304,7 @@ describe('QuestionPanel request identity', () => {
     render(
       <QuestionPanel
         questions={[question('Q1?')]}
-        conversationId="conversation"
-        requestId="request-q1"
+        actions={blockingQuestionActions('conversation', 'request-q1')}
         showToast={() => {}}
         onAnswered={onAnswered}
         onDismissed={() => {}}
@@ -330,8 +325,7 @@ describe('QuestionPanel request identity', () => {
     render(
       <QuestionPanel
         questions={[question('Q1?')]}
-        conversationId="conversation"
-        requestId="request-q1"
+        actions={blockingQuestionActions('conversation', 'request-q1')}
         showToast={() => {}}
         onAnswered={() => {}}
         onDismissed={onDismissed}

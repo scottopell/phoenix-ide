@@ -14,7 +14,8 @@ use crate::{Database, DbError, DbResult};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CoordinatorQuestion {
     pub request_id: String,
-    pub coordinator_conversation_id: String,
+    /// The Coordinator's stable `ProductConversation`.
+    pub coordinator_product_conversation_id: String,
     pub questions: Vec<UserQuestion>,
     pub asked_at_us: i64,
 }
@@ -60,7 +61,7 @@ fn decode_question(row: &sqlx::sqlite::SqliteRow) -> DbResult<CoordinatorQuestio
     let questions: String = row.try_get("questions")?;
     Ok(CoordinatorQuestion {
         request_id: row.try_get("request_id")?,
-        coordinator_conversation_id: row.try_get("coordinator_conversation_id")?,
+        coordinator_product_conversation_id: row.try_get("coordinator_product_conversation_id")?,
         questions: serde_json::from_str(&questions)
             .map_err(|error| DbError::Serialization(error.to_string()))?,
         asked_at_us: row.try_get("asked_at_us")?,
@@ -68,30 +69,40 @@ fn decode_question(row: &sqlx::sqlite::SqliteRow) -> DbResult<CoordinatorQuestio
 }
 
 impl Database {
-    /// Record a question the Coordinator posted.
+    /// Record a question the Coordinator posted from `asking_transcript_id`,
+    /// keyed on that transcript's `ProductConversation`.
     ///
     /// # Errors
-    /// Returns an error if the questions cannot be encoded or the insert fails.
+    /// Returns an error if the questions cannot be encoded, the transcript is
+    /// not a Coordinator transcript, or the insert fails.
     pub async fn post_coordinator_question(
         &self,
         request_id: &str,
-        coordinator_conversation_id: &str,
+        asking_transcript_id: &str,
         questions: &[UserQuestion],
         asked_at_us: i64,
     ) -> DbResult<()> {
         let encoded = serde_json::to_string(questions)
             .map_err(|error| DbError::Serialization(error.to_string()))?;
-        sqlx::query(
+        let inserted = sqlx::query(
             "INSERT INTO coordinator_user_questions
-                (request_id, coordinator_conversation_id, questions, asked_at_us)
-             VALUES (?1, ?2, ?3, ?4)",
+                (request_id, coordinator_product_conversation_id, questions, asked_at_us)
+             SELECT ?1, p.id, ?3, ?4
+             FROM conversations c JOIN product_conversations p ON p.id = c.product_conversation_id
+             WHERE c.id = ?2 AND p.kind = 'coordinator'",
         )
         .bind(request_id)
-        .bind(coordinator_conversation_id)
+        .bind(asking_transcript_id)
         .bind(encoded)
         .bind(asked_at_us)
         .execute(&self.pool)
-        .await?;
+        .await?
+        .rows_affected();
+        if inserted == 0 {
+            return Err(DbError::ConversationNotFound(
+                asking_transcript_id.to_string(),
+            ));
+        }
         Ok(())
     }
 
@@ -101,7 +112,7 @@ impl Database {
     /// Returns an error if the read fails or a stored question cannot be decoded.
     pub async fn open_coordinator_questions(&self) -> DbResult<Vec<CoordinatorQuestion>> {
         let rows = sqlx::query(
-            "SELECT request_id, coordinator_conversation_id, questions, asked_at_us
+            "SELECT request_id, coordinator_product_conversation_id, questions, asked_at_us
              FROM coordinator_user_questions WHERE status = 'open'
              ORDER BY asked_at_us, request_id",
         )
@@ -119,7 +130,7 @@ impl Database {
         request_id: &str,
     ) -> DbResult<Result<CoordinatorQuestion, CoordinatorQuestionSettlement>> {
         let row = sqlx::query(
-            "SELECT request_id, coordinator_conversation_id, questions, asked_at_us, status
+            "SELECT request_id, coordinator_product_conversation_id, questions, asked_at_us, status
              FROM coordinator_user_questions WHERE request_id = ?1",
         )
         .bind(request_id)
@@ -197,26 +208,6 @@ impl Database {
             })
             .collect()
     }
-
-    /// Record that the Coordinator transcript accepted a reply.
-    ///
-    /// # Errors
-    /// Returns an error if the update fails.
-    pub async fn mark_coordinator_question_reply_delivered(
-        &self,
-        request_id: &str,
-        now_us: i64,
-    ) -> DbResult<()> {
-        sqlx::query(
-            "UPDATE coordinator_user_questions SET delivered_at_us = ?2
-             WHERE request_id = ?1 AND delivered_at_us IS NULL",
-        )
-        .bind(request_id)
-        .bind(now_us)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
-    }
 }
 
 #[cfg(test)]
@@ -245,10 +236,37 @@ mod tests {
     }
 
     async fn coordinator(db: &Database) -> String {
-        db.create_conversation("ember", "ember", "/tmp", true, None, None)
+        db.get_or_create_coordinator(None, phoenix_core::llm_language::LlmLanguage::default())
             .await
             .unwrap()
             .id
+    }
+
+    #[tokio::test]
+    async fn a_question_belongs_to_the_coordinator_product_conversation() {
+        let db = Database::open_in_memory().await.unwrap();
+        let ember = db
+            .get_or_create_coordinator(None, phoenix_core::llm_language::LlmLanguage::default())
+            .await
+            .unwrap();
+        let product = ember.product_conversation_id.as_str().to_string();
+        let ember = ember.id;
+        db.post_coordinator_question("q-1", &ember, &questions(), 10)
+            .await
+            .unwrap();
+        assert_eq!(
+            db.open_coordinator_questions().await.unwrap()[0].coordinator_product_conversation_id,
+            product
+        );
+
+        let ordinary = db
+            .create_conversation("ordinary", "ordinary", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        assert!(db
+            .post_coordinator_question("q-2", &ordinary.id, &questions(), 20)
+            .await
+            .is_err());
     }
 
     #[tokio::test]
@@ -316,14 +334,6 @@ mod tests {
                 reply: "Yes".into()
             }]
         );
-        db.mark_coordinator_question_reply_delivered("q-1", 40)
-            .await
-            .unwrap();
-        assert!(db
-            .undelivered_coordinator_question_replies(16)
-            .await
-            .unwrap()
-            .is_empty());
     }
 
     #[tokio::test]
@@ -357,5 +367,61 @@ mod tests {
                 status: "withdrawn".into()
             }
         );
+    }
+
+    fn steer(message_id: &str) -> phoenix_core::domain::sm_event::SteerEntry {
+        phoenix_core::domain::sm_event::SteerEntry {
+            origin: phoenix_core::domain::db_schema::InputOrigin::UserApi,
+            text: "Answer".into(),
+            llm_text: None,
+            images: Vec::new(),
+            files: Vec::new(),
+            message_id: message_id.into(),
+            user_agent: None,
+            skill_invocation: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn the_coordinator_accepting_a_reply_marks_it_delivered() {
+        let db = Database::open_in_memory().await.unwrap();
+        let ember = coordinator(&db).await;
+        let ordinary = db
+            .create_conversation("ordinary", "ordinary", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        for request_id in ["q-open", "q-elsewhere", "q-ember"] {
+            db.post_coordinator_question(request_id, &ember, &questions(), 10)
+                .await
+                .unwrap();
+        }
+        // An open question has no reply to deliver yet.
+        db.append_steering_entry(&ember, &steer("q-open"), &"0".repeat(64))
+            .await
+            .unwrap();
+        for request_id in ["q-open", "q-elsewhere", "q-ember"] {
+            db.settle_coordinator_question(
+                request_id,
+                CoordinatorQuestionClose::Answered { reply: "Yes" },
+                20,
+            )
+            .await
+            .unwrap();
+        }
+        // The same id outside the Coordinator is not delivery.
+        db.append_steering_entry(&ordinary.id, &steer("q-elsewhere"), &"1".repeat(64))
+            .await
+            .unwrap();
+        db.append_steering_entry(&ember, &steer("q-ember"), &"2".repeat(64))
+            .await
+            .unwrap();
+        let undelivered: Vec<String> = db
+            .undelivered_coordinator_question_replies(16)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|reply| reply.request_id)
+            .collect();
+        assert_eq!(undelivered, ["q-elsewhere", "q-open"]);
     }
 }

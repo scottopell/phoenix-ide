@@ -59,7 +59,7 @@ export function receiveCoordinatorQuestions(received: readonly CoordinatorQuesti
   if (!sameQuestions(questions, received)) publish(received);
   notifyCoordinatorQuestionFeed(received.map((question) => ({
     requestId: question.request_id,
-    coordinatorConversationId: question.coordinator_conversation_id,
+    coordinatorProductConversationId: question.coordinator_product_conversation_id,
     text: coordinatorQuestionHeadline(question),
   })));
 }

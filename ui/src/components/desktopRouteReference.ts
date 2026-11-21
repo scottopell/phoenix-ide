@@ -12,3 +12,8 @@ export function extractProductRouteReference(pathname: string) {
     routeSlug: match?.[1] === 'c' ? reference : null,
   };
 }
+
+/** True on Ember's page, with or without a transcript in the path. */
+export function isCoordinatorRoute(pathname: string): boolean {
+  return pathname === '/global' || pathname.startsWith('/global/');
+}

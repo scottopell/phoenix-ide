@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import type { ConversationState } from '../../api';
 import { QuestionPanel } from '../../components/QuestionPanel';
+import { blockingQuestionActions } from '../../components/questionPanelActions';
 import { FocusScopeProvider } from '../../hooks/useFocusScope';
 import { conversationReducer, createInitialAtom, type InitPayload } from '../../conversation/atom';
 import { conversationPanelFixtureData } from './scenarios';
@@ -55,7 +56,7 @@ export function QuestionFocusFixture() {
       <div id="focus-ancestor" style={{ height: 400, overflow: 'auto' }}>
         <div style={{ height: 600 }} />
         {shown && <QuestionPanel key={atom.phase.request_id} questions={atom.phase.questions}
-          conversationId="focus-fixture" requestId={atom.phase.request_id}
+          actions={blockingQuestionActions('focus-fixture', atom.phase.request_id)}
           showToast={() => {}} onAnswered={() => {}} onDismissed={() => {}} />}
         <div style={{ height: 600 }} />
       </div>
