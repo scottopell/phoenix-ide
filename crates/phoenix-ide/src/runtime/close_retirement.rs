@@ -8230,7 +8230,10 @@ mod tests {
         assert_eq!(request.scopes[0].inventory.bash_process_groups.len(), 1);
         assert_eq!(request.scopes[0].inventory.pty_sessions.len(), 1);
         assert_eq!(request.scopes[0].inventory.browser_sessions.len(), 1);
-        assert!(request.scopes[0].inventory.equivalent_live_resources.is_empty());
+        assert!(request.scopes[0]
+            .inventory
+            .equivalent_live_resources
+            .is_empty());
         assert!(request.scopes[0]
             .inventory
             .bash_process_groups
@@ -8274,7 +8277,9 @@ mod tests {
         assert!(inventory.pty_sessions.is_empty());
         assert!(inventory.browser_sessions.is_empty());
         assert_eq!(inventory.tmux_servers.len(), 1);
-        assert!(inventory.tmux_servers.contains(&opaque_identity("legacy-tmux")));
+        assert!(inventory
+            .tmux_servers
+            .contains(&opaque_identity("legacy-tmux")));
     }
 
     #[test]
@@ -8309,12 +8314,16 @@ mod tests {
         use phoenix_core::work_scope::WorkScopeId;
 
         let error = super::build_close_retirement_inventory_scope_request(
-            phoenix_core::domain::close::CloseAttemptId::parse("native-unexpected-attempt").unwrap(),
+            phoenix_core::domain::close::CloseAttemptId::parse("native-unexpected-attempt")
+                .unwrap(),
             super::snapshot_for(b"native unexpected inventory snapshot"),
             super::CloseRetirementInventoryScopeInput {
                 scope: WorkScopeId::parse("native-unexpected-scope").unwrap(),
                 captured_worktree: None,
-                acquired_resources: vec![super::opaque_resource(Kind::EquivalentLiveResource, "unexpected".into())],
+                acquired_resources: vec![super::opaque_resource(
+                    Kind::EquivalentLiveResource,
+                    "unexpected".into(),
+                )],
             },
             super::CloseRetirementInventoryPolicy::NativeInitial,
         )
