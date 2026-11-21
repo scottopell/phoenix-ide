@@ -117,7 +117,9 @@ AND NOT EXISTS (SELECT 1 FROM close_attempt_participants participant JOIN conver
 "#;
 
 fn unexpected(object: &str) -> DbError {
-    DbError::Serialization(format!("migration 168 found unexpected {object} definition"))
+    DbError::Serialization(format!(
+        "migration 168 found unexpected {object} definition"
+    ))
 }
 
 fn append_exact_exception(
@@ -129,7 +131,9 @@ fn append_exact_exception(
     // SQLite stores CREATE TRIGGER without its final statement terminator.
     let definition = definition.strip_suffix(';').unwrap_or(definition);
     let suffix = format!("\nBEGIN\n    SELECT RAISE(ABORT, '{abort}');\nEND");
-    let prefix = definition.strip_suffix(&suffix).ok_or_else(|| unexpected(object))?;
+    let prefix = definition
+        .strip_suffix(&suffix)
+        .ok_or_else(|| unexpected(object))?;
     if !prefix.starts_with(&format!("CREATE TRIGGER {object}\n"))
         || prefix.matches("\nWHEN ").count() != 1
         || prefix.contains("\nBEGIN\n")

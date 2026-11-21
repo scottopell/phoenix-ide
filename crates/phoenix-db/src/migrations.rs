@@ -16032,27 +16032,51 @@ mod tests {
         setup_real_pre_159_schema(&pool).await;
         run_through_for_test(&pool, 167).await.unwrap();
         let db = crate::Database::from_pool_for_tests(pool.clone(), String::new());
-        let legacy = db.create_conversation("completion-legacy", "legacy", "/tmp", true, None, None)
-            .await.unwrap();
+        let legacy = db
+            .create_conversation("completion-legacy", "legacy", "/tmp", true, None, None)
+            .await
+            .unwrap();
         db.begin_close_foundation(
             &legacy.product_conversation_id,
-            &phoenix_core::domain::close::TranscriptConversationId::parse("completion-legacy").unwrap(),
+            &phoenix_core::domain::close::TranscriptConversationId::parse("completion-legacy")
+                .unwrap(),
             "completion-legacy-attempt",
-        ).await.unwrap();
+        )
+        .await
+        .unwrap();
         sqlx::query("UPDATE close_obligations SET native_managed = 1 WHERE attempt_id = 'completion-legacy-attempt'")
             .execute(&pool).await.unwrap();
         let receipt_sql = "INSERT INTO native_close_initial_receipts
             (request_id, request_fingerprint, source_transcript_id, source_message_id, source_tool_use_id,
              product_conversation_id, intent, attempt_id, run_ordinal)
             VALUES (?1, 'fingerprint', ?2, 'message', 'tool', ?3, 'initial', ?4, 1)";
-        sqlx::query(receipt_sql).bind("legacy-request").bind("completion-legacy")
-            .bind(legacy.product_conversation_id.as_str()).bind("completion-legacy-attempt")
-            .execute(&pool).await.unwrap();
-        let unreceipted = db.create_conversation("completion-unreceipted", "retained", "/tmp", true, None, None)
-            .await.unwrap();
-        db.begin_close_foundation(&unreceipted.product_conversation_id,
-            &phoenix_core::domain::close::TranscriptConversationId::parse("completion-unreceipted").unwrap(),
-            "completion-unreceipted-attempt").await.unwrap();
+        sqlx::query(receipt_sql)
+            .bind("legacy-request")
+            .bind("completion-legacy")
+            .bind(legacy.product_conversation_id.as_str())
+            .bind("completion-legacy-attempt")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let unreceipted = db
+            .create_conversation(
+                "completion-unreceipted",
+                "retained",
+                "/tmp",
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        db.begin_close_foundation(
+            &unreceipted.product_conversation_id,
+            &phoenix_core::domain::close::TranscriptConversationId::parse("completion-unreceipted")
+                .unwrap(),
+            "completion-unreceipted-attempt",
+        )
+        .await
+        .unwrap();
         let original_guards: Vec<(String, String)> = sqlx::query_as(
             "SELECT name, sql FROM sqlite_schema WHERE type = 'trigger' AND name IN
              ('close_runs_require_next_ordinal', 'close_obligations_completed_outcome_is_immutable',
@@ -16071,66 +16095,138 @@ mod tests {
             "native_close_completion_retry_finalizable",
         ] {
             assert_eq!(
-                sqlx::query_scalar::<_, i64>(
-                    "SELECT COUNT(*) FROM sqlite_schema WHERE name = ?1"
-                )
-                .bind(name)
-                .fetch_one(&pool)
-                .await
-                .unwrap(),
+                sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM sqlite_schema WHERE name = ?1")
+                    .bind(name)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap(),
                 1,
                 "{name}"
             );
         }
         assert_eq!(
-            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM native_close_completion_retry_origins")
-                .fetch_one(&pool).await.unwrap(),
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM native_close_completion_retry_origins"
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
             0,
             "historical/adopted receipts are not granted an automatic allowance"
         );
         assert_eq!(
-            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM native_close_completion_retry_successors")
-                .fetch_one(&pool).await.unwrap(),
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM native_close_completion_retry_successors"
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
             0
         );
         let origin_sql = "INSERT INTO native_close_completion_retry_origins
             (attempt_id, origin_request_id, origin_request_fingerprint, source_transcript_id,
              source_message_id, source_tool_use_id, product_conversation_id, initial_run_ordinal)
             VALUES (?1, ?2, 'fingerprint', ?3, 'message', 'tool', ?4, 1)";
-        assert!(sqlx::query(origin_sql).bind("completion-legacy-attempt").bind("legacy-request")
-            .bind("completion-legacy").bind(legacy.product_conversation_id.as_str())
-            .execute(&pool).await.is_err(), "historical receipt cannot be adopted as a fresh origin");
-        assert!(sqlx::query(origin_sql).bind("completion-unreceipted-attempt").bind("late-request")
-            .bind("completion-unreceipted").bind(unreceipted.product_conversation_id.as_str())
-            .execute(&pool).await.is_err(), "retained unreceipted operation cannot acquire origin");
-        assert!(sqlx::query(receipt_sql).bind("late-request").bind("completion-unreceipted")
-            .bind(unreceipted.product_conversation_id.as_str()).bind("completion-unreceipted-attempt")
-            .execute(&pool).await.is_err(), "receipt cannot late-bind an original source");
-        let fresh = db.create_conversation("completion-fresh", "fresh", "/tmp", true, None, None)
-            .await.unwrap();
+        assert!(
+            sqlx::query(origin_sql)
+                .bind("completion-legacy-attempt")
+                .bind("legacy-request")
+                .bind("completion-legacy")
+                .bind(legacy.product_conversation_id.as_str())
+                .execute(&pool)
+                .await
+                .is_err(),
+            "historical receipt cannot be adopted as a fresh origin"
+        );
+        assert!(
+            sqlx::query(origin_sql)
+                .bind("completion-unreceipted-attempt")
+                .bind("late-request")
+                .bind("completion-unreceipted")
+                .bind(unreceipted.product_conversation_id.as_str())
+                .execute(&pool)
+                .await
+                .is_err(),
+            "retained unreceipted operation cannot acquire origin"
+        );
+        assert!(
+            sqlx::query(receipt_sql)
+                .bind("late-request")
+                .bind("completion-unreceipted")
+                .bind(unreceipted.product_conversation_id.as_str())
+                .bind("completion-unreceipted-attempt")
+                .execute(&pool)
+                .await
+                .is_err(),
+            "receipt cannot late-bind an original source"
+        );
+        let fresh = db
+            .create_conversation("completion-fresh", "fresh", "/tmp", true, None, None)
+            .await
+            .unwrap();
         let mut fresh_tx = pool.begin().await.unwrap();
-        sqlx::query(origin_sql).bind("completion-fresh-attempt").bind("fresh-request")
-            .bind("completion-fresh").bind(fresh.product_conversation_id.as_str())
-            .execute(&mut *fresh_tx).await.unwrap();
-        Database::begin_close_foundation_inner(
-            &mut fresh_tx, &fresh.product_conversation_id,
-            &phoenix_core::domain::close::TranscriptConversationId::parse("completion-fresh").unwrap(),
-            "completion-fresh-attempt", false,
-        ).await.unwrap();
+        sqlx::query(origin_sql)
+            .bind("completion-fresh-attempt")
+            .bind("fresh-request")
+            .bind("completion-fresh")
+            .bind(fresh.product_conversation_id.as_str())
+            .execute(&mut *fresh_tx)
+            .await
+            .unwrap();
+        crate::Database::begin_close_foundation_inner(
+            &mut fresh_tx,
+            &fresh.product_conversation_id,
+            &phoenix_core::domain::close::TranscriptConversationId::parse("completion-fresh")
+                .unwrap(),
+            "completion-fresh-attempt",
+            false,
+        )
+        .await
+        .unwrap();
         sqlx::query("UPDATE close_obligations SET native_managed = 1 WHERE attempt_id = 'completion-fresh-attempt'")
             .execute(&mut *fresh_tx).await.unwrap();
-        sqlx::query(receipt_sql).bind("fresh-request").bind("completion-fresh")
-            .bind(fresh.product_conversation_id.as_str()).bind("completion-fresh-attempt")
-            .execute(&mut *fresh_tx).await.unwrap();
+        sqlx::query(receipt_sql)
+            .bind("fresh-request")
+            .bind("completion-fresh")
+            .bind(fresh.product_conversation_id.as_str())
+            .bind("completion-fresh-attempt")
+            .execute(&mut *fresh_tx)
+            .await
+            .unwrap();
         fresh_tx.commit().await.unwrap();
-        assert_eq!(sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM native_close_completion_retry_origins")
-            .fetch_one(&pool).await.unwrap(), 1);
-        assert!(sqlx::query(origin_sql.replacen("INSERT INTO", "INSERT OR REPLACE INTO", 1).as_str())
-            .bind("completion-fresh-attempt").bind("fresh-request").bind("completion-fresh")
-            .bind(fresh.product_conversation_id.as_str()).execute(&pool).await.is_err());
-        assert!(sqlx::query("UPDATE native_close_completion_retry_origins SET source_tool_use_id = 'forged'")
-            .execute(&pool).await.is_err());
-        assert!(sqlx::query("DELETE FROM native_close_completion_retry_origins").execute(&pool).await.is_err());
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM native_close_completion_retry_origins"
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            1
+        );
+        assert!(sqlx::query(
+            origin_sql
+                .replacen("INSERT INTO", "INSERT OR REPLACE INTO", 1)
+                .as_str()
+        )
+        .bind("completion-fresh-attempt")
+        .bind("fresh-request")
+        .bind("completion-fresh")
+        .bind(fresh.product_conversation_id.as_str())
+        .execute(&pool)
+        .await
+        .is_err());
+        assert!(sqlx::query(
+            "UPDATE native_close_completion_retry_origins SET source_tool_use_id = 'forged'"
+        )
+        .execute(&pool)
+        .await
+        .is_err());
+        assert!(
+            sqlx::query("DELETE FROM native_close_completion_retry_origins")
+                .execute(&pool)
+                .await
+                .is_err()
+        );
         // The existing parent run is real, but it has no interrupted all-success proof.
         assert!(sqlx::query("INSERT INTO native_close_completion_retry_admissions
             (attempt_id, origin_request_id, origin_request_fingerprint, product_conversation_id,
@@ -16149,25 +16245,51 @@ mod tests {
             assert!(sqlx::query(query).execute(&pool).await.is_err(), "{query}");
         }
         // A naked origin is deferred only until commit; it can never acquire receipt authority.
-        let orphan = db.create_conversation("completion-orphan", "orphan", "/tmp", true, None, None)
-            .await.unwrap();
+        let orphan = db
+            .create_conversation("completion-orphan", "orphan", "/tmp", true, None, None)
+            .await
+            .unwrap();
         let mut tx = pool.begin().await.unwrap();
-        sqlx::query(origin_sql).bind("completion-orphan-attempt").bind("missing-request")
-            .bind("completion-orphan").bind(orphan.product_conversation_id.as_str())
-            .execute(&mut *tx).await.unwrap();
-        Database::begin_close_foundation_inner(
-            &mut tx, &orphan.product_conversation_id,
-            &phoenix_core::domain::close::TranscriptConversationId::parse("completion-orphan").unwrap(),
-            "completion-orphan-attempt", false,
-        ).await.unwrap();
-        assert!(tx.commit().await.is_err(), "origin requires exact receipt FK at commit");
+        sqlx::query(origin_sql)
+            .bind("completion-orphan-attempt")
+            .bind("missing-request")
+            .bind("completion-orphan")
+            .bind(orphan.product_conversation_id.as_str())
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        crate::Database::begin_close_foundation_inner(
+            &mut tx,
+            &orphan.product_conversation_id,
+            &phoenix_core::domain::close::TranscriptConversationId::parse("completion-orphan")
+                .unwrap(),
+            "completion-orphan-attempt",
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(
+            tx.commit().await.is_err(),
+            "origin requires exact receipt FK at commit"
+        );
         for (name, original) in original_guards {
-            let installed: String = sqlx::query_scalar("SELECT sql FROM sqlite_schema WHERE type = 'trigger' AND name = ?1")
-                .bind(&name).fetch_one(&pool).await.unwrap();
+            let installed: String = sqlx::query_scalar(
+                "SELECT sql FROM sqlite_schema WHERE type = 'trigger' AND name = ?1",
+            )
+            .bind(&name)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
             assert!(installed.starts_with(&format!("CREATE TRIGGER {name}\n")));
             assert!(installed.ends_with("\nEND"));
-            assert!(installed.contains(original.split("\nBEGIN\n").last().unwrap()), "{name} abort body retained");
-            assert!(installed.contains("native_close_completion_retry_"), "{name} narrow automatic provenance");
+            assert!(
+                installed.contains(original.split("\nBEGIN\n").last().unwrap()),
+                "{name} abort body retained"
+            );
+            assert!(
+                installed.contains("native_close_completion_retry_"),
+                "{name} narrow automatic provenance"
+            );
         }
         // Force preparation of every changed trigger after schema-version reload, not just sqlite_schema reads.
         for query in [
@@ -16178,8 +16300,17 @@ mod tests {
             sqlx::query(query).fetch_all(&pool).await.unwrap();
         }
         assert!(sqlx::query("PRAGMA foreign_key_check")
-            .fetch_all(&pool).await.unwrap().is_empty());
-        assert_eq!(sqlx::query_scalar::<_, i64>("PRAGMA writable_schema").fetch_one(&pool).await.unwrap(), 0);
+            .fetch_all(&pool)
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("PRAGMA writable_schema")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            0
+        );
     }
 
     #[tokio::test]
