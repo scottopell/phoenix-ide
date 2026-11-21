@@ -4386,7 +4386,7 @@ async fn route_close_attempt_to_repair_tx(
     Ok(())
 }
 
-async fn list_close_expected_retirement_resources_tx(
+pub(crate) async fn list_close_expected_retirement_resources_tx(
     tx: &mut Transaction<'_, Sqlite>,
     attempt_id: &str,
 ) -> DbResult<Vec<CloseExpectedRetirementResource>> {
@@ -4538,12 +4538,26 @@ impl Database {
     ///
     /// # Errors
     /// Returns a database error unless the request names one sealed resource in
-    /// the exact active Close snapshot.
+    /// the exact active Close snapshot. Source-owned native initial runs must use
+    /// `record_native_close_initial_retirement_dispatch` instead.
     pub async fn record_close_retirement_dispatch(
         &self,
         request: RecordCloseRetirementDispatchRequest,
     ) -> DbResult<()> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let native_initial: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM native_close_initial_receipts
+             WHERE attempt_id = ?1 AND run_ordinal = 1 AND intent = 'initial')",
+        )
+        .bind(request.attempt_id.as_str())
+        .fetch_one(&mut *tx)
+        .await?;
+        if native_initial {
+            return Err(close_precondition(
+                "generic dispatch is unavailable for source-owned native initial Close operations",
+            ));
+        }
+        // An observation/adoption receipt alone must not revoke a legacy initial run.
         let current = close_obligation_for_update(&mut tx, request.attempt_id.as_str()).await?;
         if current.phase() == ClosePhase::Completed {
             let native_managed: bool = sqlx::query_scalar(
@@ -17680,6 +17694,78 @@ mod tests {
                 residual_reason: RetirementFailureReason::ManualRepairRequired
             }
         ) && item.detail.as_deref() == Some("manual cleanup")));
+    }
+
+    #[tokio::test]
+    async fn generic_dispatch_preserves_observe_adopted_legacy_initial_and_exact_replay() {
+        let db = Database::open_in_memory().await.unwrap();
+        create_root(&db, "root").await;
+        let scope = allocate_scope_worktree(&db, "root").await;
+        db.begin_close_foundation(&product_id("root"), &transcript_id("root"), "legacy-dispatch")
+            .await
+            .unwrap();
+        set_close_phase(&db, "legacy-dispatch", ClosePhase::RetirementRequested).await;
+        let snapshot = current_test_snapshot(&db, "legacy-dispatch").await;
+        let resource = RetiredResourceIdentity::parse(
+            RetiredResourceKind::Worktree,
+            LossItemIdentity::Worktree(current_test_worktree(&db, &scope).await),
+        )
+        .unwrap();
+        capture_test_inventory(
+            &db,
+            "legacy-dispatch",
+            &scope,
+            &snapshot,
+            vec![resource.clone()],
+        )
+        .await;
+        // Observe adoption binds native management without revoking the already
+        // admitted legacy initial run or minting native initial authority.
+        observe_retained_run(
+            &db,
+            &CloseRunRef {
+                attempt_id: CloseAttemptId::parse("legacy-dispatch").unwrap(),
+                ordinal: CloseRunOrdinal::INITIAL,
+            },
+        )
+        .await;
+        let adoption: (bool, i64, i64) = sqlx::query_as(
+            "SELECT native_managed,
+                    (SELECT COUNT(*) FROM native_close_initial_receipts
+                     WHERE attempt_id = ?1 AND intent = 'observe'),
+                    (SELECT COUNT(*) FROM native_close_initial_receipts
+                     WHERE attempt_id = ?1 AND intent = 'initial')
+             FROM close_obligations WHERE attempt_id = ?1",
+        )
+        .bind("legacy-dispatch")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(adoption, (true, 1, 0));
+        let request = RecordCloseRetirementDispatchRequest {
+            attempt_id: CloseAttemptId::parse("legacy-dispatch").unwrap(),
+            scope,
+            snapshot,
+            resource,
+        };
+        db.record_close_retirement_dispatch(request.clone()).await.unwrap();
+        let before: i64 = sqlx::query_scalar(
+            "SELECT dispatched_at_us FROM close_retirement_resource_dispatches WHERE attempt_id = ?1",
+        )
+        .bind("legacy-dispatch")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        db.record_close_retirement_dispatch(request).await.unwrap();
+        let after: (i64, i64) = sqlx::query_as(
+            "SELECT COUNT(*), MAX(dispatched_at_us) FROM close_retirement_resource_dispatches
+             WHERE attempt_id = ?1",
+        )
+        .bind("legacy-dispatch")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(after, (1, before));
     }
 
     #[tokio::test]

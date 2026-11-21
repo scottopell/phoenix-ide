@@ -538,6 +538,33 @@ async fn captured_initial_retirement(
     ));
     assert_eq!(initial_completion_writes(f, &receipt).await, before);
     let inventory = initial_inventory_request(f, &receipt).await;
+    // A valid inspected resource is not dispatch authority until the complete
+    // original inventory and anchor have been captured atomically.
+    let before_dispatch = initial_dispatch_writes(f, &receipt).await;
+    let uncaptured = RecordCloseRetirementDispatchRequest {
+        attempt_id: receipt.admitted.attempt_id.clone(),
+        scope: inventory.scopes[0].scope.clone(),
+        snapshot: inventory.snapshot.clone(),
+        resource: RetiredResourceIdentity::parse(
+            RetiredResourceKind::Worktree,
+            phoenix_core::domain::close::LossItemIdentity::Worktree(
+                inventory.scopes[0].inventory.worktree.clone().unwrap(),
+            ),
+        )
+        .unwrap(),
+    };
+    assert!(matches!(
+        f.db.record_native_close_initial_retirement_dispatch(
+            &command,
+            &receipt,
+            &live_source,
+            uncaptured,
+        )
+        .await,
+        LocalAuthorityResult::DurableFactEstablished(Err(DbError::CloseFoundationPrecondition(_)))
+    ));
+    assert_eq!(initial_dispatch_writes(f, &receipt).await, before_dispatch);
+    assert_eq!(initial_completion_writes(f, &receipt).await, before);
     let expected =
         f.db.capture_native_close_initial_retirement_inventory(
             &command,
@@ -552,18 +579,264 @@ async fn captured_initial_retirement(
     (command, receipt, live_source, expected)
 }
 
-async fn record_initial_retirement(
-    f: &Fixture,
+fn initial_dispatch_request(
     receipt: &NativeCloseReceipt,
     resource: &CloseExpectedRetirementResource,
-) {
-    f.db.record_close_retirement_dispatch(crate::RecordCloseRetirementDispatchRequest {
+) -> RecordCloseRetirementDispatchRequest {
+    RecordCloseRetirementDispatchRequest {
         attempt_id: receipt.admitted.attempt_id.clone(),
         scope: resource.scope.clone(),
         snapshot: resource.snapshot.clone(),
         resource: resource.resource.clone(),
-    })
+    }
+}
+
+async fn initial_dispatch_writes(f: &Fixture, receipt: &NativeCloseReceipt) -> (i64, Option<i64>, i64) {
+    sqlx::query_as(
+        "SELECT COUNT(*), MAX(dispatched_at_us),
+                (SELECT COUNT(*) FROM close_retirement_resources WHERE attempt_id = ?1)
+         FROM close_retirement_resource_dispatches WHERE attempt_id = ?1",
+    )
+    .bind(receipt.admitted.attempt_id.as_str())
+    .fetch_one(f.db.pool())
     .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn initial_dispatch_records_exact_resources_and_replays_without_effects_or_generic_bypass() {
+    let f = Fixture::new().await;
+    let (command, receipt, live_source, expected) = captured_initial_retirement(&f).await;
+    let completion_before = initial_completion_writes(&f, &receipt).await;
+    assert_eq!(initial_dispatch_writes(&f, &receipt).await, (0, None, 0));
+    for (index, resource) in expected.iter().enumerate() {
+        let request = initial_dispatch_request(&receipt, resource);
+        let before = initial_dispatch_writes(&f, &receipt).await;
+        assert!(matches!(
+            f.db.record_close_retirement_dispatch(request.clone()).await,
+            Err(DbError::CloseFoundationPrecondition(_))
+        ));
+        assert_eq!(initial_dispatch_writes(&f, &receipt).await, before);
+        for replay in [false, true] {
+            let before_dispatch = initial_dispatch_writes(&f, &receipt).await;
+            assert!(matches!(
+                f.db.record_native_close_initial_retirement_dispatch(
+                    &command,
+                    &receipt,
+                    &live_source,
+                    request.clone(),
+                )
+                .await,
+                LocalAuthorityResult::DurableFactEstablished(Ok(()))
+            ));
+            let after = initial_dispatch_writes(&f, &receipt).await;
+            assert_eq!(after.0, i64::try_from(index + 1).unwrap());
+            assert!(after.1.is_some());
+            assert_eq!(after.2, 0);
+            if replay {
+                assert_eq!(after, before_dispatch);
+            }
+        }
+        // Generic dispatch must refuse even an already durable native dispatch.
+        let before = initial_dispatch_writes(&f, &receipt).await;
+        assert!(matches!(
+            f.db.record_close_retirement_dispatch(request).await,
+            Err(DbError::CloseFoundationPrecondition(_))
+        ));
+        assert_eq!(initial_dispatch_writes(&f, &receipt).await, before);
+    }
+    assert_eq!(initial_completion_writes(&f, &receipt).await, completion_before);
+}
+
+#[tokio::test]
+async fn initial_dispatch_revalidates_live_and_durable_source_before_replay() {
+    let f = Fixture::new().await;
+    let (command, receipt, live_source, expected) = captured_initial_retirement(&f).await;
+    let request = initial_dispatch_request(&receipt, &expected[0]);
+    f.db.record_native_close_initial_retirement_dispatch(
+        &command,
+        &receipt,
+        &live_source,
+        request.clone(),
+    )
+    .await
+    .established()
+    .unwrap()
+    .unwrap();
+    let before = initial_dispatch_writes(&f, &receipt).await;
+    let completion_before = initial_completion_writes(&f, &receipt).await;
+    assert!(matches!(
+        f.db.record_native_close_initial_retirement_dispatch(
+            &command,
+            &receipt,
+            &ConvState::Idle,
+            request.clone(),
+        )
+        .await,
+        LocalAuthorityResult::DurableFactEstablished(Err(DbError::CloseFoundationPrecondition(_)))
+    ));
+    assert_eq!(initial_dispatch_writes(&f, &receipt).await, before);
+    assert_eq!(initial_completion_writes(&f, &receipt).await, completion_before);
+    f.db.update_conversation_state(&f.coordinator, &ConvState::Idle)
+        .await
+        .unwrap();
+    // Durable source loss may legitimately stop the run. Snapshot after that fence.
+    let before = initial_dispatch_writes(&f, &receipt).await;
+    let completion_before = initial_completion_writes(&f, &receipt).await;
+    assert!(matches!(
+        f.db.record_native_close_initial_retirement_dispatch(
+            &command,
+            &receipt,
+            &live_source,
+            request,
+        )
+        .await,
+        LocalAuthorityResult::DurableFactEstablished(Err(DbError::CloseFoundationPrecondition(_)))
+    ));
+    assert_eq!(initial_dispatch_writes(&f, &receipt).await, before);
+    assert_eq!(initial_completion_writes(&f, &receipt).await, completion_before);
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn initial_dispatch_rejects_mismatched_receipt_and_full_inventory_identity_without_writes() {
+    let f = Fixture::new().await;
+    let (command, receipt, live_source, expected) = captured_initial_retirement(&f).await;
+    let resource = expected
+        .iter()
+        .find(|resource| resource.resource.kind() == RetiredResourceKind::Worktree)
+        .unwrap();
+    let request = initial_dispatch_request(&receipt, resource);
+    let mut wrong_receipt = receipt.clone();
+    wrong_receipt.request_id = Uuid::new_v4();
+    let mut wrong_run = receipt.clone();
+    wrong_run.admitted.attempt_id = CloseAttemptId::parse("different-initial-attempt").unwrap();
+    let mut wrong_ordinal = receipt.clone();
+    wrong_ordinal.admitted.run_ordinal = CloseRunOrdinal::parse(2).unwrap();
+    let mut wrong_attempt = request.clone();
+    wrong_attempt.attempt_id = wrong_run.admitted.attempt_id.clone();
+    let mut wrong_scope = request.clone();
+    wrong_scope.scope = WorkScopeId::parse("different-scope").unwrap();
+    let mut wrong_generation = request.clone();
+    wrong_generation.snapshot = phoenix_core::domain::close::CloseRetirementSnapshot::parse(
+        "different-generation",
+        request.snapshot.fingerprint(),
+    )
+    .unwrap();
+    let mut wrong_fingerprint = request.clone();
+    wrong_fingerprint.snapshot = phoenix_core::domain::close::CloseRetirementSnapshot::parse(
+        request.snapshot.generation(),
+        "different-fingerprint",
+    )
+    .unwrap();
+    let phoenix_core::domain::close::LossItemIdentity::Worktree(worktree) =
+        request.resource.identity()
+    else {
+        panic!("expected full worktree identity");
+    };
+    let mut wrong_identity = request.clone();
+    wrong_identity.resource = RetiredResourceIdentity::parse(
+        RetiredResourceKind::Worktree,
+        phoenix_core::domain::close::LossItemIdentity::Worktree(WorktreeIdentity::from_parts(
+            WorktreeId::parse("different-worktree").unwrap(),
+            worktree.fingerprint().clone(),
+            worktree.locator().clone(),
+        )),
+    )
+    .unwrap();
+    let mut wrong_worktree_fingerprint = request.clone();
+    wrong_worktree_fingerprint.resource = RetiredResourceIdentity::parse(
+        RetiredResourceKind::Worktree,
+        phoenix_core::domain::close::LossItemIdentity::Worktree(WorktreeIdentity::from_parts(
+            worktree.id().clone(),
+            WorktreeFingerprint::parse("different-worktree-fingerprint").unwrap(),
+            worktree.locator().clone(),
+        )),
+    )
+    .unwrap();
+    let mut wrong_locator = request.clone();
+    wrong_locator.resource = RetiredResourceIdentity::parse(
+        RetiredResourceKind::Worktree,
+        phoenix_core::domain::close::LossItemIdentity::Worktree(WorktreeIdentity::from_parts(
+            worktree.id().clone(),
+            worktree.fingerprint().clone(),
+            GitPathIdentity::from_bytes(b"/different/worktree".to_vec()),
+        )),
+    )
+    .unwrap();
+    for replay in [false, true] {
+        if replay {
+            f.db.record_native_close_initial_retirement_dispatch(
+                &command,
+                &receipt,
+                &live_source,
+                request.clone(),
+            )
+            .await
+            .established()
+            .unwrap()
+            .unwrap();
+        }
+        let before = initial_dispatch_writes(&f, &receipt).await;
+        let completion_before = initial_completion_writes(&f, &receipt).await;
+        for proof in [&wrong_receipt, &wrong_run, &wrong_ordinal] {
+            assert!(matches!(
+                f.db.record_native_close_initial_retirement_dispatch(
+                    &command,
+                    proof,
+                    &live_source,
+                    request.clone(),
+                )
+                .await,
+                LocalAuthorityResult::DurableFactEstablished(Err(
+                    DbError::CloseFoundationPrecondition(_)
+                ))
+            ));
+            assert_eq!(initial_dispatch_writes(&f, &receipt).await, before);
+        }
+        for mismatch in [
+            &wrong_attempt,
+            &wrong_scope,
+            &wrong_generation,
+            &wrong_fingerprint,
+            &wrong_identity,
+            &wrong_worktree_fingerprint,
+            &wrong_locator,
+        ] {
+            assert!(matches!(
+                f.db.record_native_close_initial_retirement_dispatch(
+                    &command,
+                    &receipt,
+                    &live_source,
+                    mismatch.clone(),
+                )
+                .await,
+                LocalAuthorityResult::DurableFactEstablished(Err(
+                    DbError::CloseFoundationPrecondition(_)
+                ))
+            ));
+            assert_eq!(initial_dispatch_writes(&f, &receipt).await, before);
+        }
+        assert_eq!(initial_completion_writes(&f, &receipt).await, completion_before);
+    }
+}
+
+async fn record_initial_retirement(
+    f: &Fixture,
+    command: &NativeCloseCommand,
+    receipt: &NativeCloseReceipt,
+    live_source: &ConvState,
+    resource: &CloseExpectedRetirementResource,
+) {
+    f.db.record_native_close_initial_retirement_dispatch(
+        command,
+        receipt,
+        live_source,
+        initial_dispatch_request(receipt, resource),
+    )
+    .await
+    .established()
+    .unwrap()
     .unwrap();
     f.db.record_close_retirement_evidence(crate::RecordCloseRetirementEvidenceRequest {
         attempt_id: receipt.admitted.attempt_id.clone(),
@@ -648,14 +921,14 @@ async fn initial_completion_requires_source_receipt_and_all_concrete_proofs() {
         LocalAuthorityResult::DurableFactEstablished(Err(_))
     ));
     assert_eq!(initial_completion_writes(&f, &receipt).await, before);
-    record_initial_retirement(&f, &receipt, worktree).await;
+    record_initial_retirement(&f, &command, &receipt, &live_source, worktree).await;
     assert!(matches!(
         f.db.complete_native_close_initial(&command, &receipt, &live_source)
             .await,
         LocalAuthorityResult::DurableFactEstablished(Err(_))
     ));
     assert_eq!(initial_completion_writes(&f, &receipt).await, before);
-    record_initial_retirement(&f, &receipt, work_scope).await;
+    record_initial_retirement(&f, &command, &receipt, &live_source, work_scope).await;
     let completed =
         f.db.complete_native_close_initial(&command, &receipt, &live_source)
             .await

@@ -1,4 +1,4 @@
-//! Dormant initial-only acceptance. No cleanup, dispatch, retry or allowance claim.
+//! Source-bound initial acceptance and durable execution prerequisites. No physical effects.
 
 use phoenix_core::domain::close::{
     CloseAttemptId, CloseExpectedRetirementResource, CloseObligation, ClosePhase, CloseRunOrdinal,
@@ -16,7 +16,8 @@ use crate::workflow::LocalAuthorityResult;
 use crate::{
     CaptureCloseRetirementInventoryRequest, CloseCleanupFailureAuthority,
     CloseCleanupFailureResource, CloseCleanupResourceDisposition, Database, DbError, DbResult,
-    ReplaceCloseInspectionRequest, TerminalizeInitialCloseCleanupFailureRequest,
+    RecordCloseRetirementDispatchRequest, ReplaceCloseInspectionRequest,
+    TerminalizeInitialCloseCleanupFailureRequest,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -83,6 +84,90 @@ impl Database {
             }
             self.replace_close_inspection_tx(&mut tx, &request, empty_generation)
                 .await
+        }
+        .await;
+        match result {
+            Ok(()) => match tx.commit().await {
+                Ok(()) => LocalAuthorityResult::DurableFactEstablished(Ok(())),
+                Err(_) => LocalAuthorityResult::DurableFactUnclassified,
+            },
+            Err(error) => match tx.rollback().await {
+                Ok(()) => LocalAuthorityResult::DurableFactEstablished(Err(error)),
+                Err(_) => LocalAuthorityResult::DurableFactUnclassified,
+            },
+        }
+    }
+
+    /// Records intent for one exact anchored initial resource, without performing teardown.
+    /// Revalidates live/durable source, receipt, run and sealed inventory even on replay.
+    /// Commit or rollback uncertainty remains `DurableFactUnclassified`.
+    pub async fn record_native_close_initial_retirement_dispatch(
+        &self,
+        command: &NativeCloseCommand,
+        receipt: &NativeCloseReceipt,
+        live_source: &phoenix_core::domain::sm_state::ConvState,
+        request: RecordCloseRetirementDispatchRequest,
+    ) -> LocalAuthorityResult<DbResult<()>> {
+        let mut tx = match self.pool.begin_with("BEGIN IMMEDIATE").await {
+            Ok(tx) => tx,
+            Err(error) => return LocalAuthorityResult::DurableFactEstablished(Err(error.into())),
+        };
+        let result = async {
+            let (admitted, _) = require_initial_execution_tx(
+                &mut tx,
+                command,
+                receipt,
+                live_source,
+                ClosePhase::RetirementRequested,
+            )
+            .await?;
+            if request.attempt_id != admitted.attempt_id {
+                return Err(DbError::CloseFoundationPrecondition(
+                    "initial dispatch request does not match the admitted run".into(),
+                ));
+            }
+            let anchored: bool = sqlx::query_scalar(
+                "SELECT EXISTS (
+                    SELECT 1 FROM close_original_retirement_anchors anchor
+                    JOIN close_obligations obligation ON obligation.attempt_id = anchor.attempt_id
+                    WHERE anchor.attempt_id = ?1
+                      AND anchor.inspection_generation = ?2
+                      AND anchor.inspection_fingerprint = ?3
+                      AND anchor.inspection_generation = obligation.inspection_generation
+                      AND anchor.inspection_fingerprint = obligation.inspection_fingerprint
+                ) AND NOT EXISTS (
+                    SELECT 1 FROM close_retirement_anchor_exclusions WHERE attempt_id = ?1
+                )",
+            )
+            .bind(admitted.attempt_id.as_str())
+            .bind(request.snapshot.generation())
+            .bind(request.snapshot.fingerprint())
+            .fetch_one(&mut *tx)
+            .await?;
+            if !anchored {
+                return Err(DbError::CloseFoundationPrecondition(
+                    "initial dispatch requires its exact original retirement anchor".into(),
+                ));
+            }
+            let expected = crate::close_foundation::list_close_expected_retirement_resources_tx(
+                &mut tx,
+                admitted.attempt_id.as_str(),
+            )
+            .await?;
+            // Compare the typed full identity (including worktree fingerprint and locator),
+            // not just its encoded dispatch key. Require the whole inventory to be sealed
+            // before consulting the insert helper's idempotent replay path.
+            if !expected.iter().any(|resource| {
+                resource.attempt_id == request.attempt_id
+                    && resource.scope == request.scope
+                    && resource.snapshot == request.snapshot
+                    && resource.resource == request.resource
+            }) {
+                return Err(DbError::CloseFoundationPrecondition(
+                    "initial dispatch resource is not in the exact anchored sealed inventory".into(),
+                ));
+            }
+            Self::insert_close_retirement_dispatch_tx(&mut tx, &request).await
         }
         .await;
         match result {
