@@ -591,7 +591,10 @@ fn initial_dispatch_request(
     }
 }
 
-async fn initial_dispatch_writes(f: &Fixture, receipt: &NativeCloseReceipt) -> (i64, Option<i64>, i64) {
+async fn initial_dispatch_writes(
+    f: &Fixture,
+    receipt: &NativeCloseReceipt,
+) -> (i64, Option<i64>, i64) {
     sqlx::query_as(
         "SELECT COUNT(*), MAX(dispatched_at_us),
                 (SELECT COUNT(*) FROM close_retirement_resources WHERE attempt_id = ?1)
@@ -645,7 +648,10 @@ async fn initial_dispatch_records_exact_resources_and_replays_without_effects_or
         ));
         assert_eq!(initial_dispatch_writes(&f, &receipt).await, before);
     }
-    assert_eq!(initial_completion_writes(&f, &receipt).await, completion_before);
+    assert_eq!(
+        initial_completion_writes(&f, &receipt).await,
+        completion_before
+    );
 }
 
 #[tokio::test]
@@ -676,7 +682,10 @@ async fn initial_dispatch_revalidates_live_and_durable_source_before_replay() {
         LocalAuthorityResult::DurableFactEstablished(Err(DbError::CloseFoundationPrecondition(_)))
     ));
     assert_eq!(initial_dispatch_writes(&f, &receipt).await, before);
-    assert_eq!(initial_completion_writes(&f, &receipt).await, completion_before);
+    assert_eq!(
+        initial_completion_writes(&f, &receipt).await,
+        completion_before
+    );
     f.db.update_conversation_state(&f.coordinator, &ConvState::Idle)
         .await
         .unwrap();
@@ -694,7 +703,10 @@ async fn initial_dispatch_revalidates_live_and_durable_source_before_replay() {
         LocalAuthorityResult::DurableFactEstablished(Err(DbError::CloseFoundationPrecondition(_)))
     ));
     assert_eq!(initial_dispatch_writes(&f, &receipt).await, before);
-    assert_eq!(initial_completion_writes(&f, &receipt).await, completion_before);
+    assert_eq!(
+        initial_completion_writes(&f, &receipt).await,
+        completion_before
+    );
 }
 
 #[tokio::test]
@@ -817,7 +829,10 @@ async fn initial_dispatch_rejects_mismatched_receipt_and_full_inventory_identity
             ));
             assert_eq!(initial_dispatch_writes(&f, &receipt).await, before);
         }
-        assert_eq!(initial_completion_writes(&f, &receipt).await, completion_before);
+        assert_eq!(
+            initial_completion_writes(&f, &receipt).await,
+            completion_before
+        );
     }
 }
 

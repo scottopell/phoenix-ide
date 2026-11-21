@@ -17701,9 +17701,13 @@ mod tests {
         let db = Database::open_in_memory().await.unwrap();
         create_root(&db, "root").await;
         let scope = allocate_scope_worktree(&db, "root").await;
-        db.begin_close_foundation(&product_id("root"), &transcript_id("root"), "legacy-dispatch")
-            .await
-            .unwrap();
+        db.begin_close_foundation(
+            &product_id("root"),
+            &transcript_id("root"),
+            "legacy-dispatch",
+        )
+        .await
+        .unwrap();
         set_close_phase(&db, "legacy-dispatch", ClosePhase::RetirementRequested).await;
         let snapshot = current_test_snapshot(&db, "legacy-dispatch").await;
         let resource = RetiredResourceIdentity::parse(
@@ -17748,7 +17752,9 @@ mod tests {
             snapshot,
             resource,
         };
-        db.record_close_retirement_dispatch(request.clone()).await.unwrap();
+        db.record_close_retirement_dispatch(request.clone())
+            .await
+            .unwrap();
         let before: i64 = sqlx::query_scalar(
             "SELECT dispatched_at_us FROM close_retirement_resource_dispatches WHERE attempt_id = ?1",
         )

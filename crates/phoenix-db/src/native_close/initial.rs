@@ -164,7 +164,8 @@ impl Database {
                     && resource.resource == request.resource
             }) {
                 return Err(DbError::CloseFoundationPrecondition(
-                    "initial dispatch resource is not in the exact anchored sealed inventory".into(),
+                    "initial dispatch resource is not in the exact anchored sealed inventory"
+                        .into(),
                 ));
             }
             Self::insert_close_retirement_dispatch_tx(&mut tx, &request).await

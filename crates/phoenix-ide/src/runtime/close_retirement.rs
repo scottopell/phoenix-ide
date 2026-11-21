@@ -86,7 +86,9 @@ enum CloseLeaseFailure {
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum CloseRetirementInventoryPreparationError {
-    BackendStorageOrUnattributed { detail: String },
+    BackendStorageOrUnattributed {
+        detail: String,
+    },
     CapturedScopeIdentity {
         scope: WorkScopeId,
         reason: RetirementFailureReason,
@@ -922,11 +924,16 @@ fn build_close_retirement_inventory_scope_request(
         None => None,
         Some(CapturedWorktreeIdentity::Resolved(identity)) => Some(identity),
         Some(CapturedWorktreeIdentity::Unresolved { .. }) => {
-            return Err(CloseRetirementInventoryPreparationError::CapturedScopeIdentity {
-                scope: input.scope.clone(),
-                reason: RetirementFailureReason::IdentityNotProven,
-                detail: format!("scope {} has unresolved captured worktree identity", input.scope),
-            });
+            return Err(
+                CloseRetirementInventoryPreparationError::CapturedScopeIdentity {
+                    scope: input.scope.clone(),
+                    reason: RetirementFailureReason::IdentityNotProven,
+                    detail: format!(
+                        "scope {} has unresolved captured worktree identity",
+                        input.scope
+                    ),
+                },
+            );
         }
     };
     let mut inventory = CloseOwnedResourceInventory {
@@ -943,16 +950,21 @@ fn build_close_retirement_inventory_scope_request(
             continue;
         }
         let LossItemIdentity::Opaque(identity) = resource.identity() else {
-            return Err(CloseRetirementInventoryPreparationError::BackendStorageOrUnattributed {
-                detail: "registry resource identity was not opaque".to_string(),
-            });
+            return Err(
+                CloseRetirementInventoryPreparationError::BackendStorageOrUnattributed {
+                    detail: "registry resource identity was not opaque".to_string(),
+                },
+            );
         };
         inventory.tmux_servers.insert(identity.clone());
     }
     Ok(CaptureCloseRetirementInventoryRequest {
         attempt_id,
         snapshot,
-        scopes: vec![CaptureCloseRetirementInventoryScopeRequest { scope: input.scope, inventory }],
+        scopes: vec![CaptureCloseRetirementInventoryScopeRequest {
+            scope: input.scope,
+            inventory,
+        }],
     })
 }
 
@@ -1396,16 +1408,28 @@ impl RuntimeManager {
         &self,
         attempt_id: CloseAttemptId,
         snapshot: CloseRetirementSnapshot,
-    ) -> Result<CaptureCloseRetirementInventoryRequest, CloseRetirementInventoryPreparationError> {
-        let scopes = self.db().list_close_attempt_scopes(attempt_id.as_str()).await
-            .map_err(|error| CloseRetirementInventoryPreparationError::BackendStorageOrUnattributed {
-                detail: error.to_string(),
+    ) -> Result<CaptureCloseRetirementInventoryRequest, CloseRetirementInventoryPreparationError>
+    {
+        let scopes = self
+            .db()
+            .list_close_attempt_scopes(attempt_id.as_str())
+            .await
+            .map_err(|error| {
+                CloseRetirementInventoryPreparationError::BackendStorageOrUnattributed {
+                    detail: error.to_string(),
+                }
             })?;
         let mut requests = Vec::with_capacity(scopes.len());
         for captured in scopes {
-            let resources = self.acquire_close_resource_lease(&attempt_id, captured.scope.clone()).await
-                .map_err(|detail| CloseRetirementInventoryPreparationError::CapturedScopeIdentity {
-                    scope: captured.scope.clone(), reason: RetirementFailureReason::IdentityNotProven, detail,
+            let resources = self
+                .acquire_close_resource_lease(&attempt_id, captured.scope.clone())
+                .await
+                .map_err(|detail| {
+                    CloseRetirementInventoryPreparationError::CapturedScopeIdentity {
+                        scope: captured.scope.clone(),
+                        reason: RetirementFailureReason::IdentityNotProven,
+                        detail,
+                    }
                 })?;
             let request = build_close_retirement_inventory_scope_request(
                 attempt_id.clone(),
@@ -1418,7 +1442,11 @@ impl RuntimeManager {
             )?;
             requests.extend(request.scopes);
         }
-        Ok(CaptureCloseRetirementInventoryRequest { attempt_id, snapshot, scopes: requests })
+        Ok(CaptureCloseRetirementInventoryRequest {
+            attempt_id,
+            snapshot,
+            scopes: requests,
+        })
     }
 
     /// Acquires all scope fences, then seals the exact server-owned inventory.
@@ -1427,19 +1455,32 @@ impl RuntimeManager {
         attempt_id: CloseAttemptId,
         snapshot: CloseRetirementSnapshot,
     ) -> Result<(), String> {
-        let request = match self.prepare_close_retirement_inventory(attempt_id.clone(), snapshot).await {
+        let request = match self
+            .prepare_close_retirement_inventory(attempt_id.clone(), snapshot)
+            .await
+        {
             Ok(request) => request,
-            Err(CloseRetirementInventoryPreparationError::BackendStorageOrUnattributed { detail }) => return Err(detail),
-            Err(CloseRetirementInventoryPreparationError::CapturedScopeIdentity { scope, reason, detail }) => {
-                return self.route_close_attempt_to_repair(&attempt_id, &scope, reason, detail).await;
+            Err(CloseRetirementInventoryPreparationError::BackendStorageOrUnattributed {
+                detail,
+            }) => return Err(detail),
+            Err(CloseRetirementInventoryPreparationError::CapturedScopeIdentity {
+                scope,
+                reason,
+                detail,
+            }) => {
+                return self
+                    .route_close_attempt_to_repair(&attempt_id, &scope, reason, detail)
+                    .await;
             }
         };
         match self.db().capture_close_retirement_inventory(request).await {
             Ok(_) => Ok(()),
             Err(error) => {
-                self.cancel_close_resource_leases(&attempt_id).await.map_err(|cancel_error| {
-                    format!("{error}; fence reopening failed: {cancel_error}")
-                })?;
+                self.cancel_close_resource_leases(&attempt_id)
+                    .await
+                    .map_err(|cancel_error| {
+                        format!("{error}; fence reopening failed: {cancel_error}")
+                    })?;
                 Err(error.to_string())
             }
         }
@@ -8076,8 +8117,7 @@ mod tests {
         use phoenix_core::work_scope::WorkScopeId;
 
         let attempt_id =
-            phoenix_core::domain::close::CloseAttemptId::parse("native-inventory-attempt")
-                .unwrap();
+            phoenix_core::domain::close::CloseAttemptId::parse("native-inventory-attempt").unwrap();
         let snapshot = super::snapshot_for(b"native inventory snapshot");
         let scope = WorkScopeId::parse("native-inventory-scope").unwrap();
         let worktree = WorktreeIdentity::from_parts(
@@ -8113,7 +8153,10 @@ mod tests {
             unreachable!();
         };
         assert_eq!(request.scopes[0].inventory.tmux_servers.len(), 1);
-        assert!(request.scopes[0].inventory.tmux_servers.contains(tmux_identity));
+        assert!(request.scopes[0]
+            .inventory
+            .tmux_servers
+            .contains(tmux_identity));
         assert!(request.scopes[0].inventory.bash_process_groups.is_empty());
         assert!(request.scopes[0].inventory.pty_sessions.is_empty());
         assert!(request.scopes[0].inventory.browser_sessions.is_empty());
@@ -10570,12 +10613,8 @@ mod tests {
             // Poll the actual manager wrapper, not the process-step helper or a
             // spawned task. Leaving this block drops the borrowed future while
             // it holds the original lease at its first post-lookup await.
-            let completion = manager.complete_close_resource_lease(
-                &fixture.run,
-                &fixture.snapshot,
-                scope,
-                &[],
-            );
+            let completion =
+                manager.complete_close_resource_lease(&fixture.run, &fixture.snapshot, scope, &[]);
             tokio::pin!(completion);
             tokio::select! {
                 _ = hook.entered.notified() => {},
@@ -10609,7 +10648,10 @@ mod tests {
                 .await
                 .unwrap()
                 .is_empty());
-            assert!(store.acquisition_hook.is_some(), "no replacement acquisition");
+            assert!(
+                store.acquisition_hook.is_some(),
+                "no replacement acquisition"
+            );
             assert!(!store.has_acquisition(&key));
             assert_eq!(generations(store.complete.get(&key).unwrap()), original);
         }

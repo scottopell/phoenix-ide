@@ -38,7 +38,10 @@ async fn assert_native_resource_admission_fenced(
         Err(phoenix_tools::browser::session::BrowserError::RetirementFenced { .. })
     ));
     assert!(matches!(
-        backend.tmux_registry().ensure_live(&key, std::path::Path::new("/tmp"), None, None).await,
+        backend
+            .tmux_registry()
+            .ensure_live(&key, std::path::Path::new("/tmp"), None, None)
+            .await,
         Err(phoenix_tools::tmux::registry::TmuxError::RetirementFenced { .. })
     ));
 }
@@ -275,7 +278,13 @@ fn initial_request(
     target_gate: tokio::sync::OwnedMutexGuard<()>,
     response: oneshot::Sender<Result<NativeCloseInitialResult, NativeCloseApplicationError>>,
 ) -> AcknowledgedRuntimeRequest {
-    initial_request_with_backend(admitted, fixture, target_gate, response, CloseFixture::backend(fixture.db.clone()))
+    initial_request_with_backend(
+        admitted,
+        fixture,
+        target_gate,
+        response,
+        CloseFixture::backend(fixture.db.clone()),
+    )
 }
 
 fn initial_request_with_backend(
@@ -1580,7 +1589,7 @@ async fn process_shutdown_after_inventory_capture_retains_resource_admission_fen
     let attempt: String = sqlx::query_scalar(
         "SELECT attempt_id FROM native_close_initial_receipts WHERE request_id = ?1",
     )
-    .bind(fixture.command.request_id())
+    .bind(fixture.command.request_id().to_string())
     .fetch_one(fixture.db.pool())
     .await
     .unwrap();
@@ -1600,9 +1609,18 @@ async fn process_shutdown_after_inventory_capture_retains_resource_admission_fen
     .fetch_all(fixture.db.pool())
     .await
     .unwrap();
-    let scope = fixture.db.get_conversation(TARGET_ID).await.unwrap().attached_work_scope_id.unwrap();
-    assert_eq!(expected_resources, vec![(scope.as_str().to_owned(), "work_scope".to_owned())],
-        "a no-worktree scope still owns its WorkScope resource");
+    let scope = fixture
+        .db
+        .get_conversation(TARGET_ID)
+        .await
+        .unwrap()
+        .attached_work_scope_id
+        .unwrap();
+    assert_eq!(
+        expected_resources,
+        vec![(scope.as_str().to_owned(), "work_scope".to_owned())],
+        "a no-worktree scope still owns its WorkScope resource"
+    );
     assert_native_resource_admission_fenced(&backend, &scope).await;
 
     fence.close_for_process_shutdown();
@@ -1626,7 +1644,10 @@ async fn process_shutdown_after_inventory_capture_retains_resource_admission_fen
         attempt_id: receipt.admitted.attempt_id.clone(),
         ordinal: receipt.admitted.run_ordinal,
     };
-    assert_eq!(fixture.db.get_close_run(&run).await.unwrap().status, CloseRunStatus::Stopped);
+    assert_eq!(
+        fixture.db.get_close_run(&run).await.unwrap().status,
+        CloseRunStatus::Stopped
+    );
     assert_eq!(
         fixture
             .db
@@ -1744,7 +1765,10 @@ async fn stale_source_aborts_joined_inventory_worker_before_owner_cleanup() {
         admit_initial_continuation(&fixture, Arc::clone(&gate), response).await;
     let attempt = continuation.receipt.admitted.attempt_id.as_str().to_owned();
 
-    assert_eq!(continuation.step(&fixture.state).await.unwrap(), Phase::Settle);
+    assert_eq!(
+        continuation.step(&fixture.state).await.unwrap(),
+        Phase::Settle
+    );
     assert_eq!(
         continuation.step(&fixture.state).await.unwrap(),
         Phase::ReachedSettlementPhase(ClosePhase::AwaitingRetirementInspection)
@@ -1785,7 +1809,10 @@ async fn stale_source_aborts_joined_inventory_worker_before_owner_cleanup() {
         .await
         .expect("aborted inventory worker must report exit")
         .expect("inventory worker lifecycle sender must remain live until exit");
-    assert!(release.send(()).is_err(), "joined worker must drop its barrier receiver");
+    assert!(
+        release.send(()).is_err(),
+        "joined worker must drop its barrier receiver"
+    );
     assert_eq!(continuation.phase, Phase::InspectionRequired);
     assert_eq!(fence.owner_count(), 1);
     assert!(Arc::clone(&gate).try_lock_owned().is_err());
@@ -1794,7 +1821,12 @@ async fn stale_source_aborts_joined_inventory_worker_before_owner_cleanup() {
         Err(oneshot::error::TryRecvError::Empty)
     ));
     assert_eq!(
-        fixture.db.get_close_obligation(&attempt).await.unwrap().phase(),
+        fixture
+            .db
+            .get_close_obligation(&attempt)
+            .await
+            .unwrap()
+            .phase(),
         ClosePhase::RetirementRequested
     );
     for table in [
@@ -1831,7 +1863,10 @@ async fn fatal_authority_during_inventory_preparation_joins_worker_before_owner_
         admit_initial_continuation(&fixture, Arc::clone(&gate), response).await;
     let attempt = continuation.receipt.admitted.attempt_id.as_str().to_owned();
 
-    assert_eq!(continuation.step(&fixture.state).await.unwrap(), Phase::Settle);
+    assert_eq!(
+        continuation.step(&fixture.state).await.unwrap(),
+        Phase::Settle
+    );
     assert_eq!(
         continuation.step(&fixture.state).await.unwrap(),
         Phase::ReachedSettlementPhase(ClosePhase::AwaitingRetirementInspection)
@@ -1875,7 +1910,10 @@ async fn fatal_authority_during_inventory_preparation_joins_worker_before_owner_
         Ok(()),
         "the awaited fatal step must already have joined the worker"
     );
-    assert!(release.send(()).is_err(), "joined worker must drop its barrier receiver");
+    assert!(
+        release.send(()).is_err(),
+        "joined worker must drop its barrier receiver"
+    );
     assert_eq!(fence.owner_count(), 1);
     assert!(Arc::clone(&gate).try_lock_owned().is_err());
     assert!(matches!(
@@ -1888,7 +1926,12 @@ async fn fatal_authority_during_inventory_preparation_joins_worker_before_owner_
     assert!(Arc::clone(&gate).try_lock_owned().is_ok());
     assert!(reply.await.is_err());
     assert_eq!(
-        fixture.db.get_close_obligation(&attempt).await.unwrap().phase(),
+        fixture
+            .db
+            .get_close_obligation(&attempt)
+            .await
+            .unwrap()
+            .phase(),
         ClosePhase::RetirementRequested
     );
     for table in [
@@ -1920,7 +1963,10 @@ async fn dropping_continuation_during_inventory_preparation_retains_worker_custo
         admit_initial_continuation(&fixture, Arc::clone(&gate), response).await;
     let attempt = continuation.receipt.admitted.attempt_id.as_str().to_owned();
 
-    assert_eq!(continuation.step(&fixture.state).await.unwrap(), Phase::Settle);
+    assert_eq!(
+        continuation.step(&fixture.state).await.unwrap(),
+        Phase::Settle
+    );
     assert_eq!(
         continuation.step(&fixture.state).await.unwrap(),
         Phase::ReachedSettlementPhase(ClosePhase::AwaitingRetirementInspection)
@@ -1963,12 +2009,20 @@ async fn dropping_continuation_during_inventory_preparation_retains_worker_custo
         .await
         .expect("dropped continuation must abort its paused inventory worker")
         .expect("worker lifecycle sender must remain live until its future is dropped");
-    assert!(release.send(()).is_err(), "aborted worker must drop its barrier receiver");
+    assert!(
+        release.send(()).is_err(),
+        "aborted worker must drop its barrier receiver"
+    );
     assert_eq!(fence.owner_count(), 0);
     assert!(Arc::clone(&gate).try_lock_owned().is_ok());
     assert!(reply.await.is_err());
     assert_eq!(
-        fixture.db.get_close_obligation(&attempt).await.unwrap().phase(),
+        fixture
+            .db
+            .get_close_obligation(&attempt)
+            .await
+            .unwrap()
+            .phase(),
         ClosePhase::RetirementRequested
     );
     for table in [

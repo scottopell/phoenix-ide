@@ -104,7 +104,14 @@ struct NativeInitialInspectionFailureIntent {
 
 enum InventoryCapture {
     NotStarted,
-    Preparing(tokio::task::JoinHandle<Result<CaptureCloseRetirementInventoryRequest, CloseRetirementInventoryPreparationError>>),
+    Preparing(
+        tokio::task::JoinHandle<
+            Result<
+                CaptureCloseRetirementInventoryRequest,
+                CloseRetirementInventoryPreparationError,
+            >,
+        >,
+    ),
     Held,
 }
 
@@ -243,7 +250,9 @@ impl NativeCloseInitialContinuation {
             self.phase,
             NativeCloseInitialContinuationPhase::CollectingInspection
                 | NativeCloseInitialContinuationPhase::WaitingForQuiescence
-                | NativeCloseInitialContinuationPhase::ReachedSettlementPhase(phoenix_core::domain::close::ClosePhase::RetirementRequested)
+                | NativeCloseInitialContinuationPhase::ReachedSettlementPhase(
+                    phoenix_core::domain::close::ClosePhase::RetirementRequested
+                )
                 | NativeCloseInitialContinuationPhase::PreparingInventory
                 | NativeCloseInitialContinuationPhase::ClassifyingInspectionFailure
                 | NativeCloseInitialContinuationPhase::ObservingTerminal
@@ -323,7 +332,10 @@ impl NativeCloseInitialContinuation {
         &mut self,
         live_source: &phoenix_core::domain::sm_state::ConvState,
     ) {
-        if (self.collecting_inspection() || matches!(self.inventory, InventoryCapture::Preparing(_))) && !self.live_source_matches(live_source) {
+        if (self.collecting_inspection()
+            || matches!(self.inventory, InventoryCapture::Preparing(_)))
+            && !self.live_source_matches(live_source)
+        {
             if let Some(handle) = self.inspection.take() {
                 handle.abort();
             }
@@ -343,7 +355,10 @@ impl NativeCloseInitialContinuation {
         live_source: &phoenix_core::domain::sm_state::ConvState,
     ) -> Result<NativeCloseInitialContinuationPhase, NativeCloseApplicationError> {
         use NativeCloseInitialContinuationPhase as Phase;
-        if self.authority.owner.as_ref()
+        if self
+            .authority
+            .owner
+            .as_ref()
             .and_then(|owner| owner.fence.as_ref())
             .is_some_and(|fence| fence.fatal_authority_loss_is_latched())
         {
@@ -427,12 +442,18 @@ impl NativeCloseInitialContinuation {
                     Err(NativeCloseApplicationError::FatalAuthority)
                 }
             },
-            Phase::ReachedSettlementPhase(phoenix_core::domain::close::ClosePhase::RetirementRequested) => {
+            Phase::ReachedSettlementPhase(
+                phoenix_core::domain::close::ClosePhase::RetirementRequested,
+            ) => {
                 if !self.live_source_matches(live_source) {
                     self.phase = Phase::InspectionRequired;
                     return Err(NativeCloseApplicationError::SourceRefused);
                 }
-                let obligation = match self.db.get_close_obligation(self.receipt.admitted.attempt_id.as_str()).await {
+                let obligation = match self
+                    .db
+                    .get_close_obligation(self.receipt.admitted.attempt_id.as_str())
+                    .await
+                {
                     Ok(obligation) => obligation,
                     Err(error) => {
                         tracing::warn!(%error, "native Close retirement obligation lookup failed; parking source owner");
@@ -452,7 +473,10 @@ impl NativeCloseInitialContinuation {
                 // The worker shares the already-admitted authority and exact gate.
                 // Even if the actor itself is cancelled, aborting its JoinHandle
                 // cannot release either boundary before the worker future is dropped.
-                let worker_owner = self.authority.owner.as_mut()
+                let worker_owner = self
+                    .authority
+                    .owner
+                    .as_mut()
                     .expect("inventory preparation requires retained source authority")
                     .reborrow();
                 let worker_gate = std::sync::Arc::clone(&self._target_gate);
@@ -518,7 +542,16 @@ impl NativeCloseInitialContinuation {
                     },
                     _ => unreachable!("preparing phase owns preparation worker"),
                 };
-                match self.db.capture_native_close_initial_retirement_inventory(&self.command, &self.receipt, live_source, request).await {
+                match self
+                    .db
+                    .capture_native_close_initial_retirement_inventory(
+                        &self.command,
+                        &self.receipt,
+                        live_source,
+                        request,
+                    )
+                    .await
+                {
                     LocalAuthorityResult::DurableFactEstablished(Ok(_resources)) => {
                         self.inventory = InventoryCapture::Held;
                         self.phase = Phase::Captured;
@@ -529,7 +562,9 @@ impl NativeCloseInitialContinuation {
                         self.phase = Phase::InspectionRequired;
                         Err(NativeCloseApplicationError::Storage)
                     }
-                    LocalAuthorityResult::DurableFactUnclassified => Err(NativeCloseApplicationError::FatalAuthority),
+                    LocalAuthorityResult::DurableFactUnclassified => {
+                        Err(NativeCloseApplicationError::FatalAuthority)
+                    }
                 }
             }
             Phase::ReachedSettlementPhase(
