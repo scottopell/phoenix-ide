@@ -13650,9 +13650,17 @@ mod tests {
             .unwrap();
         let failure =
             initial_cleanup_failure_fixture(&db, CloseStopCertainty::ShutdownUncertain).await;
-        db.terminalize_initial_close_cleanup_failure(&failure)
-            .await
-            .unwrap();
+        // Seed the historical pre-160 fact through the shared writer: the current
+        // public ingress fence requires the receipt intent introduced by migration 160.
+        let mut tx = db.pool().begin_with("BEGIN IMMEDIATE").await.unwrap();
+        Database::terminalize_close_run_cleanup_failure_inner_tx(
+            &mut tx,
+            &CloseRunRef::initial(failure.attempt_id.clone()),
+            &failure,
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
         let retry = db
             .admit_close_safe_retry(&safe_retry_request(&failure))
             .await
