@@ -499,7 +499,7 @@ impl NativeCloseInitialContinuation {
                         None
                     };
                     backend
-                        .prepare_close_retirement_inventory(attempt, snapshot)
+                        .prepare_native_close_initial_retirement_inventory(attempt, snapshot)
                         .await
                 }));
                 self.phase = Phase::PreparingInventory;

@@ -915,10 +915,17 @@ fn close_safe_retry_execution_order(plan: &[CloseSafeRetryEffect]) -> Vec<usize>
     indices
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CloseRetirementInventoryPolicy {
+    LegacyDurable,
+    NativeInitial,
+}
+
 fn build_close_retirement_inventory_scope_request(
     attempt_id: CloseAttemptId,
     snapshot: CloseRetirementSnapshot,
     input: CloseRetirementInventoryScopeInput,
+    policy: CloseRetirementInventoryPolicy,
 ) -> Result<CaptureCloseRetirementInventoryRequest, CloseRetirementInventoryPreparationError> {
     let worktree = match input.captured_worktree {
         None => None,
@@ -946,9 +953,37 @@ fn build_close_retirement_inventory_scope_request(
         equivalent_live_resources: BTreeSet::default(),
     };
     for resource in input.acquired_resources {
-        if resource.kind() != RetiredResourceKind::TmuxServer {
+        let kind = resource.kind();
+        if policy == CloseRetirementInventoryPolicy::LegacyDurable {
+            if kind != RetiredResourceKind::TmuxServer {
+                continue;
+            }
+            let LossItemIdentity::Opaque(identity) = resource.identity() else {
+                return Err(
+                    CloseRetirementInventoryPreparationError::BackendStorageOrUnattributed {
+                        detail: "registry resource identity was not opaque".to_string(),
+                    },
+                );
+            };
+            inventory.tmux_servers.insert(identity.clone());
             continue;
         }
+
+        let target = match kind {
+            RetiredResourceKind::BashProcessGroup => &mut inventory.bash_process_groups,
+            RetiredResourceKind::TmuxServer => &mut inventory.tmux_servers,
+            RetiredResourceKind::PtySession => &mut inventory.pty_sessions,
+            RetiredResourceKind::BrowserSession => &mut inventory.browser_sessions,
+            RetiredResourceKind::Worktree
+            | RetiredResourceKind::WorkScope
+            | RetiredResourceKind::EquivalentLiveResource => {
+                return Err(
+                    CloseRetirementInventoryPreparationError::BackendStorageOrUnattributed {
+                        detail: format!("unexpected registry resource kind {kind:?} in native initial inventory"),
+                    },
+                );
+            }
+        };
         let LossItemIdentity::Opaque(identity) = resource.identity() else {
             return Err(
                 CloseRetirementInventoryPreparationError::BackendStorageOrUnattributed {
@@ -956,7 +991,7 @@ fn build_close_retirement_inventory_scope_request(
                 },
             );
         };
-        inventory.tmux_servers.insert(identity.clone());
+        target.insert(identity.clone());
     }
     Ok(CaptureCloseRetirementInventoryRequest {
         attempt_id,
@@ -1410,6 +1445,35 @@ impl RuntimeManager {
         snapshot: CloseRetirementSnapshot,
     ) -> Result<CaptureCloseRetirementInventoryRequest, CloseRetirementInventoryPreparationError>
     {
+        self.prepare_close_retirement_inventory_with_policy(
+            attempt_id,
+            snapshot,
+            CloseRetirementInventoryPolicy::LegacyDurable,
+        )
+        .await
+    }
+
+    pub(crate) async fn prepare_native_close_initial_retirement_inventory(
+        &self,
+        attempt_id: CloseAttemptId,
+        snapshot: CloseRetirementSnapshot,
+    ) -> Result<CaptureCloseRetirementInventoryRequest, CloseRetirementInventoryPreparationError>
+    {
+        self.prepare_close_retirement_inventory_with_policy(
+            attempt_id,
+            snapshot,
+            CloseRetirementInventoryPolicy::NativeInitial,
+        )
+        .await
+    }
+
+    async fn prepare_close_retirement_inventory_with_policy(
+        &self,
+        attempt_id: CloseAttemptId,
+        snapshot: CloseRetirementSnapshot,
+        policy: CloseRetirementInventoryPolicy,
+    ) -> Result<CaptureCloseRetirementInventoryRequest, CloseRetirementInventoryPreparationError>
+    {
         let scopes = self
             .db()
             .list_close_attempt_scopes(attempt_id.as_str())
@@ -1439,6 +1503,7 @@ impl RuntimeManager {
                     captured_worktree: captured.captured_worktree,
                     acquired_resources: resources,
                 },
+                policy,
             )?;
             requests.extend(request.scopes);
         }
@@ -8108,6 +8173,10 @@ fn require_browser_absent(
 
 #[cfg(test)]
 mod tests {
+    fn opaque_identity(value: &str) -> OpaqueIdentity {
+        OpaqueIdentity::parse(value).expect("test stable identity is non-empty")
+    }
+
     #[test]
     fn native_inventory_preparation_preserves_exact_durable_identities() {
         use phoenix_core::domain::close::{
@@ -8141,6 +8210,7 @@ mod tests {
             attempt_id.clone(),
             snapshot.clone(),
             input,
+            super::CloseRetirementInventoryPolicy::NativeInitial,
         )
         .unwrap();
         assert_eq!(request.attempt_id, attempt_id);
@@ -8157,9 +8227,102 @@ mod tests {
             .inventory
             .tmux_servers
             .contains(tmux_identity));
-        assert!(request.scopes[0].inventory.bash_process_groups.is_empty());
-        assert!(request.scopes[0].inventory.pty_sessions.is_empty());
-        assert!(request.scopes[0].inventory.browser_sessions.is_empty());
+        assert_eq!(request.scopes[0].inventory.bash_process_groups.len(), 1);
+        assert_eq!(request.scopes[0].inventory.pty_sessions.len(), 1);
+        assert_eq!(request.scopes[0].inventory.browser_sessions.len(), 1);
+        assert!(request.scopes[0].inventory.equivalent_live_resources.is_empty());
+        assert!(request.scopes[0]
+            .inventory
+            .bash_process_groups
+            .contains(&opaque_identity("ephemeral-bash")));
+        assert!(request.scopes[0]
+            .inventory
+            .pty_sessions
+            .contains(&opaque_identity("ephemeral-pty")));
+        assert!(request.scopes[0]
+            .inventory
+            .browser_sessions
+            .contains(&opaque_identity("ephemeral-browser")));
+    }
+
+    #[test]
+    fn legacy_inventory_preparation_keeps_tmux_only_filtering() {
+        use phoenix_core::domain::close::RetiredResourceKind as Kind;
+        use phoenix_core::work_scope::WorkScopeId;
+
+        let attempt_id =
+            phoenix_core::domain::close::CloseAttemptId::parse("legacy-inventory-attempt").unwrap();
+        let snapshot = super::snapshot_for(b"legacy inventory snapshot");
+        let request = super::build_close_retirement_inventory_scope_request(
+            attempt_id,
+            snapshot,
+            super::CloseRetirementInventoryScopeInput {
+                scope: WorkScopeId::parse("legacy-inventory-scope").unwrap(),
+                captured_worktree: None,
+                acquired_resources: vec![
+                    super::opaque_resource(Kind::BashProcessGroup, "legacy-bash".into()),
+                    super::opaque_resource(Kind::PtySession, "legacy-pty".into()),
+                    super::opaque_resource(Kind::BrowserSession, "legacy-browser".into()),
+                    super::opaque_resource(Kind::TmuxServer, "legacy-tmux".into()),
+                ],
+            },
+            super::CloseRetirementInventoryPolicy::LegacyDurable,
+        )
+        .unwrap();
+        let inventory = &request.scopes[0].inventory;
+        assert!(inventory.bash_process_groups.is_empty());
+        assert!(inventory.pty_sessions.is_empty());
+        assert!(inventory.browser_sessions.is_empty());
+        assert_eq!(inventory.tmux_servers.len(), 1);
+        assert!(inventory.tmux_servers.contains(&opaque_identity("legacy-tmux")));
+    }
+
+    #[test]
+    fn native_inventory_preparation_keeps_empty_process_inventory_empty() {
+        use phoenix_core::domain::close::CapturedWorktreeIdentity;
+        use phoenix_core::work_scope::WorkScopeId;
+
+        let attempt_id =
+            phoenix_core::domain::close::CloseAttemptId::parse("native-empty-attempt").unwrap();
+        let request = super::build_close_retirement_inventory_scope_request(
+            attempt_id,
+            super::snapshot_for(b"native empty inventory snapshot"),
+            super::CloseRetirementInventoryScopeInput {
+                scope: WorkScopeId::parse("native-empty-scope").unwrap(),
+                captured_worktree: None::<CapturedWorktreeIdentity>,
+                acquired_resources: Vec::new(),
+            },
+            super::CloseRetirementInventoryPolicy::NativeInitial,
+        )
+        .unwrap();
+        let inventory = &request.scopes[0].inventory;
+        assert!(inventory.bash_process_groups.is_empty());
+        assert!(inventory.tmux_servers.is_empty());
+        assert!(inventory.pty_sessions.is_empty());
+        assert!(inventory.browser_sessions.is_empty());
+        assert!(inventory.equivalent_live_resources.is_empty());
+    }
+
+    #[test]
+    fn native_inventory_preparation_rejects_unexpected_registry_identity() {
+        use phoenix_core::domain::close::RetiredResourceKind as Kind;
+        use phoenix_core::work_scope::WorkScopeId;
+
+        let error = super::build_close_retirement_inventory_scope_request(
+            phoenix_core::domain::close::CloseAttemptId::parse("native-unexpected-attempt").unwrap(),
+            super::snapshot_for(b"native unexpected inventory snapshot"),
+            super::CloseRetirementInventoryScopeInput {
+                scope: WorkScopeId::parse("native-unexpected-scope").unwrap(),
+                captured_worktree: None,
+                acquired_resources: vec![super::opaque_resource(Kind::EquivalentLiveResource, "unexpected".into())],
+            },
+            super::CloseRetirementInventoryPolicy::NativeInitial,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            super::CloseRetirementInventoryPreparationError::BackendStorageOrUnattributed { .. }
+        ));
     }
 
     #[test]
@@ -8184,6 +8347,7 @@ mod tests {
                 }),
                 acquired_resources: Vec::new(),
             },
+            super::CloseRetirementInventoryPolicy::NativeInitial,
         )
         .unwrap_err();
         assert!(matches!(

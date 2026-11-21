@@ -236,6 +236,11 @@ jobs:
           test "$(wc -l < evidence/inventory-preparation-selected-tests.txt | tr -d ' ')" -gt 0
           grep -F 'native_inventory_preparation_preserves_exact_durable_identities: test' evidence/inventory-preparation-selected-tests.txt
           grep -F 'native_inventory_preparation_rejects_unresolved_captured_scope: test' evidence/inventory-preparation-selected-tests.txt
+          grep -F 'native_inventory_preparation_keeps_empty_process_inventory_empty: test' evidence/inventory-preparation-selected-tests.txt
+          grep -F 'native_inventory_preparation_rejects_unexpected_registry_identity: test' evidence/inventory-preparation-selected-tests.txt
+          grep -F 'runtime::close_retirement::tests::legacy_inventory_preparation_keeps_tmux_only_filtering: test' evidence/runtime-inventory.log
+          (cd crates/phoenix-ide && "$PHOENIX_RUNTIME_TEST_BINARY" runtime::close_retirement::tests::legacy_inventory_preparation_keeps_tmux_only_filtering --exact --nocapture --test-threads=1) 2>&1 | tee evidence/legacy-inventory-preparation-execution.log
+          grep -Eq 'test result: ok\. 1 passed; 0 failed; 0 ignored;' evidence/legacy-inventory-preparation-execution.log
           (cd crates/phoenix-ide && "$PHOENIX_RUNTIME_TEST_BINARY" native_inventory_preparation_ --nocapture --test-threads=1) 2>&1 | tee evidence/inventory-preparation-execution.log
           grep -E 'test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored;' evidence/inventory-preparation-execution.log
           (cd crates/phoenix-ide && "$PHOENIX_RUNTIME_TEST_BINARY" native_close_application::tests:: --nocapture --test-threads=1) 2>&1 | tee evidence/native-close-runtime-matcher.log
