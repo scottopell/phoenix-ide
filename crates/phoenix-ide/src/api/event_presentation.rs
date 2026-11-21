@@ -439,6 +439,7 @@ impl EventPresentations {
                 | InputOrigin::RemoteConversation { .. }
                 | InputOrigin::RemoteCoordinator { .. }
                 | InputOrigin::ScheduledReminder { .. }
+                | InputOrigin::CoordinatorQuestionReply
                 | InputOrigin::SystemGenerated => None,
             })
             .collect();
@@ -521,6 +522,7 @@ impl EventPresentations {
             | InputOrigin::RemoteConversation { .. }
             | InputOrigin::RemoteCoordinator { .. }
             | InputOrigin::ScheduledReminder { .. }
+            | InputOrigin::CoordinatorQuestionReply
             | InputOrigin::SystemGenerated => None,
         }
     }

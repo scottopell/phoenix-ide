@@ -1953,6 +1953,7 @@ pub(crate) fn attributed_role(
             InputOrigin::InternalConversation { .. } => "Conversation",
             InputOrigin::SlackGateway { .. } => "Slack request",
             InputOrigin::ScheduledReminder { .. } => "Scheduled reminder",
+            InputOrigin::CoordinatorQuestionReply => "Question reply",
             InputOrigin::SystemGenerated => "System input",
             InputOrigin::SubscriptionEvent { .. } => "Conversation event",
             InputOrigin::UnknownHistorical => "Unknown input",
@@ -1970,6 +1971,7 @@ pub(crate) fn attributed_role(
             InputOrigin::InternalConversation { .. } => "Skill · Conversation",
             InputOrigin::SlackGateway { .. } => "Skill · Slack request",
             InputOrigin::ScheduledReminder { .. } => "Skill · Scheduled reminder",
+            InputOrigin::CoordinatorQuestionReply => "Skill · Question reply",
             InputOrigin::SystemGenerated => "Skill · System input",
             InputOrigin::SubscriptionEvent { .. } => "Skill · Conversation event",
             InputOrigin::UnknownHistorical => "Skill · Unknown input",
@@ -1999,6 +2001,7 @@ pub(crate) fn attributed_sender(origin: &phoenix_core::domain::db_schema::InputO
         | InputOrigin::SlackGateway { .. }
         | InputOrigin::SystemGenerated
         | InputOrigin::ScheduledReminder { .. }
+        | InputOrigin::CoordinatorQuestionReply
         | InputOrigin::SubscriptionEvent { .. } => String::new(),
     }
 }
@@ -2054,6 +2057,7 @@ async fn attributed_sender_with_cache(
         | InputOrigin::SlackGateway { .. }
         | InputOrigin::SystemGenerated
         | InputOrigin::ScheduledReminder { .. }
+        | InputOrigin::CoordinatorQuestionReply
         | InputOrigin::SubscriptionEvent { .. } => Ok(String::new()),
     }
 }

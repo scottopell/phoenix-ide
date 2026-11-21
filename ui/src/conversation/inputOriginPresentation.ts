@@ -20,6 +20,8 @@ export function inputOriginPresentation(origin: InputOrigin | undefined): {
   switch (origin.kind) {
     case 'user_api':
       return { label: 'User · API', title: 'User · API', className: 'user' };
+    case 'coordinator_question_reply':
+      return { label: 'Question reply', title: 'Your reply to a question Ember asked', className: 'user' };
     case 'internal_conversation':
       return {
         label: 'From conversation',

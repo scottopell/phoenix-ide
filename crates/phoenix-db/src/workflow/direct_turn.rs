@@ -8823,6 +8823,7 @@ mod tests {
                 | InputOrigin::SystemGenerated
                 | InputOrigin::SlackGateway { .. }
                 | InputOrigin::ScheduledReminder { .. }
+                | InputOrigin::CoordinatorQuestionReply
                 | InputOrigin::SubscriptionEvent { .. } => {}
             }
             if retry.origin != payload.submitted.origin {
@@ -8851,6 +8852,7 @@ mod tests {
                 | InputOrigin::SystemGenerated
                 | InputOrigin::SlackGateway { .. }
                 | InputOrigin::ScheduledReminder { .. }
+                | InputOrigin::CoordinatorQuestionReply
                 | InputOrigin::SubscriptionEvent { .. } => unreachable!(),
             }
             assert!(matches!(

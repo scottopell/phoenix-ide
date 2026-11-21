@@ -16356,10 +16356,11 @@ mod scope_liveness_tests {
 
         // Accepted input is a durable turn keyed by the client message id.
         let delivered: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM durable_turns WHERE conversation_id = ?1 AND client_turn_key = ?2",
+            "SELECT COUNT(*) FROM durable_turns WHERE conversation_id = ?1 AND client_turn_key = ?2
+               AND origin_kind = 'coordinator_question_reply'",
         )
         .bind(&global.id)
-        .bind(request_id)
+        .bind(phoenix_core::domain::db_schema::coordinator_question_reply_message_id(request_id))
         .fetch_one(manager.db().pool())
         .await
         .unwrap();
