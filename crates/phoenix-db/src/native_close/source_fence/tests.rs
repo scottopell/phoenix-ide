@@ -1677,6 +1677,8 @@ async fn exact_initial_process_entry_revalidates_after_independent_writer_revoke
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("entry.sqlite");
     let db = Database::open(path.to_str().unwrap()).await.unwrap();
+    // File-backed open runs only legacy schema setup; mirror numbered startup migrations.
+    crate::migrations::run_pending_migrations(db.pool()).await.unwrap();
     let (db, command, receipt, source, run) =
         initial_source_fence_inventory_fixture_with_db(db, false, None, false, false, false).await;
     let writer = Database::open(path.to_str().unwrap()).await.unwrap();
@@ -1716,6 +1718,8 @@ async fn exact_initial_process_entry_releases_writer_before_retained_cleanup_fin
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("entry.sqlite");
     let db = Database::open(path.to_str().unwrap()).await.unwrap();
+    // File-backed open runs only legacy schema setup; mirror numbered startup migrations.
+    crate::migrations::run_pending_migrations(db.pool()).await.unwrap();
     let (db, command, receipt, source, run) =
         initial_source_fence_inventory_fixture_with_db(db, false, None, false, false, true).await;
     let writer = Database::open(path.to_str().unwrap()).await.unwrap();

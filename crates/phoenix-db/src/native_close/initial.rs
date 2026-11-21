@@ -289,9 +289,15 @@ impl Database {
             Err(error) => return LocalAuthorityResult::DurableFactEstablished(Err(error.into())),
         };
         let result = validate_initial_process_step_tx(
-            &mut tx, command, receipt, live_source, scope, snapshot,
+            &mut tx,
+            command,
+            receipt,
+            live_source,
+            scope,
+            snapshot,
             InitialProcessSelection::WholeKind(kind),
-        ).await;
+        )
+        .await;
         match result {
             Ok(authorization) => match tx.commit().await {
                 Ok(()) => LocalAuthorityResult::DurableFactEstablished(Ok(authorization)),
@@ -333,9 +339,15 @@ impl Database {
             Err(error) => return NativeCloseInitialResourceEntryResult::NotStarted(error.into()),
         };
         let validation = validate_initial_process_step_tx(
-            &mut tx, command, receipt, live_source, scope, snapshot,
+            &mut tx,
+            command,
+            receipt,
+            live_source,
+            scope,
+            snapshot,
             InitialProcessSelection::ExactResource(resource),
-        ).await;
+        )
+        .await;
         if let Err(error) = validation {
             let release = match tx.rollback().await {
                 Ok(()) => NativeCloseInitialEntryRelease::Confirmed,
