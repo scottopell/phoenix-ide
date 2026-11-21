@@ -1078,22 +1078,48 @@ jobs:
           fetch-depth: 1
       - name: Set up uv
         uses: astral-sh/setup-uv@v7
+      - name: Assert and record exact existing ESS runtime
+        run: |
+          uv run --no-project --managed-python --python 3.13.1 python - <<'PYTHON'
+          import hashlib, json, os, platform, sqlite3, sys
+          from pathlib import Path
+          with sqlite3.connect(":memory:") as db:
+              metadata = {
+                  "commit": os.environ["GITHUB_SHA"],
+                  "platform": platform.platform(), "machine": platform.machine(),
+                  "python": sys.version, "executable": sys.executable,
+                  "sqlite": sqlite3.sqlite_version,
+                  "compile_options": list(db.execute("PRAGMA compile_options")),
+                  "modules": list(db.execute("PRAGMA module_list")),
+                  "collations": list(db.execute("PRAGMA collation_list")),
+                  "sha256": {p: hashlib.sha256(Path(p).read_bytes()).hexdigest() for p in
+                      ("dev.py", "scripts/launchd_deploy_helper.py", "tests/devpy/test_simple_launchd_helper.py",
+                       "tests/integration/backup_verification_scale.py")},
+              }
+          Path("backup-runtime.json").write_text(json.dumps(metadata, indent=2) + "\n")
+          print(json.dumps(metadata, indent=2))
+          assert platform.python_implementation() == "CPython"
+          assert sys.version_info[:3] == (3, 13, 1), sys.version
+          assert sqlite3.sqlite_version == "3.47.1", sqlite3.sqlite_version
+          assert platform.machine() == "arm64", platform.machine()
+          PYTHON
       - name: Focused backup helper regressions
         run: >-
-          uv run --no-project --managed-python --python 3.13 python -m unittest
+          uv run --no-project --managed-python --python 3.13.1 python -m unittest
           tests.devpy.test_simple_launchd_helper
       - name: Qualify populated large-database backup verification
         timeout-minutes: 40
         run: >-
-          uv run --no-project --managed-python --python 3.13 python
+          uv run --no-project --managed-python --python 3.13.1 python
           tests/integration/backup_verification_scale.py
+          --minimum-source-bytes 13437792256
           --work-dir "$RUNNER_TEMP/backup-verification-scale"
           --result "$GITHUB_WORKSPACE/backup-verification-result.json"
       - name: Record runner identity and commit if qualification failed early
         if: always()
         run: |
           if [ ! -f backup-verification-result.json ]; then
-            uv run --no-project --managed-python --python 3.13 python - <<'PY'
+            uv run --no-project --managed-python --python 3.13.1 python - <<'PY'
           import json, os, platform, sqlite3, sys
           from pathlib import Path
           Path("backup-verification-result.json").write_text(json.dumps({
@@ -1111,7 +1137,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: backup-verification-final-${{ github.run_id }}-${{ github.run_attempt }}
-          path: backup-verification-result.json
+          path: |
+            backup-verification-result.json
+            backup-runtime.json
           if-no-files-found: error
           retention-days: 30
       - name: Assert exact checked-out commit
