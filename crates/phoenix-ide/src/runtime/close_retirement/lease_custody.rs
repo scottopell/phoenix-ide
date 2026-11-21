@@ -588,7 +588,12 @@ mod tests {
     async fn tmux_fenced(registries: &LeaseRegistries, scope: &ResourceScopeKey) -> bool {
         match registries
             .tmux
-            .ensure_live(scope, std::path::Path::new("/close-lease-custody-test"), None, None)
+            .ensure_live(
+                scope,
+                std::path::Path::new("/close-lease-custody-test"),
+                None,
+                None,
+            )
             .await
         {
             Err(phoenix_tools::tmux::registry::TmuxError::RetirementFenced { .. }) => true,
@@ -770,8 +775,16 @@ mod tests {
         );
         assert_eq!(lease.terminal.generation(), terminal_generation);
         assert_eq!(lease.browser.generation(), browser_generation);
-        assert!(!lease.tmux.had_entry());
-        assert!(resources.is_empty());
+        // The failed acquisition installed a real admission-fence entry. Retry
+        // must obtain its permit through discovery, not pretend that entry vanished.
+        assert!(lease.tmux.had_entry());
+        assert_eq!(
+            resources,
+            vec![opaque_resource(
+                RetiredResourceKind::TmuxServer,
+                lease.tmux.instance.stable_identity(),
+            )]
+        );
         store
             .cancel_attempt(&key.0, registries.clone())
             .await

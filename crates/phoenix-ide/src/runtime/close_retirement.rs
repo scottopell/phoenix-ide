@@ -26,8 +26,8 @@ use phoenix_tools::{
     bash::registry::{BashRetirementOutcome, BashRetirementPermit},
     browser::session::{BrowserRetirementOutcome, BrowserRetirementPermit},
     tmux::registry::{
-        PersistentTmuxDiscovery, TmuxRetirementOutcome, TmuxRetirementPermit, TmuxRetirementRehydration,
-        TmuxServerInstanceIdentity,
+        PersistentTmuxDiscovery, TmuxRetirementOutcome, TmuxRetirementPermit,
+        TmuxRetirementRehydration, TmuxServerInstanceIdentity,
     },
 };
 
