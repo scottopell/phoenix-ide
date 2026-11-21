@@ -2,6 +2,7 @@
 import dataclasses
 import fcntl
 import importlib.util
+import io
 import json
 import os
 import plistlib
@@ -9,6 +10,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -106,7 +108,7 @@ class SQLiteUriPathTests(unittest.TestCase):
         with self.assertRaises(sqlite3.OperationalError):
             with helper.sqlite_writer_guard(str(missing), timeout=0.05):
                 self.fail("missing source acquired a writer slot")
-        with self.assertRaises(sqlite3.OperationalError):
+        with self.assertRaises(helper.ActivationError):
             helper.create_verified_database_backup(str(missing), self.root)
         self.assertEqual(set(self.parent.iterdir()), before)
         self.assertEqual(set(self.root.iterdir()), {self.parent})
@@ -475,6 +477,93 @@ if sys.argv[1:] == ["--build-identity"]:
             self.assertEqual(database.execute("PRAGMA integrity_check").fetchone(), ("ok",))
             self.assertEqual(database.execute("SELECT phase FROM changes").fetchall(), [("committed-in-wal",)])
 
+    def test_verifier_diagnostics_are_bounded_content_free_and_cover_all_stages(self):
+        diagnostics = {}
+        backup = helper.create_verified_database_backup(
+            str(self.database), self.root, diagnostics=diagnostics,
+        )
+        deadline = helper.time.monotonic() + 10
+        proof = helper._backup_proof(backup, deadline, diagnostics)
+        captured = io.StringIO()
+        with mock.patch.object(helper.sys, "stderr", captured):
+            helper._emit_verifier_diagnostics(diagnostics, "verified")
+        record = json.loads(captured.getvalue())
+        self.assertEqual(record["outcome"], "verified")
+        self.assertEqual(set(record["stage_ms"]), {
+            "native_backup", "integrity_check", "metadata", "table_comparisons", "fsync", "proof_hash",
+        })
+        self.assertGreater(record["rows_compared"], 0)
+        self.assertGreater(record["cells_compared"], 0)
+        self.assertGreater(record["table_ordinal"], 0)
+        self.assertNotIn("entries", captured.getvalue())
+        self.assertNotIn("one", captured.getvalue())
+        self.assertNotIn(str(backup), captured.getvalue())
+        self.assertEqual(proof["backup_bytes"], backup.stat().st_size)
+
+    def test_failed_row_comparison_diagnostics_report_only_ordinal_and_progress(self):
+        source, backup = sqlite3.connect(":memory:"), sqlite3.connect(":memory:")
+        self.addCleanup(source.close)
+        self.addCleanup(backup.close)
+        for database, value in ((source, "secret-source"), (backup, "secret-backup")):
+            database.execute('CREATE TABLE "private table name" (payload TEXT)')
+            database.execute('INSERT INTO "private table name" VALUES (?)', (value,))
+        diagnostics = {}
+        with self.assertRaises(helper.ActivationError):
+            helper._verify_logical_equivalence(
+                source, backup, helper.time.monotonic() + 10, diagnostics,
+            )
+        captured = io.StringIO()
+        with mock.patch.object(helper.sys, "stderr", captured):
+            helper._emit_verifier_diagnostics(diagnostics, "ActivationError")
+        record = json.loads(captured.getvalue())
+        self.assertEqual(record["table_ordinal"], 1)
+        self.assertEqual((record["rows_compared"], record["cells_compared"]), (0, 1))
+        for secret in ("private table name", "secret-source", "secret-backup", "payload"):
+            self.assertNotIn(secret, captured.getvalue())
+
+    def test_diagnostic_output_failure_does_not_replace_verifier_failure(self):
+        captured = io.StringIO()
+        captured.write = mock.Mock(side_effect=OSError("stderr unavailable"))
+        with mock.patch.object(helper.sys, "stderr", captured):
+            helper._emit_verifier_diagnostics({}, "ActivationError")
+
+    def test_integrity_error_does_not_expose_database_names(self):
+        with sqlite3.connect(self.database) as connection:
+            connection.execute('CREATE TABLE "SECRET_TABLE" (value CHECK(value > 0))')
+            connection.execute('PRAGMA ignore_check_constraints=ON')
+            connection.execute('INSERT INTO "SECRET_TABLE" VALUES (-1)')
+        diagnostics = {}
+        (self.database.parent / "integrity").mkdir()
+        with self.assertRaises(helper.ActivationError) as caught:
+            helper.create_verified_database_backup(str(self.database), self.database.parent / "integrity", diagnostics=diagnostics)
+        self.assertEqual(str(caught.exception), "SQLite backup integrity check failed")
+        self.assertNotIn("SECRET", json.dumps(diagnostics))
+        self.assertEqual(diagnostics["current_stage"], "integrity_check")
+
+    def test_verifier_counts_attempted_cells(self):
+        with sqlite3.connect(":memory:") as left, sqlite3.connect(":memory:") as right:
+            for connection in (left, right):
+                connection.execute("CREATE TABLE a (x, y, z)")
+                connection.execute("INSERT INTO a VALUES (1, 2, 3)")
+            right.execute("UPDATE a SET z=4")
+            diagnostics = {}
+            with self.assertRaises(helper.ActivationError):
+                helper._verify_logical_equivalence(left, right, time.monotonic() + 10, diagnostics)
+            self.assertEqual(diagnostics["cells_compared"], 3)
+            self.assertEqual(diagnostics["rows_compared"], 0)
+            self.assertEqual(diagnostics["tables_completed"], 0)
+
+    def test_verifier_timeout_records_stage_without_resetting_deadline(self):
+        with sqlite3.connect(":memory:") as left, sqlite3.connect(":memory:") as right:
+            deadline = time.monotonic() - 1
+            diagnostics = {}
+            with self.assertRaisesRegex(helper.ActivationError, "deadline exceeded"):
+                helper._verify_logical_equivalence(left, right, deadline, diagnostics)
+            self.assertEqual(diagnostics["deadline"], deadline)
+            self.assertEqual(diagnostics["current_stage"], "metadata")
+            self.assertEqual(diagnostics["stage_budget_ms"], 0)
+            self.assertIn("metadata", diagnostics["stage_ms"])
+
     def test_large_database_backup_uses_streaming_logical_verification(self):
         payload = b"z" * (8 * 1024 * 1024)
         with sqlite3.connect(self.database) as database:
@@ -529,13 +618,13 @@ if sys.argv[1:] == ["--build-identity"]:
         original = helper._backup_proof
         attempted = []
 
-        def compete(backup, deadline):
+        def compete(backup, deadline, diagnostics=None):
             with sqlite3.connect(self.database, timeout=0.05) as writer:
                 writer.execute("PRAGMA busy_timeout=50")
                 with self.assertRaisesRegex(sqlite3.OperationalError, "locked"):
                     writer.execute("INSERT INTO changes VALUES ('competing writer')")
             attempted.append(True)
-            return original(backup, deadline)
+            return original(backup, deadline, diagnostics)
 
         with mock.patch.object(helper, "_backup_proof", side_effect=compete):
             self.assertEqual(self.activate(), "committed")

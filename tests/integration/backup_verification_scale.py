@@ -42,7 +42,7 @@ def _payload(sequence: int, kind: str, size: int) -> str | bytes:
 
 
 def create_fixture(database: Path, *, minimum_bytes: int, rows_per_table: int | None,
-                   text_bytes: int, blob_bytes: int) -> dict:
+                   text_bytes: int, blob_bytes: int, extra_columns: int = 0) -> dict:
     started = time.monotonic()
     deadline = started + GENERATION_BUDGET_SECONDS
     text_rows = blob_rows = 0
@@ -64,6 +64,10 @@ def create_fixture(database: Path, *, minimum_bytes: int, rows_per_table: int | 
             CREATE INDEX documents_body_prefix ON documents(substr(body, 1, 32));
             CREATE INDEX keyed_body_prefix ON keyed_records(substr(body, 1, 32));
         """)
+        for index in range(extra_columns):
+            # Defaults become stored cells on INSERT, not virtual/generated columns.
+            connection.execute(f"ALTER TABLE documents ADD COLUMN extra_{index} INTEGER DEFAULT {index}")
+            connection.execute(f"ALTER TABLE keyed_records ADD COLUMN extra_{index} INTEGER DEFAULT {index}")
         while True:
             if time.monotonic() >= deadline:
                 raise TimeoutError("fixture generation exceeded 30-minute budget")
@@ -122,6 +126,7 @@ def create_fixture(database: Path, *, minimum_bytes: int, rows_per_table: int | 
     if source_bytes < minimum_bytes:
         raise RuntimeError(f"populated SQLite file is only {source_bytes} bytes; requires {minimum_bytes}")
     return {
+        "extra_stored_columns_per_table": extra_columns,
         "documents_rows": text_rows,
         "keyed_records_rows": blob_rows,
         "fts5_rows": fts_rows,
@@ -148,7 +153,7 @@ def run(args: argparse.Namespace) -> dict:
     database = args.work_dir / "populated-source.sqlite"
     composition = create_fixture(database, minimum_bytes=target_bytes,
                                  rows_per_table=args.rows_per_table,
-                                 text_bytes=args.text_bytes, blob_bytes=args.blob_bytes)
+                                 text_bytes=args.text_bytes, blob_bytes=args.blob_bytes, extra_columns=args.extra_columns)
     source_bytes = database.stat().st_size
     free_before_backup = shutil.disk_usage(args.work_dir).free
     if free_before_backup < source_bytes + 1_000_000_000:
@@ -156,10 +161,18 @@ def run(args: argparse.Namespace) -> dict:
 
     deadline = time.monotonic() + BACKUP_BUDGET_SECONDS
     verification_started = time.monotonic()
-    with helper.sqlite_writer_guard(str(database), timeout=BACKUP_BUDGET_SECONDS):
-        backup = helper.create_verified_database_backup(
-            str(database), args.work_dir, timeout=deadline - time.monotonic())
-        proof = helper._backup_proof(backup, deadline)
+    diagnostics = {"deadline": deadline}
+    outcome = "failure"
+    try:
+        with helper.sqlite_writer_guard(str(database), timeout=BACKUP_BUDGET_SECONDS):
+            backup = helper.create_verified_database_backup(
+                str(database), args.work_dir, timeout=deadline - time.monotonic(), diagnostics=diagnostics)
+            proof = helper._backup_proof(backup, deadline, diagnostics)
+        outcome = "success"
+    finally:
+        args.diagnostics = diagnostics
+        args.verification_elapsed_seconds = time.monotonic() - started
+        helper._emit_verifier_diagnostics(diagnostics, outcome)
     verification_elapsed = time.monotonic() - verification_started
     if verification_elapsed > BACKUP_BUDGET_SECONDS:
         raise RuntimeError(f"backup, verification, proof, and fsync exceeded {BACKUP_BUDGET_SECONDS}s: "
@@ -183,6 +196,7 @@ def run(args: argparse.Namespace) -> dict:
                     "payloads": "deterministic repeated TEXT/BLOB content; indexed FTS5 text"},
         "verification": {"elapsed_seconds": round(verification_elapsed, 3),
                          "budget_seconds": BACKUP_BUDGET_SECONDS,
+                         "diagnostics": diagnostics,
                          "proof_bytes": proof["backup_bytes"],
                          "proof_sha256": proof["backup_sha256"]},
     }
@@ -202,6 +216,7 @@ def main() -> int:
                         help="fixture threshold (small values are intended only for local smoke tests)")
     parser.add_argument("--rows-per-table", type=int,
                         help="fixed row count per table; only for local smoke tests")
+    parser.add_argument("--extra-columns", type=int, choices=(0, 24), default=0)
     parser.add_argument("--text-bytes", type=int, default=1_100)
     parser.add_argument("--blob-bytes", type=int, default=1_100)
     args = parser.parse_args()
@@ -216,6 +231,11 @@ def main() -> int:
         failure = {
             "qualification": "large populated SQLite backup verification",
             "status": "failed",
+            "diagnostics": getattr(args, "diagnostics", None),
+            "parameters": {key: getattr(args, key) for key in ("extra_columns", "text_bytes", "blob_bytes", "rows_per_table", "minimum_source_bytes")},
+            "fixture": getattr(args, "fixture", None),
+            "generation_seconds": getattr(args, "generation_seconds", None),
+            "verification_elapsed_seconds": getattr(args, "verification_elapsed_seconds", None),
             "free_disk_bytes": shutil.disk_usage(args.work_dir).free,
             "error": f"{type(exc).__name__}: {exc}",
             "commit": os.environ.get("GITHUB_SHA") or _git_commit(),

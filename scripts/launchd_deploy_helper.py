@@ -386,8 +386,43 @@ def _database_size_bytes(database_path: str) -> int:
     return page_count * page_size
 
 
-def _verify_logical_equivalence(source, backup, deadline: float) -> None:
+@contextlib.contextmanager
+def _diagnostic_stage(diagnostics: dict | None, name: str):
+    if diagnostics is None:
+        yield
+        return
+    started = time.monotonic()
+    diagnostics["current_stage"] = name
+    if "deadline" in diagnostics:
+        diagnostics["stage_budget_ms"] = round(max(0, diagnostics["deadline"] - started) * 1000, 3)
+    try:
+        yield
+    finally:
+        timings = diagnostics.setdefault("stage_ms", {})
+        timings[name] = round(timings.get(name, 0.0) + (time.monotonic() - started) * 1000, 3)
+
+
+def _emit_verifier_diagnostics(diagnostics: dict, outcome: str) -> None:
+    """Emit one bounded, content-free verifier summary without affecting the operation."""
+    try:
+        record = {"event": "sqlite_backup_verifier", "outcome": outcome,
+                  **{key: diagnostics.get(key) for key in (
+                      "current_stage", "stage_budget_ms", "stage_ms", "table_ordinal",
+                      "rows_compared", "cells_compared", "table_rows_compared",
+                      "table_cells_compared", "table_elapsed_ms", "tables_completed")}}
+        sys.stderr.write(json.dumps(record, separators=(",", ":")) + "\n")
+        sys.stderr.flush()
+    except Exception:
+        pass
+
+
+def _verify_logical_equivalence(source, backup, deadline: float, diagnostics: dict | None = None) -> None:
     """Compare SQLite metadata and persisted rows without constructing SQL dumps."""
+    if diagnostics is not None:
+        diagnostics["deadline"] = deadline
+        diagnostics.setdefault("rows_compared", 0)
+        diagnostics.setdefault("cells_compared", 0)
+        diagnostics.setdefault("tables_completed", 0)
     import sqlite3
     import struct
 
@@ -543,18 +578,18 @@ def _verify_logical_equivalence(source, backup, deadline: float) -> None:
             indexes = pragma_rows(source, f"PRAGMA {quote(schema)}.index_list({quote(name)})")
             pk_name = next((text(row[1]) for row in indexes if text(row[3]) == "pk"), None)
             if pk_name is None:
-                raise ActivationError(f"SQLite WITHOUT ROWID table has no primary key: {name}")
+                raise ActivationError(f"SQLite WITHOUT ROWID table ordinal {(diagnostics or {}).get('table_ordinal', 0)} has no primary key")
             keys = [row for row in pragma_rows(source, f"PRAGMA {quote(schema)}.index_xinfo({quote(pk_name)})")
                     if row[5]]
             if not keys or any(row[1] < 0 or row[2] is None or row[4] is None for row in keys):
-                raise ActivationError(f"cannot identify SQLite primary-key ordering: {name}")
+                raise ActivationError(f"cannot identify SQLite primary-key ordering for table ordinal {(diagnostics or {}).get('table_ordinal', 0)}")
             order = ",".join(f"{quote(text(row[2]))} COLLATE {quote(text(row[4]))}"
                              + (" DESC" if row[3] else " ASC") for row in keys)
             identity = []
         else:
             aliases = {"rowid", "_rowid_", "oid"} - {text(column[1]).lower() for column in xinfo}
             if not aliases:
-                raise ActivationError(f"cannot verify rowid identity for table shadowing all rowid aliases: {name}")
+                raise ActivationError(f"cannot verify rowid identity for table ordinal {(diagnostics or {}).get('table_ordinal', 0)}")
             rowid = next(alias for alias in ("rowid", "_rowid_", "oid") if alias in aliases)
             order = quote(rowid)
             identity = [quote(rowid)]
@@ -569,14 +604,20 @@ def _verify_logical_equivalence(source, backup, deadline: float) -> None:
             check_deadline()
             if a is None or b is None:
                 if a != b:
-                    raise ActivationError(f"SQLite backup row count differs in table: {name}")
+                    raise ActivationError(f"SQLite backup row count differs in table ordinal {(diagnostics or {}).get('table_ordinal', 0)}")
                 break
             offset = len(identity)
             if identity and a[0] != b[0]:
-                raise ActivationError(f"SQLite backup rowid differs in table: {name}")
+                raise ActivationError(f"SQLite backup row identity differs in table ordinal {(diagnostics or {}).get('table_ordinal', 0)}")
             for index in range(offset, len(a), 2):
+                if diagnostics is not None:
+                    diagnostics["cells_compared"] += 1
+                    diagnostics["table_cells_compared"] += 1
                 if typed_value(a[index], a[index + 1]) != typed_value(b[index], b[index + 1]):
-                    raise ActivationError(f"SQLite backup row differs in table: {name}")
+                    raise ActivationError(f"SQLite backup row differs in table ordinal {(diagnostics or {}).get('table_ordinal', 0)}")
+            if diagnostics is not None:
+                diagnostics["rows_compared"] += 1
+                diagnostics["table_rows_compared"] += 1
 
     old_factories = source.text_factory, backup.text_factory
     try:
@@ -584,24 +625,46 @@ def _verify_logical_equivalence(source, backup, deadline: float) -> None:
         handler = lambda: 1 if time.monotonic() >= deadline else 0
         source.set_progress_handler(handler, 1000)
         backup.set_progress_handler(handler, 1000)
-        check_deadline()
-        source_metadata = metadata(source)
-        backup_metadata = metadata(backup)
-        if source_metadata != backup_metadata:
-            raise ActivationError("SQLite backup schema or database metadata differs from the stopped source")
-        for schema, _schema_rows, _table_list, tables, _settings in source_metadata:
-            for name, kind, xinfo in tables:
-                if kind == "virtual":
-                    sql = next((row[4] for row in _schema_rows if text(row[0]) == "table" and text(row[1]) == name), None)
-                    if module_for(sql) != "fts5":
-                        raise ActivationError(f"cannot verify unsupported SQLite virtual table module: {name}")
-                    continue
-                compare_table(source, backup, schema, name, kind, xinfo)
+        with _diagnostic_stage(diagnostics, "metadata"):
+            check_deadline()
+            source_metadata = metadata(source)
+            backup_metadata = metadata(backup)
+            if source_metadata != backup_metadata:
+                raise ActivationError("SQLite backup schema or database metadata differs from the stopped source")
+        with _diagnostic_stage(diagnostics, "table_comparisons"):
+            table_ordinal = 0
+            for schema, _schema_rows, _table_list, tables, _settings in source_metadata:
+                for name, kind, xinfo in tables:
+                    if kind == "virtual":
+                        table_ordinal += 1
+                        if diagnostics is not None:
+                            diagnostics["table_ordinal"] = table_ordinal
+                            diagnostics["table_rows_compared"] = 0
+                            diagnostics["table_cells_compared"] = 0
+                            diagnostics["table_elapsed_ms"] = None
+                        sql = next((row[4] for row in _schema_rows if text(row[0]) == "table" and text(row[1]) == name), None)
+                        if module_for(sql) != "fts5":
+                            raise ActivationError(f"cannot verify unsupported SQLite virtual table module at table ordinal {table_ordinal}")
+                        continue
+                    table_ordinal += 1
+                    if diagnostics is not None:
+                        diagnostics["table_ordinal"] = table_ordinal
+                    table_started = time.monotonic()
+                    if diagnostics is not None:
+                        diagnostics["table_rows_compared"] = 0
+                        diagnostics["table_cells_compared"] = 0
+                    try:
+                        compare_table(source, backup, schema, name, kind, xinfo)
+                    finally:
+                        if diagnostics is not None:
+                            diagnostics["table_elapsed_ms"] = round((time.monotonic() - table_started) * 1000, 3)
+                    if diagnostics is not None:
+                        diagnostics["tables_completed"] = diagnostics.get("tables_completed", 0) + 1
         check_deadline()
     except sqlite3.Error as exc:
         if time.monotonic() >= deadline:
-            raise ActivationError("SQLite logical verification deadline exceeded") from exc
-        raise
+            raise ActivationError("SQLite logical verification deadline exceeded") from None
+        raise ActivationError("SQLite logical verification database operation failed") from None
     finally:
         source.text_factory, backup.text_factory = old_factories
 
@@ -624,11 +687,14 @@ def sqlite_writer_guard(database_path: str, *, timeout: float = 5):
             guard.rollback()
 
 
-def create_verified_database_backup(database_path: str, directory: Path, *, timeout: float = 600) -> Path:
+def create_verified_database_backup(database_path: str, directory: Path, *, timeout: float = 600,
+                                    diagnostics: dict | None = None) -> Path:
     import sqlite3
 
     source_path = Path(database_path)
     deadline = time.monotonic() + timeout
+    if diagnostics is not None:
+        diagnostics["deadline"] = deadline
     fd, name = tempfile.mkstemp(prefix="database-backup-", suffix=".sqlite", dir=directory)
     os.close(fd)
     backup_path = Path(name)
@@ -650,26 +716,31 @@ def create_verified_database_backup(database_path: str, directory: Path, *, time
             with contextlib.closing(sqlite3.connect(backup_path, timeout=remaining())) as backup:
                 backup.execute(f"PRAGMA busy_timeout={max(1, min(100, int(remaining() * 1000)))}")
                 backup.set_progress_handler(lambda: 1 if time.monotonic() >= deadline else 0, 1000)
-                source.backup(backup, pages=128, progress=progress, sleep=0.05)
+                with _diagnostic_stage(diagnostics, "native_backup"):
+                    source.backup(backup, pages=128, progress=progress, sleep=0.05)
                 remaining()
-                check = backup.execute("PRAGMA integrity_check").fetchone()
+                with _diagnostic_stage(diagnostics, "integrity_check"):
+                    check = backup.execute("PRAGMA integrity_check").fetchone()
                 if time.monotonic() >= deadline:
                     raise ActivationError("SQLite integrity verification deadline exceeded")
                 if check != ("ok",):
-                    raise ActivationError(f"SQLite backup integrity check failed: {check!r}")
-                _verify_logical_equivalence(source, backup, deadline)
+                    raise ActivationError("SQLite backup integrity check failed")
+                _verify_logical_equivalence(source, backup, deadline, diagnostics)
         remaining()
-        fd = os.open(backup_path, os.O_RDONLY)
-        try:
-            os.fsync(fd)
-        finally:
-            os.close(fd)
-        fsync_dir(directory)
+        with _diagnostic_stage(diagnostics, "fsync"):
+            fd = os.open(backup_path, os.O_RDONLY)
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            fsync_dir(directory)
         return backup_path
     except BaseException as exc:
         backup_path.unlink(missing_ok=True)
         if isinstance(exc, sqlite3.Error) and time.monotonic() >= deadline:
-            raise ActivationError("SQLite backup and verification deadline exceeded") from exc
+            raise ActivationError("SQLite backup and verification deadline exceeded") from None
+        if isinstance(exc, sqlite3.Error):
+            raise ActivationError("SQLite backup database operation failed") from None
         raise
 
 
@@ -828,18 +899,19 @@ def restore_predecessor(manifest: Manifest, launchctl: "Launchctl", captured: di
         raise ActivationError(details) from exc
 
 
-def _backup_proof(path: Path, deadline: float) -> dict:
+def _backup_proof(path: Path, deadline: float, diagnostics: dict | None = None) -> dict:
     digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        while True:
-            if time.monotonic() >= deadline:
-                raise ActivationError("SQLite backup and verification deadline exceeded during proof hashing")
-            block = stream.read(1024 * 1024)
-            if not block:
-                break
-            digest.update(block)
-    if time.monotonic() >= deadline:
-        raise ActivationError("SQLite backup and verification deadline exceeded during proof hashing")
+    with _diagnostic_stage(diagnostics, "proof_hash"):
+        with path.open("rb") as stream:
+            while True:
+                if time.monotonic() >= deadline:
+                    raise ActivationError("SQLite backup and verification deadline exceeded during proof hashing")
+                block = stream.read(1024 * 1024)
+                if not block:
+                    break
+                digest.update(block)
+        if time.monotonic() >= deadline:
+            raise ActivationError("SQLite backup and verification deadline exceeded during proof hashing")
     return {"backup_path": str(path), "backup_bytes": path.stat().st_size,
             "backup_sha256": digest.hexdigest()}
 
@@ -941,10 +1013,17 @@ def activate(manifest: Manifest) -> str:
                 _preflight_backup_capacity(database_path, backup_directory)
                 with sqlite_writer_guard(database_path):
                     backup_deadline = time.monotonic() + 600
-                    backup = create_verified_database_backup(
-                        database_path, backup_directory, timeout=backup_deadline - time.monotonic(),
-                    )
-                    backup_proof = _backup_proof(backup, backup_deadline)
+                    verifier_diagnostics = {}
+                    try:
+                        backup = create_verified_database_backup(
+                            database_path, backup_directory, timeout=backup_deadline - time.monotonic(),
+                            diagnostics=verifier_diagnostics,
+                        )
+                        backup_proof = _backup_proof(backup, backup_deadline, verifier_diagnostics)
+                    except BaseException as verifier_error:
+                        _emit_verifier_diagnostics(verifier_diagnostics, type(verifier_error).__name__)
+                        raise
+                    _emit_verifier_diagnostics(verifier_diagnostics, "verified")
                     write_proof(manifest, phase="backup_verified", backup=backup_proof)
                     print(f"{manifest.transaction_id}: verified SQLite backup retained at {backup}", flush=True)
                     phase = "migration_started"
