@@ -327,6 +327,10 @@ pub const PROFILE_ACTIONS: &[&str] = &[
 
 #[async_trait]
 impl Tool for BrowserProfileTool {
+    fn foreground_execution(&self) -> crate::ForegroundExecution {
+        crate::ForegroundExecution::Concurrent
+    }
+
     fn name(&self) -> &'static str {
         "browser_profile"
     }

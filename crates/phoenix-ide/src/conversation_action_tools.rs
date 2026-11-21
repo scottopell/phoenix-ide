@@ -215,6 +215,10 @@ fn operation_schema() -> Value {
 
 #[async_trait]
 impl RoutedTool for RenameConversation {
+    fn foreground_execution(&self) -> phoenix_tools::ForegroundExecution {
+        phoenix_tools::ForegroundExecution::Serial
+    }
+
     fn validate_before_peer_lookup(&self, input: &Value) -> Result<(), String> {
         let request = parse_rename_request(input.clone())?;
         if matches!(request, RenameRequest::Read { .. }) {
@@ -564,6 +568,10 @@ impl RenameConversation {
 
 #[async_trait]
 impl RoutedTool for CreateConversation {
+    fn foreground_execution(&self) -> phoenix_tools::ForegroundExecution {
+        phoenix_tools::ForegroundExecution::Serial
+    }
+
     fn validate_before_peer_lookup(&self, input: &Value) -> Result<(), String> {
         parse_create_request(input).map(|_| ())
     }

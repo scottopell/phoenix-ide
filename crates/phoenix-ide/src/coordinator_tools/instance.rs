@@ -79,6 +79,7 @@ pub(crate) enum SelfPeerPolicy {
 
 #[async_trait::async_trait]
 pub(crate) trait RoutedTool: Send + Sync {
+    fn foreground_execution(&self) -> phoenix_tools::ForegroundExecution;
     fn name(&self) -> &'static str;
     fn description(&self) -> String;
     fn clearable(&self) -> bool;
@@ -145,6 +146,10 @@ impl<T: RoutedTool + 'static> RouteTool<T> {
 
 #[async_trait::async_trait]
 impl<T: RoutedTool + 'static> Tool for RouteTool<T> {
+    fn foreground_execution(&self) -> phoenix_tools::ForegroundExecution {
+        self.0.foreground_execution()
+    }
+
     fn name(&self) -> &'static str {
         self.0.name()
     }

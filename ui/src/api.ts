@@ -587,18 +587,32 @@ export type RecoveryResumeTarget =
   | { type: 'continuation_summary'; request: ContinuationSummaryRequest }
   | { type: 'server_overload_retry'; retry: ServerOverloadRetry };
 
+export type FinalizedToolRoundResult = {
+  tool_use_id: string;
+  outcome:
+    | { type: 'success' | 'error'; output: string; display_data?: Record<string, unknown> | null; images?: ImageData[] }
+    | { type: 'trusted_instructions'; output: string }
+    | { type: 'cancelled'; message: string };
+  duration_ms?: number;
+};
+
+export type ToolRoundState = {
+  assistant_message?: { message_id: string } | undefined;
+  completed_results?: (FinalizedToolRoundResult | { pending_self_goal: unknown } | { pending_goal_report: unknown })[] | undefined;
+};
+
 export type ConversationState =
   | { type: 'idle' }
   | { type: 'awaiting_llm' }
   | { type: 'llm_requesting'; attempt: number }
   | { type: 'server_overload_retrying'; attempt: number; maxAttempts: number; retryAt: number | null; target: 'ordinary' | 'continuation' }
   | { type: 'seeded_llm_requesting'; seed_message_id: string; attempt: number }
-  | { type: 'tool_executing'; current_tool: ToolCall; remaining_tools: ToolCall[] }
+  | ({ type: 'tool_executing'; current_tool: ToolCall; remaining_tools: ToolCall[] } & ToolRoundState)
   | { type: 'awaiting_sub_agents'; pending: PendingSubAgent[]; completed_results: SubAgentResult[] }
   | { type: 'awaiting_continuation'; attempt: number }
   | { type: 'recoverable_continuation_failure'; message: string; error_kind: ErrorKind; operation_id: string; attempt: number }
   | { type: 'cancelling' }
-  | { type: 'cancelling_tool'; current_tool: ToolCall }
+  | ({ type: 'cancelling_tool'; tool_use_id: string; skipped_tools: ToolCall[] } & ToolRoundState)
   | { type: 'cancelling_sub_agents'; pending: PendingSubAgent[] }
   | { type: 'awaiting_task_approval'; title: string; priority: string; plan: string }
   | { type: 'awaiting_user_response'; questions: UserQuestion[]; request_id?: string }

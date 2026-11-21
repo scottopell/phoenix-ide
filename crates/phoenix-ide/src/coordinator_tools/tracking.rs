@@ -149,6 +149,10 @@ fn object(op: &str, fields: Value, required: &[&str]) -> Value {
 }
 #[async_trait]
 impl Tool for TrackingTool {
+    fn foreground_execution(&self) -> phoenix_tools::ForegroundExecution {
+        phoenix_tools::ForegroundExecution::Serial
+    }
+
     fn name(&self) -> &'static str {
         "tracking"
     }

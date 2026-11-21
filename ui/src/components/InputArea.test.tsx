@@ -1029,7 +1029,7 @@ describe('InputArea cancellation affordance', () => {
         cwd="conv-cancelling"
         scopeKey="conv-cancelling"
         uploadConversationId="conv-cancelling"
-        convState={{ type: 'cancelling_tool', current_tool: { id: 't', name: 'bash', input: {} } }}
+        convState={{ type: 'cancelling_tool', tool_use_id: 't', skipped_tools: [] }}
         images={[]}
         setImages={() => {}}
         isOffline={false}

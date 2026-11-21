@@ -123,6 +123,10 @@ impl GlobFilter {
 
 #[async_trait]
 impl Tool for SearchTool {
+    fn foreground_execution(&self) -> crate::ForegroundExecution {
+        crate::ForegroundExecution::Concurrent
+    }
+
     // clearable: re-queryable read — see specs/stale-tool-results (REQ-STR-002).
     fn clearable(&self) -> bool {
         true

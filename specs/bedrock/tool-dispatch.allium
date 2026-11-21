@@ -1,16 +1,16 @@
 -- allium: 3
--- Serial tool-dispatch ownership (REQ-BED-004, REQ-BED-005a, REQ-BED-007,
+-- Foreground tool-dispatch ownership (REQ-BED-004, REQ-BED-005a, REQ-BED-007,
 -- REQ-BED-033, REQ-LLM-004i, REQ-PERM-001 through REQ-PERM-005).
 --
--- Scope: the ordinary tool-executor boundary between Bedrock's selection of
--- one active call and submission of its outcome to the reducer. ToolInvocation
--- describes process-local ownership, not another conversation state or durable
--- schedule. Layer 0 precedes call-resource admission. Cleared preparation then
+-- Scope: the ordinary tool-executor boundary between Bedrock's unresolved-call
+-- selection and submission of exact outcomes to the reducer. Serial invocation
+-- and ordinary-batch owners are exclusive process-local resource dispositions,
+-- not another conversation state or durable schedule. Layer 0 precedes call-resource admission. Cleared preparation then
 -- includes the start-time broadcast, context and metrics setup; it is not pure.
 --
 -- spawn_agents uses the sub-agent admission/materialization rules instead of
 -- this ordinary invocation lifecycle. Reducer-intercepted approval, question,
--- and child-terminal calls do not enter this boundary. Scheduling, tool internals,
+-- and child-terminal calls do not enter the ordinary batch. Tool internals,
 -- permission escalation, and restarting unknown-effect tools are outside scope.
 
 use "./bedrock.allium" as bedrock
@@ -31,6 +31,10 @@ external entity ToolRuntime {
     generation: Integer
 }
 
+-- The unchanged full original AssistantMessage, including raw provider blocks;
+-- never reconstructed by serializing the parsed execution payload.
+external entity AssistantSource {}
+
 -- The typed runtime outcome owns its complete payload; this boundary observes
 -- its identity and variant. Completed payloads and failure diagnostics remain
 -- lossless when converted to Bedrock results.
@@ -44,24 +48,31 @@ external entity InvocationOutcome {
 value DispatchSelection {
     runtime: ToolRuntime
     assistant_message_id: String
+    assistant_source: AssistantSource
     call: bedrock/ToolCall
 }
 
-contract SerialToolDispatch {
+contract ForegroundToolDispatch {
     forward: (invocation: ToolInvocation, outcome: InvocationOutcome) -> InvocationOutcome
     spawn_cancellation_resolution: (conversation: bedrock/Conversation) -> SpawnCancellationResolution
 
-    @invariant SerialOwnership
-        -- Bedrock owns the active call and remaining queue. The ordinary
-        -- executor owns one dispatch generation, cancellation token, and retained
-        -- task handle. A generation is process-local; neither it nor a handle
+    @invariant ExclusiveForegroundOwnership
+        -- ForegroundDispatch is exactly Serial or OrdinaryBatch. Bedrock's
+        -- current/remaining fields own all unresolved membership, and its
+        -- completed_results own accepted receipts. The batch owns affine
+        -- preparation/execution resources and unaccepted outcomes only; it is
+        -- not another semantic pending authority or durable queue. Serial owns
+        -- one generation/token/task; a batch retains at most eight call owners
+        -- in preparing/running/ready/settling, including ready outcomes awaiting
+        -- their owning commit. Unissued/no-read/retired proofs admit no execution.
+        -- A generation is process-local; neither it nor a handle
         -- creates restart authority. REQ-BED-007 and ToolRoundAdmission govern
         -- recovery without re-executing in-flight or unknown-effect tools.
 
     @invariant CompletionNeedsThreeGuards
-        -- Only an open local-authority fence, the current dispatch generation,
-        -- and an accepting reducer state with the expected tool identity permit
-        -- an outcome to mutate conversation state. ID equality alone is not
+        -- Only an open local-authority fence, a current serial generation or
+        -- retained exact batch owner, and an accepting reducer state with exact
+        -- original source/call identity permit an outcome to mutate state. ID equality alone is not
         -- ownership: later rounds may reuse the same provider tool ID. Normal
         -- completion need not advance generation or abort the retained handle.
 
@@ -102,6 +113,342 @@ entity ToolInvocation {
     }
 }
 
+config {
+    ordinary_owner_limit: Integer = 8
+}
+
+-- These entities describe affine live resources, never persisted scheduling.
+-- Canonical unresolved and accepted membership remains exclusively in Bedrock.
+entity ForegroundDispatch {
+    runtime: ToolRuntime
+    kind: SerialDispatch | OrdinaryBatch
+}
+
+variant SerialDispatch : ForegroundDispatch {}
+
+variant OrdinaryBatch : ForegroundDispatch {
+    source: AssistantSource
+    closing: Boolean
+    cancellation_deadline: Timestamp when closing = true
+    owners: BatchCallOwner with batch = this
+    retained: owners where phase in { preparing, running, ready, settling, forced_retired }
+}
+
+entity BatchCallOwner {
+    batch: OrdinaryBatch
+    selection: DispatchSelection
+    failure_boundary: caller | required
+    phase: unissued | preparing | running | ready | settling | forced_retired | retired | no_read
+    outcome: InvocationOutcome when phase = ready | settling
+
+    transitions phase {
+        unissued -> preparing
+        unissued -> ready
+        preparing -> running
+        preparing -> ready
+        preparing -> no_read
+        preparing -> retired
+        running -> ready
+        running -> settling
+        running -> retired
+        running -> forced_retired
+        ready -> settling
+        ready -> retired
+        settling -> retired
+        forced_retired -> retired
+        no_read -> ready
+        no_read -> retired
+        terminal: retired
+    }
+}
+
+rule SelectOrdinaryBatchFromWholeOriginalResponse {
+    when: bedrock/ToolExecutionStarted(conversation, call)
+    let runtime = runtime_for(conversation)
+    requires: process_authority.open
+    requires: serial_dispatch(runtime)
+    requires: whole_source_is_ordinary(conversation)
+    requires: ordinary_batch_needed(conversation)
+    requires: no_serial_resources_owned(runtime)
+    ensures: OrdinaryBatchSelected(runtime, original_assistant_source(conversation))
+    ensures: LegacyRepresentativeWaitDeadlineDisarmed(runtime)
+
+    @guidance
+        -- Select the exclusive OrdinaryBatch disposition once for this exact
+        -- source. Classify every original call, including already-completed calls.
+        -- Any lifecycle-serial call keeps the entire response Serial. Bash and
+        -- patch can overlap; the model chooses independence. No path locks,
+        -- conflict checks, dependency inference or backgrounding are introduced.
+        -- Allocate unissued affine proofs from canonical unresolved membership;
+        -- these are resource dispositions, not a second semantic pending queue.
+}
+
+rule FillOneOrdinaryOwner {
+    when: BatchRefillRequested(batch)
+    requires: process_authority.open
+    requires: not batch.closing
+    requires: batch.retained.count < config.ordinary_owner_limit
+    requires: has_unissued_owner(batch)
+    let owner = first_unissued_owner(batch)
+    ensures: owner.phase = preparing
+    ensures: BatchPreparationReadsRequested(owner)
+
+    @guidance
+        -- Repeat only while capacity remains. Preparing authority reads count
+        -- toward the bound but reserve no execution channel, token, generation,
+        -- context, metrics writer or start publication before gate clearance.
+}
+
+rule ExistingBatchSelectionOnlyRefills {
+    when: bedrock/ToolExecutionStarted(conversation, call)
+    requires: process_authority.open
+    requires: has_ordinary_batch(conversation)
+    let batch = ordinary_batch_for(conversation)
+    requires: batch.source = original_assistant_source(conversation)
+    ensures: BatchRefillRequested(batch)
+}
+
+rule BatchClearedCallAdmitsItsOwnResources {
+    when: BatchPreparationCleared(owner, checked_call)
+    requires: process_authority.open
+    requires: batch_owner_is_current(owner)
+    requires: owner.phase = preparing
+    requires: not owner.batch.closing
+    requires: checked_payload_matches(checked_call, owner.selection.call)
+    ensures: CallResourcesReserved(owner.selection)
+    ensures: owner.phase = running
+    ensures: BatchToolTaskLaunched(owner, checked_call)
+
+    @guidance
+        -- Preserve the gate-minted payload and originating schema through
+        -- side-effecting context/start/metrics preparation and live-definition
+        -- validation. Each running owner retains its exact token, task and typed
+        -- one-shot receiver. Existing permission escalation is unchanged.
+}
+
+rule BatchUnavailableOrDeniedCallHasNoExecutionResources {
+    when: BatchPreparationRejected(owner, outcome)
+    requires: process_authority.open
+    requires: batch_owner_is_current(owner)
+    requires: owner.phase = preparing
+    ensures: owner.phase = ready
+    ensures: owner.outcome = owned_batch_outcome(owner, outcome)
+    ensures: not CallResourcesReserved(owner.selection)
+    ensures: not BatchToolTaskLaunched(owner, outcome)
+}
+
+rule BatchPreparationReadErrorPreservesCapturedBoundary {
+    when: BatchPreparationReadFailed(owner, diagnostic)
+    requires: process_authority.open
+    requires: batch_owner_is_current(owner)
+    requires: owner.phase = preparing
+    ensures: owner.phase = no_read
+    ensures: CapturedPreparationErrorReturned(owner, diagnostic)
+
+    @guidance
+        -- The first source call retains the caller's captured Caller or Required
+        -- boundary. Source calls two onward retain the existing Required tool
+        -- boundary. A current Caller error returns its actual diagnostic while
+        -- retaining affirmative no-read/no-effects cancellation proof; Required
+        -- errors take that existing fail-stop boundary and actor exit. A string
+        -- error alone is never reclassified as unknown SQLite authority.
+}
+
+rule BatchTypedOutcomeBecomesReady {
+    when: BatchReceiverResolved(owner, outcome)
+    requires: owner.phase = running
+    ensures: owner.phase = ready
+    ensures: owner.outcome = owned_batch_outcome(owner, outcome)
+
+    @guidance
+        -- Sender loss produces a concrete Failed outcome for the expected call.
+        -- Retain the running resources alongside the ready receipt until commit.
+        -- Failed/ordinary tool errors do not cancel independent siblings.
+}
+
+rule SubmitOneExactBatchReceipt {
+    when: BatchReadyReceiptSelected(owner)
+    requires: process_authority.open
+    requires: batch_owner_is_current(owner)
+    requires: owner.phase = ready
+    ensures: owner.phase = settling
+    ensures: ExactBatchReceiptSubmitted(owner, owner.outcome)
+
+    @guidance
+        -- Completed and Failed become this exact sibling's ToolCompletes;
+        -- Aborted becomes its cancellation receipt. Preserve complete result
+        -- payload and metadata. Accept results independently of earlier siblings;
+        -- the complete checkpoint and sole next model request wait for all calls.
+        -- Publish accepted live output through existing events before the whole
+        -- checkpoint where supported; no new SSE event or wire shape is required.
+}
+
+rule OwningCommitRetiresReceiptThenRefills {
+    when: BatchReceiptCommitEstablished(owner)
+    requires: process_authority.open
+    requires: owner.phase = settling
+    ensures: owner.phase = retired
+    ensures: BatchRefillRequested(owner.batch)
+
+    @guidance
+        -- Establish the owning core-state commit before releasing resources or
+        -- reusing capacity. Refill each released slot from canonical unissued
+        -- membership without waiting for any other running sibling.
+        -- A rejected/unknown commit does not retire a receipt
+        -- as successfully accepted. Closing prevents this refill from launching.
+}
+
+rule StaleBatchObservationCannotMutateSuccessor {
+    when: BatchObservationReturned(owner)
+    requires: not process_authority.open or not batch_owner_is_current(owner)
+    ensures: not ConversationMutation(owner.selection.runtime.conversation)
+    ensures: not BatchToolTaskLaunched(owner, owner.selection.call)
+
+    @guidance
+        -- Match exact runtime origin, unchanged full raw original assistant,
+        -- full call and unresolved membership. Reused provider IDs, altered raw
+        -- source, duplicate receipts and late completions cannot adopt a successor.
+        -- Actual global unknown SQLite authority is classified before this filter
+        -- and closes the process fence even when the origin became stale.
+}
+
+rule ActualUnknownBatchAuthorityClosesFenceBeforeOriginFiltering {
+    when: BatchLocalAuthorityUnclassified(owner)
+    ensures: FatalLocalAuthorityLost()
+}
+
+rule CancelEveryOrdinaryOwnerBeforePersistenceWait {
+    when: bedrock/ToolAbortRequested(conversation)
+    requires: process_authority.open
+    requires: has_ordinary_batch(conversation)
+    let batch = ordinary_batch_for(conversation)
+    requires: not batch.closing
+    ensures: batch.closing = true
+    ensures: batch.cancellation_deadline = absolute_cancellation_cutoff(conversation)
+    ensures: AvailableTypedReceiptsSnapshottedBeforeSignals(batch)
+    ensures: UnissuedAndNoReadProofsConsumedForCancellation(batch)
+    ensures: PreparationReadsInterrupted(batch)
+    ensures: EveryRunningSiblingSignalled(batch)
+
+    @guidance
+        -- Synchronously try the existing typed receivers before any cancellation
+        -- signal; retain authentic already-available Completed payloads. An
+        -- untyped tool return keeps the executor's cancellation classification.
+        -- Ready/Settling owners remain held. Signal every running sibling before
+        -- awaiting any persistence; prevent refill immediately. Missing memory
+        -- alone is not proof that a read or external effect was never issued.
+}
+
+rule ObserveCancellationWhileBatchCommitIsIssued {
+    when: BatchCommitCancellationObserved(conversation)
+    requires: process_authority.open
+    requires: has_ordinary_batch(conversation)
+    let batch = ordinary_batch_for(conversation)
+    ensures: CancellationDeliveryRetained(conversation)
+    ensures: AvailableTypedReceiptsSnapshottedBeforeSignals(batch)
+    ensures: EveryRunningSiblingSignalled(batch)
+    ensures: batch.closing = true
+
+    @guidance
+        -- Both acknowledged and addressed cancellation use the same concrete
+        -- bounded control inbox. Retain the exact request and its acknowledgement
+        -- custody once, outside dispatch-mode replacement. Bias a ready Cancel
+        -- ahead of a ready write result. Keep the same pinned issued state,
+        -- complete-round checkpoint or cancellation-evidence write until classified;
+        -- do not recurse into reducer settlement, drop, reissue or infer its result.
+        -- Service resource-only deadlines while waiting. Once classification is
+        -- established, apply the retained semantic Cancel before refill or model
+        -- dispatch, keeping its original absolute cutoff. A selected uncommitted
+        -- steering drain restores its exact entries; the ordinary post-Cancel
+        -- boundary owns their later delivery. Closed inboxes cannot spin; fatal
+        -- shutdown releases a retained acknowledgement with an honest error.
+        -- A Caller diagnostic consumes that request/acknowledgement once but
+        -- retains resource-only Closing custody and the same original cutoff.
+        -- The normal actor boundary services it without another request, write,
+        -- semantic result or forced notice. An explicit retry joins that close.
+        -- Keep resource custody during an accepted cancellation's later receipt
+        -- writes too; release it only when that exact batch retires. Scope the
+        -- timer to the retained source owner so it cannot retire a successor.
+        -- No diagnostic implies Unknown, and no write is automatically retried.
+}
+
+rule RetireEveryRemainingBatchOwnerAtAggregateDeadline {
+    when: bedrock/ToolCancellationRetirementRequested(conversation)
+    requires: process_authority.open
+    requires: has_ordinary_batch(conversation)
+    let batch = ordinary_batch_for(conversation)
+    requires: batch.closing
+    ensures: AllRemainingBatchOwnersRetired(batch)
+
+    @guidance
+        -- Use the one original aggregate deadline, never a renewed per-sibling
+        -- wait, including while another sibling's write remains issued. Snapshot
+        -- all available typed receipts again before aborting remaining Running
+        -- tasks. Retain each actual forced retirement as an affine forced_retired
+        -- owner, with its old outcome/publication authority revoked. Never retire
+        -- the Settling owner whose write is still awaiting classification.
+        -- Consume the resource timer once, and defer semantic retirement until
+        -- the existing safe actor boundary. Abort remaining owners before
+        -- acknowledging forced settlement.
+        -- Retain accepted outcomes, synthesize only unresolved results in source
+        -- order, and checkpoint the whole held round before parent Idle or child
+        -- Failed + NotifyParent. Carry one forced-retirement notice through the
+        -- existing aggregate drain; never publish it before the checkpoint.
+}
+
+rule AggregateRetirementAcknowledgedAfterAllOwners {
+    when: BatchSafeSettlementBoundaryReached(batch)
+    requires: process_authority.open
+    requires: all_batch_owners_affirmatively_retired(batch)
+    ensures: bedrock/ToolCancellationRetired(batch.runtime.conversation)
+}
+
+rule BatchBashWaitFallbackRetiresOnlyItsExactTask {
+    when: bedrock/ToolTaskRetirementRequested(conversation, call)
+    requires: process_authority.open
+    requires: has_ordinary_batch(conversation)
+    let batch = ordinary_batch_for(conversation)
+    let owner = batch_owner_for_exact_call(batch, call)
+    requires: batch_owner_is_current(owner)
+    requires: owner.phase = running
+    requires: bedrock/is_bash_wait(call)
+    requires: not batch_owner_has_available_typed_receipt(owner)
+    ensures: BatchWaitTaskOnlyAbortRequested(owner)
+    ensures: owner.phase = ready
+    ensures: owner.outcome = failed_wait_outcome(owner)
+    ensures: BatchWaitRetirementRetained(owner)
+
+    @guidance
+        -- Arm each selected wait from its own supported duration plus execution
+        -- grace and absolute persistence cutoff. Snapshot its receiver first;
+        -- preserve an available typed receipt instead of manufacturing failure.
+        -- While another sibling's write is issued, retain a Ready failed receipt
+        -- without reducer recursion, publication or another write. Once closing,
+        -- the aggregate cancellation cutoff supersedes this execution fallback.
+        -- Abort only that owner's wait
+        -- task, without signalling its token or cancelling the represented process,
+        -- handles or unrelated jobs. Retain the owner through its owning commit;
+        -- retired task output cannot replace the one synthetic Failed receipt.
+}
+rule BatchWaitAcknowledgedAtSafeReceiptSelection {
+    when: BatchReadyReceiptSelected(owner)
+    requires: process_authority.open
+    requires: batch_owner_is_current(owner)
+    requires: owner.phase = ready
+    requires: owner.outcome = failed_wait_outcome(owner)
+    ensures: bedrock/ToolTaskRetired(owner.batch.runtime.conversation, owner.selection.call)
+
+    @guidance
+        -- This is the same selected Failed receipt submitted by
+        -- SubmitOneExactBatchReceipt, not another completion authority. An
+        -- outstanding sibling write must classify before normal receipt selection.
+}
+
+invariant BoundedRetainedOrdinaryOwners {
+    for batch in OrdinaryBatches:
+        batch.retained.count <= config.ordinary_owner_limit
+}
+
 -- REQ-LLM-004i: early request-policy and terminal-surface rejection precedes
 -- ordinary dispatch ownership. Failure to read authority is an executor error,
 -- not a fabricated unavailable result or permission to execute.
@@ -111,6 +458,8 @@ rule RejectUnavailableCallBeforeOwnership {
     requires: conversation.core_status = executing_tools
     requires: call = conversation.current_tool
     requires: not has_active_ordinary_invocation(conversation)
+    requires: serial_dispatch(runtime)
+    requires: serial_response(conversation)
     requires: process_authority.open
     requires: request_policy_read_succeeded(runtime)
     requires: not originating_policy_allows(runtime, call)
@@ -123,6 +472,7 @@ rule RequestPolicyReadFails {
     when: ToolRequestPolicyReadFailed(selection)
     let runtime = selection.runtime
     let call = selection.call
+    requires: serial_dispatch(selection.runtime)
     requires: process_authority.open
     requires: selection_is_current(selection)
     ensures: ExecutorErrorReturned(runtime, call)
@@ -134,6 +484,7 @@ rule PreparationScopeReadFails {
     when: ToolPreparationScopeReadFailed(selection)
     let runtime = selection.runtime
     let call = selection.call
+    requires: serial_dispatch(selection.runtime)
     requires: process_authority.open
     requires: selection_is_current(selection)
     requires: originating_policy_allows(runtime, call)
@@ -163,6 +514,8 @@ rule RouteSpawnToItsAdmissionBoundary {
     requires: conversation.core_status = executing_tools
     requires: call = conversation.current_tool
     requires: not has_active_ordinary_invocation(conversation)
+    requires: serial_dispatch(runtime)
+    requires: serial_response(conversation)
     requires: process_authority.open
     requires: originating_policy_allows(runtime, call)
     requires: call.name = "spawn_agents"
@@ -188,6 +541,8 @@ rule RouteSpawnToItsAdmissionBoundary {
 rule RejectChangedSpawnCatalog {
     when: bedrock/ToolExecutionStarted(conversation, call)
     let runtime = runtime_for(conversation)
+    requires: serial_dispatch(runtime)
+    requires: serial_response(conversation)
     requires: process_authority.open
     requires: conversation.core_status = executing_tools
     requires: call = conversation.current_tool
@@ -201,6 +556,8 @@ rule RejectChangedSpawnCatalog {
 rule RejectUndecodableSpawnInput {
     when: bedrock/ToolExecutionStarted(conversation, call)
     let runtime = runtime_for(conversation)
+    requires: serial_dispatch(runtime)
+    requires: serial_response(conversation)
     requires: process_authority.open
     requires: conversation.core_status = executing_tools
     requires: call = conversation.current_tool
@@ -342,6 +699,8 @@ rule RequestOrdinaryPermissionBeforeResources {
     requires: conversation.core_status = executing_tools
     requires: call = conversation.current_tool
     requires: not has_active_ordinary_invocation(conversation)
+    requires: serial_dispatch(runtime)
+    requires: serial_response(conversation)
     requires: process_authority.open
     requires: originating_policy_allows(runtime, call)
     requires: call.name != "spawn_agents"
@@ -349,6 +708,7 @@ rule RequestOrdinaryPermissionBeforeResources {
     let selection = DispatchSelection{
         runtime: runtime,
         assistant_message_id: held_assistant_message_id(conversation),
+        assistant_source: original_assistant_source(conversation),
         call: call
     }
     ensures: OrdinaryPermissionCheckRequested(selection)
@@ -362,6 +722,7 @@ rule RequestOrdinaryPermissionBeforeResources {
 
 rule DeniedSelectionReturnsWithoutCallResources {
     when: PermissionDenied(selection, denial)
+    requires: serial_dispatch(selection.runtime)
     requires: process_authority.open
     requires: selection_is_current(selection)
     ensures: bedrock/ToolCompletes(selection.runtime.conversation,
@@ -387,6 +748,7 @@ rule ClearedSelectionAdmitsOrdinaryPreparation {
     when: PermissionCleared(selection, checked_call)
     let runtime = selection.runtime
     let call = selection.call
+    requires: serial_dispatch(selection.runtime)
     requires: process_authority.open
     requires: selection_is_current(selection)
     requires: not has_active_ordinary_invocation(runtime.conversation)
@@ -464,7 +826,9 @@ rule SubmitOwnedCompletionOrFailure {
     @guidance
         -- Completed and Failed become the expected call's ToolComplete.
         -- Bedrock's cancellation rules
-        -- checkpoint synthetic results rather than adopting a late real result.
+        -- preserve authentic already-typed completed results selected before
+        -- cancellation signalling; untyped tool returns keep executor cancellation
+        -- classification. No partial sibling receipt completes an aggregate drain.
         -- Reducer rejection leaves conversation state unchanged; it does not
         -- convert a current generation into permission to use another state.
 }
@@ -505,6 +869,7 @@ rule CooperativeCancellationPreservesGeneration {
 
 rule CancellationBeforeCallEffectsSettlesTheOwnedSelection {
     when: bedrock/ToolAbortRequested(conversation)
+    requires: serial_dispatch(runtime_for(conversation))
     requires: process_authority.open
     requires: conversation.core_status = cancelling_tool
     requires: not has_active_ordinary_invocation(conversation)
@@ -552,6 +917,7 @@ rule CancellationBackstopRetiresGeneration {
     let owner = runtime_for(conversation)
     let retiring = ToolInvocations where runtime = owner
         and phase in { preparing, launched, cancelling }
+    requires: serial_dispatch(runtime_for(conversation))
     requires: process_authority.open
     requires: conversation.core_status = cancelling_tool
     requires: spawn_cancellation_resolution(conversation) = established
@@ -602,6 +968,7 @@ rule RuntimeTeardownRetiresGeneration {
     ensures: runtime.generation = runtime.generation + 1
     ensures: SlotCancellationTokenSignalledIfPresent(runtime)
     ensures: RetainedToolTaskAbortRequested(runtime)
+    ensures: OrdinaryBatchResourcesRetired(runtime)
     ensures:
         for invocation in retiring:
             invocation.phase = retired
@@ -671,17 +1038,20 @@ surface OrdinaryToolDispatch {
         demands bedrock/ToolRoundAdmission
         demands bedrock/ParentTerminalAcceptance
         demands subagents/SpawnParentAdoption
-        fulfils SerialToolDispatch
+        fulfils ForegroundToolDispatch
 
     provides:
         bedrock/ToolExecutionStarted(runtime.conversation, runtime.conversation.current_tool)
             when runtime.conversation.core_status = executing_tools
                  and not has_active_ordinary_invocation(runtime.conversation)
+                 and serial_dispatch(runtime)
 
     @guarantee SelectionOwnsOneStartEffect
         -- ToolExecutionStarted is Bedrock's one effect when selecting an active
         -- call or advancing to its successor, not a repeatable dispatch API.
-        -- Each selection consumes that effect once. Cancellation may preempt
+        -- A serial selection consumes that effect once. In OrdinaryBatch a
+        -- representative effect only requests bounded refill; it cannot duplicate
+        -- a preparing/running/ready/settling owner. Cancellation may preempt
         -- preparation; single consumption does not require waiting for a read
         -- or admission response before accepting cancellation. A resumed
         -- preparation retains its original selection identity and cannot adopt
@@ -809,8 +1179,9 @@ surface RuntimeAuthorityObservations {
 -- held_assistant_message_id(conversation) -> String: the immutable message ID of
 --   the assistant round holding the selected call; never the latest durable row.
 -- selection_is_current(selection) -> Boolean: the same runtime still holds the
---   captured assistant message in ExecutingTools and its current tool equals the
---   captured exact call. Cancellation, round replacement, another selection or a
+--   captured full raw assistant source in ExecutingTools and its current tool
+--   equals the captured exact call. It does not serialize parsed input to recreate
+--   raw provider blocks. Cancellation, round replacement, another selection or a
 --   later round reusing a provider ID is false. This check and error acceptance
 --   are one owned step; no ordinary generation is required before preparation.
 -- retained_selection_for_cancellation(conversation) -> DispatchSelection: the
@@ -889,3 +1260,104 @@ surface RuntimeAuthorityObservations {
 -- tool_result_for(invocation, outcome) -> bedrock/ToolResult: preserve the entire
 --   completed result; for Failed, retain its error as a concrete error result.
 --   Both use the owned call ID. Aborted never enters this conversion.
+
+-- Foreground batch helpers and owned operation observations
+-- serial_dispatch(runtime) -> Boolean: this runtime exclusively owns Serial,
+--   never OrdinaryBatch. All ToolInvocation rules apply only to this disposition.
+-- serial_response(conversation) -> Boolean: complete original source classification
+--   selected Serial because a lifecycle-serial call occurs anywhere in it or a
+--   concurrent batch is unnecessary. This excludes initial ordinary-batch selection.
+-- original_assistant_source(conversation) -> AssistantSource: the exact unchanged
+--   full AssistantMessage retained by this round, including raw provider content.
+-- whole_source_is_ordinary(conversation) -> Boolean: every call anywhere in that
+--   original source, including accepted calls, is foreground-concurrent ordinary.
+--   spawn_agents, create_goal, enable_auto_continuation, propose_task,
+--   ask_user_question, submit_result, submit_error and lifecycle-serial registry
+--   entries make this false. No completed special call permits a tail upgrade.
+-- ordinary_batch_needed(conversation) -> Boolean: at least two ordinary calls
+--   from that same source require dispatch; singleton calls may remain Serial.
+-- no_serial_resources_owned(runtime) -> Boolean: no serial preparation/task owns
+--   resources when replacing Serial with OrdinaryBatch.
+-- OrdinaryBatchSelected(runtime, source): select that exclusive disposition and
+--   create one batch with closing=false plus affine unissued proofs for each
+--   canonical unresolved call. Emit BatchRefillRequested for available capacity.
+-- has_unissued_owner(batch) -> Boolean: a source call retains an unissued proof.
+-- first_unissued_owner(batch) -> BatchCallOwner: its first source-ordered proof.
+-- batch_owner_is_current(owner) -> Boolean: immutable runtime origin, full raw
+--   source, exact parsed call and unresolved core membership all still match. A
+--   cancelling origin remains current for settlement but cannot launch/refill.
+-- owned_batch_outcome(owner, outcome) -> InvocationOutcome: preserve the entire
+--   matching outcome; reject foreign output and substitute Failed for this exact
+--   call on foreign identity or sender loss, without replaying the invocation.
+-- has_ordinary_batch(conversation) -> Boolean: its live disposition is OrdinaryBatch.
+-- ordinary_batch_for(conversation) -> OrdinaryBatch: that existing retained owner.
+-- batch_owner_for_exact_call(batch, call) -> BatchCallOwner: the retained owner
+--   with that full exact call and original runtime/assistant source, not a lookup
+--   by a later representative or provider ID alone.
+-- failed_wait_outcome(owner) -> InvocationOutcome: the existing bounded-wait
+--   Failed diagnostic paired to this owner's call, never a rerun or cancellation
+--   of the process represented by its handle.
+-- BatchWaitTaskOnlyAbortRequested(owner): abort this retained wait task only;
+--   leave its token, represented process and other invocation resources untouched.
+-- absolute_cancellation_cutoff(conversation) -> Timestamp: the original bounded
+--   aggregate cancellation cutoff. Sibling progress never renews it.
+-- all_batch_owners_affirmatively_retired(batch) -> Boolean: every remaining owner
+--   has relinquished launch/outcome authority by explicit retirement. Missing
+--   handles, a representative receipt or a queried absence cannot establish this.
+-- AvailableTypedReceiptsSnapshottedBeforeSignals(batch): synchronously consume
+--   already-available typed one-shot receipts into ready ownership before signalling
+--   any running token. Preserve authentic Completed payloads and metadata.
+-- UnissuedAndNoReadProofsConsumedForCancellation(batch): consume affirmative
+--   unissued/no-read proofs into their exact synthetic cancellation receipts.
+-- PreparationReadsInterrupted(batch): prevent every retained read from launching
+--   and retain its affirmative no-call-effects proof until owning commit.
+-- EveryRunningSiblingSignalled(batch): signal every exact running token before
+--   awaiting cancellation persistence, including siblings behind the representative.
+-- AllRemainingBatchOwnersRetired(batch): affirmatively retire each remaining
+--   retained owner by aborting its task and removing launch/outcome authority.
+--   Preserve authentic snapshotted ready receipts in their owning complete-round
+--   checkpoint; do not replace them with synthetic cancellation. This is in-memory
+--   resource retirement, not a fabricated persistence receipt.
+-- batch_owner_has_available_typed_receipt(owner) -> Boolean: try the exact
+--   retained receiver before choosing a synthetic wait failure.
+-- BatchWaitRetirementRetained(owner): task-only retirement has revoked the old
+--   producer and retained one Ready failed receipt with its original cutoff;
+--   this resource fact does not submit a reducer event or a persistence command.
+-- BatchCommitCancellationObserved(conversation): the exact owned cancellation
+--   delivery is received while an ordinary batch write remains issued.
+-- CancellationDeliveryRetained(conversation): affine process-local request,
+--   acknowledgement/retirement custody and original cutoff retained through the
+--   issued write's classification, then consumed by normal semantic processing.
+-- BatchSafeSettlementBoundaryReached(batch): the actor resumes normal settlement
+--   after classifying the issued write; actual forced-retirement proofs remain
+--   owned until the aggregate retirement commit consumes them.
+-- OrdinaryBatchResourcesRetired(runtime): if this runtime owns OrdinaryBatch,
+--   close refill, interrupt reads, signal and abort every retained invocation in
+--   memory. Fenced teardown makes no database-backed cleanup or settlement claim.
+-- CapturedPreparationErrorReturned(owner, diagnostic): return the actual error
+--   through its immutable captured Caller/Required boundary, retaining no-read
+--   proof for Caller and invoking Required settlement fail-stop where applicable.
+--   Source two onward uses Required(Tool); no string error creates Unknown.
+-- ExactBatchReceiptSubmitted(owner, outcome): submit that exact origin-checked
+--   ToolCompletes or cancellation receipt to Bedrock; scope persistence and live
+--   output publication to its owning assistant. Retain resources through commit.
+--   An Aborted receipt removes its exact sibling identity through ToolAbortedSibling
+--   while other calls remain, and through the final ToolAborted view otherwise.
+-- BatchReceiptCommitEstablished(owner): observation of this receipt's established
+--   owning core-state commit; not a separate write, queue, or retry mechanism.
+-- BatchPreparationReadsRequested(owner): perform the same originating-policy,
+--   callable-schema and required-scope checks under the captured boundary, then
+--   invoke Layer 0 once for the exact immutable selection. Unavailable/denied
+--   returns carry paired ordinary errors without resources. Cleared returns the
+--   gate-minted payload; no generation/token/channel/context/start/metrics admission
+--   occurs before it. Every read remains selectable alongside cancellation.
+-- BatchToolTaskLaunched(owner, checked_call): retain this exact checked payload,
+--   context, token, task, typed receiver and publication resources. Recheck the
+--   live callable definition against the originating schema before execution,
+--   preserving logged capability gaps and existing per-tool authority.
+-- BatchPreparationCleared(owner, proof),
+--   BatchPreparationRejected(owner, outcome), BatchPreparationReadFailed(owner,
+--   diagnostic), BatchLocalAuthorityUnclassified(owner),
+--   BatchReceiverResolved(owner, outcome), BatchReadyReceiptSelected
+--   and BatchObservationReturned are observations of the retained preparation,
+--   gate and one-shot owners. They cannot independently mint an origin or proof.

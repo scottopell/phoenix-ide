@@ -178,6 +178,17 @@ contract SpawnParentAdoption {
         -- Reconciliation establishes exact admitted membership before a parent
         -- tool-abort acknowledgement; cancellation then drains those outcomes.
         -- Already-adopted children retain their existing fan-in owner.
+
+    @invariant ForegroundCancellationRetainsChildTerminalAuthority
+        -- REQ-SA-005 / REQ-BED-004 / REQ-BED-005: ordinary calls within one
+        -- child assistant response share the parent's bounded eight-owner dispatch
+        -- and complete source-ordered result barrier, while preserving this child's
+        -- existing execution authority. Cancellation closes refill, snapshots
+        -- already-available typed receipts before signalling every running sibling,
+        -- and retains owners through their commits or affirmative retirement.
+        -- Only the complete held-round checkpoint permits Failed + NotifyParent;
+        -- no representative receipt or parent Idle transition can skip that drain.
+        -- Parent pending membership remains owed until actual terminal acceptance.
 }
 
 ------------------------------------------------------------
@@ -638,6 +649,7 @@ rule ConcurrentMaterializationJoinsByChildIdentity {
 
 rule TerminalEvidencePrecedesParentDelivery {
     when: SubAgentReachesTerminal(child, result)
+    requires: held_foreground_round_settled(child)
     ensures: SubAgentAdmission{child: child}.terminal_evidence_persisted = true
     ensures: ParentDeliveryOwed(
         SubAgentAdmission{child: child}.parent.id, child.id, result)
@@ -660,6 +672,7 @@ rule DurableParentIdentityDeliversTerminal {
     requires: SubAgentAdmission{child: child}.terminal_evidence_persisted
     requires: SubAgentAdmission{child: child}.parent_terminal_disposition = owed
     requires: inline_child_bash_cleanup_observed(child)
+    requires: held_foreground_round_settled(child)
     ensures: CurrentParentRuntimeResolved(SubAgentAdmission{child: child}.parent.id)
     ensures: bedrock/ParentTerminalTransportArrived(
         SubAgentAdmission{child: child}.parent, parent_terminal_result(child, result))
@@ -905,6 +918,11 @@ surface NativeSpawnAdoptionBoundary {
 --   receipt. An already-adopted batch retains its existing fan-in owner.
 -- parent_owns_cancelled_spawn(invocation) -> Boolean: the parent is CancellingTool
 --   with this exact held assistant round and cancelling provider tool identity.
+-- held_foreground_round_settled(child) -> Boolean: no ordinary foreground round
+--   is held, or every exact sibling has settled/been affirmatively retired and
+--   its complete source-ordered round checkpoint is established. A representative
+--   completion alone cannot establish this. This is the existing child terminal
+--   boundary, not another delivery owner, durable queue or recovery mechanism.
 -- children_of(admissions) -> Set<bedrock/Conversation>: the exact durable children.
 -- cancellation_terminal_result(child): the authoritative pre-start cancellation
 --   payload preserving that child's identity and cancellation cause, not success.

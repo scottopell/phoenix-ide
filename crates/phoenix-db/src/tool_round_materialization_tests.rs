@@ -22,7 +22,64 @@ fn assistant(calls: &[(&str, &str)]) -> AssistantMessage {
 }
 
 #[test]
-fn restart_preserves_completed_metadata_and_interrupted_tail_order() {
+fn restart_orders_out_of_order_sibling_results_by_source_identity() {
+    let assistant = assistant(&[("unfinished", "bash"), ("finished", "read_image")]);
+    let completed = ToolResult {
+        tool_use_id: "finished".into(),
+        outcome: ToolOutcome::Success {
+            output: "authentic completed sibling".into(),
+            display_data: Some(serde_json::json!({"retained": [1, 2]})),
+            images: vec![ToolContentImage {
+                media_type: "image/png".into(),
+                data: "image".into(),
+            }],
+        },
+        duration_ms: Some(17),
+    };
+    let (_, rows) = build_materialized_tool_round(
+        "conversation",
+        10,
+        &DateTime::from_timestamp(200, 0).unwrap(),
+        &assistant,
+        &[completed],
+        &["unfinished".into()],
+        &[],
+        &HashMap::new(),
+    )
+    .unwrap();
+    let contents: Vec<_> = rows
+        .iter()
+        .map(|message| match &message.content {
+            MessageContent::Tool(content) => content,
+            MessageContent::User(_)
+            | MessageContent::Agent(_)
+            | MessageContent::System(_)
+            | MessageContent::Error(_)
+            | MessageContent::Continuation(_)
+            | MessageContent::Skill(_) => {
+                panic!("materialization must produce paired tool results")
+            }
+        })
+        .collect();
+    assert_eq!(
+        contents
+            .iter()
+            .map(|content| content.tool_use_id.as_str())
+            .collect::<Vec<_>>(),
+        ["unfinished", "finished"]
+    );
+    assert!(contents[0].is_error);
+    assert_eq!(contents[1].content, "authentic completed sibling");
+    assert!(!contents[1].is_error);
+    assert_eq!(contents[1].images[0].data, "image");
+    assert_eq!(
+        rows[1].display_data,
+        Some(serde_json::json!({"retained":[1,2],"duration_ms":17}))
+    );
+}
+
+#[test]
+fn restart_preserves_completed_metadata_and_source_order() {
     let assistant = assistant(&[
         ("done", "read_image"),
         ("unfinished", "think"),
@@ -74,7 +131,6 @@ fn restart_preserves_completed_metadata_and_interrupted_tail_order() {
             vec![image],
             Some(serde_json::json!({"duration_ms":17,"detail":[1,2]})),
         ),
-        ("promoted", "retained reference", false, vec![], None),
         (
             "unfinished",
             "[Tool execution interrupted by server restart]",
@@ -82,6 +138,7 @@ fn restart_preserves_completed_metadata_and_interrupted_tail_order() {
             vec![],
             None,
         ),
+        ("promoted", "retained reference", false, vec![], None),
     ];
     assert_eq!(rows.len(), expected.len());
     for (ordinal, (row, (id, output, is_error, images, display))) in

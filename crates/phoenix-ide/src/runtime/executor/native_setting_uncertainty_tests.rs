@@ -151,8 +151,11 @@ async fn uncertain_registered_setting_closes_authority_and_stops_https_superviso
     manager.runtimes.write().await.insert(
         source.clone(),
         crate::runtime::ConversationHandle {
-            event_tx: event_tx.clone(),
-            acknowledged_event_tx,
+            event_tx: crate::runtime::ConversationEventSender::for_test_receiver(event_tx.clone()),
+            acknowledged_event_tx:
+                crate::runtime::cancellation_inbox::AcknowledgedEventSender::for_test_receiver(
+                    acknowledged_event_tx,
+                ),
             handoff_review_tx: None,
             turn_trigger: Arc::new(std::sync::Mutex::new(None)),
             broadcast_tx: broadcaster.clone(),

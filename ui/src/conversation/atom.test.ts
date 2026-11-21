@@ -9,6 +9,26 @@ import {
 import type { Conversation, Message } from '../api';
 import { derivePendingMessages, type QueuedMessage } from '../hooks/useMessageQueue';
 
+it('clears invocation progress when a new assistant round reuses the tool ID', () => {
+  const initial = createInitialAtom();
+  const first: ConversationAtom = {
+    ...initial,
+    phase: {
+      type: 'tool_executing', current_tool: { id: 'same-id', name: 'bash', input: {} },
+      remaining_tools: [], assistant_message: { message_id: 'first-round' },
+    },
+    liveBashProgress: { 'same-id': { sequenceId: 1, progress: { handle: 'old-handle', start_offset: 0, lines: [], partial: null, truncated_before: false, end_offset: 0 } } },
+  };
+  const next = conversationReducer(first, {
+    type: 'sse_state_change', sequenceId: 1, stateUpdatedAt: 100,
+    phase: {
+      type: 'tool_executing', current_tool: { id: 'same-id', name: 'bash', input: {} },
+      remaining_tools: [], assistant_message: { message_id: 'second-round' },
+    },
+  });
+  expect(next.liveBashProgress).toEqual({});
+});
+
 // Minimal test fixtures
 const testConversation: Conversation = {
   id: 'conv-1',

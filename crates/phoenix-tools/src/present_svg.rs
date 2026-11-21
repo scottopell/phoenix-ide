@@ -408,6 +408,10 @@ impl PresentSvgTool {
 
 #[async_trait]
 impl Tool for CoordinatorPresentSvgTool {
+    fn foreground_execution(&self) -> crate::ForegroundExecution {
+        crate::ForegroundExecution::Serial
+    }
+
     fn name(&self) -> &'static str {
         "present_svg"
     }
@@ -483,6 +487,10 @@ impl Tool for CoordinatorPresentSvgTool {
 
 #[async_trait]
 impl Tool for PresentSvgTool {
+    fn foreground_execution(&self) -> crate::ForegroundExecution {
+        crate::ForegroundExecution::Serial
+    }
+
     fn name(&self) -> &'static str {
         "present_svg"
     }

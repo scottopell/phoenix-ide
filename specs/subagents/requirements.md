@@ -134,6 +134,17 @@ WHEN cancellation races child materialization or initial start
 THE SYSTEM SHALL atomically choose either cancellation-before-start or one initial start followed by cancellation
 AND SHALL NOT perform initial work more than once
 
+WHEN a child is executing ordinary foreground siblings from one assistant response
+THE SYSTEM SHALL apply the same eight-owner bound, per-call authority checks, source-ordered complete result barrier and exact-origin cancellation drain as a parent
+AND SHALL preserve its read-only or write-capable execution authority and parent pending membership.
+
+WHEN that child's foreground round is cancelled
+THE SYSTEM SHALL prevent refill and signal every running sibling before waiting for cancellation persistence
+AND SHALL preserve authentic typed completed outcomes already available before signalling
+AND SHALL checkpoint the complete held round only after every sibling settles or every remaining owner is affirmatively retired
+AND SHALL reach its failed terminal destination and notify its parent only after that checkpoint
+AND SHALL NOT use the parent's idle cancellation destination.
+
 WHEN a child runtime must be created or recovered
 THE SYSTEM SHALL join concurrent creation attempts for that child identity
 AND materialize at most one live runtime and dispatch initial work at most once
