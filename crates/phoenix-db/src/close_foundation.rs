@@ -7396,7 +7396,8 @@ impl Database {
                     .bind(occurred_at_us)
                     .execute(&mut **tx)
                     .await?;
-                    let result = Self::finish_close_failure_tx(tx, &run, &request, obligation).await?;
+                    let result =
+                        Self::finish_close_failure_tx(tx, &run, &request, obligation).await?;
                     if request.authority == CloseCleanupFailureAuthority::ExplicitlySuppressed {
                         sqlx::query(
                             "UPDATE close_completion_retry_allowances SET suppressed = 1

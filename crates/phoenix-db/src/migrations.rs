@@ -16014,9 +16014,15 @@ mod tests {
     #[tokio::test]
     async fn migration_167_upgrades_authentic_166_initial_source_fence_schema() {
         let pool = test_pool().await;
+        setup_real_pre_159_schema(&pool).await;
         run_through_for_test(&pool, 166).await.unwrap();
-        assert_eq!(sqlx::query_scalar::<_, i64>("SELECT MAX(version) FROM _migrations")
-            .fetch_one(&pool).await.unwrap(), 166);
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT MAX(version) FROM _migrations")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            166
+        );
         assert_eq!(run_pending_migrations(&pool).await.unwrap(), 1);
         assert_eq!(run_pending_migrations(&pool).await.unwrap(), 0);
         for name in [
@@ -16024,18 +16030,47 @@ mod tests {
             "native_close_source_fence_requires_exact_plan",
             "close_cleanup_failure_completion_requires_disposition",
         ] {
-            let definition: String = sqlx::query_scalar("SELECT sql FROM sqlite_schema WHERE type = 'trigger' AND name = ?1")
-                .bind(name).fetch_one(&pool).await.unwrap();
-            assert!(definition.contains("native_close_initial_complete_retirement_proofs"), "{name}");
+            let definition: String = sqlx::query_scalar(
+                "SELECT sql FROM sqlite_schema WHERE type = 'trigger' AND name = ?1",
+            )
+            .bind(name)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert!(
+                definition.contains("native_close_initial_complete_retirement_proofs"),
+                "{name}"
+            );
         }
         // Preparing the query resolves the view's full schema, not only its ledger row.
-        assert_eq!(sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM native_close_initial_complete_retirement_proofs")
-            .fetch_one(&pool).await.unwrap(), 0);
-        assert_eq!(sqlx::query_scalar::<_, i64>("PRAGMA writable_schema")
-            .fetch_one(&pool).await.unwrap(), 0);
-        assert_eq!(sqlx::query_scalar::<_, i64>("PRAGMA foreign_keys")
-            .fetch_one(&pool).await.unwrap(), 1);
-        assert!(sqlx::query("PRAGMA foreign_key_check").fetch_all(&pool).await.unwrap().is_empty());
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM native_close_initial_complete_retirement_proofs"
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("PRAGMA writable_schema")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("PRAGMA foreign_keys")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            1
+        );
+        assert!(sqlx::query("PRAGMA foreign_key_check")
+            .fetch_all(&pool)
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -20356,7 +20391,7 @@ mod tests {
         assert!(goal
             .sql
             .contains("CREATE TABLE conversation_goal_coordinator_receipts"));
-        assert_eq!(MIGRATIONS.len(), 164);
+        assert_eq!(MIGRATIONS.len(), 165);
     }
 
     #[tokio::test]
@@ -20372,7 +20407,7 @@ mod tests {
         }
         sqlx::query("UPDATE product_creation_jobs SET status = 'published', published_product_id = 'deleted-product', published_conversation_id = 'deleted-transcript' WHERE request_id = 'orphan-image'")
             .execute(&pool).await.unwrap();
-        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 17);
+        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 18);
         let identity: Vec<(String, String)> = sqlx::query_as(
             "SELECT request_id, data_sha256 FROM product_creation_image_replay_identity ORDER BY request_id",
         ).fetch_all(&pool).await.unwrap();
@@ -20426,7 +20461,7 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 17);
+        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 18);
         let retained: (String, String, String) = sqlx::query_as(
             "SELECT status, published_product_id, published_conversation_id
              FROM product_creation_jobs WHERE request_id = 'orphan-text'",
@@ -23600,7 +23635,7 @@ mod close_completion_allowance_tests {
             2
         );
 
-        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 8);
+        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 9);
         let migrated: (i64, i64) = sqlx::query_as(
             "SELECT (SELECT COUNT(*) FROM close_original_retirement_anchors WHERE attempt_id = ?1),
                     (SELECT COUNT(*) FROM close_retirement_anchor_exclusions WHERE attempt_id = ?1)"
