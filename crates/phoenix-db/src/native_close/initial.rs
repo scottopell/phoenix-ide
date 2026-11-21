@@ -72,23 +72,33 @@ pub struct NativeCloseInitialProcessAuthorization {
 
 impl NativeCloseInitialProcessAuthorization {
     /// Consume the authorization at the manager sink; it cannot be cloned or replayed.
-    pub fn into_parts(self) -> (
+    pub fn into_parts(
+        self,
+    ) -> (
         NativeCloseRunRef,
         WorkScopeId,
         phoenix_core::domain::close::CloseRetirementSnapshot,
         RetiredResourceKind,
         Vec<phoenix_core::domain::close::CloseExpectedRetirementResource>,
     ) {
-        (self.run, self.scope, self.snapshot, self.kind, self.process_inventory)
+        (
+            self.run,
+            self.scope,
+            self.snapshot,
+            self.kind,
+            self.process_inventory,
+        )
     }
 }
 
 fn is_initial_process_kind(kind: RetiredResourceKind) -> bool {
-    matches!(kind,
+    matches!(
+        kind,
         RetiredResourceKind::BashProcessGroup
             | RetiredResourceKind::TmuxServer
             | RetiredResourceKind::PtySession
-            | RetiredResourceKind::BrowserSession)
+            | RetiredResourceKind::BrowserSession
+    )
 }
 
 impl Database {
