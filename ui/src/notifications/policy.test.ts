@@ -434,3 +434,31 @@ describe('connected reminder notifications', () => {
     expect(notificationPolicyReducer(failed.state, { type: 'reminder_feed', items: [item('new')] }, env()).effects).toHaveLength(1);
   });
 });
+
+describe('Ember question notifications (REQ-AUQ-011)', () => {
+  const item = (requestId: string) => ({ requestId, coordinatorConversationId: 'ember-1', text: 'Merge the cleanup PR?' });
+  const seed = () => notificationPolicyReducer(loadedState(), { type: 'coordinator_question_feed', items: [] }, env()).state;
+
+  it('baselines questions open at load and announces each new one once', () => {
+    const baseline = notificationPolicyReducer(loadedState(), { type: 'coordinator_question_feed', items: [item('old')] }, env());
+    expect(baseline.effects).toEqual([]);
+    const fresh = notificationPolicyReducer(baseline.state, { type: 'coordinator_question_feed', items: [item('old'), item('new')] }, env());
+    expect(fresh.effects).toEqual([expect.objectContaining({
+      title: 'Ember asked a question',
+      body: 'Merge the cleanup PR?',
+      tag: 'coordinator_question:new',
+      conversation: { id: 'ember-1', slug: null, kind: 'coordinator' },
+      dedupeKey: { kind: 'coordinator_question', id: 'new' },
+    })]);
+    expect(notificationPolicyReducer(fresh.state, { type: 'coordinator_question_feed', items: [item('new')] }, env()).effects).toEqual([]);
+  });
+
+  it('follows the question setting and retries a failed browser notification', () => {
+    const off = { ...seed(), settings: { ...DEFAULT_NOTIFICATION_SETTINGS, notify_question: false } };
+    expect(notificationPolicyReducer(off, { type: 'coordinator_question_feed', items: [item('new')] }, env()).effects).toEqual([]);
+
+    const sent = notificationPolicyReducer(seed(), { type: 'coordinator_question_feed', items: [item('new')] }, env());
+    const failed = notificationPolicyReducer(sent.state, { type: 'notification_delivery_failed', conversationId: 'ember-1', dedupeKey: { kind: 'coordinator_question', id: 'new' } }, env());
+    expect(notificationPolicyReducer(failed.state, { type: 'coordinator_question_feed', items: [item('new')] }, env()).effects).toHaveLength(1);
+  });
+});

@@ -271,8 +271,10 @@ pub fn coordinator_prompt(lang: LlmLanguage) -> &'static str {
                 healthy progress alone; do not nudge/replan/reassign for activity. Idle alone is \
                 not stalled. Check-ins add no authority or reset decisions, pauses or gates. \
                 Verify unanswered user decisions remain unresolved and material; do independent \
-                authorized work first, then ask_user_question for real choices with context and \
-                recommendation. Brief with missing user input first, then material change: \
+                authorized work first, then post_user_question for real choices with context and \
+                recommendation; it does not pause you, so keep doing independent work until the \
+                reply arrives. Check list_user_questions before asking and after continuation, \
+                so nothing open is asked twice. Brief with missing user input first, then material change: \
                 problem, actual work, outcome/why and next step, in plain English with useful \
                 links and grounded status—not a fixed template. Mention material \
                 delivery/evidence limits. Check-ins are bounded, not polling. Only mutate \
@@ -284,7 +286,7 @@ pub fn coordinator_prompt(lang: LlmLanguage) -> &'static str {
                 continuations until removed/closed. A watched conversation's question comes to \
                 you first: answer it with answer_conversation_question when its assignment or \
                 your standing Authority settles it; otherwise ask the user with \
-                ask_user_question and pass the user's answer on verbatim.\n\n\
+                post_user_question and pass the user's answer on verbatim.\n\n\
                 Delegate outcomes, not attempts. \
                 State the result, required evidence, and established boundaries; let the owner \
                 choose and revise methods. In-scope command fixes, fixture repairs, and reruns \
@@ -344,7 +346,9 @@ pub fn coordinator_prompt(lang: LlmLanguage) -> &'static str {
                 completion.\n\nCheck all work; leave healthy progress alone. Idle is not stalled. \
                 Check-ins add no authority/reset decisions, pauses or gates. Verify unanswered \
                 choices remain open and matter; do authorized independent work first, then \
-                ask_user_question for real input with context/recommendation. Brief missing input \
+                post_user_question for real input with context/recommendation; not pause you, keep \
+                doing independent work until reply. list_user_questions before asking and after \
+                continuation; no repeat ask. Brief missing input \
                 first; problem, actual work, outcome/why and next step. Plain English, links, \
                 grounded status; not a fixed template. Note delivery/evidence limits. \
                 Bounded check-in, no polling. Change selected WorkScope only with unsandboxed \
@@ -353,7 +357,7 @@ pub fn coordinator_prompt(lang: LlmLanguage) -> &'static str {
                 create_conversation/rename_conversation/continue_conversation/read_automatic_continuation/set_automatic_continuation and prepare_goal/apply_goal metadata. Act on user turns and \
                 factual watch events; ordinary watches follow continuations until removed/closed. \
                 Watched conversation question come to you first: answer_conversation_question when \
-                task or Authority settle it; else ask_user_question, pass user answer verbatim.\n\n\
+                task or Authority settle it; else post_user_question, pass user answer verbatim.\n\n\
                 Delegate outcomes, not attempts. \
                 State the result, required evidence, and established boundaries; let the owner \
                 choose and revise methods. In-scope command fixes, fixture repairs, and reruns \
@@ -857,8 +861,8 @@ mod tests {
     #[test]
     fn coordinator_prompts_fit_baselines_and_teach_clear_recovery() {
         const BASELINES: [(LlmLanguage, usize, usize); 2] = [
-            (LlmLanguage::PhoenixNative, 626, 4835),
-            (LlmLanguage::Caveman, 509, 3871),
+            (LlmLanguage::PhoenixNative, 630, 5012),
+            (LlmLanguage::Caveman, 509, 4002),
         ];
         for (language, baseline_words, baseline_chars) in BASELINES {
             let prompt = coordinator_prompt(language);
@@ -900,7 +904,8 @@ mod tests {
                 "Recovery admitted",
                 "Phoenix accepted the resume request",
                 "each target's delivered/queued/rejected result",
-                "ask_user_question",
+                "post_user_question",
+                "list_user_questions",
                 "answer_conversation_question",
                 "verified standing authority",
                 "cwd/worktree_path",

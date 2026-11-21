@@ -75,15 +75,17 @@ class PhoenixApiGuidanceTests(unittest.TestCase):
 
     def test_answers_and_notes_match_transition_and_ui_not_extra_guarantees(self):
         transition = (ROOT / "crates/phoenix-state-machine/src/transition.rs").read_text()
-        response = transition.split("let answers_text = questions", 1)[1].split(
-            "let user_text =", 1
+        self.assertIn("let answers_text = phoenix_core::domain::sm_state::render_question_answers(", transition)
+        sm_state = (ROOT / "crates/phoenix-core/src/domain/sm_state.rs").read_text()
+        response = sm_state.split("pub fn render_question_answers", 1)[1].split(
+            "\n}\n", 1
         )[0]
-        self.assertIn(".filter_map(|q|", response)
-        self.assertIn("answers.get(&q.question)?", response)
-        self.assertIn("ann.notes", response)
-        self.assertNotIn("ann.preview", response)
-        self.assertIn(".find(|o| o.label == *a)", response)
-        self.assertIn("o.preview.as_deref()", response)
+        self.assertIn(".filter_map(|question|", response)
+        self.assertIn("answers.get(&question.question)?", response)
+        self.assertIn("annotation.notes", response)
+        self.assertNotIn("annotation.preview", response)
+        self.assertIn(".find(|option| option.label == *answer)", response)
+        self.assertIn("option.preview.as_deref()", response)
         panel = (ROOT / "ui/src/components/QuestionPanel.tsx").read_text()
         self.assertIn("result[q.question] = labels.join(', ')", panel)
         for text in ("every exact full question text", "backend does not enforce answer completeness",

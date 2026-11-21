@@ -16310,6 +16310,75 @@ mod scope_liveness_tests {
     }
 
     #[tokio::test]
+    async fn coordinator_question_reply_reaches_the_coordinator_once() {
+        let llm = Arc::new(RecordingLlm {
+            requests: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let manager = Arc::new(test_manager_with_recording_llm(llm.clone()).await);
+        let global = manager
+            .db()
+            .get_or_create_coordinator(
+                Some("claude-sonnet-5"),
+                phoenix_core::llm_language::LlmLanguage::default(),
+            )
+            .await
+            .unwrap();
+        let request_id = "6f1f8c2e-2b1d-4a57-9d8e-3f5f2a7c9b10";
+        let questions = vec![phoenix_core::domain::sm_state::UserQuestion {
+            question: "Merge now?".into(),
+            header: "Merge".into(),
+            options: Vec::new(),
+            multi_select: false,
+        }];
+        manager
+            .db()
+            .post_coordinator_question(request_id, &global.id, &questions, 10)
+            .await
+            .unwrap();
+        let reply = crate::coordinator_question_delivery::answer_reply(
+            request_id,
+            &questions,
+            &std::collections::HashMap::from([("Merge now?".to_string(), "Yes".to_string())]),
+            None,
+        );
+        manager
+            .db()
+            .settle_coordinator_question(
+                request_id,
+                phoenix_db::CoordinatorQuestionClose::Answered { reply: &reply },
+                20,
+            )
+            .await
+            .unwrap();
+
+        crate::coordinator_question_delivery::deliver_pass(&manager).await;
+        crate::coordinator_question_delivery::deliver_pass(&manager).await;
+
+        // Accepted input is a durable turn keyed by the client message id.
+        let delivered: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM durable_turns WHERE conversation_id = ?1 AND client_turn_key = ?2",
+        )
+        .bind(&global.id)
+        .bind(request_id)
+        .fetch_one(manager.db().pool())
+        .await
+        .unwrap();
+        assert_eq!(delivered, 1);
+        assert!(manager
+            .db()
+            .undelivered_coordinator_question_replies(16)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(manager
+            .db()
+            .open_coordinator_questions()
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
     async fn watch_wait_input_is_claimed_executed_and_settled_once() {
         let llm = Arc::new(RecordingLlm {
             requests: std::sync::atomic::AtomicUsize::new(0),

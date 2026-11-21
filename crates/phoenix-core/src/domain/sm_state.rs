@@ -218,6 +218,58 @@ pub struct QuestionAnnotation {
     pub notes: Option<String>,
 }
 
+/// Render answers to structured questions as the agent reads them, in question
+/// order: `"question" = "answer"`, then any selected preview and user notes.
+/// Questions without an answer are left out.
+#[must_use]
+pub fn render_question_answers<S: std::hash::BuildHasher>(
+    questions: &[UserQuestion],
+    answers: &std::collections::HashMap<String, String, S>,
+    annotations: Option<&std::collections::HashMap<String, QuestionAnnotation, S>>,
+) -> String {
+    questions
+        .iter()
+        .filter_map(|question| {
+            let answer = answers.get(&question.question)?;
+            let mut parts = vec![format!("\"{}\" = \"{}\"", question.question, answer)];
+            let selected_preview = question
+                .options
+                .iter()
+                .find(|option| option.label == *answer)
+                .and_then(|option| option.preview.as_deref());
+            if let Some(preview) = selected_preview {
+                parts.push(format!("selected preview:\n{preview}"));
+            }
+            if let Some(notes) = annotations
+                .and_then(|annotations| annotations.get(question.question.as_str()))
+                .and_then(|annotation| annotation.notes.as_ref())
+            {
+                parts.push(format!("user notes: {notes}"));
+            }
+            Some(parts.join(" "))
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// True when every question has exactly one non-blank answer keyed by its
+/// full text, and every note belongs to an answered question. Answers given on
+/// someone else's behalf (the Coordinator's tool, Ember's question card) must
+/// meet this before they are accepted.
+pub fn answers_cover_questions<V, S: std::hash::BuildHasher>(
+    questions: &[UserQuestion],
+    answers: &std::collections::HashMap<String, String, S>,
+    notes: Option<&std::collections::HashMap<String, V, S>>,
+) -> bool {
+    answers.len() == questions.len()
+        && questions.iter().all(|question| {
+            answers
+                .get(&question.question)
+                .is_some_and(|answer| !answer.trim().is_empty())
+        })
+        && notes.is_none_or(|notes| notes.keys().all(|key| answers.contains_key(key)))
+}
+
 /// Input for the `ask_user_question` tool (REQ-AUQ-001)
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AskUserQuestionInput {

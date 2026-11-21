@@ -863,6 +863,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "slack_channel_submissions",
         sql: include_str!("migrations/slack_channel_submissions.sql"),
     },
+    Migration {
+        version: 168,
+        name: "coordinator_user_questions",
+        sql: include_str!("migrations/coordinator_user_questions.sql"),
+    },
 ];
 
 const MIGRATION_138: &str = concat!(
