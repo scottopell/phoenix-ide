@@ -51,7 +51,7 @@ retired.
 Earlier focused results (protocol 2, not acceptance of protocol 3): helper 25;
 installer 60; restart 38; harness safety five; ReleaseUpdatePanel 32; and
 successful disposable launchd commit, partial-write failure, health failure and
-restart after initiator SIGKILL. The current focused helper suite passed 75 tests,
+restart after initiator SIGKILL. The focused helper suite passed 81 tests,
 including typed stored-row, row-identity, FTS5-shadow, quoted-module classification,
 primary-key collation/direction without temporary sorting and fail-closed comparisons.
 Hosted scale run `44017228572` qualified implementation `87e96effb`: a
@@ -61,7 +61,7 @@ on macOS ARM64 with SQLite 3.53.1. The fixture has 1,290,000 rows each in an
 ordinary table, a `WITHOUT ROWID` table and FTS5, with persisted FTS5 shadows
 and secondary indexes. This is disposable fixture/runner evidence, not a
 universal throughput guarantee, native-launchd journey or production qualification.
-Exact-head artifacts and broader CI receipts belong with the corresponding PR.
+Exact-head artifacts and broader CI receipts belong with the corresponding PR. Diagnostics emit a bounded stderr JSON summary with cumulative stage timings, stage-entry budget and ordinal row/cell progress on both success and failure; raw integrity/SQLite error content is sanitized. The disposable shape matrix covers baseline, 24 extra stored columns and denser small-payload rows on CPython 3.13.1 / SQLite 3.47.1. Hosted outcomes and their limitations are tracked with the PR; no production deadline-fitness claim follows from file size or a passing synthetic shape alone.
 
 The 6,406-line `test_current_schema_prepared_upgrade.py` and old manifest,
 Activation, schema114/123/128/129, repair, refresh and rollback classes are retired

@@ -154,6 +154,8 @@ def run(args: argparse.Namespace) -> dict:
     composition = create_fixture(database, minimum_bytes=target_bytes,
                                  rows_per_table=args.rows_per_table,
                                  text_bytes=args.text_bytes, blob_bytes=args.blob_bytes, extra_columns=args.extra_columns)
+    args.fixture = composition
+    args.generation_seconds = composition["generation_elapsed_seconds"]
     source_bytes = database.stat().st_size
     free_before_backup = shutil.disk_usage(args.work_dir).free
     if free_before_backup < source_bytes + 1_000_000_000:
@@ -171,7 +173,7 @@ def run(args: argparse.Namespace) -> dict:
         outcome = "success"
     finally:
         args.diagnostics = diagnostics
-        args.verification_elapsed_seconds = time.monotonic() - started
+        args.verification_elapsed_seconds = time.monotonic() - verification_started
         helper._emit_verifier_diagnostics(diagnostics, outcome)
     verification_elapsed = time.monotonic() - verification_started
     if verification_elapsed > BACKUP_BUDGET_SECONDS:
