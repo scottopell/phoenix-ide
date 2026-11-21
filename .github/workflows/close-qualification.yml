@@ -172,7 +172,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          for module in migrations::conversation_tools_tests:: lineage::tests::goal_tools_tests::; do
+          for module in migrations::conversation_tools_tests:: lineage::tests::goal_tools_tests:: conversation_goals::prepared::tests::goal_preparation_migration_follows_conversation_tool_migrations; do
             name="${module//::/-}"
             cargo test -p phoenix-db --lib "$module" -- --nocapture --test-threads=1 2>&1 | tee "evidence/$name.log"
             grep -Eq 'test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored;' "evidence/$name.log"
