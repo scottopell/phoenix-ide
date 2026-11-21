@@ -746,6 +746,15 @@ rule AlreadyAbsentWorktreeWithExactAttemptEvidenceIsAccepted {
 -- decision is handled by bedrock with an intentional empty set, not by this bridge.
 -- Step outcome, normalized children, stopped primary and mandatory outbox are one
 -- owning failure transaction; these events cannot defer child insertion to a worker.
+-- Native INITIAL resource failure and exact stopped replay both require the
+-- original live/durable source and retained initial receipt. The primary must
+-- be unresolved in the exact sealed original inventory; already successful
+-- resources stay excluded, and the ordered remaining tail is Failed for the
+-- primary and Unattempted for the rest. Failure, residual proof, stopped run,
+-- outcome and mandatory delivery commit together; replay is read-only. Generic
+-- legacy failure ingress cannot replace source authority. Source-owned inspection
+-- and interruption paths retain their own proof boundary; an all-success tail
+-- cannot be fabricated into resource failure when source authority is lost.
 -- REQ-WL-002b / REQ-WL-004: every retirement failure enters the same
 -- run-stopping and mandatory-Global-delivery boundary owned by bedrock.
 rule RetirementFailureStopsBeforeAnyFurtherStep {

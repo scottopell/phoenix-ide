@@ -300,6 +300,212 @@ impl Database {
         }
     }
 
+    /// Stops the exact native initial run after a source-bound resource failure.
+    /// The live source and retained command receipt are checked before either fresh
+    /// terminalization or an exact read-only replay.
+    ///
+    /// # Errors
+    /// Refuses stale source authority, mismatched retained evidence, or persistence failure.
+    /// Commit or rollback uncertainty returns `DurableFactUnclassified`.
+    #[allow(clippy::too_many_lines)] // Authority, exact tail and terminal outcome are one atomic boundary.
+    pub async fn terminalize_native_close_initial_resource_failure(
+        &self,
+        command: &NativeCloseCommand,
+        receipt: &NativeCloseReceipt,
+        live_source: &phoenix_core::domain::sm_state::ConvState,
+        request: TerminalizeInitialCloseCleanupFailureRequest,
+    ) -> LocalAuthorityResult<DbResult<CloseObligation>> {
+        let mut tx = match self.pool.begin_with("BEGIN IMMEDIATE").await {
+            Ok(tx) => tx,
+            Err(error) => return LocalAuthorityResult::DurableFactEstablished(Err(error.into())),
+        };
+        let result = async {
+            let admitted = require_initial_identity_tx(&mut tx, command, receipt, live_source).await?;
+            let run = phoenix_core::domain::close::CloseRunRef {
+                attempt_id: admitted.attempt_id.clone(),
+                ordinal: CloseRunOrdinal::INITIAL,
+            };
+            let CloseCleanupFailureAuthority::ExpectedResource { scope, snapshot, resource } =
+                &request.authority
+            else {
+                return Err(DbError::CloseFoundationPrecondition(
+                    "native initial resource failure requires expected-resource authority".into(),
+                ));
+            };
+            let now = chrono::Utc::now().timestamp_micros();
+            if request.attempt_id != admitted.attempt_id
+                || request.source_product_conversation_id != admitted.target
+                || request.failure_occurrence_id != run.failure_occurrence_id()
+                || request.detail.trim().is_empty()
+                || request.occurred_at_us < 0
+                || request.occurred_at_us > now
+                || chrono::DateTime::from_timestamp_micros(request.occurred_at_us).is_none()
+                || request.stop_certainty.confirmed_at_us().is_some_and(|confirmed| {
+                    confirmed < 0 || confirmed > request.occurred_at_us
+                })
+            {
+                return Err(DbError::CloseFoundationPrecondition(
+                    "native initial failure requires exact authority and valid occurrence evidence".into(),
+                ));
+            }
+            let obligation = crate::close_foundation::close_obligation_for_update(
+                &mut tx,
+                admitted.attempt_id.as_str(),
+            )
+            .await?;
+            if obligation.product_conversation_id() != &admitted.target
+                || obligation.snapshot() != Some(snapshot)
+            {
+                return Err(DbError::CloseFoundationPrecondition(
+                    "native initial failure differs from retained target or snapshot".into(),
+                ));
+            }
+            let run_state = sqlx::query(
+                "SELECT run.status, run.ended_at_us, run.created_at_us,
+                        (SELECT MAX(latest.run_ordinal) FROM close_runs latest WHERE latest.attempt_id = run.attempt_id) AS latest_ordinal,
+                        (SELECT latest.status FROM close_runs latest WHERE latest.attempt_id = run.attempt_id ORDER BY latest.run_ordinal DESC LIMIT 1) AS latest_status
+                 FROM close_runs run WHERE run.attempt_id = ?1 AND run.run_ordinal = 1",
+            )
+            .bind(admitted.attempt_id.as_str())
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or_else(|| DbError::CloseFoundationPrecondition("retained initial run is missing".into()))?;
+            let status: String = run_state.try_get("status")?;
+            let ended_at_us: Option<i64> = run_state.try_get("ended_at_us")?;
+            let created_at_us: i64 = run_state.try_get("created_at_us")?;
+            let latest_ordinal: Option<i64> = run_state.try_get("latest_ordinal")?;
+            let latest_status: Option<String> = run_state.try_get("latest_status")?;
+            let has_failure: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM close_cleanup_failures WHERE attempt_id = ?1 AND cleanup_run_ordinal = 1)",
+            )
+            .bind(admitted.attempt_id.as_str())
+            .fetch_one(&mut *tx)
+            .await?;
+            if request.occurred_at_us < created_at_us {
+                return Err(DbError::CloseFoundationPrecondition(
+                    "native initial failure occurrence predates its run".into(),
+                ));
+            }
+            let anchored: bool = sqlx::query_scalar(
+                "SELECT EXISTS (
+                    SELECT 1 FROM close_original_retirement_anchors anchor
+                    JOIN close_obligations obligation ON obligation.attempt_id = anchor.attempt_id
+                    WHERE anchor.attempt_id = ?1
+                      AND anchor.inspection_generation = obligation.inspection_generation
+                      AND anchor.inspection_fingerprint = obligation.inspection_fingerprint
+                ) AND NOT EXISTS (
+                    SELECT 1 FROM close_retirement_anchor_exclusions WHERE attempt_id = ?1
+                )",
+            )
+            .bind(admitted.attempt_id.as_str())
+            .fetch_one(&mut *tx)
+            .await?;
+            if !anchored {
+                return Err(DbError::CloseFoundationPrecondition(
+                    "native initial failure requires its exact anchored sealed inventory".into(),
+                ));
+            }
+            let expected = crate::close_foundation::list_close_expected_retirement_resources_tx(
+                &mut tx,
+                admitted.attempt_id.as_str(),
+            )
+            .await?;
+            if !expected.iter().any(|item| {
+                item.scope == *scope && item.snapshot == *snapshot && item.resource == *resource
+            }) {
+                return Err(DbError::CloseFoundationPrecondition(
+                    "native initial failure authority is not in the exact sealed inventory".into(),
+                ));
+            }
+            let mut tail = crate::close_foundation::expected_close_cleanup_failure_resources_tx(
+                &mut tx,
+                admitted.attempt_id.as_str(),
+                scope,
+                resource,
+            )
+            .await?;
+            if !tail.iter().any(|item| {
+                item.scope == *scope && item.resource == *resource
+                    && item.disposition == CloseCleanupResourceDisposition::Failed
+            }) {
+                return Err(DbError::CloseFoundationPrecondition(
+                    "native initial failure authority must remain unresolved".into(),
+                ));
+            }
+            let has_prior_residual = tail.iter().any(|item| {
+                (item.scope != *scope || item.resource != *resource)
+                    && item.disposition == CloseCleanupResourceDisposition::Residual
+            });
+            for item in &mut tail {
+                if item.disposition != CloseCleanupResourceDisposition::Failed {
+                    item.disposition = CloseCleanupResourceDisposition::Unattempted;
+                }
+            }
+            if request.remaining_resources != tail {
+                return Err(DbError::CloseFoundationPrecondition(
+                    "native initial failure children must equal the exact unresolved inventory tail".into(),
+                ));
+            }
+            if matches!(request.stop_certainty, CloseStopCertainty::ConversationAndProcessesStopped { .. }) {
+                let unresolved: i64 = sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM close_expected_retirement_resources expected
+                     LEFT JOIN close_retirement_resources proof ON proof.attempt_id=expected.attempt_id
+                       AND proof.scope=expected.scope AND proof.inspection_generation=expected.inspection_generation
+                       AND proof.inspection_fingerprint=expected.inspection_fingerprint
+                       AND proof.resource_kind=expected.resource_kind AND proof.identity_kind=expected.identity_kind
+                       AND proof.identity_codec=expected.identity_codec AND proof.identity_value=expected.identity_value
+                     WHERE expected.attempt_id=?1 AND expected.resource_kind IN
+                       ('bash_process_group','tmux_server','pty_session','browser_session','equivalent_live_resource')
+                       AND (proof.proof_kind IS NULL OR proof.proof_kind='residual')",
+                )
+                .bind(admitted.attempt_id.as_str())
+                .fetch_one(&mut *tx)
+                .await?;
+                if unresolved != 0 {
+                    return Err(DbError::CloseFoundationPrecondition(
+                        "confirmed source stop requires success proof for every process resource".into(),
+                    ));
+                }
+            }
+            if has_failure {
+                if status != "stopped"
+                    || latest_ordinal != Some(1)
+                    || latest_status.as_deref() != Some("stopped")
+                    || obligation.phase() != ClosePhase::Completed
+                    || obligation.close_outcome() != Some(request.stop_certainty.completion_outcome())
+                    || ended_at_us != Some(request.occurred_at_us)
+                    || !Database::retained_close_cleanup_failure_matches_tx(&mut tx, &run, &request).await?
+                {
+                    return Err(DbError::CloseFoundationPrecondition(
+                        "native initial failure replay conflicts with retained terminal evidence".into(),
+                    ));
+                }
+                return Ok(obligation);
+            }
+            if status != "running"
+                || latest_ordinal != Some(1)
+                || latest_status.as_deref() != Some("running")
+                || obligation.phase() != ClosePhase::RetirementRequested
+                || has_prior_residual
+            {
+                return Err(DbError::CloseFoundationPrecondition(
+                    "native initial failure requires the latest running retirement-requested run without prior residuals".into(),
+                ));
+            }
+            Database::terminalize_close_run_cleanup_failure_inner_tx(&mut tx, &run, &request).await
+        }.await;
+        match result {
+            Ok(obligation) => match tx.commit().await {
+                Ok(()) => LocalAuthorityResult::DurableFactEstablished(Ok(obligation)),
+                Err(_) => LocalAuthorityResult::DurableFactUnclassified,
+            },
+            Err(error) => match tx.rollback().await {
+                Ok(()) => LocalAuthorityResult::DurableFactEstablished(Err(error)),
+                Err(_) => LocalAuthorityResult::DurableFactUnclassified,
+            },
+        }
+    }
+
     /// Finalizes only the exact live source-owned initial run after its anchored inventory
     /// has concrete successful retirement proof. This archives; it is not an observation API.
     pub async fn complete_native_close_initial(
@@ -483,7 +689,7 @@ impl Database {
                 stop_certainty: CloseStopCertainty::ShutdownUncertain,
                 occurred_at_us: chrono::Utc::now().timestamp_micros(),
             };
-            Database::terminalize_close_run_cleanup_failure_tx(&mut tx, &run, &request).await
+            Database::terminalize_close_run_cleanup_failure_inner_tx(&mut tx, &run, &request).await
         }
         .await;
         match result {
@@ -748,13 +954,12 @@ async fn settle_initial_tx(
 }
 
 #[allow(clippy::too_many_lines)] // Live source, durable receipt and exact run share one boundary.
-async fn require_initial_execution_tx(
+async fn require_initial_identity_tx(
     tx: &mut Transaction<'_, Sqlite>,
     command: &NativeCloseCommand,
     receipt: &NativeCloseReceipt,
     live_source: &phoenix_core::domain::sm_state::ConvState,
-    expected_phase: phoenix_core::domain::close::ClosePhase,
-) -> DbResult<(NativeCloseRunRef, bool)> {
+) -> DbResult<NativeCloseRunRef> {
     let NativeCloseIntent::Initial { target } = command.intent() else {
         return Err(DbError::CloseFoundationPrecondition(
             "expected initial Close intent".into(),
@@ -769,7 +974,6 @@ async fn require_initial_execution_tx(
     .map_err(|_| {
         DbError::CloseFoundationPrecondition("Close requires its current executing source".into())
     })?;
-
     if receipt.request_id != command.request_id()
         || receipt.admitted.target != *target
         || receipt.admitted.run_ordinal != CloseRunOrdinal::INITIAL
@@ -778,7 +982,6 @@ async fn require_initial_execution_tx(
             "initial Close receipt does not match the command".into(),
         ));
     }
-    // Validate durable source/target, then prove the caller's exact receipt was retained.
     super::receipts::require_source_and_target_tx(tx, command).await?;
     let admitted = super::receipts::read_receipt_tx(tx, command)
         .await?
@@ -793,7 +996,18 @@ async fn require_initial_execution_tx(
             "initial Close receipt does not bind the initial run".into(),
         ));
     }
+    Ok(admitted)
+}
 
+async fn require_initial_execution_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    command: &NativeCloseCommand,
+    receipt: &NativeCloseReceipt,
+    live_source: &phoenix_core::domain::sm_state::ConvState,
+    expected_phase: phoenix_core::domain::close::ClosePhase,
+) -> DbResult<(NativeCloseRunRef, bool)> {
+    let admitted = require_initial_identity_tx(tx, command, receipt, live_source).await?;
+    let target = &receipt.admitted.target;
     let row = sqlx::query(
         "SELECT o.phase, o.native_managed, r.run_ordinal, r.status,
                 (SELECT MAX(latest.run_ordinal) FROM close_runs latest WHERE latest.attempt_id = o.attempt_id) AS latest_ordinal,

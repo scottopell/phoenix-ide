@@ -1186,7 +1186,7 @@ async fn unresolved_expected_close_cleanup_resources_tx(
     Ok(remaining)
 }
 
-async fn expected_close_cleanup_failure_resources_tx(
+pub(crate) async fn expected_close_cleanup_failure_resources_tx(
     tx: &mut Transaction<'_, Sqlite>,
     attempt_id: &str,
     failed_scope: &WorkScopeId,
@@ -6529,8 +6529,43 @@ impl Database {
 
     /// # Errors
     /// The caller must roll back on stale authority, conflicting replay, or persistence failure.
-    #[allow(clippy::too_many_lines)]
     pub async fn terminalize_close_run_cleanup_failure_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        run: &CloseRunRef,
+        request: &TerminalizeInitialCloseCleanupFailureRequest,
+    ) -> DbResult<CloseObligation> {
+        Self::require_generic_close_failure_ingress_tx(tx, run).await?;
+        Self::terminalize_close_run_cleanup_failure_inner_tx(tx, run, request).await
+    }
+
+    async fn require_generic_close_failure_ingress_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        run: &CloseRunRef,
+    ) -> DbResult<()> {
+        if run.ordinal == CloseRunOrdinal::INITIAL {
+            let source_bound_initial: bool = sqlx::query_scalar(
+                "SELECT EXISTS (
+                    SELECT 1 FROM native_close_initial_receipts receipt
+                    JOIN close_obligations obligation ON obligation.attempt_id = receipt.attempt_id
+                    WHERE receipt.attempt_id = ?1 AND receipt.run_ordinal = ?2
+                      AND receipt.intent = 'initial' AND obligation.native_managed = 1
+                )",
+            )
+            .bind(run.attempt_id.as_str())
+            .bind(run.ordinal.get())
+            .fetch_one(&mut **tx)
+            .await?;
+            if source_bound_initial {
+                return Err(close_precondition(
+                    "native initial resource failure requires its live source binding",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_lines)] // Retained authority, evidence and mandatory delivery commit together.
+    pub(crate) async fn terminalize_close_run_cleanup_failure_inner_tx(
         tx: &mut Transaction<'_, Sqlite>,
         run: &CloseRunRef,
         request: &TerminalizeInitialCloseCleanupFailureRequest,
@@ -7333,7 +7368,7 @@ impl Database {
                     occurred_at_us: Utc::now().timestamp_micros(),
                 };
                 let result =
-                    Self::terminalize_close_run_cleanup_failure_tx(tx, &run, &request).await?;
+                    Self::terminalize_close_run_cleanup_failure_inner_tx(tx, &run, &request).await?;
                 if authority == CloseCleanupFailureAuthority::ExplicitlySuppressed {
                     sqlx::query("UPDATE close_completion_retry_allowances SET suppressed = 1 WHERE attempt_id = ?1 AND suppressed = 0")
                         .bind(run.attempt_id.as_str()).execute(&mut **tx).await?;
@@ -7469,7 +7504,7 @@ impl Database {
                 stop_certainty: CloseStopCertainty::ShutdownUncertain,
                 occurred_at_us: Utc::now().timestamp_micros(),
             };
-            let result = Self::terminalize_close_run_cleanup_failure_tx(tx, &run, &request).await?;
+            let result = Self::terminalize_close_run_cleanup_failure_inner_tx(tx, &run, &request).await?;
             if authority == CloseCleanupFailureAuthority::ExplicitlySuppressed {
                 sqlx::query("UPDATE close_completion_retry_allowances SET suppressed = 1 WHERE attempt_id = ?1 AND suppressed = 0")
                     .bind(run.attempt_id.as_str()).execute(&mut **tx).await?;
@@ -17721,7 +17756,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn generic_dispatch_preserves_observe_adopted_legacy_initial_and_exact_replay() {
+    #[allow(clippy::too_many_lines)] // Exercise both generic boundaries after the same Observe adoption.
+    async fn generic_dispatch_and_failure_preserve_observe_adopted_legacy_initial() {
         let db = Database::open_in_memory().await.unwrap();
         create_root(&db, "root").await;
         let scope = allocate_scope_worktree(&db, "root").await;
@@ -17786,7 +17822,7 @@ mod tests {
         .fetch_one(db.pool())
         .await
         .unwrap();
-        db.record_close_retirement_dispatch(request).await.unwrap();
+        db.record_close_retirement_dispatch(request.clone()).await.unwrap();
         let after: (i64, i64) = sqlx::query_as(
             "SELECT COUNT(*), MAX(dispatched_at_us) FROM close_retirement_resource_dispatches
              WHERE attempt_id = ?1",
@@ -17796,6 +17832,42 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(after, (1, before));
+        let run = CloseRunRef::initial(CloseAttemptId::parse("legacy-dispatch").unwrap());
+        let mut tx = db.pool.begin().await.unwrap();
+        let remaining_resources = expected_close_cleanup_failure_resources_tx(
+            &mut tx,
+            run.attempt_id.as_str(),
+            &request.scope,
+            &request.resource,
+        )
+        .await
+        .unwrap();
+        tx.rollback().await.unwrap();
+        let failure = TerminalizeInitialCloseCleanupFailureRequest {
+            failure_occurrence_id: run.failure_occurrence_id(),
+            attempt_id: run.attempt_id.clone(),
+            source_product_conversation_id: product_id("root"),
+            authority: CloseCleanupFailureAuthority::ExpectedResource {
+                scope: request.scope.clone(),
+                snapshot: request.snapshot.clone(),
+                resource: request.resource.clone(),
+            },
+            remaining_resources,
+            reason: RetirementFailureReason::RemovalFailed,
+            detail: "legacy admitted failure after Observe adoption".into(),
+            stop_certainty: CloseStopCertainty::ShutdownUncertain,
+            occurred_at_us: chrono::Utc::now().timestamp_micros(),
+        };
+        db.terminalize_initial_close_cleanup_failure(&failure).await.unwrap();
+        db.terminalize_initial_close_cleanup_failure(&failure).await.unwrap();
+        let failures: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM close_cleanup_failures WHERE attempt_id = ?1",
+        )
+        .bind(run.attempt_id.as_str())
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(failures, 1);
     }
 
     #[tokio::test]

@@ -2295,3 +2295,263 @@ async fn try_settle_rejects_stale_source_and_wrong_receipt_before_waiting_classi
         LocalAuthorityResult::DurableFactEstablished(Err(DbError::CloseFoundationPrecondition(_)))
     ));
 }
+
+async fn failure_boundary_snapshot(db: &Database, attempt: &str) -> Vec<String> {
+    let queries = [
+        "SELECT json_group_array(json_array(phase, close_outcome, inspection_generation, inspection_fingerprint, created_at, updated_at, completed_at, native_managed)) FROM close_obligations WHERE attempt_id = ?1",
+        "SELECT json_group_array(json_array(message_id, content)) FROM messages WHERE message_id = 'close-outcome:' || ?1",
+        "SELECT json_group_array(json_array(run_ordinal, status, created_at_us, ended_at_us)) FROM (SELECT run_ordinal, status, created_at_us, ended_at_us FROM close_runs WHERE attempt_id = ?1 ORDER BY run_ordinal)",
+        "SELECT json_group_array(json_array(scope, inspection_generation, inspection_fingerprint, resource_kind, identity_kind, identity_codec, identity_value, proof_kind, absence_basis, residual_reason, detail)) FROM (SELECT scope, inspection_generation, inspection_fingerprint, resource_kind, identity_kind, identity_codec, identity_value, proof_kind, absence_basis, residual_reason, detail FROM close_retirement_resources WHERE attempt_id = ?1 ORDER BY scope, resource_kind, identity_value)",
+        "SELECT json_group_array(json_array(history_id, scope, inspection_generation, inspection_fingerprint, resource_kind, identity_kind, identity_codec, identity_value, proof_kind, absence_basis, residual_reason, detail, recorded_at)) FROM (SELECT history_id, scope, inspection_generation, inspection_fingerprint, resource_kind, identity_kind, identity_codec, identity_value, proof_kind, absence_basis, residual_reason, detail, recorded_at FROM close_retirement_resource_history WHERE attempt_id = ?1 ORDER BY history_id)",
+        "SELECT json_group_array(json_array(failure_occurrence_id, cleanup_run_ordinal, source_product_conversation_id, scope, inspection_generation, inspection_fingerprint, resource_kind, identity_kind, identity_codec, identity_value, reason, detail, stop_certainty, confirmed_at_us, occurred_at_us, authority_kind)) FROM (SELECT failure_occurrence_id, cleanup_run_ordinal, source_product_conversation_id, scope, inspection_generation, inspection_fingerprint, resource_kind, identity_kind, identity_codec, identity_value, reason, detail, stop_certainty, confirmed_at_us, occurred_at_us, authority_kind FROM close_cleanup_failures WHERE attempt_id = ?1 ORDER BY cleanup_run_ordinal)",
+        "SELECT json_group_array(json_array(failure_occurrence_id, ordinal, scope, resource_kind, identity_kind, identity_codec, identity_value, disposition)) FROM (SELECT child.failure_occurrence_id, child.ordinal, child.scope, child.resource_kind, child.identity_kind, child.identity_codec, child.identity_value, child.disposition FROM close_cleanup_failure_resources child JOIN close_cleanup_failures failure USING (failure_occurrence_id) WHERE failure.attempt_id = ?1 ORDER BY child.failure_occurrence_id, child.ordinal)",
+        "SELECT json_group_array(json_array(event_id, route_kind, mandatory_failure_occurrence_id, occurred_at_us)) FROM (SELECT event.event_id, event.route_kind, event.mandatory_failure_occurrence_id, event.occurred_at_us FROM coordinator_watch_events event JOIN close_cleanup_failures failure ON failure.failure_occurrence_id = event.mandatory_failure_occurrence_id WHERE failure.attempt_id = ?1 ORDER BY event.event_id)",
+    ];
+    let mut snapshot = Vec::with_capacity(queries.len());
+    for sql in queries {
+        snapshot.push(
+            sqlx::query_scalar(sql)
+                .bind(attempt)
+                .fetch_one(db.pool())
+                .await
+                .unwrap(),
+        );
+    }
+    snapshot
+}
+
+#[tokio::test]
+async fn native_initial_resource_failure_is_source_bound_and_replays_read_only() {
+    check_initial_resource_failure(0).await;
+    check_initial_resource_failure(1).await;
+}
+
+#[allow(clippy::too_many_lines)] // Keep fresh failure, replay and no-mutation checks together.
+async fn check_initial_resource_failure(failed_index: usize) {
+    let f = Fixture::new().await;
+    let (command, receipt, live_source, expected) = captured_initial_retirement(&f).await;
+    assert!(expected.len() >= 2);
+    let failed = &expected[failed_index];
+    for successful in &expected[..failed_index] {
+        record_initial_retirement(&f, &command, &receipt, &live_source, successful).await;
+    }
+    f.db.record_native_close_initial_retirement_dispatch(
+        &command,
+        &receipt,
+        &live_source,
+        initial_dispatch_request(&receipt, failed),
+    )
+    .await
+    .established()
+    .unwrap()
+    .unwrap();
+
+    let remaining = expected[failed_index..]
+        .iter()
+        .map(|item| crate::CloseCleanupFailureResource {
+            scope: item.scope.clone(),
+            resource: item.resource.clone(),
+            disposition: if item.scope == failed.scope && item.resource == failed.resource {
+                phoenix_core::domain::close::CloseCleanupResourceDisposition::Failed
+            } else {
+                phoenix_core::domain::close::CloseCleanupResourceDisposition::Unattempted
+            },
+        })
+        .collect::<Vec<_>>();
+    let request = crate::TerminalizeInitialCloseCleanupFailureRequest {
+        failure_occurrence_id: phoenix_core::domain::close::CloseRunRef::initial(
+            receipt.admitted.attempt_id.clone(),
+        )
+        .failure_occurrence_id(),
+        attempt_id: receipt.admitted.attempt_id.clone(),
+        source_product_conversation_id: f.target.clone(),
+        authority: crate::CloseCleanupFailureAuthority::ExpectedResource {
+            scope: failed.scope.clone(),
+            snapshot: failed.snapshot.clone(),
+            resource: failed.resource.clone(),
+        },
+        remaining_resources: remaining,
+        reason: RetirementFailureReason::RemovalFailed,
+        detail: "native initial cleanup failure".into(),
+        stop_certainty: phoenix_core::domain::close::CloseStopCertainty::ShutdownUncertain,
+        occurred_at_us: chrono::Utc::now().timestamp_micros(),
+    };
+    let before_refusals = failure_boundary_snapshot(&f.db, receipt.admitted.attempt_id.as_str()).await;
+    let mut omitted = request.clone();
+    omitted.remaining_resources.pop();
+    let mut extra = request.clone();
+    let duplicate = extra.remaining_resources[0].clone();
+    extra.remaining_resources.push(duplicate);
+    let mut wrong_disposition = request.clone();
+    wrong_disposition.remaining_resources[0].disposition =
+        phoenix_core::domain::close::CloseCleanupResourceDisposition::Unattempted;
+    let mut wrong_snapshot = request.clone();
+    let crate::CloseCleanupFailureAuthority::ExpectedResource { snapshot, .. } =
+        &mut wrong_snapshot.authority
+    else {
+        unreachable!()
+    };
+    *snapshot = phoenix_core::domain::close::CloseRetirementSnapshot::parse(
+        format!("{}-wrong", snapshot.generation()),
+        snapshot.fingerprint(),
+    )
+    .unwrap();
+    let mut wrong_timestamp = request.clone();
+    wrong_timestamp.occurred_at_us = -1;
+    for invalid in [
+        omitted,
+        extra,
+        wrong_disposition,
+        wrong_snapshot,
+        wrong_timestamp,
+    ] {
+        assert!(matches!(
+            f.db.terminalize_native_close_initial_resource_failure(
+                &command,
+                &receipt,
+                &live_source,
+                invalid,
+            )
+            .await,
+            LocalAuthorityResult::DurableFactEstablished(Err(DbError::CloseFoundationPrecondition(_)))
+        ));
+        assert_eq!(
+            failure_boundary_snapshot(&f.db, receipt.admitted.attempt_id.as_str()).await,
+            before_refusals,
+            "refused request must preserve evidence, history, failure children, outbox and run facts",
+        );
+    }
+    assert!(matches!(
+        f.db.terminalize_initial_close_cleanup_failure(&request).await,
+        Err(DbError::CloseFoundationPrecondition(_))
+    ));
+    assert_eq!(
+        failure_boundary_snapshot(&f.db, receipt.admitted.attempt_id.as_str()).await,
+        before_refusals,
+        "generic failure route must not bypass native source authority",
+    );
+
+    sqlx::query(
+        "CREATE TRIGGER reject_native_close_failure_outbox BEFORE INSERT ON coordinator_watch_events
+         WHEN NEW.route_kind = 'mandatory_close_failure'
+         BEGIN SELECT RAISE(ABORT, 'injected mandatory outbox failure'); END",
+    )
+    .execute(f.db.pool())
+    .await
+    .unwrap();
+    let rollback = f
+        .db
+        .terminalize_native_close_initial_resource_failure(
+            &command,
+            &receipt,
+            &live_source,
+            request.clone(),
+        )
+        .await;
+    let LocalAuthorityResult::DurableFactEstablished(Err(error)) = rollback else {
+        panic!("injected mandatory delivery failure must roll back");
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("injected mandatory outbox failure")
+    );
+    assert_eq!(
+        failure_boundary_snapshot(&f.db, receipt.admitted.attempt_id.as_str()).await,
+        before_refusals,
+        "mandatory outbox failure must roll back failure, children and stopped run",
+    );
+    sqlx::query("DROP TRIGGER reject_native_close_failure_outbox")
+        .execute(f.db.pool())
+        .await
+        .unwrap();
+
+    let terminal = f
+        .db
+        .terminalize_native_close_initial_resource_failure(
+            &command,
+            &receipt,
+            &live_source,
+            request.clone(),
+        )
+        .await
+        .established()
+        .unwrap()
+        .unwrap();
+    assert_eq!(terminal.phase(), ClosePhase::Completed);
+    let retained: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM close_cleanup_failures WHERE attempt_id = ?1 AND cleanup_run_ordinal = 1",
+    )
+    .bind(receipt.admitted.attempt_id.as_str())
+    .fetch_one(f.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(retained, 1);
+    let before_replay = failure_boundary_snapshot(&f.db, receipt.admitted.attempt_id.as_str()).await;
+    let stale_source = ConvState::Idle;
+    assert!(matches!(
+        f.db.terminalize_native_close_initial_resource_failure(
+            &command,
+            &receipt,
+            &stale_source,
+            request.clone(),
+        )
+        .await,
+        LocalAuthorityResult::DurableFactEstablished(Err(DbError::CloseFoundationPrecondition(_)))
+    ));
+    assert_eq!(
+        failure_boundary_snapshot(&f.db, receipt.admitted.attempt_id.as_str()).await,
+        before_replay,
+        "stale source must not mutate committed failure evidence",
+    );
+    let mut wrong_receipt = receipt.clone();
+    wrong_receipt.request_id = Uuid::new_v4();
+    assert!(matches!(
+        f.db.terminalize_native_close_initial_resource_failure(
+            &command,
+            &wrong_receipt,
+            &live_source,
+            request.clone(),
+        )
+        .await,
+        LocalAuthorityResult::DurableFactEstablished(Err(DbError::CloseFoundationPrecondition(_)))
+    ));
+    assert_eq!(
+        failure_boundary_snapshot(&f.db, receipt.admitted.attempt_id.as_str()).await,
+        before_replay,
+        "wrong receipt must not mutate committed failure evidence",
+    );
+    assert!(matches!(
+        f.db.terminalize_initial_close_cleanup_failure(&request).await,
+        Err(DbError::CloseFoundationPrecondition(_))
+    ));
+    f.db.terminalize_native_close_initial_resource_failure(
+        &command,
+        &receipt,
+        &live_source,
+        request.clone(),
+    )
+    .await
+    .established()
+    .unwrap()
+    .unwrap();
+    let after_replay = failure_boundary_snapshot(&f.db, receipt.admitted.attempt_id.as_str()).await;
+    assert_eq!(before_replay, after_replay);
+    assert!(matches!(
+        f.db.terminalize_native_close_initial_resource_failure(
+            &command,
+            &receipt,
+            &live_source,
+            crate::TerminalizeInitialCloseCleanupFailureRequest {
+                detail: "conflicting replay".into(),
+                ..request
+            },
+        )
+        .await,
+        LocalAuthorityResult::DurableFactEstablished(Err(DbError::CloseFoundationPrecondition(_)))
+    ));
+    assert_eq!(
+        failure_boundary_snapshot(&f.db, receipt.admitted.attempt_id.as_str()).await,
+        before_replay,
+    );
+}

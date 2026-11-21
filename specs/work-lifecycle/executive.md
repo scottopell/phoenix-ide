@@ -34,6 +34,10 @@ Lifecycle ended and resources retired are separate facts. Confirmed conversation
 | REQ-PROJ-WS-001 | One ordinary owner per WorkScope; subordinate participants do not become owners | Candidate / unvalidated |
 | REQ-WL-003 | PR state is advisory and never triggers Close | Candidate / unvalidated |
 
+### Native initial resource-failure boundary (qualification pending)
+
+The source-bound initial failure API validates live/durable source and retained initial receipt before fresh failure or exact stopped replay. It binds the primary and canonical unresolved tail to the sealed original inventory, preserves successful proofs, and uses the shared atomic failure/residual/outcome/mandatory-delivery writer. Generic initial failure ingress is fenced without changing Observe-adopted legacy authority; source-owned inspection and interruption retain private authority-proven routes. Authored regressions cover both an unattempted tail and a successful prefix, refusal/replay state snapshots, and injected late-outbox rollback. This slice has not executed in hosted qualification; no local native validation was run. Runtime remains Captured-only, with no physical initial effects or public replacement-equivalence claim. All-success plus source loss remains an explicit liveness gap, not permission to fabricate resource failure.
+
 ## Required Behavioral Acceptance
 
 These are acceptance obligations, **not tests reported as passing**:

@@ -324,6 +324,13 @@ AND partial repair and copied inventory writes SHALL NOT originate original-anch
 AND persistence SHALL refuse a supported fresh capture's anchor unless its exact captured scope set has a sealed inventory and matching expected resources, including each scope's WorkScope identity
 AND this supported-writer transaction guarantee and schema shape SHALL NOT claim a temporal guarantee against arbitrary future SQL writers
 
+WHEN a native initial Close records a resource failure or observes its exact stopped failure again
+THE SYSTEM SHALL verify the same live and durable source, retained initial request, original run, and target before accepting either a fresh failure or its replay
+AND SHALL bind the failed resource to the complete sealed original inventory and exact inspection snapshot, preserve every successful prefix, and retain exactly the unresolved resource tail with the primary resource Failed and other remaining resources Unattempted
+AND SHALL atomically retain the failure, residual evidence, stopped run, outcome, and mandatory failure delivery, with exact replay read-only and conflicting replay refused
+AND generic legacy failure ingress SHALL NOT bypass native initial source authority; source-owned inspection and interruption classification SHALL retain their separately proven authority boundaries
+AND a resource-failure path SHALL NOT invent an unresolved resource when all resources already have successful proof.
+
 WHEN an authorized explicit action requests retry of an exact retained failed Close run and fresh read-only safety proof establishes the retry is safe under the original authority
 THE SYSTEM SHALL admit at most one exact successor run with the next ordinal under the original Close authority
 AND duplicate observations SHALL report that retained successor rather than admit another run
