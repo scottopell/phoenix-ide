@@ -1246,6 +1246,7 @@ fn segment_view(
     ProductConversationSegmentView {
         segment_ordinal: segment.transcript_row.segment_ordinal,
         transcript_row_id: segment.transcript_row.conversation.id.clone(),
+        transcript_generation: segment.transcript_row.conversation.transcript_generation,
         slug: segment.transcript_row.conversation.slug.clone(),
         title: segment.transcript_row.conversation.title.clone(),
         messages: messages
@@ -1407,9 +1408,10 @@ fn validate_cursor(
     if cursor.product_conversation_id != aggregate.product_conversation.id().as_str()
         || cursor.generation != aggregate_generation(aggregate)
     {
-        return Err(AppError::BadRequest(
-            "stale or mismatched product conversation cursor".to_string(),
-        ));
+        return Err(AppError::TypedBadRequest {
+            message: "stale or mismatched product conversation cursor".to_string(),
+            error_type: "stale_product_conversation_cursor".to_string(),
+        });
     }
     Ok(())
 }
@@ -3210,6 +3212,16 @@ mod tests {
             )
             .await
             .unwrap();
+        sqlx::query("UPDATE conversations SET transcript_generation = 7 WHERE id = ?")
+            .bind(&root.id)
+            .execute(state.db.pool())
+            .await
+            .unwrap();
+        sqlx::query("UPDATE conversations SET transcript_generation = 11 WHERE id = ?")
+            .bind(&successor.id)
+            .execute(state.db.pool())
+            .await
+            .unwrap();
 
         let list = create_router(state.clone())
             .oneshot(
@@ -3249,6 +3261,8 @@ mod tests {
         assert_eq!(snapshot["requested_transcript_row_id"], successor.id);
         assert_eq!(snapshot["canonical_route"], "/c/root-slug");
         assert_eq!(snapshot["segments"][0]["segment_ordinal"], 0);
+        assert_eq!(snapshot["segments"][0]["transcript_generation"], 7);
+        assert_eq!(snapshot["segments"][1]["transcript_generation"], 11);
         assert_eq!(snapshot["segments"][0]["handoff"]["kind"], "historical");
         assert_eq!(
             snapshot["segments"][0]["handoff"]["continuation_message_id"],
@@ -4018,6 +4032,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(body["error_type"], "stale_product_conversation_cursor");
     }
 
     #[allow(clippy::too_many_lines)]
