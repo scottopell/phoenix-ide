@@ -16204,9 +16204,10 @@ mod tests {
             1
         );
         assert!(sqlx::query(
-            origin_sql
-                .replacen("INSERT INTO", "INSERT OR REPLACE INTO", 1)
-                .as_str()
+            "INSERT OR REPLACE INTO native_close_completion_retry_origins
+            (attempt_id, origin_request_id, origin_request_fingerprint, source_transcript_id,
+             source_message_id, source_tool_use_id, product_conversation_id, initial_run_ordinal)
+            VALUES (?1, ?2, 'fingerprint', ?3, 'message', 'tool', ?4, 1)"
         )
         .bind("completion-fresh-attempt")
         .bind("fresh-request")
