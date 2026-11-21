@@ -60,6 +60,26 @@ async fn write_source_fence_state(
     }
 }
 
+// Installed-prefix fixtures deliberately exercise their historical fence, not
+// migration168 origin logic or a production compatibility bypass.
+async fn historical_write_source_fence_state(
+    db: &Database,
+    command: &NativeCloseCommand,
+    state: &ConvState,
+) -> DbResult<()> {
+    let mut tx = db.pool().begin_with("BEGIN IMMEDIATE").await?;
+    crate::native_close::fence_pre_completion_native_sources_tx(
+        &mut tx, command.source_transcript_id(), state,
+        crate::native_close::NativeSourceLossCause::UserSourceLoss,
+    ).await?;
+    sqlx::query("UPDATE conversations SET state = ?2 WHERE id = ?1")
+        .bind(command.source_transcript_id()).bind(serde_json::to_string(state)
+            .map_err(|error| DbError::Serialization(error.to_string()))?)
+        .execute(&mut *tx).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
 async fn source_fence_allowance(db: &Database, run: &CloseRunRef) -> Option<(i64, i64)> {
     sqlx::query_as(
         "SELECT consumed, suppressed FROM close_completion_retry_allowances WHERE attempt_id = ?1",
@@ -765,15 +785,24 @@ async fn migration_166_populated_upgrade_preserves_retry_and_adds_initial_source
         },
     )
     .await;
-    let LocalAuthorityResult::DurableFactEstablished(Ok(
-        crate::native_close::NativeCloseInitialResult::NewlyAdmitted(initial_receipt),
-    )) = initial_db
-        .apply_native_close_initial(&initial_command)
-        .await
-    else {
-        panic!("expected initial native admission before migration 166");
-    };
-    let initial_run = CloseRunRef::initial(initial_receipt.admitted.attempt_id);
+    // Reproduce the installed165 admission SQL, without asking the current168
+    // API to execute against an intentionally historical schema.
+    let initial_obligation = initial_db.begin_close_foundation(
+        &product_id("migration166-initial"),
+        &TranscriptConversationId::parse("migration166-initial").unwrap(),
+        "migration166-initial-attempt",
+    ).await.unwrap();
+    sqlx::query("UPDATE close_obligations SET native_managed = 1 WHERE attempt_id = ?1")
+        .bind(initial_obligation.attempt_id().as_str()).execute(initial_db.pool()).await.unwrap();
+    sqlx::query("INSERT INTO native_close_initial_receipts
+        (request_id, request_fingerprint, source_transcript_id, source_message_id, source_tool_use_id,
+         product_conversation_id, intent, attempt_id, run_ordinal)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'initial', ?7, 1)")
+        .bind(initial_command.request_id().to_string()).bind(initial_command.fingerprint())
+        .bind(initial_command.source_transcript_id()).bind(&initial_command.source().message_id)
+        .bind(&initial_command.source().tool_use_id).bind(initial_command.intent().target().as_str())
+        .bind(initial_obligation.attempt_id().as_str()).execute(initial_db.pool()).await.unwrap();
+    let initial_run = CloseRunRef::initial(initial_obligation.attempt_id().clone());
 
     assert_eq!(
         crate::migrations::run_through_for_test(retry_db.pool(), 166)
@@ -787,13 +816,13 @@ async fn migration_166_populated_upgrade_preserves_retry_and_adds_initial_source
             .unwrap(),
         1
     );
-    write_source_fence_state(&retry_db, &assessment.command, &ConvState::Idle, false)
+    historical_write_source_fence_state(&retry_db, &assessment.command, &ConvState::Idle)
         .await
         .unwrap();
     assert_source_fenced(&retry_db, &assessment, &retry_run, &retry_pending).await;
     assert_eq!(source_fence_allowance(&retry_db, &retry_run).await, Some((0, 1)));
 
-    write_source_fence_state(&initial_db, &initial_command, &ConvState::Idle, false)
+    historical_write_source_fence_state(&initial_db, &initial_command, &ConvState::Idle)
         .await
         .unwrap();
     let initial_failures = initial_db
@@ -1771,4 +1800,231 @@ async fn initial_source_fence_classifies_partial_inspection_without_dispatch() {
         .unwrap(),
         1
     );
+}
+
+async fn completion_retry_rows(db: &Database, run: &CloseRunRef) -> (i64, i64, i64, i64) {
+    let attempt = run.attempt_id.as_str();
+    let admissions = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM native_close_completion_retry_admissions WHERE attempt_id = ?1",
+    ).bind(attempt).fetch_one(db.pool()).await.unwrap();
+    let runs = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM close_runs WHERE attempt_id = ?1",
+    ).bind(attempt).fetch_one(db.pool()).await.unwrap();
+    let plans = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM native_close_retry_plans WHERE attempt_id = ?1",
+    ).bind(attempt).fetch_one(db.pool()).await.unwrap();
+    let effects = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM close_run_retry_effects WHERE attempt_id = ?1",
+    ).bind(attempt).fetch_one(db.pool()).await.unwrap();
+    (admissions, runs, plans, effects)
+}
+
+#[tokio::test]
+async fn live_all_success_interruption_admits_exactly_one_effect_free_completion_successor() {
+    let (db, command, receipt, source, run) = all_complete_initial_source_fence_fixture().await;
+    let successes = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM close_retirement_resources WHERE attempt_id = ?1",
+    ).bind(run.attempt_id.as_str()).fetch_one(db.pool()).await.unwrap();
+    assert!(successes > 0);
+    let interrupted = db.interrupt_native_close_initial_after_retirement(&command, &receipt, &source)
+        .await.established().unwrap().unwrap();
+    assert_eq!(interrupted.close_outcome(), Some(CloseCompletionOutcome::ArchivedCleanupAttention));
+    assert_eq!(db.get_conversation(command.source_transcript_id()).await.unwrap().state, source);
+    assert_eq!(db.get_close_run(&run).await.unwrap().status, CloseRunStatus::Stopped);
+    let failures = db.list_close_cleanup_failures(run.attempt_id.as_str()).await.unwrap();
+    assert_eq!(failures.len(), 1);
+    assert_eq!(failures[0].occurrence.failure_occurrence_id, run.failure_occurrence_id());
+    assert_eq!(failures[0].occurrence.authority, CloseCleanupFailureAuthority::AttemptInterrupted);
+    assert!(failures[0].occurrence.remaining_resources.is_empty());
+    assert_eq!(db.pending_coordinator_watch_events(100).await.unwrap().len(), 1);
+    assert_eq!(source_fence_allowance(&db, &run).await, Some((0, 0)));
+    assert!(db.interrupt_native_close_initial_after_retirement(&command, &receipt, &source)
+        .await.established().unwrap().is_ok());
+    assert_eq!(db.list_close_cleanup_failures(run.attempt_id.as_str()).await.unwrap(), failures);
+
+    let crate::native_close::NativeCloseCompletionResult::NewlyAdmitted(completion) =
+        db.admit_native_close_initial_completion_retry(&command, &receipt, &source)
+            .await.established().unwrap().unwrap() else { panic!("expected new completion admission"); };
+    assert_eq!(completion.origin, receipt);
+    assert_eq!(completion.successor.attempt_id, run.attempt_id);
+    assert_eq!(completion.successor.target, *command.intent().target());
+    assert_eq!(completion.successor.run_ordinal.get(), 2);
+    assert_eq!(source_fence_allowance(&db, &run).await, Some((1, 0)));
+    assert_eq!(completion_retry_rows(&db, &run).await, (1, 2, 0, 0));
+    assert_eq!(db.admit_native_close_initial_completion_retry(&command, &receipt, &source)
+        .await.established().unwrap().unwrap(),
+        crate::native_close::NativeCloseCompletionResult::Replay(completion.clone()));
+    let successor = CloseRunRef { attempt_id: run.attempt_id.clone(), ordinal: completion.successor.run_ordinal };
+    assert_eq!(db.get_close_run(&successor).await.unwrap().status, CloseRunStatus::Running);
+    let archived = db.complete_native_close_initial_completion_retry(&command, &completion, &source)
+        .await.established().unwrap().unwrap();
+    assert_eq!(archived.close_outcome(), Some(CloseCompletionOutcome::Archived));
+    assert_eq!(db.get_close_run(&successor).await.unwrap().status, CloseRunStatus::Completed);
+    assert_eq!(db.get_close_run(&run).await.unwrap().status, CloseRunStatus::Stopped);
+    let terminal_runs = sqlx::query_as::<_, (i64, String, i64, Option<i64>)>(
+        "SELECT run_ordinal, status, created_at_us, ended_at_us FROM close_runs WHERE attempt_id = ?1 ORDER BY run_ordinal",
+    ).bind(run.attempt_id.as_str()).fetch_all(db.pool()).await.unwrap();
+    assert_eq!(terminal_runs.len(), 2);
+    assert!(terminal_runs[1].3.is_some_and(|ended| ended >= terminal_runs[1].2));
+    assert_eq!(db.list_close_cleanup_failures(run.attempt_id.as_str()).await.unwrap(), failures);
+    assert_eq!(db.complete_native_close_initial_completion_retry(&command, &completion, &source)
+        .await.established().unwrap().unwrap(), archived);
+    assert_eq!(sqlx::query_as::<_, (i64, String, i64, Option<i64>)>(
+        "SELECT run_ordinal, status, created_at_us, ended_at_us FROM close_runs WHERE attempt_id = ?1 ORDER BY run_ordinal",
+    ).bind(run.attempt_id.as_str()).fetch_all(db.pool()).await.unwrap(), terminal_runs);
+    assert_eq!(sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM messages WHERE message_id = ?1",
+    ).bind(format!("close-run-outcome:2:{}", run.attempt_id)).fetch_one(db.pool()).await.unwrap(), 1);
+    assert_eq!(completion_retry_rows(&db, &run).await, (1, 2, 0, 0));
+    assert_eq!(sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM close_retirement_resources WHERE attempt_id = ?1",
+    ).bind(run.attempt_id.as_str()).fetch_one(db.pool()).await.unwrap(), successes);
+}
+
+#[tokio::test]
+async fn concurrent_completion_admissions_share_one_successor() {
+    let (db, command, receipt, source, run) = all_complete_initial_source_fence_fixture().await;
+    assert!(db.interrupt_native_close_initial_after_retirement(&command, &receipt, &source)
+        .await.established().unwrap().is_ok());
+    let (left, right) = tokio::join!(
+        db.admit_native_close_initial_completion_retry(&command, &receipt, &source),
+        db.admit_native_close_initial_completion_retry(&command, &receipt, &source),
+    );
+    use crate::native_close::NativeCloseCompletionResult::{NewlyAdmitted, Replay};
+    let left = left.established().unwrap().unwrap();
+    let right = right.established().unwrap().unwrap();
+    assert!(matches!((&left, &right), (NewlyAdmitted(a), Replay(b)) | (Replay(a), NewlyAdmitted(b)) if a == b));
+    assert_eq!(completion_retry_rows(&db, &run).await, (1, 2, 0, 0));
+    assert_eq!(source_fence_allowance(&db, &run).await, Some((1, 0)));
+}
+
+#[tokio::test]
+async fn completion_admission_without_proof_or_with_suppressed_allowance_changes_nothing() {
+    let (db, command, receipt, source, run) =
+        all_complete_initial_source_fence_fixture_with_omissions(true, None).await;
+    assert_eq!(completion_retry_rows(&db, &run).await, (0, 1, 0, 0));
+    assert!(db.interrupt_native_close_initial_after_retirement(&command, &receipt, &source)
+        .await.established().unwrap().is_err());
+    assert!(db.admit_native_close_initial_completion_retry(&command, &receipt, &source)
+        .await.established().unwrap().is_err());
+    assert_eq!(completion_retry_rows(&db, &run).await, (0, 1, 0, 0));
+    assert_eq!(db.get_close_run(&run).await.unwrap().status, CloseRunStatus::Running);
+    assert_eq!(source_fence_allowance(&db, &run).await, Some((0, 0)));
+    assert!(db.list_close_cleanup_failures(run.attempt_id.as_str()).await.unwrap().is_empty());
+
+    let (db, command, receipt, source, run) = all_complete_initial_source_fence_fixture().await;
+    write_source_fence_state(&db, &command, &ConvState::Idle, false).await.unwrap();
+    let before = db.get_close_obligation(run.attempt_id.as_str()).await.unwrap();
+    assert_eq!(source_fence_allowance(&db, &run).await, Some((0, 1)));
+    assert!(db.admit_native_close_initial_completion_retry(&command, &receipt, &source)
+        .await.established().unwrap().is_err());
+    assert_eq!(completion_retry_rows(&db, &run).await, (0, 1, 0, 0));
+    assert_eq!(source_fence_allowance(&db, &run).await, Some((0, 1)));
+    assert_eq!(db.get_close_obligation(run.attempt_id.as_str()).await.unwrap(), before);
+}
+
+#[tokio::test]
+async fn stale_source_refuses_completion_replay_and_startup_revokes_handoff() {
+    let (db, command, receipt, source, run) = all_complete_initial_source_fence_fixture().await;
+    assert!(db.interrupt_native_close_initial_after_retirement(&command, &receipt, &source)
+        .await.established().unwrap().is_ok());
+    let crate::native_close::NativeCloseCompletionResult::NewlyAdmitted(completion) =
+        db.admit_native_close_initial_completion_retry(&command, &receipt, &source)
+            .await.established().unwrap().unwrap() else { panic!("expected new admission"); };
+    write_source_fence_state(&db, &command, &ConvState::Idle, false).await.unwrap();
+    assert!(db.admit_native_close_initial_completion_retry(&command, &receipt, &source)
+        .await.established().unwrap().is_err());
+    assert!(db.complete_native_close_initial_completion_retry(&command, &completion, &source)
+        .await.established().unwrap().is_err());
+    assert_eq!(completion_retry_rows(&db, &run).await, (1, 2, 0, 0));
+    write_source_fence_state(&db, &command, &source, false).await.unwrap();
+    assert!(db.admit_native_close_initial_completion_retry(&command, &receipt, &source)
+        .await.established().unwrap().is_err(), "restoring the identical source must not replay a revoked admission");
+
+    let (db, command, receipt, source, run) = all_complete_initial_source_fence_fixture().await;
+    assert!(db.interrupt_native_close_initial_after_retirement(&command, &receipt, &source)
+        .await.established().unwrap().is_ok());
+    assert!(matches!(
+        db.admit_native_close_initial_completion_retry(&command, &receipt, &source)
+            .await.established().unwrap().unwrap(),
+        crate::native_close::NativeCloseCompletionResult::NewlyAdmitted(_)
+    ));
+    db.reset_all_to_idle().await.unwrap();
+    write_source_fence_state(&db, &command, &source, false).await.unwrap();
+    assert!(db.admit_native_close_initial_completion_retry(&command, &receipt, &source)
+        .await.established().unwrap().is_err(), "startup revocation must survive restoration of the identical source");
+    assert_eq!(completion_retry_rows(&db, &run).await, (1, 2, 0, 0));
+    assert_eq!(source_fence_allowance(&db, &run).await, Some((1, 0)));
+}
+
+#[tokio::test]
+async fn idle_source_after_admission_stops_effect_free_successor_with_mandatory_failure() {
+    let (db, command, receipt, source, run) = all_complete_initial_source_fence_fixture().await;
+    assert!(db.interrupt_native_close_initial_after_retirement(&command, &receipt, &source)
+        .await.established().unwrap().is_ok());
+    let crate::native_close::NativeCloseCompletionResult::NewlyAdmitted(completion) =
+        db.admit_native_close_initial_completion_retry(&command, &receipt, &source)
+            .await.established().unwrap().unwrap() else { panic!("expected new admission"); };
+    write_source_fence_state(&db, &command, &ConvState::Idle, false).await.unwrap();
+    let successor = CloseRunRef { attempt_id: run.attempt_id.clone(), ordinal: completion.successor.run_ordinal };
+    assert_eq!(db.get_close_run(&successor).await.unwrap().status, CloseRunStatus::Stopped);
+    let failures = db.list_close_cleanup_failures(run.attempt_id.as_str()).await.unwrap();
+    assert_eq!(failures.len(), 2);
+    let failure = failures.iter().find(|item| item.occurrence.failure_occurrence_id == successor.failure_occurrence_id())
+        .expect("successor failure");
+    assert!(failure.occurrence.remaining_resources.is_empty());
+    assert_eq!(failure.occurrence.authority, CloseCleanupFailureAuthority::ExplicitlySuppressed);
+    assert_eq!(db.pending_coordinator_watch_events(100).await.unwrap().len(), 2);
+    assert_eq!(source_fence_allowance(&db, &run).await, Some((1, 1)));
+    assert_eq!(completion_retry_rows(&db, &run).await, (1, 2, 0, 0));
+    assert!(db.complete_native_close_initial_completion_retry(&command, &completion, &source)
+        .await.established().unwrap().is_err());
+}
+
+#[tokio::test]
+async fn uncertain_completion_failure_cannot_rewrite_history_disposition() {
+    let (db, command, receipt, source, run) = all_complete_initial_source_fence_fixture().await;
+    assert!(db.interrupt_native_close_initial_after_retirement(&command, &receipt, &source)
+        .await.established().unwrap().is_ok());
+    assert!(matches!(db.admit_native_close_initial_completion_retry(&command, &receipt, &source)
+        .await.established().unwrap().unwrap(),
+        crate::native_close::NativeCloseCompletionResult::NewlyAdmitted(_)));
+    write_source_fence_state(&db, &command, &ConvState::Idle, false).await.unwrap();
+    let before = db.get_close_obligation(run.attempt_id.as_str()).await.unwrap();
+    assert_eq!(before.close_outcome(), Some(CloseCompletionOutcome::ArchivedCleanupAttention));
+    let failure: (String, Option<i64>) = sqlx::query_as(
+        "SELECT stop_certainty, confirmed_at_us FROM close_cleanup_failures WHERE attempt_id = ?1 AND cleanup_run_ordinal = 2",
+    ).bind(run.attempt_id.as_str()).fetch_one(db.pool()).await.unwrap();
+    assert_eq!(failure, ("shutdown_uncertain".to_owned(), None));
+    // Prior History is retained without a rewrite. An uncertain successor must not
+    // independently authorize even a no-op History/attention disposition write.
+    let rejected = sqlx::query(
+        "UPDATE close_obligations SET close_outcome = 'archived_cleanup_attention' WHERE attempt_id = ?1",
+    ).bind(run.attempt_id.as_str()).execute(db.pool()).await.unwrap_err();
+    assert!(rejected.to_string().contains("automatic completion failure requires exact stopped disposition and mandatory outbox"));
+    assert_eq!(db.get_close_obligation(run.attempt_id.as_str()).await.unwrap(), before);
+    assert_eq!(completion_retry_rows(&db, &run).await, (1, 2, 0, 0));
+}
+
+#[tokio::test]
+async fn live_interruption_notification_failure_rolls_back_without_mutation() {
+    let (db, command, receipt, source, run) = all_complete_initial_source_fence_fixture().await;
+    let obligation = db.get_close_obligation(run.attempt_id.as_str()).await.unwrap();
+    let successes = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM close_retirement_resources WHERE attempt_id = ?1",
+    ).bind(run.attempt_id.as_str()).fetch_one(db.pool()).await.unwrap();
+    sqlx::raw_sql("CREATE TRIGGER reject_live_completion_notification BEFORE INSERT ON coordinator_watch_events WHEN NEW.route_kind = 'mandatory_close_failure' BEGIN SELECT RAISE(ABORT, 'injected mandatory notification failure'); END;")
+        .execute(db.pool()).await.unwrap();
+    assert!(db.interrupt_native_close_initial_after_retirement(&command, &receipt, &source)
+        .await.established().unwrap().is_err());
+    assert_eq!(db.get_conversation(command.source_transcript_id()).await.unwrap().state, source);
+    assert_eq!(db.get_close_obligation(run.attempt_id.as_str()).await.unwrap(), obligation);
+    assert_eq!(db.get_close_run(&run).await.unwrap().status, CloseRunStatus::Running);
+    assert!(db.list_close_cleanup_failures(run.attempt_id.as_str()).await.unwrap().is_empty());
+    assert!(db.pending_coordinator_watch_events(100).await.unwrap().is_empty());
+    assert_eq!(source_fence_allowance(&db, &run).await, Some((0, 0)));
+    assert_eq!(completion_retry_rows(&db, &run).await, (0, 1, 0, 0));
+    assert_eq!(sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM close_retirement_resources WHERE attempt_id = ?1",
+    ).bind(run.attempt_id.as_str()).fetch_one(db.pool()).await.unwrap(), successes);
 }

@@ -191,6 +191,9 @@ fn append_field(bytes: &mut Vec<u8>, value: &[u8]) {
     bytes.extend_from_slice(value);
 }
 
+mod completion;
+pub use completion::{NativeCloseCompletionReceipt, NativeCloseCompletionResult};
+
 mod initial;
 mod initial_exit;
 pub use initial::{
@@ -209,6 +212,9 @@ pub(crate) use source_fence::{
     fence_native_retry_sources_tx, interrupt_native_retry_tx, recover_native_retry_sources_tx,
     NativeInitialSourceFence, NativeRetrySourceFence,
 };
+
+#[cfg(test)]
+pub(crate) use source_fence::{fence_pre_completion_native_sources_tx, NativeSourceLossCause};
 
 #[cfg(test)]
 mod tests;

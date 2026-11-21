@@ -54,9 +54,9 @@ async fn retry_command(
     };
     let command = NativeCloseCommand::new(coordinator.id.clone(), source.clone(), intent).unwrap();
     let input = command.intent().source_input();
-    db.update_conversation_state(
-        &coordinator.id,
-        &ConvState::ToolExecuting {
+    // Fixture source installation precedes its receipt, including historical
+    // schema fixtures. Actual source-loss tests use the owning fence writer.
+    let state = ConvState::ToolExecuting {
             current_tool: ToolCall::new(
                 &source.tool_use_id,
                 ToolInput::Unknown { name: "close_conversation".into(), input: input.clone() },
@@ -74,8 +74,10 @@ async fn retry_command(
                 None,
                 None,
             ),
-        },
-    ).await.unwrap();
+        };
+    sqlx::query("UPDATE conversations SET state = ?2 WHERE id = ?1")
+        .bind(&coordinator.id).bind(serde_json::to_string(&state).unwrap())
+        .execute(db.pool()).await.unwrap();
     command
 }
 

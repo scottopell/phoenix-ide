@@ -6174,6 +6174,20 @@ impl Database {
                 AND effect.run_ordinal = run.run_ordinal AND NOT EXISTS (SELECT 1 FROM close_run_retry_successes success
                   WHERE success.attempt_id = effect.attempt_id AND success.run_ordinal = effect.run_ordinal AND success.ordinal = effect.ordinal)))")
             .bind(run.attempt_id.as_str()).bind(run.ordinal.get()).fetch_one(&mut **tx).await?;
+        let eligible = if eligible {
+            true
+        } else {
+            sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM native_close_completion_retry_finalizable successor
+                 JOIN close_obligations obligation ON obligation.attempt_id = successor.attempt_id
+                 WHERE successor.attempt_id = ?1 AND successor.successor_run_ordinal = ?2
+                   AND obligation.native_managed = 1)",
+            )
+            .bind(run.attempt_id.as_str())
+            .bind(run.ordinal.get())
+            .fetch_one(&mut **tx)
+            .await?
+        };
         if !eligible {
             return Err(close_precondition(
                 "retry completion requires exact running run and complete successful plan",
@@ -7644,13 +7658,30 @@ impl Database {
         .bind(run.ordinal.get())
         .fetch_one(&mut **tx)
         .await?;
-        if !native {
+        let automatic = if native {
+            false
+        } else {
+            sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS(SELECT 1 FROM native_close_completion_retry_successors
+                 WHERE attempt_id = ?1 AND successor_run_ordinal = ?2 AND successor_status = 'running')",
+            ).bind(run.attempt_id.as_str()).bind(run.ordinal.get()).fetch_one(&mut **tx).await?
+        };
+        if !native && !automatic {
             return Err(close_precondition(
                 "source fence requires an exact running native successor",
             ));
         }
         let obligation = close_obligation_for_update(tx, run.attempt_id.as_str()).await?;
-        let progress = close_safe_retry_progress_tx(tx, run).await?;
+        let progress = if automatic {
+            // Exact automatic successors cannot carry resource effects. The retained
+            // resource-plan reader intentionally rejects an empty plan.
+            CloseSafeRetryProgress {
+                successful: Vec::new(),
+                pending: Vec::new(),
+            }
+        } else {
+            close_safe_retry_progress_tx(tx, run).await?
+        };
         let request = TerminalizeInitialCloseCleanupFailureRequest {
             failure_occurrence_id: run.failure_occurrence_id(),
             attempt_id: run.attempt_id.clone(),
@@ -13784,7 +13815,7 @@ mod tests {
             crate::migrations::run_pending_migrations(db.pool())
                 .await
                 .unwrap(),
-            8
+            9
         );
         let after: (String, String, String, String, String, String, String, i64) = sqlx::query_as(
             "SELECT request_id, source_transcript_id, source_message_id, source_tool_use_id,

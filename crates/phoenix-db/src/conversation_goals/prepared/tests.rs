@@ -338,6 +338,7 @@ async fn goal_preparation_migration_follows_conversation_tool_migrations() {
             (165, "native_close_retry_worktree_metadata".into()),
             (166, "native_initial_source_fence".into()),
             (167, "native_initial_completed_interruption".into()),
+            (168, "native_initial_completion_retry_admission".into()),
         ]
     );
 }

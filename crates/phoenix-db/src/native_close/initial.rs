@@ -1008,7 +1008,7 @@ async fn settle_initial_tx(
 }
 
 #[allow(clippy::too_many_lines)] // Live source, durable receipt and exact run share one boundary.
-async fn require_initial_identity_tx(
+pub(super) async fn require_initial_identity_tx(
     tx: &mut Transaction<'_, Sqlite>,
     command: &NativeCloseCommand,
     receipt: &NativeCloseReceipt,
@@ -1152,6 +1152,23 @@ async fn apply_initial_tx(
     let latest = TranscriptConversationId::parse(topology.latest.id)
         .map_err(|error| DbError::Serialization(error.to_string()))?;
     let attempt_id = Uuid::new_v4().to_string();
+    // Deferred exact receipt/operation FKs bind original source before creation.
+    // A retained unreceipted operation cannot acquire provenance by late adoption.
+    sqlx::query(
+        "INSERT INTO native_close_completion_retry_origins
+         (attempt_id, origin_request_id, origin_request_fingerprint, source_transcript_id,
+          source_message_id, source_tool_use_id, product_conversation_id, initial_run_ordinal)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1)",
+    )
+    .bind(&attempt_id)
+    .bind(command.request_id().to_string())
+    .bind(command.fingerprint())
+    .bind(command.source_transcript_id())
+    .bind(&command.source().message_id)
+    .bind(&command.source().tool_use_id)
+    .bind(target.as_str())
+    .execute(&mut **tx)
+    .await?;
     let obligation =
         Database::begin_close_foundation_inner(tx, target, &latest, &attempt_id, false).await?;
     super::receipts::adopt_and_insert_receipt_tx(
