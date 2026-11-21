@@ -72,9 +72,10 @@ async fn historical_write_source_fence_state(
         &mut tx, command.source_transcript_id(), state,
         crate::native_close::NativeSourceLossCause::UserSourceLoss,
     ).await?;
-    sqlx::query("UPDATE conversations SET state = ?2 WHERE id = ?1")
+    sqlx::query("UPDATE conversations SET state = ?2, state_kind = ?3 WHERE id = ?1")
         .bind(command.source_transcript_id()).bind(serde_json::to_string(state)
             .map_err(|error| DbError::Serialization(error.to_string()))?)
+        .bind(crate::conv_state_kind(state))
         .execute(&mut *tx).await?;
     tx.commit().await?;
     Ok(())

@@ -75,8 +75,9 @@ async fn retry_command(
                 None,
             ),
         };
-    sqlx::query("UPDATE conversations SET state = ?2 WHERE id = ?1")
+    sqlx::query("UPDATE conversations SET state = ?2, state_kind = ?3 WHERE id = ?1")
         .bind(&coordinator.id).bind(serde_json::to_string(&state).unwrap())
+        .bind(crate::conv_state_kind(&state))
         .execute(db.pool()).await.unwrap();
     command
 }
