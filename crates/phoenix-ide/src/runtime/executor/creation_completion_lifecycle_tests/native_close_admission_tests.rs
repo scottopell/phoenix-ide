@@ -1637,7 +1637,7 @@ async fn process_shutdown_after_inventory_capture_retains_resource_admission_fen
     };
     assert_eq!(receipt.admitted.attempt_id.as_str(), attempt);
     assert_eq!(receipt.request_id, fixture.command.request_id());
-    assert_eq!(receipt.admitted.run_ordinal, 1);
+    assert_eq!(receipt.admitted.run_ordinal.get(), 1);
     let exit = tokio::time::timeout(std::time::Duration::from_secs(10), running)
         .await
         .expect("process shutdown must join the exact source actor")
