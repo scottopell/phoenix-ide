@@ -1634,14 +1634,12 @@ async fn process_shutdown_after_inventory_capture_retains_resource_admission_fen
         .await
         .unwrap();
     assert_eq!(captured_resources.len(), 1);
-    assert!(
-        fixture
-            .db
-            .list_close_retirement_evidence(&attempt)
-            .await
-            .unwrap()
-            .is_empty()
-    );
+    assert!(fixture
+        .db
+        .list_close_retirement_evidence(&attempt)
+        .await
+        .unwrap()
+        .is_empty());
     let history_before: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM close_retirement_resource_history WHERE attempt_id = ?1",
     )
@@ -1711,13 +1709,11 @@ async fn process_shutdown_after_inventory_capture_retains_resource_admission_fen
             .unwrap(),
         captured_resources
     );
-    assert!(
-        fixture
-            .db
-            .close_retirement_inventory_is_complete(&attempt)
-            .await
-            .unwrap()
-    );
+    assert!(fixture
+        .db
+        .close_retirement_inventory_is_complete(&attempt)
+        .await
+        .unwrap());
     let evidence = fixture
         .db
         .list_close_retirement_evidence(&attempt)
@@ -1768,7 +1764,10 @@ async fn process_shutdown_after_inventory_capture_retains_resource_admission_fen
     );
     assert_eq!(failure.reason, RetirementFailureReason::Interrupted);
     assert_eq!(failure.detail, detail);
-    assert_eq!(failure.stop_certainty, CloseStopCertainty::ShutdownUncertain);
+    assert_eq!(
+        failure.stop_certainty,
+        CloseStopCertainty::ShutdownUncertain
+    );
     assert_eq!(
         fixture
             .db
