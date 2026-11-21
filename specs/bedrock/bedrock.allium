@@ -526,7 +526,7 @@ variant CompletionObservationFailed : CloseCompletionObservation {
 -- run whose retained chain terminates in a nonempty successful resource plan.
 entity CloseCompletionProof {
     failed_run: CloseRun
-    provenance: completed_resource_plan | prior_verified_completion
+    provenance: completed_resource_plan | prior_verified_completion | original_initial_retirement
     planned_effect_count: Integer
     succeeded_effect_count: Integer
     primary_failure: CloseRunFailure
@@ -3479,7 +3479,10 @@ rule AutomaticCompletionOnlyRetryConsumesOneAllowanceAtomically {
     requires: failed_run.obligation = obligation
     requires: failed_run.status = stopped
     requires: failed_run.ordinal = latest_close_run_ordinal(obligation)
-    requires: failed_run.ordinal > 1
+    requires:
+        (failed_run.ordinal > 1 and proof.provenance != original_initial_retirement)
+        or (failed_run.ordinal = 1 and proof.provenance = original_initial_retirement
+            and exact_native_initial_receipt_and_original_retirement_proof(proof, receipt))
     requires: not CloseRuns.any(r => r.obligation = obligation and r.ordinal > failed_run.ordinal)
     requires: not exists CloseRun{obligation: obligation, status: running}
     requires: proof.all_planned_effects_durably_succeeded
@@ -3493,6 +3496,8 @@ rule AutomaticCompletionOnlyRetryConsumesOneAllowanceAtomically {
         (proof.provenance = completed_resource_plan and proof.planned_effect_count > 0)
         or (proof.provenance = prior_verified_completion and proof.planned_effect_count = 0
             and prior_verified_completion_chain_has_positive_resource_provenance(failed_run))
+        or (proof.provenance = original_initial_retirement and proof.planned_effect_count > 0
+            and exact_native_initial_receipt_and_original_retirement_proof(proof, receipt))
     requires: exact_interrupted_run_has_positive_persisted_completion_provenance(proof)
     requires: proof.planned_effects_fingerprint = retained_planned_effects_fingerprint(failed_run)
     requires: proof.completed_effects_fingerprint = retained_successful_effects_fingerprint(failed_run)
@@ -3516,6 +3521,16 @@ rule AutomaticCompletionOnlyRetryConsumesOneAllowanceAtomically {
     ensures: obligation.product_conversation.lifecycle = prior_lifecycle
     ensures: not AdditionalMandatoryGlobalDeliveryCreated(failed_run)
 }
+
+-- exact_native_initial_receipt_and_original_retirement_proof binds ordinal one
+-- to the retained Initial receipt, immutable original inspection anchor, exact
+-- sealed captured scopes/inventories, canonical original snapshot, exact dispatch
+-- membership, all durable original resource successes and independent WorkScope
+-- success, and confirmed conversation/owned-process shutdown. Missing, residual,
+-- foreign or ambiguous evidence fails closed. It does not grant current live
+-- authority or override Stop/pause/cancellation/revoking source replacement.
+-- All-success interruption retains its unsuccessful failure/outbox with zero
+-- fabricated resource children; startup can observe it, never dispatch a retry.
 
 -- The live admission event has exactly this owned read-only driver. It never
 -- enters the resource-retirement dispatcher. Each definite return is Ready or

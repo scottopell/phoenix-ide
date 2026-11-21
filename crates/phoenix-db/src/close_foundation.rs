@@ -7339,12 +7339,76 @@ impl Database {
                 let unresolved =
                     unresolved_expected_close_cleanup_resources_tx(tx, run.attempt_id.as_str())
                         .await?;
-                // Archiving is a new lifecycle write, not source-loss observation.
-                let first = unresolved.first().ok_or_else(|| {
-                    close_precondition(
-                        "all-complete initial retirement requires source-bound completion; source fence cannot archive",
+                if unresolved.is_empty() {
+                    let proved: bool = sqlx::query_scalar(
+                        "SELECT EXISTS(SELECT 1 FROM native_close_initial_complete_retirement_proofs
+                         WHERE attempt_id = ?1 AND run_ordinal = 1
+                           AND product_conversation_id = ?2
+                           AND inspection_generation = ?3 AND inspection_fingerprint = ?4)",
                     )
-                })?;
+                    .bind(run.attempt_id.as_str())
+                    .bind(obligation.product_conversation_id().as_str())
+                    .bind(snapshot.generation())
+                    .bind(snapshot.fingerprint())
+                    .fetch_one(&mut **tx)
+                    .await?;
+                    let active_participants = Self::count_close_settlement_active_participants_tx(
+                        tx,
+                        run.attempt_id.as_str(),
+                    )
+                    .await?;
+                    if !proved || active_participants != 0 {
+                        return Err(close_precondition(
+                            "completed initial interruption requires positive retirement and confirmed conversation shutdown",
+                        ));
+                    }
+                    let occurred_at_us = Utc::now().timestamp_micros();
+                    let request = TerminalizeInitialCloseCleanupFailureRequest {
+                        failure_occurrence_id: run.failure_occurrence_id(),
+                        attempt_id: run.attempt_id.clone(),
+                        source_product_conversation_id: obligation.product_conversation_id().clone(),
+                        authority: authority.clone(),
+                        remaining_resources: Vec::new(),
+                        reason: RetirementFailureReason::Interrupted,
+                        detail: match authority {
+                            CloseCleanupFailureAuthority::AttemptInterrupted =>
+                                "process_interrupted: initial native Close source interrupted after proved retirement".into(),
+                            _ => detail.into(),
+                        },
+                        stop_certainty: CloseStopCertainty::ConversationAndProcessesStopped {
+                            confirmed_at_us: occurred_at_us,
+                        },
+                        occurred_at_us,
+                    };
+                    sqlx::query(
+                        "INSERT INTO close_cleanup_failures (
+                            failure_occurrence_id, attempt_id, cleanup_run_ordinal,
+                            source_product_conversation_id, authority_kind, reason, detail,
+                            stop_certainty, confirmed_at_us, occurred_at_us
+                         ) VALUES (?1, ?2, 1, ?3, ?4, 'interrupted', ?5,
+                                   'conversation_and_processes_stopped', ?6, ?6)",
+                    )
+                    .bind(&request.failure_occurrence_id)
+                    .bind(run.attempt_id.as_str())
+                    .bind(request.source_product_conversation_id.as_str())
+                    .bind(request.authority.as_str())
+                    .bind(&request.detail)
+                    .bind(occurred_at_us)
+                    .execute(&mut **tx)
+                    .await?;
+                    let result = Self::finish_close_failure_tx(tx, &run, &request, obligation).await?;
+                    if request.authority == CloseCleanupFailureAuthority::ExplicitlySuppressed {
+                        sqlx::query(
+                            "UPDATE close_completion_retry_allowances SET suppressed = 1
+                             WHERE attempt_id = ?1 AND suppressed = 0",
+                        )
+                        .bind(run.attempt_id.as_str())
+                        .execute(&mut **tx)
+                        .await?;
+                    }
+                    return Ok(result);
+                }
+                let first = &unresolved[0];
                 let remaining_resources = expected_close_cleanup_failure_resources_tx(
                     tx,
                     run.attempt_id.as_str(),

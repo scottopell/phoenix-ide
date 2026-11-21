@@ -180,6 +180,13 @@ external entity RestartRepairEvidenceAdoption {
 -- and no resource/destructive effects remain. It does not resume the stopped
 -- run, replenish the per-operation budget, or authorize startup dispatch.
 -- All other resource/destructive retries remain explicit and freshly proven.
+-- Ordinal-one native Initial interruption qualifies only through its exact
+-- retained receipt, original anchor, sealed captured scope/resource inventory,
+-- exact dispatch membership, every original resource and independent WorkScope
+-- success, and confirmed shutdown. Original proof does not grant live authority.
+-- All-success interruption remains unsuccessful with mandatory delivery and no
+-- fabricated resource failure. Stop/pause/cancel/revoking source replacement
+-- suppress automatic admission; startup only observes and never rearms it.
 
 rule ChatOnlyCloseSkipsWorktreeInspection {
     when: RetirementInspectionRequested(product_conversation, attempt_id, run_ordinal)

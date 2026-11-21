@@ -1291,14 +1291,36 @@ async fn initial_source_fence_preserves_proofs_across_mixed_worktree_scopes() {
     assert_eq!(db.pending_coordinator_watch_events(100).await.unwrap().len(), 1);
 }
 
-#[tokio::test]
-async fn initial_source_fence_refuses_all_complete_sealed_inventory_without_mutation() {
+async fn all_complete_initial_source_fence_fixture() -> (
+    Database,
+    NativeCloseCommand,
+    crate::native_close::NativeCloseReceipt,
+    ConvState,
+    CloseRunRef,
+) {
+    all_complete_initial_source_fence_fixture_with_omissions(false, None).await
+}
+
+async fn all_complete_initial_source_fence_fixture_with_omissions(
+    omit_process_success: bool,
+    empty_generation: Option<&str>,
+) -> (
+    Database,
+    NativeCloseCommand,
+    crate::native_close::NativeCloseReceipt,
+    ConvState,
+    CloseRunRef,
+) {
     use phoenix_core::domain::close::{CapturedWorktreeIdentity, CloseOwnedResourceInventory,
-        CloseRetirementSnapshot};
+        CloseRetirementSnapshot, OpaqueIdentity};
 
     let db = Database::open_in_memory().await.unwrap();
     create_root(&db, "all-complete-source-fence").await;
-    let scope = allocate_scope_worktree(&db, "all-complete-source-fence").await;
+    let scope = if empty_generation.is_some() {
+        db.get_conversation("all-complete-source-fence").await.unwrap().attached_work_scope_id.unwrap()
+    } else {
+        allocate_scope_worktree(&db, "all-complete-source-fence").await
+    };
     let command = retry_command(&db, "all-complete-source-fence", NativeCloseIntent::Initial {
         target: product_id("all-complete-source-fence"),
     }).await;
@@ -1313,17 +1335,20 @@ async fn initial_source_fence_refuses_all_complete_sealed_inventory_without_muta
     assert!(db.replace_native_close_initial_inspection(&command, &receipt, &source,
         crate::ReplaceCloseInspectionRequest {
             attempt_id: run.attempt_id.clone(),
-            scopes: vec![crate::ReplaceCloseInspectionScopeRequest {
-                scope: scope.clone(), snapshot: scope_snapshot.clone(), losses: vec![],
-            }],
-        }, None).await.established().unwrap().is_ok());
-    let snapshot = CloseRetirementSnapshot::parse(
-        encode_aggregate_snapshot_component([(&scope, scope_snapshot.generation())]),
-        encode_aggregate_snapshot_component([(&scope, scope_snapshot.fingerprint())]),
-    ).unwrap();
+            scopes: if empty_generation.is_some() { vec![] } else {
+                vec![crate::ReplaceCloseInspectionScopeRequest {
+                    scope: scope.clone(), snapshot: scope_snapshot.clone(), losses: vec![],
+                }]
+            },
+        }, empty_generation).await.established().unwrap().is_ok());
+    let snapshot = db.get_close_obligation(run.attempt_id.as_str()).await.unwrap()
+        .snapshot().cloned().unwrap();
     let captured = db.list_close_attempt_scopes(run.attempt_id.as_str()).await.unwrap();
-    let Some(CapturedWorktreeIdentity::Resolved(worktree)) = captured[0].captured_worktree.clone()
-        else { panic!("expected captured worktree"); };
+    let worktree = match captured[0].captured_worktree.clone() {
+        Some(CapturedWorktreeIdentity::Resolved(worktree)) => Some(worktree),
+        None if empty_generation.is_some() => None,
+        _ => panic!("expected captured worktree or empty inspection"),
+    };
     let LocalAuthorityResult::DurableFactEstablished(Ok(resources)) =
         db.capture_native_close_initial_retirement_inventory(&command, &receipt, &source,
             crate::CaptureCloseRetirementInventoryRequest {
@@ -1331,8 +1356,10 @@ async fn initial_source_fence_refuses_all_complete_sealed_inventory_without_muta
                 scopes: vec![crate::CaptureCloseRetirementInventoryScopeRequest {
                     scope: scope.clone(),
                     inventory: CloseOwnedResourceInventory {
-                        worktree: Some(worktree), work_scopes: BTreeSet::new(),
-                        bash_process_groups: BTreeSet::new(), tmux_servers: BTreeSet::new(),
+                        worktree,
+                        work_scopes: BTreeSet::new(),
+                        bash_process_groups: [OpaqueIdentity::parse("complete-bash-session").unwrap()].into(),
+                        tmux_servers: BTreeSet::new(),
                         pty_sessions: BTreeSet::new(), browser_sessions: BTreeSet::new(),
                         equivalent_live_resources: BTreeSet::new(),
                     },
@@ -1345,26 +1372,259 @@ async fn initial_source_fence_refuses_all_complete_sealed_inventory_without_muta
                 scope: target.scope.clone(), resource: target.resource.clone(),
             },
         ).await, LocalAuthorityResult::DurableFactEstablished(Ok(()))));
-        assert!(matches!(db.record_native_close_initial_retirement_evidence(
-            &command, &receipt, &source, RecordCloseRetirementEvidenceRequest {
-                attempt_id: run.attempt_id.clone(), snapshot: snapshot.clone(),
-                scope: target.scope.clone(), resource: target.resource.clone(),
-                outcome: RetirementOutcome::Retired, detail: Some("complete proof".into()),
-            },
-        ).await, LocalAuthorityResult::DurableFactEstablished(Ok(()))));
+        if target.resource.kind() == RetiredResourceKind::BashProcessGroup && !omit_process_success {
+            db.record_close_process_step_success(&crate::CloseProcessStepSuccess {
+                run: run.clone(),
+                scope: target.scope.clone(),
+                resource_kind: crate::CloseProcessResourceKind::BashProcessGroup,
+                identity: OpaqueIdentity::parse("complete-bash-session").unwrap(),
+                outcome: crate::CloseProcessStepOutcome::Retired,
+                observed_at_us: chrono::Utc::now().timestamp_micros(),
+            }).await.unwrap();
+        }
+        {
+            assert!(matches!(db.record_native_close_initial_retirement_evidence(
+                &command, &receipt, &source, RecordCloseRetirementEvidenceRequest {
+                    attempt_id: run.attempt_id.clone(), snapshot: snapshot.clone(),
+                    scope: target.scope.clone(), resource: target.resource.clone(),
+                    outcome: RetirementOutcome::Retired, detail: Some("complete proof".into()),
+                },
+            ).await, LocalAuthorityResult::DurableFactEstablished(Ok(()))));
+        }
     }
-    assert!(db.unresolved_expected_close_cleanup_resources(run.attempt_id.as_str()).await.unwrap().is_empty());
+    assert!(!resources.is_empty());
+    assert!(resources.iter().any(|target| {
+        target.resource.kind() == RetiredResourceKind::BashProcessGroup
+    }));
+    assert!(resources.iter().any(|target| {
+        target.resource.kind() == RetiredResourceKind::WorkScope
+    }));
+    if !omit_process_success {
+        assert!(db.unresolved_expected_close_cleanup_resources(run.attempt_id.as_str())
+            .await.unwrap().is_empty());
+    }
+    (db, command, receipt, source, run)
+}
 
-    let source_before = db.get_conversation(command.source_transcript_id()).await.unwrap().state;
+#[tokio::test]
+async fn initial_all_complete_source_fence_records_truthful_unsuccessful_outcome() {
+    for interruption in [false, true] {
+        let (db, command, receipt, source, run) = all_complete_initial_source_fence_fixture().await;
+        let original_obligation = db.get_close_obligation(run.attempt_id.as_str()).await.unwrap();
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM native_close_initial_complete_retirement_proofs WHERE attempt_id = ?1 AND run_ordinal = 1 AND product_conversation_id = ?2")
+                .bind(run.attempt_id.as_str()).bind(command.intent().target().as_str())
+                .fetch_one(db.pool()).await.unwrap(),
+            1,
+        );
+        if interruption {
+            db.reset_all_to_idle().await.unwrap();
+        } else {
+            write_source_fence_state(&db, &command, &ConvState::Idle, false).await.unwrap();
+        }
+        let failure = db.list_close_cleanup_failures(run.attempt_id.as_str()).await.unwrap();
+        assert_eq!(failure.len(), 1);
+        let failure = &failure[0].occurrence;
+        assert_eq!(failure.failure_occurrence_id, run.failure_occurrence_id());
+        assert_eq!(failure.authority, if interruption {
+            CloseCleanupFailureAuthority::AttemptInterrupted
+        } else {
+            CloseCleanupFailureAuthority::ExplicitlySuppressed
+        });
+        assert_eq!(failure.reason, RetirementFailureReason::Interrupted);
+        assert!(failure.remaining_resources.is_empty());
+        assert!(matches!(failure.stop_certainty,
+            CloseStopCertainty::ConversationAndProcessesStopped { .. }));
+        assert_eq!(source_fence_allowance(&db, &run).await,
+            Some((0, if interruption { 0 } else { 1 })));
+        let obligation = db.get_close_obligation(run.attempt_id.as_str()).await.unwrap();
+        assert_eq!(obligation.close_outcome(), Some(CloseCompletionOutcome::ArchivedCleanupAttention));
+        assert_eq!(obligation.snapshot(), original_obligation.snapshot());
+        let terminal_source = db.get_conversation(command.source_transcript_id()).await.unwrap().state;
+        assert_eq!(db.get_close_run(&run).await.unwrap().status, CloseRunStatus::Stopped);
+        assert_eq!(db.pending_coordinator_watch_events(100).await.unwrap().len(), 1);
+
+        let failures = db.list_close_cleanup_failures(run.attempt_id.as_str()).await.unwrap();
+        let events: Vec<_> = db.pending_coordinator_watch_events(100).await.unwrap()
+            .into_iter().map(|event| (event.event_id, event.source_occurrence_id, event.occurred_at_us)).collect();
+        let stopped = db.get_close_run(&run).await.unwrap();
+        if !interruption {
+            write_source_fence_state(&db, &command, &ConvState::Idle, false).await.unwrap();
+        } else {
+            db.reset_all_to_idle().await.unwrap();
+        }
+        assert_eq!(db.list_close_cleanup_failures(run.attempt_id.as_str()).await.unwrap(), failures);
+        assert_eq!(db.pending_coordinator_watch_events(100).await.unwrap()
+            .into_iter().map(|event| (event.event_id, event.source_occurrence_id, event.occurred_at_us)).collect::<Vec<_>>(), events);
+        assert_eq!(db.get_close_run(&run).await.unwrap(), stopped);
+        assert_eq!(db.get_close_obligation(run.attempt_id.as_str()).await.unwrap(), obligation);
+        assert_eq!(db.get_conversation(command.source_transcript_id()).await.unwrap().state, terminal_source);
+
+        assert!(db.complete_native_close_initial(&command, &receipt, &source)
+            .await.established().unwrap().is_err(), "the interrupted initial finalizer must remain refused");
+    }
+}
+
+#[tokio::test]
+async fn all_complete_initial_source_fence_preserves_custom_empty_inspection_generation() {
+    for generation in ["no-worktree", "server_git_status_v2_retry_source_fence_test"] {
+        let (db, command, _receipt, _source, run) =
+            all_complete_initial_source_fence_fixture_with_omissions(false, Some(generation)).await;
+        let snapshot = db.get_close_obligation(run.attempt_id.as_str()).await.unwrap()
+            .snapshot().cloned().unwrap();
+        assert_eq!(snapshot.generation(), generation);
+        assert_eq!(snapshot.fingerprint(), "no-worktree");
+        assert_eq!(sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM native_close_initial_complete_retirement_proofs WHERE attempt_id = ?1")
+            .bind(run.attempt_id.as_str()).fetch_one(db.pool()).await.unwrap(), 1);
+        write_source_fence_state(&db, &command, &ConvState::Idle, false).await.unwrap();
+        assert_eq!(db.get_close_run(&run).await.unwrap().status, CloseRunStatus::Stopped);
+        let obligation = db.get_close_obligation(run.attempt_id.as_str()).await.unwrap();
+        assert_eq!(obligation.snapshot(), Some(&snapshot));
+        assert_eq!(obligation.close_outcome(), Some(CloseCompletionOutcome::ArchivedCleanupAttention));
+        let failures = db.list_close_cleanup_failures(run.attempt_id.as_str()).await.unwrap();
+        assert_eq!(failures.len(), 1);
+        assert!(failures[0].occurrence.remaining_resources.is_empty());
+        assert!(matches!(failures[0].occurrence.authority, CloseCleanupFailureAuthority::ExplicitlySuppressed { .. }));
+    }
+}
+
+#[tokio::test]
+async fn all_complete_initial_source_fence_retains_successful_bash_process_retirement() {
+    let (db, command, _receipt, _source, run) =
+        all_complete_initial_source_fence_fixture().await;
+    let process_successes: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM close_retirement_resources
+         WHERE attempt_id = ?1 AND resource_kind = 'bash_process_group'",
+    )
+    .bind(run.attempt_id.as_str())
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(process_successes, 1);
+
+    write_source_fence_state(&db, &command, &ConvState::Idle, false)
+        .await
+        .unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM close_retirement_resources
+             WHERE attempt_id = ?1 AND resource_kind = 'bash_process_group'",
+        )
+        .bind(run.attempt_id.as_str())
+        .fetch_one(db.pool())
+        .await
+        .unwrap(),
+        1,
+        "successful process retirement remains a retained fact after fencing",
+    );
+    assert_eq!(
+        db.get_close_obligation(run.attempt_id.as_str())
+            .await
+            .unwrap()
+            .close_outcome(),
+        Some(CloseCompletionOutcome::ArchivedCleanupAttention),
+    );
+}
+
+#[tokio::test]
+async fn all_complete_initial_source_fence_missing_process_step_proof_rolls_back() {
+    {
+        let (db, command, _receipt, source, run) =
+            all_complete_initial_source_fence_fixture_with_omissions(true, None)
+                .await;
+        assert!(db.unresolved_expected_close_cleanup_resources(run.attempt_id.as_str()).await.unwrap().is_empty());
+        assert_eq!(sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM native_close_initial_complete_retirement_proofs WHERE attempt_id = ?1")
+            .bind(run.attempt_id.as_str()).fetch_one(db.pool()).await.unwrap(), 0);
+        let run_before = db.get_close_run(&run).await.unwrap();
+        let obligation_before = db.get_close_obligation(run.attempt_id.as_str()).await.unwrap();
+        let failures_before = db.list_close_cleanup_failures(run.attempt_id.as_str()).await.unwrap();
+        assert!(failures_before.is_empty());
+        assert!(write_source_fence_state(&db, &command, &ConvState::Idle, false)
+            .await
+            .is_err());
+        assert_eq!(db.get_conversation(command.source_transcript_id()).await.unwrap().state, source);
+        assert_eq!(db.get_close_run(&run).await.unwrap(), run_before);
+        assert_eq!(db.get_close_obligation(run.attempt_id.as_str()).await.unwrap(), obligation_before);
+        assert!(db.list_close_cleanup_failures(run.attempt_id.as_str()).await.unwrap().is_empty());
+        assert_eq!(source_fence_allowance(&db, &run).await, Some((0, 0)));
+        assert!(db.pending_coordinator_watch_events(100).await.unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn all_complete_initial_source_fence_without_exact_proof_rolls_back() {
+    let (db, command, _receipt, source, run) = all_complete_initial_source_fence_fixture().await;
+    let successes_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM close_retirement_resources WHERE attempt_id = ?1")
+        .bind(run.attempt_id.as_str()).fetch_one(db.pool()).await.unwrap();
+    let insert_failure = "INSERT INTO close_cleanup_failures (
+        failure_occurrence_id, attempt_id, cleanup_run_ordinal,
+        source_product_conversation_id, authority_kind, reason, detail,
+        stop_certainty, confirmed_at_us, occurred_at_us
+    ) VALUES (?1, ?2, 1, ?3, 'attempt_interrupted', 'interrupted',
+              'process_interrupted: schema proof control', 'conversation_and_processes_stopped', ?4, ?4)";
+    let confirmed_at_us = chrono::Utc::now().timestamp_micros();
+    // Same insert and timestamps must be admissible with complete proof.
+    // Roll it back so only the dispatch omission changes the negative control.
+    let mut positive = db.pool().begin().await.unwrap();
+    sqlx::query(insert_failure)
+        .bind(run.failure_occurrence_id()).bind(run.attempt_id.as_str())
+        .bind(command.intent().target().as_str()).bind(confirmed_at_us)
+        .execute(&mut *positive).await.unwrap();
+    positive.rollback().await.unwrap();
+    // Dispatch rows are retained facts, not inferred from successful outcome rows.
+    // Removing one must defeat the new positive proof without changing successes.
+    let removed = sqlx::query("DELETE FROM close_retirement_resource_dispatches WHERE attempt_id = ?1 AND resource_kind = 'work_scope'")
+        .bind(run.attempt_id.as_str()).execute(db.pool()).await.unwrap();
+    assert_eq!(removed.rows_affected(), 1);
+    assert!(db.unresolved_expected_close_cleanup_resources(run.attempt_id.as_str()).await.unwrap().is_empty());
+    assert_eq!(sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM native_close_initial_complete_retirement_proofs WHERE attempt_id = ?1")
+        .bind(run.attempt_id.as_str()).fetch_one(db.pool()).await.unwrap(), 0);
     let run_before = db.get_close_run(&run).await.unwrap();
+    // The schema exception must also reject a direct parent insert, independently
+    // of the source-fenced Rust entry point's proof checks.
+    assert!(sqlx::query(insert_failure)
+        .bind(run.failure_occurrence_id()).bind(run.attempt_id.as_str())
+        .bind(command.intent().target().as_str()).bind(confirmed_at_us)
+        .execute(db.pool()).await.is_err());
+    assert_eq!(sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM close_retirement_resources WHERE attempt_id = ?1")
+        .bind(run.attempt_id.as_str()).fetch_one(db.pool()).await.unwrap(), successes_before);
+
     let obligation_before = db.get_close_obligation(run.attempt_id.as_str()).await.unwrap();
     let allowance_before = source_fence_allowance(&db, &run).await;
     assert!(write_source_fence_state(&db, &command, &ConvState::Idle, false).await.is_err());
-    assert_eq!(db.get_conversation(command.source_transcript_id()).await.unwrap().state, source_before);
-    assert_eq!(db.get_close_run(&run).await.unwrap().status, run_before.status);
+    assert_eq!(db.get_conversation(command.source_transcript_id()).await.unwrap().state, source);
+    assert_eq!(db.get_close_run(&run).await.unwrap(), run_before);
     assert_eq!(db.get_close_obligation(run.attempt_id.as_str()).await.unwrap(), obligation_before);
     assert!(db.list_close_cleanup_failures(run.attempt_id.as_str()).await.unwrap().is_empty());
     assert_eq!(source_fence_allowance(&db, &run).await, allowance_before);
+    assert!(db.pending_coordinator_watch_events(100).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn all_complete_initial_source_fence_notification_failure_rolls_back_every_fact() {
+    let (db, command, _receipt, source, run) = all_complete_initial_source_fence_fixture().await;
+    let messages_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages")
+        .fetch_one(db.pool()).await.unwrap();
+    let archived_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM conversations WHERE archived = 1")
+        .fetch_one(db.pool()).await.unwrap();
+    let lifecycle_before: String = sqlx::query_scalar("SELECT ordinary_lifecycle FROM product_conversations WHERE id = ?1")
+        .bind(command.intent().target().as_str()).fetch_one(db.pool()).await.unwrap();
+    sqlx::raw_sql("CREATE TRIGGER reject_mandatory_close_event BEFORE INSERT ON coordinator_watch_events WHEN NEW.route_kind = 'mandatory_close_failure' BEGIN SELECT RAISE(ABORT, 'injected mandatory notification failure'); END;")
+        .execute(db.pool()).await.unwrap();
+    let run_before = db.get_close_run(&run).await.unwrap();
+    let obligation_before = db.get_close_obligation(run.attempt_id.as_str()).await.unwrap();
+    assert!(write_source_fence_state(&db, &command, &ConvState::Idle, false).await.is_err());
+    assert_eq!(db.get_conversation(command.source_transcript_id()).await.unwrap().state, source);
+    assert_eq!(db.get_close_run(&run).await.unwrap(), run_before);
+    assert_eq!(db.get_close_obligation(run.attempt_id.as_str()).await.unwrap(), obligation_before);
+    assert!(db.list_close_cleanup_failures(run.attempt_id.as_str()).await.unwrap().is_empty());
+    assert_eq!(sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM messages")
+        .fetch_one(db.pool()).await.unwrap(), messages_before);
+    assert_eq!(sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM conversations WHERE archived = 1")
+        .fetch_one(db.pool()).await.unwrap(), archived_before);
+    assert_eq!(sqlx::query_scalar::<_, String>("SELECT ordinary_lifecycle FROM product_conversations WHERE id = ?1")
+        .bind(command.intent().target().as_str()).fetch_one(db.pool()).await.unwrap(), lifecycle_before);
+    assert_eq!(source_fence_allowance(&db, &run).await, Some((0, 0)));
     assert!(db.pending_coordinator_watch_events(100).await.unwrap().is_empty());
 }
 

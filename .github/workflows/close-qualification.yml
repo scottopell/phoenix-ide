@@ -141,6 +141,13 @@ jobs:
           set -euo pipefail
           cargo test -p phoenix-db --lib close_foundation::tests::native_retry::migration_163_ -- --nocapture --test-threads=1 2>&1 | tee evidence/migration163.log
           grep -E 'test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored;' evidence/migration163.log
+      - name: Execute provisional initial-interruption migration upgrade
+        if: success()
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p phoenix-db --lib migrations::tests::migration_167_upgrades_authentic_166_initial_source_fence_schema -- --exact --nocapture --test-threads=1 2>&1 | tee evidence/migration167.log
+          grep -E 'test result: ok\. 1 passed; 0 failed; 0 ignored;' evidence/migration167.log
       - name: Execute complete Close foundation module
         if: success()
         shell: bash

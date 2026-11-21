@@ -356,15 +356,17 @@ AND a live admitted source remains authorized, unsuppressed, and freshly proves 
 THE SYSTEM SHALL atomically consume that budget while admitting at most one fresh completion-only successor run
 AND SHALL make that budget durable and nonrenewable across explicit retry, repeated call, progress, continuation, restart, lost response, or Coordinator replacement
 AND SHALL create the single allowance only with the original operation, never when adopting a retained operation without an original allowance
-AND SHALL require the exact stopped latest run to have ordinal greater than one, typed `AttemptInterrupted` primary failure authority with zero resource-failure children (not zero primary failures or mandatory deliveries), and positive persisted provenance from a nonempty exact resource plan with every effect durably successful, or from a verified-completion plan with zero effects and preserved positive completion provenance under the same original operation
-AND SHALL NOT infer eligibility from initial-run interruption, an interruption label alone, an empty unproven plan, unknown effect result, or incomplete proof
-AND SHALL NOT create a hidden bootstrap retry to make an initial run eligible; only an independently authorized explicit exact-run retry may establish qualifying later-run evidence
+AND SHALL require the exact stopped latest run to have typed `AttemptInterrupted` primary failure authority with zero resource-failure children (not zero primary failures or mandatory deliveries), and positive persisted provenance from a nonempty exact resource plan with every effect durably successful, a verified-completion plan with zero effects and preserved positive completion provenance, or the original native initial run's exact retained receipt, original inspection anchor, complete sealed captured scope/resource inventory, exact dispatch membership, every original resource and independent WorkScope success, and confirmed conversation/owned-process shutdown
+AND SHALL retain all-success initial interruption as a truthful unsuccessful outcome with its own mandatory delivery and no fabricated resource-failure child; confirmed shutdown permits History/cleanup attention, not successful Close completion
+AND SHALL revalidate current live authority separately from original completion proof under the original scope and nonrenewable budget
+AND SHALL NOT infer eligibility from an interruption label alone, an empty unproven plan, unknown effect result, or incomplete proof
+AND SHALL NOT create a hidden resource or bootstrap retry to make an initial run eligible
 AND SHALL NOT automatically admit resource-plan or destructive effects, replay a completed effect, or guess an unknown failure
 AND SHALL remain observation-only at startup and SHALL NOT dispatch or rearm automatic retry there
 AND SHALL leave legacy or adopted operations without an allowance unchanged and ineligible; startup bookkeeping SHALL be conditional on an existing allowance and SHALL NOT fabricate or backfill one
 AND SHALL connect live completion-only admission to one owned read-only observation and a definite successful or failed finalization, never silently drop an admitted Running successor on authority/proof loss; inability to establish durable terminal state SHALL close process authority rather than guess success or retry
 
-WHEN Stop, pause, or cancellation is durably admitted
+WHEN Stop, pause, cancellation, or source replacement revoking original authority is durably admitted
 THE SYSTEM SHALL disable pending automatic retry and fence racing callbacks
 AND SHALL NOT allow a repeated Close request or newer request to clear suppression or rearm a cancelled attempt
 AND SHALL truthfully report exhausted budget, ineligibility, or unavailable durable storage without blind retry loops

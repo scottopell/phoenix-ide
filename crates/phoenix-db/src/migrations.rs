@@ -18,6 +18,7 @@ mod native_close_retry_dispatch;
 mod native_close_retry_failure;
 mod native_close_retry_worktree_metadata;
 mod native_close_source_fence;
+mod native_initial_completed_interruption;
 mod native_initial_source_fence;
 mod retire_commission_review;
 mod settle_historical_continuation;
@@ -866,6 +867,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 166,
         name: "native_initial_source_fence",
         sql: include_str!("migrations/native_initial_source_fence.sql"),
+    },
+    Migration {
+        version: 167,
+        name: "native_initial_completed_interruption",
+        sql: include_str!("migrations/native_initial_completed_interruption.sql"),
     },
 ];
 
@@ -12599,6 +12605,13 @@ async fn run_migration_list(pool: &SqlitePool, migrations: &[Migration]) -> DbRe
             continue;
         }
 
+        if migration.version == 167 {
+            native_initial_completed_interruption::run(pool, migration).await?;
+            applied += 1;
+            tracing::info!(version = migration.version, "Migration complete");
+            continue;
+        }
+
         if migration.version == 166 {
             native_initial_source_fence::run(pool, migration).await?;
             applied += 1;
@@ -15963,7 +15976,7 @@ mod tests {
             .unwrap()
             .is_empty());
         assert_eq!(run_through_for_test(db.pool(), 152).await.unwrap(), 1);
-        assert_eq!(run_pending_migrations(db.pool()).await.unwrap(), 13);
+        assert_eq!(run_pending_migrations(db.pool()).await.unwrap(), 14);
         assert_eq!(run_pending_migrations(db.pool()).await.unwrap(), 0);
         let ledger: Vec<(i64, String)> = sqlx::query_as(
             "SELECT version, name FROM _migrations WHERE version >= 150 ORDER BY version",
@@ -15993,8 +16006,36 @@ mod tests {
                 (164, "native_close_retry_dispatch".into()),
                 (165, "native_close_retry_worktree_metadata".into()),
                 (166, "native_initial_source_fence".into()),
+                (167, "native_initial_completed_interruption".into()),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn migration_167_upgrades_authentic_166_initial_source_fence_schema() {
+        let pool = test_pool().await;
+        run_through_for_test(&pool, 166).await.unwrap();
+        assert_eq!(sqlx::query_scalar::<_, i64>("SELECT MAX(version) FROM _migrations")
+            .fetch_one(&pool).await.unwrap(), 166);
+        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 1);
+        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 0);
+        for name in [
+            "close_cleanup_failures_require_initial_authority",
+            "native_close_source_fence_requires_exact_plan",
+            "close_cleanup_failure_completion_requires_disposition",
+        ] {
+            let definition: String = sqlx::query_scalar("SELECT sql FROM sqlite_schema WHERE type = 'trigger' AND name = ?1")
+                .bind(name).fetch_one(&pool).await.unwrap();
+            assert!(definition.contains("native_close_initial_complete_retirement_proofs"), "{name}");
+        }
+        // Preparing the query resolves the view's full schema, not only its ledger row.
+        assert_eq!(sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM native_close_initial_complete_retirement_proofs")
+            .fetch_one(&pool).await.unwrap(), 0);
+        assert_eq!(sqlx::query_scalar::<_, i64>("PRAGMA writable_schema")
+            .fetch_one(&pool).await.unwrap(), 0);
+        assert_eq!(sqlx::query_scalar::<_, i64>("PRAGMA foreign_keys")
+            .fetch_one(&pool).await.unwrap(), 1);
+        assert!(sqlx::query("PRAGMA foreign_key_check").fetch_all(&pool).await.unwrap().is_empty());
     }
 
     #[test]
@@ -16002,6 +16043,7 @@ mod tests {
         let ledger = compiled_migration_ledger();
         assert!(ledger.windows(2).all(|pair| pair[0].0 < pair[1].0));
         let expected_tail = [
+            (167, "native_initial_completed_interruption"),
             (166, "native_initial_source_fence"),
             (165, "native_close_retry_worktree_metadata"),
             (164, "native_close_retry_dispatch"),
@@ -20300,6 +20342,7 @@ mod tests {
                 (164, "native_close_retry_dispatch"),
                 (165, "native_close_retry_worktree_metadata"),
                 (166, "native_initial_source_fence"),
+                (167, "native_initial_completed_interruption"),
             ]
         );
         let goal = MIGRATIONS

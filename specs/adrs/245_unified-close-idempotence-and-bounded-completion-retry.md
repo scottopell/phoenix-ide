@@ -98,3 +98,33 @@ The durable request/attempt/run receipt and atomic budget/suppression boundaries
 - [Work Lifecycle Allium](../work-lifecycle/work-lifecycle.allium) and [Bedrock Allium](../bedrock/bedrock.allium).
 - [ADR-088](088_close-stops-on-failure-and-separates-cleanup-from-lifecycle.md): historical stop-on-failure and explicit retry policy, narrowly qualified here.
 - [Work Lifecycle Executive](../work-lifecycle/executive.md): status and acceptance obligations.
+
+## Superseding decision: proof-gated initial completion
+
+The selected completion-only policy now also admits the original native Initial
+run after an all-success interruption, subject to the same single original,
+nonrenewable allowance. This supersedes the original ordinal-greater-than-one
+restriction, not the resource-retry or startup restrictions. The implementation
+decision was delivered by the Coordinator under saved delegated authority
+(primary `user_api` messages `9f3977a8-9ef7-4032-a416-150ba68aab5a` and
+`fa7abcd2-0f75-4892-a9d9-d1b409cf111e` in transcript
+`8fa4b22f-b23c-44ef-bc72-0a02e52713bc`); it is not a new direct-human approval.
+
+Eligibility requires the retained exact Initial receipt, immutable original
+inspection anchor, complete sealed captured inventories, exact dispatch
+membership, successful original outcomes for every expected resource including
+independent WorkScope retirement and required process-step successes, and
+confirmed conversation/owned-process shutdown. Missing, foreign, residual, or
+ambiguous proof fails closed. Original proof never grants current live source
+authority. Stop, pause, cancellation, revoking source replacement, and startup
+recovery cannot automatically complete. No successful resource effect repeats.
+The interruption is a truthful unsuccessful outcome with mandatory notification,
+zero fabricated resource failures, and cleanup attention rather than successful
+Close finalization, even when confirmed shutdown permits History archival.
+
+The first implementation slice only establishes that durable interruption and
+its positive proof boundary. Initial successor admission and assembled live
+execution remain separate incomplete obligations. Migration 167 in this branch
+is provisional only: it does not allocate a main/production number, rewrite
+installed history, reconcile migration collisions, or authorize integration or
+production schema execution.
