@@ -1624,7 +1624,8 @@ async fn process_shutdown_after_inventory_capture_retains_resource_admission_fen
     assert_native_resource_admission_fenced(&backend, &scope).await;
 
     fence.close_for_process_shutdown();
-    await_native_close_phase(&mut phases, Phase::ClassifyingExitInterruption).await;
+    // Phase notifications report completed steps, not entry into classification.
+    // Successful interruption can finish in one step; await its original response.
     let receipt = match tokio::time::timeout(std::time::Duration::from_secs(10), result)
         .await
         .expect("exact stopped owner must settle its original response")
@@ -1634,6 +1635,9 @@ async fn process_shutdown_after_inventory_capture_retains_resource_admission_fen
         NativeCloseInitialResult::NewlyAdmitted(receipt) => receipt,
         other => panic!("fresh initial Close must retain its original receipt: {other:?}"),
     };
+    assert_eq!(receipt.admitted.attempt_id.as_str(), attempt);
+    assert_eq!(receipt.request_id, fixture.command.request_id());
+    assert_eq!(receipt.admitted.run_ordinal, 1);
     let exit = tokio::time::timeout(std::time::Duration::from_secs(10), running)
         .await
         .expect("process shutdown must join the exact source actor")
