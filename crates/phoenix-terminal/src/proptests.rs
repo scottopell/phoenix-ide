@@ -675,7 +675,9 @@ async fn prepared_retirement_is_inert_until_polled_and_projection_is_bound() {
     assert_eq!(handle.master_fd_raw(), fd);
 
     let prepared = registry.prepare_retirement(&permit).unwrap();
-    fn drop_send_static<T: Send + 'static>(value: T) { drop(value); }
+    fn drop_send_static<T: Send + 'static>(value: T) {
+        drop(value);
+    }
     drop_send_static(prepared.complete());
     assert_eq!(*handle.stop_tx.borrow(), StopReason::Running);
     assert_eq!(handle.master_fd_raw(), fd);
@@ -715,7 +717,10 @@ async fn prepared_retirement_rejects_projection_spoof_wrong_registry_and_stale_g
         PrepareTerminalRetirementError::StalePermit
     );
     assert_eq!(handle.master_fd_raw().is_some(), true);
-    assert_eq!(*handle.stop_tx.borrow(), crate::session::StopReason::Running);
+    assert_eq!(
+        *handle.stop_tx.borrow(),
+        crate::session::StopReason::Running
+    );
     registry.cancel_retirement(permit);
     registry.cancel_retirement(replacement_generation);
 }
@@ -758,10 +763,18 @@ async fn prepared_retirement_never_reselects_a_replacement_handle() {
         .try_insert_exact(scope.clone(), dummy_handle(Dims::try_new(80, 24).unwrap()))
         .unwrap();
     assert!(!std::sync::Arc::ptr_eq(&original, &replacement));
-    assert!(matches!(prepared.complete().await, TerminalRetirementOutcome::Residual { .. }));
-    assert!(registry.get(&scope).is_some_and(|current| std::sync::Arc::ptr_eq(&current, &replacement)));
+    assert!(matches!(
+        prepared.complete().await,
+        TerminalRetirementOutcome::Residual { .. }
+    ));
+    assert!(registry
+        .get(&scope)
+        .is_some_and(|current| std::sync::Arc::ptr_eq(&current, &replacement)));
     assert!(replacement.master_fd_raw().is_some());
-    assert_eq!(*replacement.stop_tx.borrow(), crate::session::StopReason::Running);
+    assert_eq!(
+        *replacement.stop_tx.borrow(),
+        crate::session::StopReason::Running
+    );
 }
 
 #[tokio::test(start_paused = true)]
@@ -778,17 +791,34 @@ async fn prepared_retirement_uses_exact_handle_and_shared_original_deadline() {
     let held = handle.attach_permit.clone().acquire_owned().await.unwrap();
     let mut completion = std::pin::pin!(prepared.complete());
     assert!(futures::poll!(completion.as_mut()).is_pending());
-    assert_eq!(*handle.stop_tx.borrow(), crate::session::StopReason::TearDown);
-    assert!(handle.master_fd_raw().is_some(), "relay still holds attach authority");
+    assert_eq!(
+        *handle.stop_tx.borrow(),
+        crate::session::StopReason::TearDown
+    );
+    assert!(
+        handle.master_fd_raw().is_some(),
+        "relay still holds attach authority"
+    );
     tokio::time::advance(std::time::Duration::from_secs(3)).await;
     drop(held);
     assert!(futures::poll!(completion.as_mut()).is_pending());
-    assert!(handle.master_fd_raw().is_none(), "completion reached original receipt wait");
+    assert!(
+        handle.master_fd_raw().is_none(),
+        "completion reached original receipt wait"
+    );
     assert!(handle.child_lifecycle.take_observer().is_none());
     tokio::time::advance(std::time::Duration::from_secs(2)).await;
-    assert!(matches!(completion.await, TerminalRetirementOutcome::Residual { .. }));
-    assert!(registry.get(&scope).is_some_and(|current| std::sync::Arc::ptr_eq(&current, &handle)));
-    assert!(handle.master_fd_raw().is_none(), "master close is retained for retry");
+    assert!(matches!(
+        completion.await,
+        TerminalRetirementOutcome::Residual { .. }
+    ));
+    assert!(registry
+        .get(&scope)
+        .is_some_and(|current| std::sync::Arc::ptr_eq(&current, &handle)));
+    assert!(
+        handle.master_fd_raw().is_none(),
+        "master close is retained for retry"
+    );
     // The observer receipt is authoritative; complete did not create a second observer.
     exited.send(Ok(TerminalExit::Exited(0))).unwrap();
 }
@@ -799,8 +829,10 @@ async fn prepared_retirement_rejects_absent_target_and_original_deadline_expiry(
     let registry = ActiveTerminals::new();
     let scope = scope("prepared-expiry");
     let absent = registry.begin_retirement(&scope);
-    assert_eq!(registry.prepare_retirement(&absent).unwrap_err(),
-        PrepareTerminalRetirementError::NoPhysicalTarget);
+    assert_eq!(
+        registry.prepare_retirement(&absent).unwrap_err(),
+        PrepareTerminalRetirementError::NoPhysicalTarget
+    );
     registry.cancel_retirement(absent);
     let handle = registry
         .try_insert_exact(scope.clone(), dummy_handle(Dims::try_new(80, 24).unwrap()))
@@ -811,10 +843,14 @@ async fn prepared_retirement_rejects_absent_target_and_original_deadline_expiry(
     );
     let prepared = registry.prepare_retirement(&permit).unwrap();
     tokio::time::advance(std::time::Duration::from_secs(1)).await;
-    assert_eq!(registry.prepare_retirement(&permit).unwrap_err(),
-        PrepareTerminalRetirementError::DeadlineExpired);
-    assert!(matches!(prepared.complete().await,
-        TerminalRetirementOutcome::Residual { .. }));
+    assert_eq!(
+        registry.prepare_retirement(&permit).unwrap_err(),
+        PrepareTerminalRetirementError::DeadlineExpired
+    );
+    assert!(matches!(
+        prepared.complete().await,
+        TerminalRetirementOutcome::Residual { .. }
+    ));
     assert_eq!(*handle.stop_tx.borrow(), StopReason::Running);
     assert!(handle.master_fd_raw().is_some());
     assert!(registry.is_retirement_fenced(&scope));
@@ -836,10 +872,15 @@ async fn prepared_retirement_cancellation_retains_exact_evidence_at_both_waits()
         let permit = registry.begin_retirement(&scope);
         let mut completion = Box::pin(registry.prepare_retirement(&permit).unwrap().complete());
         assert!(futures::poll!(completion.as_mut()).is_pending());
-        assert_eq!(*handle.stop_tx.borrow(), crate::session::StopReason::TearDown);
+        assert_eq!(
+            *handle.stop_tx.borrow(),
+            crate::session::StopReason::TearDown
+        );
         assert_eq!(handle.master_fd_raw().is_some(), cancel_during_attach);
         drop(completion);
-        assert!(registry.get(&scope).is_some_and(|current| std::sync::Arc::ptr_eq(&current, &handle)));
+        assert!(registry
+            .get(&scope)
+            .is_some_and(|current| std::sync::Arc::ptr_eq(&current, &handle)));
         assert!(registry.is_retirement_fenced(&scope));
         assert_eq!(handle.master_fd_raw().is_some(), cancel_during_attach);
         assert!(handle.child_lifecycle.take_observer().is_none());
@@ -850,8 +891,14 @@ async fn prepared_retirement_cancellation_retains_exact_evidence_at_both_waits()
         // Explicit fixture resolution is not a claim that this leaf supervises
         // cleanup after caller cancellation.
         exit.send(Ok(TerminalExit::Exited(0))).unwrap();
-        assert_eq!(handle.child_lifecycle.receipt().wait().await, Ok(TerminalExit::Exited(0)));
-        assert_eq!(resolution.complete().await, TerminalRetirementOutcome::Retired);
+        assert_eq!(
+            handle.child_lifecycle.receipt().wait().await,
+            Ok(TerminalExit::Exited(0))
+        );
+        assert_eq!(
+            resolution.complete().await,
+            TerminalRetirementOutcome::Retired
+        );
         assert!(registry.get(&scope).is_none());
         assert!(registry.is_retirement_fenced(&scope));
         registry.cancel_retirement(permit);
@@ -869,9 +916,14 @@ async fn prepared_retirement_observer_error_retains_exact_handle_without_exit_pr
     assert!(futures::poll!(completion.as_mut()).is_pending());
     assert!(handle.master_fd_raw().is_none());
     exit.send(Err(nix::errno::Errno::ECHILD)).unwrap();
-    assert!(matches!(completion.await, TerminalRetirementOutcome::Residual { .. }));
+    assert!(matches!(
+        completion.await,
+        TerminalRetirementOutcome::Residual { .. }
+    ));
     assert!(!handle.child_lifecycle.receipt().exited());
-    assert!(registry.get(&scope).is_some_and(|current| std::sync::Arc::ptr_eq(&current, &handle)));
+    assert!(registry
+        .get(&scope)
+        .is_some_and(|current| std::sync::Arc::ptr_eq(&current, &handle)));
     assert!(registry.is_retirement_fenced(&scope));
     assert!(handle.child_lifecycle.take_observer().is_none());
 }
@@ -888,10 +940,19 @@ async fn prepared_retirement_completes_from_the_single_natural_exit_receipt() {
     assert!(handle.child_lifecycle.take_observer().is_none());
     let mut completion = std::pin::pin!(prepared.complete());
     assert!(futures::poll!(completion.as_mut()).is_pending());
-    assert_eq!(*handle.stop_tx.borrow(), crate::session::StopReason::TearDown);
+    assert_eq!(
+        *handle.stop_tx.borrow(),
+        crate::session::StopReason::TearDown
+    );
     exit.send(Ok(TerminalExit::Exited(0))).unwrap();
-    assert_eq!(handle.child_lifecycle.receipt().wait().await, Ok(TerminalExit::Exited(0)));
-    assert!(handle.master_fd_raw().is_some(), "relay still owns the master");
+    assert_eq!(
+        handle.child_lifecycle.receipt().wait().await,
+        Ok(TerminalExit::Exited(0))
+    );
+    assert!(
+        handle.master_fd_raw().is_some(),
+        "relay still owns the master"
+    );
     drop(held);
     assert_eq!(completion.await, TerminalRetirementOutcome::Retired);
     assert!(handle.master_fd_raw().is_none());

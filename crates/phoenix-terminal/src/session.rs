@@ -291,18 +291,30 @@ impl PreparedTerminalRetirement {
                     reason: "terminal retirement deadline elapsed before teardown".into(),
                 };
             }
-            let valid = map.retirements.get(&original.work_scope).is_some_and(|state| {
-                state.generation == original.generation.0
-                    && state.owner == Some(TerminalRetirementOwner::Close)
-            }) && map.handles.get(&original.work_scope)
-                .is_some_and(|current| Arc::ptr_eq(current, &target));
+            let valid = map
+                .retirements
+                .get(&original.work_scope)
+                .is_some_and(|state| {
+                    state.generation == original.generation.0
+                        && state.owner == Some(TerminalRetirementOwner::Close)
+                })
+                && map
+                    .handles
+                    .get(&original.work_scope)
+                    .is_some_and(|current| Arc::ptr_eq(current, &target));
             if !valid {
                 let observed_absence = map.handles.get(&original.work_scope).is_none()
-                    && map.retirements.get(&original.work_scope).is_some_and(|state| {
-                        state.generation == original.generation.0
-                            && state.owner == Some(TerminalRetirementOwner::Close)
-                    })
-                    && original.child_exit.as_ref().is_some_and(ChildExitReceipt::exited);
+                    && map
+                        .retirements
+                        .get(&original.work_scope)
+                        .is_some_and(|state| {
+                            state.generation == original.generation.0
+                                && state.owner == Some(TerminalRetirementOwner::Close)
+                        })
+                    && original
+                        .child_exit
+                        .as_ref()
+                        .is_some_and(ChildExitReceipt::exited);
                 return if observed_absence {
                     TerminalRetirementOutcome::Retired
                 } else {
@@ -316,10 +328,9 @@ impl PreparedTerminalRetirement {
             target.stop_tx.send_replace(StopReason::TearDown);
             Arc::clone(&target.attach_permit)
         };
-        let Ok(Ok(relay_authority)) = tokio::time::timeout_at(
-            original.deadline,
-            attach_permit.acquire_owned(),
-        ).await else {
+        let Ok(Ok(relay_authority)) =
+            tokio::time::timeout_at(original.deadline, attach_permit.acquire_owned()).await
+        else {
             return TerminalRetirementOutcome::Residual {
                 reason: "terminal relay did not release after teardown request".into(),
             };
@@ -338,18 +349,30 @@ impl PreparedTerminalRetirement {
                     reason: "terminal retirement deadline elapsed before teardown".into(),
                 };
             }
-            if !map.retirements.get(&original.work_scope).is_some_and(|state| {
-                state.generation == original.generation.0
-                    && state.owner == Some(TerminalRetirementOwner::Close)
-            }) || !map.handles.get(&original.work_scope)
-                .is_some_and(|current| Arc::ptr_eq(current, &target))
+            if !map
+                .retirements
+                .get(&original.work_scope)
+                .is_some_and(|state| {
+                    state.generation == original.generation.0
+                        && state.owner == Some(TerminalRetirementOwner::Close)
+                })
+                || !map
+                    .handles
+                    .get(&original.work_scope)
+                    .is_some_and(|current| Arc::ptr_eq(current, &target))
             {
                 let observed_absence = map.handles.get(&original.work_scope).is_none()
-                    && map.retirements.get(&original.work_scope).is_some_and(|state| {
-                        state.generation == original.generation.0
-                            && state.owner == Some(TerminalRetirementOwner::Close)
-                    })
-                    && original.child_exit.as_ref().is_some_and(ChildExitReceipt::exited);
+                    && map
+                        .retirements
+                        .get(&original.work_scope)
+                        .is_some_and(|state| {
+                            state.generation == original.generation.0
+                                && state.owner == Some(TerminalRetirementOwner::Close)
+                        })
+                    && original
+                        .child_exit
+                        .as_ref()
+                        .is_some_and(ChildExitReceipt::exited);
                 drop(map);
                 drop(relay_authority);
                 return if observed_absence {
@@ -366,8 +389,10 @@ impl PreparedTerminalRetirement {
             .child_exit
             .as_ref()
             .expect("captured terminal handle must have its original child receipt");
-        if !matches!(tokio::time::timeout_at(original.deadline, receipt.wait()).await, Ok(Ok(_)))
-            || tokio::time::Instant::now() >= original.deadline
+        if !matches!(
+            tokio::time::timeout_at(original.deadline, receipt.wait()).await,
+            Ok(Ok(_))
+        ) || tokio::time::Instant::now() >= original.deadline
         {
             drop(relay_authority);
             return TerminalRetirementOutcome::Residual {
@@ -383,11 +408,17 @@ impl PreparedTerminalRetirement {
                     reason: "terminal retirement deadline elapsed before registry removal".into(),
                 };
             }
-            let valid = map.retirements.get(&original.work_scope).is_some_and(|state| {
-                state.generation == original.generation.0
-                    && state.owner == Some(TerminalRetirementOwner::Close)
-            }) && map.handles.get(&original.work_scope)
-                .is_some_and(|current| Arc::ptr_eq(current, &target));
+            let valid = map
+                .retirements
+                .get(&original.work_scope)
+                .is_some_and(|state| {
+                    state.generation == original.generation.0
+                        && state.owner == Some(TerminalRetirementOwner::Close)
+                })
+                && map
+                    .handles
+                    .get(&original.work_scope)
+                    .is_some_and(|current| Arc::ptr_eq(current, &target));
             if !valid {
                 drop(map);
                 drop(relay_authority);
@@ -977,17 +1008,22 @@ impl ActiveTerminals {
         if !std::sync::Weak::ptr_eq(&original.registry, &Arc::downgrade(&self.0)) {
             return Err(PrepareTerminalRetirementError::WrongRegistry);
         }
-        let target = original.handle.as_ref()
+        let target = original
+            .handle
+            .as_ref()
             .ok_or(PrepareTerminalRetirementError::NoPhysicalTarget)?;
         if tokio::time::Instant::now() >= original.deadline {
             return Err(PrepareTerminalRetirementError::DeadlineExpired);
         }
         {
             let map = self.0.lock().expect("terminal registry poisoned");
-            let valid_fence = map.retirements.get(&original.work_scope).is_some_and(|state| {
-                state.generation == original.generation.0
-                    && state.owner == Some(TerminalRetirementOwner::Close)
-            });
+            let valid_fence = map
+                .retirements
+                .get(&original.work_scope)
+                .is_some_and(|state| {
+                    state.generation == original.generation.0
+                        && state.owner == Some(TerminalRetirementOwner::Close)
+                });
             let valid_target = match (&original.handle, map.handles.get(&original.work_scope)) {
                 (Some(expected), Some(current)) => Arc::ptr_eq(expected, current),
                 (None, None) => true,

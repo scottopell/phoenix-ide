@@ -142,6 +142,26 @@ pub trait TmuxBackend: Send + Sync + std::fmt::Debug {
         expires: Instant,
     ) -> TokenBoundKill;
 
+    /// Requires teardown bound to the exact process incarnation at the effect.
+    /// Backends without that capability fail closed; token/PID observations followed
+    /// by a new socket-path command are not an exact-process capability.
+    async fn kill_server_if_process(
+        &self,
+        _socket_path: &Path,
+        _config_path: &Path,
+        _expected_token: &str,
+        _expected_process: ProcessIdentity,
+        expires: Instant,
+    ) -> TokenBoundKill {
+        if Instant::now() >= expires {
+            TokenBoundKill::DeadlineExceeded
+        } else {
+            TokenBoundKill::Failed {
+                reason: "backend cannot bind tmux teardown to the exact process incarnation".to_string(),
+            }
+        }
+    }
+
     /// `Ok(None)` when tmux reports no such window.
     async fn capture_pane(
         &self,
@@ -277,44 +297,10 @@ impl TmuxBackend for SystemTmuxBackend {
         expected_token: &str,
         expires: Instant,
     ) -> TokenBoundKill {
-        let token_test = format!("#{{==:#{{E:{SERVER_TOKEN_VAR}}},{expected_token}}}");
-        let mut command = tokio::process::Command::new("tmux");
-        command
-            .arg("-f")
-            .arg(config_path)
-            .arg("-S")
-            .arg(socket_path)
-            .args([
-                "if-shell",
-                "-F",
-                &token_test,
-                "kill-server",
-                "display-message -p PHOENIX_TOKEN_MISMATCH",
-            ])
-            .env_remove("TMUX")
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        command.kill_on_drop(true);
-        match command_output(command, Some(expires)).await {
-            Ok(None) => TokenBoundKill::DeadlineExceeded,
-            Ok(Some(output)) if output.status.success() => {
-                if String::from_utf8_lossy(&output.stdout).contains("PHOENIX_TOKEN_MISMATCH") {
-                    TokenBoundKill::TokenMismatch
-                } else {
-                    TokenBoundKill::Killed
-                }
-            }
-            Ok(Some(output)) => TokenBoundKill::Failed {
-                reason: format!(
-                    "exact token-bound kill-server failed: {}",
-                    String::from_utf8_lossy(&output.stderr).trim()
-                ),
-            },
-            Err(error) => TokenBoundKill::Failed {
-                reason: error.to_string(),
-            },
-        }
+        kill_server_if_condition(
+            socket_path, config_path,
+            &format!("#{{==:#{{E:{SERVER_TOKEN_VAR}}},{expected_token}}}"), expires,
+        ).await
     }
 
     async fn capture_pane(
@@ -594,6 +580,51 @@ async fn run_tmux_quiet_output(socket_path: &Path, args: &[&str]) -> std::io::Re
         .await
 }
 
+async fn kill_server_if_condition(
+    socket_path: &Path,
+    config_path: &Path,
+    condition: &str,
+    expires: Instant,
+) -> TokenBoundKill {
+    let mut command = tokio::process::Command::new("tmux");
+    command
+        .arg("-f")
+        .arg(config_path)
+        .arg("-S")
+        .arg(socket_path)
+        .args([
+            "if-shell",
+            "-F",
+            condition,
+            "kill-server",
+            "display-message -p PHOENIX_TOKEN_MISMATCH",
+        ])
+        .env_remove("TMUX")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    command.kill_on_drop(true);
+    match command_output(command, Some(expires)).await {
+        Ok(None) => TokenBoundKill::DeadlineExceeded,
+        Ok(Some(output)) if output.status.success() => {
+            if String::from_utf8_lossy(&output.stdout).contains("PHOENIX_TOKEN_MISMATCH") {
+                TokenBoundKill::TokenMismatch
+            } else {
+                TokenBoundKill::Killed
+            }
+        }
+        Ok(Some(output)) => TokenBoundKill::Failed {
+            reason: format!(
+                "exact token-bound kill-server failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ),
+        },
+        Err(error) => TokenBoundKill::Failed {
+            reason: error.to_string(),
+        },
+    }
+}
+
 async fn exact_server_process_identity_until(
     socket_path: &Path,
     expected_token: &str,
@@ -862,6 +893,19 @@ async fn wait_for_spawned_pane(socket_path: &Path, config_path: &Path) -> Result
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[tokio::test(start_paused = true)]
+    async fn system_exact_process_teardown_fails_closed_without_path_command() {
+        let backend = SystemTmuxBackend { binary_available: true };
+        let expires = Instant::now() + Duration::from_secs(1);
+        let process = ProcessIdentity { pid: 42, start_time: 123 };
+        let socket = Path::new("/not-opened-by-exact-retirement/socket");
+        let config = Path::new("/not-opened-by-exact-retirement/config");
+        let outcome = backend.kill_server_if_process(socket, config, "inherited-token", process, expires).await;
+        assert!(matches!(outcome, TokenBoundKill::Failed { reason } if reason.contains("exact process incarnation")));
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert_eq!(backend.kill_server_if_process(socket, config, "inherited-token", process, expires).await, TokenBoundKill::DeadlineExceeded);
+    }
 
     #[test]
     fn production_spawn_builds_exact_pane_environment() {

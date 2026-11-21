@@ -332,6 +332,37 @@ jobs:
           for test in "${tests[@]}"; do
             grep -Fx "test proptests::$test ... ok" evidence/terminal-execution.log
           done
+      - name: Qualify inert exact tmux ownership and fail-closed system boundary
+        if: success() || failure()
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p phoenix-tools --lib tmux:: -- --list 2>&1 | tee evidence/tmux-inventory.log
+          tests=(
+            tmux::registry::tests::prepared_tmux_owner_is_inert_until_consumed_and_uses_original_token
+            tmux::registry::tests::prepared_tmux_owner_requires_physical_target_not_placeholder
+            tmux::registry::tests::prepared_tmux_owner_records_original_absence_not_replacement_kill
+            tmux::registry::tests::prepared_tmux_owner_never_kills_same_token_replacement_pid
+            tmux::registry::tests::process_bound_fake_rejects_birth_mismatch_and_unproven_process
+            tmux::registry::tests::prepared_tmux_owner_rejects_spoof_wrong_registry_and_no_target
+            tmux::registry::tests::prepared_tmux_owner_rejects_stale_fence_and_replaced_entry_without_kill
+            tmux::registry::tests::prepared_tmux_owner_uses_original_expiry_and_bounds_lock_waits
+            tmux::registry::tests::cancel_uses_original_scope_and_registry_not_mutable_projection
+            tmux::registry::tests::batch_cancel_uses_each_original_target_when_projections_duplicate
+            tmux::registry::tests::single_cancel_ignores_spoofed_generation_and_preserves_newer_fence
+            tmux::registry::tests::batch_cancel_uses_original_generations_not_spoofed_projections
+            tmux::registry::tests::wrong_registry_batch_cancel_retains_all_foreign_fences_for_issuer
+            tmux::registry::tests::cancellation_retry_deadline_does_not_renew_teardown_expiry
+            tmux::backend::tests::system_exact_process_teardown_fails_closed_without_path_command
+          )
+          for test in "${tests[@]}"; do
+            grep -Fx "$test: test" evidence/tmux-inventory.log
+          done
+          cargo test -p phoenix-tools --lib tmux:: -- --nocapture --test-threads=1 2>&1 | tee evidence/tmux-execution.log
+          grep -E 'test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored;' evidence/tmux-execution.log
+          for test in "${tests[@]}"; do
+            grep -Fx "test $test ... ok" evidence/tmux-execution.log
+          done
       - name: Qualify native Close public adapter parsing and discovery
         if: success() || failure()
         shell: bash

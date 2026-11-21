@@ -528,6 +528,38 @@ impl TmuxBackend for FakeTmuxBackend {
         TokenBoundKill::Killed
     }
 
+    async fn kill_server_if_process(
+        &self,
+        socket_path: &Path,
+        _config_path: &Path,
+        expected_token: &str,
+        expected_process: ProcessIdentity,
+        expires: Instant,
+    ) -> TokenBoundKill {
+        if Instant::now() >= expires {
+            return TokenBoundKill::DeadlineExceeded;
+        }
+        let mut world = self.world();
+        if world.stall(socket_path).is_some() {
+            return TokenBoundKill::DeadlineExceeded;
+        }
+        let Some(server) = world.live_server(socket_path) else {
+            return TokenBoundKill::TokenMismatch;
+        };
+        // This fake provides an atomic exact-incarnation capability. The system
+        // backend deliberately fails closed until it can supply the same contract.
+        if server.process != expected_process
+            || server.env.get(SERVER_TOKEN_VAR).map(String::as_str) != Some(expected_token)
+        {
+            return TokenBoundKill::TokenMismatch;
+        }
+        let process = server.process;
+        world.processes.insert(process, FakeProcessState::Exited);
+        world.endpoints.remove(socket_path);
+        world.kill_server_commands.push(socket_path.to_path_buf());
+        TokenBoundKill::Killed
+    }
+
     async fn capture_pane(
         &self,
         socket_path: &Path,
