@@ -920,17 +920,26 @@ async fn initial_retirement_evidence_is_source_bound_replayable_and_not_generic(
     // Evidence cannot establish success before this exact resource's dispatch intent.
     assert!(matches!(
         f.db.record_native_close_initial_retirement_evidence(
-            &command, &receipt, &live_source, request.clone(),
+            &command,
+            &receipt,
+            &live_source,
+            request.clone(),
         )
         .await,
         LocalAuthorityResult::DurableFactEstablished(Err(DbError::CloseFoundationPrecondition(_)))
     ));
     assert_eq!(initial_evidence_writes(&f, &receipt).await, evidence_before);
     assert_eq!(initial_dispatch_writes(&f, &receipt).await, dispatch_before);
-    assert_eq!(initial_completion_writes(&f, &receipt).await, completion_before);
+    assert_eq!(
+        initial_completion_writes(&f, &receipt).await,
+        completion_before
+    );
 
     f.db.record_native_close_initial_retirement_dispatch(
-        &command, &receipt, &live_source, initial_dispatch_request(&receipt, resource),
+        &command,
+        &receipt,
+        &live_source,
+        initial_dispatch_request(&receipt, resource),
     )
     .await
     .established()
@@ -939,7 +948,10 @@ async fn initial_retirement_evidence_is_source_bound_replayable_and_not_generic(
     let completion_after_dispatch = initial_completion_writes(&f, &receipt).await;
     assert!(matches!(
         f.db.record_native_close_initial_retirement_evidence(
-            &command, &receipt, &live_source, request.clone(),
+            &command,
+            &receipt,
+            &live_source,
+            request.clone(),
         )
         .await,
         LocalAuthorityResult::DurableFactEstablished(Ok(()))
@@ -955,14 +967,20 @@ async fn initial_retirement_evidence_is_source_bound_replayable_and_not_generic(
     // and completion state remain unchanged.
     assert!(matches!(
         f.db.record_native_close_initial_retirement_evidence(
-            &command, &receipt, &live_source, request.clone(),
+            &command,
+            &receipt,
+            &live_source,
+            request.clone(),
         )
         .await,
         LocalAuthorityResult::DurableFactEstablished(Ok(()))
     ));
     assert_eq!(initial_evidence_writes(&f, &receipt).await, evidence_after);
     assert_eq!(initial_dispatch_writes(&f, &receipt).await, dispatch_after);
-    assert_eq!(initial_completion_writes(&f, &receipt).await, completion_after_dispatch);
+    assert_eq!(
+        initial_completion_writes(&f, &receipt).await,
+        completion_after_dispatch
+    );
 
     let other_target = Fixture::create_target(&f.db, "second-target").await;
     let mut wrong_request_id = receipt.clone();
@@ -985,14 +1003,28 @@ async fn initial_retirement_evidence_is_source_bound_replayable_and_not_generic(
     ] {
         assert!(matches!(
             f.db.record_native_close_initial_retirement_evidence(
-                candidate_command, proof, &live_source, request.clone(),
+                candidate_command,
+                proof,
+                &live_source,
+                request.clone(),
             )
             .await,
-            LocalAuthorityResult::DurableFactEstablished(Err(DbError::CloseFoundationPrecondition(_)))
+            LocalAuthorityResult::DurableFactEstablished(Err(
+                DbError::CloseFoundationPrecondition(_)
+            ))
         ));
-        assert_eq!(initial_evidence_writes(&f, &receipt).await, before_rejections.0);
-        assert_eq!(initial_dispatch_writes(&f, &receipt).await, before_rejections.1);
-        assert_eq!(initial_completion_writes(&f, &receipt).await, before_rejections.2);
+        assert_eq!(
+            initial_evidence_writes(&f, &receipt).await,
+            before_rejections.0
+        );
+        assert_eq!(
+            initial_dispatch_writes(&f, &receipt).await,
+            before_rejections.1
+        );
+        assert_eq!(
+            initial_completion_writes(&f, &receipt).await,
+            before_rejections.2
+        );
     }
 
     let phoenix_core::domain::close::LossItemIdentity::Worktree(worktree) =
@@ -1052,14 +1084,22 @@ async fn initial_retirement_evidence_is_source_bound_replayable_and_not_generic(
     ] {
         assert!(matches!(
             f.db.record_native_close_initial_retirement_evidence(
-                &command, &receipt, &live_source, mismatch,
+                &command,
+                &receipt,
+                &live_source,
+                mismatch,
             )
             .await,
-            LocalAuthorityResult::DurableFactEstablished(Err(DbError::CloseFoundationPrecondition(_)))
+            LocalAuthorityResult::DurableFactEstablished(Err(
+                DbError::CloseFoundationPrecondition(_)
+            ))
         ));
         assert_eq!(initial_evidence_writes(&f, &receipt).await, evidence_after);
         assert_eq!(initial_dispatch_writes(&f, &receipt).await, dispatch_after);
-        assert_eq!(initial_completion_writes(&f, &receipt).await, completion_after_dispatch);
+        assert_eq!(
+            initial_completion_writes(&f, &receipt).await,
+            completion_after_dispatch
+        );
     }
     assert!(matches!(
         f.db.record_close_retirement_evidence(request.clone()).await,
@@ -1078,17 +1118,21 @@ async fn initial_retirement_evidence_is_source_bound_replayable_and_not_generic(
     );
     assert!(matches!(
         f.db.record_native_close_initial_retirement_evidence(
-            &command, &receipt, &live_source, request,
+            &command,
+            &receipt,
+            &live_source,
+            request,
         )
         .await,
         LocalAuthorityResult::DurableFactEstablished(Err(DbError::CloseFoundationPrecondition(_)))
     ));
     assert_eq!(initial_evidence_writes(&f, &receipt).await, fenced_before.0);
     assert_eq!(initial_dispatch_writes(&f, &receipt).await, fenced_before.1);
-    assert_eq!(initial_completion_writes(&f, &receipt).await, fenced_before.2);
+    assert_eq!(
+        initial_completion_writes(&f, &receipt).await,
+        fenced_before.2
+    );
 }
-
-
 
 #[tokio::test]
 async fn initial_retirement_evidence_adopts_exact_prior_retirement_without_replacing_it() {
@@ -1111,7 +1155,10 @@ async fn initial_retirement_evidence_adopts_exact_prior_retirement_without_repla
     let before = initial_evidence_writes(&f, &receipt).await;
     assert!(matches!(
         f.db.record_native_close_initial_retirement_evidence(
-            &command, &receipt, &live_source, request.clone(),
+            &command,
+            &receipt,
+            &live_source,
+            request.clone(),
         )
         .await,
         LocalAuthorityResult::DurableFactEstablished(Err(DbError::CloseFoundationPrecondition(_)))
@@ -1123,18 +1170,25 @@ async fn initial_retirement_evidence_adopts_exact_prior_retirement_without_repla
     assert_eq!(retired.0, 1);
     assert_eq!(retired.1.as_deref(), Some("retired"));
     f.db.record_native_close_initial_retirement_evidence(
-        &command, &receipt, &live_source, request.clone(),
+        &command,
+        &receipt,
+        &live_source,
+        request.clone(),
     )
-    .await.established().unwrap().unwrap();
+    .await
+    .established()
+    .unwrap()
+    .unwrap();
     let adopted = initial_evidence_writes(&f, &receipt).await;
     assert_eq!(adopted.0, 1);
     assert_eq!(adopted.1.as_deref(), Some("retired"));
     assert_eq!(adopted.5, 2);
     assert_eq!(adopted.4, retired.4);
-    f.db.record_native_close_initial_retirement_evidence(
-        &command, &receipt, &live_source, request,
-    )
-    .await.established().unwrap().unwrap();
+    f.db.record_native_close_initial_retirement_evidence(&command, &receipt, &live_source, request)
+        .await
+        .established()
+        .unwrap()
+        .unwrap();
     assert_eq!(initial_evidence_writes(&f, &receipt).await, adopted);
 }
 

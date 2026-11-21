@@ -1234,6 +1234,21 @@ async fn initial_source_fence_preserves_proofs_across_mixed_worktree_scopes() {
     ));
     let expected = db.unresolved_expected_close_cleanup_resources(run.attempt_id.as_str()).await.unwrap();
     assert_eq!(expected.len(), resources.len() - 1);
+    let dispatch_sql = "SELECT scope, inspection_generation, inspection_fingerprint,
+        resource_kind, identity_kind, identity_codec, identity_value, dispatched_at_us
+        FROM close_retirement_resource_dispatches WHERE attempt_id = ?1
+        ORDER BY scope, resource_kind, identity_kind, identity_value";
+    type DispatchFact = (String, String, String, String, String, String, String, i64);
+    let dispatches_before = sqlx::query_as::<_, DispatchFact>(dispatch_sql)
+        .bind(run.attempt_id.as_str())
+        .fetch_all(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(dispatches_before.len(), 2);
+    assert!(dispatches_before.iter().any(|fact| fact.0 == root_scope.as_str()
+        && fact.3 == "work_scope"));
+    assert!(dispatches_before.iter().any(|fact| fact.0 == child_scope.as_str()
+        && fact.3 == "tmux_server"));
     assert!(!expected.iter().any(|item| item.scope == retired.scope
         && item.resource == retired.resource));
     let allowance_before = source_fence_allowance(&db, &run).await;
@@ -1259,9 +1274,15 @@ async fn initial_source_fence_preserves_proofs_across_mixed_worktree_scopes() {
         WHERE attempt_id = ?1 AND scope = ?2 AND resource_kind = 'work_scope'")
         .bind(run.attempt_id.as_str()).bind(root_scope.as_str())
         .fetch_one(db.pool()).await.unwrap(), "retired");
-    assert_eq!(sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM close_retirement_resource_dispatches
-        WHERE attempt_id = ?1").bind(run.attempt_id.as_str())
-        .fetch_one(db.pool()).await.unwrap(), 1);
+    assert_eq!(
+        sqlx::query_as::<_, DispatchFact>(dispatch_sql)
+            .bind(run.attempt_id.as_str())
+            .fetch_all(db.pool())
+            .await
+            .unwrap(),
+        dispatches_before,
+        "source fencing must preserve both exact prior dispatch facts without adding effects"
+    );
     assert_eq!(source_fence_allowance(&db, &run).await,
         allowance_before.map(|(consumed, _)| (consumed, 1)));
     assert_eq!(db.pending_coordinator_watch_events(100).await.unwrap().len(), 1);

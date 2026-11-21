@@ -5188,12 +5188,8 @@ impl Database {
             validate_adopted_absence_evidence(&mut tx, &request, *absence_basis).await?;
         }
 
-        Self::record_close_retirement_evidence_sql_tx(
-            &mut *tx,
-            &request,
-            &inspection_generation,
-        )
-        .await?;
+        Self::record_close_retirement_evidence_sql_tx(&mut *tx, &request, &inspection_generation)
+            .await?;
 
         if matches!(request.outcome, RetirementOutcome::Residual { .. })
             && phase == ClosePhase::RetirementRequested
