@@ -1342,7 +1342,7 @@ async fn all_complete_initial_source_fence_fixture_with_omissions(
     ConvState,
     CloseRunRef,
 ) {
-    initial_source_fence_inventory_fixture(omit_process_success, empty_generation, omit_bash_dispatch, true).await
+    initial_source_fence_inventory_fixture(omit_process_success, empty_generation, omit_bash_dispatch, true, false).await
 }
 
 async fn initial_source_fence_inventory_fixture(
@@ -1350,6 +1350,33 @@ async fn initial_source_fence_inventory_fixture(
     empty_generation: Option<&str>,
     omit_bash_dispatch: bool,
     record_completion: bool,
+    include_second_bash: bool,
+) -> (
+    Database,
+    NativeCloseCommand,
+    crate::native_close::NativeCloseReceipt,
+    ConvState,
+    CloseRunRef,
+) {
+    let db = Database::open_in_memory().await.unwrap();
+    initial_source_fence_inventory_fixture_with_db(
+        db,
+        omit_process_success,
+        empty_generation,
+        omit_bash_dispatch,
+        record_completion,
+        include_second_bash,
+    )
+    .await
+}
+
+async fn initial_source_fence_inventory_fixture_with_db(
+    db: Database,
+    omit_process_success: bool,
+    empty_generation: Option<&str>,
+    omit_bash_dispatch: bool,
+    record_completion: bool,
+    include_second_bash: bool,
 ) -> (
     Database,
     NativeCloseCommand,
@@ -1360,7 +1387,6 @@ async fn initial_source_fence_inventory_fixture(
     use phoenix_core::domain::close::{CapturedWorktreeIdentity, CloseOwnedResourceInventory,
         CloseRetirementSnapshot, OpaqueIdentity};
 
-    let db = Database::open_in_memory().await.unwrap();
     create_root(&db, "all-complete-source-fence").await;
     let scope = if empty_generation.is_some() {
         db.get_conversation("all-complete-source-fence").await.unwrap().attached_work_scope_id.unwrap()
@@ -1404,7 +1430,12 @@ async fn initial_source_fence_inventory_fixture(
                     inventory: CloseOwnedResourceInventory {
                         worktree,
                         work_scopes: BTreeSet::new(),
-                        bash_process_groups: [OpaqueIdentity::parse("complete-bash-session").unwrap()].into(),
+                        bash_process_groups: if include_second_bash {
+                            [OpaqueIdentity::parse("complete-bash-session").unwrap(),
+                             OpaqueIdentity::parse("complete-bash-session-b").unwrap()].into()
+                        } else {
+                            [OpaqueIdentity::parse("complete-bash-session").unwrap()].into()
+                        },
                         tmux_servers: BTreeSet::new(),
                         pty_sessions: BTreeSet::new(), browser_sessions: BTreeSet::new(),
                         equivalent_live_resources: BTreeSet::new(),
@@ -1466,7 +1497,7 @@ async fn initial_source_fence_inventory_fixture(
 async fn initial_process_authorization_requires_exact_durable_source_scope_snapshot_and_dispatch() {
     use phoenix_core::domain::close::{CloseRetirementSnapshot, RetiredResourceKind};
 
-    let (db, command, receipt, source, run) = initial_source_fence_inventory_fixture(false, None, false, false).await;
+    let (db, command, receipt, source, run) = initial_source_fence_inventory_fixture(false, None, false, false, false).await;
     let inventories = db.list_close_expected_retirement_resources(run.attempt_id.as_str()).await.unwrap();
     let process = inventories.iter().find(|item| {
         item.resource.kind() == RetiredResourceKind::BashProcessGroup
@@ -1514,14 +1545,14 @@ async fn initial_process_authorization_rejects_missing_dispatch_and_stopped_or_c
     use phoenix_core::domain::close::RetiredResourceKind;
 
     let (db, command, receipt, source, run) =
-        initial_source_fence_inventory_fixture(false, None, true, false).await;
+        initial_source_fence_inventory_fixture(false, None, true, false, false).await;
     let item = db.list_close_expected_retirement_resources(run.attempt_id.as_str()).await.unwrap()
         .into_iter().find(|item| item.resource.kind() == RetiredResourceKind::BashProcessGroup).unwrap();
     assert!(db.authorize_native_close_initial_process_step(
         &command, &receipt, &source, item.scope.clone(), item.snapshot.clone(), RetiredResourceKind::BashProcessGroup,
     ).await.established().unwrap().is_err());
 
-    let (db, command, receipt, source, run) = initial_source_fence_inventory_fixture(false, None, false, false).await;
+    let (db, command, receipt, source, run) = initial_source_fence_inventory_fixture(false, None, false, false, false).await;
     let item = db.list_close_expected_retirement_resources(run.attempt_id.as_str()).await.unwrap()
         .into_iter().find(|item| item.resource.kind() == RetiredResourceKind::BashProcessGroup).unwrap();
     write_source_fence_state(&db, &command, &ConvState::Idle, false).await.unwrap();
@@ -1532,10 +1563,230 @@ async fn initial_process_authorization_rejects_missing_dispatch_and_stopped_or_c
 }
 
 #[tokio::test]
+async fn exact_initial_process_entry_is_per_resource_not_whole_kind() {
+    use crate::native_close::{
+        NativeCloseInitialEntryRelease, NativeCloseInitialResourceEntryDecision as Decision,
+        NativeCloseInitialResourceEntryResult as EntryResult,
+    };
+    use phoenix_core::domain::close::RetiredResourceKind;
+
+    for process_receipt in [false, true] {
+    let (db, command, receipt, source, run) =
+        initial_source_fence_inventory_fixture(false, None, false, false, true).await;
+    let resources = db.list_close_expected_retirement_resources(run.attempt_id.as_str()).await.unwrap();
+    let mut bash: Vec<_> = resources.into_iter()
+        .filter(|item| item.resource.kind() == RetiredResourceKind::BashProcessGroup).collect();
+    bash.sort_by_key(|item| item.resource.identity().value().to_owned());
+    assert_eq!(bash.len(), 2);
+    let a = &bash[0];
+    let b = &bash[1];
+    if process_receipt {
+        let mut success = initial_bash_process_success(&run, &a.scope);
+        success.identity = phoenix_core::domain::close::OpaqueIdentity::parse(a.resource.identity().value()).unwrap();
+        assert!(db.record_native_close_initial_process_step_success(
+            &command, &receipt, &source, a.snapshot.clone(), success,
+        ).await.established().unwrap().is_ok());
+    } else {
+        assert!(db.record_native_close_initial_retirement_evidence(
+            &command, &receipt, &source, crate::RecordCloseRetirementEvidenceRequest {
+                attempt_id: run.attempt_id.clone(), snapshot: a.snapshot.clone(),
+                scope: a.scope.clone(), resource: a.resource.clone(),
+                outcome: phoenix_core::domain::close::RetirementOutcome::Retired, detail: None,
+            },
+        ).await.established().unwrap().is_ok());
+    }
+
+    let mut called = false;
+    assert!(matches!(db.enter_native_close_initial_process_resource(
+        &command, &receipt, &source, a.scope.clone(), a.snapshot.clone(), &a.resource,
+        || { called = true; Decision::Entered },
+    ).await, EntryResult::Rejected { release: NativeCloseInitialEntryRelease::Confirmed, .. }));
+    assert!(!called);
+
+    // Whole-kind compatibility remains deliberately conservative: A's success blocks the set.
+    assert!(db.authorize_native_close_initial_process_step(
+        &command, &receipt, &source, a.scope.clone(), a.snapshot.clone(),
+        RetiredResourceKind::BashProcessGroup,
+    ).await.established().unwrap().is_err());
+
+    assert!(matches!(db.enter_native_close_initial_process_resource(
+        &command, &receipt, &source, b.scope.clone(), b.snapshot.clone(), &b.resource,
+        || Decision::Entered,
+    ).await, EntryResult::Invoked {
+        decision: Decision::Entered,
+        release: NativeCloseInitialEntryRelease::Confirmed,
+    }));
+    }
+}
+
+#[tokio::test]
+async fn exact_initial_process_entry_missing_dispatch_never_invokes_handoff() {
+    use crate::native_close::{
+        NativeCloseInitialResourceEntryDecision as Decision,
+        NativeCloseInitialResourceEntryResult as EntryResult,
+    };
+    use phoenix_core::domain::close::RetiredResourceKind;
+
+    let (db, command, receipt, source, run) =
+        initial_source_fence_inventory_fixture(false, None, true, false, false).await;
+    let item = db.list_close_expected_retirement_resources(run.attempt_id.as_str()).await.unwrap()
+        .into_iter().find(|item| item.resource.kind() == RetiredResourceKind::BashProcessGroup).unwrap();
+    let mut called = false;
+    assert!(matches!(db.enter_native_close_initial_process_resource(
+        &command, &receipt, &source, item.scope, item.snapshot, &item.resource,
+        || { called = true; Decision::Entered },
+    ).await, EntryResult::Rejected { .. }));
+    assert!(!called);
+}
+
+#[tokio::test]
+async fn exact_initial_process_entry_rejects_stopped_and_restored_source_without_handoff() {
+    use crate::native_close::{
+        NativeCloseInitialEntryRelease, NativeCloseInitialResourceEntryDecision as Decision,
+        NativeCloseInitialResourceEntryResult as EntryResult,
+    };
+    use phoenix_core::domain::close::RetiredResourceKind;
+
+    let (db, command, receipt, source, run) =
+        initial_source_fence_inventory_fixture(false, None, false, false, false).await;
+    let item = db.list_close_expected_retirement_resources(run.attempt_id.as_str()).await.unwrap()
+        .into_iter().find(|item| item.resource.kind() == RetiredResourceKind::BashProcessGroup).unwrap();
+    write_source_fence_state(&db, &command, &ConvState::Idle, false).await.unwrap();
+    for restore in [false, true] {
+        if restore {
+            write_source_fence_state(&db, &command, &source, false).await.unwrap();
+        }
+        let mut called = false;
+        assert!(matches!(db.enter_native_close_initial_process_resource(
+            &command, &receipt, &source, item.scope.clone(), item.snapshot.clone(), &item.resource,
+            || { called = true; Decision::Entered },
+        ).await, EntryResult::Rejected { release: NativeCloseInitialEntryRelease::Confirmed, .. }));
+        assert!(!called);
+    }
+}
+
+#[tokio::test]
+async fn exact_initial_process_entry_revalidates_after_independent_writer_revokes_source() {
+    use std::{future::Future, task::Poll};
+    use crate::native_close::{
+        NativeCloseInitialEntryRelease, NativeCloseInitialResourceEntryDecision as Decision,
+        NativeCloseInitialResourceEntryResult as EntryResult,
+    };
+    use phoenix_core::domain::close::RetiredResourceKind;
+
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("entry.sqlite");
+    let db = Database::open(path.to_str().unwrap()).await.unwrap();
+    let (db, command, receipt, source, run) =
+        initial_source_fence_inventory_fixture_with_db(db, false, None, false, false, false).await;
+    let writer = Database::open(path.to_str().unwrap()).await.unwrap();
+    let item = db.list_close_expected_retirement_resources(run.attempt_id.as_str()).await.unwrap()
+        .into_iter().find(|item| item.resource.kind() == RetiredResourceKind::BashProcessGroup).unwrap();
+    let mut tx = writer.pool().begin_with("BEGIN IMMEDIATE").await.unwrap();
+    let mut called = false;
+    let mut entry = Box::pin(db.enter_native_close_initial_process_resource(
+        &command, &receipt, &source, item.scope, item.snapshot, &item.resource,
+        || { called = true; Decision::Entered },
+    ));
+    // Poll once while the independent writer owns the reservation. This does not
+    // assume whether the pending entry is at pool acquisition or SQLite's busy wait.
+    std::future::poll_fn(|cx| {
+        assert!(entry.as_mut().poll(cx).is_pending());
+        Poll::Ready(())
+    }).await;
+    crate::write_conversation_state_tx(
+        &mut tx, command.source_transcript_id(), &ConvState::Idle, Utc::now(),
+    ).await.unwrap();
+    tx.commit().await.unwrap();
+    let result = tokio::time::timeout(std::time::Duration::from_secs(5), entry).await.unwrap();
+    assert!(matches!(result, EntryResult::Rejected {
+        release: NativeCloseInitialEntryRelease::Confirmed, ..
+    }));
+    assert!(!called);
+}
+
+#[tokio::test]
+async fn exact_initial_process_entry_releases_writer_before_retained_cleanup_finishes() {
+    use crate::native_close::{
+        NativeCloseInitialEntryRelease, NativeCloseInitialResourceEntryDecision as Decision,
+        NativeCloseInitialResourceEntryResult as EntryResult,
+    };
+    use phoenix_core::domain::close::RetiredResourceKind;
+
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("entry.sqlite");
+    let db = Database::open(path.to_str().unwrap()).await.unwrap();
+    let (db, command, receipt, source, run) =
+        initial_source_fence_inventory_fixture_with_db(db, false, None, false, false, true).await;
+    let writer = Database::open(path.to_str().unwrap()).await.unwrap();
+    let bash: Vec<_> = db.list_close_expected_retirement_resources(run.attempt_id.as_str()).await.unwrap()
+        .into_iter().filter(|item| item.resource.kind() == RetiredResourceKind::BashProcessGroup).collect();
+    assert_eq!(bash.len(), 2);
+    let (release, pending_cleanup) = tokio::sync::oneshot::channel::<()>();
+    let mut retained_cleanup = None;
+    assert!(matches!(db.enter_native_close_initial_process_resource(
+        &command, &receipt, &source, bash[0].scope.clone(), bash[0].snapshot.clone(), &bash[0].resource,
+        || { retained_cleanup = Some(pending_cleanup); Decision::Entered },
+    ).await, EntryResult::Invoked {
+        decision: Decision::Entered, release: NativeCloseInitialEntryRelease::Confirmed,
+    }));
+    let mut retained_cleanup = retained_cleanup.unwrap();
+    assert!(matches!(retained_cleanup.try_recv(), Err(tokio::sync::oneshot::error::TryRecvError::Empty)));
+    tokio::time::timeout(std::time::Duration::from_secs(5),
+        writer.update_conversation_state(command.source_transcript_id(), &ConvState::Idle),
+    ).await.unwrap().unwrap();
+    let mut called = false;
+    assert!(matches!(db.enter_native_close_initial_process_resource(
+        &command, &receipt, &source, bash[1].scope.clone(), bash[1].snapshot.clone(), &bash[1].resource,
+        || { called = true; Decision::Entered },
+    ).await, EntryResult::Rejected { release: NativeCloseInitialEntryRelease::Confirmed, .. }));
+    assert!(!called);
+    release.send(()).unwrap();
+    retained_cleanup.await.unwrap();
+}
+
+#[tokio::test]
+async fn exact_initial_process_entry_requires_original_binding_and_preserves_local_refusal() {
+    use crate::native_close::{
+        NativeCloseInitialEntryRelease, NativeCloseInitialResourceEntryDecision as Decision,
+        NativeCloseInitialResourceEntryResult as EntryResult,
+    };
+    use phoenix_core::domain::close::{CloseRetirementSnapshot, LossItemIdentity, RetiredResourceIdentity, RetiredResourceKind};
+
+    let (db, command, receipt, source, run) =
+        initial_source_fence_inventory_fixture(false, None, false, false, false).await;
+    let item = db.list_close_expected_retirement_resources(run.attempt_id.as_str()).await.unwrap()
+        .into_iter().find(|item| item.resource.kind() == RetiredResourceKind::BashProcessGroup).unwrap();
+    let foreign = RetiredResourceIdentity::parse(
+        RetiredResourceKind::BashProcessGroup,
+        LossItemIdentity::Opaque(phoenix_core::domain::close::OpaqueIdentity::parse("foreign-process").unwrap()),
+    ).unwrap();
+    let wrong_snapshot = CloseRetirementSnapshot::parse("wrong-generation", "wrong-fingerprint").unwrap();
+    for (scope, snapshot, resource) in [
+        (item.scope.clone(), item.snapshot.clone(), foreign),
+        (item.scope.clone(), wrong_snapshot, item.resource.clone()),
+        (phoenix_core::work_scope::WorkScopeId::new(), item.snapshot.clone(), item.resource.clone()),
+    ] {
+        let mut called = false;
+        assert!(matches!(db.enter_native_close_initial_process_resource(
+            &command, &receipt, &source, scope, snapshot, &resource,
+            || { called = true; Decision::Entered },
+        ).await, EntryResult::Rejected { release: NativeCloseInitialEntryRelease::Confirmed, .. }));
+        assert!(!called);
+    }
+    assert!(matches!(db.enter_native_close_initial_process_resource(
+        &command, &receipt, &source, item.scope, item.snapshot, &item.resource,
+        || Decision::Refused,
+    ).await, EntryResult::Invoked {
+        decision: Decision::Refused, release: NativeCloseInitialEntryRelease::Confirmed,
+    }));
+}
+
+#[tokio::test]
 async fn initial_process_authorization_rejects_source_changed_then_restored() {
     use phoenix_core::domain::close::RetiredResourceKind;
 
-    let (db, command, receipt, source, run) = initial_source_fence_inventory_fixture(false, None, false, false).await;
+    let (db, command, receipt, source, run) = initial_source_fence_inventory_fixture(false, None, false, false, false).await;
     let item = db.list_close_expected_retirement_resources(run.attempt_id.as_str()).await.unwrap()
         .into_iter().find(|item| item.resource.kind() == RetiredResourceKind::BashProcessGroup).unwrap();
     write_source_fence_state(&db, &command, &ConvState::Idle, false).await.unwrap();
@@ -1551,7 +1802,7 @@ async fn initial_process_authorization_rejects_prior_process_success_or_positive
     use phoenix_core::domain::close::RetiredResourceKind;
 
     for record_process_receipt in [false, true] {
-        let (db, command, receipt, source, run) = initial_source_fence_inventory_fixture(false, None, false, false).await;
+        let (db, command, receipt, source, run) = initial_source_fence_inventory_fixture(false, None, false, false, false).await;
         let process = db.list_close_expected_retirement_resources(run.attempt_id.as_str()).await.unwrap()
             .into_iter().find(|item| item.resource.kind() == RetiredResourceKind::BashProcessGroup).unwrap();
         if record_process_receipt {

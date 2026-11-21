@@ -138,7 +138,13 @@ jobs:
             initial_process_authorization_requires_exact_durable_source_scope_snapshot_and_dispatch \
             initial_process_authorization_rejects_missing_dispatch_and_stopped_or_changed_source \
             initial_process_authorization_rejects_source_changed_then_restored \
-            initial_process_authorization_rejects_prior_process_success_or_positive_retirement; do
+            initial_process_authorization_rejects_prior_process_success_or_positive_retirement \
+            exact_initial_process_entry_is_per_resource_not_whole_kind \
+            exact_initial_process_entry_missing_dispatch_never_invokes_handoff \
+            exact_initial_process_entry_rejects_stopped_and_restored_source_without_handoff \
+            exact_initial_process_entry_requires_original_binding_and_preserves_local_refusal \
+            exact_initial_process_entry_revalidates_after_independent_writer_revokes_source \
+            exact_initial_process_entry_releases_writer_before_retained_cleanup_finishes; do
             grep -F "close_foundation::tests::native_retry::$test: test" evidence/selected-tests.txt
           done
       - name: Execute migration163 populated upgrade and authority regressions
@@ -172,7 +178,13 @@ jobs:
             initial_process_authorization_requires_exact_durable_source_scope_snapshot_and_dispatch \
             initial_process_authorization_rejects_missing_dispatch_and_stopped_or_changed_source \
             initial_process_authorization_rejects_source_changed_then_restored \
-            initial_process_authorization_rejects_prior_process_success_or_positive_retirement; do
+            initial_process_authorization_rejects_prior_process_success_or_positive_retirement \
+            exact_initial_process_entry_is_per_resource_not_whole_kind \
+            exact_initial_process_entry_missing_dispatch_never_invokes_handoff \
+            exact_initial_process_entry_rejects_stopped_and_restored_source_without_handoff \
+            exact_initial_process_entry_requires_original_binding_and_preserves_local_refusal \
+            exact_initial_process_entry_revalidates_after_independent_writer_revokes_source \
+            exact_initial_process_entry_releases_writer_before_retained_cleanup_finishes; do
             grep -F "test close_foundation::tests::native_retry::$test ... ok" evidence/close-foundation.log
           done
       - name: Execute migration159 regression module selectors

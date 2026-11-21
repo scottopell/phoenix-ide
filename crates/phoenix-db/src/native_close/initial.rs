@@ -70,6 +70,33 @@ pub struct NativeCloseInitialProcessAuthorization {
     process_inventory: Vec<phoenix_core::domain::close::CloseExpectedRetirementResource>,
 }
 
+/// Synchronous handoff result; this closed enum cannot represent a future.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NativeCloseInitialResourceEntryDecision {
+    Entered,
+    Refused,
+}
+
+#[derive(Debug)]
+pub enum NativeCloseInitialEntryRelease {
+    Confirmed,
+    Unconfirmed(DbError),
+}
+
+#[must_use = "entry decisions and unconfirmed transaction release must be supervised"]
+#[derive(Debug)]
+pub enum NativeCloseInitialResourceEntryResult {
+    NotStarted(DbError),
+    Rejected {
+        error: DbError,
+        release: NativeCloseInitialEntryRelease,
+    },
+    Invoked {
+        decision: NativeCloseInitialResourceEntryDecision,
+        release: NativeCloseInitialEntryRelease,
+    },
+}
+
 impl NativeCloseInitialProcessAuthorization {
     /// Consume the authorization at the manager sink; it cannot be cloned or replayed.
     pub fn into_parts(
@@ -101,6 +128,147 @@ fn is_initial_process_kind(kind: RetiredResourceKind) -> bool {
     )
 }
 
+#[derive(Debug, Clone, Copy)]
+enum InitialProcessSelection<'a> {
+    WholeKind(RetiredResourceKind),
+    ExactResource(&'a RetiredResourceIdentity),
+}
+
+async fn validate_initial_process_step_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    command: &NativeCloseCommand,
+    receipt: &NativeCloseReceipt,
+    live_source: &phoenix_core::domain::sm_state::ConvState,
+    scope: WorkScopeId,
+    snapshot: phoenix_core::domain::close::CloseRetirementSnapshot,
+    selection: InitialProcessSelection<'_>,
+) -> DbResult<NativeCloseInitialProcessAuthorization> {
+    let kind = match selection {
+        InitialProcessSelection::WholeKind(kind) => kind,
+        InitialProcessSelection::ExactResource(resource) => resource.kind(),
+    };
+    let result = async {
+        if !is_initial_process_kind(kind) {
+            return Err(DbError::CloseFoundationPrecondition(
+                "initial process authorization requires a process resource kind".into(),
+            ));
+        }
+        let (admitted, _) = require_initial_execution_tx(
+            tx, command, receipt, live_source, ClosePhase::RetirementRequested,
+        ).await?;
+        let anchored: bool = sqlx::query_scalar(
+            "SELECT EXISTS (
+                SELECT 1 FROM close_original_retirement_anchors anchor
+                JOIN close_obligations obligation ON obligation.attempt_id = anchor.attempt_id
+                WHERE anchor.attempt_id = ?1
+                  AND anchor.inspection_generation = obligation.inspection_generation
+                  AND anchor.inspection_fingerprint = obligation.inspection_fingerprint
+            ) AND NOT EXISTS (
+                SELECT 1 FROM close_retirement_anchor_exclusions WHERE attempt_id = ?1
+            ) AND EXISTS (
+                SELECT 1 FROM close_attempt_scopes captured
+                JOIN close_retirement_inventories inventory
+                  ON inventory.attempt_id = captured.attempt_id AND inventory.scope = captured.scope
+                JOIN close_obligations obligation ON obligation.attempt_id = captured.attempt_id
+                WHERE captured.attempt_id = ?1 AND captured.scope = ?2
+                  AND inventory.sealed = 1
+                  AND inventory.inspection_generation = ?3
+                  AND inventory.inspection_fingerprint = ?4
+                  AND inventory.inspection_generation = obligation.inspection_generation
+                  AND inventory.inspection_fingerprint = obligation.inspection_fingerprint
+            ) AND NOT EXISTS (
+                SELECT 1 FROM close_attempt_scopes scope
+                WHERE scope.attempt_id = ?1 AND NOT EXISTS (
+                    SELECT 1 FROM close_retirement_inventories inventory
+                    JOIN close_obligations obligation ON obligation.attempt_id = inventory.attempt_id
+                    WHERE inventory.attempt_id = scope.attempt_id AND inventory.scope = scope.scope
+                      AND inventory.sealed = 1
+                      AND inventory.inspection_generation = obligation.inspection_generation
+                      AND inventory.inspection_fingerprint = obligation.inspection_fingerprint
+                )
+            )",
+        ).bind(admitted.attempt_id.as_str()).bind(scope.as_str())
+            .bind(snapshot.generation()).bind(snapshot.fingerprint())
+            .fetch_one(&mut **tx).await?;
+        if !anchored {
+            return Err(DbError::CloseFoundationPrecondition(
+                "initial process authorization requires the original anchored sealed scope inventory".into(),
+            ));
+        }
+        let expected = crate::close_foundation::list_close_expected_retirement_resources_tx(
+            tx, admitted.attempt_id.as_str(),
+        ).await?;
+        if expected.iter().any(|item| item.scope == scope && item.snapshot != snapshot) {
+            return Err(DbError::CloseFoundationPrecondition(
+                "initial process authorization snapshot differs from original inventory".into(),
+            ));
+        }
+        let process_inventory: Vec<_> = match selection {
+            InitialProcessSelection::WholeKind(_) => expected.iter()
+                .filter(|item| item.scope == scope && item.snapshot == snapshot
+                    && item.resource.kind() == kind)
+                .cloned().collect(),
+            InitialProcessSelection::ExactResource(resource) => {
+                let exact = expected.iter().find(|item| item.attempt_id == admitted.attempt_id
+                    && item.scope == scope && item.snapshot == snapshot
+                    && item.resource == *resource).cloned().ok_or_else(|| {
+                        DbError::CloseFoundationPrecondition(
+                            "initial process entry requires the exact resource in the original scoped inventory".into(),
+                        )
+                    })?;
+                vec![exact]
+            }
+        };
+        for item in &process_inventory {
+            let dispatched: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM close_retirement_resource_dispatches
+                 WHERE attempt_id = ?1 AND scope = ?2 AND inspection_generation = ?3
+                   AND inspection_fingerprint = ?4 AND resource_kind = ?5
+                   AND identity_kind = ?6 AND identity_codec = ?7 AND identity_value = ?8)",
+            ).bind(item.attempt_id.as_str()).bind(item.scope.as_str())
+                .bind(item.snapshot.generation()).bind(item.snapshot.fingerprint())
+                .bind(item.resource.kind().as_str()).bind(item.resource.identity().identity_kind())
+                .bind(item.resource.identity().codec()).bind(item.resource.identity().value())
+                .fetch_one(&mut **tx).await?;
+            if !dispatched {
+                return Err(DbError::CloseFoundationPrecondition(
+                    "initial process launch requires every exact kind dispatch to be durable".into(),
+                ));
+            }
+        }
+        for item in &process_inventory {
+            let successful_process_receipt: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM close_process_step_successes
+                 WHERE attempt_id = ?1 AND run_ordinal = ?2 AND scope = ?3
+                   AND resource_kind = ?4 AND identity_value = ?5)",
+            ).bind(admitted.attempt_id.as_str()).bind(admitted.run_ordinal.get())
+                .bind(item.scope.as_str()).bind(item.resource.kind().as_str())
+                .bind(item.resource.identity().value())
+                .fetch_one(&mut **tx).await?;
+            let positive_retirement_evidence: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM close_retirement_resource_history
+                 WHERE attempt_id = ?1 AND scope = ?2 AND inspection_generation = ?3
+                   AND inspection_fingerprint = ?4 AND resource_kind = ?5
+                   AND identity_kind = ?6 AND identity_codec = ?7 AND identity_value = ?8
+                   AND proof_kind IN ('retired', 'absence_adopted'))",
+            ).bind(item.attempt_id.as_str()).bind(item.scope.as_str())
+                .bind(item.snapshot.generation()).bind(item.snapshot.fingerprint())
+                .bind(item.resource.kind().as_str()).bind(item.resource.identity().identity_kind())
+                .bind(item.resource.identity().codec()).bind(item.resource.identity().value())
+                .fetch_one(&mut **tx).await?;
+            if successful_process_receipt || positive_retirement_evidence {
+                return Err(DbError::CloseFoundationPrecondition(
+                    "initial process authorization refuses an exact resource with prior success or positive retirement evidence".into(),
+                ));
+            }
+        }
+        Ok(NativeCloseInitialProcessAuthorization {
+            run: admitted, scope, snapshot, kind, process_inventory,
+        })
+    }.await;
+    result
+}
+
 impl Database {
     /// Revalidate current source and the complete durable launch inventory against a
     /// transaction-time snapshot before an initial process-kind launch. This check does
@@ -120,113 +288,10 @@ impl Database {
             Ok(tx) => tx,
             Err(error) => return LocalAuthorityResult::DurableFactEstablished(Err(error.into())),
         };
-        let result = async {
-            if !is_initial_process_kind(kind) {
-                return Err(DbError::CloseFoundationPrecondition(
-                    "initial process authorization requires a process resource kind".into(),
-                ));
-            }
-            let (admitted, _) = require_initial_execution_tx(
-                &mut tx, command, receipt, live_source, ClosePhase::RetirementRequested,
-            ).await?;
-            let anchored: bool = sqlx::query_scalar(
-                "SELECT EXISTS (
-                    SELECT 1 FROM close_original_retirement_anchors anchor
-                    JOIN close_obligations obligation ON obligation.attempt_id = anchor.attempt_id
-                    WHERE anchor.attempt_id = ?1
-                      AND anchor.inspection_generation = obligation.inspection_generation
-                      AND anchor.inspection_fingerprint = obligation.inspection_fingerprint
-                ) AND NOT EXISTS (
-                    SELECT 1 FROM close_retirement_anchor_exclusions WHERE attempt_id = ?1
-                ) AND EXISTS (
-                    SELECT 1 FROM close_attempt_scopes captured
-                    JOIN close_retirement_inventories inventory
-                      ON inventory.attempt_id = captured.attempt_id AND inventory.scope = captured.scope
-                    JOIN close_obligations obligation ON obligation.attempt_id = captured.attempt_id
-                    WHERE captured.attempt_id = ?1 AND captured.scope = ?2
-                      AND inventory.sealed = 1
-                      AND inventory.inspection_generation = ?3
-                      AND inventory.inspection_fingerprint = ?4
-                      AND inventory.inspection_generation = obligation.inspection_generation
-                      AND inventory.inspection_fingerprint = obligation.inspection_fingerprint
-                ) AND NOT EXISTS (
-                    SELECT 1 FROM close_attempt_scopes scope
-                    WHERE scope.attempt_id = ?1 AND NOT EXISTS (
-                        SELECT 1 FROM close_retirement_inventories inventory
-                        JOIN close_obligations obligation ON obligation.attempt_id = inventory.attempt_id
-                        WHERE inventory.attempt_id = scope.attempt_id AND inventory.scope = scope.scope
-                          AND inventory.sealed = 1
-                          AND inventory.inspection_generation = obligation.inspection_generation
-                          AND inventory.inspection_fingerprint = obligation.inspection_fingerprint
-                    )
-                )",
-            ).bind(admitted.attempt_id.as_str()).bind(scope.as_str())
-                .bind(snapshot.generation()).bind(snapshot.fingerprint())
-                .fetch_one(&mut *tx).await?;
-            if !anchored {
-                return Err(DbError::CloseFoundationPrecondition(
-                    "initial process authorization requires the original anchored sealed scope inventory".into(),
-                ));
-            }
-            let expected = crate::close_foundation::list_close_expected_retirement_resources_tx(
-                &mut tx, admitted.attempt_id.as_str(),
-            ).await?;
-            if expected.iter().any(|item| item.scope == scope && item.snapshot != snapshot) {
-                return Err(DbError::CloseFoundationPrecondition(
-                    "initial process authorization snapshot differs from original inventory".into(),
-                ));
-            }
-            let process_inventory: Vec<_> = expected.iter()
-                .filter(|item| item.scope == scope && item.snapshot == snapshot
-                    && item.resource.kind() == kind)
-                .cloned().collect();
-            for item in &process_inventory {
-                let dispatched: bool = sqlx::query_scalar(
-                    "SELECT EXISTS(SELECT 1 FROM close_retirement_resource_dispatches
-                     WHERE attempt_id = ?1 AND scope = ?2 AND inspection_generation = ?3
-                       AND inspection_fingerprint = ?4 AND resource_kind = ?5
-                       AND identity_kind = ?6 AND identity_codec = ?7 AND identity_value = ?8)",
-                ).bind(item.attempt_id.as_str()).bind(item.scope.as_str())
-                    .bind(item.snapshot.generation()).bind(item.snapshot.fingerprint())
-                    .bind(item.resource.kind().as_str()).bind(item.resource.identity().identity_kind())
-                    .bind(item.resource.identity().codec()).bind(item.resource.identity().value())
-                    .fetch_one(&mut *tx).await?;
-                if !dispatched {
-                    return Err(DbError::CloseFoundationPrecondition(
-                        "initial process launch requires every exact kind dispatch to be durable".into(),
-                    ));
-                }
-            }
-            for item in &process_inventory {
-                let successful_process_receipt: bool = sqlx::query_scalar(
-                    "SELECT EXISTS(SELECT 1 FROM close_process_step_successes
-                     WHERE attempt_id = ?1 AND run_ordinal = ?2 AND scope = ?3
-                       AND resource_kind = ?4 AND identity_value = ?5)",
-                ).bind(admitted.attempt_id.as_str()).bind(admitted.run_ordinal.get())
-                    .bind(item.scope.as_str()).bind(item.resource.kind().as_str())
-                    .bind(item.resource.identity().value())
-                    .fetch_one(&mut *tx).await?;
-                let positive_retirement_evidence: bool = sqlx::query_scalar(
-                    "SELECT EXISTS(SELECT 1 FROM close_retirement_resource_history
-                     WHERE attempt_id = ?1 AND scope = ?2 AND inspection_generation = ?3
-                       AND inspection_fingerprint = ?4 AND resource_kind = ?5
-                       AND identity_kind = ?6 AND identity_codec = ?7 AND identity_value = ?8
-                       AND proof_kind IN ('retired', 'absence_adopted'))",
-                ).bind(item.attempt_id.as_str()).bind(item.scope.as_str())
-                    .bind(item.snapshot.generation()).bind(item.snapshot.fingerprint())
-                    .bind(item.resource.kind().as_str()).bind(item.resource.identity().identity_kind())
-                    .bind(item.resource.identity().codec()).bind(item.resource.identity().value())
-                    .fetch_one(&mut *tx).await?;
-                if successful_process_receipt || positive_retirement_evidence {
-                    return Err(DbError::CloseFoundationPrecondition(
-                        "initial process authorization refuses an exact resource with prior success or positive retirement evidence".into(),
-                    ));
-                }
-            }
-            Ok(NativeCloseInitialProcessAuthorization {
-                run: admitted, scope, snapshot, kind, process_inventory,
-            })
-        }.await;
+        let result = validate_initial_process_step_tx(
+            &mut tx, command, receipt, live_source, scope, snapshot,
+            InitialProcessSelection::WholeKind(kind),
+        ).await;
         match result {
             Ok(authorization) => match tx.commit().await {
                 Ok(()) => LocalAuthorityResult::DurableFactEstablished(Ok(authorization)),
@@ -241,6 +306,51 @@ impl Database {
 }
 
 impl Database {
+    /// Validates and synchronously hands off one exact initial process resource while
+    /// holding SQLite's writer reservation. The callback must only perform a short,
+    /// nonblocking in-memory handoff of an already selected exact owner: no I/O, locks,
+    /// SQL, or waits. Any entered ownership must be stored externally before returning;
+    /// later cleanup must not wait while this database transaction is held. This leaf
+    /// does not solve cancellation/supervision or integrate physical effects.
+    /// Cancellation during release can prevent any result after the handoff ran:
+    /// absence of an `Invoked` return is not proof of non-entry and cannot justify
+    /// retry. The externally retained entered owner must remain supervised.
+    pub async fn enter_native_close_initial_process_resource<F>(
+        &self,
+        command: &NativeCloseCommand,
+        receipt: &NativeCloseReceipt,
+        live_source: &phoenix_core::domain::sm_state::ConvState,
+        scope: WorkScopeId,
+        snapshot: phoenix_core::domain::close::CloseRetirementSnapshot,
+        resource: &RetiredResourceIdentity,
+        handoff: F,
+    ) -> NativeCloseInitialResourceEntryResult
+    where
+        F: FnOnce() -> NativeCloseInitialResourceEntryDecision,
+    {
+        let mut tx = match self.pool.begin_with("BEGIN IMMEDIATE").await {
+            Ok(tx) => tx,
+            Err(error) => return NativeCloseInitialResourceEntryResult::NotStarted(error.into()),
+        };
+        let validation = validate_initial_process_step_tx(
+            &mut tx, command, receipt, live_source, scope, snapshot,
+            InitialProcessSelection::ExactResource(resource),
+        ).await;
+        if let Err(error) = validation {
+            let release = match tx.rollback().await {
+                Ok(()) => NativeCloseInitialEntryRelease::Confirmed,
+                Err(error) => NativeCloseInitialEntryRelease::Unconfirmed(error.into()),
+            };
+            return NativeCloseInitialResourceEntryResult::Rejected { error, release };
+        }
+        let decision = handoff();
+        let release = match tx.rollback().await {
+            Ok(()) => NativeCloseInitialEntryRelease::Confirmed,
+            Err(error) => NativeCloseInitialEntryRelease::Unconfirmed(error.into()),
+        };
+        NativeCloseInitialResourceEntryResult::Invoked { decision, release }
+    }
+
     /// Replaces only the exact source-owned initial inspection; does not dispatch effects.
     pub async fn replace_native_close_initial_inspection(
         &self,

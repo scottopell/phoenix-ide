@@ -199,6 +199,8 @@ mod initial_exit;
 pub use initial::{
     NativeCloseInitialExecution, NativeCloseInitialProcessAuthorization, NativeCloseInitialResult,
     NativeCloseInitialSettlement, NativeCloseReceipt, NativeCloseRunRef,
+    NativeCloseInitialEntryRelease, NativeCloseInitialResourceEntryDecision,
+    NativeCloseInitialResourceEntryResult,
 };
 mod observe;
 mod receipts;
