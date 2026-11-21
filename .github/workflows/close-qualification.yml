@@ -307,6 +307,31 @@ jobs:
             prepared_retirement_reports_selected_observation_failure; do
             grep -F "test bash::registry::tests::$test ... ok" evidence/bash-registry-execution.log
           done
+      - name: Qualify inert exact terminal retirement ownership and terminal regressions
+        if: success() || failure()
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p phoenix-terminal --lib -- --list 2>&1 | tee evidence/terminal-inventory.log
+          tests=(
+            prepared_retirement_is_inert_until_polled_and_projection_is_bound
+            prepared_retirement_rejects_projection_spoof_wrong_registry_and_stale_generation
+            retirement_cancellation_uses_original_scope_and_registry_binding
+            prepared_retirement_never_reselects_a_replacement_handle
+            prepared_retirement_uses_exact_handle_and_shared_original_deadline
+            prepared_retirement_rejects_absent_target_and_original_deadline_expiry
+            prepared_retirement_cancellation_retains_exact_evidence_at_both_waits
+            prepared_retirement_observer_error_retains_exact_handle_without_exit_proof
+            prepared_retirement_completes_from_the_single_natural_exit_receipt
+          )
+          for test in "${tests[@]}"; do
+            grep -Fx "proptests::$test: test" evidence/terminal-inventory.log
+          done
+          cargo test -p phoenix-terminal --lib -- --nocapture --test-threads=1 2>&1 | tee evidence/terminal-execution.log
+          grep -E 'test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored;' evidence/terminal-execution.log
+          for test in "${tests[@]}"; do
+            grep -Fx "test proptests::$test ... ok" evidence/terminal-execution.log
+          done
       - name: Qualify native Close public adapter parsing and discovery
         if: success() || failure()
         shell: bash

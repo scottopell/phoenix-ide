@@ -188,15 +188,23 @@ impl BashRetirementPermit {
         selected: &BashRetirementTarget,
         deadline: tokio::time::Instant,
     ) -> Result<PreparedBashRetirement, BashRetirementPreparationError> {
-        let matching_targets = self.exact_process_groups.iter()
+        let matching_targets = self
+            .exact_process_groups
+            .iter()
             .filter(|target| target.handle_id == selected.handle_id)
             .collect::<Vec<_>>();
-        if matching_targets.len() != 1 || **matching_targets.first().expect("length checked") != *selected {
+        if matching_targets.len() != 1
+            || **matching_targets.first().expect("length checked") != *selected
+        {
             return Err(BashRetirementPreparationError::TargetMismatch);
         }
-        let matching_handles = self.removed_handles.iter()
-            .filter(|handle| handle.handle_id == selected.handle_id
-                && handle.launch_identity == selected.launch_identity)
+        let matching_handles = self
+            .removed_handles
+            .iter()
+            .filter(|handle| {
+                handle.handle_id == selected.handle_id
+                    && handle.launch_identity == selected.launch_identity
+            })
             .collect::<Vec<_>>();
         if matching_handles.len() != 1 {
             return Err(BashRetirementPreparationError::TargetMismatch);
@@ -207,7 +215,9 @@ impl BashRetirementPermit {
         }
         let actual = tokio::time::timeout_at(deadline, async {
             (handle.live_pgid().await, handle.live_pid().await)
-        }).await.map_err(|_| BashRetirementPreparationError::DeadlineExpired)?;
+        })
+        .await
+        .map_err(|_| BashRetirementPreparationError::DeadlineExpired)?;
         if tokio::time::Instant::now() >= deadline {
             return Err(BashRetirementPreparationError::DeadlineExpired);
         }
@@ -260,12 +270,24 @@ impl PreparedBashRetirement {
         self.complete_with(
             |handle| async move {
                 #[cfg(unix)]
-                { handle.signal_live_incarnation(libc::SIGKILL).await.map(|_| ()) }
+                {
+                    handle
+                        .signal_live_incarnation(libc::SIGKILL)
+                        .await
+                        .map(|_| ())
+                }
                 #[cfg(not(unix))]
-                { let _ = handle; Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "exact bash retirement is unsupported on this host")) }
+                {
+                    let _ = handle;
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::Unsupported,
+                        "exact bash retirement is unsupported on this host",
+                    ))
+                }
             },
             |target| std::future::ready(retirement_target_has_live_member(&target)),
-        ).await
+        )
+        .await
     }
 
     async fn complete_with<S, SFut, V, VFut>(self, signal: S, verify: V) -> BashRetirementOutcome
@@ -292,7 +314,9 @@ impl PreparedBashRetirement {
                 return Err(RetirementTargetFailure::DeadlineExpired);
             }
             if let Err(error) = signal(Arc::clone(&self.handle)).await {
-                report.kill_failures.push((self.target.pgid, error.to_string()));
+                report
+                    .kill_failures
+                    .push((self.target.pgid, error.to_string()));
                 return Err(RetirementTargetFailure::Failed);
             }
             let observed = verify(self.target.clone()).await;
@@ -302,42 +326,73 @@ impl PreparedBashRetirement {
             match observed {
                 Ok(false) => Ok(()),
                 Ok(true) => {
-                    report.kill_failures.push((self.target.pgid, "exact process group remains live after retirement".into()));
+                    report.kill_failures.push((
+                        self.target.pgid,
+                        "exact process group remains live after retirement".into(),
+                    ));
                     Err(RetirementTargetFailure::Failed)
                 }
                 Err(error) => {
-                    report.kill_failures.push((self.target.pgid, error.to_string()));
+                    report
+                        .kill_failures
+                        .push((self.target.pgid, error.to_string()));
                     Err(RetirementTargetFailure::Failed)
                 }
             }
-        }).await;
+        })
+        .await;
         match result {
             Ok(Ok(())) => BashRetirementOutcome::Retired(report),
-            Ok(Err(RetirementTargetFailure::StaleGeneration)) => BashRetirementOutcome::StaleGeneration(report),
-            Ok(Err(RetirementTargetFailure::Failed)) => BashRetirementOutcome::AbsenceVerified(report),
+            Ok(Err(RetirementTargetFailure::StaleGeneration)) => {
+                BashRetirementOutcome::StaleGeneration(report)
+            }
+            Ok(Err(RetirementTargetFailure::Failed)) => {
+                BashRetirementOutcome::AbsenceVerified(report)
+            }
             Ok(Err(RetirementTargetFailure::DeadlineExpired)) | Err(_) => {
-                report.kill_failures.push((self.target.pgid, "exact target retirement deadline expired; absence unverified".into()));
+                report.kill_failures.push((
+                    self.target.pgid,
+                    "exact target retirement deadline expired; absence unverified".into(),
+                ));
                 BashRetirementOutcome::AbsenceVerified(report)
             }
         }
     }
 }
 
-enum RetirementTargetFailure { StaleGeneration, Failed, DeadlineExpired }
+enum RetirementTargetFailure {
+    StaleGeneration,
+    Failed,
+    DeadlineExpired,
+}
 
 fn retirement_target_has_live_member(target: &BashRetirementTarget) -> std::io::Result<bool> {
     #[cfg(target_os = "linux")]
-    { linux_retirement_target_has_live_member(target) }
+    {
+        linux_retirement_target_has_live_member(target)
+    }
     #[cfg(all(unix, not(target_os = "linux")))]
     {
         let rc = unsafe { libc::kill(-target.pgid, 0) };
-        if rc == 0 { Ok(true) } else {
+        if rc == 0 {
+            Ok(true)
+        } else {
             let error = std::io::Error::last_os_error();
-            if error.raw_os_error() == Some(libc::ESRCH) { Ok(false) } else { Err(error) }
+            if error.raw_os_error() == Some(libc::ESRCH) {
+                Ok(false)
+            } else {
+                Err(error)
+            }
         }
     }
     #[cfg(not(unix))]
-    { let _ = target; Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "exact bash absence observation is unsupported on this host")) }
+    {
+        let _ = target;
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "exact bash absence observation is unsupported on this host",
+        ))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2156,25 +2211,48 @@ mod tests {
     async fn prepared_target_drop_is_inert_and_original_permit_can_rollback() {
         fn assert_owned_send_static<T: Send + 'static>() {}
         assert_owned_send_static::<PreparedBashRetirement>();
-        fn drop_owned_future<F: std::future::Future + Send + 'static>(future: F) { drop(future); }
+        fn drop_owned_future<F: std::future::Future + Send + 'static>(future: F) {
+            drop(future);
+        }
 
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let registry = BashHandleRegistry::with_lifecycle_sink(Some(tx));
         let owner = scope("prepared-bash-retirement");
         let mut reservation = registry.reserve_spawn(&owner).await.unwrap();
         let handle = Handle::new_live(
-            owner.clone(), reservation.handle_id().clone(), "test".into(), None,
-            std::path::PathBuf::from("/tmp"), 12345, 12345, 1024,
+            owner.clone(),
+            reservation.handle_id().clone(),
+            "test".into(),
+            None,
+            std::path::PathBuf::from("/tmp"),
+            12345,
+            12345,
+            1024,
         );
-        registry.commit_spawn(&mut reservation, handle.clone()).await.unwrap();
+        registry
+            .commit_spawn(&mut reservation, handle.clone())
+            .await
+            .unwrap();
         let permit = registry.begin_retirement(&owner).await;
         let target = permit.exact_process_groups[0].clone();
         while rx.try_recv().is_ok() {}
         let generation = permit.generation;
         {
-            let prepared = permit.prepare_target(&target, tokio::time::Instant::now() + Duration::from_secs(1)).await.unwrap();
+            let prepared = permit
+                .prepare_target(
+                    &target,
+                    tokio::time::Instant::now() + Duration::from_secs(1),
+                )
+                .await
+                .unwrap();
             drop(prepared);
-            let prepared = permit.prepare_target(&target, tokio::time::Instant::now() + Duration::from_secs(1)).await.unwrap();
+            let prepared = permit
+                .prepare_target(
+                    &target,
+                    tokio::time::Instant::now() + Duration::from_secs(1),
+                )
+                .await
+                .unwrap();
             drop_owned_future(prepared.complete());
         }
         let table = permit.entry.read().await;
@@ -2182,7 +2260,10 @@ mod tests {
         assert_eq!(table.teardown_generation, generation.0);
         assert_eq!(table.admission.pending.load(Ordering::Acquire), 0);
         drop(table);
-        assert!(matches!(rx.try_recv(), Err(tokio::sync::mpsc::error::TryRecvError::Empty)));
+        assert!(matches!(
+            rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
         assert_eq!(handle.live_pgid().await, Some(12345));
         registry.cancel_retirement(permit).await;
         assert!(registry.get_by_id(&handle.handle_id).await.is_some());
@@ -2196,32 +2277,55 @@ mod tests {
         for pid in [12345_u32, 12346] {
             let mut reservation = registry.reserve_spawn(&owner).await.unwrap();
             let handle = Handle::new_live(
-                owner.clone(), reservation.handle_id().clone(), "test".into(), None,
-                std::path::PathBuf::from("/tmp"), pid as i32, pid, 1024,
+                owner.clone(),
+                reservation.handle_id().clone(),
+                "test".into(),
+                None,
+                std::path::PathBuf::from("/tmp"),
+                pid as i32,
+                pid,
+                1024,
             );
-            registry.commit_spawn(&mut reservation, handle.clone()).await.unwrap();
+            registry
+                .commit_spawn(&mut reservation, handle.clone())
+                .await
+                .unwrap();
             originals.push(handle);
         }
         let permit = registry.begin_retirement(&owner).await;
         let selected = permit.exact_process_groups[0].clone();
-        let exact_handle = originals.iter().find(|h| h.handle_id == selected.handle_id).unwrap().clone();
-        let prepared = permit.prepare_target(&selected, tokio::time::Instant::now() + Duration::from_secs(1)).await.unwrap();
+        let exact_handle = originals
+            .iter()
+            .find(|h| h.handle_id == selected.handle_id)
+            .unwrap()
+            .clone();
+        let prepared = permit
+            .prepare_target(
+                &selected,
+                tokio::time::Instant::now() + Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
         let signaled = Arc::new(std::sync::Mutex::new(Vec::new()));
         let signal_log = Arc::clone(&signaled);
         let verified = Arc::new(std::sync::Mutex::new(Vec::new()));
         let verification_log = verified.clone();
-        let outcome = prepared.complete_with(
-            move |handle| {
-                assert!(Arc::ptr_eq(&handle, &exact_handle));
-                signal_log.lock().unwrap().push(handle.handle_id.clone());
-                async { Ok(()) }
-            },
-            move |target| {
-                verification_log.lock().unwrap().push(target);
-                async { Ok(false) }
-            },
-        ).await;
-        assert!(matches!(&outcome, BashRetirementOutcome::Retired(report) if !report.has_failures()));
+        let outcome = prepared
+            .complete_with(
+                move |handle| {
+                    assert!(Arc::ptr_eq(&handle, &exact_handle));
+                    signal_log.lock().unwrap().push(handle.handle_id.clone());
+                    async { Ok(()) }
+                },
+                move |target| {
+                    verification_log.lock().unwrap().push(target);
+                    async { Ok(false) }
+                },
+            )
+            .await;
+        assert!(
+            matches!(&outcome, BashRetirementOutcome::Retired(report) if !report.has_failures())
+        );
         assert_eq!(*signaled.lock().unwrap(), vec![selected.handle_id.clone()]);
         assert_eq!(*verified.lock().unwrap(), vec![selected.clone()]);
         assert_eq!(outcome.report().live_handle_pgids, vec![selected.pgid]);
@@ -2235,19 +2339,41 @@ mod tests {
         let registry = BashHandleRegistry::new();
         let owner = scope("prepared-bash-stale");
         let mut reservation = registry.reserve_spawn(&owner).await.unwrap();
-        let handle = Handle::new_live(owner.clone(), reservation.handle_id().clone(), "test".into(), None,
-            std::path::PathBuf::from("/tmp"), 12345, 12345, 1024);
-        registry.commit_spawn(&mut reservation, handle).await.unwrap();
+        let handle = Handle::new_live(
+            owner.clone(),
+            reservation.handle_id().clone(),
+            "test".into(),
+            None,
+            std::path::PathBuf::from("/tmp"),
+            12345,
+            12345,
+            1024,
+        );
+        registry
+            .commit_spawn(&mut reservation, handle)
+            .await
+            .unwrap();
         let stale_permit = registry.begin_retirement(&owner).await;
         let stale_target = stale_permit.exact_process_groups[0].clone();
-        let stale = stale_permit.prepare_target(&stale_target, tokio::time::Instant::now() + Duration::from_secs(1)).await.unwrap();
+        let stale = stale_permit
+            .prepare_target(
+                &stale_target,
+                tokio::time::Instant::now() + Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
         let current_permit = registry.begin_retirement(&owner).await;
         let signaled = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let signal_count = Arc::clone(&signaled);
-        let outcome = stale.complete_with(
-            move |_| { signal_count.fetch_add(1, Ordering::SeqCst); async { Ok(()) } },
-            |_| async { Ok(false) },
-        ).await;
+        let outcome = stale
+            .complete_with(
+                move |_| {
+                    signal_count.fetch_add(1, Ordering::SeqCst);
+                    async { Ok(()) }
+                },
+                |_| async { Ok(false) },
+            )
+            .await;
         assert!(matches!(outcome, BashRetirementOutcome::StaleGeneration(_)));
         assert_eq!(signaled.load(Ordering::SeqCst), 0);
         registry.cancel_retirement(current_permit).await;
@@ -2255,19 +2381,41 @@ mod tests {
         let registry = BashHandleRegistry::new();
         let owner = scope("prepared-bash-expired");
         let mut reservation = registry.reserve_spawn(&owner).await.unwrap();
-        let handle = Handle::new_live(owner.clone(), reservation.handle_id().clone(), "test".into(), None,
-            std::path::PathBuf::from("/tmp"), 12345, 12345, 1024);
-        registry.commit_spawn(&mut reservation, handle).await.unwrap();
+        let handle = Handle::new_live(
+            owner.clone(),
+            reservation.handle_id().clone(),
+            "test".into(),
+            None,
+            std::path::PathBuf::from("/tmp"),
+            12345,
+            12345,
+            1024,
+        );
+        registry
+            .commit_spawn(&mut reservation, handle)
+            .await
+            .unwrap();
         let permit = registry.begin_retirement(&owner).await;
         let target = permit.exact_process_groups[0].clone();
-        let expired = permit.prepare_target(&target, tokio::time::Instant::now() + Duration::from_secs(1)).await.unwrap();
+        let expired = permit
+            .prepare_target(
+                &target,
+                tokio::time::Instant::now() + Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
         tokio::time::advance(Duration::from_secs(1)).await;
         let signaled = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let signal_count = Arc::clone(&signaled);
-        let outcome = expired.complete_with(
-            move |_| { signal_count.fetch_add(1, Ordering::SeqCst); async { Ok(()) } },
-            |_| async { Ok(false) },
-        ).await;
+        let outcome = expired
+            .complete_with(
+                move |_| {
+                    signal_count.fetch_add(1, Ordering::SeqCst);
+                    async { Ok(()) }
+                },
+                |_| async { Ok(false) },
+            )
+            .await;
         assert_eq!(signaled.load(Ordering::SeqCst), 0);
         assert!(outcome.report().has_failures());
         registry.cancel_retirement(permit).await;
@@ -2279,15 +2427,29 @@ mod tests {
         let owner = scope("prepared-bash-mismatch");
         let mut reservation = registry.reserve_spawn(&owner).await.unwrap();
         let handle = Handle::new_live(
-            owner.clone(), reservation.handle_id().clone(), "test".into(), None,
-            std::path::PathBuf::from("/tmp"), 12345, 12345, 1024,
+            owner.clone(),
+            reservation.handle_id().clone(),
+            "test".into(),
+            None,
+            std::path::PathBuf::from("/tmp"),
+            12345,
+            12345,
+            1024,
         );
-        registry.commit_spawn(&mut reservation, handle).await.unwrap();
+        registry
+            .commit_spawn(&mut reservation, handle)
+            .await
+            .unwrap();
         let mut permit = registry.begin_retirement(&owner).await;
         let original = permit.exact_process_groups[0].clone();
         let mut mismatch = original.clone();
         mismatch.pgid += 1;
-        assert!(matches!(permit.prepare_target(&mismatch, tokio::time::Instant::now()).await, Err(BashRetirementPreparationError::TargetMismatch)));
+        assert!(matches!(
+            permit
+                .prepare_target(&mismatch, tokio::time::Instant::now())
+                .await,
+            Err(BashRetirementPreparationError::TargetMismatch)
+        ));
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         for field in ["pgid", "pid", "launch", "handle"] {
             let mut forged = original.clone();
@@ -2299,12 +2461,28 @@ mod tests {
                 _ => unreachable!(),
             }
             permit.exact_process_groups[0] = forged.clone();
-            assert!(matches!(permit.prepare_target(&forged, deadline).await, Err(BashRetirementPreparationError::TargetMismatch)), "forged {field}");
+            assert!(
+                matches!(
+                    permit.prepare_target(&forged, deadline).await,
+                    Err(BashRetirementPreparationError::TargetMismatch)
+                ),
+                "forged {field}"
+            );
         }
         permit.exact_process_groups[0] = original.clone();
-        assert!(matches!(permit.prepare_target(&original, tokio::time::Instant::now()).await, Err(BashRetirementPreparationError::DeadlineExpired)));
+        assert!(matches!(
+            permit
+                .prepare_target(&original, tokio::time::Instant::now())
+                .await,
+            Err(BashRetirementPreparationError::DeadlineExpired)
+        ));
         permit.exact_process_groups.push(original.clone());
-        assert!(matches!(permit.prepare_target(&original, tokio::time::Instant::now()).await, Err(BashRetirementPreparationError::TargetMismatch)));
+        assert!(matches!(
+            permit
+                .prepare_target(&original, tokio::time::Instant::now())
+                .await,
+            Err(BashRetirementPreparationError::TargetMismatch)
+        ));
         registry.cancel_retirement(permit).await;
     }
 
@@ -2312,7 +2490,9 @@ mod tests {
     async fn prepared_retirement_observation_uses_only_original_remaining_budget() {
         struct ObservationGuard(Arc<AtomicBool>);
         impl Drop for ObservationGuard {
-            fn drop(&mut self) { self.0.store(true, Ordering::Release); }
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
         }
         let (_, permit, prepared, _) = prepared_fixture("prepared-shared-deadline").await;
         let original_deadline = prepared.deadline;
@@ -2323,7 +2503,11 @@ mod tests {
         let dropped = Arc::new(AtomicBool::new(false));
         let retained = dropped.clone();
         let mut cleanup = Box::pin(prepared.complete_with(
-            |_| async move { signal_tx.send(()).unwrap(); release_rx.await.unwrap(); Ok(()) },
+            |_| async move {
+                signal_tx.send(()).unwrap();
+                release_rx.await.unwrap();
+                Ok(())
+            },
             |_| async move {
                 let _guard = ObservationGuard(retained);
                 observe_tx.send(()).unwrap();
@@ -2348,15 +2532,39 @@ mod tests {
         assert!(permit.entry.try_write().is_ok());
     }
 
-    async fn prepared_fixture(name: &str) -> (BashHandleRegistry, BashRetirementPermit, PreparedBashRetirement, Arc<Handle>) {
+    async fn prepared_fixture(
+        name: &str,
+    ) -> (
+        BashHandleRegistry,
+        BashRetirementPermit,
+        PreparedBashRetirement,
+        Arc<Handle>,
+    ) {
         let registry = BashHandleRegistry::new();
         let owner = scope(name);
         let mut reservation = registry.reserve_spawn(&owner).await.unwrap();
-        let handle = Handle::new_live(owner.clone(), reservation.handle_id().clone(), "test".into(), None,
-            std::path::PathBuf::from("/tmp"), 12345, 12345, 1024);
-        registry.commit_spawn(&mut reservation, handle.clone()).await.unwrap();
+        let handle = Handle::new_live(
+            owner.clone(),
+            reservation.handle_id().clone(),
+            "test".into(),
+            None,
+            std::path::PathBuf::from("/tmp"),
+            12345,
+            12345,
+            1024,
+        );
+        registry
+            .commit_spawn(&mut reservation, handle.clone())
+            .await
+            .unwrap();
         let permit = registry.begin_retirement(&owner).await;
-        let prepared = permit.prepare_target(&permit.exact_process_groups[0], tokio::time::Instant::now() + Duration::from_secs(1)).await.unwrap();
+        let prepared = permit
+            .prepare_target(
+                &permit.exact_process_groups[0],
+                tokio::time::Instant::now() + Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
         (registry, permit, prepared, handle)
     }
 
@@ -2387,7 +2595,10 @@ mod tests {
         let (observed_tx, observed_rx) = tokio::sync::oneshot::channel();
         let mut cleanup = Box::pin(prepared.complete_with(
             move |_| async move {
-                assert!(entry.try_write().is_err(), "generation must remain excluded during signal");
+                assert!(
+                    entry.try_write().is_err(),
+                    "generation must remain excluded during signal"
+                );
                 entered_tx.send(()).unwrap();
                 Ok(())
             },
@@ -2398,9 +2609,14 @@ mod tests {
         ));
         poll_pending(cleanup.as_mut()).await;
         assert_eq!(entered_rx.try_recv(), Ok(()));
-        assert!(permit.entry.try_write().is_err(), "generation must remain excluded during observation");
+        assert!(
+            permit.entry.try_write().is_err(),
+            "generation must remain excluded during observation"
+        );
         observed_tx.send(()).unwrap();
-        assert!(matches!(cleanup.await, BashRetirementOutcome::Retired(report) if !report.has_failures()));
+        assert!(
+            matches!(cleanup.await, BashRetirementOutcome::Retired(report) if !report.has_failures())
+        );
         assert!(permit.entry.try_write().is_ok());
     }
 
@@ -2408,7 +2624,9 @@ mod tests {
     async fn prepared_retirement_signal_timeout_drops_owned_signal_and_reports_exact_failure() {
         struct SignalGuard(Arc<AtomicBool>);
         impl Drop for SignalGuard {
-            fn drop(&mut self) { self.0.store(true, Ordering::Release); }
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
         }
         let (_, permit, prepared, _) = prepared_fixture("prepared-signal-deadline").await;
         let dropped = Arc::new(AtomicBool::new(false));
@@ -2465,15 +2683,26 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn prepared_retirement_preserves_scope_uncertainty_and_selected_signal_failure() {
         let (_, permit, prepared, _) = prepared_fixture("prepared-exact-failure").await;
-        permit.entry.read().await.admission.unverified_launch.store(true, Ordering::Release);
-        let outcome = prepared.complete_with(
-            |_| async { Err(std::io::Error::other("selected signal refused")) },
-            |_| async { panic!("failed signal cannot produce absence") },
-        ).await;
+        permit
+            .entry
+            .read()
+            .await
+            .admission
+            .unverified_launch
+            .store(true, Ordering::Release);
+        let outcome = prepared
+            .complete_with(
+                |_| async { Err(std::io::Error::other("selected signal refused")) },
+                |_| async { panic!("failed signal cannot produce absence") },
+            )
+            .await;
         assert!(outcome.report().has_failures());
         assert_eq!(outcome.report().live_handle_pgids, vec![12345]);
         assert_eq!(outcome.report().kill_failures.len(), 1);
-        assert_eq!(outcome.report().scope_uncertainty, Some(BashScopeUncertainty::UnregisteredLaunch));
+        assert_eq!(
+            outcome.report().scope_uncertainty,
+            Some(BashScopeUncertainty::UnregisteredLaunch)
+        );
     }
 
     fn launch_identity(pid: u32, launch_uuid: &str) -> BashLaunchIdentity {
