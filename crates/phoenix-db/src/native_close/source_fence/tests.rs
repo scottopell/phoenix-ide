@@ -1205,11 +1205,19 @@ async fn initial_source_fence_preserves_proofs_across_mixed_worktree_scopes() {
             }).await else { panic!("expected sealed inventory"); };
     let retired = resources.iter().find(|target| target.scope == root_scope
         && target.resource.kind() == RetiredResourceKind::WorkScope).unwrap();
-    db.record_close_retirement_evidence(RecordCloseRetirementEvidenceRequest {
-        attempt_id: run.attempt_id.clone(), snapshot: snapshot.clone(),
-        scope: retired.scope.clone(), resource: retired.resource.clone(),
-        outcome: RetirementOutcome::Retired, detail: Some("already retired".into()),
-    }).await.unwrap();
+    assert!(matches!(db.record_native_close_initial_retirement_dispatch(
+        &command, &receipt, &source, RecordCloseRetirementDispatchRequest {
+            attempt_id: run.attempt_id.clone(), snapshot: snapshot.clone(),
+            scope: retired.scope.clone(), resource: retired.resource.clone(),
+        },
+    ).await, LocalAuthorityResult::DurableFactEstablished(Ok(()))));
+    assert!(matches!(db.record_native_close_initial_retirement_evidence(
+        &command, &receipt, &source, RecordCloseRetirementEvidenceRequest {
+            attempt_id: run.attempt_id.clone(), snapshot: snapshot.clone(),
+            scope: retired.scope.clone(), resource: retired.resource.clone(),
+            outcome: RetirementOutcome::Retired, detail: Some("already retired".into()),
+        },
+    ).await, LocalAuthorityResult::DurableFactEstablished(Ok(()))));
     let dispatched = resources.iter().find(|target| target.scope == child_scope
         && target.resource.kind() == RetiredResourceKind::TmuxServer).unwrap();
     assert!(matches!(
@@ -1310,11 +1318,19 @@ async fn initial_source_fence_refuses_all_complete_sealed_inventory_without_muta
                 }],
             }).await else { panic!("expected sealed inventory"); };
     for target in &resources {
-        db.record_close_retirement_evidence(RecordCloseRetirementEvidenceRequest {
-            attempt_id: run.attempt_id.clone(), snapshot: snapshot.clone(),
-            scope: target.scope.clone(), resource: target.resource.clone(),
-            outcome: RetirementOutcome::Retired, detail: Some("complete proof".into()),
-        }).await.unwrap();
+        assert!(matches!(db.record_native_close_initial_retirement_dispatch(
+            &command, &receipt, &source, RecordCloseRetirementDispatchRequest {
+                attempt_id: run.attempt_id.clone(), snapshot: snapshot.clone(),
+                scope: target.scope.clone(), resource: target.resource.clone(),
+            },
+        ).await, LocalAuthorityResult::DurableFactEstablished(Ok(()))));
+        assert!(matches!(db.record_native_close_initial_retirement_evidence(
+            &command, &receipt, &source, RecordCloseRetirementEvidenceRequest {
+                attempt_id: run.attempt_id.clone(), snapshot: snapshot.clone(),
+                scope: target.scope.clone(), resource: target.resource.clone(),
+                outcome: RetirementOutcome::Retired, detail: Some("complete proof".into()),
+            },
+        ).await, LocalAuthorityResult::DurableFactEstablished(Ok(()))));
     }
     assert!(db.unresolved_expected_close_cleanup_resources(run.attempt_id.as_str()).await.unwrap().is_empty());
 

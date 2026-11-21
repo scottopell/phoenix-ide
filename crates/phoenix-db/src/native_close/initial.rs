@@ -3,8 +3,8 @@
 use phoenix_core::domain::close::{
     CloseAttemptId, CloseExpectedRetirementResource, CloseObligation, ClosePhase, CloseRunOrdinal,
     CloseStopCertainty, GitPathIdentity, RetiredResourceIdentity, RetiredResourceKind,
-    RetirementFailureReason, TranscriptConversationId, WorktreeFingerprint, WorktreeId,
-    WorktreeIdentity,
+    RetirementFailureReason, RetirementOutcome, TranscriptConversationId, WorktreeFingerprint,
+    WorktreeId, WorktreeIdentity,
 };
 use phoenix_core::domain::product_conversation::ProductConversationId;
 use phoenix_core::work_scope::WorkScopeId;
@@ -16,8 +16,8 @@ use crate::workflow::LocalAuthorityResult;
 use crate::{
     CaptureCloseRetirementInventoryRequest, CloseCleanupFailureAuthority,
     CloseCleanupFailureResource, CloseCleanupResourceDisposition, Database, DbError, DbResult,
-    RecordCloseRetirementDispatchRequest, ReplaceCloseInspectionRequest,
-    TerminalizeInitialCloseCleanupFailureRequest,
+    RecordCloseRetirementDispatchRequest, RecordCloseRetirementEvidenceRequest,
+    ReplaceCloseInspectionRequest, TerminalizeInitialCloseCleanupFailureRequest,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -171,6 +171,123 @@ impl Database {
             Self::insert_close_retirement_dispatch_tx(&mut tx, &request).await
         }
         .await;
+        match result {
+            Ok(()) => match tx.commit().await {
+                Ok(()) => LocalAuthorityResult::DurableFactEstablished(Ok(())),
+                Err(_) => LocalAuthorityResult::DurableFactUnclassified,
+            },
+            Err(error) => match tx.rollback().await {
+                Ok(()) => LocalAuthorityResult::DurableFactEstablished(Err(error)),
+                Err(_) => LocalAuthorityResult::DurableFactUnclassified,
+            },
+        }
+    }
+
+    /// Records successful native initial retirement evidence after exact dispatch intent.
+    /// Revalidates source authority before replay and performs no physical retirement.
+    /// Residual failures require a separate source-bound terminalization boundary.
+    pub async fn record_native_close_initial_retirement_evidence(
+        &self,
+        command: &NativeCloseCommand,
+        receipt: &NativeCloseReceipt,
+        live_source: &phoenix_core::domain::sm_state::ConvState,
+        request: RecordCloseRetirementEvidenceRequest,
+    ) -> LocalAuthorityResult<DbResult<()>> {
+        let mut tx = match self.pool.begin_with("BEGIN IMMEDIATE").await {
+            Ok(tx) => tx,
+            Err(error) => return LocalAuthorityResult::DurableFactEstablished(Err(error.into())),
+        };
+        let result = async {
+            let (admitted, _) = require_initial_execution_tx(
+                &mut tx,
+                command,
+                receipt,
+                live_source,
+                ClosePhase::RetirementRequested,
+            )
+            .await?;
+            if request.attempt_id != admitted.attempt_id {
+                return Err(DbError::CloseFoundationPrecondition(
+                    "initial retirement evidence does not match the admitted run".into(),
+                ));
+            }
+            if !matches!(
+                &request.outcome,
+                RetirementOutcome::Retired | RetirementOutcome::AbsenceAdopted { .. }
+            ) {
+                return Err(DbError::CloseFoundationPrecondition(
+                    "native initial success evidence accepts only retired or adopted absence proof".into(),
+                ));
+            }
+            let anchored: bool = sqlx::query_scalar(
+                "SELECT EXISTS (
+                    SELECT 1 FROM close_original_retirement_anchors anchor
+                    JOIN close_obligations obligation ON obligation.attempt_id = anchor.attempt_id
+                    WHERE anchor.attempt_id = ?1
+                      AND anchor.inspection_generation = obligation.inspection_generation
+                      AND anchor.inspection_fingerprint = obligation.inspection_fingerprint
+                ) AND NOT EXISTS (
+                    SELECT 1 FROM close_retirement_anchor_exclusions WHERE attempt_id = ?1
+                ) AND NOT EXISTS (
+                    SELECT 1 FROM close_attempt_scopes scope WHERE scope.attempt_id = ?1
+                      AND NOT EXISTS (
+                        SELECT 1 FROM close_retirement_inventories inventory
+                        JOIN close_obligations obligation ON obligation.attempt_id = inventory.attempt_id
+                        WHERE inventory.attempt_id = scope.attempt_id AND inventory.scope = scope.scope
+                          AND inventory.sealed = 1
+                          AND inventory.inspection_generation = obligation.inspection_generation
+                          AND inventory.inspection_fingerprint = obligation.inspection_fingerprint
+                      )
+                )",
+            ).bind(admitted.attempt_id.as_str()).fetch_one(&mut *tx).await?;
+            if !anchored {
+                return Err(DbError::CloseFoundationPrecondition(
+                    "initial evidence requires its exact anchored sealed retirement inventory".into(),
+                ));
+            }
+            let expected = crate::close_foundation::list_close_expected_retirement_resources_tx(
+                &mut tx,
+                admitted.attempt_id.as_str(),
+            )
+            .await?;
+            if !expected.iter().any(|resource| {
+                resource.attempt_id == request.attempt_id
+                    && resource.scope == request.scope
+                    && resource.snapshot == request.snapshot
+                    && resource.resource == request.resource
+            }) {
+                return Err(DbError::CloseFoundationPrecondition(
+                    "initial evidence resource is not in the exact anchored sealed inventory".into(),
+                ));
+            }
+            if let RetirementOutcome::AbsenceAdopted { absence_basis } = &request.outcome {
+                crate::close_foundation::validate_adopted_absence_evidence(
+                    &mut tx,
+                    &request,
+                    *absence_basis,
+                )
+                .await?;
+            }
+            let dispatched: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM close_retirement_resource_dispatches
+                 WHERE attempt_id = ?1 AND scope = ?2 AND inspection_generation = ?3
+                   AND inspection_fingerprint = ?4 AND resource_kind = ?5
+                   AND identity_kind = ?6 AND identity_codec = ?7 AND identity_value = ?8)",
+            )
+            .bind(request.attempt_id.as_str()).bind(request.scope.as_str())
+            .bind(request.snapshot.generation()).bind(request.snapshot.fingerprint())
+            .bind(request.resource.kind().as_str()).bind(request.resource.identity().identity_kind())
+            .bind(request.resource.identity().codec()).bind(request.resource.identity().value())
+            .fetch_one(&mut *tx).await?;
+            if !dispatched {
+                return Err(DbError::CloseFoundationPrecondition(
+                    "initial retirement evidence requires its exact persisted dispatch".into(),
+                ));
+            }
+            Database::record_close_retirement_evidence_sql_tx(
+                &mut *tx, &request, request.snapshot.generation(),
+            ).await
+        }.await;
         match result {
             Ok(()) => match tx.commit().await {
                 Ok(()) => LocalAuthorityResult::DurableFactEstablished(Ok(())),

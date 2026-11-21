@@ -710,7 +710,7 @@ fn parse_close_loss_item(
     }
 }
 
-async fn validate_adopted_absence_evidence(
+pub(crate) async fn validate_adopted_absence_evidence(
     tx: &mut Transaction<'_, Sqlite>,
     request: &RecordCloseRetirementEvidenceRequest,
     absence_basis: AbsenceBasis,
@@ -5059,6 +5059,19 @@ impl Database {
     ) -> DbResult<()> {
         let mut conn = self.pool.acquire().await?;
         let mut tx = conn.begin_with("BEGIN IMMEDIATE").await?;
+        let native_initial: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM native_close_initial_receipts
+             WHERE attempt_id = ?1 AND intent = 'initial' AND run_ordinal = 1)",
+        )
+        .bind(request.attempt_id.as_str())
+        .fetch_one(&mut *tx)
+        .await?;
+        if native_initial {
+            return Err(close_precondition(format!(
+                "attempt {} retirement evidence requires native initial source authority",
+                request.attempt_id
+            )));
+        }
         let phase_record = sqlx::query(
             "SELECT phase, inspection_generation, inspection_fingerprint FROM close_obligations WHERE attempt_id = ?1",
         )
@@ -5175,6 +5188,34 @@ impl Database {
             validate_adopted_absence_evidence(&mut tx, &request, *absence_basis).await?;
         }
 
+        Self::record_close_retirement_evidence_sql_tx(
+            &mut *tx,
+            &request,
+            &inspection_generation,
+        )
+        .await?;
+
+        if matches!(request.outcome, RetirementOutcome::Residual { .. })
+            && phase == ClosePhase::RetirementRequested
+        {
+            set_close_phase_tx(
+                &mut tx,
+                request.attempt_id.as_str(),
+                ClosePhase::NeedsRepair,
+            )
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    // Keep history insertion, proof promotion, and replay checks in one shared transaction body.
+    #[allow(clippy::too_many_lines)]
+    pub(crate) async fn record_close_retirement_evidence_sql_tx(
+        tx: &mut sqlx::SqliteConnection,
+        request: &RecordCloseRetirementEvidenceRequest,
+        inspection_generation: &str,
+    ) -> DbResult<()> {
         let (proof_kind, absence_basis, residual_reason) = match &request.outcome {
             RetirementOutcome::Retired => ("retired", None, None),
             RetirementOutcome::AbsenceAdopted { absence_basis } => (
@@ -5191,7 +5232,6 @@ impl Database {
                 ("residual", None, Some(residual_reason.as_str()))
             }
         };
-
         let now = Utc::now().to_rfc3339();
         sqlx::query(
             "INSERT OR IGNORE INTO close_retirement_resource_history (
@@ -5202,7 +5242,7 @@ impl Database {
         )
         .bind(request.attempt_id.as_str())
         .bind(request.scope.as_str())
-        .bind(&inspection_generation)
+        .bind(inspection_generation)
         .bind(request.snapshot.fingerprint())
         .bind(request.resource.kind().as_str())
         .bind(request.resource.identity().identity_kind())
@@ -5233,7 +5273,7 @@ impl Database {
         )
         .bind(request.attempt_id.as_str())
         .bind(request.scope.as_str())
-        .bind(&inspection_generation)
+        .bind(inspection_generation)
         .bind(request.snapshot.fingerprint())
         .bind(request.resource.kind().as_str())
         .bind(request.resource.identity().identity_kind())
@@ -5265,7 +5305,7 @@ impl Database {
         )
         .bind(request.attempt_id.as_str())
         .bind(request.scope.as_str())
-        .bind(&inspection_generation)
+        .bind(inspection_generation)
         .bind(request.snapshot.fingerprint())
         .bind(request.resource.kind().as_str())
         .bind(request.resource.identity().identity_kind())
@@ -5284,7 +5324,7 @@ impl Database {
             request.resource.identity().codec().to_string(),
         );
         let reuses_same_attempt_retirement = matches!(
-            request.outcome,
+            &request.outcome,
             RetirementOutcome::AbsenceAdopted {
                 absence_basis: AbsenceBasis::SameAttemptPriorRetirement
             }
@@ -5296,18 +5336,6 @@ impl Database {
                 request.attempt_id
             )));
         }
-
-        if matches!(request.outcome, RetirementOutcome::Residual { .. })
-            && phase == ClosePhase::RetirementRequested
-        {
-            set_close_phase_tx(
-                &mut tx,
-                request.attempt_id.as_str(),
-                ClosePhase::NeedsRepair,
-            )
-            .await?;
-        }
-        tx.commit().await?;
         Ok(())
     }
 
