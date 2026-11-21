@@ -5731,10 +5731,32 @@ impl Database {
         success: &CloseProcessStepSuccess,
     ) -> DbResult<()> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let native_initial: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM native_close_initial_receipts
+             WHERE attempt_id = ?1 AND run_ordinal = 1 AND intent = 'initial')",
+        )
+        .bind(success.run.attempt_id.as_str())
+        .fetch_one(&mut *tx)
+        .await?;
+        if native_initial {
+            return Err(close_precondition(
+                "generic process success is unavailable for source-owned native initial Close operations",
+            ));
+        }
+        Self::insert_close_process_step_success_tx(&mut tx, success).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Read/compare/insert for process-step success; caller owns transaction and source checks.
+    pub(crate) async fn insert_close_process_step_success_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        success: &CloseProcessStepSuccess,
+    ) -> DbResult<()> {
         let retained: Option<(String, i64)> = sqlx::query_as("SELECT outcome, observed_at_us FROM close_process_step_successes
             WHERE attempt_id = ?1 AND run_ordinal = ?2 AND scope = ?3 AND resource_kind = ?4 AND identity_value = ?5")
             .bind(success.run.attempt_id.as_str()).bind(success.run.ordinal.get()).bind(success.scope.as_str())
-            .bind(success.resource_kind.as_str()).bind(success.identity.as_str()).fetch_optional(&mut *tx).await?;
+            .bind(success.resource_kind.as_str()).bind(success.identity.as_str()).fetch_optional(&mut **tx).await?;
         if let Some(retained) = retained {
             if retained != (success.outcome.as_str().to_owned(), success.observed_at_us) {
                 return Err(close_precondition(
@@ -5747,9 +5769,8 @@ impl Database {
                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)")
                 .bind(success.run.attempt_id.as_str()).bind(success.run.ordinal.get()).bind(success.scope.as_str())
                 .bind(success.resource_kind.as_str()).bind(success.identity.as_str()).bind(success.outcome.as_str())
-                .bind(success.observed_at_us).execute(&mut *tx).await?;
+                .bind(success.observed_at_us).execute(&mut **tx).await?;
         }
-        tx.commit().await?;
         Ok(())
     }
 

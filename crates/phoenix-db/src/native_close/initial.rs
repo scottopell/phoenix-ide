@@ -183,6 +183,148 @@ impl Database {
         }
     }
 
+    /// Records process teardown success only under the exact source-owned initial authority.
+    pub async fn record_native_close_initial_process_step_success(
+        &self,
+        command: &NativeCloseCommand,
+        receipt: &NativeCloseReceipt,
+        live_source: &phoenix_core::domain::sm_state::ConvState,
+        snapshot: phoenix_core::domain::close::CloseRetirementSnapshot,
+        success: crate::CloseProcessStepSuccess,
+    ) -> LocalAuthorityResult<DbResult<()>> {
+        let mut tx = match self.pool.begin_with("BEGIN IMMEDIATE").await {
+            Ok(tx) => tx,
+            Err(error) => return LocalAuthorityResult::DurableFactEstablished(Err(error.into())),
+        };
+        let result = async {
+            let (admitted, _) = require_initial_execution_tx(
+                &mut tx,
+                command,
+                receipt,
+                live_source,
+                ClosePhase::RetirementRequested,
+            )
+            .await?;
+            if success.run.attempt_id != admitted.attempt_id
+                || success.run.ordinal != admitted.run_ordinal
+            {
+                return Err(DbError::CloseFoundationPrecondition(
+                    "initial process success does not match the admitted run".into(),
+                ));
+            }
+            let (created_at_us,): (i64,) = sqlx::query_as(
+                "SELECT created_at_us FROM close_runs
+                 WHERE attempt_id = ?1 AND run_ordinal = ?2 AND status = 'running'",
+            )
+            .bind(admitted.attempt_id.as_str())
+            .bind(admitted.run_ordinal.get())
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or_else(|| DbError::CloseFoundationPrecondition(
+                "initial process success requires its running admitted run".into(),
+            ))?;
+            let now = chrono::Utc::now().timestamp_micros();
+            if chrono::DateTime::from_timestamp_micros(success.observed_at_us).is_none()
+                || success.observed_at_us < created_at_us
+                || success.observed_at_us > now
+            {
+                return Err(DbError::CloseFoundationPrecondition(
+                    "initial process success observation time is outside the run interval".into(),
+                ));
+            }
+            let anchored: bool = sqlx::query_scalar(
+                "SELECT EXISTS (
+                    SELECT 1 FROM close_original_retirement_anchors anchor
+                    JOIN close_obligations obligation ON obligation.attempt_id = anchor.attempt_id
+                    WHERE anchor.attempt_id = ?1
+                      AND anchor.inspection_generation = ?2
+                      AND anchor.inspection_fingerprint = ?3
+                      AND anchor.inspection_generation = obligation.inspection_generation
+                      AND anchor.inspection_fingerprint = obligation.inspection_fingerprint
+                ) AND NOT EXISTS (
+                    SELECT 1 FROM close_retirement_anchor_exclusions WHERE attempt_id = ?1
+                ) AND NOT EXISTS (
+                    SELECT 1 FROM close_attempt_scopes scope WHERE scope.attempt_id = ?1
+                      AND NOT EXISTS (
+                        SELECT 1 FROM close_retirement_inventories inventory
+                        WHERE inventory.attempt_id = scope.attempt_id AND inventory.scope = scope.scope
+                          AND inventory.sealed = 1 AND inventory.inspection_generation = ?2
+                          AND inventory.inspection_fingerprint = ?3
+                      )
+                )",
+            )
+            .bind(admitted.attempt_id.as_str())
+            .bind(snapshot.generation())
+            .bind(snapshot.fingerprint())
+            .fetch_one(&mut *tx)
+            .await?;
+            if !anchored {
+                return Err(DbError::CloseFoundationPrecondition(
+                    "initial process success requires the exact original sealed inventory".into(),
+                ));
+            }
+            let resource_kind = match success.resource_kind {
+                crate::CloseProcessResourceKind::BashProcessGroup => RetiredResourceKind::BashProcessGroup,
+                crate::CloseProcessResourceKind::PtySession => RetiredResourceKind::PtySession,
+                crate::CloseProcessResourceKind::BrowserSession => RetiredResourceKind::BrowserSession,
+            };
+            let process_identity = RetiredResourceIdentity::parse(
+                resource_kind,
+                phoenix_core::domain::close::LossItemIdentity::Opaque(success.identity.clone()),
+            )
+                .map_err(|error| DbError::Serialization(error.to_string()))?;
+            let expected = crate::close_foundation::list_close_expected_retirement_resources_tx(
+                &mut tx,
+                admitted.attempt_id.as_str(),
+            )
+            .await?;
+            let member = expected.iter().find(|resource| {
+                resource.attempt_id == success.run.attempt_id
+                    && resource.scope == success.scope
+                    && resource.snapshot == snapshot
+                    && resource.resource == process_identity
+            });
+            if member.is_none() {
+                return Err(DbError::CloseFoundationPrecondition(
+                    "initial process success is not an exact typed member of the anchored inventory".into(),
+                ));
+            }
+            let dispatched: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM close_retirement_resource_dispatches
+                 WHERE attempt_id = ?1 AND scope = ?2 AND inspection_generation = ?3
+                   AND inspection_fingerprint = ?4 AND resource_kind = ?5
+                   AND identity_kind = ?6 AND identity_codec = ?7 AND identity_value = ?8)",
+            )
+            .bind(admitted.attempt_id.as_str())
+            .bind(success.scope.as_str())
+            .bind(snapshot.generation())
+            .bind(snapshot.fingerprint())
+            .bind(process_identity.kind().as_str())
+            .bind(process_identity.identity().identity_kind())
+            .bind(process_identity.identity().codec())
+            .bind(process_identity.identity().value())
+            .fetch_one(&mut *tx)
+            .await?;
+            if !dispatched {
+                return Err(DbError::CloseFoundationPrecondition(
+                    "initial process success requires exact persisted dispatch intent".into(),
+                ));
+            }
+            Database::insert_close_process_step_success_tx(&mut tx, &success).await
+        }
+        .await;
+        match result {
+            Ok(()) => match tx.commit().await {
+                Ok(()) => LocalAuthorityResult::DurableFactEstablished(Ok(())),
+                Err(_) => LocalAuthorityResult::DurableFactUnclassified,
+            },
+            Err(error) => match tx.rollback().await {
+                Ok(()) => LocalAuthorityResult::DurableFactEstablished(Err(error)),
+                Err(_) => LocalAuthorityResult::DurableFactUnclassified,
+            },
+        }
+    }
+
     /// Records successful native initial retirement evidence after exact dispatch intent.
     /// Revalidates source authority before replay and performs no physical retirement.
     /// Residual failures require a separate source-bound terminalization boundary.

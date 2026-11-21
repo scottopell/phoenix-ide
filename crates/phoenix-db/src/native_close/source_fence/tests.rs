@@ -1328,12 +1328,13 @@ async fn all_complete_initial_source_fence_fixture() -> (
     ConvState,
     CloseRunRef,
 ) {
-    all_complete_initial_source_fence_fixture_with_omissions(false, None).await
+    all_complete_initial_source_fence_fixture_with_omissions(false, None, false).await
 }
 
 async fn all_complete_initial_source_fence_fixture_with_omissions(
     omit_process_success: bool,
     empty_generation: Option<&str>,
+    omit_bash_dispatch: bool,
 ) -> (
     Database,
     NativeCloseCommand,
@@ -1396,6 +1397,9 @@ async fn all_complete_initial_source_fence_fixture_with_omissions(
                 }],
             }).await else { panic!("expected sealed inventory"); };
     for target in &resources {
+        if omit_bash_dispatch && target.resource.kind() == RetiredResourceKind::BashProcessGroup {
+            continue;
+        }
         assert!(matches!(db.record_native_close_initial_retirement_dispatch(
             &command, &receipt, &source, RecordCloseRetirementDispatchRequest {
                 attempt_id: run.attempt_id.clone(), snapshot: snapshot.clone(),
@@ -1403,14 +1407,18 @@ async fn all_complete_initial_source_fence_fixture_with_omissions(
             },
         ).await, LocalAuthorityResult::DurableFactEstablished(Ok(()))));
         if target.resource.kind() == RetiredResourceKind::BashProcessGroup && !omit_process_success {
-            db.record_close_process_step_success(&crate::CloseProcessStepSuccess {
+            let success = crate::CloseProcessStepSuccess {
                 run: run.clone(),
                 scope: target.scope.clone(),
                 resource_kind: crate::CloseProcessResourceKind::BashProcessGroup,
                 identity: OpaqueIdentity::parse("complete-bash-session").unwrap(),
                 outcome: crate::CloseProcessStepOutcome::Retired,
                 observed_at_us: chrono::Utc::now().timestamp_micros(),
-            }).await.unwrap();
+            };
+            assert!(db.record_close_process_step_success(&success).await.is_err());
+            assert!(matches!(db.record_native_close_initial_process_step_success(
+                &command, &receipt, &source, snapshot.clone(), success,
+            ).await, LocalAuthorityResult::DurableFactEstablished(Ok(()))));
         }
         {
             assert!(matches!(db.record_native_close_initial_retirement_evidence(
@@ -1434,6 +1442,180 @@ async fn all_complete_initial_source_fence_fixture_with_omissions(
             .await.unwrap().is_empty());
     }
     (db, command, receipt, source, run)
+}
+
+fn initial_bash_process_success(
+    run: &CloseRunRef,
+    scope: &phoenix_core::work_scope::WorkScopeId,
+) -> crate::CloseProcessStepSuccess {
+    crate::CloseProcessStepSuccess {
+        run: run.clone(),
+        scope: scope.clone(),
+        resource_kind: crate::CloseProcessResourceKind::BashProcessGroup,
+        identity: phoenix_core::domain::close::OpaqueIdentity::parse("complete-bash-session").unwrap(),
+        outcome: crate::CloseProcessStepOutcome::Retired,
+        observed_at_us: chrono::Utc::now().timestamp_micros(),
+    }
+}
+
+async fn initial_process_success_count(db: &Database, run: &CloseRunRef) -> i64 {
+    sqlx::query_scalar(
+        "SELECT COUNT(*) FROM close_process_step_successes
+         WHERE attempt_id = ?1 AND run_ordinal = 1 AND resource_kind = 'bash_process_group'",
+    )
+    .bind(run.attempt_id.as_str())
+    .fetch_one(db.pool())
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn initial_process_success_is_source_bound_idempotent_and_generic_writer_cannot_replay() {
+    let (db, command, receipt, source, run) =
+        all_complete_initial_source_fence_fixture_with_omissions(true, None, false).await;
+    let snapshot = db.get_close_obligation(run.attempt_id.as_str()).await.unwrap()
+        .snapshot().cloned().unwrap();
+    let scope = db.list_close_attempt_scopes(run.attempt_id.as_str()).await.unwrap()[0]
+        .scope.clone();
+    let success = initial_bash_process_success(&run, &scope);
+
+    assert!(db.record_close_process_step_success(&success).await.is_err());
+    assert_eq!(initial_process_success_count(&db, &run).await, 0);
+    assert!(matches!(db.record_native_close_initial_process_step_success(
+        &command, &receipt, &source, snapshot.clone(), success.clone(),
+    ).await, LocalAuthorityResult::DurableFactEstablished(Ok(()))));
+    assert_eq!(initial_process_success_count(&db, &run).await, 1);
+    let retained = db.list_close_process_step_successes(&run).await.unwrap();
+    assert!(matches!(db.record_native_close_initial_process_step_success(
+        &command, &receipt, &source, snapshot.clone(), success.clone(),
+    ).await, LocalAuthorityResult::DurableFactEstablished(Ok(()))));
+    assert_eq!(db.list_close_process_step_successes(&run).await.unwrap(), retained);
+    let mut conflicting_time = success.clone();
+    conflicting_time.observed_at_us -= 1;
+    assert!(matches!(db.record_native_close_initial_process_step_success(
+        &command, &receipt, &source, snapshot.clone(), conflicting_time,
+    ).await, LocalAuthorityResult::DurableFactEstablished(Err(_))));
+    assert_eq!(db.list_close_process_step_successes(&run).await.unwrap(), retained);
+
+    let mut conflicting = success.clone();
+    conflicting.outcome = crate::CloseProcessStepOutcome::AbsenceVerified;
+    assert!(matches!(db.record_native_close_initial_process_step_success(
+        &command, &receipt, &source, snapshot, conflicting,
+    ).await, LocalAuthorityResult::DurableFactEstablished(Err(_))));
+    assert!(db.record_close_process_step_success(&success).await.is_err());
+    assert_eq!(initial_process_success_count(&db, &run).await, 1);
+}
+
+#[tokio::test]
+async fn initial_process_success_requires_exact_dispatch() {
+    let (db, command, receipt, source, run) =
+        all_complete_initial_source_fence_fixture_with_omissions(true, None, true).await;
+    let snapshot = db.get_close_obligation(run.attempt_id.as_str()).await.unwrap()
+        .snapshot().cloned().unwrap();
+    let scope = db.list_close_attempt_scopes(run.attempt_id.as_str()).await.unwrap()[0]
+        .scope.clone();
+    let success = initial_bash_process_success(&run, &scope);
+    assert!(matches!(db.record_native_close_initial_process_step_success(
+        &command, &receipt, &source, snapshot, success,
+    ).await, LocalAuthorityResult::DurableFactEstablished(Err(_))));
+    assert_eq!(initial_process_success_count(&db, &run).await, 0);
+}
+
+#[tokio::test]
+async fn initial_process_success_rejects_wrong_live_source_and_revoked_restored_source() {
+    let (db, command, receipt, source, run) =
+        all_complete_initial_source_fence_fixture_with_omissions(true, None, false).await;
+    let snapshot = db.get_close_obligation(run.attempt_id.as_str()).await.unwrap()
+        .snapshot().cloned().unwrap();
+    let scope = db.list_close_attempt_scopes(run.attempt_id.as_str()).await.unwrap()[0]
+        .scope.clone();
+    let success = initial_bash_process_success(&run, &scope);
+    assert!(matches!(db.record_native_close_initial_process_step_success(
+        &command, &receipt, &ConvState::Idle, snapshot.clone(), success.clone(),
+    ).await, LocalAuthorityResult::DurableFactEstablished(Err(_))));
+    assert_eq!(initial_process_success_count(&db, &run).await, 0);
+
+    assert!(matches!(db.record_native_close_initial_process_step_success(
+        &command, &receipt, &source, snapshot.clone(), success.clone(),
+    ).await, LocalAuthorityResult::DurableFactEstablished(Ok(()))));
+    write_source_fence_state(&db, &command, &ConvState::Idle, false).await.unwrap();
+    assert!(matches!(db.record_native_close_initial_process_step_success(
+        &command, &receipt, &source, snapshot.clone(), success.clone(),
+    ).await, LocalAuthorityResult::DurableFactEstablished(Err(_))));
+    write_source_fence_state(&db, &command, &source, false).await.unwrap();
+    assert!(matches!(db.record_native_close_initial_process_step_success(
+        &command, &receipt, &source, snapshot, success,
+    ).await, LocalAuthorityResult::DurableFactEstablished(Err(_))));
+    assert_eq!(initial_process_success_count(&db, &run).await, 1);
+}
+
+#[tokio::test]
+async fn initial_process_success_requires_exact_run_snapshot_scope_and_identity() {
+    let (db, command, receipt, source, run) =
+        all_complete_initial_source_fence_fixture_with_omissions(true, None, false).await;
+    let snapshot = db.get_close_obligation(run.attempt_id.as_str()).await.unwrap()
+        .snapshot().cloned().unwrap();
+    let scope = db.list_close_attempt_scopes(run.attempt_id.as_str()).await.unwrap()[0]
+        .scope.clone();
+    let success = initial_bash_process_success(&run, &scope);
+    let mut wrong_attempt = success.clone();
+    wrong_attempt.run.attempt_id = phoenix_core::domain::close::CloseAttemptId::parse(
+        format!("{}-other", run.attempt_id),
+    ).unwrap();
+    let mut wrong_ordinal = success.clone();
+    wrong_ordinal.run.ordinal = phoenix_core::domain::close::CloseRunOrdinal::parse(2).unwrap();
+    let mut wrong_scope = success.clone();
+    wrong_scope.scope = phoenix_core::work_scope::WorkScopeId::parse("not-captured-scope").unwrap();
+    let mut wrong_identity = success.clone();
+    wrong_identity.identity = phoenix_core::domain::close::OpaqueIdentity::parse("other-session").unwrap();
+    let wrong_snapshot = phoenix_core::domain::close::CloseRetirementSnapshot::parse(
+        "other-generation", "other-fingerprint",
+    ).unwrap();
+
+    for (candidate_snapshot, candidate) in [
+        (snapshot.clone(), wrong_attempt),
+        (snapshot.clone(), wrong_ordinal),
+        (snapshot.clone(), wrong_scope),
+        (snapshot.clone(), wrong_identity),
+        (wrong_snapshot, success),
+    ] {
+        assert!(matches!(db.record_native_close_initial_process_step_success(
+            &command, &receipt, &source, candidate_snapshot, candidate,
+        ).await, LocalAuthorityResult::DurableFactEstablished(Err(_))));
+        assert_eq!(initial_process_success_count(&db, &run).await, 0);
+    }
+}
+
+#[tokio::test]
+async fn initial_process_success_rejects_out_of_interval_times_and_stopped_run_replay() {
+    let (db, command, receipt, source, run) =
+        all_complete_initial_source_fence_fixture_with_omissions(true, None, false).await;
+    let snapshot = db.get_close_obligation(run.attempt_id.as_str()).await.unwrap()
+        .snapshot().cloned().unwrap();
+    let scope = db.list_close_attempt_scopes(run.attempt_id.as_str()).await.unwrap()[0]
+        .scope.clone();
+    let created_at: i64 = sqlx::query_scalar(
+        "SELECT created_at_us FROM close_runs WHERE attempt_id = ?1 AND run_ordinal = 1",
+    ).bind(run.attempt_id.as_str()).fetch_one(db.pool()).await.unwrap();
+    for observed_at_us in [created_at - 1, chrono::Utc::now().timestamp_micros() + 60_000_000] {
+        let mut invalid_time = initial_bash_process_success(&run, &scope);
+        invalid_time.observed_at_us = observed_at_us;
+        assert!(matches!(db.record_native_close_initial_process_step_success(
+            &command, &receipt, &source, snapshot.clone(), invalid_time,
+        ).await, LocalAuthorityResult::DurableFactEstablished(Err(_))));
+        assert_eq!(initial_process_success_count(&db, &run).await, 0);
+    }
+
+    let success = initial_bash_process_success(&run, &scope);
+    assert!(matches!(db.record_native_close_initial_process_step_success(
+        &command, &receipt, &source, snapshot.clone(), success.clone(),
+    ).await, LocalAuthorityResult::DurableFactEstablished(Ok(()))));
+    write_source_fence_state(&db, &command, &ConvState::Idle, false).await.unwrap();
+    assert_eq!(db.get_close_run(&run).await.unwrap().status, CloseRunStatus::Stopped);
+    assert!(matches!(db.record_native_close_initial_process_step_success(
+        &command, &receipt, &source, snapshot, success,
+    ).await, LocalAuthorityResult::DurableFactEstablished(Err(_))));
+    assert_eq!(initial_process_success_count(&db, &run).await, 1);
 }
 
 #[tokio::test]
@@ -1499,7 +1681,7 @@ async fn initial_all_complete_source_fence_records_truthful_unsuccessful_outcome
 async fn all_complete_initial_source_fence_preserves_custom_empty_inspection_generation() {
     for generation in ["no-worktree", "server_git_status_v2_retry_source_fence_test"] {
         let (db, command, _receipt, _source, run) =
-            all_complete_initial_source_fence_fixture_with_omissions(false, Some(generation)).await;
+            all_complete_initial_source_fence_fixture_with_omissions(false, Some(generation), false).await;
         let snapshot = db.get_close_obligation(run.attempt_id.as_str()).await.unwrap()
             .snapshot().cloned().unwrap();
         assert_eq!(snapshot.generation(), generation);
@@ -1560,7 +1742,7 @@ async fn all_complete_initial_source_fence_retains_successful_bash_process_retir
 async fn all_complete_initial_source_fence_missing_process_step_proof_rolls_back() {
     {
         let (db, command, _receipt, source, run) =
-            all_complete_initial_source_fence_fixture_with_omissions(true, None)
+            all_complete_initial_source_fence_fixture_with_omissions(true, None, false)
                 .await;
         assert!(db.unresolved_expected_close_cleanup_resources(run.attempt_id.as_str()).await.unwrap().is_empty());
         assert_eq!(sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM native_close_initial_complete_retirement_proofs WHERE attempt_id = ?1")
@@ -1902,7 +2084,7 @@ async fn concurrent_completion_admissions_share_one_successor() {
 #[tokio::test]
 async fn completion_admission_without_proof_or_with_suppressed_allowance_changes_nothing() {
     let (db, command, receipt, source, run) =
-        all_complete_initial_source_fence_fixture_with_omissions(true, None).await;
+        all_complete_initial_source_fence_fixture_with_omissions(true, None, false).await;
     assert_eq!(completion_retry_rows(&db, &run).await, (0, 1, 0, 0));
     assert!(db.interrupt_native_close_initial_after_retirement(&command, &receipt, &source)
         .await.established().unwrap().is_err());
