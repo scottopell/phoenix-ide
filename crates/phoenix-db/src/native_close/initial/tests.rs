@@ -1242,8 +1242,11 @@ async fn initial_completion_requires_source_receipt_and_all_concrete_proofs() {
     ));
     let mut generic_tx = f.db.pool().begin_with("BEGIN IMMEDIATE").await.unwrap();
     assert!(matches!(
-        crate::Database::complete_close_retirement_tx(&mut generic_tx, &receipt.admitted.attempt_id)
-            .await,
+        crate::Database::complete_close_retirement_tx(
+            &mut generic_tx,
+            &receipt.admitted.attempt_id
+        )
+        .await,
         Err(DbError::CloseFoundationPrecondition(_))
     ));
     generic_tx.rollback().await.unwrap();
@@ -1319,8 +1322,11 @@ async fn initial_completion_requires_source_receipt_and_all_concrete_proofs() {
     );
     let mut generic_tx = f.db.pool().begin_with("BEGIN IMMEDIATE").await.unwrap();
     assert!(matches!(
-        crate::Database::complete_close_retirement_tx(&mut generic_tx, &receipt.admitted.attempt_id)
-            .await,
+        crate::Database::complete_close_retirement_tx(
+            &mut generic_tx,
+            &receipt.admitted.attempt_id
+        )
+        .await,
         Err(DbError::CloseFoundationPrecondition(_))
     ));
     generic_tx.rollback().await.unwrap();
@@ -1356,16 +1362,22 @@ async fn initial_completion_requires_source_receipt_and_all_concrete_proofs() {
     );
     let replay_before = initial_finalization_snapshot(&f, &receipt).await;
     let mut wrong_target = receipt.clone();
-    wrong_target.admitted.target = ProductConversationId::parse("foreign-completed-target").unwrap();
+    wrong_target.admitted.target =
+        ProductConversationId::parse("foreign-completed-target").unwrap();
     let mut wrong_attempt = receipt.clone();
     wrong_attempt.admitted.attempt_id = CloseAttemptId::parse("foreign-completed-attempt").unwrap();
     for invalid_receipt in [&wrong_target, &wrong_attempt] {
         assert!(matches!(
             f.db.complete_native_close_initial(&command, invalid_receipt, &live_source)
                 .await,
-            LocalAuthorityResult::DurableFactEstablished(Err(DbError::CloseFoundationPrecondition(_)))
+            LocalAuthorityResult::DurableFactEstablished(Err(
+                DbError::CloseFoundationPrecondition(_)
+            ))
         ));
-        assert_eq!(initial_finalization_snapshot(&f, &receipt).await, replay_before);
+        assert_eq!(
+            initial_finalization_snapshot(&f, &receipt).await,
+            replay_before
+        );
     }
     let conflicting_command = f.command(f.source.clone(), &wrong_target.admitted.target);
     assert_eq!(conflicting_command.request_id(), command.request_id());
@@ -1375,7 +1387,10 @@ async fn initial_completion_requires_source_receipt_and_all_concrete_proofs() {
             .await,
         LocalAuthorityResult::DurableFactEstablished(Err(DbError::CloseFoundationPrecondition(_)))
     ));
-    assert_eq!(initial_finalization_snapshot(&f, &receipt).await, replay_before);
+    assert_eq!(
+        initial_finalization_snapshot(&f, &receipt).await,
+        replay_before
+    );
     let mut wrong_receipt = receipt.clone();
     wrong_receipt.request_id = Uuid::new_v4();
     assert!(matches!(
@@ -1383,19 +1398,28 @@ async fn initial_completion_requires_source_receipt_and_all_concrete_proofs() {
             .await,
         LocalAuthorityResult::DurableFactEstablished(Err(DbError::CloseFoundationPrecondition(_)))
     ));
-    assert_eq!(initial_finalization_snapshot(&f, &receipt).await, replay_before);
+    assert_eq!(
+        initial_finalization_snapshot(&f, &receipt).await,
+        replay_before
+    );
     assert!(matches!(
         f.db.complete_native_close_initial(&command, &receipt, &ConvState::Idle)
             .await,
         LocalAuthorityResult::DurableFactEstablished(Err(DbError::CloseFoundationPrecondition(_)))
     ));
-    assert_eq!(initial_finalization_snapshot(&f, &receipt).await, replay_before);
+    assert_eq!(
+        initial_finalization_snapshot(&f, &receipt).await,
+        replay_before
+    );
     assert!(matches!(
         f.db.complete_close_retirement(&receipt.admitted.attempt_id)
             .await,
         Err(DbError::CloseFoundationPrecondition(_))
     ));
-    assert_eq!(initial_finalization_snapshot(&f, &receipt).await, replay_before);
+    assert_eq!(
+        initial_finalization_snapshot(&f, &receipt).await,
+        replay_before
+    );
     let replay =
         f.db.complete_native_close_initial(&command, &receipt, &live_source)
             .await
@@ -1403,7 +1427,10 @@ async fn initial_completion_requires_source_receipt_and_all_concrete_proofs() {
             .unwrap()
             .unwrap();
     assert_eq!(replay, completed);
-    assert_eq!(initial_finalization_snapshot(&f, &receipt).await, replay_before);
+    assert_eq!(
+        initial_finalization_snapshot(&f, &receipt).await,
+        replay_before
+    );
     f.db.update_conversation_state(&f.coordinator, &ConvState::Idle)
         .await
         .unwrap();
@@ -2670,7 +2697,10 @@ async fn check_initial_resource_failure(failed_index: usize) {
             .await,
         LocalAuthorityResult::DurableFactEstablished(Err(DbError::CloseFoundationPrecondition(_)))
     ));
-    assert_eq!(initial_finalization_snapshot(&f, &receipt).await, stopped_before);
+    assert_eq!(
+        initial_finalization_snapshot(&f, &receipt).await,
+        stopped_before
+    );
     let after_replay = failure_boundary_snapshot(&f.db, receipt.admitted.attempt_id.as_str()).await;
     assert_eq!(before_replay, after_replay);
     assert!(matches!(
