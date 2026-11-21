@@ -134,6 +134,13 @@ jobs:
             original_snapshots_require_matching_captured_scopes_and_nonempty_values; do
             grep -F "native_close::retry_execution::snapshot_tests::$test: test" evidence/selected-tests.txt
           done
+          for test in \
+            initial_process_authorization_requires_exact_durable_source_scope_snapshot_and_dispatch \
+            initial_process_authorization_rejects_missing_dispatch_and_stopped_or_changed_source \
+            initial_process_authorization_rejects_source_changed_then_restored \
+            initial_process_authorization_rejects_prior_process_success_or_positive_retirement; do
+            grep -F "close_foundation::tests::native_retry::$test: test" evidence/selected-tests.txt
+          done
       - name: Execute migration163 populated upgrade and authority regressions
         if: success()
         shell: bash
@@ -161,6 +168,13 @@ jobs:
         run: |
           set -euo pipefail
           cargo test -p phoenix-db --lib close_foundation::tests:: -- --nocapture --test-threads=1 2>&1 | tee evidence/close-foundation.log
+          for test in \
+            initial_process_authorization_requires_exact_durable_source_scope_snapshot_and_dispatch \
+            initial_process_authorization_rejects_missing_dispatch_and_stopped_or_changed_source \
+            initial_process_authorization_rejects_source_changed_then_restored \
+            initial_process_authorization_rejects_prior_process_success_or_positive_retirement; do
+            grep -F "test close_foundation::tests::native_retry::$test ... ok" evidence/close-foundation.log
+          done
       - name: Execute migration159 regression module selectors
         if: success() || failure()
         shell: bash

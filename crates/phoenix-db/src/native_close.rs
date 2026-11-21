@@ -197,8 +197,8 @@ pub use completion::{NativeCloseCompletionReceipt, NativeCloseCompletionResult};
 mod initial;
 mod initial_exit;
 pub use initial::{
-    NativeCloseInitialExecution, NativeCloseInitialResult, NativeCloseInitialSettlement,
-    NativeCloseReceipt, NativeCloseRunRef,
+    NativeCloseInitialExecution, NativeCloseInitialProcessAuthorization, NativeCloseInitialResult,
+    NativeCloseInitialSettlement, NativeCloseReceipt, NativeCloseRunRef,
 };
 mod observe;
 mod receipts;

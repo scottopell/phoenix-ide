@@ -1342,6 +1342,21 @@ async fn all_complete_initial_source_fence_fixture_with_omissions(
     ConvState,
     CloseRunRef,
 ) {
+    initial_source_fence_inventory_fixture(omit_process_success, empty_generation, omit_bash_dispatch, true).await
+}
+
+async fn initial_source_fence_inventory_fixture(
+    omit_process_success: bool,
+    empty_generation: Option<&str>,
+    omit_bash_dispatch: bool,
+    record_completion: bool,
+) -> (
+    Database,
+    NativeCloseCommand,
+    crate::native_close::NativeCloseReceipt,
+    ConvState,
+    CloseRunRef,
+) {
     use phoenix_core::domain::close::{CapturedWorktreeIdentity, CloseOwnedResourceInventory,
         CloseRetirementSnapshot, OpaqueIdentity};
 
@@ -1406,6 +1421,9 @@ async fn all_complete_initial_source_fence_fixture_with_omissions(
                 scope: target.scope.clone(), resource: target.resource.clone(),
             },
         ).await, LocalAuthorityResult::DurableFactEstablished(Ok(()))));
+        if !record_completion {
+            continue;
+        }
         if target.resource.kind() == RetiredResourceKind::BashProcessGroup && !omit_process_success {
             let success = crate::CloseProcessStepSuccess {
                 run: run.clone(),
@@ -1437,11 +1455,124 @@ async fn all_complete_initial_source_fence_fixture_with_omissions(
     assert!(resources.iter().any(|target| {
         target.resource.kind() == RetiredResourceKind::WorkScope
     }));
-    if !omit_process_success {
+    if record_completion && !omit_process_success {
         assert!(db.unresolved_expected_close_cleanup_resources(run.attempt_id.as_str())
             .await.unwrap().is_empty());
     }
     (db, command, receipt, source, run)
+}
+
+#[tokio::test]
+async fn initial_process_authorization_requires_exact_durable_source_scope_snapshot_and_dispatch() {
+    use phoenix_core::domain::close::{CloseRetirementSnapshot, RetiredResourceKind};
+
+    let (db, command, receipt, source, run) = initial_source_fence_inventory_fixture(false, None, false, false).await;
+    let inventories = db.list_close_expected_retirement_resources(run.attempt_id.as_str()).await.unwrap();
+    let process = inventories.iter().find(|item| {
+        item.resource.kind() == RetiredResourceKind::BashProcessGroup
+    }).unwrap();
+    let auth = db.authorize_native_close_initial_process_step(
+        &command, &receipt, &source, process.scope.clone(), process.snapshot.clone(),
+        RetiredResourceKind::BashProcessGroup,
+    ).await.established().unwrap().unwrap();
+    let (authorized_run, authorized_scope, authorized_snapshot, kind, process_inventory) = auth.into_parts();
+    assert_eq!(authorized_run.attempt_id, run.attempt_id);
+    assert_eq!(authorized_scope, process.scope);
+    assert_eq!(authorized_snapshot, process.snapshot);
+    assert_eq!(kind, RetiredResourceKind::BashProcessGroup);
+    assert_eq!(process_inventory.len(), 1);
+    assert!(process_inventory.iter().all(|item| {
+        item.resource.kind() == RetiredResourceKind::BashProcessGroup
+    }));
+
+    // A process-kind absent from this sealed inventory is valid but yields no work.
+    let empty = db.authorize_native_close_initial_process_step(
+        &command, &receipt, &source, process.scope.clone(), process.snapshot.clone(),
+        RetiredResourceKind::BrowserSession,
+    ).await.established().unwrap().unwrap();
+    assert!(empty.into_parts().4.is_empty());
+    // A second transaction-time check does not claim a physical launch.
+    assert!(db.authorize_native_close_initial_process_step(
+        &command, &receipt, &source, process.scope.clone(), process.snapshot.clone(),
+        RetiredResourceKind::BashProcessGroup,
+    ).await.established().unwrap().is_ok());
+
+    for (scope, snapshot, kind) in [
+        (process.scope.clone(), CloseRetirementSnapshot::parse("wrong-generation", "wrong-fingerprint").unwrap(), RetiredResourceKind::BashProcessGroup),
+        (phoenix_core::work_scope::WorkScopeId::new(), process.snapshot.clone(), RetiredResourceKind::BashProcessGroup),
+        (process.scope.clone(), process.snapshot.clone(), RetiredResourceKind::WorkScope),
+        (process.scope.clone(), process.snapshot.clone(), RetiredResourceKind::EquivalentLiveResource),
+    ] {
+        assert!(db.authorize_native_close_initial_process_step(
+            &command, &receipt, &source, scope, snapshot, kind,
+        ).await.established().unwrap().is_err());
+    }
+}
+
+#[tokio::test]
+async fn initial_process_authorization_rejects_missing_dispatch_and_stopped_or_changed_source() {
+    use phoenix_core::domain::close::RetiredResourceKind;
+
+    let (db, command, receipt, source, run) =
+        initial_source_fence_inventory_fixture(false, None, true, false).await;
+    let item = db.list_close_expected_retirement_resources(run.attempt_id.as_str()).await.unwrap()
+        .into_iter().find(|item| item.resource.kind() == RetiredResourceKind::BashProcessGroup).unwrap();
+    assert!(db.authorize_native_close_initial_process_step(
+        &command, &receipt, &source, item.scope.clone(), item.snapshot.clone(), RetiredResourceKind::BashProcessGroup,
+    ).await.established().unwrap().is_err());
+
+    let (db, command, receipt, source, run) = initial_source_fence_inventory_fixture(false, None, false, false).await;
+    let item = db.list_close_expected_retirement_resources(run.attempt_id.as_str()).await.unwrap()
+        .into_iter().find(|item| item.resource.kind() == RetiredResourceKind::BashProcessGroup).unwrap();
+    write_source_fence_state(&db, &command, &ConvState::Idle, false).await.unwrap();
+    assert_eq!(db.get_close_run(&run).await.unwrap().status, CloseRunStatus::Stopped);
+    assert!(db.authorize_native_close_initial_process_step(
+        &command, &receipt, &source, item.scope, item.snapshot, RetiredResourceKind::BashProcessGroup,
+    ).await.established().unwrap().is_err());
+}
+
+#[tokio::test]
+async fn initial_process_authorization_rejects_source_changed_then_restored() {
+    use phoenix_core::domain::close::RetiredResourceKind;
+
+    let (db, command, receipt, source, run) = initial_source_fence_inventory_fixture(false, None, false, false).await;
+    let item = db.list_close_expected_retirement_resources(run.attempt_id.as_str()).await.unwrap()
+        .into_iter().find(|item| item.resource.kind() == RetiredResourceKind::BashProcessGroup).unwrap();
+    write_source_fence_state(&db, &command, &ConvState::Idle, false).await.unwrap();
+    write_source_fence_state(&db, &command, &source, false).await.unwrap();
+    assert_eq!(db.get_conversation(command.source_transcript_id()).await.unwrap().state, source);
+    assert!(db.authorize_native_close_initial_process_step(
+        &command, &receipt, &source, item.scope, item.snapshot, RetiredResourceKind::BashProcessGroup,
+    ).await.established().unwrap().is_err());
+}
+
+#[tokio::test]
+async fn initial_process_authorization_rejects_prior_process_success_or_positive_retirement() {
+    use phoenix_core::domain::close::RetiredResourceKind;
+
+    for record_process_receipt in [false, true] {
+        let (db, command, receipt, source, run) = initial_source_fence_inventory_fixture(false, None, false, false).await;
+        let process = db.list_close_expected_retirement_resources(run.attempt_id.as_str()).await.unwrap()
+            .into_iter().find(|item| item.resource.kind() == RetiredResourceKind::BashProcessGroup).unwrap();
+        if record_process_receipt {
+            assert!(db.record_native_close_initial_process_step_success(
+                &command, &receipt, &source, process.snapshot.clone(),
+                initial_bash_process_success(&run, &process.scope),
+            ).await.established().unwrap().is_ok());
+        } else {
+            assert!(db.record_native_close_initial_retirement_evidence(
+                &command, &receipt, &source, RecordCloseRetirementEvidenceRequest {
+                    attempt_id: run.attempt_id.clone(), scope: process.scope.clone(),
+                    snapshot: process.snapshot.clone(), resource: process.resource.clone(),
+                    outcome: RetirementOutcome::Retired, detail: None,
+                },
+            ).await.established().unwrap().is_ok());
+        }
+        assert!(db.authorize_native_close_initial_process_step(
+            &command, &receipt, &source, process.scope, process.snapshot,
+            RetiredResourceKind::BashProcessGroup,
+        ).await.established().unwrap().is_err());
+    }
 }
 
 fn initial_bash_process_success(
