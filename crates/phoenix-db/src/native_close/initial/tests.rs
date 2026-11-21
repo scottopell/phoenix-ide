@@ -2352,9 +2352,9 @@ async fn check_initial_resource_failure(failed_index: usize) {
             scope: item.scope.clone(),
             resource: item.resource.clone(),
             disposition: if item.scope == failed.scope && item.resource == failed.resource {
-                phoenix_core::domain::close::CloseCleanupResourceDisposition::Failed
+                crate::close_foundation::CloseCleanupResourceDisposition::Failed
             } else {
-                phoenix_core::domain::close::CloseCleanupResourceDisposition::Unattempted
+                crate::close_foundation::CloseCleanupResourceDisposition::Unattempted
             },
         })
         .collect::<Vec<_>>();
@@ -2376,7 +2376,8 @@ async fn check_initial_resource_failure(failed_index: usize) {
         stop_certainty: phoenix_core::domain::close::CloseStopCertainty::ShutdownUncertain,
         occurred_at_us: chrono::Utc::now().timestamp_micros(),
     };
-    let before_refusals = failure_boundary_snapshot(&f.db, receipt.admitted.attempt_id.as_str()).await;
+    let before_refusals =
+        failure_boundary_snapshot(&f.db, receipt.admitted.attempt_id.as_str()).await;
     let mut omitted = request.clone();
     omitted.remaining_resources.pop();
     let mut extra = request.clone();
@@ -2384,7 +2385,7 @@ async fn check_initial_resource_failure(failed_index: usize) {
     extra.remaining_resources.push(duplicate);
     let mut wrong_disposition = request.clone();
     wrong_disposition.remaining_resources[0].disposition =
-        phoenix_core::domain::close::CloseCleanupResourceDisposition::Unattempted;
+        crate::close_foundation::CloseCleanupResourceDisposition::Unattempted;
     let mut wrong_snapshot = request.clone();
     let crate::CloseCleanupFailureAuthority::ExpectedResource { snapshot, .. } =
         &mut wrong_snapshot.authority
@@ -2413,7 +2414,9 @@ async fn check_initial_resource_failure(failed_index: usize) {
                 invalid,
             )
             .await,
-            LocalAuthorityResult::DurableFactEstablished(Err(DbError::CloseFoundationPrecondition(_)))
+            LocalAuthorityResult::DurableFactEstablished(Err(
+                DbError::CloseFoundationPrecondition(_)
+            ))
         ));
         assert_eq!(
             failure_boundary_snapshot(&f.db, receipt.admitted.attempt_id.as_str()).await,
@@ -2422,7 +2425,8 @@ async fn check_initial_resource_failure(failed_index: usize) {
         );
     }
     assert!(matches!(
-        f.db.terminalize_initial_close_cleanup_failure(&request).await,
+        f.db.terminalize_initial_close_cleanup_failure(&request)
+            .await,
         Err(DbError::CloseFoundationPrecondition(_))
     ));
     assert_eq!(
@@ -2439,9 +2443,8 @@ async fn check_initial_resource_failure(failed_index: usize) {
     .execute(f.db.pool())
     .await
     .unwrap();
-    let rollback = f
-        .db
-        .terminalize_native_close_initial_resource_failure(
+    let rollback =
+        f.db.terminalize_native_close_initial_resource_failure(
             &command,
             &receipt,
             &live_source,
@@ -2451,11 +2454,9 @@ async fn check_initial_resource_failure(failed_index: usize) {
     let LocalAuthorityResult::DurableFactEstablished(Err(error)) = rollback else {
         panic!("injected mandatory delivery failure must roll back");
     };
-    assert!(
-        error
-            .to_string()
-            .contains("injected mandatory outbox failure")
-    );
+    assert!(error
+        .to_string()
+        .contains("injected mandatory outbox failure"));
     assert_eq!(
         failure_boundary_snapshot(&f.db, receipt.admitted.attempt_id.as_str()).await,
         before_refusals,
@@ -2466,9 +2467,8 @@ async fn check_initial_resource_failure(failed_index: usize) {
         .await
         .unwrap();
 
-    let terminal = f
-        .db
-        .terminalize_native_close_initial_resource_failure(
+    let terminal =
+        f.db.terminalize_native_close_initial_resource_failure(
             &command,
             &receipt,
             &live_source,
@@ -2487,7 +2487,8 @@ async fn check_initial_resource_failure(failed_index: usize) {
     .await
     .unwrap();
     assert_eq!(retained, 1);
-    let before_replay = failure_boundary_snapshot(&f.db, receipt.admitted.attempt_id.as_str()).await;
+    let before_replay =
+        failure_boundary_snapshot(&f.db, receipt.admitted.attempt_id.as_str()).await;
     let stale_source = ConvState::Idle;
     assert!(matches!(
         f.db.terminalize_native_close_initial_resource_failure(
@@ -2522,7 +2523,8 @@ async fn check_initial_resource_failure(failed_index: usize) {
         "wrong receipt must not mutate committed failure evidence",
     );
     assert!(matches!(
-        f.db.terminalize_initial_close_cleanup_failure(&request).await,
+        f.db.terminalize_initial_close_cleanup_failure(&request)
+            .await,
         Err(DbError::CloseFoundationPrecondition(_))
     ));
     f.db.terminalize_native_close_initial_resource_failure(

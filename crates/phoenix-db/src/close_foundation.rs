@@ -7368,7 +7368,8 @@ impl Database {
                     occurred_at_us: Utc::now().timestamp_micros(),
                 };
                 let result =
-                    Self::terminalize_close_run_cleanup_failure_inner_tx(tx, &run, &request).await?;
+                    Self::terminalize_close_run_cleanup_failure_inner_tx(tx, &run, &request)
+                        .await?;
                 if authority == CloseCleanupFailureAuthority::ExplicitlySuppressed {
                     sqlx::query("UPDATE close_completion_retry_allowances SET suppressed = 1 WHERE attempt_id = ?1 AND suppressed = 0")
                         .bind(run.attempt_id.as_str()).execute(&mut **tx).await?;
@@ -7504,7 +7505,8 @@ impl Database {
                 stop_certainty: CloseStopCertainty::ShutdownUncertain,
                 occurred_at_us: Utc::now().timestamp_micros(),
             };
-            let result = Self::terminalize_close_run_cleanup_failure_inner_tx(tx, &run, &request).await?;
+            let result =
+                Self::terminalize_close_run_cleanup_failure_inner_tx(tx, &run, &request).await?;
             if authority == CloseCleanupFailureAuthority::ExplicitlySuppressed {
                 sqlx::query("UPDATE close_completion_retry_allowances SET suppressed = 1 WHERE attempt_id = ?1 AND suppressed = 0")
                     .bind(run.attempt_id.as_str()).execute(&mut **tx).await?;
@@ -17822,7 +17824,9 @@ mod tests {
         .fetch_one(db.pool())
         .await
         .unwrap();
-        db.record_close_retirement_dispatch(request.clone()).await.unwrap();
+        db.record_close_retirement_dispatch(request.clone())
+            .await
+            .unwrap();
         let after: (i64, i64) = sqlx::query_as(
             "SELECT COUNT(*), MAX(dispatched_at_us) FROM close_retirement_resource_dispatches
              WHERE attempt_id = ?1",
@@ -17858,15 +17862,18 @@ mod tests {
             stop_certainty: CloseStopCertainty::ShutdownUncertain,
             occurred_at_us: chrono::Utc::now().timestamp_micros(),
         };
-        db.terminalize_initial_close_cleanup_failure(&failure).await.unwrap();
-        db.terminalize_initial_close_cleanup_failure(&failure).await.unwrap();
-        let failures: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM close_cleanup_failures WHERE attempt_id = ?1",
-        )
-        .bind(run.attempt_id.as_str())
-        .fetch_one(db.pool())
-        .await
-        .unwrap();
+        db.terminalize_initial_close_cleanup_failure(&failure)
+            .await
+            .unwrap();
+        db.terminalize_initial_close_cleanup_failure(&failure)
+            .await
+            .unwrap();
+        let failures: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM close_cleanup_failures WHERE attempt_id = ?1")
+                .bind(run.attempt_id.as_str())
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
         assert_eq!(failures, 1);
     }
 
