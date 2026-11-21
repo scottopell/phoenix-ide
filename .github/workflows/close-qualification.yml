@@ -273,6 +273,40 @@ jobs:
           grep -E 'test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored;' evidence/native-close-runtime-matcher.log
           (cd crates/phoenix-ide && "$PHOENIX_RUNTIME_TEST_BINARY" native_close_admission_tests:: --nocapture --test-threads=1) 2>&1 | tee evidence/native-close-runtime-actor.log
           grep -E 'test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored;' evidence/native-close-runtime-actor.log
+      - name: Qualify inert exact Bash retirement ownership and registry regressions
+        if: success() || failure()
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p phoenix-tools --lib -- --list 2>&1 | tee evidence/bash-registry-inventory.log
+          for test in \
+            prepared_target_drop_is_inert_and_original_permit_can_rollback \
+            prepared_completion_signals_and_verifies_only_selected_target \
+            stale_generation_and_expired_deadline_never_signal \
+            preparation_rejects_duplicate_handle_target_and_inexact_identity \
+            prepared_retirement_observation_uses_only_original_remaining_budget \
+            prepared_retirement_lock_contention_spends_original_deadline \
+            prepared_retirement_keeps_generation_excluded_through_observation \
+            prepared_retirement_signal_timeout_drops_owned_signal_and_reports_exact_failure \
+            prepared_retirement_preserves_scope_uncertainty_and_selected_signal_failure \
+            prepared_retirement_reports_selected_observation_failure; do
+            grep -F "bash::registry::tests::$test: test" evidence/bash-registry-inventory.log
+          done
+          cargo test -p phoenix-tools --lib bash::registry::tests:: -- --nocapture --test-threads=1 2>&1 | tee evidence/bash-registry-execution.log
+          grep -E 'test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored;' evidence/bash-registry-execution.log
+          for test in \
+            prepared_target_drop_is_inert_and_original_permit_can_rollback \
+            prepared_completion_signals_and_verifies_only_selected_target \
+            stale_generation_and_expired_deadline_never_signal \
+            preparation_rejects_duplicate_handle_target_and_inexact_identity \
+            prepared_retirement_observation_uses_only_original_remaining_budget \
+            prepared_retirement_lock_contention_spends_original_deadline \
+            prepared_retirement_keeps_generation_excluded_through_observation \
+            prepared_retirement_signal_timeout_drops_owned_signal_and_reports_exact_failure \
+            prepared_retirement_preserves_scope_uncertainty_and_selected_signal_failure \
+            prepared_retirement_reports_selected_observation_failure; do
+            grep -F "test bash::registry::tests::$test ... ok" evidence/bash-registry-execution.log
+          done
       - name: Qualify native Close public adapter parsing and discovery
         if: success() || failure()
         shell: bash
