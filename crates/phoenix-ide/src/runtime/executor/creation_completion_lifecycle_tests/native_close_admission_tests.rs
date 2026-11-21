@@ -1553,9 +1553,16 @@ async fn assert_actor_exit_from_dormant_close(process_shutdown: bool) {
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn process_shutdown_after_inventory_capture_retains_resource_admission_fences() {
     use native_close::NativeCloseInitialContinuationPhase as Phase;
-    use phoenix_core::domain::close::{ClosePhase, CloseRunRef, CloseRunStatus};
+    use phoenix_core::domain::close::{
+        CloseCompletionOutcome, ClosePhase, CloseRunRef, CloseRunStatus, CloseStopCertainty,
+        RetirementFailureReason, RetirementOutcome,
+    };
+    use phoenix_db::{
+        CloseCleanupFailureAuthority, CloseCleanupFailureResource, CloseCleanupResourceDisposition,
+    };
 
     let fixture = CloseFixture::new().await;
     let mut harness = fixture.runtime(true);
@@ -1621,6 +1628,28 @@ async fn process_shutdown_after_inventory_capture_retains_resource_admission_fen
         vec![(scope.as_str().to_owned(), "work_scope".to_owned())],
         "a no-worktree scope still owns its WorkScope resource"
     );
+    let captured_resources = fixture
+        .db
+        .list_close_expected_retirement_resources(&attempt)
+        .await
+        .unwrap();
+    assert_eq!(captured_resources.len(), 1);
+    assert!(
+        fixture
+            .db
+            .list_close_retirement_evidence(&attempt)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let history_before: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM close_retirement_resource_history WHERE attempt_id = ?1",
+    )
+    .bind(&attempt)
+    .fetch_one(fixture.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(history_before, 0);
     assert_native_resource_admission_fenced(&backend, &scope).await;
 
     fence.close_for_process_shutdown();
@@ -1673,10 +1702,140 @@ async fn process_shutdown_after_inventory_capture_retains_resource_admission_fen
             .unwrap()
             .archived
     );
+    // Interruption observes the sealed unresolved resource; it performs no retirement.
+    assert_eq!(
+        fixture
+            .db
+            .list_close_expected_retirement_resources(&attempt)
+            .await
+            .unwrap(),
+        captured_resources
+    );
+    assert!(
+        fixture
+            .db
+            .close_retirement_inventory_is_complete(&attempt)
+            .await
+            .unwrap()
+    );
+    let evidence = fixture
+        .db
+        .list_close_retirement_evidence(&attempt)
+        .await
+        .unwrap();
+    assert_eq!(evidence.len(), 1);
+    let expected = &captured_resources[0];
+    let residual = &evidence[0];
+    assert_eq!(residual.attempt_id, expected.attempt_id);
+    assert_eq!(residual.scope, expected.scope);
+    assert_eq!(residual.snapshot, expected.snapshot);
+    assert_eq!(residual.resource, expected.resource);
+    assert_eq!(
+        residual.outcome,
+        RetirementOutcome::Residual {
+            residual_reason: RetirementFailureReason::ManualRepairRequired,
+        }
+    );
+    let detail = "process_interrupted: initial native Close admission stopped before effects; exact sealed initial retirement inventory retained";
+    assert_eq!(residual.detail.as_deref(), Some(detail));
+    assert_eq!(residual.created_at, residual.updated_at);
+    let failures = fixture
+        .db
+        .list_close_cleanup_failures(&attempt)
+        .await
+        .unwrap();
+    assert_eq!(failures.len(), 1);
+    assert_eq!(failures[0].run_ordinal, run.ordinal);
+    let failure = &failures[0].occurrence;
+    assert_eq!(failure.failure_occurrence_id, run.failure_occurrence_id());
+    assert_eq!(failure.attempt_id, expected.attempt_id);
+    assert_eq!(failure.source_product_conversation_id, fixture.target);
+    assert_eq!(
+        failure.authority,
+        CloseCleanupFailureAuthority::ExpectedResource {
+            scope: expected.scope.clone(),
+            snapshot: expected.snapshot.clone(),
+            resource: expected.resource.clone(),
+        }
+    );
+    assert_eq!(
+        failure.remaining_resources,
+        vec![CloseCleanupFailureResource {
+            scope: expected.scope.clone(),
+            resource: expected.resource.clone(),
+            disposition: CloseCleanupResourceDisposition::Failed,
+        }]
+    );
+    assert_eq!(failure.reason, RetirementFailureReason::Interrupted);
+    assert_eq!(failure.detail, detail);
+    assert_eq!(failure.stop_certainty, CloseStopCertainty::ShutdownUncertain);
+    assert_eq!(
+        fixture
+            .db
+            .get_close_obligation(&attempt)
+            .await
+            .unwrap()
+            .close_outcome(),
+        Some(CloseCompletionOutcome::CloseIncomplete)
+    );
+    // Count every row as well as the exact matching observation: extra success/history
+    // rows must not be hidden by the typed current-snapshot reader or a filtered join.
+    let observation_counts: (i64, i64, i64) = sqlx::query_as(
+        "SELECT
+            (SELECT COUNT(*) FROM close_retirement_resources WHERE attempt_id = ?1),
+            (SELECT COUNT(*) FROM close_retirement_resource_history WHERE attempt_id = ?1),
+            (SELECT COUNT(*) FROM close_retirement_resource_history h
+             JOIN close_retirement_resources r
+               ON r.attempt_id = h.attempt_id AND r.scope = h.scope
+              AND r.inspection_generation = h.inspection_generation
+              AND r.inspection_fingerprint = h.inspection_fingerprint
+              AND r.resource_kind = h.resource_kind AND r.identity_kind = h.identity_kind
+              AND r.identity_codec = h.identity_codec AND r.identity_value = h.identity_value
+             WHERE h.attempt_id = ?1 AND h.proof_kind = 'residual'
+               AND r.proof_kind = h.proof_kind AND r.absence_basis IS NULL
+               AND h.absence_basis IS NULL AND r.residual_reason = h.residual_reason
+               AND r.detail = h.detail AND h.recorded_at = r.created_at
+               AND r.created_at = r.updated_at)",
+    )
+    .bind(&attempt)
+    .fetch_one(fixture.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(observation_counts, (1, 1, 1));
+    let event_counts: (i64, i64) = sqlx::query_as(
+        "SELECT
+            (SELECT COUNT(*) FROM coordinator_watch_events WHERE mandatory_failure_occurrence_id = ?1),
+            (SELECT COUNT(*) FROM coordinator_watch_events e
+             JOIN close_cleanup_failures f ON f.failure_occurrence_id = e.event_id
+             WHERE f.failure_occurrence_id = ?1 AND e.mandatory_failure_occurrence_id = ?1
+               AND e.source_occurrence_id = ?1 AND e.route_kind = 'mandatory_close_failure'
+               AND e.watch_id IS NULL AND e.mandatory_source_product_id = ?2
+               AND e.source_occurrence_kind = 'close_cleanup_failure'
+               AND e.source_generation = 0 AND e.source_transcript_id = ?3
+               AND e.terminal_kind = 'cleanup_failed' AND e.terminal_reason = 'interrupted'
+               AND e.occurred_at_us = f.occurred_at_us)",
+    )
+    .bind(run.failure_occurrence_id())
+    .bind(fixture.target.as_str())
+    .bind(TARGET_ID)
+    .fetch_one(fixture.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(event_counts, (1, 1));
+    let active_scope: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM work_scopes WHERE id = ?1 AND lifecycle = 'active' AND retired_at IS NULL",
+    )
+    .bind(scope.as_str())
+    .fetch_one(fixture.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(active_scope, 1);
     for table in [
         "close_retirement_resource_dispatches",
-        "close_retirement_resources",
         "close_worktree_cleanup_plans",
+        "close_process_step_successes",
+        "close_run_retry_effects",
+        "close_run_retry_successes",
     ] {
         let sql = format!("SELECT COUNT(*) FROM {table} WHERE attempt_id = ?1");
         let count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(sql.as_str()))
