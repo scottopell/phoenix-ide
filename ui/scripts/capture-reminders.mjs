@@ -7,7 +7,7 @@ const storyIds = [
   'initial-failure',
   'alias-fallback-initial-failure',
   'loaded-stale-upcoming',
-  'retry-mutation-rejection',  'retry-mutation-rejection',
+  'retry-mutation-rejection',
   'compact-due',
   'compact-scheduled',
   'compact-cancelled',
@@ -88,6 +88,9 @@ runSurfaceCapture({
         await panel.waitFor({ state: 'visible' });
         const toggle = page.getByRole('button', { name: /Reminders/ });
         assert.equal(await toggle.getAttribute('aria-expanded'), 'false');
+        const expectedSummary = id === 'compact-due' ? '1 due' : id === 'compact-cancelled' ? '1 cancelled' : '1 upcoming';
+        assert.equal(await panel.locator('.grounding-summary').textContent(), expectedSummary, 'summary reflects server state');
+        assert.equal(await panel.locator('.grounding-count').textContent(), '1', 'summary counts the reminder once');
         const expectedText = Array.from({ length: 18 }, (_, index) => `Line ${index + 1}: review the deployment checklist, confirm the service owner, inspect the latest monitoring evidence, and record any follow-up before the scheduled release window.`).join('\n');
         assert.ok(expectedText.length > 1000 && expectedText.includes('Line 18:'), 'fixture contains long multi-line reminder text');
         assert.equal(await page.locator('.reminder-card').count(), 0, 'collapsed panel hides details');
@@ -105,25 +108,31 @@ runSurfaceCapture({
         await page.screenshot({ path: path.join(outDir, `${stem}.png`), fullPage: false });
         await writeFile(path.join(outDir, `${stem}.json`), JSON.stringify({ id, viewport, journey: ['initial collapsed disclosure'], geometry: collapsed }, null, 2));
         await page.locator('#input-area textarea').first().focus();
-        await page.locator('.product-conversation-page__transcript').evaluate((node) => { node.scrollTop = Math.max(0, (node.scrollHeight - node.clientHeight) / 2); });
+        await page.locator('.product-conversation-page__transcript .message-virtual-transcript').evaluate((node) => { node.scrollTop = (node.scrollHeight - node.clientHeight) / 2; });
+        await page.evaluate(() => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))));
         const collapsedBeforeRefresh = await page.evaluate(() => ({
           composerFocused: document.activeElement === document.querySelector('#input-area textarea'),
           composer: document.querySelector('#input-area')?.getBoundingClientRect().toJSON(),
-          scrollTop: document.querySelector('.product-conversation-page__transcript')?.scrollTop,
+          scrollTop: document.querySelector('.product-conversation-page__transcript .message-virtual-transcript')?.scrollTop,
           panel: document.querySelector('.reminders-panel')?.getBoundingClientRect().toJSON(),
         }));
         assert.equal(collapsedBeforeRefresh.composerFocused, true, 'composer focus control is active before collapsed refresh');
+        assert.ok(collapsedBeforeRefresh.scrollTop > 0, 'collapsed refresh starts at a nonzero actual transcript scroll position');
+        const collapsedRevision = await panel.getAttribute('data-reminder-revisions');
         const collapsedRequestCount = Number(await page.locator('html').getAttribute('data-product-conversation-fixture-reminder-requests'));
         await page.evaluate(() => window.dispatchEvent(new Event('focus')));
         await page.waitForFunction((count) => Number(document.documentElement.dataset['productConversationFixtureReminderRequests']) > count, collapsedRequestCount);
-        await page.waitForFunction(() => document.documentElement.dataset['productConversationFixtureReminderState'] === 'loaded');
+        await page.waitForFunction((previous) => {
+          const current = document.querySelector('.reminders-panel')?.getAttribute('data-reminder-revisions');
+          return current && current !== previous;
+        }, collapsedRevision);
         await page.evaluate(() => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))));
         assert.equal(await toggle.getAttribute('aria-expanded'), 'false', 'background refresh preserves initial collapsed state');
         assert.equal(await page.locator('.reminder-card').count(), 0, 'background refresh keeps details hidden while collapsed');
         const collapsedAfterRefresh = await page.evaluate(() => ({
           composerFocused: document.activeElement === document.querySelector('#input-area textarea'),
           composer: document.querySelector('#input-area')?.getBoundingClientRect().toJSON(),
-          scrollTop: document.querySelector('.product-conversation-page__transcript')?.scrollTop,
+          scrollTop: document.querySelector('.product-conversation-page__transcript .message-virtual-transcript')?.scrollTop,
           panel: document.querySelector('.reminders-panel')?.getBoundingClientRect().toJSON(),
         }));
         assert.deepEqual(collapsedAfterRefresh, collapsedBeforeRefresh, 'collapsed refresh preserves composer focus, panel/composer geometry and reading position');
@@ -139,21 +148,31 @@ runSurfaceCapture({
         } else assert.equal(await page.getByRole('button', { name: /Reschedule|Cancel reminder/ }).count(), 0, 'non-scheduled states have no mutation actions');
         const textarea = page.locator('#input-area textarea').first();
         await textarea.focus();
-        const transcript = page.locator('.product-conversation-page__transcript');
-        await transcript.evaluate((node) => { node.scrollTop = Math.max(0, (node.scrollHeight - node.clientHeight) / 2); });
+        const transcript = page.locator('.product-conversation-page__transcript .message-virtual-transcript');
+        await transcript.evaluate((node) => { node.scrollTop = (node.scrollHeight - node.clientHeight) / 2; });
+        await page.locator('.reminders-panel .grounding-section-body').evaluate((node) => { node.scrollTop = (node.scrollHeight - node.clientHeight) / 2; });
+        await page.evaluate(() => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))));
         const before = await page.evaluate(() => ({
           requests: Number(document.documentElement.dataset['productConversationFixtureReminderRequests']),
-          transcript: (() => { const n = document.querySelector('.product-conversation-page__transcript'); const r = n?.getBoundingClientRect(); return { scrollTop: n?.scrollTop, x: r?.x, y: r?.y, width: r?.width, height: r?.height }; })(),
+          reminderScrollTop: document.querySelector('.reminders-panel .grounding-section-body')?.scrollTop,
+          transcript: (() => { const n = document.querySelector('.product-conversation-page__transcript .message-virtual-transcript'); const r = n?.getBoundingClientRect(); return { scrollTop: n?.scrollTop, x: r?.x, y: r?.y, width: r?.width, height: r?.height }; })(),
           composer: (() => { const r = document.querySelector('#input-area')?.getBoundingClientRect(); return r ? { x: r.x, y: r.y, width: r.width, height: r.height } : null; })(),
           composerFocused: document.activeElement === document.querySelector('#input-area textarea'),
         }));
+        assert.ok(before.transcript.scrollTop > 0, 'expanded refresh starts at a nonzero actual transcript scroll position');
+        assert.ok(before.reminderScrollTop > 0, 'expanded refresh starts at a nonzero reminder-details scroll position');
+        const expandedRevision = await panel.getAttribute('data-reminder-revisions');
         await page.evaluate(() => window.dispatchEvent(new Event('focus')));
         await page.waitForFunction((count) => Number(document.documentElement.dataset['productConversationFixtureReminderRequests']) > count, before.requests);
-        await page.waitForFunction(() => document.documentElement.dataset['productConversationFixtureReminderState'] === 'loaded');
+        await page.waitForFunction((previous) => {
+          const current = document.querySelector('.reminders-panel')?.getAttribute('data-reminder-revisions');
+          return current && current !== previous;
+        }, expandedRevision);
         await page.evaluate(() => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))));
         const after = await page.evaluate(() => ({
           requests: Number(document.documentElement.dataset['productConversationFixtureReminderRequests']),
-          transcript: (() => { const n = document.querySelector('.product-conversation-page__transcript'); const r = n?.getBoundingClientRect(); return { scrollTop: n?.scrollTop, x: r?.x, y: r?.y, width: r?.width, height: r?.height }; })(),
+          reminderScrollTop: document.querySelector('.reminders-panel .grounding-section-body')?.scrollTop,
+          transcript: (() => { const n = document.querySelector('.product-conversation-page__transcript .message-virtual-transcript'); const r = n?.getBoundingClientRect(); return { scrollTop: n?.scrollTop, x: r?.x, y: r?.y, width: r?.width, height: r?.height }; })(),
           composer: (() => { const r = document.querySelector('#input-area')?.getBoundingClientRect(); return r ? { x: r.x, y: r.y, width: r.width, height: r.height } : null; })(),
           composerFocused: document.activeElement === document.querySelector('#input-area textarea'),
           expanded: document.querySelector('.reminders-panel button[aria-expanded]')?.getAttribute('aria-expanded'),
@@ -162,6 +181,7 @@ runSurfaceCapture({
         assert.equal(before.composerFocused, true, 'composer focus control is active before expanded refresh');
         assert.equal(after.composerFocused, true, 'background refresh preserves exact composer focus');
         assert.equal(after.transcript.scrollTop, before.transcript.scrollTop, 'background refresh preserves transcript scroll');
+        assert.equal(after.reminderScrollTop, before.reminderScrollTop, 'background refresh preserves reminder-details scroll');
         assert.deepEqual(after.transcript, before.transcript, 'background refresh preserves transcript geometry');
         assert.deepEqual(after.composer, before.composer, 'background refresh preserves composer geometry');
         const expanded = await page.evaluate(() => ({ panel: document.querySelector('.reminders-panel')?.getBoundingClientRect().height, details: document.querySelector('.grounding-section-body')?.getBoundingClientRect().height ?? null, composer: document.querySelector('#input-area')?.getBoundingClientRect().toJSON(), width: document.documentElement.clientWidth, scrollWidth: document.documentElement.scrollWidth }));
@@ -172,6 +192,7 @@ runSurfaceCapture({
         await writeFile(path.join(outDir, `${expandedStem}.json`), JSON.stringify({ id, viewport, journey: ['collapsed → Enter expanded → background refresh preserves focus, scroll, geometry, and expansion'], geometry: expanded, refresh: { before, after } }, null, 2));
         await toggle.press('Space');
         assert.equal(await toggle.getAttribute('aria-expanded'), 'false', 'Space collapses the disclosure');
+        assert.equal(await panel.evaluate((node) => node.getBoundingClientRect().height), collapsed.panel, 'collapse restores compact height');
         journey.push('collapsed → Enter reveals full text and correct actions → background refresh retains expanded state and composer/transcript geometry → Space collapses');
       }
     } else if (id === 'retry-mutation-rejection') {

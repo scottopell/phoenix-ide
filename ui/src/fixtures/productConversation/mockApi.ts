@@ -307,6 +307,7 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
   let reminderFailuresAfterLoad = scenario.reminderFixture?.failuresAfterFirstLoad ?? 0;
   let hasLoadedReminders = false;
   let reminderRequestCount = 0;
+  let reminderRevisionBump = 0;
   let reminderMutationCount = 0;
   let conflictRows: import('../../generated/Reminder').Reminder[] | undefined;
   globalThis.fetch = async (input, init) => {
@@ -332,8 +333,12 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
       hasLoadedReminders = true;
       record('ReminderState', 'loaded');
       const rows = conflictRows ?? scenario.reminderFixture.reminders;
-      record('ReminderServedRevision', rows.find((row) => row.id === 'upcoming-fixture')?.revision ?? 0);
-      return Response.json(rows);
+      const servedRows = scenario.reminderFixture.advanceRevisionOnRefresh
+        ? rows.map((row) => ({ ...row, revision: row.revision + reminderRevisionBump }))
+        : rows;
+      if (scenario.reminderFixture.advanceRevisionOnRefresh) reminderRevisionBump += 1;
+      record('ReminderServedRevision', servedRows.find((row) => row.id === 'upcoming-fixture')?.revision ?? 0);
+      return Response.json(servedRows);
     }
     if (scenario.reminderFixture?.rejectMutation && requestUrl.pathname.startsWith(`${reminderPath}/`) && init?.method === 'POST') {
       reminderMutationCount += 1;

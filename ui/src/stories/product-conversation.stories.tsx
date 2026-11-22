@@ -108,13 +108,33 @@ const compactReminder = (id: string, kind: 'due' | 'scheduled' | 'cancelled') =>
       ? { kind: 'cancelled' as const, cancelled_at_us: 1782907200000000 }
       : { kind: 'scheduled' as const },
 });
-const compactReminders = (kind: 'due' | 'scheduled' | 'cancelled') => withReminders(
-  `reminders-compact-${kind}` as Extract<ProductConversationScenarioId, `reminders-${string}`>,
-  0,
-);
-const compactDueScenario = { ...compactReminders('due'), reminderFixture: { reminders: [compactReminder('compact-due', 'due')], initialFailures: 0 } };
-const compactScheduledScenario = { ...compactReminders('scheduled'), reminderFixture: { reminders: [compactReminder('compact-scheduled', 'scheduled')], initialFailures: 0 } };
-const compactCancelledScenario = { ...compactReminders('cancelled'), reminderFixture: { reminders: [compactReminder('compact-cancelled', 'cancelled')], initialFailures: 0 } };
+const reminderHistory = makeVirtualizedReactionScenario().snapshot.segments[0]!.messages
+  .filter((message) => message.message_id.startsWith('recovery-'));
+const compactReminders = (kind: 'due' | 'scheduled' | 'cancelled') => {
+  const base = withReminders(`reminders-compact-${kind}`, 0);
+  const snapshot = base.snapshot!;
+  const latestRow = snapshot.latest_transcript_row_id;
+  return {
+    ...base,
+    snapshot: {
+      ...snapshot,
+      segments: snapshot.segments.map((segment) => segment.transcript_row_id === latestRow ? {
+        ...segment,
+        messages: [...segment.messages, ...reminderHistory.map((message, index) => ({
+          ...message, message_id: `reminder-history-${index}`, conversation_id: latestRow,
+          sequence_id: index + 7,
+        }))],
+      } : segment),
+    },
+    reminderFixture: {
+      reminders: [compactReminder(`compact-${kind}`, kind)], initialFailures: 0,
+      advanceRevisionOnRefresh: true,
+    },
+  };
+};
+const compactDueScenario = compactReminders('due');
+const compactScheduledScenario = compactReminders('scheduled');
+const compactCancelledScenario = compactReminders('cancelled');
 const compactEmptyScenario = { ...withReminders('reminders-compact-empty', 0), reminderFixture: { reminders: [], initialFailures: 0 } };
 export const RemindersCompactDue: Story = () => <ProductConversationFixture scenario={compactDueScenario} />;
 RemindersCompactDue.storyName = 'reminders-compact-due';

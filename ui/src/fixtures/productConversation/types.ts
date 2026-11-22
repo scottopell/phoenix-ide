@@ -100,6 +100,7 @@ export interface ReminderFixture {
   initialFailures?: number;
   rejectMutation?: boolean;
   failuresAfterFirstLoad?: number;
+  advanceRevisionOnRefresh?: boolean;
 }
 
 interface ScenarioCommon {

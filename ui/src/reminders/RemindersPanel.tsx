@@ -111,7 +111,8 @@ function OwnedRemindersPanel({ conversationId, readOnly }: { conversationId: str
   ].filter(Boolean).join(' · ');
   return <>
     <ReminderFetchStatus error={loadError} loaded={reminders !== null} retry={refresh} />
-    {hasPanel && <section className="reminders-panel" aria-label="Reminders">
+    {hasPanel && <section className="reminders-panel" aria-label="Reminders"
+      data-reminder-revisions={JSON.stringify(displayedReminders.map(({ id, revision }) => ({ id, revision })))}>
       <GroundingSection icon="◷" title="Reminders" summary={summary} count={count} expanded={expanded}
         attention={attention} onToggle={() => setExpanded((value) => !value)}>
         {Object.entries(errors).map(([id, message]) => <p role="alert" key={id}>{message}</p>)}
