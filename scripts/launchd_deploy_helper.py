@@ -28,6 +28,7 @@ DEPLOY_HELPER_LABEL_PREFIX = "com.phoenix-ide.deploy"
 DEFAULT_TRANSITION_TIMEOUT_SECS = 30.0
 DEFAULT_HEALTH_TIMEOUT_SECS = 120.0
 MIGRATION_TIMEOUT_SECS = 600
+BACKUP_VERIFICATION_TIMEOUT_SECS = 900.0
 FULL_GIT_SHA_RE = re.compile(r"[0-9a-f]{40}")
 HASH_RE = re.compile(r"[0-9a-f]{64}")
 TERMINAL_STATES = {"committed", "precondition_failed", "failed"}
@@ -376,7 +377,7 @@ def _database_size_bytes(database_path: str) -> int:
     if not path.is_absolute() or path.is_symlink() or not path.is_file():
         raise ActivationError("configured production database must be an existing regular file")
     try:
-        with sqlite3.connect(f"{path.absolute().as_uri()}?mode=ro", uri=True, timeout=5) as database:
+        with contextlib.closing(sqlite3.connect(f"{path.absolute().as_uri()}?mode=ro", uri=True, timeout=5)) as database:
             page_count = database.execute("PRAGMA page_count").fetchone()[0]
             page_size = database.execute("PRAGMA page_size").fetchone()[0]
     except (sqlite3.Error, OSError, TypeError) as exc:
@@ -386,27 +387,316 @@ def _database_size_bytes(database_path: str) -> int:
     return page_count * page_size
 
 
-def _logical_digest(database, deadline: float) -> str:
-    digest = hashlib.sha256()
-    database.set_progress_handler(
-        lambda: 1 if time.monotonic() >= deadline else 0, 1000,
-    )
+@contextlib.contextmanager
+def _diagnostic_stage(diagnostics: dict | None, name: str):
+    if diagnostics is None:
+        yield
+        return
+    started = time.monotonic()
+    diagnostics["current_stage"] = name
+    if "deadline" in diagnostics:
+        diagnostics["stage_budget_ms"] = round(max(0, diagnostics["deadline"] - started) * 1000, 3)
     try:
-        for line in database.iterdump():
-            if time.monotonic() >= deadline:
-                raise ActivationError("SQLite logical verification deadline exceeded")
-            encoded = line.encode("utf-8")
-            digest.update(len(encoded).to_bytes(8, "big"))
-            digest.update(encoded)
-    except Exception as exc:
-        if isinstance(exc, ActivationError):
-            raise
-        if time.monotonic() >= deadline:
-            raise ActivationError("SQLite logical verification deadline exceeded") from exc
-        raise
+        yield
     finally:
-        database.set_progress_handler(None, 0)
-    return digest.hexdigest()
+        timings = diagnostics.setdefault("stage_ms", {})
+        timings[name] = round(timings.get(name, 0.0) + (time.monotonic() - started) * 1000, 3)
+
+
+def _emit_verifier_diagnostics(diagnostics: dict, outcome: str) -> None:
+    """Emit one bounded, content-free verifier summary without affecting the operation."""
+    try:
+        record = {"event": "sqlite_backup_verifier", "outcome": outcome,
+                  **{key: diagnostics.get(key) for key in (
+                      "current_stage", "stage_budget_ms", "stage_ms", "table_ordinal",
+                      "rows_compared", "cells_compared", "table_rows_compared",
+                      "table_cells_compared", "table_elapsed_ms", "tables_completed")}}
+        sys.stderr.write(json.dumps(record, separators=(",", ":")) + "\n")
+        sys.stderr.flush()
+    except Exception:
+        pass
+
+
+def _verify_logical_equivalence(source, backup, deadline: float, diagnostics: dict | None = None) -> None:
+    """Compare SQLite metadata and persisted rows without constructing SQL dumps."""
+    if diagnostics is not None:
+        diagnostics["deadline"] = deadline
+        diagnostics.setdefault("rows_compared", 0)
+        diagnostics.setdefault("cells_compared", 0)
+        diagnostics.setdefault("tables_completed", 0)
+    import sqlite3
+    import struct
+
+    def check_deadline() -> None:
+        if time.monotonic() >= deadline:
+            raise ActivationError("SQLite logical verification deadline exceeded")
+
+    def text(value) -> str:
+        return value.decode("utf-8") if isinstance(value, bytes) else value
+
+    def quote(identifier: str) -> str:
+        return '"' + identifier.replace('"', '""') + '"'
+
+    def pragma_rows(database, statement: str):
+        check_deadline()
+        rows = database.execute(statement).fetchall()
+        check_deadline()
+        return rows
+
+    def metadata(database):
+        check_deadline()
+        db_list = pragma_rows(database, "PRAGMA database_list")
+        schemas = [text(row[1]) for row in db_list if text(row[1]) != "temp"]
+        info = []
+        for schema in schemas:
+            qschema = quote(schema)
+            schema_rows = pragma_rows(
+                database,
+                f"SELECT type,name,tbl_name,rootpage,sql FROM {qschema}.sqlite_schema ORDER BY type,name,tbl_name",
+            )
+            table_list = pragma_rows(database, f"PRAGMA {qschema}.table_list")
+            table_entries = []
+            for row in table_list:
+                if text(row[0]) != schema:
+                    continue
+                name, kind = text(row[1]), text(row[2])
+                xinfo = pragma_rows(database, f"PRAGMA {qschema}.table_xinfo({quote(name)})")
+                table_entries.append((name, kind, tuple(xinfo)))
+            settings = (pragma_rows(database, f"PRAGMA {qschema}.user_version")[0][0],
+                        pragma_rows(database, f"PRAGMA {qschema}.application_id")[0][0],
+                        text(pragma_rows(database, f"PRAGMA {qschema}.encoding")[0][0]))
+            info.append((schema, tuple(schema_rows), tuple(row for row in table_list if text(row[0]) == schema),
+                         tuple(table_entries), settings))
+        return tuple(info)
+
+    def module_for(sql):
+        sql = text(sql or b"")
+        length = len(sql)
+        position = 0
+
+        def token():
+            nonlocal position
+            while position < length:
+                if sql[position].isspace():
+                    position += 1
+                elif sql.startswith("--", position):
+                    end = sql.find("\n", position + 2)
+                    position = length if end < 0 else end + 1
+                elif sql.startswith("/*", position):
+                    end = sql.find("*/", position + 2)
+                    if end < 0:
+                        return None
+                    position = end + 2
+                else:
+                    break
+            if position >= length:
+                return None
+
+            char = sql[position]
+            if char in ("'", '"', '`', '['):
+                closing = ']' if char == '[' else char
+                position += 1
+                value = []
+                while position < length:
+                    current = sql[position]
+                    position += 1
+                    if current == closing:
+                        if closing != ']' and position < length and sql[position] == closing:
+                            value.append(closing)
+                            position += 1
+                            continue
+                        return ("identifier", "".join(value))
+                    value.append(current)
+                return None
+            if char == '.':
+                position += 1
+                return ("dot", char)
+            start = position
+            while position < length and not sql[position].isspace() and sql[position] not in ".();'\"`[]":
+                if sql.startswith("--", position) or sql.startswith("/*", position):
+                    break
+                position += 1
+            if start == position:
+                return None
+            return ("word", sql[start:position])
+
+        def take_word(expected):
+            item = token()
+            if item is None or item[0] != "word" or item[1].upper() != expected:
+                return False
+            return True
+
+        if not (take_word("CREATE") and take_word("VIRTUAL") and take_word("TABLE")):
+            return None
+        next_item = token()
+        if next_item is not None and next_item[0] == "word" and next_item[1].upper() == "IF":
+            if not (take_word("NOT") and take_word("EXISTS")):
+                return None
+            next_item = token()
+        if next_item is None or next_item[0] not in ("word", "identifier"):
+            return None
+        after_name = position
+        separator = token()
+        if separator == ("dot", "."):
+            table = token()
+            if table is None or table[0] not in ("word", "identifier"):
+                return None
+        else:
+            position = after_name
+        if not take_word("USING"):
+            return None
+        module = token()
+        if module is None or module[0] not in ("word", "identifier"):
+            return None
+        return module[1].lower()
+
+    def cells_equal(left_value, right_value):
+        if type(left_value) is not type(right_value):
+            return False
+        if type(left_value) is float:
+            return struct.pack(">d", left_value) == struct.pack(">d", right_value)
+        return left_value == right_value
+
+    def compare_table(source, backup, schema: str, name: str, kind: str, xinfo) -> None:
+        check_deadline()
+        if kind == "virtual":
+            return  # FTS5's persisted shadow tables carry its stored contents.
+        if kind not in ("table", "shadow"):
+            return
+        columns = [(text(row[1]), text(row[2]), int(row[5])) for row in xinfo if int(row[6]) not in (1, 2)]
+        names = [column[0] for column in columns]
+        list_row = next(row for row in pragma_rows(source, f"PRAGMA {quote(schema)}.table_list")
+                        if text(row[1]) == name and text(row[0]) == schema)
+        without_rowid = bool(list_row[4])
+        if without_rowid:
+            indexes = pragma_rows(source, f"PRAGMA {quote(schema)}.index_list({quote(name)})")
+            pk_name = next((text(row[1]) for row in indexes if text(row[3]) == "pk"), None)
+            if pk_name is None:
+                raise ActivationError(f"SQLite WITHOUT ROWID table ordinal {(diagnostics or {}).get('table_ordinal', 0)} has no primary key")
+            keys = [row for row in pragma_rows(source, f"PRAGMA {quote(schema)}.index_xinfo({quote(pk_name)})")
+                    if row[5]]
+            if not keys or any(row[1] < 0 or row[2] is None or row[4] is None for row in keys):
+                raise ActivationError(f"cannot identify SQLite primary-key ordering for table ordinal {(diagnostics or {}).get('table_ordinal', 0)}")
+            order = ",".join(f"{quote(text(row[2]))} COLLATE {quote(text(row[4]))}"
+                             + (" DESC" if row[3] else " ASC") for row in keys)
+            identity = []
+        else:
+            aliases = {"rowid", "_rowid_", "oid"} - {text(column[1]).lower() for column in xinfo}
+            if not aliases:
+                raise ActivationError(f"cannot verify rowid identity for table ordinal {(diagnostics or {}).get('table_ordinal', 0)}")
+            rowid = next(alias for alias in ("rowid", "_rowid_", "oid") if alias in aliases)
+            order = quote(rowid)
+            identity = [quote(rowid)]
+        selected = identity + [quote(column) for column in names]
+        table = f"{quote(schema)}.{quote(name)}"
+        query = f"SELECT {','.join(selected)} FROM {table} ORDER BY {order}"
+        check_deadline()
+        source.text_factory = backup.text_factory = lambda raw: (raw,)
+        try:
+            with contextlib.closing(source.execute(query)) as left:
+                with contextlib.closing(backup.execute(query)) as right:
+                    offset = len(identity)
+                    cell_count = len(names)
+                    while True:
+                        check_deadline()
+                        left_batch = left.fetchmany(16)
+                        right_batch = right.fetchmany(16)
+                        check_deadline()
+                        if not left_batch or not right_batch:
+                            if bool(left_batch) != bool(right_batch):
+                                raise ActivationError(f"SQLite backup row count differs in table ordinal {(diagnostics or {}).get('table_ordinal', 0)}")
+                            break
+
+                        if all(type(value) is not float for batch in (left_batch, right_batch)
+                               for row in batch for value in row[offset:]) and left_batch == right_batch:
+                            if diagnostics is not None:
+                                diagnostics["cells_compared"] += cell_count * len(left_batch)
+                                diagnostics["table_cells_compared"] += cell_count * len(left_batch)
+                                diagnostics["rows_compared"] += len(left_batch)
+                                diagnostics["table_rows_compared"] += len(left_batch)
+                            del left_batch, right_batch
+                            check_deadline()
+                            continue
+
+                        for row_index in range(min(len(left_batch), len(right_batch))):
+                            a, b = left_batch[row_index], right_batch[row_index]
+                            check_deadline()
+                            if identity and a[0] != b[0]:
+                                raise ActivationError(f"SQLite backup row identity differs in table ordinal {(diagnostics or {}).get('table_ordinal', 0)}")
+                            if all(type(value) is not float for row in (a, b)
+                                   for value in row[offset:]) and a == b:
+                                if diagnostics is not None:
+                                    diagnostics["cells_compared"] += cell_count
+                                    diagnostics["table_cells_compared"] += cell_count
+                                    diagnostics["rows_compared"] += 1
+                                    diagnostics["table_rows_compared"] += 1
+                                continue
+                            for index in range(offset, len(a)):
+                                if diagnostics is not None:
+                                    diagnostics["cells_compared"] += 1
+                                    diagnostics["table_cells_compared"] += 1
+                                if not cells_equal(a[index], b[index]):
+                                    raise ActivationError(f"SQLite backup row differs in table ordinal {(diagnostics or {}).get('table_ordinal', 0)}")
+                            if diagnostics is not None:
+                                diagnostics["rows_compared"] += 1
+                                diagnostics["table_rows_compared"] += 1
+                        if len(left_batch) != len(right_batch):
+                            raise ActivationError(f"SQLite backup row count differs in table ordinal {(diagnostics or {}).get('table_ordinal', 0)}")
+                        del left_batch, right_batch
+                        check_deadline()
+        finally:
+            source.text_factory = backup.text_factory = bytes
+
+    old_factories = source.text_factory, backup.text_factory
+    try:
+        source.text_factory = backup.text_factory = bytes
+        handler = lambda: 1 if time.monotonic() >= deadline else 0
+        source.set_progress_handler(handler, 1000)
+        backup.set_progress_handler(handler, 1000)
+        with _diagnostic_stage(diagnostics, "metadata"):
+            check_deadline()
+            source_metadata = metadata(source)
+            backup_metadata = metadata(backup)
+            if source_metadata != backup_metadata:
+                raise ActivationError("SQLite backup schema or database metadata differs from the stopped source")
+        with _diagnostic_stage(diagnostics, "table_comparisons"):
+            table_ordinal = 0
+            for schema, _schema_rows, _table_list, tables, _settings in source_metadata:
+                for name, kind, xinfo in tables:
+                    if kind == "virtual":
+                        table_ordinal += 1
+                        if diagnostics is not None:
+                            diagnostics["table_ordinal"] = table_ordinal
+                            diagnostics["table_rows_compared"] = 0
+                            diagnostics["table_cells_compared"] = 0
+                            diagnostics["table_elapsed_ms"] = None
+                        sql = next((row[4] for row in _schema_rows if text(row[0]) == "table" and text(row[1]) == name), None)
+                        if module_for(sql) != "fts5":
+                            raise ActivationError(f"cannot verify unsupported SQLite virtual table module at table ordinal {table_ordinal}")
+                        continue
+                    table_ordinal += 1
+                    if diagnostics is not None:
+                        diagnostics["table_ordinal"] = table_ordinal
+                    table_started = time.monotonic()
+                    if diagnostics is not None:
+                        diagnostics["table_rows_compared"] = 0
+                        diagnostics["table_cells_compared"] = 0
+                    try:
+                        compare_table(source, backup, schema, name, kind, xinfo)
+                    finally:
+                        if diagnostics is not None:
+                            diagnostics["table_elapsed_ms"] = round((time.monotonic() - table_started) * 1000, 3)
+                    if diagnostics is not None:
+                        diagnostics["tables_completed"] = diagnostics.get("tables_completed", 0) + 1
+        check_deadline()
+    except sqlite3.Error as exc:
+        if time.monotonic() >= deadline:
+            raise ActivationError("SQLite logical verification deadline exceeded") from None
+        raise ActivationError("SQLite logical verification database operation failed") from None
+    finally:
+        source.text_factory, backup.text_factory = old_factories
+
+
 
 
 @contextlib.contextmanager
@@ -425,11 +715,14 @@ def sqlite_writer_guard(database_path: str, *, timeout: float = 5):
             guard.rollback()
 
 
-def create_verified_database_backup(database_path: str, directory: Path, *, timeout: float = 600) -> Path:
+def create_verified_database_backup(database_path: str, directory: Path, *, timeout: float = BACKUP_VERIFICATION_TIMEOUT_SECS,
+                                    diagnostics: dict | None = None) -> Path:
     import sqlite3
 
     source_path = Path(database_path)
     deadline = time.monotonic() + timeout
+    if diagnostics is not None:
+        diagnostics["deadline"] = deadline
     fd, name = tempfile.mkstemp(prefix="database-backup-", suffix=".sqlite", dir=directory)
     os.close(fd)
     backup_path = Path(name)
@@ -451,27 +744,31 @@ def create_verified_database_backup(database_path: str, directory: Path, *, time
             with contextlib.closing(sqlite3.connect(backup_path, timeout=remaining())) as backup:
                 backup.execute(f"PRAGMA busy_timeout={max(1, min(100, int(remaining() * 1000)))}")
                 backup.set_progress_handler(lambda: 1 if time.monotonic() >= deadline else 0, 1000)
-                source.backup(backup, pages=128, progress=progress, sleep=0.05)
+                with _diagnostic_stage(diagnostics, "native_backup"):
+                    source.backup(backup, pages=128, progress=progress, sleep=0.05)
                 remaining()
-                check = backup.execute("PRAGMA integrity_check").fetchone()
+                with _diagnostic_stage(diagnostics, "integrity_check"):
+                    check = backup.execute("PRAGMA integrity_check").fetchone()
                 if time.monotonic() >= deadline:
                     raise ActivationError("SQLite integrity verification deadline exceeded")
                 if check != ("ok",):
-                    raise ActivationError(f"SQLite backup integrity check failed: {check!r}")
-                if _logical_digest(source, deadline) != _logical_digest(backup, deadline):
-                    raise ActivationError("SQLite backup logical contents differ from the stopped source")
+                    raise ActivationError("SQLite backup integrity check failed")
+                _verify_logical_equivalence(source, backup, deadline, diagnostics)
         remaining()
-        fd = os.open(backup_path, os.O_RDONLY)
-        try:
-            os.fsync(fd)
-        finally:
-            os.close(fd)
-        fsync_dir(directory)
+        with _diagnostic_stage(diagnostics, "fsync"):
+            fd = os.open(backup_path, os.O_RDONLY)
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            fsync_dir(directory)
         return backup_path
     except BaseException as exc:
         backup_path.unlink(missing_ok=True)
         if isinstance(exc, sqlite3.Error) and time.monotonic() >= deadline:
-            raise ActivationError("SQLite backup and verification deadline exceeded") from exc
+            raise ActivationError("SQLite backup and verification deadline exceeded") from None
+        if isinstance(exc, sqlite3.Error):
+            raise ActivationError("SQLite backup database operation failed") from None
         raise
 
 
@@ -630,18 +927,19 @@ def restore_predecessor(manifest: Manifest, launchctl: "Launchctl", captured: di
         raise ActivationError(details) from exc
 
 
-def _backup_proof(path: Path, deadline: float) -> dict:
+def _backup_proof(path: Path, deadline: float, diagnostics: dict | None = None) -> dict:
     digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        while True:
-            if time.monotonic() >= deadline:
-                raise ActivationError("SQLite backup and verification deadline exceeded during proof hashing")
-            block = stream.read(1024 * 1024)
-            if not block:
-                break
-            digest.update(block)
-    if time.monotonic() >= deadline:
-        raise ActivationError("SQLite backup and verification deadline exceeded during proof hashing")
+    with _diagnostic_stage(diagnostics, "proof_hash"):
+        with path.open("rb") as stream:
+            while True:
+                if time.monotonic() >= deadline:
+                    raise ActivationError("SQLite backup and verification deadline exceeded during proof hashing")
+                block = stream.read(1024 * 1024)
+                if not block:
+                    break
+                digest.update(block)
+        if time.monotonic() >= deadline:
+            raise ActivationError("SQLite backup and verification deadline exceeded during proof hashing")
     return {"backup_path": str(path), "backup_bytes": path.stat().st_size,
             "backup_sha256": digest.hexdigest()}
 
@@ -742,11 +1040,18 @@ def activate(manifest: Manifest) -> str:
             else:
                 _preflight_backup_capacity(database_path, backup_directory)
                 with sqlite_writer_guard(database_path):
-                    backup_deadline = time.monotonic() + 600
-                    backup = create_verified_database_backup(
-                        database_path, backup_directory, timeout=backup_deadline - time.monotonic(),
-                    )
-                    backup_proof = _backup_proof(backup, backup_deadline)
+                    backup_deadline = time.monotonic() + BACKUP_VERIFICATION_TIMEOUT_SECS
+                    verifier_diagnostics = {}
+                    try:
+                        backup = create_verified_database_backup(
+                            database_path, backup_directory, timeout=backup_deadline - time.monotonic(),
+                            diagnostics=verifier_diagnostics,
+                        )
+                        backup_proof = _backup_proof(backup, backup_deadline, verifier_diagnostics)
+                    except BaseException as verifier_error:
+                        _emit_verifier_diagnostics(verifier_diagnostics, type(verifier_error).__name__)
+                        raise
+                    _emit_verifier_diagnostics(verifier_diagnostics, "verified")
                     write_proof(manifest, phase="backup_verified", backup=backup_proof)
                     print(f"{manifest.transaction_id}: verified SQLite backup retained at {backup}", flush=True)
                     phase = "migration_started"
