@@ -4055,9 +4055,10 @@ async fn inspect_worktree_at_until(
         return Err("captured worktree administrative incarnation changed".to_string());
     }
     let status_path = path.clone();
-    let output = tokio::task::spawn_blocking(move || run_bounded_git_status_until(&status_path, deadline))
-        .await
-        .map_err(|error| error.to_string())??;
+    let output =
+        tokio::task::spawn_blocking(move || run_bounded_git_status_until(&status_path, deadline))
+            .await
+            .map_err(|error| error.to_string())??;
     if !output.status.success() {
         return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
     }
@@ -4085,7 +4086,8 @@ async fn inspect_worktree_at_until(
     .await
     .map_err(|error| error.to_string())??;
     observation.extend_from_slice(&content_observation);
-    observe_detached_head_and_submodules_until(&path, &mut observation, &mut losses, deadline).await?;
+    observe_detached_head_and_submodules_until(&path, &mut observation, &mut losses, deadline)
+        .await?;
     let snapshot = snapshot_for(&observation);
     if std::time::Instant::now() >= deadline {
         return Err("worktree inspection exceeded its deadline".to_string());
@@ -4103,51 +4105,56 @@ async fn observe_detached_head_and_submodules_until(
         return Err("detached head inspection exceeded its deadline".to_string());
     }
     let path = path.to_path_buf();
-    let observed = tokio::task::spawn_blocking(move || -> Result<(WorktreeObservation, Vec<Vec<u8>>), String> {
-        if std::time::Instant::now() >= deadline {
-            return Err("detached head inspection exceeded its deadline".to_string());
-        }
-        let mut visited = std::collections::HashSet::new();
-        visited.insert(path.canonicalize().map_err(|error| error.to_string())?);
-        let symbolic = run_bounded_git_command_until(
-            &path,
-            &["symbolic-ref", "-q", "HEAD"],
-            None,
-            deadline,
-            "detached head inspection",
-        )?;
-        let mut result = Vec::new();
-        let mut detached_head = None;
-        if symbolic.status.success() {
-            result.push((b"HEAD_SYMBOLIC".to_vec(), symbolic.stdout.trim_ascii().to_vec()));
-        } else {
-            let head = run_bounded_git_command_until(
+    let observed = tokio::task::spawn_blocking(
+        move || -> Result<(WorktreeObservation, Vec<Vec<u8>>), String> {
+            if std::time::Instant::now() >= deadline {
+                return Err("detached head inspection exceeded its deadline".to_string());
+            }
+            let mut visited = std::collections::HashSet::new();
+            visited.insert(path.canonicalize().map_err(|error| error.to_string())?);
+            let symbolic = run_bounded_git_command_until(
                 &path,
-                &["rev-parse", "--verify", "HEAD"],
+                &["symbolic-ref", "-q", "HEAD"],
                 None,
                 deadline,
                 "detached head inspection",
             )?;
-            if !head.status.success() {
-                return Err(String::from_utf8_lossy(&head.stderr).trim().to_string());
+            let mut result = Vec::new();
+            let mut detached_head = None;
+            if symbolic.status.success() {
+                result.push((
+                    b"HEAD_SYMBOLIC".to_vec(),
+                    symbolic.stdout.trim_ascii().to_vec(),
+                ));
+            } else {
+                let head = run_bounded_git_command_until(
+                    &path,
+                    &["rev-parse", "--verify", "HEAD"],
+                    None,
+                    deadline,
+                    "detached head inspection",
+                )?;
+                if !head.status.success() {
+                    return Err(String::from_utf8_lossy(&head.stderr).trim().to_string());
+                }
+                let head_oid = head.stdout.trim_ascii().to_vec();
+                result.push((b"HEAD".to_vec(), head_oid.clone()));
+                let evidence = detached_reachability_evidence_until(&path, &head_oid, deadline)?;
+                result.push((b"DETACHED".to_vec(), evidence.clone()));
+                detached_head = evidence.is_empty().then_some(head_oid);
             }
-            let head_oid = head.stdout.trim_ascii().to_vec();
-            result.push((b"HEAD".to_vec(), head_oid.clone()));
-            let evidence = detached_reachability_evidence_until(&path, &head_oid, deadline)?;
-            result.push((b"DETACHED".to_vec(), evidence.clone()));
-            detached_head = evidence.is_empty().then_some(head_oid);
-        }
-        observe_initialized_submodules(&path, &[], &mut result, deadline, &mut visited)?;
-        let unreachable = if let Some(head_oid) = detached_head {
-            detached_unreachable_commits_until(&path, &head_oid, deadline)?
-        } else {
-            Vec::new()
-        };
-        if std::time::Instant::now() >= deadline {
-            return Err("detached head inspection exceeded its deadline".to_string());
-        }
-        Ok((result, unreachable))
-    })
+            observe_initialized_submodules(&path, &[], &mut result, deadline, &mut visited)?;
+            let unreachable = if let Some(head_oid) = detached_head {
+                detached_unreachable_commits_until(&path, &head_oid, deadline)?
+            } else {
+                Vec::new()
+            };
+            if std::time::Instant::now() >= deadline {
+                return Err("detached head inspection exceeded its deadline".to_string());
+            }
+            Ok((result, unreachable))
+        },
+    )
     .await
     .map_err(|error| error.to_string())??;
     let (observed, unreachable) = observed;
@@ -4331,7 +4338,9 @@ fn detached_reachability_evidence_until(
         "detached reachability evidence",
     )?;
     if !reachable.status.success() {
-        return Err(String::from_utf8_lossy(&reachable.stderr).trim().to_string());
+        return Err(String::from_utf8_lossy(&reachable.stderr)
+            .trim()
+            .to_string());
     }
     if !reachable.stdout.is_empty() {
         return Ok(reachable.stdout);
@@ -4912,12 +4921,8 @@ fn observe_initialized_submodules(
             ]
             .concat(),
         ));
-        let detached_loss = detached_head_is_unreachable(
-            &submodule_path,
-            observation,
-            &relative_path,
-            deadline,
-        )?;
+        let detached_loss =
+            detached_head_is_unreachable(&submodule_path, observation, &relative_path, deadline)?;
         let gitlink_changed = gitlink.stage_zero_oid.as_deref() != Some(submodule_head_oid);
         if gitlink_changed || gitlink.has_unmerged_stage {
             observation.push((
@@ -4930,11 +4935,9 @@ fn observe_initialized_submodules(
             ));
         }
         if detached_loss {
-            for oid in detached_unreachable_commits_until(
-                &submodule_path,
-                submodule_head_oid,
-                deadline,
-            )? {
+            for oid in
+                detached_unreachable_commits_until(&submodule_path, submodule_head_oid, deadline)?
+            {
                 observation.push((
                     [b"SUBMODULE_LOSS\0detached\0".as_slice(), oid.as_slice()].concat(),
                     Vec::new(),
@@ -8664,8 +8667,7 @@ mod tests {
         remove_quarantine_then_administrative_dir,
         remove_quarantine_then_administrative_dir_with_hooks, rotate_inspection_generation,
         run_bounded_git_status_until, snapshot_for, staged_index_entries_by_path,
-        staged_index_entries_for_paths_until,
-        worktree_quarantine_path, CloseLeaseFailure,
+        staged_index_entries_for_paths_until, worktree_quarantine_path, CloseLeaseFailure,
         ExactWorktreeRemoval, FinalTombstoneRecovery,
     };
     use crate::db::{CloseCleanupResourceDisposition, CloseWorktreeFinalTombstone};
@@ -12084,7 +12086,10 @@ mod tests {
         .unwrap();
 
         assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
-        assert_eq!(std::fs::read(external.join("sentinel")).unwrap(), b"preserve\n");
+        assert_eq!(
+            std::fs::read(external.join("sentinel")).unwrap(),
+            b"preserve\n"
+        );
     }
 
     #[cfg(unix)]
@@ -12387,9 +12392,13 @@ mod tests {
             command,
             std::time::Instant::now(),
             "expired initial Close probe",
-        ).unwrap_err();
+        )
+        .unwrap_err();
         assert_eq!(error, "expired initial Close probe exceeded its deadline");
-        assert!(!marker.exists(), "expired budget cannot admit a subprocess effect");
+        assert!(
+            !marker.exists(),
+            "expired budget cannot admit a subprocess effect"
+        );
     }
 
     #[cfg(unix)]
@@ -12416,22 +12425,24 @@ mod tests {
         let status = child.wait().unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_millis(300);
 
-        let error = super::wait_bounded_child_output(child, deadline, "pipe retention probe")
-            .unwrap_err();
+        let error =
+            super::wait_bounded_child_output(child, deadline, "pipe retention probe").unwrap_err();
 
         assert_eq!(error, "pipe retention probe exceeded its deadline");
         assert!(status.success());
-        assert!(marker.exists(), "fixture handshake confirms descendant launch");
+        assert!(
+            marker.exists(),
+            "fixture handshake confirms descendant launch"
+        );
     }
 
     #[test]
     fn expired_original_fsmonitor_deadline_refuses_before_repository_access() {
         let temp = tempfile::tempdir().unwrap();
         let nonexistent = temp.path().join("not-a-repository");
-        let error = super::stop_bound_fsmonitor_daemons_until(
-            &nonexistent,
-            std::time::Instant::now(),
-        ).unwrap_err();
+        let error =
+            super::stop_bound_fsmonitor_daemons_until(&nonexistent, std::time::Instant::now())
+                .unwrap_err();
         assert_eq!(error, "submodule fsmonitor shutdown exceeded its deadline");
         assert!(!nonexistent.exists());
     }
@@ -12440,11 +12451,9 @@ mod tests {
     fn expired_hidden_worktree_deadline_refuses_before_repository_access() {
         let temp = tempfile::tempdir().unwrap();
         let nonexistent = temp.path().join("not-a-repository");
-        let error = super::observe_hidden_worktree_changes_until(
-            &nonexistent,
-            std::time::Instant::now(),
-        )
-        .unwrap_err();
+        let error =
+            super::observe_hidden_worktree_changes_until(&nonexistent, std::time::Instant::now())
+                .unwrap_err();
         assert_eq!(error, "hidden worktree inspection exceeded its deadline");
         assert!(!nonexistent.exists());
     }
@@ -12470,12 +12479,9 @@ mod tests {
         let losses = [CloseLossItem::UnstagedTrackedPath(
             GitPathIdentity::from_bytes(b"tracked".to_vec()),
         )];
-        let error = super::observe_dirty_content_until(
-            &nonexistent,
-            &losses,
-            std::time::Instant::now(),
-        )
-        .unwrap_err();
+        let error =
+            super::observe_dirty_content_until(&nonexistent, &losses, std::time::Instant::now())
+                .unwrap_err();
         assert_eq!(error, "dirty content inspection exceeded its deadline");
         assert!(!nonexistent.exists());
     }
@@ -12484,11 +12490,8 @@ mod tests {
     fn expired_ignored_content_deadline_refuses_before_repository_access() {
         let temp = tempfile::tempdir().unwrap();
         let nonexistent = temp.path().join("not-a-repository");
-        let error = super::ensure_no_ignored_content_until(
-            &nonexistent,
-            std::time::Instant::now(),
-        )
-        .unwrap_err();
+        let error = super::ensure_no_ignored_content_until(&nonexistent, std::time::Instant::now())
+            .unwrap_err();
         assert_eq!(error, "ignored-content inspection exceeded its deadline");
         assert!(!nonexistent.exists());
     }
@@ -13503,7 +13506,10 @@ mod tests {
         )
         .unwrap_err();
 
-        assert_eq!(error, "sparse-checkout rule inspection exceeded its deadline");
+        assert_eq!(
+            error,
+            "sparse-checkout rule inspection exceeded its deadline"
+        );
     }
 
     #[tokio::test]

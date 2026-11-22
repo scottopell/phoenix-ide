@@ -935,5 +935,5 @@ async fn registered_creation_receipt_retention_preserves_jobs_and_children_atomi
             target.id.clone()
         )
     );
-    assert_eq!(run_pending_migrations(&pool).await.unwrap(), 0);
+    assert_eq!(run_through_for_test(&pool, 147).await.unwrap(), 0);
 }
