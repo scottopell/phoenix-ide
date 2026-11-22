@@ -555,8 +555,11 @@ mod tests {
         use super::super::*;
         use proptest::prelude::*;
 
-        /// Subset of the `git check-ref-format --branch` rules relevant to names
-        /// of the shape `task-...`.
+        /// Hand-written subset of the `git check-ref-format --branch` rules
+        /// relevant to names of the shape `task-...`. It is not checked against
+        /// a real git in tests (no subprocesses), so a rule git enforces that is
+        /// missing here would go unnoticed; extend it if git rejects a branch
+        /// this accepts.
         #[allow(clippy::case_sensitive_file_extension_comparisons)]
         fn is_valid_branch(name: &str) -> bool {
             !name.is_empty()
