@@ -433,14 +433,27 @@ impl NativeCloseInitialContinuation {
         .is_ok_and(|command| command == self.command)
     }
 
+    /// Settle only the response observer. Revocation does not release the
+    /// admitted owner, target gate, or independently supervised physical work.
+    fn settle_source_refused(&mut self) {
+        if let Some(response) = self._response.take() {
+            let _ = response.send(Err(NativeCloseApplicationError::SourceRefused));
+        }
+    }
+
     pub(super) fn abort_inspection_if_source_revoked(
         &mut self,
         live_source: &phoenix_core::domain::sm_state::ConvState,
     ) {
-        if (self.collecting_inspection()
+        if self.live_source_matches(live_source) {
+            return;
+        }
+        // Also refuse a revoked observer between phase workers, before exact
+        // durable-terminal observation can settle it as an admission success.
+        self.settle_source_refused();
+        if self.collecting_inspection()
             || matches!(self.inventory, InventoryCapture::Preparing(_))
-            || self.process_retirement.is_some())
-            && !self.live_source_matches(live_source)
+            || self.process_retirement.is_some()
         {
             if let Some(handle) = self.inspection.take() {
                 handle.abort();
@@ -462,6 +475,7 @@ impl NativeCloseInitialContinuation {
     ) -> Result<NativeCloseInitialContinuationPhase, NativeCloseApplicationError> {
         if !self.live_source_matches(live_source) {
             self.phase = NativeCloseInitialContinuationPhase::InspectionRequired;
+            self.settle_source_refused();
             return Err(NativeCloseApplicationError::SourceRefused);
         }
         if self.post_retirement.is_none() {
@@ -623,6 +637,7 @@ impl NativeCloseInitialContinuation {
             ) => {
                 if !self.live_source_matches(live_source) {
                     self.phase = Phase::InspectionRequired;
+                    self.settle_source_refused();
                     return Err(NativeCloseApplicationError::SourceRefused);
                 }
                 let obligation = match self
@@ -686,6 +701,7 @@ impl NativeCloseInitialContinuation {
                     self.abort_inspection_if_source_revoked(live_source);
                     self.abort_and_join_inventory_preparation().await;
                     self.phase = Phase::InspectionRequired;
+                    self.settle_source_refused();
                     return Err(NativeCloseApplicationError::SourceRefused);
                 }
                 match &self.inventory {
@@ -759,6 +775,7 @@ impl NativeCloseInitialContinuation {
             ) => {
                 if !self.live_source_matches(live_source) {
                     self.phase = Phase::InspectionRequired;
+                    self.settle_source_refused();
                     return Err(NativeCloseApplicationError::SourceRefused);
                 }
                 let db = self.db.clone();
@@ -772,6 +789,7 @@ impl NativeCloseInitialContinuation {
             Phase::CollectingInspection => {
                 if !self.live_source_matches(live_source) {
                     self.abort_inspection_if_source_revoked(live_source);
+                    self.settle_source_refused();
                     return Err(NativeCloseApplicationError::SourceRefused);
                 }
                 if !self

@@ -264,6 +264,9 @@ async fn bash_stage_two_stop_ack_reaches_real_second_writer_and_cleans_once() {
         !close_output.is_success(),
         "Stop ACK revokes this Close source"
     );
+    let close_error: serde_json::Value = serde_json::from_str(close_output.output())
+        .expect("public Close refusal is structured JSON");
+    assert_eq!(close_error["code"], "source_refused");
 
     assert_eq!(
         backend.bash_handles().snapshot_live_pgids().await,

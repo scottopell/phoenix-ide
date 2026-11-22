@@ -270,7 +270,9 @@ async fn assert_unknown_release_custody(drop_close_before_second_writer: bool) {
     let input = serde_json::json!({
         "action":"initial", "product_conversation_id":fixture.target.as_str()
     });
-    let mut close = Some(tokio::spawn(async move { close_tool.run(input, close_ctx).await }));
+    let mut close = Some(tokio::spawn(async move {
+        close_tool.run(input, close_ctx).await
+    }));
 
     let (eligible, custody) = tokio::time::timeout(std::time::Duration::from_secs(60), reached_rx)
         .await
@@ -308,10 +310,16 @@ async fn assert_unknown_release_custody(drop_close_before_second_writer: bool) {
     let callback = tokio::time::timeout(std::time::Duration::from_secs(10), callback_rx).await;
     teardown.wait_for_worker().await;
     if let Some((cancelled, released, attempts, actor_finished)) = observer_drop_observations {
-        assert!(cancelled, "public observer was cancelled before resuming stage two");
+        assert!(
+            cancelled,
+            "public observer was cancelled before resuming stage two"
+        );
         assert!(!released, "second writer had not returned at observer drop");
         assert_eq!(attempts, 0, "second callback had not run at observer drop");
-        assert!(!actor_finished, "source actor remained alive at the stage-two barrier");
+        assert!(
+            !actor_finished,
+            "source actor remained alive at the stage-two barrier"
+        );
     }
     assert!(
         stats.actual_confirmed_release.load(Ordering::SeqCst),

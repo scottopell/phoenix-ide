@@ -493,7 +493,7 @@ async fn direct_new_initial_returns_continuation_owning_reply_gate_and_owner() {
             response,
         )
         .await;
-    let continuation = match admission {
+    let mut continuation = match admission {
         Ok(native_close::NativeCloseInitialAdmission::Continued {
             result: NativeCloseInitialResult::NewlyAdmitted(receipt),
             continuation,
@@ -515,6 +515,36 @@ async fn direct_new_initial_returns_continuation_owning_reply_gate_and_owner() {
         reply.try_recv(),
         Err(oneshot::error::TryRecvError::Empty)
     ));
+    assert_eq!(count(&fixture.db, "native_close_initial_receipts").await, 1);
+    assert_eq!(count(&fixture.db, "close_runs").await, 1);
+
+    // A response classification is not durable authority release. Exercise
+    // revocation between phase workers, without fabricating a SQLite Stop.
+    continuation.abort_inspection_if_source_revoked(&fixture.state);
+    assert!(matches!(
+        reply.try_recv(),
+        Err(oneshot::error::TryRecvError::Empty)
+    ));
+    continuation.abort_inspection_if_source_revoked(&ConvState::Idle);
+    assert_eq!(
+        reply.try_recv().unwrap(),
+        Err(NativeCloseApplicationError::SourceRefused)
+    );
+    assert!(matches!(
+        reply.try_recv(),
+        Err(oneshot::error::TryRecvError::Closed)
+    ));
+    drop(reply);
+    continuation.abort_inspection_if_source_revoked(&ConvState::Idle);
+    assert!(!continuation.release_if_exactly_terminal().await);
+    assert_eq!(
+        continuation.phase,
+        native_close::NativeCloseInitialContinuationPhase::Prepare
+    );
+    assert!(continuation.authority.owner.is_some());
+    assert_eq!(fence.owner_count(), 1);
+    assert!(!fence.fatal_authority_loss_is_latched());
+    assert!(Arc::clone(&gate).try_lock_owned().is_err());
     assert_eq!(count(&fixture.db, "native_close_initial_receipts").await, 1);
     assert_eq!(count(&fixture.db, "close_runs").await, 1);
 
