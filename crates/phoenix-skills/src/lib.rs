@@ -705,33 +705,71 @@ fn strip_frontmatter(content: &str) -> String {
 }
 
 /// Substitute argument placeholders in the skill body.
-/// Order: `$ARGUMENTS[N]` and `$N` first (to prevent `$ARGUMENTS` from
-/// corrupting them), then `$ARGUMENTS`. If no placeholder exists, append
-/// arguments.
+///
+/// When the body contains `$ARGUMENTS`, one left-to-right pass replaces each
+/// `$ARGUMENTS[N]` and `$N` (all consecutive digits) with the Nth
+/// whitespace-delimited argument and each bare `$ARGUMENTS` with the full
+/// argument string. Inserted text is never rescanned, so placeholder-shaped
+/// text inside the arguments reaches the model verbatim. A positional
+/// placeholder with no matching argument is left as written. If no
+/// `$ARGUMENTS` placeholder exists, the arguments are appended.
 fn substitute_arguments(body: &str, arguments: &str) -> String {
     if arguments.is_empty() {
         return body.to_string();
     }
-
-    if body.contains("$ARGUMENTS") {
-        let tokens: Vec<&str> = arguments.split_whitespace().collect();
-        let mut result = body.to_string();
-
-        // Positional first (prevents $ARGUMENTS from corrupting $ARGUMENTS[N])
-        for (i, token) in tokens.iter().enumerate() {
-            let n = i + 1;
-            result = result
-                .replace(&format!("$ARGUMENTS[{n}]"), token)
-                .replace(&format!("${n}"), token);
-        }
-
-        // Then the full $ARGUMENTS
-        result = result.replace("$ARGUMENTS", arguments);
-
-        result
-    } else {
-        format!("{body}\nARGUMENTS: {arguments}")
+    if !body.contains("$ARGUMENTS") {
+        return format!("{body}\nARGUMENTS: {arguments}");
     }
+
+    let tokens: Vec<&str> = arguments.split_whitespace().collect();
+    let positional = |digits: &str| -> Option<&str> {
+        let n: usize = digits.parse().ok()?;
+        n.checked_sub(1).and_then(|i| tokens.get(i).copied())
+    };
+
+    let mut out = String::with_capacity(body.len() + arguments.len());
+    let mut rest = body;
+    while let Some(dollar) = rest.find('$') {
+        let (literal, from_dollar) = rest.split_at(dollar);
+        out.push_str(literal);
+        let after = from_dollar.get(1..).unwrap_or_default();
+        if let Some(after_name) = after.strip_prefix("ARGUMENTS") {
+            let indexed = after_name
+                .strip_prefix('[')
+                .and_then(|index_and_rest| index_and_rest.split_once(']'))
+                .and_then(|(digits, tail)| Some((positional_digits(digits)?, tail)));
+            if let Some((digits, tail)) = indexed {
+                if let Some(token) = positional(digits) {
+                    out.push_str(token);
+                } else {
+                    out.push_str("$ARGUMENTS[");
+                    out.push_str(digits);
+                    out.push(']');
+                }
+                rest = tail;
+                continue;
+            }
+            out.push_str(arguments);
+            rest = after_name;
+            continue;
+        }
+        let digit_len = after.bytes().take_while(u8::is_ascii_digit).count();
+        let (digits, tail) = after.split_at(digit_len);
+        if let Some(token) = positional_digits(digits).and_then(positional) {
+            out.push_str(token);
+            rest = tail;
+        } else {
+            out.push('$');
+            rest = after;
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// `digits` when it is a non-empty run of ASCII digits.
+fn positional_digits(digits: &str) -> Option<&str> {
+    (!digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())).then_some(digits)
 }
 
 #[cfg(test)]
@@ -1667,5 +1705,84 @@ mod tests {
         let result =
             invoke_skill("simple", "extra args", SkillAudience::Conversation, &skills).unwrap();
         assert!(result.body.contains("ARGUMENTS: extra args"));
+    }
+}
+
+#[cfg(test)]
+mod substitute_arguments_tests {
+    use super::substitute_arguments;
+    use proptest::prelude::*;
+
+    #[test]
+    fn multi_digit_positional_selects_its_own_token() {
+        let args = "a b c d e f g h i j";
+        assert_eq!(
+            substitute_arguments("tenth=$10 first=$1 $ARGUMENTS[10] $ARGUMENTS", args),
+            format!("tenth=j first=a j {args}")
+        );
+    }
+
+    #[test]
+    fn placeholder_text_inside_arguments_is_not_rescanned() {
+        assert_eq!(
+            substitute_arguments("target=$1 env=$2 all=$ARGUMENTS", "price=$2 prod"),
+            "target=price=$2 env=prod all=price=$2 prod"
+        );
+        assert_eq!(
+            substitute_arguments("q=$1 (full: $ARGUMENTS)", "explain-$ARGUMENTS-usage x"),
+            "q=explain-$ARGUMENTS-usage (full: explain-$ARGUMENTS-usage x)"
+        );
+    }
+
+    #[test]
+    fn unmatched_positionals_and_bare_dollars_stay_literal() {
+        assert_eq!(
+            substitute_arguments(
+                "Budget is $100, $ alone, $ARGUMENTS[9]. Do: $ARGUMENTS",
+                "ship it"
+            ),
+            "Budget is $100, $ alone, $ARGUMENTS[9]. Do: ship it"
+        );
+        assert_eq!(substitute_arguments("$0 $ARGUMENTS$", "x"), "$0 x$");
+    }
+
+    proptest! {
+        // Arguments drawn from placeholder-heavy text are delivered verbatim
+        // wherever the body asks for them.
+        #[test]
+        fn arguments_survive_verbatim(
+            args in "[a-z$0-9\\[\\] ]{0,8}(\\$ARGUMENTS|\\$1|\\$2)?[a-z ]{0,8}",
+            prefix in "[a-z .]{0,12}",
+        ) {
+            prop_assume!(!args.is_empty());
+            let body = format!("{prefix}<<$ARGUMENTS>>");
+            let out = substitute_arguments(&body, &args);
+            let expected = format!("{prefix}<<{args}>>");
+            prop_assert_eq!(out, expected);
+        }
+
+        #[test]
+        fn positional_tokens_survive_verbatim(
+            tokens in proptest::collection::vec("[a-z$0-9]{1,6}", 1..12),
+        ) {
+            let args = tokens.join(" ");
+            let body: String = (1..=tokens.len())
+                .map(|n| format!("[${n}]"))
+                .chain(std::iter::once("$ARGUMENTS".to_string()))
+                .collect();
+            let expected: String = tokens
+                .iter()
+                .map(|t| format!("[{t}]"))
+                .chain(std::iter::once(args.clone()))
+                .collect();
+            prop_assert_eq!(substitute_arguments(&body, &args), expected);
+        }
+
+        // Bodies without `$ARGUMENTS` are never rewritten, only appended to.
+        #[test]
+        fn bodies_without_marker_are_preserved(body in "[a-z$0-9 \\n]{0,40}", args in "[a-z]{1,8}") {
+            prop_assume!(!body.contains("$ARGUMENTS"));
+            prop_assert_eq!(substitute_arguments(&body, &args), format!("{body}\nARGUMENTS: {args}"));
+        }
     }
 }
