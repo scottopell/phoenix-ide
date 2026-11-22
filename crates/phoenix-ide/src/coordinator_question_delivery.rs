@@ -3,18 +3,17 @@
 //! The reply is stored first and delivered to the current Coordinator
 //! transcript by a retrying pass, so an answer given while the Coordinator is
 //! busy, between transcripts, or before restart is never lost. The question's
-//! request id doubles as the message id, so a repeated pass cannot duplicate it.
+//! request id is the message id.
 
 use std::collections::HashMap;
-use std::sync::Arc;
 
 use phoenix_core::domain::db_schema::InputOrigin;
 use phoenix_core::domain::sm_state::{render_question_answers, QuestionAnnotation, UserQuestion};
 
-use crate::runtime::RuntimeManager;
-use crate::send_chat_service::{
-    MessageExpansionPolicy, SendChatApplicationService, SendChatOutcome, SendChatRequest,
-};
+use phoenix_db::UndeliveredCoordinatorQuestionReply;
+
+use crate::coordinator_delivery::CoordinatorSender;
+use crate::send_chat_service::SendChatOutcome;
 
 /// The Coordinator-facing text for an answered question.
 pub(crate) fn answer_reply(
@@ -36,61 +35,26 @@ pub(crate) fn dismissal_reply(request_id: &str) -> String {
     )
 }
 
-/// Deliver stored replies to the current Coordinator transcript.
-pub(crate) async fn deliver_pass(runtime: &Arc<RuntimeManager>) {
-    let db = runtime.db();
-    let replies = match db.undelivered_coordinator_question_replies(16).await {
-        Ok(replies) => replies,
-        Err(error) => {
-            tracing::warn!(%error, "coordinator question reply discovery failed; retrying");
-            return;
-        }
-    };
-    if replies.is_empty() {
-        return;
-    }
-    let target = match db.coordinator_watch_target().await {
-        Ok(Some(target)) => target,
-        Ok(None) => {
-            tracing::debug!("coordinator question replies awaiting coordinator transcript");
-            return;
-        }
-        Err(error) => {
-            tracing::warn!(%error, "coordinator question reply target lookup failed; retrying");
-            return;
-        }
-    };
-    let service = SendChatApplicationService::new(db.clone(), runtime.clone());
+/// Send stored replies to the current Coordinator transcript.
+pub(crate) async fn deliver(
+    sender: &CoordinatorSender,
+    replies: Vec<UndeliveredCoordinatorQuestionReply>,
+) {
     for reply in replies {
-        let request = SendChatRequest {
-            conversation_id: target.clone(),
-            origin: InputOrigin::UserApi,
-            text: reply.reply,
-            message_id: reply.request_id.clone(),
-            images: Vec::new(),
-            files: Vec::new(),
-            user_agent: None,
-            expansion_policy: MessageExpansionPolicy::LiteralText,
-        };
-        match service.send(request).await {
-            Ok(
-                SendChatOutcome::Delivered
-                | SendChatOutcome::AlreadyPersisted
-                | SendChatOutcome::QueuedAsSteering,
-            ) => {
-                let now = chrono::Utc::now().timestamp_micros();
-                if let Err(error) = db
-                    .mark_coordinator_question_reply_delivered(&reply.request_id, now)
-                    .await
-                {
-                    tracing::warn!(request_id = %reply.request_id, %error, "coordinator question reply delivered but not marked; the next pass is idempotent");
-                }
+        let request_id = reply.request_id;
+        match sender
+            .send(InputOrigin::UserApi, reply.reply, request_id.clone())
+            .await
+        {
+            Ok(SendChatOutcome::Delivered | SendChatOutcome::QueuedAsSteering) => {}
+            Ok(SendChatOutcome::AlreadyPersisted) => {
+                tracing::warn!(%request_id, "coordinator transcript already holds this message id without recording the reply delivered");
             }
             Ok(SendChatOutcome::Rejected { message, code }) => {
-                tracing::warn!(request_id = %reply.request_id, code, %message, "coordinator question reply not accepted; retrying");
+                tracing::warn!(%request_id, code, %message, "coordinator question reply not accepted; retrying");
             }
             Err(error) => {
-                tracing::warn!(request_id = %reply.request_id, %error, "coordinator question reply delivery failed; retrying");
+                tracing::warn!(%request_id, %error, "coordinator question reply delivery failed; retrying");
             }
         }
     }

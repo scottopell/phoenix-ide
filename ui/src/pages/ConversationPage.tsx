@@ -45,6 +45,7 @@ import { MessageListSkeleton } from '../components/Skeleton';
 import { FileBrowserOverlay, useFileExplorer } from '../components/FileExplorer';
 import { PaneDivider } from '../components/PaneDivider';
 import { QuestionPanel } from '../components/QuestionPanel';
+import { blockingQuestionActions } from '../components/questionPanelActions';
 import {
   useMessageQueue,
   useConnection,
@@ -2654,10 +2655,7 @@ function ConversationPageContent({
         <QuestionPanel
           key={convStateForChildren.request_id ?? 'legacy-question'}
           questions={convStateForChildren.questions}
-          conversationId={conversation.id}
-          {...(convStateForChildren.request_id === undefined
-            ? {}
-            : { requestId: convStateForChildren.request_id })}
+          actions={blockingQuestionActions(conversation.id, convStateForChildren.request_id)}
           showToast={showInfo}
           readOnly={readOnly || isArchived}
           onAnswered={() => dispatch({ type: 'local_phase_change', phase: { type: 'llm_requesting', attempt: 1 }, expectedConversationId: conversation.id })}

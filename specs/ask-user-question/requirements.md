@@ -197,8 +197,12 @@ coordinating
 AND its prompt SHALL direct it not to act on what the question asks until the
 reply arrives.
 
+A question SHALL belong to the Coordinator's stable conversation identity, not
+to the transcript that asked it.
+
 THE question SHALL stay open until the user answers or dismisses it or the
-Coordinator withdraws it, across Coordinator turns, continuations and restarts.
+Coordinator withdraws it, across Coordinator turns, continuations, restarts and
+deletion of the transcript that asked it.
 
 Ordinary conversations SHALL keep the blocking question tool unchanged.
 
@@ -223,16 +227,26 @@ THE Ember entry SHALL show how many questions wait for the user.
 WHEN a Coordinator question opens while the app is running
 THE SYSTEM SHALL raise one question notification for it, under the user's
 question-notification setting. Questions already open when the app loads SHALL
-NOT be announced again.
+NOT be announced again. Activating the notification SHALL open Ember's page on
+its current transcript. No notification SHALL be raised while Ember's page is
+visible and focused, whichever Ember transcript it shows.
 
 WHEN the user answers or dismisses a Coordinator question
 THE SYSTEM SHALL accept only the first reply, refusing later ones as stale,
 AND SHALL deliver the reply to the current Coordinator transcript as a user
-message naming the request identity, exactly once, retrying until accepted
-even if the Coordinator is busy or between transcripts.
+message naming the request identity, retrying until accepted even if the
+Coordinator is busy or between transcripts.
+
+THE reply SHALL count as delivered in the same transaction in which a
+transcript of that Coordinator accepts it, directly or as queued steering, so
+no later Coordinator transcript receives it again. A reply accepted and then
+cancelled before the Coordinator reads it SHALL NOT be resent.
 
 **Rationale:** Answers are the user's words and must reach the Coordinator even
 when it is mid-turn; storing the reply before delivery means no answer is lost.
+Message-id deduplication is per transcript, so delivery must be recorded at
+acceptance rather than afterwards, or a continuation between the two steps
+would receive the reply a second time.
 
 ---
 

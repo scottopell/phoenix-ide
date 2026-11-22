@@ -84,6 +84,11 @@ export function closeNotificationsForConversation(conversationId: string): void 
   store.closeForConversation(conversationId);
 }
 
+/** Close notifications about Ember, which the user is now looking at. */
+export function closeCoordinatorNotifications(): void {
+  store.closeForCoordinatorPage();
+}
+
 export function loadNotificationSettings(): Promise<NotificationSettings> {
   return store.loadSettings();
 }

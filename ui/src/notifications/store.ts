@@ -12,9 +12,11 @@ import {
   type NotificationEnv,
   type NotificationPolicyEvent,
   type NotificationPolicyState,
+  type NotificationTarget,
   initialPolicyState,
   notificationPolicyReducer,
 } from './policy';
+import { isCoordinatorRoute } from '../components/desktopRouteReference';
 
 const coordinatorConversationIds = new Set<string>();
 let activeConversationSlugOverride: string | null = null;
@@ -27,8 +29,13 @@ export function registerCoordinatorNotificationTarget(conversationId: string): v
   coordinatorConversationIds.add(conversationId);
 }
 
+/**
+ * A `coordinator` target names Ember's stable ProductConversation, so it opens
+ * Ember's page on whichever transcript is current.
+ */
 export function notificationRoute(conversation: { id: string; slug?: string | null; kind?: 'ordinary' | 'coordinator' }): string {
-  return conversation.kind === 'coordinator' || coordinatorConversationIds.has(conversation.id)
+  if (conversation.kind === 'coordinator') return '/global';
+  return coordinatorConversationIds.has(conversation.id)
     ? `/global/${conversation.id}`
     : `/c/${conversation.slug ?? conversation.id}`;
 }
@@ -43,6 +50,18 @@ function currentActiveSlug(): string | null {
   if (typeof window === 'undefined') return null;
   const match = window.location.pathname.match(/^\/(?:c|global)\/([^/?#]+)/);
   return match?.[1] ? decodeURIComponent(match[1]) : null;
+}
+
+function onCoordinatorPage(): boolean {
+  return typeof window !== 'undefined' && isCoordinatorRoute(window.location.pathname);
+}
+
+/** Live notifications about Ember are filed under one key, whatever id they carry. */
+const COORDINATOR_PAGE = Symbol('coordinator page');
+type LiveKey = string | typeof COORDINATOR_PAGE;
+
+function liveKey(target: NotificationTarget): LiveKey {
+  return target.kind === 'coordinator' ? COORDINATOR_PAGE : target.id;
 }
 
 function errorMessage(err: unknown, fallback: string): string {
@@ -61,7 +80,7 @@ export class NotificationStore {
   private listeners = new Set<() => void>();
   // Live Notification instances retained per conversation id so they can be
   // closed when the conversation is acknowledged without a click.
-  private liveByConversationId = new Map<string, Map<string, Notification>>();
+  private liveByConversationId = new Map<LiveKey, Map<string, Notification>>();
   private loadPromise: Promise<NotificationSettings> | null = null;
   // Saves are sequenced so PUTs reach the server in user-edit order; the
   // reducer's `latestSaveId` separately guards which response wins locally.
@@ -86,6 +105,7 @@ export class NotificationStore {
       visible: hasDocument && document.visibilityState === 'visible',
       hasFocus: hasDocument && document.hasFocus(),
       activeSlug: currentActiveSlug(),
+      onCoordinatorPage: onCoordinatorPage(),
       isMonitored: monitoredConversationLookup,
     };
   }
@@ -131,10 +151,10 @@ export class NotificationStore {
       case 'show_browser_notification':
         try {
           const notification = new Notification(effect.title, { body: effect.body, tag: effect.tag });
-          this.rememberLive(effect.conversation.id, effect.tag, notification);
+          this.rememberLive(liveKey(effect.conversation), effect.tag, notification);
           notification.onclick = () => {
             window.focus();
-            this.closeForConversation(effect.conversation.id);
+            this.closeLive(liveKey(effect.conversation));
             window.dispatchEvent(
               new CustomEvent('phoenix:navigate-to-conversation', {
                 detail: { route: notificationRoute(effect.conversation) },
@@ -172,7 +192,7 @@ export class NotificationStore {
 
   // --- Live notification registry ---
 
-  private rememberLive(conversationId: string, tag: string, notification: Notification): void {
+  private rememberLive(conversationId: LiveKey, tag: string, notification: Notification): void {
     let byTag = this.liveByConversationId.get(conversationId);
     if (!byTag) {
       byTag = new Map<string, Notification>();
@@ -183,14 +203,14 @@ export class NotificationStore {
       previous.close();
       // previous.close() fires its onclose -> forgetLive, which removes the
       // now-empty per-conversation map. Re-attach it before storing the
-      // replacement so closeForConversation can still find it.
+      // replacement so closeLive can still find it.
       this.liveByConversationId.set(conversationId, byTag);
     }
     byTag.set(tag, notification);
     notification.onclose = () => this.forgetLive(conversationId, tag, notification);
   }
 
-  private forgetLive(conversationId: string, tag: string, notification: Notification): void {
+  private forgetLive(conversationId: LiveKey, tag: string, notification: Notification): void {
     const byTag = this.liveByConversationId.get(conversationId);
     if (!byTag || byTag.get(tag) !== notification) return;
     byTag.delete(tag);
@@ -198,6 +218,14 @@ export class NotificationStore {
   }
 
   closeForConversation(conversationId: string): void {
+    this.closeLive(conversationId);
+  }
+
+  closeForCoordinatorPage(): void {
+    this.closeLive(COORDINATOR_PAGE);
+  }
+
+  private closeLive(conversationId: LiveKey): void {
     const byTag = this.liveByConversationId.get(conversationId);
     if (!byTag) return;
     this.liveByConversationId.delete(conversationId);

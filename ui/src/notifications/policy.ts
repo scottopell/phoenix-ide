@@ -14,16 +14,26 @@ import type { ReminderNotification } from '../generated/ReminderNotification';
 import type { ReminderNotificationTarget } from '../generated/ReminderNotificationTarget';
 
 export type NotificationTarget = { id: string; slug: string | null; kind?: 'ordinary' | 'coordinator' };
+
+/**
+ * Snapshot feeds polled from the server. Each item has a stable id; an id is
+ * announced at most once, and ids present on the first snapshot are baseline.
+ */
+export type NotificationFeed = 'reminder' | 'coordinator_question';
+/** One item of a feed. */
+export type FeedKey = { kind: NotificationFeed; id: string };
+/** Ids already announced or baselined; null until the feed's first snapshot. */
+export type FeedSeenIds = Set<string> | null;
+
 export type NotificationDedupeKey =
   | { kind: 'attention'; key: string }
-  | { kind: 'reminder'; id: string }
-  | { kind: 'coordinator_question'; id: string }
+  | FeedKey
   | null;
 
 /** An open question Ember posted without stopping (REQ-AUQ-010). */
 export type CoordinatorQuestionNotification = {
   requestId: string;
-  coordinatorConversationId: string;
+  coordinatorProductConversationId: string;
   text: string;
 };
 
@@ -61,8 +71,10 @@ export type PolicyNotificationEvent = {
   type: Exclude<NotificationEventType, 'reminder_due' | 'coordinator_question'>;
   title: string;
   conversation: Conversation;
-} | { type: 'reminder_due'; title: string; conversation: ReminderNotificationTarget; reminderId: string; text: string }
-  | { type: 'coordinator_question'; title: string; conversation: NotificationTarget; requestId: string; text: string };
+} | { type: 'reminder_due'; title: string; conversation: ReminderNotificationTarget; feed: FeedKey & { kind: 'reminder' }; text: string }
+  | { type: 'coordinator_question'; title: string; conversation: NotificationTarget; feed: FeedKey & { kind: 'coordinator_question' }; text: string };
+
+type FeedNotificationEvent = Extract<PolicyNotificationEvent, { feed: FeedKey }>;
 
 export type NotificationPolicyState = {
   settingsStatus: SettingsStatus;
@@ -87,10 +99,7 @@ export type NotificationPolicyState = {
   // Last delivered blocking attention key per conversation, used to dedupe
   // live SSE delivery against list-refresh catch-up.
   attentionSeenByConversationId: Map<string, string>;
-  reminderFeedSeeded: boolean;
-  reminderSeenIds: Set<string>;
-  coordinatorQuestionFeedSeeded: boolean;
-  coordinatorQuestionSeenIds: Set<string>;
+  feeds: Record<NotificationFeed, FeedSeenIds>;
 };
 
 // Ambient browser facts the reducer needs to decide delivery. Supplied by
@@ -101,6 +110,8 @@ export type NotificationEnv = {
   visible: boolean;
   hasFocus: boolean;
   activeSlug: string | null;
+  /** True while Ember's page is showing, whichever transcript it shows. */
+  onCoordinatorPage: boolean;
   /** True for a conversation Ember monitors; absent means none are. */
   isMonitored?: (conversation: Conversation) => boolean;
 };
@@ -147,10 +158,7 @@ export function initialPolicyState(): NotificationPolicyState {
     permissionCuePending: false,
     busyStartedAtByConversationId: new Map(),
     attentionSeenByConversationId: new Map(),
-    reminderFeedSeeded: false,
-    reminderSeenIds: new Set(),
-    coordinatorQuestionFeedSeeded: false,
-    coordinatorQuestionSeenIds: new Set(),
+    feeds: { reminder: null, coordinator_question: null },
   };
 }
 
@@ -186,12 +194,19 @@ export function eventForState(state: ConversationState, conversation: Conversati
   }
 }
 
+function isFeedEvent(event: PolicyNotificationEvent): event is FeedNotificationEvent {
+  return 'feed' in event;
+}
+
+function withFeed(state: NotificationPolicyState, feed: NotificationFeed, seenIds: FeedSeenIds): NotificationPolicyState {
+  return { ...state, feeds: { ...state.feeds, [feed]: seenIds } };
+}
+
 // Unresolved blocking states collapse by conversation + event so live and
 // catch-up paths dedupe against each other. Completions get no key — each
 // completion is independently notification-worthy.
 export function attentionKeyFor(event: PolicyNotificationEvent): string | null {
-  if (event.type === 'agent_finished') return null;
-  if (event.type === 'reminder_due' || event.type === 'coordinator_question') return null;
+  if (event.type === 'agent_finished' || isFeedEvent(event)) return null;
   if (event.conversation.state?.type === 'recoverable_continuation_failure') {
     const state = event.conversation.state;
     return `${event.conversation.id}:${event.type}:${state.operation_id}:${state.attempt}`;
@@ -203,8 +218,7 @@ export function attentionKeyFor(event: PolicyNotificationEvent): string | null {
 // conversation is a distinct browser notification; blocking states collapse
 // by conversation + event.
 export function notificationTagFor(event: PolicyNotificationEvent): string {
-  if (event.type === 'reminder_due') return `reminder_due:${event.reminderId}`;
-  if (event.type === 'coordinator_question') return `coordinator_question:${event.requestId}`;
+  if (isFeedEvent(event)) return `${event.type}:${event.feed.id}`;
   if (event.type === 'agent_finished') {
     return `${event.type}:${event.conversation.id}:${event.conversation.updated_at}`;
   }
@@ -212,15 +226,14 @@ export function notificationTagFor(event: PolicyNotificationEvent): string {
 }
 
 function shouldSuppressForFocus(env: NotificationEnv, conversation: NotificationTarget): boolean {
-  return env.visible && env.hasFocus && env.activeSlug !== null && (env.activeSlug === conversation.slug || env.activeSlug === conversation.id);
+  if (!env.visible || !env.hasFocus) return false;
+  if (conversation.kind === 'coordinator') return env.onCoordinatorPage;
+  return env.activeSlug !== null && (env.activeSlug === conversation.slug || env.activeSlug === conversation.id);
 }
 
 function markAttentionSeen(state: NotificationPolicyState, event: PolicyNotificationEvent): NotificationPolicyState {
-  if (event.type === 'reminder_due') {
-    return { ...state, reminderSeenIds: new Set([...state.reminderSeenIds, event.reminderId]) };
-  }
-  if (event.type === 'coordinator_question') {
-    return { ...state, coordinatorQuestionSeenIds: new Set([...state.coordinatorQuestionSeenIds, event.requestId]) };
+  if (isFeedEvent(event)) {
+    return withFeed(state, event.feed.kind, new Set([...(state.feeds[event.feed.kind] ?? []), event.feed.id]));
   }
   const key = attentionKeyFor(event);
   if (!key) return state;
@@ -264,9 +277,23 @@ function notificationBody(event: PolicyNotificationEvent): string {
 }
 
 function notificationDedupeKey(event: PolicyNotificationEvent, attentionKey: string | null): NotificationDedupeKey {
-  if (event.type === 'reminder_due') return { kind: 'reminder', id: event.reminderId };
-  if (event.type === 'coordinator_question') return { kind: 'coordinator_question', id: event.requestId };
+  if (isFeedEvent(event)) return event.feed;
   return attentionKey === null ? null : { kind: 'attention', key: attentionKey };
+}
+
+function reduceFeed(state: NotificationPolicyState, env: NotificationEnv, feed: NotificationFeed, events: readonly FeedNotificationEvent[]): ReduceResult {
+  if (state.feeds[feed] === null) {
+    return { state: withFeed(state, feed, new Set(events.map((event) => event.feed.id))), effects: [] };
+  }
+  let next = state;
+  const effects: NotificationEffect[] = [];
+  for (const event of events) {
+    if (next.feeds[feed]?.has(event.feed.id)) continue;
+    const result = decideDelivery(next, env, event);
+    next = result.state;
+    effects.push(...result.effects);
+  }
+  return { state: next, effects };
 }
 
 // The shared delivery gate: master toggle, per-event toggle, focus
@@ -419,57 +446,34 @@ export function notificationPolicyReducer(
     case 'catchup_scan':
       return reduceCatchupScan(state, env, event.conversations);
 
-    case 'reminder_feed': {
-      const currentIds = new Set(event.items.map((item) => item.reminder.id));
-      if (!state.reminderFeedSeeded) {
-        return { state: { ...state, reminderFeedSeeded: true, reminderSeenIds: currentIds }, effects: [] };
-      }
-      let next = state;
-      const effects: NotificationEffect[] = [];
-      for (const item of event.items) {
-        if (next.reminderSeenIds.has(item.reminder.id)) continue;
-        const result = decideDelivery(next, env, { type: 'reminder_due', title: 'Reminder due', conversation: item.target, reminderId: item.reminder.id, text: item.reminder.text });
-        next = result.state;
-        effects.push(...result.effects);
-      }
-      return { state: next, effects };
-    }
+    case 'reminder_feed':
+      return reduceFeed(state, env, 'reminder', event.items.map((item) => ({
+        type: 'reminder_due',
+        title: 'Reminder due',
+        conversation: item.target,
+        feed: { kind: 'reminder', id: item.reminder.id },
+        text: item.reminder.text,
+      })));
 
-    case 'coordinator_question_feed': {
-      // Questions already open when the page loads are shown on Ember's page,
-      // not re-announced; only questions that appear afterwards notify.
-      const currentIds = new Set(event.items.map((item) => item.requestId));
-      if (!state.coordinatorQuestionFeedSeeded) {
-        return { state: { ...state, coordinatorQuestionFeedSeeded: true, coordinatorQuestionSeenIds: currentIds }, effects: [] };
-      }
-      let next = state;
-      const effects: NotificationEffect[] = [];
-      for (const item of event.items) {
-        if (next.coordinatorQuestionSeenIds.has(item.requestId)) continue;
-        const result = decideDelivery(next, env, {
-          type: 'coordinator_question',
-          title: 'Ember asked a question',
-          conversation: { id: item.coordinatorConversationId, slug: null, kind: 'coordinator' },
-          requestId: item.requestId,
-          text: item.text,
-        });
-        next = result.state;
-        effects.push(...result.effects);
-      }
-      return { state: next, effects };
-    }
+    // Questions already open when the page loads are shown on Ember's page,
+    // not re-announced; only questions that appear afterwards notify.
+    case 'coordinator_question_feed':
+      return reduceFeed(state, env, 'coordinator_question', event.items.map((item) => ({
+        type: 'coordinator_question',
+        title: 'Ember asked a question',
+        conversation: { id: item.coordinatorProductConversationId, slug: null, kind: 'coordinator' },
+        feed: { kind: 'coordinator_question', id: item.requestId },
+        text: item.text,
+      })));
 
     case 'notification_delivery_failed': {
       if (event.dedupeKey === null) return { state, effects: [] };
-      if (event.dedupeKey.kind === 'coordinator_question') {
-        const coordinatorQuestionSeenIds = new Set(state.coordinatorQuestionSeenIds);
-        coordinatorQuestionSeenIds.delete(event.dedupeKey.id);
-        return { state: { ...state, coordinatorQuestionSeenIds }, effects: [] };
-      }
-      if (event.dedupeKey.kind === 'reminder') {
-        const reminderSeenIds = new Set(state.reminderSeenIds);
-        reminderSeenIds.delete(event.dedupeKey.id);
-        return { state: { ...state, reminderSeenIds }, effects: [] };
+      if (event.dedupeKey.kind !== 'attention') {
+        const seen = state.feeds[event.dedupeKey.kind];
+        if (!seen) return { state, effects: [] };
+        const seenIds = new Set(seen);
+        seenIds.delete(event.dedupeKey.id);
+        return { state: withFeed(state, event.dedupeKey.kind, seenIds), effects: [] };
       }
       if (state.attentionSeenByConversationId.get(event.conversationId) !== event.dedupeKey.key) return { state, effects: [] };
       return { state: clearAttentionSeen(state, event.conversationId), effects: [] };
