@@ -1,7 +1,9 @@
 """Ordinary deploy failures stop for manual recovery without inspecting SQLite."""
+import contextlib
 import dataclasses
 import fcntl
 import importlib.util
+import io
 import json
 import os
 import plistlib
@@ -9,6 +11,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -18,6 +21,44 @@ SPEC = importlib.util.spec_from_file_location("simple_launchd_helper_test", ROOT
 helper = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = helper
 SPEC.loader.exec_module(helper)
+
+
+class ReleaseProofQualificationTests(unittest.TestCase):
+    def test_only_normal_success_counts_as_a_completed_proof_witness(self):
+        spec = importlib.util.spec_from_file_location(
+            "proof_qualification_harness", ROOT / "tests/integration/qualify_release_helper.py",
+        )
+        harness = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(harness)
+
+        class Witnesses(unittest.TestCase):
+            def test_pass(self):
+                pass
+
+            @unittest.skip("deliberately missing witness")
+            def test_skip(self):
+                self.fail()
+
+            @unittest.expectedFailure
+            def test_expected_failure(self):
+                self.fail()
+
+            def test_failure(self):
+                self.fail()
+
+            def test_subtest_failure(self):
+                with self.subTest(phase="proof"):
+                    self.fail()
+
+        suite = unittest.defaultTestLoader.loadTestsFromTestCase(Witnesses)
+        ids = set(harness.case_ids(suite))
+        result = unittest.TextTestRunner(
+            stream=io.StringIO(), resultclass=harness.ProofQualificationResult,
+        ).run(suite)
+        expected = {Witnesses("test_pass").id()}
+        self.assertEqual(result.successful_test_ids, expected)
+        self.assertEqual(len(ids), 5)
+        self.assertFalse(result.wasSuccessful())
 
 
 class FakeLaunchctl:
@@ -68,20 +109,35 @@ class SQLiteUriPathTests(unittest.TestCase):
         self.parent = self.root / "parent # ? % \x01"
         self.parent.mkdir()
         self.database = self.parent / "real # ? % \x02.sqlite"
-        with sqlite3.connect(self.database) as connection:
+        with contextlib.closing(sqlite3.connect(self.database)) as connection, connection:
             connection.execute("CREATE TABLE entries(value TEXT NOT NULL)")
             connection.executemany("INSERT INTO entries VALUES (?)", [("one",), ("two %?#",)])
         self.expected = [("one",), ("two %?#",)]
 
+    def test_database_size_connection_closes_after_success(self):
+        connection = mock.Mock()
+        connection.execute.return_value.fetchone.side_effect = [(3,), (4096,)]
+        with mock.patch.object(sqlite3, "connect", return_value=connection):
+            self.assertEqual(helper._database_size_bytes(str(self.database)), 3 * 4096)
+        connection.close.assert_called_once_with()
+
+    def test_database_size_connection_closes_after_sqlite_error(self):
+        connection = mock.Mock()
+        connection.execute.side_effect = sqlite3.OperationalError("database unavailable")
+        with mock.patch.object(sqlite3, "connect", return_value=connection):
+            with self.assertRaisesRegex(helper.ActivationError, "cannot inspect production database capacity"):
+                helper._database_size_bytes(str(self.database))
+        connection.close.assert_called_once_with()
+
     def test_capacity_and_verified_backup_use_actual_special_character_source(self):
         before = set(self.parent.iterdir())
-        with sqlite3.connect(self.database) as connection:
+        with contextlib.closing(sqlite3.connect(self.database)) as connection:
             expected_size = connection.execute("PRAGMA page_count").fetchone()[0] * connection.execute("PRAGMA page_size").fetchone()[0]
         self.assertEqual(helper._database_size_bytes(str(self.database)), expected_size)
         with mock.patch.object(helper.shutil, "disk_usage", return_value=type("Usage", (), {"free": 1 << 30})()):
             self.assertEqual(helper._preflight_backup_capacity(str(self.database), self.root), expected_size + 16 * 1024 * 1024)
         backup = helper.create_verified_database_backup(str(self.database), self.root)
-        with sqlite3.connect(backup) as connection:
+        with contextlib.closing(sqlite3.connect(backup)) as connection:
             self.assertEqual(connection.execute("SELECT value FROM entries ORDER BY rowid").fetchall(), self.expected)
         self.assertGreater(backup.stat().st_size, 0)
         self.assertEqual(set(self.parent.iterdir()), before)
@@ -90,10 +146,10 @@ class SQLiteUriPathTests(unittest.TestCase):
     def test_writer_guard_fences_real_special_character_database(self):
         before = set(self.parent.iterdir())
         with helper.sqlite_writer_guard(str(self.database), timeout=0.1):
-            with sqlite3.connect(self.database, timeout=0.05) as competitor:
+            with contextlib.closing(sqlite3.connect(self.database, timeout=0.05)) as competitor:
                 with self.assertRaisesRegex(sqlite3.OperationalError, "locked"):
                     competitor.execute("BEGIN IMMEDIATE")
-        with sqlite3.connect(self.database, timeout=0.05) as competitor:
+        with contextlib.closing(sqlite3.connect(self.database, timeout=0.05)) as competitor:
             competitor.execute("BEGIN IMMEDIATE")
             competitor.rollback()
         self.assertEqual(set(self.parent.iterdir()), before)
@@ -106,10 +162,155 @@ class SQLiteUriPathTests(unittest.TestCase):
         with self.assertRaises(sqlite3.OperationalError):
             with helper.sqlite_writer_guard(str(missing), timeout=0.05):
                 self.fail("missing source acquired a writer slot")
-        with self.assertRaises(sqlite3.OperationalError):
+        with self.assertRaises(helper.ActivationError):
             helper.create_verified_database_backup(str(missing), self.root)
         self.assertEqual(set(self.parent.iterdir()), before)
         self.assertEqual(set(self.root.iterdir()), {self.parent})
+
+
+class SQLiteLogicalEquivalenceTests(unittest.TestCase):
+    def compare(self, source_sql, backup_sql, *, expect_difference=False):
+        source = sqlite3.connect(":memory:")
+        backup = sqlite3.connect(":memory:")
+        self.addCleanup(source.close)
+        self.addCleanup(backup.close)
+        source.executescript(source_sql)
+        backup.executescript(backup_sql)
+        if expect_difference:
+            with self.assertRaises(helper.ActivationError):
+                helper._verify_logical_equivalence(source, backup, helper.time.monotonic() + 10)
+        else:
+            helper._verify_logical_equivalence(source, backup, helper.time.monotonic() + 10)
+
+    def test_compares_all_sqlite_storage_classes_and_preserves_text_factories(self):
+        source = sqlite3.connect(":memory:")
+        backup = sqlite3.connect(":memory:")
+        self.addCleanup(source.close)
+        self.addCleanup(backup.close)
+        for database in (source, backup):
+            database.execute("CREATE TABLE values_table (id INTEGER PRIMARY KEY, value)")
+        source.executemany("INSERT INTO values_table(value) VALUES (?)", [(1,), (1.25,), ("same",), (b"same",), (None,)])
+        backup.executemany("INSERT INTO values_table(value) VALUES (?)", [(1,), (1.25,), ("same",), (b"same",), (None,)])
+        factories = source.text_factory, backup.text_factory
+        helper._verify_logical_equivalence(source, backup, helper.time.monotonic() + 10)
+        self.assertEqual((source.text_factory, backup.text_factory), factories)
+        backup.execute("UPDATE values_table SET value=1.0 WHERE id=1")
+        with self.assertRaisesRegex(helper.ActivationError, "row differs"):
+            helper._verify_logical_equivalence(source, backup, helper.time.monotonic() + 10)
+
+    def test_compares_rowid_and_without_rowid_primary_key_identity(self):
+        self.compare("CREATE TABLE t (value TEXT); INSERT INTO t(rowid,value) VALUES (8,'x');",
+                     "CREATE TABLE t (value TEXT); INSERT INTO t(rowid,value) VALUES (9,'x');",
+                     expect_difference=True)
+        self.compare("CREATE TABLE t (a TEXT, b INTEGER, PRIMARY KEY (b,a)) WITHOUT ROWID; INSERT INTO t VALUES ('x',1);",
+                     "CREATE TABLE t (a TEXT, b INTEGER, PRIMARY KEY (b,a)) WITHOUT ROWID; INSERT INTO t VALUES ('x',1);")
+        self.compare("CREATE TABLE t (a TEXT, b INTEGER, PRIMARY KEY (b,a)) WITHOUT ROWID; INSERT INTO t VALUES ('x',1);",
+                     "CREATE TABLE t (a TEXT, b INTEGER, PRIMARY KEY (b,a)) WITHOUT ROWID; INSERT INTO t VALUES ('x',2);",
+                     expect_difference=True)
+
+    def test_compares_schema_and_database_metadata(self):
+        self.compare("CREATE TABLE t (value); PRAGMA user_version=4;",
+                     "CREATE TABLE t (value); PRAGMA user_version=5;", expect_difference=True)
+        self.compare("CREATE TABLE t (value); PRAGMA application_id=41;",
+                     "CREATE TABLE t (value); PRAGMA application_id=42;", expect_difference=True)
+        self.compare("CREATE TABLE t (value); CREATE INDEX i ON t(value);",
+                     "CREATE TABLE t (value); CREATE INDEX i ON t(value);")
+        self.compare("CREATE TABLE t (value); CREATE INDEX i ON t(value);",
+                     "CREATE TABLE t (value); CREATE INDEX i ON t(value COLLATE NOCASE);", expect_difference=True)
+
+    def test_fts5_virtual_contents_are_verified_through_persisted_shadow_tables(self):
+        try:
+            self.compare("CREATE VIRTUAL TABLE docs USING fts5(body); INSERT INTO docs VALUES ('source token');",
+                         "CREATE VIRTUAL TABLE docs USING fts5(body); INSERT INTO docs VALUES ('backup token');",
+                         expect_difference=True)
+        except sqlite3.OperationalError as exc:
+            if "fts5" in str(exc).lower():
+                self.skipTest("SQLite was built without FTS5")
+            raise
+        self.compare("CREATE VIRTUAL TABLE docs USING fts5(body); INSERT INTO docs VALUES ('same token');",
+                     "CREATE VIRTUAL TABLE docs USING fts5(body); INSERT INTO docs VALUES ('same token');")
+
+    def test_rtree_module_is_not_spoofed_by_quoted_table_name(self):
+        statements = (
+            'CREATE VIRTUAL TABLE "USING fts5" USING rtree(id, min_x, max_x);',
+            'CREATE VIRTUAL TABLE spatial /* USING fts5 */ USING rtree(id, min_x, max_x);',
+            'CREATE VIRTUAL TABLE spatial USING rtree(id, min_x, max_x);',
+        )
+        try:
+            for sql in statements:
+                with self.subTest(sql=sql):
+                    self.compare(sql, sql, expect_difference=True)
+        except sqlite3.OperationalError as exc:
+            if "no such module" in str(exc).lower():
+                self.skipTest("SQLite was built without RTree")
+            raise
+
+    def test_fts5_module_parsing_ignores_names_and_comments_and_accepts_quotes(self):
+        sql = ('ATTACH DATABASE \':memory:\' AS "odd schema"; '
+               'CREATE VIRTUAL TABLE "odd schema"."USING rtree" '
+               '/* misleading USING rtree */ USING "fts5"(body); '
+               "INSERT INTO \"odd schema\".\"USING rtree\" VALUES ('same token');")
+        try:
+            self.compare(sql, sql)
+        except sqlite3.OperationalError as exc:
+            if "fts5" in str(exc).lower():
+                self.skipTest("SQLite was built without FTS5")
+            raise
+
+    def test_single_quoted_fts5_identifiers_are_supported(self):
+        for sql in ("CREATE VIRTUAL TABLE docs USING 'fts5'(body);",
+                    "CREATE VIRTUAL TABLE 'do''cs' USING fts5(body);"):
+            with self.subTest(sql=sql):
+                self.compare(sql, sql)
+
+    def test_without_rowid_uses_primary_key_collation_and_direction_without_sort(self):
+        for key in ('a DESC,b ASC', 'a COLLATE NOCASE,b'):
+            with self.subTest(key=key):
+                source, backup = sqlite3.connect(':memory:'), sqlite3.connect(':memory:')
+                self.addCleanup(source.close)
+                self.addCleanup(backup.close)
+                for database in (source, backup):
+                    database.executescript(f'CREATE TABLE t(a TEXT,b INTEGER,p BLOB, PRIMARY KEY({key})) WITHOUT ROWID;'
+                                           "INSERT INTO t VALUES ('Z',1,X'00'),('a',2,X'01');")
+                queries = []
+                source.set_trace_callback(queries.append)
+                helper._verify_logical_equivalence(source, backup, helper.time.monotonic() + 10)
+                query = next(sql for sql in queries if sql.startswith('SELECT ') and 'FROM "main"."t"' in sql)
+                plan = source.execute('EXPLAIN QUERY PLAN ' + query).fetchall()
+                self.assertFalse(any('TEMP B-TREE' in row[3] for row in plan), plan)
+                backup.execute("UPDATE t SET p=X'02' WHERE a='Z'")
+                with self.assertRaisesRegex(helper.ActivationError, 'row differs'):
+                    helper._verify_logical_equivalence(source, backup, helper.time.monotonic() + 10)
+
+    def test_fails_closed_for_unrecognized_virtual_table_modules(self):
+        source = sqlite3.connect(":memory:")
+        backup = sqlite3.connect(":memory:")
+        self.addCleanup(source.close)
+        self.addCleanup(backup.close)
+        try:
+            for database in (source, backup):
+                database.execute("CREATE VIRTUAL TABLE spatial USING rtree(id, min_x, max_x)")
+        except sqlite3.OperationalError as exc:
+            if "no such module" in str(exc).lower():
+                self.skipTest("SQLite was built without RTree")
+            raise
+        with self.assertRaisesRegex(helper.ActivationError, "unsupported SQLite virtual table module"):
+            helper._verify_logical_equivalence(source, backup, helper.time.monotonic() + 10)
+
+    def test_virtual_generated_columns_still_shadow_rowid_aliases(self):
+        for alias in ("rowid", "RoWiD", "_rowid_", "OID"):
+            actual = "oid" if alias.lower() != "oid" else "_rowid_"
+            schema = f'CREATE TABLE t (value TEXT, "{alias}" GENERATED ALWAYS AS (42) VIRTUAL);'
+            self.compare(schema + f"INSERT INTO t({actual},value) VALUES (8,'x');",
+                         schema + f"INSERT INTO t({actual},value) VALUES (9,'x');",
+                         expect_difference=True)
+        schema = ('CREATE TABLE t (value TEXT, rowid AS (1), '
+                  '_rowid_ AS (2), oid AS (3));')
+        self.compare(schema, schema, expect_difference=True)
+
+    def test_fails_closed_when_all_rowid_aliases_are_shadowed(self):
+        self.compare("CREATE TABLE t (ROWID, _RowId_, OID);",
+                     "CREATE TABLE t (ROWID, _RowId_, OID);", expect_difference=True)
 
 
 class SimpleLaunchdHelperTests(unittest.TestCase):
@@ -119,7 +320,7 @@ class SimpleLaunchdHelperTests(unittest.TestCase):
         self.root = Path(self.temp.name).resolve()
         binary = self.root / "candidate"
         binary.write_text(f'''#!{sys.executable}
-import json, os, sqlite3, sys
+import contextlib, hashlib, json, os, sqlite3, sys
 from pathlib import Path
 if sys.argv[1:] == ["--build-identity"]:
     print(json.dumps({{"version": "1.0", "git_sha": "{'a' * 40}"}}))
@@ -127,9 +328,33 @@ if sys.argv[1:] == ["--build-identity"]:
 assert sys.argv[1:] == ["--migrate-only"]
 status = json.loads(Path(os.environ["TEST_STATUS_PATH"]).read_text())
 assert status["state"] == "migration_started"
+if os.environ.get("TEST_PROOF_PATH"):
+    proof = json.loads(Path(os.environ["TEST_PROOF_PATH"]).read_text())
+    with Path(os.environ["TEST_EVENTS"]).open("a") as stream:
+        stream.write("proof-check:" + proof["phase"] + "\\n")
+    assert proof["transaction_id"] == os.environ["TEST_TRANSACTION_ID"]
+    assert proof["phase"] == "migration_started"
+    assert proof["boundary"] == "attempted"
+    assert proof["database_source"] == "existing"
+    backup = proof["backup"]
+    backup_path = Path(backup["backup_path"])
+    assert backup_path.is_file()
+    assert backup_path.resolve().parent == Path(os.environ["TEST_PROOF_PATH"]).resolve().parent
+    assert backup["backup_bytes"] == backup_path.stat().st_size > 0
+    assert backup["backup_sha256"] == hashlib.sha256(backup_path.read_bytes()).hexdigest()
+    with contextlib.closing(sqlite3.connect(backup_path)) as backup_db:
+        backup_contents = backup_db.execute("SELECT phase FROM changes ORDER BY rowid").fetchall()
+    with contextlib.closing(sqlite3.connect(os.environ["PHOENIX_DB_PATH"])) as source_db:
+        source_contents = source_db.execute("SELECT phase FROM changes ORDER BY rowid").fetchall()
+    assert backup_contents == source_contents
+    Path(os.environ["TEST_PROOF_OBSERVED"]).write_text(json.dumps({{
+        "transaction_id": proof["transaction_id"], "phase": proof["phase"],
+        "boundary": proof["boundary"], "database_source": proof["database_source"],
+        "backup": backup, "pre_migration_contents": backup_contents,
+    }}))
 with Path(os.environ["TEST_EVENTS"]).open("a") as stream:
     stream.write("migrate\\n")
-with sqlite3.connect(os.environ["PHOENIX_DB_PATH"]) as db:
+with contextlib.closing(sqlite3.connect(os.environ["PHOENIX_DB_PATH"])) as db, db:
     db.execute("CREATE TABLE IF NOT EXISTS changes(phase TEXT)")
     db.execute("INSERT INTO changes VALUES (?)", (status["state"],))
 if os.environ.get("FAIL_MIGRATION"):
@@ -138,7 +363,7 @@ if os.environ.get("FAIL_MIGRATION"):
 ''')
         binary.chmod(0o755)
         self.database = self.root / "application.db"
-        with sqlite3.connect(self.database) as db:
+        with contextlib.closing(sqlite3.connect(self.database)) as db, db:
             db.execute("CREATE TABLE changes(phase TEXT)")
         candidate_plist = self.root / "candidate.plist"
         self.environment = {
@@ -194,7 +419,7 @@ if sys.argv[1:] == ["--build-identity"]:
         return json.loads(Path(self.manifest.status_path).read_text())
 
     def changes(self):
-        with sqlite3.connect(self.database) as db:
+        with contextlib.closing(sqlite3.connect(self.database)) as db:
             return db.execute("SELECT phase FROM changes").fetchall()
 
     def test_success_invokes_migration_once_after_durable_checkpoint_and_stop(self):
@@ -204,7 +429,7 @@ if sys.argv[1:] == ["--build-identity"]:
         backups = list(self.root.glob("database-backup-*.sqlite"))
         self.assertEqual(len(backups), 1)
         self.assertEqual(backups[0].stat().st_mode & 0o777, 0o600)
-        with sqlite3.connect(backups[0]) as backup:
+        with contextlib.closing(sqlite3.connect(backups[0])) as backup:
             self.assertEqual(backup.execute("PRAGMA integrity_check").fetchone(), ("ok",))
         self.assertEqual(self.changes(), [("migration_started",)])
         self.assertEqual((self.root / "events").read_text().splitlines(), ["stop", "migrate", "start"])
@@ -320,23 +545,112 @@ if sys.argv[1:] == ["--build-identity"]:
         self.assertEqual(proof["boundary"], "attempted")
 
     def test_native_backup_includes_committed_wal_and_matches_logical_contents(self):
-        with sqlite3.connect(self.database) as database:
+        database = sqlite3.connect(self.database)
+        self.addCleanup(database.close)
+        with database:
             database.execute("PRAGMA journal_mode=WAL")
             database.execute("INSERT INTO changes VALUES ('committed-in-wal')")
         wal = Path(str(self.database) + "-wal")
         self.assertTrue(wal.exists())
         backup = helper.create_verified_database_backup(str(self.database), self.root)
-        with sqlite3.connect(backup) as database:
+        with contextlib.closing(sqlite3.connect(backup)) as database:
             self.assertEqual(database.execute("PRAGMA integrity_check").fetchone(), ("ok",))
             self.assertEqual(database.execute("SELECT phase FROM changes").fetchall(), [("committed-in-wal",)])
 
+    def test_verifier_diagnostics_are_bounded_content_free_and_cover_all_stages(self):
+        diagnostics = {}
+        backup = helper.create_verified_database_backup(
+            str(self.database), self.root, diagnostics=diagnostics,
+        )
+        deadline = helper.time.monotonic() + 10
+        proof = helper._backup_proof(backup, deadline, diagnostics)
+        captured = io.StringIO()
+        with mock.patch.object(helper.sys, "stderr", captured):
+            helper._emit_verifier_diagnostics(diagnostics, "verified")
+        record = json.loads(captured.getvalue())
+        self.assertEqual(record["outcome"], "verified")
+        self.assertEqual(set(record["stage_ms"]), {
+            "native_backup", "integrity_check", "metadata", "table_comparisons", "fsync", "proof_hash",
+        })
+        self.assertGreater(record["rows_compared"], 0)
+        self.assertGreater(record["cells_compared"], 0)
+        self.assertGreater(record["table_ordinal"], 0)
+        self.assertNotIn("entries", captured.getvalue())
+        self.assertNotIn("one", captured.getvalue())
+        self.assertNotIn(str(backup), captured.getvalue())
+        self.assertEqual(proof["backup_bytes"], backup.stat().st_size)
+
+    def test_failed_row_comparison_diagnostics_report_only_ordinal_and_progress(self):
+        source, backup = sqlite3.connect(":memory:"), sqlite3.connect(":memory:")
+        self.addCleanup(source.close)
+        self.addCleanup(backup.close)
+        for database, value in ((source, "secret-source"), (backup, "secret-backup")):
+            database.execute('CREATE TABLE "private table name" (payload TEXT)')
+            database.execute('INSERT INTO "private table name" VALUES (?)', (value,))
+        diagnostics = {}
+        with self.assertRaises(helper.ActivationError):
+            helper._verify_logical_equivalence(
+                source, backup, helper.time.monotonic() + 10, diagnostics,
+            )
+        captured = io.StringIO()
+        with mock.patch.object(helper.sys, "stderr", captured):
+            helper._emit_verifier_diagnostics(diagnostics, "ActivationError")
+        record = json.loads(captured.getvalue())
+        self.assertEqual(record["table_ordinal"], 1)
+        self.assertEqual((record["rows_compared"], record["cells_compared"]), (0, 1))
+        for secret in ("private table name", "secret-source", "secret-backup", "payload"):
+            self.assertNotIn(secret, captured.getvalue())
+
+    def test_diagnostic_output_failure_does_not_replace_verifier_failure(self):
+        captured = io.StringIO()
+        captured.write = mock.Mock(side_effect=OSError("stderr unavailable"))
+        with mock.patch.object(helper.sys, "stderr", captured):
+            helper._emit_verifier_diagnostics({}, "ActivationError")
+
+    def test_integrity_error_does_not_expose_database_names(self):
+        with contextlib.closing(sqlite3.connect(self.database)) as connection, connection:
+            connection.execute('CREATE TABLE "SECRET_TABLE" (value CHECK(value > 0))')
+            connection.execute('PRAGMA ignore_check_constraints=ON')
+            connection.execute('INSERT INTO "SECRET_TABLE" VALUES (-1)')
+        diagnostics = {}
+        (self.database.parent / "integrity").mkdir()
+        with self.assertRaises(helper.ActivationError) as caught:
+            helper.create_verified_database_backup(str(self.database), self.database.parent / "integrity", diagnostics=diagnostics)
+        self.assertEqual(str(caught.exception), "SQLite backup integrity check failed")
+        self.assertNotIn("SECRET", json.dumps(diagnostics))
+        self.assertEqual(diagnostics["current_stage"], "integrity_check")
+
+    def test_verifier_counts_attempted_cells(self):
+        with contextlib.closing(sqlite3.connect(":memory:")) as left, left, contextlib.closing(sqlite3.connect(":memory:")) as right, right:
+            for connection in (left, right):
+                connection.execute("CREATE TABLE a (x, y, z)")
+                connection.execute("INSERT INTO a VALUES (1, 2, 3)")
+            right.execute("UPDATE a SET z=4")
+            diagnostics = {}
+            with self.assertRaises(helper.ActivationError):
+                helper._verify_logical_equivalence(left, right, time.monotonic() + 10, diagnostics)
+            self.assertEqual(diagnostics["cells_compared"], 3)
+            self.assertEqual(diagnostics["rows_compared"], 0)
+            self.assertEqual(diagnostics["tables_completed"], 0)
+
+    def test_verifier_timeout_records_stage_without_resetting_deadline(self):
+        with contextlib.closing(sqlite3.connect(":memory:")) as left, left, contextlib.closing(sqlite3.connect(":memory:")) as right, right:
+            deadline = time.monotonic() - 1
+            diagnostics = {}
+            with self.assertRaisesRegex(helper.ActivationError, "deadline exceeded"):
+                helper._verify_logical_equivalence(left, right, deadline, diagnostics)
+            self.assertEqual(diagnostics["deadline"], deadline)
+            self.assertEqual(diagnostics["current_stage"], "metadata")
+            self.assertEqual(diagnostics["stage_budget_ms"], 0)
+            self.assertIn("metadata", diagnostics["stage_ms"])
+
     def test_large_database_backup_uses_streaming_logical_verification(self):
         payload = b"z" * (8 * 1024 * 1024)
-        with sqlite3.connect(self.database) as database:
+        with contextlib.closing(sqlite3.connect(self.database)) as database, database:
             database.execute("CREATE TABLE large_payloads (id INTEGER PRIMARY KEY, data BLOB NOT NULL)")
             database.executemany("INSERT INTO large_payloads(data) VALUES (?)", [(payload,) for _ in range(4)])
         backup = helper.create_verified_database_backup(str(self.database), self.root, timeout=30)
-        with sqlite3.connect(backup) as database:
+        with contextlib.closing(sqlite3.connect(backup)) as database:
             self.assertEqual(database.execute("SELECT count(*) FROM large_payloads").fetchone(), (4,))
             self.assertEqual(database.execute("PRAGMA integrity_check").fetchone(), ("ok",))
 
@@ -350,7 +664,7 @@ if sys.argv[1:] == ["--build-identity"]:
         self.assertLess(required, 1024 * 1024 * 1024)
 
     def test_backup_and_verification_share_a_bounded_deadline(self):
-        with sqlite3.connect(self.database) as database:
+        with contextlib.closing(sqlite3.connect(self.database)) as database, database:
             database.execute("INSERT INTO changes VALUES (?)", ("x" * 2_000_000,))
         started = helper.time.monotonic()
         with self.assertRaisesRegex(helper.ActivationError, "deadline"):
@@ -380,17 +694,131 @@ if sys.argv[1:] == ["--build-identity"]:
             with self.assertRaisesRegex(helper.ActivationError, "deadline exceeded during proof hashing"):
                 helper._backup_proof(backup, real_clock() + 1)
 
+    def test_backup_default_deadline_uses_named_budget(self):
+        diagnostics = {}
+        with mock.patch.object(helper.time, "monotonic", return_value=123.0):
+            backup = helper.create_verified_database_backup(
+                str(self.database), self.root, diagnostics=diagnostics,
+            )
+        self.assertEqual(diagnostics["deadline"], 123.0 + helper.BACKUP_VERIFICATION_TIMEOUT_SECS)
+        self.assertTrue(backup.exists())
+
+    def test_activation_backup_and_proof_share_one_deterministic_deadline(self):
+        clock = [321.0]
+        captured = {}
+        real_proof = helper._backup_proof
+        real_backup = helper.create_verified_database_backup
+
+        def capture_backup(database_path, directory, *, timeout, diagnostics=None):
+            captured["backup_timeout"] = timeout
+            backup = real_backup(database_path, directory, timeout=timeout, diagnostics=diagnostics)
+            clock[0] += 100.0
+            return backup
+
+        def capture_proof(backup, deadline, diagnostics=None):
+            captured["deadline"] = deadline
+            return real_proof(backup, deadline, diagnostics)
+
+        with mock.patch.object(helper.time, "monotonic", side_effect=lambda: clock[0]), \
+             mock.patch.object(helper, "create_verified_database_backup", side_effect=capture_backup), \
+             mock.patch.object(helper, "_backup_proof", side_effect=capture_proof):
+            self.assertEqual(self.activate(), "committed")
+        self.assertEqual(captured["deadline"], 321.0 + helper.BACKUP_VERIFICATION_TIMEOUT_SECS)
+        self.assertEqual(captured["backup_timeout"], helper.BACKUP_VERIFICATION_TIMEOUT_SECS)
+        self.assertEqual(clock[0], captured["deadline"] - helper.BACKUP_VERIFICATION_TIMEOUT_SECS + 100.0)
+
+    def test_activation_proof_expiry_after_backup_recovers_and_retains_backup(self):
+        clock = [321.0]
+        real_backup = helper.create_verified_database_backup
+        real_proof = helper._backup_proof
+        captured = {}
+        database_path = self.database
+        writer_succeeded = []
+
+        def backup_then_expire(database_path_arg, directory, *, timeout, diagnostics=None):
+            backup = real_backup(database_path_arg, directory, timeout=timeout, diagnostics=diagnostics)
+            captured["backup"] = backup
+            captured["deadline"] = clock[0] + helper.BACKUP_VERIFICATION_TIMEOUT_SECS
+            clock[0] = captured["deadline"]
+            return backup
+
+        def actual_proof_at_expiry(backup, deadline, diagnostics=None):
+            captured["proof_deadline"] = deadline
+            return real_proof(backup, deadline, diagnostics)
+
+        with mock.patch.object(helper.time, "monotonic", side_effect=lambda: clock[0]), \
+             mock.patch.object(helper, "create_verified_database_backup", side_effect=backup_then_expire), \
+             mock.patch.object(helper, "_backup_proof", side_effect=actual_proof_at_expiry):
+            self.assertEqual(self.activate(), "failed")
+
+        self.assertEqual(captured["proof_deadline"], captured["deadline"])
+        self.assertTrue(captured["backup"].exists())
+        self.assertIn(captured["backup"], list(self.root.glob("database-backup-*.sqlite")))
+        with contextlib.closing(sqlite3.connect(database_path, timeout=0.05)) as writer, writer:
+            writer.execute("INSERT INTO changes VALUES ('guard released')")
+            writer_succeeded.append(True)
+        self.assertEqual(writer_succeeded, [True])
+        self.assertEqual(self.launch.starts, [self.manifest.target_plist])
+        self.assertNotIn("migrate", (self.root / "events").read_text())
+        self.assertEqual(Path(self.manifest.target_binary).read_bytes(), self.previous_binary)
+        proof = json.loads((self.root / "status.proof.json").read_text())
+        self.assertEqual(proof["boundary"], "not_crossed")
+        self.assertEqual(proof["recovery_outcome"], "predecessor_recovered_verified")
+
+    def test_backup_timeout_before_boundary_recovers_unchanged_predecessor(self):
+        clock = [100.0]
+        real_restore = helper.restore_predecessor
+        recovery_writer_succeeded = []
+
+        def monotonic():
+            return clock[0]
+
+        def timeout_backup(database_path, directory, *, timeout, diagnostics=None):
+            self.assertEqual(timeout, helper.BACKUP_VERIFICATION_TIMEOUT_SECS)
+            self.assertEqual(clock[0], 100.0)
+            with contextlib.closing(sqlite3.connect(database_path, timeout=0.05)) as writer, writer:
+                with self.assertRaisesRegex(sqlite3.OperationalError, "locked"):
+                    writer.execute("INSERT INTO changes VALUES ('competing writer')")
+            clock[0] += helper.BACKUP_VERIFICATION_TIMEOUT_SECS + 0.001
+            raise helper.ActivationError("SQLite backup and verification deadline exceeded")
+
+        def restore_after_release(manifest, launchctl, captured, previous_plist):
+            with contextlib.closing(sqlite3.connect(self.database, timeout=0.05)) as writer, writer:
+                writer.execute("INSERT INTO changes VALUES ('recovery writer')")
+            recovery_writer_succeeded.append(True)
+            return real_restore(manifest, launchctl, captured, previous_plist)
+
+        before_binary = Path(self.manifest.target_binary).read_bytes()
+        before_plist = Path(self.manifest.target_plist).read_bytes()
+        with mock.patch.object(helper.time, "monotonic", side_effect=monotonic), \
+             mock.patch.object(helper, "create_verified_database_backup", side_effect=timeout_backup), \
+             mock.patch.object(helper, "restore_predecessor", side_effect=restore_after_release):
+            self.assertEqual(self.activate(), "failed")
+        self.assertEqual(recovery_writer_succeeded, [True])
+        self.assertEqual(Path(self.manifest.target_binary).read_bytes(), before_binary)
+        self.assertEqual(Path(self.manifest.target_plist).read_bytes(), before_plist)
+        self.assertEqual(self.changes(), [("recovery writer",)])
+        self.assertEqual((self.root / "events").read_text().splitlines(), ["stop", "start"])
+        self.assertFalse(list(self.root.glob("database-backup-*.sqlite")))
+        self.assertNotIn("migrate", (self.root / "events").read_text())
+        self.assertIn("unchanged predecessor restored and exact identity verified", self.status()["failure"])
+        proof = json.loads((self.root / "status.proof.json").read_text())
+        self.assertEqual(proof["boundary"], "not_crossed")
+        self.assertEqual(proof["recovery_outcome"], "predecessor_recovered_verified")
+        self.assertEqual(proof["outcome"], "failed")
+        self.assertEqual(helper.MIGRATION_TIMEOUT_SECS, 600)
+
     def test_writer_guard_blocks_competing_writer_until_migration_handoff(self):
         original = helper._backup_proof
         attempted = []
 
-        def compete(backup, deadline):
-            with sqlite3.connect(self.database, timeout=0.05) as writer:
+        def compete(backup, deadline, diagnostics=None):
+            with contextlib.closing(sqlite3.connect(self.database, timeout=0.05)) as writer, writer:
                 writer.execute("PRAGMA busy_timeout=50")
                 with self.assertRaisesRegex(sqlite3.OperationalError, "locked"):
                     writer.execute("INSERT INTO changes VALUES ('competing writer')")
             attempted.append(True)
-            return original(backup, deadline)
+            return original(backup, deadline, diagnostics)
 
         with mock.patch.object(helper, "_backup_proof", side_effect=compete):
             self.assertEqual(self.activate(), "committed")
@@ -412,13 +840,13 @@ if sys.argv[1:] == ["--build-identity"]:
 
     def test_writer_guard_released_before_predecessor_recovery(self):
         def failed_backup(*_args, **_kwargs):
-            with sqlite3.connect(self.database, timeout=0.05) as writer:
+            with contextlib.closing(sqlite3.connect(self.database, timeout=0.05)) as writer, writer:
                 with self.assertRaises(sqlite3.OperationalError):
                     writer.execute("INSERT INTO changes VALUES ('blocked')")
             raise helper.ActivationError("backup failed")
 
         def recover(_manifest, _launchctl, _captured, _previous_plist):
-            with sqlite3.connect(self.database, timeout=0.05) as writer:
+            with contextlib.closing(sqlite3.connect(self.database, timeout=0.05)) as writer, writer:
                 writer.execute("INSERT INTO changes VALUES ('after guard release')")
             return 99
 
@@ -438,6 +866,62 @@ if sys.argv[1:] == ["--build-identity"]:
         path.write_text(json.dumps(raw))
         with self.assertRaisesRegex(helper.ActivationError, "unsupported deployment manifest"):
             helper.Manifest.load(path)
+
+    def enable_candidate_proof_witness(self):
+        self.environment["TEST_PROOF_PATH"] = str(Path(self.manifest.status_path).with_suffix(".proof.json"))
+        self.environment["TEST_PROOF_OBSERVED"] = str(self.root / "candidate-proof-observed.json")
+        self.environment["TEST_TRANSACTION_ID"] = self.manifest.transaction_id
+        self.refresh_plist()
+
+    def test_candidate_reopens_durable_migration_proof_before_migrating_existing_source(self):
+        self.enable_candidate_proof_witness()
+        with contextlib.closing(sqlite3.connect(self.database)) as database, database:
+            database.execute("INSERT INTO changes VALUES ('pre-migration')")
+
+        self.assertEqual(self.activate(), "committed")
+
+        observed = json.loads((self.root / "candidate-proof-observed.json").read_text())
+        final = json.loads(Path(self.manifest.status_path).with_suffix(".proof.json").read_text())
+        self.assertEqual(observed["transaction_id"], self.manifest.transaction_id)
+        self.assertEqual(observed["phase"], "migration_started")
+        self.assertEqual(observed["boundary"], "attempted")
+        self.assertEqual(observed["database_source"], "existing")
+        self.assertEqual(final["transaction_id"], observed["transaction_id"])
+        self.assertEqual(final["phase"], "candidate_verified")
+        self.assertEqual(final["boundary"], "crossed")
+        self.assertEqual(final["database_source"], "existing")
+        backup = observed["backup"]
+        final_backup = final["backup"]
+        self.assertEqual(final_backup, backup)
+        backup_path = Path(backup["backup_path"])
+        self.assertTrue(backup_path.is_file())
+        self.assertEqual(backup["backup_bytes"], backup_path.stat().st_size)
+        self.assertEqual(backup["backup_sha256"], helper.sha256(backup_path))
+        with contextlib.closing(sqlite3.connect(backup_path)) as database:
+            self.assertEqual(database.execute("SELECT phase FROM changes ORDER BY rowid").fetchall(),
+                             [("pre-migration",)])
+        self.assertEqual(observed["pre_migration_contents"], [["pre-migration"]])
+        self.assertEqual(self.changes(), [("pre-migration",), ("migration_started",)])
+
+    def test_candidate_proof_witness_rejects_missing_pre_migration_publication(self):
+        self.enable_candidate_proof_witness()
+        write_proof = helper.write_proof
+
+        def omit_migration_publication(manifest, **fields):
+            if fields.get("phase") != "migration_started" or fields.get("outcome") == "failed":
+                write_proof(manifest, **fields)
+
+        with mock.patch.object(helper, "write_proof", side_effect=omit_migration_publication):
+            self.assertEqual(self.activate(), "failed")
+        self.assertEqual(self.changes(), [])
+        self.assertFalse(Path(self.environment["TEST_PROOF_OBSERVED"]).exists())
+        proof = json.loads(Path(self.environment["TEST_PROOF_PATH"]).read_text())
+        self.assertIn("proof-check:backup_verified", (self.root / "events").read_text().splitlines())
+        self.assertIn("candidate migration exited 1", self.status()["failure"])
+        self.assertEqual(proof["phase"], "migration_started")
+        self.assertEqual(proof["outcome"], "failed")
+        self.assertEqual(proof["boundary"], "attempted")
+        self.assertTrue(Path(proof["backup"]["backup_path"]).is_file())
 
     def test_success_records_durable_backup_proof(self):
         self.assertEqual(self.activate(), "committed")
@@ -865,7 +1349,7 @@ h.fetch_identity = lambda *args, **kwargs: h.Identity("0.9", "b" * 40)
 result = h.activate(h.Manifest.load(Path(sys.argv[2])))
 raise SystemExit(0 if result == "committed" else 1)
 '''
-        result = subprocess.run([sys.executable, "-c", runner, str(ROOT / "scripts/launchd_deploy_helper.py"),
+        result = subprocess.run([sys.executable, "-c", runner, str(Path(helper.__file__)),
                                  str(manifest_path)], capture_output=True, text=True)
         self.assertEqual(result.returncode, 1)
         self.assertIn("actual migration failure detail", result.stderr)
@@ -955,6 +1439,7 @@ raise SystemExit(0 if result == "committed" else 1)
         run = helper.subprocess.run
         def execute(command, **kwargs):
             if command[-1] == "--migrate-only":
+                self.assertEqual(kwargs["timeout"], 600)
                 raise subprocess.TimeoutExpired(command, helper.MIGRATION_TIMEOUT_SECS)
             return run(command, **kwargs)
         with mock.patch.object(helper.subprocess, "run", side_effect=execute):
