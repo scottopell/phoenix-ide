@@ -9546,10 +9546,17 @@ async fn enable_mcp_server(
 /// Slugify a human-readable label (e.g. "Shell integration setup (zsh)") into
 /// a kebab-case slug (e.g. "shell-integration-setup-zsh"). Used for seeded
 /// conversation titles when the LLM title generator would receive empty text.
+/// Longest slug [`slugify_label`] emits; keeps branch names and URL slugs
+/// derived from free-form titles under the 255-byte path-component limit.
+pub(crate) const MAX_LABEL_SLUG_LEN: usize = 100;
+
 pub(crate) fn slugify_label(label: &str) -> String {
-    let mut out = String::with_capacity(label.len());
+    let mut out = String::with_capacity(label.len().min(MAX_LABEL_SLUG_LEN));
     let mut prev_dash = true;
     for ch in label.chars() {
+        if out.len() >= MAX_LABEL_SLUG_LEN {
+            break;
+        }
         if ch.is_ascii_alphanumeric() {
             out.push(ch.to_ascii_lowercase());
             prev_dash = false;
@@ -18901,6 +18908,34 @@ mod file_read_tests {
 #[cfg(test)]
 mod attachment_storage_tests {
     use super::*;
+
+    #[test]
+    fn slugify_label_is_bounded_and_clean() {
+        let long = slugify_label(&"word ".repeat(200));
+        assert!(long.len() <= MAX_LABEL_SLUG_LEN, "{}", long.len());
+        assert!(!long.ends_with('-'));
+        assert_eq!(
+            slugify_label("Shell integration setup (zsh)"),
+            "shell-integration-setup-zsh"
+        );
+        assert_eq!(slugify_label("日本語"), "");
+    }
+
+    mod slug_proptests {
+        use super::super::*;
+        use proptest::prelude::*;
+
+        proptest! {
+            #[test]
+            fn slugify_label_output_is_ref_safe(s in "\\PC{0,600}") {
+                let out = slugify_label(&s);
+                prop_assert!(out.len() <= MAX_LABEL_SLUG_LEN);
+                prop_assert!(out.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'));
+                prop_assert!(!out.starts_with('-') && !out.ends_with('-') && !out.contains("--"));
+                prop_assert_eq!(slugify_label(&out), out);
+            }
+        }
+    }
 
     #[test]
     fn sanitizes_attachment_name_to_basename_ascii() {
