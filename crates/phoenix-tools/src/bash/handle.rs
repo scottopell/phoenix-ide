@@ -34,6 +34,9 @@ use tokio::sync::{Mutex, RwLock};
 
 use super::ring::{RingBuffer, RingLine};
 
+mod native_retirement;
+pub use native_retirement::{NativeBashSignal, NativeBashSignalError};
+
 /// Default tombstone tail size (REQ-BASH-006: `TOMBSTONE_TAIL_LINES`).
 pub const TOMBSTONE_TAIL_LINES: usize = 2000;
 
@@ -217,7 +220,7 @@ pub struct Handle {
     pub started_at: SystemTime,
     /// The current handle state. Always written through
     /// [`Self::transition_to_terminal`].
-    state: RwLock<Arc<HandleState>>,
+    state: Arc<RwLock<Arc<HandleState>>>,
     lifecycle_epoch: std::sync::Mutex<Option<Arc<AtomicU64>>>,
     /// Kill-attempt bookkeeping for `kill_pending_kernel` semantics.
     /// Separate from `LiveData` so recording an attempt does not require
@@ -457,7 +460,7 @@ impl Handle {
             label,
             working_dir,
             started_at: SystemTime::now(),
-            state: RwLock::new(Arc::new(HandleState::Live(live))),
+            state: Arc::new(RwLock::new(Arc::new(HandleState::Live(live)))),
             lifecycle_epoch: std::sync::Mutex::new(None),
             kill_attempt: RwLock::new(None),
             exit_signal: tx,

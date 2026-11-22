@@ -415,6 +415,28 @@ jobs:
             grep -Eq 'test result: ok\. 1 passed; 0 failed; 0 ignored;' "evidence/deadline-$test.log" || failed=1
           done
           test "$failed" -eq 0
+      - name: Qualify native Bash physical-stage admission boundaries
+        if: success() || failure()
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p phoenix-tools --lib -- --list 2>&1 | tee evidence/bash-native-leaf-inventory.log
+          for test in \
+            expired_stop_and_group_stages_perform_zero_effects \
+            each_physical_stage_is_attempted_only_once_even_after_os_error \
+            dropping_native_owner_does_not_resume_observed_child \
+            group_kill_requires_explicit_resume_before_state_pin_release; do
+            grep -F "bash::handle::native_retirement::tests::$test: test" evidence/bash-native-leaf-inventory.log
+          done
+          cargo test -p phoenix-tools --lib bash::handle::native_retirement::tests:: -- --nocapture --test-threads=1 2>&1 | tee evidence/bash-native-leaf-execution.log
+          grep -Eq 'test result: ok\. 4 passed; 0 failed; 0 ignored;' evidence/bash-native-leaf-execution.log
+          for test in \
+            expired_stop_and_group_stages_perform_zero_effects \
+            each_physical_stage_is_attempted_only_once_even_after_os_error \
+            dropping_native_owner_does_not_resume_observed_child \
+            group_kill_requires_explicit_resume_before_state_pin_release; do
+            grep -F "test bash::handle::native_retirement::tests::$test ... ok" evidence/bash-native-leaf-execution.log
+          done
       - name: Qualify inert exact Bash retirement ownership and registry regressions
         if: success() || failure()
         shell: bash
