@@ -5391,7 +5391,9 @@ mod repository_lock_tests {
         };
         assert!(error.contains("timed out"), "{error}");
         assert!(!nonexistent_common_dir.exists());
-        assert!(!nonexistent_common_dir.join("phoenix-creation.lock").exists());
+        assert!(!nonexistent_common_dir
+            .join("phoenix-creation.lock")
+            .exists());
     }
 
     #[test]
@@ -5432,8 +5434,8 @@ mod repository_lock_tests {
             .status()
             .unwrap();
         assert!(status.success());
-        let (_, lock_path) = RepositoryMutationLock::open_file(repo.path(), Duration::from_secs(30))
-            .unwrap();
+        let (_, lock_path) =
+            RepositoryMutationLock::open_file(repo.path(), Duration::from_secs(30)).unwrap();
         let common_dir = lock_path.parent().unwrap();
 
         let first = RepositoryMutationLock::acquire_common_directory_until(

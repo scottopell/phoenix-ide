@@ -4647,11 +4647,7 @@ fn list_registered_worktrees_in_common_directory_until(
         use std::os::unix::process::CommandExt as _;
         command.process_group(0);
     }
-    run_bounded_spawned_git(
-        command,
-        deadline,
-        "exact Worktree registration inspection",
-    )
+    run_bounded_spawned_git(command, deadline, "exact Worktree registration inspection")
 }
 
 fn run_bounded_git_command_until(
@@ -5277,11 +5273,9 @@ fn prepare_physical_worktree_removal_until(
     let common_git_dir = exact_worktree_common_git_dir_until(&inspection_path, deadline)?;
     let common_git_dir_incarnation = observe_administrative_dir_incarnation(&common_git_dir)?;
     check_directory_deletion_deadline(Some(deadline))?;
-    let repository_lock = RepositoryMutationLock::acquire_common_directory_until(
-        &common_git_dir,
-        deadline,
-    )
-    .map_err(|(message, _)| message)?;
+    let repository_lock =
+        RepositoryMutationLock::acquire_common_directory_until(&common_git_dir, deadline)
+            .map_err(|(message, _)| message)?;
     check_directory_deletion_deadline(Some(deadline))?;
     if observe_administrative_dir_incarnation(&common_git_dir)? != common_git_dir_incarnation {
         return Err("worktree repository incarnation changed while acquiring its lock".to_string());
@@ -13107,7 +13101,10 @@ mod tests {
             let entry = entry.unwrap();
             std::fs::rename(entry.path(), common.join(entry.file_name())).unwrap();
         }
-        assert_eq!(super::exact_worktree_common_git_dir(&target).unwrap(), common);
+        assert_eq!(
+            super::exact_worktree_common_git_dir(&target).unwrap(),
+            common
+        );
         assert_ne!(
             observe_administrative_dir_incarnation(&common).unwrap(),
             prepared.common_git_dir_incarnation,
@@ -13164,13 +13161,15 @@ mod tests {
             WorktreeId::parse("unaccessed-worktree").unwrap(),
             WorktreeFingerprint::parse("unaccessed-incarnation").unwrap(),
             GitPathIdentity::from_bytes(
-                temp.path().join("not-a-repository").to_string_lossy().as_bytes().to_vec(),
+                temp.path()
+                    .join("not-a-repository")
+                    .to_string_lossy()
+                    .as_bytes()
+                    .to_vec(),
             ),
         );
-        let result = super::prepare_physical_worktree_removal_until(
-            &identity,
-            std::time::Instant::now(),
-        );
+        let result =
+            super::prepare_physical_worktree_removal_until(&identity, std::time::Instant::now());
         let Err(error) = result else {
             panic!("expired repository lock unexpectedly acquired");
         };

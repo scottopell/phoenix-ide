@@ -66,7 +66,11 @@ jobs:
           cargo test -p phoenix-db --lib -- --list 2>&1 | tee evidence/inventory.log
           grep -E '^close_foundation::tests::.*: test$|^migrations::close_completion_allowance_tests::migration_172_.*: test$|^migrations::tests::migration_(180|181)_.*: test$|^native_close::.*: test$' evidence/inventory.log > evidence/selected-tests.txt
           test -s evidence/selected-tests.txt
+          grep -F 'close_foundation::tests::inspection_aggregate_validator_preserves_exact_content_and_empty_generation_rules: test' evidence/selected-tests.txt
           for test in \
+            first_effect_refuses_missing_dispatch_mismatched_binding_and_completed_resource \
+            first_effect_callback_is_refused_on_source_loss_and_preserves_exact_result \
+            first_effect_callback_holds_writer_reservation_against_source_update \
             initial_worktree_entry_requires_exact_dispatch_and_refuses_completed_reentry \
             initial_worktree_entry_rejects_durable_source_revocation_before_handoff \
             initial_worktree_metadata_requires_exact_original_dispatched_authority_and_live_source \
@@ -198,6 +202,7 @@ jobs:
         run: |
           set -euo pipefail
           cargo test -p phoenix-db --lib close_foundation::tests:: -- --nocapture --test-threads=1 2>&1 | tee evidence/close-foundation.log
+          grep -F 'test close_foundation::tests::inspection_aggregate_validator_preserves_exact_content_and_empty_generation_rules ... ok' evidence/close-foundation.log
           for test in \
             initial_process_authorization_requires_exact_durable_source_scope_snapshot_and_dispatch \
             initial_process_authorization_rejects_missing_dispatch_and_stopped_or_changed_source \
@@ -225,6 +230,12 @@ jobs:
           set -euo pipefail
           cargo test -p phoenix-db --lib native_close:: -- --nocapture --test-threads=1 2>&1 | tee evidence/native-close-db.log
           grep -E 'test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored;' evidence/native-close-db.log
+          for test in \
+            first_effect_refuses_missing_dispatch_mismatched_binding_and_completed_resource \
+            first_effect_callback_is_refused_on_source_loss_and_preserves_exact_result \
+            first_effect_callback_holds_writer_reservation_against_source_update; do
+            grep -F "test native_close::initial::tests::$test ... ok" evidence/native-close-db.log
+          done
       - name: Execute complete migrations regression module
         if: success() || failure()
         shell: bash

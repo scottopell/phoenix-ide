@@ -1867,6 +1867,37 @@ fn encode_aggregate_snapshot_component<'a>(
     encoded
 }
 
+/// Checks canonical scope-ordered inspection content against an exact aggregate.
+/// Empty content still requires retained obligation provenance from the caller;
+/// its generation may be custom, but its fingerprint must be `no-worktree`.
+/// This is read-only evidence validation, not retirement authorization.
+///
+/// # Errors
+/// Returns a Close precondition error when the content does not compose the snapshot.
+pub fn validate_close_retirement_inspection_aggregate(
+    snapshot: &CloseRetirementSnapshot,
+    inspections: &[CloseInspection],
+) -> DbResult<()> {
+    let generation = encode_aggregate_snapshot_component(
+        inspections
+            .iter()
+            .map(|inspection| (&inspection.target.scope, inspection.snapshot.generation())),
+    );
+    let fingerprint = encode_aggregate_snapshot_component(
+        inspections
+            .iter()
+            .map(|inspection| (&inspection.target.scope, inspection.snapshot.fingerprint())),
+    );
+    if fingerprint != snapshot.fingerprint()
+        || (!inspections.is_empty() && generation != snapshot.generation())
+    {
+        return Err(close_precondition(
+            "retained inspection rows do not prove the requested exact snapshot",
+        ));
+    }
+    Ok(())
+}
+
 fn parse_close_writer_authority(
     detector: CloseWriterDetector,
     kind: &str,
@@ -3435,23 +3466,7 @@ impl Database {
                 ));
             }
         }
-        let generation = encode_aggregate_snapshot_component(
-            inspections
-                .iter()
-                .map(|inspection| (&inspection.target.scope, inspection.snapshot.generation())),
-        );
-        let fingerprint = encode_aggregate_snapshot_component(
-            inspections
-                .iter()
-                .map(|inspection| (&inspection.target.scope, inspection.snapshot.fingerprint())),
-        );
-        if fingerprint != snapshot.fingerprint()
-            || (!inspections.is_empty() && generation != snapshot.generation())
-        {
-            return Err(close_precondition(
-                "retained inspection rows do not prove the requested exact snapshot",
-            ));
-        }
+        validate_close_retirement_inspection_aggregate(snapshot, &inspections)?;
         Ok(inspections)
     }
 
@@ -12019,6 +12034,43 @@ mod tests {
             .await
             .unwrap();
         assert!(evidence.is_empty());
+    }
+
+    #[test]
+    fn inspection_aggregate_validator_preserves_exact_content_and_empty_generation_rules() {
+        let scope = WorkScopeId::parse("scope-aggregate").unwrap();
+        let inspection = CloseInspection {
+            attempt_id: CloseAttemptId::parse("attempt-aggregate").unwrap(),
+            target: CloseRetirementTarget { scope },
+            snapshot: CloseRetirementSnapshot::parse("generation", "fingerprint").unwrap(),
+            inspected_at: Utc::now(),
+        };
+        let generation = encode_aggregate_snapshot_component([(
+            &inspection.target.scope,
+            inspection.snapshot.generation(),
+        )]);
+        let fingerprint = encode_aggregate_snapshot_component([(
+            &inspection.target.scope,
+            inspection.snapshot.fingerprint(),
+        )]);
+        let aggregate = CloseRetirementSnapshot::parse(&generation, &fingerprint).unwrap();
+        validate_close_retirement_inspection_aggregate(&aggregate, &[inspection.clone()]).unwrap();
+        for changed in [
+            CloseRetirementSnapshot::parse("changed-generation", "fingerprint").unwrap(),
+            CloseRetirementSnapshot::parse("generation", "changed-fingerprint").unwrap(),
+        ] {
+            let mut changed_inspection = inspection.clone();
+            changed_inspection.snapshot = changed;
+            assert!(validate_close_retirement_inspection_aggregate(
+                &aggregate,
+                &[changed_inspection],
+            )
+            .is_err());
+        }
+        let empty = CloseRetirementSnapshot::parse("custom-generation", "no-worktree").unwrap();
+        validate_close_retirement_inspection_aggregate(&empty, &[]).unwrap();
+        let wrong = CloseRetirementSnapshot::parse("custom-generation", "not-empty").unwrap();
+        assert!(validate_close_retirement_inspection_aggregate(&wrong, &[]).is_err());
     }
 
     #[tokio::test]

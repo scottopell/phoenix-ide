@@ -100,6 +100,18 @@ pub enum NativeCloseInitialResourceEntryResult {
     },
 }
 
+/// A returned refusal proves the first-effect callback was not invoked.
+/// Cancellation or panic returns no such proof.
+#[must_use = "unconfirmed transaction release must remain supervised"]
+#[derive(Debug)]
+pub enum NativeCloseInitialFirstEffectError {
+    NotStarted(DbError),
+    Rejected {
+        error: DbError,
+        release: NativeCloseInitialEntryRelease,
+    },
+}
+
 impl NativeCloseInitialProcessAuthorization {
     /// Consume the authorization at the manager sink; it cannot be cloned or replayed.
     pub fn into_parts(
@@ -400,7 +412,105 @@ impl Database {
     }
 }
 
+async fn validate_initial_worktree_entry_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    command: &NativeCloseCommand,
+    receipt: &NativeCloseReceipt,
+    live_source: &phoenix_core::domain::sm_state::ConvState,
+    scope: &WorkScopeId,
+    snapshot: &phoenix_core::domain::close::CloseRetirementSnapshot,
+    resource: &RetiredResourceIdentity,
+) -> DbResult<()> {
+    let (admitted, _) = require_initial_execution_tx(
+        tx, command, receipt, live_source, ClosePhase::RetirementRequested,
+    ).await?;
+    if resource.kind() != RetiredResourceKind::Worktree {
+        return Err(DbError::CloseFoundationPrecondition(
+            "initial worktree entry requires an exact worktree resource".into(),
+        ));
+    }
+    require_initial_original_dispatch_tx(tx, &admitted, scope, snapshot, resource).await?;
+    let identity = resource.identity();
+    let already_proven: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM close_retirement_resource_history
+         WHERE attempt_id = ?1 AND scope = ?2 AND inspection_generation = ?3
+           AND inspection_fingerprint = ?4 AND resource_kind = ?5
+           AND identity_kind = ?6 AND identity_codec = ?7 AND identity_value = ?8
+           AND proof_kind IN ('retired', 'absence_adopted'))
+         OR EXISTS(SELECT 1 FROM close_retirement_resources
+         WHERE attempt_id = ?1 AND scope = ?2 AND inspection_generation = ?3
+           AND inspection_fingerprint = ?4 AND resource_kind = ?5
+           AND identity_kind = ?6 AND identity_codec = ?7 AND identity_value = ?8
+           AND proof_kind IN ('retired', 'absence_adopted'))",
+    ).bind(admitted.attempt_id.as_str()).bind(scope.as_str())
+        .bind(snapshot.generation()).bind(snapshot.fingerprint())
+        .bind(resource.kind().as_str()).bind(identity.identity_kind())
+        .bind(identity.codec()).bind(identity.value())
+        .fetch_one(&mut **tx).await?;
+    if already_proven {
+        return Err(DbError::CloseFoundationPrecondition(
+            "initial worktree entry refuses an exact resource with positive retirement evidence".into(),
+        ));
+    }
+    Ok(())
+}
+
 impl Database {
+    /// Runs a bounded synchronous real first-effect callback under the same live and
+    /// durable source, exact-run, original-dispatch, exact-resource and not-completed
+    /// validation as `enter_native_close_initial_worktree_resource`.
+    ///
+    /// The `BEGIN IMMEDIATE` writer reservation remains held until the callback returns
+    /// and rollback is attempted. The callback must not perform database work, wait for
+    /// another operation that needs this database's writer, or await; any such work can
+    /// deadlock behind this reservation. Keep the callback bounded and synchronous.
+    /// This API is only a future integration seam; it performs no physical effect itself.
+    ///
+    /// The callback's `T` is retained only in this future until rollback has been
+    /// awaited. Callers must therefore run this future under an external,
+    /// non-cancelled supervisor and independently retain any callback outcome
+    /// needed for recovery. If this future is cancelled or panics, callback
+    /// invocation and rollback classification are unknown: do not infer that the
+    /// callback was not invoked and do not retry it on that basis. This API makes
+    /// no cancellation-safety guarantee. `Err` means only `NotStarted` or
+    /// `Rejected`; `Ok` means only that the callback returned, not that a physical
+    /// effect succeeded. This seam does not prevent replay; an external affine
+    /// owner is mandatory to ensure at-most-once entry across repeated calls or
+    /// lost responses. Receipt replay is not an ownership mechanism.
+    pub async fn with_native_close_initial_worktree_first_effect<F, T>(
+        &self,
+        command: &NativeCloseCommand,
+        receipt: &NativeCloseReceipt,
+        live_source: &phoenix_core::domain::sm_state::ConvState,
+        scope: WorkScopeId,
+        snapshot: phoenix_core::domain::close::CloseRetirementSnapshot,
+        resource: &RetiredResourceIdentity,
+        first_effect: F,
+    ) -> Result<(T, NativeCloseInitialEntryRelease), NativeCloseInitialFirstEffectError>
+    where
+        F: FnOnce() -> T,
+    {
+        let mut tx = match self.pool.begin_with("BEGIN IMMEDIATE").await {
+            Ok(tx) => tx,
+            Err(error) => return Err(NativeCloseInitialFirstEffectError::NotStarted(error.into())),
+        };
+        if let Err(error) = validate_initial_worktree_entry_tx(
+            &mut tx, command, receipt, live_source, &scope, &snapshot, resource,
+        ).await {
+            let release = match tx.rollback().await {
+                Ok(()) => NativeCloseInitialEntryRelease::Confirmed,
+                Err(error) => NativeCloseInitialEntryRelease::Unconfirmed(error.into()),
+            };
+            return Err(NativeCloseInitialFirstEffectError::Rejected { error, release });
+        }
+        let result = first_effect();
+        let release = match tx.rollback().await {
+            Ok(()) => NativeCloseInitialEntryRelease::Confirmed,
+            Err(error) => NativeCloseInitialEntryRelease::Unconfirmed(error.into()),
+        };
+        Ok((result, release))
+    }
+
     /// Validates and synchronously hands off one exact initial process resource while
     /// holding SQLite's writer reservation. The callback must only perform a short,
     /// nonblocking in-memory handoff of an already selected exact owner: no I/O, locks,
@@ -483,42 +593,9 @@ impl Database {
             Ok(tx) => tx,
             Err(error) => return NativeCloseInitialResourceEntryResult::NotStarted(error.into()),
         };
-        let validation = async {
-            let (admitted, _) = require_initial_execution_tx(
-                &mut tx, command, receipt, live_source, ClosePhase::RetirementRequested,
-            ).await?;
-            if resource.kind() != RetiredResourceKind::Worktree {
-                return Err(DbError::CloseFoundationPrecondition(
-                    "initial worktree entry requires an exact worktree resource".into(),
-                ));
-            }
-            require_initial_original_dispatch_tx(
-                &mut tx, &admitted, &scope, &snapshot, resource,
-            ).await?;
-            let identity = resource.identity();
-            let already_proven: bool = sqlx::query_scalar(
-                "SELECT EXISTS(SELECT 1 FROM close_retirement_resource_history
-                 WHERE attempt_id = ?1 AND scope = ?2 AND inspection_generation = ?3
-                   AND inspection_fingerprint = ?4 AND resource_kind = ?5
-                   AND identity_kind = ?6 AND identity_codec = ?7 AND identity_value = ?8
-                   AND proof_kind IN ('retired', 'absence_adopted'))
-                 OR EXISTS(SELECT 1 FROM close_retirement_resources
-                 WHERE attempt_id = ?1 AND scope = ?2 AND inspection_generation = ?3
-                   AND inspection_fingerprint = ?4 AND resource_kind = ?5
-                   AND identity_kind = ?6 AND identity_codec = ?7 AND identity_value = ?8
-                   AND proof_kind IN ('retired', 'absence_adopted'))",
-            ).bind(admitted.attempt_id.as_str()).bind(scope.as_str())
-                .bind(snapshot.generation()).bind(snapshot.fingerprint())
-                .bind(resource.kind().as_str()).bind(identity.identity_kind())
-                .bind(identity.codec()).bind(identity.value())
-                .fetch_one(&mut *tx).await?;
-            if already_proven {
-                return Err(DbError::CloseFoundationPrecondition(
-                    "initial worktree entry refuses an exact resource with positive retirement evidence".into(),
-                ));
-            }
-            Ok(())
-        }.await;
+        let validation = validate_initial_worktree_entry_tx(
+            &mut tx, command, receipt, live_source, &scope, &snapshot, resource,
+        ).await;
         if let Err(error) = validation {
             let release = match tx.rollback().await {
                 Ok(()) => NativeCloseInitialEntryRelease::Confirmed,
