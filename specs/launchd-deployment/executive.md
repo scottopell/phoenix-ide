@@ -190,14 +190,16 @@ counters, ordering and deadlines unchanged. It does not enable mmap.
 On CPython 3.13.1 / SQLite 3.47.1, twelve alternating measured pairs after two
 warmups on actual 5,000-row-per-principal-table file-backed fixtures showed
 comparison medians (milliseconds) dense 41.503→39.062, baseline 72.721→69.429,
-and wide 215.051→194.744. Integrity timings were essentially unchanged. These
-small warm-cache measurements do not establish full-path deadline fit.
+and wide 215.051→194.744. Integrity timings were observationally similar, but
+this microbenchmark used a read-only backup connection: its integrity timing is
+not equivalent to the writable production check (see diagnostic limitations
+below). These small warm-cache measurements do not establish full-path deadline fit.
 The candidate helper SHA-256 is
 `a50af20e662af0a20e5026df8bfa5c27d52bf6f2498879078f248d5ec172cadf`.
 119 focused tests passed with no ResourceWarning/unraisable log matches,
 including explicit storage-code/byte-value and unsupported-code diagnostics
-coverage. Independent exact-delta review supports one targeted dense rerun;
-exact-source dense/native qualification and production assessment remain gates.
+coverage. Independent exact-delta review supported the targeted dense run
+reported below; dense qualification and production assessment remain gates.
 
 ### Integer-tag terminal qualification
 
@@ -225,6 +227,35 @@ The earlier smaller fixture's integrity ratio was 0.982726. These warm-cache
 measurements do not support a cache-only correction or establish scale behavior;
 no cache tuning or additional full-size rerun followed. Dense full-path success
 and fresh production assessment remain mandatory gates.
+
+### Rejected overlap diagnostic and integrity-connection limitation
+
+On CPython 3.13.1 / SQLite 3.47.1, a disposable CHECK-violating database was
+rejected by integrity checking through a writable backup connection but reported
+`ok` through a read-only connection. Initial read-only overlap screens therefore
+do not establish equivalent integrity coverage and cannot qualify production.
+The integer microbenchmark above shares that limitation. Both pager-cache
+screens, inspected separately, ran integrity on writable destination connections;
+their negative results are not invalidated by this connection-mode finding.
+The production helper uses writable destination integrity checking throughout.
+
+A corrected overlap prototype used a separately owned writable connection and
+was measured through actual `create_verified_database_backup` calls, including
+copy, integrity, exhaustive comparison and fsync, under a shared 30-second
+screening deadline. Both helpers rejected the synthetic CHECK violation.
+At 300,000 principal rows, five measured pairs following two warmups per arm
+showed sequential/overlap full-helper wall medians of 5.014/5.407 seconds;
+median paired wall and CPU ratios were 1.080467 and 1.306689. At 40,000 rows,
+wall medians were 0.655/0.706 seconds. Arms alternated with the prototype first
+in each pair; these are warm-cache observations, not scale predictions.
+The harness recorded no warnings or unraisable exceptions. It removed each
+backup after its run and used temporary fixture ownership; it did not emit a
+separate post-cleanup receipt. The prototype's focused suite had failed before
+its final connection-mode correction and was not rerun afterward.
+
+Overlap was rejected and its source/tests restored, not committed as a candidate.
+No cache tuning, overlap implementation or additional hosted dense run followed.
+The integer-tag production source and failed dense gate remain unchanged.
 
 ## Operator recovery
 
