@@ -14,6 +14,12 @@ sys.modules[SPEC.name] = release
 SPEC.loader.exec_module(release)
 
 
+RC9_SPEC = importlib.util.spec_from_file_location("frozen_rc9_prepare_test", ROOT / "scripts/frozen_rc8_prepare.py")
+rc9_prepare = importlib.util.module_from_spec(RC9_SPEC)
+sys.modules[RC9_SPEC.name] = rc9_prepare
+RC9_SPEC.loader.exec_module(rc9_prepare)
+
+
 def git(repo, *args, input=None):
     return subprocess.run(["git", "-C", str(repo), *args], input=input, check=True,
                           stdout=subprocess.PIPE, stderr=subprocess.PIPE).stdout.decode().strip()
@@ -162,6 +168,160 @@ class FrozenRc7GateTests(unittest.TestCase):
         frozen_case = workflow.split("              release-frozen-rc7)", 1)[1].split("                ;;", 1)[0]
         self.assertLess(frozen_case.index('[[ -z "$RETRY_TAG" ]]'), frozen_case.index("git fetch --no-tags origin refs/heads/release/frozen-rc7"))
         self.assertIn('exit 1', frozen_case.split('git fetch', 1)[0])
+
+
+class FrozenRc9PreparationTests(unittest.TestCase):
+    def test_profile_and_candidate_verification_boundaries(self):
+        profile = rc9_prepare.RC9
+        self.assertEqual(profile.commit, "35ee3cacf590e755d62b88ed4f140b7ae4d7acc8")
+        self.assertEqual(profile.base, release.CANDIDATE)
+        self.assertEqual(profile.version, "0.13.2-rc.9")
+        self.assertEqual(profile.tree, "57fa3c14e2830d06a629026086268c2e96279cd0")
+        self.assertEqual(rc9_prepare.RC9_PATHS, frozenset({
+            ".github/workflows/ci.yml", "Cargo.lock", "crates/phoenix-ide/Cargo.toml",
+            "scripts/launchd_deploy_helper.py", "tests/devpy/test_backup_comparator.py",
+            "tests/devpy/test_backup_verification_scale.py",
+            "tests/devpy/test_simple_launchd_helper.py",
+            "tests/integration/backup_verification_scale.py",
+            "tests/integration/qualify_release_helper.py",
+        }))
+        old = b'name = "phoenix_ide"\nversion = "0.13.2-rc.7"'
+        new = old.replace(b"rc.7", b"rc.9")
+        manifest = b'[package]\n' + old + b'\n'
+        lock = b'[[package]]\n' + old + b'\n'
+        paths = sorted(rc9_prepare.RC9_PATHS)
+        def fake_git(repo, *args):
+            if args == ("rev-parse", f"{profile.commit}^{{commit}}"):
+                return profile.commit.encode()
+            if args == ("show", "-s", "--format=%T", profile.commit):
+                return profile.tree.encode()
+            if args == ("rev-parse", f"{profile.base}^"):
+                return profile.application_base.encode()
+            if args[0] == "merge-base":
+                return b""
+            if args[0] == "rev-list":
+                return f"{profile.commit} {profile.base}".encode()
+            if args[0] == "diff-tree":
+                return "\n".join(paths).encode()
+            if args[0] == "show":
+                source, file = args[1].split(":", 1)
+                if file == rc9_prepare.HELPER:
+                    return b"helper"
+                contents = manifest if file.endswith("Cargo.toml") else lock
+                return contents.replace(old, new) if source == profile.commit else contents
+            raise AssertionError(args)
+        from dataclasses import replace
+        import hashlib
+        with mock.patch.object(rc9_prepare, "git", side_effect=fake_git), mock.patch.object(
+            rc9_prepare, "RC9", replace(profile, helper_sha256=hashlib.sha256(b"helper").hexdigest())
+        ):
+            self.assertEqual(rc9_prepare.verify_rc9_candidate()["commit"], profile.commit)
+            with mock.patch.object(rc9_prepare, "git", side_effect=lambda repo, *args: (
+                f"{profile.commit} {profile.base} {'f'*40}".encode() if args[0] == "rev-list" else fake_git(repo, *args)
+            )):
+                with self.assertRaisesRegex(ValueError, "sole direct parent"):
+                    rc9_prepare.verify_rc9_candidate()
+            with mock.patch.object(rc9_prepare, "git", side_effect=lambda repo, *args: (
+                f"{profile.commit} {'f'*40}".encode() if args[0] == "rev-list" else fake_git(repo, *args)
+            )):
+                with self.assertRaisesRegex(ValueError, "sole direct parent"):
+                    rc9_prepare.verify_rc9_candidate()
+            paths.append("extra")
+            with self.assertRaisesRegex(ValueError, "changed paths"):
+                rc9_prepare.verify_rc9_candidate()
+            paths.pop()
+            with mock.patch.object(rc9_prepare, "git", side_effect=lambda repo, *args: (
+                manifest.replace(old, b'name = "phoenix_ide"\nversion = "0.13.2-rc.8"')
+                if args == ("show", f"{profile.commit}:crates/phoenix-ide/Cargo.toml") else fake_git(repo, *args)
+            )):
+                with self.assertRaisesRegex(ValueError, "manifest"):
+                    rc9_prepare.verify_rc9_candidate()
+            with mock.patch.object(rc9_prepare, "git", side_effect=lambda repo, *args: (
+                lock.replace(old, b'name = "phoenix_ide"\nversion = "0.13.2-rc.8"')
+                if args == ("show", f"{profile.commit}:Cargo.lock") else fake_git(repo, *args)
+            )):
+                with self.assertRaisesRegex(ValueError, "lockfile"):
+                    rc9_prepare.verify_rc9_candidate()
+
+            for file, contents in (
+                ("crates/phoenix-ide/Cargo.toml", manifest),
+                ("Cargo.lock", lock),
+            ):
+                with self.subTest(file=file), mock.patch.object(
+                    rc9_prepare, "git", side_effect=lambda repo, *args: (
+                        contents.replace(old, new) + b"# unexpected non-version edit\n"
+                        if args == ("show", f"{profile.commit}:{file}") else fake_git(repo, *args)
+                    )
+                ):
+                    with self.assertRaisesRegex(ValueError, "beyond its version replacement"):
+                        rc9_prepare.verify_rc9_candidate()
+
+    def test_rc8_profile_pins_remain_unchanged(self):
+        profile = rc9_prepare.rc8_profile()
+        self.assertEqual(profile.commit, "d5d2a45651035f58f3231f0dc82fd9ef59b7cb3c")
+        self.assertEqual(profile.version, "0.13.2-rc.8")
+        self.assertEqual(profile.tree, "5ebc83729fc5630f8ffcd03477b0aaac1187982b")
+
+    def test_latest_exact_ci_failure_refuses_and_no_selectors(self):
+        profile = rc9_prepare.RC9
+        good = {"path": rc9_prepare.CI_WORKFLOW, "head_sha": profile.commit,
+                "event": "workflow_dispatch", "status": "completed", "conclusion": "success",
+                "run_number": 12, "id": 77, "run_attempt": 1}
+        import contextlib
+        import io
+        import json
+        failure = dict(good, run_number=13, id=78, conclusion="failure")
+        payload = io.BytesIO(json.dumps({"workflow_runs": [good, failure]}).encode())
+        with mock.patch.object(rc9_prepare.urllib.request, "urlopen", return_value=contextlib.nullcontext(payload)) as request:
+            with self.assertRaisesRegex(ValueError, "latest exact-candidate"):
+                rc9_prepare.latest_rc9_ci_run()
+            url = request.call_args.args[0].full_url
+            self.assertIn("head_sha=" + profile.commit, url)
+            self.assertIn("event=workflow_dispatch", url)
+        with self.assertRaisesRegex(SystemExit, "no source, version, tag, or run selectors"):
+            rc9_prepare.main(["gate-rc9", "--source", "other"])
+
+    def test_tag_rejected_before_source_or_api_and_provenance_is_distinct(self):
+        with mock.patch.object(rc9_prepare, "verify_rc9_candidate") as source, mock.patch.object(
+            rc9_prepare, "latest_rc9_ci_run"
+        ) as ci:
+            with self.assertRaisesRegex(ValueError, "release-tag input"):
+                rc9_prepare.gate_rc9(tag_input="v0.13.2-rc.9")
+            source.assert_not_called()
+            ci.assert_not_called()
+        with self.assertRaisesRegex(ValueError, "distinct"):
+            rc9_prepare.rc9_provenance_json(rc9_prepare.RC9.commit, 10, 1, 11, 1)
+        provenance = rc9_prepare.rc9_provenance_json("a" * 40, 10, 1, 11, 1)
+        self.assertEqual(provenance["operation"], "prepare-frozen-rc9")
+        self.assertEqual(provenance["source_commit"], rc9_prepare.RC9.commit)
+        self.assertEqual(provenance["controller_commit"], "a" * 40)
+
+    def test_workflow_is_preparation_only_and_uses_protected_macos_path(self):
+        workflow = (ROOT / ".github/workflows/release.yml").read_text()
+        case = workflow.split("              prepare-frozen-rc9)", 1)[1].split("                ;;", 1)[0]
+        self.assertLess(case.index('[[ -z "$RETRY_TAG" ]]'), case.index("git fetch"))
+        self.assertIn("refs/heads/main:refs/remotes/origin/main", case)
+        self.assertIn('test "$(git rev-parse origin/main)" = "$GITHUB_SHA"', case)
+        self.assertIn("refs/heads/candidate/rc9-helper-qualification:refs/remotes/origin/candidate/rc9-helper-qualification", case)
+        self.assertIn(rc9_prepare.RC9.commit, case)
+        self.assertIn('git show "$GITHUB_SHA:scripts/frozen_rc8_prepare.py"', case)
+        self.assertIn('gate-rc9 >> "$GITHUB_OUTPUT"', case)
+        self.assertNotIn("release=true", case)
+        self.assertNotIn("release-frozen-rc9", workflow)
+        self.assertNotIn("publish-frozen-rc9", workflow)
+        self.assertIn("inputs.operation == 'prepare-frozen-rc9') && 'preparation'", workflow)
+        material = workflow.split("      - name: Materialize trusted frozen RC9 controller outside candidate source", 1)[1].split("      - uses: pnpm/action-setup", 1)[0]
+        self.assertIn("CONTROLLER_COMMIT: ${{ needs.gate.outputs.controller_commit }}", material)
+        self.assertIn('test "$CONTROLLER_COMMIT" != "$(git rev-parse HEAD)"', material)
+        self.assertIn("provenance-rc9", material)
+        self.assertIn("rc9-provenance.json", material)
+        self.assertIn("RC9-SOURCE-AND-HELPER-PROVENANCE-${{ matrix.target }}.json", workflow)
+        self.assertIn("name: desktop-preparation-${{ matrix.target }}-${{ needs.gate.outputs.commit }}", workflow)
+        self.assertIn("path: ${{ runner.temp }}/release-assets/*", workflow)
+        self.assertIn("if: needs.gate.outputs.preparation == 'true'", workflow)
+        self.assertIn("environment: macos-release-signing", workflow)
+        self.assertIn("needs.gate.outputs.preparation == 'true'", workflow)
+        self.assertIn("if: needs.gate.outputs.release == 'true'", workflow)
 
 
 if __name__ == "__main__":

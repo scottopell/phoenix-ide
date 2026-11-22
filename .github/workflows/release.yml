@@ -4,7 +4,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event_name == 'workflow_dispatch' && (inputs.operation == 'prepare-main' || inputs.operation == 'prepare-incident-237100-arm64' || inputs.operation == 'prepare-incident-237100-linux-x86_64' || inputs.operation == 'prepare-frozen-rc8') && 'preparation' || 'release' }}
+  group: ${{ github.workflow }}-${{ github.event_name == 'workflow_dispatch' && (inputs.operation == 'prepare-main' || inputs.operation == 'prepare-incident-237100-arm64' || inputs.operation == 'prepare-incident-237100-linux-x86_64' || inputs.operation == 'prepare-frozen-rc8' || inputs.operation == 'prepare-frozen-rc9') && 'preparation' || 'release' }}
   cancel-in-progress: false
 
 on:
@@ -24,6 +24,7 @@ on:
           - prepare-incident-237100-arm64
           - prepare-incident-237100-linux-x86_64
           - prepare-frozen-rc8
+          - prepare-frozen-rc9
           - release-frozen-rc7
           - release-frozen-rc8
           - retry-release
@@ -130,6 +131,27 @@ jobs:
                 test "$(git rev-parse FETCH_HEAD)" = "$GITHUB_SHA"
                 git show "$GITHUB_SHA:scripts/frozen_rc8_prepare.py" > "$RUNNER_TEMP/frozen_rc8_prepare.py"
                 python3 "$RUNNER_TEMP/frozen_rc8_prepare.py" gate >> "$GITHUB_OUTPUT"
+                exit 0
+                ;;
+              prepare-frozen-rc9)
+                [[ -z "$RETRY_TAG" ]] || {
+                  echo "Frozen RC9 preparation does not accept a release tag" >&2
+                  exit 1
+                }
+                git fetch --no-tags origin refs/heads/main:refs/remotes/origin/main
+                test "$(git rev-parse origin/main)" = "$GITHUB_SHA" || {
+                  echo "Frozen RC9 preparation must run from the current main commit" >&2
+                  exit 1
+                }
+                git fetch --no-tags origin refs/heads/candidate/rc9-helper-qualification:refs/remotes/origin/candidate/rc9-helper-qualification
+                test "$(git rev-parse origin/candidate/rc9-helper-qualification)" = 35ee3cacf590e755d62b88ed4f140b7ae4d7acc8 || {
+                  echo "Frozen RC9 candidate ref moved from its immutable pin" >&2
+                  exit 1
+                }
+                git fetch --no-tags origin "$GITHUB_SHA"
+                test "$(git rev-parse FETCH_HEAD)" = "$GITHUB_SHA"
+                git show "$GITHUB_SHA:scripts/frozen_rc8_prepare.py" > "$RUNNER_TEMP/frozen_rc8_prepare.py"
+                python3 "$RUNNER_TEMP/frozen_rc8_prepare.py" gate-rc9 >> "$GITHUB_OUTPUT"
                 exit 0
                 ;;
               release-frozen-rc7)
@@ -510,6 +532,23 @@ jobs:
             "${{ github.run_id }}" "${{ github.run_attempt }}" \
             "${{ needs.gate.outputs.qualification_ci_run }}" "${{ needs.gate.outputs.qualification_ci_attempt }}"
           test -z "$(git status --porcelain)"
+      - name: Materialize trusted frozen RC9 controller outside candidate source
+        if: github.event_name == 'workflow_dispatch' && inputs.operation == 'prepare-frozen-rc9'
+        env:
+          CONTROLLER_COMMIT: ${{ needs.gate.outputs.controller_commit }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = '35ee3cacf590e755d62b88ed4f140b7ae4d7acc8'
+          test -z "$(git status --porcelain)"
+          git fetch --no-tags origin "$CONTROLLER_COMMIT"
+          test "$(git rev-parse FETCH_HEAD)" = "$CONTROLLER_COMMIT"
+          test "$CONTROLLER_COMMIT" != "$(git rev-parse HEAD)"
+          git show "$CONTROLLER_COMMIT:scripts/frozen_rc8_prepare.py" > "$RUNNER_TEMP/frozen_rc8_prepare.py"
+          python3 "$RUNNER_TEMP/frozen_rc8_prepare.py" provenance-rc9 \
+            "$RUNNER_TEMP/rc9-provenance.json" "$CONTROLLER_COMMIT" \
+            "${{ github.run_id }}" "${{ github.run_attempt }}" \
+            "${{ needs.gate.outputs.qualification_ci_run }}" "${{ needs.gate.outputs.qualification_ci_attempt }}"
+          test -z "$(git status --porcelain)"
       - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
         with:
           package_json_file: ui/package.json
@@ -661,6 +700,11 @@ jobs:
         run: |
           cp "$RUNNER_TEMP/rc8-provenance.json" \
             "$RUNNER_TEMP/release-assets/RC8-SOURCE-AND-HELPER-PROVENANCE-${{ matrix.target }}.json"
+      - name: Record frozen RC9 source and release-helper provenance
+        if: github.event_name == 'workflow_dispatch' && inputs.operation == 'prepare-frozen-rc9'
+        run: |
+          cp "$RUNNER_TEMP/rc9-provenance.json" \
+            "$RUNNER_TEMP/release-assets/RC9-SOURCE-AND-HELPER-PROVENANCE-${{ matrix.target }}.json"
       - name: Remove protected material
         if: always()
         run: |

@@ -1054,7 +1054,7 @@ class PreparationTests(unittest.TestCase):
         preparation, after = preparation_and_after.split("\n  build-macos:", 1)
         release_jobs = before + "\n  build-macos:" + after
         self.assertEqual(2, release_jobs.count("git restore ui/dist/.gitkeep"))
-        self.assertEqual(6, release_jobs.count('test -z "$(git status --porcelain)"'))
+        self.assertEqual(8, release_jobs.count('test -z "$(git status --porcelain)"'))
         self.assertEqual(1, preparation.count("git restore ui/dist/.gitkeep"))
         self.assertEqual(1, preparation.count('test -z "$(git status --porcelain)"'))
         self.assertIn("cargo build --locked --profile release-min", preparation)

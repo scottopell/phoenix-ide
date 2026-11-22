@@ -159,6 +159,7 @@ surface DesktopReleaseWorkflow {
         ReleaseGateRejected(gate)
         FrozenRc8ReleaseTagRequested(gate, tag_input)
         FrozenRc8PreparationRequested(preparation, tag_input)
+        FrozenRc9PreparationRequested(preparation, tag_input)
         StandaloneHelperVerified(pair)
         DesktopAppVerified(pair)
         NotarizationSubmitted(pair)
@@ -189,6 +190,13 @@ surface DesktopReleaseWorkflow {
 --   from exact current main. Nonempty tag_input is rejected before candidate
 --   qualification. The latest exact-candidate ci.yml workflow_dispatch run must
 --   be completed successful; no older-success fallback or source selectors exist.
+-- frozen_rc9_source_and_ci_are_exact(identity, tag_input) -> Boolean
+--   REQ-DESKTOP-REL-014 fixed RC9 commit/tree/version/helper/ref match, with RC7
+--   as sole direct parent, the exact nine-path scope and version-only bytes.
+--   Exact current-main controller and application-base ancestry match; tag input
+--   is empty. Latest exact-candidate ci.yml workflow_dispatch is completed
+--   successful, including ordinary success of both proof-publication witnesses.
+--   No source/version/run selectors, older-success fallback or RC8 evidence apply.
 -- frozen_rc8_preparation_run_qualifies(gate) -> Boolean
 --   REQ-DESKTOP-REL-002: repository scottopell/phoenix-ide run 44975553897,
 --   attempt 1, release.yml workflow_dispatch at controller
@@ -405,6 +413,21 @@ rule FrozenRc8PreparationRetainsNoPublicationAuthority {
     ensures: preparation_has_no_release_authority(preparation)
     ensures: preparation_uses_release_security_path(preparation) implies sanitized_preparation_receipts_exist(preparation)
     ensures: preparation.verified = (preparation_uses_release_security_path(preparation) and required_native_pairs_passed(preparation))
+}
+
+rule FrozenRc9PreparationRetainsNoPublicationAuthority {
+    when: FrozenRc9PreparationRequested(preparation, tag_input)
+    requires: frozen_rc9_source_and_ci_are_exact(preparation.identity, tag_input)
+    ensures: preparation_has_no_release_authority(preparation)
+    ensures: preparation_uses_release_security_path(preparation) implies sanitized_preparation_receipts_exist(preparation)
+    ensures: preparation.verified = (preparation_uses_release_security_path(preparation) and required_native_pairs_passed(preparation))
+}
+
+rule FrozenRc9PreparationRefusesUnqualifiedRequests {
+    when: FrozenRc9PreparationRequested(preparation, tag_input)
+    requires: not frozen_rc9_source_and_ci_are_exact(preparation.identity, tag_input)
+    ensures: preparation.verified = false
+    ensures: preparation_has_no_release_authority(preparation)
 }
 
 rule GateCreatesOnlyRepresentableReleaseTag {

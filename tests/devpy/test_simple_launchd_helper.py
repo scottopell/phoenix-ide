@@ -23,6 +23,44 @@ sys.modules[SPEC.name] = helper
 SPEC.loader.exec_module(helper)
 
 
+class ReleaseProofQualificationTests(unittest.TestCase):
+    def test_only_normal_success_counts_as_a_completed_proof_witness(self):
+        spec = importlib.util.spec_from_file_location(
+            "proof_qualification_harness", ROOT / "tests/integration/qualify_release_helper.py",
+        )
+        harness = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(harness)
+
+        class Witnesses(unittest.TestCase):
+            def test_pass(self):
+                pass
+
+            @unittest.skip("deliberately missing witness")
+            def test_skip(self):
+                self.fail()
+
+            @unittest.expectedFailure
+            def test_expected_failure(self):
+                self.fail()
+
+            def test_failure(self):
+                self.fail()
+
+            def test_subtest_failure(self):
+                with self.subTest(phase="proof"):
+                    self.fail()
+
+        suite = unittest.defaultTestLoader.loadTestsFromTestCase(Witnesses)
+        ids = set(harness.case_ids(suite))
+        result = unittest.TextTestRunner(
+            stream=io.StringIO(), resultclass=harness.ProofQualificationResult,
+        ).run(suite)
+        expected = {Witnesses("test_pass").id()}
+        self.assertEqual(result.successful_test_ids, expected)
+        self.assertEqual(len(ids), 5)
+        self.assertFalse(result.wasSuccessful())
+
+
 class FakeLaunchctl:
     def __init__(self, manifest):
         self.manifest = manifest
@@ -282,7 +320,7 @@ class SimpleLaunchdHelperTests(unittest.TestCase):
         self.root = Path(self.temp.name).resolve()
         binary = self.root / "candidate"
         binary.write_text(f'''#!{sys.executable}
-import contextlib, json, os, sqlite3, sys
+import contextlib, hashlib, json, os, sqlite3, sys
 from pathlib import Path
 if sys.argv[1:] == ["--build-identity"]:
     print(json.dumps({{"version": "1.0", "git_sha": "{'a' * 40}"}}))
@@ -290,6 +328,30 @@ if sys.argv[1:] == ["--build-identity"]:
 assert sys.argv[1:] == ["--migrate-only"]
 status = json.loads(Path(os.environ["TEST_STATUS_PATH"]).read_text())
 assert status["state"] == "migration_started"
+if os.environ.get("TEST_PROOF_PATH"):
+    proof = json.loads(Path(os.environ["TEST_PROOF_PATH"]).read_text())
+    with Path(os.environ["TEST_EVENTS"]).open("a") as stream:
+        stream.write("proof-check:" + proof["phase"] + "\\n")
+    assert proof["transaction_id"] == os.environ["TEST_TRANSACTION_ID"]
+    assert proof["phase"] == "migration_started"
+    assert proof["boundary"] == "attempted"
+    assert proof["database_source"] == "existing"
+    backup = proof["backup"]
+    backup_path = Path(backup["backup_path"])
+    assert backup_path.is_file()
+    assert backup_path.resolve().parent == Path(os.environ["TEST_PROOF_PATH"]).resolve().parent
+    assert backup["backup_bytes"] == backup_path.stat().st_size > 0
+    assert backup["backup_sha256"] == hashlib.sha256(backup_path.read_bytes()).hexdigest()
+    with contextlib.closing(sqlite3.connect(backup_path)) as backup_db:
+        backup_contents = backup_db.execute("SELECT phase FROM changes ORDER BY rowid").fetchall()
+    with contextlib.closing(sqlite3.connect(os.environ["PHOENIX_DB_PATH"])) as source_db:
+        source_contents = source_db.execute("SELECT phase FROM changes ORDER BY rowid").fetchall()
+    assert backup_contents == source_contents
+    Path(os.environ["TEST_PROOF_OBSERVED"]).write_text(json.dumps({{
+        "transaction_id": proof["transaction_id"], "phase": proof["phase"],
+        "boundary": proof["boundary"], "database_source": proof["database_source"],
+        "backup": backup, "pre_migration_contents": backup_contents,
+    }}))
 with Path(os.environ["TEST_EVENTS"]).open("a") as stream:
     stream.write("migrate\\n")
 with contextlib.closing(sqlite3.connect(os.environ["PHOENIX_DB_PATH"])) as db, db:
@@ -805,6 +867,62 @@ if sys.argv[1:] == ["--build-identity"]:
         with self.assertRaisesRegex(helper.ActivationError, "unsupported deployment manifest"):
             helper.Manifest.load(path)
 
+    def enable_candidate_proof_witness(self):
+        self.environment["TEST_PROOF_PATH"] = str(Path(self.manifest.status_path).with_suffix(".proof.json"))
+        self.environment["TEST_PROOF_OBSERVED"] = str(self.root / "candidate-proof-observed.json")
+        self.environment["TEST_TRANSACTION_ID"] = self.manifest.transaction_id
+        self.refresh_plist()
+
+    def test_candidate_reopens_durable_migration_proof_before_migrating_existing_source(self):
+        self.enable_candidate_proof_witness()
+        with contextlib.closing(sqlite3.connect(self.database)) as database, database:
+            database.execute("INSERT INTO changes VALUES ('pre-migration')")
+
+        self.assertEqual(self.activate(), "committed")
+
+        observed = json.loads((self.root / "candidate-proof-observed.json").read_text())
+        final = json.loads(Path(self.manifest.status_path).with_suffix(".proof.json").read_text())
+        self.assertEqual(observed["transaction_id"], self.manifest.transaction_id)
+        self.assertEqual(observed["phase"], "migration_started")
+        self.assertEqual(observed["boundary"], "attempted")
+        self.assertEqual(observed["database_source"], "existing")
+        self.assertEqual(final["transaction_id"], observed["transaction_id"])
+        self.assertEqual(final["phase"], "candidate_verified")
+        self.assertEqual(final["boundary"], "crossed")
+        self.assertEqual(final["database_source"], "existing")
+        backup = observed["backup"]
+        final_backup = final["backup"]
+        self.assertEqual(final_backup, backup)
+        backup_path = Path(backup["backup_path"])
+        self.assertTrue(backup_path.is_file())
+        self.assertEqual(backup["backup_bytes"], backup_path.stat().st_size)
+        self.assertEqual(backup["backup_sha256"], helper.sha256(backup_path))
+        with contextlib.closing(sqlite3.connect(backup_path)) as database:
+            self.assertEqual(database.execute("SELECT phase FROM changes ORDER BY rowid").fetchall(),
+                             [("pre-migration",)])
+        self.assertEqual(observed["pre_migration_contents"], [["pre-migration"]])
+        self.assertEqual(self.changes(), [("pre-migration",), ("migration_started",)])
+
+    def test_candidate_proof_witness_rejects_missing_pre_migration_publication(self):
+        self.enable_candidate_proof_witness()
+        write_proof = helper.write_proof
+
+        def omit_migration_publication(manifest, **fields):
+            if fields.get("phase") != "migration_started" or fields.get("outcome") == "failed":
+                write_proof(manifest, **fields)
+
+        with mock.patch.object(helper, "write_proof", side_effect=omit_migration_publication):
+            self.assertEqual(self.activate(), "failed")
+        self.assertEqual(self.changes(), [])
+        self.assertFalse(Path(self.environment["TEST_PROOF_OBSERVED"]).exists())
+        proof = json.loads(Path(self.environment["TEST_PROOF_PATH"]).read_text())
+        self.assertIn("proof-check:backup_verified", (self.root / "events").read_text().splitlines())
+        self.assertIn("candidate migration exited 1", self.status()["failure"])
+        self.assertEqual(proof["phase"], "migration_started")
+        self.assertEqual(proof["outcome"], "failed")
+        self.assertEqual(proof["boundary"], "attempted")
+        self.assertTrue(Path(proof["backup"]["backup_path"]).is_file())
+
     def test_success_records_durable_backup_proof(self):
         self.assertEqual(self.activate(), "committed")
         proof = json.loads((self.root / "status.proof.json").read_text())
@@ -1231,7 +1349,7 @@ h.fetch_identity = lambda *args, **kwargs: h.Identity("0.9", "b" * 40)
 result = h.activate(h.Manifest.load(Path(sys.argv[2])))
 raise SystemExit(0 if result == "committed" else 1)
 '''
-        result = subprocess.run([sys.executable, "-c", runner, str(ROOT / "scripts/launchd_deploy_helper.py"),
+        result = subprocess.run([sys.executable, "-c", runner, str(Path(helper.__file__)),
                                  str(manifest_path)], capture_output=True, text=True)
         self.assertEqual(result.returncode, 1)
         self.assertIn("actual migration failure detail", result.stderr)
