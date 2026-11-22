@@ -523,7 +523,11 @@ mod tests {
 
     #[test]
     fn linux_scan_rechecks_membership_after_transient_incomplete_stat() {
-        for stat in ["", "42 (Chrome worker) S 1", "42 (Chrome worker) S 1 invalid"] {
+        for stat in [
+            "",
+            "42 (Chrome worker) S 1",
+            "42 (Chrome worker) S 1 invalid",
+        ] {
             for after in [
                 Ok(0),
                 Ok(99),
@@ -541,7 +545,10 @@ mod tests {
             }
             for (after, expected) in [
                 (Ok(42), None),
-                (Err(io::Error::from_raw_os_error(libc::EPERM)), Some(libc::EPERM)),
+                (
+                    Err(io::Error::from_raw_os_error(libc::EPERM)),
+                    Some(libc::EPERM),
+                ),
             ] {
                 let mut observations = [Ok(42), after].into_iter();
                 let error = linux_process_is_live_member(
