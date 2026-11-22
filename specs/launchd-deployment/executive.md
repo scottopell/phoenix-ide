@@ -254,9 +254,9 @@ separate post-cleanup receipt. The prototype's focused suite had failed before
 its final connection-mode correction and was not rerun afterward.
 
 Overlap was rejected and its source/tests restored, not committed as a candidate.
-No cache tuning or overlap implementation was retained. The integer-tag source
-remains the last hosted dense result; its failed qualification is not waived by
-the later bounded diagnostic below.
+No cache tuning or overlap implementation was retained. The integer-tag dense
+failure remains historical evidence; the bounded diagnostic below did not waive
+it. The later full-size TEXT-wrapper qualification is reported separately.
 
 ### Row-only TEXT-wrapper remedy candidate
 
@@ -288,9 +288,45 @@ the full file hashes differ because scratch includes script metadata.
 
 The parent four-module regression passed 124 tests with ResourceWarning promoted
 to errors and no resource-warning or unraisable matches. Independent exact-delta
-static review found no actionable issue. These results support one targeted
-hosted qualification, not deployment: exact-source dense completion, ordinary
-CI/native results, clean integration and fresh rollout assessment remain gates.
+static review found no actionable issue. These results supported one targeted
+hosted qualification; they did not qualify deployment.
+
+The [targeted dense job](https://github.com/scottopell/phoenix-ide/actions/runs/45029233626/job/137228906115)
+subsequently passed on source `db576d9fcadb4eb11a5ffe5f83a7c50788c20091`,
+helper SHA256 `ef126688b3b194bcb3ee7466011be66858a72f40a1f71b0d497825d9594fdb3e`.
+On CPython 3.13.1 / SQLite 3.47.1 it verified a 13,439,737,856-byte dense fixture
+with 15,685,000 rows per principal table and 128-byte TEXT/BLOB payloads:
+
+| Stage | Seconds |
+|---|---:|
+| Native copy | 32.135 |
+| Full writable integrity | 438.709 |
+| Metadata | 0.003 |
+| Exhaustive comparison | 319.638 |
+| Fsync | 0.000213 |
+| Proof hash | 14.672 |
+| Shared verification interval | **805.162 / 900** |
+
+Generation took 366.977 seconds outside the verification budget; writer-guard
+acquisition took 0.001 seconds and the enclosing interval was 805.165 seconds.
+The comparator completed all eight stored tables (table ordinal nine including
+the virtual table), 62,934,642 rows and 141,593,413 cells. Proof covered all
+13,439,737,856 bytes with SHA256
+`389a6a3669a48f915883ada1ae5eff60e13ff3b95333b05a00429094c23e8a09`.
+This is a current-source dense backup-and-hash success, not evidence of durable
+transaction-proof publication, real service installation/migration or rollout
+safety. No performance repeatability guarantee follows from a single runner.
+
+The overall targeted workflow failed a separate UI assertion in
+`ProductConversationPage`'s active-Close background-refresh test, not the dense
+job. PR ordinary CI and macOS app checks passed on a synthetic merge whose tree
+is byte-identical to the candidate. [Explicit ordinary CI](https://github.com/scottopell/phoenix-ide/actions/runs/45032119542)
+passed on the candidate commit with dense disabled; checkout logs confirm the
+candidate rather than the PR merge. Observed `main`
+`db5f0a064a348b3927854c75b90aa5748c5a30e9` is an ancestor of the clean candidate;
+no predecessor release/version/publication history is introduced. Fresh rollout
+assessment and frozen-release application-boundary verification remain separate
+gates; no deployment, merge or publication is claimed.
 
 ## Operator recovery
 
