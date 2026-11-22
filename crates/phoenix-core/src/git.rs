@@ -94,12 +94,17 @@ pub fn read_worktree_registration_file(
     let file = options.open(path)?;
     let metadata = file.metadata()?;
     if !metadata.is_file() || metadata.len() > MAX_GIT_POINTER_BYTES {
-        return Err(std::io::Error::other("Git registration is not a bounded regular file"));
+        return Err(std::io::Error::other(
+            "Git registration is not a bounded regular file",
+        ));
     }
     let mut bytes = Vec::with_capacity(usize::try_from(metadata.len()).unwrap_or(0));
-    file.take(MAX_GIT_POINTER_BYTES + 1).read_to_end(&mut bytes)?;
+    file.take(MAX_GIT_POINTER_BYTES + 1)
+        .read_to_end(&mut bytes)?;
     if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_GIT_POINTER_BYTES {
-        return Err(std::io::Error::other("Git registration exceeded its capture limit"));
+        return Err(std::io::Error::other(
+            "Git registration exceeded its capture limit",
+        ));
     }
     Ok((metadata, bytes))
 }

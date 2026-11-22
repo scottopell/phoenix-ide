@@ -4826,7 +4826,9 @@ fn read_git_pipe(
         overflow |= n > remaining;
     }
     if overflow {
-        return Err(std::io::Error::other("Git output exceeded its capture limit"));
+        return Err(std::io::Error::other(
+            "Git output exceeded its capture limit",
+        ));
     }
     Ok(bytes)
 }

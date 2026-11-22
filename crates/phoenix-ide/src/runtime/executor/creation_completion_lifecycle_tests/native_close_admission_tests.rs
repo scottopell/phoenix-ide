@@ -2357,7 +2357,9 @@ async fn stale_source_aborts_joined_inventory_worker_before_owner_cleanup() {
     drop(continuation);
     assert_eq!(fence.owner_count(), 0);
     assert!(Arc::clone(&gate).try_lock_owned().is_ok());
-    assert!(reply.await.is_err());
+    // The SourceRefused response was consumed by try_recv above. Polling this
+    // completed oneshot again would panic rather than prove owner cleanup.
+    drop(reply);
 }
 
 #[tokio::test]

@@ -176,6 +176,7 @@ pub struct BashRetirementPermit {
     generation: BashTeardownGeneration,
     had_handles: bool,
     entry: Arc<RwLock<ResourceScopeKeyHandles>>,
+    global_index: Arc<RwLock<HashMap<HandleId, RegisteredHandle>>>,
     removed_handles: Vec<Arc<Handle>>,
 }
 
@@ -235,6 +236,8 @@ impl BashRetirementPermit {
             generation: self.generation,
             target: selected.clone(),
             deadline,
+            global_index: Arc::clone(&self.global_index),
+            work_scope: self.work_scope.clone(),
         })
     }
 
@@ -254,6 +257,8 @@ impl BashRetirementPermit {
 #[derive(Debug)]
 pub struct PreparedBashRetirement {
     entry: Arc<RwLock<ResourceScopeKeyHandles>>,
+    global_index: Arc<RwLock<HashMap<HandleId, RegisteredHandle>>>,
+    work_scope: ResourceScopeKey,
     handle: Arc<Handle>,
     generation: BashTeardownGeneration,
     target: BashRetirementTarget,
@@ -723,7 +728,7 @@ pub type BashLifecycleSink = tokio::sync::mpsc::UnboundedSender<BashLifecycleEve
 #[derive(Debug, Default)]
 pub struct BashHandleRegistry {
     inner: RwLock<HashMap<ResourceScopeKey, Arc<RwLock<ResourceScopeKeyHandles>>>>,
-    handles_by_id: RwLock<HashMap<HandleId, RegisteredHandle>>,
+    handles_by_id: Arc<RwLock<HashMap<HandleId, RegisteredHandle>>>,
     /// Per-handle ring byte cap. Defaults to [`RING_BUFFER_BYTES`]; tests
     /// override to small values to exercise eviction.
     ring_bytes_cap: usize,
@@ -743,7 +748,7 @@ impl BashHandleRegistry {
     pub fn new() -> Self {
         Self {
             inner: RwLock::new(HashMap::new()),
-            handles_by_id: RwLock::new(HashMap::new()),
+            handles_by_id: Arc::new(RwLock::new(HashMap::new())),
             ring_bytes_cap: RING_BUFFER_BYTES,
             live_handle_cap: LIVE_HANDLE_CAP,
             lifecycle_sink: None,
@@ -758,7 +763,7 @@ impl BashHandleRegistry {
     pub fn with_lifecycle_sink(sink: Option<BashLifecycleSink>) -> Self {
         Self {
             inner: RwLock::new(HashMap::new()),
-            handles_by_id: RwLock::new(HashMap::new()),
+            handles_by_id: Arc::new(RwLock::new(HashMap::new())),
             ring_bytes_cap: RING_BUFFER_BYTES,
             live_handle_cap: LIVE_HANDLE_CAP,
             lifecycle_sink: sink,
@@ -771,7 +776,7 @@ impl BashHandleRegistry {
     pub fn with_caps(ring_bytes_cap: usize, live_handle_cap: usize) -> Self {
         Self {
             inner: RwLock::new(HashMap::new()),
-            handles_by_id: RwLock::new(HashMap::new()),
+            handles_by_id: Arc::new(RwLock::new(HashMap::new())),
             ring_bytes_cap,
             live_handle_cap,
             lifecycle_sink: None,
@@ -1431,6 +1436,7 @@ impl BashHandleRegistry {
             generation: fence.generation(),
             had_handles: !removed_handles.is_empty(),
             entry: fence.entry,
+            global_index: Arc::clone(&self.handles_by_id),
             removed_handles,
         }
     }
@@ -1455,6 +1461,7 @@ impl BashHandleRegistry {
             generation: fence.generation,
             had_handles: !removed_handles.is_empty(),
             entry: Arc::clone(&fence.entry),
+            global_index: Arc::clone(&self.handles_by_id),
             removed_handles,
         };
         self.complete_retirement_with_policy(&permit, SignalFailurePolicy::Continue)

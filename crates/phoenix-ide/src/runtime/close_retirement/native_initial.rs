@@ -7,9 +7,9 @@
 pub(crate) mod bash;
 pub(super) mod capture_binding;
 pub(crate) mod resource;
+mod supervision;
 #[cfg(unix)]
 pub(crate) mod worktree;
-mod supervision;
 
 use super::verify_observed_process_identities;
 use super::{CloseProcessStepExecutor, RetirementFailureReason};

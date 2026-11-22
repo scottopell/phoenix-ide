@@ -1,16 +1,18 @@
 //! Original registry-generation custody for separately admitted native Bash leaves.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
+use phoenix_core::work_scope::ResourceScopeKey;
 use thiserror::Error;
-use tokio::sync::OwnedRwLockWriteGuard;
+use tokio::sync::{OwnedRwLockWriteGuard, RwLock};
 use tokio::time::Instant;
 
 use super::{
     record_handle_in_report, retirement_target_has_live_member, BashRetirementTarget,
-    BashTeardownGeneration, CascadeBashReport, ResourceScopeKeyHandles,
+    BashTeardownGeneration, CascadeBashReport, RegisteredHandle, ResourceScopeKeyHandles,
 };
-use crate::bash::handle::{Handle, NativeBashSignal, NativeBashSignalError, WaiterSettlement};
+use crate::bash::handle::{Handle, HandleId, NativeBashSignal, NativeBashSignalError, WaiterSettlement};
 
 #[derive(Debug, Error)]
 pub enum NativeBashRetirementError {
@@ -26,6 +28,16 @@ pub enum NativeBashRetirementError {
     TargetMismatch,
     #[error("native Bash leaf preparation failed: {0}")]
     Native(#[source] NativeBashSignalError),
+    #[error("compensated refusal handback requires successful native cleanup")]
+    CleanupIncomplete,
+    #[error("compensated refusal handback is forbidden after any process-group signal attempt")]
+    GroupSignalAttempted,
+    #[error("original Bash teardown generation is stale")]
+    StaleHandbackGeneration,
+    #[error("the exact original handle is not uniquely held by this native owner")]
+    OriginalMembershipMismatch,
+    #[error("the original handle id is already occupied in the work table or global index")]
+    HandbackCollision,
 }
 
 #[derive(Debug)]
@@ -40,6 +52,8 @@ pub enum NativeBashRetirementOutcome {
 #[must_use = "retain through confirmed external writer release and explicit cleanup"]
 pub struct NativeBashRetirement {
     _registry_writer: OwnedRwLockWriteGuard<ResourceScopeKeyHandles>,
+    global_index: Arc<RwLock<HashMap<HandleId, RegisteredHandle>>>,
+    work_scope: ResourceScopeKey,
     _handle: Arc<Handle>,
     generation: BashTeardownGeneration,
     target: BashRetirementTarget,
@@ -47,6 +61,7 @@ pub struct NativeBashRetirement {
     signal: NativeBashSignal,
     report: CascadeBashReport,
     cleanup_complete: bool,
+    group_signal_attempted: bool,
     group_signal_succeeded: bool,
 }
 
@@ -56,6 +71,8 @@ impl super::PreparedBashRetirement {
     pub async fn prepare_native(self) -> Result<NativeBashRetirement, NativeBashRetirementError> {
         let Self {
             entry,
+            global_index,
+            work_scope,
             handle,
             generation,
             target,
@@ -106,6 +123,8 @@ impl super::PreparedBashRetirement {
         );
         Ok(NativeBashRetirement {
             _registry_writer: writer,
+            global_index,
+            work_scope,
             _handle: handle,
             generation,
             target,
@@ -113,6 +132,7 @@ impl super::PreparedBashRetirement {
             signal,
             report,
             cleanup_complete: false,
+            group_signal_attempted: false,
             group_signal_succeeded: false,
         })
     }
@@ -128,6 +148,7 @@ impl NativeBashRetirement {
     }
 
     pub fn try_signal_group(&mut self) -> Result<(), NativeBashSignalError> {
+        self.group_signal_attempted = true;
         let result = self.signal.try_signal_group();
         if result.is_ok() {
             self.group_signal_succeeded = true;
@@ -141,6 +162,48 @@ impl NativeBashRetirement {
         self.signal.resume_after_writer_release()?;
         self.signal.release_state_pin_after_writer_release()?;
         self.cleanup_complete = true;
+        Ok(())
+    }
+
+    /// Return the exact original live handle to its original table only when refusal is
+    /// confirmed before any group-signal attempt and explicit native cleanup succeeded.
+    /// The borrowed owner remains intact on every error; this operation never cancels or
+    /// refreshes the original teardown fence and does not signal or renew its deadline.
+    pub async fn handback_compensated_refusal(&mut self) -> Result<(), NativeBashRetirementError> {
+        if !self.cleanup_complete {
+            return Err(NativeBashRetirementError::CleanupIncomplete);
+        }
+        if self.group_signal_attempted {
+            return Err(NativeBashRetirementError::GroupSignalAttempted);
+        }
+        if !self._registry_writer.teardown_started
+            || self._registry_writer.teardown_generation != self.generation.0
+        {
+            return Err(NativeBashRetirementError::StaleHandbackGeneration);
+        }
+        let handle = Arc::clone(&self._handle);
+        if handle.handle_id != self.target.handle_id
+            || handle.launch_identity != self.target.launch_identity
+            || self._registry_writer.handles.contains_key(&handle.handle_id)
+        {
+            return Err(NativeBashRetirementError::OriginalMembershipMismatch);
+        }
+
+        // This is intentionally the only awaited lock acquisition after validation. Do not
+        // consult the registry's inner scope map here: teardown may hold its writer while
+        // waiting on this table, which would invert lock order.
+        let mut global_index = self.global_index.write().await;
+        if global_index.contains_key(&handle.handle_id) {
+            return Err(NativeBashRetirementError::HandbackCollision);
+        }
+        self._registry_writer.insert(Arc::clone(&handle));
+        global_index.insert(
+            handle.handle_id.clone(),
+            RegisteredHandle {
+                owner: self.work_scope.clone(),
+                handle,
+            },
+        );
         Ok(())
     }
 

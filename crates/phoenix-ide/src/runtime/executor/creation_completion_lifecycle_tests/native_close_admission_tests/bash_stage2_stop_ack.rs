@@ -211,6 +211,10 @@ async fn bash_stage_two_stop_ack_reaches_real_second_writer_and_cleans_once() {
         .expect("real Bash retirement reaches stop-observation barrier")
         .unwrap();
     assert!(eligible, "original source must be eligible before Stop ACK");
+    assert!(
+        stats.precleanup_handback_refused.load(Ordering::SeqCst),
+        "the original owner cannot hand back membership before explicit cleanup"
+    );
     stop_actor(&sender).await;
     let (revoked, deadline_unexpired, refused) =
         tokio::time::timeout(std::time::Duration::from_secs(10), async {
@@ -243,17 +247,15 @@ async fn bash_stage_two_stop_ack_reaches_real_second_writer_and_cleans_once() {
         "the original owner compensates the observed stop exactly once after writer release"
     );
     // The completion witness establishes that the second writer has released
-    // the barrier, so it is now safe to inspect and dispose the test-owned
-    // native owner. Its Bash custody retains the scope registry writer guard;
-    // drop it before awaiting public Close completion or issuing public Bash
-    // registry operations, both of which need that registry.
+    // the barrier. Confirmed refusal plus successful compensation must hand
+    // back the exact handle and release the native table writer without test
+    // intervention. Uncertain cleanup paths must still retain their owners.
     {
-        let mut state = custody.lock().await;
+        let state = custody.lock().await;
         assert!(
-            state.owner.is_some(),
-            "failed destructive authorization retains the original owner"
+            state.owner.is_none(),
+            "confirmed compensated refusal releases native custody after handback"
         );
-        drop(state.owner.take());
     }
 
     let close_output = tokio::time::timeout(std::time::Duration::from_secs(30), close)
@@ -275,6 +277,16 @@ async fn bash_stage_two_stop_ack_reaches_real_second_writer_and_cleans_once() {
         live_pgids,
         vec![pgid],
         "the refused second-stage callback must preserve the test-owned group; original handle state: {original_state:?}; waiter settlement: {original_settlement:?}"
+    );
+    let returned = backend
+        .bash_handles()
+        .get_by_id(&phoenix_tools::bash::HandleId::new(handle_id.clone()))
+        .await
+        .expect("the same original handle is publicly addressable again");
+    assert!(Arc::ptr_eq(&returned.handle, &original.handle));
+    assert!(
+        backend.bash_handles().reserve_spawn(&work_key).await.is_err(),
+        "compensated handback must not reopen the sealed scope"
     );
 
     // Stop ACK may refuse the Close source, but the Bash child is test-owned.

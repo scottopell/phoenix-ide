@@ -77,7 +77,10 @@ fn select_original_worktrees(
             let LossItemIdentity::Worktree(identity) = item.resource.identity() else {
                 return Err("captured Worktree has no typed worktree identity".into());
             };
-            if targets.iter().any(|prior: &OriginalWorktreeTarget| prior.resource.scope == *scope) {
+            if targets
+                .iter()
+                .any(|prior: &OriginalWorktreeTarget| prior.resource.scope == *scope)
+            {
                 return Err("captured scope has multiple Worktree resources".into());
             }
             targets.push(OriginalWorktreeTarget {
@@ -87,8 +90,7 @@ fn select_original_worktrees(
         }
     }
     if inventory.iter().any(|item| {
-        item.resource.kind() == RetiredResourceKind::Worktree
-            && !scopes.contains(&item.scope)
+        item.resource.kind() == RetiredResourceKind::Worktree && !scopes.contains(&item.scope)
     }) {
         return Err("captured Worktree has no captured WorkScope".into());
     }
@@ -420,7 +422,9 @@ mod tests {
     fn rejects_duplicate_or_foreign_original_worktree_targets() {
         let item = resource(RetiredResourceKind::Worktree, "first");
         let scope = item.scope.clone();
-        assert!(select_original_worktrees(&[item.clone(), item.clone()], &[scope.clone()]).is_err());
+        assert!(
+            select_original_worktrees(&[item.clone(), item.clone()], &[scope.clone()]).is_err()
+        );
         assert!(select_original_worktrees(&[item], &[]).is_err());
     }
 

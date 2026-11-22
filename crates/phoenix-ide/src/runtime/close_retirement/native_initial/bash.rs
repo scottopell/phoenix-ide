@@ -29,6 +29,7 @@ pub(crate) enum BashStage {
     GroupWriterPending,
     WritersReleased,
     CleanupBlocked,
+    CompensatedRefusal,
     Verified,
     Quarantined,
 }
@@ -52,6 +53,7 @@ pub(crate) struct BashStage2TestStats {
     pub(crate) group_attempts: std::sync::atomic::AtomicUsize,
     pub(crate) group_signal_succeeded: std::sync::atomic::AtomicBool,
     pub(crate) cleanup_attempts: std::sync::atomic::AtomicUsize,
+    pub(crate) precleanup_handback_refused: std::sync::atomic::AtomicBool,
     pub(crate) actual_confirmed_release: std::sync::atomic::AtomicBool,
 }
 
@@ -164,6 +166,7 @@ impl BashEntryContext {
             return Err(NativeInitialStepError::FatalAuthority);
         }
         let mut problem = state.stop_failure.take();
+        let mut confirmed_group_refusal = false;
         #[cfg(test)]
         let mut test_hook = state.test_hook.take();
         if problem.is_none() {
@@ -179,6 +182,13 @@ impl BashEntryContext {
                 if let Some(hook) = test_hook.as_mut() {
                     let (replacement, _) = tokio::sync::oneshot::channel();
                     let reached = std::mem::replace(&mut hook.reached, replacement);
+                    hook.stats.precleanup_handback_refused.store(
+                        matches!(
+                            state.owner.as_mut().unwrap().handback_compensated_refusal().await,
+                            Err(phoenix_tools::bash::registry::NativeBashRetirementError::CleanupIncomplete)
+                        ),
+                        std::sync::atomic::Ordering::SeqCst,
+                    );
                     let _ = reached.send((
                         self.source_entry
                             .is_eligible_unrevoked_before_deadline_for_test(),
@@ -262,16 +272,20 @@ impl BashEntryContext {
                         problem = match admission {
                             WorkerEntryResult::Ran(Ok(())) => None,
                             WorkerEntryResult::Ran(Err(error)) => Some(format!("Bash group signal failed: {error}")),
-                            WorkerEntryResult::Busy | WorkerEntryResult::Refused => Some(
-                                "live source unavailable, expired or revoked before Bash group signal".into()
-                            ),
+                            WorkerEntryResult::Busy | WorkerEntryResult::Refused => {
+                                confirmed_group_refusal = true;
+                                Some("live source unavailable, expired or revoked before Bash group signal".into())
+                            }
                         };
                     }
                     Err(NativeCloseInitialFirstEffectError::NotStarted(error))
                     | Err(NativeCloseInitialFirstEffectError::Rejected {
                         error,
                         release: NativeCloseInitialEntryRelease::Confirmed,
-                    }) => problem = Some(format!("Bash group authorization refused: {error}")),
+                    }) => {
+                        confirmed_group_refusal = true;
+                        problem = Some(format!("Bash group authorization refused: {error}"));
+                    }
                     // Missing/unconfirmed writer release is NOT permission to
                     // resume, drop the state pin, verify, or retry either leaf.
                     _ => {
@@ -303,7 +317,22 @@ impl BashEntryContext {
             ));
         }
         if let Some(problem) = problem {
-            state.stage = BashStage::CleanupBlocked;
+            if confirmed_group_refusal {
+                // The second leaf never entered and every writer is definitely
+                // released. Return only this compensated original handle, not
+                // the scope permit, and do not reopen spawn or Close admission.
+                if let Err(error) = owner.handback_compensated_refusal().await {
+                    state.stage = BashStage::CleanupBlocked;
+                    return Err(failure(
+                        expected,
+                        format!("{problem}; Bash handback retains original owner: {error}"),
+                    ));
+                }
+                state.stage = BashStage::CompensatedRefusal;
+                drop(state.owner.take());
+            } else {
+                state.stage = BashStage::CleanupBlocked;
+            }
             return Err(failure(expected, problem));
         }
         let outcome = owner.verify_after_cleanup().await;

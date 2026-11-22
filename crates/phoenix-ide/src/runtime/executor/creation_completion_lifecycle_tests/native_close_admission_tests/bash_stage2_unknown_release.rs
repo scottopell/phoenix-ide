@@ -369,6 +369,14 @@ async fn assert_unknown_release_custody(drop_close_before_second_writer: bool) {
         );
     }
     assert!(
+        backend
+            .bash_handles()
+            .get_by_id(&phoenix_tools::bash::HandleId::new(handle_id.clone()))
+            .await
+            .is_none(),
+        "unknown release must not hand back ordinary handle membership"
+    );
+    assert!(
         matches!(
             *settlement.borrow_and_update(),
             phoenix_tools::bash::handle::WaiterSettlement::Pending
