@@ -701,21 +701,37 @@ fn split_frontmatter(content: &str) -> Option<(&str, &str)> {
     None
 }
 
-/// True when every top-level line of a frontmatter block is blank, a comment,
-/// an indented continuation, or a `key:` line. Prose between two horizontal
-/// rules is not a mapping.
+/// True when `line` is a top-level `key:` line (bare or quoted key).
+fn is_frontmatter_key_line(line: &str) -> bool {
+    let Some((key, _)) = line.split_once(':') else {
+        return false;
+    };
+    let quoted = key.len() >= 2
+        && ((key.starts_with('"') && key.ends_with('"'))
+            || (key.starts_with('\'') && key.ends_with('\'')));
+    quoted
+        || (key.starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_')
+            && key
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.')))
+}
+
+/// True when the block is a YAML mapping: it opens with a `key:` line and every
+/// other top-level line is blank, a comment, an indented continuation, a `key:`
+/// line, or an indentless sequence item (`- x`) belonging to a preceding key.
+/// Prose or a bare list between two horizontal rules is not a mapping.
 fn looks_like_frontmatter_mapping(block: &str) -> bool {
+    let mut seen_key = false;
     block.lines().all(|line| {
         let t = line.trim_end();
         if t.is_empty() || t.starts_with('#') || t.starts_with([' ', '\t']) {
             return true;
         }
-        t.split_once(':').is_some_and(|(key, _)| {
-            key.starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_')
-                && key
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
-        })
+        if is_frontmatter_key_line(t) {
+            seen_key = true;
+            return true;
+        }
+        seen_key && (t == "-" || t.starts_with("- "))
     })
 }
 
@@ -833,6 +849,20 @@ mod tests {
             "body\r\n"
         );
         assert_eq!(strip_frontmatter("---\nname: a\n---   \nbody"), "body");
+    }
+
+    #[test]
+    fn test_strip_frontmatter_accepts_indentless_sequences() {
+        let content = "---\nname: build\nallowed-tools:\n- Read\n- Bash\ndescription: d\n---\nBody";
+        assert_eq!(strip_frontmatter(content), "Body");
+        let quoted = "---\n\"name\": build\n---\nBody";
+        assert_eq!(strip_frontmatter(quoted), "Body");
+    }
+
+    #[test]
+    fn test_strip_frontmatter_keeps_leading_list_between_rules() {
+        let content = "---\n- first\n- second\n---\nafter";
+        assert_eq!(strip_frontmatter(content), content);
     }
 
     #[test]
