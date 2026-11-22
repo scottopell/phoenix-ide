@@ -395,7 +395,10 @@ async fn prepare_retains_exact_source_and_payload_without_mutating_or_dispatchin
     .fetch_one(db.pool())
     .await
     .unwrap();
-    assert_eq!(persisted_shape, ("local".into(), None, None, "prepared".into()));
+    assert_eq!(
+        persisted_shape,
+        ("local".into(), None, None, "prepared".into())
+    );
     assert_eq!(preparation_count(&db).await, 1);
     assert_eq!(counts(&db).await, before);
     assert_eq!(

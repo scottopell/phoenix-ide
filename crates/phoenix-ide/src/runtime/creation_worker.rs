@@ -2527,21 +2527,40 @@ impl RepositoryMutationLock {
         Self::acquire_with_timeout(repo_root, Duration::from_secs(30))
     }
 
+    pub(crate) fn acquire_common_directory_until(
+        common_dir: &Path,
+        deadline: std::time::Instant,
+    ) -> Result<Self, (String, ErrorKind)> {
+        let (file, lock_path) = Self::open_common_directory_file_until(common_dir, deadline)?;
+        Self::acquire_open_file_until(file, lock_path, deadline)
+    }
+
     fn acquire_with_timeout(
         repo_root: &Path,
         timeout: Duration,
     ) -> Result<Self, (String, ErrorKind)> {
         let deadline = std::time::Instant::now() + timeout;
         let (file, lock_path) = Self::open_file(repo_root, timeout)?;
+        Self::acquire_open_file_until(file, lock_path, deadline)
+    }
+
+    fn acquire_open_file_until(
+        file: std::fs::File,
+        lock_path: PathBuf,
+        deadline: std::time::Instant,
+    ) -> Result<Self, (String, ErrorKind)> {
         loop {
             if std::time::Instant::now() >= deadline {
-                return Err((
-                    "repository mutation lock acquisition timed out".to_string(),
-                    ErrorKind::ServerError,
-                ));
+                return Err(Self::timed_out());
             }
             match file.try_lock_exclusive() {
-                Ok(()) => return Ok(Self { file }),
+                Ok(()) => {
+                    let guard = Self { file };
+                    if std::time::Instant::now() >= deadline {
+                        return Err(Self::timed_out());
+                    }
+                    return Ok(guard);
+                }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
                 Err(error) => {
                     return Err((
@@ -2552,13 +2571,17 @@ impl RepositoryMutationLock {
             }
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             if remaining.is_zero() {
-                return Err((
-                    "repository mutation lock acquisition timed out".to_string(),
-                    ErrorKind::ServerError,
-                ));
+                return Err(Self::timed_out());
             }
             std::thread::sleep(remaining.min(Duration::from_millis(25)));
         }
+    }
+
+    fn timed_out() -> (String, ErrorKind) {
+        (
+            "repository mutation lock acquisition timed out".to_string(),
+            ErrorKind::ServerError,
+        )
     }
 
     fn open_file(
@@ -2571,7 +2594,13 @@ impl RepositoryMutationLock {
             timeout,
         )
         .map_err(|error| (error, ErrorKind::ServerError))?;
-        let lock_path = PathBuf::from(common_dir.trim()).join("phoenix-creation.lock");
+        Self::open_common_directory_file(Path::new(common_dir.trim()))
+    }
+
+    fn open_common_directory_file(
+        common_dir: &Path,
+    ) -> Result<(std::fs::File, PathBuf), (String, ErrorKind)> {
+        let lock_path = common_dir.join("phoenix-creation.lock");
         let file = std::fs::OpenOptions::new()
             .create(true)
             .truncate(false)
@@ -2587,6 +2616,21 @@ impl RepositoryMutationLock {
                     ErrorKind::ServerError,
                 )
             })?;
+        Ok((file, lock_path))
+    }
+
+    fn open_common_directory_file_until(
+        common_dir: &Path,
+        deadline: std::time::Instant,
+    ) -> Result<(std::fs::File, PathBuf), (String, ErrorKind)> {
+        if std::time::Instant::now() >= deadline {
+            return Err(Self::timed_out());
+        }
+        let (file, lock_path) = Self::open_common_directory_file(common_dir)?;
+        if std::time::Instant::now() >= deadline {
+            drop(file);
+            return Err(Self::timed_out());
+        }
         Ok((file, lock_path))
     }
 }
@@ -5326,6 +5370,95 @@ mod existing_message_recovery_tests {
 mod repository_lock_tests {
     use super::RepositoryMutationLock;
     use fs2::FileExt;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn repository_mutation_lock_guard_is_send_sync_static() {
+        fn assert_send_sync_static<T: Send + Sync + 'static>() {}
+        assert_send_sync_static::<RepositoryMutationLock>();
+    }
+
+    #[test]
+    fn expired_common_directory_deadline_does_not_create_lock_file() {
+        let parent = tempfile::tempdir().unwrap();
+        let nonexistent_common_dir = parent.path().join("not-created");
+        let result = RepositoryMutationLock::acquire_common_directory_until(
+            &nonexistent_common_dir,
+            Instant::now(),
+        );
+        let Err((error, _)) = result else {
+            panic!("expired common-directory lock unexpectedly acquired");
+        };
+        assert!(error.contains("timed out"), "{error}");
+        assert!(!nonexistent_common_dir.exists());
+        assert!(!nonexistent_common_dir.join("phoenix-creation.lock").exists());
+    }
+
+    #[test]
+    fn common_directory_contention_exhausts_the_supplied_deadline() {
+        let temp = tempfile::tempdir().unwrap();
+        let holder = RepositoryMutationLock::acquire_common_directory_until(
+            temp.path(),
+            Instant::now() + Duration::from_secs(30),
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_millis(100);
+        let result = RepositoryMutationLock::acquire_common_directory_until(temp.path(), deadline);
+        let Err((error, _)) = result else {
+            panic!("contended repository lock unexpectedly acquired");
+        };
+        assert!(error.contains("timed out"), "{error}");
+        assert!(Instant::now() >= deadline);
+        // A coarse liveness guard catches an accidental fresh 30-second budget;
+        // the live holder, not elapsed time, establishes lock contention.
+        assert!(Instant::now() < deadline + Duration::from_secs(5));
+        let contender = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(temp.path().join("phoenix-creation.lock"))
+            .unwrap();
+        assert!(contender.try_lock_exclusive().is_err());
+        drop(holder);
+        contender.try_lock_exclusive().unwrap();
+        contender.unlock().unwrap();
+    }
+
+    #[test]
+    fn common_directory_lock_serializes_holders_and_releases_on_same_path() {
+        let repo = tempfile::tempdir().unwrap();
+        let status = phoenix_core::git::command()
+            .args(["init", "--quiet"])
+            .current_dir(repo.path())
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let (_, lock_path) = RepositoryMutationLock::open_file(repo.path(), Duration::from_secs(30))
+            .unwrap();
+        let common_dir = lock_path.parent().unwrap();
+
+        let first = RepositoryMutationLock::acquire_common_directory_until(
+            common_dir,
+            Instant::now() + Duration::from_secs(30),
+        )
+        .unwrap();
+        let contender = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .unwrap();
+        assert!(contender.try_lock_exclusive().is_err());
+        drop(first);
+
+        let second = RepositoryMutationLock::acquire_common_directory_until(
+            common_dir,
+            Instant::now() + Duration::from_secs(30),
+        )
+        .unwrap();
+        assert!(contender.try_lock_exclusive().is_err());
+        drop(second);
+        contender.try_lock_exclusive().unwrap();
+        contender.unlock().unwrap();
+    }
 
     #[test]
     fn blocked_repository_mutation_lock_times_out_and_releases_waiter() {

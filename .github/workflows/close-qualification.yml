@@ -322,6 +322,13 @@ jobs:
             bounded_child_waits_for_pipe_eof_until_deadline_after_direct_child_exits
             expired_original_fsmonitor_deadline_refuses_before_repository_access
             worktree_effect_receives_the_original_absolute_deadline
+            expired_repository_lock_deadline_refuses_before_repository_access
+            worktree_repository_lock_uses_shared_common_directory_until_released
+            expired_prepared_worktree_refuses_before_first_teardown_effect
+            prepared_worktree_core_holds_existing_repository_lock_through_effect_hook
+            prepared_worktree_refuses_replaced_common_directory_before_teardown
+            common_directory_registry_query_lists_linked_worktree_without_nested_git
+            expired_common_directory_registry_query_refuses_before_directory_access
             expired_common_git_directory_deadline_refuses_before_repository_access
             expired_git_directory_resolver_deadline_refuses_before_repository_access
             expired_git_directory_capture_deadline_refuses_before_repository_access
@@ -421,6 +428,16 @@ jobs:
             prepared_retirement_reports_selected_observation_failure; do
             grep -F "test bash::registry::tests::$test ... ok" evidence/bash-registry-execution.log
           done
+      - name: Qualify shared repository lock custody and deadline refusal
+        if: success() || failure()
+        shell: bash
+        run: |
+          set -euo pipefail
+          module=runtime::creation_worker::repository_lock_tests::
+          (cd crates/phoenix-ide && "$PHOENIX_RUNTIME_TEST_BINARY" "$module" --list) | tee evidence/repository-lock-discovery.log
+          grep -Eq '^runtime::creation_worker::repository_lock_tests::[^ ]+: test$' evidence/repository-lock-discovery.log
+          (cd crates/phoenix-ide && "$PHOENIX_RUNTIME_TEST_BINARY" "$module" --nocapture --test-threads=1) 2>&1 | tee evidence/repository-lock.log
+          grep -Eq 'test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored;' evidence/repository-lock.log
       - name: Qualify inert exact terminal retirement ownership and terminal regressions
         if: success() || failure()
         shell: bash
