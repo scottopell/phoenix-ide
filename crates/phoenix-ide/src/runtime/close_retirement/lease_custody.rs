@@ -9,7 +9,9 @@ use phoenix_tools::tmux::registry::TmuxRegistry;
 use std::path::PathBuf;
 
 use crate::terminal::session::TerminalRetirementPermit;
-use phoenix_core::domain::close::{RetiredResourceIdentity, RetiredResourceKind};
+use phoenix_core::domain::close::{
+    CloseRetirementSnapshot, RetiredResourceIdentity, RetiredResourceKind,
+};
 use phoenix_core::work_scope::{ResourceScopeKey, WorkScopeId};
 use phoenix_tools::browser::session::BrowserRetirementPermit;
 use phoenix_tools::tmux::registry::{
@@ -106,6 +108,8 @@ impl FailedAcquisition {
             terminal: self.terminal,
             browser: self.browser,
             resources,
+            capture_evidence: None,
+            native_initial_entered: Vec::new(),
         })
     }
 
@@ -127,7 +131,16 @@ enum AcquiringLease {
 
 #[derive(Default)]
 pub(crate) struct CloseResourceLeaseStore {
+    #[cfg(test)]
+    pub(super) terminal_entry_hook: Option<super::native_initial::resource::TerminalEntryTestHook>,
+    #[cfg(test)]
+    pub(super) bash_stage2_hook: Option<super::native_initial::bash::BashStage2TestHook>,
+    // External process-epoch supervision is never owned by an actor waiter.
+    pub(super) native_initial_supervisors: Vec<super::native_initial::resource::NativeInitialResourceRecord>,
     pub(crate) complete: HashMap<LeaseKey, CloseResourceLease>,
+    // Native initial preparation owns the original affine lease outside the global
+    // store lock. Keeping the reservation here prevents reopening while it lives.
+    pub(super) native_initial_leases: HashMap<LeaseKey, Arc<tokio::sync::Mutex<CloseResourceLease>>>,
     acquiring: HashMap<LeaseKey, AcquiringLease>,
     reopening: HashMap<String, BoxFuture<'static, Reopening>>,
     #[cfg(test)]
@@ -141,8 +154,78 @@ pub(crate) struct CloseResourceLeaseStore {
 }
 
 impl CloseResourceLeaseStore {
+    pub(super) fn reserve_native_initial_lease(
+        &mut self,
+        key: &LeaseKey,
+    ) -> Result<Arc<tokio::sync::Mutex<CloseResourceLease>>, String> {
+        if let Some(lease) = self.native_initial_leases.get(key) {
+            return Ok(Arc::clone(lease));
+        }
+        let lease = self.complete.remove(key).ok_or("native initial lease is missing")?;
+        let lease = Arc::new(tokio::sync::Mutex::new(lease));
+        self.native_initial_leases.insert(key.clone(), Arc::clone(&lease));
+        Ok(lease)
+    }
+
+    /// Return only definitely inert, idle reservations to the ordinary lease
+    /// store. Arc uniqueness proves no preparation still borrows a permit;
+    /// retained resource state separately forbids reopening transferred owners,
+    /// even if SQLite release or the physical outcome remains unknown.
+    fn restore_unentered_native_initial_leases(&mut self, attempt: &str) -> Result<(), String> {
+        let keys = self.native_initial_leases.keys()
+            .filter(|(candidate, _)| candidate == attempt)
+            .cloned().collect::<Vec<_>>();
+        for key in &keys {
+            let lease = self.native_initial_leases.get(key).expect("selected reservation");
+            if Arc::strong_count(lease) != 1 || self.native_initial_supervisors.iter().any(|record| {
+                record.expected.attempt_id.as_str() == attempt
+                    && record.expected.scope == key.1 && record.retains_entry()
+            }) {
+                return Err("native initial retirement still owns the original Close lease".into());
+            }
+        }
+        for key in keys {
+            let lease = self.native_initial_leases.remove(&key).expect("validated reservation");
+            // No await or external reference can intervene while this store is
+            // exclusively held. Do not clone the affine permits to restore them.
+            match Arc::try_unwrap(lease) {
+                Ok(lease) => { self.complete.insert(key, lease.into_inner()); }
+                Err(lease) => {
+                    self.native_initial_leases.insert(key, lease);
+                    return Err("native initial lease custody changed during restoration".into());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn bind_capture_evidence(
+        &mut self, attempt: &str, scopes: &[super::native_initial::capture_binding::ScopeCaptureEvidence],
+    ) -> Result<(), String> {
+        if scopes.is_empty() { return Err("native capture has no scopes".into()); }
+        let mut bindings = Vec::with_capacity(scopes.len());
+        for (index, scope) in scopes.iter().enumerate() {
+            if scopes[..index].iter().any(|prior| prior.scope() == scope.scope()) {
+                return Err("duplicate native capture binding scope".into());
+            }
+            let key = (attempt.to_string(), scope.scope().clone());
+            let lease = self.complete.get(&key).ok_or("native initial lease was lost before binding")?;
+            let binding = scope.bind(lease.browser.deadline());
+            if lease.capture_evidence.as_ref().is_some_and(|bound| bound != &binding) {
+                return Err("native initial lease was bound to different evidence or deadline".into());
+            }
+            bindings.push((key, binding));
+        }
+        for (key, binding) in bindings {
+            let lease = self.complete.get_mut(&key).expect("validated original native initial lease");
+            lease.capture_evidence = Some(binding);
+        }
+        Ok(())
+    }
+
     pub(super) fn discard_completed(&mut self, attempt: &str) {
         if self.reopening.contains_key(attempt)
+            || self.native_initial_leases.keys().any(|(candidate, _)| candidate == attempt)
             || self
                 .acquiring
                 .keys()
@@ -171,6 +254,9 @@ impl CloseResourceLeaseStore {
     ) -> Result<Vec<RetiredResourceIdentity>, String> {
         if self.is_reopening(&key.0) {
             return Err("Close lease reopening is incomplete".to_string());
+        }
+        if self.native_initial_leases.contains_key(&key) {
+            return Err("Close resource lease is reserved by native initial retirement".to_string());
         }
         if let Some(lease) = self.complete.get(&key) {
             return Ok(lease.resources.clone());
@@ -249,6 +335,7 @@ impl CloseResourceLeaseStore {
         attempt: &str,
         registries: LeaseRegistries,
     ) -> Result<(), String> {
+        self.restore_unentered_native_initial_leases(attempt)?;
         if !self.reopening.contains_key(attempt) {
             let mut acquiring = self
                 .acquiring
@@ -321,8 +408,8 @@ impl LeaseRegistries {
             .begin_teardown(&key)
             .await
             .expect("begin_teardown installs a fenced owner table");
-        let terminal = self.terminal.begin_retirement(&key);
-        let browser = self.browser.begin_retirement(&key).await;
+        let terminal = self.terminal.begin_retirement_by(&key, expires);
+        let browser = self.browser.begin_retirement_with_deadline(&key, expires).await;
         let tmux = async {
             #[cfg(test)]
             if let Some(hook) = hook {
@@ -390,6 +477,8 @@ impl LeaseRegistries {
             terminal,
             browser,
             resources,
+            capture_evidence: None,
+            native_initial_entered: Vec::new(),
         })
     }
 
@@ -483,8 +572,12 @@ impl LeaseRegistries {
                 terminal,
                 browser,
                 resources,
+                capture_evidence,
+                native_initial_entered,
             } = lease;
-            cancelling.push((key, bash, terminal, browser, resources));
+            cancelling.push((
+                key, bash, terminal, browser, resources, capture_evidence, native_initial_entered,
+            ));
             permits.push(tmux);
         }
         #[cfg(test)]
@@ -496,7 +589,7 @@ impl LeaseRegistries {
             let leases = cancelling
                 .into_iter()
                 .zip(permits)
-                .map(|((key, bash, terminal, browser, resources), tmux)| {
+                .map(|((key, bash, terminal, browser, resources, capture_evidence, native_initial_entered), tmux)| {
                     (
                         key,
                         CloseResourceLease {
@@ -505,6 +598,8 @@ impl LeaseRegistries {
                             terminal,
                             browser,
                             resources,
+                            capture_evidence,
+                            native_initial_entered,
                         },
                     )
                 })
@@ -519,7 +614,7 @@ impl LeaseRegistries {
             let leases = cancelling
                 .into_iter()
                 .zip(error.into_permits())
-                .map(|((key, bash, terminal, browser, resources), tmux)| {
+                .map(|((key, bash, terminal, browser, resources, capture_evidence, native_initial_entered), tmux)| {
                     (
                         key,
                         CloseResourceLease {
@@ -528,13 +623,15 @@ impl LeaseRegistries {
                             terminal,
                             browser,
                             resources,
+                            capture_evidence,
+                            native_initial_entered,
                         },
                     )
                 })
                 .collect();
             return Err((detail, leases));
         }
-        for (_, bash, terminal, browser, _) in cancelling {
+        for (_, bash, terminal, browser, _, _, _) in cancelling {
             self.bash.cancel_retirement(bash).await;
             self.terminal.cancel_retirement(terminal);
             #[cfg(test)]
@@ -948,6 +1045,163 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn capture_binding_batch_is_atomic_when_a_later_scope_is_missing() {
+        let registries = registries();
+        let mut store = CloseResourceLeaseStore::default();
+        let first = key("attempt", "first");
+        let second = key("attempt", "second");
+        store
+            .acquire(first.clone(), registries.clone(), None, None)
+            .await
+            .unwrap();
+        let snapshot = CloseRetirementSnapshot::parse("original", "fingerprint").unwrap();
+        let scopes = [first.1.clone(), second.1.clone()].map(|scope| {
+            super::super::native_initial::capture_binding::test_scope(scope, snapshot.clone())
+        });
+
+        let error = store.bind_capture_evidence(&first.0, &scopes).unwrap_err();
+
+        assert!(error.contains("lease was lost before binding"));
+        assert!(store.complete.get(&first).unwrap().capture_evidence.is_none());
+    }
+
+    #[tokio::test]
+    async fn capture_binding_batch_is_atomic_when_a_later_binding_conflicts() {
+        let registries = registries();
+        let mut store = CloseResourceLeaseStore::default();
+        let first = key("attempt", "first");
+        let second = key("attempt", "second");
+        for scope_key in [&first, &second] {
+            store
+                .acquire(scope_key.clone(), registries.clone(), None, None)
+                .await
+                .unwrap();
+        }
+        let original = CloseRetirementSnapshot::parse("original", "fingerprint").unwrap();
+        let changed = CloseRetirementSnapshot::parse("changed", "fingerprint").unwrap();
+        let original_scopes = [first.1.clone(), second.1.clone()].map(|scope| {
+            super::super::native_initial::capture_binding::test_scope(scope, original.clone())
+        });
+        let existing = [super::super::native_initial::capture_binding::test_scope(
+            second.1.clone(),
+            changed,
+        )];
+        store.bind_capture_evidence(&first.0, &existing).unwrap();
+        let previous = store.complete.get(&second).unwrap().capture_evidence.clone();
+
+        let error = store.bind_capture_evidence(&first.0, &original_scopes).unwrap_err();
+
+        assert!(error.contains("bound to different evidence or deadline"));
+        assert!(store.complete.get(&first).unwrap().capture_evidence.is_none());
+        assert_eq!(store.complete.get(&second).unwrap().capture_evidence, previous);
+    }
+
+    #[tokio::test]
+    async fn exact_capture_binding_repeat_preserves_original_deadline_and_evidence() {
+        let registries = registries();
+        let mut store = CloseResourceLeaseStore::default();
+        let lease_key = key("attempt", "scope");
+        store
+            .acquire(lease_key.clone(), registries, None, None)
+            .await
+            .unwrap();
+        let snapshot = CloseRetirementSnapshot::parse("original", "fingerprint").unwrap();
+        let scopes = [super::super::native_initial::capture_binding::test_scope(
+            lease_key.1.clone(),
+            snapshot.clone(),
+        )];
+        let original_deadline = store.complete.get(&lease_key).unwrap().browser.deadline();
+
+        store.bind_capture_evidence(&lease_key.0, &scopes).unwrap();
+        let original_evidence = store.complete.get(&lease_key).unwrap().capture_evidence.clone();
+        store.bind_capture_evidence(&lease_key.0, &scopes).unwrap();
+
+        let lease = store.complete.get(&lease_key).unwrap();
+        assert_eq!(lease.browser.deadline(), original_deadline);
+        assert_eq!(lease.capture_evidence, original_evidence);
+        assert_eq!(
+            lease.capture_evidence.as_ref().unwrap().deadline(),
+            original_deadline
+        );
+        assert!(lease.capture_evidence.as_ref().unwrap().verifies_request(&snapshot));
+    }
+
+    #[tokio::test]
+    async fn changed_capture_binding_is_rejected_without_replacing_original_evidence() {
+        let registries = registries();
+        let mut store = CloseResourceLeaseStore::default();
+        let lease_key = key("attempt", "scope");
+        store
+            .acquire(lease_key.clone(), registries, None, None)
+            .await
+            .unwrap();
+        let original = CloseRetirementSnapshot::parse("original", "fingerprint").unwrap();
+        let changed = CloseRetirementSnapshot::parse("changed", "fingerprint").unwrap();
+        let original_scope = [super::super::native_initial::capture_binding::test_scope(
+            lease_key.1.clone(),
+            original.clone(),
+        )];
+        let changed_scope = [super::super::native_initial::capture_binding::test_scope(
+            lease_key.1.clone(),
+            changed,
+        )];
+        store.bind_capture_evidence(&lease_key.0, &original_scope).unwrap();
+        let original_evidence = store.complete.get(&lease_key).unwrap().capture_evidence.clone();
+
+        let error = store.bind_capture_evidence(&lease_key.0, &changed_scope).unwrap_err();
+
+        assert!(error.contains("bound to different evidence or deadline"));
+        assert_eq!(store.complete.get(&lease_key).unwrap().capture_evidence, original_evidence);
+        assert!(store
+            .complete
+            .get(&lease_key)
+            .unwrap()
+            .capture_evidence
+            .as_ref()
+            .unwrap()
+            .verifies_request(&original));
+    }
+
+    #[tokio::test]
+    async fn cancellation_before_native_entry_preserves_bound_capture_evidence() {
+        let registries = registries();
+        let mut store = CloseResourceLeaseStore::default();
+        let lease_key = key("attempt", "scope");
+        store
+            .acquire(lease_key.clone(), registries.clone(), None, None)
+            .await
+            .unwrap();
+        let snapshot = CloseRetirementSnapshot::parse("original", "fingerprint").unwrap();
+        let scopes = [super::super::native_initial::capture_binding::test_scope(
+            lease_key.1.clone(),
+            snapshot.clone(),
+        )];
+        store.bind_capture_evidence(&lease_key.0, &scopes).unwrap();
+        let original_evidence = store.complete.get(&lease_key).unwrap().capture_evidence.clone();
+        let reservation = store.reserve_native_initial_lease(&lease_key).unwrap();
+        drop(reservation);
+        let mut hook = reopening_hook(false);
+        hook.fail_tmux_batch = true;
+        store.reopening_hook = Some(hook);
+
+        let error = store.cancel_attempt(&lease_key.0, registries).await.unwrap_err();
+
+        assert!(error.contains("injected tmux batch cancellation failure"));
+        let restored = store.complete.get(&lease_key).expect("cancel failure retains lease");
+        assert!(restored.native_initial_entered.is_empty());
+        assert_eq!(restored.capture_evidence, original_evidence);
+        assert!(restored
+            .capture_evidence
+            .as_ref()
+            .unwrap()
+            .verifies_request(&snapshot));
+        assert_eq!(
+            restored.capture_evidence.as_ref().unwrap().deadline(),
+            restored.browser.deadline()
+        );
+    }
+
+    #[tokio::test]
     async fn multi_scope_reopen_error_returns_every_exact_permit() {
         let registries = registries();
         let mut store = CloseResourceLeaseStore::default();
@@ -959,6 +1213,12 @@ mod tests {
                 .await
                 .unwrap();
         }
+        let snapshot = CloseRetirementSnapshot::parse("original", "fingerprint").unwrap();
+        let scopes = [first.1.clone(), second.1.clone()].map(|scope| super::super::native_initial::capture_binding::test_scope(scope, snapshot.clone()));
+        store.bind_capture_evidence(&first.0, &scopes).unwrap();
+        let original_binding = store.complete.get(&first).unwrap().capture_evidence.clone();
+        store.complete.get_mut(&first).unwrap()
+            .native_initial_entered.push(RetiredResourceKind::TmuxServer);
         let originals = [
             generations(store.complete.get(&first).unwrap()),
             generations(store.complete.get(&second).unwrap()),
@@ -972,6 +1232,11 @@ mod tests {
             .unwrap_err();
         assert!(error.contains("injected tmux batch cancellation failure"));
         assert_eq!(store.complete.len(), 2);
+        let retained = store.complete.get(&first).unwrap();
+        assert_eq!(retained.capture_evidence, original_binding);
+        assert!(retained.capture_evidence.as_ref().unwrap().verifies_request(&snapshot));
+        assert_eq!(retained.capture_evidence.as_ref().unwrap().deadline(), retained.browser.deadline());
+        assert_eq!(retained.native_initial_entered, [RetiredResourceKind::TmuxServer]);
         assert_eq!(
             generations(store.complete.get(&first).unwrap()),
             originals[0]
@@ -1077,5 +1342,100 @@ mod tests {
         registries.tmux.cancel_retirement(newer).await.unwrap();
         assert!(store.complete.is_empty());
         assert!(store.reopening.is_empty());
+    }
+
+    #[tokio::test]
+    async fn idle_unentered_reservation_restores_the_original_affine_lease() {
+        let registries = registries();
+        let mut store = CloseResourceLeaseStore::default();
+        let key = key("attempt", "scope");
+        store
+            .acquire(key.clone(), registries.clone(), None, None)
+            .await
+            .unwrap();
+        let original_resources = store.complete.get(&key).unwrap().resources.clone();
+        let original_generations = generations(store.complete.get(&key).unwrap());
+
+        let reservation = store.reserve_native_initial_lease(&key).unwrap();
+        assert!(!store.complete.contains_key(&key));
+        drop(reservation);
+
+        store
+            .restore_unentered_native_initial_leases(&key.0)
+            .unwrap();
+        let restored = store.complete.get(&key).expect("original lease restored");
+        assert_eq!(generations(restored), original_generations);
+        assert_eq!(restored.resources, original_resources);
+        assert!(!store.native_initial_leases.contains_key(&key));
+
+        // Reserving again returns the same permit generations, not replacement permits.
+        let reserved_again = store.reserve_native_initial_lease(&key).unwrap();
+        let reserved_again = reserved_again.lock().await;
+        assert_eq!(generations(&reserved_again), original_generations);
+    }
+
+    #[tokio::test]
+    async fn restoration_refuses_an_outstanding_native_initial_lease_borrower() {
+        let registries = registries();
+        let mut store = CloseResourceLeaseStore::default();
+        let key = key("attempt", "scope");
+        store
+            .acquire(key.clone(), registries, None, None)
+            .await
+            .unwrap();
+        let original_generations = generations(store.complete.get(&key).unwrap());
+        let reservation = store.reserve_native_initial_lease(&key).unwrap();
+        let outstanding_borrower = Arc::clone(&reservation);
+
+        let error = store
+            .restore_unentered_native_initial_leases(&key.0)
+            .unwrap_err();
+        assert!(error.contains("still owns the original Close lease"));
+        assert!(!store.complete.contains_key(&key));
+        assert!(store.native_initial_leases.contains_key(&key));
+        let borrowed_lease = reservation.lock().await;
+        assert_eq!(generations(&borrowed_lease), original_generations);
+        drop(borrowed_lease);
+
+        drop(outstanding_borrower);
+        drop(reservation);
+        store
+            .restore_unentered_native_initial_leases(&key.0)
+            .unwrap();
+        assert_eq!(generations(store.complete.get(&key).unwrap()), original_generations);
+    }
+
+    #[tokio::test]
+    async fn native_initial_reservation_does_not_block_unrelated_lease_acquisition() {
+        let registries = registries();
+        let mut store = CloseResourceLeaseStore::default();
+        let reserved = key("attempt", "reserved-scope");
+        let unrelated_attempt = key("other-attempt", "other-attempt-scope");
+        let unrelated_scope = key("attempt", "other-scope");
+        store
+            .acquire(reserved.clone(), registries.clone(), None, None)
+            .await
+            .unwrap();
+        let reservation = store.reserve_native_initial_lease(&reserved).unwrap();
+        // These keys have never acquired permits: exercise new acquisition,
+        // not the fast path that returns an existing complete lease.
+        assert!(!store.complete.contains_key(&unrelated_attempt));
+        assert!(!store.complete.contains_key(&unrelated_scope));
+
+        assert!(store
+            .acquire(reserved.clone(), registries.clone(), None, None)
+            .await
+            .is_err());
+        assert!(store
+            .acquire(unrelated_attempt.clone(), registries.clone(), None, None)
+            .await
+            .is_ok());
+        assert!(store
+            .acquire(unrelated_scope.clone(), registries, None, None)
+            .await
+            .is_ok());
+        assert!(store.complete.contains_key(&unrelated_attempt));
+        assert!(store.complete.contains_key(&unrelated_scope));
+        drop(reservation);
     }
 }

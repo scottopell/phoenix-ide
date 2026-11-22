@@ -1,6 +1,8 @@
 //! Exact-instance resource fences and receipts for Close retirement.
 
 mod native_retry;
+pub(crate) use native_retry::NativeInitialWorkScopePrecondition;
+pub(crate) mod native_initial;
 
 use std::{
     collections::BTreeSet,
@@ -63,6 +65,8 @@ pub(crate) struct CloseResourceLease {
     terminal: TerminalRetirementPermit,
     browser: BrowserRetirementPermit,
     resources: Vec<RetiredResourceIdentity>,
+    capture_evidence: Option<native_initial::capture_binding::CaptureEvidenceBinding>,
+    native_initial_entered: Vec<RetiredResourceKind>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -763,6 +767,7 @@ async fn run_close_process_steps<E: CloseProcessStepExecutor>(
 struct LiveCloseProcessStepExecutor<'a> {
     manager: &'a RuntimeManager,
     lease: &'a CloseResourceLease,
+    browser_custody: phoenix_tools::browser::session::BrowserRetirementCustody,
 }
 
 #[async_trait::async_trait]
@@ -873,7 +878,7 @@ impl CloseProcessStepExecutor for LiveCloseProcessStepExecutor<'_> {
         let outcome = require_browser_absent(
             self.manager
                 .browser_sessions()
-                .complete_retirement(&self.lease.browser)
+                .complete_retirement_with_custody(&self.lease.browser, self.browser_custody.clone())
                 .await,
         )
         .map_err(|reason| CloseProcessStepFailure {
@@ -1484,7 +1489,11 @@ impl RuntimeManager {
                 }
             })?;
         let mut requests = Vec::with_capacity(scopes.len());
+        let mut native_scopes = Vec::new();
         for captured in scopes {
+            if policy == CloseRetirementInventoryPolicy::NativeInitial {
+                native_scopes.push(captured.clone());
+            }
             let resources = self
                 .acquire_close_resource_lease(&attempt_id, captured.scope.clone())
                 .await
@@ -1507,11 +1516,16 @@ impl RuntimeManager {
             )?;
             requests.extend(request.scopes);
         }
-        Ok(CaptureCloseRetirementInventoryRequest {
-            attempt_id,
-            snapshot,
-            scopes: requests,
-        })
+        let request = CaptureCloseRetirementInventoryRequest { attempt_id, snapshot, scopes: requests };
+        if policy == CloseRetirementInventoryPolicy::NativeInitial {
+            let evidence = native_initial::capture_binding::read_capture_evidence(
+                self.db(), &request, &native_scopes,
+            ).await.map_err(|detail| CloseRetirementInventoryPreparationError::BackendStorageOrUnattributed { detail })?;
+            self.close_retirement_leases.lock().await
+                .bind_capture_evidence(request.attempt_id.as_str(), &evidence)
+                .map_err(|detail| CloseRetirementInventoryPreparationError::BackendStorageOrUnattributed { detail })?;
+        }
+        Ok(request)
     }
 
     /// Acquires all scope fences, then seals the exact server-owned inventory.
@@ -3997,6 +4011,10 @@ impl RuntimeManager {
             let mut executor = LiveCloseProcessStepExecutor {
                 manager: self,
                 lease,
+                // Legacy execution does not transfer native source/target custody.
+                browser_custody: phoenix_tools::browser::session::BrowserRetirementCustody::new(
+                    std::sync::Arc::new(()),
+                ),
             };
             run_close_process_steps(
                 self.db(),
@@ -5351,7 +5369,7 @@ where
         common_git_dir,
         common_git_dir_incarnation,
         deadline,
-        repository_lock: _repository_lock,
+        repository_lock,
     } = prepared;
     check_directory_deletion_deadline(Some(deadline))?;
     if !inspection_path
@@ -5388,6 +5406,7 @@ where
         after_quarantine,
         effects,
         deadline,
+        repository_lock,
     ))
 }
 
@@ -6591,22 +6610,43 @@ fn stop_bound_fsmonitor_daemons_until(
     path: &Path,
     deadline: std::time::Instant,
 ) -> Result<FsmonitorStop, String> {
+    stop_bound_fsmonitor_daemons_with_admission_until(path, deadline, None)
+}
+
+fn stop_bound_fsmonitor_daemons_with_admission_until(
+    path: &Path,
+    deadline: std::time::Instant,
+    first_submodule_spawn_admission: Option<SubmoduleSpawnAdmissionEffect>,
+) -> Result<FsmonitorStop, String> {
     if std::time::Instant::now() >= deadline {
         return Err("submodule fsmonitor shutdown exceeded its deadline".to_string());
     }
-    let submodules = run_bounded_git_command_until(
-        path,
-        &[
-            "submodule",
-            "foreach",
-            "--quiet",
-            "--recursive",
-            r#"output=$(git fsmonitor--daemon stop 2>&1); result=$?; if [ "$result" -eq 0 ] || { [ "$result" -eq 128 ] && [ "$output" = 'fatal: fsmonitor--daemon is not running' ]; }; then exit 0; fi; printf '%s\n' "$output" >&2; exit "$result""#,
-        ],
-        None,
-        deadline,
-        "submodule fsmonitor shutdown",
-    )?;
+    let arguments = [
+        "submodule",
+        "foreach",
+        "--quiet",
+        "--recursive",
+        r#"output=$(git fsmonitor--daemon stop 2>&1); result=$?; if [ "$result" -eq 0 ] || { [ "$result" -eq 128 ] && [ "$output" = 'fatal: fsmonitor--daemon is not running' ]; }; then exit 0; fi; printf '%s\n' "$output" >&2; exit "$result""#,
+    ];
+    let mut command = phoenix_core::git::command_with_config(&[("core.fsmonitor", "false")]);
+    bind_git_command_to_worktree_until(&mut command, path, deadline)?;
+    command
+        .args(arguments)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        command.process_group(0);
+    }
+    if std::time::Instant::now() >= deadline {
+        return Err("Close teardown deadline elapsed before recursive fsmonitor shutdown spawn".to_string());
+    }
+    let child = match first_submodule_spawn_admission {
+        Some(admit_spawn) => admit_spawn(&mut command, deadline)?,
+        None => command.spawn().map_err(|error| error.to_string())?,
+    };
+    let submodules = wait_bounded_child_output(child, deadline, "submodule fsmonitor shutdown")?;
     if !submodules.status.success() {
         return Err(format!(
             "submodule fsmonitor shutdown failed ({}): {}",
@@ -6671,7 +6711,7 @@ fn writer_gap(
 }
 
 #[derive(Clone)]
-struct CloseWriterProbe {
+pub(super) struct CloseWriterProbe {
     // Native execution must not classify an untyped writer-observation commit
     // error as a proven terminal failure.
     persistence_uncertain: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
@@ -8265,8 +8305,21 @@ fn decode_hex_bytes(encoded: &str) -> Option<Vec<u8>> {
         .collect()
 }
 
-type StopFsmonitorEffect =
-    Box<dyn FnOnce(&Path, std::time::Instant) -> Result<FsmonitorStop, String> + Send>;
+pub(super) type SubmoduleSpawnAdmissionEffect = Box<
+    dyn FnOnce(
+            &mut std::process::Command,
+            std::time::Instant,
+        ) -> Result<std::process::Child, String>
+        + Send,
+>;
+type StopFsmonitorEffect = Box<
+    dyn FnOnce(
+            &Path,
+            std::time::Instant,
+            Option<SubmoduleSpawnAdmissionEffect>,
+        ) -> Result<FsmonitorStop, String>
+        + Send,
+>;
 type OpenDescriptorsEffect =
     Box<dyn FnOnce(&Path, std::time::Instant) -> Result<ExternalWriterEvidence, String> + Send>;
 type ExternalWriterEffect =
@@ -8280,17 +8333,28 @@ type ExternalWriterEffect =
 /// the real functions; there is no test-only global switch. The decision logic
 /// in [`quarantine_and_remove_exact_worktree_with_effects`] is identical whether
 /// the real or an injected adapter is supplied.
-struct CloseWorktreeEffects {
+pub(super) struct CloseWorktreeEffects {
     stop_fsmonitor: StopFsmonitorEffect,
+    first_submodule_spawn_admission: Option<SubmoduleSpawnAdmissionEffect>,
     observe_open_descriptors: OpenDescriptorsEffect,
     observe_external_writer: ExternalWriterEffect,
 }
 
 impl CloseWorktreeEffects {
     fn production(probe: CloseWriterProbe) -> Self {
+        Self::production_with_first_submodule_spawn_admission(probe, None)
+    }
+
+    pub(super) fn production_with_first_submodule_spawn_admission(
+        probe: CloseWriterProbe,
+        first_submodule_spawn_admission: Option<SubmoduleSpawnAdmissionEffect>,
+    ) -> Self {
         let descriptor_probe = probe.clone();
         Self {
-            stop_fsmonitor: Box::new(stop_bound_fsmonitor_daemons_until),
+            stop_fsmonitor: Box::new(|path, deadline, admission| {
+                stop_bound_fsmonitor_daemons_with_admission_until(path, deadline, admission)
+            }),
+            first_submodule_spawn_admission,
             observe_open_descriptors: Box::new(move |path, deadline| {
                 descriptor_probe.observe_until(
                     path,
@@ -8319,12 +8383,13 @@ async fn quarantine_and_remove_exact_worktree<F, B>(
     after_quarantine: F,
     effects: CloseWorktreeEffects,
     deadline: std::time::Instant,
+    repository_lock: RepositoryMutationLock,
 ) -> Result<ExactWorktreeRemoval, String>
 where
     F: FnOnce(&Path) + Send + 'static,
     B: FnMut(&Path, (u64, u64), Option<(u64, u64)>) -> Result<(), String> + Send + 'static,
 {
-    quarantine_and_remove_exact_worktree_with_effects_until(
+    quarantine_and_remove_exact_worktree_with_repository_lock_until(
         identity,
         confirmed_snapshot,
         planned_administrative_dir,
@@ -8334,6 +8399,7 @@ where
         after_quarantine,
         effects,
         deadline,
+        Some(repository_lock),
     )
     .await
 }
@@ -8368,7 +8434,7 @@ where
     .await
 }
 
-#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 async fn quarantine_and_remove_exact_worktree_with_effects_until<F, B>(
     identity: &WorktreeIdentity,
     confirmed_snapshot: &CloseRetirementSnapshot,
@@ -8384,9 +8450,42 @@ where
     F: FnOnce(&Path) + Send + 'static,
     B: FnMut(&Path, (u64, u64), Option<(u64, u64)>) -> Result<(), String> + Send + 'static,
 {
+    quarantine_and_remove_exact_worktree_with_repository_lock_until(
+        identity,
+        confirmed_snapshot,
+        planned_administrative_dir,
+        planned_administrative_dir_incarnation,
+        final_tombstone,
+        bind_tombstone,
+        after_quarantine,
+        effects,
+        deadline,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+async fn quarantine_and_remove_exact_worktree_with_repository_lock_until<F, B>(
+    identity: &WorktreeIdentity,
+    confirmed_snapshot: &CloseRetirementSnapshot,
+    planned_administrative_dir: PathBuf,
+    planned_administrative_dir_incarnation: String,
+    final_tombstone: Option<CloseWorktreeFinalTombstone>,
+    bind_tombstone: B,
+    after_quarantine: F,
+    effects: CloseWorktreeEffects,
+    deadline: std::time::Instant,
+    repository_lock: Option<RepositoryMutationLock>,
+) -> Result<ExactWorktreeRemoval, String>
+where
+    F: FnOnce(&Path) + Send + 'static,
+    B: FnMut(&Path, (u64, u64), Option<(u64, u64)>) -> Result<(), String> + Send + 'static,
+{
     check_directory_deletion_deadline(Some(deadline))?;
     let CloseWorktreeEffects {
         stop_fsmonitor,
+        first_submodule_spawn_admission,
         observe_open_descriptors,
         observe_external_writer,
     } = effects;
@@ -8400,6 +8499,7 @@ where
     let inspection_identity = identity.clone();
     let confirmed_fingerprint = confirmed_snapshot.fingerprint().to_string();
     tokio::task::spawn_blocking(move || {
+        let _repository_lock = repository_lock;
         let inspection_path = if resuming_quarantine {
             &quarantine
         } else {
@@ -8426,7 +8526,11 @@ where
         }
 
         check_directory_deletion_deadline(Some(deadline))?;
-        if let Err(detail) = stop_fsmonitor(inspection_path, deadline) {
+        if let Err(detail) = stop_fsmonitor(
+            inspection_path,
+            deadline,
+            first_submodule_spawn_admission,
+        ) {
             return Ok(ExactWorktreeRemoval::StopFailed { detail });
         }
         check_directory_deletion_deadline(Some(deadline))?;
@@ -13077,6 +13181,85 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread")]
+    async fn aborting_close_waiter_keeps_original_repository_lock_until_inner_effect_returns() {
+        use fs2::FileExt as _;
+
+        let temp = tempfile::tempdir().unwrap();
+        let target = linked_close_worktree(&temp);
+        let identity = inspection_identity(&target);
+        let snapshot = inspect_worktree(&identity).await.unwrap().0;
+        let common = super::exact_worktree_common_git_dir(&target).unwrap();
+        let admin = super::exact_worktree_administrative_dir(&target, &common).unwrap();
+        let incarnation = observe_administrative_dir_incarnation(&admin).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let prepared = super::prepare_physical_worktree_removal_until(&identity, deadline)
+            .unwrap()
+            .unwrap();
+        let repository_lock = prepared.repository_lock;
+        let contender_path = common.join("phoenix-creation.lock");
+        let contender = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&contender_path)
+            .unwrap();
+        let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let effects = injected_close_worktree_effects(move |_| {
+            let _ = reached_tx.send(());
+            if release_rx
+                .recv_timeout(std::time::Duration::from_secs(30))
+                .is_err()
+            {
+                return Err("fixture release signal was dropped".to_string());
+            }
+            Err("fixture stopped at first teardown effect".to_string())
+        });
+
+        let waiter = tokio::spawn(async move {
+            super::quarantine_and_remove_exact_worktree_with_repository_lock_until(
+                &identity,
+                &snapshot,
+                admin,
+                incarnation,
+                None,
+                |_, _, _| panic!("must not bind a deletion tombstone"),
+                |_| panic!("must not quarantine after failed fsmonitor stop"),
+                effects,
+                deadline,
+                Some(repository_lock),
+            )
+            .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(10), reached_rx)
+            .await
+            .expect("first teardown effect was not reached")
+            .expect("effect reach signal was dropped");
+
+        waiter.abort();
+        let joined = waiter.await;
+        assert!(matches!(joined, Err(error) if error.is_cancelled()));
+        assert!(contender.try_lock_exclusive().is_err());
+
+        release_tx
+            .send(())
+            .expect("inner effect should still be waiting for release");
+        drop(release_tx);
+        let lock_path = contender_path;
+        tokio::task::spawn_blocking(move || {
+            let lock = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(lock_path)
+                .unwrap();
+            lock.lock_exclusive().unwrap();
+            lock.unlock().unwrap();
+        })
+        .await
+        .expect("competing repository lock worker panicked");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
     async fn prepared_worktree_refuses_replaced_common_directory_before_teardown() {
         let temp = tempfile::tempdir().unwrap();
         let target = linked_close_worktree(&temp);
@@ -14090,7 +14273,8 @@ mod tests {
         stop_fsmonitor: impl FnOnce(&Path) -> Result<super::FsmonitorStop, String> + Send + 'static,
     ) -> super::CloseWorktreeEffects {
         super::CloseWorktreeEffects {
-            stop_fsmonitor: Box::new(move |path, _deadline| stop_fsmonitor(path)),
+            stop_fsmonitor: Box::new(move |path, _deadline, _admission| stop_fsmonitor(path)),
+            first_submodule_spawn_admission: None,
             observe_open_descriptors: Box::new(|_, _| {
                 Ok(super::ExternalWriterEvidence::NoPositiveEvidence)
             }),
@@ -14104,7 +14288,8 @@ mod tests {
         stop_fsmonitor: impl FnOnce(&Path) -> Result<super::FsmonitorStop, String> + Send + 'static,
     ) -> super::CloseWorktreeEffects {
         super::CloseWorktreeEffects {
-            stop_fsmonitor: Box::new(move |path, _deadline| stop_fsmonitor(path)),
+            stop_fsmonitor: Box::new(move |path, _deadline, _admission| stop_fsmonitor(path)),
+            first_submodule_spawn_admission: None,
             observe_open_descriptors: Box::new(|_, _| {
                 panic!("must not scan for open descriptors before quarantine commits")
             }),

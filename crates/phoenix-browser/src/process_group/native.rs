@@ -169,6 +169,70 @@ impl OwnedChromeGroup {
         })
     }
 
+    /// Deliver one signal to the launch group without waiting or scheduling work.
+    ///
+    /// The retained, unreaped child plus the exact birth-identity and process-group
+    /// checks in `signal` are the authority; the numeric process-group id alone is
+    /// never sufficient.
+    pub(crate) fn signal_now(
+        &self,
+        child: &mut tokio::process::Child,
+        signal: libc::c_int,
+        original_deadline: Instant,
+    ) -> io::Result<bool> {
+        // Identity validation can itself be delayed. Admission is authoritative
+        // only if the original caller's budget still remains at the syscall edge.
+        let observation = self.observe_root(child)?;
+        if !observation.permits_signal() {
+            return Ok(false);
+        }
+        if Instant::now() >= original_deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "Chrome signal admission deadline elapsed",
+            ));
+        }
+        let pid = libc::pid_t::try_from(self.root.pid).map_err(io::Error::other)?;
+        // SAFETY: the unreaped owned child anchors this isolated launch group;
+        // identity was revalidated above and the deadline check is immediately
+        // adjacent to this synchronous syscall.
+        let result = if unsafe { libc::kill(-pid, signal) } == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        };
+        signal_delivery(result)
+    }
+
+    /// Verify group completion without sending any signal. The caller owns the
+    /// timing and any separately admitted signal effects.
+    pub(crate) async fn verify_drained(
+        &mut self,
+        child: &mut tokio::process::Child,
+        deadline: Instant,
+    ) -> io::Result<()> {
+        if self.drained {
+            return Ok(());
+        }
+        loop {
+            let observation = self.observe_root(child)?;
+            if observation.permits_completion() {
+                let live_members = group_has_live_members(self.root.pid)?;
+                if !live_members && self.observe_root(child)? == RootObservation::Exited {
+                    self.drained = true;
+                    return Ok(());
+                }
+            }
+            if Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "Chrome launch group did not drain",
+                ));
+            }
+            tokio::task::yield_now().await;
+        }
+    }
+
     pub(crate) async fn drain(
         &mut self,
         child: &mut tokio::process::Child,
@@ -683,6 +747,68 @@ mod tests {
             group.observe_root(&mut child).unwrap(),
             RootObservation::Exited
         );
+        child.wait().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn synchronous_signal_and_verification_are_separate_effects() {
+        let mut child = tokio::process::Command::new("/bin/sh")
+            .args(["-c", "echo ready; read release"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .process_group(0)
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let mut output = tokio::io::BufReader::new(child.stdout.take().unwrap());
+        let mut ready = String::new();
+        tokio::time::timeout(Duration::from_secs(5), output.read_line(&mut ready))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(ready.trim(), "ready");
+        let identity = current_process_identity(child.id().unwrap()).unwrap();
+        let mut group = OwnedChromeGroup::adopt(identity, &mut child).unwrap();
+
+        assert!(group
+            .signal_now(
+                &mut child,
+                libc::SIGTERM,
+                Instant::now() + Duration::from_secs(5),
+            )
+            .unwrap());
+        assert!(!group.is_drained(), "signal delivery is not drain proof");
+        group
+            .verify_drained(&mut child, Instant::now() + Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert!(group.is_drained());
+        child.wait().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn expired_original_deadline_rejects_final_signal_admission() {
+        let mut child = tokio::process::Command::new("/bin/sh")
+            .args(["-c", "echo ready; read release"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .process_group(0)
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let mut output = tokio::io::BufReader::new(child.stdout.take().unwrap());
+        let mut ready = String::new();
+        tokio::time::timeout(Duration::from_secs(5), output.read_line(&mut ready))
+            .await
+            .unwrap()
+            .unwrap();
+        let identity = current_process_identity(child.id().unwrap()).unwrap();
+        let group = OwnedChromeGroup::adopt(identity, &mut child).unwrap();
+
+        let result = group.signal_now(&mut child, libc::SIGTERM, Instant::now());
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::TimedOut);
+        assert!(child.try_wait().unwrap().is_none(), "expired admission must have no signal effect");
+        child.kill().await.unwrap();
         child.wait().await.unwrap();
     }
 

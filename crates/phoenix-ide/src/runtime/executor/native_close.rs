@@ -1,4 +1,9 @@
-//! Source-owned, initial-only Close admission. No cleanup or retry dispatch.
+//! Source-owned initial Close admission and bounded runtime-process retirement.
+//! Worktree/scope cleanup, completion and retry are not dispatched here.
+
+mod post_retirement;
+mod process_retirement;
+pub(super) mod source_entry;
 
 use super::{
     CancellationToken, ConversationRuntime, LlmClient, RuntimeSettlementAuthority, Storage,
@@ -16,6 +21,21 @@ use phoenix_core::domain::db_schema::SourceToolCall;
 use phoenix_core::domain::product_conversation::ProductConversationId;
 use phoenix_db::native_close::NativeCloseInitialResult;
 use phoenix_db::workflow::LocalAuthorityResult;
+
+fn terminal_run_outcome_is_compatible(
+    status: phoenix_core::domain::close::CloseRunStatus,
+    outcome: phoenix_core::domain::close::CloseCompletionOutcome,
+) -> bool {
+    use phoenix_core::domain::close::{CloseCompletionOutcome as Outcome, CloseRunStatus};
+
+    match status {
+        CloseRunStatus::Completed => matches!(outcome, Outcome::Archived | Outcome::Cancelled),
+        // Stopped runs can have a completed failed/cancelled obligation when the
+        // durable Close work finished before the run itself was stopped.
+        CloseRunStatus::Stopped => true,
+        CloseRunStatus::Running => false,
+    }
+}
 
 /// Refuse queued work without resuming ordinary actor execution during Close exit.
 pub(super) fn refuse_during_exit(request: crate::runtime::AcknowledgedRuntimeRequest) {
@@ -65,6 +85,9 @@ pub(super) struct NativeCloseInitialContinuation {
         tokio::task::JoinHandle<Result<NativeInitialInspection, NativeInitialInspectionFailure>>,
     >,
     inventory: InventoryCapture,
+    process_retirement: Option<process_retirement::ProcessRetirement>,
+    post_retirement: Option<post_retirement::PostRetirement>,
+    source_entry: Option<source_entry::SourceEntryWorker>,
     backend: std::sync::Arc<crate::runtime::RuntimeManager>,
     #[cfg(test)]
     inventory_preparation_test_barrier: Option<InventoryPreparationTestBarrier>,
@@ -85,6 +108,9 @@ pub(super) enum NativeCloseInitialContinuationPhase {
     ReachedSettlementPhase(phoenix_core::domain::close::ClosePhase),
     PreparingInventory,
     Captured,
+    RetiringProcesses,
+    ProcessRetirementBlocked,
+    RuntimeProcessesDone,
     AwaitingStopWorkConfirmation,
     CollectingInspection,
     InspectionRequired,
@@ -156,14 +182,51 @@ impl Drop for NativeCloseInitialContinuation {
             handle.abort();
         }
         self.inventory.abort_owned_worker();
+        if let Some(progress) = &self.process_retirement { progress.abort(); }
     }
 }
 
 impl NativeCloseInitialContinuation {
+    /// Opens eligibility only from the actor's actual source and the capture's
+    /// original deadline, before the first original process lease is reserved.
+    pub(super) async fn ensure_source_entry(
+        &mut self,
+        controller: &mut Option<source_entry::SourceEntryController>,
+        live_state: &phoenix_core::domain::sm_state::ConvState,
+    ) -> Result<(), NativeCloseApplicationError> {
+        if self.phase != NativeCloseInitialContinuationPhase::RetiringProcesses || self.source_entry.is_some()
+            || !self.process_retirement.as_ref().is_some_and(process_retirement::ProcessRetirement::has_resources) {
+            return Ok(());
+        }
+        let (scopes, snapshot) = self.process_retirement.as_ref().expect("guarded cursor").captured_binding();
+        let deadline = match self.backend.native_initial_original_entry_deadline(
+            self.receipt.admitted.attempt_id.as_str(), scopes, snapshot,
+        ).await {
+            Ok(deadline) => deadline,
+            Err(_) => {
+                self.phase = NativeCloseInitialContinuationPhase::ProcessRetirementBlocked;
+                return Err(NativeCloseApplicationError::FatalAuthority);
+            }
+        };
+        let mut original = source_entry::SourceEntryController::new(self.command.clone(), deadline);
+        if original.revalidate(live_state, &self.command) != source_entry::ActorEntryResult::Updated {
+            // A refusal is terminal for this eligibility cell, never a hot loop
+            // constructing another controller for the same immutable command.
+            self.source_entry = Some(original.worker());
+            *controller = Some(original);
+            self.phase = NativeCloseInitialContinuationPhase::InspectionRequired;
+            return Err(NativeCloseApplicationError::SourceRefused);
+        }
+        // Dropping a previous actor-owned controller revokes its worker handles.
+        self.source_entry = Some(original.worker());
+        *controller = Some(original);
+        Ok(())
+    }
+
     /// Releases the source owner only after exact durable terminal evidence is observed.
     /// A failed or unrelated read leaves the continuation and its guards untouched.
-    pub(super) async fn release_if_exactly_stopped(&mut self) -> bool {
-        use phoenix_core::domain::close::{ClosePhase, CloseRunRef, CloseRunStatus};
+    pub(super) async fn release_if_exactly_terminal(&mut self) -> bool {
+        use phoenix_core::domain::close::{ClosePhase, CloseRunRef};
 
         let run = CloseRunRef {
             attempt_id: self.receipt.admitted.attempt_id.clone(),
@@ -185,11 +248,12 @@ impl NativeCloseInitialContinuation {
             return false;
         };
         if observed_run.run != run
-            || observed_run.status != CloseRunStatus::Stopped
             || obligation.attempt_id() != &run.attempt_id
             || obligation.product_conversation_id() != &self.receipt.admitted.target
             || obligation.phase() != ClosePhase::Completed
-            || obligation.close_outcome().is_none()
+            || !obligation.close_outcome().is_some_and(|outcome| {
+                terminal_run_outcome_is_compatible(observed_run.status, outcome)
+            })
         {
             return false;
         }
@@ -203,9 +267,10 @@ impl NativeCloseInitialContinuation {
         true
     }
 
-    /// Only the preparation task belongs to this continuation. Its acquired
-    /// resource permits belong to the manager and remain fenced after a failed Close.
+    /// Drain every owned phase worker before releasing source/gate custody.
+    /// Resource permits stay manager-owned and fenced after a failed Close.
     pub(super) async fn abort_and_join_inventory_preparation(&mut self) {
+        if let Some(progress) = &mut self.process_retirement { progress.abort_and_join().await; }
         if let InventoryCapture::Preparing(handle) = &self.inventory {
             handle.abort();
         }
@@ -224,6 +289,7 @@ impl NativeCloseInitialContinuation {
     }
 
     pub(super) fn freeze_for_exit_observation(&mut self) {
+        if let Some(progress) = &self.process_retirement { progress.abort(); }
         if let Some(handle) = self.inspection.take() {
             handle.abort();
         }
@@ -254,6 +320,9 @@ impl NativeCloseInitialContinuation {
                     phoenix_core::domain::close::ClosePhase::RetirementRequested
                 )
                 | NativeCloseInitialContinuationPhase::PreparingInventory
+                | NativeCloseInitialContinuationPhase::Captured
+                | NativeCloseInitialContinuationPhase::RetiringProcesses
+                | NativeCloseInitialContinuationPhase::RuntimeProcessesDone
                 | NativeCloseInitialContinuationPhase::ClassifyingInspectionFailure
                 | NativeCloseInitialContinuationPhase::ObservingTerminal
                 | NativeCloseInitialContinuationPhase::ClassifyingExitInterruption
@@ -261,10 +330,19 @@ impl NativeCloseInitialContinuation {
     }
 
     pub(super) async fn observe_terminal_if_required(&mut self) -> bool {
-        self.terminal_observation_retry && self.release_if_exactly_stopped().await
+        self.terminal_observation_retry && self.release_if_exactly_terminal().await
     }
 
     pub(super) fn next_service_at(&self) -> tokio::time::Instant {
+        if self.phase == NativeCloseInitialContinuationPhase::Captured {
+            return tokio::time::Instant::now() + std::time::Duration::from_millis(1);
+        }
+        if self.phase == NativeCloseInitialContinuationPhase::RetiringProcesses {
+            return tokio::time::Instant::now() + self.process_retirement.as_ref().expect("runtime cursor retained").service_delay();
+        }
+        if self.phase == NativeCloseInitialContinuationPhase::RuntimeProcessesDone {
+            return tokio::time::Instant::now() + std::time::Duration::from_millis(1);
+        }
         let delay_ms = if self.collecting_inspection()
             || self.phase == NativeCloseInitialContinuationPhase::PreparingInventory
         {
@@ -333,7 +411,8 @@ impl NativeCloseInitialContinuation {
         live_source: &phoenix_core::domain::sm_state::ConvState,
     ) {
         if (self.collecting_inspection()
-            || matches!(self.inventory, InventoryCapture::Preparing(_)))
+            || matches!(self.inventory, InventoryCapture::Preparing(_))
+            || self.process_retirement.is_some())
             && !self.live_source_matches(live_source)
         {
             if let Some(handle) = self.inspection.take() {
@@ -342,8 +421,68 @@ impl NativeCloseInitialContinuation {
             if let InventoryCapture::Preparing(handle) = &self.inventory {
                 handle.abort();
             }
+            if let Some(progress) = &self.process_retirement { progress.abort(); }
             self.phase = NativeCloseInitialContinuationPhase::InspectionRequired;
             tracing::warn!("native Close inspection result invalidated after source revocation; retaining owner for exact terminal classification");
+        }
+    }
+
+    async fn step_post_retirement(
+        &mut self,
+        live_source: &phoenix_core::domain::sm_state::ConvState,
+    ) -> Result<NativeCloseInitialContinuationPhase, NativeCloseApplicationError> {
+        if !self.live_source_matches(live_source) {
+            self.phase = NativeCloseInitialContinuationPhase::InspectionRequired;
+            return Err(NativeCloseApplicationError::SourceRefused);
+        }
+        if self.post_retirement.is_none() {
+            let Some(processes) = self.process_retirement.as_ref() else {
+                self.phase = NativeCloseInitialContinuationPhase::ProcessRetirementBlocked;
+                tracing::error!("native Close reached post-process phase without captured inventory");
+                return Ok(self.phase);
+            };
+            let (scopes, snapshot) = processes.captured_binding();
+            match post_retirement::PostRetirement::new(
+                processes.captured_inventory().to_vec(),
+                scopes.to_vec(),
+                snapshot.clone(),
+            ) {
+                Ok(cursor) => self.post_retirement = Some(cursor),
+                Err(detail) => {
+                    self.phase = NativeCloseInitialContinuationPhase::ProcessRetirementBlocked;
+                    tracing::error!(%detail, "native Close post-process cursor rejected captured inventory");
+                    return Ok(self.phase);
+                }
+            }
+        }
+        match self.post_retirement.as_mut().expect("cursor initialized").step(
+            &self.command,
+            &self.receipt,
+            &self.db,
+            &self.backend,
+            live_source,
+        ).await {
+            Ok(post_retirement::PostRetirementStep::Retiring) => {
+                Ok(NativeCloseInitialContinuationPhase::RuntimeProcessesDone)
+            }
+            Ok(post_retirement::PostRetirementStep::Completed(_)) => {
+                self.phase = NativeCloseInitialContinuationPhase::ObservingTerminal;
+                Ok(self.phase)
+            }
+            Ok(post_retirement::PostRetirementStep::Blocked) => {
+                self.phase = NativeCloseInitialContinuationPhase::ProcessRetirementBlocked;
+                Ok(self.phase)
+            }
+            Ok(post_retirement::PostRetirementStep::Unclassified) => {
+                Ok(NativeCloseInitialContinuationPhase::RuntimeProcessesDone)
+            }
+            Ok(post_retirement::PostRetirementStep::FatalAuthority) => {
+                Err(NativeCloseApplicationError::FatalAuthority)
+            }
+            Err(error) => {
+                tracing::warn!(%error, "native Close post-process boundary rolled back; retaining original cursor");
+                Ok(NativeCloseInitialContinuationPhase::RuntimeProcessesDone)
+            }
         }
     }
 
@@ -378,7 +517,7 @@ impl NativeCloseInitialContinuation {
                 {
                     LocalAuthorityResult::DurableFactEstablished(Ok(_)) => {
                         self.phase = Phase::ObservingTerminal;
-                        if self.release_if_exactly_stopped().await {
+                        if self.release_if_exactly_terminal().await {
                             self.phase = Phase::Finished;
                         }
                         Ok(self.phase)
@@ -542,6 +681,8 @@ impl NativeCloseInitialContinuation {
                     },
                     _ => unreachable!("preparing phase owns preparation worker"),
                 };
+                let scope_order = request.scopes.iter().map(|scope| scope.scope.clone()).collect();
+                let captured_snapshot = request.snapshot.clone();
                 match self
                     .db
                     .capture_native_close_initial_retirement_inventory(
@@ -552,7 +693,8 @@ impl NativeCloseInitialContinuation {
                     )
                     .await
                 {
-                    LocalAuthorityResult::DurableFactEstablished(Ok(_resources)) => {
+                    LocalAuthorityResult::DurableFactEstablished(Ok(resources)) => {
+                        self.process_retirement = Some(process_retirement::ProcessRetirement::new(resources, scope_order, captured_snapshot));
                         self.inventory = InventoryCapture::Held;
                         self.phase = Phase::Captured;
                         Ok(self.phase)
@@ -690,7 +832,7 @@ impl NativeCloseInitialContinuation {
                     LocalAuthorityResult::DurableFactEstablished(Ok(_obligation)) => {
                         self.inspection_failure = None;
                         self.phase = Phase::ObservingTerminal;
-                        if self.release_if_exactly_stopped().await {
+                        if self.release_if_exactly_terminal().await {
                             self.phase = Phase::Finished;
                         }
                         Ok(self.phase)
@@ -705,13 +847,19 @@ impl NativeCloseInitialContinuation {
                 }
             }
             Phase::ObservingTerminal => {
-                if self.release_if_exactly_stopped().await {
+                if self.release_if_exactly_terminal().await {
                     self.phase = Phase::Finished;
                 }
                 Ok(self.phase)
             }
+            Phase::Captured => {
+                self.phase = Phase::RetiringProcesses;
+                Ok(self.phase)
+            }
+            Phase::RetiringProcesses => self.step_process_retirement(live_source).await,
+            Phase::RuntimeProcessesDone => self.step_post_retirement(live_source).await,
             Phase::ReachedSettlementPhase(_)
-            | Phase::Captured
+            | Phase::ProcessRetirementBlocked
             | Phase::AwaitingStopWorkConfirmation
             | Phase::InspectionRequired
             | Phase::ExitObservationOnly
@@ -793,6 +941,9 @@ where
                     phase: NativeCloseInitialContinuationPhase::Prepare,
                     inspection: None,
                     inventory: InventoryCapture::NotStarted,
+                    process_retirement: None,
+                    post_retirement: None,
+                    source_entry: None,
                     backend: std::sync::Arc::clone(backend),
                     #[cfg(test)]
                     inventory_preparation_test_barrier: None,
@@ -903,6 +1054,36 @@ where
             LocalAuthorityResult::DurableFactUnclassified => {
                 // Keep the guard armed: Drop closes the fence before owner release.
                 Err(NativeCloseApplicationError::FatalAuthority)
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod terminal_compatibility_tests {
+    use super::terminal_run_outcome_is_compatible;
+    use phoenix_core::domain::close::{CloseCompletionOutcome, CloseRunStatus};
+
+    #[test]
+    fn terminal_run_status_and_outcome_matrix_is_explicit() {
+        let outcomes = [
+            CloseCompletionOutcome::Archived,
+            CloseCompletionOutcome::Cancelled,
+            CloseCompletionOutcome::ArchivedCleanupAttention,
+            CloseCompletionOutcome::CloseIncomplete,
+        ];
+        let cases = [
+            (CloseRunStatus::Running, [false, false, false, false]),
+            (CloseRunStatus::Stopped, [true, true, true, true]),
+            (CloseRunStatus::Completed, [true, true, false, false]),
+        ];
+        for (status, expected) in cases {
+            for (outcome, expected) in outcomes.into_iter().zip(expected) {
+                assert_eq!(
+                    terminal_run_outcome_is_compatible(status, outcome),
+                    expected,
+                    "{status:?} with {outcome:?}",
+                );
             }
         }
     }

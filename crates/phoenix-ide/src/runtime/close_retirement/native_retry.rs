@@ -24,6 +24,45 @@ use crate::db::{
     RecordCloseWorktreeCleanupPlanRequest,
 };
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NativeScopeRuntimeDrain {
+    Drained,
+    Blocked,
+    Unclassified,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum NativeRetryNoLiveResourcesError {
+    Blocked,
+    Unclassified,
+}
+
+fn native_retry_no_live_resources_result(
+    drain: NativeScopeRuntimeDrain,
+) -> Result<(), NativeRetryNoLiveResourcesError> {
+    match drain {
+        NativeScopeRuntimeDrain::Drained => Ok(()),
+        NativeScopeRuntimeDrain::Blocked => Err(NativeRetryNoLiveResourcesError::Blocked),
+        NativeScopeRuntimeDrain::Unclassified => {
+            Err(NativeRetryNoLiveResourcesError::Unclassified)
+        }
+    }
+}
+
+fn classify_native_scope_runtime_drain(
+    has_live_other: bool,
+    tmux: Option<phoenix_core::domain::work_scope_inventory::TmuxServerStatus>,
+) -> NativeScopeRuntimeDrain {
+    use phoenix_core::domain::work_scope_inventory::TmuxServerStatus;
+    if has_live_other || tmux == Some(TmuxServerStatus::Live) {
+        NativeScopeRuntimeDrain::Blocked
+    } else if tmux == Some(TmuxServerStatus::NotProbed) {
+        NativeScopeRuntimeDrain::Unclassified
+    } else {
+        NativeScopeRuntimeDrain::Drained
+    }
+}
+
 #[derive(Debug)]
 pub(super) enum NativeRetryExecutionError {
     TerminalizedFailure(String),
@@ -60,7 +99,53 @@ fn classify_native_retry_execution(
     }
 }
 
+/// Outcome of proving that an initial native Close may retire a WorkScope.
+/// DB read failures are kept distinct from an established failed precondition.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum NativeInitialWorkScopePrecondition {
+    Ready(WorkScopeRetirementPrecondition),
+    Failed(String),
+    Unclassified,
+}
+
 impl super::RuntimeManager {
+    pub(crate) async fn native_initial_work_scope_precondition(
+        &self,
+        key: &ResourceScopeKey,
+    ) -> NativeInitialWorkScopePrecondition {
+        let ResourceScopeKey::Work(scope) = key else {
+            return NativeInitialWorkScopePrecondition::Failed(
+                "native initial Close requires a Work scope".into(),
+            );
+        };
+        match self.db().work_scope_has_unresolved_product_ownership(scope).await {
+            Ok(true) => return NativeInitialWorkScopePrecondition::Failed(
+                "work scope has unresolved ProductConversation ownership".into(),
+            ),
+            Ok(false) => {}
+            Err(error) => {
+                tracing::warn!(%error, "native initial WorkScope ownership check unclassified");
+                return NativeInitialWorkScopePrecondition::Unclassified;
+            }
+        }
+        match self.native_scope_runtime_drain(scope).await {
+            NativeScopeRuntimeDrain::Drained => {}
+            NativeScopeRuntimeDrain::Blocked => {
+                return NativeInitialWorkScopePrecondition::Failed(
+                    "initial Close scope still has a live runtime resource; target preserved".into(),
+                );
+            }
+            NativeScopeRuntimeDrain::Unclassified => {
+                return NativeInitialWorkScopePrecondition::Unclassified;
+            }
+        }
+        NativeInitialWorkScopePrecondition::Ready(
+            WorkScopeRetirementPrecondition::after_runtime_inventory_found_no_live_resource(
+                scope.clone(),
+            ),
+        )
+    }
+
     pub(crate) async fn execute_native_close_retry(
         &self,
         command: &NativeCloseCommand,
@@ -268,10 +353,22 @@ impl super::RuntimeManager {
                 )
                 .await;
         }
-        if let Err(detail) = self.native_retry_no_live_resources(&effect.scope).await {
-            return self
-                .native_retry_failure(command, admitted, context, effect, &detail)
-                .await;
+        if let Err(error) = self.native_retry_no_live_resources(&effect.scope).await {
+            return match error {
+                NativeRetryNoLiveResourcesError::Blocked => {
+                    self.native_retry_failure(
+                        command,
+                        admitted,
+                        context,
+                        effect,
+                        "native retry scope still has a live runtime resource; target preserved",
+                    )
+                    .await
+                }
+                NativeRetryNoLiveResourcesError::Unclassified => {
+                    Err(NativeRetryExecutionError::Unclassified)
+                }
+            };
         }
         let precondition =
             WorkScopeRetirementPrecondition::after_runtime_inventory_found_no_live_resource(
@@ -326,10 +423,22 @@ impl super::RuntimeManager {
         run: &CloseRunRef,
         effect: &CloseSafeRetryEffect,
     ) -> Result<(), NativeRetryExecutionError> {
-        if let Err(detail) = self.native_retry_no_live_resources(&effect.scope).await {
-            return self
-                .native_retry_failure(command, admitted, context, effect, &detail)
-                .await;
+        if let Err(error) = self.native_retry_no_live_resources(&effect.scope).await {
+            return match error {
+                NativeRetryNoLiveResourcesError::Blocked => {
+                    self.native_retry_failure(
+                        command,
+                        admitted,
+                        context,
+                        effect,
+                        "native retry scope still has a live runtime resource; target preserved",
+                    )
+                    .await
+                }
+                NativeRetryNoLiveResourcesError::Unclassified => {
+                    Err(NativeRetryExecutionError::Unclassified)
+                }
+            };
         }
         let scope = context
             .scopes
@@ -595,10 +704,15 @@ impl super::RuntimeManager {
     async fn native_retry_no_live_resources(
         &self,
         scope: &phoenix_core::work_scope::WorkScopeId,
-    ) -> Result<(), String> {
-        use phoenix_core::domain::work_scope_inventory::{
-            BrowserSessionLiveness, TmuxServerStatus,
-        };
+    ) -> Result<(), NativeRetryNoLiveResourcesError> {
+        native_retry_no_live_resources_result(self.native_scope_runtime_drain(scope).await)
+    }
+
+    async fn native_scope_runtime_drain(
+        &self,
+        scope: &phoenix_core::work_scope::WorkScopeId,
+    ) -> NativeScopeRuntimeDrain {
+        use phoenix_core::domain::work_scope_inventory::BrowserSessionLiveness;
         let key = ResourceScopeKey::Work(scope.clone());
         let inventory = phoenix_tools::work_scope_inventory::assemble_inventory(
             &key,
@@ -609,20 +723,12 @@ impl super::RuntimeManager {
             self.browser_sessions(),
         )
         .await;
-        if inventory.bash.iter().any(|handle| handle.state.is_live())
-            || inventory
-                .tmux
-                .is_some_and(|tmux| tmux.status != TmuxServerStatus::Gone)
+        let has_live_other = inventory.bash.iter().any(|handle| handle.state.is_live())
             || inventory
                 .browser
                 .is_some_and(|browser| browser.state != BrowserSessionLiveness::TornDown)
-            || self.terminals.get(&key).is_some()
-        {
-            return Err(
-                "native retry scope still has a live runtime resource; target preserved".into(),
-            );
-        }
-        Ok(())
+            || self.terminals.get(&key).is_some();
+        classify_native_scope_runtime_drain(has_live_other, inventory.tmux.map(|tmux| tmux.status))
     }
 
     async fn native_retry_record_success(
@@ -714,6 +820,50 @@ impl super::RuntimeManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unprobed_tmux_cannot_establish_initial_scope_drain_or_failure() {
+        use phoenix_core::domain::work_scope_inventory::TmuxServerStatus;
+        assert_eq!(
+            classify_native_scope_runtime_drain(false, Some(TmuxServerStatus::NotProbed)),
+            NativeScopeRuntimeDrain::Unclassified,
+        );
+        assert_eq!(
+            classify_native_scope_runtime_drain(false, Some(TmuxServerStatus::Live)),
+            NativeScopeRuntimeDrain::Blocked,
+        );
+        for tmux in [None, Some(TmuxServerStatus::Gone)] {
+            assert_eq!(
+                classify_native_scope_runtime_drain(false, tmux),
+                NativeScopeRuntimeDrain::Drained,
+            );
+        }
+        assert_eq!(
+            classify_native_scope_runtime_drain(true, Some(TmuxServerStatus::NotProbed)),
+            NativeScopeRuntimeDrain::Blocked,
+        );
+    }
+
+    #[test]
+    fn retry_runtime_unknown_remains_unclassified_while_blocked_is_distinct() {
+        assert_eq!(
+            native_retry_no_live_resources_result(NativeScopeRuntimeDrain::Drained),
+            Ok(()),
+        );
+        assert_eq!(
+            native_retry_no_live_resources_result(NativeScopeRuntimeDrain::Blocked),
+            Err(NativeRetryNoLiveResourcesError::Blocked),
+        );
+        let Err(NativeRetryNoLiveResourcesError::Unclassified) =
+            native_retry_no_live_resources_result(NativeScopeRuntimeDrain::Unclassified)
+        else {
+            panic!("unknown runtime inventory must remain unclassified");
+        };
+        assert!(matches!(
+            classify_native_retry_execution(Err(NativeRetryExecutionError::Unclassified)),
+            LocalAuthorityResult::DurableFactUnclassified
+        ));
+    }
 
     #[test]
     fn execution_diagnostics_do_not_establish_terminal_authority() {

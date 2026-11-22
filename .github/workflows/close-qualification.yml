@@ -295,6 +295,14 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          cargo build -p phoenix_ide --bin phoenix_ide --message-format=json > evidence/runtime-launcher-build.jsonl
+          launch_exe="$(jq -r 'select(.reason == "compiler-artifact" and .target.name == "phoenix_ide" and (.target.kind | index("bin")) != null and .executable != null) | .executable' evidence/runtime-launcher-build.jsonl)"
+          test -n "$launch_exe"
+          test -x "$launch_exe"
+          export PHOENIX_BASH_LAUNCH_TEST_EXE="$(realpath "$launch_exe")"
+          export PHOENIX_BASH_LAUNCH_TEST_REQUIRED=1
+          printf 'PHOENIX_BASH_LAUNCH_TEST_REQUIRED=1\n' >> "$GITHUB_ENV"
+          printf 'PHOENIX_BASH_LAUNCH_TEST_EXE=%s\n' "$PHOENIX_BASH_LAUNCH_TEST_EXE" >> "$GITHUB_ENV"
           cargo test -p phoenix_ide --lib --no-run --message-format=json > evidence/runtime-build.jsonl
           runtime_test_binary="$(jq -r 'select(.reason == "compiler-artifact" and .target.name == "phoenix_ide" and .profile.test == true and .executable != null) | .executable' evidence/runtime-build.jsonl)"
           test -n "$runtime_test_binary"
@@ -304,7 +312,26 @@ jobs:
           (cd crates/phoenix-ide && "$runtime_test_binary" --list) 2>&1 | tee evidence/runtime-inventory.log
           grep -E 'native_close_application::tests::.*: test$|native_close_admission_tests::.*: test$' evidence/runtime-inventory.log > evidence/runtime-selected-tests.txt
           grep -F 'native_close_admission_tests::native_close_backend_requires_actor_database_authority_not_matching_path: test' evidence/runtime-selected-tests.txt
+          grep -F 'native_close_admission_tests::bash_stage2_stop_ack::bash_stage_two_stop_ack_reaches_real_second_writer_and_cleans_once: test' evidence/runtime-selected-tests.txt
           test -s evidence/runtime-selected-tests.txt
+          for module in \
+            runtime::executor::native_close::source_entry::tests:: \
+            runtime::executor::native_close::process_retirement::tests:: \
+            runtime::executor::native_close::post_retirement::tests:: \
+            runtime::executor::native_close::terminal_compatibility_tests:: \
+            runtime::close_retirement::native_initial::resource::tests:: \
+            runtime::close_retirement::native_initial::supervision::tests:: \
+            runtime::close_retirement::native_initial::capture_binding::tests::; do
+            test "$(grep -c "^${module}.*: test$" evidence/runtime-inventory.log)" -gt 0
+          done
+          for test in \
+            native_close_source_entry_is_revoked_by_acknowledged_stop_in_real_actor \
+            native_close_source_entry_is_revoked_by_shutdown_in_real_actor \
+            native_close_source_entry_cannot_reopen_after_live_state_replacement \
+            acknowledged_stop_revokes_captured_terminal_entry_while_db_pool_is_unavailable \
+            acknowledged_stop_revokes_captured_terminal_entry_while_independent_sqlite_writer_is_held; do
+            grep -F "native_close_admission_tests::$test: test" evidence/runtime-selected-tests.txt
+          done
           grep -F 'stopped_live_source_refuses_exact_observe_replay_before_database_lookup: test' evidence/runtime-selected-tests.txt
           grep -E '^runtime::close_retirement::lease_custody::tests::.*: test$' evidence/runtime-inventory.log > evidence/lease-custody-selected-tests.txt
           test "$(wc -l < evidence/lease-custody-selected-tests.txt | tr -d ' ')" -gt 0
@@ -331,6 +358,27 @@ jobs:
           grep -E 'test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored;' evidence/native-close-runtime-matcher.log
           (cd crates/phoenix-ide && "$PHOENIX_RUNTIME_TEST_BINARY" native_close_admission_tests:: --nocapture --test-threads=1) 2>&1 | tee evidence/native-close-runtime-actor.log
           grep -E 'test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored;' evidence/native-close-runtime-actor.log
+          grep -F 'native_close_admission_tests::bash_stage2_stop_ack::bash_stage_two_stop_ack_reaches_real_second_writer_and_cleans_once ... ok' evidence/native-close-runtime-actor.log
+          for test in \
+            native_close_source_entry_is_revoked_by_acknowledged_stop_in_real_actor \
+            native_close_source_entry_is_revoked_by_shutdown_in_real_actor \
+            native_close_source_entry_cannot_reopen_after_live_state_replacement \
+            acknowledged_stop_revokes_captured_terminal_entry_while_db_pool_is_unavailable \
+            acknowledged_stop_revokes_captured_terminal_entry_while_independent_sqlite_writer_is_held; do
+            grep -F "native_close_admission_tests::$test ... ok" evidence/native-close-runtime-actor.log
+          done
+          for module in \
+            runtime::executor::native_close::source_entry::tests:: \
+            runtime::executor::native_close::process_retirement::tests:: \
+            runtime::executor::native_close::post_retirement::tests:: \
+            runtime::executor::native_close::terminal_compatibility_tests:: \
+            runtime::close_retirement::native_initial::resource::tests:: \
+            runtime::close_retirement::native_initial::supervision::tests:: \
+            runtime::close_retirement::native_initial::capture_binding::tests::; do
+            log="evidence/${module//::/-}.log"
+            (cd crates/phoenix-ide && "$PHOENIX_RUNTIME_TEST_BINARY" "$module" --nocapture --test-threads=1) 2>&1 | tee "$log"
+            grep -E 'test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored;' "$log"
+          done
       - name: Qualify original-deadline worktree inspection prerequisites
         if: success() || failure()
         shell: bash
@@ -347,6 +395,7 @@ jobs:
             worktree_repository_lock_uses_shared_common_directory_until_released
             expired_prepared_worktree_refuses_before_first_teardown_effect
             prepared_worktree_core_holds_existing_repository_lock_through_effect_hook
+            aborting_close_waiter_keeps_original_repository_lock_until_inner_effect_returns
             prepared_worktree_refuses_replaced_common_directory_before_teardown
             common_directory_registry_query_lists_linked_worktree_without_nested_git
             expired_common_directory_registry_query_refuses_before_directory_access

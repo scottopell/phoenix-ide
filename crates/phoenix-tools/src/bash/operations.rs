@@ -4782,7 +4782,9 @@ mod tests {
     fn waiter_success_producer_is_take_once_across_handle_clones() {
         let handle = live_handle();
         let other = handle.clone();
-        let producer = handle.take_waiter_settlement_producer().expect("first claim");
+        let producer = handle
+            .take_waiter_settlement_producer()
+            .expect("first claim");
         assert!(other.take_waiter_settlement_producer().is_none());
         drop(producer);
         assert!(handle.take_waiter_settlement_producer().is_none());
@@ -4795,7 +4797,9 @@ mod tests {
     #[test]
     fn waiter_unique_success_producer_cannot_overwrite_failure() {
         let handle = live_handle();
-        let producer = handle.take_waiter_settlement_producer().expect("first claim");
+        let producer = handle
+            .take_waiter_settlement_producer()
+            .expect("first claim");
         handle.unverify_waiter("retained failure");
         producer.settle();
         assert_eq!(

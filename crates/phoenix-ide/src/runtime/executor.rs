@@ -60,6 +60,7 @@ use tracing::Instrument;
 mod capacity;
 mod continuation;
 mod native_close;
+pub(crate) use native_close::source_entry::{SourceEntryWorker, WorkerEntryResult};
 mod native_close_observe;
 mod native_close_retry;
 mod native_task_approval;
@@ -2354,6 +2355,8 @@ where
     svg_publication_lifetime: Arc<super::svg_artifacts::SvgPublicationLifetime>,
     handoff_completion_authority: Option<crate::runtime::AdmittedOperation>,
     required_settlement_authority: Option<RequiredSettlementScope>,
+    // Actor-only controller; background Close workers receive no reopening API.
+    native_close_source_entry: Option<native_close::source_entry::SourceEntryController>,
     handoff_completion_timestamp: Option<DateTime<Utc>>,
     continuation_effect_disposition: ContinuationEffectDisposition,
     recovery_disposition: RuntimeRecoveryDisposition,
@@ -2589,6 +2592,7 @@ where
             svg_publication_lifetime: super::svg_artifacts::SvgPublicationLifetime::new(),
             handoff_completion_authority: None,
             required_settlement_authority: None,
+            native_close_source_entry: None,
             handoff_completion_timestamp: None,
             continuation_effect_disposition: ContinuationEffectDisposition::Continue,
             recovery_disposition: RuntimeRecoveryDisposition::Continue,
@@ -2690,12 +2694,28 @@ where
             })
     }
 
+    /// Revoke before persistence; a leaf already holding the short source guard
+    /// finishes first. No SQLite writer waits for an actor reply or actor mutex.
+    async fn revoke_native_close_source_entry(&mut self) {
+        if let Some(controller) = &mut self.native_close_source_entry {
+            while controller.revoke() == native_close::source_entry::ActorEntryResult::Busy {
+                tokio::task::yield_now().await;
+            }
+        }
+    }
+
     fn install_live_state(
         &mut self,
         state: ConvState,
         state_updated_at: DateTime<Utc>,
         publish: bool,
     ) -> Result<(), String> {
+        if self.native_close_source_entry.as_ref().is_some_and(|controller| !controller.matches_state(&state)) {
+            if self.native_close_source_entry.as_mut().expect("checked controller").revoke()
+                == native_close::source_entry::ActorEntryResult::Busy {
+                return Err("Close first effect must finish before source replacement".into());
+            }
+        }
         let _owner = self.live_state_owner()?;
         self.state = state;
         self.state_updated_at = state_updated_at;
@@ -3249,6 +3269,7 @@ where
         // or target gate while its owned preparation worker is still running.
         macro_rules! join_pending_native_close_before_fatal {
             () => {
+                self.revoke_native_close_source_entry().await;
                 if let Some(mut continuation) = pending_native_close_initial.take() {
                     continuation.abort_and_join_inventory_preparation().await;
                 }
@@ -3262,6 +3283,7 @@ where
 
         macro_rules! defer_exit_until_native_close_observed {
             ($disposition:expr) => {{
+                self.revoke_native_close_source_entry().await;
                 if let Some(continuation) = pending_native_close_initial.as_mut() {
                     continuation.begin_exit_interruption();
                     self.abort_external_effects().await;
@@ -3299,6 +3321,7 @@ where
                     return self.closed_authority_exit().await;
                 }
                 if deferred_native_close_exit.is_none() {
+                    self.revoke_native_close_source_entry().await;
                     self.abort_external_effects().await;
                     defer_exit_until_native_close_observed!(
                         RuntimeExitDisposition::CoordinatedShutdown
@@ -3307,6 +3330,7 @@ where
             }
             if deferred_native_close_exit.is_none() {
                 if let Some(disposition) = self.recovery_exit_disposition() {
+                    self.revoke_native_close_source_entry().await;
                     tracing::warn!(
                         conversation_id = %self.context.conversation_id,
                         "Exiting runtime to reconstruct an uncommitted operation from database truth"
@@ -3352,6 +3376,7 @@ where
                         join_pending_native_close_before_fatal!();
                         return self.fatal_local_authority_exit();
                     }
+                    self.revoke_native_close_source_entry().await;
                     self.abort_external_effects().await;
                     defer_exit_until_native_close_observed!(RuntimeExitDisposition::CoordinatedShutdown);
                 }
@@ -3362,6 +3387,7 @@ where
                     if pending_native_close_initial.as_ref().is_some_and(|continuation| continuation.needs_service(native_close_step_ready)) => {
                     let mut continuation = pending_native_close_initial.take().expect("guarded continuation");
                     if continuation.observe_terminal_if_required().await {
+                        self.revoke_native_close_source_entry().await;
                         native_close_step_ready = false;
                         continue;
                     }
@@ -3373,7 +3399,10 @@ where
                     native_close_step_ready = false;
                     // Continuation owns the exact admitted database authority; admission
                     // configuration may change after transfer and is not reconsulted.
-                    let stepped = continuation.step(&self.state).await;
+                    let stepped = match continuation.ensure_source_entry(&mut self.native_close_source_entry, &self.state).await {
+                        Ok(()) => continuation.step(&self.state).await,
+                        Err(error) => Err(error),
+                    };
                     #[cfg(test)]
                     if let (Some(observer), Ok(phase)) = (&self.native_close_phase_observer, &stepped) {
                         let _ = observer.send(*phase);
@@ -3400,11 +3429,18 @@ where
                             pending_native_close_initial = Some(continuation);
                             native_close_step_ready = false;
                         }
+                        Ok(native_close::NativeCloseInitialContinuationPhase::RetiringProcesses
+                            | native_close::NativeCloseInitialContinuationPhase::ProcessRetirementBlocked
+                            | native_close::NativeCloseInitialContinuationPhase::RuntimeProcessesDone) => {
+                            pending_native_close_initial = Some(continuation);
+                            native_close_step_ready = false;
+                        }
                         Ok(native_close::NativeCloseInitialContinuationPhase::AwaitingStopWorkConfirmation) => {
                             tracing::debug!("initial Close is awaiting Stop work confirmation");
                             pending_native_close_initial = Some(continuation);
                         }
                         Ok(native_close::NativeCloseInitialContinuationPhase::Finished) => {
+                            self.revoke_native_close_source_entry().await;
                             pending_native_close_initial = None;
                         }
                         Ok(native_close::NativeCloseInitialContinuationPhase::InspectionRequired) => {
@@ -3427,6 +3463,7 @@ where
                             pending_native_close_initial = Some(continuation);
                         }
                         Err(super::native_close_application::NativeCloseApplicationError::FatalAuthority) => {
+                            self.revoke_native_close_source_entry().await;
                             continuation.abort_and_join_inventory_preparation().await;
                             drop(continuation);
                             join_pending_native_close_before_fatal!();
@@ -3537,6 +3574,9 @@ where
                             continue;
                         }
                     };
+                    if matches!(&event, Event::UserCancel { .. } | Event::Shutdown) {
+                        self.revoke_native_close_source_entry().await;
+                    }
                     let result = self.process_acknowledged_event(event).await;
                     // The durable source fence is part of the event transaction; optional
                     // Close observation must not delay its acknowledgement.
@@ -3546,7 +3586,7 @@ where
                         if continuation.phase == native_close::NativeCloseInitialContinuationPhase::InspectionRequired {
                             continuation.abort_and_join_inventory_preparation().await;
                         }
-                        if continuation.release_if_exactly_stopped().await {
+                        if continuation.release_if_exactly_terminal().await {
                             pending_native_close_initial = None;
                         }
                     }
@@ -3567,6 +3607,7 @@ where
                     // is dropped and connected SSE clients detect the closed
                     // stream and trigger a reconnect to the new runtime.
                     if matches!(event, Event::Shutdown) {
+                        self.revoke_native_close_source_entry().await;
                         self.svg_publication_lifetime.coordinated_shutdown();
                         tracing::info!(
                             conv_id = %self.context.conversation_id,
@@ -3574,7 +3615,7 @@ where
                         );
                         self.abort_external_effects().await;
                         if let Some(continuation) = pending_native_close_initial.as_mut() {
-                            if continuation.release_if_exactly_stopped().await {
+                            if continuation.release_if_exactly_terminal().await {
                                 pending_native_close_initial = None;
                             }
                         }
@@ -3600,7 +3641,7 @@ where
                         if continuation.phase == native_close::NativeCloseInitialContinuationPhase::InspectionRequired {
                             continuation.abort_and_join_inventory_preparation().await;
                         }
-                        if continuation.release_if_exactly_stopped().await {
+                        if continuation.release_if_exactly_terminal().await {
                             pending_native_close_initial = None;
                         }
                     }
@@ -4238,6 +4279,9 @@ where
         event: Event,
         authority: TransitionAuthority,
     ) -> Result<(), String> {
+        if matches!(&event, Event::UserCancel { .. } | Event::Shutdown) {
+            self.revoke_native_close_source_entry().await;
+        }
         if self.fatal_local_authority_fence.is_closed()
             && self.handoff_completion_authority.is_none()
             && (self
@@ -4682,6 +4726,9 @@ where
         ordinary_input_id: Option<&str>,
         authority: TransitionAuthority,
     ) -> Result<Vec<Event>, String> {
+        if self.native_close_source_entry.as_ref().is_some_and(|controller| !controller.matches_state(&result.new_state)) {
+            self.revoke_native_close_source_entry().await;
+        }
         let remaining = self.bash_wait_transition_remaining(&result.new_state);
         if let Some(remaining) = remaining {
             let dispatch_index = result.effects.iter().position(|effect| {
