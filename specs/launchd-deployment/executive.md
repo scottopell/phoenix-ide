@@ -254,8 +254,43 @@ separate post-cleanup receipt. The prototype's focused suite had failed before
 its final connection-mode correction and was not rerun afterward.
 
 Overlap was rejected and its source/tests restored, not committed as a candidate.
-No cache tuning, overlap implementation or additional hosted dense run followed.
-The integer-tag production source and failed dense gate remain unchanged.
+No cache tuning or overlap implementation was retained. The integer-tag source
+remains the last hosted dense result; its failed qualification is not waived by
+the later bounded diagnostic below.
+
+### Row-only TEXT-wrapper remedy candidate
+
+The next candidate removes per-cell SQL storage-tag expressions. On the helper's
+ordinary owned SQLite connections, row-only `text_factory` wraps raw TEXT bytes
+in a one-element tuple, distinct from BLOB bytes, integer, REAL and NULL values.
+Metadata retains its byte factory. Both sides are checked for REAL values before
+batch or row equality shortcuts; fallback uses exact types and binary64 REAL
+comparison. Nested cursor ownership closes both row cursors before restoring
+factories, including execute, fetch, mismatch and deadline failures.
+
+A bounded CPython 3.13.1 / SQLite 3.47.1 dense screen used 300,000 principal rows,
+128-byte TEXT/BLOB payloads and no extra columns. The source was 256,053,248 bytes.
+Two warmup pairs and five measured pairs alternated arm order. Actual-helper
+wall medians were 5.142 seconds for integer tags and 4.707 seconds for the wrapper,
+with matching 1,203,721 rows, 2,708,217 cells and eight completed stored tables.
+The screen included native backup, full integrity on the writable backup,
+exhaustive comparison and file/directory fsync under one 30-second deadline;
+it did not include outer transaction-proof publication or qualify the 900-second
+large-fixture path. Both helpers rejected CHECK corruption. Retained-cursor
+witnesses, warning/unraisable reports and temporary-directory cleanup were clean.
+
+Earlier exploratory attempts are retained as diagnostics, not successful runs:
+an initial baseline fixture exceeded its source cap, and two cursor-witness
+attempts stopped before generation because of harness selection/count mistakes.
+A reduced 1,000-row baseline/wide comparator screen is only supporting evidence.
+The tracked production function blocks match the closed scratch candidate;
+the full file hashes differ because scratch includes script metadata.
+
+The parent four-module regression passed 124 tests with ResourceWarning promoted
+to errors and no resource-warning or unraisable matches. Independent exact-delta
+static review found no actionable issue. These results support one targeted
+hosted qualification, not deployment: exact-source dense completion, ordinary
+CI/native results, clean integration and fresh rollout assessment remain gates.
 
 ## Operator recovery
 

@@ -1,8 +1,10 @@
 """Behavioral coverage for SQLite backup equivalence checks."""
+import contextlib
 import importlib.util
 import sqlite3
 import struct
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -52,31 +54,36 @@ class BackupComparatorTests(unittest.TestCase):
             source.close()
             backup.close()
 
-    def test_storage_class_codes_preserve_byte_values(self):
+    def test_injective_text_representation_preserves_storage_classes_and_bytes(self):
         database = sqlite3.connect(":memory:")
         self.addCleanup(database.close)
-        database.text_factory = bytes
-        cases = (("NULL", 110, None), ("42", 105, 42), ("1.25", 114, 1.25),
-                 ("CAST(X'ff80' AS TEXT)", 116, b"\xff\x80"),
-                 ("X'ff00'", 98, b"\xff\x00"))
-        for expression, code, value in cases:
+        database.text_factory = lambda raw: (raw,)
+        cases = (("NULL", type(None), None), ("42", int, 42), ("1.25", float, 1.25),
+                 ("CAST(X'ff8000' AS TEXT)", tuple, (b"\xff\x80\x00",)),
+                 ("X'ff8000'", bytes, b"\xff\x80\x00"),
+                 ("CAST(X'' AS TEXT)", tuple, (b"",)), ("X''", bytes, b""))
+        for expression, value_type, value in cases:
             with self.subTest(expression=expression):
-                self.assertEqual(database.execute(
-                    f"SELECT unicode(typeof({expression})), {expression}"
-                ).fetchone(), (code, value))
+                with contextlib.closing(database.execute(f"SELECT {expression}")) as cursor:
+                    actual = cursor.fetchone()[0]
+                self.assertIs(type(actual), value_type)
+                self.assertEqual(actual, value)
 
-    def test_unknown_storage_code_reports_activation_error_and_restores_factories(self):
+    def test_mismatch_error_is_content_free_and_restores_distinct_factories(self):
         source, backup = sqlite3.connect(":memory:"), sqlite3.connect(":memory:")
         self.addCleanup(source.close)
         self.addCleanup(backup.close)
-        for database, value in ((source, 1), (backup, 2)):
-            database.execute("CREATE TABLE cells(v)")
-            database.execute("INSERT INTO cells VALUES (?)", (value,))
-            database.create_function("unicode", 1, lambda value: 999)
-        with self.assertRaisesRegex(helper.ActivationError, "storage class code.*999"):
+        source_factory = lambda raw: raw.decode("utf-8")
+        backup_factory = lambda raw: raw
+        source.text_factory, backup.text_factory = source_factory, backup_factory
+        for database, value in ((source, "private-source"), (backup, "private-backup")):
+            database.execute('CREATE TABLE "private-table"("private-column")')
+            database.execute('INSERT INTO "private-table" VALUES (?)', (value,))
+        with self.assertRaises(helper.ActivationError) as raised:
             helper._verify_logical_equivalence(source, backup, helper.time.monotonic() + 10)
-        self.assertIs(source.text_factory, str)
-        self.assertIs(backup.text_factory, str)
+        self.assertEqual(str(raised.exception), "SQLite backup row differs in table ordinal 0")
+        self.assertIs(source.text_factory, source_factory)
+        self.assertIs(backup.text_factory, backup_factory)
 
     def test_all_storage_classes(self):
         def setup(db):
@@ -225,6 +232,199 @@ class BackupComparatorTests(unittest.TestCase):
         finally:
             source.close()
             backup.close()
+
+    def test_numeric_type_and_signed_zero_mismatches_at_batch_boundaries(self):
+        for position in (15, 16, 17):
+            for left, right in ((1, 1.0), (-0.0, 0.0)):
+                for reverse in (False, True):
+                    source_value, backup_value = (right, left) if reverse else (left, right)
+                    with self.subTest(position=position, left=repr(source_value),
+                                      right=repr(backup_value)):
+                        def setup(db):
+                            db.execute("CREATE TABLE cells(v)")
+                            db.executemany("INSERT INTO cells VALUES (?)", ((123,) for _ in range(33)))
+                            db.execute("UPDATE cells SET v=? WHERE rowid=?", (source_value, position))
+                            stored = db.execute("SELECT v FROM cells WHERE rowid=?", (position,)).fetchone()[0]
+                            self.assertIs(type(stored), type(source_value))
+                            if type(stored) is float:
+                                self.assertEqual(struct.pack(">d", stored), struct.pack(">d", source_value))
+
+                        diagnostics = self.compare_outcomes(
+                            setup, "reject", lambda db: db.execute(
+                                "UPDATE cells SET v=? WHERE rowid=?", (backup_value, position)),
+                        )
+                        self.assertEqual(diagnostics["table_rows_compared"], position - 1)
+                        self.assertEqual(diagnostics["table_cells_compared"], position)
+                        self.assertEqual(diagnostics["rows_compared"], position - 1)
+                        self.assertEqual(diagnostics["cells_compared"], position)
+
+    def test_text_blob_bytes_at_batch_boundaries_in_both_directions(self):
+        for position in (15, 16, 17):
+            for payload in ("ff8000", "00", ""):
+                text_expression = f"CAST(X'{payload}' AS TEXT)"
+                blob_expression = f"X'{payload}'"
+                for left, right, outcome in (
+                    (text_expression, blob_expression, "reject"),
+                    (blob_expression, text_expression, "reject"),
+                    (text_expression, text_expression, "accept"),
+                    (blob_expression, blob_expression, "accept"),
+                ):
+                    with self.subTest(position=position, left=left, right=right):
+                        def setup(db):
+                            db.execute("CREATE TABLE cells(v)")
+                            db.executemany("INSERT INTO cells VALUES (?)", ((123,) for _ in range(33)))
+                            db.execute(f"UPDATE cells SET v={left} WHERE rowid=?", (position,))
+
+                        diagnostics = self.compare_outcomes(
+                            setup, outcome, lambda db: db.execute(
+                                f"UPDATE cells SET v={right} WHERE rowid=?", (position,)),
+                        )
+                        self.assertEqual(diagnostics["table_rows_compared"],
+                                         position - 1 if outcome == "reject" else 1)
+                        self.assertEqual(diagnostics["rows_compared"],
+                                         position - 1 if outcome == "reject" else 34)
+                        self.assertEqual(diagnostics["cells_compared"],
+                                         position if outcome == "reject" else 38)
+
+    def test_distinct_factories_across_multiple_tables_success_and_late_failure(self):
+        def setup(db):
+            db.executescript("""CREATE TABLE after_cells(v TEXT);
+                INSERT INTO after_cells VALUES ('second table');
+                CREATE TABLE cells(v TEXT);
+                INSERT INTO cells VALUES (CAST(X'ff8000' AS TEXT));""")
+
+        accepted = self.compare_outcomes(setup, "accept")
+        self.assertEqual(accepted["tables_completed"], 3)
+        rejected = self.compare_outcomes(setup, "reject", lambda db: db.execute(
+            "UPDATE after_cells SET v='different'"))
+        self.assertEqual(rejected["tables_completed"], 1)
+        self.assertEqual(rejected["table_ordinal"], 2)
+        self.assertEqual(rejected["rows_compared"], 1)
+        self.assertEqual(rejected["cells_compared"], 2)
+
+    def test_scale_fixture_counters_match_independent_sql_inventory(self):
+        fixture = load_helper("backup_comparator_scale_fixture",
+                              ROOT / "tests/integration/backup_verification_scale.py")
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "source.sqlite"
+            composition = fixture.create_fixture(
+                path, minimum_bytes=1, rows_per_table=17,
+                text_bytes=32, blob_bytes=32, extra_columns=1,
+            )
+            self.assertEqual(composition["documents_rows"], 17)
+            self.assertEqual(composition["keyed_records_rows"], 17)
+            self.assertTrue(composition["fts5_shadow_rows"])
+            with contextlib.closing(sqlite3.connect(path)) as source, \
+                    contextlib.closing(sqlite3.connect(":memory:")) as backup:
+                source.backup(backup)
+                expected = dict.fromkeys(("rows_compared", "cells_compared", "tables_completed",
+                                          "table_ordinal", "table_rows_compared", "table_cells_compared"), 0)
+                with contextlib.closing(source.execute("PRAGMA main.table_list")) as cursor:
+                    tables = cursor.fetchall()
+                for schema, name, kind, *_ in tables:
+                    if schema != "main":
+                        continue
+                    expected["table_ordinal"] += 1
+                    expected["table_rows_compared"] = expected["table_cells_compared"] = 0
+                    if kind == "virtual":
+                        continue
+                    quoted = '"' + name.replace('"', '""') + '"'
+                    with contextlib.closing(source.execute(f"SELECT count(*) FROM {quoted}")) as cursor:
+                        count = cursor.fetchone()[0]
+                    with contextlib.closing(source.execute(f"PRAGMA table_xinfo({quoted})")) as cursor:
+                        width = sum(row[6] not in (1, 2) for row in cursor.fetchall())
+                    expected["rows_compared"] += count
+                    expected["cells_compared"] += count * width
+                    expected["tables_completed"] += 1
+                    expected["table_rows_compared"] = count
+                    expected["table_cells_compared"] = count * width
+                diagnostics = {}
+                helper._verify_logical_equivalence(
+                    source, backup, helper.time.monotonic() + 10, diagnostics,
+                )
+                self.assertEqual({key: diagnostics[key] for key in expected}, expected)
+
+    def test_retained_row_cursors_close_before_factories_restore_on_all_exits(self):
+        for case in ("success", "mismatch", "leftfetch", "rightfetch", "backup-execute", "deadline"):
+            with self.subTest(case=case):
+                retained = []
+                events = []
+                test = self
+
+                class RowCursor:
+                    def __init__(self, cursor, owner):
+                        self.cursor, self.owner = cursor, owner
+                        self.closed = False
+                        retained.append(self)
+
+                    def fetchmany(self, count):
+                        if case == self.owner.side + "fetch":
+                            raise sqlite3.OperationalError("private injected fetch error")
+                        return self.cursor.fetchmany(count)
+
+                    def close(self):
+                        test.assertIsNot(self.owner.text_factory, bytes)
+                        test.assertFalse(self.closed)
+                        self.cursor.close()
+                        self.closed = True
+                        events.append(self.owner.side)
+
+                class ConnectionWitness:
+                    def __init__(self, database, side):
+                        self.database, self.side = database, side
+
+                    @property
+                    def text_factory(self):
+                        return self.database.text_factory
+
+                    @text_factory.setter
+                    def text_factory(self, factory):
+                        if factory is bytes:
+                            test.assertTrue(all(cursor.closed for cursor in retained))
+                        self.database.text_factory = factory
+
+                    def set_progress_handler(self, *args):
+                        return self.database.set_progress_handler(*args)
+
+                    def execute(self, query, *args):
+                        row_query = query.startswith("SELECT ") and "ORDER BY" in query and ".sqlite_schema " not in query
+                        if row_query and case == "backup-execute" and self.side == "right":
+                            raise sqlite3.OperationalError("private injected execute error")
+                        cursor = self.database.execute(query, *args)
+                        return RowCursor(cursor, self) if row_query else cursor
+
+                with contextlib.closing(sqlite3.connect(":memory:")) as source, \
+                        contextlib.closing(sqlite3.connect(":memory:")) as backup:
+                    for db, value in ((source, 1), (backup, 2 if case == "mismatch" else 1)):
+                        db.execute("CREATE TABLE cells(v)")
+                        db.execute("INSERT INTO cells VALUES (?)", (value,))
+                    source_factory = lambda raw: raw.decode("utf-8")
+                    backup_factory = lambda raw: raw
+                    source.text_factory, backup.text_factory = source_factory, backup_factory
+                    left, right = ConnectionWitness(source, "left"), ConnectionWitness(backup, "right")
+
+                    def clock():
+                        return 101.0 if case == "deadline" and len(retained) >= 2 else 100.0
+
+                    with mock.patch.object(helper.time, "monotonic", side_effect=clock):
+                        if case == "success":
+                            helper._verify_logical_equivalence(left, right, 101.0)
+                        else:
+                            message = ("SQLite logical verification deadline exceeded" if case == "deadline"
+                                       else "SQLite backup row differs in table ordinal 0" if case == "mismatch"
+                                       else "SQLite logical verification database operation failed")
+                            with self.assertRaises(helper.ActivationError) as raised:
+                                helper._verify_logical_equivalence(left, right, 101.0)
+                            self.assertEqual(str(raised.exception), message)
+                    self.assertIs(source.text_factory, source_factory)
+                    self.assertIs(backup.text_factory, backup_factory)
+                    self.assertEqual(len(retained), 4 if case == "success" else 1 if case == "backup-execute" else 2)
+                    self.assertEqual(events, ["left"] if case == "backup-execute" else
+                                     ["right", "left"] * (len(retained) // 2))
+                    for cursor in retained:
+                        self.assertTrue(cursor.closed)
+                        with self.assertRaises(sqlite3.ProgrammingError):
+                            cursor.cursor.fetchone()
 
     def test_empty_table_and_no_diagnostics(self):
         source, backup = sqlite3.connect(":memory:"), sqlite3.connect(":memory:")
