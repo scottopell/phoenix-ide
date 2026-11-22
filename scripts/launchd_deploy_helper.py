@@ -28,6 +28,7 @@ DEPLOY_HELPER_LABEL_PREFIX = "com.phoenix-ide.deploy"
 DEFAULT_TRANSITION_TIMEOUT_SECS = 30.0
 DEFAULT_HEALTH_TIMEOUT_SECS = 120.0
 MIGRATION_TIMEOUT_SECS = 600
+BACKUP_VERIFICATION_TIMEOUT_SECS = 900.0
 FULL_GIT_SHA_RE = re.compile(r"[0-9a-f]{40}")
 HASH_RE = re.compile(r"[0-9a-f]{64}")
 TERMINAL_STATES = {"committed", "precondition_failed", "failed"}
@@ -376,7 +377,7 @@ def _database_size_bytes(database_path: str) -> int:
     if not path.is_absolute() or path.is_symlink() or not path.is_file():
         raise ActivationError("configured production database must be an existing regular file")
     try:
-        with sqlite3.connect(f"{path.absolute().as_uri()}?mode=ro", uri=True, timeout=5) as database:
+        with contextlib.closing(sqlite3.connect(f"{path.absolute().as_uri()}?mode=ro", uri=True, timeout=5)) as database:
             page_count = database.execute("PRAGMA page_count").fetchone()[0]
             page_size = database.execute("PRAGMA page_size").fetchone()[0]
     except (sqlite3.Error, OSError, TypeError) as exc:
@@ -549,19 +550,12 @@ def _verify_logical_equivalence(source, backup, deadline: float, diagnostics: di
             return None
         return module[1].lower()
 
-    def typed_value(storage, value):
-        storage = text(storage)
-        if storage == "null":
-            return (storage, None)
-        if storage == "integer":
-            return (storage, int(value))
-        if storage == "real":
-            return (storage, struct.pack(">d", float(value)))
-        if storage in ("text", "blob"):
-            if not isinstance(value, bytes):
-                raise ActivationError("SQLite returned a non-byte TEXT/BLOB value during verification")
-            return (storage, value)
-        raise ActivationError(f"unsupported SQLite storage class during verification: {storage!r}")
+    def cells_equal(left_value, right_value):
+        if type(left_value) is not type(right_value):
+            return False
+        if type(left_value) is float:
+            return struct.pack(">d", left_value) == struct.pack(">d", right_value)
+        return left_value == right_value
 
     def compare_table(source, backup, schema: str, name: str, kind: str, xinfo) -> None:
         check_deadline()
@@ -593,31 +587,65 @@ def _verify_logical_equivalence(source, backup, deadline: float, diagnostics: di
             rowid = next(alias for alias in ("rowid", "_rowid_", "oid") if alias in aliases)
             order = quote(rowid)
             identity = [quote(rowid)]
-        selected = identity + [part for column in names for part in (f"typeof({quote(column)})", quote(column))]
+        selected = identity + [quote(column) for column in names]
         table = f"{quote(schema)}.{quote(name)}"
         query = f"SELECT {','.join(selected)} FROM {table} ORDER BY {order}"
         check_deadline()
-        left, right = source.execute(query), backup.execute(query)
-        while True:
-            check_deadline()
-            a, b = left.fetchone(), right.fetchone()
-            check_deadline()
-            if a is None or b is None:
-                if a != b:
-                    raise ActivationError(f"SQLite backup row count differs in table ordinal {(diagnostics or {}).get('table_ordinal', 0)}")
-                break
-            offset = len(identity)
-            if identity and a[0] != b[0]:
-                raise ActivationError(f"SQLite backup row identity differs in table ordinal {(diagnostics or {}).get('table_ordinal', 0)}")
-            for index in range(offset, len(a), 2):
-                if diagnostics is not None:
-                    diagnostics["cells_compared"] += 1
-                    diagnostics["table_cells_compared"] += 1
-                if typed_value(a[index], a[index + 1]) != typed_value(b[index], b[index + 1]):
-                    raise ActivationError(f"SQLite backup row differs in table ordinal {(diagnostics or {}).get('table_ordinal', 0)}")
-            if diagnostics is not None:
-                diagnostics["rows_compared"] += 1
-                diagnostics["table_rows_compared"] += 1
+        source.text_factory = backup.text_factory = lambda raw: (raw,)
+        try:
+            with contextlib.closing(source.execute(query)) as left:
+                with contextlib.closing(backup.execute(query)) as right:
+                    offset = len(identity)
+                    cell_count = len(names)
+                    while True:
+                        check_deadline()
+                        left_batch = left.fetchmany(16)
+                        right_batch = right.fetchmany(16)
+                        check_deadline()
+                        if not left_batch or not right_batch:
+                            if bool(left_batch) != bool(right_batch):
+                                raise ActivationError(f"SQLite backup row count differs in table ordinal {(diagnostics or {}).get('table_ordinal', 0)}")
+                            break
+
+                        if all(type(value) is not float for batch in (left_batch, right_batch)
+                               for row in batch for value in row[offset:]) and left_batch == right_batch:
+                            if diagnostics is not None:
+                                diagnostics["cells_compared"] += cell_count * len(left_batch)
+                                diagnostics["table_cells_compared"] += cell_count * len(left_batch)
+                                diagnostics["rows_compared"] += len(left_batch)
+                                diagnostics["table_rows_compared"] += len(left_batch)
+                            del left_batch, right_batch
+                            check_deadline()
+                            continue
+
+                        for row_index in range(min(len(left_batch), len(right_batch))):
+                            a, b = left_batch[row_index], right_batch[row_index]
+                            check_deadline()
+                            if identity and a[0] != b[0]:
+                                raise ActivationError(f"SQLite backup row identity differs in table ordinal {(diagnostics or {}).get('table_ordinal', 0)}")
+                            if all(type(value) is not float for row in (a, b)
+                                   for value in row[offset:]) and a == b:
+                                if diagnostics is not None:
+                                    diagnostics["cells_compared"] += cell_count
+                                    diagnostics["table_cells_compared"] += cell_count
+                                    diagnostics["rows_compared"] += 1
+                                    diagnostics["table_rows_compared"] += 1
+                                continue
+                            for index in range(offset, len(a)):
+                                if diagnostics is not None:
+                                    diagnostics["cells_compared"] += 1
+                                    diagnostics["table_cells_compared"] += 1
+                                if not cells_equal(a[index], b[index]):
+                                    raise ActivationError(f"SQLite backup row differs in table ordinal {(diagnostics or {}).get('table_ordinal', 0)}")
+                            if diagnostics is not None:
+                                diagnostics["rows_compared"] += 1
+                                diagnostics["table_rows_compared"] += 1
+                        if len(left_batch) != len(right_batch):
+                            raise ActivationError(f"SQLite backup row count differs in table ordinal {(diagnostics or {}).get('table_ordinal', 0)}")
+                        del left_batch, right_batch
+                        check_deadline()
+        finally:
+            source.text_factory = backup.text_factory = bytes
 
     old_factories = source.text_factory, backup.text_factory
     try:
@@ -687,7 +715,7 @@ def sqlite_writer_guard(database_path: str, *, timeout: float = 5):
             guard.rollback()
 
 
-def create_verified_database_backup(database_path: str, directory: Path, *, timeout: float = 600,
+def create_verified_database_backup(database_path: str, directory: Path, *, timeout: float = BACKUP_VERIFICATION_TIMEOUT_SECS,
                                     diagnostics: dict | None = None) -> Path:
     import sqlite3
 
@@ -1012,7 +1040,7 @@ def activate(manifest: Manifest) -> str:
             else:
                 _preflight_backup_capacity(database_path, backup_directory)
                 with sqlite_writer_guard(database_path):
-                    backup_deadline = time.monotonic() + 600
+                    backup_deadline = time.monotonic() + BACKUP_VERIFICATION_TIMEOUT_SECS
                     verifier_diagnostics = {}
                     try:
                         backup = create_verified_database_backup(

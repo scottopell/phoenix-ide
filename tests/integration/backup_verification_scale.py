@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import closing
 import hashlib
 import importlib.util
 import json
@@ -17,7 +18,6 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 HELPER_PATH = ROOT / "scripts/launchd_deploy_helper.py"
 DEFAULT_SOURCE_BYTES = 13_400_000_000
-BACKUP_BUDGET_SECONDS = 600.0
 GENERATION_BUDGET_SECONDS = 1_800.0
 BATCH_ROWS = 5_000
 
@@ -46,7 +46,7 @@ def create_fixture(database: Path, *, minimum_bytes: int, rows_per_table: int | 
     started = time.monotonic()
     deadline = started + GENERATION_BUDGET_SECONDS
     text_rows = blob_rows = 0
-    with sqlite3.connect(database) as connection:
+    with closing(sqlite3.connect(database)) as connection:
         connection.execute("PRAGMA journal_mode=WAL")
         connection.execute("PRAGMA synchronous=NORMAL")
         connection.execute("PRAGMA page_size=4096")
@@ -140,8 +140,28 @@ def create_fixture(database: Path, *, minimum_bytes: int, rows_per_table: int | 
     }
 
 
+def run_verified_backup(helper, database: Path, work_dir: Path, diagnostics: dict,
+                        *, clock=time.monotonic) -> tuple[Path, dict, float, float, float]:
+    """Verify under the writer guard; lock acquisition is outside the verification budget."""
+    envelope_started = clock()
+    with helper.sqlite_writer_guard(str(database)):
+        guarded_at = clock()
+        deadline = guarded_at + helper.BACKUP_VERIFICATION_TIMEOUT_SECS
+        backup = helper.create_verified_database_backup(
+            str(database), work_dir, timeout=deadline - clock(), diagnostics=diagnostics)
+        proof = helper._backup_proof(backup, deadline, diagnostics)
+        verification_elapsed = clock() - guarded_at
+    guard_acquisition_elapsed = guarded_at - envelope_started
+    envelope_elapsed = clock() - envelope_started
+    if verification_elapsed > helper.BACKUP_VERIFICATION_TIMEOUT_SECS:
+        raise RuntimeError(f"backup, verification, proof, and fsync exceeded "
+                           f"{helper.BACKUP_VERIFICATION_TIMEOUT_SECS}s: {verification_elapsed:.3f}s")
+    return backup, proof, guard_acquisition_elapsed, verification_elapsed, envelope_elapsed
+
+
 def run(args: argparse.Namespace) -> dict:
     helper = load_helper()
+    backup_budget_seconds = helper.BACKUP_VERIFICATION_TIMEOUT_SECS
     target_bytes = args.minimum_source_bytes
     # Ensure enough space for source, verified copy, plus modest SQLite/temp headroom.
     free = shutil.disk_usage(args.work_dir).free
@@ -161,24 +181,16 @@ def run(args: argparse.Namespace) -> dict:
     if free_before_backup < source_bytes + 1_000_000_000:
         raise RuntimeError(f"insufficient free disk for backup: {free_before_backup} bytes free")
 
-    deadline = time.monotonic() + BACKUP_BUDGET_SECONDS
-    verification_started = time.monotonic()
-    diagnostics = {"deadline": deadline}
+    diagnostics = {}
     outcome = "failure"
     try:
-        with helper.sqlite_writer_guard(str(database), timeout=BACKUP_BUDGET_SECONDS):
-            backup = helper.create_verified_database_backup(
-                str(database), args.work_dir, timeout=deadline - time.monotonic(), diagnostics=diagnostics)
-            proof = helper._backup_proof(backup, deadline, diagnostics)
+        (backup, proof, guard_acquisition_elapsed, verification_elapsed,
+         envelope_elapsed) = run_verified_backup(helper, database, args.work_dir, diagnostics)
         outcome = "success"
     finally:
         args.diagnostics = diagnostics
-        args.verification_elapsed_seconds = time.monotonic() - verification_started
+        args.verification_elapsed_seconds = locals().get("verification_elapsed")
         helper._emit_verifier_diagnostics(diagnostics, outcome)
-    verification_elapsed = time.monotonic() - verification_started
-    if verification_elapsed > BACKUP_BUDGET_SECONDS:
-        raise RuntimeError(f"backup, verification, proof, and fsync exceeded {BACKUP_BUDGET_SECONDS}s: "
-                           f"{verification_elapsed:.3f}s")
     if proof["backup_bytes"] != source_bytes:
         raise RuntimeError(f"backup size {proof['backup_bytes']} differs from source {source_bytes}")
     if source_bytes < target_bytes:
@@ -197,7 +209,9 @@ def run(args: argparse.Namespace) -> dict:
                     "actual_populated_sqlite_file": True,
                     "payloads": "deterministic repeated TEXT/BLOB content; indexed FTS5 text"},
         "verification": {"elapsed_seconds": round(verification_elapsed, 3),
-                         "budget_seconds": BACKUP_BUDGET_SECONDS,
+                         "guard_acquisition_seconds": round(guard_acquisition_elapsed, 3),
+                         "envelope_seconds": round(envelope_elapsed, 3),
+                         "budget_seconds": backup_budget_seconds,
                          "diagnostics": diagnostics,
                          "proof_bytes": proof["backup_bytes"],
                          "proof_sha256": proof["backup_sha256"]},

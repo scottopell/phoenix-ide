@@ -309,20 +309,32 @@ fn linux_process_is_live_member(
         }
         Err(error) => return Err(error),
     };
-    let tail = stat
-        .rsplit_once(')')
-        .ok_or_else(|| io::Error::other("invalid process stat"))?
-        .1;
-    let mut fields = tail.split_whitespace();
-    let state = fields
-        .next()
-        .ok_or_else(|| io::Error::other("missing process state"))?;
-    let _parent = fields.next();
-    let actual = fields
-        .next()
-        .and_then(|field| field.parse::<u32>().ok())
-        .ok_or_else(|| io::Error::other("missing process group"))?;
-    Ok(actual == group && state != "Z" && state != "X")
+    let parsed = (|| {
+        let tail = stat
+            .rsplit_once(')')
+            .ok_or_else(|| io::Error::other("invalid process stat"))?
+            .1;
+        let mut fields = tail.split_whitespace();
+        let state = fields
+            .next()
+            .ok_or_else(|| io::Error::other("missing process state"))?;
+        let _parent = fields.next();
+        let actual = fields
+            .next()
+            .and_then(|field| field.parse::<u32>().ok())
+            .ok_or_else(|| io::Error::other("missing process group"))?;
+        Ok(actual == group && state != "Z" && state != "X")
+    })();
+    match parsed {
+        Ok(live) => Ok(live),
+        Err(error) => {
+            if is_member()? {
+                Err(error)
+            } else {
+                Ok(false)
+            }
+        }
+    }
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -506,6 +518,49 @@ mod tests {
                 || Err(io::Error::from(io::ErrorKind::NotFound)),
             )
             .is_err());
+        }
+    }
+
+    #[test]
+    fn linux_scan_rechecks_membership_after_transient_incomplete_stat() {
+        for stat in [
+            "",
+            "42 (Chrome worker) S 1",
+            "42 (Chrome worker) S 1 invalid",
+        ] {
+            for after in [
+                Ok(0),
+                Ok(99),
+                Err(io::Error::from_raw_os_error(libc::ESRCH)),
+            ] {
+                let mut observations = [Ok(42), after].into_iter();
+                assert!(!linux_process_is_live_member(
+                    42,
+                    42,
+                    |_| observations.next().unwrap(),
+                    || Ok(stat.to_owned()),
+                )
+                .unwrap());
+                assert!(observations.next().is_none());
+            }
+            for (after, expected) in [
+                (Ok(42), None),
+                (
+                    Err(io::Error::from_raw_os_error(libc::EPERM)),
+                    Some(libc::EPERM),
+                ),
+            ] {
+                let mut observations = [Ok(42), after].into_iter();
+                let error = linux_process_is_live_member(
+                    42,
+                    42,
+                    |_| observations.next().unwrap(),
+                    || Ok(stat.to_owned()),
+                )
+                .unwrap_err();
+                assert_eq!(error.raw_os_error(), expected);
+                assert!(observations.next().is_none());
+            }
         }
     }
 

@@ -102,7 +102,7 @@ value TargetService {
 --   metadata/stored-row comparison, including FTS5 shadow rows and row identity,
 --   was fsynced and remains available as transaction evidence. Unsupported
 --   virtual-table modules and all-rowid-alias-shadow tables fail closed. Backup,
---   integrity, comparison, fsync and proof hashing share a 600-second deadline.
+--   integrity, comparison, fsync and proof hashing share a 900-second deadline.
 -- first_install_absence_proven(transaction) -> Boolean
 --   Transaction-matched private proof records database_source absent and backup
 --   null only when the database path is absent and no managed predecessor,
@@ -216,7 +216,7 @@ rule VerifyStoppedDatabaseBackup {
         -- storage classes and rowid/primary-key identity; verify FTS5 through its
         -- persisted shadow rows, and reject unsupported modules or unidentifiable
         -- rowid tables. Backup, integrity check, comparison, fsync and proof hash
-        -- share the 600-second backup-verification deadline. Retain the native
+        -- share the 900-second backup-verification deadline. Retain the native
         -- backup after success or failure.
 }
 
