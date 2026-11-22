@@ -20,6 +20,7 @@ use tokio::sync::{mpsc, oneshot, Mutex};
 
 mod bash_native_success;
 mod bash_stage2_stop_ack;
+mod bash_stage2_unknown_release;
 mod registered_disposable_path;
 
 const TARGET_ID: &str = "native-close-target";
@@ -1681,12 +1682,15 @@ async fn run_acknowledged_stop_revokes_captured_terminal_entry(
     };
     use sqlx::Connection;
 
-    let scope = fixture
-        .db
-        .get_work_scopes_for_conversation(fixture.target.as_str())
-        .await
-        .unwrap()
-        .remove(0);
+    let scopes: Vec<String> = sqlx::query_scalar(
+        "SELECT work_scope_id FROM product_conversation_work_scopes WHERE product_conversation_id = ?1",
+    )
+    .bind(fixture.target.as_str())
+    .fetch_all(fixture.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(scopes.len(), 1, "the fixture has one original WorkScope");
+    let scope = phoenix_core::work_scope::WorkScopeId::parse(scopes[0].clone()).unwrap();
     let backend = CloseFixture::backend(fixture.db.clone());
     let fd: std::os::fd::OwnedFd = std::fs::OpenOptions::new()
         .read(true)
@@ -1715,7 +1719,7 @@ async fn run_acknowledged_stop_revokes_captured_terminal_entry(
         attach_permit: Arc::new(tokio::sync::Semaphore::new(1)),
         retirement_requested: TerminalRetirementRequest::default(),
     };
-    let key = phoenix_core::resource_scope::ResourceScopeKey::Work(scope.clone());
+    let key = phoenix_core::work_scope::ResourceScopeKey::Work(scope.clone());
     let terminal = backend
         .terminals
         .try_insert_exact(key.clone(), terminal)
@@ -1844,7 +1848,6 @@ async fn run_acknowledged_stop_revokes_captured_terminal_entry(
     .fetch_one(fixture.db.pool())
     .await
     .unwrap();
-    let attempt = CloseAttemptId::new(attempt).unwrap();
     assert!(fixture
         .db
         .list_close_retirement_evidence(&attempt)
@@ -1856,7 +1859,7 @@ async fn run_acknowledged_stop_revokes_captured_terminal_entry(
         Err(phoenix_terminal::session::ActiveTerminalInsertError::RetirementFenced)
     ));
     drop(reply);
-    sender.send(Message::Event(Event::Shutdown)).await.unwrap();
+    harness.event_tx.send(Event::Shutdown).await.unwrap();
     tokio::time::timeout(Duration::from_secs(30), actor)
         .await
         .expect("source actor did not shut down")

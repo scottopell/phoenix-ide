@@ -456,6 +456,10 @@ impl LaunchSlot {
         &self,
         custody: BrowserRetirementCustody,
     ) -> Result<(), BrowserError> {
+        // Legacy teardown cancels scenarios before waiting for the slot lock.
+        // Staged preparation remains non-destructive; its close occurs only in
+        // stop_and_delete_prepared after physical entry has been authorized.
+        self.scenario_owner.close();
         let (state, ready_session) = self.lock_for_teardown().await;
         self.stop_and_delete_prepared(state, ready_session, custody)
             .await

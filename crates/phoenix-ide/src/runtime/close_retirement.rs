@@ -14331,7 +14331,7 @@ mod tests {
         let mut effects = injected_close_worktree_effects_rejecting_scans(|_| {
             panic!("replaced by deadline-aware effect")
         });
-        effects.stop_fsmonitor = Box::new(move |_, received| {
+        effects.stop_fsmonitor = Box::new(move |_, received, _admission| {
             assert_eq!(received, deadline);
             Err("fixture stopped before fsmonitor effect".to_string())
         });

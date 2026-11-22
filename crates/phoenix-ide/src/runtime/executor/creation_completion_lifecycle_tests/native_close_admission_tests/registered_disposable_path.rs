@@ -111,7 +111,7 @@ async fn registered_close_captures_and_retires_disposable_empty_work_scope() {
     let attempt_id: String = sqlx::query_scalar(
         "SELECT attempt_id FROM native_close_initial_receipts WHERE request_id=?1",
     )
-    .bind(fixture.command.request_id())
+    .bind(fixture.command.request_id().to_string())
     .fetch_one(fixture.db.pool())
     .await
     .unwrap();

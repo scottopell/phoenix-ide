@@ -58,9 +58,8 @@ async fn run_native_bash_success(group_count: usize) {
     let work_key = ResourceScopeKey::Work(scope.clone());
     let bash = BashTool;
     let cwd = std::env::current_dir().expect("test process has a current directory");
-    let shell_quote = |path: &std::path::Path| {
-        format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"))
-    };
+    let shell_quote =
+        |path: &std::path::Path| format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"));
     let mut settlements = Vec::with_capacity(group_count);
     let mut pgids = BTreeSet::new();
     let mut original_identities = BTreeSet::new();
@@ -166,10 +165,8 @@ async fn run_native_bash_success(group_count: usize) {
     }
 
     let retriever = Arc::new(fixture.db.fts_retriever());
-    let read_service = crate::api::global_read::GlobalReadService::new(
-        fixture.db.clone(),
-        retriever,
-    );
+    let read_service =
+        crate::api::global_read::GlobalReadService::new(fixture.db.clone(), retriever);
     let send_chat = Arc::new(SendChatApplicationService::new(
         fixture.db.clone(),
         Arc::clone(&backend),
@@ -193,7 +190,9 @@ async fn run_native_bash_success(group_count: usize) {
     let actor = ConversationRuntime::new(
         ConvContext::coordinator(&fixture.source_transcript_id, "test-model", 200_000, 16_384),
         fixture.state.clone(),
-        Arc::new(crate::runtime::traits::DatabaseStorage::new(fixture.db.clone())),
+        Arc::new(crate::runtime::traits::DatabaseStorage::new(
+            fixture.db.clone(),
+        )),
         Arc::new(MockLlmClient::new("test-model")),
         Arc::new(MockToolExecutor::new()),
         backend.browser_sessions().clone(),
@@ -259,8 +258,13 @@ async fn run_native_bash_success(group_count: usize) {
             .await
             .expect("real Bash retirement reaches the stop-observation barrier")
             .expect("stage-two hook remains owned by the retained task");
-        assert!(eligible, "the original source is eligible before group signaling");
-        resume.send(()).expect("the retained owner is waiting at the hook");
+        assert!(
+            eligible,
+            "the original source is eligible before group signaling"
+        );
+        resume
+            .send(())
+            .expect("the retained owner is waiting at the hook");
         let callback_result = tokio::time::timeout(std::time::Duration::from_secs(10), callback)
             .await
             .expect("the production second writer callback is reached")
@@ -307,7 +311,11 @@ async fn run_native_bash_success(group_count: usize) {
         .to_owned();
     assert_eq!(admission["status"], "newly_admitted");
 
-    let captured_scopes = fixture.db.list_close_attempt_scopes(&attempt_id).await.unwrap();
+    let captured_scopes = fixture
+        .db
+        .list_close_attempt_scopes(&attempt_id)
+        .await
+        .unwrap();
     assert_eq!(captured_scopes.len(), 1);
     assert_eq!(captured_scopes[0].scope, scope);
     assert!(
@@ -320,8 +328,16 @@ async fn run_native_bash_success(group_count: usize) {
         obligation.close_outcome(),
         Some(CloseCompletionOutcome::Archived)
     );
-    let evidence = fixture.db.list_close_retirement_evidence(&attempt_id).await.unwrap();
-    let expected = fixture.db.list_close_expected_retirement_resources(&attempt_id).await.unwrap();
+    let evidence = fixture
+        .db
+        .list_close_retirement_evidence(&attempt_id)
+        .await
+        .unwrap();
+    let expected = fixture
+        .db
+        .list_close_expected_retirement_resources(&attempt_id)
+        .await
+        .unwrap();
     let original_scope_resources: Vec<_> = expected
         .iter()
         .filter(|item| item.resource.kind() == RetiredResourceKind::WorkScope)
@@ -381,8 +397,7 @@ async fn run_native_bash_success(group_count: usize) {
         .map(|step| step.identity.as_str().to_owned())
         .collect();
     assert_eq!(
-        successful_process_steps,
-        original_identities,
+        successful_process_steps, original_identities,
         "initial-run process receipts match the original scope and launch identities"
     );
     let remaining_pgids = tokio::time::timeout(

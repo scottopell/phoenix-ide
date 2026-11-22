@@ -50,7 +50,9 @@ pub(crate) struct BashStage2TestHook {
 pub(crate) struct BashStage2TestStats {
     pub(crate) stop_attempts: std::sync::atomic::AtomicUsize,
     pub(crate) group_attempts: std::sync::atomic::AtomicUsize,
+    pub(crate) group_signal_succeeded: std::sync::atomic::AtomicBool,
     pub(crate) cleanup_attempts: std::sync::atomic::AtomicUsize,
+    pub(crate) actual_confirmed_release: std::sync::atomic::AtomicBool,
 }
 
 pub(crate) struct BashCustodyState {
@@ -218,6 +220,10 @@ impl BashEntryContext {
                             if let Some(hook) = test_hook.as_mut() {
                                 let (replacement, _) = tokio::sync::oneshot::channel();
                                 let callback = std::mem::replace(&mut hook.callback, replacement);
+                                hook.stats.group_signal_succeeded.store(
+                                    matches!(&admission, WorkerEntryResult::Ran(Ok(()))),
+                                    std::sync::atomic::Ordering::SeqCst,
+                                );
                                 let _ = callback.send((
                                     revoked,
                                     self.source_entry.original_deadline_unexpired_for_test(),
@@ -231,22 +237,26 @@ impl BashEntryContext {
                 // Explicit test fault injection at the real second return,
                 // never a claimed naturally occurring SQLite uncertainty.
                 #[cfg(test)]
-                let result = if test_hook
-                    .as_ref()
-                    .is_some_and(|hook| hook.inject_unknown_release)
-                {
-                    result.map(|(admission, _)| {
-                        (
-                            admission,
-                            NativeCloseInitialEntryRelease::Unconfirmed(
-                                phoenix_db::DbError::CloseFoundationPrecondition(
-                                    "injected second Bash writer release uncertainty".into(),
+                let result = match (result, test_hook.as_ref()) {
+                    (Ok((admission, NativeCloseInitialEntryRelease::Confirmed)), Some(hook)) => {
+                        hook.stats.actual_confirmed_release.store(
+                            true,
+                            std::sync::atomic::Ordering::SeqCst,
+                        );
+                        if hook.inject_unknown_release {
+                            Ok((
+                                admission,
+                                NativeCloseInitialEntryRelease::Unconfirmed(
+                                    phoenix_db::DbError::CloseFoundationPrecondition(
+                                        "injected second Bash writer release uncertainty".into(),
+                                    ),
                                 ),
-                            ),
-                        )
-                    })
-                } else {
-                    result
+                            ))
+                        } else {
+                            Ok((admission, NativeCloseInitialEntryRelease::Confirmed))
+                        }
+                    }
+                    (result, _) => result,
                 };
                 match result {
                     Ok((admission, NativeCloseInitialEntryRelease::Confirmed)) => {
