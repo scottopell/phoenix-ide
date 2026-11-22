@@ -44,6 +44,7 @@ Allowing gaps does not approve an ID allocation, decision, or publication.
 
 | ADR | Title | Status | Affects |
 | --- | --- | --- | --- |
+| [271](271_gate-ordinary-publication-on-exact-source-ci.md) | Gate ordinary publication on exact merged-source CI | Accepted | REQ-DESKTOP-REL-015 |
 | [270](270_publish-fixed-rc8-through-rebuilt-release-path.md) | Publish fixed RC8 through the rebuilt release path | Accepted | REQ-DESKTOP-REL-002/010/014 |
 | [269](269_external-models-in-user-toml.md) | Load external model definitions from user TOML at startup | Accepted | REQ-LLM-003c, REQ-AG-010 |
 | [264](264_scan-only-coordinator-history-with-host-owned-batches.md) | Scan only Coordinator history through bounded host-owned batches | Accepted | REQ-SCAN-001–008, REQ-TRACK-004–007 |

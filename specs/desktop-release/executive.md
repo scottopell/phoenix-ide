@@ -16,10 +16,17 @@ ADR-270 and REQ-DESKTOP-REL-002 define `release-frozen-rc8` separately from `pre
 
 Admission selects the exact candidate for fresh release builds and the existing publisher; it does not upload preparation bytes or treat their receipts as acceptance of newly signed release bytes. Release signing/notarization, both native acceptance passes, exact private-draft assets/digests and RC non-latest metadata remain mandatory. The Allium release rules model fixed eligibility and refusal independently of preparation authority. Local validation passed 45 focused frozen-controller tests, the desktop workflow regression contract, the full `devpy` check lane, and Allium validation with zero errors. Independent review caught and corrected the preparation artifact names in the normative contract. These are source-level checks, not hosted release signing, tag creation, publication, deployment, or installation evidence.
 
+## Ordinary exact-source publication admission
+
+Ordinary version pushes and existing exact-tag retries use `scripts/release_source_ci.py` inside the read-only gate job before downstream tag/build/publication jobs can start. It waits at most 3600 seconds for the latest `ci.yml` push/main run at the exact source SHA, then rechecks the run identity and attempt before admission. API failure, timeout or non-success refuses publication; historical retries without that evidence refuse rather than borrowing PR or parent CI. Successful qualification is a per-Release-run admission snapshot, reusable by partial job reruns; rerunning the gate requalifies. Frozen-candidate and preparation operations retain their separate gates.
+
+Deterministic helper tests cover discovery, pending/latest selection, timeout, identity/attempt changes, failure and API errors. Workflow-boundary tests execute the actual shell command and condition, check exact SHA/token threading, and verify mutation jobs remain downstream of successful gate completion. Hosted qualification of this delta and an actual ordinary release remain separate evidence.
+
 ## Requirement mapping
 
 | Requirement | Implementation and verification |
 |---|---|
+| REQ-DESKTOP-REL-015 | Read-only ordinary source CI step in `release.yml`; `release_source_ci.py` and `test_release_source_ci.py` cover exact run/attempt admission and downstream refusal. |
 | REQ-DESKTOP-REL-001 | The macOS release matrix builds the standalone helper and app from one immutable checkout. `package-desktop-release.sh` resolves the unchanged clean embedded Git identity to the full gate commit and compares helper bytes before and after outer-app signing. |
 | REQ-DESKTOP-REL-002 | Linux and macOS standalone names remain unchanged. The two desktop ZIPs are additions produced by the existing macOS architecture matrix. Fixed RC8 publication has source admission plumbing and Allium rules, but protected preparation `44975553897` attempt `1` remains in progress; no RC8 release qualification is claimed. See ADR-270. |
 | REQ-DESKTOP-REL-003 | The protected macOS job imports a Developer ID certificate, verifies configured certificate authority, signs the helper once, packages and signs the app with hardened runtime, then submits, staples, verifies, and assesses it. Real evidence is available from [preparation run 37220027105](https://github.com/scottopell/phoenix-ide/actions/runs/37220027105): Apple Silicon submission `57792d41-55ce-4302-911a-dd1479842f97` and Intel submission `9ec7336a-84d9-4f54-b2da-779350fd94f8` were Accepted; both staples and Gatekeeper assessments passed. |
