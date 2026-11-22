@@ -546,7 +546,7 @@ mod tests {
                 "task-1-x:y",
                 "task-1-x*",
             ] {
-                let git_ok = std::process::Command::new("git")
+                let git_ok = crate::git::command()
                     .args(["check-ref-format", "--branch", name])
                     .output()
                     .is_ok_and(|o| o.status.success());
