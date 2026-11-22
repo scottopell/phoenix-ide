@@ -17,6 +17,8 @@ from pathlib import Path
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[2]
+REAL_SUBPROCESS_RUN = subprocess.run
+REAL_SUBPROCESS_POPEN = subprocess.Popen
 
 
 def refuse_subprocess(command, *_args, **_kwargs):
@@ -1221,6 +1223,76 @@ class PreparationTests(unittest.TestCase):
         transactions = [path for path in historical.parent.iterdir() if path != historical]
         self.assertEqual(1, len(transactions))
         return transactions[0], events
+
+    @mock.patch.object(subprocess, "Popen", REAL_SUBPROCESS_POPEN)
+    def test_release_deploy_materializes_and_launches_selected_source_helper(self):
+        source_commit = REAL_SUBPROCESS_RUN(
+            ["git", "rev-parse", "HEAD"], cwd=ROOT, capture_output=True, text=True, check=True,
+        ).stdout.strip()
+        expected_helper = REAL_SUBPROCESS_RUN(
+            ["git", "show", f"{source_commit}:scripts/launchd_deploy_helper.py"],
+            cwd=ROOT, capture_output=True, check=True,
+        ).stdout
+        identity = self.dev.RuntimeIdentity("2.0.0-rc.8", source_commit)
+        with tempfile.TemporaryDirectory() as td:
+            binary = Path(td) / "release-candidate"
+            binary.write_bytes(b"fixture release binary")
+            prepared = self.dev.PreparedCandidate(
+                binary, self.dev.ProdSourceKind.PUBLISHED_RELEASE, source_commit, identity,
+                release_tag="v2.0.0-rc.8", release_commit=source_commit,
+            )
+            fetched_refs = []
+            commands = []
+            real_run = REAL_SUBPROCESS_RUN
+
+            def run(command, **kwargs):
+                command = [str(part) for part in command]
+                commands.append(command)
+                if command[-1:] == ["--build-identity"]:
+                    return subprocess.CompletedProcess(command, 0, json.dumps(dataclasses.asdict(identity)), "")
+                if command[:2] == ["gh", "api"]:
+                    fetched_refs.append(command[2])
+                    return subprocess.CompletedProcess(command, 0, expected_helper, b"")
+                if command and command[0] == sys.executable:
+                    return real_run(command, **kwargs)
+                return subprocess.CompletedProcess(command, 0, "", "")
+
+            with mock.patch.object(self.dev, "_launchd_candidate_env", return_value=({"PHOENIX_PASSWORD": "fixture"}, None)), \
+                 mock.patch.object(self.dev, "_prepare_release_candidate", return_value=prepared), \
+                 mock.patch.object(self.dev, "_binary_identity", return_value=identity), \
+                 mock.patch.object(self.dev, "capture_login_shell_path", return_value=("/usr/bin:/bin", "test")), \
+                 mock.patch.object(self.dev, "print_launchd_path_report"), \
+                 mock.patch.object(self.dev, "_ensure_newsyslog_config"), \
+                 mock.patch.object(self.dev.subprocess, "run", side_effect=run):
+                self.dev.launchd_prod_deploy(release="v2.0.0-rc.8")
+
+            transactions = list((self.dev.LAUNCHD_DEPLOY_DIR / "transactions").iterdir())
+            self.assertEqual(1, len(transactions))
+            transaction = transactions[0]
+            helper_path = transaction / "activate.py"
+            self.assertEqual(expected_helper, helper_path.read_bytes())
+            launch_plist = transaction / "helper.plist"
+            arguments = plistlib.loads(launch_plist.read_bytes())["ProgramArguments"]
+            self.assertEqual(str(helper_path), arguments[1])
+            self.assertIn(["launchctl", "bootstrap", f"gui/{os.getuid()}", str(launch_plist)], commands)
+            self.assertEqual(hashlib.sha256(expected_helper).hexdigest(), self.dev._file_sha256(helper_path))
+            self.assertEqual(
+                [f"repos/scottopell/phoenix-ide/contents/scripts/launchd_deploy_helper.py?ref={source_commit}"],
+                fetched_refs,
+            )
+            manifest = json.loads((transaction / "manifest.json").read_text())
+            self.assertEqual(source_commit, manifest["source_commit"])
+            self.assertEqual("v2.0.0-rc.8", manifest["release_tag"])
+            self.assertEqual(dataclasses.asdict(identity), manifest["expected"])
+            self.assertEqual("3\n", REAL_SUBPROCESS_RUN(
+                [sys.executable, str(helper_path), "--protocol-version"],
+                capture_output=True, text=True, check=True,
+            ).stdout)
+            self.assertIn(b"def _verify_logical_equivalence", expected_helper)
+            self.assertIn(b"left.fetchone(), right.fetchone()", expected_helper)
+            self.assertIn(b"def _emit_verifier_diagnostics", expected_helper)
+            self.assertIn(b'"cells_compared"', expected_helper)
+            self.assertNotIn(b"iterdump", expected_helper)
 
     def test_installer_stages_only_protocol_three_ordinary_handoff(self):
         staging, events = self.staged_deploy()

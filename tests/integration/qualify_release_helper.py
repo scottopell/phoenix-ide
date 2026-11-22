@@ -85,8 +85,8 @@ def run(args: argparse.Namespace) -> int:
 
         # Load the unchanged bounded suite, then point its shared helper binding at
         # the materialized release helper. The suite uses fixtures/mocks only.
-        actual_helper = import_from_path("simple_launchd_helper_test", destination)
         test_module = import_from_path("phoenix_qualified_launchd_helper_tests", TEST_PATH)
+        actual_helper = import_from_path("simple_launchd_helper_test", destination)
         test_module.helper = actual_helper
         suite = unittest.defaultTestLoader.loadTestsFromModule(test_module)
         test_count = suite.countTestCases()
