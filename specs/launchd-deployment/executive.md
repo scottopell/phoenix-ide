@@ -95,11 +95,22 @@ reaped, and source/destination had no open handles after completion.
 
 This is one observed pass, not a controlled comparator speedup estimate or a
 universal deadline guarantee. It does not retroactively qualify the earlier
-failed 900-second run. Exact-source integrated review, a fresh hosted
-qualification, corrected release preparation and fresh sole-executor rollout
-gates remain outstanding for this candidate. The historical hosted result above
-belongs to its named earlier implementation. No production acceptance follows
-from either isolated or synthetic fixture success.
+failed 900-second run. Independent integrated-source review found no blocker.
+Hosted run [45005235506](https://github.com/scottopell/phoenix-ide/actions/runs/45005235506)
+records a **failed matrix** for exact source
+`c484f7dff8aa917d2ed7ba03a7e36b9aa91500d0`, not release readiness: baseline and wide fixtures
+completed in 315.275 and 322.792 seconds, but dense failed closed at the shared
+900-second deadline during comparison, before fsync/proof. Dense contained
+15,685,000 rows in each principal table and was 13,439,737,856 bytes; it spent
+49.684 seconds copying, 539.206 on integrity and 311.085 in comparison, reaching
+50,084,010 fully matched rows and 115,892,119 attempted cells. Its failure
+artifact retains content-free stage diagnostics; total verification elapsed is
+null on verifier exceptions, so stage scope-exit durations are not completion
+claims. Both macOS and Linux release-helper qualification jobs passed. Successful
+hosted qualification, guarded integration, corrected release preparation and
+fresh sole-executor rollout gates remain unmet. The historical hosted result
+above belongs to its named earlier implementation. No production acceptance
+follows from isolated or synthetic fixture success.
 
 ## Operator recovery
 
