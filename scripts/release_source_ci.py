@@ -106,4 +106,3 @@ if __name__ == "__main__":
         raise SystemExit(1) from error
 
 __all__ = ["qualify", "main"]
-
