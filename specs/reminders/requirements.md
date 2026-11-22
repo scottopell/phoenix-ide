@@ -86,6 +86,8 @@ AND SHALL preserve that provenance through persistence, queueing, transcript/wir
 
 Browser notification delivery SHALL use the existing permission, settings and focus policy. Receipts SHALL state available notification capability without claiming closed-app phone delivery. A model failure SHALL NOT erase a due reminder.
 
+The conversation reminder panel SHALL be collapsed by default and expose a compact count and server-authoritative state summary. Full reminder text, identifiers, schedule details and management actions SHALL appear only after deliberate expansion using the shared collapsible-panel interaction. Due reminders SHALL remain discoverable in the compact summary; scheduled reminders SHALL NOT be labelled due merely because the client's clock has passed their deadline. Background refresh SHALL preserve the user's expansion choice and SHALL NOT request keyboard focus. Refreshes that retain the reminder contents and state SHALL preserve the reading position. A clean empty reminder list SHALL NOT reserve a panel row.
+
 ### REQ-REM-009: Bounded lifecycle ownership
 
 THE SYSTEM SHALL consume existing ProductConversation admission and continuation authority without interpreting individual Close phases or making pending reminders block Close

@@ -91,6 +91,60 @@ const withReminders = (id: Extract<ProductConversationScenarioId, `reminders-${s
   title: `Reminders ${id.slice('reminders-'.length)}`,
   reminderFixture: { reminders: [...reminderRows], initialFailures, rejectMutation, failuresAfterFirstLoad },
 });
+const longReminderText = Array.from({ length: 18 }, (_, index) =>
+  `Line ${index + 1}: review the deployment checklist, confirm the service owner, inspect the latest monitoring evidence, and record any follow-up before the scheduled release window.`
+).join('\n');
+const compactReminder = (id: string, kind: 'due' | 'scheduled' | 'cancelled') => ({
+  id,
+  product_conversation_id: reminderOwner,
+  text: longReminderText,
+  due_at_us: kind === 'due' ? 1782907200000000 : 1782993600000000,
+  timezone: 'America/Los_Angeles',
+  revision: 1,
+  created_at_us: 1782900000000000,
+  state: kind === 'due'
+    ? { kind: 'due' as const, occurred_at_us: 1782907200000000 }
+    : kind === 'cancelled'
+      ? { kind: 'cancelled' as const, cancelled_at_us: 1782907200000000 }
+      : { kind: 'scheduled' as const },
+});
+const reminderHistory = makeVirtualizedReactionScenario().snapshot.segments[0]!.messages
+  .filter((message) => message.message_id.startsWith('recovery-'));
+const compactReminders = (kind: 'due' | 'scheduled' | 'cancelled') => {
+  const base = withReminders(`reminders-compact-${kind}`, 0);
+  const snapshot = base.snapshot!;
+  const latestRow = snapshot.latest_transcript_row_id;
+  return {
+    ...base,
+    snapshot: {
+      ...snapshot,
+      segments: snapshot.segments.map((segment) => segment.transcript_row_id === latestRow ? {
+        ...segment,
+        messages: [...segment.messages, ...reminderHistory.map((message, index) => ({
+          ...message, message_id: `reminder-history-${index}`, conversation_id: latestRow,
+          sequence_id: index + 7,
+        }))],
+      } : segment),
+    },
+    reminderFixture: {
+      reminders: [compactReminder(`compact-${kind}`, kind)], initialFailures: 0,
+      advanceRevisionOnRefresh: true,
+    },
+  };
+};
+const compactDueScenario = compactReminders('due');
+const compactScheduledScenario = compactReminders('scheduled');
+const compactCancelledScenario = compactReminders('cancelled');
+const compactEmptyScenario = { ...withReminders('reminders-compact-empty', 0), reminderFixture: { reminders: [], initialFailures: 0 } };
+export const RemindersCompactDue: Story = () => <ProductConversationFixture scenario={compactDueScenario} />;
+RemindersCompactDue.storyName = 'reminders-compact-due';
+export const RemindersCompactScheduled: Story = () => <ProductConversationFixture scenario={compactScheduledScenario} />;
+RemindersCompactScheduled.storyName = 'reminders-compact-scheduled';
+export const RemindersCompactCancelled: Story = () => <ProductConversationFixture scenario={compactCancelledScenario} />;
+RemindersCompactCancelled.storyName = 'reminders-compact-cancelled';
+export const RemindersCompactEmpty: Story = () => <ProductConversationFixture scenario={compactEmptyScenario} />;
+RemindersCompactEmpty.storyName = 'reminders-compact-empty';
+
 export const RemindersInitialFailure: Story = () => <ProductConversationFixture scenario={withReminders('reminders-initial-failure', 1)} />;
 RemindersInitialFailure.storyName = 'reminders-initial-failure';
 export const RemindersAliasFallbackInitialFailure: Story = () => <ProductConversationFixture scenario={{

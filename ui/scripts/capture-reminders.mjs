@@ -8,9 +8,14 @@ const storyIds = [
   'alias-fallback-initial-failure',
   'loaded-stale-upcoming',
   'retry-mutation-rejection',
+  'compact-due',
+  'compact-scheduled',
+  'compact-cancelled',
+  'compact-empty',
 ];
 const viewports = [
   { name: 'mobile-375x667', width: 375, height: 667, isMobile: true, hasTouch: true },
+  { name: 'mobile-390x844', width: 390, height: 844, isMobile: true, hasTouch: true },
   { name: 'mobile-393x852', width: 393, height: 852, isMobile: true, hasTouch: true },
   { name: 'desktop', width: 1440, height: 900 },
 ];
@@ -60,13 +65,142 @@ runSurfaceCapture({
       journey.push('initial GET failure → retry → loaded reminders');
     } else if (id === 'loaded-stale-upcoming') {
       await page.getByRole('region', { name: 'Reminders' }).waitFor({ state: 'visible' });
+      const disclosure = page.getByRole('button', { name: /Reminders/ });
+      assert.equal(await disclosure.getAttribute('aria-expanded'), 'false', 'loaded reminder panel starts collapsed');
+      await disclosure.press('Enter');
+      await page.getByText('Reminder due').waitFor({ state: 'visible' });
       await page.evaluate(() => window.dispatchEvent(new Event('focus')));
       await retry.waitFor({ state: 'visible' });
       await page.getByText('Reminder due').waitFor({ state: 'visible' });
       await page.getByText('Check the release candidate').waitFor({ state: 'visible' });
       journey.push('loaded due/upcoming reminders → focus refresh failure retains both with stale warning');
+    } else if (id.startsWith('compact-')) {
+      await mkdir(outDir, { recursive: true });
+      const empty = id === 'compact-empty';
+      const panel = page.getByRole('region', { name: 'Reminders' });
+      if (empty) {
+        assert.equal(await panel.count(), 0, 'empty fixture must omit the reminders panel');
+        const composer = page.locator('#input-area');
+        const rect = await composer.boundingBox();
+        assert.ok(rect && rect.y >= 0 && rect.y + rect.height <= viewport.height, 'empty fixture composer stays visible');
+        journey.push('empty reminders → no panel; composer remains visible');
+      } else {
+        await panel.waitFor({ state: 'visible' });
+        const toggle = page.getByRole('button', { name: /Reminders/ });
+        assert.equal(await toggle.getAttribute('aria-expanded'), 'false');
+        const expectedSummary = id === 'compact-due' ? '1 due' : id === 'compact-cancelled' ? '1 cancelled' : '1 upcoming';
+        assert.equal(await panel.locator('.grounding-summary').textContent(), expectedSummary, 'summary reflects server state');
+        assert.equal(await panel.locator('.grounding-count').textContent(), '1', 'summary counts the reminder once');
+        const expectedText = Array.from({ length: 18 }, (_, index) => `Line ${index + 1}: review the deployment checklist, confirm the service owner, inspect the latest monitoring evidence, and record any follow-up before the scheduled release window.`).join('\n');
+        assert.ok(expectedText.length > 1000 && expectedText.includes('Line 18:'), 'fixture contains long multi-line reminder text');
+        assert.equal(await page.locator('.reminder-card').count(), 0, 'collapsed panel hides details');
+        assert.equal(await page.getByRole('button', { name: /Reschedule|Cancel reminder/ }).count(), 0, 'collapsed panel hides actions');
+        const collapsed = await page.evaluate(() => ({
+          panel: document.querySelector('.reminders-panel')?.getBoundingClientRect().height ?? null,
+          composer: (() => { const r = document.querySelector('#input-area')?.getBoundingClientRect(); return r ? { x: r.x, y: r.y, width: r.width, height: r.height, bottom: r.bottom } : null; })(),
+          transcript: (() => { const r = document.querySelector('.product-conversation-page__transcript')?.getBoundingClientRect(); return r ? { x: r.x, y: r.y, width: r.width, height: r.height } : null; })(),
+          width: document.documentElement.clientWidth, scrollWidth: document.documentElement.scrollWidth,
+        }));
+        assert.ok(collapsed.panel <= 60, `collapsed reminders height ${collapsed.panel}px exceeds 60px`);
+        assert.ok(collapsed.composer?.y >= 0 && collapsed.composer.bottom <= viewport.height, 'composer stays within viewport');
+        assert.ok(collapsed.scrollWidth <= collapsed.width + 1, 'collapsed page has no horizontal overflow');
+        const stem = `${id}--${viewport.name}--collapsed`;
+        await page.screenshot({ path: path.join(outDir, `${stem}.png`), fullPage: false });
+        await writeFile(path.join(outDir, `${stem}.json`), JSON.stringify({ id, viewport, journey: ['initial collapsed disclosure'], geometry: collapsed }, null, 2));
+        await page.locator('#input-area textarea').first().focus();
+        await page.locator('.product-conversation-page__transcript .message-virtual-transcript').evaluate((node) => { node.scrollTop = (node.scrollHeight - node.clientHeight) / 2; });
+        await page.evaluate(() => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+        const collapsedBeforeRefresh = await page.evaluate(() => ({
+          composerFocused: document.activeElement === document.querySelector('#input-area textarea'),
+          composer: document.querySelector('#input-area')?.getBoundingClientRect().toJSON(),
+          scrollTop: document.querySelector('.product-conversation-page__transcript .message-virtual-transcript')?.scrollTop,
+          panel: document.querySelector('.reminders-panel')?.getBoundingClientRect().toJSON(),
+        }));
+        assert.equal(collapsedBeforeRefresh.composerFocused, true, 'composer focus control is active before collapsed refresh');
+        assert.ok(collapsedBeforeRefresh.scrollTop > 0, 'collapsed refresh starts at a nonzero actual transcript scroll position');
+        const collapsedRevision = await panel.getAttribute('data-reminder-revisions');
+        const collapsedRequestCount = Number(await page.locator('html').getAttribute('data-product-conversation-fixture-reminder-requests'));
+        await page.evaluate(() => window.dispatchEvent(new Event('focus')));
+        await page.waitForFunction((count) => Number(document.documentElement.dataset['productConversationFixtureReminderRequests']) > count, collapsedRequestCount);
+        await page.waitForFunction((previous) => {
+          const current = document.querySelector('.reminders-panel')?.getAttribute('data-reminder-revisions');
+          return current && current !== previous;
+        }, collapsedRevision);
+        await page.evaluate(() => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+        assert.equal(await toggle.getAttribute('aria-expanded'), 'false', 'background refresh preserves initial collapsed state');
+        assert.equal(await page.locator('.reminder-card').count(), 0, 'background refresh keeps details hidden while collapsed');
+        const collapsedAfterRefresh = await page.evaluate(() => ({
+          composerFocused: document.activeElement === document.querySelector('#input-area textarea'),
+          composer: document.querySelector('#input-area')?.getBoundingClientRect().toJSON(),
+          scrollTop: document.querySelector('.product-conversation-page__transcript .message-virtual-transcript')?.scrollTop,
+          panel: document.querySelector('.reminders-panel')?.getBoundingClientRect().toJSON(),
+        }));
+        assert.deepEqual(collapsedAfterRefresh, collapsedBeforeRefresh, 'collapsed refresh preserves composer focus, panel/composer geometry and reading position');
+        await writeFile(path.join(outDir, `${stem}.json`), JSON.stringify({ id, viewport, geometry: collapsed, refresh: { before: collapsedBeforeRefresh, after: collapsedAfterRefresh } }, null, 2));
+        await toggle.press('Enter');
+        assert.equal(await toggle.getAttribute('aria-expanded'), 'true');
+        assert.equal(await page.locator('.reminder-card p').textContent(), expectedText, 'expanded disclosure renders exact full long text');
+        const stateName = id === 'compact-due' ? 'Reminder due' : id === 'compact-cancelled' ? 'Cancelled' : 'Upcoming';
+        await page.getByText(stateName, { exact: true }).waitFor({ state: 'visible' });
+        if (id === 'compact-scheduled') {
+          await page.getByRole('button', { name: 'Reschedule' }).waitFor({ state: 'visible' });
+          await page.getByRole('button', { name: 'Cancel reminder' }).waitFor({ state: 'visible' });
+        } else assert.equal(await page.getByRole('button', { name: /Reschedule|Cancel reminder/ }).count(), 0, 'non-scheduled states have no mutation actions');
+        const textarea = page.locator('#input-area textarea').first();
+        await textarea.focus();
+        const transcript = page.locator('.product-conversation-page__transcript .message-virtual-transcript');
+        await transcript.evaluate((node) => { node.scrollTop = (node.scrollHeight - node.clientHeight) / 2; });
+        await page.locator('.reminders-panel .grounding-section-body').evaluate((node) => { node.scrollTop = (node.scrollHeight - node.clientHeight) / 2; });
+        await page.evaluate(() => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+        const before = await page.evaluate(() => ({
+          requests: Number(document.documentElement.dataset['productConversationFixtureReminderRequests']),
+          reminderScrollTop: document.querySelector('.reminders-panel .grounding-section-body')?.scrollTop,
+          transcript: (() => { const n = document.querySelector('.product-conversation-page__transcript .message-virtual-transcript'); const r = n?.getBoundingClientRect(); return { scrollTop: n?.scrollTop, x: r?.x, y: r?.y, width: r?.width, height: r?.height }; })(),
+          composer: (() => { const r = document.querySelector('#input-area')?.getBoundingClientRect(); return r ? { x: r.x, y: r.y, width: r.width, height: r.height } : null; })(),
+          composerFocused: document.activeElement === document.querySelector('#input-area textarea'),
+        }));
+        assert.ok(before.transcript.scrollTop > 0, 'expanded refresh starts at a nonzero actual transcript scroll position');
+        assert.ok(before.reminderScrollTop > 0, 'expanded refresh starts at a nonzero reminder-details scroll position');
+        const expandedRevision = await panel.getAttribute('data-reminder-revisions');
+        await page.evaluate(() => window.dispatchEvent(new Event('focus')));
+        await page.waitForFunction((count) => Number(document.documentElement.dataset['productConversationFixtureReminderRequests']) > count, before.requests);
+        await page.waitForFunction((previous) => {
+          const current = document.querySelector('.reminders-panel')?.getAttribute('data-reminder-revisions');
+          return current && current !== previous;
+        }, expandedRevision);
+        await page.evaluate(() => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+        const after = await page.evaluate(() => ({
+          requests: Number(document.documentElement.dataset['productConversationFixtureReminderRequests']),
+          reminderScrollTop: document.querySelector('.reminders-panel .grounding-section-body')?.scrollTop,
+          transcript: (() => { const n = document.querySelector('.product-conversation-page__transcript .message-virtual-transcript'); const r = n?.getBoundingClientRect(); return { scrollTop: n?.scrollTop, x: r?.x, y: r?.y, width: r?.width, height: r?.height }; })(),
+          composer: (() => { const r = document.querySelector('#input-area')?.getBoundingClientRect(); return r ? { x: r.x, y: r.y, width: r.width, height: r.height } : null; })(),
+          composerFocused: document.activeElement === document.querySelector('#input-area textarea'),
+          expanded: document.querySelector('.reminders-panel button[aria-expanded]')?.getAttribute('aria-expanded'),
+        }));
+        assert.equal(after.expanded, 'true', 'background refresh preserves expanded disclosure');
+        assert.equal(before.composerFocused, true, 'composer focus control is active before expanded refresh');
+        assert.equal(after.composerFocused, true, 'background refresh preserves exact composer focus');
+        assert.equal(after.transcript.scrollTop, before.transcript.scrollTop, 'background refresh preserves transcript scroll');
+        assert.equal(after.reminderScrollTop, before.reminderScrollTop, 'background refresh preserves reminder-details scroll');
+        assert.deepEqual(after.transcript, before.transcript, 'background refresh preserves transcript geometry');
+        assert.deepEqual(after.composer, before.composer, 'background refresh preserves composer geometry');
+        const expanded = await page.evaluate(() => ({ panel: document.querySelector('.reminders-panel')?.getBoundingClientRect().height, details: document.querySelector('.grounding-section-body')?.getBoundingClientRect().height ?? null, composer: document.querySelector('#input-area')?.getBoundingClientRect().toJSON(), width: document.documentElement.clientWidth, scrollWidth: document.documentElement.scrollWidth }));
+        assert.ok(expanded.composer.y >= 0 && expanded.composer.bottom <= viewport.height, 'composer stays visible after expanded refresh');
+        assert.ok(expanded.scrollWidth <= expanded.width + 1, 'expanded page has no horizontal overflow');
+        const expandedStem = `${id}--${viewport.name}--expanded`;
+        await page.screenshot({ path: path.join(outDir, `${expandedStem}.png`), fullPage: false });
+        await writeFile(path.join(outDir, `${expandedStem}.json`), JSON.stringify({ id, viewport, journey: ['collapsed → Enter expanded → background refresh preserves focus, scroll, geometry, and expansion'], geometry: expanded, refresh: { before, after } }, null, 2));
+        await toggle.press('Space');
+        assert.equal(await toggle.getAttribute('aria-expanded'), 'false', 'Space collapses the disclosure');
+        assert.equal(await panel.evaluate((node) => node.getBoundingClientRect().height), collapsed.panel, 'collapse restores compact height');
+        journey.push('collapsed → Enter reveals full text and correct actions → background refresh retains expanded state and composer/transcript geometry → Space collapses');
+      }
     } else if (id === 'retry-mutation-rejection') {
       await page.getByRole('region', { name: 'Reminders' }).waitFor({ state: 'visible' });
+      const disclosure = page.getByRole('button', { name: /Reminders/ });
+      assert.equal(await disclosure.getAttribute('aria-expanded'), 'false', 'loaded reminder panel starts collapsed');
+      await disclosure.press('Enter');
+      await page.getByText('Reminder due').waitFor({ state: 'visible' });
       await page.evaluate(() => window.dispatchEvent(new Event('focus')));
       await retry.waitFor({ state: 'visible' });
       await page.getByText('Reminder due').waitFor({ state: 'visible' });
@@ -89,7 +223,7 @@ runSurfaceCapture({
       await page.getByRole('alert').filter({ hasText: 'This reminder changed. Review its current time before trying again.' }).scrollIntoViewIfNeeded();
       await page.screenshot({ path: path.join(outDir, `${id}--${viewport.name}--mutation-conflict.png`), fullPage: false });
       await page.getByRole('button', { name: 'Cancel reminder' }).click();
-      await page.getByText('Cancelled').waitFor({ state: 'visible' });
+      await page.locator('.reminder-card__state').filter({ hasText: /^Cancelled$/ }).waitFor({ state: 'visible' });
       await page.waitForFunction(() => document.documentElement.dataset['productConversationFixtureReminderServedRevision'] === '6');
       const retriedMutation = await page.evaluate(() => ({
         revision: Number(document.documentElement.dataset['productConversationFixtureLastReminderRevision']),
@@ -100,6 +234,8 @@ runSurfaceCapture({
       assert.deepEqual(retriedMutation, { revision: 5, mutations: 2, outcome: 'accepted', acceptedRevision: 6 }, 'explicit user retry must use the fresh revision and advance it');
       journey.push('loaded → focus refresh failure → keyboard retry → 409 alert → server row refetched without replay → explicit retry at revision 5 succeeds');
     }
+
+    if (id.startsWith('compact-')) return true;
 
     const evidence = await page.evaluate(() => {
       const selectors = ['.reminders-panel', '.reminder-card', '.reminders-fetch-status', '#input-area'];

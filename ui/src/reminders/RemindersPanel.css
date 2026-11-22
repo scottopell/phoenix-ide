@@ -39,19 +39,20 @@
 }
 
 .reminders-panel {
-  margin: 0.5rem 1rem;
-  padding: 0.75rem;
+  margin: 0.25rem 1rem;
   border: 1px solid var(--border-color);
-  border-radius: 8px;
+  border-radius: 6px;
   font-size: 0.85rem;
-  max-height: 30vh;
-  overflow: auto;
+  overflow: hidden;
   flex-shrink: 0;
 }
 
-.reminders-panel h2 {
-  margin: 0 0 0.5rem;
-  font-size: 0.95rem;
+.reminders-panel .grounding-section {
+  border-top: 0;
+}
+
+.reminders-panel .grounding-section-body {
+  padding: 0.25rem 0.5rem 0.5rem;
 }
 
 .reminders-panel ul {
@@ -115,7 +116,7 @@
   box-sizing: border-box;
 }
 
-.reminders-panel button,
+.reminder-card__actions button,
 .reminders-fetch-status button,
 .reminder-edit input {
   padding: 0.35rem 0.5rem;
@@ -126,17 +127,17 @@
   border-radius: 4px;
 }
 
-.reminders-panel button,
+.reminder-card__actions button,
 .reminders-fetch-status button {
   cursor: pointer;
 }
 
-.reminders-panel button:disabled {
+.reminder-card__actions button:disabled {
   opacity: 0.5;
   cursor: default;
 }
 
-.reminders-panel button:focus-visible,
+.reminder-card__actions button:focus-visible,
 .reminders-fetch-status button:focus-visible,
 .reminders-fetch-status summary:focus-visible,
 .reminder-edit input:focus-visible {
@@ -144,7 +145,7 @@
   outline-offset: 2px;
 }
 
-.reminders-panel button:hover:not(:disabled),
+.reminder-card__actions button:hover:not(:disabled),
 .reminders-fetch-status button:hover:not(:disabled) {
   background: var(--bg-tertiary);
 }

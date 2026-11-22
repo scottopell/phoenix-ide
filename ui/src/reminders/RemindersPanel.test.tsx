@@ -17,6 +17,11 @@ beforeEach(() => {
 });
 afterEach(() => { vi.restoreAllMocks(); });
 
+async function expandReminders() {
+  const toggle = await screen.findByRole('button', { name: /Reminders/ });
+  if (toggle.getAttribute('aria-expanded') === 'false') fireEvent.click(toggle);
+}
+
 describe('reminder visibility and management', () => {
   it('uses a compact, accessible status for an unloaded list, not the card panel or an empty claim', async () => {
     vi.mocked(api.listReminders).mockRejectedValueOnce(new Error('Load failed')).mockResolvedValue([]);
@@ -37,6 +42,95 @@ describe('reminder visibility and management', () => {
     expect(api.listReminders).toHaveBeenCalledTimes(2);
   });
 
+  it('starts collapsed with a compact mixed-state summary and no reminder details or actions', async () => {
+    vi.mocked(api.listReminders).mockResolvedValue([
+      reminder({ text: 'Private due detail', state: { kind: 'due', occurred_at_us: 2 } }),
+      reminder({ id: 'scheduled', text: 'Private scheduled detail' }),
+      reminder({ id: 'cancelled', text: 'Private cancelled detail', state: { kind: 'cancelled', cancelled_at_us: 3 } }),
+    ]);
+    render(<RemindersPanel conversationId="owner" />);
+    const toggle = await screen.findByRole('button', { name: /Reminders/ });
+    expect(toggle).toHaveAttribute('aria-expanded', 'false');
+    expect(toggle).toHaveTextContent('1 due · 1 upcoming · 1 cancelled');
+    expect(toggle.closest('.grounding-section')).toHaveClass('has-attention');
+    expect(screen.queryByText('Private due detail')).not.toBeInTheDocument();
+    expect(screen.queryByText('Private scheduled detail')).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Cancel reminder' })).not.toBeInTheDocument();
+    fireEvent.click(toggle);
+    expect(toggle).toHaveAttribute('aria-expanded', 'true');
+    expect(screen.getByText('Private due detail')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Cancel reminder' })).toBeInTheDocument();
+  });
+
+  it.each([
+    { label: 'due', rows: [reminder({ state: { kind: 'due', occurred_at_us: 2 } })], summary: '1 due' },
+    { label: 'scheduled', rows: [reminder()], summary: '1 upcoming' },
+    { label: 'cancelled', rows: [reminder({ state: { kind: 'cancelled', cancelled_at_us: 3 } })], summary: '1 cancelled' },
+  ])('summarizes the server state for $label reminders', async ({ rows, summary }) => {
+    vi.mocked(api.listReminders).mockResolvedValue(rows);
+    render(<RemindersPanel conversationId="owner" />);
+    expect(await screen.findByRole('button', { name: /Reminders/ })).toHaveTextContent(summary);
+  });
+
+  it('keeps a loaded empty list absent without implying a due reminder', async () => {
+    vi.mocked(api.listReminders).mockResolvedValue([]);
+    render(<RemindersPanel conversationId="owner" />);
+    await waitFor(() => expect(api.listReminders).toHaveBeenCalledTimes(1));
+    expect(screen.queryByRole('region', { name: 'Reminders' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /Reminders/ })).not.toBeInTheDocument();
+    expect(screen.queryByText('None')).not.toBeInTheDocument();
+    expect(screen.queryByText('Reminder due')).not.toBeInTheDocument();
+  });
+
+  it('keeps error and unconfirmed status discoverable in the collapsed summary without double-counting', async () => {
+    vi.mocked(api.listReminders).mockResolvedValueOnce([reminder(), reminder({ id: 'rem-2', text: 'Second reminder' })])
+      .mockRejectedValue(new Error('Load failed'));
+    vi.mocked(api.manageReminder).mockRejectedValueOnce(new ApiResponseError('Already due', 409))
+      .mockRejectedValueOnce(new Error('Network response lost'));
+    render(<RemindersPanel conversationId="owner" />);
+    await expandReminders();
+    fireEvent.click((await screen.findAllByRole('button', { name: 'Cancel reminder' }))[0]!);
+    await screen.findByText('Could not cancel reminder: Already due');
+    fireEvent.click(screen.getAllByRole('button', { name: 'Cancel reminder' })[1]!);
+    await screen.findByText('Could not confirm cancel reminder: Network response lost');
+    fireEvent.click(screen.getByRole('button', { name: /Reminders/ }));
+    const summary = screen.getByRole('button', { name: /Reminders/ });
+    expect(summary).toHaveAttribute('aria-expanded', 'false');
+    expect(summary).toHaveTextContent('2 upcoming · 1 unconfirmed · 1 action error');
+    expect(summary.querySelector('.grounding-count')).toHaveTextContent('2');
+    expect(summary).not.toHaveTextContent('2 unconfirmed');
+  });
+
+  it('stays collapsed after refresh and resets expansion when conversation ownership changes', async () => {
+    vi.mocked(api.listReminders).mockResolvedValue([reminder()]);
+    const { rerender } = render(<RemindersPanel conversationId="owner" />);
+    const toggle = await screen.findByRole('button', { name: /Reminders/ });
+    fireEvent.click(toggle);
+    expect(toggle).toHaveAttribute('aria-expanded', 'true');
+    fireEvent.click(toggle);
+    window.dispatchEvent(new Event('online'));
+    await waitFor(() => expect(api.listReminders).toHaveBeenCalledTimes(2));
+    expect(screen.getByRole('button', { name: /Reminders/ })).toHaveAttribute('aria-expanded', 'false');
+    expect(screen.queryByText('Inspect Safari')).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: /Reminders/ }));
+    expect(screen.getByText('Inspect Safari')).toBeInTheDocument();
+    rerender(<RemindersPanel conversationId="other" />);
+    const otherToggle = await screen.findByRole('button', { name: /Reminders/ });
+    expect(otherToggle).toHaveAttribute('aria-expanded', 'false');
+    expect(screen.queryByText('Inspect Safari')).not.toBeInTheDocument();
+  });
+
+  it('keeps a read-only panel collapsed by default and omits management actions when expanded', async () => {
+    vi.mocked(api.listReminders).mockResolvedValue([reminder()]);
+    render(<RemindersPanel conversationId="owner" readOnly />);
+    const toggle = await screen.findByRole('button', { name: /Reminders/ });
+    expect(toggle).toHaveAttribute('aria-expanded', 'false');
+    fireEvent.click(toggle);
+    expect(screen.getByText('Inspect Safari')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Reschedule' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Cancel reminder' })).not.toBeInTheDocument();
+  });
+
   it('keeps the live region mounted while the first request is pending and announces its failure', async () => {
     let reject!: (error: Error) => void;
     vi.mocked(api.listReminders).mockImplementationOnce(() => new Promise<Reminder[]>((_resolve, fail) => { reject = fail; }));
@@ -52,6 +146,7 @@ describe('reminder visibility and management', () => {
       .mockRejectedValueOnce(new Error('Load failed')).mockRejectedValueOnce(new Error('Load failed'))
       .mockResolvedValue([reminder({ state: { kind: 'due', occurred_at_us: 2 } })]);
     render(<RemindersPanel conversationId="owner" />);
+    await expandReminders();
     expect(await screen.findByText('Reminder due')).toBeInTheDocument();
     fireEvent.focus(window);
     await screen.findByText('Reminders may be out of date');
@@ -76,12 +171,15 @@ describe('reminder visibility and management', () => {
     await screen.findByText('Reminders may be out of date');
     expect(document.querySelector('.reminders-announcement')).toHaveTextContent('Reminders may be out of date');
     expect(screen.queryByRole('region', { name: 'Reminders' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /Reminders/ })).not.toBeInTheDocument();
+    expect(screen.queryByText('Reminder due')).not.toBeInTheDocument();
   });
 
   it('keeps an uncertain cancellation actionable without silently replaying the mutation', async () => {
     vi.mocked(api.listReminders).mockResolvedValueOnce([reminder()]).mockRejectedValueOnce(new Error('Load failed'));
     vi.mocked(api.manageReminder).mockRejectedValue(new Error('Network error'));
     render(<RemindersPanel conversationId="owner" />);
+    await expandReminders();
     fireEvent.click(await screen.findByRole('button', { name: 'Cancel reminder' }));
     expect(await screen.findByRole('alert')).toHaveTextContent('Could not confirm cancel reminder: Network error');
     expect(screen.getByText('Upcoming')).toBeInTheDocument();
@@ -98,6 +196,7 @@ describe('reminder visibility and management', () => {
       .mockResolvedValueOnce([reminder()]).mockResolvedValue([saved]);
     vi.mocked(api.manageReminder).mockRejectedValueOnce(new Error('Network response lost'));
     render(<RemindersPanel conversationId="owner" />);
+    await expandReminders();
     if (operation === 'reschedule') {
       fireEvent.click(await screen.findByRole('button', { name: 'Reschedule' }));
       fireEvent.change(screen.getByLabelText('Local date and time'), { target: { value: '2030-02-01T10:30' } });
@@ -120,6 +219,7 @@ describe('reminder visibility and management', () => {
     vi.mocked(api.listReminders).mockResolvedValueOnce([reminder()]).mockResolvedValue([]);
     vi.mocked(api.manageReminder).mockRejectedValueOnce(new Error('Network response lost'));
     render(<RemindersPanel conversationId="owner" />);
+    await expandReminders();
     fireEvent.click(await screen.findByRole('button', { name: 'Cancel reminder' }));
     await waitFor(() => expect(api.listReminders).toHaveBeenCalledTimes(2));
     expect(screen.getByRole('alert')).toHaveTextContent('Could not confirm cancel reminder');
@@ -132,6 +232,7 @@ describe('reminder visibility and management', () => {
     vi.mocked(api.manageReminder).mockRejectedValueOnce(new Error('Network response lost'))
       .mockRejectedValueOnce(new ApiResponseError('Already due', 409));
     render(<RemindersPanel conversationId="owner" />);
+    await expandReminders();
     fireEvent.click((await screen.findAllByRole('button', { name: 'Cancel reminder' }))[0]!);
     await waitFor(() => expect(api.listReminders).toHaveBeenCalledTimes(2));
     fireEvent.click(screen.getAllByRole('button', { name: 'Reschedule' })[1]!);
@@ -148,6 +249,7 @@ describe('reminder visibility and management', () => {
     vi.mocked(api.listReminders).mockResolvedValue([reminder(), other]);
     vi.mocked(api.manageReminder).mockRejectedValueOnce(new ApiResponseError('Already due', 409));
     render(<RemindersPanel conversationId="owner" />);
+    await expandReminders();
     fireEvent.click((await screen.findAllByRole('button', { name: 'Cancel reminder' }))[0]!);
     expect(await screen.findByRole('alert')).toHaveTextContent('Could not cancel reminder: Already due');
     fireEvent.click(screen.getAllByRole('button', { name: 'Reschedule' })[1]!);
@@ -160,6 +262,7 @@ describe('reminder visibility and management', () => {
       .mockResolvedValue([reminder({ state: { kind: 'cancelled', cancelled_at_us: 2 } })]);
     vi.mocked(api.manageReminder).mockRejectedValueOnce(new ApiResponseError('Internal error', 500));
     render(<RemindersPanel conversationId="owner" />);
+    await expandReminders();
     fireEvent.click(await screen.findByRole('button', { name: 'Cancel reminder' }));
     await waitFor(() => expect(screen.getByText('Cancelled')).toBeInTheDocument());
     expect(screen.queryByRole('alert')).not.toBeInTheDocument();
@@ -173,6 +276,7 @@ describe('reminder visibility and management', () => {
         state: { kind: 'due', occurred_at_us: dueAt } })]);
     vi.mocked(api.manageReminder).mockRejectedValueOnce(new Error('Network response lost'));
     render(<RemindersPanel conversationId="owner" />);
+    await expandReminders();
     fireEvent.click(await screen.findByRole('button', { name: 'Reschedule' }));
     fireEvent.change(screen.getByLabelText('Local date and time'), { target: { value: '2030-02-01T10:30' } });
     fireEvent.click(screen.getByRole('button', { name: 'Save reminder time' }));
@@ -186,6 +290,7 @@ describe('reminder visibility and management', () => {
       .mockResolvedValue([reminder({ revision: 2, due_at_us: Date.parse('2030-11-03T06:30:00Z') * 1000 })]);
     vi.mocked(api.manageReminder).mockRejectedValueOnce(new Error('Network response lost'));
     render(<RemindersPanel conversationId="owner" />);
+    await expandReminders();
     fireEvent.click(await screen.findByRole('button', { name: 'Reschedule' }));
     fireEvent.change(screen.getByLabelText('Local date and time'), { target: { value: '2030-11-03T01:30' } });
     fireEvent.click(screen.getByRole('button', { name: 'Save reminder time' }));
@@ -201,6 +306,7 @@ describe('reminder visibility and management', () => {
       .mockResolvedValue([reminder({ revision: 2, due_at_us: Date.parse('2030-02-01T15:30:00Z') * 1000 + 123456 })]);
     vi.mocked(api.manageReminder).mockRejectedValueOnce(new Error('Network response lost'));
     render(<RemindersPanel conversationId="owner" />);
+    await expandReminders();
     fireEvent.click(await screen.findByRole('button', { name: 'Reschedule' }));
     fireEvent.change(screen.getByLabelText('Local date and time'), { target: { value: '2030-02-01T10:30' } });
     fireEvent.click(screen.getByRole('button', { name: 'Save reminder time' }));
@@ -214,6 +320,7 @@ describe('reminder visibility and management', () => {
       .mockResolvedValue([reminder({ revision: 2, due_at_us: Date.parse('2030-02-01T15:30:00Z') * 1000 })]);
     vi.mocked(api.manageReminder).mockRejectedValueOnce(new Error('Network response lost'));
     render(<RemindersPanel conversationId="owner" />);
+    await expandReminders();
     fireEvent.click(await screen.findByRole('button', { name: 'Reschedule' }));
     fireEvent.change(screen.getByLabelText('Local date and time'), { target: { value: '2030-02-01T10:30' } });
     fireEvent.change(screen.getByLabelText('UTC offset (optional)'), { target: { value: ' -05:00 ' } });
@@ -229,6 +336,7 @@ describe('reminder visibility and management', () => {
     vi.mocked(api.listReminders).mockResolvedValue([reminder()]);
     vi.mocked(api.manageReminder).mockRejectedValueOnce(new ApiResponseError('Invalid local date', 400));
     render(<RemindersPanel conversationId="owner" />);
+    await expandReminders();
     fireEvent.click(await screen.findByRole('button', { name: 'Reschedule' }));
     fireEvent.click(screen.getByRole('button', { name: 'Save reminder time' }));
     expect(await screen.findByRole('alert')).toHaveTextContent('Could not reschedule reminder: Invalid local date');
@@ -241,6 +349,7 @@ describe('reminder visibility and management', () => {
     vi.mocked(api.listReminders).mockResolvedValueOnce([reminder()]).mockRejectedValueOnce(new Error('Load failed'));
     vi.mocked(api.manageReminder).mockRejectedValue(new ApiResponseError('Invalid local date', 400));
     render(<RemindersPanel conversationId="owner" />);
+    await expandReminders();
     fireEvent.click(await screen.findByRole('button', { name: 'Reschedule' }));
     fireEvent.click(screen.getByRole('button', { name: 'Save reminder time' }));
     expect(await screen.findByRole('alert')).toHaveTextContent('Could not reschedule reminder: Invalid local date');
@@ -253,10 +362,16 @@ describe('reminder visibility and management', () => {
   it('does not present a confirmed cancellation as a refreshed list when the GET fails', async () => {
     vi.mocked(api.listReminders).mockResolvedValueOnce([reminder()]).mockRejectedValueOnce(new Error('Load failed'));
     render(<RemindersPanel conversationId="owner" />);
+    await expandReminders();
     fireEvent.click(await screen.findByRole('button', { name: 'Cancel reminder' }));
     await screen.findByText('Reminders may be out of date');
     expect(document.querySelector('.reminders-announcement')).toHaveTextContent('Reminders may be out of date');
     expect(screen.getByText('Cancellation saved — list not refreshed')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: /Reminders/ }));
+    const summary = screen.getByRole('button', { name: /Reminders/ });
+    expect(summary).toHaveTextContent('1 saved — awaiting refresh');
+    expect(summary).not.toHaveTextContent('1 upcoming');
+    expect(summary).toHaveTextContent('1');
     expect(screen.queryByText('Upcoming')).not.toBeInTheDocument();
     expect(screen.queryByText('Cancelled')).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: 'Cancel reminder' })).not.toBeInTheDocument();
@@ -267,6 +382,7 @@ describe('reminder visibility and management', () => {
     vi.mocked(api.listReminders).mockResolvedValueOnce([reminder(), reminder({ id: 'rem-2', text: 'Second task' })])
       .mockRejectedValue(new Error('Load failed'));
     render(<RemindersPanel conversationId="owner" />);
+    await expandReminders();
     expect(await screen.findByText('Second task')).toBeInTheDocument();
     fireEvent.click(screen.getAllByRole('button', { name: 'Cancel reminder' })[0]!);
     await screen.findByText('Cancellation saved — list not refreshed');
@@ -287,6 +403,7 @@ describe('reminder visibility and management', () => {
       })
       .mockRejectedValueOnce(new Error('Load failed'));
     render(<RemindersPanel conversationId="owner" />);
+    await expandReminders();
     await screen.findByRole('button', { name: 'Cancel reminder' });
     fireEvent.focus(window);
     await waitFor(() => expect(api.listReminders).toHaveBeenCalledTimes(2));
@@ -301,6 +418,7 @@ describe('reminder visibility and management', () => {
   it('shows upcoming and durable due cards independently of a model response', async () => {
     vi.mocked(api.listReminders).mockResolvedValue([reminder(), reminder({ id: 'due', text: 'Capture storage', state: { kind: 'due', occurred_at_us: 2 } })]);
     render(<RemindersPanel conversationId="owner" />);
+    await expandReminders();
     expect(await screen.findByText('Reminder due')).toBeInTheDocument();
     expect(screen.getByText('Upcoming')).toBeInTheDocument();
     expect(screen.getByText('Capture storage')).toBeInTheDocument();
@@ -317,6 +435,7 @@ describe('reminder visibility and management', () => {
   it('cancels the observed revision then refreshes the durable record', async () => {
     vi.mocked(api.listReminders).mockResolvedValueOnce([reminder()]).mockResolvedValue([reminder({ state: { kind: 'cancelled', cancelled_at_us: 2 } })]);
     render(<RemindersPanel conversationId="owner" />);
+    await expandReminders();
     fireEvent.click(await screen.findByRole('button', { name: 'Cancel reminder' }));
     await waitFor(() => expect(api.manageReminder).toHaveBeenCalledWith('owner', 'rem-1', 'cancel', 1, undefined));
     expect(await screen.findByText('Cancelled')).toBeInTheDocument();
@@ -325,6 +444,7 @@ describe('reminder visibility and management', () => {
   it('keeps the edit revision when a background refresh changes the saved reminder', async () => {
     vi.mocked(api.listReminders).mockResolvedValueOnce([reminder()]).mockResolvedValue([reminder({ revision: 2 })]);
     render(<RemindersPanel conversationId="owner" />);
+    await expandReminders();
     fireEvent.click(await screen.findByRole('button', { name: 'Reschedule' }));
     fireEvent.focus(window);
     await waitFor(() => expect(api.listReminders).toHaveBeenCalledTimes(2));
@@ -340,8 +460,10 @@ describe('reminder visibility and management', () => {
     vi.mocked(api.listReminders).mockResolvedValue([reminder()]);
     vi.mocked(api.manageReminder).mockRejectedValue(new ApiResponseError('This reminder changed.', 409));
     render(<RemindersPanel conversationId="owner" />);
+    await expandReminders();
     fireEvent.click(await screen.findByRole('button', { name: 'Reschedule' }));
     fireEvent.click(screen.getByRole('button', { name: 'Save reminder time' }));
+
     expect(await screen.findByRole('alert')).toHaveTextContent('This reminder changed.');
     expect(screen.queryByRole('button', { name: 'Save reminder time' })).not.toBeInTheDocument();
     await waitFor(() => expect(api.listReminders).toHaveBeenCalledTimes(2));
@@ -353,6 +475,7 @@ describe('reminder visibility and management', () => {
     const { rerender } = render(<RemindersPanel conversationId="old" />);
     const oldSignal = vi.mocked(api.listReminders).mock.calls[0]?.[1];
     rerender(<RemindersPanel conversationId="new" />);
+    await expandReminders();
     expect(await screen.findByText('New owner reminder')).toBeInTheDocument();
     await act(async () => { resolveOld([reminder({ text: 'Stale owner reminder' })]); });
     expect(oldSignal?.aborted).toBe(true);

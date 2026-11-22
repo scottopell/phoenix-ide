@@ -74,6 +74,10 @@ export const productConversationScenarioDefinitions = [
   { id: 'compact-events-global', title: 'Compact Global events', viewport: 'desktop', state: 'ready' },
   { id: 'compact-events-redacted', title: 'Redacted event evidence', viewport: 'desktop', state: 'ready' },
   { id: 'composer-focus', title: 'Composer focus ownership', viewport: 'desktop', state: 'ready' },
+  { id: 'reminders-compact-due', title: 'Compact due reminder disclosure', viewport: 'mobile', state: 'ready' },
+  { id: 'reminders-compact-scheduled', title: 'Compact scheduled reminder disclosure', viewport: 'mobile', state: 'ready' },
+  { id: 'reminders-compact-cancelled', title: 'Compact cancelled reminder disclosure', viewport: 'mobile', state: 'ready' },
+  { id: 'reminders-compact-empty', title: 'Compact empty reminder state', viewport: 'mobile', state: 'ready' },
   { id: 'reminders-initial-failure', title: 'Reminders initial GET failure', viewport: 'mobile', state: 'ready' },
   { id: 'reminders-alias-fallback-initial-failure', title: 'Conversation alias 404 fallback reminders initial GET failure', viewport: 'mobile', state: 'ready' },
   { id: 'reminders-loaded-stale-upcoming', title: 'Loaded stale and upcoming reminders', viewport: 'mobile', state: 'ready' },
@@ -96,6 +100,7 @@ export interface ReminderFixture {
   initialFailures?: number;
   rejectMutation?: boolean;
   failuresAfterFirstLoad?: number;
+  advanceRevisionOnRefresh?: boolean;
 }
 
 interface ScenarioCommon {
