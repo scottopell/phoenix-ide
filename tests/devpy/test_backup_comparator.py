@@ -118,6 +118,102 @@ class BackupComparatorTests(unittest.TestCase):
             source.close()
             backup.close()
 
+    def test_batched_late_value_and_rowid_mismatches_keep_rowwise_counters(self):
+        boundaries = (16, 17, 32, 33, 40)
+        for position in boundaries:
+            with self.subTest(kind="value", position=position):
+                def setup_value(db):
+                    db.execute("CREATE TABLE cells(id INTEGER PRIMARY KEY, value)")
+                    db.executemany("INSERT INTO cells VALUES (?, ?)",
+                                   ((row, row) for row in range(1, 41)))
+                diagnostics = self.compare_outcomes(
+                    setup_value, "reject",
+                    lambda db, row=position: db.execute(
+                        "UPDATE cells SET value=-1 WHERE id=?", (row,)),
+                )
+                self.assertEqual(diagnostics["table_rows_compared"], position - 1)
+                self.assertEqual(diagnostics["table_cells_compared"], position * 2)
+
+            with self.subTest(kind="rowid", position=position):
+                def setup_rowid(db):
+                    db.execute("CREATE TABLE cells(id INTEGER PRIMARY KEY, value)")
+                    db.executemany("INSERT INTO cells VALUES (?, ?)",
+                                   ((row, row) for row in range(1, 41)))
+                diagnostics = self.compare_outcomes(
+                    setup_rowid, "reject",
+                    lambda db, row=position: db.execute(
+                        "UPDATE cells SET rowid=100000 WHERE id=?", (row,)),
+                )
+                self.assertEqual(diagnostics["table_rows_compared"], position - 1)
+                self.assertEqual(diagnostics["table_cells_compared"], (position - 1) * 2)
+
+            with self.subTest(kind="signed zero", position=position):
+                def setup_zero(db):
+                    db.execute("CREATE TABLE cells(value)")
+                    db.executemany("INSERT INTO cells(rowid,value) VALUES (?,?)",
+                                   ((row, -0.0 if row == position else float(row))
+                                    for row in range(1, 41)))
+                diagnostics = self.compare_outcomes(
+                    setup_zero, "reject",
+                    lambda db, row=position: db.execute(
+                        "UPDATE cells SET value=0.0 WHERE rowid=?", (row,)),
+                )
+                self.assertEqual(diagnostics["table_rows_compared"], position - 1)
+                self.assertEqual(diagnostics["table_cells_compared"], position)
+
+    def test_batched_extra_and_missing_rows_after_each_boundary(self):
+        for count in (16, 17, 32, 33, 40):
+            for extra in (True, False):
+                with self.subTest(count=count, extra=extra):
+                    def setup(db):
+                        db.execute("CREATE TABLE cells(id INTEGER PRIMARY KEY, value)")
+                        db.executemany("INSERT INTO cells VALUES (?,?)",
+                                       ((row, row) for row in range(1, count + 1)))
+                    def mutate(db):
+                        if extra:
+                            db.execute("INSERT INTO cells VALUES (?,?)", (count + 1, count + 1))
+                        else:
+                            db.execute("DELETE FROM cells WHERE id=?", (count,))
+                    diagnostics = self.compare_outcomes(setup, "reject", mutate)
+                    self.assertEqual(diagnostics["table_rows_compared"], count - (0 if extra else 1))
+                    self.assertEqual(diagnostics["table_cells_compared"],
+                                     2 * (count - (0 if extra else 1)))
+
+    def test_deadline_after_full_batch_reports_completed_batch_before_failure(self):
+        source, backup = sqlite3.connect(":memory:"), sqlite3.connect(":memory:")
+        try:
+            for db in (source, backup):
+                db.execute("CREATE TABLE cells(value)")
+                db.executemany("INSERT INTO cells VALUES (?)", ((row,) for row in range(40)))
+            diagnostics = {}
+
+            def clock():
+                return 101.0 if diagnostics.get("rows_compared", 0) >= 16 else 100.0
+
+            with mock.patch.object(helper.time, "monotonic", side_effect=clock):
+                with self.assertRaisesRegex(helper.ActivationError, "deadline exceeded"):
+                    helper._verify_logical_equivalence(source, backup, 101.0, diagnostics)
+            self.assertEqual(diagnostics["table_rows_compared"], 16)
+            self.assertEqual(diagnostics["table_cells_compared"], 16)
+            self.assertEqual(diagnostics["tables_completed"], 0)
+        finally:
+            source.close()
+            backup.close()
+
+    def test_empty_table_and_no_diagnostics(self):
+        source, backup = sqlite3.connect(":memory:"), sqlite3.connect(":memory:")
+        try:
+            for db in (source, backup):
+                db.execute("CREATE TABLE empty(value)")
+                db.execute("CREATE TABLE real_values(value)")
+                db.execute("INSERT INTO real_values VALUES (?)", (-0.0,))
+            helper._verify_logical_equivalence(
+                source, backup, helper.time.monotonic() + 10, None,
+            )
+        finally:
+            source.close()
+            backup.close()
+
     def test_numeric_and_storage_class_matrix(self):
         cases = (
             ("same bytes TEXT versus BLOB", "CAST(X'4142' AS TEXT)", "CAST(X'4142' AS BLOB)", "reject", ("text", "blob")),

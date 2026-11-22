@@ -114,10 +114,10 @@ follows from isolated or synthetic fixture success.
 
 ### Targeted dense remedy candidate
 
-The clean integration candidate adds an equal-row shortcut only when all typed
-values match and no cell is tagged REAL; REAL rows retain binary64 comparison.
-It preserves row ordering/identity, stored FTS5 shadow coverage, per-row deadline
-checks, diagnostics and the shared 900-second bound. On CPython 3.13.1 / SQLite
+The first clean integration candidate added an equal-row shortcut only when all
+typed values match and no cell is tagged REAL; REAL rows retain binary64 comparison.
+That candidate preserved row ordering/identity, stored FTS5 shadow coverage,
+per-row deadline checks, diagnostics and the shared 900-second bound. On CPython 3.13.1 / SQLite
 3.47.1, eight alternating old/new pairs on small replicas of the hosted shapes
 showed dense comparison medians of 0.0348→0.0296 seconds, baseline
 0.0489→0.0443 and wide 0.1676→0.1310. These measurements justify targeted hosted
@@ -127,10 +127,46 @@ pass used a different helper hash and does not qualify this shortcut.
 The CI dispatch can select just `dense` while retaining the complete `all`
 matrix. The dense payload remains 128 bytes per TEXT/BLOB, and all safety checks
 and budgets are unchanged. Independent review found no code blocker; 111 focused
-Python tests and four spec/task lanes passed. Hosted dense and native browser
-cleanup validation remain required. The browser candidate rechecks kernel
-process-group membership after malformed `/proc` data, while retaining errors
-for malformed data on still-owned members and uncertain membership queries.
+Python tests and four spec/task lanes passed. However, targeted run
+[45009531119](https://github.com/scottopell/phoenix-ide/actions/runs/45009531119)
+failed dense on `4f8ac34ae682c84603350fbcbba9ca80a3f4b957` with helper SHA-256
+`f3725a2d47329bf4d41508f524809dc7eebea80485ad91a87301b2c873947e9b`.
+The unchanged 13,439,737,856-byte fixture reached 54,925,671 matched rows and
+125,575,441 attempted cells: copy took 34.061 seconds, integrity 513.438,
+metadata 0.014 and comparison consumed the remaining 352.468 seconds before
+timeout, with no fsync/proof completion. Different stage timings and censored
+comparison progress do not establish a controlled full-size speedup.
+
+The formatting-only follow-up `4e649b58e6cd7dfa78f1db71c26870961a3b5264` passed
+all hosted CI lanes in run
+[45009887069](https://github.com/scottopell/phoenix-ide/actions/runs/45009887069).
+The browser candidate rechecks kernel process-group membership after malformed
+`/proc` data, while retaining errors for malformed data on still-owned members
+and uncertain membership queries. Native CI success does not waive dense failure.
+
+The next comparator candidate fetches 16-row batches per side (plus one retained
+fallback row pair) and uses whole-batch equality only when every runtime storage
+tag excludes REAL.
+Other batches retain rowwise typed comparison and exact mismatch counters.
+Deadline checks bracket fetching and comparison; equal-batch progress is counted
+before the post-comparison deadline check. Timeout progress is therefore
+batch-granular, not an identical clock-call/progress trace to the rowwise loop.
+Buffers are bounded by row count, not bytes; large values can still increase
+memory use and the duration of an uninterruptible Python comparison. Fetch-ahead
+can change which deadline or SQLite read failure precedes an earlier mismatch,
+without permitting an invalid database to pass.
+
+On pinned CPython 3.13.1 / SQLite 3.47.1, twelve alternating paired measurements
+following two warmup pairs on 5,000-row-per-principal-table disposable fixtures
+showed rowwise→batch comparison medians of dense 0.047224→0.040171 seconds,
+baseline 0.071097→0.060929 and wide 0.213089→0.201491. Equal successful counters
+were asserted. These are small comparison-only observations, not full-path
+estimates. The batch helper SHA-256 is
+`2c10785eb667c271d732a0646b58e9bf4a22c268e2f9b39be4403a590b0bdec0`;
+115 focused Python tests passed, including batch-boundary mismatches, signed
+zero, missing/extra rows and post-batch deadline failure. Independent exact-delta
+review found no blocker before one targeted hosted run; exact-source hosted
+dense/native qualification remain gates.
 
 ## Operator recovery
 

@@ -603,35 +603,58 @@ def _verify_logical_equivalence(source, backup, deadline: float, diagnostics: di
         query = f"SELECT {','.join(selected)} FROM {table} ORDER BY {order}"
         check_deadline()
         left, right = source.execute(query), backup.execute(query)
+        offset = len(identity)
+        cell_count = len(names)
         while True:
             check_deadline()
-            a, b = left.fetchone(), right.fetchone()
+            left_batch = left.fetchmany(16)
+            right_batch = right.fetchmany(16)
             check_deadline()
-            if a is None or b is None:
-                if a != b:
+            if not left_batch or not right_batch:
+                if bool(left_batch) != bool(right_batch):
                     raise ActivationError(f"SQLite backup row count differs in table ordinal {(diagnostics or {}).get('table_ordinal', 0)}")
                 break
-            offset = len(identity)
-            if identity and a[0] != b[0]:
-                raise ActivationError(f"SQLite backup row identity differs in table ordinal {(diagnostics or {}).get('table_ordinal', 0)}")
-            # Python tuple equality loses the binary64 sign of zero for REAL.
-            if a == b and b"real" not in a[offset::2]:
+
+            # Equal projected tuples include row identity and storage-class tags.
+            # REAL values still require the binary64 comparison below.
+            if left_batch == right_batch and all(
+                b"real" not in row[offset::2] for row in left_batch
+            ):
                 if diagnostics is not None:
-                    count = (len(a) - offset) // 2
-                    diagnostics["cells_compared"] += count
-                    diagnostics["table_cells_compared"] += count
+                    diagnostics["cells_compared"] += cell_count * len(left_batch)
+                    diagnostics["table_cells_compared"] += cell_count * len(left_batch)
+                    diagnostics["rows_compared"] += len(left_batch)
+                    diagnostics["table_rows_compared"] += len(left_batch)
+                del left_batch, right_batch
+                check_deadline()
+                continue
+
+            for row_index in range(min(len(left_batch), len(right_batch))):
+                a, b = left_batch[row_index], right_batch[row_index]
+                check_deadline()
+                if identity and a[0] != b[0]:
+                    raise ActivationError(f"SQLite backup row identity differs in table ordinal {(diagnostics or {}).get('table_ordinal', 0)}")
+                # Python tuple equality loses the binary64 sign of zero for REAL.
+                if a == b and b"real" not in a[offset::2]:
+                    if diagnostics is not None:
+                        diagnostics["cells_compared"] += cell_count
+                        diagnostics["table_cells_compared"] += cell_count
+                        diagnostics["rows_compared"] += 1
+                        diagnostics["table_rows_compared"] += 1
+                    continue
+                for index in range(offset, len(a), 2):
+                    if diagnostics is not None:
+                        diagnostics["cells_compared"] += 1
+                        diagnostics["table_cells_compared"] += 1
+                    if not cells_equal(a[index], a[index + 1], b[index], b[index + 1]):
+                        raise ActivationError(f"SQLite backup row differs in table ordinal {(diagnostics or {}).get('table_ordinal', 0)}")
+                if diagnostics is not None:
                     diagnostics["rows_compared"] += 1
                     diagnostics["table_rows_compared"] += 1
-                continue
-            for index in range(offset, len(a), 2):
-                if diagnostics is not None:
-                    diagnostics["cells_compared"] += 1
-                    diagnostics["table_cells_compared"] += 1
-                if not cells_equal(a[index], a[index + 1], b[index], b[index + 1]):
-                    raise ActivationError(f"SQLite backup row differs in table ordinal {(diagnostics or {}).get('table_ordinal', 0)}")
-            if diagnostics is not None:
-                diagnostics["rows_compared"] += 1
-                diagnostics["table_rows_compared"] += 1
+            if len(left_batch) != len(right_batch):
+                raise ActivationError(f"SQLite backup row count differs in table ordinal {(diagnostics or {}).get('table_ordinal', 0)}")
+            del left_batch, right_batch
+            check_deadline()
 
     old_factories = source.text_factory, backup.text_factory
     try:
