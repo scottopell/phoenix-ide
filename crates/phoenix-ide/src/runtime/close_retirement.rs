@@ -1516,14 +1516,30 @@ impl RuntimeManager {
             )?;
             requests.extend(request.scopes);
         }
-        let request = CaptureCloseRetirementInventoryRequest { attempt_id, snapshot, scopes: requests };
+        let request = CaptureCloseRetirementInventoryRequest {
+            attempt_id,
+            snapshot,
+            scopes: requests,
+        };
         if policy == CloseRetirementInventoryPolicy::NativeInitial {
             let evidence = native_initial::capture_binding::read_capture_evidence(
-                self.db(), &request, &native_scopes,
-            ).await.map_err(|detail| CloseRetirementInventoryPreparationError::BackendStorageOrUnattributed { detail })?;
-            self.close_retirement_leases.lock().await
+                self.db(),
+                &request,
+                &native_scopes,
+            )
+            .await
+            .map_err(|detail| {
+                CloseRetirementInventoryPreparationError::BackendStorageOrUnattributed { detail }
+            })?;
+            self.close_retirement_leases
+                .lock()
+                .await
                 .bind_capture_evidence(request.attempt_id.as_str(), &evidence)
-                .map_err(|detail| CloseRetirementInventoryPreparationError::BackendStorageOrUnattributed { detail })?;
+                .map_err(|detail| {
+                    CloseRetirementInventoryPreparationError::BackendStorageOrUnattributed {
+                        detail,
+                    }
+                })?;
         }
         Ok(request)
     }
@@ -6640,7 +6656,9 @@ fn stop_bound_fsmonitor_daemons_with_admission_until(
         command.process_group(0);
     }
     if std::time::Instant::now() >= deadline {
-        return Err("Close teardown deadline elapsed before recursive fsmonitor shutdown spawn".to_string());
+        return Err(
+            "Close teardown deadline elapsed before recursive fsmonitor shutdown spawn".to_string(),
+        );
     }
     let child = match first_submodule_spawn_admission {
         Some(admit_spawn) => admit_spawn(&mut command, deadline)?,

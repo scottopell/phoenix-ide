@@ -1502,11 +1502,15 @@ struct CapturedLaunchSlot(Arc<LaunchSlot>);
 
 impl std::fmt::Debug for CapturedLaunchSlot {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_tuple("CapturedLaunchSlot").field(&(Arc::as_ptr(&self.0) as usize)).finish()
+        f.debug_tuple("CapturedLaunchSlot")
+            .field(&(Arc::as_ptr(&self.0) as usize))
+            .finish()
     }
 }
 impl PartialEq for CapturedLaunchSlot {
-    fn eq(&self, other: &Self) -> bool { Arc::ptr_eq(&self.0, &other.0) }
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
 }
 impl Eq for CapturedLaunchSlot {}
 
@@ -1543,7 +1547,9 @@ pub struct BrowserRetirementPermit {
 
 impl BrowserRetirementPermit {
     #[must_use]
-    pub fn deadline(&self) -> tokio::time::Instant { self.original.deadline }
+    pub fn deadline(&self) -> tokio::time::Instant {
+        self.original.deadline
+    }
 }
 
 impl BrowserRetirementPermit {
@@ -1673,7 +1679,8 @@ impl Drop for KillTaskCompletion {
                 tracing::debug!(%error, "browser lifecycle sink closed");
             }
         }
-        self.attempt.complete(Err("browser kill task cancelled or panicked".into()));
+        self.attempt
+            .complete(Err("browser kill task cancelled or panicked".into()));
     }
 }
 
@@ -1845,9 +1852,13 @@ impl BrowserPreparedRetirement {
                 return match tokio::time::timeout_at(
                     self.deadline,
                     self.manager.wait_for_kill_completion(existing.attempt),
-                ).await {
+                )
+                .await
+                {
                     Ok(Ok(())) => BrowserRetirementOutcome::Retired,
-                    Ok(Err(error)) => BrowserRetirementOutcome::Residual { reason: error.to_string() },
+                    Ok(Err(error)) => BrowserRetirementOutcome::Residual {
+                        reason: error.to_string(),
+                    },
                     Err(_) => BrowserRetirementOutcome::Residual {
                         reason: "browser retirement deadline elapsed while joining attempt".into(),
                     },
@@ -1857,19 +1868,28 @@ impl BrowserPreparedRetirement {
         };
         if tokio::time::Instant::now() >= self.deadline {
             drop((gate, guards));
-            return BrowserRetirementOutcome::Residual { reason: "browser retirement deadline elapsed".into() };
+            return BrowserRetirementOutcome::Residual {
+                reason: "browser retirement deadline elapsed".into(),
+            };
         }
         let scope = self.scope.clone();
         let slot = self.slot.0.clone();
         let attempt = {
-            let mut current = self.current_kill.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut current = self
+                .current_kill
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let attempt = KillAttempt::new();
             *current = Some(attempt.clone());
             attempt
         };
         let teardown_failed = self.teardown_failed.clone();
         let audience = self.audience.clone();
-        self.manager.emit_lifecycle(&scope, audience.clone(), BrowserSessionLifecycleKind::TeardownPending);
+        self.manager.emit_lifecycle(
+            &scope,
+            audience.clone(),
+            BrowserSessionLifecycleKind::TeardownPending,
+        );
         let group = attempt.custody_group();
         group.retain(custody);
         group.retain(BrowserRetirementCustody::new(Arc::new(gate)));
@@ -1877,30 +1897,48 @@ impl BrowserPreparedRetirement {
         let key = self.identity.session_key.clone();
         let attempt_task = attempt.clone();
         let completion = KillTaskCompletion {
-            attempt: attempt_task.clone(), teardown_failed, scope: scope.clone(), audience: audience.clone(),
+            attempt: attempt_task.clone(),
+            teardown_failed,
+            scope: scope.clone(),
+            audience: audience.clone(),
             sink: manager.lifecycle_sink.clone(),
         };
         let task = tokio::spawn(async move {
             let _completion = completion;
             let task_custody = BrowserRetirementCustody::new(group.clone());
-            if let Err(error) = slot.stop_and_delete_prepared(guards.state, guards.ready_session, task_custody).await {
-                manager.complete_kill_failure(&key, &attempt_task, error.to_string()).await;
+            if let Err(error) = slot
+                .stop_and_delete_prepared(guards.state, guards.ready_session, task_custody)
+                .await
+            {
+                manager
+                    .complete_kill_failure(&key, &attempt_task, error.to_string())
+                    .await;
                 return Err(error);
             }
             if let Some(entry) = manager.remove_session_if_current(&key, &slot).await {
                 let removed_scope = entry.scope.clone();
                 let removed_audience = entry.audience();
                 drop(entry);
-                manager.emit_lifecycle(&removed_scope, removed_audience, BrowserSessionLifecycleKind::Inactive);
+                manager.emit_lifecycle(
+                    &removed_scope,
+                    removed_audience,
+                    BrowserSessionLifecycleKind::Inactive,
+                );
             }
             attempt_task.complete(Ok(()));
             Ok::<(), BrowserError>(())
         });
         match tokio::time::timeout_at(self.deadline, task).await {
             Ok(Ok(Ok(()))) => BrowserRetirementOutcome::Retired,
-            Ok(Ok(Err(error))) => BrowserRetirementOutcome::Residual { reason: error.to_string() },
-            Ok(Err(error)) => BrowserRetirementOutcome::Residual { reason: format!("browser kill task failed: {error}") },
-            Err(_) => BrowserRetirementOutcome::Residual { reason: "browser retirement deadline elapsed while awaiting cleanup".into() },
+            Ok(Ok(Err(error))) => BrowserRetirementOutcome::Residual {
+                reason: error.to_string(),
+            },
+            Ok(Err(error)) => BrowserRetirementOutcome::Residual {
+                reason: format!("browser kill task failed: {error}"),
+            },
+            Err(_) => BrowserRetirementOutcome::Residual {
+                reason: "browser retirement deadline elapsed while awaiting cleanup".into(),
+            },
         }
     }
 }
@@ -2243,13 +2281,13 @@ impl BrowserSessionManager {
     }
 
     fn permit_is_authentic(&self, permit: &BrowserRetirementPermit) -> bool {
-        self.retirement_issuer == permit.original.issuer
-            && permit.projections_match_original()
+        self.retirement_issuer == permit.original.issuer && permit.projections_match_original()
     }
 
     fn invalid_permit_outcome() -> BrowserRetirementOutcome {
         BrowserRetirementOutcome::Residual {
-            reason: "browser retirement permit issuer or identity projection is invalid".to_string(),
+            reason: "browser retirement permit issuer or identity projection is invalid"
+                .to_string(),
         }
     }
 
@@ -2743,77 +2781,149 @@ impl BrowserSessionManager {
         if !self.permit_is_authentic(permit) || deadline > permit.original.deadline {
             return Err("browser retirement permit is invalid or deadline was extended".into());
         }
-        let captured = permit.original.captured_slots.iter()
+        let captured = permit
+            .original
+            .captured_slots
+            .iter()
             .find(|capture| capture.identity == *expected)
-            .ok_or_else(|| "browser identity is not captured by this retirement permit".to_string())?;
+            .ok_or_else(|| {
+                "browser identity is not captured by this retirement permit".to_string()
+            })?;
         let effective_deadline = deadline.min(permit.original.deadline);
         let slot = captured.slot.clone();
         let (scope, current_kill, teardown_failed, audience, existing_attempt) = {
-            let state = tokio::time::timeout_at(effective_deadline, self.state.read()).await
+            let state = tokio::time::timeout_at(effective_deadline, self.state.read())
+                .await
                 .map_err(|_| "browser retirement deadline elapsed".to_string())?;
             let key = Self::permit_fence_key(permit);
-            if !state.retirements.get(&key).is_some_and(|fence| fence.fenced && fence.generation == permit.original.generation.get()) {
+            if !state.retirements.get(&key).is_some_and(|fence| {
+                fence.fenced && fence.generation == permit.original.generation.get()
+            }) {
                 return Err("browser retirement fence is stale".into());
             }
-            let entry = state.sessions.get(&expected.session_key)
+            let entry = state
+                .sessions
+                .get(&expected.session_key)
                 .ok_or_else(|| "captured browser session is absent".to_string())?;
             if !Arc::ptr_eq(&entry.session, &slot.0)
-                || !Self::current_entry_metadata_matches_identity(entry, &expected.session_key, &permit.original.work_scope, expected)
+                || !Self::current_entry_metadata_matches_identity(
+                    entry,
+                    &expected.session_key,
+                    &permit.original.work_scope,
+                    expected,
+                )
             {
                 return Err("captured browser session was replaced".into());
             }
-            let current = entry.current_kill.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            let existing = current.as_ref().filter(|attempt| attempt.result().is_none())
-                .and_then(|attempt| attempt.join_group().map(|custody_group| PreparedExistingAttempt {
-                    attempt: attempt.clone(), custody_group,
-                }));
-            (entry.scope.clone(), entry.current_kill.clone(), entry.teardown_failed.clone(), entry.audience(), existing)
+            let current = entry
+                .current_kill
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let existing = current
+                .as_ref()
+                .filter(|attempt| attempt.result().is_none())
+                .and_then(|attempt| {
+                    attempt
+                        .join_group()
+                        .map(|custody_group| PreparedExistingAttempt {
+                            attempt: attempt.clone(),
+                            custody_group,
+                        })
+                });
+            (
+                entry.scope.clone(),
+                entry.current_kill.clone(),
+                entry.teardown_failed.clone(),
+                entry.audience(),
+                existing,
+            )
         };
         if let Some(existing) = existing_attempt {
             return Ok(BrowserPreparedRetirement {
-                manager: self.clone(), identity: expected.clone(), slot, scope, current_kill,
-                teardown_failed, audience, deadline: effective_deadline,
+                manager: self.clone(),
+                identity: expected.clone(),
+                slot,
+                scope,
+                current_kill,
+                teardown_failed,
+                audience,
+                deadline: effective_deadline,
                 selection: PreparedRetirementSelection::Existing(existing),
             });
         }
-        let gate = tokio::time::timeout_at(effective_deadline, slot.0.retirement_gate.clone().lock_owned()).await
-            .map_err(|_| "browser retirement gate wait timed out".to_string())?;
-        let launch_result = tokio::time::timeout_at(effective_deadline, slot.0.lock_for_teardown()).await
+        let gate = tokio::time::timeout_at(
+            effective_deadline,
+            slot.0.retirement_gate.clone().lock_owned(),
+        )
+        .await
+        .map_err(|_| "browser retirement gate wait timed out".to_string())?;
+        let launch_result = tokio::time::timeout_at(effective_deadline, slot.0.lock_for_teardown())
+            .await
             .map_err(|_| "browser launch slot wait timed out".to_string())?;
-        let launch = launch_slot::PreparedLaunchGuards { state: launch_result.0, ready_session: launch_result.1 };
-        let observed = launch.identity_snapshot().ok_or_else(|| "captured launch identity is no longer available".to_string())?;
+        let launch = launch_slot::PreparedLaunchGuards {
+            state: launch_result.0,
+            ready_session: launch_result.1,
+        };
+        let observed = launch
+            .identity_snapshot()
+            .ok_or_else(|| "captured launch identity is no longer available".to_string())?;
         if observed != expected.durable {
             return Err("captured durable launch identity changed".into());
         }
         {
-            let state = tokio::time::timeout_at(effective_deadline, self.state.read()).await
+            let state = tokio::time::timeout_at(effective_deadline, self.state.read())
+                .await
                 .map_err(|_| "browser registry validation timed out".to_string())?;
             let key = Self::permit_fence_key(permit);
-            if !state.retirements.get(&key).is_some_and(|fence| fence.fenced && fence.generation == permit.original.generation.get()) {
+            if !state.retirements.get(&key).is_some_and(|fence| {
+                fence.fenced && fence.generation == permit.original.generation.get()
+            }) {
                 return Err("browser retirement fence is stale".into());
             }
-            let entry = state.sessions.get(&expected.session_key)
+            let entry = state
+                .sessions
+                .get(&expected.session_key)
                 .ok_or_else(|| "captured browser session is absent".to_string())?;
             if !Arc::ptr_eq(&entry.session, &slot.0)
-                || !Self::current_entry_metadata_matches_identity(entry, &expected.session_key, &permit.original.work_scope, expected)
+                || !Self::current_entry_metadata_matches_identity(
+                    entry,
+                    &expected.session_key,
+                    &permit.original.work_scope,
+                    expected,
+                )
                 || observed != expected.durable
             {
                 return Err("captured browser session or durable identity was replaced".into());
             }
-            if entry.current_kill.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
-                .as_ref().is_some_and(|attempt| attempt.result().is_none()) {
+            if entry
+                .current_kill
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_ref()
+                .is_some_and(|attempt| attempt.result().is_none())
+            {
                 return Err("browser retirement attempt appeared while preparing".into());
             }
         }
         Ok(BrowserPreparedRetirement {
-            manager: self.clone(), identity: expected.clone(), slot, scope, current_kill,
-            teardown_failed, audience, deadline: effective_deadline,
+            manager: self.clone(),
+            identity: expected.clone(),
+            slot,
+            scope,
+            current_kill,
+            teardown_failed,
+            audience,
+            deadline: effective_deadline,
             selection: PreparedRetirementSelection::New { gate, launch },
         })
     }
 
     pub async fn begin_retirement(&self, work_scope: &ResourceScopeKey) -> BrowserRetirementPermit {
-        self.begin_retirement_with_deadline(work_scope, tokio::time::Instant::now() + Duration::from_secs(30)).await
+        self.begin_retirement_with_deadline(
+            work_scope,
+            tokio::time::Instant::now() + Duration::from_secs(30),
+        )
+        .await
     }
 
     pub async fn begin_retirement_with_deadline(
@@ -2887,8 +2997,11 @@ impl BrowserSessionManager {
         actor: &EffectiveResourceAccess,
     ) -> BrowserRetirementPermit {
         self.begin_retirement_for_actor_with_deadline(
-            work_scope, actor, tokio::time::Instant::now() + Duration::from_secs(30),
-        ).await
+            work_scope,
+            actor,
+            tokio::time::Instant::now() + Duration::from_secs(30),
+        )
+        .await
     }
 
     pub async fn begin_retirement_for_actor_with_deadline(
@@ -2931,9 +3044,16 @@ impl BrowserSessionManager {
             }
             None => Vec::new(),
         };
-        let captured_slots = current.as_ref().zip(instances.first()).map(|((slot, _, _), identity)| vec![
-            CapturedRetirementInstance { identity: identity.clone(), slot: CapturedLaunchSlot(slot.clone()) }
-        ]).unwrap_or_default();
+        let captured_slots = current
+            .as_ref()
+            .zip(instances.first())
+            .map(|((slot, _, _), identity)| {
+                vec![CapturedRetirementInstance {
+                    identity: identity.clone(),
+                    slot: CapturedLaunchSlot(slot.clone()),
+                }]
+            })
+            .unwrap_or_default();
         let had_entries = !instances.is_empty();
         BrowserRetirementPermit {
             work_scope: work_scope.clone(),
@@ -3121,7 +3241,13 @@ impl BrowserSessionManager {
                     BrowserSessionAudience::Conversation(entry.creator_conversation_id.clone())
                 }
             };
-            (entry.session.clone(), attempt, audience, lifecycle_kind, entry.teardown_failed.clone())
+            (
+                entry.session.clone(),
+                attempt,
+                audience,
+                lifecycle_kind,
+                entry.teardown_failed.clone(),
+            )
         };
         let group = attempt.custody_group();
         group.retain(custody);
@@ -4057,7 +4183,8 @@ mod lifecycle_hook_tests {
         assert_eq!(
             foreign.complete_retirement(&permit).await,
             super::BrowserRetirementOutcome::Residual {
-                reason: "browser retirement permit issuer or identity projection is invalid".to_string()
+                reason: "browser retirement permit issuer or identity projection is invalid"
+                    .to_string()
             }
         );
         foreign.reopen_after_permit(permit).await;
@@ -4077,7 +4204,8 @@ mod lifecycle_hook_tests {
         assert_eq!(
             manager.complete_retirement(&permit).await,
             super::BrowserRetirementOutcome::Residual {
-                reason: "browser retirement permit issuer or identity projection is invalid".to_string()
+                reason: "browser retirement permit issuer or identity projection is invalid"
+                    .to_string()
             }
         );
         manager.reopen_after_permit(permit).await;
@@ -4097,7 +4225,8 @@ mod lifecycle_hook_tests {
         assert_eq!(
             manager.complete_retirement(&stale).await,
             super::BrowserRetirementOutcome::Residual {
-                reason: "browser retirement permit issuer or identity projection is invalid".to_string()
+                reason: "browser retirement permit issuer or identity projection is invalid"
+                    .to_string()
             }
         );
         manager.reopen_after_permit(stale).await;

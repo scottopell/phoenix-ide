@@ -807,7 +807,10 @@ mod tests {
 
         let result = group.signal_now(&mut child, libc::SIGTERM, Instant::now());
         assert_eq!(result.unwrap_err().kind(), io::ErrorKind::TimedOut);
-        assert!(child.try_wait().unwrap().is_none(), "expired admission must have no signal effect");
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "expired admission must have no signal effect"
+        );
         child.kill().await.unwrap();
         child.wait().await.unwrap();
     }

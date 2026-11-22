@@ -4,18 +4,18 @@
 //! confirmed release and externally retained supervision in `resource`. The
 //! legacy kind-wide adapter below is test-only, not a production entry path.
 
-pub(crate) mod resource;
 pub(crate) mod bash;
 pub(super) mod capture_binding;
+pub(crate) mod resource;
 mod supervision;
 
+use super::verify_observed_process_identities;
+use super::{CloseProcessStepExecutor, RetirementFailureReason};
 use phoenix_core::domain::close::{
     CloseRetirementSnapshot, LossItemIdentity, OpaqueIdentity, RetiredResourceIdentity,
     RetiredResourceKind, RetirementOutcome,
 };
 use phoenix_db::{CloseProcessResourceKind, CloseProcessStepOutcome};
-use super::{CloseProcessStepExecutor, RetirementFailureReason};
-use super::verify_observed_process_identities;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum NativeInitialProcessStep {
@@ -92,13 +92,13 @@ fn expected_resources<'a>(
     inventory: &'a [RetiredResourceIdentity],
     kind: RetiredResourceKind,
 ) -> Vec<&'a RetiredResourceIdentity> {
-    inventory.iter().filter(|resource| resource.kind() == kind).collect()
+    inventory
+        .iter()
+        .filter(|resource| resource.kind() == kind)
+        .collect()
 }
 
-fn inventories_match(
-    left: &[RetiredResourceIdentity],
-    right: &[RetiredResourceIdentity],
-) -> bool {
+fn inventories_match(left: &[RetiredResourceIdentity], right: &[RetiredResourceIdentity]) -> bool {
     left.len() == right.len() && left.iter().all(|resource| right.contains(resource))
 }
 
@@ -113,7 +113,10 @@ fn validate_inventory(inventory: &[RetiredResourceIdentity]) -> Result<(), Strin
                 | RetiredResourceKind::BrowserSession
         );
         if !allowed {
-            return Err(format!("unsupported sealed native process kind: {:?}", resource.kind()));
+            return Err(format!(
+                "unsupported sealed native process kind: {:?}",
+                resource.kind()
+            ));
         }
         if seen.contains(&resource) {
             return Err("sealed inventory contains duplicate resource identities".into());
@@ -144,15 +147,27 @@ fn verify_tmux_observation(
     observed: &[RetiredResourceIdentity],
     expected: &[&RetiredResourceIdentity],
 ) -> Result<(), String> {
-    let expected = expected.iter().map(|resource| (*resource).clone()).collect::<Vec<_>>();
+    let expected = expected
+        .iter()
+        .map(|resource| (*resource).clone())
+        .collect::<Vec<_>>();
     let actual = observed.to_vec();
-    if actual.iter().enumerate().any(|(index, resource)| actual[..index].contains(resource))
-        || expected.iter().enumerate().any(|(index, resource)| expected[..index].contains(resource))
+    if actual
+        .iter()
+        .enumerate()
+        .any(|(index, resource)| actual[..index].contains(resource))
+        || expected
+            .iter()
+            .enumerate()
+            .any(|(index, resource)| expected[..index].contains(resource))
     {
         return Err("tmux observation or sealed inventory contains duplicate resources".into());
     }
-    if actual.len() != expected.len() || actual.iter().any(|resource| !expected.contains(resource)) {
-        return Err(format!("observed tmux resources {actual:?} do not match sealed resources {expected:?}"));
+    if actual.len() != expected.len() || actual.iter().any(|resource| !expected.contains(resource))
+    {
+        return Err(format!(
+            "observed tmux resources {actual:?} do not match sealed resources {expected:?}"
+        ));
     }
     Ok(())
 }
@@ -173,9 +188,14 @@ fn enter_native_initial_kind(
     validate_inventory(lease_resources).map_err(NativeInitialStepError::InvalidSealedInventory)?;
     validate_inventory(sealed_inventory).map_err(NativeInitialStepError::InvalidSealedInventory)?;
     let kind = step.retired_kind();
-    let leased_kind = lease_resources.iter().filter(|resource| resource.kind() == kind)
-        .cloned().collect::<Vec<_>>();
-    if sealed_inventory.iter().any(|resource| resource.kind() != kind)
+    let leased_kind = lease_resources
+        .iter()
+        .filter(|resource| resource.kind() == kind)
+        .cloned()
+        .collect::<Vec<_>>();
+    if sealed_inventory
+        .iter()
+        .any(|resource| resource.kind() != kind)
         || !inventories_match(&leased_kind, sealed_inventory)
     {
         return Err(NativeInitialStepError::SealedInventoryMismatch);
@@ -206,9 +226,8 @@ async fn execute_one_kind<E: CloseProcessStepExecutor>(
             resources: failure.resources,
             detail: failure.reason,
         })?;
-        verify_process_observation(&observed.identities, &expected).map_err(|detail| {
-            NativeInitialStepError::ObservationMismatch { kind, detail }
-        })?;
+        verify_process_observation(&observed.identities, &expected)
+            .map_err(|detail| NativeInitialStepError::ObservationMismatch { kind, detail })?;
         return Ok(NativeInitialObservation::Process {
             kind: process_kind,
             identities: observed.identities,
@@ -217,11 +236,14 @@ async fn execute_one_kind<E: CloseProcessStepExecutor>(
         });
     }
     let observed = executor.retire_tmux().await.map_err(|(reason, detail)| {
-        NativeInitialStepError::Unattributed { kind, reason, detail }
+        NativeInitialStepError::Unattributed {
+            kind,
+            reason,
+            detail,
+        }
     })?;
-    verify_tmux_observation(&observed.resources, &expected).map_err(|detail| {
-        NativeInitialStepError::ObservationMismatch { kind, detail }
-    })?;
+    verify_tmux_observation(&observed.resources, &expected)
+        .map_err(|detail| NativeInitialStepError::ObservationMismatch { kind, detail })?;
     Ok(NativeInitialObservation::Tmux {
         resources: observed.resources,
         outcome: observed.outcome,
@@ -241,21 +263,38 @@ impl super::RuntimeManager {
         snapshot: &phoenix_core::domain::close::CloseRetirementSnapshot,
     ) -> Result<tokio::time::Instant, NativeInitialStepError> {
         let leases = self.close_retirement_leases.lock().await;
-        if scopes.is_empty() || scopes.iter().collect::<std::collections::BTreeSet<_>>().len() != scopes.len()
-            || leases.complete.keys().filter(|(candidate, _)| candidate == attempt).count() != scopes.len() {
+        if scopes.is_empty()
+            || scopes
+                .iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len()
+                != scopes.len()
+            || leases
+                .complete
+                .keys()
+                .filter(|(candidate, _)| candidate == attempt)
+                .count()
+                != scopes.len()
+        {
             return Err(NativeInitialStepError::SealedInventoryMismatch);
         }
         let mut deadline = None;
         for scope in scopes {
-            let lease = leases.complete.get(&(attempt.to_string(), scope.clone()))
+            let lease = leases
+                .complete
+                .get(&(attempt.to_string(), scope.clone()))
                 .ok_or(NativeInitialStepError::MissingLease)?;
-            let bound = lease.capture_evidence.as_ref()
+            let bound = lease
+                .capture_evidence
+                .as_ref()
                 .ok_or(NativeInitialStepError::MissingLease)?;
             if !bound.verifies_scope(scope, snapshot) {
                 return Err(NativeInitialStepError::SealedInventoryMismatch);
             }
             let original = bound.deadline();
-            deadline = Some(deadline.map_or(original, |previous: tokio::time::Instant| previous.min(original)));
+            deadline = Some(deadline.map_or(original, |previous: tokio::time::Instant| {
+                previous.min(original)
+            }));
         }
         deadline.ok_or(NativeInitialStepError::MissingLease)
     }
@@ -280,14 +319,24 @@ impl super::RuntimeManager {
             RetiredResourceKind::BrowserSession => NativeInitialProcessStep::Browser,
             _ => return Err(NativeInitialStepError::SealedInventoryMismatch),
         };
-        if inventory.iter().any(|item| item.attempt_id != run.attempt_id
-            || item.scope != scope || item.snapshot != snapshot || item.resource.kind() != kind) {
+        if inventory.iter().any(|item| {
+            item.attempt_id != run.attempt_id
+                || item.scope != scope
+                || item.snapshot != snapshot
+                || item.resource.kind() != kind
+        }) {
             return Err(NativeInitialStepError::SealedInventoryMismatch);
         }
-        let sealed_inventory = inventory.into_iter().map(|item| item.resource).collect::<Vec<_>>();
+        let sealed_inventory = inventory
+            .into_iter()
+            .map(|item| item.resource)
+            .collect::<Vec<_>>();
         let mut leases = self.close_retirement_leases.lock().await;
         // Lock contention must not carry a launch past fatal authority loss.
-        if self.fatal_local_authority_fence.fatal_authority_loss_is_latched() {
+        if self
+            .fatal_local_authority_fence
+            .fatal_authority_loss_is_latched()
+        {
             return Err(NativeInitialStepError::FatalAuthority);
         }
         let key = (run.attempt_id.as_str().to_string(), scope);
@@ -296,13 +345,20 @@ impl super::RuntimeManager {
         };
         enter_native_initial_kind(
             &lease.resources,
-            lease.capture_evidence.as_ref().map(|binding| binding.snapshot()),
+            lease
+                .capture_evidence
+                .as_ref()
+                .map(|binding| binding.snapshot()),
             &mut lease.native_initial_entered,
             &snapshot,
             step,
             &sealed_inventory,
         )?;
-        let mut executor = super::LiveCloseProcessStepExecutor { manager: self, lease, browser_custody };
+        let mut executor = super::LiveCloseProcessStepExecutor {
+            manager: self,
+            lease,
+            browser_custody,
+        };
         execute_one_kind(&mut executor, step, &sealed_inventory).await
     }
 }
@@ -322,17 +378,30 @@ mod tests {
                 NativeInitialProcessStep::Browser,
             ]
         );
-        assert_eq!(NativeInitialProcessStep::Bash.retired_kind(), RetiredResourceKind::BashProcessGroup);
-        assert_eq!(NativeInitialProcessStep::Tmux.retired_kind(), RetiredResourceKind::TmuxServer);
-        assert_eq!(NativeInitialProcessStep::Terminal.retired_kind(), RetiredResourceKind::PtySession);
-        assert_eq!(NativeInitialProcessStep::Browser.retired_kind(), RetiredResourceKind::BrowserSession);
+        assert_eq!(
+            NativeInitialProcessStep::Bash.retired_kind(),
+            RetiredResourceKind::BashProcessGroup
+        );
+        assert_eq!(
+            NativeInitialProcessStep::Tmux.retired_kind(),
+            RetiredResourceKind::TmuxServer
+        );
+        assert_eq!(
+            NativeInitialProcessStep::Terminal.retired_kind(),
+            RetiredResourceKind::PtySession
+        );
+        assert_eq!(
+            NativeInitialProcessStep::Browser.retired_kind(),
+            RetiredResourceKind::BrowserSession
+        );
     }
 
     #[test]
     fn process_matching_is_exact_and_does_not_accept_duplicate_observations() {
         let identity = OpaqueIdentity::parse("bash:1").expect("valid identity");
-        let resource = super::super::opaque_resource(RetiredResourceKind::BashProcessGroup, "bash:1".into());
-        let expected = [ &resource ];
+        let resource =
+            super::super::opaque_resource(RetiredResourceKind::BashProcessGroup, "bash:1".into());
+        let expected = [&resource];
         assert!(verify_process_observation(std::slice::from_ref(&identity), &expected).is_ok());
         assert!(verify_process_observation(&[], &expected).is_err());
         assert!(verify_process_observation(&[identity.clone(), identity], &expected).is_err());
@@ -357,7 +426,10 @@ mod tests {
         assert!(inventories_match(&inventory, &[b.clone(), a.clone()]));
         assert!(!inventories_match(&inventory, &[a.clone()]));
         let extra = resource(RetiredResourceKind::BrowserSession, "browser:1");
-        assert!(!inventories_match(&inventory, &[a.clone(), b.clone(), extra]));
+        assert!(!inventories_match(
+            &inventory,
+            &[a.clone(), b.clone(), extra]
+        ));
         assert!(!inventories_match(&inventory, &[a.clone(), a.clone()]));
     }
 
@@ -379,27 +451,60 @@ mod tests {
 
     #[async_trait::async_trait]
     impl CloseProcessStepExecutor for FakeExecutor {
-        async fn retire_bash(&mut self) -> Result<super::super::CloseObservedProcessRetirement, super::super::CloseProcessStepFailure> {
+        async fn retire_bash(
+            &mut self,
+        ) -> Result<
+            super::super::CloseObservedProcessRetirement,
+            super::super::CloseProcessStepFailure,
+        > {
             self.calls.push("bash");
             if self.fail_bash {
-                return Err(super::super::CloseProcessStepFailure { resources: Vec::new(), reason: "first failure".into() });
+                return Err(super::super::CloseProcessStepFailure {
+                    resources: Vec::new(),
+                    reason: "first failure".into(),
+                });
             }
-            Ok(super::super::CloseObservedProcessRetirement { identities: Vec::new(), outcome: CloseProcessStepOutcome::Retired })
+            Ok(super::super::CloseObservedProcessRetirement {
+                identities: Vec::new(),
+                outcome: CloseProcessStepOutcome::Retired,
+            })
         }
-        async fn retire_tmux(&mut self) -> Result<super::super::CloseObservedTmuxRetirement, (RetirementFailureReason, String)> {
+        async fn retire_tmux(
+            &mut self,
+        ) -> Result<super::super::CloseObservedTmuxRetirement, (RetirementFailureReason, String)>
+        {
             self.calls.push("tmux");
-            Ok(super::super::CloseObservedTmuxRetirement { resources: Vec::new(), outcome: RetirementOutcome::Retired })
+            Ok(super::super::CloseObservedTmuxRetirement {
+                resources: Vec::new(),
+                outcome: RetirementOutcome::Retired,
+            })
         }
-        async fn retire_terminal(&mut self) -> Result<super::super::CloseObservedProcessRetirement, super::super::CloseProcessStepFailure> {
+        async fn retire_terminal(
+            &mut self,
+        ) -> Result<
+            super::super::CloseObservedProcessRetirement,
+            super::super::CloseProcessStepFailure,
+        > {
             self.calls.push("terminal");
             if self.stall_terminal {
                 std::future::pending::<()>().await;
             }
-            Ok(super::super::CloseObservedProcessRetirement { identities: Vec::new(), outcome: CloseProcessStepOutcome::Retired })
+            Ok(super::super::CloseObservedProcessRetirement {
+                identities: Vec::new(),
+                outcome: CloseProcessStepOutcome::Retired,
+            })
         }
-        async fn retire_browser(&mut self) -> Result<super::super::CloseObservedProcessRetirement, super::super::CloseProcessStepFailure> {
+        async fn retire_browser(
+            &mut self,
+        ) -> Result<
+            super::super::CloseObservedProcessRetirement,
+            super::super::CloseProcessStepFailure,
+        > {
             self.calls.push("browser");
-            Ok(super::super::CloseObservedProcessRetirement { identities: Vec::new(), outcome: CloseProcessStepOutcome::Retired })
+            Ok(super::super::CloseObservedProcessRetirement {
+                identities: Vec::new(),
+                outcome: CloseProcessStepOutcome::Retired,
+            })
         }
     }
 
@@ -407,17 +512,36 @@ mod tests {
     async fn one_kind_executor_calls_only_requested_step_and_stops_on_first_failure() {
         let mut executor = FakeExecutor::default();
         let result = execute_one_kind(&mut executor, NativeInitialProcessStep::Terminal, &[]).await;
-        assert!(matches!(result, Ok(NativeInitialObservation::Process { kind: CloseProcessResourceKind::PtySession, .. })));
+        assert!(matches!(
+            result,
+            Ok(NativeInitialObservation::Process {
+                kind: CloseProcessResourceKind::PtySession,
+                ..
+            })
+        ));
         assert_eq!(executor.calls, ["terminal"]);
 
         let mismatch = resource(RetiredResourceKind::BrowserSession, "browser:1");
         let mut executor = FakeExecutor::default();
-        assert!(matches!(execute_one_kind(&mut executor, NativeInitialProcessStep::Browser, &[mismatch]).await, Err(NativeInitialStepError::ObservationMismatch { .. })));
+        assert!(matches!(
+            execute_one_kind(
+                &mut executor,
+                NativeInitialProcessStep::Browser,
+                &[mismatch]
+            )
+            .await,
+            Err(NativeInitialStepError::ObservationMismatch { .. })
+        ));
         assert_eq!(executor.calls, ["browser"]);
 
-        let mut executor = FakeExecutor { fail_bash: true, ..FakeExecutor::default() };
+        let mut executor = FakeExecutor {
+            fail_bash: true,
+            ..FakeExecutor::default()
+        };
         let result = execute_one_kind(&mut executor, NativeInitialProcessStep::Bash, &[]).await;
-        assert!(matches!(result, Err(NativeInitialStepError::ProcessFailure { detail, .. }) if detail == "first failure"));
+        assert!(
+            matches!(result, Err(NativeInitialStepError::ProcessFailure { detail, .. }) if detail == "first failure")
+        );
         assert_eq!(executor.calls, ["bash"]);
     }
 
@@ -429,7 +553,14 @@ mod tests {
         step: NativeInitialProcessStep,
         inventory: &[RetiredResourceIdentity],
     ) -> Result<NativeInitialObservation, NativeInitialStepError> {
-        enter_native_initial_kind(lease_resources, Some(snapshot), entered, snapshot, step, inventory)?;
+        enter_native_initial_kind(
+            lease_resources,
+            Some(snapshot),
+            entered,
+            snapshot,
+            step,
+            inventory,
+        )?;
         execute_one_kind(executor, step, inventory).await
     }
 
@@ -443,9 +574,15 @@ mod tests {
         let mut entered = Vec::new();
         let mut executor = FakeExecutor::default();
         let step = NativeInitialProcessStep::Tmux;
-        assert!(try_enter_and_execute(&mut executor, &mut entered, &[], &snapshot, step, &[]).await.is_ok());
-        assert!(matches!(try_enter_and_execute(&mut executor, &mut entered, &[], &snapshot, step, &[]).await,
-            Err(NativeInitialStepError::AlreadyEntered)));
+        assert!(
+            try_enter_and_execute(&mut executor, &mut entered, &[], &snapshot, step, &[])
+                .await
+                .is_ok()
+        );
+        assert!(matches!(
+            try_enter_and_execute(&mut executor, &mut entered, &[], &snapshot, step, &[]).await,
+            Err(NativeInitialStepError::AlreadyEntered)
+        ));
         assert_eq!(executor.calls, ["tmux"]);
         assert_eq!(entered, [RetiredResourceKind::TmuxServer]);
     }
@@ -457,20 +594,63 @@ mod tests {
         let resource = resource(RetiredResourceKind::BashProcessGroup, "bash:1");
         let inventory = [resource];
         let mut entered = Vec::new();
-        let mut executor = FakeExecutor { fail_bash: true, ..FakeExecutor::default() };
+        let mut executor = FakeExecutor {
+            fail_bash: true,
+            ..FakeExecutor::default()
+        };
         let step = NativeInitialProcessStep::Bash;
-        assert!(matches!(enter_native_initial_kind(&inventory, Some(&other), &mut entered, &snapshot, step, &inventory),
-            Err(NativeInitialStepError::SealedInventoryMismatch)));
-        assert!(matches!(enter_native_initial_kind(&inventory, None, &mut entered, &snapshot, step, &inventory),
-            Err(NativeInitialStepError::SealedInventoryMismatch)));
-        assert!(matches!(enter_native_initial_kind(&inventory, Some(&snapshot), &mut entered, &snapshot, step, &[]),
-            Err(NativeInitialStepError::SealedInventoryMismatch)));
+        assert!(matches!(
+            enter_native_initial_kind(
+                &inventory,
+                Some(&other),
+                &mut entered,
+                &snapshot,
+                step,
+                &inventory
+            ),
+            Err(NativeInitialStepError::SealedInventoryMismatch)
+        ));
+        assert!(matches!(
+            enter_native_initial_kind(&inventory, None, &mut entered, &snapshot, step, &inventory),
+            Err(NativeInitialStepError::SealedInventoryMismatch)
+        ));
+        assert!(matches!(
+            enter_native_initial_kind(
+                &inventory,
+                Some(&snapshot),
+                &mut entered,
+                &snapshot,
+                step,
+                &[]
+            ),
+            Err(NativeInitialStepError::SealedInventoryMismatch)
+        ));
         assert!(entered.is_empty());
         assert!(executor.calls.is_empty());
-        assert!(matches!(try_enter_and_execute(&mut executor, &mut entered, &inventory, &snapshot, step, &inventory).await,
-            Err(NativeInitialStepError::ProcessFailure { .. })));
-        assert!(matches!(try_enter_and_execute(&mut executor, &mut entered, &inventory, &snapshot, step, &inventory).await,
-            Err(NativeInitialStepError::AlreadyEntered)));
+        assert!(matches!(
+            try_enter_and_execute(
+                &mut executor,
+                &mut entered,
+                &inventory,
+                &snapshot,
+                step,
+                &inventory
+            )
+            .await,
+            Err(NativeInitialStepError::ProcessFailure { .. })
+        ));
+        assert!(matches!(
+            try_enter_and_execute(
+                &mut executor,
+                &mut entered,
+                &inventory,
+                &snapshot,
+                step,
+                &inventory
+            )
+            .await,
+            Err(NativeInitialStepError::AlreadyEntered)
+        ));
         assert_eq!(executor.calls, ["bash"]);
     }
 
@@ -478,22 +658,32 @@ mod tests {
     async fn dropped_pending_physical_future_does_not_restore_entry() {
         let snapshot = snapshot("original");
         let mut entered = Vec::new();
-        let mut executor = FakeExecutor { stall_terminal: true, ..FakeExecutor::default() };
+        let mut executor = FakeExecutor {
+            stall_terminal: true,
+            ..FakeExecutor::default()
+        };
         let step = NativeInitialProcessStep::Terminal;
         {
-            let future = try_enter_and_execute(&mut executor, &mut entered, &[], &snapshot, step, &[]);
+            let future =
+                try_enter_and_execute(&mut executor, &mut entered, &[], &snapshot, step, &[]);
             tokio::pin!(future);
-            assert!(matches!(futures::poll!(future.as_mut()), std::task::Poll::Pending));
+            assert!(matches!(
+                futures::poll!(future.as_mut()),
+                std::task::Poll::Pending
+            ));
         }
         assert_eq!(executor.calls, ["terminal"]);
-        assert!(matches!(try_enter_and_execute(&mut executor, &mut entered, &[], &snapshot, step, &[]).await,
-            Err(NativeInitialStepError::AlreadyEntered)));
+        assert!(matches!(
+            try_enter_and_execute(&mut executor, &mut entered, &[], &snapshot, step, &[]).await,
+            Err(NativeInitialStepError::AlreadyEntered)
+        ));
         assert_eq!(executor.calls, ["terminal"]);
     }
 
     #[test]
     fn tmux_matching_is_exact() {
-        let resource = super::super::opaque_resource(RetiredResourceKind::TmuxServer, "tmux:1".into());
+        let resource =
+            super::super::opaque_resource(RetiredResourceKind::TmuxServer, "tmux:1".into());
         assert!(verify_tmux_observation(&[resource.clone()], &[&resource]).is_ok());
         assert!(verify_tmux_observation(&[], &[&resource]).is_err());
     }

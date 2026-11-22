@@ -1,13 +1,10 @@
 //! Source-owned post-process continuation over the captured original inventory.
 
 use phoenix_core::domain::close::{
-    CloseExpectedRetirementResource, CloseObligation, CloseRetirementSnapshot,
-    RetiredResourceKind,
+    CloseExpectedRetirementResource, CloseObligation, CloseRetirementSnapshot, RetiredResourceKind,
 };
 use phoenix_core::domain::sm_state::ConvState;
-use phoenix_core::work_scope::{
-    ResourceScopeKey, WorkScopeId, WorkScopeRetirementOutcome,
-};
+use phoenix_core::work_scope::{ResourceScopeKey, WorkScopeId, WorkScopeRetirementOutcome};
 use phoenix_db::native_close::{NativeCloseCommand, NativeCloseReceipt};
 use phoenix_db::workflow::LocalAuthorityResult;
 use phoenix_db::{Database, DbError, DbResult, RecordCloseRetirementDispatchRequest};
@@ -79,20 +76,30 @@ impl PostRetirement {
         }
         if original_inventory.iter().any(|resource| {
             resource.snapshot != snapshot
-                || original_inventory.first().is_some_and(|first| first.attempt_id != resource.attempt_id)
+                || original_inventory
+                    .first()
+                    .is_some_and(|first| first.attempt_id != resource.attempt_id)
         }) {
             return Err("post-process cursor differs from captured attempt or snapshot".into());
         }
-        let scope_resources: Vec<_> = original_inventory.iter()
+        let scope_resources: Vec<_> = original_inventory
+            .iter()
             .filter(|resource| resource.resource.kind() == RetiredResourceKind::WorkScope)
             .collect();
-        if scope_resources.len() != scope_order.len() || scope_order.iter().any(|scope| {
-            scope_resources.iter().filter(|resource| &resource.scope == scope).count() != 1
-        }) || scope_resources.iter().any(|resource| {
-            !matches!(resource.resource.identity(),
+        if scope_resources.len() != scope_order.len()
+            || scope_order.iter().any(|scope| {
+                scope_resources
+                    .iter()
+                    .filter(|resource| &resource.scope == scope)
+                    .count()
+                    != 1
+            })
+            || scope_resources.iter().any(|resource| {
+                !matches!(resource.resource.identity(),
                 phoenix_core::domain::close::LossItemIdentity::Opaque(identity)
                     if identity.as_str() == resource.scope.as_str())
-        }) {
+            })
+        {
             return Err("captured WorkScope resources do not match captured scope order".into());
         }
         Ok(Self {
@@ -130,9 +137,11 @@ impl PostRetirement {
         }
         // A captured Worktree is not evidence of absence and has no supported adapter.
         // Keep the complete original inventory attached to this blocked cursor.
-        if self.original_inventory.iter().any(|resource| {
-            resource.resource.kind() == RetiredResourceKind::Worktree
-        }) {
+        if self
+            .original_inventory
+            .iter()
+            .any(|resource| resource.resource.kind() == RetiredResourceKind::Worktree)
+        {
             self.stage = Stage::Blocked;
             tracing::warn!(
                 attempt_id = %receipt.admitted.attempt_id,
@@ -144,7 +153,9 @@ impl PostRetirement {
         if matches!(&self.stage, Stage::Finalizing) {
             return match run_authoritative_command(&mut self.stage, || {
                 db.complete_native_close_initial(command, receipt, live_source)
-            }).await {
+            })
+            .await
+            {
                 AuthoritativeCommand::Established(Ok(obligation)) => {
                     self.stage = Stage::Completed(obligation.clone());
                     Ok(PostRetirementStep::Completed(obligation))
@@ -158,7 +169,8 @@ impl PostRetirement {
             self.stage = Stage::Finalizing;
             return Ok(PostRetirementStep::Retiring);
         };
-        if resource.attempt_id != receipt.admitted.attempt_id || resource.snapshot != self.snapshot {
+        if resource.attempt_id != receipt.admitted.attempt_id || resource.snapshot != self.snapshot
+        {
             return Err(DbError::CloseFoundationPrecondition(
                 "post-retirement cursor differs from admitted original inventory".into(),
             ));
@@ -177,7 +189,9 @@ impl PostRetirement {
                         resource: resource.resource.clone(),
                     },
                 )
-            }).await {
+            })
+            .await
+            {
                 AuthoritativeCommand::Established(Ok(())) => {
                     self.stage = Stage::Retiring;
                     Ok(PostRetirementStep::Retiring)
@@ -189,7 +203,10 @@ impl PostRetirement {
 
         // Reconcile the exact original proof before checking live preconditions:
         // a lost successful reply must not turn retirement into a new failure.
-        let evidence = match db.list_close_retirement_evidence(resource.attempt_id.as_str()).await {
+        let evidence = match db
+            .list_close_retirement_evidence(resource.attempt_id.as_str())
+            .await
+        {
             Ok(evidence) => evidence,
             Err(error) => {
                 tracing::warn!(%error, "native initial scope proof read unclassified");
@@ -197,20 +214,34 @@ impl PostRetirement {
             }
         };
         if evidence.iter().any(|proof| {
-            proof.attempt_id == resource.attempt_id && proof.scope == resource.scope
-                && proof.snapshot == resource.snapshot && proof.resource == resource.resource
-                && matches!(&proof.outcome, phoenix_core::domain::close::RetirementOutcome::Retired
-                    | phoenix_core::domain::close::RetirementOutcome::AbsenceAdopted { .. })
+            proof.attempt_id == resource.attempt_id
+                && proof.scope == resource.scope
+                && proof.snapshot == resource.snapshot
+                && proof.resource == resource.resource
+                && matches!(
+                    &proof.outcome,
+                    phoenix_core::domain::close::RetirementOutcome::Retired
+                        | phoenix_core::domain::close::RetirementOutcome::AbsenceAdopted { .. }
+                )
         }) {
             self.scope_index += 1;
-            self.stage = if self.scope_index == self.scope_order.len() { Stage::Finalizing } else { Stage::Dispatch };
+            self.stage = if self.scope_index == self.scope_order.len() {
+                Stage::Finalizing
+            } else {
+                Stage::Dispatch
+            };
             return Ok(PostRetirementStep::Retiring);
         }
-        let precondition = match backend.native_initial_work_scope_precondition(
-            &ResourceScopeKey::Work(resource.scope.clone()),
-        ).await {
-            crate::runtime::close_retirement::NativeInitialWorkScopePrecondition::Ready(value) => value,
-            crate::runtime::close_retirement::NativeInitialWorkScopePrecondition::Failed(detail) => {
+        let precondition = match backend
+            .native_initial_work_scope_precondition(&ResourceScopeKey::Work(resource.scope.clone()))
+            .await
+        {
+            crate::runtime::close_retirement::NativeInitialWorkScopePrecondition::Ready(value) => {
+                value
+            }
+            crate::runtime::close_retirement::NativeInitialWorkScopePrecondition::Failed(
+                detail,
+            ) => {
                 tracing::warn!(%detail, "native initial WorkScope retirement blocked");
                 self.stage = Stage::Blocked;
                 return Ok(PostRetirementStep::Blocked);
@@ -230,7 +261,9 @@ impl PostRetirement {
                 precondition,
                 "native initial Close WorkScope retirement",
             )
-        }).await {
+        })
+        .await
+        {
             AuthoritativeCommand::Established(Ok(WorkScopeRetirementOutcome::Retired)) => {
                 self.scope_index += 1;
                 self.stage = if self.scope_index == self.scope_order.len() {
@@ -246,7 +279,7 @@ impl PostRetirement {
                 Ok(PostRetirementStep::Blocked)
             }
             AuthoritativeCommand::Established(Err(error)) => Err(error),
-            AuthoritativeCommand::FatalAuthority => Ok(PostRetirementStep::FatalAuthority)
+            AuthoritativeCommand::FatalAuthority => Ok(PostRetirementStep::FatalAuthority),
         }
     }
 }
@@ -255,8 +288,8 @@ impl PostRetirement {
 mod tests {
     use super::*;
     use phoenix_core::domain::close::{
-        CloseAttemptId, GitPathIdentity, LossItemIdentity, OpaqueIdentity,
-        RetiredResourceIdentity, WorktreeFingerprint, WorktreeId, WorktreeIdentity,
+        CloseAttemptId, GitPathIdentity, LossItemIdentity, OpaqueIdentity, RetiredResourceIdentity,
+        WorktreeFingerprint, WorktreeId, WorktreeIdentity,
     };
 
     fn resource(kind: RetiredResourceKind, identity: &str) -> CloseExpectedRetirementResource {
@@ -268,12 +301,14 @@ mod tests {
                     WorktreeFingerprint::parse("fingerprint").unwrap(),
                     GitPathIdentity::from_bytes(b"worktree".to_vec()),
                 )),
-            ).unwrap()
+            )
+            .unwrap()
         } else {
             RetiredResourceIdentity::parse(
                 kind,
                 LossItemIdentity::Opaque(OpaqueIdentity::parse(identity).unwrap()),
-            ).unwrap()
+            )
+            .unwrap()
         };
         CloseExpectedRetirementResource {
             attempt_id: CloseAttemptId::parse("attempt").unwrap(),
@@ -285,21 +320,23 @@ mod tests {
 
     #[tokio::test]
     async fn unclassified_command_is_latched_and_later_operation_is_not_invoked() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
         use phoenix_db::workflow::LocalAuthorityResult;
+        use std::sync::atomic::{AtomicUsize, Ordering};
 
         let mut stage = Stage::Dispatch;
         let calls = AtomicUsize::new(0);
         let first = run_authoritative_command(&mut stage, || {
             calls.fetch_add(1, Ordering::SeqCst);
             std::future::ready(LocalAuthorityResult::<()>::DurableFactUnclassified)
-        }).await;
+        })
+        .await;
         assert!(matches!(first, AuthoritativeCommand::FatalAuthority));
         assert!(matches!(stage, Stage::FatalAuthority));
         let second = run_authoritative_command(&mut stage, || {
             calls.fetch_add(1, Ordering::SeqCst);
             std::future::ready(LocalAuthorityResult::DurableFactEstablished(()))
-        }).await;
+        })
+        .await;
         assert!(matches!(second, AuthoritativeCommand::FatalAuthority));
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         // This proves classifier/dispatch behavior only, not real SQLite uncertainty.
@@ -315,9 +352,10 @@ mod tests {
         let snapshot = inventory[0].snapshot.clone();
         let cursor = PostRetirement::new(inventory.clone(), vec![scope], snapshot).unwrap();
         assert_eq!(cursor.original_inventory, inventory);
-        assert!(cursor.original_inventory.iter().any(|item| {
-            item.resource.kind() == RetiredResourceKind::Worktree
-        }));
+        assert!(cursor
+            .original_inventory
+            .iter()
+            .any(|item| { item.resource.kind() == RetiredResourceKind::Worktree }));
     }
 
     #[test]

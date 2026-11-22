@@ -1,20 +1,35 @@
 //! Actor-owned runtime-process cursor. No worktree or scope completion authority.
 
-use super::{NativeCloseApplicationError, NativeCloseInitialContinuation, NativeCloseInitialContinuationPhase as Phase};
-use crate::runtime::close_retirement::native_initial::{NativeInitialObservation, NativeInitialProcessStep, NativeInitialStepError};
-use crate::runtime::close_retirement::native_initial::resource::{NativeInitialPreparedEntry, ResourceObserver};
-use phoenix_core::domain::close::{AbsenceBasis, CloseExpectedRetirementResource, CloseRunRef, LossItemIdentity, RetiredResourceIdentity, RetiredResourceKind, RetirementOutcome};
-use phoenix_core::work_scope::WorkScopeId;
-use phoenix_db::{CloseProcessStepOutcome, CloseProcessStepSuccess, RecordCloseRetirementDispatchRequest, RecordCloseRetirementEvidenceRequest};
-use phoenix_db::workflow::LocalAuthorityResult;
-use std::sync::Arc;
+use super::{
+    NativeCloseApplicationError, NativeCloseInitialContinuation,
+    NativeCloseInitialContinuationPhase as Phase,
+};
+use crate::runtime::close_retirement::native_initial::resource::{
+    NativeInitialPreparedEntry, ResourceObserver,
+};
+use crate::runtime::close_retirement::native_initial::{
+    NativeInitialObservation, NativeInitialProcessStep, NativeInitialStepError,
+};
 use futures::FutureExt;
+use phoenix_core::domain::close::{
+    AbsenceBasis, CloseExpectedRetirementResource, CloseRunRef, LossItemIdentity,
+    RetiredResourceIdentity, RetiredResourceKind, RetirementOutcome,
+};
+use phoenix_core::work_scope::WorkScopeId;
+use phoenix_db::workflow::LocalAuthorityResult;
+use phoenix_db::{
+    CloseProcessStepOutcome, CloseProcessStepSuccess, RecordCloseRetirementDispatchRequest,
+    RecordCloseRetirementEvidenceRequest,
+};
+use std::sync::Arc;
 
 /// The retained task owns release classification even after its observer goes
 /// away. Only preparation tasks are abortable; entry replies are observations.
 fn spawn_retained_entry(
     backend: Arc<crate::runtime::RuntimeManager>,
-    entry: impl std::future::Future<Output = Result<ResourceObserver, NativeInitialStepError>> + Send + 'static,
+    entry: impl std::future::Future<Output = Result<ResourceObserver, NativeInitialStepError>>
+        + Send
+        + 'static,
 ) -> tokio::task::JoinHandle<Result<ResourceObserver, NativeInitialStepError>> {
     tokio::spawn(async move {
         let result = match std::panic::AssertUnwindSafe(entry).catch_unwind().await {
@@ -27,7 +42,6 @@ fn spawn_retained_entry(
         result
     })
 }
-
 
 #[derive(Debug)]
 enum BlockedProcess {
@@ -43,7 +57,8 @@ pub(super) struct ProcessRetirement {
     kind_index: usize,
     dispatch_index: usize,
     // Only inert preparation belongs to the actor and may be aborted.
-    worker: Option<tokio::task::JoinHandle<Result<NativeInitialPreparedEntry, NativeInitialStepError>>>,
+    worker:
+        Option<tokio::task::JoinHandle<Result<NativeInitialPreparedEntry, NativeInitialStepError>>>,
     // Entry may already have crossed the first-effect boundary. Never abort it
     // when Stop, source loss, or a response cancellation interrupts this cursor.
     entry: Option<tokio::task::JoinHandle<Result<ResourceObserver, NativeInitialStepError>>>,
@@ -59,46 +74,102 @@ pub(super) struct ProcessRetirement {
 
 impl ProcessRetirement {
     pub(super) fn has_resources(&self) -> bool {
-        self.inventory.iter().any(|item| NativeInitialProcessStep::ORDERED.iter()
-            .any(|step| item.resource.kind() == step.retired_kind()))
+        self.inventory.iter().any(|item| {
+            NativeInitialProcessStep::ORDERED
+                .iter()
+                .any(|step| item.resource.kind() == step.retired_kind())
+        })
     }
 
-    pub(super) fn captured_binding(&self) -> (&[WorkScopeId], &phoenix_core::domain::close::CloseRetirementSnapshot) {
+    pub(super) fn captured_binding(
+        &self,
+    ) -> (
+        &[WorkScopeId],
+        &phoenix_core::domain::close::CloseRetirementSnapshot,
+    ) {
         (&self.scopes, &self.snapshot)
     }
     pub(super) fn captured_inventory(&self) -> &[CloseExpectedRetirementResource] {
         &self.inventory
     }
 
-    pub(super) fn new(inventory: Vec<CloseExpectedRetirementResource>, scopes: Vec<WorkScopeId>, snapshot: phoenix_core::domain::close::CloseRetirementSnapshot) -> Self {
-        Self { inventory, snapshot, scopes, scope_index: 0, kind_index: 0, dispatch_index: 0, worker: None, entry: None, resource_index: 0, observer: None, pending: None, evidence_index: 0, process_receipt_recorded: false, blocked: None, retry_backoff: false }
+    pub(super) fn new(
+        inventory: Vec<CloseExpectedRetirementResource>,
+        scopes: Vec<WorkScopeId>,
+        snapshot: phoenix_core::domain::close::CloseRetirementSnapshot,
+    ) -> Self {
+        Self {
+            inventory,
+            snapshot,
+            scopes,
+            scope_index: 0,
+            kind_index: 0,
+            dispatch_index: 0,
+            worker: None,
+            entry: None,
+            resource_index: 0,
+            observer: None,
+            pending: None,
+            evidence_index: 0,
+            process_receipt_recorded: false,
+            blocked: None,
+            retry_backoff: false,
+        }
     }
 
     pub(super) fn service_delay(&self) -> std::time::Duration {
         // Give ordinary events a service opportunity after each bounded cursor
         // mutation, without spending the original two-second tmux permit budget
         // on a quarter-second sleep for every dispatch/evidence row.
-        if self.retry_backoff { std::time::Duration::from_millis(250) }
-        else if self.worker.as_ref().is_some_and(|worker| !worker.is_finished())
-            || self.entry.as_ref().is_some_and(|worker| !worker.is_finished()) { std::time::Duration::from_millis(10) }
-        else { std::time::Duration::from_millis(1) }
+        if self.retry_backoff {
+            std::time::Duration::from_millis(250)
+        } else if self
+            .worker
+            .as_ref()
+            .is_some_and(|worker| !worker.is_finished())
+            || self
+                .entry
+                .as_ref()
+                .is_some_and(|worker| !worker.is_finished())
+        {
+            std::time::Duration::from_millis(10)
+        } else {
+            std::time::Duration::from_millis(1)
+        }
     }
 
     pub(super) fn abort(&self) {
-        if let Some(worker) = &self.worker { worker.abort(); }
+        if let Some(worker) = &self.worker {
+            worker.abort();
+        }
     }
 
     pub(super) async fn abort_and_join(&mut self) {
         self.abort();
-        if let Some(worker) = self.worker.take() { let _ = worker.await; }
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.await;
+        }
     }
 
     fn current(&self) -> Option<(WorkScopeId, NativeInitialProcessStep)> {
-        self.scopes.get(self.scope_index).map(|scope| (scope.clone(), NativeInitialProcessStep::ORDERED[self.kind_index]))
+        self.scopes.get(self.scope_index).map(|scope| {
+            (
+                scope.clone(),
+                NativeInitialProcessStep::ORDERED[self.kind_index],
+            )
+        })
     }
 
-    fn current_resources(&self, scope: &WorkScopeId, step: NativeInitialProcessStep) -> Vec<CloseExpectedRetirementResource> {
-        self.inventory.iter().filter(|item| &item.scope == scope && item.resource.kind() == step.retired_kind()).cloned().collect()
+    fn current_resources(
+        &self,
+        scope: &WorkScopeId,
+        step: NativeInitialProcessStep,
+    ) -> Vec<CloseExpectedRetirementResource> {
+        self.inventory
+            .iter()
+            .filter(|item| &item.scope == scope && item.resource.kind() == step.retired_kind())
+            .cloned()
+            .collect()
     }
 
     fn advance(&mut self) {
@@ -117,14 +188,20 @@ impl ProcessRetirement {
 }
 
 impl NativeCloseInitialContinuation {
-    pub(super) async fn step_process_retirement(&mut self, live_source: &phoenix_core::domain::sm_state::ConvState) -> Result<Phase, NativeCloseApplicationError> {
+    pub(super) async fn step_process_retirement(
+        &mut self,
+        live_source: &phoenix_core::domain::sm_state::ConvState,
+    ) -> Result<Phase, NativeCloseApplicationError> {
         if !self.live_source_matches(live_source) {
             self.abort_and_join_inventory_preparation().await;
             self.phase = Phase::InspectionRequired;
             return Err(NativeCloseApplicationError::SourceRefused);
         }
         // Keep the cursor in the continuation across every await/error path.
-        let progress = self.process_retirement.as_mut().expect("captured inventory owns runtime cursor");
+        let progress = self
+            .process_retirement
+            .as_mut()
+            .expect("captured inventory owns runtime cursor");
         if progress.blocked.is_some() {
             self.phase = Phase::ProcessRetirementBlocked;
             return Ok(self.phase);
@@ -136,16 +213,32 @@ impl NativeCloseInitialContinuation {
         let resources = progress.current_resources(&scope, step);
         progress.retry_backoff = false;
         if let Some(resource) = resources.get(progress.dispatch_index) {
-            match self.db.record_native_close_initial_retirement_dispatch(&self.command, &self.receipt, live_source, RecordCloseRetirementDispatchRequest {
-                attempt_id: resource.attempt_id.clone(), scope: resource.scope.clone(), snapshot: resource.snapshot.clone(), resource: resource.resource.clone(),
-            }).await {
-                LocalAuthorityResult::DurableFactEstablished(Ok(())) => { progress.dispatch_index += 1; }
+            match self
+                .db
+                .record_native_close_initial_retirement_dispatch(
+                    &self.command,
+                    &self.receipt,
+                    live_source,
+                    RecordCloseRetirementDispatchRequest {
+                        attempt_id: resource.attempt_id.clone(),
+                        scope: resource.scope.clone(),
+                        snapshot: resource.snapshot.clone(),
+                        resource: resource.resource.clone(),
+                    },
+                )
+                .await
+            {
+                LocalAuthorityResult::DurableFactEstablished(Ok(())) => {
+                    progress.dispatch_index += 1;
+                }
                 LocalAuthorityResult::DurableFactEstablished(Err(error)) => {
                     // No effect has started for this kind; retry this immutable dispatch only.
                     tracing::warn!(%error, "native initial runtime dispatch rolled back; retaining cursor");
                     progress.retry_backoff = true;
                 }
-                LocalAuthorityResult::DurableFactUnclassified => return Err(NativeCloseApplicationError::FatalAuthority),
+                LocalAuthorityResult::DurableFactUnclassified => {
+                    return Err(NativeCloseApplicationError::FatalAuthority)
+                }
             }
             return Ok(self.phase);
         }
@@ -158,18 +251,26 @@ impl NativeCloseInitialContinuation {
         let resources = vec![resource.clone()];
         if progress.pending.is_none() && progress.observer.is_none() {
             if let Some(entry) = &progress.entry {
-                if !entry.is_finished() { return Ok(self.phase); }
+                if !entry.is_finished() {
+                    return Ok(self.phase);
+                }
                 match progress.entry.take().expect("entry handle retained").await {
                     Ok(Ok(observer)) => progress.observer = Some(observer),
-                    Ok(Err(NativeInitialStepError::FatalAuthority)) => return Err(NativeCloseApplicationError::FatalAuthority),
+                    Ok(Err(NativeInitialStepError::FatalAuthority)) => {
+                        return Err(NativeCloseApplicationError::FatalAuthority)
+                    }
                     Ok(Err(error)) => progress.blocked = Some(BlockedProcess::Worker(error)),
                     Err(error) => progress.blocked = Some(BlockedProcess::Join(error.to_string())),
                 }
-                if progress.blocked.is_some() { self.phase = Phase::ProcessRetirementBlocked; }
+                if progress.blocked.is_some() {
+                    self.phase = Phase::ProcessRetirementBlocked;
+                }
                 return Ok(self.phase);
             }
             if progress.worker.is_none() {
-                let Some(owner) = self.authority.owner.as_mut() else { return Err(NativeCloseApplicationError::SourceRefused); };
+                let Some(owner) = self.authority.owner.as_mut() else {
+                    return Err(NativeCloseApplicationError::SourceRefused);
+                };
                 let source_custody = owner.reborrow();
                 let target_custody = std::sync::Arc::clone(&self._target_gate);
                 let backend = std::sync::Arc::clone(&self.backend);
@@ -177,15 +278,29 @@ impl NativeCloseInitialContinuation {
                     std::sync::Arc::new((source_custody, target_custody)),
                 );
                 progress.worker = Some(tokio::spawn(async move {
-                    backend.prepare_native_initial_resource(resource, custody).await
+                    backend
+                        .prepare_native_initial_resource(resource, custody)
+                        .await
                 }));
                 return Ok(self.phase);
             }
-            if !progress.worker.as_ref().is_some_and(tokio::task::JoinHandle::is_finished) { return Ok(self.phase); }
-            let result = progress.worker.take().expect("preparation owns inert worker").await;
+            if !progress
+                .worker
+                .as_ref()
+                .is_some_and(tokio::task::JoinHandle::is_finished)
+            {
+                return Ok(self.phase);
+            }
+            let result = progress
+                .worker
+                .take()
+                .expect("preparation owns inert worker")
+                .await;
             let prepared = match result {
                 Ok(Ok(prepared)) => prepared,
-                Ok(Err(NativeInitialStepError::FatalAuthority)) => return Err(NativeCloseApplicationError::FatalAuthority),
+                Ok(Err(NativeInitialStepError::FatalAuthority)) => {
+                    return Err(NativeCloseApplicationError::FatalAuthority)
+                }
                 other => {
                     let blocked = match other {
                         Ok(Err(error)) => BlockedProcess::Worker(error),
@@ -200,7 +315,9 @@ impl NativeCloseInitialContinuation {
             // No SQLite callback waits for locks or polls an effect. Missing DB
             // return/release keeps the independently retained owner quarantined.
             let Some(source_entry) = self.source_entry.clone() else {
-                progress.blocked = Some(BlockedProcess::Worker(NativeInitialStepError::FatalAuthority));
+                progress.blocked = Some(BlockedProcess::Worker(
+                    NativeInitialStepError::FatalAuthority,
+                ));
                 return Err(NativeCloseApplicationError::FatalAuthority);
             };
             let db = self.db.clone();
@@ -211,16 +328,27 @@ impl NativeCloseInitialContinuation {
             let durable_source = live_source.clone();
             let backend = Arc::clone(&self.backend);
             progress.entry = Some(spawn_retained_entry(backend, async move {
-                prepared.enter(&db, &command, &receipt, &durable_source, &source_entry).await
+                prepared
+                    .enter(&db, &command, &receipt, &durable_source, &source_entry)
+                    .await
             }));
             return Ok(self.phase);
         }
         if progress.pending.is_none() {
-            let mut observer = progress.observer.as_ref().expect("entered resource retains external observation").lock().await;
-            if !observer.task().is_finished() { return Ok(self.phase); }
+            let mut observer = progress
+                .observer
+                .as_ref()
+                .expect("entered resource retains external observation")
+                .lock()
+                .await;
+            if !observer.task().is_finished() {
+                return Ok(self.phase);
+            }
             match observer.observe().await {
                 Ok(Ok(observation)) => progress.pending = Some(observation),
-                Ok(Err(NativeInitialStepError::FatalAuthority)) => return Err(NativeCloseApplicationError::FatalAuthority),
+                Ok(Err(NativeInitialStepError::FatalAuthority)) => {
+                    return Err(NativeCloseApplicationError::FatalAuthority)
+                }
                 Ok(Err(error)) => progress.blocked = Some(BlockedProcess::Worker(error)),
                 Err(error) => progress.blocked = Some(BlockedProcess::Join(format!("{error:?}"))),
             }
@@ -229,25 +357,56 @@ impl NativeCloseInitialContinuation {
                 return Ok(self.phase);
             }
         }
-        let observation = progress.pending.as_ref().expect("finished worker retains observation");
+        let observation = progress
+            .pending
+            .as_ref()
+            .expect("finished worker retains observation");
         // The worker verifies exact membership; additionally tie each returned
         // observation to the actor's currently dispatched kind before any write.
         let (process, outcome) = match observation {
-            NativeInitialObservation::Process { kind, identities, outcome, observed_at_us } => {
+            NativeInitialObservation::Process {
+                kind,
+                identities,
+                outcome,
+                observed_at_us,
+            } => {
                 let expected_kind = match step {
-                    NativeInitialProcessStep::Bash => phoenix_db::CloseProcessResourceKind::BashProcessGroup,
-                    NativeInitialProcessStep::Terminal => phoenix_db::CloseProcessResourceKind::PtySession,
-                    NativeInitialProcessStep::Browser => phoenix_db::CloseProcessResourceKind::BrowserSession,
-                    NativeInitialProcessStep::Tmux => return Err(NativeCloseApplicationError::FatalAuthority),
+                    NativeInitialProcessStep::Bash => {
+                        phoenix_db::CloseProcessResourceKind::BashProcessGroup
+                    }
+                    NativeInitialProcessStep::Terminal => {
+                        phoenix_db::CloseProcessResourceKind::PtySession
+                    }
+                    NativeInitialProcessStep::Browser => {
+                        phoenix_db::CloseProcessResourceKind::BrowserSession
+                    }
+                    NativeInitialProcessStep::Tmux => {
+                        return Err(NativeCloseApplicationError::FatalAuthority)
+                    }
                 };
-                if *kind != expected_kind || identities.len() != resources.len() { return Err(NativeCloseApplicationError::FatalAuthority); }
-                (Some((*kind, identities, *outcome, *observed_at_us)), match outcome {
-                    CloseProcessStepOutcome::Retired => RetirementOutcome::Retired,
-                    CloseProcessStepOutcome::AbsenceVerified => RetirementOutcome::AbsenceAdopted { absence_basis: AbsenceBasis::SameAttemptPriorRetirement },
-                })
+                if *kind != expected_kind || identities.len() != resources.len() {
+                    return Err(NativeCloseApplicationError::FatalAuthority);
+                }
+                (
+                    Some((*kind, identities, *outcome, *observed_at_us)),
+                    match outcome {
+                        CloseProcessStepOutcome::Retired => RetirementOutcome::Retired,
+                        CloseProcessStepOutcome::AbsenceVerified => {
+                            RetirementOutcome::AbsenceAdopted {
+                                absence_basis: AbsenceBasis::SameAttemptPriorRetirement,
+                            }
+                        }
+                    },
+                )
             }
-            NativeInitialObservation::Tmux { resources: observed, outcome, .. } => {
-                if step != NativeInitialProcessStep::Tmux || observed.len() != resources.len() { return Err(NativeCloseApplicationError::FatalAuthority); }
+            NativeInitialObservation::Tmux {
+                resources: observed,
+                outcome,
+                ..
+            } => {
+                if step != NativeInitialProcessStep::Tmux || observed.len() != resources.len() {
+                    return Err(NativeCloseApplicationError::FatalAuthority);
+                }
                 (None, outcome.clone())
             }
         };
@@ -256,22 +415,62 @@ impl NativeCloseInitialContinuation {
             return Ok(self.phase);
         };
         if let Some((kind, identities, process_outcome, observed_at_us)) = process {
-            let LossItemIdentity::Opaque(identity) = resource.resource.identity() else { return Err(NativeCloseApplicationError::FatalAuthority); };
-            if !identities.contains(identity) { return Err(NativeCloseApplicationError::FatalAuthority); }
+            let LossItemIdentity::Opaque(identity) = resource.resource.identity() else {
+                return Err(NativeCloseApplicationError::FatalAuthority);
+            };
+            if !identities.contains(identity) {
+                return Err(NativeCloseApplicationError::FatalAuthority);
+            }
             if !progress.process_receipt_recorded {
-                match self.db.record_native_close_initial_process_step_success(&self.command, &self.receipt, live_source, resource.snapshot.clone(), CloseProcessStepSuccess {
-                    run: CloseRunRef::initial(self.receipt.admitted.attempt_id.clone()), scope: scope.clone(), resource_kind: kind, identity: identity.clone(), outcome: process_outcome, observed_at_us,
-                }).await {
-                    LocalAuthorityResult::DurableFactEstablished(Ok(())) => progress.process_receipt_recorded = true,
-                    LocalAuthorityResult::DurableFactEstablished(Err(error)) => { progress.retry_backoff = true; tracing::warn!(%error, "native initial process evidence rolled back; retrying evidence only"); }
-                    LocalAuthorityResult::DurableFactUnclassified => return Err(NativeCloseApplicationError::FatalAuthority),
+                match self
+                    .db
+                    .record_native_close_initial_process_step_success(
+                        &self.command,
+                        &self.receipt,
+                        live_source,
+                        resource.snapshot.clone(),
+                        CloseProcessStepSuccess {
+                            run: CloseRunRef::initial(self.receipt.admitted.attempt_id.clone()),
+                            scope: scope.clone(),
+                            resource_kind: kind,
+                            identity: identity.clone(),
+                            outcome: process_outcome,
+                            observed_at_us,
+                        },
+                    )
+                    .await
+                {
+                    LocalAuthorityResult::DurableFactEstablished(Ok(())) => {
+                        progress.process_receipt_recorded = true
+                    }
+                    LocalAuthorityResult::DurableFactEstablished(Err(error)) => {
+                        progress.retry_backoff = true;
+                        tracing::warn!(%error, "native initial process evidence rolled back; retrying evidence only");
+                    }
+                    LocalAuthorityResult::DurableFactUnclassified => {
+                        return Err(NativeCloseApplicationError::FatalAuthority)
+                    }
                 }
                 return Ok(self.phase);
             }
         }
-        match self.db.record_native_close_initial_retirement_evidence(&self.command, &self.receipt, live_source, RecordCloseRetirementEvidenceRequest {
-            attempt_id: resource.attempt_id.clone(), scope: resource.scope.clone(), snapshot: resource.snapshot.clone(), resource: resource.resource.clone(), outcome, detail: None,
-        }).await {
+        match self
+            .db
+            .record_native_close_initial_retirement_evidence(
+                &self.command,
+                &self.receipt,
+                live_source,
+                RecordCloseRetirementEvidenceRequest {
+                    attempt_id: resource.attempt_id.clone(),
+                    scope: resource.scope.clone(),
+                    snapshot: resource.snapshot.clone(),
+                    resource: resource.resource.clone(),
+                    outcome,
+                    detail: None,
+                },
+            )
+            .await
+        {
             LocalAuthorityResult::DurableFactEstablished(Ok(())) => {
                 // Observation is durable before selecting the next original
                 // resource. Never rerun an effect to retry evidence persistence.
@@ -280,8 +479,13 @@ impl NativeCloseInitialContinuation {
                 progress.observer = None;
                 progress.process_receipt_recorded = false;
             }
-            LocalAuthorityResult::DurableFactEstablished(Err(error)) => { progress.retry_backoff = true; tracing::warn!(%error, "native initial retirement evidence rolled back; retrying evidence only"); }
-            LocalAuthorityResult::DurableFactUnclassified => return Err(NativeCloseApplicationError::FatalAuthority),
+            LocalAuthorityResult::DurableFactEstablished(Err(error)) => {
+                progress.retry_backoff = true;
+                tracing::warn!(%error, "native initial retirement evidence rolled back; retrying evidence only");
+            }
+            LocalAuthorityResult::DurableFactUnclassified => {
+                return Err(NativeCloseApplicationError::FatalAuthority)
+            }
         }
         Ok(self.phase)
     }
@@ -296,7 +500,9 @@ mod tests {
         let backend = Arc::new(crate::runtime::RuntimeManager::new(
             phoenix_db::Database::open_in_memory().await.unwrap(),
             Arc::new(phoenix_llm::ModelRegistry::new_empty()),
-            crate::platform::PlatformCapability::None { details: "retained entry test".into() },
+            crate::platform::PlatformCapability::None {
+                details: "retained entry test".into(),
+            },
             Arc::new(crate::tools::mcp::McpClientManager::new()),
             None,
         ));
@@ -311,9 +517,13 @@ mod tests {
         drop(task);
         assert!(!backend.fatal_local_authority_fence.is_closed());
         release.send(()).unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(30), fatal.changed()).await
-            .expect("detached entry must publish its fatal classification").unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(30), fatal.changed())
+            .await
+            .expect("detached entry must publish its fatal classification")
+            .unwrap();
         assert_eq!(*fatal.borrow(), Some("native_close_initial_retained_entry"));
-        assert!(backend.fatal_local_authority_fence.fatal_authority_loss_is_latched());
+        assert!(backend
+            .fatal_local_authority_fence
+            .fatal_authority_loss_is_latched());
     }
 }

@@ -18,8 +18,9 @@ use phoenix_db::Database;
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot, Mutex};
 
-mod registered_disposable_path;
+mod bash_native_success;
 mod bash_stage2_stop_ack;
+mod registered_disposable_path;
 
 const TARGET_ID: &str = "native-close-target";
 
@@ -275,7 +276,10 @@ fn install_source_entry_for_test(
         fixture.command.clone(),
         tokio::time::Instant::now() + std::time::Duration::from_secs(30),
     );
-    assert_eq!(controller.revalidate(&harness.runtime.state, &fixture.command), ActorEntryResult::Updated);
+    assert_eq!(
+        controller.revalidate(&harness.runtime.state, &fixture.command),
+        ActorEntryResult::Updated
+    );
     let worker = controller.worker();
     harness.runtime.native_close_source_entry = Some(controller);
     worker
@@ -288,15 +292,23 @@ async fn native_close_source_entry_is_revoked_by_acknowledged_stop_in_real_actor
     let mut harness = fixture.runtime(true);
     let worker = install_source_entry_for_test(&mut harness, &fixture);
     // Prove this was an open cell, not an initially refusing test double.
-    assert_eq!(worker.try_first_effect(&fixture.command, || ()), WorkerEntryResult::Ran(()));
+    assert_eq!(
+        worker.try_first_effect(&fixture.command, || ()),
+        WorkerEntryResult::Ran(())
+    );
     let (sender, running) = start_actor(&mut harness);
     stop_actor(&sender).await;
     let mut effects = 0;
-    assert_eq!(worker.try_first_effect(&fixture.command, || effects += 1), WorkerEntryResult::Refused);
+    assert_eq!(
+        worker.try_first_effect(&fixture.command, || effects += 1),
+        WorkerEntryResult::Refused
+    );
     assert_eq!(effects, 0);
     harness.event_tx.send(Event::Shutdown).await.unwrap();
-    tokio::time::timeout(std::time::Duration::from_secs(10), running).await
-        .expect("actor must exit after acknowledged Stop").unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(10), running)
+        .await
+        .expect("actor must exit after acknowledged Stop")
+        .unwrap();
 }
 
 #[tokio::test]
@@ -305,13 +317,21 @@ async fn native_close_source_entry_is_revoked_by_shutdown_in_real_actor() {
     let fixture = CloseFixture::new().await;
     let mut harness = fixture.runtime(true);
     let worker = install_source_entry_for_test(&mut harness, &fixture);
-    assert_eq!(worker.try_first_effect(&fixture.command, || ()), WorkerEntryResult::Ran(()));
+    assert_eq!(
+        worker.try_first_effect(&fixture.command, || ()),
+        WorkerEntryResult::Ran(())
+    );
     let (_sender, running) = start_actor(&mut harness);
     harness.event_tx.send(Event::Shutdown).await.unwrap();
-    tokio::time::timeout(std::time::Duration::from_secs(10), running).await
-        .expect("shutdown must settle the real actor").unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(10), running)
+        .await
+        .expect("shutdown must settle the real actor")
+        .unwrap();
     let mut effects = 0;
-    assert_eq!(worker.try_first_effect(&fixture.command, || effects += 1), WorkerEntryResult::Refused);
+    assert_eq!(
+        worker.try_first_effect(&fixture.command, || effects += 1),
+        WorkerEntryResult::Refused
+    );
     assert_eq!(effects, 0);
 }
 
@@ -321,10 +341,19 @@ async fn native_close_source_entry_cannot_reopen_after_live_state_replacement() 
     let fixture = CloseFixture::new().await;
     let mut harness = fixture.runtime(true);
     let worker = install_source_entry_for_test(&mut harness, &fixture);
-    harness.runtime.install_live_state(ConvState::Idle, chrono::Utc::now(), false).unwrap();
-    harness.runtime.install_live_state(fixture.state.clone(), chrono::Utc::now(), false).unwrap();
+    harness
+        .runtime
+        .install_live_state(ConvState::Idle, chrono::Utc::now(), false)
+        .unwrap();
+    harness
+        .runtime
+        .install_live_state(fixture.state.clone(), chrono::Utc::now(), false)
+        .unwrap();
     let mut effects = 0;
-    assert_eq!(worker.try_first_effect(&fixture.command, || effects += 1), WorkerEntryResult::Refused);
+    assert_eq!(
+        worker.try_first_effect(&fixture.command, || effects += 1),
+        WorkerEntryResult::Refused
+    );
     assert_eq!(effects, 0);
 }
 
@@ -1628,7 +1657,8 @@ async fn acknowledged_stop_revokes_captured_terminal_entry_while_db_pool_is_unav
 }
 
 #[tokio::test]
-async fn acknowledged_stop_revokes_captured_terminal_entry_while_independent_sqlite_writer_is_held() {
+async fn acknowledged_stop_revokes_captured_terminal_entry_while_independent_sqlite_writer_is_held()
+{
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("native-close.db");
     let db = Database::open(path.to_str().unwrap()).await.unwrap();
@@ -1643,56 +1673,91 @@ async fn run_acknowledged_stop_revokes_captured_terminal_entry(
     fixture: CloseFixture,
     independent_writer_path: Option<&std::path::Path>,
 ) {
-    use phoenix_terminal::session::{ShellIntegrationStatus, StopReason, TerminalChildKind,
-        TerminalHandle, TerminalLaunchIdentity, TerminalRetirementRequest};
-    use phoenix_terminal::command_tracker::CommandTracker;
     use crate::runtime::close_retirement::native_initial::resource::TerminalEntryTestHook;
+    use phoenix_terminal::command_tracker::CommandTracker;
+    use phoenix_terminal::session::{
+        ShellIntegrationStatus, StopReason, TerminalChildKind, TerminalHandle,
+        TerminalLaunchIdentity, TerminalRetirementRequest,
+    };
     use sqlx::Connection;
 
-    let scope = fixture.db.get_work_scopes_for_conversation(fixture.target.as_str())
-        .await.unwrap().remove(0);
+    let scope = fixture
+        .db
+        .get_work_scopes_for_conversation(fixture.target.as_str())
+        .await
+        .unwrap()
+        .remove(0);
     let backend = CloseFixture::backend(fixture.db.clone());
     let fd: std::os::fd::OwnedFd = std::fs::OpenOptions::new()
-        .read(true).write(true).open("/dev/null").unwrap().into();
+        .read(true)
+        .write(true)
+        .open("/dev/null")
+        .unwrap()
+        .into();
     let (stop_tx, _) = tokio::sync::watch::channel(StopReason::Running);
     let terminal = TerminalHandle {
         master_fd: std::sync::Mutex::new(Some(fd)),
         child_pid: nix::unistd::Pid::from_raw(1),
         child_lifecycle: phoenix_terminal::child_lifecycle::TerminalChildLifecycle::passive(),
         launch_identity: TerminalLaunchIdentity {
-            process: phoenix_core::process_identity::ProcessIdentity { pid: 1, start_time: 1 },
+            process: phoenix_core::process_identity::ProcessIdentity {
+                pid: 1,
+                start_time: 1,
+            },
             launch_uuid: "native-close-blocked-terminal-test".into(),
         },
         child_kind: TerminalChildKind::Shell,
-        tracker: Arc::new(std::sync::Mutex::new(CommandTracker::new("close-blocked-terminal".to_string()))),
+        tracker: Arc::new(std::sync::Mutex::new(CommandTracker::new(
+            "close-blocked-terminal".to_string(),
+        ))),
         shell_integration_status: Arc::new(std::sync::Mutex::new(ShellIntegrationStatus::Unknown)),
         stop_tx,
         attach_permit: Arc::new(tokio::sync::Semaphore::new(1)),
         retirement_requested: TerminalRetirementRequest::default(),
     };
     let key = phoenix_core::resource_scope::ResourceScopeKey::Work(scope.clone());
-    let terminal = backend.terminals.try_insert_exact(key.clone(), terminal).unwrap();
+    let terminal = backend
+        .terminals
+        .try_insert_exact(key.clone(), terminal)
+        .unwrap();
     let (reached, reached_rx) = oneshot::channel::<bool>();
     let (resume, resume_rx) = oneshot::channel();
     let (pending, pending_rx) = oneshot::channel();
     let (callback, callback_rx) = oneshot::channel();
     let (completed, completed_rx) = oneshot::channel();
-    backend.set_terminal_entry_test_hook(TerminalEntryTestHook {
-        scope, reached: Some(reached), resume: resume_rx,
-        pending: Some(pending), callback: Some(callback), completed: Some(completed),
-    }).await;
+    backend
+        .set_terminal_entry_test_hook(TerminalEntryTestHook {
+            scope,
+            reached: Some(reached),
+            resume: resume_rx,
+            pending: Some(pending),
+            callback: Some(callback),
+            completed: Some(completed),
+        })
+        .await;
     let mut harness = fixture.runtime(true);
     let admitted = harness.runtime.admit_authoritative_effect().unwrap();
     let sender = setup_actor_queue(&mut harness);
     let gate = Arc::new(Mutex::new(()));
     let (response, reply) = oneshot::channel();
-    sender.send(initial_request_with_backend(
-        admitted, &fixture, gate.lock_owned().await, response, Arc::clone(&backend),
-    )).await.unwrap();
+    sender
+        .send(initial_request_with_backend(
+            admitted,
+            &fixture,
+            gate.lock_owned().await,
+            response,
+            Arc::clone(&backend),
+        ))
+        .await
+        .unwrap();
     let actor = spawn_actor(&mut harness);
-    assert!(tokio::time::timeout(Duration::from_secs(30), reached_rx).await
-        .expect("captured Terminal never reached DB-entry boundary").unwrap(),
-        "source cell was not eligible, unrevoked, and before its original deadline at DB wait");
+    assert!(
+        tokio::time::timeout(Duration::from_secs(30), reached_rx)
+            .await
+            .expect("captured Terminal never reached DB-entry boundary")
+            .unwrap(),
+        "source cell was not eligible, unrevoked, and before its original deadline at DB wait"
+    );
     // InMemoryStorage lets actor Stop settle independently. Durable ToolExecuting
     // source is NOT changed: DB rejection must not mask a broken live source gate.
     enum HeldWriter {
@@ -1705,57 +1770,97 @@ async fn run_acknowledged_stop_revokes_captured_terminal_entry(
                 .filename(path)
                 .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
                 .busy_timeout(Duration::ZERO);
-            let mut connection = sqlx::SqliteConnection::connect_with(&options).await.unwrap();
-            sqlx::query("BEGIN IMMEDIATE").execute(&mut connection).await.unwrap();
+            let mut connection = sqlx::SqliteConnection::connect_with(&options)
+                .await
+                .unwrap();
+            sqlx::query("BEGIN IMMEDIATE")
+                .execute(&mut connection)
+                .await
+                .unwrap();
             // Explicitly distinguish external SQLite writer contention from an
             // exhausted application pool: acquire and return a pool connection now.
             drop(fixture.db.pool().acquire().await.unwrap());
             HeldWriter::Independent(connection)
         }
-        None => HeldWriter::Pool(fixture.db.pool().begin_with("BEGIN IMMEDIATE").await.unwrap()),
+        None => HeldWriter::Pool(
+            fixture
+                .db
+                .pool()
+                .begin_with("BEGIN IMMEDIATE")
+                .await
+                .unwrap(),
+        ),
     };
     resume.send(()).unwrap();
     // In the independent-writer variant, this proves that the same entry
     // future's first poll returned Pending while the app pool was available.
     // It does not prove SQLx's worker had reached SQLite BEGIN IMMEDIATE then.
-    assert!(tokio::time::timeout(Duration::from_secs(30), pending_rx).await
-        .expect("entry did not poll its DB future").unwrap());
+    assert!(tokio::time::timeout(Duration::from_secs(30), pending_rx)
+        .await
+        .expect("entry did not poll its DB future")
+        .unwrap());
     stop_actor(&sender).await;
     let untouched = || {
         assert!(!terminal.retirement_requested.is_requested());
         assert_eq!(*terminal.stop_tx.borrow(), StopReason::Running);
         assert!(terminal.master_fd_raw().is_some());
-        assert!(Arc::ptr_eq(&terminal, &backend.terminals.get(&key).unwrap()));
+        assert!(Arc::ptr_eq(
+            &terminal,
+            &backend.terminals.get(&key).unwrap()
+        ));
     };
     untouched();
     // Release before DB assertions/teardown; continue the SAME entry future.
     match writer {
         HeldWriter::Pool(writer) => writer.rollback().await.unwrap(),
         HeldWriter::Independent(mut connection) => {
-            sqlx::query("ROLLBACK").execute(&mut connection).await.unwrap();
+            sqlx::query("ROLLBACK")
+                .execute(&mut connection)
+                .await
+                .unwrap();
             connection.close().await.unwrap();
         }
     }
-    tokio::time::timeout(Duration::from_secs(30), completed_rx).await
-        .expect("retained Terminal entry did not settle after writer release").unwrap();
+    tokio::time::timeout(Duration::from_secs(30), completed_rx)
+        .await
+        .expect("retained Terminal entry did not settle after writer release")
+        .unwrap();
     untouched();
     // The pre-wait witness proves the source was open and before its original
     // deadline; this callback witness requires it already revoked, still before
     // that same deadline, and Refused. Together with the acknowledged Stop, this
     // supports source revocation on Stop (including controller Drop), but does not
     // claim the flag's unique cause: another concurrent source revoker could race.
-    assert_eq!(callback_rx.await.expect("DB validator never invoked the entry callback"), (true, true, true));
+    assert_eq!(
+        callback_rx
+            .await
+            .expect("DB validator never invoked the entry callback"),
+        (true, true, true)
+    );
     let attempt: String = sqlx::query_scalar(
         "SELECT attempt_id FROM native_close_initial_receipts WHERE request_id = ?1",
-    ).bind(fixture.command.request_id().to_string()).fetch_one(fixture.db.pool()).await.unwrap();
+    )
+    .bind(fixture.command.request_id().to_string())
+    .fetch_one(fixture.db.pool())
+    .await
+    .unwrap();
     let attempt = CloseAttemptId::new(attempt).unwrap();
-    assert!(fixture.db.list_close_retirement_evidence(&attempt).await.unwrap().is_empty());
-    assert!(matches!(backend.terminals.reserve_spawn(&key),
-        Err(phoenix_terminal::session::ActiveTerminalInsertError::RetirementFenced)));
+    assert!(fixture
+        .db
+        .list_close_retirement_evidence(&attempt)
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(matches!(
+        backend.terminals.reserve_spawn(&key),
+        Err(phoenix_terminal::session::ActiveTerminalInsertError::RetirementFenced)
+    ));
     drop(reply);
     sender.send(Message::Event(Event::Shutdown)).await.unwrap();
-    tokio::time::timeout(Duration::from_secs(30), actor).await
-        .expect("source actor did not shut down").unwrap();
+    tokio::time::timeout(Duration::from_secs(30), actor)
+        .await
+        .expect("source actor did not shut down")
+        .unwrap();
     // Refused original custody stays fenced until fixture epoch teardown. Never
     // reopen via legacy cancellation or complete the passive child for cleanup.
 }
@@ -2955,10 +3060,8 @@ async fn registered_close_waiting_for_target_gate_is_refused_after_source_stop()
     let fixture = CloseFixture::new().await;
     let backend = CloseFixture::backend(fixture.db.clone());
     let retriever = Arc::new(fixture.db.fts_retriever());
-    let read_service = crate::api::global_read::GlobalReadService::new(
-        fixture.db.clone(),
-        retriever,
-    );
+    let read_service =
+        crate::api::global_read::GlobalReadService::new(fixture.db.clone(), retriever);
     let send_chat = Arc::new(SendChatApplicationService::new(
         fixture.db.clone(),
         Arc::clone(&backend),

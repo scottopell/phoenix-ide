@@ -83,7 +83,11 @@ impl SourceEntryController {
         live_state: &ConvState,
         exact_original: &NativeCloseCommand,
     ) -> ActorEntryResult {
-        if self.shared.revoked.load(std::sync::atomic::Ordering::Acquire) {
+        if self
+            .shared
+            .revoked
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
             return ActorEntryResult::Refused;
         }
         let mut eligibility = match try_lock(&self.shared) {
@@ -138,7 +142,9 @@ impl Drop for SourceEntryController {
 impl SourceEntryWorker {
     #[cfg(test)]
     pub(crate) fn is_revoked_for_test(&self) -> bool {
-        self.shared.revoked.load(std::sync::atomic::Ordering::Acquire)
+        self.shared
+            .revoked
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Read-only witness for the terminal-entry test hook. Do not use `try_lock`:
@@ -146,7 +152,10 @@ impl SourceEntryWorker {
     /// behavior this observation is meant to witness.
     #[cfg(test)]
     pub(crate) fn is_eligible_unrevoked_before_deadline_for_test(&self) -> bool {
-        if self.shared.revoked.load(std::sync::atomic::Ordering::Acquire)
+        if self
+            .shared
+            .revoked
+            .load(std::sync::atomic::Ordering::Acquire)
             || Instant::now() >= self.shared.deadline
         {
             return false;
@@ -154,7 +163,10 @@ impl SourceEntryWorker {
         match self.shared.eligibility.try_lock() {
             Ok(eligibility) => {
                 *eligibility == Eligibility::Eligible
-                    && !self.shared.revoked.load(std::sync::atomic::Ordering::Acquire)
+                    && !self
+                        .shared
+                        .revoked
+                        .load(std::sync::atomic::Ordering::Acquire)
                     && Instant::now() < self.shared.deadline
             }
             Err(_) => false,
@@ -166,7 +178,6 @@ impl SourceEntryWorker {
     pub(crate) fn original_deadline_unexpired_for_test(&self) -> bool {
         Instant::now() < self.shared.deadline
     }
-
 
     /// Runs a synchronous first-effect step only while the actor-established
     /// original-source eligibility is held. The mutex guard spans the callback,
@@ -183,7 +194,10 @@ impl SourceEntryWorker {
             LockAttempt::Busy => return WorkerEntryResult::Busy,
             LockAttempt::Poisoned => return WorkerEntryResult::Refused,
         };
-        if self.shared.revoked.load(std::sync::atomic::Ordering::Acquire)
+        if self
+            .shared
+            .revoked
+            .load(std::sync::atomic::Ordering::Acquire)
             || *guard != Eligibility::Eligible
         {
             return WorkerEntryResult::Refused;
@@ -301,8 +315,14 @@ mod tests {
             WorkerEntryResult::Refused
         );
         assert!(!called);
-        assert_eq!(controller.revalidate(&state, &mismatched), ActorEntryResult::Refused);
-        assert_eq!(controller.revalidate(&state, &command), ActorEntryResult::Refused);
+        assert_eq!(
+            controller.revalidate(&state, &mismatched),
+            ActorEntryResult::Refused
+        );
+        assert_eq!(
+            controller.revalidate(&state, &command),
+            ActorEntryResult::Refused
+        );
         assert_eq!(
             worker.try_first_effect(&command, || called = true),
             WorkerEntryResult::Refused
@@ -317,8 +337,14 @@ mod tests {
             command.clone(),
             Instant::now() + std::time::Duration::from_secs(5),
         );
-        assert_eq!(controller.revalidate(&state, &command), ActorEntryResult::Updated);
-        assert_eq!(controller.revalidate(&state, &mismatched), ActorEntryResult::Refused);
+        assert_eq!(
+            controller.revalidate(&state, &command),
+            ActorEntryResult::Updated
+        );
+        assert_eq!(
+            controller.revalidate(&state, &mismatched),
+            ActorEntryResult::Refused
+        );
         let worker = controller.worker();
         let mut called = false;
         assert_eq!(
@@ -326,7 +352,10 @@ mod tests {
             WorkerEntryResult::Refused
         );
         assert!(!called);
-        assert_eq!(controller.revalidate(&state, &command), ActorEntryResult::Refused);
+        assert_eq!(
+            controller.revalidate(&state, &command),
+            ActorEntryResult::Refused
+        );
     }
 
     #[test]
@@ -336,7 +365,10 @@ mod tests {
             command.clone(),
             Instant::now() + std::time::Duration::from_secs(5),
         );
-        assert_eq!(controller.revalidate(&state, &command), ActorEntryResult::Updated);
+        assert_eq!(
+            controller.revalidate(&state, &command),
+            ActorEntryResult::Updated
+        );
         let worker = controller.worker();
         drop(controller);
         let mut called = false;
@@ -351,7 +383,10 @@ mod tests {
     fn expired_deadline_refuses_revalidation_and_worker_entry() {
         let (state, command, _) = fixture();
         let mut controller = SourceEntryController::new(command.clone(), Instant::now());
-        assert_eq!(controller.revalidate(&state, &command), ActorEntryResult::Refused);
+        assert_eq!(
+            controller.revalidate(&state, &command),
+            ActorEntryResult::Refused
+        );
         let worker = controller.worker();
         let mut called = false;
         assert_eq!(
@@ -368,14 +403,20 @@ mod tests {
             command.clone(),
             Instant::now() + std::time::Duration::from_secs(5),
         );
-        assert_eq!(controller.revalidate(&state, &command), ActorEntryResult::Updated);
+        assert_eq!(
+            controller.revalidate(&state, &command),
+            ActorEntryResult::Updated
+        );
         let worker = controller.worker();
         let result = worker.try_first_effect(&command, || {
             assert_eq!(controller.revoke(), ActorEntryResult::Busy);
             42
         });
         assert_eq!(result, WorkerEntryResult::Ran(42));
-        assert_eq!(worker.try_first_effect(&command, || ()), WorkerEntryResult::Refused);
+        assert_eq!(
+            worker.try_first_effect(&command, || ()),
+            WorkerEntryResult::Refused
+        );
     }
 
     #[test]
@@ -385,7 +426,10 @@ mod tests {
             command.clone(),
             Instant::now() + std::time::Duration::from_secs(5),
         );
-        assert_eq!(controller.revalidate(&state, &command), ActorEntryResult::Updated);
+        assert_eq!(
+            controller.revalidate(&state, &command),
+            ActorEntryResult::Updated
+        );
         let worker = controller.worker();
 
         let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -393,7 +437,10 @@ mod tests {
         }));
         assert!(panic.is_err());
 
-        assert_eq!(controller.revalidate(&state, &command), ActorEntryResult::Refused);
+        assert_eq!(
+            controller.revalidate(&state, &command),
+            ActorEntryResult::Refused
+        );
         assert_eq!(controller.revoke(), ActorEntryResult::Refused);
         let mut called = false;
         assert_eq!(
@@ -401,7 +448,10 @@ mod tests {
             WorkerEntryResult::Refused
         );
         assert!(!called);
-        assert_eq!(controller.revalidate(&state, &command), ActorEntryResult::Refused);
+        assert_eq!(
+            controller.revalidate(&state, &command),
+            ActorEntryResult::Refused
+        );
         assert_eq!(controller.revoke(), ActorEntryResult::Refused);
     }
 
@@ -412,7 +462,10 @@ mod tests {
             command.clone(),
             Instant::now() + std::time::Duration::from_secs(5),
         );
-        assert_eq!(controller.revalidate(&state, &command), ActorEntryResult::Updated);
+        assert_eq!(
+            controller.revalidate(&state, &command),
+            ActorEntryResult::Updated
+        );
         assert_eq!(controller.revoke(), ActorEntryResult::Updated);
         let worker = controller.worker();
         let mut called = false;

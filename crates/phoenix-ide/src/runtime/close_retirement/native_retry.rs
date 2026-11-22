@@ -43,9 +43,7 @@ fn native_retry_no_live_resources_result(
     match drain {
         NativeScopeRuntimeDrain::Drained => Ok(()),
         NativeScopeRuntimeDrain::Blocked => Err(NativeRetryNoLiveResourcesError::Blocked),
-        NativeScopeRuntimeDrain::Unclassified => {
-            Err(NativeRetryNoLiveResourcesError::Unclassified)
-        }
+        NativeScopeRuntimeDrain::Unclassified => Err(NativeRetryNoLiveResourcesError::Unclassified),
     }
 }
 
@@ -118,10 +116,16 @@ impl super::RuntimeManager {
                 "native initial Close requires a Work scope".into(),
             );
         };
-        match self.db().work_scope_has_unresolved_product_ownership(scope).await {
-            Ok(true) => return NativeInitialWorkScopePrecondition::Failed(
-                "work scope has unresolved ProductConversation ownership".into(),
-            ),
+        match self
+            .db()
+            .work_scope_has_unresolved_product_ownership(scope)
+            .await
+        {
+            Ok(true) => {
+                return NativeInitialWorkScopePrecondition::Failed(
+                    "work scope has unresolved ProductConversation ownership".into(),
+                )
+            }
             Ok(false) => {}
             Err(error) => {
                 tracing::warn!(%error, "native initial WorkScope ownership check unclassified");
@@ -132,7 +136,8 @@ impl super::RuntimeManager {
             NativeScopeRuntimeDrain::Drained => {}
             NativeScopeRuntimeDrain::Blocked => {
                 return NativeInitialWorkScopePrecondition::Failed(
-                    "initial Close scope still has a live runtime resource; target preserved".into(),
+                    "initial Close scope still has a live runtime resource; target preserved"
+                        .into(),
                 );
             }
             NativeScopeRuntimeDrain::Unclassified => {

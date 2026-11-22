@@ -10,10 +10,8 @@ async fn registered_close_captures_and_retires_disposable_empty_work_scope() {
     let fixture = CloseFixture::new().await;
     let backend = CloseFixture::backend(fixture.db.clone());
     let retriever = Arc::new(fixture.db.fts_retriever());
-    let read_service = crate::api::global_read::GlobalReadService::new(
-        fixture.db.clone(),
-        retriever,
-    );
+    let read_service =
+        crate::api::global_read::GlobalReadService::new(fixture.db.clone(), retriever);
     let send_chat = Arc::new(SendChatApplicationService::new(
         fixture.db.clone(),
         Arc::clone(&backend),
@@ -37,7 +35,9 @@ async fn registered_close_captures_and_retires_disposable_empty_work_scope() {
     let mut actor = ConversationRuntime::new(
         ConvContext::coordinator(&fixture.source_transcript_id, "test-model", 200_000, 16_384),
         fixture.state.clone(),
-        Arc::new(crate::runtime::traits::DatabaseStorage::new(fixture.db.clone())),
+        Arc::new(crate::runtime::traits::DatabaseStorage::new(
+            fixture.db.clone(),
+        )),
         Arc::new(MockLlmClient::new("test-model")),
         Arc::new(MockToolExecutor::new()),
         backend.browser_sessions().clone(),
@@ -98,13 +98,14 @@ async fn registered_close_captures_and_retires_disposable_empty_work_scope() {
         "product_conversation_id": fixture.target.as_str()
     });
 
-    let output = tokio::time::timeout(
-        std::time::Duration::from_secs(30),
-        tool.run(input, context),
-    )
-    .await
-    .expect("registered Close must finish its actor-owned lifecycle");
-    assert!(output.is_success(), "registered Close failed: {}", output.output());
+    let output = tokio::time::timeout(std::time::Duration::from_secs(30), tool.run(input, context))
+        .await
+        .expect("registered Close must finish its actor-owned lifecycle");
+    assert!(
+        output.is_success(),
+        "registered Close failed: {}",
+        output.output()
+    );
     assert_eq!(count(&fixture.db, "native_close_initial_receipts").await, 1);
 
     let attempt_id: String = sqlx::query_scalar(

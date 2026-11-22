@@ -2710,9 +2710,18 @@ where
         state_updated_at: DateTime<Utc>,
         publish: bool,
     ) -> Result<(), String> {
-        if self.native_close_source_entry.as_ref().is_some_and(|controller| !controller.matches_state(&state)) {
-            if self.native_close_source_entry.as_mut().expect("checked controller").revoke()
-                == native_close::source_entry::ActorEntryResult::Busy {
+        if self
+            .native_close_source_entry
+            .as_ref()
+            .is_some_and(|controller| !controller.matches_state(&state))
+        {
+            if self
+                .native_close_source_entry
+                .as_mut()
+                .expect("checked controller")
+                .revoke()
+                == native_close::source_entry::ActorEntryResult::Busy
+            {
                 return Err("Close first effect must finish before source replacement".into());
             }
         }
@@ -4726,7 +4735,11 @@ where
         ordinary_input_id: Option<&str>,
         authority: TransitionAuthority,
     ) -> Result<Vec<Event>, String> {
-        if self.native_close_source_entry.as_ref().is_some_and(|controller| !controller.matches_state(&result.new_state)) {
+        if self
+            .native_close_source_entry
+            .as_ref()
+            .is_some_and(|controller| !controller.matches_state(&result.new_state))
+        {
             self.revoke_native_close_source_entry().await;
         }
         let remaining = self.bash_wait_transition_remaining(&result.new_state);

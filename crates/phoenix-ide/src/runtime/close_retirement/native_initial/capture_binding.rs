@@ -36,12 +36,16 @@ impl CaptureEvidenceBinding {
         if &self.scope != scope || &self.aggregate != aggregate {
             return Err("original worktree capture scope or aggregate differs".into());
         }
-        let original = self.worktree.as_ref()
+        let original = self
+            .worktree
+            .as_ref()
             .ok_or("original capture has no worktree")?;
         if original != identity {
             return Err("original worktree capture full identity differs".into());
         }
-        let content = self.content.as_ref()
+        let content = self
+            .content
+            .as_ref()
             .ok_or("original worktree capture has no content inspection")?;
         Ok(OriginalWorktreeCapture {
             identity: original,
@@ -55,11 +59,18 @@ impl CaptureEvidenceBinding {
         &self.aggregate
     }
 
-    pub(in crate::runtime::close_retirement) fn verifies_request(&self, snapshot: &CloseRetirementSnapshot) -> bool {
+    pub(in crate::runtime::close_retirement) fn verifies_request(
+        &self,
+        snapshot: &CloseRetirementSnapshot,
+    ) -> bool {
         &self.aggregate == snapshot
     }
 
-    pub(in crate::runtime::close_retirement) fn verifies_scope(&self, scope: &WorkScopeId, snapshot: &CloseRetirementSnapshot) -> bool {
+    pub(in crate::runtime::close_retirement) fn verifies_scope(
+        &self,
+        scope: &WorkScopeId,
+        snapshot: &CloseRetirementSnapshot,
+    ) -> bool {
         &self.scope == scope && &self.aggregate == snapshot
     }
 
@@ -77,13 +88,21 @@ pub(in crate::runtime::close_retirement) struct ScopeCaptureEvidence {
 }
 
 impl ScopeCaptureEvidence {
-    pub(in crate::runtime::close_retirement) fn scope(&self) -> &WorkScopeId { &self.scope }
+    pub(in crate::runtime::close_retirement) fn scope(&self) -> &WorkScopeId {
+        &self.scope
+    }
 
-    pub(in crate::runtime::close_retirement) fn bind(&self, deadline: tokio::time::Instant) -> CaptureEvidenceBinding {
+    pub(in crate::runtime::close_retirement) fn bind(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> CaptureEvidenceBinding {
         CaptureEvidenceBinding {
             scope: self.scope.clone(),
-            aggregate: self.aggregate.clone(), worktree: self.worktree.clone(),
-            content: self.content.clone(), losses: self.losses.clone(), deadline,
+            aggregate: self.aggregate.clone(),
+            worktree: self.worktree.clone(),
+            content: self.content.clone(),
+            losses: self.losses.clone(),
+            deadline,
         }
     }
 }
@@ -96,7 +115,9 @@ pub(in crate::runtime::close_retirement) async fn read_capture_evidence(
     request: &CaptureCloseRetirementInventoryRequest,
     scopes: &[CloseAttemptScope],
 ) -> Result<Vec<ScopeCaptureEvidence>, String> {
-    let obligation = db.get_close_obligation(request.attempt_id.as_str()).await
+    let obligation = db
+        .get_close_obligation(request.attempt_id.as_str())
+        .await
         .map_err(|error| error.to_string())?;
     if obligation.attempt_id() != &request.attempt_id
         || obligation.phase() != ClosePhase::RetirementRequested
@@ -104,8 +125,10 @@ pub(in crate::runtime::close_retirement) async fn read_capture_evidence(
     {
         return Err("native capture requires the original RetirementRequested snapshot".into());
     }
-    let projection = db.get_active_close_projection_for_product(obligation.product_conversation_id())
-        .await.map_err(|error| error.to_string())?
+    let projection = db
+        .get_active_close_projection_for_product(obligation.product_conversation_id())
+        .await
+        .map_err(|error| error.to_string())?
         .ok_or("native capture has no active product projection")?;
     if projection.obligation.attempt_id() != &request.attempt_id
         || projection.obligation.phase() != ClosePhase::RetirementRequested
@@ -113,7 +136,14 @@ pub(in crate::runtime::close_retirement) async fn read_capture_evidence(
     {
         return Err("native capture projection is not the original requested attempt".into());
     }
-    validate_capture_evidence(&request.attempt_id, &request.snapshot, scopes, request, &projection.inspections, &projection.losses)
+    validate_capture_evidence(
+        &request.attempt_id,
+        &request.snapshot,
+        scopes,
+        request,
+        &projection.inspections,
+        &projection.losses,
+    )
 }
 
 fn validate_capture_evidence(
@@ -217,11 +247,17 @@ fn validate_capture_evidence(
 
 #[cfg(test)]
 pub(in crate::runtime::close_retirement) fn test_scope(
-    scope: WorkScopeId, aggregate: CloseRetirementSnapshot,
+    scope: WorkScopeId,
+    aggregate: CloseRetirementSnapshot,
 ) -> ScopeCaptureEvidence {
-    ScopeCaptureEvidence { scope, aggregate, worktree: None, content: None, losses: Vec::new() }
+    ScopeCaptureEvidence {
+        scope,
+        aggregate,
+        worktree: None,
+        content: None,
+        losses: Vec::new(),
+    }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -275,7 +311,10 @@ mod tests {
     }
 
     fn assert_rejected_as(error: String, expected: &str) {
-        assert!(error.contains(expected), "expected {expected:?}, got {error:?}");
+        assert!(
+            error.contains(expected),
+            "expected {expected:?}, got {error:?}"
+        );
     }
 
     fn validate_error(
@@ -322,10 +361,12 @@ mod tests {
             snapshot: aggregate,
             scopes: entries
                 .into_iter()
-                .map(|(scope, identity)| CaptureCloseRetirementInventoryScopeRequest {
-                    scope,
-                    inventory: inventory(identity),
-                })
+                .map(
+                    |(scope, identity)| CaptureCloseRetirementInventoryScopeRequest {
+                        scope,
+                        inventory: inventory(identity),
+                    },
+                )
                 .collect(),
         }
     }
@@ -373,7 +414,11 @@ mod tests {
         let scope_id = scope("scope-a");
         let identity = worktree("fingerprint-a", b"repo/\xff");
         let content = snapshot("content");
-        let inspections = [inspection(attempt.clone(), scope_id.clone(), content.clone())];
+        let inspections = [inspection(
+            attempt.clone(),
+            scope_id.clone(),
+            content.clone(),
+        )];
         let aggregate = aggregate_for(&inspections);
         let request = request(
             attempt.clone(),
@@ -386,7 +431,8 @@ mod tests {
             Some(CapturedWorktreeIdentity::Resolved(identity.clone())),
         )];
 
-        let evidence = validate(&attempt, &aggregate, &scopes, &request, &inspections, &[]).unwrap();
+        let evidence =
+            validate(&attempt, &aggregate, &scopes, &request, &inspections, &[]).unwrap();
 
         assert_eq!(evidence.len(), 1);
         assert_eq!(evidence[0].worktree, Some(identity));
@@ -396,12 +442,22 @@ mod tests {
     #[test]
     fn rejects_fingerprint_or_locator_inventory_changes() {
         for (captured, inventoried) in [
-            (worktree("fingerprint-a", b"repo"), worktree("fingerprint-b", b"repo")),
-            (worktree("fingerprint-a", b"repo-a"), worktree("fingerprint-a", b"repo-b")),
+            (
+                worktree("fingerprint-a", b"repo"),
+                worktree("fingerprint-b", b"repo"),
+            ),
+            (
+                worktree("fingerprint-a", b"repo-a"),
+                worktree("fingerprint-a", b"repo-b"),
+            ),
         ] {
             let attempt = attempt();
             let scope_id = scope("scope-a");
-            let inspections = [inspection(attempt.clone(), scope_id.clone(), snapshot("content"))];
+            let inspections = [inspection(
+                attempt.clone(),
+                scope_id.clone(),
+                snapshot("content"),
+            )];
             let aggregate = aggregate_for(&inspections);
             let request = request(
                 attempt.clone(),
@@ -438,11 +494,23 @@ mod tests {
             aggregate.clone(),
             vec![(unresolved_scope, None)],
         );
-        assert!(validate(&attempt, &aggregate, &unresolved, &unresolved_request, &[], &[]).is_err());
+        assert!(validate(
+            &attempt,
+            &aggregate,
+            &unresolved,
+            &unresolved_request,
+            &[],
+            &[]
+        )
+        .is_err());
 
         let plain_scope = scope("plain");
         let plain = [captured_scope(attempt.clone(), plain_scope.clone(), None)];
-        let plain_request = request(attempt.clone(), aggregate.clone(), vec![(plain_scope, None)]);
+        let plain_request = request(
+            attempt.clone(),
+            aggregate.clone(),
+            vec![(plain_scope, None)],
+        );
         assert!(validate(&attempt, &aggregate, &plain, &plain_request, &[], &[]).is_ok());
     }
 
@@ -473,7 +541,15 @@ mod tests {
             captured_scope(attempt.clone(), scope_a.clone(), None),
             captured_scope(attempt.clone(), scope_a, None),
         ];
-        assert!(validate(&attempt, &aggregate, &duplicate_scopes, &duplicate, &[], &[]).is_err());
+        assert!(validate(
+            &attempt,
+            &aggregate,
+            &duplicate_scopes,
+            &duplicate,
+            &[],
+            &[]
+        )
+        .is_err());
     }
 
     #[test]
@@ -487,7 +563,11 @@ mod tests {
             Some(CapturedWorktreeIdentity::Resolved(identity.clone())),
         )];
         let content = snapshot("content");
-        let inspections = [inspection(attempt.clone(), scope_id.clone(), content.clone())];
+        let inspections = [inspection(
+            attempt.clone(),
+            scope_id.clone(),
+            content.clone(),
+        )];
         let aggregate = aggregate_for(&inspections);
         let request = request(
             attempt.clone(),
@@ -500,7 +580,11 @@ mod tests {
             &aggregate,
             &scopes,
             &request,
-            &[inspection(foreign_attempt.clone(), scope_id.clone(), content.clone())],
+            &[inspection(
+                foreign_attempt.clone(),
+                scope_id.clone(),
+                content.clone()
+            )],
             &[],
         )
         .is_err());
@@ -512,7 +596,15 @@ mod tests {
                 b"new-file".to_vec(),
             )),
         };
-        assert!(validate(&attempt, &aggregate, &scopes, &request, &inspections, &[loss]).is_err());
+        assert!(validate(
+            &attempt,
+            &aggregate,
+            &scopes,
+            &request,
+            &inspections,
+            &[loss]
+        )
+        .is_err());
     }
 
     #[test]
@@ -526,7 +618,11 @@ mod tests {
             Some(CapturedWorktreeIdentity::Resolved(identity.clone())),
         )];
         let content = snapshot("content");
-        let inspections = [inspection(attempt.clone(), scope_id.clone(), content.clone())];
+        let inspections = [inspection(
+            attempt.clone(),
+            scope_id.clone(),
+            content.clone(),
+        )];
         let aggregate = aggregate_for(&inspections);
         let request = request(
             attempt.clone(),
@@ -584,8 +680,11 @@ mod tests {
             CloseRetirementSnapshot::parse("changed-generation", "original-content").unwrap(),
             snapshot("changed-content"),
         ] {
-            let changed_inspections =
-                [inspection(attempt.clone(), scope_id.clone(), changed.clone())];
+            let changed_inspections = [inspection(
+                attempt.clone(),
+                scope_id.clone(),
+                changed.clone(),
+            )];
             let changed_losses = [CloseInspectionLoss {
                 attempt_id: attempt.clone(),
                 scope: scope_id.clone(),
@@ -615,30 +714,57 @@ mod tests {
         let scope_b = scope("scope-b");
         let identity = worktree("fingerprint", b"same-repo");
         let scopes = [
-            captured_scope(attempt.clone(), scope_a.clone(), Some(CapturedWorktreeIdentity::Resolved(identity.clone()))),
-            captured_scope(attempt.clone(), scope_b.clone(), Some(CapturedWorktreeIdentity::Resolved(identity.clone()))),
+            captured_scope(
+                attempt.clone(),
+                scope_a.clone(),
+                Some(CapturedWorktreeIdentity::Resolved(identity.clone())),
+            ),
+            captured_scope(
+                attempt.clone(),
+                scope_b.clone(),
+                Some(CapturedWorktreeIdentity::Resolved(identity.clone())),
+            ),
         ];
         let inspections = [
             inspection(attempt.clone(), scope_a.clone(), snapshot("content-a")),
             inspection(attempt.clone(), scope_b.clone(), snapshot("content-b")),
         ];
         let aggregate = aggregate_for(&inspections);
-        let request = request(attempt.clone(), aggregate.clone(), vec![
-            (scope_a.clone(), Some(identity.clone())),
-            (scope_b.clone(), Some(identity.clone())),
-        ]);
+        let request = request(
+            attempt.clone(),
+            aggregate.clone(),
+            vec![
+                (scope_a.clone(), Some(identity.clone())),
+                (scope_b.clone(), Some(identity.clone())),
+            ],
+        );
         let losses = [CloseInspectionLoss {
-            attempt_id: attempt.clone(), scope: scope_a.clone(),
+            attempt_id: attempt.clone(),
+            scope: scope_a.clone(),
             snapshot: inspections[0].snapshot.clone(),
-            item: CloseLossItem::UntrackedNonIgnoredPath(GitPathIdentity::from_bytes(b"file-a".to_vec())),
+            item: CloseLossItem::UntrackedNonIgnoredPath(GitPathIdentity::from_bytes(
+                b"file-a".to_vec(),
+            )),
         }];
-        let evidence = validate(&attempt, &aggregate, &scopes, &request, &inspections, &losses).unwrap();
+        let evidence = validate(
+            &attempt,
+            &aggregate,
+            &scopes,
+            &request,
+            &inspections,
+            &losses,
+        )
+        .unwrap();
         let deadline = tokio::time::Instant::now();
         let bound_a = evidence[0].bind(deadline);
         let bound_b = evidence[1].bind(deadline);
         let before_a = bound_a.clone();
-        let selected_a = bound_a.select_worktree(&scope_a, &aggregate, &identity).unwrap();
-        let selected_b = bound_b.select_worktree(&scope_b, &aggregate, &identity).unwrap();
+        let selected_a = bound_a
+            .select_worktree(&scope_a, &aggregate, &identity)
+            .unwrap();
+        let selected_b = bound_b
+            .select_worktree(&scope_b, &aggregate, &identity)
+            .unwrap();
         assert_eq!(selected_a.identity, &identity);
         assert_eq!(selected_a.content, &inspections[0].snapshot);
         assert_eq!(selected_b.content, &inspections[1].snapshot);
@@ -648,10 +774,18 @@ mod tests {
         assert_eq!(selected_a.deadline, deadline);
         assert_eq!(selected_b.deadline, deadline);
         assert_eq!(bound_a, before_a);
-        assert!(bound_a.select_worktree(&scope_b, &aggregate, &identity).is_err());
-        assert!(bound_a.select_worktree(&scope_a, &snapshot("foreign"), &identity).is_err());
-        assert!(bound_a.select_worktree(&scope_a, &aggregate, &worktree("changed", b"same-repo")).is_err());
-        assert!(bound_a.select_worktree(&scope_a, &aggregate, &worktree("fingerprint", b"elsewhere")).is_err());
+        assert!(bound_a
+            .select_worktree(&scope_b, &aggregate, &identity)
+            .is_err());
+        assert!(bound_a
+            .select_worktree(&scope_a, &snapshot("foreign"), &identity)
+            .is_err());
+        assert!(bound_a
+            .select_worktree(&scope_a, &aggregate, &worktree("changed", b"same-repo"))
+            .is_err());
+        assert!(bound_a
+            .select_worktree(&scope_a, &aggregate, &worktree("fingerprint", b"elsewhere"))
+            .is_err());
     }
 
     #[test]
@@ -661,9 +795,13 @@ mod tests {
         let deadline = tokio::time::Instant::now();
         let mut bound = test_scope(scope_id.clone(), aggregate.clone()).bind(deadline);
         let identity = worktree("fingerprint", b"repo");
-        assert!(bound.select_worktree(&scope_id, &aggregate, &identity).is_err());
+        assert!(bound
+            .select_worktree(&scope_id, &aggregate, &identity)
+            .is_err());
         bound.worktree = Some(identity.clone());
-        assert!(bound.select_worktree(&scope_id, &aggregate, &identity).is_err());
+        assert!(bound
+            .select_worktree(&scope_id, &aggregate, &identity)
+            .is_err());
     }
 
     #[test]
@@ -675,7 +813,11 @@ mod tests {
         let item = CloseLossItem::UntrackedNonIgnoredPath(GitPathIdentity::from_bytes(
             b"new-file".to_vec(),
         ));
-        let inspections = [inspection(attempt.clone(), scope_id.clone(), content.clone())];
+        let inspections = [inspection(
+            attempt.clone(),
+            scope_id.clone(),
+            content.clone(),
+        )];
         let aggregate = aggregate_for(&inspections);
         let request = request(
             attempt.clone(),
@@ -693,8 +835,24 @@ mod tests {
             snapshot: content.clone(),
             item: item.clone(),
         }];
-        let first = validate(&attempt, &aggregate, &scopes, &request, &inspections, &losses).unwrap();
-        let repeated = validate(&attempt, &aggregate, &scopes, &request, &inspections, &losses).unwrap();
+        let first = validate(
+            &attempt,
+            &aggregate,
+            &scopes,
+            &request,
+            &inspections,
+            &losses,
+        )
+        .unwrap();
+        let repeated = validate(
+            &attempt,
+            &aggregate,
+            &scopes,
+            &request,
+            &inspections,
+            &losses,
+        )
+        .unwrap();
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
         let first_binding = first[0].bind(deadline);
         let repeated_binding = repeated[0].bind(deadline);

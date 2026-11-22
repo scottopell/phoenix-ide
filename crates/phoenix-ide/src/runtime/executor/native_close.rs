@@ -182,7 +182,9 @@ impl Drop for NativeCloseInitialContinuation {
             handle.abort();
         }
         self.inventory.abort_owned_worker();
-        if let Some(progress) = &self.process_retirement { progress.abort(); }
+        if let Some(progress) = &self.process_retirement {
+            progress.abort();
+        }
     }
 }
 
@@ -194,14 +196,29 @@ impl NativeCloseInitialContinuation {
         controller: &mut Option<source_entry::SourceEntryController>,
         live_state: &phoenix_core::domain::sm_state::ConvState,
     ) -> Result<(), NativeCloseApplicationError> {
-        if self.phase != NativeCloseInitialContinuationPhase::RetiringProcesses || self.source_entry.is_some()
-            || !self.process_retirement.as_ref().is_some_and(process_retirement::ProcessRetirement::has_resources) {
+        if self.phase != NativeCloseInitialContinuationPhase::RetiringProcesses
+            || self.source_entry.is_some()
+            || !self
+                .process_retirement
+                .as_ref()
+                .is_some_and(process_retirement::ProcessRetirement::has_resources)
+        {
             return Ok(());
         }
-        let (scopes, snapshot) = self.process_retirement.as_ref().expect("guarded cursor").captured_binding();
-        let deadline = match self.backend.native_initial_original_entry_deadline(
-            self.receipt.admitted.attempt_id.as_str(), scopes, snapshot,
-        ).await {
+        let (scopes, snapshot) = self
+            .process_retirement
+            .as_ref()
+            .expect("guarded cursor")
+            .captured_binding();
+        let deadline = match self
+            .backend
+            .native_initial_original_entry_deadline(
+                self.receipt.admitted.attempt_id.as_str(),
+                scopes,
+                snapshot,
+            )
+            .await
+        {
             Ok(deadline) => deadline,
             Err(_) => {
                 self.phase = NativeCloseInitialContinuationPhase::ProcessRetirementBlocked;
@@ -209,7 +226,8 @@ impl NativeCloseInitialContinuation {
             }
         };
         let mut original = source_entry::SourceEntryController::new(self.command.clone(), deadline);
-        if original.revalidate(live_state, &self.command) != source_entry::ActorEntryResult::Updated {
+        if original.revalidate(live_state, &self.command) != source_entry::ActorEntryResult::Updated
+        {
             // A refusal is terminal for this eligibility cell, never a hot loop
             // constructing another controller for the same immutable command.
             self.source_entry = Some(original.worker());
@@ -270,7 +288,9 @@ impl NativeCloseInitialContinuation {
     /// Drain every owned phase worker before releasing source/gate custody.
     /// Resource permits stay manager-owned and fenced after a failed Close.
     pub(super) async fn abort_and_join_inventory_preparation(&mut self) {
-        if let Some(progress) = &mut self.process_retirement { progress.abort_and_join().await; }
+        if let Some(progress) = &mut self.process_retirement {
+            progress.abort_and_join().await;
+        }
         if let InventoryCapture::Preparing(handle) = &self.inventory {
             handle.abort();
         }
@@ -289,7 +309,9 @@ impl NativeCloseInitialContinuation {
     }
 
     pub(super) fn freeze_for_exit_observation(&mut self) {
-        if let Some(progress) = &self.process_retirement { progress.abort(); }
+        if let Some(progress) = &self.process_retirement {
+            progress.abort();
+        }
         if let Some(handle) = self.inspection.take() {
             handle.abort();
         }
@@ -338,7 +360,12 @@ impl NativeCloseInitialContinuation {
             return tokio::time::Instant::now() + std::time::Duration::from_millis(1);
         }
         if self.phase == NativeCloseInitialContinuationPhase::RetiringProcesses {
-            return tokio::time::Instant::now() + self.process_retirement.as_ref().expect("runtime cursor retained").service_delay();
+            return tokio::time::Instant::now()
+                + self
+                    .process_retirement
+                    .as_ref()
+                    .expect("runtime cursor retained")
+                    .service_delay();
         }
         if self.phase == NativeCloseInitialContinuationPhase::RuntimeProcessesDone {
             return tokio::time::Instant::now() + std::time::Duration::from_millis(1);
@@ -421,7 +448,9 @@ impl NativeCloseInitialContinuation {
             if let InventoryCapture::Preparing(handle) = &self.inventory {
                 handle.abort();
             }
-            if let Some(progress) = &self.process_retirement { progress.abort(); }
+            if let Some(progress) = &self.process_retirement {
+                progress.abort();
+            }
             self.phase = NativeCloseInitialContinuationPhase::InspectionRequired;
             tracing::warn!("native Close inspection result invalidated after source revocation; retaining owner for exact terminal classification");
         }
@@ -438,7 +467,9 @@ impl NativeCloseInitialContinuation {
         if self.post_retirement.is_none() {
             let Some(processes) = self.process_retirement.as_ref() else {
                 self.phase = NativeCloseInitialContinuationPhase::ProcessRetirementBlocked;
-                tracing::error!("native Close reached post-process phase without captured inventory");
+                tracing::error!(
+                    "native Close reached post-process phase without captured inventory"
+                );
                 return Ok(self.phase);
             };
             let (scopes, snapshot) = processes.captured_binding();
@@ -455,13 +486,19 @@ impl NativeCloseInitialContinuation {
                 }
             }
         }
-        match self.post_retirement.as_mut().expect("cursor initialized").step(
-            &self.command,
-            &self.receipt,
-            &self.db,
-            &self.backend,
-            live_source,
-        ).await {
+        match self
+            .post_retirement
+            .as_mut()
+            .expect("cursor initialized")
+            .step(
+                &self.command,
+                &self.receipt,
+                &self.db,
+                &self.backend,
+                live_source,
+            )
+            .await
+        {
             Ok(post_retirement::PostRetirementStep::Retiring) => {
                 Ok(NativeCloseInitialContinuationPhase::RuntimeProcessesDone)
             }
@@ -681,7 +718,11 @@ impl NativeCloseInitialContinuation {
                     },
                     _ => unreachable!("preparing phase owns preparation worker"),
                 };
-                let scope_order = request.scopes.iter().map(|scope| scope.scope.clone()).collect();
+                let scope_order = request
+                    .scopes
+                    .iter()
+                    .map(|scope| scope.scope.clone())
+                    .collect();
                 let captured_snapshot = request.snapshot.clone();
                 match self
                     .db
@@ -694,7 +735,11 @@ impl NativeCloseInitialContinuation {
                     .await
                 {
                     LocalAuthorityResult::DurableFactEstablished(Ok(resources)) => {
-                        self.process_retirement = Some(process_retirement::ProcessRetirement::new(resources, scope_order, captured_snapshot));
+                        self.process_retirement = Some(process_retirement::ProcessRetirement::new(
+                            resources,
+                            scope_order,
+                            captured_snapshot,
+                        ));
                         self.inventory = InventoryCapture::Held;
                         self.phase = Phase::Captured;
                         Ok(self.phase)

@@ -139,8 +139,13 @@ where
         if let Some(result) = &self.observed {
             return result.clone();
         }
-        let receiver = self.result.as_mut().expect("unobserved result retains receiver");
-        let result = receiver.await.map_err(|_| ObserveError::WorkerEndedWithoutResult);
+        let receiver = self
+            .result
+            .as_mut()
+            .expect("unobserved result retains receiver");
+        let result = receiver
+            .await
+            .map_err(|_| ObserveError::WorkerEndedWithoutResult);
         // No await between consuming the channel and retaining the result.
         self.observed = Some(result.clone());
         self.result.take();
@@ -155,7 +160,10 @@ where
 
     #[cfg(test)]
     async fn wait_until_entered(&mut self) {
-        self.entered.take().expect("entry signal available").await
+        self.entered
+            .take()
+            .expect("entry signal available")
+            .await
             .expect("actor sends entry signal");
     }
 }
@@ -186,7 +194,10 @@ mod tests {
         });
 
         gate.cancel_before_entry();
-        supervisor.task.await.expect("gate task should exit cleanly");
+        supervisor
+            .task
+            .await
+            .expect("gate task should exit cleanly");
         assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 
@@ -196,12 +207,16 @@ mod tests {
         let owner_drops = Arc::clone(&drops);
         let calls = Arc::new(AtomicUsize::new(0));
         let work_calls = Arc::clone(&calls);
-        let (mut gate, mut supervisor) = ResourceSupervisor::<()>::spawn(move |owner: DropProbe| async move {
-            work_calls.fetch_add(1, Ordering::SeqCst);
-            drop(owner);
-        });
+        let (mut gate, mut supervisor) =
+            ResourceSupervisor::<()>::spawn(move |owner: DropProbe| async move {
+                work_calls.fetch_add(1, Ordering::SeqCst);
+                drop(owner);
+            });
 
-        assert!(matches!(gate.transfer(DropProbe(owner_drops)), EntryDecision::Transferred));
+        assert!(matches!(
+            gate.transfer(DropProbe(owner_drops)),
+            EntryDecision::Transferred
+        ));
         supervisor.wait_until_entered().await;
         // Close the release sender without confirmation. Actor has definitely
         // taken the owner and is now waiting on release.
@@ -218,11 +233,12 @@ mod tests {
         let work_calls = Arc::clone(&calls);
         let (response_tx, response_rx) = oneshot::channel::<usize>();
         drop(response_rx); // initiating caller disappears before completion
-        let (mut gate, mut supervisor) = ResourceSupervisor::<usize>::spawn(move |value| async move {
-            work_calls.fetch_add(1, Ordering::SeqCst);
-            let _ = response_tx.send(value);
-            value + 1
-        });
+        let (mut gate, mut supervisor) =
+            ResourceSupervisor::<usize>::spawn(move |value| async move {
+                work_calls.fetch_add(1, Ordering::SeqCst);
+                let _ = response_tx.send(value);
+                value + 1
+            });
 
         assert!(matches!(gate.transfer(41), EntryDecision::Transferred));
         assert!(gate.confirm_release());
@@ -248,13 +264,18 @@ mod tests {
         let (consumed_tx, consumed_rx) = oneshot::channel();
         let waiter = tokio::spawn(async move {
             let result = waiter_supervisor.lock().await.observe().await;
-            consumed_tx.send(result).expect("test retains completion signal");
+            consumed_tx
+                .send(result)
+                .expect("test retains completion signal");
             // Model an actor worker whose returned value is lost before its
             // JoinHandle is consumed. The external record must retain custody
             // of the outcome independently of that response.
             std::future::pending::<()>().await;
         });
-        assert_eq!(consumed_rx.await.expect("waiter consumed physical result"), Ok(19));
+        assert_eq!(
+            consumed_rx.await.expect("waiter consumed physical result"),
+            Ok(19)
+        );
         waiter.abort();
         assert!(waiter.await.expect_err("waiter cancelled").is_cancelled());
         assert_eq!(supervisor.lock().await.observe().await, Ok(19));
@@ -281,7 +302,8 @@ mod tests {
 
     #[tokio::test]
     async fn cancelled_observe_keeps_receiver_for_later_observation() {
-        let (mut gate, mut supervisor) = ResourceSupervisor::<usize>::spawn(|value| async move { value });
+        let (mut gate, mut supervisor) =
+            ResourceSupervisor::<usize>::spawn(|value| async move { value });
         assert!(matches!(gate.transfer(7), EntryDecision::Transferred));
 
         // No result can arrive before release, so timing out this observation
