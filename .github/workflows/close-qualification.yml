@@ -66,6 +66,13 @@ jobs:
           cargo test -p phoenix-db --lib -- --list 2>&1 | tee evidence/inventory.log
           grep -E '^close_foundation::tests::.*: test$|^migrations::close_completion_allowance_tests::migration_172_.*: test$|^migrations::tests::migration_(180|181)_.*: test$|^native_close::.*: test$' evidence/inventory.log > evidence/selected-tests.txt
           test -s evidence/selected-tests.txt
+          for test in \
+            initial_worktree_entry_requires_exact_dispatch_and_refuses_completed_reentry \
+            initial_worktree_entry_rejects_durable_source_revocation_before_handoff \
+            initial_worktree_metadata_requires_exact_original_dispatched_authority_and_live_source \
+            initial_work_scope_retirement_rejects_unresolved_originals_then_commits_proof_atomically; do
+            grep -Fx "native_close::initial::tests::$test: test" evidence/selected-tests.txt
+          done
           grep -F 'stopped_original_retirement_proof_rejects_missing_and_excluded_provenance: test' evidence/selected-tests.txt
           grep -F 'dispatched_absence_retry_resumes_retirement_with_retained_snapshot: test' evidence/selected-tests.txt
           grep -F 'ordinary_and_replay_stop_fence_native_retry_and_suppress_existing_allowance: test' evidence/selected-tests.txt
@@ -230,14 +237,18 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          failed=0
           for module in migrations::conversation_tools_tests:: lineage::tests::goal_tools_tests:: conversation_goals::prepared::tests::goal_preparation_migration_follows_conversation_tool_migrations; do
             name="${module//::/-}"
-            cargo test -p phoenix-db --lib "$module" -- --nocapture --test-threads=1 2>&1 | tee "evidence/$name.log"
-            grep -Eq 'test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored;' "evidence/$name.log"
+            if ! cargo test -p phoenix-db --lib "$module" -- --nocapture --test-threads=1 2>&1 | tee "evidence/$name.log"; then
+              failed=1
+            fi
+            grep -Eq 'test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored;' "evidence/$name.log" || failed=1
           done
-          grep -Fx 'test lineage::tests::goal_tools_tests::canonical_goal_tools_prefixes_upgrade_reopen_and_remain_idempotent ... ok' evidence/lineage-tests-goal_tools_tests-.log
+          grep -Fx 'test lineage::tests::goal_tools_tests::canonical_goal_tools_prefixes_upgrade_reopen_and_remain_idempotent ... ok' evidence/lineage-tests-goal_tools_tests-.log || failed=1
+          test "$failed" -eq 0
       - name: Qualify shared WorkScope lifecycle regression boundaries
-        if: success()
+        if: success() || failure()
         shell: bash
         run: |
           set -euo pipefail

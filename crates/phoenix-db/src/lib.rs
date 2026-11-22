@@ -2612,7 +2612,7 @@ impl Database {
     }
 
     #[allow(clippy::too_many_lines)]
-    async fn retire_work_scope_lifecycle_tx(
+    pub(crate) async fn retire_work_scope_lifecycle_tx(
         tx: &mut Transaction<'_, Sqlite>,
         precondition: WorkScopeRetirementPrecondition,
         reason: &str,
