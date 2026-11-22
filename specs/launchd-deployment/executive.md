@@ -199,6 +199,33 @@ including explicit storage-code/byte-value and unsupported-code diagnostics
 coverage. Independent exact-delta review supports one targeted dense rerun;
 exact-source dense/native qualification and production assessment remain gates.
 
+### Integer-tag terminal qualification
+
+Exact candidate `547a0e11258620ee04a3d259bb352595063ff7ca` passed ordinary
+[CI 45017168621](https://github.com/scottopell/phoenix-ide/actions/runs/45017168621)
+and macOS app run 45017168612, but failed single targeted dense
+[45017164489](https://github.com/scottopell/phoenix-ide/actions/runs/45017164489).
+Copy took 45.132 seconds, full integrity 697.975 seconds and comparison exited
+after 156.879 seconds at the shared deadline: 12,574,736 rows / 37,724,208 cells,
+zero completed tables, ordinal 1; no fsync/proof success. Slower generation and
+copy as well as integrity mean these different runs do not isolate a comparator
+regression or prove runner contention. This is a performance/deadline failure,
+not an established external-infrastructure blocker.
+
+Subsequent pager-cache diagnostics left the production candidate unchanged.
+Actual dense fixtures with 40,000 and 300,000 principal rows used respectively
+69,328,896 and 512,106,496 aggregate main-file bytes across independent source
+and backup images; temporary images were removed. Fresh connections, native
+copy outside timing, unchanged full integrity/comparison, two warmup pairs and
+twelve alternating measured pairs for the larger fixture compared observed
+backup cache -2000 against -65536, with source settings and mmap unchanged.
+The larger fixture's paired integrity wall ratio was 1.029413 (zero wins out of
+twelve), and comparison ratio 1.006437 (two wins). CPU roughly equalled wall.
+The earlier smaller fixture's integrity ratio was 0.982726. These warm-cache
+measurements do not support a cache-only correction or establish scale behavior;
+no cache tuning or additional full-size rerun followed. Dense full-path success
+and fresh production assessment remain mandatory gates.
+
 ## Operator recovery
 
 Inspect logs, transaction-matched proof, any verified backup or first-install
