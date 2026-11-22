@@ -207,15 +207,9 @@ impl TaskSource {
 /// blocks are not headings (a `# comment` in a shell fence is not a title).
 /// An optional closing `#` sequence is stripped (`# Title #` -> `Title`).
 fn extract_h1(body: &str) -> Option<String> {
-    let mut lines = body.lines().peekable();
-    if lines.peek().is_some_and(|l| l.trim_end() == "---") {
-        lines.next();
-        for line in lines.by_ref() {
-            if matches!(line.trim_end(), "---" | "...") {
-                break;
-            }
-        }
-    }
+    let all: Vec<&str> = body.lines().collect();
+    let body_start = front_matter_len(&all);
+    let lines = all.into_iter().skip(body_start);
 
     let mut fence: Option<(char, usize)> = None;
     for line in lines {
@@ -263,6 +257,33 @@ fn extract_h1(body: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// Number of leading lines occupied by a YAML front-matter block, or 0.
+///
+/// A block counts only when the opening `---` is immediately followed by a
+/// `key:` line and a closing `---`/`...` exists; otherwise the leading `---` is
+/// an ordinary thematic break and the document is left intact.
+fn front_matter_len(lines: &[&str]) -> usize {
+    if lines.first().is_none_or(|l| l.trim_end() != "---") {
+        return 0;
+    }
+    let first_is_key = lines.get(1).is_some_and(|l| {
+        l.split_once(':').is_some_and(|(key, _)| {
+            !key.is_empty()
+                && key
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-'))
+        })
+    });
+    if !first_is_key {
+        return 0;
+    }
+    lines
+        .iter()
+        .skip(2)
+        .position(|l| matches!(l.trim_end(), "---" | "..."))
+        .map_or(0, |close| close + 3)
 }
 
 /// True when `task-{id}-{slug}` is already a valid git branch name for this
@@ -479,6 +500,28 @@ mod tests {
             Some("Real")
         );
         assert_eq!(extract_h1("```\n# only in fence\n```\n"), None);
+    }
+
+    #[test]
+    fn h1_survives_leading_thematic_break() {
+        assert_eq!(
+            extract_h1("---\n\n# Repair database indexes\n\nActual task body.").as_deref(),
+            Some("Repair database indexes")
+        );
+        assert_eq!(
+            extract_h1("---\n# Title\n---\nbody\n").as_deref(),
+            Some("Title")
+        );
+        // Unclosed `key:` block is not front matter either.
+        assert_eq!(
+            extract_h1("---\ntitle: x\n\n# Real\n").as_deref(),
+            Some("Real")
+        );
+        // Closed front matter is still skipped.
+        assert_eq!(
+            extract_h1("---\ntitle: x\n\n# yaml\n---\n# Real\n").as_deref(),
+            Some("Real")
+        );
     }
 
     #[test]
