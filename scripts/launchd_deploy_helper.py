@@ -551,22 +551,20 @@ def _verify_logical_equivalence(source, backup, deadline: float, diagnostics: di
         return module[1].lower()
 
     def cells_equal(left_storage, left_value, right_storage, right_value):
-        # text_factory=bytes makes typeof() results bytes too. Comparing these
-        # fixed tags avoids per-cell UTF-8 decoding and temporary tuples.
+        # unicode(typeof()) yields unique initial code points for SQLite's five storage classes.
         if left_storage != right_storage:
             return False
-        if left_storage == b"null":
+        if left_storage == 110:
             return True
-        if left_storage == b"integer":
+        if left_storage == 105:
             return left_value == right_value
-        if left_storage == b"real":
+        if left_storage == 114:
             return struct.pack(">d", left_value) == struct.pack(">d", right_value)
-        if left_storage in (b"text", b"blob"):
+        if left_storage in (116, 98):
             if not isinstance(left_value, bytes) or not isinstance(right_value, bytes):
                 raise ActivationError("SQLite returned a non-byte TEXT/BLOB value during verification")
             return left_value == right_value
-        storage = text(left_storage)
-        raise ActivationError(f"unsupported SQLite storage class during verification: {storage!r}")
+        raise ActivationError(f"unsupported SQLite storage class code during verification: {left_storage!r}")
 
     def compare_table(source, backup, schema: str, name: str, kind: str, xinfo) -> None:
         check_deadline()
@@ -598,7 +596,7 @@ def _verify_logical_equivalence(source, backup, deadline: float, diagnostics: di
             rowid = next(alias for alias in ("rowid", "_rowid_", "oid") if alias in aliases)
             order = quote(rowid)
             identity = [quote(rowid)]
-        selected = identity + [part for column in names for part in (f"typeof({quote(column)})", quote(column))]
+        selected = identity + [part for column in names for part in (f"unicode(typeof({quote(column)}))", quote(column))]
         table = f"{quote(schema)}.{quote(name)}"
         query = f"SELECT {','.join(selected)} FROM {table} ORDER BY {order}"
         check_deadline()
@@ -618,7 +616,7 @@ def _verify_logical_equivalence(source, backup, deadline: float, diagnostics: di
             # Equal projected tuples include row identity and storage-class tags.
             # REAL values still require the binary64 comparison below.
             if left_batch == right_batch and all(
-                b"real" not in row[offset::2] for row in left_batch
+                114 not in row[offset::2] for row in left_batch
             ):
                 if diagnostics is not None:
                     diagnostics["cells_compared"] += cell_count * len(left_batch)
@@ -635,7 +633,7 @@ def _verify_logical_equivalence(source, backup, deadline: float, diagnostics: di
                 if identity and a[0] != b[0]:
                     raise ActivationError(f"SQLite backup row identity differs in table ordinal {(diagnostics or {}).get('table_ordinal', 0)}")
                 # Python tuple equality loses the binary64 sign of zero for REAL.
-                if a == b and b"real" not in a[offset::2]:
+                if a == b and 114 not in a[offset::2]:
                     if diagnostics is not None:
                         diagnostics["cells_compared"] += cell_count
                         diagnostics["table_cells_compared"] += cell_count

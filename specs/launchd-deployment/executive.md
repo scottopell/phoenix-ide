@@ -168,6 +168,37 @@ zero, missing/extra rows and post-batch deadline failure. Independent exact-delt
 review found no blocker before one targeted hosted run; exact-source hosted
 dense/native qualification remain gates.
 
+### Batch result and integer-tag candidate
+
+The batch helper at `73b7be92a0d8a88f631a7a2205887038a57506f9` failed the
+single targeted dense run
+[45012823182](https://github.com/scottopell/phoenix-ide/actions/runs/45012823182).
+Copy took 31.060 seconds and integrity 477.056 seconds; comparison exited after
+391.864 seconds at the shared deadline, without fsync/proof success. Ordinary
+exact-source [CI 45012827553](https://github.com/scottopell/phoenix-ide/actions/runs/45012827553)
+and macOS app run 45012827512 passed. Native success does not qualify dense.
+
+The earlier 115-test unittest result was not warning-clean: SQLite fixture
+connections and the capacity-reader connection relied on garbage collection
+for closing. Explicit connection ownership was added while preserving write
+transactions and the open WAL-source fixture. Subsequently 117 focused tests
+passed with explicit checks for ResourceWarning and unraisable exceptions.
+
+The next candidate projects `unicode(typeof(column))` integer storage tags,
+leaving values, byte text factories, binary64 REAL comparison, batch size,
+counters, ordering and deadlines unchanged. It does not enable mmap.
+On CPython 3.13.1 / SQLite 3.47.1, twelve alternating measured pairs after two
+warmups on actual 5,000-row-per-principal-table file-backed fixtures showed
+comparison medians (milliseconds) dense 41.503→39.062, baseline 72.721→69.429,
+and wide 215.051→194.744. Integrity timings were essentially unchanged. These
+small warm-cache measurements do not establish full-path deadline fit.
+The candidate helper SHA-256 is
+`a50af20e662af0a20e5026df8bfa5c27d52bf6f2498879078f248d5ec172cadf`.
+119 focused tests passed with no ResourceWarning/unraisable log matches,
+including explicit storage-code/byte-value and unsupported-code diagnostics
+coverage. Independent exact-delta review supports one targeted dense rerun;
+exact-source dense/native qualification and production assessment remain gates.
+
 ## Operator recovery
 
 Inspect logs, transaction-matched proof, any verified backup or first-install

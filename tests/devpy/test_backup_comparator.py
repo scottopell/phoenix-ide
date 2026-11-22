@@ -52,6 +52,32 @@ class BackupComparatorTests(unittest.TestCase):
             source.close()
             backup.close()
 
+    def test_storage_class_codes_preserve_byte_values(self):
+        database = sqlite3.connect(":memory:")
+        self.addCleanup(database.close)
+        database.text_factory = bytes
+        cases = (("NULL", 110, None), ("42", 105, 42), ("1.25", 114, 1.25),
+                 ("CAST(X'ff80' AS TEXT)", 116, b"\xff\x80"),
+                 ("X'ff00'", 98, b"\xff\x00"))
+        for expression, code, value in cases:
+            with self.subTest(expression=expression):
+                self.assertEqual(database.execute(
+                    f"SELECT unicode(typeof({expression})), {expression}"
+                ).fetchone(), (code, value))
+
+    def test_unknown_storage_code_reports_activation_error_and_restores_factories(self):
+        source, backup = sqlite3.connect(":memory:"), sqlite3.connect(":memory:")
+        self.addCleanup(source.close)
+        self.addCleanup(backup.close)
+        for database, value in ((source, 1), (backup, 2)):
+            database.execute("CREATE TABLE cells(v)")
+            database.execute("INSERT INTO cells VALUES (?)", (value,))
+            database.create_function("unicode", 1, lambda value: 999)
+        with self.assertRaisesRegex(helper.ActivationError, "storage class code.*999"):
+            helper._verify_logical_equivalence(source, backup, helper.time.monotonic() + 10)
+        self.assertIs(source.text_factory, str)
+        self.assertIs(backup.text_factory, str)
+
     def test_all_storage_classes(self):
         def setup(db):
             db.execute("CREATE TABLE cells(k INTEGER PRIMARY KEY, v)")
