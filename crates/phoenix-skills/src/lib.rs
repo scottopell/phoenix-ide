@@ -145,18 +145,11 @@ struct SkillFrontmatter {
 
 /// Parse skill metadata from SKILL.md YAML frontmatter.
 ///
-/// Expects the file to start with `---\n`, followed by `key: value` lines,
-/// closed by `\n---\n`. Returns `None` if either required field is missing or the
+/// Expects the file to start with a `---` line, followed by `key: value` lines,
+/// closed by another `---` line (LF or CRLF endings). Returns `None` if either required field is missing or the
 /// frontmatter is malformed.
 fn parse_skill_frontmatter(content: &str) -> Option<SkillFrontmatter> {
-    let body = content.strip_prefix("---\n")?;
-    let end = body.find("\n---\n").or_else(|| {
-        // Handle frontmatter at end of file with no trailing newline after ---
-        body.find("\n---").filter(|&i| i + 4 == body.len())
-    })?;
-    // Safety: `end` is from `find()` on `body`
-    #[allow(clippy::string_slice)]
-    let frontmatter = &body[..end];
+    let (frontmatter, _body) = split_frontmatter(content)?;
 
     let mut name: Option<String> = None;
     let mut description: Option<String> = None;
@@ -681,26 +674,76 @@ pub fn invoke_trusted_coordinator_builtin(
     Ok(content)
 }
 
-/// Strip YAML frontmatter (--- delimited block at the top of the file).
-/// Returns the body content after the closing ---.
-fn strip_frontmatter(content: &str) -> String {
-    let trimmed = content.trim_start();
-    if !trimmed.starts_with("---") {
-        return content.to_string();
+/// Split `content` into `(frontmatter, body)` at strict `---` delimiter lines.
+///
+/// The first line must be exactly `---` (trailing whitespace allowed) and the
+/// closing delimiter is the next line that is exactly `---`. Lines such as
+/// `----`, `--- title` or `---more` are never delimiters. Both LF and CRLF line
+/// endings are accepted. Returns `None` when there is no closed block.
+fn split_frontmatter(content: &str) -> Option<(&str, &str)> {
+    let mut lines = content.split_inclusive('\n');
+    let open = lines.next()?;
+    if open.trim_end() != "---" {
+        return None;
     }
-    // Safety: we checked that `trimmed` starts with "---" (3 bytes), so
-    // slicing at byte offset 3 is a valid UTF-8 boundary.
-    #[allow(clippy::string_slice)]
-    let after_open = &trimmed[3..];
-    if let Some(end_pos) = after_open.find("\n---") {
-        // Skip past the closing "---" and any trailing newline
-        // Safety: `end_pos` is from `find()` on `after_open`; adding 4
-        // accounts for "\n---" (4 bytes). The result is a valid UTF-8 boundary.
-        #[allow(clippy::string_slice)]
-        let body_start_str = &after_open[end_pos + 4..];
-        body_start_str.trim_start_matches('\n').to_string()
-    } else {
-        content.to_string()
+    let fm_start = open.len();
+    let mut offset = fm_start;
+    for line in lines {
+        if line.trim_end() == "---" {
+            // Safety: offsets are sums of `split_inclusive` segment lengths,
+            // so they fall on UTF-8 boundaries.
+            #[allow(clippy::string_slice)]
+            let parts = (&content[fm_start..offset], &content[offset + line.len()..]);
+            return Some(parts);
+        }
+        offset += line.len();
+    }
+    None
+}
+
+/// True when `line` is a top-level `key:` line (bare or quoted key).
+fn is_frontmatter_key_line(line: &str) -> bool {
+    let Some((key, _)) = line.split_once(':') else {
+        return false;
+    };
+    let quoted = key.len() >= 2
+        && ((key.starts_with('"') && key.ends_with('"'))
+            || (key.starts_with('\'') && key.ends_with('\'')));
+    quoted
+        || (key.starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_')
+            && key
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.')))
+}
+
+/// True when the block is a YAML mapping: it opens with a `key:` line and every
+/// other top-level line is blank, a comment, an indented continuation, a `key:`
+/// line, or an indentless sequence item (`- x`) belonging to a preceding key.
+/// Prose or a bare list between two horizontal rules is not a mapping.
+fn looks_like_frontmatter_mapping(block: &str) -> bool {
+    let mut seen_key = false;
+    block.lines().all(|line| {
+        let t = line.trim_end();
+        if t.is_empty() || t.starts_with('#') || t.starts_with([' ', '\t']) {
+            return true;
+        }
+        if is_frontmatter_key_line(t) {
+            seen_key = true;
+            return true;
+        }
+        seen_key && (t == "-" || t.starts_with("- "))
+    })
+}
+
+/// Strip YAML frontmatter (--- delimited block at the top of the file).
+/// Returns the body content after the closing ---. Content that only
+/// resembles frontmatter (a leading horizontal rule) is returned unchanged.
+fn strip_frontmatter(content: &str) -> String {
+    match split_frontmatter(content.trim_start()) {
+        Some((block, body)) if looks_like_frontmatter_mapping(block) => {
+            body.trim_start_matches(['\r', '\n']).to_string()
+        }
+        _ => content.to_string(),
     }
 }
 
@@ -779,6 +822,95 @@ mod tests {
         let content = "  ---\nname: build\ndescription: Build it\n---\n\nBody here.";
         let result = strip_frontmatter(content);
         assert_eq!(result, "Body here.");
+    }
+
+    #[test]
+    fn test_strip_frontmatter_keeps_document_opening_with_horizontal_rule() {
+        let content = "---\n\nIntro text\n\n---\n\nMore";
+        assert_eq!(strip_frontmatter(content), content);
+    }
+
+    #[test]
+    fn test_strip_frontmatter_requires_exact_delimiter_lines() {
+        for content in [
+            "--- not fm\nname: a\n---\nbody",
+            "----\nname: a\n----\nbody",
+            "---\nname: a\n----\nbody",
+            "---\nname: a\n---more\nbody",
+        ] {
+            assert_eq!(strip_frontmatter(content), content, "{content:?}");
+        }
+    }
+
+    #[test]
+    fn test_strip_frontmatter_crlf_and_trailing_space_delimiters() {
+        assert_eq!(
+            strip_frontmatter("---\r\nname: a\r\n---\r\nbody\r\n"),
+            "body\r\n"
+        );
+        assert_eq!(strip_frontmatter("---\nname: a\n---   \nbody"), "body");
+    }
+
+    #[test]
+    fn test_strip_frontmatter_accepts_indentless_sequences() {
+        let content = "---\nname: build\nallowed-tools:\n- Read\n- Bash\ndescription: d\n---\nBody";
+        assert_eq!(strip_frontmatter(content), "Body");
+        let quoted = "---\n\"name\": build\n---\nBody";
+        assert_eq!(strip_frontmatter(quoted), "Body");
+    }
+
+    #[test]
+    fn test_strip_frontmatter_keeps_leading_list_between_rules() {
+        let content = "---\n- first\n- second\n---\nafter";
+        assert_eq!(strip_frontmatter(content), content);
+    }
+
+    #[test]
+    fn test_strip_frontmatter_empty_block() {
+        assert_eq!(strip_frontmatter("---\n---\nbody"), "body");
+    }
+
+    #[test]
+    fn test_parse_frontmatter_crlf() {
+        let content = "---\r\nname: build\r\ndescription: Build it\r\n---\r\nBody";
+        let fm = parse_skill_frontmatter(content).unwrap();
+        assert_eq!(fm.name, "build");
+        assert_eq!(fm.description, "Build it");
+    }
+
+    mod proptests {
+        use super::*;
+        use proptest::prelude::*;
+
+        proptest! {
+            // Prose (no `key:` shape) between two rules is never frontmatter.
+            #[test]
+            fn rule_delimited_prose_is_preserved(
+                prose in "[A-Za-z][A-Za-z ,.!?]{0,40}",
+                tail in "[ -~\n]{0,60}",
+            ) {
+                let content = format!("---\n\n{prose}\n\n---\n{tail}");
+                prop_assert_eq!(strip_frontmatter(&content), content);
+            }
+
+            // Valid LF frontmatter: body is returned verbatim, minus leading newlines.
+            #[test]
+            fn valid_frontmatter_yields_body(
+                name in "[a-z][a-z0-9-]{0,12}",
+                desc in "[A-Za-z0-9 ]{0,20}",
+                body in "[A-Za-z0-9#][ -~\n]{0,60}",
+            ) {
+                let content = format!("---\nname: {name}\ndescription: {desc}\n---\n\n{body}");
+                prop_assert_eq!(strip_frontmatter(&content), body);
+            }
+
+            // Whatever the input, the result is the input or a suffix of it.
+            #[test]
+            fn result_is_input_or_suffix(content in "[-a-z: \r\n]{0,80}") {
+                let out = strip_frontmatter(&content);
+                prop_assert!(content == out || content.ends_with(&out));
+            }
+        }
     }
 
     // -------------------------------------------------------------------------
