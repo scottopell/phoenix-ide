@@ -239,10 +239,9 @@ impl BashEntryContext {
                 #[cfg(test)]
                 let result = match (result, test_hook.as_ref()) {
                     (Ok((admission, NativeCloseInitialEntryRelease::Confirmed)), Some(hook)) => {
-                        hook.stats.actual_confirmed_release.store(
-                            true,
-                            std::sync::atomic::Ordering::SeqCst,
-                        );
+                        hook.stats
+                            .actual_confirmed_release
+                            .store(true, std::sync::atomic::Ordering::SeqCst);
                         if hook.inject_unknown_release {
                             Ok((
                                 admission,

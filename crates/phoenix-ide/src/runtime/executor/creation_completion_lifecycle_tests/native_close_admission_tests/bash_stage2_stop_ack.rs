@@ -242,19 +242,11 @@ async fn bash_stage_two_stop_ack_reaches_real_second_writer_and_cleans_once() {
         1,
         "the original owner compensates the observed stop exactly once after writer release"
     );
-    let close_output = tokio::time::timeout(std::time::Duration::from_secs(30), close)
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(
-        !close_output.is_success(),
-        "Stop ACK revokes this Close source"
-    );
-
-    // The barrier awaits while holding the custody slot, so only inspect it
-    // after the completion witness. Dispose the test-owned native owner after
-    // confirmed writer release to drop its scope registry guard before public
-    // Bash registry operations.
+    // The completion witness establishes that the second writer has released
+    // the barrier, so it is now safe to inspect and dispose the test-owned
+    // native owner. Its Bash custody retains the scope registry writer guard;
+    // drop it before awaiting public Close completion or issuing public Bash
+    // registry operations, both of which need that registry.
     {
         let mut state = custody.lock().await;
         assert!(
@@ -263,6 +255,15 @@ async fn bash_stage_two_stop_ack_reaches_real_second_writer_and_cleans_once() {
         );
         drop(state.owner.take());
     }
+
+    let close_output = tokio::time::timeout(std::time::Duration::from_secs(30), close)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        !close_output.is_success(),
+        "Stop ACK revokes this Close source"
+    );
 
     assert_eq!(
         backend.bash_handles().snapshot_live_pgids().await,

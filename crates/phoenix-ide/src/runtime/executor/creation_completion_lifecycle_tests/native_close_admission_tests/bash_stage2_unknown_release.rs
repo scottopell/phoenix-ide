@@ -19,11 +19,8 @@ struct ConfirmedBashFixtureTeardown {
 
 impl ConfirmedBashFixtureTeardown {
     async fn wait_for_worker(&mut self) {
-        let completion = tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            &mut self.completion,
-        )
-        .await;
+        let completion =
+            tokio::time::timeout(std::time::Duration::from_secs(10), &mut self.completion).await;
         self.worker_done = matches!(&completion, Ok(Ok(())));
         completion
             .expect("retained Bash task must classify the injected release")
@@ -34,7 +31,10 @@ impl ConfirmedBashFixtureTeardown {
         assert!(self.worker_done && self.stats.actual_confirmed_release.load(Ordering::SeqCst));
         let mut state = self.custody.lock().await;
         assert_eq!(state.stage, BashStage::Quarantined);
-        state.owner.as_mut().expect("original owner retained")
+        state
+            .owner
+            .as_mut()
+            .expect("original owner retained")
             .cleanup_after_writer_release()
             .expect("confirmed writer allows test-only stop cleanup");
         drop(state.owner.take());
@@ -44,7 +44,8 @@ impl ConfirmedBashFixtureTeardown {
 
 impl Drop for ConfirmedBashFixtureTeardown {
     fn drop(&mut self) {
-        if self.restored || !self.worker_done
+        if self.restored
+            || !self.worker_done
             || !self.stats.actual_confirmed_release.load(Ordering::SeqCst)
         {
             return;
@@ -73,6 +74,15 @@ impl Drop for ConfirmedBashFixtureTeardown {
 
 #[tokio::test]
 async fn bash_second_writer_injected_unknown_release_quarantines_original_owner() {
+    assert_unknown_release_custody(false).await;
+}
+
+#[tokio::test]
+async fn bash_second_writer_unknown_release_retains_owner_after_public_close_waiter_drop() {
+    assert_unknown_release_custody(true).await;
+}
+
+async fn assert_unknown_release_custody(drop_close_before_second_writer: bool) {
     use crate::coordinator_tools;
     use crate::runtime::close_retirement::native_initial::bash::BashStage2TestHook;
     use crate::send_chat_service::SendChatApplicationService;
@@ -87,7 +97,9 @@ async fn bash_second_writer_injected_unknown_release_quarantines_original_owner(
             std::env::var_os("PHOENIX_BASH_LAUNCH_TEST_REQUIRED").is_none(),
             "hosted qualification must provide the real Phoenix launcher binary"
         );
-        eprintln!("explicitly skipping native Close Bash test: PHOENIX_BASH_LAUNCH_TEST_EXE is unset");
+        eprintln!(
+            "explicitly skipping native Close Bash test: PHOENIX_BASH_LAUNCH_TEST_EXE is unset"
+        );
         return;
     };
     let launch_exe = PathBuf::from(launch_exe);
@@ -128,7 +140,11 @@ async fn bash_second_writer_injected_unknown_release_quarantines_original_owner(
             context,
         )
         .await;
-    assert!(spawned.is_success(), "real Bash fixture failed to launch: {}", spawned.output());
+    assert!(
+        spawned.is_success(),
+        "real Bash fixture failed to launch: {}",
+        spawned.output()
+    );
     let spawned_json: serde_json::Value = serde_json::from_str(spawned.output()).unwrap();
     let handle_id = spawned_json["handle"].as_str().unwrap().to_owned();
     let original = backend
@@ -138,9 +154,17 @@ async fn bash_second_writer_injected_unknown_release_quarantines_original_owner(
         .expect("public Bash launch registers the original handle");
     let mut settlement = original.handle.subscribe_waiter_settlement();
     let pgids = backend.bash_handles().snapshot_live_pgids().await;
-    assert_eq!(pgids.len(), 1, "fixture owns exactly one live process group");
+    assert_eq!(
+        pgids.len(),
+        1,
+        "fixture owns exactly one live process group"
+    );
     let pgid = pgids[0];
-    let registered = backend.bash_handles().get_existing(&work_key).await.unwrap();
+    let registered = backend
+        .bash_handles()
+        .get_existing(&work_key)
+        .await
+        .unwrap();
     assert_eq!(registered.read().await.live_count().await, 1);
 
     let stats = Arc::new(BashStage2TestStats::default());
@@ -246,7 +270,7 @@ async fn bash_second_writer_injected_unknown_release_quarantines_original_owner(
     let input = serde_json::json!({
         "action":"initial", "product_conversation_id":fixture.target.as_str()
     });
-    let close = tokio::spawn(async move { close_tool.run(input, close_ctx).await });
+    let mut close = Some(tokio::spawn(async move { close_tool.run(input, close_ctx).await }));
 
     let (eligible, custody) = tokio::time::timeout(std::time::Duration::from_secs(60), reached_rx)
         .await
@@ -259,26 +283,71 @@ async fn bash_second_writer_injected_unknown_release_quarantines_original_owner(
         worker_done: false,
         restored: false,
     };
+    let observer_drop_observations = if drop_close_before_second_writer {
+        // Drop only the public response observer while the retained worker is
+        // paused before the second writer. Keep the actor and independent
+        // callback/completion/custody probes alive through classification.
+        // Record now, but assert only after resuming and joining retained work:
+        // assertion unwinding must not abandon the physically stopped fixture.
+        let observer_cancelled = if let Some(observer) = close.take() {
+            observer.abort();
+            matches!(observer.await, Err(error) if error.is_cancelled())
+        } else {
+            false
+        };
+        Some((
+            observer_cancelled,
+            stats.actual_confirmed_release.load(Ordering::SeqCst),
+            stats.group_attempts.load(Ordering::SeqCst),
+            running.is_finished(),
+        ))
+    } else {
+        None
+    };
     let resumed = resume_tx.send(());
     let callback = tokio::time::timeout(std::time::Duration::from_secs(10), callback_rx).await;
     teardown.wait_for_worker().await;
-    assert!(stats.actual_confirmed_release.load(Ordering::SeqCst),
-        "only an actual Confirmed second writer return permits injected uncertainty");
-    assert!(eligible, "the original source is live before the second writer");
+    if let Some((cancelled, released, attempts, actor_finished)) = observer_drop_observations {
+        assert!(cancelled, "public observer was cancelled before resuming stage two");
+        assert!(!released, "second writer had not returned at observer drop");
+        assert_eq!(attempts, 0, "second callback had not run at observer drop");
+        assert!(!actor_finished, "source actor remained alive at the stage-two barrier");
+    }
+    assert!(
+        stats.actual_confirmed_release.load(Ordering::SeqCst),
+        "only an actual Confirmed second writer return permits injected uncertainty"
+    );
+    assert!(
+        eligible,
+        "the original source is live before the second writer"
+    );
     resumed.expect("retained owner waits at the barrier");
     let (revoked, deadline_unexpired, refused) = callback
         .expect("real second physical callback must run")
         .unwrap();
-    assert!(!revoked && deadline_unexpired && !refused,
-        "second writer uses the unrevoked original source and unexpired original deadline");
+    assert!(
+        !revoked && deadline_unexpired && !refused,
+        "second writer uses the unrevoked original source and unexpired original deadline"
+    );
     assert_eq!(stats.stop_attempts.load(Ordering::SeqCst), 1);
     assert_eq!(stats.group_attempts.load(Ordering::SeqCst), 1);
-    assert!(stats.group_signal_succeeded.load(Ordering::SeqCst),
-        "the actual second callback must successfully signal the original group");
+    assert!(
+        stats.group_signal_succeeded.load(Ordering::SeqCst),
+        "the actual second callback must successfully signal the original group"
+    );
     assert_eq!(stats.cleanup_attempts.load(Ordering::SeqCst), 0);
-    assert!(backend.local_authority_is_closed(), "unknown release closes process-wide admission");
-    assert!(backend.acquire_local_authority_pass().is_err(), "a fresh scope cannot mutate after fatal close");
-    assert_eq!(backend.observed_local_authority_failure_boundary(), Some("native_close_initial_bash_group_entry"));
+    assert!(
+        backend.local_authority_is_closed(),
+        "unknown release closes process-wide admission"
+    );
+    assert!(
+        backend.acquire_local_authority_pass().is_err(),
+        "a fresh scope cannot mutate after fatal close"
+    );
+    assert_eq!(
+        backend.observed_local_authority_failure_boundary(),
+        Some("native_close_initial_bash_group_entry")
+    );
 
     // The hook replaces a Confirmed return AFTER the real callback, not an actual
     // unknown SQLite result. This owner and its original waiter must stay pinned
@@ -286,12 +355,18 @@ async fn bash_second_writer_injected_unknown_release_quarantines_original_owner(
     {
         let state = custody.lock().await;
         assert_eq!(state.stage, BashStage::Quarantined);
-        assert!(state.owner.is_some(), "entire original owner remains in custody");
+        assert!(
+            state.owner.is_some(),
+            "entire original owner remains in custody"
+        );
     }
-    assert!(matches!(
-        *settlement.borrow_and_update(),
-        phoenix_tools::bash::handle::WaiterSettlement::Pending
-    ), "the exact original waiter has not falsely completed cleanup");
+    assert!(
+        matches!(
+            *settlement.borrow_and_update(),
+            phoenix_tools::bash::handle::WaiterSettlement::Pending
+        ),
+        "the exact original waiter has not falsely completed cleanup"
+    );
     // The retained owner's scope writer is still held: a registry snapshot
     // would block here, and is not a valid witness for this fatal boundary.
     let receipts = count(&fixture.db, "native_close_initial_receipts").await;
@@ -306,10 +381,15 @@ async fn bash_second_writer_injected_unknown_release_quarantines_original_owner(
         .expect("fatal source actor must exit after the retained task settles")
         .unwrap();
     assert_eq!(disposition, RuntimeExitDisposition::FatalLocalAuthorityLoss);
-    assert_eq!(count(&fixture.db, "native_close_initial_receipts").await, receipts);
+    assert_eq!(
+        count(&fixture.db, "native_close_initial_receipts").await,
+        receipts
+    );
     assert_eq!(count(&fixture.db, "close_runs").await, runs);
-    close.abort();
-    let _ = close.await;
+    if let Some(observer) = close {
+        observer.abort();
+        let _ = observer.await;
+    }
 
     // INJECTION-ONLY TEST FIXTURE RESTORE: the real writer returned Confirmed;
     // only this test's hook substituted Unconfirmed after it returned. Never
@@ -322,7 +402,10 @@ async fn bash_second_writer_injected_unknown_release_quarantines_original_owner(
             match observed {
                 phoenix_tools::bash::handle::WaiterSettlement::Settled => break,
                 phoenix_tools::bash::handle::WaiterSettlement::Pending => {
-                    settlement.changed().await.expect("the original waiter remains owned");
+                    settlement
+                        .changed()
+                        .await
+                        .expect("the original waiter remains owned");
                 }
                 other => panic!("original waiter did not settle: {other:?}"),
             }
@@ -330,7 +413,14 @@ async fn bash_second_writer_injected_unknown_release_quarantines_original_owner(
     })
     .await
     .expect("test-only restore must reap the exact original waiter");
-    assert!(backend.bash_handles().snapshot_live_pgids().await.is_empty());
-    assert_eq!(stats.cleanup_attempts.load(Ordering::SeqCst), 0,
-        "only explicit test teardown, never production unknown cleanup, resumed the owner");
+    assert!(backend
+        .bash_handles()
+        .snapshot_live_pgids()
+        .await
+        .is_empty());
+    assert_eq!(
+        stats.cleanup_attempts.load(Ordering::SeqCst),
+        0,
+        "only explicit test teardown, never production unknown cleanup, resumed the owner"
+    );
 }

@@ -314,6 +314,7 @@ jobs:
           grep -F 'native_close_admission_tests::native_close_backend_requires_actor_database_authority_not_matching_path: test' evidence/runtime-selected-tests.txt
           grep -F 'native_close_admission_tests::bash_stage2_stop_ack::bash_stage_two_stop_ack_reaches_real_second_writer_and_cleans_once: test' evidence/runtime-selected-tests.txt
           grep -F 'native_close_admission_tests::bash_stage2_unknown_release::bash_second_writer_injected_unknown_release_quarantines_original_owner: test' evidence/runtime-selected-tests.txt
+          grep -F 'native_close_admission_tests::bash_stage2_unknown_release::bash_second_writer_unknown_release_retains_owner_after_public_close_waiter_drop: test' evidence/runtime-selected-tests.txt
           for test in \
             native_close_retires_one_registered_real_bash_group \
             native_close_retires_two_registered_real_bash_groups_under_one_scope_capture; do
@@ -366,6 +367,7 @@ jobs:
           grep -E 'test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored;' evidence/native-close-runtime-actor.log
           grep -F 'native_close_admission_tests::bash_stage2_stop_ack::bash_stage_two_stop_ack_reaches_real_second_writer_and_cleans_once ... ok' evidence/native-close-runtime-actor.log
           grep -F 'native_close_admission_tests::bash_stage2_unknown_release::bash_second_writer_injected_unknown_release_quarantines_original_owner ... ok' evidence/native-close-runtime-actor.log
+          grep -F 'native_close_admission_tests::bash_stage2_unknown_release::bash_second_writer_unknown_release_retains_owner_after_public_close_waiter_drop ... ok' evidence/native-close-runtime-actor.log
           for test in \
             native_close_retires_one_registered_real_bash_group \
             native_close_retires_two_registered_real_bash_groups_under_one_scope_capture; do
