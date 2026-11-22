@@ -10,6 +10,7 @@
 //! authoritative behavioural specification.
 
 pub mod backend;
+pub mod close_gate;
 #[cfg(any(test, feature = "test-support"))]
 pub mod fake_backend;
 pub mod invoke;

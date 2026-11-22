@@ -51,6 +51,13 @@ jobs:
           name: close-format-${{ github.sha }}-${{ github.run_attempt }}
           path: evidence/hosted-format.patch
           if-no-files-found: error
+      - name: Prepare disposable tmux integration dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y tmux coreutils
+          { tmux -V; /usr/bin/timeout --version; } | tee evidence/tmux-versions.log
       - name: Compile database tests and inventory exact selectors
         shell: bash
         run: |
@@ -353,6 +360,14 @@ jobs:
             tmux::registry::tests::batch_cancel_uses_original_generations_not_spoofed_projections
             tmux::registry::tests::wrong_registry_batch_cancel_retains_all_foreign_fences_for_issuer
             tmux::registry::tests::cancellation_retry_deadline_does_not_renew_teardown_expiry
+            tmux::close_gate::tests::embed_paths_reject_tmux_format_syntax_and_controls
+            tmux::close_gate::tests::shell_quote_preserves_spaces_and_apostrophes
+            tmux::close_gate::tests::close_gate_queue_only_kills_after_helper_and_exact_guard_succeed
+            tmux::close_gate::tests::private_gate_approves_only_the_expected_request_and_fails_closed_on_eof
+            tmux::close_gate::tests::canceled_request_drops_the_owned_writable_stream
+            tmux::close_gate::tests::wrong_nonce_and_changed_process_are_denied_before_reply
+            tmux::close_gate::tests::helper_protocol_rejects_wrong_approval_truncated_eof_and_expired_raw_deadline
+            tmux::close_gate::tests::report_parser_is_bounded_and_canonical
             tmux::backend::tests::system_exact_process_teardown_fails_closed_without_path_command
           )
           for test in "${tests[@]}"; do
@@ -362,6 +377,31 @@ jobs:
           grep -E 'test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored;' evidence/tmux-execution.log
           for test in "${tests[@]}"; do
             grep -Fx "test $test ... ok" evidence/tmux-execution.log
+          done
+      - name: Qualify actual same-server queue and early helper dispatch
+        if: success() || failure()
+        timeout-minutes: 30
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p phoenix_ide --test tmux_close_gate -- --list 2>&1 | tee evidence/tmux-gate-inventory.log
+          tests=(
+            helper_probe_emits_exact_protocol_marker_and_exits_before_startup
+            malformed_recognized_helper_arguments_exit_125_without_falling_through
+            disposable::same_token_socket_rebinding_never_kills_the_replacement_server
+            disposable::token_change_while_helper_waits_preserves_the_original_server
+            disposable::cancellation_before_helper_approval_never_kills_the_server
+            disposable::exact_gate_kills_only_the_original_disposable_server
+            disposable::exact_gate_rejects_birth_and_token_mismatch_without_killing
+            disposable::exact_gate_rejects_unsupported_or_format_embedded_helper
+          )
+          for test in "${tests[@]}"; do
+            grep -Fx "$test: test" evidence/tmux-gate-inventory.log
+          done
+          cargo test -p phoenix_ide --test tmux_close_gate -- --nocapture --test-threads=1 2>&1 | tee evidence/tmux-gate-execution.log
+          grep -F 'test result: ok. 8 passed; 0 failed; 0 ignored;' evidence/tmux-gate-execution.log
+          for test in "${tests[@]}"; do
+            grep -Fx "test $test ... ok" evidence/tmux-gate-execution.log
           done
       - name: Qualify native Close public adapter parsing and discovery
         if: success() || failure()

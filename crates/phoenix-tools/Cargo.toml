@@ -42,7 +42,7 @@ phoenix-browser = { path = "../phoenix-browser" }
 async-trait = "0.1"
 
 # Async runtime (process spawning, PTY, locks, cancellation).
-tokio = { version = "1", features = ["fs", "io-util", "process", "rt", "sync", "time", "macros"] }
+tokio = { version = "1", features = ["fs", "io-util", "net", "process", "rt", "sync", "time", "macros"] }
 tokio-util = "0.7"
 futures = "0.3"
 
@@ -86,6 +86,7 @@ uuid = { version = "1", features = ["v4"] }
 
 # Locating tmux on PATH at registry init.
 which = "8"
+tempfile = "3"
 
 # Process-group / signal management for bash.
 libc = "0.2"
@@ -101,7 +102,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
 proptest = "1"
-tempfile = "3"
 futures = "0.3"
 # test-util enables tokio::time::{pause, advance} and #[tokio::test(start_paused)]
 # for deterministic timer tests (e.g. the bash reader idle-flush timeout).
