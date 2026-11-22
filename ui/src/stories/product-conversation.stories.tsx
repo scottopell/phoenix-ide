@@ -91,6 +91,40 @@ const withReminders = (id: Extract<ProductConversationScenarioId, `reminders-${s
   title: `Reminders ${id.slice('reminders-'.length)}`,
   reminderFixture: { reminders: [...reminderRows], initialFailures, rejectMutation, failuresAfterFirstLoad },
 });
+const longReminderText = Array.from({ length: 18 }, (_, index) =>
+  `Line ${index + 1}: review the deployment checklist, confirm the service owner, inspect the latest monitoring evidence, and record any follow-up before the scheduled release window.`
+).join('\n');
+const compactReminder = (id: string, kind: 'due' | 'scheduled' | 'cancelled') => ({
+  id,
+  product_conversation_id: reminderOwner,
+  text: longReminderText,
+  due_at_us: kind === 'due' ? 1782907200000000 : 1782993600000000,
+  timezone: 'America/Los_Angeles',
+  revision: 1,
+  created_at_us: 1782900000000000,
+  state: kind === 'due'
+    ? { kind: 'due' as const, occurred_at_us: 1782907200000000 }
+    : kind === 'cancelled'
+      ? { kind: 'cancelled' as const, cancelled_at_us: 1782907200000000 }
+      : { kind: 'scheduled' as const },
+});
+const compactReminders = (kind: 'due' | 'scheduled' | 'cancelled') => withReminders(
+  `reminders-compact-${kind}` as Extract<ProductConversationScenarioId, `reminders-${string}`>,
+  0,
+);
+const compactDueScenario = { ...compactReminders('due'), reminderFixture: { reminders: [compactReminder('compact-due', 'due')], initialFailures: 0 } };
+const compactScheduledScenario = { ...compactReminders('scheduled'), reminderFixture: { reminders: [compactReminder('compact-scheduled', 'scheduled')], initialFailures: 0 } };
+const compactCancelledScenario = { ...compactReminders('cancelled'), reminderFixture: { reminders: [compactReminder('compact-cancelled', 'cancelled')], initialFailures: 0 } };
+const compactEmptyScenario = { ...withReminders('reminders-compact-empty', 0), reminderFixture: { reminders: [], initialFailures: 0 } };
+export const RemindersCompactDue: Story = () => <ProductConversationFixture scenario={compactDueScenario} />;
+RemindersCompactDue.storyName = 'reminders-compact-due';
+export const RemindersCompactScheduled: Story = () => <ProductConversationFixture scenario={compactScheduledScenario} />;
+RemindersCompactScheduled.storyName = 'reminders-compact-scheduled';
+export const RemindersCompactCancelled: Story = () => <ProductConversationFixture scenario={compactCancelledScenario} />;
+RemindersCompactCancelled.storyName = 'reminders-compact-cancelled';
+export const RemindersCompactEmpty: Story = () => <ProductConversationFixture scenario={compactEmptyScenario} />;
+RemindersCompactEmpty.storyName = 'reminders-compact-empty';
+
 export const RemindersInitialFailure: Story = () => <ProductConversationFixture scenario={withReminders('reminders-initial-failure', 1)} />;
 RemindersInitialFailure.storyName = 'reminders-initial-failure';
 export const RemindersAliasFallbackInitialFailure: Story = () => <ProductConversationFixture scenario={{
