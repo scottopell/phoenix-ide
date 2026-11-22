@@ -212,7 +212,7 @@ AND SHALL attach the child to the parent's exact durable `WorkScope` identity
 
 WHEN deciding whether multiple Work children may be pending for one parent
 THE SYSTEM SHALL qualify only the parent's actual resolved model identifier
-AND SHALL qualify exactly `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-6-astra`, and `gpt-6-sol`
+AND SHALL qualify exactly `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-6-astra`, `gpt-6-sol`, and `gpt-6.1-sol`
 AND SHALL NOT infer qualification from provider, model family, version ordering, reasoning effort, service tier, configuration tier, named worker, child model, or child persona
 AND SHALL treat `gpt-5.6-luna`, `gpt-6-luna`, every unknown or newly introduced identifier, every custom route, and every otherwise unlisted parent model as unqualified
 

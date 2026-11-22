@@ -251,6 +251,22 @@ Builds a static `--release` binary with the UI embedded (debug symbols kept unle
 ## Extending the codebase
 *Procedures for adding to Phoenix without breaking its invariants.*
 
+### Model addition review
+
+For every PR that adds, replaces, or renames a built-in model, record whether
+its exact resolved model ID can orchestrate parallel Work sub-agents as a
+parent. Review the model's entry in
+[`subagent_qualification.rs`](crates/phoenix-core/src/subagent_qualification.rs)
+and check that the effective `spawn_agents` tool description, input schema,
+and runtime admission agree. Qualification attaches to the parent model's ID.
+
+Before approving parallel Work support, require a disposable probe with that
+model as the parent. One `spawn_agents` call must admit two `mode: "work"`
+children whose runs overlap and whose writes land in separate files. If the
+model stays single-writer, record that as an explicit review decision and
+verify the advertised and enforced single-writer limit. Link the evidence in
+the PR.
+
 ### Adding a New Tool
 
 See [`crates/phoenix-tools/src/think.rs`](crates/phoenix-tools/src/think.rs) as the simplest example.

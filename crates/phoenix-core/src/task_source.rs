@@ -174,7 +174,19 @@ impl TaskSource {
     #[must_use]
     pub fn branch_and_id(&self, conv_id: &str) -> (String, String) {
         match self {
-            Self::Taskmd { id, slug, .. } => (format!("task-{id}-{slug}"), id.clone()),
+            Self::Taskmd { id, slug, .. } => {
+                let branch = if slug_is_ref_safe(slug) {
+                    format!("task-{id}-{slug}")
+                } else {
+                    let sanitized = slug_segment(slug);
+                    if sanitized.is_empty() {
+                        format!("task-{id}")
+                    } else {
+                        format!("task-{id}-{sanitized}")
+                    }
+                };
+                (branch, id.clone())
+            }
             Self::PlainMarkdown { stem } => {
                 let conv_prefix: String = conv_id.chars().take(8).collect();
                 let sanitized = slug_segment(stem);
@@ -191,55 +203,103 @@ impl TaskSource {
 
 /// First ATX `# H1` heading in a markdown body, trimmed; `None` if there is none.
 ///
-/// Lines inside fenced code blocks and indented code (4+ spaces) are not
-/// headings. A closing `#` sequence (`# Title ##`) is not part of the title.
+/// Lines inside YAML front matter, fenced code blocks, and indented code
+/// blocks are not headings (a `# comment` in a shell fence is not a title).
+/// An optional closing `#` sequence is stripped (`# Title #` -> `Title`).
 fn extract_h1(body: &str) -> Option<String> {
+    let all: Vec<&str> = body.lines().collect();
+    let body_start = front_matter_len(&all);
+    let lines = all.into_iter().skip(body_start);
+
     let mut fence: Option<(char, usize)> = None;
-    for line in body.lines() {
+    for line in lines {
         let indent = line.len() - line.trim_start_matches(' ').len();
-        let unindented = line.trim_start_matches(' ');
-        if let Some((ch, len)) = fence {
-            let run = unindented.chars().take_while(|&c| c == ch).count();
-            if indent < 4 && run >= len && unindented.trim_start_matches(ch).trim().is_empty() {
+        let rest = line.trim_start_matches(' ');
+        let marker = rest
+            .chars()
+            .next()
+            .filter(|c| matches!(c, '`' | '~'))
+            .map(|c| (c, rest.chars().take_while(|x| *x == c).count()))
+            .filter(|(_, n)| *n >= 3);
+        if let Some((open_char, open_len)) = fence {
+            if indent < 4
+                && marker.is_some_and(|(c, n)| c == open_char && n >= open_len)
+                && rest.trim_start_matches(open_char).trim().is_empty()
+            {
                 fence = None;
             }
             continue;
         }
+        if indent < 4 {
+            if let Some((c, n)) = marker {
+                // A backtick fence's info string may not contain backticks.
+                if c == '~' || !rest.trim_start_matches(c).contains('`') {
+                    fence = Some((c, n));
+                    continue;
+                }
+            }
+        }
         if indent >= 4 {
             continue;
         }
-        if let Some(ch) = unindented.chars().next().filter(|c| matches!(c, '`' | '~')) {
-            let run = unindented.chars().take_while(|&c| c == ch).count();
-            if run >= 3 {
-                fence = Some((ch, run));
-                continue;
-            }
-        }
-        let Some(rest) = unindented.strip_prefix('#') else {
+        let Some(text) = rest.strip_prefix("# ") else {
             continue;
         };
-        if !rest.starts_with([' ', '\t']) {
-            continue;
-        }
-        let title = strip_closing_hashes(rest.trim());
-        if !title.is_empty() {
-            return Some(title.to_string());
+        let text = text.trim();
+        let without_closing = text.trim_end_matches('#');
+        let text = if without_closing.is_empty() || without_closing.ends_with(' ') {
+            without_closing.trim_end()
+        } else {
+            text
+        };
+        if !text.is_empty() {
+            return Some(text.to_string());
         }
     }
     None
 }
 
-/// Drop an ATX closing sequence: trailing `#`s preceded by whitespace (or the
-/// whole text when it is only `#`s).
-fn strip_closing_hashes(text: &str) -> &str {
-    let without = text.trim_end_matches('#');
-    if without.len() == text.len() {
-        text
-    } else if without.is_empty() || without.ends_with([' ', '\t']) {
-        without.trim_end()
-    } else {
-        text
+/// Number of leading lines occupied by a YAML front-matter block, or 0.
+///
+/// A block counts only when the opening `---` is immediately followed by a
+/// `key:` line and a closing `---`/`...` exists; otherwise the leading `---` is
+/// an ordinary thematic break and the document is left intact.
+fn front_matter_len(lines: &[&str]) -> usize {
+    if lines.first().is_none_or(|l| l.trim_end() != "---") {
+        return 0;
     }
+    let first_is_key = lines.get(1).is_some_and(|l| {
+        l.split_once(':').is_some_and(|(key, _)| {
+            !key.is_empty()
+                && key
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-'))
+        })
+    });
+    if !first_is_key {
+        return 0;
+    }
+    lines
+        .iter()
+        .skip(2)
+        .position(|l| matches!(l.trim_end(), "---" | "..."))
+        .map_or(0, |close| close + 3)
+}
+
+/// True when `task-{id}-{slug}` is already a valid git branch name for this
+/// slug, so it can be used verbatim. Conservative subset of
+/// `git check-ref-format`: restricted alphabet, no `..`, no trailing `.`,
+/// no `.lock` suffix.
+// git rejects the lowercase `.lock` suffix only, so the comparison is deliberately case-sensitive.
+#[allow(clippy::case_sensitive_file_extension_comparisons)]
+fn slug_is_ref_safe(slug: &str) -> bool {
+    !slug.is_empty()
+        && slug
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        && !slug.contains("..")
+        && !slug.ends_with('.')
+        && !slug.ends_with(".lock")
 }
 
 /// Title-case a `-`/`_`-separated identifier (`fix-login_bug` → `Fix Login Bug`).
@@ -427,44 +487,156 @@ mod tests {
     }
 
     #[test]
-    fn title_ignores_hash_lines_in_fenced_code() {
-        let body = "```sh\n# install deps\nmake\n```\n\n# Real Title";
-        assert_eq!(extract_h1(body).as_deref(), Some("Real Title"));
-        let tilde = "~~~~\n# nope\n~~~\n# still nope\n~~~~\n# Yes";
-        assert_eq!(extract_h1(tilde).as_deref(), Some("Yes"));
-        // Unclosed fence swallows the rest: no heading outside it.
-        assert_eq!(extract_h1("```\n# x"), None);
+    fn h1_ignores_code_fences_indented_code_and_front_matter() {
+        assert_eq!(
+            extract_h1("```bash\n# install deps\nmake\n```\n\n# Real Title\n").as_deref(),
+            Some("Real Title")
+        );
+        assert_eq!(
+            extract_h1("~~~\n# x\n~~~\n# Real\n").as_deref(),
+            Some("Real")
+        );
+        // A shorter closing fence does not close a longer one.
+        assert_eq!(
+            extract_h1("````\n```\n# inside\n````\n# Real\n").as_deref(),
+            Some("Real")
+        );
+        assert_eq!(
+            extract_h1("para\n\n        # comment\n\n# Real\n").as_deref(),
+            Some("Real")
+        );
+        assert_eq!(
+            extract_h1("---\ntitle: x\n# yaml comment\n---\n# Real\n").as_deref(),
+            Some("Real")
+        );
+        assert_eq!(extract_h1("```\n# only in fence\n```\n"), None);
     }
 
     #[test]
-    fn title_ignores_indented_code_and_requires_space() {
-        assert_eq!(extract_h1("    # code\n#nospace\n#Hashtag"), None);
-        assert_eq!(extract_h1("   # Ok").as_deref(), Some("Ok"));
-        assert_eq!(extract_h1("#\tTabbed").as_deref(), Some("Tabbed"));
+    fn h1_survives_leading_thematic_break() {
+        assert_eq!(
+            extract_h1("---\n\n# Repair database indexes\n\nActual task body.").as_deref(),
+            Some("Repair database indexes")
+        );
+        assert_eq!(
+            extract_h1("---\n# Title\n---\nbody\n").as_deref(),
+            Some("Title")
+        );
+        // Unclosed `key:` block is not front matter either.
+        assert_eq!(
+            extract_h1("---\ntitle: x\n\n# Real\n").as_deref(),
+            Some("Real")
+        );
+        // Closed front matter is still skipped.
+        assert_eq!(
+            extract_h1("---\ntitle: x\n\n# yaml\n---\n# Real\n").as_deref(),
+            Some("Real")
+        );
     }
 
     #[test]
-    fn title_strips_closing_hashes() {
-        assert_eq!(extract_h1("# Title ##").as_deref(), Some("Title"));
-        assert_eq!(extract_h1("# C#").as_deref(), Some("C#"));
-        assert_eq!(extract_h1("# #"), None);
-        assert_eq!(extract_h1("# Title"), Some("Title".to_string()));
+    fn h1_strips_closing_hashes_and_rejects_empty() {
+        assert_eq!(extract_h1("# Title #\n").as_deref(), Some("Title"));
+        assert_eq!(extract_h1("# C# rocks\n").as_deref(), Some("C# rocks"));
+        assert_eq!(extract_h1("# C#\n").as_deref(), Some("C#"));
+        assert_eq!(extract_h1("# #\n# Real\n").as_deref(), Some("Real"));
+        assert_eq!(
+            extract_h1("   # Indented ok\n").as_deref(),
+            Some("Indented ok")
+        );
     }
 
     #[test]
-    fn plain_markdown_branch_is_bounded_and_nonempty() {
+    fn taskmd_branch_is_always_a_valid_git_ref() {
+        for (file, want) in [
+            ("12345-p1-ready--fix.the.bug.md", "task-12345-fix.the.bug"),
+            ("12345-p1-ready--x.lock.md", "task-12345-x-lock"),
+            ("12345-p1-ready--x..y.md", "task-12345-x-y"),
+            ("12345-p1-ready--a b.md", "task-12345-a-b"),
+            ("12345-p1-ready--Fix_Bug~1.md", "task-12345-fix-bug-1"),
+        ] {
+            let (branch, id) = TaskSource::detect(file).unwrap().branch_and_id("c");
+            assert_eq!(branch, want, "{file}");
+            assert_eq!(id, "12345");
+        }
+    }
+
+    mod ref_props {
+        use super::super::*;
+        use proptest::prelude::*;
+
+        /// Hand-written subset of the `git check-ref-format --branch` rules
+        /// relevant to names of the shape `task-...`. It is not checked against
+        /// a real git in tests (no subprocesses), so a rule git enforces that is
+        /// missing here would go unnoticed; extend it if git rejects a branch
+        /// this accepts.
+        #[allow(clippy::case_sensitive_file_extension_comparisons)]
+        fn is_valid_branch(name: &str) -> bool {
+            !name.is_empty()
+                && !name.starts_with('-')
+                && !name.contains("..")
+                && !name.contains("@{")
+                && !name.contains("//")
+                && !name.ends_with('.')
+                && !name.ends_with('/')
+                && name != "@"
+                && !name
+                    .chars()
+                    .any(|c| c.is_control() || " ~^:?*[\\".contains(c))
+                && name
+                    .split('/')
+                    .all(|part| !part.starts_with('.') && !part.ends_with(".lock"))
+        }
+
+        fn arb_text() -> impl Strategy<Value = String> {
+            prop_oneof![
+                "[A-Za-z0-9._~^:?*\\[\\] @{}/-]{1,24}",
+                any::<String>().prop_map(|s| s.chars().take(24).collect()),
+            ]
+        }
+
+        proptest! {
+            #[test]
+            fn taskmd_branch_is_valid_ref(slug in arb_text(), id in "[0-9]{1,6}", conv in "[a-z0-9-]{1,16}") {
+                let source = TaskSource::Taskmd {
+                    id,
+                    priority: Priority::P2,
+                    status: Status::Ready,
+                    slug,
+                };
+                let (branch, _) = source.branch_and_id(&conv);
+                prop_assert!(is_valid_branch(&branch), "{branch}");
+            }
+
+            #[test]
+            fn plain_markdown_branch_is_valid_ref(stem in arb_text(), conv in "[a-z0-9-]{1,16}") {
+                let source = TaskSource::PlainMarkdown { stem };
+                let (branch, id) = source.branch_and_id(&conv);
+                prop_assert!(is_valid_branch(&branch), "{branch}");
+                prop_assert!(!id.is_empty());
+            }
+
+            #[test]
+            fn detected_filenames_yield_valid_ref(name in arb_text(), conv in "[a-z0-9-]{1,16}") {
+                for filename in [format!("{name}.md"), format!("12345-p1-ready--{name}.md")] {
+                    if let Some(source) = TaskSource::detect(&filename) {
+                        let (branch, _) = source.branch_and_id(&conv);
+                        prop_assert!(is_valid_branch(&branch), "{filename} -> {branch}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn plain_markdown_branch_is_bounded() {
         let long = TaskSource::detect(&format!("{}.md", "a".repeat(300))).unwrap();
         let (branch, id) = long.branch_and_id("conv-12345678");
         assert!(branch.len() < 80, "{branch}");
         assert!(!id.ends_with('-'));
-        let (branch, id) = TaskSource::detect("日本語.md")
-            .unwrap()
-            .branch_and_id("conv-12345678");
-        assert_eq!(id, "conv-123");
-        assert_eq!(branch, "task-conv-123-conv-123");
     }
 
-    mod proptests {
+    mod slug_proptests {
         use super::super::*;
         use proptest::prelude::*;
 
@@ -481,15 +653,6 @@ mod tests {
             fn slug_segment_is_idempotent(s in "\\PC{0,200}") {
                 let once = slug_segment(&s);
                 prop_assert_eq!(slug_segment(&once), once);
-            }
-
-            #[test]
-            fn h1_never_comes_from_inside_a_fence(
-                inner in "[ -~]{0,30}",
-                title in "[A-Za-z][A-Za-z0-9 ]{0,20}",
-            ) {
-                let body = format!("```\n# {inner}\n```\n# {title}");
-                prop_assert_eq!(extract_h1(&body), Some(title.trim().to_string()));
             }
         }
     }

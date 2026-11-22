@@ -770,7 +770,7 @@ invariant QualificationIsExplicitAndFailClosed {
     for p in bedrock.Conversation:
         parallel_work_qualified(p.resolved_model_id)
             = (p.resolved_model_id in {
-                "gpt-5.6-sol", "gpt-5.6-terra", "gpt-6-astra", "gpt-6-sol" })
+                "gpt-5.6-sol", "gpt-5.6-terra", "gpt-6-astra", "gpt-6-sol", "gpt-6.1-sol" })
 }
 
 invariant AdmittedChildStartsAtMostOnce {
@@ -921,7 +921,7 @@ surface NativeSpawnAdoptionBoundary {
 -- admission_for_parent_result(parent, result) -> SubAgentAdmission: the admission
 --   whose exact child identity is result.agent_id and durable parent is parent.
 -- parallel_work_qualified(model_id: String) -> Boolean
---   True exactly for gpt-5.6-sol, gpt-5.6-terra, gpt-6-astra, and gpt-6-sol.
+--   True exactly for gpt-5.6-sol, gpt-5.6-terra, gpt-6-astra, gpt-6-sol, and gpt-6.1-sol.
 --   False for gpt-5.6-luna, gpt-6-luna, every Anthropic identifier in the supported catalog, custom
 --   routes, unknown identifiers, and newly introduced identifiers.
 -- pending_work_admissions(parent: Conversation) -> Integer

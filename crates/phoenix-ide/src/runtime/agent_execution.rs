@@ -335,12 +335,14 @@ execution = [{model = "luna", connection = "codex", reasoning_effort = "low"}]
     fn tool_definition_uses_one_qualification_for_description_and_schema() {
         let catalog =
             SpawnCatalog::resolve(&AgentConfig::default(), vec![route("gpt-6-sol", "codex")]);
-        let qualified = catalog.tool_definition("gpt-6-sol", true, false);
-        assert!(qualified.description.contains("may run in parallel"));
-        assert!(qualified
-            .input_schema
-            .to_string()
-            .contains("may run in parallel"));
+        for parent_model in ["gpt-6-sol", "gpt-6.1-sol"] {
+            let qualified = catalog.tool_definition(parent_model, true, false);
+            assert!(qualified.description.contains("may run in parallel"));
+            assert!(qualified
+                .input_schema
+                .to_string()
+                .contains("may run in parallel"));
+        }
 
         for definition in [
             catalog.tool_definition("gpt-6-luna", true, false),
