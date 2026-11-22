@@ -192,6 +192,17 @@ pub enum ExitState {
     WaiterPanicked,
 }
 
+/// Resource-lifetime proof, independent from process lifecycle or output completeness.
+/// Success means the owned child wait succeeded, all present reader tasks returned
+/// normally (dropping their pipes), and command scratch was removed or absent.
+/// A handled read error can lose output but still release the reader's resources.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WaiterSettlement {
+    Pending,
+    Settled,
+    Unverified(String),
+}
+
 /// A bash handle: identity + lifecycle state + watch-channel for exit notification.
 ///
 /// The handle is owned by exactly one `ResourceScopeKeyHandles` registry entry.
@@ -232,6 +243,8 @@ pub struct Handle {
     /// (per `tokio::sync::watch` semantics).
     exit_signal: watch::Sender<Option<ExitState>>,
     exit_observer: watch::Receiver<Option<ExitState>>,
+    /// Aggregate proof from the one waiter responsible for this exact handle.
+    waiter_settlement: watch::Sender<WaiterSettlement>,
 }
 
 impl std::fmt::Debug for Handle {
@@ -450,6 +463,7 @@ impl Handle {
             ring: Mutex::new(RingBuffer::new(ring_bytes_cap)),
         };
         let (tx, rx) = watch::channel::<Option<ExitState>>(None);
+        let (settlement_tx, _) = watch::channel(WaiterSettlement::Pending);
         Arc::new(Self {
             controller_scope,
             handle_id,
@@ -465,6 +479,7 @@ impl Handle {
             kill_attempt: RwLock::new(None),
             exit_signal: tx,
             exit_observer: rx,
+            waiter_settlement: settlement_tx,
         })
     }
 
@@ -645,6 +660,36 @@ impl Handle {
     /// the practical effect is no different.
     pub fn publish_exit(&self, state: ExitState) {
         let _ = self.exit_signal.send(Some(state));
+    }
+
+    /// Subscribe to the late-subscription-safe aggregate waiter settlement witness.
+    pub fn subscribe_waiter_settlement(&self) -> watch::Receiver<WaiterSettlement> {
+        self.waiter_settlement.subscribe()
+    }
+
+    /// Publish successful settlement only while the witness is still pending.
+    pub(super) fn settle_waiter(&self) {
+        self.waiter_settlement.send_if_modified(|state| {
+            if matches!(*state, WaiterSettlement::Pending) {
+                *state = WaiterSettlement::Settled;
+                true
+            } else {
+                false
+            }
+        });
+    }
+
+    /// Fail closed. An armed panic guard may replace a prior success, but
+    /// failures are terminal and can never be overwritten by success.
+    pub(super) fn unverify_waiter(&self, reason: impl Into<String>) {
+        self.waiter_settlement.send_if_modified(|state| {
+            if !matches!(*state, WaiterSettlement::Unverified(_)) {
+                *state = WaiterSettlement::Unverified(reason.into());
+                true
+            } else {
+                false
+            }
+        });
     }
 
     /// Return the live `LiveData`'s pgid if the handle is currently live
@@ -871,6 +916,7 @@ impl Drop for ExitWatchPanicGuard {
                 "bash waiter task dropped without disarm — publishing WaiterPanicked"
             );
             let _ = handle.exit_signal.send(Some(ExitState::WaiterPanicked));
+            handle.unverify_waiter("waiter task panicked or was cancelled");
         }
     }
 }

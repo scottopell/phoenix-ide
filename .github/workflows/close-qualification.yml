@@ -422,6 +422,7 @@ jobs:
           set -euo pipefail
           cargo test -p phoenix-tools --lib -- --list 2>&1 | tee evidence/bash-native-leaf-inventory.log
           for test in \
+            nonleader_preparation_is_unsupported \
             expired_stop_and_group_stages_perform_zero_effects \
             each_physical_stage_is_attempted_only_once_even_after_os_error \
             dropping_native_owner_does_not_resume_observed_child \
@@ -429,13 +430,66 @@ jobs:
             grep -F "bash::handle::native_retirement::tests::$test: test" evidence/bash-native-leaf-inventory.log
           done
           cargo test -p phoenix-tools --lib bash::handle::native_retirement::tests:: -- --nocapture --test-threads=1 2>&1 | tee evidence/bash-native-leaf-execution.log
-          grep -Eq 'test result: ok\. 4 passed; 0 failed; 0 ignored;' evidence/bash-native-leaf-execution.log
+          grep -Eq 'test result: ok\. 5 passed; 0 failed; 0 ignored;' evidence/bash-native-leaf-execution.log
           for test in \
+            nonleader_preparation_is_unsupported \
             expired_stop_and_group_stages_perform_zero_effects \
             each_physical_stage_is_attempted_only_once_even_after_os_error \
             dropping_native_owner_does_not_resume_observed_child \
             group_kill_requires_explicit_resume_before_state_pin_release; do
             grep -F "test bash::handle::native_retirement::tests::$test ... ok" evidence/bash-native-leaf-execution.log
+          done
+      - name: Qualify exact Bash waiter resource settlement
+        if: success() || failure()
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p phoenix-tools --lib -- --list 2>&1 | tee evidence/bash-settlement-inventory.log
+          tests=(
+            bash::operations::tests::handled_pipe_read_error_still_settles_reader_resources
+            bash::operations::tests::waiter_child_wait_error_is_unverified
+            bash::operations::tests::waiter_reader_join_error_is_unverified_but_success_settles_late_subscribers
+            bash::operations::tests::armed_panic_guard_unverifies_even_after_settlement
+            bash::operations::tests::waiter_scratch_cleanup_failure_keeps_legacy_terminal_exit_but_unverifies
+            bash::operations::tests::waiter_missing_scratch_directory_is_settled
+            bash::operations::tests::dropping_polled_pending_run_waiter_unverifies_without_terminalizing
+            bash::operations::tests::waiter_reader_join_error_still_awaits_gated_stderr_reader
+            bash::operations::tests::waiter_cannot_terminalize_before_reader_drains_unterminated_tail
+            bash::operations::tests::waiter_bounds_reader_drain_when_a_descendant_keeps_pipe_open
+            bash::registry::native_retirement::tests::waiter_settlement_uses_original_remaining_deadline
+            bash::registry::native_retirement::tests::waiter_settlement_failure_or_late_success_cannot_verify
+            bash::registry::native_retirement::tests::waiter_settlement_accepts_retained_success_but_not_closed_pending
+          )
+          for test in "${tests[@]}"; do
+            grep -Fx "$test: test" evidence/bash-settlement-inventory.log
+          done
+          for test in "${tests[@]}"; do
+            log="evidence/settlement-${test##*::}.log"
+            cargo test -p phoenix-tools --lib "$test" -- --exact --test-threads=1 2>&1 | tee "$log"
+            grep -F "test $test ... ok" "$log"
+            grep -Eq 'test result: ok\. 1 passed; 0 failed; 0 ignored;' "$log"
+          done
+      - name: Qualify original Bash native registry preparation fences
+        if: success() || failure()
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p phoenix-tools --lib -- --list 2>&1 | tee evidence/bash-native-registry-inventory.log
+          for test in \
+            native_preparation_refuses_expired_original_deadline \
+            native_preparation_registry_wait_spends_original_deadline \
+            native_preparation_refuses_replaced_generation_after_registry_wait \
+            native_preparation_cancellation_keeps_original_admission_closed; do
+            grep -F "bash::registry::tests::$test: test" evidence/bash-native-registry-inventory.log
+          done
+          cargo test -p phoenix-tools --lib bash::registry::tests::native_preparation_ -- --nocapture --test-threads=1 2>&1 | tee evidence/bash-native-registry-execution.log
+          grep -Eq 'test result: ok\. 4 passed; 0 failed; 0 ignored;' evidence/bash-native-registry-execution.log
+          for test in \
+            native_preparation_refuses_expired_original_deadline \
+            native_preparation_registry_wait_spends_original_deadline \
+            native_preparation_refuses_replaced_generation_after_registry_wait \
+            native_preparation_cancellation_keeps_original_admission_closed; do
+            grep -F "test bash::registry::tests::$test ... ok" evidence/bash-native-registry-execution.log
           done
       - name: Qualify inert exact Bash retirement ownership and registry regressions
         if: success() || failure()

@@ -32,6 +32,11 @@ use tokio::sync::{watch, Notify, RwLock};
 use super::handle::{BashLaunchIdentity, Handle, HandleId, HandleState};
 use super::ring::RING_BUFFER_BYTES;
 
+mod native_retirement;
+pub use native_retirement::{
+    NativeBashRetirement, NativeBashRetirementError, NativeBashRetirementOutcome,
+};
+
 /// Per-`ResourceScopeKey` cap on `running` handles (REQ-BASH-005:
 /// `LIVE_HANDLE_CAP`).
 pub const LIVE_HANDLE_CAP: usize = 8;
@@ -2530,6 +2535,81 @@ mod tests {
         assert!(dropped.load(Ordering::Acquire));
         assert!(outcome.report().has_failures());
         assert!(permit.entry.try_write().is_ok());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn native_preparation_refuses_expired_original_deadline() {
+        let (registry, permit, prepared, handle) =
+            prepared_fixture("native-preparation-expired").await;
+        let original_deadline = prepared.deadline;
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert_eq!(tokio::time::Instant::now(), original_deadline);
+        assert!(matches!(
+            prepared.prepare_native().await,
+            Err(NativeBashRetirementError::DeadlineExpired)
+        ));
+        assert!(handle.kill_attempt().await.is_none());
+        assert!(permit.entry.try_write().is_ok());
+        assert!(registry.reserve_spawn(&permit.work_scope).await.is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn native_preparation_registry_wait_spends_original_deadline() {
+        let (registry, permit, prepared, handle) =
+            prepared_fixture("native-preparation-lock-deadline").await;
+        let original_deadline = prepared.deadline;
+        let lock = permit.entry.write().await;
+        let mut preparation = Box::pin(prepared.prepare_native());
+        poll_pending(preparation.as_mut()).await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+        // The same original wait expires even while its registry writer stays held.
+        assert!(matches!(
+            preparation.await,
+            Err(NativeBashRetirementError::DeadlineExpired)
+        ));
+        assert_eq!(tokio::time::Instant::now(), original_deadline);
+        drop(lock);
+        assert!(permit.entry.try_write().is_ok());
+        assert!(handle.kill_attempt().await.is_none());
+        assert!(registry.reserve_spawn(&permit.work_scope).await.is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn native_preparation_refuses_replaced_generation_after_registry_wait() {
+        let (registry, original, prepared, handle) =
+            prepared_fixture("native-preparation-stale-generation").await;
+        let replacement = registry.begin_retirement(&original.work_scope).await;
+        assert_ne!(original.generation, replacement.generation);
+        let lock = replacement.entry.write().await;
+        let mut preparation = Box::pin(prepared.prepare_native());
+        poll_pending(preparation.as_mut()).await;
+        drop(lock);
+        assert!(matches!(
+            preparation.await,
+            Err(NativeBashRetirementError::StaleGeneration)
+        ));
+        let table = original.entry.read().await;
+        assert!(table.teardown_started);
+        assert_eq!(table.teardown_generation, replacement.generation.0);
+        drop(table);
+        assert!(handle.kill_attempt().await.is_none());
+        assert!(registry.reserve_spawn(&original.work_scope).await.is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn native_preparation_cancellation_keeps_original_admission_closed() {
+        let (registry, permit, prepared, handle) =
+            prepared_fixture("native-preparation-cancellation").await;
+        let lock = permit.entry.write().await;
+        let mut preparation = Box::pin(prepared.prepare_native());
+        poll_pending(preparation.as_mut()).await;
+        drop(preparation);
+        assert!(lock.teardown_started);
+        assert_eq!(lock.teardown_generation, permit.generation.0);
+        drop(lock);
+        assert!(permit.entry.try_write().is_ok());
+        assert!(handle.kill_attempt().await.is_none());
+        assert!(registry.reserve_spawn(&permit.work_scope).await.is_err());
     }
 
     async fn prepared_fixture(
