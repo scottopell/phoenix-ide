@@ -10,6 +10,11 @@ on:
         description: "Run disposable 13.4 GB SQLite backup qualification"
         type: boolean
         default: false
+      backup_verification_shape:
+        description: "Target one fixture or the full qualification matrix"
+        type: choice
+        options: [all, baseline, wide, dense]
+        default: all
   pull_request:
   push:
     branches:
@@ -1071,16 +1076,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - shape: baseline
-            payload: 1100
-            columns: 0
-          - shape: wide
-            payload: 1100
-            columns: 24
-          - shape: dense
-            payload: 128
-            columns: 0
+        include: ${{ inputs.backup_verification_shape == 'dense' && fromJSON('[{"shape":"dense","payload":128,"columns":0}]') || inputs.backup_verification_shape == 'wide' && fromJSON('[{"shape":"wide","payload":1100,"columns":24}]') || inputs.backup_verification_shape == 'baseline' && fromJSON('[{"shape":"baseline","payload":1100,"columns":0}]') || fromJSON('[{"shape":"baseline","payload":1100,"columns":0},{"shape":"wide","payload":1100,"columns":24},{"shape":"dense","payload":128,"columns":0}]') }}
     runs-on: macos-latest
     timeout-minutes: 45
     env:

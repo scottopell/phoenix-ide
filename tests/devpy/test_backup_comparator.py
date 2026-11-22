@@ -5,6 +5,8 @@ import struct
 import sys
 import unittest
 from pathlib import Path
+from unittest import mock
+
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -57,6 +59,64 @@ class BackupComparatorTests(unittest.TestCase):
                 (1,NULL),(2,9223372036854775807),(3,1.25),(4,'text'),(5,X'ff00'),
                 (6,CAST(X'ff80' AS TEXT));""")
         self.compare_outcomes(setup, "accept")
+
+    def test_equal_nonreal_rows_count_all_cells_and_restore_text_factories(self):
+        def setup(db):
+            db.execute("CREATE TABLE cells(k INTEGER PRIMARY KEY, n, i, t, invalid, b)")
+            db.executescript("""INSERT INTO cells VALUES
+                (1,NULL,9223372036854775807,'text',CAST(X'ff80' AS TEXT),X'ff00'),
+                (2,NULL,-1,'more',CAST(X'80ff' AS TEXT),X'0001');""")
+
+        diagnostics = self.compare_outcomes(setup, "accept")
+        self.assertEqual({key: diagnostics[key] for key in (
+            "rows_compared", "cells_compared", "table_rows_compared",
+            "table_cells_compared", "tables_completed", "table_ordinal",
+        )}, {
+            "rows_compared": 3, "cells_compared": 17,
+            "table_rows_compared": 1, "table_cells_compared": 5,
+            "tables_completed": 2, "table_ordinal": 2,
+        })
+
+    def test_equal_real_values_in_declared_and_untyped_columns(self):
+        for declaration in ("REAL", ""):
+            with self.subTest(declaration=declaration or "untyped"):
+                def setup(db):
+                    db.execute(f"CREATE TABLE cells(v {declaration})")
+                    db.execute("INSERT INTO cells VALUES (1.25)")
+                    self.assertEqual(db.execute("SELECT typeof(v) FROM cells").fetchone(), ("real",))
+
+                diagnostics = self.compare_outcomes(setup, "accept")
+                self.assertEqual(diagnostics["rows_compared"], 2)
+                self.assertEqual(diagnostics["cells_compared"], 6)
+                self.assertEqual(diagnostics["tables_completed"], 2)
+
+    def test_equal_nonreal_rows_still_check_deadline(self):
+        source, backup = sqlite3.connect(":memory:"), sqlite3.connect(":memory:")
+        source_factory = lambda value: value.decode("utf-8")
+        backup_factory = lambda value: value.decode("utf-8")
+        source.text_factory, backup.text_factory = source_factory, backup_factory
+        try:
+            for db in (source, backup):
+                db.execute("CREATE TABLE cells(v)")
+                db.executemany("INSERT INTO cells VALUES (?)", ((1,), (2,)))
+            diagnostics = {}
+
+            def clock():
+                return 101.0 if diagnostics.get("rows_compared", 0) >= 2 else 100.0
+
+            with mock.patch.object(helper.time, "monotonic", side_effect=clock):
+                with self.assertRaisesRegex(helper.ActivationError, "deadline exceeded"):
+                    helper._verify_logical_equivalence(source, backup, 101.0, diagnostics)
+            self.assertEqual(diagnostics["rows_compared"], 2)
+            self.assertEqual(diagnostics["cells_compared"], 2)
+            self.assertEqual(diagnostics["table_rows_compared"], 2)
+            self.assertEqual(diagnostics["table_cells_compared"], 2)
+            self.assertEqual(diagnostics["tables_completed"], 0)
+            self.assertIs(source.text_factory, source_factory)
+            self.assertIs(backup.text_factory, backup_factory)
+        finally:
+            source.close()
+            backup.close()
 
     def test_numeric_and_storage_class_matrix(self):
         cases = (

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import closing
 import hashlib
 import importlib.util
 import json
@@ -45,7 +46,7 @@ def create_fixture(database: Path, *, minimum_bytes: int, rows_per_table: int | 
     started = time.monotonic()
     deadline = started + GENERATION_BUDGET_SECONDS
     text_rows = blob_rows = 0
-    with sqlite3.connect(database) as connection:
+    with closing(sqlite3.connect(database)) as connection:
         connection.execute("PRAGMA journal_mode=WAL")
         connection.execute("PRAGMA synchronous=NORMAL")
         connection.execute("PRAGMA page_size=4096")

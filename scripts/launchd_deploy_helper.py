@@ -614,6 +614,15 @@ def _verify_logical_equivalence(source, backup, deadline: float, diagnostics: di
             offset = len(identity)
             if identity and a[0] != b[0]:
                 raise ActivationError(f"SQLite backup row identity differs in table ordinal {(diagnostics or {}).get('table_ordinal', 0)}")
+            # Python tuple equality loses the binary64 sign of zero for REAL.
+            if a == b and b"real" not in a[offset::2]:
+                if diagnostics is not None:
+                    count = (len(a) - offset) // 2
+                    diagnostics["cells_compared"] += count
+                    diagnostics["table_cells_compared"] += count
+                    diagnostics["rows_compared"] += 1
+                    diagnostics["table_rows_compared"] += 1
+                continue
             for index in range(offset, len(a), 2):
                 if diagnostics is not None:
                     diagnostics["cells_compared"] += 1

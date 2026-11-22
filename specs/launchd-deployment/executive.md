@@ -112,6 +112,26 @@ fresh sole-executor rollout gates remain unmet. The historical hosted result
 above belongs to its named earlier implementation. No production acceptance
 follows from isolated or synthetic fixture success.
 
+### Targeted dense remedy candidate
+
+The clean integration candidate adds an equal-row shortcut only when all typed
+values match and no cell is tagged REAL; REAL rows retain binary64 comparison.
+It preserves row ordering/identity, stored FTS5 shadow coverage, per-row deadline
+checks, diagnostics and the shared 900-second bound. On CPython 3.13.1 / SQLite
+3.47.1, eight alternating old/new pairs on small replicas of the hosted shapes
+showed dense comparison medians of 0.0348→0.0296 seconds, baseline
+0.0489→0.0443 and wide 0.1676→0.1310. These measurements justify targeted hosted
+qualification only, not a full-size runtime prediction. The earlier isolated
+pass used a different helper hash and does not qualify this shortcut.
+
+The CI dispatch can select just `dense` while retaining the complete `all`
+matrix. The dense payload remains 128 bytes per TEXT/BLOB, and all safety checks
+and budgets are unchanged. Independent review found no code blocker; 111 focused
+Python tests and four spec/task lanes passed. Hosted dense and native browser
+cleanup validation remain required. The browser candidate rechecks kernel
+process-group membership after malformed `/proc` data, while retaining errors
+for malformed data on still-owned members and uncertain membership queries.
+
 ## Operator recovery
 
 Inspect logs, transaction-matched proof, any verified backup or first-install
