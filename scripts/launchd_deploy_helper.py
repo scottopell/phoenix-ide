@@ -377,7 +377,7 @@ def _database_size_bytes(database_path: str) -> int:
     if not path.is_absolute() or path.is_symlink() or not path.is_file():
         raise ActivationError("configured production database must be an existing regular file")
     try:
-        with sqlite3.connect(f"{path.absolute().as_uri()}?mode=ro", uri=True, timeout=5) as database:
+        with contextlib.closing(sqlite3.connect(f"{path.absolute().as_uri()}?mode=ro", uri=True, timeout=5)) as database:
             page_count = database.execute("PRAGMA page_count").fetchone()[0]
             page_size = database.execute("PRAGMA page_size").fetchone()[0]
     except (sqlite3.Error, OSError, TypeError) as exc:
