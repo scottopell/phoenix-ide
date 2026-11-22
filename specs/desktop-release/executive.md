@@ -2,6 +2,14 @@
 
 Phoenix release source contains a direct-distribution path for architecture-specific Phoenix.app ZIP archives alongside the six standalone server/debug artifacts. Protected preparation run 37220027105 qualified both architectures at source `f5f98d7b2e51b112157e12c2b23d62c1a3c58d71`: Developer ID signatures and hardened runtime verified, Apple notarization Accepted, staples validated, and Gatekeeper accepted. RC publication and clean-host desktop user acceptance remain separate gates.
 
+## Corrected-candidate preparation
+
+The controller source adds preparation-only `prepare-frozen-rc8` for immutable candidate `d5d2a45651035f58f3231f0dc82fd9ef59b7cb3c` (`0.13.2-rc.8`). It reuses the protected two-architecture macOS signing/notarization/headless path with fixed source/tree/helper pins and latest exact-candidate CI admission. The controller is materialized from the exact main-owned workflow commit outside the candidate checkout. Separate `RC8-SOURCE-AND-HELPER-PROVENANCE.json` retains the Python deployment helper digest and selected CI run/attempt without changing schema-1 packaging receipts (which still label their preparation mode `prepare-main`). Neither artifact alone admits publication or rollout.
+
+The source gate checks RC8 descent from frozen RC7 and `main` descent from RC7's exact application parent; frozen RC7's separate version commit is not required on `main`. A divergent-branch fixture and an available-real-object regression exercise that graph. A direct read-only gate run has admitted the exact frozen candidate with successful CI run `44969803027`, attempt `1`; this is not a protected artifact run.
+
+Bounded Python tests cover source and CI refusal, provenance execution, tag-input refusal, terminal shell-case behavior, protected environment and tag/Linux/publication guards. RC8 protected signing/notarization and native artifact acceptance have not been dispatched; source tests do not establish those results. The Allium normal-main and incident preparation lifecycles remain unchanged: the fixed source gate is specified by REQ-DESKTOP-REL-014 and reuses the existing macOS acceptance path without adding a release lifecycle.
+
 ## Requirement mapping
 
 | Requirement | Implementation and verification |
@@ -17,6 +25,7 @@ Phoenix release source contains a direct-distribution path for architecture-spec
 | REQ-DESKTOP-REL-009 | The shared release-version parser accepts only stable or bounded `rc.N` SemVer, drives workflow/publisher channel metadata, keeps RCs non-latest, and fails closed on stable/RC metadata disagreement. RCs use the same protected signing, notarization, exact-asset, and private-draft path as stable releases. |
 | REQ-DESKTOP-REL-010 | The protected `prepare-main` workflow operation binds both production macOS signing/notarization jobs to exact current `main`, retains prepared artifacts plus sanitized receipts as GitHub Actions artifacts without attaching them to a GitHub Release, and structurally excludes tag creation, GitHub release mutation, publication, deployment, and installation. |
 | REQ-DESKTOP-REL-012 | The fixed `prepare-incident-237100-arm64` operation gates candidate git-object version/registry/main ancestry, selects only ARM, and extracts the exact workflow controller outside the unchanged candidate workspace after native build. Its scoped wrapper retries only the matching temporary app staple/validate service failures under a bounded policy; separate sanitized provenance supplements, but does not alter, schema-1 receipts. Focused fixtures cover orchestration/privacy/process cleanup; real protected artifact production remains unverified until an exact hosted run passes. |
+| REQ-DESKTOP-REL-014 | Fixed corrected-candidate gate in `scripts/frozen_rc8_prepare.py` and protected `release.yml` preparation operation; bounded regression tests in `test_frozen_rc8_prepare.py`. Source-level qualification only; protected hosted artifacts remain pending. |
 | REQ-DESKTOP-REL-013 | The separately commissioned `prepare-incident-237100-linux-x86_64` operation is fixed to candidate 237100, x86_64-unknown-linux-musl, and its exact workflow controller; it retains only the statically linked candidate binary and a schema-1 receipt with exact provenance, identity checks, and artifact digest. Existing controller/workflow fixtures exercise the gate, static ELF and embedded-identity checks, closed two-file payload, and receipt privacy. No hosted artifact is claimed by this source-level contract. |
 
 ## Qualified protected configuration

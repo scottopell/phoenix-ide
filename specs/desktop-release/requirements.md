@@ -137,6 +137,17 @@ THE SYSTEM SHALL NOT create or move a tag, create or mutate a GitHub release, ru
 
 The preparation identity SHALL NOT authorize a release version, release tag, stable/RC classification decision, or byte-identical future rebuild. Public release SHALL continue to require the separately authorized version-bump/tag/publication flow.
 
+## REQ-DESKTOP-REL-014 — Fixed corrected-candidate preparation
+
+WHEN an authorized operator selects `prepare-frozen-rc8` from the exact current protected `main` workflow,
+THE SYSTEM SHALL prepare both supported macOS architectures from immutable candidate `d5d2a45651035f58f3231f0dc82fd9ef59b7cb3c`, tree `5ebc83729fc5630f8ffcd03477b0aaac1187982b`, version `0.13.2-rc.8`, with release-bound `scripts/launchd_deploy_helper.py` SHA-256 `936886046a098896cb9656326d705776a66ed9d472161fdafc27f865c40f832e`.
+
+This fixed source exception to REQ-DESKTOP-REL-010 SHALL require the candidate ref to match the immutable pin, candidate ancestry from frozen RC7 `86071b4cc2ab0f9efdb8a3debf03b8569baf26f9`, that RC7 commit's parent matching frozen application base `d3b57573ccf8662d05125338aad2307bb03da598`, `main` ancestry from that application base, exact manifest/lockfile version and helper digest, and the latest exact-candidate `workflow_dispatch` CI run to be completed successfully. It SHALL reject tag input and SHALL NOT accept source, version, or CI-run selection inputs. The controller SHALL be materialized outside candidate source from the exact workflow commit, not supplied by the candidate checkout. Preparation SHALL NOT incorporate other `main` application changes or introduce independent helper trust.
+
+Both pairs SHALL pass the existing protected signing, notarization, staple, Gatekeeper, architecture, embedded identity, checksum, protected-material cleanup and native headless acceptance gates. Schema-1 packaging receipts SHALL remain unchanged; a separate sanitized provenance artifact SHALL bind candidate commit/tree/version, deployment Python helper path/digest, distinct workflow controller commit, preparation run/attempt, and the successful qualification CI run/attempt selected by the gate. That Python helper digest SHALL NOT be represented as the compiled server executable digest. The exact-candidate CI SHALL exercise the actual release-selected/materialized deployment helper's source identity, protocol and fixture checks.
+
+The operation SHALL retain only preparation Actions artifacts and sanitized evidence. It SHALL NOT create or move tags, mutate or publish a GitHub Release, build Linux publication assets, deploy, install, or imply production performance or compatibility admission. Its separate provenance SHALL distinguish the fixed operation from the unchanged packaging receipt's `prepare-main` label; that receipt alone SHALL NOT establish protected workflow origin or normal-current-main preparation. Publication and rollout require separate authorization and qualification of the exact bytes being used.
+
 ## REQ-DESKTOP-REL-011 — Publish standalone browser CLI binaries
 
 WHEN the immutable release source includes the browser CLI entrypoint,
