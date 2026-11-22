@@ -7,6 +7,8 @@
 pub(crate) mod bash;
 pub(super) mod capture_binding;
 pub(crate) mod resource;
+#[cfg(unix)]
+pub(crate) mod worktree;
 mod supervision;
 
 use super::verify_observed_process_identities;

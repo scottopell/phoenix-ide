@@ -4765,14 +4765,8 @@ fn wait_bounded_child_output(
         terminate_bounded_child(&mut child);
         return Err("Git stderr was not piped".into());
     };
-    let stdout_reader = std::thread::spawn(move || {
-        let mut bytes = Vec::new();
-        std::io::Read::read_to_end(&mut std::io::BufReader::new(stdout), &mut bytes).map(|_| bytes)
-    });
-    let stderr_reader = std::thread::spawn(move || {
-        let mut bytes = Vec::new();
-        std::io::Read::read_to_end(&mut std::io::BufReader::new(stderr), &mut bytes).map(|_| bytes)
-    });
+    let stdout_reader = std::thread::spawn(move || read_git_pipe(stdout, None));
+    let stderr_reader = std::thread::spawn(move || read_git_pipe(stderr, None));
     let status = loop {
         match child.try_wait() {
             Ok(Some(status))
@@ -4811,6 +4805,30 @@ fn wait_bounded_child_output(
         stdout,
         stderr,
     })
+}
+
+fn read_git_pipe(
+    pipe: impl std::io::Read,
+    limit: Option<usize>,
+) -> Result<Vec<u8>, std::io::Error> {
+    use std::io::Read as _;
+    let mut reader = std::io::BufReader::new(pipe);
+    let mut bytes = Vec::new();
+    let mut chunk = [0; 8192];
+    let mut overflow = false;
+    loop {
+        let n = reader.read(&mut chunk)?;
+        if n == 0 {
+            break;
+        }
+        let remaining = limit.unwrap_or(usize::MAX).saturating_sub(bytes.len());
+        bytes.extend_from_slice(&chunk[..n.min(remaining)]);
+        overflow |= n > remaining;
+    }
+    if overflow {
+        return Err(std::io::Error::other("Git output exceeded its capture limit"));
+    }
+    Ok(bytes)
 }
 
 fn terminate_bounded_child(child: &mut std::process::Child) {

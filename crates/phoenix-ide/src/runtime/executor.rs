@@ -60,6 +60,8 @@ use tracing::Instrument;
 mod capacity;
 mod continuation;
 mod native_close;
+#[cfg(test)]
+pub(crate) use native_close::source_entry::SourceEntryController;
 pub(crate) use native_close::source_entry::{SourceEntryWorker, WorkerEntryResult};
 mod native_close_observe;
 mod native_close_retry;

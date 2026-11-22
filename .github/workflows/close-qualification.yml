@@ -328,7 +328,8 @@ jobs:
             runtime::executor::native_close::terminal_compatibility_tests:: \
             runtime::close_retirement::native_initial::resource::tests:: \
             runtime::close_retirement::native_initial::supervision::tests:: \
-            runtime::close_retirement::native_initial::capture_binding::tests::; do
+            runtime::close_retirement::native_initial::capture_binding::tests:: \
+            runtime::close_retirement::native_initial::worktree::tests::; do
             test "$(grep -c "^${module}.*: test$" evidence/runtime-inventory.log)" -gt 0
           done
           for test in \
@@ -388,7 +389,8 @@ jobs:
             runtime::executor::native_close::terminal_compatibility_tests:: \
             runtime::close_retirement::native_initial::resource::tests:: \
             runtime::close_retirement::native_initial::supervision::tests:: \
-            runtime::close_retirement::native_initial::capture_binding::tests::; do
+            runtime::close_retirement::native_initial::capture_binding::tests:: \
+            runtime::close_retirement::native_initial::worktree::tests::; do
             log="evidence/${module//::/-}.log"
             (cd crates/phoenix-ide && "$PHOENIX_RUNTIME_TEST_BINARY" "$module" --nocapture --test-threads=1) 2>&1 | tee "$log"
             grep -E 'test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored;' "$log"

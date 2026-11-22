@@ -1,7 +1,8 @@
 //! Source-owned post-process continuation over the captured original inventory.
 
 use phoenix_core::domain::close::{
-    CloseExpectedRetirementResource, CloseObligation, CloseRetirementSnapshot, RetiredResourceKind,
+    CloseExpectedRetirementResource, CloseObligation, CloseRetirementSnapshot, LossItemIdentity,
+    RetiredResourceKind, WorktreeIdentity,
 };
 use phoenix_core::domain::sm_state::ConvState;
 use phoenix_core::work_scope::{ResourceScopeKey, WorkScopeId, WorkScopeRetirementOutcome};
@@ -55,8 +56,48 @@ enum Stage {
     FatalAuthority,
 }
 
+// A captured Worktree remains an exact typed target; it is never inferred absent
+// from the lack of physical evidence. This is preparation, not physical authority.
+#[derive(Debug)]
+struct OriginalWorktreeTarget {
+    resource: CloseExpectedRetirementResource,
+    identity: WorktreeIdentity,
+}
+
+fn select_original_worktrees(
+    inventory: &[CloseExpectedRetirementResource],
+    scopes: &[WorkScopeId],
+) -> Result<Vec<OriginalWorktreeTarget>, String> {
+    let mut targets = Vec::new();
+    for scope in scopes {
+        let scoped = inventory.iter().filter(|item| {
+            item.scope == *scope && item.resource.kind() == RetiredResourceKind::Worktree
+        });
+        for item in scoped {
+            let LossItemIdentity::Worktree(identity) = item.resource.identity() else {
+                return Err("captured Worktree has no typed worktree identity".into());
+            };
+            if targets.iter().any(|prior: &OriginalWorktreeTarget| prior.resource.scope == *scope) {
+                return Err("captured scope has multiple Worktree resources".into());
+            }
+            targets.push(OriginalWorktreeTarget {
+                resource: item.clone(),
+                identity: identity.clone(),
+            });
+        }
+    }
+    if inventory.iter().any(|item| {
+        item.resource.kind() == RetiredResourceKind::Worktree
+            && !scopes.contains(&item.scope)
+    }) {
+        return Err("captured Worktree has no captured WorkScope".into());
+    }
+    Ok(targets)
+}
+
 pub(super) struct PostRetirement {
     original_inventory: Vec<CloseExpectedRetirementResource>,
+    worktree_targets: Vec<OriginalWorktreeTarget>,
     scope_order: Vec<WorkScopeId>,
     snapshot: CloseRetirementSnapshot,
     scope_index: usize,
@@ -102,8 +143,10 @@ impl PostRetirement {
         {
             return Err("captured WorkScope resources do not match captured scope order".into());
         }
+        let worktree_targets = select_original_worktrees(&original_inventory, &scope_order)?;
         Ok(Self {
             original_inventory,
+            worktree_targets,
             scope_order,
             snapshot,
             scope_index: 0,
@@ -135,16 +178,14 @@ impl PostRetirement {
         if let Stage::Completed(obligation) = &self.stage {
             return Ok(PostRetirementStep::Completed(obligation.clone()));
         }
-        // A captured Worktree is not evidence of absence and has no supported adapter.
-        // Keep the complete original inventory attached to this blocked cursor.
-        if self
-            .original_inventory
-            .iter()
-            .any(|resource| resource.resource.kind() == RetiredResourceKind::Worktree)
-        {
+        // No physical sink is installed yet. The target is selected from the
+        // complete captured inventory, but no WorkScope may retire past it.
+        if let Some(target) = self.worktree_targets.first() {
             self.stage = Stage::Blocked;
             tracing::warn!(
                 attempt_id = %receipt.admitted.attempt_id,
+                scope = %target.resource.scope,
+                worktree_id = %target.identity.id().as_str(),
                 "native initial Close blocked: captured Worktree resources require the native adapter"
             );
             return Ok(PostRetirementStep::Blocked);
@@ -356,6 +397,31 @@ mod tests {
             .original_inventory
             .iter()
             .any(|item| { item.resource.kind() == RetiredResourceKind::Worktree }));
+    }
+
+    #[test]
+    fn original_worktree_targets_follow_scope_order_and_preserve_full_identity() {
+        let first = resource(RetiredResourceKind::Worktree, "first");
+        let mut second = resource(RetiredResourceKind::Worktree, "second");
+        second.scope = WorkScopeId::parse("other").unwrap();
+        let targets = select_original_worktrees(
+            &[second.clone(), first.clone()],
+            &[first.scope.clone(), second.scope.clone()],
+        )
+        .unwrap();
+        assert_eq!(targets.len(), 2);
+        assert_eq!(targets[0].resource, first);
+        assert_eq!(targets[1].resource, second);
+        assert!(matches!(targets[0].resource.resource.identity(),
+            LossItemIdentity::Worktree(identity) if identity == &targets[0].identity));
+    }
+
+    #[test]
+    fn rejects_duplicate_or_foreign_original_worktree_targets() {
+        let item = resource(RetiredResourceKind::Worktree, "first");
+        let scope = item.scope.clone();
+        assert!(select_original_worktrees(&[item.clone(), item.clone()], &[scope.clone()]).is_err());
+        assert!(select_original_worktrees(&[item], &[]).is_err());
     }
 
     #[test]

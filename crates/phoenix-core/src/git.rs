@@ -40,18 +40,21 @@ pub fn observe_worktree_fingerprint(path: &Path) -> Option<String> {
     let marker = path.join(".git");
     let metadata = std::fs::symlink_metadata(&marker).ok()?;
     let marker_bytes = if metadata.is_file() {
-        if metadata.len() > MAX_GIT_POINTER_BYTES {
-            return None;
-        }
-        let mut bytes = Vec::with_capacity(usize::try_from(metadata.len()).ok()?);
-        std::fs::File::open(&marker)
-            .ok()?
-            .take(MAX_GIT_POINTER_BYTES + 1)
-            .read_to_end(&mut bytes)
-            .ok()?;
-        if u64::try_from(bytes.len()).ok()? > MAX_GIT_POINTER_BYTES {
-            return None;
-        }
+        return observe_linked_worktree_fingerprint(path);
+    } else if metadata.is_dir() {
+        ordinary_repository_identity(&marker)?
+    } else {
+        return None;
+    };
+    fingerprint_with_marker(&metadata, marker_bytes)
+}
+
+/// Observe only a linked-worktree marker; never fall back to repository-directory
+/// inspection when an original linked marker was replaced between checks.
+#[must_use]
+pub fn observe_linked_worktree_fingerprint(path: &Path) -> Option<String> {
+    let (metadata, bytes) = read_worktree_registration_file(&path.join(".git")).ok()?;
+    let marker_bytes = {
         let pointer = std::str::from_utf8(&bytes).ok()?;
         let git_dir = pointer
             .strip_suffix("\r\n")
@@ -62,16 +65,43 @@ pub fn observe_worktree_fingerprint(path: &Path) -> Option<String> {
             return None;
         }
         git_dir.as_bytes().to_vec()
-    } else if metadata.is_dir() {
-        ordinary_repository_identity(&marker)?
-    } else {
-        return None;
     };
+    fingerprint_with_marker(&metadata, marker_bytes)
+}
+
+fn fingerprint_with_marker(metadata: &std::fs::Metadata, marker_bytes: Vec<u8>) -> Option<String> {
     let mut encoded = String::with_capacity(marker_bytes.len() * 2);
     for byte in marker_bytes {
         write!(&mut encoded, "{byte:02x}").ok()?;
     }
-    Some(worktree_fingerprint_from_metadata(&metadata, &encoded))
+    Some(worktree_fingerprint_from_metadata(metadata, &encoded))
+}
+
+/// Read a bounded regular Git registration file.
+/// On Unix, no-follow/nonblocking open rejects symlinks and prevents a replaced
+/// FIFO from trapping a Close admission leaf.
+/// Descriptor metadata, rather than a preceding pathname check, owns the file kind.
+pub fn read_worktree_registration_file(
+    path: &Path,
+) -> std::io::Result<(std::fs::Metadata, Vec<u8>)> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = options.open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.len() > MAX_GIT_POINTER_BYTES {
+        return Err(std::io::Error::other("Git registration is not a bounded regular file"));
+    }
+    let mut bytes = Vec::with_capacity(usize::try_from(metadata.len()).unwrap_or(0));
+    file.take(MAX_GIT_POINTER_BYTES + 1).read_to_end(&mut bytes)?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_GIT_POINTER_BYTES {
+        return Err(std::io::Error::other("Git registration exceeded its capture limit"));
+    }
+    Ok((metadata, bytes))
 }
 
 fn ordinary_repository_identity(git_dir: &Path) -> Option<Vec<u8>> {
