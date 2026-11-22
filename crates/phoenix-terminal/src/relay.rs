@@ -27,7 +27,7 @@ use futures::StreamExt;
 use tokio::io::unix::AsyncFd;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 
-use super::session::{Dims, StopReason};
+use super::session::{Dims, StopReason, TerminalRetirementRequest};
 
 /// How the relay loop exited.
 ///
@@ -174,6 +174,7 @@ pub struct RelayConfig<F> {
     pub tracker: Arc<Mutex<CommandTracker>>,
     pub on_resize: F,
     pub stop_rx: tokio::sync::watch::Receiver<StopReason>,
+    pub retirement_requested: TerminalRetirementRequest,
     pub conv_id: String,
 }
 
@@ -193,6 +194,7 @@ where
         tracker,
         on_resize,
         stop_rx,
+        retirement_requested,
         conv_id,
     } = cfg;
     let conv_id = conv_id.as_str();
@@ -220,6 +222,7 @@ where
         ws_incoming,
         on_resize,
         stop_rx,
+        retirement_requested,
         ws_closed,
         writer_outcome,
         conv_id,
@@ -313,6 +316,7 @@ async fn relay_writer<W>(
     mut ws_incoming: impl futures::Stream<Item = Vec<u8>> + Unpin,
     on_resize: impl Fn(Dims),
     mut stop_rx: tokio::sync::watch::Receiver<StopReason>,
+    retirement_requested: TerminalRetirementRequest,
     ws_closed: Arc<tokio::sync::Notify>,
     writer_outcome: Arc<Mutex<Option<RelayExit>>>,
     conv_id: &str,
@@ -330,13 +334,20 @@ where
     };
 
     loop {
+        if retirement_requested.is_requested() {
+            return exit_with(RelayExit::Stopped(StopReason::TearDown));
+        }
         tokio::select! {
             _ = stop_rx.changed() => {
                 // Copy out the reason before notifying — the reader's wakeup
                 // could race with another caller resetting the channel (e.g.
                 // a reclaimer transitioning Running → Detach → Running for a
                 // new relay). The copy freezes our view.
-                let reason = *stop_rx.borrow();
+                let reason = if retirement_requested.is_requested() {
+                    StopReason::TearDown
+                } else {
+                    *stop_rx.borrow()
+                };
                 if reason != StopReason::Running {
                     return exit_with(RelayExit::Stopped(reason));
                 }
@@ -466,6 +477,7 @@ mod tests {
                 tracker: Arc::clone(&tracker),
                 on_resize: null_resize(),
                 stop_rx: default_stop(),
+                retirement_requested: TerminalRetirementRequest::default(),
                 conv_id: "test".to_string(),
             },
         )
@@ -512,6 +524,7 @@ mod tests {
                 tracker: Arc::clone(&tracker),
                 on_resize: null_resize(),
                 stop_rx: default_stop(),
+                retirement_requested: TerminalRetirementRequest::default(),
                 conv_id: "test".to_string(),
             },
         )
@@ -593,6 +606,7 @@ mod tests {
                         tracker: Arc::clone(&tracker),
                         on_resize: null_resize(),
                         stop_rx: default_stop(),
+                        retirement_requested: TerminalRetirementRequest::default(),
                         conv_id: "prop-test".to_string(),
                     },
                 ).await;
@@ -664,6 +678,7 @@ mod tests {
                             resizes_spy.lock().unwrap().push(dims);
                         },
                         stop_rx: default_stop(),
+                        retirement_requested: TerminalRetirementRequest::default(),
                         conv_id: "prop-resize".to_string(),
                     },
                 ).await;
@@ -709,6 +724,7 @@ mod tests {
                 tracker: Arc::clone(&tracker),
                 on_resize: move |dims| spy.lock().unwrap().push(dims),
                 stop_rx: default_stop(),
+                retirement_requested: TerminalRetirementRequest::default(),
                 conv_id: "deep-spy".to_string(),
             },
         )
@@ -758,6 +774,7 @@ mod tests {
                         tracker: Arc::clone(&tracker),
                         on_resize: null_resize(),
                         stop_rx: default_stop(),
+                        retirement_requested: TerminalRetirementRequest::default(),
                         conv_id: "clean-exit".to_string(),
                     },
                 ).await;
@@ -854,6 +871,7 @@ mod tests {
                     tracker: tracker_for_relay,
                     on_resize: null_resize(),
                     stop_rx,
+                    retirement_requested: TerminalRetirementRequest::default(),
                     conv_id: "detach-test".to_string(),
                 },
             )
@@ -904,6 +922,7 @@ mod tests {
                     tracker,
                     on_resize: null_resize(),
                     stop_rx,
+                    retirement_requested: TerminalRetirementRequest::default(),
                     conv_id: "teardown-test".to_string(),
                 },
             )
@@ -943,6 +962,7 @@ mod tests {
                     tracker: tracker_clone,
                     on_resize: null_resize(),
                     stop_rx: stop_rx_1,
+                    retirement_requested: TerminalRetirementRequest::default(),
                     conv_id: "relay-1".to_string(),
                 },
             )
@@ -975,6 +995,7 @@ mod tests {
                     tracker: tracker_clone_2,
                     on_resize: null_resize(),
                     stop_rx: stop_rx_2,
+                    retirement_requested: TerminalRetirementRequest::default(),
                     conv_id: "relay-2".to_string(),
                 },
             )
@@ -1000,6 +1021,43 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn requested_retirement_stops_new_detach_relay_with_live_pty_and_pending_input() {
+        let (_shell_end, pty_end) = tokio::io::duplex(4096);
+        let tracker = make_tracker();
+        let (ws_tx, _ws_rx) = ws_out_channel(32);
+        let ws_in = futures::stream::pending::<Vec<u8>>().boxed();
+        let retirement_requested = TerminalRetirementRequest::default();
+        retirement_requested.request_for_test();
+
+        // Model the fresh subscription installed after the prior relay's
+        // Detach was reset to Running for reclaim. Pending input and the live
+        // duplex endpoint ensure neither input nor EOF drives the exit.
+        let (stop_tx, _) = watch::channel(StopReason::Detach);
+        stop_tx.send_replace(StopReason::Running);
+        let stop_rx = stop_tx.subscribe();
+
+        let exit = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            run_relay(
+                pty_end,
+                ws_tx,
+                ws_in,
+                RelayConfig {
+                    tracker,
+                    on_resize: null_resize(),
+                    stop_rx,
+                    retirement_requested,
+                    conv_id: "retirement-startup".to_string(),
+                },
+            ),
+        )
+        .await
+        .expect("requested retirement must stop the relay promptly");
+
+        assert_eq!(exit, RelayExit::Stopped(StopReason::TearDown));
+    }
+
     /// `PtyEof` regression: if the shell exits while a stop signal is also
     /// arriving, the exit reason must still be `PtyEof` so the handler runs
     /// full teardown. The reader detects EOF first and wins the race.
@@ -1015,8 +1073,10 @@ mod tests {
         // what the stop channel might have been poised to carry.
         let (_stop_tx, stop_rx) = watch::channel(StopReason::Running);
 
-        // Close the shell end immediately — drops the write end, reader gets EOF.
+        // EOF must remain authoritative even when retirement was requested.
         drop(shell_end);
+        let retirement_requested = TerminalRetirementRequest::default();
+        retirement_requested.request_for_test();
 
         let exit = run_relay(
             pty_end,
@@ -1026,6 +1086,7 @@ mod tests {
                 tracker,
                 on_resize: null_resize(),
                 stop_rx,
+                retirement_requested,
                 conv_id: "eof-regression".to_string(),
             },
         )

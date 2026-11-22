@@ -275,6 +275,7 @@ async fn handle_socket(
             tracker,
             on_resize,
             stop_rx,
+            retirement_requested: arc_handle.retirement_requested.clone(),
             conv_id: conversation_id.clone(),
         },
     )
@@ -686,6 +687,7 @@ mod reclaim_tests {
             shell_integration_status: Arc::new(Mutex::new(ShellIntegrationStatus::Unknown)),
             stop_tx,
             attach_permit: Arc::new(Semaphore::new(1)),
+            retirement_requested: phoenix_terminal::session::TerminalRetirementRequest::default(),
         })
     }
 
@@ -995,6 +997,7 @@ mod reclaim_tests {
                     tracker,
                     on_resize: |_| {},
                     stop_rx,
+                    retirement_requested: phoenix_terminal::session::TerminalRetirementRequest::default(),
                     conv_id: "reclaim".to_string(),
                 },
             )

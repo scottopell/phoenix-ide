@@ -91,6 +91,7 @@ fn dummy_handle_kind(
         )),
         stop_tx,
         attach_permit: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
+        retirement_requested: super::session::TerminalRetirementRequest::default(),
     }
 }
 
@@ -685,6 +686,137 @@ async fn prepared_retirement_is_inert_until_polled_and_projection_is_bound() {
 }
 
 #[tokio::test]
+async fn try_enter_sets_monotonic_flag_without_touching_watch_or_fd() {
+    use crate::session::{StopReason, TerminalRetirementEntryError};
+    let registry = ActiveTerminals::new();
+    let scope = scope("try-enter-first-effect");
+    let handle = registry
+        .try_insert_exact(scope.clone(), dummy_handle(Dims::try_new(80, 24).unwrap()))
+        .unwrap();
+    let fd = handle.master_fd_raw();
+    let permit = registry.begin_retirement(&scope);
+    let prepared = registry.prepare_retirement(&permit).unwrap();
+    let borrowed_watch = handle.stop_tx.borrow();
+
+    let (send, receive) = std::sync::mpsc::channel();
+    let entry = std::thread::spawn(move || {
+        assert!(send.send(prepared.try_enter()).is_ok());
+    });
+    let observed = receive.recv_timeout(std::time::Duration::from_secs(30));
+    assert_eq!(*borrowed_watch, StopReason::Running);
+    drop(borrowed_watch);
+    entry.join().unwrap();
+    let entered = match observed.expect("entry must return while watch remains borrowed") {
+        Ok(entered) => entered,
+        Err((_owner, error)) => panic!("valid target failed entry: {error:?}"),
+    };
+    assert!(handle.retirement_requested.is_requested());
+    assert_eq!(handle.master_fd_raw(), fd);
+    assert!(matches!(
+        registry.prepare_retirement(&permit).unwrap().try_enter(),
+        Err((_owner, TerminalRetirementEntryError::AlreadyRequested))
+    ));
+    drop(entered);
+    registry.cancel_retirement(permit);
+    assert!(registry.get_for_attach(&scope).is_none());
+    assert!(!registry.prepare_relay(&scope, &handle));
+    assert!(handle.retirement_requested.is_requested());
+}
+
+#[tokio::test]
+async fn try_enter_registry_contention_returns_original_owner_without_effect() {
+    use crate::session::{StopReason, TerminalRetirementEntryError};
+    let registry = ActiveTerminals::new();
+    let scope = scope("try-enter-registry-busy");
+    let handle = registry
+        .try_insert_exact(scope.clone(), dummy_handle(Dims::try_new(80, 24).unwrap()))
+        .unwrap();
+    let permit = registry.begin_retirement(&scope);
+    let prepared = registry.prepare_retirement(&permit).unwrap();
+    let (send, receive) = std::sync::mpsc::channel();
+    let (entry, observed) = registry.with_registry_lock_for_test(|| {
+        let entry = std::thread::spawn(move || {
+            assert!(send.send(prepared.try_enter()).is_ok());
+        });
+        let observed = receive.recv_timeout(std::time::Duration::from_secs(30));
+        (entry, observed)
+    });
+    entry.join().unwrap();
+    let (prepared, error) = match observed.expect("entry must return before registry unlock") {
+        Ok(_) => panic!("contended registry unexpectedly entered"),
+        Err(failure) => failure,
+    };
+    assert_eq!(error, TerminalRetirementEntryError::RegistryBusy);
+    assert!(!handle.retirement_requested.is_requested());
+    assert_eq!(*handle.stop_tx.borrow(), StopReason::Running);
+    assert!(handle.master_fd_raw().is_some());
+    assert!(prepared.try_enter().is_ok());
+    registry.cancel_retirement(permit);
+}
+
+#[tokio::test]
+async fn try_enter_rejects_superseded_generation_and_replaced_target_without_effect() {
+    use crate::session::{StopReason, TerminalRetirementEntryError};
+    for replace_target in [false, true] {
+        let registry = ActiveTerminals::new();
+        let scope = scope("try-enter-stale-binding");
+        let original = registry
+            .try_insert_exact(scope.clone(), dummy_handle(Dims::try_new(80, 24).unwrap()))
+            .unwrap();
+        let permit = registry.begin_retirement(&scope);
+        let prepared = registry.prepare_retirement(&permit).unwrap();
+        registry.cancel_retirement(permit);
+        let current = if replace_target {
+            registry.remove_unfenced(&scope);
+            registry
+                .try_insert_exact(scope.clone(), dummy_handle(Dims::try_new(80, 24).unwrap()))
+                .unwrap()
+        } else {
+            original.clone()
+        };
+        let replacement_permit = registry.begin_retirement(&scope);
+        let (retained, error) = match prepared.try_enter() {
+            Ok(_) => panic!("stale retirement unexpectedly entered"),
+            Err(failure) => failure,
+        };
+        assert_eq!(error, TerminalRetirementEntryError::StaleTarget);
+        for handle in [&original, &current] {
+            assert!(!handle.retirement_requested.is_requested());
+            assert_eq!(*handle.stop_tx.borrow(), StopReason::Running);
+            assert!(handle.master_fd_raw().is_some());
+        }
+        drop(retained);
+        registry.cancel_retirement(replacement_permit);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn try_enter_expiry_has_no_first_effect() {
+    use crate::session::{StopReason, TerminalRetirementEntryError};
+    let registry = ActiveTerminals::new();
+    let scope = scope("try-enter-rejected");
+    let original = registry
+        .try_insert_exact(scope.clone(), dummy_handle(Dims::try_new(80, 24).unwrap()))
+        .unwrap();
+    let permit = registry.begin_retirement_by(
+        &scope,
+        tokio::time::Instant::now() + std::time::Duration::from_secs(1),
+    );
+    let prepared = registry.prepare_retirement(&permit).unwrap();
+    tokio::time::advance(std::time::Duration::from_secs(1)).await;
+    let (prepared, error) = match prepared.try_enter() {
+        Ok(_) => panic!("expired retirement unexpectedly entered"),
+        Err(failure) => failure,
+    };
+    assert_eq!(error, TerminalRetirementEntryError::DeadlineExpired);
+    assert!(!original.retirement_requested.is_requested());
+    assert_eq!(*original.stop_tx.borrow(), StopReason::Running);
+    assert!(original.master_fd_raw().is_some());
+    drop(prepared);
+    registry.cancel_retirement(permit);
+}
+
+#[tokio::test]
 async fn prepared_retirement_rejects_projection_spoof_wrong_registry_and_stale_generation() {
     use crate::session::PrepareTerminalRetirementError;
     let registry = ActiveTerminals::new();
@@ -870,7 +1002,12 @@ async fn prepared_retirement_cancellation_retains_exact_evidence_at_both_waits()
             None
         };
         let permit = registry.begin_retirement(&scope);
-        let mut completion = Box::pin(registry.prepare_retirement(&permit).unwrap().complete());
+        let entered = match registry.prepare_retirement(&permit).unwrap().try_enter() {
+            Ok(entered) => entered,
+            Err((_owner, error)) => panic!("valid target failed entry: {error:?}"),
+        };
+        assert!(handle.retirement_requested.is_requested());
+        let mut completion = Box::pin(entered.complete());
         assert!(futures::poll!(completion.as_mut()).is_pending());
         assert_eq!(
             *handle.stop_tx.borrow(),
@@ -1203,6 +1340,7 @@ async fn sighup_resistant_attached_child_times_out_bounded_with_retry_authority(
                 )),
                 stop_tx,
                 attach_permit: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
+                retirement_requested: super::session::TerminalRetirementRequest::default(),
             },
         )
         .expect("publish resistant child");

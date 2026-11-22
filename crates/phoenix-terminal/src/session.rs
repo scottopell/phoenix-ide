@@ -3,12 +3,33 @@
 use nix::unistd::Pid;
 use std::collections::HashMap;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::{watch, Semaphore};
 
 use super::child_lifecycle::{ChildExitReceipt, TerminalChildLifecycle};
 use super::command_tracker::CommandTracker;
 use phoenix_core::{process_identity::ProcessIdentity, work_scope::ResourceScopeKey};
+
+/// Monotonic, read-only retirement signal shared with the attached relay.
+#[derive(Clone, Default, Debug)]
+pub struct TerminalRetirementRequest(Arc<AtomicBool>);
+
+impl TerminalRetirementRequest {
+    #[must_use]
+    pub fn is_requested(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+
+    fn request(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn request_for_test(&self) {
+        self.request();
+    }
+}
 
 /// One outer liveness budget for terminal retirement during Close.
 ///
@@ -140,6 +161,8 @@ pub struct TerminalHandle {
     /// so neither reclaimer can proceed into the relay's acquire path while
     /// another relay is still running. See task 24691 follow-up.
     pub attach_permit: Arc<Semaphore>,
+    /// Monotonic per-physical-handle teardown request. Never reset.
+    pub retirement_requested: TerminalRetirementRequest,
 }
 
 impl std::fmt::Debug for TerminalHandle {
@@ -241,6 +264,24 @@ pub struct PreparedTerminalRetirement {
     original: Arc<OriginalTerminalRetirementTarget>,
 }
 
+/// Fixed-size failure reason from the synchronous first-effect fence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminalRetirementEntryError {
+    RegistryBusy,
+    DeadlineExpired,
+    StaleTarget,
+    AlreadyRequested,
+    RegistryPoisoned,
+}
+
+/// Owner whose first effect has been synchronously admitted.
+#[must_use]
+pub struct EnteredTerminalRetirement {
+    registry: ActiveTerminals,
+    target: Arc<TerminalHandle>,
+    original: Arc<OriginalTerminalRetirementTarget>,
+}
+
 impl std::fmt::Debug for PreparedTerminalRetirement {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PreparedTerminalRetirement")
@@ -273,8 +314,71 @@ pub struct TerminalRetirementPermit {
 }
 
 impl PreparedTerminalRetirement {
-    /// Consume this exact prepared target using the original generation and
-    /// absolute deadline. Missing original targets require a separate absence proof.
+    fn try_enter_effect(&self) -> Result<(), TerminalRetirementEntryError> {
+        if tokio::time::Instant::now() >= self.original.deadline {
+            return Err(TerminalRetirementEntryError::DeadlineExpired);
+        }
+        let map = match self.registry.0.try_lock() {
+            Ok(map) => map,
+            Err(std::sync::TryLockError::WouldBlock) => {
+                return Err(TerminalRetirementEntryError::RegistryBusy);
+            }
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(TerminalRetirementEntryError::RegistryPoisoned);
+            }
+        };
+        let original = &self.original;
+        let valid = map.retirements.get(&original.work_scope).is_some_and(|state| {
+            state.generation == original.generation.0
+                && state.owner == Some(TerminalRetirementOwner::Close)
+        }) && map.handles.get(&original.work_scope)
+            .is_some_and(|current| Arc::ptr_eq(current, &self.target));
+        if !valid {
+            return Err(TerminalRetirementEntryError::StaleTarget);
+        }
+        if tokio::time::Instant::now() >= original.deadline {
+            return Err(TerminalRetirementEntryError::DeadlineExpired);
+        }
+        if self.target.retirement_requested.is_requested() {
+            return Err(TerminalRetirementEntryError::AlreadyRequested);
+        }
+        self.target.retirement_requested.request();
+        Ok(())
+    }
+
+    /// Synchronously claim the exact Close retirement as its first effect.
+    /// Every failure returns this original owner intact; this method performs no
+    /// allocation, logging, waiting, notification, or resource teardown.
+    pub fn try_enter(self) -> Result<EnteredTerminalRetirement, (Self, TerminalRetirementEntryError)> {
+        if let Err(error) = self.try_enter_effect() {
+            return Err((self, error));
+        }
+        Ok(EnteredTerminalRetirement {
+            registry: self.registry,
+            target: self.target,
+            original: self.original,
+        })
+    }
+}
+
+impl EnteredTerminalRetirement {
+    /// Wake the relay and finish cleanup using the same exact owner and deadline.
+    /// This asynchronous completion is not part of the first-effect callback.
+    pub async fn complete(self) -> TerminalRetirementOutcome {
+        PreparedTerminalRetirement {
+            registry: self.registry,
+            target: self.target,
+            original: self.original,
+        }
+        .complete()
+        .await
+    }
+}
+
+impl PreparedTerminalRetirement {
+    /// Legacy completion and exact retained-evidence resolution. This may wait
+    /// before its first effect and must not be used as a synchronous entry fence.
+    /// Call `try_enter` at the source-owned fence for the bounded entry path.
     pub async fn complete(self) -> TerminalRetirementOutcome {
         let original = &self.original;
         let target = self.target;
@@ -519,6 +623,12 @@ impl ActiveTerminals {
             .iter()
             .filter(|(candidate, _)| *candidate == scope)
             .count()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_registry_lock_for_test<T>(&self, action: impl FnOnce() -> T) -> T {
+        let _guard = self.0.lock().expect("terminal registry poisoned");
+        action()
     }
 
     #[must_use]
@@ -782,6 +892,7 @@ impl ActiveTerminals {
         }
         map.handles
             .get(scope)
+            .filter(|handle| !handle.retirement_requested.is_requested())
             .filter(|handle| !handle.child_lifecycle.receipt().exited())
             .cloned()
     }
@@ -799,6 +910,7 @@ impl ActiveTerminals {
             .retirements
             .get(scope)
             .is_some_and(|retirement| retirement.owner.is_some())
+            || handle.retirement_requested.is_requested()
             || handle.child_lifecycle.receipt().exited()
             || !map
                 .handles

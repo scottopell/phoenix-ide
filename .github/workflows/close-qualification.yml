@@ -456,6 +456,10 @@ jobs:
           set -euo pipefail
           cargo test -p phoenix-terminal --lib -- --list 2>&1 | tee evidence/terminal-inventory.log
           tests=(
+            try_enter_sets_monotonic_flag_without_touching_watch_or_fd
+            try_enter_registry_contention_returns_original_owner_without_effect
+            try_enter_rejects_superseded_generation_and_replaced_target_without_effect
+            try_enter_expiry_has_no_first_effect
             prepared_retirement_is_inert_until_polled_and_projection_is_bound
             prepared_retirement_rejects_projection_spoof_wrong_registry_and_stale_generation
             retirement_cancellation_uses_original_scope_and_registry_binding
@@ -474,6 +478,8 @@ jobs:
           for test in "${tests[@]}"; do
             grep -Fx "test proptests::$test ... ok" evidence/terminal-execution.log
           done
+          grep -Fx 'relay::tests::requested_retirement_stops_new_detach_relay_with_live_pty_and_pending_input: test' evidence/terminal-inventory.log
+          grep -Fx 'test relay::tests::requested_retirement_stops_new_detach_relay_with_live_pty_and_pending_input ... ok' evidence/terminal-execution.log
       - name: Qualify inert exact tmux ownership and fail-closed system boundary
         if: success() || failure()
         shell: bash

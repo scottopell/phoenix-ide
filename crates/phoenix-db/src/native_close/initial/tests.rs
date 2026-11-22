@@ -38,7 +38,9 @@ impl Fixture {
         let path = temp_dir.path().join("initial-entry.sqlite");
         let path = path.to_string_lossy().into_owned();
         let db = Database::open(&path).await.unwrap();
-        crate::migrations::run_pending_migrations(db.pool()).await.unwrap();
+        crate::migrations::run_pending_migrations(db.pool())
+            .await
+            .unwrap();
         Self::with_database(db, Some((temp_dir, path))).await
     }
 
@@ -759,45 +761,94 @@ async fn initial_worktree_entry_requires_exact_dispatch_and_refuses_completed_re
 async fn first_effect_refuses_missing_dispatch_mismatched_binding_and_completed_resource() {
     let f = Fixture::new().await;
     let (command, receipt, live_source, expected) = captured_initial_retirement(&f).await;
-    let worktree = expected.iter()
+    let worktree = expected
+        .iter()
         .find(|item| item.resource.kind() == RetiredResourceKind::Worktree)
         .unwrap();
     let invoked = std::cell::Cell::new(false);
-    let callback = || { invoked.set(true); };
-    let undispatched = f.db.with_native_close_initial_worktree_first_effect(
-        &command, &receipt, &live_source, worktree.scope.clone(),
-        worktree.snapshot.clone(), &worktree.resource, callback,
-    ).await;
-    assert!(matches!(undispatched, Err(NativeCloseInitialFirstEffectError::Rejected {
-        release: NativeCloseInitialEntryRelease::Confirmed, ..
-    })));
+    let callback = || {
+        invoked.set(true);
+    };
+    let undispatched =
+        f.db.with_native_close_initial_worktree_first_effect(
+            &command,
+            &receipt,
+            &live_source,
+            worktree.scope.clone(),
+            worktree.snapshot.clone(),
+            &worktree.resource,
+            callback,
+        )
+        .await;
+    assert!(matches!(
+        undispatched,
+        Err(NativeCloseInitialFirstEffectError::Rejected {
+            release: NativeCloseInitialEntryRelease::Confirmed,
+            ..
+        })
+    ));
     assert!(!invoked.get());
     f.db.record_native_close_initial_retirement_dispatch(
-        &command, &receipt, &live_source, initial_dispatch_request(&receipt, worktree),
-    ).await.established().unwrap().unwrap();
+        &command,
+        &receipt,
+        &live_source,
+        initial_dispatch_request(&receipt, worktree),
+    )
+    .await
+    .established()
+    .unwrap()
+    .unwrap();
     let foreign_snapshot = phoenix_core::domain::close::CloseRetirementSnapshot::parse(
-        "foreign-generation", "foreign-fingerprint",
-    ).unwrap();
+        "foreign-generation",
+        "foreign-fingerprint",
+    )
+    .unwrap();
     for (scope, snapshot) in [
-        (WorkScopeId::parse("foreign-scope").unwrap(), worktree.snapshot.clone()),
+        (
+            WorkScopeId::parse("foreign-scope").unwrap(),
+            worktree.snapshot.clone(),
+        ),
         (worktree.scope.clone(), foreign_snapshot),
     ] {
-        let rejected = f.db.with_native_close_initial_worktree_first_effect(
-            &command, &receipt, &live_source, scope, snapshot, &worktree.resource, callback,
-        ).await;
-        assert!(matches!(rejected, Err(NativeCloseInitialFirstEffectError::Rejected {
-            release: NativeCloseInitialEntryRelease::Confirmed, ..
-        })));
+        let rejected =
+            f.db.with_native_close_initial_worktree_first_effect(
+                &command,
+                &receipt,
+                &live_source,
+                scope,
+                snapshot,
+                &worktree.resource,
+                callback,
+            )
+            .await;
+        assert!(matches!(
+            rejected,
+            Err(NativeCloseInitialFirstEffectError::Rejected {
+                release: NativeCloseInitialEntryRelease::Confirmed,
+                ..
+            })
+        ));
         assert!(!invoked.get());
     }
     record_initial_retirement(&f, &command, &receipt, &live_source, worktree).await;
-    let completed = f.db.with_native_close_initial_worktree_first_effect(
-        &command, &receipt, &live_source, worktree.scope.clone(),
-        worktree.snapshot.clone(), &worktree.resource, callback,
-    ).await;
-    assert!(matches!(completed, Err(NativeCloseInitialFirstEffectError::Rejected {
-        release: NativeCloseInitialEntryRelease::Confirmed, ..
-    })));
+    let completed =
+        f.db.with_native_close_initial_worktree_first_effect(
+            &command,
+            &receipt,
+            &live_source,
+            worktree.scope.clone(),
+            worktree.snapshot.clone(),
+            &worktree.resource,
+            callback,
+        )
+        .await;
+    assert!(matches!(
+        completed,
+        Err(NativeCloseInitialFirstEffectError::Rejected {
+            release: NativeCloseInitialEntryRelease::Confirmed,
+            ..
+        })
+    ));
     assert!(!invoked.get());
 }
 
@@ -805,22 +856,38 @@ async fn first_effect_refuses_missing_dispatch_mismatched_binding_and_completed_
 async fn first_effect_callback_is_refused_on_source_loss_and_preserves_exact_result() {
     let f = Fixture::new().await;
     let (command, receipt, live_source, expected) = captured_initial_retirement(&f).await;
-    let worktree = expected.iter()
+    let worktree = expected
+        .iter()
         .find(|item| item.resource.kind() == RetiredResourceKind::Worktree)
         .unwrap();
     f.db.record_native_close_initial_retirement_dispatch(
-        &command, &receipt, &live_source, initial_dispatch_request(&receipt, worktree),
-    ).await.established().unwrap().unwrap();
+        &command,
+        &receipt,
+        &live_source,
+        initial_dispatch_request(&receipt, worktree),
+    )
+    .await
+    .established()
+    .unwrap()
+    .unwrap();
 
     let invoked = std::cell::Cell::new(false);
-    let refused = f.db.with_native_close_initial_worktree_first_effect(
-        &command, &receipt, &ConvState::Idle, worktree.scope.clone(),
-        worktree.snapshot.clone(), &worktree.resource, || {
-            invoked.set(true);
-            "must-not-run"
-        },
-    ).await;
-    assert!(matches!(refused,
+    let refused =
+        f.db.with_native_close_initial_worktree_first_effect(
+            &command,
+            &receipt,
+            &ConvState::Idle,
+            worktree.scope.clone(),
+            worktree.snapshot.clone(),
+            &worktree.resource,
+            || {
+                invoked.set(true);
+                "must-not-run"
+            },
+        )
+        .await;
+    assert!(matches!(
+        refused,
         Err(NativeCloseInitialFirstEffectError::Rejected {
             error: DbError::CloseFoundationPrecondition(_),
             release: NativeCloseInitialEntryRelease::Confirmed,
@@ -828,45 +895,79 @@ async fn first_effect_callback_is_refused_on_source_loss_and_preserves_exact_res
     ));
     assert!(!invoked.get());
 
-    let outcome = f.db.with_native_close_initial_worktree_first_effect(
-        &command, &receipt, &live_source, worktree.scope.clone(),
-        worktree.snapshot.clone(), &worktree.resource,
-        || String::from("exact real-effect outcome"),
-    ).await;
+    let outcome =
+        f.db.with_native_close_initial_worktree_first_effect(
+            &command,
+            &receipt,
+            &live_source,
+            worktree.scope.clone(),
+            worktree.snapshot.clone(),
+            &worktree.resource,
+            || String::from("exact real-effect outcome"),
+        )
+        .await;
     match outcome {
         Ok((result, NativeCloseInitialEntryRelease::Confirmed)) => {
             assert_eq!(result, "exact real-effect outcome");
         }
         _ => panic!("expected callback result and confirmed reservation release"),
     }
-    f.db.update_conversation_state(&f.coordinator, &ConvState::Idle).await.unwrap();
-    let revoked = f.db.with_native_close_initial_worktree_first_effect(
-        &command, &receipt, &live_source, worktree.scope.clone(),
-        worktree.snapshot.clone(), &worktree.resource, || { invoked.set(true); },
-    ).await;
-    assert!(matches!(revoked, Err(NativeCloseInitialFirstEffectError::Rejected {
-        release: NativeCloseInitialEntryRelease::Confirmed, ..
-    })));
-    assert!(!invoked.get(), "stale live source cannot bypass durable revocation");
+    f.db.update_conversation_state(&f.coordinator, &ConvState::Idle)
+        .await
+        .unwrap();
+    let revoked =
+        f.db.with_native_close_initial_worktree_first_effect(
+            &command,
+            &receipt,
+            &live_source,
+            worktree.scope.clone(),
+            worktree.snapshot.clone(),
+            &worktree.resource,
+            || {
+                invoked.set(true);
+            },
+        )
+        .await;
+    assert!(matches!(
+        revoked,
+        Err(NativeCloseInitialFirstEffectError::Rejected {
+            release: NativeCloseInitialEntryRelease::Confirmed,
+            ..
+        })
+    ));
+    assert!(
+        !invoked.get(),
+        "stale live source cannot bypass durable revocation"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn first_effect_callback_holds_writer_reservation_against_source_update() {
     let f = Fixture::new_file_backed().await;
     let (command, receipt, live_source, expected) = captured_initial_retirement(&f).await;
-    let worktree = expected.iter()
+    let worktree = expected
+        .iter()
         .find(|item| item.resource.kind() == RetiredResourceKind::Worktree)
         .unwrap();
     f.db.record_native_close_initial_retirement_dispatch(
-        &command, &receipt, &live_source, initial_dispatch_request(&receipt, worktree),
-    ).await.established().unwrap().unwrap();
+        &command,
+        &receipt,
+        &live_source,
+        initial_dispatch_request(&receipt, worktree),
+    )
+    .await
+    .established()
+    .unwrap()
+    .unwrap();
 
     let path = f.db_path.as_deref().expect("file-backed fixture");
     let options = sqlx::sqlite::SqliteConnectOptions::new()
         .filename(path)
         .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
         .busy_timeout(std::time::Duration::ZERO);
-    let mut competing_writer = sqlx::SqliteConnection::connect_with(&options).await.unwrap();
+    let mut competing_writer = sqlx::SqliteConnection::connect_with(&options)
+        .await
+        .unwrap();
     let conversation_id = f.coordinator.clone();
     let (start_tx, start_rx) = tokio::sync::oneshot::channel::<()>();
     let (busy_tx, busy_rx) = std::sync::mpsc::sync_channel::<Result<i32, String>>(1);
@@ -874,45 +975,63 @@ async fn first_effect_callback_holds_writer_reservation_against_source_update() 
     let (retry_tx, retry_rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
     let competing = tokio::spawn(async move {
         start_rx.await.unwrap();
-        let error = sqlx::query(
-            "UPDATE conversations SET updated_at = updated_at WHERE id = ?1",
-        )
-        .bind(&conversation_id)
-        .execute(&mut competing_writer)
-        .await
-        .unwrap_err();
-        let code = error.as_database_error().and_then(|db| db.code())
+        let error = sqlx::query("UPDATE conversations SET updated_at = updated_at WHERE id = ?1")
+            .bind(&conversation_id)
+            .execute(&mut competing_writer)
+            .await
+            .unwrap_err();
+        let code = error
+            .as_database_error()
+            .and_then(|db| db.code())
             .and_then(|code| code.parse::<i32>().ok());
         let _ = busy_tx.send(code.ok_or_else(|| format!("expected SQLite code 5, got {error}")));
         release_rx.await.map_err(|error| error.to_string())?;
-        sqlx::query(
-            "UPDATE conversations SET updated_at = updated_at WHERE id = ?1",
-        )
-        .bind(&conversation_id)
-        .execute(&mut competing_writer)
-        .await
-        .map_err(|error| error.to_string())?;
+        sqlx::query("UPDATE conversations SET updated_at = updated_at WHERE id = ?1")
+            .bind(&conversation_id)
+            .execute(&mut competing_writer)
+            .await
+            .map_err(|error| error.to_string())?;
         let _ = retry_tx.send(Ok(()));
         Ok::<(), String>(())
     });
 
-    let outcome = f.db.with_native_close_initial_worktree_first_effect(
-        &command, &receipt, &live_source, worktree.scope.clone(),
-        worktree.snapshot.clone(), &worktree.resource, || {
-            start_tx.send(()).unwrap();
-            let code = busy_rx.recv_timeout(std::time::Duration::from_secs(30))
-                .expect("competing writer should acknowledge while callback is held")
-                .expect("competing UPDATE should report SQLITE_BUSY (5)");
-            assert_eq!(code, 5);
-            Err::<(), _>("callback-result-sentinel")
-        },
-    ).await;
-    assert!(matches!(outcome,
-        Ok((Err("callback-result-sentinel"), NativeCloseInitialEntryRelease::Confirmed))
+    let outcome =
+        f.db.with_native_close_initial_worktree_first_effect(
+            &command,
+            &receipt,
+            &live_source,
+            worktree.scope.clone(),
+            worktree.snapshot.clone(),
+            &worktree.resource,
+            || {
+                start_tx.send(()).unwrap();
+                let code = busy_rx
+                    .recv_timeout(std::time::Duration::from_secs(30))
+                    .expect("competing writer should acknowledge while callback is held")
+                    .expect("competing UPDATE should report SQLITE_BUSY (5)");
+                assert_eq!(code, 5);
+                Err::<(), _>("callback-result-sentinel")
+            },
+        )
+        .await;
+    assert!(matches!(
+        outcome,
+        Ok((
+            Err("callback-result-sentinel"),
+            NativeCloseInitialEntryRelease::Confirmed
+        ))
     ));
     release_tx.send(()).unwrap();
-    tokio::time::timeout(std::time::Duration::from_secs(30), retry_rx).await.unwrap().unwrap().unwrap();
-    tokio::time::timeout(std::time::Duration::from_secs(30), competing).await.unwrap().unwrap().unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(30), retry_rx)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(30), competing)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
 }
 
 #[tokio::test]

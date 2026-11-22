@@ -422,8 +422,13 @@ async fn validate_initial_worktree_entry_tx(
     resource: &RetiredResourceIdentity,
 ) -> DbResult<()> {
     let (admitted, _) = require_initial_execution_tx(
-        tx, command, receipt, live_source, ClosePhase::RetirementRequested,
-    ).await?;
+        tx,
+        command,
+        receipt,
+        live_source,
+        ClosePhase::RetirementRequested,
+    )
+    .await?;
     if resource.kind() != RetiredResourceKind::Worktree {
         return Err(DbError::CloseFoundationPrecondition(
             "initial worktree entry requires an exact worktree resource".into(),
@@ -442,14 +447,21 @@ async fn validate_initial_worktree_entry_tx(
            AND inspection_fingerprint = ?4 AND resource_kind = ?5
            AND identity_kind = ?6 AND identity_codec = ?7 AND identity_value = ?8
            AND proof_kind IN ('retired', 'absence_adopted'))",
-    ).bind(admitted.attempt_id.as_str()).bind(scope.as_str())
-        .bind(snapshot.generation()).bind(snapshot.fingerprint())
-        .bind(resource.kind().as_str()).bind(identity.identity_kind())
-        .bind(identity.codec()).bind(identity.value())
-        .fetch_one(&mut **tx).await?;
+    )
+    .bind(admitted.attempt_id.as_str())
+    .bind(scope.as_str())
+    .bind(snapshot.generation())
+    .bind(snapshot.fingerprint())
+    .bind(resource.kind().as_str())
+    .bind(identity.identity_kind())
+    .bind(identity.codec())
+    .bind(identity.value())
+    .fetch_one(&mut **tx)
+    .await?;
     if already_proven {
         return Err(DbError::CloseFoundationPrecondition(
-            "initial worktree entry refuses an exact resource with positive retirement evidence".into(),
+            "initial worktree entry refuses an exact resource with positive retirement evidence"
+                .into(),
         ));
     }
     Ok(())
@@ -495,8 +507,16 @@ impl Database {
             Err(error) => return Err(NativeCloseInitialFirstEffectError::NotStarted(error.into())),
         };
         if let Err(error) = validate_initial_worktree_entry_tx(
-            &mut tx, command, receipt, live_source, &scope, &snapshot, resource,
-        ).await {
+            &mut tx,
+            command,
+            receipt,
+            live_source,
+            &scope,
+            &snapshot,
+            resource,
+        )
+        .await
+        {
             let release = match tx.rollback().await {
                 Ok(()) => NativeCloseInitialEntryRelease::Confirmed,
                 Err(error) => NativeCloseInitialEntryRelease::Unconfirmed(error.into()),
@@ -594,8 +614,15 @@ impl Database {
             Err(error) => return NativeCloseInitialResourceEntryResult::NotStarted(error.into()),
         };
         let validation = validate_initial_worktree_entry_tx(
-            &mut tx, command, receipt, live_source, &scope, &snapshot, resource,
-        ).await;
+            &mut tx,
+            command,
+            receipt,
+            live_source,
+            &scope,
+            &snapshot,
+            resource,
+        )
+        .await;
         if let Err(error) = validation {
             let release = match tx.rollback().await {
                 Ok(()) => NativeCloseInitialEntryRelease::Confirmed,
