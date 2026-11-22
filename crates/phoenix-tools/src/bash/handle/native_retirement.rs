@@ -105,8 +105,9 @@ impl Handle {
             };
             let pid = live.pid;
             let pgid = live.pgid;
-            let numeric_pid = i32::try_from(pid)
-                .map_err(|_| NativeBashSignalError::Io(io::Error::from_raw_os_error(libc::EINVAL)))?;
+            let numeric_pid = i32::try_from(pid).map_err(|_| {
+                NativeBashSignalError::Io(io::Error::from_raw_os_error(libc::EINVAL))
+            })?;
             // PIDFD_SIGNAL_PROCESS_GROUP addresses the group whose leader has
             // this pidfd's identity. A nonleader cannot authorize another group.
             if pgid <= 0 || pgid != numeric_pid {
@@ -132,17 +133,27 @@ impl Handle {
             // Signal zero checks support/permissions and original group presence
             // without delivering a signal. Reject old kernels before any SIGSTOP.
             let supported = unsafe {
-                libc::syscall(libc::SYS_pidfd_send_signal, pidfd.as_raw_fd(), 0,
-                    std::ptr::null::<libc::siginfo_t>(), PIDFD_SIGNAL_PROCESS_GROUP)
+                libc::syscall(
+                    libc::SYS_pidfd_send_signal,
+                    pidfd.as_raw_fd(),
+                    0,
+                    std::ptr::null::<libc::siginfo_t>(),
+                    PIDFD_SIGNAL_PROCESS_GROUP,
+                )
             };
             if supported != 0 {
                 let error = io::Error::last_os_error();
-                if matches!(error.raw_os_error(), Some(libc::EINVAL) | Some(libc::ENOSYS)) {
+                if matches!(
+                    error.raw_os_error(),
+                    Some(libc::EINVAL) | Some(libc::ENOSYS)
+                ) {
                     return Err(NativeBashSignalError::Unsupported);
                 }
                 return Err(NativeBashSignalError::Io(error));
             }
-            if Instant::now() >= deadline { return Err(NativeBashSignalError::Expired); }
+            if Instant::now() >= deadline {
+                return Err(NativeBashSignalError::Expired);
+            }
             Ok(Some(NativeBashSignal {
                 state_pin: Some(guard),
                 pidfd,
@@ -294,17 +305,38 @@ impl NativeBashSignal {
         }
         #[cfg(target_os = "linux")]
         {
-            if self.phase != Phase::StopObserved { return Err(NativeBashSignalError::WrongPhase); }
-            if Instant::now() >= self.deadline { return Err(NativeBashSignalError::Expired); }
-            if !self.exact_stop_observed()? { return Err(NativeBashSignalError::NotStopped); }
+            if self.phase != Phase::StopObserved {
+                return Err(NativeBashSignalError::WrongPhase);
+            }
+            if Instant::now() >= self.deadline {
+                return Err(NativeBashSignalError::Expired);
+            }
+            if !self.exact_stop_observed()? {
+                return Err(NativeBashSignalError::NotStopped);
+            }
             let fd = self.pidfd.as_raw_fd();
-            attempt_once(&mut self.phase, Phase::StopObserved, Phase::GroupAttempted, self.deadline, || {
-                let rc = unsafe {
-                    libc::syscall(libc::SYS_pidfd_send_signal, fd, libc::SIGKILL,
-                        std::ptr::null::<libc::siginfo_t>(), PIDFD_SIGNAL_PROCESS_GROUP)
-                };
-                if rc == 0 { Ok(()) } else { Err(io::Error::last_os_error()) }
-            })
+            attempt_once(
+                &mut self.phase,
+                Phase::StopObserved,
+                Phase::GroupAttempted,
+                self.deadline,
+                || {
+                    let rc = unsafe {
+                        libc::syscall(
+                            libc::SYS_pidfd_send_signal,
+                            fd,
+                            libc::SIGKILL,
+                            std::ptr::null::<libc::siginfo_t>(),
+                            PIDFD_SIGNAL_PROCESS_GROUP,
+                        )
+                    };
+                    if rc == 0 {
+                        Ok(())
+                    } else {
+                        Err(io::Error::last_os_error())
+                    }
+                },
+            )
         }
     }
 
@@ -375,7 +407,9 @@ mod tests {
             1024,
         );
         assert!(matches!(
-            handle.prepare_native_leaf(Instant::now() + std::time::Duration::from_secs(1)).await,
+            handle
+                .prepare_native_leaf(Instant::now() + std::time::Duration::from_secs(1))
+                .await,
             Err(NativeBashSignalError::Unsupported)
         ));
         // This is an admission result, not syscall interception: the Linux path

@@ -453,6 +453,10 @@ jobs:
             bash::operations::tests::waiter_scratch_cleanup_failure_keeps_legacy_terminal_exit_but_unverifies
             bash::operations::tests::waiter_missing_scratch_directory_is_settled
             bash::operations::tests::dropping_polled_pending_run_waiter_unverifies_without_terminalizing
+            bash::operations::tests::dropping_unpolled_run_waiter_unverifies_without_polling_child
+            bash::operations::tests::waiter_success_producer_is_take_once_across_handle_clones
+            bash::operations::tests::waiter_unique_success_producer_cannot_overwrite_failure
+            bash::operations::tests::duplicate_waiter_claim_cannot_revoke_completed_settlement
             bash::operations::tests::waiter_reader_join_error_still_awaits_gated_stderr_reader
             bash::operations::tests::waiter_cannot_terminalize_before_reader_drains_unterminated_tail
             bash::operations::tests::waiter_bounds_reader_drain_when_a_descendant_keeps_pipe_open

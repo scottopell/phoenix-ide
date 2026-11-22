@@ -54,7 +54,13 @@ impl super::PreparedBashRetirement {
     /// Convert inert registry custody to native leaf custody under the original deadline.
     /// No signal is sent; the returned owner keeps the original registry writer held.
     pub async fn prepare_native(self) -> Result<NativeBashRetirement, NativeBashRetirementError> {
-        let Self { entry, handle, generation, target, deadline } = self;
+        let Self {
+            entry,
+            handle,
+            generation,
+            target,
+            deadline,
+        } = self;
         if Instant::now() >= deadline {
             return Err(NativeBashRetirementError::DeadlineExpired);
         }
@@ -92,7 +98,12 @@ impl super::PreparedBashRetirement {
             scope_uncertainty: uncertainty,
             ..CascadeBashReport::default()
         };
-        record_handle_in_report(&mut report, target.pgid, target.pid, target.kill_pending_kernel);
+        record_handle_in_report(
+            &mut report,
+            target.pgid,
+            target.pid,
+            target.kill_pending_kernel,
+        );
         Ok(NativeBashRetirement {
             _registry_writer: writer,
             _handle: handle,
@@ -139,31 +150,42 @@ impl NativeBashRetirement {
         if !self.cleanup_complete {
             self.report.kill_failures.push((
                 self.target.pgid,
-                "native retirement verification refused before explicit writer-release cleanup".into(),
+                "native retirement verification refused before explicit writer-release cleanup"
+                    .into(),
             ));
             return NativeBashRetirementOutcome::Unverified(self.report.clone());
         }
         if !self._registry_writer.teardown_started
             || self._registry_writer.teardown_generation != self.generation.0
         {
-            self.report.kill_failures.push((self.target.pgid, "original Bash teardown generation is stale".into()));
+            self.report.kill_failures.push((
+                self.target.pgid,
+                "original Bash teardown generation is stale".into(),
+            ));
             return NativeBashRetirementOutcome::StaleGeneration(self.report.clone());
         }
         if Instant::now() >= self.deadline {
-            self.report.kill_failures.push((self.target.pgid, "original Bash retirement deadline expired; absence unverified".into()));
+            self.report.kill_failures.push((
+                self.target.pgid,
+                "original Bash retirement deadline expired; absence unverified".into(),
+            ));
             return NativeBashRetirementOutcome::Unverified(self.report.clone());
         }
-        if let Err(reason) = await_waiter_settlement(
-            self._handle.subscribe_waiter_settlement(), self.deadline,
-        ).await {
+        if let Err(reason) =
+            await_waiter_settlement(self._handle.subscribe_waiter_settlement(), self.deadline).await
+        {
             self.report.kill_failures.push((self.target.pgid, reason));
             return NativeBashRetirementOutcome::Unverified(self.report.clone());
         }
         let observed = tokio::time::timeout_at(self.deadline, async {
             retirement_target_has_live_member(&self.target)
-        }).await;
+        })
+        .await;
         if Instant::now() >= self.deadline {
-            self.report.kill_failures.push((self.target.pgid, "original Bash retirement deadline expired; absence unverified".into()));
+            self.report.kill_failures.push((
+                self.target.pgid,
+                "original Bash retirement deadline expired; absence unverified".into(),
+            ));
             return NativeBashRetirementOutcome::Unverified(self.report.clone());
         }
         match observed {
@@ -178,20 +200,28 @@ impl NativeBashRetirement {
                 NativeBashRetirementOutcome::Unverified(self.report.clone())
             }
             Ok(Ok(true)) => {
-                self.report.kill_failures.push((self.target.pgid, "exact process group remains live after native retirement".into()));
+                self.report.kill_failures.push((
+                    self.target.pgid,
+                    "exact process group remains live after native retirement".into(),
+                ));
                 NativeBashRetirementOutcome::Unverified(self.report.clone())
             }
             Ok(Err(error)) => {
-                self.report.kill_failures.push((self.target.pgid, format!("native process-group absence observation failed: {error}")));
+                self.report.kill_failures.push((
+                    self.target.pgid,
+                    format!("native process-group absence observation failed: {error}"),
+                ));
                 NativeBashRetirementOutcome::Unverified(self.report.clone())
             }
             Err(_) => {
-                self.report.kill_failures.push((self.target.pgid, "original Bash retirement deadline expired; absence unverified".into()));
+                self.report.kill_failures.push((
+                    self.target.pgid,
+                    "original Bash retirement deadline expired; absence unverified".into(),
+                ));
                 NativeBashRetirementOutcome::Unverified(self.report.clone())
             }
         }
     }
-
 }
 
 /// The exact waiter's proof is independent of a tombstone or group absence.
@@ -213,14 +243,19 @@ async fn await_waiter_settlement(
                 }
                 WaiterSettlement::Pending => {}
             }
-            observer.changed().await
+            observer
+                .changed()
+                .await
                 .map_err(|_| "exact Bash waiter settlement observer closed".to_string())?;
         }
-    }).await;
+    })
+    .await;
     if Instant::now() >= deadline {
         return Err("original Bash retirement deadline expired during waiter settlement".into());
     }
-    result.map_err(|_| "original Bash retirement deadline expired during waiter settlement".to_string())?
+    result.map_err(|_| {
+        "original Bash retirement deadline expired during waiter settlement".to_string()
+    })?
 }
 
 #[cfg(test)]
@@ -237,7 +272,8 @@ mod tests {
         let mut wait = std::pin::pin!(wait);
         let first = std::future::poll_fn(|cx| {
             std::task::Poll::Ready(std::future::Future::poll(wait.as_mut(), cx))
-        }).await;
+        })
+        .await;
         assert!(first.is_pending());
         tokio::time::advance(Duration::from_secs(1)).await;
         assert!(wait.await.unwrap_err().contains("deadline expired"));
@@ -247,14 +283,20 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn waiter_settlement_failure_or_late_success_cannot_verify() {
         let (sender, observer) = tokio::sync::watch::channel(WaiterSettlement::Pending);
-        sender.send_replace(WaiterSettlement::Unverified("reader drain timed out".into()));
+        sender.send_replace(WaiterSettlement::Unverified(
+            "reader drain timed out".into(),
+        ));
         let deadline = Instant::now() + Duration::from_secs(1);
-        assert!(await_waiter_settlement(observer.clone(), deadline).await
-            .unwrap_err().contains("reader drain timed out"));
+        assert!(await_waiter_settlement(observer.clone(), deadline)
+            .await
+            .unwrap_err()
+            .contains("reader drain timed out"));
         sender.send_replace(WaiterSettlement::Settled);
         tokio::time::advance(Duration::from_secs(1)).await;
-        assert!(await_waiter_settlement(observer, deadline).await
-            .unwrap_err().contains("deadline expired"));
+        assert!(await_waiter_settlement(observer, deadline)
+            .await
+            .unwrap_err()
+            .contains("deadline expired"));
     }
 
     #[tokio::test]
@@ -265,7 +307,9 @@ mod tests {
         assert!(await_waiter_settlement(observer, deadline).await.is_ok());
         let (sender, observer) = tokio::sync::watch::channel(WaiterSettlement::Pending);
         drop(sender);
-        assert!(await_waiter_settlement(observer, deadline).await
-            .unwrap_err().contains("observer closed"));
+        assert!(await_waiter_settlement(observer, deadline)
+            .await
+            .unwrap_err()
+            .contains("observer closed"));
     }
 }

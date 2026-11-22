@@ -245,6 +245,8 @@ pub struct Handle {
     exit_observer: watch::Receiver<Option<ExitState>>,
     /// Aggregate proof from the one waiter responsible for this exact handle.
     waiter_settlement: watch::Sender<WaiterSettlement>,
+    waiter_settlement_producer:
+        std::sync::Mutex<Option<super::operations::WaiterSettlementProducer>>,
 }
 
 impl std::fmt::Debug for Handle {
@@ -463,7 +465,7 @@ impl Handle {
             ring: Mutex::new(RingBuffer::new(ring_bytes_cap)),
         };
         let (tx, rx) = watch::channel::<Option<ExitState>>(None);
-        let (settlement_tx, _) = watch::channel(WaiterSettlement::Pending);
+        let (settlement_tx, settlement_producer) = super::operations::waiter_settlement_channel();
         Arc::new(Self {
             controller_scope,
             handle_id,
@@ -480,6 +482,7 @@ impl Handle {
             exit_signal: tx,
             exit_observer: rx,
             waiter_settlement: settlement_tx,
+            waiter_settlement_producer: std::sync::Mutex::new(Some(settlement_producer)),
         })
     }
 
@@ -667,16 +670,15 @@ impl Handle {
         self.waiter_settlement.subscribe()
     }
 
-    /// Publish successful settlement only while the witness is still pending.
-    pub(super) fn settle_waiter(&self) {
-        self.waiter_settlement.send_if_modified(|state| {
-            if matches!(*state, WaiterSettlement::Pending) {
-                *state = WaiterSettlement::Settled;
-                true
-            } else {
-                false
-            }
-        });
+    /// Transfer the exact handle's sole success producer to its waiter.
+    /// No Arc clone can claim a replacement, even after the producer is dropped.
+    pub(super) fn take_waiter_settlement_producer(
+        &self,
+    ) -> Option<super::operations::WaiterSettlementProducer> {
+        self.waiter_settlement_producer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
     }
 
     /// Fail closed. An armed panic guard may replace a prior success, but
