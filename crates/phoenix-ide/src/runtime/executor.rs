@@ -31735,7 +31735,13 @@ mod work_subagent_cwd_guard_tests {
 
     #[tokio::test]
     async fn qualified_parent_models_admit_multiple_luna_work_children() {
-        for parent_model in ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-6-astra", "gpt-6-sol"] {
+        for parent_model in [
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "gpt-6-astra",
+            "gpt-6-sol",
+            "gpt-6.1-sol",
+        ] {
             let worktree = TempDir::new().expect("worktree tempdir");
             let (spawn_tx, spawn_rx) = mpsc::channel::<SubAgentSpawnRequest>(2);
             let (cancel_tx, _cancel_rx) = mpsc::channel(1);
