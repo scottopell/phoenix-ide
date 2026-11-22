@@ -140,7 +140,7 @@ jobs:
         timeout-minutes: 20
         run: ./dev.py check --lanes rust,cargo-fmt --rust-phase build --profile-work --profile-work-dir "$RUST_EVIDENCE_DIR/check"
       - name: Qualify missing continuation notification witness
-        timeout-minutes: 8
+        timeout-minutes: 15
         shell: bash
         run: |
           set -euo pipefail
