@@ -1100,7 +1100,7 @@ jobs:
       - name: Focused backup helper regressions
         run: >-
           uv run --no-project --managed-python --python 3.13.1 python -m unittest
-          tests.devpy.test_simple_launchd_helper
+          tests.devpy.test_simple_launchd_helper tests.devpy.test_backup_comparator
       - name: Qualify populated large-database backup verification
         timeout-minutes: 40
         run: >-

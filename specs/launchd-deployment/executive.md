@@ -7,7 +7,7 @@ validates exact candidate artifacts and checks backup capacity for an existing
 database before disruption; it quarantines the canonical plist and observes
 predecessor stop. For an existing database it holds a bounded SQLite
 `BEGIN IMMEDIATE` writer reservation across backup verification and durable
-boundary recording, retaining the fsynced native backup and transaction proof. Backup verification checks integrity, then compares source and backup metadata and typed stored rows in lockstep, including rowid/primary-key identity and persisted FTS5 shadow rows. Unsupported virtual-table modules and tables shadowing every rowid alias fail closed. Backup creation, integrity, equivalence, fsync and proof hashing share a 600-second deadline.
+boundary recording, retaining the fsynced native backup and transaction proof. Backup verification checks integrity, then compares source and backup metadata and typed stored rows in lockstep, including rowid/primary-key identity and persisted FTS5 shadow rows. Unsupported virtual-table modules and tables shadowing every rowid alias fail closed. Backup creation, integrity, equivalence, fsync and proof hashing share a 900-second deadline.
 Only a true first install with absent database and no managed predecessor,
 installed binary/plist or loaded service omits the backup: private proof records
 `database_source: absent`, `backup: null`, with path absence rechecked before
@@ -76,12 +76,30 @@ migration128 data/constraint and migration-lineage tests remain. The maintained
 macOS app workflow runs ordinary helper, installer, harness-safety and restart
 tests instead of the removed prepared-upgrade module.
 
-Full TypeScript checking is blocked by older primary dependencies missing patched
-micromark/mdast modules; no wire type shape changed. The disposable populated-
-database qualification targets a 13.4 GB SQLite file but has no hosted success
-result yet; this is not a universal 13 GB performance guarantee. No production
-deployment was performed; production remains `9c5d471d`. Focused and disposable
-results do not claim hosted/full-repository or production acceptance.
+### Fifteen-minute candidate qualification (2026-11-22)
+
+[ADR-272](../adrs/272_bound-exhaustive-backup-verification-to-fifteen-minutes.md)
+qualifies ADR-263 with a shared 900-second backup-verification deadline; candidate
+migration remains bounded separately at 600 seconds. The comparator avoids
+per-cell tag decoding and tuple allocation without changing storage-class,
+binary64, row-identity, schema or FTS5-shadow comparisons.
+
+Helper SHA-256 `7a55695c633c49e5a9fa879e7dabac897f5087d7172c0532cc1e97110b5d9fca`
+completed one retained-snapshot, distinct-image isolated full-path qualification
+in 817.564 seconds (supervisor 817.972 seconds), including proof hashing, on
+CPython 3.13.1 / SQLite 3.47.1. The source was 13,745,197,056 bytes; exhaustive
+comparison covered 6,988,720 rows and 63,467,170 cells. Copy took 83.774 seconds,
+integrity 403.330, metadata 0.081, comparison 316.863, fsync under 0.001 and
+proof hashing 13.510. Source identity/header were unchanged, the worker was
+reaped, and source/destination had no open handles after completion.
+
+This is one observed pass, not a controlled comparator speedup estimate or a
+universal deadline guarantee. It does not retroactively qualify the earlier
+failed 900-second run. Exact-source integrated review, a fresh hosted
+qualification, corrected release preparation and fresh sole-executor rollout
+gates remain outstanding for this candidate. The historical hosted result above
+belongs to its named earlier implementation. No production acceptance follows
+from either isolated or synthetic fixture success.
 
 ## Operator recovery
 

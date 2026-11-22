@@ -1,0 +1,160 @@
+"""Behavioral coverage for SQLite backup equivalence checks."""
+import importlib.util
+import sqlite3
+import struct
+import sys
+import unittest
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[2]
+
+
+def load_helper(name, path):
+    spec = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+helper = load_helper("backup_comparator_launchd_helper", ROOT / "scripts/launchd_deploy_helper.py")
+
+
+class BackupComparatorTests(unittest.TestCase):
+    def compare_outcomes(self, setup, expected, mutate=None):
+        source, backup = sqlite3.connect(":memory:"), sqlite3.connect(":memory:")
+        source_factory = lambda value: value.decode("utf-8")
+        backup_factory = lambda value: value.decode("utf-8")
+        source.text_factory, backup.text_factory = source_factory, backup_factory
+        diagnostics = {}
+        try:
+            setup(source)
+            setup(backup)
+            if mutate is not None:
+                mutate(backup)
+            if expected == "reject":
+                with self.assertRaises(helper.ActivationError):
+                    helper._verify_logical_equivalence(
+                        source, backup, helper.time.monotonic() + 10, diagnostics,
+                    )
+            else:
+                helper._verify_logical_equivalence(
+                    source, backup, helper.time.monotonic() + 10, diagnostics,
+                )
+            self.assertEqual((source.text_factory, backup.text_factory),
+                             (source_factory, backup_factory))
+            for timing in diagnostics.get("stage_ms", {}).values():
+                self.assertGreaterEqual(timing, 0)
+            return diagnostics
+        finally:
+            source.close()
+            backup.close()
+
+    def test_all_storage_classes(self):
+        def setup(db):
+            db.execute("CREATE TABLE cells(k INTEGER PRIMARY KEY, v)")
+            db.executescript("""INSERT INTO cells VALUES
+                (1,NULL),(2,9223372036854775807),(3,1.25),(4,'text'),(5,X'ff00'),
+                (6,CAST(X'ff80' AS TEXT));""")
+        self.compare_outcomes(setup, "accept")
+
+    def test_numeric_and_storage_class_matrix(self):
+        cases = (
+            ("same bytes TEXT versus BLOB", "CAST(X'4142' AS TEXT)", "CAST(X'4142' AS BLOB)", "reject", ("text", "blob")),
+            ("different invalid UTF-8 TEXT", "CAST(X'ff' AS TEXT)", "CAST(X'fe' AS TEXT)", "reject", ("text", "text")),
+            ("different BLOB", "X'0102'", "X'0103'", "reject", ("blob", "blob")),
+            ("INTEGER 1 versus REAL 1", "1", "1.0", "reject", ("integer", "real")),
+        )
+        for label, source_expr, backup_expr, expected, storage in cases:
+            with self.subTest(case=label):
+                source, backup = sqlite3.connect(":memory:"), sqlite3.connect(":memory:")
+                try:
+                    for db, expression in ((source, source_expr), (backup, backup_expr)):
+                        db.execute("CREATE TABLE cells(v)")
+                        db.execute(f"INSERT INTO cells VALUES ({expression})")
+                    self.assertEqual(source.execute("SELECT typeof(v) FROM cells").fetchone()[0], storage[0])
+                    self.assertEqual(backup.execute("SELECT typeof(v) FROM cells").fetchone()[0], storage[1])
+                finally:
+                    source.close()
+                    backup.close()
+                self.compare_outcomes(
+                    lambda db, expr=source_expr: (db.execute("CREATE TABLE cells(v)"),
+                                                   db.execute(f"INSERT INTO cells VALUES ({expr})")),
+                    expected,
+                    lambda db, expr=backup_expr: db.execute(f"UPDATE cells SET v={expr}"),
+                )
+
+        def setup_infinities(db):
+            db.execute("CREATE TABLE cells(v)")
+            db.executemany("INSERT INTO cells VALUES (?)", ((float("inf"),), (float("-inf"),)))
+            self.assertEqual(db.execute("SELECT typeof(v),v FROM cells").fetchall(),
+                             [("real", float("inf")), ("real", float("-inf"))])
+        self.compare_outcomes(setup_infinities, "accept")
+
+        def setup_nan_normalized_to_null(db):
+            db.execute("CREATE TABLE cells(v)")
+            db.execute("INSERT INTO cells VALUES (?)", (float("nan"),))
+            self.assertEqual(db.execute("SELECT typeof(v),v FROM cells").fetchone(), ("null", None))
+        self.compare_outcomes(setup_nan_normalized_to_null, "accept")
+        self.compare_outcomes(
+            setup_nan_normalized_to_null, "accept",
+            lambda db: db.execute("UPDATE cells SET v=NULL"),
+        )
+
+    def test_binary64_signed_zero_is_not_collapsed(self):
+        def setup(db):
+            db.execute("CREATE TABLE cells(v)")
+            db.execute("INSERT INTO cells VALUES (?)", (-0.0,))
+            stored = db.execute("SELECT typeof(v),v FROM cells").fetchone()
+            self.assertEqual(stored[0], "real")
+            self.assertEqual(struct.pack(">d", stored[1]), struct.pack(">d", -0.0))
+        self.compare_outcomes(setup, "accept")
+        self.compare_outcomes(setup, "reject", lambda db: db.execute("UPDATE cells SET v=0.0"))
+
+    def test_without_rowid_composite_desc_nocase_payload_difference(self):
+        def setup(db):
+            db.executescript("""CREATE TABLE keyed(a TEXT COLLATE NOCASE,b INTEGER,payload TEXT,
+                PRIMARY KEY(a COLLATE NOCASE DESC,b ASC)) WITHOUT ROWID;
+                INSERT INTO keyed VALUES('k',2,'same'),('K',1,'also same');""")
+        self.compare_outcomes(setup, "accept")
+        self.compare_outcomes(setup, "reject", lambda db: db.execute(
+            "UPDATE keyed SET payload='changed' WHERE a='k' AND b=2"))
+
+    def test_fts5_shadow_block_difference_is_rejected(self):
+        def setup(db):
+            db.executescript("CREATE VIRTUAL TABLE docs USING fts5(body); INSERT INTO docs VALUES('same terms');")
+            columns = [row[1] for row in db.execute("PRAGMA table_info(docs_data)")]
+            self.assertIn("block", columns)
+            self.assertIsNotNone(db.execute("SELECT block FROM docs_data WHERE id=1").fetchone())
+        def mutate(db):
+            db.execute("UPDATE docs_data SET block=zeroblob(length(block)) WHERE id=1")
+        self.compare_outcomes(setup, "accept")
+        self.compare_outcomes(setup, "reject", mutate)
+
+    def test_real_index_schema_change_is_rejected(self):
+        def setup(db):
+            db.execute("CREATE TABLE records(value TEXT)")
+            db.execute("INSERT INTO records VALUES ('same')")
+        self.compare_outcomes(setup, "reject", lambda db: db.execute(
+            "CREATE INDEX records_value_idx ON records(value)"))
+
+    def test_rowid_mutation_is_rejected(self):
+        def setup(db):
+            db.execute("CREATE TABLE records(value TEXT)")
+            db.execute("INSERT INTO records(rowid,value) VALUES(7,'same')")
+        self.compare_outcomes(setup, "reject", lambda db: db.execute("UPDATE records SET rowid=8"))
+
+    def test_late_third_column_mismatch_reports_attempts_not_completed_rows(self):
+        def setup(db):
+            db.execute("CREATE TABLE cells(id INTEGER PRIMARY KEY,a,b,c) WITHOUT ROWID")
+            db.execute("INSERT INTO cells VALUES (1,1,2,3)")
+        diagnostics = self.compare_outcomes(setup, "reject", lambda db: db.execute(
+            "UPDATE cells SET c=99 WHERE id=1"))
+        self.assertEqual(diagnostics["cells_compared"], 4)
+        self.assertEqual(diagnostics["rows_compared"], 0)
+        self.assertEqual(diagnostics["tables_completed"], 0)
+
+
+
+if __name__ == "__main__":
+    unittest.main()

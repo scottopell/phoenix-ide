@@ -614,6 +614,120 @@ if sys.argv[1:] == ["--build-identity"]:
             with self.assertRaisesRegex(helper.ActivationError, "deadline exceeded during proof hashing"):
                 helper._backup_proof(backup, real_clock() + 1)
 
+    def test_backup_default_deadline_uses_named_budget(self):
+        diagnostics = {}
+        with mock.patch.object(helper.time, "monotonic", return_value=123.0):
+            backup = helper.create_verified_database_backup(
+                str(self.database), self.root, diagnostics=diagnostics,
+            )
+        self.assertEqual(diagnostics["deadline"], 123.0 + helper.BACKUP_VERIFICATION_TIMEOUT_SECS)
+        self.assertTrue(backup.exists())
+
+    def test_activation_backup_and_proof_share_one_deterministic_deadline(self):
+        clock = [321.0]
+        captured = {}
+        real_proof = helper._backup_proof
+        real_backup = helper.create_verified_database_backup
+
+        def capture_backup(database_path, directory, *, timeout, diagnostics=None):
+            captured["backup_timeout"] = timeout
+            backup = real_backup(database_path, directory, timeout=timeout, diagnostics=diagnostics)
+            clock[0] += 100.0
+            return backup
+
+        def capture_proof(backup, deadline, diagnostics=None):
+            captured["deadline"] = deadline
+            return real_proof(backup, deadline, diagnostics)
+
+        with mock.patch.object(helper.time, "monotonic", side_effect=lambda: clock[0]), \
+             mock.patch.object(helper, "create_verified_database_backup", side_effect=capture_backup), \
+             mock.patch.object(helper, "_backup_proof", side_effect=capture_proof):
+            self.assertEqual(self.activate(), "committed")
+        self.assertEqual(captured["deadline"], 321.0 + helper.BACKUP_VERIFICATION_TIMEOUT_SECS)
+        self.assertEqual(captured["backup_timeout"], helper.BACKUP_VERIFICATION_TIMEOUT_SECS)
+        self.assertEqual(clock[0], captured["deadline"] - helper.BACKUP_VERIFICATION_TIMEOUT_SECS + 100.0)
+
+    def test_activation_proof_expiry_after_backup_recovers_and_retains_backup(self):
+        clock = [321.0]
+        real_backup = helper.create_verified_database_backup
+        real_proof = helper._backup_proof
+        captured = {}
+        database_path = self.database
+        writer_succeeded = []
+
+        def backup_then_expire(database_path_arg, directory, *, timeout, diagnostics=None):
+            backup = real_backup(database_path_arg, directory, timeout=timeout, diagnostics=diagnostics)
+            captured["backup"] = backup
+            captured["deadline"] = clock[0] + helper.BACKUP_VERIFICATION_TIMEOUT_SECS
+            clock[0] = captured["deadline"]
+            return backup
+
+        def actual_proof_at_expiry(backup, deadline, diagnostics=None):
+            captured["proof_deadline"] = deadline
+            return real_proof(backup, deadline, diagnostics)
+
+        with mock.patch.object(helper.time, "monotonic", side_effect=lambda: clock[0]), \
+             mock.patch.object(helper, "create_verified_database_backup", side_effect=backup_then_expire), \
+             mock.patch.object(helper, "_backup_proof", side_effect=actual_proof_at_expiry):
+            self.assertEqual(self.activate(), "failed")
+
+        self.assertEqual(captured["proof_deadline"], captured["deadline"])
+        self.assertTrue(captured["backup"].exists())
+        self.assertIn(captured["backup"], list(self.root.glob("database-backup-*.sqlite")))
+        with sqlite3.connect(database_path, timeout=0.05) as writer:
+            writer.execute("INSERT INTO changes VALUES ('guard released')")
+            writer_succeeded.append(True)
+        self.assertEqual(writer_succeeded, [True])
+        self.assertEqual(self.launch.starts, [self.manifest.target_plist])
+        self.assertNotIn("migrate", (self.root / "events").read_text())
+        self.assertEqual(Path(self.manifest.target_binary).read_bytes(), self.previous_binary)
+        proof = json.loads((self.root / "status.proof.json").read_text())
+        self.assertEqual(proof["boundary"], "not_crossed")
+        self.assertEqual(proof["recovery_outcome"], "predecessor_recovered_verified")
+
+    def test_backup_timeout_before_boundary_recovers_unchanged_predecessor(self):
+        clock = [100.0]
+        real_restore = helper.restore_predecessor
+        recovery_writer_succeeded = []
+
+        def monotonic():
+            return clock[0]
+
+        def timeout_backup(database_path, directory, *, timeout, diagnostics=None):
+            self.assertEqual(timeout, helper.BACKUP_VERIFICATION_TIMEOUT_SECS)
+            self.assertEqual(clock[0], 100.0)
+            with sqlite3.connect(database_path, timeout=0.05) as writer:
+                with self.assertRaisesRegex(sqlite3.OperationalError, "locked"):
+                    writer.execute("INSERT INTO changes VALUES ('competing writer')")
+            clock[0] += helper.BACKUP_VERIFICATION_TIMEOUT_SECS + 0.001
+            raise helper.ActivationError("SQLite backup and verification deadline exceeded")
+
+        def restore_after_release(manifest, launchctl, captured, previous_plist):
+            with sqlite3.connect(self.database, timeout=0.05) as writer:
+                writer.execute("INSERT INTO changes VALUES ('recovery writer')")
+            recovery_writer_succeeded.append(True)
+            return real_restore(manifest, launchctl, captured, previous_plist)
+
+        before_binary = Path(self.manifest.target_binary).read_bytes()
+        before_plist = Path(self.manifest.target_plist).read_bytes()
+        with mock.patch.object(helper.time, "monotonic", side_effect=monotonic), \
+             mock.patch.object(helper, "create_verified_database_backup", side_effect=timeout_backup), \
+             mock.patch.object(helper, "restore_predecessor", side_effect=restore_after_release):
+            self.assertEqual(self.activate(), "failed")
+        self.assertEqual(recovery_writer_succeeded, [True])
+        self.assertEqual(Path(self.manifest.target_binary).read_bytes(), before_binary)
+        self.assertEqual(Path(self.manifest.target_plist).read_bytes(), before_plist)
+        self.assertEqual(self.changes(), [("recovery writer",)])
+        self.assertEqual((self.root / "events").read_text().splitlines(), ["stop", "start"])
+        self.assertFalse(list(self.root.glob("database-backup-*.sqlite")))
+        self.assertNotIn("migrate", (self.root / "events").read_text())
+        self.assertIn("unchanged predecessor restored and exact identity verified", self.status()["failure"])
+        proof = json.loads((self.root / "status.proof.json").read_text())
+        self.assertEqual(proof["boundary"], "not_crossed")
+        self.assertEqual(proof["recovery_outcome"], "predecessor_recovered_verified")
+        self.assertEqual(proof["outcome"], "failed")
+        self.assertEqual(helper.MIGRATION_TIMEOUT_SECS, 600)
+
     def test_writer_guard_blocks_competing_writer_until_migration_handoff(self):
         original = helper._backup_proof
         attempted = []
@@ -1189,6 +1303,7 @@ raise SystemExit(0 if result == "committed" else 1)
         run = helper.subprocess.run
         def execute(command, **kwargs):
             if command[-1] == "--migrate-only":
+                self.assertEqual(kwargs["timeout"], 600)
                 raise subprocess.TimeoutExpired(command, helper.MIGRATION_TIMEOUT_SECS)
             return run(command, **kwargs)
         with mock.patch.object(helper.subprocess, "run", side_effect=execute):

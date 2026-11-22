@@ -28,6 +28,7 @@ DEPLOY_HELPER_LABEL_PREFIX = "com.phoenix-ide.deploy"
 DEFAULT_TRANSITION_TIMEOUT_SECS = 30.0
 DEFAULT_HEALTH_TIMEOUT_SECS = 120.0
 MIGRATION_TIMEOUT_SECS = 600
+BACKUP_VERIFICATION_TIMEOUT_SECS = 900.0
 FULL_GIT_SHA_RE = re.compile(r"[0-9a-f]{40}")
 HASH_RE = re.compile(r"[0-9a-f]{64}")
 TERMINAL_STATES = {"committed", "precondition_failed", "failed"}
@@ -549,18 +550,22 @@ def _verify_logical_equivalence(source, backup, deadline: float, diagnostics: di
             return None
         return module[1].lower()
 
-    def typed_value(storage, value):
-        storage = text(storage)
-        if storage == "null":
-            return (storage, None)
-        if storage == "integer":
-            return (storage, int(value))
-        if storage == "real":
-            return (storage, struct.pack(">d", float(value)))
-        if storage in ("text", "blob"):
-            if not isinstance(value, bytes):
+    def cells_equal(left_storage, left_value, right_storage, right_value):
+        # text_factory=bytes makes typeof() results bytes too. Comparing these
+        # fixed tags avoids per-cell UTF-8 decoding and temporary tuples.
+        if left_storage != right_storage:
+            return False
+        if left_storage == b"null":
+            return True
+        if left_storage == b"integer":
+            return left_value == right_value
+        if left_storage == b"real":
+            return struct.pack(">d", left_value) == struct.pack(">d", right_value)
+        if left_storage in (b"text", b"blob"):
+            if not isinstance(left_value, bytes) or not isinstance(right_value, bytes):
                 raise ActivationError("SQLite returned a non-byte TEXT/BLOB value during verification")
-            return (storage, value)
+            return left_value == right_value
+        storage = text(left_storage)
         raise ActivationError(f"unsupported SQLite storage class during verification: {storage!r}")
 
     def compare_table(source, backup, schema: str, name: str, kind: str, xinfo) -> None:
@@ -613,7 +618,7 @@ def _verify_logical_equivalence(source, backup, deadline: float, diagnostics: di
                 if diagnostics is not None:
                     diagnostics["cells_compared"] += 1
                     diagnostics["table_cells_compared"] += 1
-                if typed_value(a[index], a[index + 1]) != typed_value(b[index], b[index + 1]):
+                if not cells_equal(a[index], a[index + 1], b[index], b[index + 1]):
                     raise ActivationError(f"SQLite backup row differs in table ordinal {(diagnostics or {}).get('table_ordinal', 0)}")
             if diagnostics is not None:
                 diagnostics["rows_compared"] += 1
@@ -687,7 +692,7 @@ def sqlite_writer_guard(database_path: str, *, timeout: float = 5):
             guard.rollback()
 
 
-def create_verified_database_backup(database_path: str, directory: Path, *, timeout: float = 600,
+def create_verified_database_backup(database_path: str, directory: Path, *, timeout: float = BACKUP_VERIFICATION_TIMEOUT_SECS,
                                     diagnostics: dict | None = None) -> Path:
     import sqlite3
 
@@ -1012,7 +1017,7 @@ def activate(manifest: Manifest) -> str:
             else:
                 _preflight_backup_capacity(database_path, backup_directory)
                 with sqlite_writer_guard(database_path):
-                    backup_deadline = time.monotonic() + 600
+                    backup_deadline = time.monotonic() + BACKUP_VERIFICATION_TIMEOUT_SECS
                     verifier_diagnostics = {}
                     try:
                         backup = create_verified_database_backup(
