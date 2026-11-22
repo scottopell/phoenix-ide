@@ -1366,6 +1366,7 @@ async fn initial_source_fence_inventory_fixture(
         omit_bash_dispatch,
         record_completion,
         include_second_bash,
+        BTreeSet::new(),
     )
     .await
 }
@@ -1377,6 +1378,7 @@ async fn initial_source_fence_inventory_fixture_with_db(
     omit_bash_dispatch: bool,
     record_completion: bool,
     include_second_bash: bool,
+    pty_sessions: BTreeSet<phoenix_core::domain::close::OpaqueIdentity>,
 ) -> (
     Database,
     NativeCloseCommand,
@@ -1437,7 +1439,7 @@ async fn initial_source_fence_inventory_fixture_with_db(
                             [OpaqueIdentity::parse("complete-bash-session").unwrap()].into()
                         },
                         tmux_servers: BTreeSet::new(),
-                        pty_sessions: BTreeSet::new(), browser_sessions: BTreeSet::new(),
+                        pty_sessions, browser_sessions: BTreeSet::new(),
                         equivalent_live_resources: BTreeSet::new(),
                     },
                 }],
@@ -1491,6 +1493,270 @@ async fn initial_source_fence_inventory_fixture_with_db(
             .await.unwrap().is_empty());
     }
     (db, command, receipt, source, run)
+}
+
+#[tokio::test]
+async fn initial_process_first_effect_preserves_nested_error_and_confirms_release() {
+    use crate::native_close::{NativeCloseInitialEntryRelease, NativeCloseInitialFirstEffectError};
+    use phoenix_core::domain::close::RetiredResourceKind;
+
+    let (db, command, receipt, source, run) =
+        initial_source_fence_inventory_fixture(false, None, false, false, false).await;
+    let item = db.list_close_expected_retirement_resources(run.attempt_id.as_str()).await.unwrap()
+        .into_iter().find(|item| item.resource.kind() == RetiredResourceKind::BashProcessGroup).unwrap();
+    let (effect, release) = db.with_native_close_initial_process_first_effect(
+        &command, &receipt, &source, item.scope, item.snapshot, &item.resource,
+        || Err::<(), _>("physical process action failed"),
+    ).await.unwrap_or_else(|error| match error {
+        NativeCloseInitialFirstEffectError::NotStarted(error) => panic!("entry did not start: {error}"),
+        NativeCloseInitialFirstEffectError::Rejected { error, .. } => panic!("valid exact process rejected: {error}"),
+    });
+    assert_eq!(effect, Err("physical process action failed"));
+    assert!(matches!(release, NativeCloseInitialEntryRelease::Confirmed));
+}
+
+#[tokio::test]
+async fn initial_pty_process_first_effect_preserves_nested_error_and_confirms_release() {
+    use crate::native_close::{NativeCloseInitialEntryRelease, NativeCloseInitialFirstEffectError};
+    use phoenix_core::domain::close::{OpaqueIdentity, RetiredResourceKind};
+
+    let pty_identity = OpaqueIdentity::parse("exact-pty-session").unwrap();
+    let (db, command, receipt, source, run) = initial_source_fence_inventory_fixture_with_db(
+        Database::open_in_memory().await.unwrap(),
+        false,
+        None,
+        false,
+        false,
+        false,
+        [pty_identity.clone()].into(),
+    )
+    .await;
+    let pty_items: Vec<_> = db
+        .list_close_expected_retirement_resources(run.attempt_id.as_str())
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|item| item.resource.kind() == RetiredResourceKind::PtySession)
+        .collect();
+    assert_eq!(pty_items.len(), 1);
+    let item = &pty_items[0];
+    assert_eq!(
+        item.resource.identity(),
+        &phoenix_core::domain::close::LossItemIdentity::Opaque(pty_identity),
+    );
+
+    let (effect, release) = db
+        .with_native_close_initial_process_first_effect(
+            &command,
+            &receipt,
+            &source,
+            item.scope.clone(),
+            item.snapshot.clone(),
+            &item.resource,
+            || Err::<(), _>("physical PTY action failed"),
+        )
+        .await
+        .unwrap_or_else(|error| match error {
+            NativeCloseInitialFirstEffectError::NotStarted(error) => {
+                panic!("entry did not start: {error}")
+            }
+            NativeCloseInitialFirstEffectError::Rejected { error, .. } => {
+                panic!("valid exact PTY session rejected: {error}")
+            }
+        });
+    assert_eq!(effect, Err("physical PTY action failed"));
+    assert!(matches!(release, NativeCloseInitialEntryRelease::Confirmed));
+
+    // Recording success for this exact original PTY forbids a second entry.
+    let success = crate::CloseProcessStepSuccess {
+        run: run.clone(),
+        scope: item.scope.clone(),
+        resource_kind: crate::CloseProcessResourceKind::PtySession,
+        identity: OpaqueIdentity::parse(item.resource.identity().value()).unwrap(),
+        outcome: crate::CloseProcessStepOutcome::Retired,
+        observed_at_us: Utc::now().timestamp_micros(),
+    };
+    assert!(db
+        .record_native_close_initial_process_step_success(
+            &command,
+            &receipt,
+            &source,
+            item.snapshot.clone(),
+            success,
+        )
+        .await
+        .established()
+        .unwrap()
+        .is_ok());
+    let mut called = false;
+    let repeated = db
+        .with_native_close_initial_process_first_effect(
+            &command,
+            &receipt,
+            &source,
+            item.scope.clone(),
+            item.snapshot.clone(),
+            &item.resource,
+            || called = true,
+        )
+        .await;
+    assert!(matches!(
+        repeated,
+        Err(NativeCloseInitialFirstEffectError::Rejected {
+            release: NativeCloseInitialEntryRelease::Confirmed,
+            ..
+        })
+    ));
+    assert!(!called);
+}
+
+#[tokio::test]
+async fn initial_process_first_effect_rejects_invalid_dispatch_binding_and_source_without_callback() {
+    use crate::native_close::{NativeCloseInitialEntryRelease, NativeCloseInitialFirstEffectError};
+    use phoenix_core::domain::close::{CloseRetirementSnapshot, RetiredResourceKind};
+
+    let (db, command, receipt, source, run) =
+        initial_source_fence_inventory_fixture(false, None, true, false, false).await;
+    let item = db.list_close_expected_retirement_resources(run.attempt_id.as_str()).await.unwrap()
+        .into_iter().find(|item| item.resource.kind() == RetiredResourceKind::BashProcessGroup).unwrap();
+    let mut called = false;
+    let result = db.with_native_close_initial_process_first_effect(
+        &command, &receipt, &source, item.scope.clone(), item.snapshot.clone(), &item.resource,
+        || { called = true; () },
+    ).await;
+    assert!(matches!(result, Err(NativeCloseInitialFirstEffectError::Rejected {
+        release: NativeCloseInitialEntryRelease::Confirmed, ..
+    })));
+    assert!(!called);
+
+    let (db, command, receipt, source, run) =
+        initial_source_fence_inventory_fixture(false, None, false, false, false).await;
+    let resources = db.list_close_expected_retirement_resources(run.attempt_id.as_str()).await.unwrap();
+    let process = resources.iter().find(|item| item.resource.kind() == RetiredResourceKind::BashProcessGroup).unwrap();
+    let other_kind = resources.iter().find(|item| item.resource.kind() == RetiredResourceKind::WorkScope).unwrap();
+    let wrong_scope = phoenix_core::work_scope::WorkScopeId::new();
+    let wrong_snapshot = CloseRetirementSnapshot::parse("stale-generation", "stale-fingerprint").unwrap();
+    for (scope, snapshot, resource) in [
+        (wrong_scope, process.snapshot.clone(), process.resource.clone()),
+        (process.scope.clone(), wrong_snapshot, process.resource.clone()),
+        (process.scope.clone(), process.snapshot.clone(), other_kind.resource.clone()),
+    ] {
+        let mut called = false;
+        let result = db.with_native_close_initial_process_first_effect(
+            &command, &receipt, &source, scope, snapshot, &resource,
+            || { called = true; () },
+        ).await;
+        assert!(matches!(result, Err(NativeCloseInitialFirstEffectError::Rejected {
+            release: NativeCloseInitialEntryRelease::Confirmed, ..
+        })));
+        assert!(!called);
+    }
+
+    write_source_fence_state(&db, &command, &ConvState::Idle, false).await.unwrap();
+    for restore in [false, true] {
+        if restore {
+            write_source_fence_state(&db, &command, &source, false).await.unwrap();
+        }
+        let mut called = false;
+        let result = db.with_native_close_initial_process_first_effect(
+            &command, &receipt, &source, process.scope.clone(), process.snapshot.clone(), &process.resource,
+            || { called = true; () },
+        ).await;
+        assert!(matches!(result, Err(NativeCloseInitialFirstEffectError::Rejected {
+            release: NativeCloseInitialEntryRelease::Confirmed, ..
+        })));
+        assert!(!called);
+    }
+}
+
+#[tokio::test]
+async fn initial_process_first_effect_revalidates_after_independent_writer_revokes_source() {
+    use std::{future::Future, task::Poll};
+    use crate::native_close::{NativeCloseInitialEntryRelease, NativeCloseInitialFirstEffectError};
+    use phoenix_core::domain::close::RetiredResourceKind;
+
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("first-effect.sqlite");
+    let db = Database::open(path.to_str().unwrap()).await.unwrap();
+    // File-backed open runs only legacy schema setup; mirror numbered startup migrations.
+    crate::migrations::run_pending_migrations(db.pool()).await.unwrap();
+    let (db, command, receipt, source, run) =
+        initial_source_fence_inventory_fixture_with_db(db, false, None, false, false, false, BTreeSet::new()).await;
+    let writer = Database::open(path.to_str().unwrap()).await.unwrap();
+    let item = db.list_close_expected_retirement_resources(run.attempt_id.as_str()).await.unwrap()
+        .into_iter().find(|item| item.resource.kind() == RetiredResourceKind::BashProcessGroup).unwrap();
+    let mut tx = writer.pool().begin_with("BEGIN IMMEDIATE").await.unwrap();
+    let mut called = false;
+    let mut entry = Box::pin(db.with_native_close_initial_process_first_effect(
+        &command, &receipt, &source, item.scope, item.snapshot, &item.resource,
+        || { called = true; () },
+    ));
+    // Pending may be pool acquisition or SQLite contention; neither is an entry.
+    // The independent writer commits source loss before the callback can run.
+    std::future::poll_fn(|cx| {
+        assert!(entry.as_mut().poll(cx).is_pending());
+        Poll::Ready(())
+    }).await;
+    crate::write_conversation_state_tx(
+        &mut tx, command.source_transcript_id(), &ConvState::Idle, Utc::now(),
+    ).await.unwrap();
+    tx.commit().await.unwrap();
+    let result = tokio::time::timeout(std::time::Duration::from_secs(5), entry).await.unwrap();
+    assert!(matches!(result, Err(NativeCloseInitialFirstEffectError::Rejected {
+        release: NativeCloseInitialEntryRelease::Confirmed, ..
+    })));
+    assert!(!called);
+}
+
+#[tokio::test]
+async fn initial_process_first_effect_prior_success_or_retirement_blocks_only_exact_resource() {
+    use crate::native_close::{NativeCloseInitialEntryRelease, NativeCloseInitialFirstEffectError};
+    use phoenix_core::domain::close::{OpaqueIdentity, RetiredResourceKind, RetirementOutcome};
+
+    for process_success in [false, true] {
+        let (db, command, receipt, source, run) =
+            initial_source_fence_inventory_fixture(false, None, false, false, true).await;
+        let mut bash: Vec<_> = db.list_close_expected_retirement_resources(run.attempt_id.as_str()).await.unwrap()
+            .into_iter().filter(|item| item.resource.kind() == RetiredResourceKind::BashProcessGroup).collect();
+        bash.sort_by_key(|item| item.resource.identity().value().to_owned());
+        assert_eq!(bash.len(), 2);
+        let a = &bash[0];
+        let b = &bash[1];
+        if process_success {
+            let mut success = initial_bash_process_success(&run, &a.scope);
+            success.identity = OpaqueIdentity::parse(a.resource.identity().value()).unwrap();
+            assert!(db.record_native_close_initial_process_step_success(
+                &command, &receipt, &source, a.snapshot.clone(), success,
+            ).await.established().unwrap().is_ok());
+        } else {
+            assert!(db.record_native_close_initial_retirement_evidence(
+                &command, &receipt, &source, RecordCloseRetirementEvidenceRequest {
+                    attempt_id: run.attempt_id.clone(), scope: a.scope.clone(),
+                    snapshot: a.snapshot.clone(), resource: a.resource.clone(),
+                    outcome: RetirementOutcome::Retired, detail: None,
+                },
+            ).await.established().unwrap().is_ok());
+        }
+        let mut called = false;
+        let blocked = db.with_native_close_initial_process_first_effect(
+            &command, &receipt, &source, a.scope.clone(), a.snapshot.clone(), &a.resource,
+            || { called = true; () },
+        ).await;
+        assert!(matches!(blocked, Err(NativeCloseInitialFirstEffectError::Rejected {
+            release: NativeCloseInitialEntryRelease::Confirmed, ..
+        })));
+        assert!(!called);
+
+        let (effect, release) = db.with_native_close_initial_process_first_effect(
+            &command, &receipt, &source, b.scope.clone(), b.snapshot.clone(), &b.resource,
+            || Err::<(), _>("B action failed"),
+        ).await.unwrap_or_else(|error| match error {
+            NativeCloseInitialFirstEffectError::NotStarted(error) => panic!("entry did not start: {error}"),
+            NativeCloseInitialFirstEffectError::Rejected { error, .. } => panic!("unrecorded B rejected: {error}"),
+        });
+        assert_eq!(effect, Err("B action failed"));
+        assert!(matches!(release, NativeCloseInitialEntryRelease::Confirmed));
+    }
 }
 
 #[tokio::test]
@@ -1680,7 +1946,7 @@ async fn exact_initial_process_entry_revalidates_after_independent_writer_revoke
     // File-backed open runs only legacy schema setup; mirror numbered startup migrations.
     crate::migrations::run_pending_migrations(db.pool()).await.unwrap();
     let (db, command, receipt, source, run) =
-        initial_source_fence_inventory_fixture_with_db(db, false, None, false, false, false).await;
+        initial_source_fence_inventory_fixture_with_db(db, false, None, false, false, false, BTreeSet::new()).await;
     let writer = Database::open(path.to_str().unwrap()).await.unwrap();
     let item = db.list_close_expected_retirement_resources(run.attempt_id.as_str()).await.unwrap()
         .into_iter().find(|item| item.resource.kind() == RetiredResourceKind::BashProcessGroup).unwrap();
@@ -1721,7 +1987,7 @@ async fn exact_initial_process_entry_releases_writer_before_retained_cleanup_fin
     // File-backed open runs only legacy schema setup; mirror numbered startup migrations.
     crate::migrations::run_pending_migrations(db.pool()).await.unwrap();
     let (db, command, receipt, source, run) =
-        initial_source_fence_inventory_fixture_with_db(db, false, None, false, false, true).await;
+        initial_source_fence_inventory_fixture_with_db(db, false, None, false, false, true, BTreeSet::new()).await;
     let writer = Database::open(path.to_str().unwrap()).await.unwrap();
     let bash: Vec<_> = db.list_close_expected_retirement_resources(run.attempt_id.as_str()).await.unwrap()
         .into_iter().filter(|item| item.resource.kind() == RetiredResourceKind::BashProcessGroup).collect();

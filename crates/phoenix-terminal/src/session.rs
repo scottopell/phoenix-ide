@@ -328,11 +328,17 @@ impl PreparedTerminalRetirement {
             }
         };
         let original = &self.original;
-        let valid = map.retirements.get(&original.work_scope).is_some_and(|state| {
-            state.generation == original.generation.0
-                && state.owner == Some(TerminalRetirementOwner::Close)
-        }) && map.handles.get(&original.work_scope)
-            .is_some_and(|current| Arc::ptr_eq(current, &self.target));
+        let valid = map
+            .retirements
+            .get(&original.work_scope)
+            .is_some_and(|state| {
+                state.generation == original.generation.0
+                    && state.owner == Some(TerminalRetirementOwner::Close)
+            })
+            && map
+                .handles
+                .get(&original.work_scope)
+                .is_some_and(|current| Arc::ptr_eq(current, &self.target));
         if !valid {
             return Err(TerminalRetirementEntryError::StaleTarget);
         }
@@ -349,7 +355,9 @@ impl PreparedTerminalRetirement {
     /// Synchronously claim the exact Close retirement as its first effect.
     /// Every failure returns this original owner intact; this method performs no
     /// allocation, logging, waiting, notification, or resource teardown.
-    pub fn try_enter(self) -> Result<EnteredTerminalRetirement, (Self, TerminalRetirementEntryError)> {
+    pub fn try_enter(
+        self,
+    ) -> Result<EnteredTerminalRetirement, (Self, TerminalRetirementEntryError)> {
         if let Err(error) = self.try_enter_effect() {
             return Err((self, error));
         }

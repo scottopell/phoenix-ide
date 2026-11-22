@@ -582,6 +582,64 @@ impl Database {
         NativeCloseInitialResourceEntryResult::Invoked { decision, release }
     }
 
+    /// Runs a synchronous callback only after validating the exact initial process
+    /// resource against live and durable source authority, its original sealed scope
+    /// and snapshot, durable dispatch, resource kind, and absence of prior success or
+    /// positive retirement evidence. The callback runs while `BEGIN IMMEDIATE` is held,
+    /// before rollback is attempted.
+    ///
+    /// This makes no cancellation-safety guarantee. The callback outcome is retained
+    /// only in this future; callers must supervise it externally and independently
+    /// retain any outcome needed for recovery. Cancellation or panic after callback
+    /// entry does not prove non-invocation, and an absent return cannot justify retry.
+    /// The callback must be a bounded, nonwaiting leaf: no full teardown, async wait,
+    /// database recursion, or conflicting source-lock acquisition. The copied
+    /// `live_source` is evidence, not independently synchronized actor authority;
+    /// the caller must retain current source ownership across the real first effect.
+    /// External retained outcomes remain caller-owned. This API does not integrate
+    /// runtime or terminal effects.
+    pub async fn with_native_close_initial_process_first_effect<F, T>(
+        &self,
+        command: &NativeCloseCommand,
+        receipt: &NativeCloseReceipt,
+        live_source: &phoenix_core::domain::sm_state::ConvState,
+        scope: WorkScopeId,
+        snapshot: phoenix_core::domain::close::CloseRetirementSnapshot,
+        resource: &RetiredResourceIdentity,
+        first_effect: F,
+    ) -> Result<(T, NativeCloseInitialEntryRelease), NativeCloseInitialFirstEffectError>
+    where
+        F: FnOnce() -> T,
+    {
+        let mut tx = match self.pool.begin_with("BEGIN IMMEDIATE").await {
+            Ok(tx) => tx,
+            Err(error) => return Err(NativeCloseInitialFirstEffectError::NotStarted(error.into())),
+        };
+        if let Err(error) = validate_initial_process_step_tx(
+            &mut tx,
+            command,
+            receipt,
+            live_source,
+            scope,
+            snapshot,
+            InitialProcessSelection::ExactResource(resource),
+        )
+        .await
+        {
+            let release = match tx.rollback().await {
+                Ok(()) => NativeCloseInitialEntryRelease::Confirmed,
+                Err(error) => NativeCloseInitialEntryRelease::Unconfirmed(error.into()),
+            };
+            return Err(NativeCloseInitialFirstEffectError::Rejected { error, release });
+        }
+        let result = first_effect();
+        let release = match tx.rollback().await {
+            Ok(()) => NativeCloseInitialEntryRelease::Confirmed,
+            Err(error) => NativeCloseInitialEntryRelease::Unconfirmed(error.into()),
+        };
+        Ok((result, release))
+    }
+
     /// Fence one exact initial worktree effect with the source and original dispatch
     /// while holding SQLite's writer reservation. `handoff` is a one-shot affine
     /// ownership transfer, not a retryable check: it must synchronously install

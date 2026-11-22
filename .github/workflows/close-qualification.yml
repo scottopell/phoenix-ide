@@ -156,6 +156,11 @@ jobs:
             grep -F "native_close::retry_execution::snapshot_tests::$test: test" evidence/selected-tests.txt
           done
           for test in \
+            initial_process_first_effect_preserves_nested_error_and_confirms_release \
+            initial_pty_process_first_effect_preserves_nested_error_and_confirms_release \
+            initial_process_first_effect_rejects_invalid_dispatch_binding_and_source_without_callback \
+            initial_process_first_effect_revalidates_after_independent_writer_revokes_source \
+            initial_process_first_effect_prior_success_or_retirement_blocks_only_exact_resource \
             initial_process_authorization_requires_exact_durable_source_scope_snapshot_and_dispatch \
             initial_process_authorization_rejects_missing_dispatch_and_stopped_or_changed_source \
             initial_process_authorization_rejects_source_changed_then_restored \
@@ -204,6 +209,11 @@ jobs:
           cargo test -p phoenix-db --lib close_foundation::tests:: -- --nocapture --test-threads=1 2>&1 | tee evidence/close-foundation.log
           grep -F 'test close_foundation::tests::inspection_aggregate_validator_preserves_exact_content_and_empty_generation_rules ... ok' evidence/close-foundation.log
           for test in \
+            initial_process_first_effect_preserves_nested_error_and_confirms_release \
+            initial_pty_process_first_effect_preserves_nested_error_and_confirms_release \
+            initial_process_first_effect_rejects_invalid_dispatch_binding_and_source_without_callback \
+            initial_process_first_effect_revalidates_after_independent_writer_revokes_source \
+            initial_process_first_effect_prior_success_or_retirement_blocks_only_exact_resource \
             initial_process_authorization_requires_exact_durable_source_scope_snapshot_and_dispatch \
             initial_process_authorization_rejects_missing_dispatch_and_stopped_or_changed_source \
             initial_process_authorization_rejects_source_changed_then_restored \

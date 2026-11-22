@@ -997,7 +997,8 @@ mod reclaim_tests {
                     tracker,
                     on_resize: |_| {},
                     stop_rx,
-                    retirement_requested: phoenix_terminal::session::TerminalRetirementRequest::default(),
+                    retirement_requested:
+                        phoenix_terminal::session::TerminalRetirementRequest::default(),
                     conv_id: "reclaim".to_string(),
                 },
             )
