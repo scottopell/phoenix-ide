@@ -1764,7 +1764,8 @@ fn render_messages<'a>(
                     phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical => {
                         format!("[Input of unknown historical origin]\n{}", user_content.llm_text())
                     }
-                    phoenix_core::domain::db_schema::InputOrigin::UserApi => {
+                    phoenix_core::domain::db_schema::InputOrigin::UserApi
+                    | phoenix_core::domain::db_schema::InputOrigin::CoordinatorQuestionReply => {
                         user_content.llm_text().to_string()
                     }
                 };
@@ -1838,6 +1839,7 @@ fn render_messages<'a>(
             MessageContent::Skill(skill_content) => {
                 let source = match &msg.origin {
                     phoenix_core::domain::db_schema::InputOrigin::UserApi => "[User-facing API input]".to_string(),
+                    phoenix_core::domain::db_schema::InputOrigin::CoordinatorQuestionReply => "[User's reply to your question]".to_string(),
                     phoenix_core::domain::db_schema::InputOrigin::RemoteApi { instance_id } => format!("[API-channel input from authenticated instance {instance_id}]"),
                     phoenix_core::domain::db_schema::InputOrigin::RemoteConversation { instance_id, product_conversation_id, transcript_id, .. } => format!("[Message from conversation {product_conversation_id}, transcript {transcript_id}, authenticated instance {instance_id}]"),
                     phoenix_core::domain::db_schema::InputOrigin::RemoteCoordinator { instance_id, product_conversation_id, transcript_id, .. } => format!("[Message from remote Coordinator {product_conversation_id}, transcript {transcript_id}, authenticated instance {instance_id}]"),

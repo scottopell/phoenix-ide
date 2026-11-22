@@ -541,6 +541,7 @@ enum InputOrigin: Codable, Equatable, Sendable {
     case slackGateway(requestId: String)
     case subscriptionEvent(eventId: String)
     case scheduledReminder(reminderId: String)
+    case coordinatorQuestionReply
 
     private enum CodingKeys: String, CodingKey {
         case kind, product_conversation_id, transcript_id, event_id, source_call, request_id, reminder_id
@@ -563,6 +564,7 @@ enum InputOrigin: Codable, Equatable, Sendable {
             self = .subscriptionEvent(eventId: try container.decode(String.self, forKey: .event_id))
         case "scheduled_reminder":
             self = .scheduledReminder(reminderId: try container.decode(String.self, forKey: .reminder_id))
+        case "coordinator_question_reply": self = .coordinatorQuestionReply
         default:
             throw DecodingError.dataCorruptedError(
                 forKey: .kind, in: container, debugDescription: "Unrecognized input origin")
@@ -589,6 +591,7 @@ enum InputOrigin: Codable, Equatable, Sendable {
         case let .scheduledReminder(reminderId):
             try container.encode("scheduled_reminder", forKey: .kind)
             try container.encode(reminderId, forKey: .reminder_id)
+        case .coordinatorQuestionReply: try container.encode("coordinator_question_reply", forKey: .kind)
         }
     }
 
@@ -635,6 +638,7 @@ enum InputOrigin: Codable, Equatable, Sendable {
         case .slackGateway: "Slack request"
         case .subscriptionEvent: "Conversation event"
         case .scheduledReminder: "Scheduled reminder"
+        case .coordinatorQuestionReply: "Question reply"
         }
     }
 }

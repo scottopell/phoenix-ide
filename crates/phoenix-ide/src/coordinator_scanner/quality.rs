@@ -561,7 +561,8 @@ async fn fixture(
             | InputOrigin::RemoteApi { .. }
             | InputOrigin::RemoteConversation { .. }
             | InputOrigin::RemoteCoordinator { .. }
-            | InputOrigin::ScheduledReminder { .. }) => original.clone(),
+            | InputOrigin::ScheduledReminder { .. }
+            | InputOrigin::CoordinatorQuestionReply) => original.clone(),
         };
         db.add_message_with_seq_and_origin(
             &actual_message_id,
@@ -740,7 +741,8 @@ fn validate_prepared(
             | InputOrigin::RemoteApi { .. }
             | InputOrigin::RemoteConversation { .. }
             | InputOrigin::RemoteCoordinator { .. }
-            | InputOrigin::ScheduledReminder { .. }) => original.clone(),
+            | InputOrigin::ScheduledReminder { .. }
+            | InputOrigin::CoordinatorQuestionReply) => original.clone(),
         };
         assert_eq!(
             actual.origin, expected_origin,

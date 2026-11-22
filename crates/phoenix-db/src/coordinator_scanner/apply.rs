@@ -105,13 +105,19 @@ fn quotes<'a>(
 }
 fn primary(fragment: &ScanFragment) -> bool {
     fragment.role == ScanRole::User
-        && matches!(
-            fragment.origin,
+        && match fragment.origin {
             InputOrigin::UserApi
-                | InputOrigin::UnknownHistorical
-                | InputOrigin::SlackGateway { .. }
-                | InputOrigin::RemoteApi { .. }
-        )
+            | InputOrigin::UnknownHistorical
+            | InputOrigin::SlackGateway { .. }
+            | InputOrigin::RemoteApi { .. }
+            | InputOrigin::CoordinatorQuestionReply => true,
+            InputOrigin::InternalConversation { .. }
+            | InputOrigin::SystemGenerated
+            | InputOrigin::RemoteConversation { .. }
+            | InputOrigin::RemoteCoordinator { .. }
+            | InputOrigin::SubscriptionEvent { .. }
+            | InputOrigin::ScheduledReminder { .. } => false,
+        }
 }
 #[allow(clippy::too_many_lines)]
 async fn apply(
@@ -314,4 +320,43 @@ async fn apply(
         changed_item_count: changed.len(),
         registry_revision: revision,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fragment(role: ScanRole, origin: InputOrigin) -> ScanFragment {
+        ScanFragment {
+            fragment_id: "f".into(),
+            message_id: "m".into(),
+            role,
+            origin,
+            is_meta: false,
+            created_at_us: 0,
+            part_ordinal: 0,
+            utf8_start: 0,
+            utf8_end: 1,
+            complete_message: true,
+            prose_digest: String::new(),
+            text: "Yes, implement that".into(),
+        }
+    }
+
+    #[test]
+    fn a_reply_to_a_coordinator_question_is_primary_user_intent() {
+        assert!(primary(&fragment(
+            ScanRole::User,
+            InputOrigin::CoordinatorQuestionReply
+        )));
+        assert!(primary(&fragment(ScanRole::User, InputOrigin::UserApi)));
+        assert!(!primary(&fragment(
+            ScanRole::Assistant,
+            InputOrigin::CoordinatorQuestionReply
+        )));
+        assert!(!primary(&fragment(
+            ScanRole::User,
+            InputOrigin::SystemGenerated
+        )));
+    }
 }

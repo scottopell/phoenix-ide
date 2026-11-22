@@ -612,6 +612,18 @@ impl SendChatApplicationService {
                 code: "reserved_message_id",
             });
         }
+        if phoenix_core::domain::db_schema::is_coordinator_question_reply_message_id(
+            &req.message_id,
+        ) != matches!(
+            req.origin,
+            phoenix_core::domain::db_schema::InputOrigin::CoordinatorQuestionReply
+        ) {
+            return Ok(SendChatOutcome::Rejected {
+                message: "message_id namespace is reserved for replies to Coordinator questions"
+                    .into(),
+                code: "reserved_message_id",
+            });
+        }
         let acceptance_guard = match admission_guard {
             Some(guard) => guard,
             None => self.runtime.lock_message_acceptance(&conversation.id).await,
@@ -1943,6 +1955,42 @@ mod tests {
             assert!(matches!(
                 service.send(changed).await,
                 Err(SendChatServiceError::IdempotencyConflict)
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn question_reply_ids_and_origin_only_travel_together() {
+        use phoenix_core::domain::db_schema::{coordinator_question_reply_message_id, InputOrigin};
+        let runtime = acceptance_pass_runtime().await;
+        let db = runtime.db();
+        db.create_conversation("client-id", "client-id", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let service = super::SendChatApplicationService::new(db.clone(), runtime.clone());
+        let send = |origin, message_id: String| SendChatRequest {
+            conversation_id: "client-id".into(),
+            origin,
+            message_id,
+            text: "Yes".into(),
+            images: vec![],
+            files: vec![],
+            user_agent: None,
+            expansion_policy: MessageExpansionPolicy::LiteralText,
+        };
+        for request in [
+            send(
+                InputOrigin::UserApi,
+                coordinator_question_reply_message_id("q-1"),
+            ),
+            send(InputOrigin::CoordinatorQuestionReply, "q-1".into()),
+        ] {
+            assert!(matches!(
+                service.send(request).await.unwrap(),
+                SendChatOutcome::Rejected {
+                    code: "reserved_message_id",
+                    ..
+                }
             ));
         }
     }

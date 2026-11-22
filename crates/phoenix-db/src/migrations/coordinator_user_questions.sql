@@ -23,25 +23,45 @@ CREATE INDEX coordinator_user_questions_undelivered
     ON coordinator_user_questions (settled_at_us)
     WHERE status IN ('answered', 'dismissed') AND delivered_at_us IS NULL;
 
--- REQ-AUQ-011: a reply is delivered by the insert that accepts it.
+-- REQ-AUQ-011: replies carry their own input origin.
+PRAGMA writable_schema = ON;
+UPDATE sqlite_schema
+SET sql = replace(sql, '''slack_gateway'', ''scheduled_reminder''))',
+                  '''slack_gateway'', ''scheduled_reminder'', ''coordinator_question_reply''))')
+WHERE type = 'table' AND name IN ('messages', 'steering_messages', 'durable_turns');
+UPDATE sqlite_schema
+SET sql = replace(sql, 'origin_kind IN (''unknown_historical'',''user_api'',''system_generated''))',
+                  'origin_kind IN (''unknown_historical'',''user_api'',''system_generated'',''coordinator_question_reply''))')
+WHERE type = 'table' AND name = 'coordinator_watch_ending_evidence';
+UPDATE sqlite_schema
+SET sql = replace(sql, '''subscription_event'',''scheduled_reminder''))',
+                  '''subscription_event'',''scheduled_reminder'',''coordinator_question_reply''))')
+WHERE type = 'table' AND name = 'coordinator_scan_evidence_origins';
+PRAGMA writable_schema = RESET;
+
+-- A reply is delivered by the insert that accepts it into a transcript of the
+-- question's Coordinator; only an answered or dismissed, undelivered question
+-- can be accepted.
 CREATE TRIGGER coordinator_question_reply_accept_turn AFTER INSERT ON durable_turns
-WHEN NEW.origin_kind = 'user_api'
+WHEN NEW.origin_kind = 'coordinator_question_reply'
 BEGIN
     UPDATE coordinator_user_questions
     SET delivered_at_us = CAST(unixepoch('subsec') * 1000000 AS INTEGER)
-    WHERE request_id = NEW.client_turn_key AND delivered_at_us IS NULL
-      AND status IN ('answered', 'dismissed')
+    WHERE 'coordinator-question-reply:' || request_id = NEW.client_turn_key
+      AND delivered_at_us IS NULL AND status IN ('answered', 'dismissed')
       AND coordinator_product_conversation_id =
           (SELECT product_conversation_id FROM conversations WHERE id = NEW.conversation_id);
+    SELECT CASE WHEN changes() != 1 THEN RAISE(ABORT, 'question reply not deliverable') END;
 END;
 
 CREATE TRIGGER coordinator_question_reply_accept_steering AFTER INSERT ON steering_messages
-WHEN NEW.origin_kind = 'user_api'
+WHEN NEW.origin_kind = 'coordinator_question_reply'
 BEGIN
     UPDATE coordinator_user_questions
     SET delivered_at_us = CAST(unixepoch('subsec') * 1000000 AS INTEGER)
-    WHERE request_id = NEW.message_id AND delivered_at_us IS NULL
-      AND status IN ('answered', 'dismissed')
+    WHERE 'coordinator-question-reply:' || request_id = NEW.message_id
+      AND delivered_at_us IS NULL AND status IN ('answered', 'dismissed')
       AND coordinator_product_conversation_id =
           (SELECT product_conversation_id FROM conversations WHERE id = NEW.conversation_id);
+    SELECT CASE WHEN changes() != 1 THEN RAISE(ABORT, 'question reply not deliverable') END;
 END;
