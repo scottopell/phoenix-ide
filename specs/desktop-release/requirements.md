@@ -191,3 +191,13 @@ After finalizing the validated receipt, the workflow SHALL hash its exact bytes.
 This operation SHALL NOT create or move tags, mutate or publish GitHub Releases, deploy, install, or expand compatibility admission under `specs/compatibility/requirements.md` REQ-COMP-015. It SHALL NOT authorize any other candidate, version, Linux architecture/target, operation, or ordinary preparation/release behavior. Its Linux target does not alter REQ-DESKTOP-REL-012's ARM-only operation or the normal two-architecture macOS preparation/release requirements.
 
 Artifact production alone grants no deployment or compatibility authority. The exact prepared-systemd source is admitted only under `specs/compatibility/requirements.md` REQ-COMP-016 and `specs/production-deployment/requirements.md` REQ-PD-029, including independent receipt-digest admission. No bare-Linux activation, downgrade, predecessor rollback, or other deployment source is admitted.
+
+## REQ-DESKTOP-REL-015 — Qualify ordinary release source with exact-source CI
+
+AT initial workflow admission for an ordinary version-push release or exact-tag retry, BEFORE downstream tag or publication jobs can run, THE SYSTEM SHALL identify the latest GitHub Actions run of `ci.yml` triggered by `push` on `main` whose head commit is the exact release source commit, SHALL wait up to 3600 seconds for that run to complete, AND SHALL proceed only when it completes successfully.
+
+The gate SHALL fail closed on an Actions API error, timeout, or any conclusion other than success. It SHALL NOT substitute a pull-request run, a parent or other commit's run, or another workflow. This requirement applies to historical exact-tag retries as well as new ordinary version pushes; a historical source without a qualifying exact-source run SHALL be refused.
+
+A successful gate is an admission snapshot for that Release run. A partial rerun that retains the successful gate MAY reuse that admission; rerunning the gate SHALL requalify the exact source. The gate is not continuous monitoring of CI during builds or publication.
+
+This gate does not change the fixed `release-frozen-rc7` publication exception in REQ-DESKTOP-REL-002, the fixed `prepare-frozen-rc8` operation in REQ-DESKTOP-REL-014, or normal/incident preparation operations. It grants no deployment, installation, or compatibility authority.
