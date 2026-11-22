@@ -238,7 +238,7 @@ jobs:
         run: |
           set -euo pipefail
           failed=0
-          for module in migrations::conversation_tools_tests:: lineage::tests::goal_tools_tests:: conversation_goals::prepared::tests::goal_preparation_migration_follows_conversation_tool_migrations; do
+          for module in migrations::conversation_tools_tests:: lineage::tests::goal_tools_tests:: conversation_goals::prepared::tests::; do
             name="${module//::/-}"
             if ! cargo test -p phoenix-db --lib "$module" -- --nocapture --test-threads=1 2>&1 | tee "evidence/$name.log"; then
               failed=1
@@ -589,6 +589,7 @@ jobs:
           (cd crates/phoenix-ide && "$PHOENIX_RUNTIME_TEST_BINARY" close_retirement::tests::native_retry_ --nocapture --test-threads=1) 2>&1 | tee evidence/native-close-retry-assessment.log
           grep -Eq 'test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored;' evidence/native-close-retry-assessment.log
       - name: Qualify Coordinator Goal discovery migration ledger
+        if: success() || failure()
         shell: bash
         run: |
           set -euo pipefail

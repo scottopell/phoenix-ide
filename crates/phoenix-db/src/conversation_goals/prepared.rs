@@ -380,7 +380,7 @@ impl Database {
             };
             let reference = Uuid::new_v4();
             let (operation, objective, disposition, reason) = columns(&intent);
-            sqlx::query("INSERT INTO conversation_goal_preparations(reference,owner_id,caller_conversation_id,source_product_id,workflow_id,turn_id,message_id,tool_use_id,operation,expected_version,observed_goal_id,objective,disposition,reason) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
+            sqlx::query("INSERT INTO conversation_goal_preparations(reference,owner_id,source_kind,caller_conversation_id,source_product_id,workflow_id,turn_id,message_id,tool_use_id,operation,expected_version,observed_goal_id,objective,disposition,reason) VALUES(?, ?, 'local', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
                 .bind(reference.as_bytes().as_slice()).bind(owner.as_str()).bind(caller).bind(source.product_conversation_id.as_str())
                 .bind(source.execution.workflow_id()).bind(source.execution.turn_id()).bind(source.message_id.as_str()).bind(source.tool_use_id.as_str())
                 .bind(operation).bind(expected_version.get()).bind(observed_goal_id.as_ref().map(GoalId::as_str)).bind(objective).bind(disposition).bind(reason).execute(&mut *tx).await?;
