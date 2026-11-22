@@ -156,8 +156,8 @@ class FrozenRc7GateTests(unittest.TestCase):
         self.assertIn(release.CANDIDATE, workflow)
         self.assertIn("refs/heads/main", workflow)
         self.assertIn('test \"$(git rev-parse FETCH_HEAD)\" = \"$GITHUB_SHA\"', workflow)
-        self.assertIn("needs.gate.outputs.operation == 'release-frozen-rc7' && needs.gate.outputs.controller_commit", workflow)
-        self.assertIn('"${{ needs.gate.outputs.operation }}" == release-frozen-rc7', workflow)
+        self.assertIn("(needs.gate.outputs.operation == 'release-frozen-rc7' || needs.gate.outputs.operation == 'release-frozen-rc8') && needs.gate.outputs.controller_commit", workflow)
+        self.assertIn('"${{ needs.gate.outputs.operation }}" == release-frozen-rc7 || "${{ needs.gate.outputs.operation }}" == release-frozen-rc8', workflow)
         self.assertIn("86071b4cc2ab0f9efdb8a3debf03b8569baf26f9", workflow)
         frozen_case = workflow.split("              release-frozen-rc7)", 1)[1].split("                ;;", 1)[0]
         self.assertLess(frozen_case.index('[[ -z "$RETRY_TAG" ]]'), frozen_case.index("git fetch --no-tags origin refs/heads/release/frozen-rc7"))

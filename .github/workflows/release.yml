@@ -25,6 +25,7 @@ on:
           - prepare-incident-237100-linux-x86_64
           - prepare-frozen-rc8
           - release-frozen-rc7
+          - release-frozen-rc8
           - retry-release
       tag:
         description: Existing immutable release tag (retry-release only)
@@ -144,6 +145,26 @@ jobs:
                 git fetch --no-tags origin refs/heads/release/frozen-rc7
                 test "$(git rev-parse FETCH_HEAD)" = 86071b4cc2ab0f9efdb8a3debf03b8569baf26f9
                 python3 scripts/frozen_rc5_release.py gate >> "$GITHUB_OUTPUT"
+                exit 0
+                ;;
+              release-frozen-rc8)
+                [[ -z "$RETRY_TAG" ]] || {
+                  echo "Frozen RC8 release does not accept a release tag" >&2
+                  exit 1
+                }
+                git fetch --no-tags origin refs/heads/main:refs/remotes/origin/main
+                test "$(git rev-parse origin/main)" = "$GITHUB_SHA" || {
+                  echo "Frozen RC8 release must run from the current main commit" >&2
+                  exit 1
+                }
+                git fetch --no-tags origin refs/heads/candidate/rc8-helper-correction:refs/remotes/origin/candidate/rc8-helper-correction
+                test "$(git rev-parse origin/candidate/rc8-helper-correction)" = d5d2a45651035f58f3231f0dc82fd9ef59b7cb3c || {
+                  echo "Frozen RC8 candidate ref moved from its immutable pin" >&2
+                  exit 1
+                }
+                git fetch --no-tags origin "$GITHUB_SHA"
+                test "$(git rev-parse FETCH_HEAD)" = "$GITHUB_SHA"
+                python3 scripts/frozen_rc8_release.py gate >> "$GITHUB_OUTPUT"
                 exit 0
                 ;;
               retry-release)
@@ -268,7 +289,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: ${{ needs.gate.outputs.operation == 'release-frozen-rc7' && needs.gate.outputs.controller_commit || needs.gate.outputs.commit }}
+          ref: ${{ (needs.gate.outputs.operation == 'release-frozen-rc7' || needs.gate.outputs.operation == 'release-frozen-rc8') && needs.gate.outputs.controller_commit || needs.gate.outputs.commit }}
           fetch-depth: 0
       - name: Create exact release tag
         run: |
@@ -280,7 +301,7 @@ jobs:
           }
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          if [[ "${{ needs.gate.outputs.operation }}" == release-frozen-rc7 ]]; then
+          if [[ "${{ needs.gate.outputs.operation }}" == release-frozen-rc7 || "${{ needs.gate.outputs.operation }}" == release-frozen-rc8 ]]; then
             git tag -a "$TAG" "$COMMIT" -m "$TAG"
           else
             git tag -a "$TAG" -m "$TAG"
