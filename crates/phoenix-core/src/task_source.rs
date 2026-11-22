@@ -507,4 +507,89 @@ mod tests {
             assert_eq!(id, "12345");
         }
     }
+
+    mod ref_props {
+        use super::super::*;
+        use proptest::prelude::*;
+
+        /// Mirror of the `git check-ref-format --branch` rules relevant to
+        /// names of the shape `task-...`.
+        fn is_valid_branch(name: &str) -> bool {
+            !name.is_empty()
+                && !name.starts_with('-')
+                && !name.contains("..")
+                && !name.contains("@{")
+                && !name.contains("//")
+                && !name.ends_with('.')
+                && !name.ends_with('/')
+                && name != "@"
+                && !name
+                    .chars()
+                    .any(|c| c.is_control() || " ~^:?*[\\".contains(c))
+                && name
+                    .split('/')
+                    .all(|part| !part.starts_with('.') && !part.ends_with(".lock"))
+        }
+
+        #[test]
+        fn validator_agrees_with_git() {
+            for name in [
+                "task-1-ok",
+                "task-1-a.b",
+                "task-1-x.lock",
+                "task-1-a b",
+                "task-1-x..y",
+                "task-1-x~1",
+                "task-1-x.",
+                "task-1-x@{y",
+                "task-1-x:y",
+                "task-1-x*",
+            ] {
+                let git_ok = std::process::Command::new("git")
+                    .args(["check-ref-format", "--branch", name])
+                    .output()
+                    .is_ok_and(|o| o.status.success());
+                assert_eq!(is_valid_branch(name), git_ok, "{name}");
+            }
+        }
+
+        fn arb_text() -> impl Strategy<Value = String> {
+            prop_oneof![
+                "[A-Za-z0-9._~^:?*\\[\\] @{}/-]{1,24}",
+                any::<String>().prop_map(|s| s.chars().take(24).collect()),
+            ]
+        }
+
+        proptest! {
+            #[test]
+            fn taskmd_branch_is_valid_ref(slug in arb_text(), id in "[0-9]{1,6}", conv in "[a-z0-9-]{1,16}") {
+                let source = TaskSource::Taskmd {
+                    id,
+                    priority: Priority::P2,
+                    status: Status::Ready,
+                    slug,
+                };
+                let (branch, _) = source.branch_and_id(&conv);
+                prop_assert!(is_valid_branch(&branch), "{branch}");
+            }
+
+            #[test]
+            fn plain_markdown_branch_is_valid_ref(stem in arb_text(), conv in "[a-z0-9-]{1,16}") {
+                let source = TaskSource::PlainMarkdown { stem };
+                let (branch, id) = source.branch_and_id(&conv);
+                prop_assert!(is_valid_branch(&branch), "{branch}");
+                prop_assert!(!id.is_empty());
+            }
+
+            #[test]
+            fn detected_filenames_yield_valid_ref(name in arb_text(), conv in "[a-z0-9-]{1,16}") {
+                for filename in [format!("{name}.md"), format!("12345-p1-ready--{name}.md")] {
+                    if let Some(source) = TaskSource::detect(&filename) {
+                        let (branch, _) = source.branch_and_id(&conv);
+                        prop_assert!(is_valid_branch(&branch), "{filename} -> {branch}");
+                    }
+                }
+            }
+        }
+    }
 }
