@@ -2324,10 +2324,11 @@ async fn stale_source_aborts_joined_inventory_worker_before_owner_cleanup() {
     assert_eq!(continuation.phase, Phase::InspectionRequired);
     assert_eq!(fence.owner_count(), 1);
     assert!(Arc::clone(&gate).try_lock_owned().is_err());
-    assert!(matches!(
+    assert_eq!(
         reply.try_recv(),
-        Err(oneshot::error::TryRecvError::Empty)
-    ));
+        Ok(Err(NativeCloseApplicationError::SourceRefused)),
+        "revocation settles the observer without releasing the retained owner or gate"
+    );
     assert_eq!(
         fixture
             .db

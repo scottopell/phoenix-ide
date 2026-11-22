@@ -268,10 +268,13 @@ async fn bash_stage_two_stop_ack_reaches_real_second_writer_and_cleans_once() {
         .expect("public Close refusal is structured JSON");
     assert_eq!(close_error["code"], "source_refused");
 
+    let live_pgids = backend.bash_handles().snapshot_live_pgids().await;
+    let original_state = original.handle.state().await;
+    let original_settlement = settlement.borrow().clone();
     assert_eq!(
-        backend.bash_handles().snapshot_live_pgids().await,
+        live_pgids,
         vec![pgid],
-        "the refused second-stage callback must not have sent a group effect"
+        "the refused second-stage callback must preserve the test-owned group; original handle state: {original_state:?}; waiter settlement: {original_settlement:?}"
     );
 
     // Stop ACK may refuse the Close source, but the Bash child is test-owned.
