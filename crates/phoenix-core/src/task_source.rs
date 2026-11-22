@@ -514,6 +514,7 @@ mod tests {
 
         /// Mirror of the `git check-ref-format --branch` rules relevant to
         /// names of the shape `task-...`.
+        #[allow(clippy::case_sensitive_file_extension_comparisons)]
         fn is_valid_branch(name: &str) -> bool {
             !name.is_empty()
                 && !name.starts_with('-')
