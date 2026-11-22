@@ -18,7 +18,7 @@ spec = importlib.util.spec_from_file_location("frozen_rc8_prepare", SCRIPT)
 controller = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(controller)
 WORKFLOW = (ROOT / ".github/workflows/release.yml").read_text()
-PINNED = {name: getattr(controller, name) for name in ("BASE", "CANDIDATE", "TREE", "HELPER_SHA256")}
+PINNED = {name: getattr(controller, name) for name in ("APPLICATION_BASE", "BASE", "CANDIDATE", "TREE", "HELPER_SHA256")}
 
 
 class GitFixture(unittest.TestCase):
@@ -30,12 +30,14 @@ class GitFixture(unittest.TestCase):
                         GIT_COMMITTER_NAME="fixture", GIT_COMMITTER_EMAIL="f@example.test")
         self.git("init", "-q")
         self.write_candidate_files()
-        self.base = self.commit("base")
+        self.application_base = self.commit("application base")
+        self.base = self.commit("frozen RC7 version")
         self.write_candidate_files(version=controller.VERSION)
         self.candidate = self.commit("candidate")
         self.git("update-ref", "refs/remotes/origin/main", self.commit("main"))
         self.pins = contextlib.ExitStack()
         self.addCleanup(self.pins.close)
+        self.pins.enter_context(mock.patch.object(controller, "APPLICATION_BASE", self.application_base))
         self.pins.enter_context(mock.patch.object(controller, "BASE", self.base))
         self.pins.enter_context(mock.patch.object(controller, "CANDIDATE", self.candidate))
         self.pins.enter_context(mock.patch.object(controller, "TREE", self.git("show", "-s", "--format=%T", self.candidate)))
@@ -68,6 +70,26 @@ class CandidateVerificationTests(GitFixture):
         self.assertEqual(result["commit"], self.candidate)
         self.assertEqual(result["tree"], controller.TREE)
         self.assertEqual(self.git("status", "--porcelain"), before)
+
+    def test_accepts_main_divergent_from_frozen_rc7_at_application_base(self):
+        self.git("checkout", "--detach", self.application_base)
+        main = self.commit("main application work")
+        self.git("update-ref", "refs/remotes/origin/main", main)
+        with self.assertRaises(subprocess.CalledProcessError):
+            self.git("merge-base", "--is-ancestor", self.base, main)
+        self.assertEqual(controller.verify_candidate(self.repo)["commit"], self.candidate)
+
+    def test_rejects_main_without_application_base_ancestry(self):
+        tree = self.git("mktree")
+        unrelated = subprocess.check_output(
+            ["git", "-C", str(self.repo), "commit-tree", tree, "-m", "unrelated main"], env=self.env).decode().strip()
+        self.git("update-ref", "refs/remotes/origin/main", unrelated)
+        with self.assertRaisesRegex(ValueError, "ancestry"):
+            controller.verify_candidate(self.repo)
+
+    def test_rejects_wrong_application_base_pin(self):
+        with mock.patch.object(controller, "APPLICATION_BASE", self.candidate), self.assertRaisesRegex(ValueError, "application base"):
+            controller.verify_candidate(self.repo)
 
     def test_rejects_wrong_tree_pin(self):
         with mock.patch.object(controller, "TREE", "0" * 40), self.assertRaisesRegex(ValueError, "tree"):
@@ -113,7 +135,7 @@ class PinnedCandidateTests(unittest.TestCase):
             self.skipTest("frozen candidate object is unavailable in this checkout")
         self.assertEqual(tree, PINNED["TREE"])
         with mock.patch.multiple(controller, **PINNED):
-            result = controller.verify_candidate(ROOT, main_ref=PINNED["CANDIDATE"])
+            result = controller.verify_candidate(ROOT)
         self.assertEqual(result["commit"], PINNED["CANDIDATE"])
 
 

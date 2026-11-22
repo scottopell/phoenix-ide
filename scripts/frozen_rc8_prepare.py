@@ -9,6 +9,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+APPLICATION_BASE = "d3b57573ccf8662d05125338aad2307bb03da598"
 BASE = "86071b4cc2ab0f9efdb8a3debf03b8569baf26f9"
 CANDIDATE = "d5d2a45651035f58f3231f0dc82fd9ef59b7cb3c"
 TREE = "5ebc83729fc5630f8ffcd03477b0aaac1187982b"
@@ -32,7 +33,9 @@ def verify_candidate(repo=".", main_ref="origin/main"):
         if git(repo, "show", "-s", "--format=%T", CANDIDATE).decode().strip() != TREE:
             raise ValueError("pinned RC8 candidate tree does not match")
         git(repo, "merge-base", "--is-ancestor", BASE, CANDIDATE)
-        git(repo, "merge-base", "--is-ancestor", BASE, main_ref)
+        if git(repo, "rev-parse", f"{BASE}^").decode().strip() != APPLICATION_BASE:
+            raise ValueError("frozen RC7 application base does not match")
+        git(repo, "merge-base", "--is-ancestor", APPLICATION_BASE, main_ref)
     except subprocess.CalledProcessError as error:
         raise ValueError("pinned RC8 candidate or RC7 base ancestry check failed") from error
     manifest = git(repo, "show", f"{CANDIDATE}:crates/phoenix-ide/Cargo.toml")

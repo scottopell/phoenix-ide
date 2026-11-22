@@ -6,6 +6,8 @@ Phoenix release source contains a direct-distribution path for architecture-spec
 
 The controller source adds preparation-only `prepare-frozen-rc8` for immutable candidate `d5d2a45651035f58f3231f0dc82fd9ef59b7cb3c` (`0.13.2-rc.8`). It reuses the protected two-architecture macOS signing/notarization/headless path with fixed source/tree/helper pins and latest exact-candidate CI admission. The controller is materialized from the exact main-owned workflow commit outside the candidate checkout. Separate `RC8-SOURCE-AND-HELPER-PROVENANCE.json` retains the Python deployment helper digest and selected CI run/attempt without changing schema-1 packaging receipts (which still label their preparation mode `prepare-main`). Neither artifact alone admits publication or rollout.
 
+The source gate checks RC8 descent from frozen RC7 and `main` descent from RC7's exact application parent; frozen RC7's separate version commit is not required on `main`. A divergent-branch fixture and an available-real-object regression exercise that graph. A direct read-only gate run has admitted the exact frozen candidate with successful CI run `44969803027`, attempt `1`; this is not a protected artifact run.
+
 Bounded Python tests cover source and CI refusal, provenance execution, tag-input refusal, terminal shell-case behavior, protected environment and tag/Linux/publication guards. RC8 protected signing/notarization and native artifact acceptance have not been dispatched; source tests do not establish those results. The Allium normal-main and incident preparation lifecycles remain unchanged: the fixed source gate is specified by REQ-DESKTOP-REL-014 and reuses the existing macOS acceptance path without adding a release lifecycle.
 
 ## Requirement mapping
