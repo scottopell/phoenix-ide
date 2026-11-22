@@ -1607,22 +1607,9 @@ fn nes(s: &str, what: &str) -> Result<NonEmptyString, ForkResolveError> {
     NonEmptyString::new(s).map_err(|_| ForkResolveError::Internal(format!("{what} is empty")))
 }
 
-/// Reduce a file stem to a path-safe lowercase segment for the draft filename.
+/// Path-safe lowercase draft-filename segment, `brief` when nothing survives.
 fn sanitize_stem(stem: &str) -> String {
-    let mut out = String::new();
-    let mut prev_dash = false;
-    for ch in stem.chars() {
-        if ch.is_ascii_alphanumeric() {
-            out.push(ch.to_ascii_lowercase());
-            prev_dash = false;
-        } else if !out.is_empty() && !prev_dash {
-            out.push('-');
-            prev_dash = true;
-        }
-    }
-    while out.ends_with('-') {
-        out.pop();
-    }
+    let out = phoenix_core::task_source::slug_segment(stem);
     if out.is_empty() {
         "brief".to_string()
     } else {

@@ -177,7 +177,7 @@ impl TaskSource {
             Self::Taskmd { id, slug, .. } => (format!("task-{id}-{slug}"), id.clone()),
             Self::PlainMarkdown { stem } => {
                 let conv_prefix: String = conv_id.chars().take(8).collect();
-                let sanitized = sanitize_branch_segment(stem);
+                let sanitized = slug_segment(stem);
                 let id_segment = if sanitized.is_empty() {
                     conv_prefix.clone()
                 } else {
@@ -189,14 +189,57 @@ impl TaskSource {
     }
 }
 
-/// First `# H1` heading in a markdown body, trimmed; `None` if there is none.
+/// First ATX `# H1` heading in a markdown body, trimmed; `None` if there is none.
+///
+/// Lines inside fenced code blocks and indented code (4+ spaces) are not
+/// headings. A closing `#` sequence (`# Title ##`) is not part of the title.
 fn extract_h1(body: &str) -> Option<String> {
-    body.lines().find_map(|line| {
-        line.trim_start()
-            .strip_prefix("# ")
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-    })
+    let mut fence: Option<(char, usize)> = None;
+    for line in body.lines() {
+        let indent = line.len() - line.trim_start_matches(' ').len();
+        let unindented = line.trim_start_matches(' ');
+        if let Some((ch, len)) = fence {
+            let run = unindented.chars().take_while(|&c| c == ch).count();
+            if indent < 4 && run >= len && unindented.trim_start_matches(ch).trim().is_empty() {
+                fence = None;
+            }
+            continue;
+        }
+        if indent >= 4 {
+            continue;
+        }
+        if let Some(ch) = unindented.chars().next().filter(|c| matches!(c, '`' | '~')) {
+            let run = unindented.chars().take_while(|&c| c == ch).count();
+            if run >= 3 {
+                fence = Some((ch, run));
+                continue;
+            }
+        }
+        let Some(rest) = unindented.strip_prefix('#') else {
+            continue;
+        };
+        if !rest.starts_with([' ', '\t']) {
+            continue;
+        }
+        let title = strip_closing_hashes(rest.trim());
+        if !title.is_empty() {
+            return Some(title.to_string());
+        }
+    }
+    None
+}
+
+/// Drop an ATX closing sequence: trailing `#`s preceded by whitespace (or the
+/// whole text when it is only `#`s).
+fn strip_closing_hashes(text: &str) -> &str {
+    let without = text.trim_end_matches('#');
+    if without.len() == text.len() {
+        text
+    } else if without.is_empty() || without.ends_with([' ', '\t']) {
+        without.trim_end()
+    } else {
+        text
+    }
 }
 
 /// Title-case a `-`/`_`-separated identifier (`fix-login_bug` → `Fix Login Bug`).
@@ -215,12 +258,22 @@ fn identifier_to_title(ident: &str) -> String {
         .join(" ")
 }
 
-/// Reduce an arbitrary file stem to a git-branch-safe lowercase segment:
-/// `[a-z0-9]+` runs joined by single `-`, everything else dropped.
-fn sanitize_branch_segment(stem: &str) -> String {
+/// Longest slug segment [`slug_segment`] emits; keeps a branch or file name
+/// well under the 255-byte path-component limit.
+pub const MAX_SLUG_SEGMENT_LEN: usize = 48;
+
+/// Reduce an arbitrary string to a git-ref- and filename-safe lowercase
+/// segment: `[a-z0-9]+` runs joined by single `-`, everything else dropped,
+/// at most [`MAX_SLUG_SEGMENT_LEN`] bytes with no trailing `-`. Empty when the
+/// input has no ASCII alphanumerics.
+#[must_use]
+pub fn slug_segment(stem: &str) -> String {
     let mut out = String::new();
     let mut prev_dash = false;
     for ch in stem.chars() {
+        if out.len() >= MAX_SLUG_SEGMENT_LEN {
+            break;
+        }
         if ch.is_ascii_alphanumeric() {
             out.push(ch.to_ascii_lowercase());
             prev_dash = false;
@@ -371,5 +424,73 @@ mod tests {
         let plain = TaskSource::detect("migration_notes.md").unwrap();
         assert_eq!(plain.title("# DB migration plan"), "DB migration plan");
         assert_eq!(plain.title("(no heading)"), "Migration Notes");
+    }
+
+    #[test]
+    fn title_ignores_hash_lines_in_fenced_code() {
+        let body = "```sh\n# install deps\nmake\n```\n\n# Real Title";
+        assert_eq!(extract_h1(body).as_deref(), Some("Real Title"));
+        let tilde = "~~~~\n# nope\n~~~\n# still nope\n~~~~\n# Yes";
+        assert_eq!(extract_h1(tilde).as_deref(), Some("Yes"));
+        // Unclosed fence swallows the rest: no heading outside it.
+        assert_eq!(extract_h1("```\n# x"), None);
+    }
+
+    #[test]
+    fn title_ignores_indented_code_and_requires_space() {
+        assert_eq!(extract_h1("    # code\n#nospace\n#Hashtag"), None);
+        assert_eq!(extract_h1("   # Ok").as_deref(), Some("Ok"));
+        assert_eq!(extract_h1("#\tTabbed").as_deref(), Some("Tabbed"));
+    }
+
+    #[test]
+    fn title_strips_closing_hashes() {
+        assert_eq!(extract_h1("# Title ##").as_deref(), Some("Title"));
+        assert_eq!(extract_h1("# C#").as_deref(), Some("C#"));
+        assert_eq!(extract_h1("# #"), None);
+        assert_eq!(extract_h1("# Title"), Some("Title".to_string()));
+    }
+
+    #[test]
+    fn plain_markdown_branch_is_bounded_and_nonempty() {
+        let long = TaskSource::detect(&format!("{}.md", "a".repeat(300))).unwrap();
+        let (branch, id) = long.branch_and_id("conv-12345678");
+        assert!(branch.len() < 80, "{branch}");
+        assert!(!id.ends_with('-'));
+        let (branch, id) = TaskSource::detect("日本語.md")
+            .unwrap()
+            .branch_and_id("conv-12345678");
+        assert_eq!(id, "conv-123");
+        assert_eq!(branch, "task-conv-123-conv-123");
+    }
+
+    mod proptests {
+        use super::super::*;
+        use proptest::prelude::*;
+
+        proptest! {
+            #[test]
+            fn slug_segment_is_safe_and_bounded(s in "\\PC{0,400}") {
+                let out = slug_segment(&s);
+                prop_assert!(out.len() <= MAX_SLUG_SEGMENT_LEN);
+                prop_assert!(out.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'));
+                prop_assert!(!out.starts_with('-') && !out.ends_with('-') && !out.contains("--"));
+            }
+
+            #[test]
+            fn slug_segment_is_idempotent(s in "\\PC{0,200}") {
+                let once = slug_segment(&s);
+                prop_assert_eq!(slug_segment(&once), once);
+            }
+
+            #[test]
+            fn h1_never_comes_from_inside_a_fence(
+                inner in "[ -~]{0,30}",
+                title in "[A-Za-z][A-Za-z0-9 ]{0,20}",
+            ) {
+                let body = format!("```\n# {inner}\n```\n# {title}");
+                prop_assert_eq!(extract_h1(&body), Some(title.trim().to_string()));
+            }
+        }
     }
 }
