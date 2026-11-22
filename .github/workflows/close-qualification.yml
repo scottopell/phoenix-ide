@@ -403,6 +403,30 @@ jobs:
           for test in "${tests[@]}"; do
             grep -Fx "test $test ... ok" evidence/tmux-gate-execution.log
           done
+      - name: Qualify actual browser task custody and abnormal completion
+        if: success() || failure()
+        timeout-minutes: 20
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p phoenix-browser --lib session::launch_slot::tests:: -- --list 2>&1 | tee evidence/browser-custody-inventory.log
+          tests=(
+            session::launch_slot::tests::joining_an_existing_kill_retains_late_custody_until_completion
+            session::launch_slot::tests::custody_destructors_never_run_under_kill_or_registry_locks
+            session::launch_slot::tests::dropped_kill_task_guard_settles_abnormal_exit
+            session::launch_slot::tests::aborted_retirement_parent_keeps_custody_in_spawned_kill_task
+            session::launch_slot::tests::aborted_kill_task_before_first_poll_marks_failure
+            session::launch_slot::tests::aborted_kill_task_while_slot_held_marks_failure
+            session::launch_slot::tests::aborted_waiter_keeps_custody_inside_actual_blocking_profile_cleanup
+          )
+          for test in "${tests[@]}"; do
+            grep -Fx "$test: test" evidence/browser-custody-inventory.log
+          done
+          for test in "${tests[@]}"; do
+            cargo test -p phoenix-browser --lib "$test" -- --exact --nocapture --test-threads=1 2>&1 | tee -a evidence/browser-custody-execution.log
+            grep -Fx "test $test ... ok" evidence/browser-custody-execution.log
+          done
+          test "$(grep -Fc 'test result: ok. 1 passed; 0 failed; 0 ignored;' evidence/browser-custody-execution.log)" -eq "${#tests[@]}"
       - name: Qualify native Close public adapter parsing and discovery
         if: success() || failure()
         shell: bash

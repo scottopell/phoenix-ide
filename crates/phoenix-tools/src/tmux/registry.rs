@@ -3384,7 +3384,9 @@ mod tests {
             TmuxRetirementOutcome::Retired
         );
         assert_eq!(fake.kill_server_count(&identity.socket_path), 1);
-        assert!(!fake.server(&identity.socket_path).is_some_and(|server| server.live));
+        assert!(!fake
+            .server(&identity.socket_path)
+            .is_some_and(|server| server.live));
     }
 
     #[tokio::test]

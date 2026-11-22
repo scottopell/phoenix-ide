@@ -1513,6 +1513,22 @@ impl BrowserRetirementPermit {
     }
 }
 
+/// Caller-owned lifetime guard for retirement work. This is only a keepalive:
+/// it grants no source, launch, process, or profile cleanup authority.
+#[derive(Clone)]
+pub struct BrowserRetirementCustody(Arc<dyn Send + Sync + 'static>);
+
+impl BrowserRetirementCustody {
+    #[must_use]
+    pub fn new<T: Send + Sync + 'static>(payload: Arc<T>) -> Self {
+        Self(payload)
+    }
+
+    fn no_op() -> Self {
+        Self::new(Arc::new(()))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BrowserRetirementOutcome {
     Retired,
@@ -1558,35 +1574,119 @@ struct BrowserSessionRegistryState {
 /// plus the live session arc.
 struct KillAttempt {
     done: Notify,
-    result: std::sync::Mutex<Option<Result<(), String>>>,
+    progress: std::sync::Mutex<KillAttemptProgress>,
+}
+
+#[derive(Default)]
+struct KillAttemptProgress {
+    result: Option<Result<(), String>>,
+    custody: Option<Arc<CustodyGroup>>,
+    live_custody: std::sync::Weak<CustodyGroup>,
+}
+
+#[derive(Default)]
+struct CustodyGroup {
+    payloads: std::sync::Mutex<Vec<BrowserRetirementCustody>>,
+}
+
+impl CustodyGroup {
+    fn retain(&self, custody: BrowserRetirementCustody) {
+        self.payloads
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(custody);
+    }
+}
+
+// Owned by the spawned task itself, not by a caller awaiting its JoinHandle.
+// A cancelled or panicking task must settle joiners even if its first caller vanished.
+struct KillTaskCompletion {
+    attempt: Arc<KillAttempt>,
+    teardown_failed: Arc<AtomicBool>,
+    scope: ResourceScopeKey,
+    audience: BrowserSessionAudience,
+    sink: Option<BrowserSessionLifecycleSink>,
+}
+
+impl Drop for KillTaskCompletion {
+    fn drop(&mut self) {
+        if self.attempt.result().is_some() {
+            return;
+        }
+        self.teardown_failed.store(true, Ordering::SeqCst);
+        if let Some(sink) = &self.sink {
+            if let Err(error) = sink.send(BrowserSessionLifecycleEvent {
+                work_scope: self.scope.clone(),
+                audience: self.audience.clone(),
+                kind: BrowserSessionLifecycleKind::TeardownFailed,
+            }) {
+                tracing::debug!(%error, "browser lifecycle sink closed");
+            }
+        }
+        self.attempt.complete(Err("browser kill task cancelled or panicked".into()));
+    }
 }
 
 impl KillAttempt {
     fn new() -> Arc<Self> {
+        let custody = Arc::new(CustodyGroup::default());
         Arc::new(Self {
             done: Notify::new(),
-            result: std::sync::Mutex::new(None),
+            progress: std::sync::Mutex::new(KillAttemptProgress {
+                live_custody: Arc::downgrade(&custody),
+                custody: Some(custody),
+                ..KillAttemptProgress::default()
+            }),
         })
     }
 
     fn complete(&self, result: Result<(), String>) -> bool {
-        let mut slot = self
-            .result
+        let mut progress = self
+            .progress
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if slot.is_some() {
+        if progress.result.is_some() {
             return false;
         }
-        *slot = Some(result);
-        drop(slot);
+        progress.result = Some(result);
+        let custody = progress.custody.take();
+        drop(progress);
         self.done.notify_waiters();
+        drop(custody);
         true
     }
 
-    fn result(&self) -> Option<Result<(), String>> {
-        self.result
+    fn custody_group(&self) -> Arc<CustodyGroup> {
+        self.progress
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .custody
+            .as_ref()
+            .expect("new kill attempt has custody until completion")
+            .clone()
+    }
+
+    fn join_group(&self) -> Option<Arc<CustodyGroup>> {
+        let progress = self
+            .progress
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        progress.live_custody.upgrade()
+    }
+
+    #[cfg(test)]
+    fn retain_until_complete(&self, custody: BrowserRetirementCustody) {
+        if let Some(group) = self.join_group() {
+            group.retain(custody);
+        }
+        // On an already completed attempt, custody is released outside all locks.
+    }
+
+    fn result(&self) -> Option<Result<(), String>> {
+        self.progress
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .result
             .clone()
     }
 }
@@ -2029,7 +2129,7 @@ impl BrowserSessionManager {
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .as_ref()
                     .is_some_and(|current| Arc::ptr_eq(current, attempt));
-                if !is_current {
+                if !is_current || attempt.result().is_some() {
                     return None;
                 }
                 entry.teardown_failed.store(true, Ordering::SeqCst);
@@ -2638,8 +2738,9 @@ impl BrowserSessionManager {
         key: String,
         work_scope: ResourceScopeKey,
         expected: Option<BrowserSessionInstanceIdentity>,
+        custody: BrowserRetirementCustody,
     ) -> KillSessionOutcome {
-        let (session, attempt, audience, lifecycle_kind) = {
+        let (session, attempt, audience, lifecycle_kind, teardown_failed) = {
             let state = self.state.write().await;
             let Some(entry) = state.sessions.get(&key) else {
                 return KillSessionOutcome::Absent;
@@ -2654,14 +2755,15 @@ impl BrowserSessionManager {
                 .current_kill
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if let Some(attempt) = current
+            if let Some((attempt, group)) = current
                 .as_ref()
-                .filter(|attempt| attempt.result().is_none())
+                .and_then(|attempt| attempt.join_group().map(|group| (attempt.clone(), group)))
             {
+                drop(current);
+                drop(state);
                 tracing::debug!(work_scope = %work_scope, "browser kill already requested");
-                return KillSessionOutcome::AlreadyRequested {
-                    attempt: attempt.clone(),
-                };
+                group.retain(custody);
+                return KillSessionOutcome::AlreadyRequested { attempt };
             }
             let attempt = KillAttempt::new();
             *current = Some(attempt.clone());
@@ -2676,20 +2778,31 @@ impl BrowserSessionManager {
                     BrowserSessionAudience::Conversation(entry.creator_conversation_id.clone())
                 }
             };
-            (entry.session.clone(), attempt, audience, lifecycle_kind)
+            (entry.session.clone(), attempt, audience, lifecycle_kind, entry.teardown_failed.clone())
         };
-        self.emit_lifecycle(&work_scope, audience, lifecycle_kind);
+        let group = attempt.custody_group();
+        group.retain(custody);
+        self.emit_lifecycle(&work_scope, audience.clone(), lifecycle_kind);
 
         let requested_scope = work_scope;
         let manager = Arc::clone(self);
         let task_attempt = attempt.clone();
+        let completion = KillTaskCompletion {
+            attempt: attempt.clone(),
+            teardown_failed,
+            scope: requested_scope.clone(),
+            audience,
+            sink: self.lifecycle_sink.clone(),
+        };
         KillSessionOutcome::Started {
             key: key.clone(),
             attempt,
             handle: tokio::spawn(async move {
+                let _completion = completion;
+                let task_custody = BrowserRetirementCustody::new(group.clone());
                 tracing::info!(work_scope = %requested_scope, "Killing browser session");
 
-                if let Err(error) = session.stop_and_delete().await {
+                if let Err(error) = session.stop_and_delete(task_custody).await {
                     manager
                         .complete_kill_failure(&key, &task_attempt, error.to_string())
                         .await;
@@ -2725,6 +2838,22 @@ impl BrowserSessionManager {
         self: &Arc<Self>,
         permit: &BrowserRetirementPermit,
     ) -> BrowserRetirementOutcome {
+        self.complete_retirement_with_custody(permit, BrowserRetirementCustody::no_op())
+            .await
+    }
+
+    /// Retire under a caller-owned keepalive, carried through actual kill and
+    /// blocking profile cleanup (including late callers joining an active kill).
+    /// Success means browser cleanup and registry bookkeeping finished, not that
+    /// arbitrary custody destructors have run. After an abnormal kill-task exit,
+    /// a surviving blocking cleanup may still hold the custody group. Custody
+    /// does not authorize a launch or deletion, and does not cancel or revoke
+    /// any in-flight browser work.
+    pub async fn complete_retirement_with_custody(
+        self: &Arc<Self>,
+        permit: &BrowserRetirementPermit,
+        custody: BrowserRetirementCustody,
+    ) -> BrowserRetirementOutcome {
         let matches_current_generation = {
             let state = self.state.read().await;
             state
@@ -2743,6 +2872,7 @@ impl BrowserSessionManager {
                         expected.session_key.clone(),
                         permit.work_scope.clone(),
                         Some(expected.clone()),
+                        custody.clone(),
                     )
                     .await
                 {
@@ -2775,6 +2905,7 @@ impl BrowserSessionManager {
         }
 
         let verified = self.verify_exact_absence(permit).await;
+        let _ = &custody.0;
         if !failures.is_empty() {
             return BrowserRetirementOutcome::Residual {
                 reason: failures.join("; "),
@@ -3036,7 +3167,10 @@ impl BrowserSessionManager {
             };
             if let Some(scope) = scope {
                 tracing::info!(scope_key = %key, "Cleaning up idle browser session");
-                match self.spawn_kill_session_by_key(key, scope, None).await {
+                match self
+                    .spawn_kill_session_by_key(key, scope, None, BrowserRetirementCustody::no_op())
+                    .await
+                {
                     KillSessionOutcome::Absent => {}
                     KillSessionOutcome::Started {
                         key,

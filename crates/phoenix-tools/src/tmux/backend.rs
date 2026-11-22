@@ -15,8 +15,8 @@ use phoenix_core::process_identity::{
     current_process_identity, process_identity_matches, ProcessIdentity,
 };
 
-use super::probe::{command_output, probe_until, ProbeResult};
 use super::close_gate;
+use super::probe::{command_output, probe_until, ProbeResult};
 use super::registry::{TmuxError, TMUX_DEFAULT_SESSION};
 
 pub(crate) const SERVER_TOKEN_VAR: &str = "PHOENIX_TMUX_SERVER_TOKEN";
@@ -158,7 +158,8 @@ pub trait TmuxBackend: Send + Sync + std::fmt::Debug {
             TokenBoundKill::DeadlineExceeded
         } else {
             TokenBoundKill::Failed {
-                reason: "backend cannot bind tmux teardown to the exact process incarnation".to_string(),
+                reason: "backend cannot bind tmux teardown to the exact process incarnation"
+                    .to_string(),
             }
         }
     }
@@ -299,22 +300,47 @@ impl TmuxBackend for SystemTmuxBackend {
         expires: Instant,
     ) -> TokenBoundKill {
         kill_server_if_condition(
-            socket_path, config_path,
-            &format!("#{{==:#{{E:{SERVER_TOKEN_VAR}}},{expected_token}}}"), expires,
-        ).await
+            socket_path,
+            config_path,
+            &format!("#{{==:#{{E:{SERVER_TOKEN_VAR}}},{expected_token}}}"),
+            expires,
+        )
+        .await
     }
 
     async fn kill_server_if_process(
-        &self, socket_path: &Path, config_path: &Path, expected_token: &str,
-        expected_process: ProcessIdentity, expires: Instant,
+        &self,
+        socket_path: &Path,
+        config_path: &Path,
+        expected_token: &str,
+        expected_process: ProcessIdentity,
+        expires: Instant,
     ) -> TokenBoundKill {
-        if Instant::now() >= expires { return TokenBoundKill::DeadlineExceeded; }
-        if !self.binary_available { return TokenBoundKill::Failed { reason: "tmux binary unavailable".into() }; }
+        if Instant::now() >= expires {
+            return TokenBoundKill::DeadlineExceeded;
+        }
+        if !self.binary_available {
+            return TokenBoundKill::Failed {
+                reason: "tmux binary unavailable".into(),
+            };
+        }
         let helper_executable = match std::env::current_exe() {
             Ok(path) => path,
-            Err(error) => return TokenBoundKill::Failed { reason: format!("cannot locate helper executable: {error}") },
+            Err(error) => {
+                return TokenBoundKill::Failed {
+                    reason: format!("cannot locate helper executable: {error}"),
+                }
+            }
         };
-        close_gate::retire_exact_on_server(socket_path, config_path, expected_token, expected_process, expires, &helper_executable).await
+        close_gate::retire_exact_on_server(
+            socket_path,
+            config_path,
+            expected_token,
+            expected_process,
+            expires,
+            &helper_executable,
+        )
+        .await
     }
 
     async fn capture_pane(
@@ -910,15 +936,27 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn system_exact_process_teardown_fails_closed_without_path_command() {
-        let backend = SystemTmuxBackend { binary_available: false };
+        let backend = SystemTmuxBackend {
+            binary_available: false,
+        };
         let expires = Instant::now() + Duration::from_secs(1);
-        let process = ProcessIdentity { pid: 42, start_time: 123 };
+        let process = ProcessIdentity {
+            pid: 42,
+            start_time: 123,
+        };
         let socket = Path::new("/not-opened-by-exact-retirement/socket");
         let config = Path::new("/not-opened-by-exact-retirement/config");
-        let outcome = backend.kill_server_if_process(socket, config, "inherited-token", process, expires).await;
+        let outcome = backend
+            .kill_server_if_process(socket, config, "inherited-token", process, expires)
+            .await;
         assert!(matches!(outcome, TokenBoundKill::Failed { .. }));
         tokio::time::advance(Duration::from_secs(1)).await;
-        assert_eq!(backend.kill_server_if_process(socket, config, "inherited-token", process, expires).await, TokenBoundKill::DeadlineExceeded);
+        assert_eq!(
+            backend
+                .kill_server_if_process(socket, config, "inherited-token", process, expires)
+                .await,
+            TokenBoundKill::DeadlineExceeded
+        );
     }
 
     #[test]

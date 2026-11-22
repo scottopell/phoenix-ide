@@ -4,7 +4,8 @@ use super::{
     BrowserLaunchIdentity, BrowserProfileMarker, BrowserRetainedLaunch, BrowserRetirementFenceKey,
     BrowserSession, BrowserSessionLifecycleEvent, BrowserSessionLifecycleKind,
     BrowserSessionLifecycleSink, BrowserSessionLookup, BrowserSessionManager,
-    BrowserSessionRegistryState, ProfileDeletionProof, ProfilingState, MAX_CONSOLE_LOGS,
+    BrowserSessionRegistryState, BrowserRetirementCustody, ProfileDeletionProof, ProfilingState,
+    MAX_CONSOLE_LOGS,
 };
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use crate::process_group::OwnedChromeGroup;
@@ -409,7 +410,10 @@ impl LaunchSlot {
         }
     }
 
-    pub(super) async fn stop_and_delete(&self) -> Result<(), BrowserError> {
+    pub(super) async fn stop_and_delete(
+        &self,
+        custody: BrowserRetirementCustody,
+    ) -> Result<(), BrowserError> {
         self.scenario_owner.close();
         let mut state = self.state.write().await;
         if matches!(&*state, LaunchState::PreSpawnFailed(_)) {
@@ -442,26 +446,15 @@ impl LaunchSlot {
         let unmarked = matches!(&*state, LaunchState::Pending(pending) if !pending.marker);
         let profile = self.profile.clone();
         let key = self.key.clone();
-        tokio::task::spawn_blocking(move || {
-            if unmarked {
-                if profile_marker_path(&profile).exists() {
-                    return Err(BrowserError::OperationFailed(
-                        "unmarked launch path now has a marker; preserving foreign profile".into(),
-                    ));
-                }
-                std::fs::remove_dir_all(&profile)
-                    .or_else(|error| {
-                        if error.kind() == std::io::ErrorKind::NotFound {
-                            Ok(())
-                        } else {
-                            Err(error)
-                        }
-                    })
-                    .map_err(|error| BrowserError::OperationFailed(error.to_string()))
-            } else {
-                delete_profile_if_owned_and_stopped(&profile, &key, &identity, proof)
-            }
-        })
+        spawn_profile_cleanup(
+            profile,
+            key,
+            identity,
+            proof,
+            unmarked,
+            custody,
+            #[cfg(test)] None,
+        )
         .await
         .map_err(|error| {
             BrowserError::OperationFailed(format!("profile cleanup task failed: {error}"))
@@ -469,6 +462,46 @@ impl LaunchSlot {
         *state = LaunchState::Stopped;
         Ok(())
     }
+}
+
+fn spawn_profile_cleanup(
+    profile: PathBuf,
+    key: String,
+    identity: BrowserLaunchIdentity,
+    proof: ProfileDeletionProof,
+    unmarked: bool,
+    custody: BrowserRetirementCustody,
+    #[cfg(test)] gate: Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>,
+) -> JoinHandle<Result<(), BrowserError>> {
+    tokio::task::spawn_blocking(move || {
+        let _custody = custody;
+        let _ = &_custody.0;
+        #[cfg(test)]
+        if let Some((entered, release)) = gate {
+            entered.send(()).expect("cleanup test waits for entry");
+            release
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("cleanup test releases blocking work");
+        }
+        if unmarked {
+            if profile_marker_path(&profile).exists() {
+                return Err(BrowserError::OperationFailed(
+                    "unmarked launch path now has a marker; preserving foreign profile".into(),
+                ));
+            }
+            std::fs::remove_dir_all(&profile)
+                .or_else(|error| {
+                    if error.kind() == std::io::ErrorKind::NotFound {
+                        Ok(())
+                    } else {
+                        Err(error)
+                    }
+                })
+                .map_err(|error| BrowserError::OperationFailed(error.to_string()))
+        } else {
+            delete_profile_if_owned_and_stopped(&profile, &key, &identity, proof)
+        }
+    })
 }
 
 async fn apply_initial_device(
@@ -630,6 +663,108 @@ pub(super) mod tests {
     use crate::session::{session_key, BrowserRetirementOutcome, ScopedSession};
     use phoenix_core::work_scope::{EffectiveResourceAccess, ResourceAuthority, ResourceScopeKey};
     use std::sync::atomic::{AtomicBool, AtomicUsize};
+
+    struct CustodyDropWitness {
+        dropped: Arc<AtomicBool>,
+        changed: Arc<Notify>,
+    }
+
+    impl Drop for CustodyDropWitness {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::SeqCst);
+            self.changed.notify_one();
+        }
+    }
+
+    fn witnessed_custody() -> (BrowserRetirementCustody, Arc<AtomicBool>, Arc<Notify>) {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let changed = Arc::new(Notify::new());
+        let custody = BrowserRetirementCustody::new(Arc::new(CustodyDropWitness {
+            dropped: dropped.clone(),
+            changed: changed.clone(),
+        }));
+        (custody, dropped, changed)
+    }
+
+    #[tokio::test]
+    async fn aborted_waiter_keeps_custody_inside_actual_blocking_profile_cleanup() {
+        let root = tempfile::tempdir().unwrap();
+        let profile = root.path().join("owned-unmarked-profile");
+        std::fs::create_dir(&profile).unwrap();
+        let attempt = crate::session::KillAttempt::new();
+        let (initial, initially_dropped, _) = witnessed_custody();
+        attempt.retain_until_complete(initial);
+        let group = attempt.custody_group();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let waiter = tokio::spawn(async move {
+            spawn_profile_cleanup(
+                profile,
+                "test-key".into(),
+                BrowserLaunchIdentity { launch_uuid: "test".into(), chrome_process: None },
+                ProfileDeletionProof::RootOnly,
+                true,
+                BrowserRetirementCustody::new(group),
+                Some((entered_tx, release_rx)),
+            )
+            .await
+        });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            tokio::task::spawn_blocking(move || entered_rx.recv()),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+        let (late, late_dropped, changed) = witnessed_custody();
+        attempt.retain_until_complete(late);
+        waiter.abort();
+        assert!(waiter.await.unwrap_err().is_cancelled());
+        assert!(attempt.complete(Err("abnormal kill".into())));
+        assert!(
+            !initially_dropped.load(Ordering::SeqCst) && !late_dropped.load(Ordering::SeqCst),
+            "blocking closure must own both caller custodies after completion and waiter abort"
+        );
+        let manager = Arc::new(BrowserSessionManager::default());
+        let scope = scope();
+        let slot = reserve_in_manager(&manager, &scope).await;
+        *slot.state.write().await = LaunchState::PreSpawnFailed("safe retry".into());
+        let key = session_key(&scope, &EffectiveResourceAccess::new("owner", ResourceAuthority::Work));
+        *manager.state.read().await.sessions.get(&key).unwrap().current_kill.lock().unwrap() =
+            Some(attempt.clone());
+        // Attach a genuinely new caller payload after the attempt has already
+        // completed abnormally. Only the physical cleanup owns the weak group's
+        // remaining lifetime; joining must not discard this late custody.
+        let (after_completion, after_completion_dropped, after_completion_changed) = witnessed_custody();
+        let held = manager.spawn_kill_session_by_key(
+            key.clone(), scope.clone(), None, after_completion,
+        ).await;
+        let crate::session::KillSessionOutcome::AlreadyRequested { attempt: joined } = held else {
+            panic!("physical cleanup still holds group: no second kill task");
+        };
+        assert!(Arc::ptr_eq(&joined, &attempt));
+        assert!(manager.wait_for_kill_completion(joined).await.is_err());
+        assert!(!after_completion_dropped.load(Ordering::SeqCst),
+            "completed result does not release custody while physical cleanup is live");
+        release_tx.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), changed.notified())
+            .await.expect("blocking closure releases custody after cleanup");
+        tokio::time::timeout(std::time::Duration::from_secs(5), after_completion_changed.notified())
+            .await.expect("physical cleanup releases the post-completion joiner's custody");
+        assert!(after_completion_dropped.load(Ordering::SeqCst));
+        assert!(initially_dropped.load(Ordering::SeqCst));
+        assert!(late_dropped.load(Ordering::SeqCst));
+        assert!(!root.path().join("owned-unmarked-profile").exists());
+        assert!(attempt.join_group().is_none(), "completed attempt cannot keep group alive");
+        let retry = manager.spawn_kill_session_by_key(
+            key, scope, None, BrowserRetirementCustody::no_op(),
+        ).await;
+        let crate::session::KillSessionOutcome::Started { handle, .. } = retry else {
+            panic!("quiescent group permits a new kill attempt");
+        };
+        assert!(handle.await.unwrap().is_ok());
+    }
 
     pub(in crate::session) struct LaunchFault {
         pub(super) opaque: bool,
@@ -916,6 +1051,203 @@ pub(super) mod tests {
         assert_eq!(stop_attempts.load(Ordering::SeqCst), 2);
         assert!(dropped.load(Ordering::SeqCst));
         assert!(!manager.is_active(&scope).await);
+    }
+
+    #[test]
+    fn joining_an_existing_kill_retains_late_custody_until_completion() {
+        let attempt = crate::session::KillAttempt::new();
+        let (custody, dropped, _) = witnessed_custody();
+        attempt.retain_until_complete(custody);
+        assert!(!dropped.load(Ordering::SeqCst));
+        assert!(attempt.complete(Ok(())));
+        assert!(dropped.load(Ordering::SeqCst));
+    }
+
+    struct LockCheckDrop {
+        attempt: Arc<crate::session::KillAttempt>,
+        manager: Arc<BrowserSessionManager>,
+        unlocked: Arc<AtomicBool>,
+    }
+
+    impl Drop for LockCheckDrop {
+        fn drop(&mut self) {
+            let registry = self.manager.state.try_read();
+            let unlocked = registry.as_ref().is_ok_and(|registry| {
+                registry.sessions.values().all(|entry| entry.current_kill.try_lock().is_ok())
+            }) && self.attempt.progress.try_lock().is_ok();
+            self.unlocked.store(unlocked, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn custody_destructors_never_run_under_kill_or_registry_locks() {
+        let manager = Arc::new(BrowserSessionManager::default());
+        let scope = scope();
+        reserve_in_manager(&manager, &scope).await;
+        let attempt = crate::session::KillAttempt::new();
+        let unlocked = Arc::new(AtomicBool::new(false));
+        let custody = BrowserRetirementCustody::new(Arc::new(LockCheckDrop {
+            attempt: attempt.clone(),
+            manager: manager.clone(),
+            unlocked: unlocked.clone(),
+        }));
+        attempt.retain_until_complete(custody);
+        assert!(attempt.complete(Ok(())));
+        assert!(unlocked.load(Ordering::SeqCst));
+
+        let unlocked = Arc::new(AtomicBool::new(false));
+        let custody = BrowserRetirementCustody::new(Arc::new(LockCheckDrop {
+            attempt: attempt.clone(),
+            manager: manager.clone(),
+            unlocked: unlocked.clone(),
+        }));
+        attempt.retain_until_complete(custody);
+        assert!(unlocked.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn dropped_kill_task_guard_settles_abnormal_exit() {
+        let attempt = crate::session::KillAttempt::new();
+        let guard = crate::session::KillTaskCompletion {
+            attempt: attempt.clone(),
+            teardown_failed: Arc::new(AtomicBool::new(false)),
+            scope: scope(),
+            audience: crate::session::BrowserSessionAudience::Scope,
+            sink: None,
+        };
+        drop(guard);
+        assert!(attempt.result().unwrap().is_err());
+        assert!(!attempt.complete(Ok(())));
+    }
+
+    #[tokio::test]
+    async fn aborted_retirement_parent_keeps_custody_in_spawned_kill_task() {
+        let (tx, mut events) = tokio::sync::mpsc::unbounded_channel();
+        let manager = BrowserSessionManager::with_lifecycle_sink(Some(tx));
+        let scope = scope();
+        let slot = reserve_in_manager(&manager, &scope).await;
+        *slot.state.write().await = LaunchState::InjectedPending(InjectedPending {
+            failures_remaining: 0,
+            stop_attempts: Arc::new(AtomicUsize::new(0)),
+            dropped: Arc::new(AtomicBool::new(false)),
+        });
+        let permit = manager.begin_retirement(&scope).await;
+        let state_guard = slot.state.write().await;
+        let (custody, dropped, changed) = witnessed_custody();
+        let parent = {
+            let manager = manager.clone();
+            tokio::spawn(async move {
+                manager.complete_retirement_with_custody(&permit, custody).await
+            })
+        };
+        let event = tokio::time::timeout(std::time::Duration::from_secs(5), events.recv())
+            .await.unwrap().unwrap();
+        assert_eq!(event.kind, BrowserSessionLifecycleKind::TeardownPending);
+        let attempt = {
+            let registry = manager.state.read().await;
+            let attempt = registry.sessions.values().next().unwrap().current_kill.lock().unwrap()
+                .as_ref().unwrap().clone();
+            attempt
+        };
+        let (late, late_dropped, late_changed) = witnessed_custody();
+        let key = session_key(
+            &scope,
+            &EffectiveResourceAccess::new("owner", ResourceAuthority::Work),
+        );
+        let joined = manager
+            .spawn_kill_session_by_key(key, scope.clone(), Some(permit.instances[0].clone()), late)
+            .await;
+        let crate::session::KillSessionOutcome::AlreadyRequested {
+            attempt: joined_attempt,
+        } = joined else {
+            panic!("late caller must join the active kill");
+        };
+        assert!(Arc::ptr_eq(&attempt, &joined_attempt));
+        let joiner = {
+            let manager = manager.clone();
+            tokio::spawn(async move { manager.wait_for_kill_completion(joined_attempt).await })
+        };
+        joiner.abort();
+        assert!(joiner.await.unwrap_err().is_cancelled());
+        parent.abort();
+        assert!(parent.await.unwrap_err().is_cancelled());
+        assert!(
+            !dropped.load(Ordering::SeqCst) && !late_dropped.load(Ordering::SeqCst),
+            "spawned kill retains both caller custodies while blocked on slot"
+        );
+        drop(state_guard);
+        tokio::time::timeout(std::time::Duration::from_secs(5), manager.wait_for_kill_completion(attempt))
+            .await.unwrap().unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), changed.notified())
+            .await.expect("kill task releases initial custody after bookkeeping");
+        tokio::time::timeout(std::time::Duration::from_secs(5), late_changed.notified())
+            .await.expect("kill task releases late custody after bookkeeping");
+        assert!(dropped.load(Ordering::SeqCst));
+        assert!(late_dropped.load(Ordering::SeqCst));
+    }
+
+    async fn assert_aborted_kill_task(before_first_poll: bool) {
+        let (tx, mut events) = tokio::sync::mpsc::unbounded_channel();
+        let manager = BrowserSessionManager::with_lifecycle_sink(Some(tx));
+        let scope = scope();
+        let slot = reserve_in_manager(&manager, &scope).await;
+        let closed = if before_first_poll {
+            None
+        } else {
+            let (closed, observed) = tokio::sync::oneshot::channel();
+            slot.scenario_owner.start(move |mut cancelled| async move {
+                if !*cancelled.borrow() {
+                    cancelled.changed().await.unwrap();
+                }
+                assert!(*cancelled.borrow());
+                let _ = closed.send(());
+            }).unwrap();
+            Some(observed)
+        };
+        *slot.state.write().await = LaunchState::InjectedPending(InjectedPending {
+            failures_remaining: 0,
+            stop_attempts: Arc::new(AtomicUsize::new(0)),
+            dropped: Arc::new(AtomicBool::new(false)),
+        });
+        let state_guard = slot.state.write().await;
+        let key = session_key(
+            &scope,
+            &EffectiveResourceAccess::new("owner", ResourceAuthority::Work),
+        );
+        let started = manager
+            .spawn_kill_session_by_key(key, scope.clone(), None, BrowserRetirementCustody::no_op())
+            .await;
+        let crate::session::KillSessionOutcome::Started { handle, attempt, .. } = started else {
+            panic!("kill must start");
+        };
+        // The pending event is synchronous; consuming it must not yield before
+        // the before-first-poll abort on the current-thread test runtime.
+        assert_eq!(events.try_recv().unwrap().kind, BrowserSessionLifecycleKind::TeardownPending);
+        if let Some(closed) = closed {
+            tokio::time::timeout(std::time::Duration::from_secs(5), closed)
+                .await.expect("kill enters stop_and_delete before abort").unwrap();
+        }
+        handle.abort();
+        assert!(handle.await.unwrap_err().is_cancelled());
+        assert!(tokio::time::timeout(std::time::Duration::from_secs(5), manager.wait_for_kill_completion(attempt))
+            .await.unwrap().is_err());
+        assert_eq!(events.recv().await.unwrap().kind, BrowserSessionLifecycleKind::TeardownFailed);
+        assert_eq!(manager.inventory_metadata(&scope).await.unwrap().state,
+            crate::session::BrowserInventoryState::TeardownFailed);
+        assert!(manager.get_session(&scope).await.is_err());
+        assert!(manager.state.read().await.sessions.values().next().unwrap()
+            .teardown_failed.load(Ordering::SeqCst));
+        drop(state_guard);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn aborted_kill_task_before_first_poll_marks_failure() {
+        assert_aborted_kill_task(true).await;
+    }
+
+    #[tokio::test]
+    async fn aborted_kill_task_while_slot_held_marks_failure() {
+        assert_aborted_kill_task(false).await;
     }
 
     #[tokio::test]
