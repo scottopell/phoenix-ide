@@ -321,6 +321,41 @@ jobs:
             expired_original_deadline_does_not_spawn_git_or_a_sentinel_effect
             bounded_child_waits_for_pipe_eof_until_deadline_after_direct_child_exits
             expired_original_fsmonitor_deadline_refuses_before_repository_access
+            worktree_effect_receives_the_original_absolute_deadline
+            expired_common_git_directory_deadline_refuses_before_repository_access
+            expired_git_directory_resolver_deadline_refuses_before_repository_access
+            expired_git_directory_capture_deadline_refuses_before_repository_access
+            expired_git_directory_verification_deadline_rejects_even_empty_bindings
+            expired_administrative_deletion_deadline_preserves_live_registration
+            expired_identity_bound_deletion_refuses_before_hook_or_tombstone_effect
+            expired_error_cleanup_preserves_reserved_tombstone
+            future_deadline_removes_exact_identity_bound_directory_without_following_symlink
+            administrative_final_tombstone_prevents_false_absence_completion
+            administrative_remover_reserves_distinct_random_private_final_roots
+            randomized_administrative_final_residues_are_preserved_by_exact_remover
+            administrative_cleanup_with_missing_parent_is_truly_absent
+            dangling_administrative_parent_is_not_proof_of_absence
+            permissive_final_tombstone_is_rejected_before_target_move
+            administrative_final_tombstone_symlink_is_not_absence_or_adopted_custody
+            administrative_quarantine_swap_before_final_move_preserves_replacement_for_needs_repair
+            restart_refuses_unresolved_administrative_final_tombstone
+            expired_macos_process_inventory_stops_before_listing
+            macos_process_inventory_failures_are_absent_evidence
+            macos_process_inventory_retries_full_buffer_and_accepts_complete_list
+            linux_writer_process_expired_deadline_precedes_missing_or_malformed_identity
+            linux_process_owner_expired_deadline_precedes_missing_or_malformed_status
+            linux_zombie_expired_deadline_precedes_missing_tasks_or_malformed_status
+            linux_writer_scan_expired_deadline_stops_without_persisting_a_gap
+            linux_writer_scan_propagates_detector_stop_without_gap_evidence
+            linux_zombie_without_executable_does_not_hide_writers_or_live_gaps
+            linux_zombie_leader_with_sibling_threads_remains_a_gap
+            linux_live_to_zombie_during_observation_is_a_gap
+            linux_descriptor_scan_classifies_access_and_retains_identity
+            linux_readonly_descriptor_position_changes_are_not_writer_gaps
+            linux_descriptor_scan_retains_inventory_and_descriptor_gaps
+            linux_cwd_scan_proves_namespace_authority_and_fails_closed_on_gaps
+            linux_mapping_scan_requires_writable_shared_authority
+            linux_pid_reuse_during_observation_retains_gap
             expired_hidden_worktree_deadline_refuses_before_repository_access
             expired_ignored_content_deadline_refuses_before_repository_access
             expired_dirty_content_deadline_refuses_before_repository_access
