@@ -104,6 +104,15 @@ runSurfaceCapture({
         const stem = `${id}--${viewport.name}--collapsed`;
         await page.screenshot({ path: path.join(outDir, `${stem}.png`), fullPage: false });
         await writeFile(path.join(outDir, `${stem}.json`), JSON.stringify({ id, viewport, journey: ['initial collapsed disclosure'], geometry: collapsed }, null, 2));
+        await page.locator('#input-area textarea').first().focus();
+        await page.locator('.product-conversation-page__transcript').evaluate((node) => { node.scrollTop = Math.max(0, (node.scrollHeight - node.clientHeight) / 2); });
+        const collapsedBeforeRefresh = await page.evaluate(() => ({
+          composerFocused: document.activeElement === document.querySelector('#input-area textarea'),
+          composer: document.querySelector('#input-area')?.getBoundingClientRect().toJSON(),
+          scrollTop: document.querySelector('.product-conversation-page__transcript')?.scrollTop,
+          panel: document.querySelector('.reminders-panel')?.getBoundingClientRect().toJSON(),
+        }));
+        assert.equal(collapsedBeforeRefresh.composerFocused, true, 'composer focus control is active before collapsed refresh');
         const collapsedRequestCount = Number(await page.locator('html').getAttribute('data-product-conversation-fixture-reminder-requests'));
         await page.evaluate(() => window.dispatchEvent(new Event('focus')));
         await page.waitForFunction((count) => Number(document.documentElement.dataset['productConversationFixtureReminderRequests']) > count, collapsedRequestCount);
@@ -111,6 +120,14 @@ runSurfaceCapture({
         await page.evaluate(() => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))));
         assert.equal(await toggle.getAttribute('aria-expanded'), 'false', 'background refresh preserves initial collapsed state');
         assert.equal(await page.locator('.reminder-card').count(), 0, 'background refresh keeps details hidden while collapsed');
+        const collapsedAfterRefresh = await page.evaluate(() => ({
+          composerFocused: document.activeElement === document.querySelector('#input-area textarea'),
+          composer: document.querySelector('#input-area')?.getBoundingClientRect().toJSON(),
+          scrollTop: document.querySelector('.product-conversation-page__transcript')?.scrollTop,
+          panel: document.querySelector('.reminders-panel')?.getBoundingClientRect().toJSON(),
+        }));
+        assert.deepEqual(collapsedAfterRefresh, collapsedBeforeRefresh, 'collapsed refresh preserves composer focus, panel/composer geometry and reading position');
+        await writeFile(path.join(outDir, `${stem}.json`), JSON.stringify({ id, viewport, geometry: collapsed, refresh: { before: collapsedBeforeRefresh, after: collapsedAfterRefresh } }, null, 2));
         await toggle.press('Enter');
         assert.equal(await toggle.getAttribute('aria-expanded'), 'true');
         assert.equal(await page.locator('.reminder-card p').textContent(), expectedText, 'expanded disclosure renders exact full long text');
@@ -128,7 +145,7 @@ runSurfaceCapture({
           requests: Number(document.documentElement.dataset['productConversationFixtureReminderRequests']),
           transcript: (() => { const n = document.querySelector('.product-conversation-page__transcript'); const r = n?.getBoundingClientRect(); return { scrollTop: n?.scrollTop, x: r?.x, y: r?.y, width: r?.width, height: r?.height }; })(),
           composer: (() => { const r = document.querySelector('#input-area')?.getBoundingClientRect(); return r ? { x: r.x, y: r.y, width: r.width, height: r.height } : null; })(),
-          active: document.activeElement?.tagName,
+          composerFocused: document.activeElement === document.querySelector('#input-area textarea'),
         }));
         await page.evaluate(() => window.dispatchEvent(new Event('focus')));
         await page.waitForFunction((count) => Number(document.documentElement.dataset['productConversationFixtureReminderRequests']) > count, before.requests);
@@ -138,11 +155,12 @@ runSurfaceCapture({
           requests: Number(document.documentElement.dataset['productConversationFixtureReminderRequests']),
           transcript: (() => { const n = document.querySelector('.product-conversation-page__transcript'); const r = n?.getBoundingClientRect(); return { scrollTop: n?.scrollTop, x: r?.x, y: r?.y, width: r?.width, height: r?.height }; })(),
           composer: (() => { const r = document.querySelector('#input-area')?.getBoundingClientRect(); return r ? { x: r.x, y: r.y, width: r.width, height: r.height } : null; })(),
-          active: document.activeElement?.tagName,
+          composerFocused: document.activeElement === document.querySelector('#input-area textarea'),
           expanded: document.querySelector('.reminders-panel button[aria-expanded]')?.getAttribute('aria-expanded'),
         }));
         assert.equal(after.expanded, 'true', 'background refresh preserves expanded disclosure');
-        assert.equal(after.active, before.active, 'background refresh preserves composer focus');
+        assert.equal(before.composerFocused, true, 'composer focus control is active before expanded refresh');
+        assert.equal(after.composerFocused, true, 'background refresh preserves exact composer focus');
         assert.equal(after.transcript.scrollTop, before.transcript.scrollTop, 'background refresh preserves transcript scroll');
         assert.deepEqual(after.transcript, before.transcript, 'background refresh preserves transcript geometry');
         assert.deepEqual(after.composer, before.composer, 'background refresh preserves composer geometry');
