@@ -202,7 +202,7 @@ runSurfaceCapture({
       await page.getByRole('alert').filter({ hasText: 'This reminder changed. Review its current time before trying again.' }).scrollIntoViewIfNeeded();
       await page.screenshot({ path: path.join(outDir, `${id}--${viewport.name}--mutation-conflict.png`), fullPage: false });
       await page.getByRole('button', { name: 'Cancel reminder' }).click();
-      await page.getByText('Cancelled').waitFor({ state: 'visible' });
+      await page.locator('.reminder-card__state').filter({ hasText: /^Cancelled$/ }).waitFor({ state: 'visible' });
       await page.waitForFunction(() => document.documentElement.dataset['productConversationFixtureReminderServedRevision'] === '6');
       const retriedMutation = await page.evaluate(() => ({
         revision: Number(document.documentElement.dataset['productConversationFixtureLastReminderRevision']),
