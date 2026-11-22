@@ -1497,6 +1497,19 @@ impl BrowserSessionInstanceIdentity {
 type BrowserRetirementSession = (String, Arc<LaunchSlot>, String, BrowserSessionAudience);
 type BrowserActorRetirementSession = (Arc<LaunchSlot>, String, BrowserSessionAudience);
 
+// Private capture is the authority seal. Public permit fields are reporting
+// projections only; changing them must never redirect cleanup or rollback.
+#[derive(Debug, PartialEq, Eq)]
+struct BrowserRetirementOriginalIdentity {
+    issuer: uuid::Uuid,
+    work_scope: ResourceScopeKey,
+    actor_session_key: Option<String>,
+    instances: Vec<BrowserSessionInstanceIdentity>,
+    generation: BrowserRetirementGeneration,
+    had_entries: bool,
+}
+
+#[must_use = "retirement remains fenced until exact completion or explicit rollback"]
 #[derive(Debug, PartialEq, Eq)]
 pub struct BrowserRetirementPermit {
     pub work_scope: ResourceScopeKey,
@@ -1504,6 +1517,17 @@ pub struct BrowserRetirementPermit {
     pub instances: Vec<BrowserSessionInstanceIdentity>,
     generation: BrowserRetirementGeneration,
     had_entries: bool,
+    original: BrowserRetirementOriginalIdentity,
+}
+
+impl BrowserRetirementPermit {
+    fn projections_match_original(&self) -> bool {
+        self.work_scope == self.original.work_scope
+            && self.actor_session_key == self.original.actor_session_key
+            && self.instances == self.original.instances
+            && self.generation == self.original.generation
+            && self.had_entries == self.original.had_entries
+    }
 }
 
 impl BrowserRetirementPermit {
@@ -1757,6 +1781,7 @@ pub struct BrowserSessionManager {
     /// fences in the same lock so exact retirement can close admission without a
     /// check-then-insert race.
     state: Arc<RwLock<BrowserSessionRegistryState>>,
+    retirement_issuer: uuid::Uuid,
     /// Optional lifecycle event sink. Populated by [`RuntimeManager::new`]
     /// so session create/destroy edges flow into per-conversation SSE
     /// streams. Stays `None` for tool-level tests.
@@ -1814,6 +1839,7 @@ impl BrowserSessionManager {
     ) -> Arc<Self> {
         let manager = Arc::new(Self {
             state: Arc::new(RwLock::new(BrowserSessionRegistryState::default())),
+            retirement_issuer: uuid::Uuid::new_v4(),
             lifecycle_sink: sink,
             scope_liveness_hook: std::sync::OnceLock::new(),
             shutting_down: AtomicBool::new(false),
@@ -2080,10 +2106,21 @@ impl BrowserSessionManager {
     }
 
     fn permit_fence_key(permit: &BrowserRetirementPermit) -> BrowserRetirementFenceKey {
-        permit.actor_session_key.as_ref().map_or_else(
-            || BrowserRetirementFenceKey::Scope(permit.work_scope.clone()),
+        permit.original.actor_session_key.as_ref().map_or_else(
+            || BrowserRetirementFenceKey::Scope(permit.original.work_scope.clone()),
             |key| BrowserRetirementFenceKey::Session(key.clone()),
         )
+    }
+
+    fn permit_is_authentic(&self, permit: &BrowserRetirementPermit) -> bool {
+        self.retirement_issuer == permit.original.issuer
+            && permit.projections_match_original()
+    }
+
+    fn invalid_permit_outcome() -> BrowserRetirementOutcome {
+        BrowserRetirementOutcome::Residual {
+            reason: "browser retirement permit issuer or identity projection is invalid".to_string(),
+        }
     }
 
     fn current_entry_matches_identity(
@@ -2589,12 +2626,21 @@ impl BrowserSessionManager {
                 user_data_key,
             });
         }
+        let had_entries = !instances.is_empty();
         BrowserRetirementPermit {
             work_scope: work_scope.clone(),
             actor_session_key: None,
-            had_entries: !instances.is_empty(),
-            instances,
+            instances: instances.clone(),
             generation,
+            had_entries,
+            original: BrowserRetirementOriginalIdentity {
+                issuer: self.retirement_issuer,
+                work_scope: work_scope.clone(),
+                actor_session_key: None,
+                instances,
+                generation,
+                had_entries,
+            },
         }
     }
 
@@ -2637,12 +2683,21 @@ impl BrowserSessionManager {
             }
             None => Vec::new(),
         };
+        let had_entries = !instances.is_empty();
         BrowserRetirementPermit {
             work_scope: work_scope.clone(),
-            actor_session_key: Some(actor_key),
-            had_entries: !instances.is_empty(),
-            instances,
+            actor_session_key: Some(actor_key.clone()),
+            instances: instances.clone(),
             generation,
+            had_entries,
+            original: BrowserRetirementOriginalIdentity {
+                issuer: self.retirement_issuer,
+                work_scope: work_scope.clone(),
+                actor_session_key: Some(actor_key),
+                instances,
+                generation,
+                had_entries,
+            },
         }
     }
 
@@ -2650,6 +2705,9 @@ impl BrowserSessionManager {
         &self,
         permit: &BrowserRetirementPermit,
     ) -> BrowserRetirementOutcome {
+        if !self.permit_is_authentic(permit) {
+            return Self::invalid_permit_outcome();
+        }
         let state = self.state.read().await;
         if !state
             .retirements
@@ -2854,6 +2912,9 @@ impl BrowserSessionManager {
         permit: &BrowserRetirementPermit,
         custody: BrowserRetirementCustody,
     ) -> BrowserRetirementOutcome {
+        if !self.permit_is_authentic(permit) {
+            return Self::invalid_permit_outcome();
+        }
         let matches_current_generation = {
             let state = self.state.read().await;
             state
@@ -2939,9 +3000,12 @@ impl BrowserSessionManager {
             hook.release.notified().await;
         }
         let mut state = self.state.write().await;
+        if !self.permit_is_authentic(&permit) {
+            return;
+        }
         let key = Self::permit_fence_key(&permit);
         if state.retirements.get(&key).is_some_and(|retirement| {
-            retirement.fenced && retirement.generation == permit.generation.get()
+            retirement.fenced && retirement.generation == permit.original.generation.get()
         }) {
             Self::reopen_retirement(&mut state, &key);
         }
@@ -3329,6 +3393,7 @@ impl Default for BrowserSessionManager {
     fn default() -> Self {
         Self {
             state: Arc::new(RwLock::new(BrowserSessionRegistryState::default())),
+            retirement_issuer: uuid::Uuid::new_v4(),
             lifecycle_sink: None,
             scope_liveness_hook: std::sync::OnceLock::new(),
             shutting_down: AtomicBool::new(false),
@@ -3684,6 +3749,71 @@ mod lifecycle_hook_tests {
 
         assert_eq!(scope_permit.work_scope, scope);
         assert_eq!(actor_permit.work_scope, scope);
+    }
+
+    #[tokio::test]
+    async fn retirement_permit_from_matching_foreign_fence_has_no_authority() {
+        let issuer = Arc::new(BrowserSessionManager::default());
+        let foreign = Arc::new(BrowserSessionManager::default());
+        let scope = scope("browser-foreign-retirement-permit");
+        let permit = issuer.begin_retirement(&scope).await;
+        let _matching_foreign_fence = foreign.begin_retirement(&scope).await;
+
+        assert_eq!(permit.generation().get(), 1);
+        assert_eq!(permit.generation(), _matching_foreign_fence.generation());
+        assert_ne!(permit, _matching_foreign_fence);
+        assert_eq!(
+            foreign.verify_exact_absence(&permit).await,
+            BrowserSessionManager::invalid_permit_outcome()
+        );
+        assert_eq!(
+            foreign.complete_retirement(&permit).await,
+            super::BrowserRetirementOutcome::Residual {
+                reason: "browser retirement permit issuer or identity projection is invalid".to_string()
+            }
+        );
+        foreign.reopen_after_permit(permit).await;
+        assert!(issuer.is_retirement_fenced(&scope).await);
+        assert!(foreign.is_retirement_fenced(&scope).await);
+    }
+
+    #[tokio::test]
+    async fn mutated_retirement_projection_cannot_redirect_completion_or_reopen() {
+        let manager = Arc::new(BrowserSessionManager::default());
+        let original_scope = scope("browser-original-retirement-projection");
+        let redirected_scope = scope("browser-redirected-retirement-projection");
+        let mut permit = manager.begin_retirement(&original_scope).await;
+        let _redirected_fence = manager.begin_retirement(&redirected_scope).await;
+        permit.work_scope = redirected_scope.clone();
+
+        assert_eq!(
+            manager.complete_retirement(&permit).await,
+            super::BrowserRetirementOutcome::Residual {
+                reason: "browser retirement permit issuer or identity projection is invalid".to_string()
+            }
+        );
+        manager.reopen_after_permit(permit).await;
+        assert!(manager.is_retirement_fenced(&original_scope).await);
+        assert!(manager.is_retirement_fenced(&redirected_scope).await);
+    }
+
+    #[tokio::test]
+    async fn stale_retirement_generation_spoof_cannot_complete_or_reopen_newer_fence() {
+        let manager = Arc::new(BrowserSessionManager::default());
+        let scope = scope("browser-spoofed-retirement-generation");
+        let mut stale = manager.begin_retirement(&scope).await;
+        let current = manager.begin_retirement(&scope).await;
+        assert_ne!(stale.generation, current.generation);
+        stale.generation = current.generation;
+
+        assert_eq!(
+            manager.complete_retirement(&stale).await,
+            super::BrowserRetirementOutcome::Residual {
+                reason: "browser retirement permit issuer or identity projection is invalid".to_string()
+            }
+        );
+        manager.reopen_after_permit(stale).await;
+        assert!(manager.is_retirement_fenced(&scope).await);
     }
 
     #[tokio::test]

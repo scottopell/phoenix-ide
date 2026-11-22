@@ -13785,7 +13785,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("before-observe.db");
         let db = Database::open(path.to_str().unwrap()).await.unwrap();
-        crate::migrations::run_through_for_test(db.pool(), 159)
+        crate::migrations::run_through_for_test(db.pool(), 172)
             .await
             .unwrap();
         let failure =

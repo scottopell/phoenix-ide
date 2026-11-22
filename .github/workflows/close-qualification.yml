@@ -64,14 +64,17 @@ jobs:
           set -euo pipefail
           cargo test -p phoenix-db --lib --no-run 2>&1 | tee evidence/compile.log
           cargo test -p phoenix-db --lib -- --list 2>&1 | tee evidence/inventory.log
-          grep -E '^close_foundation::tests::.*: test$|^migrations::close_completion_allowance_tests::migration_159_.*: test$|^native_close::.*: test$' evidence/inventory.log > evidence/selected-tests.txt
+          grep -E '^close_foundation::tests::.*: test$|^migrations::close_completion_allowance_tests::migration_172_.*: test$|^migrations::tests::migration_(180|181)_.*: test$|^native_close::.*: test$' evidence/inventory.log > evidence/selected-tests.txt
           test -s evidence/selected-tests.txt
           grep -F 'stopped_original_retirement_proof_rejects_missing_and_excluded_provenance: test' evidence/selected-tests.txt
           grep -F 'dispatched_absence_retry_resumes_retirement_with_retained_snapshot: test' evidence/selected-tests.txt
           grep -F 'ordinary_and_replay_stop_fence_native_retry_and_suppress_existing_allowance: test' evidence/selected-tests.txt
           grep -F 'rejected_source_state_write_rolls_back_native_fence: test' evidence/selected-tests.txt
           grep -F 'startup_and_observer_interrupt_native_retry_from_original_pending_plan_preserving_allowance: test' evidence/selected-tests.txt
-          grep -F 'migration_159_excludes_legacy_sealed_inventory_and_preserves_shared_g2_capture: test' evidence/selected-tests.txt
+          grep -F 'migration_172_excludes_legacy_sealed_inventory_and_preserves_shared_g2_capture: test' evidence/selected-tests.txt
+          grep -Fx 'close_foundation::tests::native_retry::migration_179_populated_upgrade_preserves_retry_and_adds_initial_source_authority: test' evidence/selected-tests.txt
+          grep -F 'migration_180_upgrades_authentic_179_initial_source_fence_schema: test' evidence/selected-tests.txt
+          grep -F 'migration_181_adds_unbackfilled_initial_completion_successor_authority: test' evidence/selected-tests.txt
           grep -F 'native_retry_success_requires_exact_live_receipt_effect_and_evidence_before_replay: test' evidence/selected-tests.txt
           grep -F 'native_retry_finalizes_exact_g1_successes_without_rebinding_current_g2: test' evidence/selected-tests.txt
           grep -F 'retry_interruption_uses_pending_effect_not_successful_prior_resource: test' evidence/selected-tests.txt
@@ -83,10 +86,10 @@ jobs:
             grep -F "close_foundation::tests::native_retry::$test: test" evidence/selected-tests.txt
           done
           for test in \
-            migration_163_upgrades_populated_162_without_rebinding_g1_or_g2 \
-            migration_163_g1_failure_guards_preserve_g2_and_exact_pending_children \
-            migration_163_upgrade_preserves_installed_source_fence_behavior \
-            migration_163_unknown_installed_prefix_rolls_back_both_trigger_rewrites; do
+            migration_176_upgrades_populated_162_without_rebinding_g1_or_g2 \
+            migration_176_g1_failure_guards_preserve_g2_and_exact_pending_children \
+            migration_176_upgrade_preserves_installed_source_fence_behavior \
+            migration_176_unknown_installed_prefix_rolls_back_both_trigger_rewrites; do
             grep -F "close_foundation::tests::native_retry::$test: test" evidence/selected-tests.txt
           done
           for test in \
@@ -117,14 +120,14 @@ jobs:
             native_retry_dispatch_replays_historical_g1_without_retimestamping \
             native_retry_raw_dispatch_rejects_backdated_new_row \
             native_retry_raw_dispatch_rejects_g2_and_malformed_plan_without_legacy_fallthrough \
-            migration_164_preserves_populated_163_rows_and_rewrites_only_dispatch_authority \
+            migration_177_preserves_populated_163_rows_and_rewrites_only_dispatch_authority \
             non_native_retry_dispatch_retains_legacy_current_snapshot_authority; do
             grep -F "close_foundation::tests::native_retry::$test: test" evidence/selected-tests.txt
           done
           for test in \
             native_retry_worktree_metadata_is_source_bound_to_pending_original_g1_effect \
-            migration_165_unknown_second_authority_prefix_rolls_back_first_rewrite_and_ledger \
-            migration_165_refuses_native_g2_legacy_metadata_authority; do
+            migration_178_unknown_second_authority_prefix_rolls_back_first_rewrite_and_ledger \
+            migration_178_refuses_native_g2_legacy_metadata_authority; do
             grep -F "close_foundation::tests::native_retry::$test: test" evidence/selected-tests.txt
           done
           for test in \
@@ -154,27 +157,34 @@ jobs:
             exact_initial_process_entry_releases_writer_before_retained_cleanup_finishes; do
             grep -F "close_foundation::tests::native_retry::$test: test" evidence/selected-tests.txt
           done
-      - name: Execute migration163 populated upgrade and authority regressions
+      - name: Execute migration176 populated upgrade and authority regressions
         if: success()
         shell: bash
         run: |
           set -euo pipefail
-          cargo test -p phoenix-db --lib close_foundation::tests::native_retry::migration_163_ -- --nocapture --test-threads=1 2>&1 | tee evidence/migration163.log
-          grep -E 'test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored;' evidence/migration163.log
-      - name: Execute provisional initial-interruption migration upgrade
+          cargo test -p phoenix-db --lib close_foundation::tests::native_retry::migration_176_ -- --nocapture --test-threads=1 2>&1 | tee evidence/migration176.log
+          grep -E 'test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored;' evidence/migration176.log
+      - name: Execute native source-fence migration upgrade
+        if: success() || failure()
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p phoenix-db --lib close_foundation::tests::native_retry::migration_179_populated_upgrade_preserves_retry_and_adds_initial_source_authority -- --exact --nocapture --test-threads=1 2>&1 | tee evidence/migration179.log
+          grep -E 'test result: ok\. 1 passed; 0 failed; 0 ignored;' evidence/migration179.log
+      - name: Execute initial-interruption migration upgrade
         if: success()
         shell: bash
         run: |
           set -euo pipefail
-          cargo test -p phoenix-db --lib migrations::tests::migration_167_upgrades_authentic_166_initial_source_fence_schema -- --exact --nocapture --test-threads=1 2>&1 | tee evidence/migration167.log
-          grep -E 'test result: ok\. 1 passed; 0 failed; 0 ignored;' evidence/migration167.log
+          cargo test -p phoenix-db --lib migrations::tests::migration_180_upgrades_authentic_179_initial_source_fence_schema -- --exact --nocapture --test-threads=1 2>&1 | tee evidence/migration180.log
+          grep -E 'test result: ok\. 1 passed; 0 failed; 0 ignored;' evidence/migration180.log
       - name: Execute initial completion retry-admission migration upgrade
         if: success()
         shell: bash
         run: |
           set -euo pipefail
-          cargo test -p phoenix-db --lib migrations::tests::migration_168_adds_unbackfilled_initial_completion_successor_authority -- --exact --nocapture --test-threads=1 2>&1 | tee evidence/migration168.log
-          grep -E 'test result: ok\. 1 passed; 0 failed; 0 ignored;' evidence/migration168.log
+          cargo test -p phoenix-db --lib migrations::tests::migration_181_adds_unbackfilled_initial_completion_successor_authority -- --exact --nocapture --test-threads=1 2>&1 | tee evidence/migration181.log
+          grep -E 'test result: ok\. 1 passed; 0 failed; 0 ignored;' evidence/migration181.log
       - name: Execute complete Close foundation module
         if: success()
         shell: bash
@@ -194,13 +204,13 @@ jobs:
             exact_initial_process_entry_releases_writer_before_retained_cleanup_finishes; do
             grep -F "test close_foundation::tests::native_retry::$test ... ok" evidence/close-foundation.log
           done
-      - name: Execute migration159 regression module selectors
+      - name: Execute migration172 regression module selectors
         if: success() || failure()
         shell: bash
         run: |
           set -euo pipefail
-          cargo test -p phoenix-db --lib migrations::close_completion_allowance_tests::migration_159_ -- --nocapture --test-threads=1 2>&1 | tee evidence/migration159.log
-          grep -E 'test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored;' evidence/migration159.log
+          cargo test -p phoenix-db --lib migrations::close_completion_allowance_tests::migration_172_ -- --nocapture --test-threads=1 2>&1 | tee evidence/migration172.log
+          grep -E 'test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored;' evidence/migration172.log
       - name: Execute native Close DB request and observation tests
         if: success() || failure()
         shell: bash
@@ -208,7 +218,15 @@ jobs:
           set -euo pipefail
           cargo test -p phoenix-db --lib native_close:: -- --nocapture --test-threads=1 2>&1 | tee evidence/native-close-db.log
           grep -E 'test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored;' evidence/native-close-db.log
+      - name: Execute complete migrations regression module
+        if: success() || failure()
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p phoenix-db --lib migrations:: -- --nocapture --test-threads=1 2>&1 | tee evidence/migrations-full.log
+          grep -E 'test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored;' evidence/migrations-full.log
       - name: Qualify migration-tail regression modules
+        if: success() || failure()
         shell: bash
         run: |
           set -euo pipefail
@@ -217,6 +235,7 @@ jobs:
             cargo test -p phoenix-db --lib "$module" -- --nocapture --test-threads=1 2>&1 | tee "evidence/$name.log"
             grep -Eq 'test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored;' "evidence/$name.log"
           done
+          grep -Fx 'test lineage::tests::goal_tools_tests::canonical_goal_tools_prefixes_upgrade_reopen_and_remain_idempotent ... ok' evidence/lineage-tests-goal_tools_tests-.log
       - name: Qualify shared WorkScope lifecycle regression boundaries
         if: success()
         shell: bash
@@ -427,6 +446,30 @@ jobs:
             grep -Fx "test $test ... ok" evidence/browser-custody-execution.log
           done
           test "$(grep -Fc 'test result: ok. 1 passed; 0 failed; 0 ignored;' evidence/browser-custody-execution.log)" -eq "${#tests[@]}"
+      - name: Qualify browser permit issuer and immutable identity seals
+        if: success() || failure()
+        timeout-minutes: 20
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p phoenix-browser --lib session:: -- --list 2>&1 | tee evidence/browser-permit-inventory.log
+          tests=(
+            session::lifecycle_hook_tests::retirement_permit_from_matching_foreign_fence_has_no_authority
+            session::lifecycle_hook_tests::mutated_retirement_projection_cannot_redirect_completion_or_reopen
+            session::lifecycle_hook_tests::stale_retirement_generation_spoof_cannot_complete_or_reopen_newer_fence
+            session::launch_slot::tests::tampered_nonempty_permit_never_enters_teardown_or_reopens_fence
+          )
+          for test in "${tests[@]}"; do
+            grep -Fx "$test: test" evidence/browser-permit-inventory.log
+          done
+          : > evidence/browser-permit-execution.log
+          for test in "${tests[@]}"; do
+            cargo test -p phoenix-browser --lib "$test" -- --exact --nocapture --test-threads=1 2>&1 | tee -a evidence/browser-permit-execution.log
+          done
+          for test in "${tests[@]}"; do
+            grep -Fx "test $test ... ok" evidence/browser-permit-execution.log
+          done
+          test "$(grep -Fc 'test result: ok. 1 passed; 0 failed; 0 ignored;' evidence/browser-permit-execution.log)" -eq "${#tests[@]}"
       - name: Qualify native Close public adapter parsing and discovery
         if: success() || failure()
         shell: bash

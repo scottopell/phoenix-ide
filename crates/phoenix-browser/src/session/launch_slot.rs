@@ -1121,6 +1121,52 @@ pub(super) mod tests {
     }
 
     #[tokio::test]
+    async fn tampered_nonempty_permit_never_enters_teardown_or_reopens_fence() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = Arc::new(BrowserSessionManager {
+            tmp_root: temp.path().to_path_buf(),
+            ..BrowserSessionManager::default()
+        });
+        let scope = scope();
+        let slot = reserve_in_manager(&manager, &scope).await;
+        tokio::fs::create_dir_all(&slot.profile).await.unwrap();
+        let sentinel = slot.profile.join("untouched");
+        tokio::fs::write(&sentinel, b"original").await.unwrap();
+        *slot.state.write().await = LaunchState::PreSpawnFailed("never launched".into());
+
+        for mutation in 0..4 {
+            let mut permit = manager.begin_retirement(&scope).await;
+            assert_eq!(permit.instances.len(), 1);
+            match mutation {
+                0 => permit.actor_session_key = Some("another-actor".into()),
+                1 => permit.instances.clear(),
+                2 => permit.instances[0].session_key = "another-session".into(),
+                3 => permit.had_entries = false,
+                _ => unreachable!(),
+            }
+            assert!(matches!(
+                manager.verify_exact_absence(&permit).await,
+                BrowserRetirementOutcome::Residual { .. }
+            ));
+            assert!(matches!(
+                manager.complete_retirement(&permit).await,
+                BrowserRetirementOutcome::Residual { .. }
+            ));
+            manager.reopen_after_permit(permit).await;
+            assert!(manager.is_retirement_fenced(&scope).await);
+            let registry = manager.state.read().await;
+            assert_eq!(registry.sessions.len(), 1);
+            let entry = registry.sessions.values().next().unwrap();
+            assert!(Arc::ptr_eq(&entry.session, &slot));
+            assert!(entry.current_kill.lock().unwrap().is_none());
+            assert!(!entry.teardown_failed.load(Ordering::SeqCst));
+            drop(registry);
+            assert!(matches!(*slot.state.read().await, LaunchState::PreSpawnFailed(_)));
+            assert_eq!(tokio::fs::read(&sentinel).await.unwrap(), b"original");
+        }
+    }
+
+    #[tokio::test]
     async fn aborted_retirement_parent_keeps_custody_in_spawned_kill_task() {
         let (tx, mut events) = tokio::sync::mpsc::unbounded_channel();
         let manager = BrowserSessionManager::with_lifecycle_sink(Some(tx));
@@ -1132,6 +1178,7 @@ pub(super) mod tests {
             dropped: Arc::new(AtomicBool::new(false)),
         });
         let permit = manager.begin_retirement(&scope).await;
+        let expected = permit.instances[0].clone();
         let state_guard = slot.state.write().await;
         let (custody, dropped, changed) = witnessed_custody();
         let parent = {
@@ -1155,7 +1202,7 @@ pub(super) mod tests {
             &EffectiveResourceAccess::new("owner", ResourceAuthority::Work),
         );
         let joined = manager
-            .spawn_kill_session_by_key(key, scope.clone(), Some(permit.instances[0].clone()), late)
+            .spawn_kill_session_by_key(key, scope.clone(), Some(expected), late)
             .await;
         let crate::session::KillSessionOutcome::AlreadyRequested {
             attempt: joined_attempt,

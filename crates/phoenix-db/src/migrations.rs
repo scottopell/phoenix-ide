@@ -11,6 +11,7 @@ use phoenix_core::work_scope::WorkScopeId;
 
 use super::{DbError, DbResult, ProjectSeedId};
 
+mod federated_conversation_actions;
 mod federated_subscriptions;
 mod goal_execution;
 mod local_goal_watch;
@@ -817,66 +818,126 @@ const MIGRATIONS: &[Migration] = &[
     },
     Migration {
         version: 156,
+        name: "remote_coordinator_goals",
+        sql: include_str!("migrations/remote_coordinator_goals.sql"),
+    },
+    Migration {
+        version: 158,
+        name: "federated_conversation_actions",
+        sql: "-- Native conversation action source qualification (special migration runner).",
+    },
+    Migration {
+        version: 159,
+        name: "federated_continuation_receipts",
+        sql: include_str!("migrations/federated_continuation_receipts.sql"),
+    },
+    Migration {
+        version: 160,
+        name: "slack_trigger_emojis",
+        sql: include_str!("migrations/slack_trigger_emojis.sql"),
+    },
+    Migration {
+        version: 161,
+        name: "slack_single_trigger_emoji",
+        sql: include_str!("migrations/slack_single_trigger_emoji.sql"),
+    },
+    Migration {
+        version: 162,
+        name: "slack_saved_capture",
+        sql: include_str!("migrations/slack_saved_capture.sql"),
+    },
+    Migration {
+        version: 163,
+        name: "product_conversation_read_state",
+        sql: include_str!("migrations/product_conversation_read_state.sql"),
+    },
+    Migration {
+        version: 164,
+        name: "coordinator_durable_tracking",
+        sql: include_str!("coordinator_tracking/schema.sql"),
+    },
+    Migration {
+        version: 165,
+        name: "watch_ending_evidence",
+        sql: include_str!("migrations/watch_ending_evidence.sql"),
+    },
+    Migration {
+        version: 166,
+        name: "coordinator_transcript_scanner",
+        sql: include_str!("coordinator_scanner/schema.sql"),
+    },
+    Migration {
+        version: 167,
+        name: "slack_channel_submissions",
+        sql: include_str!("migrations/slack_channel_submissions.sql"),
+    },
+    Migration {
+        version: 168,
+        name: "coordinator_user_questions",
+        sql: include_str!("migrations/coordinator_user_questions.sql"),
+    },
+    Migration {
+        version: 169,
         name: "native_task_approval_receipts",
         sql: include_str!("migrations/native_task_approval_receipts.sql"),
     },
     Migration {
-        version: 157,
+        version: 170,
         name: "close_completion_allowances_and_native_retry_fence",
         sql: MIGRATION_157,
     },
     Migration {
-        version: 158,
+        version: 171,
         name: "native_close_initial_receipts",
         sql: MIGRATION_158,
     },
     Migration {
-        version: 159,
+        version: 172,
         name: "close_original_retirement_anchors",
         sql: include_str!("migrations/close_original_retirement_anchor.sql"),
     },
     Migration {
-        version: 160,
+        version: 173,
         name: "native_close_exact_observation_receipts",
         sql: include_str!("migrations/native_close_exact_observation_receipts.sql"),
     },
     Migration {
-        version: 161,
+        version: 174,
         name: "native_close_explicit_retry_admission",
         sql: include_str!("migrations/native_close_explicit_retry_admission.sql"),
     },
     Migration {
-        version: 162,
+        version: 175,
         name: "native_close_source_fence",
         sql: include_str!("migrations/native_close_source_fence.sql"),
     },
     Migration {
-        version: 163,
+        version: 176,
         name: "native_close_retry_failure",
         sql: include_str!("migrations/native_close_retry_failure.sql"),
     },
     Migration {
-        version: 164,
+        version: 177,
         name: "native_close_retry_dispatch",
         sql: include_str!("migrations/native_close_retry_dispatch.sql"),
     },
     Migration {
-        version: 165,
+        version: 178,
         name: "native_close_retry_worktree_metadata",
         sql: include_str!("migrations/native_close_retry_worktree_metadata.sql"),
     },
     Migration {
-        version: 166,
+        version: 179,
         name: "native_initial_source_fence",
         sql: include_str!("migrations/native_initial_source_fence.sql"),
     },
     Migration {
-        version: 167,
+        version: 180,
         name: "native_initial_completed_interruption",
         sql: include_str!("migrations/native_initial_completed_interruption.sql"),
     },
     Migration {
-        version: 168,
+        version: 181,
         name: "native_initial_completion_retry_admission",
         sql: include_str!("migrations/native_initial_completion_retry_admission.sql"),
     },
@@ -12230,6 +12291,7 @@ async fn migration_080_prepare(tx: &mut Transaction<'_, Sqlite>) -> DbResult<boo
 }
 
 mod coordinator_home;
+mod slack_saved_capture;
 
 struct WritableSchemaGuard {
     connection: Option<sqlx::pool::PoolConnection<Sqlite>>,
@@ -12507,6 +12569,75 @@ pub(crate) async fn run_unpublished_tools_d3_for_test(pool: &SqlitePool) -> DbRe
     run_migration_list(pool, &unpublished).await
 }
 
+struct ForeignKeysDisabledConnection {
+    connection: sqlx::pool::PoolConnection<Sqlite>,
+    armed: bool,
+}
+
+impl Drop for ForeignKeysDisabledConnection {
+    fn drop(&mut self) {
+        if self.armed {
+            self.connection.close_on_drop();
+        }
+    }
+}
+
+async fn run_migration_156(pool: &SqlitePool, migration: &Migration) -> DbResult<()> {
+    let mut guard = ForeignKeysDisabledConnection {
+        connection: pool.acquire().await?,
+        armed: true,
+    };
+    sqlx::query("PRAGMA foreign_keys = OFF")
+        .execute(&mut *guard.connection)
+        .await?;
+    let result = async {
+        let mut tx = guard.connection.begin_with("BEGIN IMMEDIATE").await?;
+        let result: DbResult<()> = async {
+            sqlx::raw_sql(migration.sql).execute(&mut *tx).await?;
+            let violation = sqlx::query(
+                "SELECT 1 FROM pragma_foreign_key_check WHERE \"table\" IN (
+                'conversation_goal_actors','conversation_goal_preparations',
+                'conversation_goal_coordinator_receipts','conversation_goal_history') LIMIT 1",
+            )
+            .fetch_optional(&mut *tx)
+            .await?;
+            if violation.is_some() {
+                return Err(DbError::Serialization(
+                    "migration 156 left invalid goal foreign keys".to_string(),
+                ));
+            }
+            sqlx::query("INSERT INTO _migrations (version, name) VALUES (?, ?)")
+                .bind(migration.version)
+                .bind(migration.name)
+                .execute(&mut *tx)
+                .await?;
+            Ok(())
+        }
+        .await;
+        match result {
+            Ok(()) => tx.commit().await.map_err(DbError::from),
+            Err(error) => {
+                tx.rollback().await?;
+                Err(error)
+            }
+        }
+    }
+    .await;
+    sqlx::query("PRAGMA foreign_keys = ON")
+        .execute(&mut *guard.connection)
+        .await?;
+    let enabled: i64 = sqlx::query_scalar("PRAGMA foreign_keys")
+        .fetch_one(&mut *guard.connection)
+        .await?;
+    if enabled != 1 {
+        return Err(DbError::Serialization(
+            "migration 156 could not restore foreign keys".to_string(),
+        ));
+    }
+    guard.armed = false;
+    result
+}
+
 #[cfg(test)]
 pub(crate) async fn run_through_for_test(pool: &SqlitePool, version: u32) -> DbResult<u32> {
     let end = MIGRATIONS.partition_point(|migration| migration.version <= version);
@@ -12514,9 +12645,9 @@ pub(crate) async fn run_through_for_test(pool: &SqlitePool, version: u32) -> DbR
 }
 
 #[cfg(test)]
-pub(crate) async fn setup_real_162_for_test(pool: &SqlitePool) {
-    tests::setup_real_pre_159_schema(pool).await;
-    run_through_for_test(pool, 162).await.unwrap();
+pub(crate) async fn setup_real_175_for_test(pool: &SqlitePool) {
+    tests::setup_real_pre_172_schema(pool).await;
+    run_through_for_test(pool, 175).await.unwrap();
 }
 
 /// Run all pending migrations against the database.
@@ -12595,45 +12726,63 @@ async fn run_migration_list(pool: &SqlitePool, migrations: &[Migration]) -> DbRe
             continue;
         }
 
-        if migration.version == 164 {
+        if migration.version == 177 {
             native_close_retry_dispatch::run(pool, migration).await?;
             applied += 1;
             continue;
         }
-        if migration.version == 165 {
+        if migration.version == 178 {
             native_close_retry_worktree_metadata::run(pool, migration).await?;
             applied += 1;
             continue;
         }
 
-        if migration.version == 163 {
+        if migration.version == 176 {
             native_close_retry_failure::run(pool, migration).await?;
             applied += 1;
             continue;
         }
 
-        if migration.version == 167 {
+        if migration.version == 180 {
             native_initial_completed_interruption::run(pool, migration).await?;
             applied += 1;
             tracing::info!(version = migration.version, "Migration complete");
             continue;
         }
 
-        if migration.version == 168 {
+        if migration.version == 181 {
             native_initial_completion_retry_admission::run(pool, migration).await?;
             applied += 1;
             tracing::info!(version = migration.version, "Migration complete");
             continue;
         }
 
-        if migration.version == 166 {
+        if migration.version == 179 {
             native_initial_source_fence::run(pool, migration).await?;
             applied += 1;
             continue;
         }
 
-        if migration.version == 162 {
+        if migration.version == 175 {
             native_close_source_fence::run(pool, migration).await?;
+            applied += 1;
+            continue;
+        }
+
+        if migration.version == 156 {
+            run_migration_156(pool, migration).await?;
+            applied += 1;
+            continue;
+        }
+
+        if migration.version == 158 {
+            federated_conversation_actions::run(pool, migration).await?;
+            applied += 1;
+            continue;
+        }
+
+        if migration.version == 162 {
+            slack_saved_capture::run(pool, migration).await?;
             applied += 1;
             continue;
         }
@@ -15990,7 +16139,7 @@ mod tests {
             .unwrap()
             .is_empty());
         assert_eq!(run_through_for_test(db.pool(), 152).await.unwrap(), 1);
-        assert_eq!(run_pending_migrations(db.pool()).await.unwrap(), 15);
+        assert_eq!(run_pending_migrations(db.pool()).await.unwrap(), 27);
         assert_eq!(run_pending_migrations(db.pool()).await.unwrap(), 0);
         let ledger: Vec<(i64, String)> = sqlx::query_as(
             "SELECT version, name FROM _migrations WHERE version >= 150 ORDER BY version",
@@ -16006,31 +16155,43 @@ mod tests {
                 (152, "goal_preparation_inflight_source".into()),
                 (153, "close_writer_observations".into()),
                 (155, "ordinary_self_goal_admission".into()),
-                (156, "native_task_approval_receipts".into()),
+                (156, "remote_coordinator_goals".into()),
+                (158, "federated_conversation_actions".into()),
+                (159, "federated_continuation_receipts".into()),
+                (160, "slack_trigger_emojis".into()),
+                (161, "slack_single_trigger_emoji".into()),
+                (162, "slack_saved_capture".into()),
+                (163, "product_conversation_read_state".into()),
+                (164, "coordinator_durable_tracking".into()),
+                (165, "watch_ending_evidence".into()),
+                (166, "coordinator_transcript_scanner".into()),
+                (167, "slack_channel_submissions".into()),
+                (168, "coordinator_user_questions".into()),
+                (169, "native_task_approval_receipts".into()),
                 (
-                    157,
+                    170,
                     "close_completion_allowances_and_native_retry_fence".into()
                 ),
-                (158, "native_close_initial_receipts".into()),
-                (159, "close_original_retirement_anchors".into()),
-                (160, "native_close_exact_observation_receipts".into()),
-                (161, "native_close_explicit_retry_admission".into()),
-                (162, "native_close_source_fence".into()),
-                (163, "native_close_retry_failure".into()),
-                (164, "native_close_retry_dispatch".into()),
-                (165, "native_close_retry_worktree_metadata".into()),
-                (166, "native_initial_source_fence".into()),
-                (167, "native_initial_completed_interruption".into()),
-                (168, "native_initial_completion_retry_admission".into()),
+                (171, "native_close_initial_receipts".into()),
+                (172, "close_original_retirement_anchors".into()),
+                (173, "native_close_exact_observation_receipts".into()),
+                (174, "native_close_explicit_retry_admission".into()),
+                (175, "native_close_source_fence".into()),
+                (176, "native_close_retry_failure".into()),
+                (177, "native_close_retry_dispatch".into()),
+                (178, "native_close_retry_worktree_metadata".into()),
+                (179, "native_initial_source_fence".into()),
+                (180, "native_initial_completed_interruption".into()),
+                (181, "native_initial_completion_retry_admission".into()),
             ]
         );
     }
 
     #[tokio::test]
-    async fn migration_168_adds_unbackfilled_initial_completion_successor_authority() {
+    async fn migration_181_adds_unbackfilled_initial_completion_successor_authority() {
         let pool = test_pool().await;
-        setup_real_pre_159_schema(&pool).await;
-        run_through_for_test(&pool, 167).await.unwrap();
+        setup_real_pre_172_schema(&pool).await;
+        run_through_for_test(&pool, 180).await.unwrap();
         let db = crate::Database::from_pool_for_tests(pool.clone(), String::new());
         let legacy = db
             .create_conversation("completion-legacy", "legacy", "/tmp", true, None, None)
@@ -16084,8 +16245,8 @@ mod tests {
               'close_cleanup_failure_completion_requires_disposition') ORDER BY name",
         ).fetch_all(&pool).await.unwrap();
         assert_eq!(original_guards.len(), 5);
-        assert_eq!(run_through_for_test(&pool, 168).await.unwrap(), 1);
-        assert_eq!(run_through_for_test(&pool, 168).await.unwrap(), 0);
+        assert_eq!(run_through_for_test(&pool, 181).await.unwrap(), 1);
+        assert_eq!(run_through_for_test(&pool, 181).await.unwrap(), 0);
         for name in [
             "native_close_completion_retry_origins",
             "native_close_completion_retry_admissions",
@@ -16315,19 +16476,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn migration_167_upgrades_authentic_166_initial_source_fence_schema() {
+    async fn migration_180_upgrades_authentic_179_initial_source_fence_schema() {
         let pool = test_pool().await;
-        setup_real_pre_159_schema(&pool).await;
-        run_through_for_test(&pool, 166).await.unwrap();
+        setup_real_pre_172_schema(&pool).await;
+        run_through_for_test(&pool, 179).await.unwrap();
         assert_eq!(
             sqlx::query_scalar::<_, i64>("SELECT MAX(version) FROM _migrations")
                 .fetch_one(&pool)
                 .await
                 .unwrap(),
-            166
+            179
         );
-        assert_eq!(run_through_for_test(&pool, 167).await.unwrap(), 1);
-        assert_eq!(run_through_for_test(&pool, 167).await.unwrap(), 0);
+        assert_eq!(run_through_for_test(&pool, 180).await.unwrap(), 1);
+        assert_eq!(run_through_for_test(&pool, 180).await.unwrap(), 0);
         for name in [
             "close_cleanup_failures_require_initial_authority",
             "native_close_source_fence_requires_exact_plan",
@@ -16381,19 +16542,31 @@ mod tests {
         let ledger = compiled_migration_ledger();
         assert!(ledger.windows(2).all(|pair| pair[0].0 < pair[1].0));
         let expected_tail = [
-            (168, "native_initial_completion_retry_admission"),
-            (167, "native_initial_completed_interruption"),
-            (166, "native_initial_source_fence"),
-            (165, "native_close_retry_worktree_metadata"),
-            (164, "native_close_retry_dispatch"),
-            (163, "native_close_retry_failure"),
-            (162, "native_close_source_fence"),
-            (161, "native_close_explicit_retry_admission"),
-            (160, "native_close_exact_observation_receipts"),
-            (159, "close_original_retirement_anchors"),
-            (158, "native_close_initial_receipts"),
-            (157, "close_completion_allowances_and_native_retry_fence"),
-            (156, "native_task_approval_receipts"),
+            (181, "native_initial_completion_retry_admission"),
+            (180, "native_initial_completed_interruption"),
+            (179, "native_initial_source_fence"),
+            (178, "native_close_retry_worktree_metadata"),
+            (177, "native_close_retry_dispatch"),
+            (176, "native_close_retry_failure"),
+            (175, "native_close_source_fence"),
+            (174, "native_close_explicit_retry_admission"),
+            (173, "native_close_exact_observation_receipts"),
+            (172, "close_original_retirement_anchors"),
+            (171, "native_close_initial_receipts"),
+            (170, "close_completion_allowances_and_native_retry_fence"),
+            (169, "native_task_approval_receipts"),
+            (168, "coordinator_user_questions"),
+            (167, "slack_channel_submissions"),
+            (166, "coordinator_transcript_scanner"),
+            (165, "watch_ending_evidence"),
+            (164, "coordinator_durable_tracking"),
+            (163, "product_conversation_read_state"),
+            (162, "slack_saved_capture"),
+            (161, "slack_single_trigger_emoji"),
+            (160, "slack_trigger_emojis"),
+            (159, "federated_continuation_receipts"),
+            (158, "federated_conversation_actions"),
+            (156, "remote_coordinator_goals"),
             (155, "ordinary_self_goal_admission"),
             (153, "close_writer_observations"),
             (152, "goal_preparation_inflight_source"),
@@ -17314,9 +17487,9 @@ mod tests {
         }
     }
 
-    pub(super) async fn setup_real_pre_159_schema(pool: &SqlitePool) {
+    pub(super) async fn setup_real_pre_172_schema(pool: &SqlitePool) {
         setup_legacy_conversations_table(pool).await;
-        let end = MIGRATIONS.partition_point(|migration| migration.version <= 158);
+        let end = MIGRATIONS.partition_point(|migration| migration.version <= 171);
         run_migration_list(pool, &MIGRATIONS[..end]).await.unwrap();
     }
 
@@ -20670,19 +20843,31 @@ mod tests {
                 (152, "goal_preparation_inflight_source"),
                 (153, "close_writer_observations"),
                 (155, "ordinary_self_goal_admission"),
-                (156, "native_task_approval_receipts"),
-                (157, "close_completion_allowances_and_native_retry_fence"),
-                (158, "native_close_initial_receipts"),
-                (159, "close_original_retirement_anchors"),
-                (160, "native_close_exact_observation_receipts"),
-                (161, "native_close_explicit_retry_admission"),
-                (162, "native_close_source_fence"),
-                (163, "native_close_retry_failure"),
-                (164, "native_close_retry_dispatch"),
-                (165, "native_close_retry_worktree_metadata"),
-                (166, "native_initial_source_fence"),
-                (167, "native_initial_completed_interruption"),
-                (168, "native_initial_completion_retry_admission"),
+                (156, "remote_coordinator_goals"),
+                (158, "federated_conversation_actions"),
+                (159, "federated_continuation_receipts"),
+                (160, "slack_trigger_emojis"),
+                (161, "slack_single_trigger_emoji"),
+                (162, "slack_saved_capture"),
+                (163, "product_conversation_read_state"),
+                (164, "coordinator_durable_tracking"),
+                (165, "watch_ending_evidence"),
+                (166, "coordinator_transcript_scanner"),
+                (167, "slack_channel_submissions"),
+                (168, "coordinator_user_questions"),
+                (169, "native_task_approval_receipts"),
+                (170, "close_completion_allowances_and_native_retry_fence"),
+                (171, "native_close_initial_receipts"),
+                (172, "close_original_retirement_anchors"),
+                (173, "native_close_exact_observation_receipts"),
+                (174, "native_close_explicit_retry_admission"),
+                (175, "native_close_source_fence"),
+                (176, "native_close_retry_failure"),
+                (177, "native_close_retry_dispatch"),
+                (178, "native_close_retry_worktree_metadata"),
+                (179, "native_initial_source_fence"),
+                (180, "native_initial_completed_interruption"),
+                (181, "native_initial_completion_retry_admission"),
             ]
         );
         let goal = MIGRATIONS
@@ -20696,7 +20881,7 @@ mod tests {
         assert!(goal
             .sql
             .contains("CREATE TABLE conversation_goal_coordinator_receipts"));
-        assert_eq!(MIGRATIONS.len(), 166);
+        assert_eq!(MIGRATIONS.len(), 178);
     }
 
     #[tokio::test]
@@ -20712,7 +20897,7 @@ mod tests {
         }
         sqlx::query("UPDATE product_creation_jobs SET status = 'published', published_product_id = 'deleted-product', published_conversation_id = 'deleted-transcript' WHERE request_id = 'orphan-image'")
             .execute(&pool).await.unwrap();
-        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 19);
+        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 31);
         let identity: Vec<(String, String)> = sqlx::query_as(
             "SELECT request_id, data_sha256 FROM product_creation_image_replay_identity ORDER BY request_id",
         ).fetch_all(&pool).await.unwrap();
@@ -20766,7 +20951,7 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 19);
+        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 31);
         let retained: (String, String, String) = sqlx::query_as(
             "SELECT status, published_product_id, published_conversation_id
              FROM product_creation_jobs WHERE request_id = 'orphan-text'",
@@ -23588,14 +23773,14 @@ mod close_completion_allowance_tests {
     use sqlx::sqlite::SqlitePoolOptions;
 
     use super::{
-        run_pending_migrations, tests::setup_real_pre_159_schema, MIGRATIONS, MIGRATION_157,
+        run_pending_migrations, tests::setup_real_pre_172_schema, MIGRATIONS, MIGRATION_157,
     };
 
     #[tokio::test]
     // Keep the migration's before/after, failed-write, cascade and rollback
     // assertions together so each observes the same retained fixture state.
     #[allow(clippy::too_many_lines)]
-    async fn migration_157_seeds_only_future_operations_and_enforces_monotonicity() {
+    async fn migration_170_seeds_only_future_operations_and_enforces_monotonicity() {
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
             .connect("sqlite::memory:")
@@ -23800,8 +23985,8 @@ mod close_completion_allowance_tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::too_many_lines)] // Exercise the real 158 -> 159 boundary and shared G1 -> G2 path.
-    async fn migration_159_excludes_legacy_sealed_inventory_and_preserves_shared_g2_capture() {
+    #[allow(clippy::too_many_lines)] // Exercise the real 171 -> 172 boundary and shared G1 -> G2 path.
+    async fn migration_172_excludes_legacy_sealed_inventory_and_preserves_shared_g2_capture() {
         use crate::{
             CaptureCloseRetirementInventoryRequest, CaptureCloseRetirementInventoryScopeRequest,
             ReplaceCloseInspectionRequest, ReplaceCloseInspectionScopeRequest,
@@ -23818,7 +24003,7 @@ mod close_completion_allowance_tests {
             .connect("sqlite::memory:")
             .await
             .unwrap();
-        setup_real_pre_159_schema(&pool).await;
+        setup_real_pre_172_schema(&pool).await;
         let missing_tables: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM sqlite_schema WHERE name IN ('close_original_retirement_anchors', 'close_retirement_anchor_exclusions')"
         ).fetch_one(&pool).await.unwrap();
@@ -23874,7 +24059,7 @@ mod close_completion_allowance_tests {
             .unwrap()
             .clone();
 
-        // Author the genuine pre-159 capture using only tables and constraints
+        // Author the genuine pre-172 capture using only tables and constraints
         // available at 158. In particular, no modern capture API can run here.
         sqlx::query(
             "INSERT INTO close_retirement_inventories
@@ -24060,13 +24245,13 @@ mod close_completion_allowance_tests {
     }
 
     #[tokio::test]
-    async fn migration_159_excludes_a_preexisting_zero_inventory_attempt() {
+    async fn migration_172_excludes_a_preexisting_zero_inventory_attempt() {
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
             .connect("sqlite::memory:")
             .await
             .unwrap();
-        setup_real_pre_159_schema(&pool).await;
+        setup_real_pre_172_schema(&pool).await;
         let db = crate::Database::from_pool_for_tests(pool.clone(), String::new());
         let conversation = db
             .create_conversation("legacy-zero", "legacy-zero", "/tmp", true, None, None)
@@ -24082,7 +24267,7 @@ mod close_completion_allowance_tests {
 
         let migration = MIGRATIONS
             .iter()
-            .find(|migration| migration.version == 159)
+            .find(|migration| migration.version == 172)
             .unwrap();
         sqlx::raw_sql(migration.sql).execute(&pool).await.unwrap();
 
@@ -24114,7 +24299,7 @@ mod close_completion_allowance_tests {
 
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
-    async fn migration_159_seals_anchor_and_exclusion_without_hidden_rowid_or_replace_escape() {
+    async fn migration_172_seals_anchor_and_exclusion_without_hidden_rowid_or_replace_escape() {
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
             .connect("sqlite::memory:")
@@ -24151,7 +24336,7 @@ mod close_completion_allowance_tests {
         .unwrap();
         let migration = MIGRATIONS
             .iter()
-            .find(|migration| migration.version == 159)
+            .find(|migration| migration.version == 172)
             .unwrap();
         sqlx::raw_sql(migration.sql).execute(&pool).await.unwrap();
 
@@ -24353,7 +24538,7 @@ mod native_close_initial_receipt_tests {
 
     #[tokio::test]
     #[allow(clippy::too_many_lines)] // One fixture checks the full immutable receipt lifecycle.
-    async fn migration_158_binds_initial_receipts_to_their_exact_obligation_and_run() {
+    async fn migration_171_binds_initial_receipts_to_their_exact_obligation_and_run() {
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
             .connect("sqlite::memory:")

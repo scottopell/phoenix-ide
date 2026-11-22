@@ -745,10 +745,10 @@ async fn source_fence_refuses_resource_plan_inspection_and_retry_artifact_near_m
 }
 
 #[tokio::test]
-async fn migration_166_populated_upgrade_preserves_retry_and_adds_initial_source_authority() {
-    let (retry_db, assessment, receipt) = migration_163_pending_fixture().await;
+async fn migration_179_populated_upgrade_preserves_retry_and_adds_initial_source_authority() {
+    let (retry_db, assessment, receipt) = migration_176_pending_fixture().await;
     assert_eq!(
-        crate::migrations::run_through_for_test(retry_db.pool(), 165)
+        crate::migrations::run_through_for_test(retry_db.pool(), 178)
             .await
             .unwrap(),
         3
@@ -769,10 +769,10 @@ async fn migration_166_populated_upgrade_preserves_retry_and_adds_initial_source
         .connect("sqlite::memory:")
         .await
         .unwrap();
-    crate::migrations::setup_real_162_for_test(&initial_pool).await;
+    crate::migrations::setup_real_175_for_test(&initial_pool).await;
     let initial_db = Database::from_pool_for_tests(initial_pool, String::new());
     assert_eq!(
-        crate::migrations::run_through_for_test(initial_db.pool(), 165)
+        crate::migrations::run_through_for_test(initial_db.pool(), 178)
             .await
             .unwrap(),
         3
@@ -806,13 +806,13 @@ async fn migration_166_populated_upgrade_preserves_retry_and_adds_initial_source
     let initial_run = CloseRunRef::initial(initial_obligation.attempt_id().clone());
 
     assert_eq!(
-        crate::migrations::run_through_for_test(retry_db.pool(), 166)
+        crate::migrations::run_through_for_test(retry_db.pool(), 179)
             .await
             .unwrap(),
         1
     );
     assert_eq!(
-        crate::migrations::run_through_for_test(initial_db.pool(), 166)
+        crate::migrations::run_through_for_test(initial_db.pool(), 179)
             .await
             .unwrap(),
         1

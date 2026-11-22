@@ -41,7 +41,7 @@ pub(super) async fn run(pool: &SqlitePool, migration: &Migration) -> DbResult<()
         .await?;
         if !is_known_installed_trigger(name, &definition) {
             return Err(DbError::Serialization(format!(
-                "migration 165 found unexpected {name} definition"
+                "migration 178 found unexpected {name} definition"
             )));
         }
         let replacement = INSTALLED_AUTHORITY_PREFIX

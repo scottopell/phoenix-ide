@@ -30,7 +30,7 @@ pub(super) async fn run(pool: &SqlitePool, migration: &Migration) -> DbResult<()
         .await?;
         if definition.matches(installed).count() != 1 {
             return Err(DbError::Serialization(format!(
-                "migration 163 found unexpected {name} definition"
+                "migration 176 found unexpected {name} definition"
             )));
         }
         let replacement = format!("{exemption}{}", installed.strip_prefix("WHEN ").unwrap());
