@@ -23,6 +23,36 @@ concurrency:
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
+  qualify-release-helper:
+    name: release helper qualification (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-15]
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 1
+      - uses: astral-sh/setup-uv@v7
+      - name: Materialize and qualify candidate release helper
+        run: >-
+          uv run --no-project --managed-python --python 3.13.1
+          tests/integration/qualify_release_helper.py
+          --commit "${{ github.event.pull_request.head.sha || github.sha }}"
+          --output release-helper-qualification.json
+      - name: Upload qualification receipt
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: release-helper-qualification-${{ matrix.os }}
+          path: release-helper-qualification.json
+          if-no-files-found: warn
+
   check-worker-budget:
     name: check worker budget (exact source)
     runs-on: ubuntu-latest
