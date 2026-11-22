@@ -1647,7 +1647,8 @@ impl Drop for KillTaskCompletion {
                 tracing::debug!(%error, "browser lifecycle sink closed");
             }
         }
-        self.attempt.complete(Err("browser kill task cancelled or panicked".into()));
+        self.attempt
+            .complete(Err("browser kill task cancelled or panicked".into()));
     }
 }
 
@@ -2113,13 +2114,13 @@ impl BrowserSessionManager {
     }
 
     fn permit_is_authentic(&self, permit: &BrowserRetirementPermit) -> bool {
-        self.retirement_issuer == permit.original.issuer
-            && permit.projections_match_original()
+        self.retirement_issuer == permit.original.issuer && permit.projections_match_original()
     }
 
     fn invalid_permit_outcome() -> BrowserRetirementOutcome {
         BrowserRetirementOutcome::Residual {
-            reason: "browser retirement permit issuer or identity projection is invalid".to_string(),
+            reason: "browser retirement permit issuer or identity projection is invalid"
+                .to_string(),
         }
     }
 
@@ -2836,7 +2837,13 @@ impl BrowserSessionManager {
                     BrowserSessionAudience::Conversation(entry.creator_conversation_id.clone())
                 }
             };
-            (entry.session.clone(), attempt, audience, lifecycle_kind, entry.teardown_failed.clone())
+            (
+                entry.session.clone(),
+                attempt,
+                audience,
+                lifecycle_kind,
+                entry.teardown_failed.clone(),
+            )
         };
         let group = attempt.custody_group();
         group.retain(custody);
@@ -3769,7 +3776,8 @@ mod lifecycle_hook_tests {
         assert_eq!(
             foreign.complete_retirement(&permit).await,
             super::BrowserRetirementOutcome::Residual {
-                reason: "browser retirement permit issuer or identity projection is invalid".to_string()
+                reason: "browser retirement permit issuer or identity projection is invalid"
+                    .to_string()
             }
         );
         foreign.reopen_after_permit(permit).await;
@@ -3789,7 +3797,8 @@ mod lifecycle_hook_tests {
         assert_eq!(
             manager.complete_retirement(&permit).await,
             super::BrowserRetirementOutcome::Residual {
-                reason: "browser retirement permit issuer or identity projection is invalid".to_string()
+                reason: "browser retirement permit issuer or identity projection is invalid"
+                    .to_string()
             }
         );
         manager.reopen_after_permit(permit).await;
@@ -3809,7 +3818,8 @@ mod lifecycle_hook_tests {
         assert_eq!(
             manager.complete_retirement(&stale).await,
             super::BrowserRetirementOutcome::Residual {
-                reason: "browser retirement permit issuer or identity projection is invalid".to_string()
+                reason: "browser retirement permit issuer or identity projection is invalid"
+                    .to_string()
             }
         );
         manager.reopen_after_permit(stale).await;

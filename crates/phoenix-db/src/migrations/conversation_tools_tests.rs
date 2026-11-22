@@ -52,8 +52,13 @@ pub(super) async fn body_sql<'a>(
 }
 
 fn registered_migration_count_after(version: u32) -> u32 {
-    u32::try_from(MIGRATIONS.iter().filter(|migration| migration.version > version).count())
-        .expect("registered migration count fits u32")
+    u32::try_from(
+        MIGRATIONS
+            .iter()
+            .filter(|migration| migration.version > version)
+            .count(),
+    )
+    .expect("registered migration count fits u32")
 }
 
 fn registered_migration_count_between(after: u32, through: u32) -> u32 {
@@ -790,7 +795,7 @@ async fn registered_creation_receipt_retention_preserves_jobs_and_children_atomi
         .await
         .unwrap();
     let before_rollback = snapshot(&mut pool.acquire().await.unwrap()).await;
-    let error = run_pending_migrations(&pool).await.unwrap_err();
+    let error = run_through_for_test(&pool, 147).await.unwrap_err();
     assert!(
         error.to_string().contains("creation receipt ledger fault"),
         "{error}"
@@ -805,8 +810,8 @@ async fn registered_creation_receipt_retention_preserves_jobs_and_children_atomi
         .await
         .unwrap();
     assert_eq!(
-        run_pending_migrations(&pool).await.unwrap(),
-        registered_migration_count_after(146)
+        run_through_for_test(&pool, 147).await.unwrap(),
+        registered_migration_count_between(146, 147)
     );
     let ledger_entry: (i64, String) =
         sqlx::query_as("SELECT version, name FROM _migrations WHERE version=147")

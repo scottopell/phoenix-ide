@@ -310,6 +310,48 @@ jobs:
           grep -E 'test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored;' evidence/native-close-runtime-matcher.log
           (cd crates/phoenix-ide && "$PHOENIX_RUNTIME_TEST_BINARY" native_close_admission_tests:: --nocapture --test-threads=1) 2>&1 | tee evidence/native-close-runtime-actor.log
           grep -E 'test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored;' evidence/native-close-runtime-actor.log
+      - name: Qualify original-deadline worktree inspection prerequisites
+        if: success() || failure()
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -x "$PHOENIX_RUNTIME_TEST_BINARY"
+          failed=0
+          tests=(
+            expired_original_deadline_does_not_spawn_git_or_a_sentinel_effect
+            bounded_child_waits_for_pipe_eof_until_deadline_after_direct_child_exits
+            expired_original_fsmonitor_deadline_refuses_before_repository_access
+            expired_hidden_worktree_deadline_refuses_before_repository_access
+            expired_ignored_content_deadline_refuses_before_repository_access
+            expired_dirty_content_deadline_refuses_before_repository_access
+            expired_dirty_index_deadline_refuses_before_repository_access
+            worktree_inspection_rejects_expired_deadline_before_repository_access
+            sparse_checkout_rule_inspection_rejects_expired_deadline_before_repository_access
+            expired_directory_deletion_deadline_preserves_entries_before_inspection
+            deadline_directory_deletion_recurses_without_following_symlinks
+            directory_child_swap_after_inspection_preserves_replacement_for_needs_repair
+            file_child_swap_after_inspection_preserves_replacement_for_needs_repair
+            detached_unreachable_commits_until_rejects_expired_deadline_before_repository_access
+            detached_head_is_unreachable_rejects_expired_deadline_before_repository_access
+            detached_reachability_evidence_until_rejects_expired_deadline_before_repository_access
+            staged_index_query_materializes_only_requested_dirty_paths
+            detached_unreachable_commits_excludes_the_exact_stash_ref
+            detached_unreachable_commits_tolerates_an_absent_stash_ref
+            hidden_assume_unchanged_content_is_loss_and_preserves_real_index_flag
+            hidden_skip_worktree_content_is_loss_and_clean_path_is_not
+            sparse_checkout_absent_skip_worktree_path_is_not_loss_but_present_modified_one_is
+            hidden_pathspec_magic_name_is_treated_literally
+            hidden_assume_unchanged_executable_mode_is_loss
+            initialized_submodule_dirty_state_changes_snapshot_and_emits_exact_path
+            initialized_submodule_detached_commit_is_reported_as_exact_oid_loss
+          )
+          for test in "${tests[@]}"; do
+            name="runtime::close_retirement::tests::$test"
+            grep -Fx "$name: test" evidence/runtime-inventory.log || { failed=1; continue; }
+            (cd crates/phoenix-ide && "$PHOENIX_RUNTIME_TEST_BINARY" "$name" --exact --nocapture --test-threads=1) 2>&1 | tee "evidence/deadline-$test.log" || failed=1
+            grep -Eq 'test result: ok\. 1 passed; 0 failed; 0 ignored;' "evidence/deadline-$test.log" || failed=1
+          done
+          test "$failed" -eq 0
       - name: Qualify inert exact Bash retirement ownership and registry regressions
         if: success() || failure()
         shell: bash

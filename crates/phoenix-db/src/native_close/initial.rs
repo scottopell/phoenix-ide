@@ -14,13 +14,13 @@ use uuid::Uuid;
 use super::{NativeCloseCommand, NativeCloseIntent};
 use crate::workflow::LocalAuthorityResult;
 use crate::{
+    BindCloseWorktreeFinalTombstoneObjectRequest, BindCloseWorktreeFinalTombstoneRequest,
     CaptureCloseRetirementInventoryRequest, CloseCleanupFailureAuthority,
     CloseCleanupFailureResource, CloseCleanupResourceDisposition, Database, DbError, DbResult,
-    BindCloseWorktreeFinalTombstoneObjectRequest, BindCloseWorktreeFinalTombstoneRequest,
     RecordCloseRetirementDispatchRequest, RecordCloseRetirementEvidenceRequest,
-    RecordCloseWorktreeCleanupPlanRequest,
-    ReplaceCloseInspectionRequest, TerminalizeInitialCloseCleanupFailureRequest,
-    WorkScopeRetirementBlocker, WorkScopeRetirementOutcome, WorkScopeRetirementPrecondition,
+    RecordCloseWorktreeCleanupPlanRequest, ReplaceCloseInspectionRequest,
+    TerminalizeInitialCloseCleanupFailureRequest, WorkScopeRetirementBlocker,
+    WorkScopeRetirementOutcome, WorkScopeRetirementPrecondition,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -319,11 +319,15 @@ async fn require_initial_original_dispatch_tx(
         ));
     }
     let expected = crate::close_foundation::list_close_expected_retirement_resources_tx(
-        tx, admitted.attempt_id.as_str(),
-    ).await?;
+        tx,
+        admitted.attempt_id.as_str(),
+    )
+    .await?;
     if !expected.iter().any(|item| {
-        item.attempt_id == admitted.attempt_id && item.scope == *scope
-            && item.snapshot == *snapshot && item.resource == *resource
+        item.attempt_id == admitted.attempt_id
+            && item.scope == *scope
+            && item.snapshot == *snapshot
+            && item.resource == *resource
     }) {
         return Err(DbError::CloseFoundationPrecondition(
             "initial metadata resource is not in the exact original inventory".into(),
@@ -335,11 +339,17 @@ async fn require_initial_original_dispatch_tx(
          WHERE attempt_id = ?1 AND scope = ?2 AND inspection_generation = ?3
            AND inspection_fingerprint = ?4 AND resource_kind = ?5
            AND identity_kind = ?6 AND identity_codec = ?7 AND identity_value = ?8)",
-    ).bind(admitted.attempt_id.as_str()).bind(scope.as_str())
-        .bind(snapshot.generation()).bind(snapshot.fingerprint())
-        .bind(resource.kind().as_str()).bind(identity.identity_kind())
-        .bind(identity.codec()).bind(identity.value())
-        .fetch_one(&mut **tx).await?;
+    )
+    .bind(admitted.attempt_id.as_str())
+    .bind(scope.as_str())
+    .bind(snapshot.generation())
+    .bind(snapshot.fingerprint())
+    .bind(resource.kind().as_str())
+    .bind(identity.identity_kind())
+    .bind(identity.codec())
+    .bind(identity.value())
+    .fetch_one(&mut **tx)
+    .await?;
     if !dispatched {
         return Err(DbError::CloseFoundationPrecondition(
             "initial metadata requires exact persisted dispatch membership".into(),
@@ -533,10 +543,16 @@ impl Database {
         request: RecordCloseWorktreeCleanupPlanRequest,
     ) -> LocalAuthorityResult<DbResult<()>> {
         self.write_native_close_initial_worktree_metadata(
-            command, receipt, live_source, request.attempt_id.clone(),
-            request.scope.clone(), request.snapshot.clone(), request.resource.clone(),
+            command,
+            receipt,
+            live_source,
+            request.attempt_id.clone(),
+            request.scope.clone(),
+            request.snapshot.clone(),
+            request.resource.clone(),
             InitialWorktreeMetadata::Plan(request),
-        ).await
+        )
+        .await
     }
 
     /// Binds the exact final worktree tombstone under the source-owned initial run.
@@ -548,10 +564,16 @@ impl Database {
         request: BindCloseWorktreeFinalTombstoneRequest,
     ) -> LocalAuthorityResult<DbResult<()>> {
         self.write_native_close_initial_worktree_metadata(
-            command, receipt, live_source, request.attempt_id.clone(),
-            request.scope.clone(), request.snapshot.clone(), request.resource.clone(),
+            command,
+            receipt,
+            live_source,
+            request.attempt_id.clone(),
+            request.scope.clone(),
+            request.snapshot.clone(),
+            request.resource.clone(),
             InitialWorktreeMetadata::Tombstone(request),
-        ).await
+        )
+        .await
     }
 
     /// Binds the exact worktree tombstone object under the source-owned initial run.
@@ -563,10 +585,16 @@ impl Database {
         request: BindCloseWorktreeFinalTombstoneObjectRequest,
     ) -> LocalAuthorityResult<DbResult<()>> {
         self.write_native_close_initial_worktree_metadata(
-            command, receipt, live_source, request.attempt_id.clone(),
-            request.scope.clone(), request.snapshot.clone(), request.resource.clone(),
+            command,
+            receipt,
+            live_source,
+            request.attempt_id.clone(),
+            request.scope.clone(),
+            request.snapshot.clone(),
+            request.resource.clone(),
             InitialWorktreeMetadata::TombstoneObject(request),
-        ).await
+        )
+        .await
     }
 
     async fn write_native_close_initial_worktree_metadata(
@@ -586,16 +614,22 @@ impl Database {
         };
         let result = async {
             let (admitted, _) = require_initial_execution_tx(
-                &mut tx, command, receipt, live_source, ClosePhase::RetirementRequested,
-            ).await?;
-            if attempt_id != admitted.attempt_id || resource.kind() != RetiredResourceKind::Worktree {
+                &mut tx,
+                command,
+                receipt,
+                live_source,
+                ClosePhase::RetirementRequested,
+            )
+            .await?;
+            if attempt_id != admitted.attempt_id || resource.kind() != RetiredResourceKind::Worktree
+            {
                 return Err(DbError::CloseFoundationPrecondition(
-                    "initial worktree metadata must match its admitted run and worktree resource".into(),
+                    "initial worktree metadata must match its admitted run and worktree resource"
+                        .into(),
                 ));
             }
-            require_initial_original_dispatch_tx(
-                &mut tx, &admitted, &scope, &snapshot, &resource,
-            ).await?;
+            require_initial_original_dispatch_tx(&mut tx, &admitted, &scope, &snapshot, &resource)
+                .await?;
             match metadata {
                 InitialWorktreeMetadata::Plan(request) => {
                     Self::record_close_worktree_cleanup_plan_tx(&mut tx, request).await
@@ -607,7 +641,8 @@ impl Database {
                     Self::bind_close_worktree_final_tombstone_object_tx(&mut tx, request).await
                 }
             }
-        }.await;
+        }
+        .await;
         match result {
             Ok(()) => match tx.commit().await {
                 Ok(()) => LocalAuthorityResult::DurableFactEstablished(Ok(())),
@@ -638,8 +673,13 @@ impl Database {
         };
         let result = async {
             let (admitted, _) = require_initial_execution_tx(
-                &mut tx, command, receipt, live_source, ClosePhase::RetirementRequested,
-            ).await?;
+                &mut tx,
+                command,
+                receipt,
+                live_source,
+                ClosePhase::RetirementRequested,
+            )
+            .await?;
             if resource.kind() != RetiredResourceKind::WorkScope
                 || precondition.scope_id() != &scope
                 || !matches!(resource.identity(),
@@ -652,9 +692,11 @@ impl Database {
             }
             let expected = require_initial_original_dispatch_tx(
                 &mut tx, &admitted, &scope, &snapshot, &resource,
-            ).await?;
-            for item in expected.iter().filter(|item| item.scope == scope
-                && item.resource.kind() != RetiredResourceKind::WorkScope) {
+            )
+            .await?;
+            for item in expected.iter().filter(|item| {
+                item.scope == scope && item.resource.kind() != RetiredResourceKind::WorkScope
+            }) {
                 let identity = item.resource.identity();
                 let proven: bool = sqlx::query_scalar(
                     "SELECT EXISTS(SELECT 1 FROM close_retirement_resources
@@ -662,11 +704,17 @@ impl Database {
                        AND inspection_fingerprint = ?4 AND resource_kind = ?5
                        AND identity_kind = ?6 AND identity_codec = ?7 AND identity_value = ?8
                        AND proof_kind IN ('retired', 'absence_adopted'))",
-                ).bind(admitted.attempt_id.as_str()).bind(item.scope.as_str())
-                    .bind(item.snapshot.generation()).bind(item.snapshot.fingerprint())
-                    .bind(item.resource.kind().as_str()).bind(identity.identity_kind())
-                    .bind(identity.codec()).bind(identity.value())
-                    .fetch_one(&mut *tx).await?;
+                )
+                .bind(admitted.attempt_id.as_str())
+                .bind(item.scope.as_str())
+                .bind(item.snapshot.generation())
+                .bind(item.snapshot.fingerprint())
+                .bind(item.resource.kind().as_str())
+                .bind(identity.identity_kind())
+                .bind(identity.codec())
+                .bind(identity.value())
+                .fetch_one(&mut *tx)
+                .await?;
                 if !proven {
                     return Err(DbError::CloseFoundationPrecondition(
                         "initial WorkScope retirement has unresolved original resources".into(),
@@ -674,7 +722,9 @@ impl Database {
                 }
             }
             if reason.trim().is_empty() {
-                return Err(DbError::Serialization("work scope retirement reason must not be empty".into()));
+                return Err(DbError::Serialization(
+                    "work scope retirement reason must not be empty".into(),
+                ));
             }
             let coordinator_owned: bool = sqlx::query_scalar(
                 "SELECT EXISTS(SELECT 1 FROM coordinator_work_scope WHERE work_scope_id = ?1)",
@@ -688,8 +738,12 @@ impl Database {
                 ));
             }
             let outcome = Database::retire_work_scope_lifecycle_tx(
-                &mut tx, precondition, reason, Some(&admitted.attempt_id),
-            ).await?;
+                &mut tx,
+                precondition,
+                reason,
+                Some(&admitted.attempt_id),
+            )
+            .await?;
             if matches!(outcome, WorkScopeRetirementOutcome::Retired) {
                 Database::record_close_retirement_evidence_sql_tx(
                     &mut tx,
@@ -702,12 +756,18 @@ impl Database {
                         detail: Some(reason.to_owned()),
                     },
                     snapshot.generation(),
-                ).await?;
+                )
+                .await?;
             }
             Ok(outcome)
-        }.await;
+        }
+        .await;
         let committed = matches!(result, Ok(WorkScopeRetirementOutcome::Retired));
-        let finalized = if committed { tx.commit().await } else { tx.rollback().await };
+        let finalized = if committed {
+            tx.commit().await
+        } else {
+            tx.rollback().await
+        };
         match finalized {
             Ok(()) => LocalAuthorityResult::DurableFactEstablished(result),
             Err(_) => LocalAuthorityResult::DurableFactUnclassified,

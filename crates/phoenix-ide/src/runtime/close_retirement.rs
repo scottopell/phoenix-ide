@@ -4023,11 +4023,39 @@ async fn inspect_worktree_at(
     identity: &WorktreeIdentity,
     path: PathBuf,
 ) -> Result<(CloseRetirementSnapshot, Vec<CloseLossItem>), String> {
-    if observe_worktree_fingerprint(&path).as_deref() != Some(identity.fingerprint().as_str()) {
+    // One compatibility budget covers the complete top-level worktree inspection.
+    inspect_worktree_at_until(
+        identity,
+        path,
+        std::time::Instant::now() + std::time::Duration::from_secs(30),
+    )
+    .await
+}
+
+async fn inspect_worktree_at_until(
+    identity: &WorktreeIdentity,
+    path: PathBuf,
+    deadline: std::time::Instant,
+) -> Result<(CloseRetirementSnapshot, Vec<CloseLossItem>), String> {
+    if std::time::Instant::now() >= deadline {
+        return Err("worktree inspection exceeded its deadline".to_string());
+    }
+    let fingerprint_path = path.clone();
+    let expected_fingerprint = identity.fingerprint().as_str().to_owned();
+    let fingerprint_valid = tokio::task::spawn_blocking(move || {
+        if std::time::Instant::now() >= deadline {
+            return Err("worktree inspection exceeded its deadline".to_string());
+        }
+        Ok(observe_worktree_fingerprint(&fingerprint_path).as_deref()
+            == Some(expected_fingerprint.as_str()))
+    })
+    .await
+    .map_err(|error| error.to_string())??;
+    if !fingerprint_valid {
         return Err("captured worktree administrative incarnation changed".to_string());
     }
     let status_path = path.clone();
-    let output = tokio::task::spawn_blocking(move || run_bounded_git_status(&status_path))
+    let output = tokio::task::spawn_blocking(move || run_bounded_git_status_until(&status_path, deadline))
         .await
         .map_err(|error| error.to_string())??;
     if !output.status.success() {
@@ -4036,10 +4064,11 @@ async fn inspect_worktree_at(
     let mut observation = canonical_status_observation(&output.stdout);
     let mut losses = parse_status_losses(&output.stdout);
     let hidden_path = path.clone();
-    let hidden_dirty =
-        tokio::task::spawn_blocking(move || observe_hidden_worktree_changes(&hidden_path))
-            .await
-            .map_err(|error| error.to_string())??;
+    let hidden_dirty = tokio::task::spawn_blocking(move || {
+        observe_hidden_worktree_changes_until(&hidden_path, deadline)
+    })
+    .await
+    .map_err(|error| error.to_string())??;
     for path in hidden_dirty {
         observation.extend_from_slice(b"HIDDEN_UNSTAGED\\0");
         observation.extend_from_slice(path.as_bytes());
@@ -4050,62 +4079,78 @@ async fn inspect_worktree_at(
     losses.dedup();
     let content_path = path.clone();
     let content_losses = losses.clone();
-    let content_observation =
-        tokio::task::spawn_blocking(move || observe_dirty_content(&content_path, &content_losses))
-            .await
-            .map_err(|error| error.to_string())??;
+    let content_observation = tokio::task::spawn_blocking(move || {
+        observe_dirty_content_until(&content_path, &content_losses, deadline)
+    })
+    .await
+    .map_err(|error| error.to_string())??;
     observation.extend_from_slice(&content_observation);
-    observe_detached_head_and_submodules(&path, &mut observation, &mut losses).await?;
-    Ok((snapshot_for(&observation), losses))
+    observe_detached_head_and_submodules_until(&path, &mut observation, &mut losses, deadline).await?;
+    let snapshot = snapshot_for(&observation);
+    if std::time::Instant::now() >= deadline {
+        return Err("worktree inspection exceeded its deadline".to_string());
+    }
+    Ok((snapshot, losses))
 }
 
-type WorktreeObservation = Vec<(Vec<u8>, Vec<u8>)>;
-
-async fn observe_detached_head_and_submodules(
+async fn observe_detached_head_and_submodules_until(
     path: &Path,
     observation: &mut Vec<u8>,
     losses: &mut Vec<CloseLossItem>,
+    deadline: std::time::Instant,
 ) -> Result<(), String> {
+    if std::time::Instant::now() >= deadline {
+        return Err("detached head inspection exceeded its deadline".to_string());
+    }
     let path = path.to_path_buf();
-    let loss_path = path.clone();
-    let observed = tokio::task::spawn_blocking(move || -> Result<WorktreeObservation, String> {
+    let observed = tokio::task::spawn_blocking(move || -> Result<(WorktreeObservation, Vec<Vec<u8>>), String> {
+        if std::time::Instant::now() >= deadline {
+            return Err("detached head inspection exceeded its deadline".to_string());
+        }
         let mut visited = std::collections::HashSet::new();
         visited.insert(path.canonicalize().map_err(|error| error.to_string())?);
-        let mut symbolic = phoenix_core::git::command();
-        bind_git_command_to_worktree(&mut symbolic, &path)?;
-        let symbolic = symbolic
-            .args(["symbolic-ref", "-q", "HEAD"])
-            .output()
-            .map_err(|error| error.to_string())?;
+        let symbolic = run_bounded_git_command_until(
+            &path,
+            &["symbolic-ref", "-q", "HEAD"],
+            None,
+            deadline,
+            "detached head inspection",
+        )?;
         let mut result = Vec::new();
+        let mut detached_head = None;
         if symbolic.status.success() {
-            result.push((
-                b"HEAD_SYMBOLIC".to_vec(),
-                symbolic.stdout.trim_ascii().to_vec(),
-            ));
+            result.push((b"HEAD_SYMBOLIC".to_vec(), symbolic.stdout.trim_ascii().to_vec()));
         } else {
-            let mut head = phoenix_core::git::command();
-            bind_git_command_to_worktree(&mut head, &path)?;
-            let head = head
-                .args(["rev-parse", "--verify", "HEAD"])
-                .output()
-                .map_err(|error| error.to_string())?;
+            let head = run_bounded_git_command_until(
+                &path,
+                &["rev-parse", "--verify", "HEAD"],
+                None,
+                deadline,
+                "detached head inspection",
+            )?;
             if !head.status.success() {
                 return Err(String::from_utf8_lossy(&head.stderr).trim().to_string());
             }
             let head_oid = head.stdout.trim_ascii().to_vec();
             result.push((b"HEAD".to_vec(), head_oid.clone()));
-            result.push((
-                b"DETACHED".to_vec(),
-                detached_reachability_evidence(&path, &head_oid)?,
-            ));
+            let evidence = detached_reachability_evidence_until(&path, &head_oid, deadline)?;
+            result.push((b"DETACHED".to_vec(), evidence.clone()));
+            detached_head = evidence.is_empty().then_some(head_oid);
         }
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         observe_initialized_submodules(&path, &[], &mut result, deadline, &mut visited)?;
-        Ok(result)
+        let unreachable = if let Some(head_oid) = detached_head {
+            detached_unreachable_commits_until(&path, &head_oid, deadline)?
+        } else {
+            Vec::new()
+        };
+        if std::time::Instant::now() >= deadline {
+            return Err("detached head inspection exceeded its deadline".to_string());
+        }
+        Ok((result, unreachable))
     })
     .await
     .map_err(|error| error.to_string())??;
+    let (observed, unreachable) = observed;
     let head_oid = observed
         .iter()
         .find_map(|(tag, value)| (tag == b"HEAD").then_some(value.clone()));
@@ -4115,15 +4160,15 @@ async fn observe_detached_head_and_submodules(
         observation.extend_from_slice(&value);
         observation.push(0);
         if tag == b"DETACHED" && value.is_empty() {
-            let head = head_oid
-                .as_ref()
-                .ok_or_else(|| "detached worktree has no resolved HEAD".to_string())?;
-            for oid in detached_unreachable_commits(&loss_path, head)? {
+            if head_oid.is_none() {
+                return Err("detached worktree has no resolved HEAD".to_string());
+            }
+            for oid in &unreachable {
                 observation.extend_from_slice(b"DETACHED_UNREACHABLE\0");
-                observation.extend_from_slice(&oid);
+                observation.extend_from_slice(oid);
                 observation.push(0);
                 losses.push(CloseLossItem::DetachedUnreachableCommit(
-                    GitOidIdentity::parse_hex(String::from_utf8_lossy(&oid).trim())
+                    GitOidIdentity::parse_hex(String::from_utf8_lossy(oid).trim())
                         .map_err(|error| error.to_string())?,
                 ));
             }
@@ -4148,35 +4193,52 @@ async fn observe_detached_head_and_submodules(
             });
         }
     }
+    if std::time::Instant::now() >= deadline {
+        return Err("detached head inspection exceeded its deadline".to_string());
+    }
     Ok(())
 }
+
+type WorktreeObservation = Vec<(Vec<u8>, Vec<u8>)>;
 
 fn detached_head_is_unreachable(
     repository: &Path,
     observation: &mut WorktreeObservation,
     relative_path: &[u8],
+    deadline: std::time::Instant,
 ) -> Result<bool, String> {
-    let mut symbolic = phoenix_core::git::command();
-    bind_git_command_to_worktree(&mut symbolic, repository)?;
-    let detached = !symbolic
-        .args(["symbolic-ref", "-q", "HEAD"])
-        .status()
-        .map_err(|error| error.to_string())?
-        .success();
+    if std::time::Instant::now() >= deadline {
+        return Err("detached head inspection exceeded its deadline".to_string());
+    }
+    let symbolic = run_bounded_git_command_until(
+        repository,
+        &["symbolic-ref", "-q", "HEAD"],
+        None,
+        deadline,
+        "detached head inspection",
+    )?;
+    let detached = !symbolic.status.success();
     if !detached {
+        if std::time::Instant::now() >= deadline {
+            return Err("detached head inspection exceeded its deadline".to_string());
+        }
         return Ok(false);
     }
-    let mut head = phoenix_core::git::command();
-    bind_git_command_to_worktree(&mut head, repository)?;
-    let head = head
-        .args(["rev-parse", "--verify", "HEAD"])
-        .output()
-        .map_err(|error| error.to_string())?;
+    let head = run_bounded_git_command_until(
+        repository,
+        &["rev-parse", "--verify", "HEAD"],
+        None,
+        deadline,
+        "detached head inspection",
+    )?;
     if !head.status.success() {
         return Err(String::from_utf8_lossy(&head.stderr).trim().to_string());
     }
     let head_oid = head.stdout.trim_ascii().to_vec();
-    let evidence = detached_reachability_evidence(repository, &head_oid)?;
+    let evidence = detached_reachability_evidence_until(repository, &head_oid, deadline)?;
+    if std::time::Instant::now() >= deadline {
+        return Err("detached head inspection exceeded its deadline".to_string());
+    }
     observation.push((
         [b"SUBMODULE_DETACHED\0".as_slice(), relative_path].concat(),
         evidence.clone(),
@@ -4184,32 +4246,54 @@ fn detached_head_is_unreachable(
     Ok(evidence.is_empty())
 }
 
+// Retained for direct compatibility assertions in the unit tests only.
+#[cfg(test)]
 fn detached_unreachable_commits(
     repository: &Path,
     head_oid: &[u8],
 ) -> Result<Vec<Vec<u8>>, String> {
+    detached_unreachable_commits_until(
+        repository,
+        head_oid,
+        std::time::Instant::now() + std::time::Duration::from_secs(5),
+    )
+}
+
+fn detached_unreachable_commits_until(
+    repository: &Path,
+    head_oid: &[u8],
+    deadline: std::time::Instant,
+) -> Result<Vec<Vec<u8>>, String> {
+    if std::time::Instant::now() >= deadline {
+        return Err("detached commit reachability exceeded its deadline".to_string());
+    }
     let head_text = std::str::from_utf8(head_oid).map_err(|error| error.to_string())?;
-    let mut stash = phoenix_core::git::command();
-    bind_git_command_to_worktree(&mut stash, repository)?;
-    let stash_exists = stash
-        .args(["show-ref", "--verify", "--quiet", "refs/stash"])
-        .status()
-        .map_err(|error| error.to_string())?
-        .success();
-    let mut command = phoenix_core::git::command();
-    bind_git_command_to_worktree(&mut command, repository)?;
-    command.args([
+    let stash = run_bounded_git_command_until(
+        repository,
+        &["show-ref", "--verify", "--quiet", "refs/stash"],
+        None,
+        deadline,
+        "detached commit reachability",
+    )?;
+    let stash_exists = stash.status.success();
+    let mut arguments = vec![
         "rev-list",
         head_text,
         "--not",
         "--branches",
         "--remotes",
         "--tags",
-    ]);
+    ];
     if stash_exists {
-        command.arg("refs/stash");
+        arguments.push("refs/stash");
     }
-    let output = command.output().map_err(|error| error.to_string())?;
+    let output = run_bounded_git_command_until(
+        repository,
+        &arguments,
+        None,
+        deadline,
+        "detached commit reachability",
+    )?;
     if !output.status.success() {
         return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
     }
@@ -4221,12 +4305,18 @@ fn detached_unreachable_commits(
         .collect())
 }
 
-fn detached_reachability_evidence(repository: &Path, head_oid: &[u8]) -> Result<Vec<u8>, String> {
+fn detached_reachability_evidence_until(
+    repository: &Path,
+    head_oid: &[u8],
+    deadline: std::time::Instant,
+) -> Result<Vec<u8>, String> {
+    if std::time::Instant::now() >= deadline {
+        return Err("detached reachability evidence exceeded its deadline".to_string());
+    }
     let head_text = std::str::from_utf8(head_oid).map_err(|error| error.to_string())?;
-    let mut reachable = phoenix_core::git::command();
-    bind_git_command_to_worktree(&mut reachable, repository)?;
-    let reachable = reachable
-        .args([
+    let reachable = run_bounded_git_command_until(
+        repository,
+        &[
             "for-each-ref",
             "--contains",
             head_text,
@@ -4235,38 +4325,45 @@ fn detached_reachability_evidence(repository: &Path, head_oid: &[u8]) -> Result<
             "refs/remotes",
             "refs/tags",
             "refs/stash",
-        ])
-        .output()
-        .map_err(|error| error.to_string())?;
+        ],
+        None,
+        deadline,
+        "detached reachability evidence",
+    )?;
     if !reachable.status.success() {
-        return Err(String::from_utf8_lossy(&reachable.stderr)
-            .trim()
-            .to_string());
+        return Err(String::from_utf8_lossy(&reachable.stderr).trim().to_string());
     }
     if !reachable.stdout.is_empty() {
         return Ok(reachable.stdout);
     }
-    let _ = head_oid;
-    let mut listing = phoenix_core::git::command();
-    bind_git_command_to_worktree(&mut listing, repository)?;
-    let listing = listing
-        .args(["worktree", "list", "--porcelain", "-z"])
-        .output()
-        .map_err(|error| error.to_string())?;
+    let listing = run_bounded_git_command_until(
+        repository,
+        &["worktree", "list", "--porcelain", "-z"],
+        None,
+        deadline,
+        "detached reachability evidence",
+    )?;
     if !listing.status.success() {
         return Err(String::from_utf8_lossy(&listing.stderr).trim().to_string());
+    }
+    if std::time::Instant::now() >= deadline {
+        return Err("detached reachability evidence exceeded its deadline".to_string());
     }
     let repository = repository
         .canonicalize()
         .map_err(|error| format!("cannot canonicalize inspected worktree: {error}"))?;
-    let mut git_dir = phoenix_core::git::command();
-    bind_git_command_to_worktree(&mut git_dir, &repository)?;
-    let git_dir = git_dir
-        .args(["rev-parse", "--absolute-git-dir"])
-        .output()
-        .map_err(|error| error.to_string())?;
+    let git_dir = run_bounded_git_command_until(
+        &repository,
+        &["rev-parse", "--absolute-git-dir"],
+        None,
+        deadline,
+        "detached reachability evidence",
+    )?;
     if !git_dir.status.success() {
         return Err(String::from_utf8_lossy(&git_dir.stderr).trim().to_string());
+    }
+    if std::time::Instant::now() >= deadline {
+        return Err("detached reachability evidence exceeded its deadline".to_string());
     }
     let git_dir = path_buf_from_git_bytes(git_dir.stdout.trim_ascii())
         .canonicalize()
@@ -4282,7 +4379,7 @@ fn detached_reachability_evidence(repository: &Path, head_oid: &[u8]) -> Result<
                 .as_ref()
                 .and_then(|path| path.canonicalize().ok())
                 .is_some_and(|path| path != repository && path != git_dir);
-            let _ = (oid, is_other);
+            let _ = (oid, is_other, head_oid);
         }
     }
     Ok(Vec::new())
@@ -4435,17 +4532,13 @@ fn bind_git_command_to_worktree(
     Ok(())
 }
 
-fn run_bounded_git_status(repository: &Path) -> Result<std::process::Output, String> {
-    run_bounded_git_status_until(
-        repository,
-        std::time::Instant::now() + std::time::Duration::from_secs(5),
-    )
-}
-
 fn run_bounded_git_status_until(
     repository: &Path,
     deadline: std::time::Instant,
 ) -> Result<std::process::Output, String> {
+    if std::time::Instant::now() >= deadline {
+        return Err("Git status inspection exceeded its deadline".to_string());
+    }
     let mut command = phoenix_core::git::command_with_config(&[("core.fsmonitor", "false")]);
     bind_git_command_to_worktree(&mut command, repository)?;
     command
@@ -4476,6 +4569,9 @@ fn run_bounded_git_command_until(
     deadline: std::time::Instant,
     operation: &str,
 ) -> Result<std::process::Output, String> {
+    if std::time::Instant::now() >= deadline {
+        return Err(format!("{operation} exceeded its deadline"));
+    }
     let mut command = phoenix_core::git::command_with_config(&[("core.fsmonitor", "false")]);
     bind_git_command_to_worktree(&mut command, repository)?;
     command
@@ -4527,6 +4623,9 @@ fn run_bounded_spawned_git(
     deadline: std::time::Instant,
     operation: &str,
 ) -> Result<std::process::Output, String> {
+    if std::time::Instant::now() >= deadline {
+        return Err(format!("{operation} exceeded its deadline"));
+    }
     let child = command.spawn().map_err(|error| error.to_string())?;
     wait_bounded_child_output(child, deadline, operation)
 }
@@ -4536,8 +4635,14 @@ fn wait_bounded_child_output(
     deadline: std::time::Instant,
     operation: &str,
 ) -> Result<std::process::Output, String> {
-    let stdout = child.stdout.take().ok_or("Git stdout was not piped")?;
-    let stderr = child.stderr.take().ok_or("Git stderr was not piped")?;
+    let Some(stdout) = child.stdout.take() else {
+        terminate_bounded_child(&mut child);
+        return Err("Git stdout was not piped".into());
+    };
+    let Some(stderr) = child.stderr.take() else {
+        terminate_bounded_child(&mut child);
+        return Err("Git stderr was not piped".into());
+    };
     let stdout_reader = std::thread::spawn(move || {
         let mut bytes = Vec::new();
         std::io::Read::read_to_end(&mut std::io::BufReader::new(stdout), &mut bytes).map(|_| bytes)
@@ -4547,19 +4652,24 @@ fn wait_bounded_child_output(
         std::io::Read::read_to_end(&mut std::io::BufReader::new(stderr), &mut bytes).map(|_| bytes)
     });
     let status = loop {
-        if let Some(status) = child.try_wait().map_err(|error| error.to_string())? {
-            break status;
+        match child.try_wait() {
+            Ok(Some(status))
+                if stdout_reader.is_finished()
+                    && stderr_reader.is_finished()
+                    && std::time::Instant::now() < deadline =>
+            {
+                break status;
+            }
+            Ok(_) => {}
+            Err(error) => {
+                terminate_bounded_child(&mut child);
+                let _ = stdout_reader.join();
+                let _ = stderr_reader.join();
+                return Err(error.to_string());
+            }
         }
         if std::time::Instant::now() >= deadline {
-            #[cfg(unix)]
-            unsafe {
-                let process_group = i32::try_from(child.id())
-                    .map_err(|error| format!("Git process id overflow: {error}"))?;
-                libc::kill(-process_group, libc::SIGKILL);
-            }
-            #[cfg(not(unix))]
-            let _ = child.kill();
-            child.wait().map_err(|error| error.to_string())?;
+            terminate_bounded_child(&mut child);
             let _ = stdout_reader.join();
             let _ = stderr_reader.join();
             return Err(format!("{operation} exceeded its deadline"));
@@ -4579,6 +4689,19 @@ fn wait_bounded_child_output(
         stdout,
         stderr,
     })
+}
+
+fn terminate_bounded_child(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    unsafe {
+        if let Ok(process_group) = i32::try_from(child.id()) {
+            libc::kill(-process_group, libc::SIGKILL);
+        }
+        let _ = child.kill();
+    }
+    #[cfg(not(unix))]
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 struct IndexedGitlink {
@@ -4720,7 +4843,7 @@ fn observe_initialized_submodules(
             return Err("initialized submodule graph contains a cycle".to_string());
         }
 
-        let status = run_bounded_git_status(&submodule_path)?;
+        let status = run_bounded_git_status_until(&submodule_path, deadline)?;
         if !status.status.success() {
             return Err(format!(
                 "cannot inspect initialized submodule {}: {}",
@@ -4729,32 +4852,37 @@ fn observe_initialized_submodules(
             ));
         }
         let mut submodule_losses = parse_status_losses(&status.stdout);
-        for hidden in observe_hidden_worktree_changes(&submodule_path)? {
+        for hidden in observe_hidden_worktree_changes_until(&submodule_path, deadline)? {
             let loss = CloseLossItem::UnstagedTrackedPath(hidden);
             if !submodule_losses.contains(&loss) {
                 submodule_losses.push(loss);
             }
         }
         let mut submodule_status = canonical_status_observation(&status.stdout);
-        submodule_status
-            .extend_from_slice(&observe_dirty_content(&submodule_path, &submodule_losses)?);
+        submodule_status.extend_from_slice(&observe_dirty_content_until(
+            &submodule_path,
+            &submodule_losses,
+            deadline,
+        )?);
         observation.push((
             [b"SUBMODULE_STATUS\0".as_slice(), relative_path.as_slice()].concat(),
             submodule_status,
         ));
 
-        let mut symbolic_head = phoenix_core::git::command();
-        bind_git_command_to_worktree(&mut symbolic_head, &submodule_path)?;
-        let symbolic_head = symbolic_head
-            .args(["symbolic-ref", "-q", "HEAD"])
-            .output()
-            .map_err(|error| error.to_string())?;
-        let mut submodule_head = phoenix_core::git::command();
-        bind_git_command_to_worktree(&mut submodule_head, &submodule_path)?;
-        let submodule_head = submodule_head
-            .args(["rev-parse", "--verify", "HEAD"])
-            .output()
-            .map_err(|error| error.to_string())?;
+        let symbolic_head = run_bounded_git_command_until(
+            &submodule_path,
+            &["symbolic-ref", "-q", "HEAD"],
+            None,
+            deadline,
+            "Git submodule HEAD inspection",
+        )?;
+        let submodule_head = run_bounded_git_command_until(
+            &submodule_path,
+            &["rev-parse", "--verify", "HEAD"],
+            None,
+            deadline,
+            "Git submodule HEAD inspection",
+        )?;
         if !submodule_head.status.success() && symbolic_head.status.success() {
             observation.push((
                 [
@@ -4784,8 +4912,12 @@ fn observe_initialized_submodules(
             ]
             .concat(),
         ));
-        let detached_loss =
-            detached_head_is_unreachable(&submodule_path, observation, &relative_path)?;
+        let detached_loss = detached_head_is_unreachable(
+            &submodule_path,
+            observation,
+            &relative_path,
+            deadline,
+        )?;
         let gitlink_changed = gitlink.stage_zero_oid.as_deref() != Some(submodule_head_oid);
         if gitlink_changed || gitlink.has_unmerged_stage {
             observation.push((
@@ -4798,7 +4930,11 @@ fn observe_initialized_submodules(
             ));
         }
         if detached_loss {
-            for oid in detached_unreachable_commits(&submodule_path, submodule_head_oid)? {
+            for oid in detached_unreachable_commits_until(
+                &submodule_path,
+                submodule_head_oid,
+                deadline,
+            )? {
                 observation.push((
                     [b"SUBMODULE_LOSS\0detached\0".as_slice(), oid.as_slice()].concat(),
                     Vec::new(),
@@ -4841,6 +4977,9 @@ fn observe_initialized_submodules(
             deadline,
             visited,
         )?;
+    }
+    if std::time::Instant::now() >= deadline {
+        return Err("Git submodule inspection exceeded its aggregate deadline".to_string());
     }
     Ok(())
 }
@@ -5200,7 +5339,6 @@ fn remove_directory_contents_at(directory: &std::os::fd::OwnedFd) -> Result<(), 
 }
 
 #[cfg(unix)]
-#[allow(clippy::too_many_lines)]
 fn remove_directory_contents_at_with_hook<H>(
     directory: &std::os::fd::OwnedFd,
     after_inspection: &mut H,
@@ -5208,8 +5346,36 @@ fn remove_directory_contents_at_with_hook<H>(
 where
     H: FnMut(libc::c_int, &std::ffi::CStr),
 {
+    // Preserve legacy unbounded callers; native initial retirement must supply
+    // its captured absolute deadline to the shared implementation below.
+    remove_directory_contents_at_with_hook_and_deadline(directory, after_inspection, None)
+}
+
+#[cfg(unix)]
+fn check_directory_deletion_deadline(deadline: Option<std::time::Instant>) -> Result<(), String> {
+    if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+        return Err("descriptor-bound directory deletion exceeded its deadline".to_string());
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[allow(clippy::too_many_lines)]
+fn remove_directory_contents_at_with_hook_and_deadline<H>(
+    directory: &std::os::fd::OwnedFd,
+    after_inspection: &mut H,
+    deadline: Option<std::time::Instant>,
+) -> Result<(), String>
+where
+    H: FnMut(libc::c_int, &std::ffi::CStr),
+{
     use std::ffi::CStr;
     use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
+
+    // Cooperative checks stop new effects, not in-flight syscalls. The caller
+    // must retain destructive custody until this synchronous walk has returned;
+    // expiry is not proof of removal and may leave an identity-bound private slot.
+    check_directory_deletion_deadline(deadline)?;
     // SAFETY: dup returns a new owned descriptor or -1. fdopendir consumes only
     // that duplicate, while the caller retains the descriptor used by openat.
     let duplicate = unsafe { libc::dup(directory.as_raw_fd()) };
@@ -5232,6 +5398,7 @@ where
 
     let result = (|| {
         loop {
+            check_directory_deletion_deadline(deadline)?;
             // SAFETY: stream remains valid until closed below. errno is reset so
             // a null result can distinguish end-of-directory from an error.
             unsafe { *errno_location() = 0 };
@@ -5240,7 +5407,7 @@ where
             if entry.is_null() {
                 let error = std::io::Error::last_os_error();
                 return if error.raw_os_error() == Some(0) {
-                    Ok(())
+                    check_directory_deletion_deadline(deadline)
                 } else {
                     Err(format!("cannot read deletion descriptor: {error}"))
                 };
@@ -5269,9 +5436,11 @@ where
             // SAFETY: fstatat initialized metadata on success.
             let metadata = unsafe { metadata.assume_init() };
             after_inspection(directory.as_raw_fd(), name);
+            check_directory_deletion_deadline(deadline)?;
             let (slot, moved) =
                 bind_deletion_entry_to_private_slot(directory.as_raw_fd(), name, &metadata)?;
             if moved.st_mode & libc::S_IFMT == libc::S_IFDIR {
+                check_directory_deletion_deadline(deadline)?;
                 // SAFETY: openat does not follow the private slot because O_NOFOLLOW is set.
                 let child = unsafe {
                     libc::openat(
@@ -5303,7 +5472,12 @@ where
                         "private deletion slot was replaced before descriptor binding".to_string(),
                     );
                 }
-                remove_directory_contents_at_with_hook(&child, after_inspection)?;
+                remove_directory_contents_at_with_hook_and_deadline(
+                    &child,
+                    after_inspection,
+                    deadline,
+                )?;
+                check_directory_deletion_deadline(deadline)?;
                 // SAFETY: unlinkat targets only the unpredictable identity-checked slot.
                 if unsafe {
                     libc::unlinkat(directory.as_raw_fd(), slot.as_ptr(), libc::AT_REMOVEDIR)
@@ -5315,6 +5489,7 @@ where
                     ));
                 }
             } else {
+                check_directory_deletion_deadline(deadline)?;
                 // SAFETY: unlinkat targets only the unpredictable identity-checked slot.
                 if unsafe { libc::unlinkat(directory.as_raw_fd(), slot.as_ptr(), 0) } < 0 {
                     return Err(format!(
@@ -5327,7 +5502,8 @@ where
     })();
     // SAFETY: stream is the valid DIR pointer returned by fdopendir.
     unsafe { libc::closedir(stream) };
-    result
+    result?;
+    check_directory_deletion_deadline(deadline)
 }
 
 fn reserve_private_tombstone(root: &Path, description: &str) -> Result<(), String> {
@@ -5969,7 +6145,19 @@ fn classify_fsmonitor_stop(output: &std::process::Output) -> Result<FsmonitorSto
 }
 
 fn stop_bound_fsmonitor_daemons(path: &Path) -> Result<FsmonitorStop, String> {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    stop_bound_fsmonitor_daemons_until(
+        path,
+        std::time::Instant::now() + std::time::Duration::from_secs(5),
+    )
+}
+
+fn stop_bound_fsmonitor_daemons_until(
+    path: &Path,
+    deadline: std::time::Instant,
+) -> Result<FsmonitorStop, String> {
+    if std::time::Instant::now() >= deadline {
+        return Err("submodule fsmonitor shutdown exceeded its deadline".to_string());
+    }
     let submodules = run_bounded_git_command_until(
         path,
         &[
@@ -7516,6 +7704,16 @@ where
 }
 
 fn ensure_no_ignored_content(path: &Path) -> Result<(), String> {
+    ensure_no_ignored_content_until(
+        path,
+        std::time::Instant::now() + std::time::Duration::from_secs(10),
+    )
+}
+
+fn ensure_no_ignored_content_until(
+    path: &Path,
+    deadline: std::time::Instant,
+) -> Result<(), String> {
     fn inspect(
         path: &Path,
         deadline: std::time::Instant,
@@ -7561,11 +7759,7 @@ fn ensure_no_ignored_content(path: &Path) -> Result<(), String> {
         }
         Ok(())
     }
-    inspect(
-        path,
-        std::time::Instant::now() + std::time::Duration::from_secs(10),
-        &mut std::collections::HashSet::new(),
-    )
+    inspect(path, deadline, &mut std::collections::HashSet::new())
 }
 
 fn canonical_status_observation(status: &[u8]) -> Vec<u8> {
@@ -7587,13 +7781,22 @@ fn canonical_status_observation(status: &[u8]) -> Vec<u8> {
     observation
 }
 
-/// Detect modifications that `git status` intentionally suppresses for index entries
-/// marked assume-unchanged or skip-worktree. All index mutations happen in a copied index.
-fn observe_hidden_worktree_changes(repository: &Path) -> Result<Vec<GitPathIdentity>, String> {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+fn observe_hidden_worktree_changes_until(
+    repository: &Path,
+    deadline: std::time::Instant,
+) -> Result<Vec<GitPathIdentity>, String> {
+    if std::time::Instant::now() >= deadline {
+        return Err("hidden worktree inspection exceeded its deadline".into());
+    }
     let index_path = git_index_path(repository, deadline)?;
     if !index_path.exists() {
+        if std::time::Instant::now() >= deadline {
+            return Err("hidden worktree inspection exceeded its deadline".into());
+        }
         return Ok(Vec::new());
+    }
+    if std::time::Instant::now() >= deadline {
+        return Err("hidden worktree inspection exceeded its deadline".into());
     }
     let private_index = tempfile::NamedTempFile::new_in(
         index_path
@@ -7601,6 +7804,9 @@ fn observe_hidden_worktree_changes(repository: &Path) -> Result<Vec<GitPathIdent
             .ok_or("Git index has no parent directory")?,
     )
     .map_err(|error| error.to_string())?;
+    if std::time::Instant::now() >= deadline {
+        return Err("hidden worktree inspection exceeded its deadline".into());
+    }
     std::fs::copy(&index_path, private_index.path())
         .map_err(|error| format!("cannot copy Git index for hidden-change inspection: {error}"))?;
     let private_index = private_index.path();
@@ -7619,12 +7825,18 @@ fn observe_hidden_worktree_changes(repository: &Path) -> Result<Vec<GitPathIdent
     }
     let candidates = hidden_index_candidates(&flags.stdout);
     if candidates.is_empty() {
+        if std::time::Instant::now() >= deadline {
+            return Err("hidden worktree inspection exceeded its deadline".into());
+        }
         return Ok(Vec::new());
     }
     let sparse_absent = sparse_checkout_absent_paths(repository, &candidates, deadline)?;
 
     let mut dirty = BTreeSet::new();
     for batch in candidates.chunks(256) {
+        if std::time::Instant::now() >= deadline {
+            return Err("hidden worktree inspection exceeded its deadline".into());
+        }
         let batch_paths = batch
             .iter()
             .filter(|candidate| !sparse_absent.contains(candidate.path.as_slice()))
@@ -7683,6 +7895,9 @@ fn observe_hidden_worktree_changes(repository: &Path) -> Result<Vec<GitPathIdent
                 .into_iter()
                 .filter(|path| batch.contains(path)),
         );
+    }
+    if std::time::Instant::now() >= deadline {
+        return Err("hidden worktree inspection exceeded its deadline".into());
     }
     Ok(dirty.into_iter().map(GitPathIdentity::from_bytes).collect())
 }
@@ -7779,36 +7994,55 @@ fn git_sparse_checkout_selected_paths(
     cone: bool,
     deadline: std::time::Instant,
 ) -> Result<Vec<Vec<u8>>, String> {
+    const OPERATION: &str = "sparse-checkout rule inspection";
+    if std::time::Instant::now() >= deadline {
+        return Err(format!("{OPERATION} exceeded its deadline"));
+    }
+
+    let mut input = tempfile::tempfile()
+        .map_err(|error| format!("cannot prepare sparse-checkout probe paths: {error}"))?;
+    {
+        use std::io::Write as _;
+        for path in paths {
+            if std::time::Instant::now() >= deadline {
+                return Err(format!("{OPERATION} exceeded its deadline"));
+            }
+            // Filesystem writes are cooperative and cannot be preempted mid-write.
+            input
+                .write_all(path)
+                .and_then(|()| input.write_all(&[0]))
+                .map_err(|error| format!("cannot write sparse-checkout probe paths: {error}"))?;
+        }
+    }
+    if std::time::Instant::now() >= deadline {
+        return Err(format!("{OPERATION} exceeded its deadline"));
+    }
+    {
+        use std::io::Seek as _;
+        input
+            .rewind()
+            .map_err(|error| format!("cannot rewind sparse-checkout probe paths: {error}"))?;
+    }
+
     let mut command = phoenix_core::git::command();
     bind_git_command_to_worktree(&mut command, repository)?;
     command
         .arg("sparse-checkout")
         .arg("check-rules")
         .arg("-z")
-        .stdin(std::process::Stdio::piped())
+        .stdin(std::process::Stdio::from(input))
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .env("GIT_OPTIONAL_LOCKS", "0");
     if cone {
         command.arg("--cone");
     }
-    let mut child = command
-        .spawn()
-        .map_err(|error| format!("cannot inspect sparse-checkout rules: {error}"))?;
+    #[cfg(unix)]
     {
-        use std::io::Write as _;
-        let mut stdin = child
-            .stdin
-            .take()
-            .ok_or("cannot open sparse-checkout stdin")?;
-        for path in paths {
-            stdin
-                .write_all(path)
-                .and_then(|()| stdin.write_all(&[0]))
-                .map_err(|error| format!("cannot write sparse-checkout probe paths: {error}"))?;
-        }
+        use std::os::unix::process::CommandExt as _;
+        command.process_group(0);
     }
-    let output = wait_bounded_child_output(child, deadline, "sparse-checkout rule inspection")?;
+    let output = run_bounded_spawned_git(command, deadline, OPERATION)?;
     if !output.status.success() {
         return Err(format!(
             "cannot inspect sparse-checkout rules: {}",
@@ -7862,8 +8096,17 @@ fn git_index_path(repository: &Path, deadline: std::time::Instant) -> Result<Pat
     })
 }
 
-fn observe_dirty_content(repository: &Path, losses: &[CloseLossItem]) -> Result<Vec<u8>, String> {
+fn observe_dirty_content_until(
+    repository: &Path,
+    losses: &[CloseLossItem],
+    deadline: std::time::Instant,
+) -> Result<Vec<u8>, String> {
+    if std::time::Instant::now() >= deadline {
+        return Err("dirty content inspection exceeded its deadline".into());
+    }
     let mut observation = Vec::new();
+    // These checks are cooperative: a blocking filesystem operation already in
+    // progress cannot be interrupted when the deadline elapses.
     let mut paths = losses
         .iter()
         .filter_map(|loss| match loss.identity() {
@@ -7875,8 +8118,11 @@ fn observe_dirty_content(repository: &Path, losses: &[CloseLossItem]) -> Result<
         .collect::<Vec<_>>();
     paths.sort();
     paths.dedup();
-    let staged_entries = staged_index_entries_for_paths(repository, &paths)?;
+    let staged_entries = staged_index_entries_for_paths_until(repository, &paths, deadline)?;
     for path in paths {
+        if std::time::Instant::now() >= deadline {
+            return Err("dirty content inspection exceeded its deadline".into());
+        }
         observation.extend_from_slice(b"CONTENT\0");
         observation.extend_from_slice(&path);
         observation.push(0);
@@ -7916,6 +8162,9 @@ fn observe_dirty_content(repository: &Path, losses: &[CloseLossItem]) -> Result<
                 let mut digest = Sha256::new();
                 let mut buffer = vec![0_u8; 64 * 1024];
                 loop {
+                    if std::time::Instant::now() >= deadline {
+                        return Err("dirty content inspection exceeded its deadline".into());
+                    }
                     use std::io::Read as _;
                     let read = file
                         .read(&mut buffer)
@@ -7945,25 +8194,39 @@ fn observe_dirty_content(repository: &Path, losses: &[CloseLossItem]) -> Result<
         }
         observation.push(0);
     }
+    if std::time::Instant::now() >= deadline {
+        return Err("dirty content inspection exceeded its deadline".into());
+    }
     Ok(observation)
 }
 
-fn staged_index_entries_for_paths(
+fn staged_index_entries_for_paths_until(
     repository: &Path,
     paths: &[Vec<u8>],
+    deadline: std::time::Instant,
 ) -> Result<std::collections::BTreeMap<Vec<u8>, Vec<Vec<u8>>>, String> {
+    if std::time::Instant::now() >= deadline {
+        return Err("dirty index inspection exceeded its deadline".into());
+    }
     let mut entries = std::collections::BTreeMap::new();
     for batch in paths.chunks(256) {
+        if std::time::Instant::now() >= deadline {
+            return Err("dirty index inspection exceeded its deadline".into());
+        }
         let mut command = phoenix_core::git::command();
         bind_git_command_to_worktree(&mut command, repository)?;
-        command.args(["--literal-pathspecs", "ls-files", "--stage", "-z", "--"]);
-        for path in batch {
-            command.arg(path_buf_from_git_bytes(path));
-        }
-        let output = command
+        command
+            .args(["--literal-pathspecs", "ls-files", "--stage", "-z", "--"])
+            .args(batch.iter().map(|path| path_buf_from_git_bytes(path)))
             .current_dir(repository)
-            .output()
-            .map_err(|error| format!("cannot inspect dirty index: {error}"))?;
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt as _;
+            command.process_group(0);
+        }
+        let output = run_bounded_spawned_git(command, deadline, "dirty index inspection")?;
         if !output.status.success() {
             return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
         }
@@ -8401,7 +8664,8 @@ mod tests {
         remove_quarantine_then_administrative_dir,
         remove_quarantine_then_administrative_dir_with_hooks, rotate_inspection_generation,
         run_bounded_git_status_until, snapshot_for, staged_index_entries_by_path,
-        staged_index_entries_for_paths, worktree_quarantine_path, CloseLeaseFailure,
+        staged_index_entries_for_paths_until,
+        worktree_quarantine_path, CloseLeaseFailure,
         ExactWorktreeRemoval, FinalTombstoneRecovery,
     };
     use crate::db::{CloseCleanupResourceDisposition, CloseWorktreeFinalTombstone};
@@ -11780,6 +12044,51 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn expired_directory_deletion_deadline_preserves_entries_before_inspection() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("sentinel"), "preserve\n").unwrap();
+        let descriptor = open_directory(&root);
+
+        let error = super::remove_directory_contents_at_with_hook_and_deadline(
+            &descriptor,
+            &mut |_, _| panic!("expired deletion must not inspect an entry"),
+            Some(std::time::Instant::now()),
+        )
+        .unwrap_err();
+
+        assert!(error.contains("deadline"));
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
+        assert_eq!(std::fs::read(root.join("sentinel")).unwrap(), b"preserve\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deadline_directory_deletion_recurses_without_following_symlinks() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        let external = temp.path().join("external");
+        std::fs::create_dir_all(root.join("nested/deeper")).unwrap();
+        std::fs::create_dir(&external).unwrap();
+        std::fs::write(external.join("sentinel"), "preserve\n").unwrap();
+        std::fs::write(root.join("nested/deeper/owned"), "remove\n").unwrap();
+        std::os::unix::fs::symlink(&external, root.join("nested/external-link")).unwrap();
+        let descriptor = open_directory(&root);
+
+        super::remove_directory_contents_at_with_hook_and_deadline(
+            &descriptor,
+            &mut |_, _| {},
+            Some(std::time::Instant::now() + std::time::Duration::from_secs(30)),
+        )
+        .unwrap();
+
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+        assert_eq!(std::fs::read(external.join("sentinel")).unwrap(), b"preserve\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn directory_child_swap_after_inspection_preserves_replacement_for_needs_repair() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("root");
@@ -12064,6 +12373,124 @@ mod tests {
         let fresh = test_worktree_snapshot(&identity, &target);
         assert_eq!(fresh.fingerprint(), confirmed.fingerprint());
         assert!(target.join("deps/child/build/unique").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn expired_original_deadline_does_not_spawn_git_or_a_sentinel_effect() {
+        let temp = tempfile::tempdir().unwrap();
+        let marker = temp.path().join("must-not-be-created");
+        let mut command = std::process::Command::new("/bin/sh");
+        command.args(["-c", "printf invoked > \"$1\"", "deadline-sentinel"]);
+        command.arg(&marker);
+        let error = super::run_bounded_spawned_git(
+            command,
+            std::time::Instant::now(),
+            "expired initial Close probe",
+        ).unwrap_err();
+        assert_eq!(error, "expired initial Close probe exceeded its deadline");
+        assert!(!marker.exists(), "expired budget cannot admit a subprocess effect");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_child_waits_for_pipe_eof_until_deadline_after_direct_child_exits() {
+        use std::os::unix::process::CommandExt as _;
+
+        let temp = tempfile::tempdir().unwrap();
+        let marker = temp.path().join("descendant-started");
+        let mut command = std::process::Command::new("/bin/sh");
+        command
+            .args([
+                "-c",
+                "(/bin/sleep 60) & printf ready > \"$1\"; exit 0",
+                "pipe-retention-fixture",
+            ])
+            .arg(&marker)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .process_group(0);
+        let mut child = command.spawn().unwrap();
+        // Direct-child exit is the causal boundary under test, not a scheduling
+        // assumption within the deadline. Its descendant still owns the pipes.
+        let status = child.wait().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(300);
+
+        let error = super::wait_bounded_child_output(child, deadline, "pipe retention probe")
+            .unwrap_err();
+
+        assert_eq!(error, "pipe retention probe exceeded its deadline");
+        assert!(status.success());
+        assert!(marker.exists(), "fixture handshake confirms descendant launch");
+    }
+
+    #[test]
+    fn expired_original_fsmonitor_deadline_refuses_before_repository_access() {
+        let temp = tempfile::tempdir().unwrap();
+        let nonexistent = temp.path().join("not-a-repository");
+        let error = super::stop_bound_fsmonitor_daemons_until(
+            &nonexistent,
+            std::time::Instant::now(),
+        ).unwrap_err();
+        assert_eq!(error, "submodule fsmonitor shutdown exceeded its deadline");
+        assert!(!nonexistent.exists());
+    }
+
+    #[test]
+    fn expired_hidden_worktree_deadline_refuses_before_repository_access() {
+        let temp = tempfile::tempdir().unwrap();
+        let nonexistent = temp.path().join("not-a-repository");
+        let error = super::observe_hidden_worktree_changes_until(
+            &nonexistent,
+            std::time::Instant::now(),
+        )
+        .unwrap_err();
+        assert_eq!(error, "hidden worktree inspection exceeded its deadline");
+        assert!(!nonexistent.exists());
+    }
+
+    #[test]
+    fn expired_dirty_index_deadline_refuses_before_repository_access() {
+        let temp = tempfile::tempdir().unwrap();
+        let nonexistent = temp.path().join("not-a-repository");
+        let error = super::staged_index_entries_for_paths_until(
+            &nonexistent,
+            &[b"tracked".to_vec()],
+            std::time::Instant::now(),
+        )
+        .unwrap_err();
+        assert_eq!(error, "dirty index inspection exceeded its deadline");
+        assert!(!nonexistent.exists());
+    }
+
+    #[test]
+    fn expired_dirty_content_deadline_refuses_before_repository_access() {
+        let temp = tempfile::tempdir().unwrap();
+        let nonexistent = temp.path().join("not-a-repository");
+        let losses = [CloseLossItem::UnstagedTrackedPath(
+            GitPathIdentity::from_bytes(b"tracked".to_vec()),
+        )];
+        let error = super::observe_dirty_content_until(
+            &nonexistent,
+            &losses,
+            std::time::Instant::now(),
+        )
+        .unwrap_err();
+        assert_eq!(error, "dirty content inspection exceeded its deadline");
+        assert!(!nonexistent.exists());
+    }
+
+    #[test]
+    fn expired_ignored_content_deadline_refuses_before_repository_access() {
+        let temp = tempfile::tempdir().unwrap();
+        let nonexistent = temp.path().join("not-a-repository");
+        let error = super::ensure_no_ignored_content_until(
+            &nonexistent,
+            std::time::Instant::now(),
+        )
+        .unwrap_err();
+        assert_eq!(error, "ignored-content inspection exceeded its deadline");
+        assert!(!nonexistent.exists());
     }
 
     #[cfg(unix)]
@@ -13045,6 +13472,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn worktree_inspection_rejects_expired_deadline_before_repository_access() {
+        let temp = tempfile::tempdir().unwrap();
+        let nonexistent_repository = temp.path().join("does-not-exist");
+        let identity = WorktreeIdentity::from_parts(
+            WorktreeId::parse("expired-inspection-worktree").unwrap(),
+            WorktreeFingerprint::parse("captured-incarnation").unwrap(),
+            GitPathIdentity::from_bytes(b"unopened-repository".to_vec()),
+        );
+        let deadline = std::time::Instant::now() - std::time::Duration::from_millis(1);
+
+        let error = super::inspect_worktree_at_until(&identity, nonexistent_repository, deadline)
+            .await
+            .unwrap_err();
+
+        assert_eq!(error, "worktree inspection exceeded its deadline");
+    }
+
+    #[test]
+    fn sparse_checkout_rule_inspection_rejects_expired_deadline_before_repository_access() {
+        let temp = tempfile::tempdir().unwrap();
+        let nonexistent_repository = temp.path().join("does-not-exist");
+        let deadline = std::time::Instant::now() - std::time::Duration::from_millis(1);
+
+        let error = super::git_sparse_checkout_selected_paths(
+            &nonexistent_repository,
+            &[b"tracked/path".to_vec()],
+            false,
+            deadline,
+        )
+        .unwrap_err();
+
+        assert_eq!(error, "sparse-checkout rule inspection exceeded its deadline");
+    }
+
+    #[tokio::test]
     async fn sparse_checkout_absent_skip_worktree_path_is_not_loss_but_present_modified_one_is() {
         let temp = tempfile::tempdir().unwrap();
         initialize_repository(temp.path());
@@ -13210,6 +13672,54 @@ mod tests {
         assert!(head.status.success());
 
         assert!(super::detached_unreachable_commits(temp.path(), head.stdout.trim_ascii()).is_ok());
+    }
+
+    #[test]
+    fn detached_unreachable_commits_until_rejects_expired_deadline_before_repository_access() {
+        let temp = tempfile::tempdir().unwrap();
+        let nonexistent = temp.path().join("does-not-exist");
+
+        let error = super::detached_unreachable_commits_until(
+            &nonexistent,
+            b"invalid head is not parsed before expiration",
+            std::time::Instant::now(),
+        )
+        .unwrap_err();
+
+        assert!(error.contains("exceeded its deadline"));
+    }
+
+    #[test]
+    fn detached_head_is_unreachable_rejects_expired_deadline_before_repository_access() {
+        let temp = tempfile::tempdir().unwrap();
+        let nonexistent = temp.path().join("does-not-exist");
+        let mut observation = Vec::new();
+
+        let error = super::detached_head_is_unreachable(
+            &nonexistent,
+            &mut observation,
+            b"submodule",
+            std::time::Instant::now(),
+        )
+        .unwrap_err();
+
+        assert!(error.contains("exceeded its deadline"));
+        assert!(observation.is_empty());
+    }
+
+    #[test]
+    fn detached_reachability_evidence_until_rejects_expired_deadline_before_repository_access() {
+        let temp = tempfile::tempdir().unwrap();
+        let nonexistent = temp.path().join("does-not-exist");
+
+        let error = super::detached_reachability_evidence_until(
+            &nonexistent,
+            b"invalid head is not parsed before expiration",
+            std::time::Instant::now(),
+        )
+        .unwrap_err();
+
+        assert!(error.contains("exceeded its deadline"));
     }
 
     #[tokio::test]
@@ -14136,7 +14646,13 @@ mod tests {
         run_git(temp.path(), &["add", "unrelated"]);
         run_git(temp.path(), &["commit", "--quiet", "-m", "unrelated"]);
 
-        let entries = staged_index_entries_for_paths(temp.path(), &[b"tracked".to_vec()]).unwrap();
+        let paths = [b"tracked".to_vec()];
+        let entries = staged_index_entries_for_paths_until(
+            temp.path(),
+            &paths,
+            std::time::Instant::now() + std::time::Duration::from_secs(5),
+        )
+        .unwrap();
         assert_eq!(entries.len(), 1);
         assert!(entries.contains_key(b"tracked".as_slice()));
         assert!(!entries.contains_key(b"unrelated".as_slice()));

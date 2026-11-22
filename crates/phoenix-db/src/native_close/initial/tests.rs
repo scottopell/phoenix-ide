@@ -595,8 +595,10 @@ fn initial_dispatch_request(
 async fn initial_worktree_entry_requires_exact_dispatch_and_refuses_completed_reentry() {
     let f = Fixture::new().await;
     let (command, receipt, live_source, expected) = captured_initial_retirement(&f).await;
-    let worktree = expected.iter()
-        .find(|item| item.resource.kind() == RetiredResourceKind::Worktree).unwrap();
+    let worktree = expected
+        .iter()
+        .find(|item| item.resource.kind() == RetiredResourceKind::Worktree)
+        .unwrap();
     let entered = std::cell::Cell::new(0);
     let transferred = std::cell::Cell::new(false);
     // Model the independently retained owner: writer-fence replay cannot mint
@@ -608,82 +610,170 @@ async fn initial_worktree_entry_requires_exact_dispatch_and_refuses_completed_re
         entered.set(entered.get() + 1);
         NativeCloseInitialResourceEntryDecision::Entered
     };
-    let undispatched = f.db.enter_native_close_initial_worktree_resource(
-        &command, &receipt, &live_source, worktree.scope.clone(),
-        worktree.snapshot.clone(), &worktree.resource, handoff,
-    ).await;
-    assert!(matches!(undispatched, NativeCloseInitialResourceEntryResult::Rejected {
-        error: DbError::CloseFoundationPrecondition(_),
-        release: NativeCloseInitialEntryRelease::Confirmed,
-    }));
+    let undispatched =
+        f.db.enter_native_close_initial_worktree_resource(
+            &command,
+            &receipt,
+            &live_source,
+            worktree.scope.clone(),
+            worktree.snapshot.clone(),
+            &worktree.resource,
+            handoff,
+        )
+        .await;
+    assert!(matches!(
+        undispatched,
+        NativeCloseInitialResourceEntryResult::Rejected {
+            error: DbError::CloseFoundationPrecondition(_),
+            release: NativeCloseInitialEntryRelease::Confirmed,
+        }
+    ));
     assert_eq!(entered.get(), 0);
     f.db.record_native_close_initial_retirement_dispatch(
-        &command, &receipt, &live_source, initial_dispatch_request(&receipt, worktree),
-    ).await.established().unwrap().unwrap();
+        &command,
+        &receipt,
+        &live_source,
+        initial_dispatch_request(&receipt, worktree),
+    )
+    .await
+    .established()
+    .unwrap()
+    .unwrap();
     let wrong_snapshot = phoenix_core::domain::close::CloseRetirementSnapshot::parse(
-        "another-generation", "another-fingerprint",
-    ).unwrap();
-    let mismatched = f.db.enter_native_close_initial_worktree_resource(
-        &command, &receipt, &live_source, worktree.scope.clone(),
-        wrong_snapshot, &worktree.resource, handoff,
-    ).await;
-    assert!(matches!(mismatched, NativeCloseInitialResourceEntryResult::Rejected {
-        error: DbError::CloseFoundationPrecondition(_),
-        release: NativeCloseInitialEntryRelease::Confirmed,
-    }));
+        "another-generation",
+        "another-fingerprint",
+    )
+    .unwrap();
+    let mismatched =
+        f.db.enter_native_close_initial_worktree_resource(
+            &command,
+            &receipt,
+            &live_source,
+            worktree.scope.clone(),
+            wrong_snapshot,
+            &worktree.resource,
+            handoff,
+        )
+        .await;
+    assert!(matches!(
+        mismatched,
+        NativeCloseInitialResourceEntryResult::Rejected {
+            error: DbError::CloseFoundationPrecondition(_),
+            release: NativeCloseInitialEntryRelease::Confirmed,
+        }
+    ));
     assert_eq!(entered.get(), 0);
-    let admitted = f.db.enter_native_close_initial_worktree_resource(
-        &command, &receipt, &live_source, worktree.scope.clone(),
-        worktree.snapshot.clone(), &worktree.resource, handoff,
-    ).await;
-    assert!(matches!(admitted, NativeCloseInitialResourceEntryResult::Invoked {
-        decision: NativeCloseInitialResourceEntryDecision::Entered,
-        release: NativeCloseInitialEntryRelease::Confirmed,
-    }));
+    let admitted =
+        f.db.enter_native_close_initial_worktree_resource(
+            &command,
+            &receipt,
+            &live_source,
+            worktree.scope.clone(),
+            worktree.snapshot.clone(),
+            &worktree.resource,
+            handoff,
+        )
+        .await;
+    assert!(matches!(
+        admitted,
+        NativeCloseInitialResourceEntryResult::Invoked {
+            decision: NativeCloseInitialResourceEntryDecision::Entered,
+            release: NativeCloseInitialEntryRelease::Confirmed,
+        }
+    ));
     assert_eq!(entered.get(), 1);
-    let pending_replay = f.db.enter_native_close_initial_worktree_resource(
-        &command, &receipt, &live_source, worktree.scope.clone(),
-        worktree.snapshot.clone(), &worktree.resource, handoff,
-    ).await;
-    assert!(matches!(pending_replay, NativeCloseInitialResourceEntryResult::Invoked {
-        decision: NativeCloseInitialResourceEntryDecision::Refused,
-        release: NativeCloseInitialEntryRelease::Confirmed,
-    }));
-    assert_eq!(entered.get(), 1, "retained owner refuses duplicate pre-proof entry");
+    let pending_replay =
+        f.db.enter_native_close_initial_worktree_resource(
+            &command,
+            &receipt,
+            &live_source,
+            worktree.scope.clone(),
+            worktree.snapshot.clone(),
+            &worktree.resource,
+            handoff,
+        )
+        .await;
+    assert!(matches!(
+        pending_replay,
+        NativeCloseInitialResourceEntryResult::Invoked {
+            decision: NativeCloseInitialResourceEntryDecision::Refused,
+            release: NativeCloseInitialEntryRelease::Confirmed,
+        }
+    ));
+    assert_eq!(
+        entered.get(),
+        1,
+        "retained owner refuses duplicate pre-proof entry"
+    );
     record_initial_retirement(&f, &command, &receipt, &live_source, worktree).await;
-    let completed = f.db.enter_native_close_initial_worktree_resource(
-        &command, &receipt, &live_source, worktree.scope.clone(),
-        worktree.snapshot.clone(), &worktree.resource, handoff,
-    ).await;
-    assert!(matches!(completed, NativeCloseInitialResourceEntryResult::Rejected {
-        error: DbError::CloseFoundationPrecondition(_),
-        release: NativeCloseInitialEntryRelease::Confirmed,
-    }));
-    assert_eq!(entered.get(), 1, "completed proof cannot grant another entry");
+    let completed =
+        f.db.enter_native_close_initial_worktree_resource(
+            &command,
+            &receipt,
+            &live_source,
+            worktree.scope.clone(),
+            worktree.snapshot.clone(),
+            &worktree.resource,
+            handoff,
+        )
+        .await;
+    assert!(matches!(
+        completed,
+        NativeCloseInitialResourceEntryResult::Rejected {
+            error: DbError::CloseFoundationPrecondition(_),
+            release: NativeCloseInitialEntryRelease::Confirmed,
+        }
+    ));
+    assert_eq!(
+        entered.get(),
+        1,
+        "completed proof cannot grant another entry"
+    );
 }
 
 #[tokio::test]
 async fn initial_worktree_entry_rejects_durable_source_revocation_before_handoff() {
     let f = Fixture::new().await;
     let (command, receipt, live_source, expected) = captured_initial_retirement(&f).await;
-    let worktree = expected.iter()
-        .find(|item| item.resource.kind() == RetiredResourceKind::Worktree).unwrap();
+    let worktree = expected
+        .iter()
+        .find(|item| item.resource.kind() == RetiredResourceKind::Worktree)
+        .unwrap();
     f.db.record_native_close_initial_retirement_dispatch(
-        &command, &receipt, &live_source, initial_dispatch_request(&receipt, worktree),
-    ).await.established().unwrap().unwrap();
-    f.db.update_conversation_state(&f.coordinator, &ConvState::Idle).await.unwrap();
+        &command,
+        &receipt,
+        &live_source,
+        initial_dispatch_request(&receipt, worktree),
+    )
+    .await
+    .established()
+    .unwrap()
+    .unwrap();
+    f.db.update_conversation_state(&f.coordinator, &ConvState::Idle)
+        .await
+        .unwrap();
     let invoked = std::cell::Cell::new(false);
-    let result = f.db.enter_native_close_initial_worktree_resource(
-        &command, &receipt, &live_source, worktree.scope.clone(),
-        worktree.snapshot.clone(), &worktree.resource, || {
-            invoked.set(true);
-            NativeCloseInitialResourceEntryDecision::Entered
-        },
-    ).await;
-    assert!(matches!(result, NativeCloseInitialResourceEntryResult::Rejected {
-        error: DbError::CloseFoundationPrecondition(_),
-        release: NativeCloseInitialEntryRelease::Confirmed,
-    }));
+    let result =
+        f.db.enter_native_close_initial_worktree_resource(
+            &command,
+            &receipt,
+            &live_source,
+            worktree.scope.clone(),
+            worktree.snapshot.clone(),
+            &worktree.resource,
+            || {
+                invoked.set(true);
+                NativeCloseInitialResourceEntryDecision::Entered
+            },
+        )
+        .await;
+    assert!(matches!(
+        result,
+        NativeCloseInitialResourceEntryResult::Rejected {
+            error: DbError::CloseFoundationPrecondition(_),
+            release: NativeCloseInitialEntryRelease::Confirmed,
+        }
+    ));
     assert!(!invoked.get());
 }
 
@@ -2835,125 +2925,222 @@ async fn initial_worktree_metadata_requires_exact_original_dispatched_authority_
         administrative_dir: std::path::PathBuf::from("/tmp/initial-authority-admin"),
     };
 
-    let before_dispatch = f.db.close_worktree_cleanup_plan(
-        &receipt.admitted.attempt_id,
-        &worktree.scope,
-        &worktree.snapshot,
-        &worktree.resource,
-    ).await.unwrap();
+    let before_dispatch =
+        f.db.close_worktree_cleanup_plan(
+            &receipt.admitted.attempt_id,
+            &worktree.scope,
+            &worktree.snapshot,
+            &worktree.resource,
+        )
+        .await
+        .unwrap();
     assert!(before_dispatch.is_none());
     assert!(matches!(
         f.db.record_native_close_initial_worktree_cleanup_plan(
-            &command, &receipt, &live_source, plan(),
-        ).await,
+            &command,
+            &receipt,
+            &live_source,
+            plan(),
+        )
+        .await,
         LocalAuthorityResult::DurableFactEstablished(Err(DbError::CloseFoundationPrecondition(_)))
     ));
-    assert!(f.db.close_worktree_cleanup_plan(
-        &receipt.admitted.attempt_id,
-        &worktree.scope,
-        &worktree.snapshot,
-        &worktree.resource,
-    ).await.unwrap().is_none());
+    assert!(f
+        .db
+        .close_worktree_cleanup_plan(
+            &receipt.admitted.attempt_id,
+            &worktree.scope,
+            &worktree.snapshot,
+            &worktree.resource,
+        )
+        .await
+        .unwrap()
+        .is_none());
 
     f.db.record_native_close_initial_retirement_dispatch(
-        &command, &receipt, &live_source, initial_dispatch_request(&receipt, worktree),
-    ).await.established().unwrap().unwrap();
+        &command,
+        &receipt,
+        &live_source,
+        initial_dispatch_request(&receipt, worktree),
+    )
+    .await
+    .established()
+    .unwrap()
+    .unwrap();
     let wrong_snapshot = crate::RecordCloseWorktreeCleanupPlanRequest {
         snapshot: phoenix_core::domain::close::CloseRetirementSnapshot::parse(
-            "foreign-generation", "foreign-fingerprint",
-        ).unwrap(),
+            "foreign-generation",
+            "foreign-fingerprint",
+        )
+        .unwrap(),
         ..plan()
     };
     assert!(matches!(
         f.db.record_native_close_initial_worktree_cleanup_plan(
-            &command, &receipt, &live_source, wrong_snapshot,
-        ).await,
+            &command,
+            &receipt,
+            &live_source,
+            wrong_snapshot,
+        )
+        .await,
         LocalAuthorityResult::DurableFactEstablished(Err(DbError::CloseFoundationPrecondition(_)))
     ));
-    assert!(f.db.close_worktree_cleanup_plan(
-        &receipt.admitted.attempt_id,
-        &worktree.scope,
-        &worktree.snapshot,
-        &worktree.resource,
-    ).await.unwrap().is_none());
+    assert!(f
+        .db
+        .close_worktree_cleanup_plan(
+            &receipt.admitted.attempt_id,
+            &worktree.scope,
+            &worktree.snapshot,
+            &worktree.resource,
+        )
+        .await
+        .unwrap()
+        .is_none());
 
     f.db.record_native_close_initial_worktree_cleanup_plan(
-        &command, &receipt, &live_source, plan(),
-    ).await.established().unwrap().unwrap();
-    assert!(f.db.close_worktree_cleanup_plan(
-        &receipt.admitted.attempt_id,
-        &worktree.scope,
-        &worktree.snapshot,
-        &worktree.resource,
-    ).await.unwrap().is_some());
+        &command,
+        &receipt,
+        &live_source,
+        plan(),
+    )
+    .await
+    .established()
+    .unwrap()
+    .unwrap();
+    assert!(f
+        .db
+        .close_worktree_cleanup_plan(
+            &receipt.admitted.attempt_id,
+            &worktree.scope,
+            &worktree.snapshot,
+            &worktree.resource,
+        )
+        .await
+        .unwrap()
+        .is_some());
 
     f.db.update_conversation_state(&f.coordinator, &ConvState::Idle)
-        .await.unwrap();
+        .await
+        .unwrap();
     let stopped_plan = crate::RecordCloseWorktreeCleanupPlanRequest {
         administrative_dir_incarnation: "must-not-write".into(),
         ..plan()
     };
     assert!(matches!(
         f.db.record_native_close_initial_worktree_cleanup_plan(
-            &command, &receipt, &live_source, stopped_plan,
-        ).await,
+            &command,
+            &receipt,
+            &live_source,
+            stopped_plan,
+        )
+        .await,
         LocalAuthorityResult::DurableFactEstablished(Err(DbError::CloseFoundationPrecondition(_)))
     ));
-    let retained = f.db.close_worktree_cleanup_plan(
-        &receipt.admitted.attempt_id,
-        &worktree.scope,
-        &worktree.snapshot,
-        &worktree.resource,
-    ).await.unwrap().unwrap();
-    assert_eq!(retained.administrative_dir_incarnation, "initial-authority-test");
+    let retained =
+        f.db.close_worktree_cleanup_plan(
+            &receipt.admitted.attempt_id,
+            &worktree.scope,
+            &worktree.snapshot,
+            &worktree.resource,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        retained.administrative_dir_incarnation,
+        "initial-authority-test"
+    );
 }
 
 #[tokio::test]
-async fn initial_work_scope_retirement_rejects_unresolved_originals_then_commits_proof_atomically() {
+async fn initial_work_scope_retirement_rejects_unresolved_originals_then_commits_proof_atomically()
+{
     let f = Fixture::new().await;
     let (command, receipt, live_source, expected) = captured_initial_retirement(&f).await;
-    let worktree = expected.iter()
-        .find(|item| item.resource.kind() == RetiredResourceKind::Worktree).unwrap();
-    let work_scope = expected.iter()
-        .find(|item| item.resource.kind() == RetiredResourceKind::WorkScope).unwrap();
-    let precondition = || phoenix_core::work_scope::WorkScopeRetirementPrecondition::
-        after_runtime_inventory_found_no_live_resource(work_scope.scope.clone());
+    let worktree = expected
+        .iter()
+        .find(|item| item.resource.kind() == RetiredResourceKind::Worktree)
+        .unwrap();
+    let work_scope = expected
+        .iter()
+        .find(|item| item.resource.kind() == RetiredResourceKind::WorkScope)
+        .unwrap();
+    let precondition = || {
+        phoenix_core::work_scope::WorkScopeRetirementPrecondition::
+        after_runtime_inventory_found_no_live_resource(work_scope.scope.clone())
+    };
     let lifecycle = || async {
         sqlx::query_scalar::<_, String>("SELECT lifecycle FROM work_scopes WHERE id = ?1")
             .bind(work_scope.scope.as_str())
-            .fetch_one(f.db.pool()).await.unwrap()
+            .fetch_one(f.db.pool())
+            .await
+            .unwrap()
     };
 
     f.db.record_native_close_initial_retirement_dispatch(
-        &command, &receipt, &live_source, initial_dispatch_request(&receipt, worktree),
-    ).await.established().unwrap().unwrap();
+        &command,
+        &receipt,
+        &live_source,
+        initial_dispatch_request(&receipt, worktree),
+    )
+    .await
+    .established()
+    .unwrap()
+    .unwrap();
     f.db.record_native_close_initial_retirement_dispatch(
-        &command, &receipt, &live_source, initial_dispatch_request(&receipt, work_scope),
-    ).await.established().unwrap().unwrap();
+        &command,
+        &receipt,
+        &live_source,
+        initial_dispatch_request(&receipt, work_scope),
+    )
+    .await
+    .established()
+    .unwrap()
+    .unwrap();
     assert_eq!(lifecycle().await, "active");
-    let unresolved = f.db.retire_work_scope_for_native_close_initial(
-        &command, &receipt, &live_source, work_scope.scope.clone(),
-        work_scope.snapshot.clone(), work_scope.resource.clone(), precondition(),
-        "retire only after original resources resolve",
-    ).await;
-    assert!(matches!(unresolved,
+    let unresolved =
+        f.db.retire_work_scope_for_native_close_initial(
+            &command,
+            &receipt,
+            &live_source,
+            work_scope.scope.clone(),
+            work_scope.snapshot.clone(),
+            work_scope.resource.clone(),
+            precondition(),
+            "retire only after original resources resolve",
+        )
+        .await;
+    assert!(matches!(
+        unresolved,
         LocalAuthorityResult::DurableFactEstablished(Err(DbError::CloseFoundationPrecondition(_)))
     ));
     assert_eq!(lifecycle().await, "active");
     let scope_proofs: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM close_retirement_resources WHERE attempt_id = ?1
          AND scope = ?2 AND resource_kind = 'work_scope'",
-    ).bind(receipt.admitted.attempt_id.as_str()).bind(work_scope.scope.as_str())
-        .fetch_one(f.db.pool()).await.unwrap();
+    )
+    .bind(receipt.admitted.attempt_id.as_str())
+    .bind(work_scope.scope.as_str())
+    .fetch_one(f.db.pool())
+    .await
+    .unwrap();
     assert_eq!(scope_proofs, 0);
 
     record_initial_retirement(&f, &command, &receipt, &live_source, worktree).await;
-    let retired = f.db.retire_work_scope_for_native_close_initial(
-        &command, &receipt, &live_source, work_scope.scope.clone(),
-        work_scope.snapshot.clone(), work_scope.resource.clone(), precondition(),
-        "original resources resolved",
-    ).await;
-    assert!(matches!(retired,
+    let retired =
+        f.db.retire_work_scope_for_native_close_initial(
+            &command,
+            &receipt,
+            &live_source,
+            work_scope.scope.clone(),
+            work_scope.snapshot.clone(),
+            work_scope.resource.clone(),
+            precondition(),
+            "original resources resolved",
+        )
+        .await;
+    assert!(matches!(
+        retired,
         LocalAuthorityResult::DurableFactEstablished(Ok(
             phoenix_core::work_scope::WorkScopeRetirementOutcome::Retired
         ))
@@ -2962,8 +3149,12 @@ async fn initial_work_scope_retirement_rejects_unresolved_originals_then_commits
     let proof: (String, Option<String>) = sqlx::query_as(
         "SELECT proof_kind, detail FROM close_retirement_resources
          WHERE attempt_id = ?1 AND scope = ?2 AND resource_kind = 'work_scope'",
-    ).bind(receipt.admitted.attempt_id.as_str()).bind(work_scope.scope.as_str())
-        .fetch_one(f.db.pool()).await.unwrap();
+    )
+    .bind(receipt.admitted.attempt_id.as_str())
+    .bind(work_scope.scope.as_str())
+    .fetch_one(f.db.pool())
+    .await
+    .unwrap();
     assert_eq!(proof.0, "retired");
     assert_eq!(proof.1.as_deref(), Some("original resources resolved"));
 }
