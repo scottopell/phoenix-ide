@@ -566,7 +566,7 @@ runSurfaceCapture({
     const fixtureHash = id === 'long-history-110-messages' ? '#message-long-older-target' : '';
     const baseUrl = process.env.LADLE_URL ?? `http://127.0.0.1:${process.env.LADLE_PORT ?? 61123}/`;
     return buildLadleStoryUrl(baseUrl, storyKey, { fixtureTheme: theme, fixtureHash,
-      ...(['ordinary-lazy-history', 'global-lazy-history', 'ember-tracking-continued', 'ember-tracking-fallback'].includes(id) ? { fixtureBrowserHistory: '1' } : {}),
+      ...(['ordinary-lazy-history', 'global-lazy-history', 'ember-tracking-observations', 'ember-tracking-fallback'].includes(id) ? { fixtureBrowserHistory: '1' } : {}),
     });
   },
   preparePage: async ({ page }) => {
