@@ -13679,7 +13679,7 @@ pub(crate) mod hard_delete_cascade_tests {
             .await
             .unwrap();
         let before = state.runtime.get_or_create(&coordinator.id).await.unwrap();
-        super::update_coordinator_language(
+        let Json(saved) = super::update_coordinator_language(
             State(state.clone()),
             Json(super::LlmLanguageSettingRequest {
                 language: "adhd".into(),
@@ -13687,6 +13687,7 @@ pub(crate) mod hard_delete_cascade_tests {
         )
         .await
         .unwrap();
+        assert_eq!(saved.language, "adhd");
         assert!(state
             .runtime
             .try_get_handle(&coordinator.id)
