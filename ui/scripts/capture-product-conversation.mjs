@@ -5,6 +5,7 @@ import process from 'node:process';
 import { buildLadleStoryUrl, runSurfaceCapture } from './capture-ladle-surface.mjs';
 
 const measurements = [];
+const trackingMeasurements = [];
 const journeys = [];
 
 async function assertMobileContinuation(page, id, viewport, outDir) {
@@ -488,7 +489,7 @@ async function assertEmberTracking(page, id, viewport, outDir) {
   if (await due.locator('.ember-tracking-card details').first().getAttribute('open') !== null) throw new Error('Saved observation was not collapsed');
   const collapsedHeight = await due.locator('.ember-tracking-card').evaluate(element => element.getBoundingClientRect().height);
   if (collapsedHeight <= 0 || collapsedHeight > 240) throw new Error(`Collapsed observation is not compact: ${collapsedHeight}px`);
-  measurements.push({ id, viewport: viewport.name, collapsedTrackingCardHeight: collapsedHeight });
+  trackingMeasurements.push({ id, viewport: viewport.name, collapsedTrackingCardHeight: collapsedHeight });
   const composer = page.locator('.product-conversation-page__composer #message-input');
   await composer.waitFor({ state: 'visible' });
   await composer.fill('Unsent tracking QA draft');
@@ -525,7 +526,7 @@ async function assertEmberTracking(page, id, viewport, outDir) {
   if (copied !== original) throw new Error('Copy did not preserve the original producer payload');
   const afterCopyScroll = await scroller.evaluate(element => element.scrollTop);
   if (Math.abs(afterCopyScroll - beforeCopyScroll) > 3) throw new Error(`Copy jumped the transcript scroller: ${beforeCopyScroll} -> ${afterCopyScroll}`);
-  measurements.push({ id, viewport: viewport.name, beforeCopyScroll, afterCopyScroll });
+  trackingMeasurements.push({ id, viewport: viewport.name, beforeCopyScroll, afterCopyScroll });
   await page.screenshot({ path: `${outDir}/${id}--${viewport.name}--expanded.png`, fullPage: true });
   await summary.focus();
   await summary.press('Enter');
@@ -557,6 +558,7 @@ async function writeReport(outDir) {
     '| Scenario | Viewport | Theme | transcript h | main h | chat h | virtual h | positive rows | overflow |',
     '| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | --- |',
     ...measurements.map((item) => `| ${item.id} | ${item.viewport} | ${item.theme} | ${item.transcript.height} | ${item.mainArea.height} | ${item.chatView.height} | ${item.virtualTranscript.height} | ${item.positiveRows} | ${item.horizontalOverflow ? 'yes' : 'no'} |`),
+    '', '## Tracking measurements', ...trackingMeasurements.map(item => `- ${JSON.stringify(item)}`),
     '', '## Deterministic interaction coverage', ...journeys.map((journey) => `- ${journey}`), '',
     'Screenshots and journeys cover only the scenarios selected for this run. Geometry, viewer, and Recall coverage is present only where recorded above. Lazy-history fixtures use HashRouter so browser Back/Forward exercises actual browser history without a Phoenix server; this is not production-path cold-reload or physical-device acceptance. Emulated zero-inset viewports cannot prove physical notch geometry. Shared runner fails on unexpected console, page, request, and >=400 response failures.',
     `Browser engine: ${process.env.PLAYWRIGHT_BROWSER ?? 'chromium'}.`, '',
