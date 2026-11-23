@@ -1,4 +1,4 @@
-//! Opt-in bridge qualification through the runtime, real tools, and SQLite.
+//! Opt-in bridge qualification through the runtime, real tools, and `SQLite`.
 
 use super::*;
 use phoenix_core::domain::tool_discovery::{
@@ -295,18 +295,19 @@ async fn codex_native_discovery_runtime_sqlite_roundtrip() {
         .unwrap()
         .is_empty());
     assert!(db.get_messages(CONVERSATION).await.unwrap().iter().any(|message| matches!(&message.content, MessageContent::Agent(blocks) if blocks.iter().any(|block| matches!(block,ContentBlock::Text { text } if text.trim()=="OK")))));
-    let requests = client.requests.lock().unwrap();
-    assert_eq!(requests.len(), 3);
-    assert!(requests.iter().all(|request| request
-        .telemetry
-        .as_ref()
-        .unwrap()
-        .attempt_capture
-        .finalized()
-        .unwrap()
-        .transport
-        == phoenix_llm::LlmTransport::Websocket));
-    drop(requests);
+    {
+        let requests = client.requests.lock().unwrap();
+        assert_eq!(requests.len(), 3);
+        assert!(requests.iter().all(|request| request
+            .telemetry
+            .as_ref()
+            .unwrap()
+            .attempt_capture
+            .finalized()
+            .unwrap()
+            .transport
+            == phoenix_llm::LlmTransport::Websocket));
+    }
     drop(runtime);
     db.pool().close().await;
     println!("Codex native search: actual WebSocket runtime, selector, SQLite ownership and final response passed");
