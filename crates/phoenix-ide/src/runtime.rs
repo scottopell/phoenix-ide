@@ -7096,6 +7096,30 @@ impl RuntimeManager {
         }
     }
 
+    // REQ-LL-003
+    pub(crate) async fn change_idle_coordinator_language(
+        &self,
+        id: &str,
+        language: crate::llm_language::LlmLanguage,
+    ) -> Result<bool, phoenix_db::DbError> {
+        let _messages = self.lock_message_acceptance(id).await;
+        let creations = self.runtime_creations.lock().await;
+        if creations.contains_key(id)
+            || self
+                .effective_conversation_state(id)
+                .await
+                .is_some_and(|state| !matches!(state, ConvState::Idle))
+        {
+            return Ok(false);
+        }
+        let applied = self.db.set_idle_coordinator_language(id, language).await?;
+        if applied {
+            self.evict_runtime(id, EvictionReason::LanguageChanged)
+                .await;
+        }
+        Ok(applied)
+    }
+
     pub(crate) async fn lock_remote_goal_apply(
         &self,
         action_reference: uuid::Uuid,
@@ -14868,6 +14892,52 @@ mod scope_liveness_tests {
             .expect("materialization joins")
             .expect("materialization succeeds");
         assert!(first.same_channel(&handle.broadcast_tx));
+    }
+
+    #[tokio::test]
+    async fn coordinator_language_refuses_in_flight_materialization() {
+        use phoenix_core::llm_language::LlmLanguage;
+        let mgr = Arc::new(test_manager().await);
+        let home = tempfile::tempdir().unwrap();
+        mgr.db()
+            .initialize_coordinator_work_scope(home.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let coordinator = mgr
+            .db()
+            .get_or_create_coordinator(None, LlmLanguage::Caveman)
+            .await
+            .unwrap();
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        mgr.runtime_materialization_barriers
+            .lock()
+            .await
+            .insert(coordinator.id.clone(), Arc::clone(&barrier));
+        let materialization = {
+            let mgr = Arc::clone(&mgr);
+            let id = coordinator.id.clone();
+            tokio::spawn(async move { mgr.get_or_create(&id).await })
+        };
+        barrier.wait().await;
+        assert!(!mgr
+            .change_idle_coordinator_language(&coordinator.id, LlmLanguage::Adhd)
+            .await
+            .unwrap());
+        assert_eq!(
+            mgr.db()
+                .get_conversation(&coordinator.id)
+                .await
+                .unwrap()
+                .llm_language,
+            LlmLanguage::Caveman
+        );
+        barrier.wait().await;
+        materialization.await.unwrap().unwrap();
+        assert!(mgr
+            .change_idle_coordinator_language(&coordinator.id, LlmLanguage::Adhd)
+            .await
+            .unwrap());
+        assert!(mgr.try_get_handle(&coordinator.id).await.is_none());
     }
 
     #[tokio::test]

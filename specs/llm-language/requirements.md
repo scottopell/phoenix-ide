@@ -31,6 +31,6 @@ THE SYSTEM SHALL offer an Ember-specific language selector after Coordinator cre
 WHEN the user changes Ember's language while its current transcript is idle
 THE SYSTEM SHALL persist the selection for that Coordinator, apply it to subsequent requests and continuations, and preserve its identity, history and authority.
 
-THE SYSTEM SHALL reject a change while Ember is working or its current transcript changes during the save, explain the refusal, and retain the saved selection. The control SHALL expose loading and save failures with a retry path.
+THE SYSTEM SHALL reject a change while Ember is starting, working, or its current transcript changes during the save, explain the refusal, and retain the saved selection. The control SHALL expose loading and save failures with a retry path.
 
 Changing Ember's language SHALL NOT change the global default, ordinary conversations, or already-created research agents.

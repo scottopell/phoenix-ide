@@ -1725,32 +1725,17 @@ async fn update_coordinator_language(
         .await
         .map_err(map_admission_db_error)?;
     let _admission = admission.lock().await;
-    let conversation = state
-        .db
-        .get_conversation(&id)
-        .await
-        .map_err(|error| AppError::Internal(error.to_string()))?;
-    let effective = state
+    if !state
         .runtime
-        .effective_conversation_state(&id)
+        .change_idle_coordinator_language(&id, language)
         .await
-        .unwrap_or(conversation.state);
-    if !matches!(effective, ConvState::Idle)
-        || !state
-            .db
-            .set_idle_coordinator_language(&id, language)
-            .await
-            .map_err(|error| AppError::Internal(error.to_string()))?
+        .map_err(|error| AppError::Internal(error.to_string()))?
     {
         return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
-            "Ember must be idle to change language. Wait for it to finish or stop it, then try again.",
+            "Ember must be idle to change language. Wait for it to finish starting or working, or stop it, then try again.",
             "coordinator_language_busy",
         ))));
     }
-    state
-        .runtime
-        .evict_runtime(&id, crate::runtime::EvictionReason::LanguageChanged)
-        .await;
     Ok(Json(llm_language_setting_response(language)))
 }
 
@@ -13676,6 +13661,46 @@ pub(crate) mod hard_delete_cascade_tests {
             .set_idle_coordinator_language("missing", LlmLanguage::Caveman)
             .await
             .unwrap());
+    }
+
+    #[tokio::test]
+    async fn coordinator_language_save_recreates_warm_runtime() {
+        use phoenix_core::llm_language::LlmLanguage;
+        let state = make_test_state().await;
+        let home = tempfile::tempdir().unwrap();
+        state
+            .db
+            .initialize_coordinator_work_scope(home.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let coordinator = state
+            .db
+            .get_or_create_coordinator(None, LlmLanguage::Caveman)
+            .await
+            .unwrap();
+        let before = state.runtime.get_or_create(&coordinator.id).await.unwrap();
+        super::update_coordinator_language(
+            State(state.clone()),
+            Json(super::LlmLanguageSettingRequest {
+                language: "adhd".into(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(state
+            .runtime
+            .try_get_handle(&coordinator.id)
+            .await
+            .is_none());
+        let after = state.runtime.get_or_create(&coordinator.id).await.unwrap();
+        assert!(!before.event_tx.same_channel(&after.event_tx));
+        assert_eq!(*after.state_rx.borrow(), ConvState::Idle);
+        assert!(state
+            .db
+            .get_messages(&coordinator.id)
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]
