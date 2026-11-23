@@ -1914,11 +1914,7 @@ async fn provision_conversation(
                     .map_err(|error| (error, ErrorKind::ServerError))?
                 };
                 (
-                    format!(
-                        "task-{}-{}",
-                        snapshot.task_id,
-                        slugify_label(&snapshot.task_title)
-                    ),
+                    approved_task_branch_name(&snapshot.task_id, &snapshot.task_title),
                     Some(oid),
                     Some(base_branch),
                 )
@@ -5933,5 +5929,30 @@ mod model_resolution_tests {
             resolve_creation_model(&registry, Some("mock")).unwrap(),
             "mock"
         );
+    }
+}
+
+/// `task-{id}-{slug}`, or `task-{id}` when the title has no ASCII alphanumerics.
+fn approved_task_branch_name(task_id: &str, task_title: &str) -> String {
+    let slug = slugify_label(task_title);
+    if slug.is_empty() {
+        format!("task-{task_id}")
+    } else {
+        format!("task-{task_id}-{slug}")
+    }
+}
+
+#[cfg(test)]
+mod approved_task_branch_tests {
+    use super::approved_task_branch_name;
+
+    #[test]
+    fn branch_name_has_no_dangling_separator() {
+        assert_eq!(
+            approved_task_branch_name("123", "Fix login"),
+            "task-123-fix-login"
+        );
+        assert_eq!(approved_task_branch_name("123", "日本語"), "task-123");
+        assert!(approved_task_branch_name("123", &"x".repeat(500)).len() < 120);
     }
 }

@@ -178,7 +178,7 @@ impl TaskSource {
                 let branch = if slug_is_ref_safe(slug) {
                     format!("task-{id}-{slug}")
                 } else {
-                    let sanitized = sanitize_branch_segment(slug);
+                    let sanitized = slug_segment(slug);
                     if sanitized.is_empty() {
                         format!("task-{id}")
                     } else {
@@ -189,7 +189,7 @@ impl TaskSource {
             }
             Self::PlainMarkdown { stem } => {
                 let conv_prefix: String = conv_id.chars().take(8).collect();
-                let sanitized = sanitize_branch_segment(stem);
+                let sanitized = slug_segment(stem);
                 let id_segment = if sanitized.is_empty() {
                     conv_prefix.clone()
                 } else {
@@ -318,12 +318,22 @@ fn identifier_to_title(ident: &str) -> String {
         .join(" ")
 }
 
-/// Reduce an arbitrary file stem to a git-branch-safe lowercase segment:
-/// `[a-z0-9]+` runs joined by single `-`, everything else dropped.
-fn sanitize_branch_segment(stem: &str) -> String {
+/// Longest slug segment [`slug_segment`] emits; keeps a branch or file name
+/// well under the 255-byte path-component limit.
+pub const MAX_SLUG_SEGMENT_LEN: usize = 48;
+
+/// Reduce an arbitrary string to a git-ref- and filename-safe lowercase
+/// segment: `[a-z0-9]+` runs joined by single `-`, everything else dropped,
+/// at most [`MAX_SLUG_SEGMENT_LEN`] bytes with no trailing `-`. Empty when the
+/// input has no ASCII alphanumerics.
+#[must_use]
+pub fn slug_segment(stem: &str) -> String {
     let mut out = String::new();
     let mut prev_dash = false;
     for ch in stem.chars() {
+        if out.len() >= MAX_SLUG_SEGMENT_LEN {
+            break;
+        }
         if ch.is_ascii_alphanumeric() {
             out.push(ch.to_ascii_lowercase());
             prev_dash = false;
@@ -614,6 +624,35 @@ mod tests {
                         prop_assert!(is_valid_branch(&branch), "{filename} -> {branch}");
                     }
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn plain_markdown_branch_is_bounded() {
+        let long = TaskSource::detect(&format!("{}.md", "a".repeat(300))).unwrap();
+        let (branch, id) = long.branch_and_id("conv-12345678");
+        assert!(branch.len() < 80, "{branch}");
+        assert!(!id.ends_with('-'));
+    }
+
+    mod slug_proptests {
+        use super::super::*;
+        use proptest::prelude::*;
+
+        proptest! {
+            #[test]
+            fn slug_segment_is_safe_and_bounded(s in "\\PC{0,400}") {
+                let out = slug_segment(&s);
+                prop_assert!(out.len() <= MAX_SLUG_SEGMENT_LEN);
+                prop_assert!(out.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'));
+                prop_assert!(!out.starts_with('-') && !out.ends_with('-') && !out.contains("--"));
+            }
+
+            #[test]
+            fn slug_segment_is_idempotent(s in "\\PC{0,200}") {
+                let once = slug_segment(&s);
+                prop_assert_eq!(slug_segment(&once), once);
             }
         }
     }
