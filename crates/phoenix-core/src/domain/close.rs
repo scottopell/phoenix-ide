@@ -1589,7 +1589,10 @@ mod tests {
         ] {
             let value = serde_json::Value::String(category.as_str().to_owned());
             assert_eq!(serde_json::to_value(category).unwrap(), value);
-            assert_eq!(serde_json::from_value::<LossCategory>(value).unwrap(), category);
+            assert_eq!(
+                serde_json::from_value::<LossCategory>(value).unwrap(),
+                category
+            );
         }
         assert_eq!(
             LossCategory::StagedTrackedPaths.as_str(),

@@ -4163,7 +4163,12 @@ fn inspect_worktree_at_with_policy_until(
         return Err("native worktree inspection does not yet support dirty status".to_string());
     }
     let mut losses = parse_status_losses(&output.stdout);
-    losses.extend(ignored_paths.iter().cloned().map(CloseLossItem::IgnoredPath));
+    losses.extend(
+        ignored_paths
+            .iter()
+            .cloned()
+            .map(CloseLossItem::IgnoredPath),
+    );
     losses.sort_by_key(|loss| (loss.category().as_str(), loss.identity().value()));
     losses.dedup();
     let hidden_dirty = match policy {
@@ -5311,9 +5316,15 @@ fn observe_initialized_submodules_with_leaf_until(
                 String::from_utf8_lossy(&status.stderr).trim()
             ));
         }
-        let ignored_paths = observe_ignored_paths_with_leaf_until(&submodule_path, deadline, git_leaf)?;
+        let ignored_paths =
+            observe_ignored_paths_with_leaf_until(&submodule_path, deadline, git_leaf)?;
         let mut submodule_losses = parse_status_losses(&status.stdout);
-        submodule_losses.extend(ignored_paths.iter().cloned().map(CloseLossItem::IgnoredPath));
+        submodule_losses.extend(
+            ignored_paths
+                .iter()
+                .cloned()
+                .map(CloseLossItem::IgnoredPath),
+        );
         for hidden in
             observe_hidden_worktree_changes_with_leaf_until(&submodule_path, deadline, git_leaf)?
         {
@@ -10099,7 +10110,14 @@ fn observe_ignored_paths_with_leaf_until(
 ) -> Result<Vec<GitPathIdentity>, String> {
     let output = run_bounded_git_command_with_leaf_until(
         repository,
-        &["ls-files", "--others", "--ignored", "--exclude-standard", "-z", "--"],
+        &[
+            "ls-files",
+            "--others",
+            "--ignored",
+            "--exclude-standard",
+            "-z",
+            "--",
+        ],
         None,
         deadline,
         "exact ignored-path inspection",
@@ -11133,14 +11151,13 @@ mod tests {
     }
 
     use super::{
-        both_worktree_paths_absent, canonical_status_observation,
+        append_ignored_paths, both_worktree_paths_absent, canonical_status_observation,
         complete_persisted_worktree_administrative_cleanup, exact_worktree_administrative_dir,
         git_path_from_observation, inspect_and_remove_exact_worktree_with_hook, inspect_worktree,
-        append_ignored_paths, observe_administrative_dir_incarnation,
-        observe_ignored_paths_with_leaf_until, observe_worktree_fingerprint, parse_status_losses,
-        planned_administrative_dir_is_absent, remove_directory_contents_at_with_hook,
-        remove_exact_worktree_administrative_dir_with_hook, remove_identity_bound_directory,
-        remove_quarantine_then_administrative_dir,
+        observe_administrative_dir_incarnation, observe_ignored_paths_with_leaf_until,
+        observe_worktree_fingerprint, parse_status_losses, planned_administrative_dir_is_absent,
+        remove_directory_contents_at_with_hook, remove_exact_worktree_administrative_dir_with_hook,
+        remove_identity_bound_directory, remove_quarantine_then_administrative_dir,
         remove_quarantine_then_administrative_dir_with_hooks, rotate_inspection_generation,
         run_bounded_git_status_until, snapshot_for, staged_index_entries_by_path,
         staged_index_entries_for_paths_until, worktree_quarantine_path, CloseLeaseFailure,
@@ -16123,12 +16140,15 @@ mod tests {
                 _ => None,
             })
             .collect::<Vec<_>>();
-        assert_eq!(ignored_paths, [b"cache/another".as_slice(), b"cache/unique".as_slice()]);
+        assert_eq!(
+            ignored_paths,
+            [b"cache/another".as_slice(), b"cache/unique".as_slice()]
+        );
         assert_eq!(losses.len(), 2);
         let common = super::exact_worktree_common_git_dir(&target).unwrap();
         let administrative = super::exact_worktree_administrative_dir(&target, &common).unwrap();
         let incarnation = observe_administrative_dir_incarnation(&administrative).unwrap();
-        let error = super::inspect_and_remove_exact_worktree(
+        let result = super::inspect_and_remove_exact_worktree(
             runtime.handle(),
             &identity,
             &confirmed,
@@ -16140,8 +16160,10 @@ mod tests {
             }),
             |_, _, _| Ok(()),
         )
-        .err()
-        .expect("ignored data must prevent deletion");
+        .unwrap();
+        let super::ExactWorktreeRemoval::ReinspectionRequired { detail: error } = result else {
+            panic!("ignored data must require fresh confirmation before deletion");
+        };
         assert!(
             error.contains("fresh confirmation is required"),
             "changed ignored inventory must refuse deletion: {error}"
@@ -16376,7 +16398,8 @@ mod tests {
                 }
                 .unwrap();
                 assert!(result.1.is_empty());
-                let mut expected_calls = vec!["Git status inspection", "exact ignored-path inspection"];
+                let mut expected_calls =
+                    vec!["Git status inspection", "exact ignored-path inspection"];
                 if !native {
                     expected_calls.push("Git index path inspection");
                 }
@@ -16478,6 +16501,11 @@ mod tests {
                 "gitlinks",
             ),
         ] {
+            let refusal_stage = if stop == "Git status inspection" {
+                "exact ignored-path inspection"
+            } else {
+                stop
+            };
             let mut stopped = false;
             let error = super::inspect_worktree_at_with_git_leaf_until(
                 &identity,
@@ -16490,8 +16518,8 @@ mod tests {
                         .get_envs()
                         .any(|(key, value)| key == "GIT_INDEX_FILE" && value.is_some()));
                     assert!(!command.get_args().any(|arg| arg == "update-index"));
+                    stopped = operation == refusal_stage;
                     if operation == stop {
-                        stopped = true;
                         return Ok(synthetic_inspection_output(stdout.to_vec(), success));
                     }
                     let stdout = match operation {
@@ -19501,7 +19529,8 @@ mod tests {
     }
 
     #[test]
-    fn porcelain_loss_parser_distinguishes_loss_categories_and_leaves_collapsed_ignored_paths_for_enumeration() {
+    fn porcelain_loss_parser_distinguishes_loss_categories_and_leaves_collapsed_ignored_paths_for_enumeration(
+    ) {
         let losses =
             parse_status_losses(b"M  staged\0 M unstaged\0MM both\0?? untracked\0!! ignored/\0");
         assert_eq!(losses.len(), 5);
@@ -19519,12 +19548,35 @@ mod tests {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
         let mut leaf = |command: std::process::Command, _, operation: &str| {
             assert_eq!(operation, "exact ignored-path inspection");
-            let args = command.get_args().map(|arg| arg.to_string_lossy().into_owned()).collect::<Vec<_>>();
-            assert!(args.ends_with(&["ls-files", "--others", "--ignored", "--exclude-standard", "-z", "--"].map(str::to_owned)));
-            Ok(synthetic_inspection_output(b"out/cache/a\0out/cache/b\0".to_vec(), true))
+            let args = command
+                .get_args()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect::<Vec<_>>();
+            assert!(args.ends_with(
+                &[
+                    "ls-files",
+                    "--others",
+                    "--ignored",
+                    "--exclude-standard",
+                    "-z",
+                    "--"
+                ]
+                .map(str::to_owned)
+            ));
+            Ok(synthetic_inspection_output(
+                b"out/cache/a\0out/cache/b\0".to_vec(),
+                true,
+            ))
         };
-        let paths = observe_ignored_paths_with_leaf_until(temp.path(), deadline, &mut leaf).unwrap();
-        assert_eq!(paths.iter().map(GitPathIdentity::as_bytes).collect::<Vec<_>>(), [b"out/cache/a".as_slice(), b"out/cache/b".as_slice()]);
+        let paths =
+            observe_ignored_paths_with_leaf_until(temp.path(), deadline, &mut leaf).unwrap();
+        assert_eq!(
+            paths
+                .iter()
+                .map(GitPathIdentity::as_bytes)
+                .collect::<Vec<_>>(),
+            [b"out/cache/a".as_slice(), b"out/cache/b".as_slice()]
+        );
     }
 
     #[test]
@@ -19537,7 +19589,9 @@ mod tests {
         let mut with_exact = collapsed;
         append_ignored_paths(&mut with_exact, &exact);
         assert_ne!(clean, snapshot_for(&with_exact));
-        assert!(with_exact.windows(b"IGNORED_PATH\0target/a.log\0".len()).any(|window| window == b"IGNORED_PATH\0target/a.log\0"));
+        assert!(with_exact
+            .windows(b"IGNORED_PATH\0target/a.log\0".len())
+            .any(|window| window == b"IGNORED_PATH\0target/a.log\0"));
     }
 
     #[test]

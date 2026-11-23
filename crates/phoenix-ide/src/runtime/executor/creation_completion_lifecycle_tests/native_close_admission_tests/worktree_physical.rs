@@ -434,6 +434,7 @@ async fn run_public_worktree_close(journey: WorktreeJourney) {
         WorktreeJourney::RetainContentBlockers | WorktreeJourney::RetryLossClassification
     );
     if content_blocked {
+        std::fs::create_dir_all(git.repo.join(".git/info")).unwrap();
         std::fs::write(git.repo.join(".git/info/exclude"), b"build/\n").unwrap();
         std::fs::create_dir(git.worktree.join("build")).unwrap();
         std::fs::write(git.worktree.join("build/a.bin"), b"retained build a").unwrap();
@@ -603,7 +604,12 @@ async fn run_public_worktree_close(journey: WorktreeJourney) {
         .unwrap();
         let run = CloseRunRef::initial(CloseAttemptId::parse(&attempt).unwrap());
         assert_eq!(
-            fixture.db.get_close_obligation(&attempt).await.unwrap().phase(),
+            fixture
+                .db
+                .get_close_obligation(&attempt)
+                .await
+                .unwrap()
+                .phase(),
             ClosePhase::AwaitingRetirementInspection
         );
         assert_eq!(
@@ -631,8 +637,12 @@ async fn run_public_worktree_close(journey: WorktreeJourney) {
         assert_eq!(outbox_count, 0);
         assert_no_initial_inspection_writes(&fixture.db, &attempt).await;
         assert_eq!(backend.fatal_local_authority_fence.owner_count(), 1);
-        assert!(!backend.fatal_local_authority_fence.fatal_authority_loss_is_latched());
-        let admission = backend.conversation_admission(fixture.target.as_str()).await;
+        assert!(!backend
+            .fatal_local_authority_fence
+            .fatal_authority_loss_is_latched());
+        let admission = backend
+            .conversation_admission(fixture.target.as_str())
+            .await;
         assert!(Arc::clone(&admission).try_lock_owned().is_err());
         assert_eq!(physical_snapshot(&git.root), physical_before_admission);
 
@@ -738,43 +748,91 @@ async fn run_public_worktree_close(journey: WorktreeJourney) {
             CloseAttemptId::parse(admitted["admitted"]["attempt_id"].as_str().unwrap()).unwrap();
         let run = CloseRunRef::initial(attempt.clone());
         // Public ingress releases the response only after exact terminal observation.
-        let obligation = fixture.db.get_close_obligation(attempt.as_str()).await.unwrap();
+        let obligation = fixture
+            .db
+            .get_close_obligation(attempt.as_str())
+            .await
+            .unwrap();
         assert_eq!(obligation.phase(), ClosePhase::Completed);
-        assert_eq!(obligation.close_outcome(), Some(CloseCompletionOutcome::CloseIncomplete));
-        assert_eq!(fixture.db.get_close_run(&run).await.unwrap().status, CloseRunStatus::Stopped);
-        let losses = fixture.db.list_close_retirement_losses(attempt.as_str()).await.unwrap();
+        assert_eq!(
+            obligation.close_outcome(),
+            Some(CloseCompletionOutcome::CloseIncomplete)
+        );
+        assert_eq!(
+            fixture.db.get_close_run(&run).await.unwrap().status,
+            CloseRunStatus::Stopped
+        );
+        let losses = fixture
+            .db
+            .list_close_retirement_losses(attempt.as_str())
+            .await
+            .unwrap();
         assert_eq!(losses.len(), 3);
         for item in [
-            CloseLossItem::UnstagedTrackedPath(GitPathIdentity::from_bytes(b"tracked.txt".to_vec())),
+            CloseLossItem::UnstagedTrackedPath(GitPathIdentity::from_bytes(
+                b"tracked.txt".to_vec(),
+            )),
             CloseLossItem::IgnoredPath(GitPathIdentity::from_bytes(b"build/a.bin".to_vec())),
             CloseLossItem::IgnoredPath(GitPathIdentity::from_bytes(b"build/b.bin".to_vec())),
         ] {
-            assert!(losses.iter().any(|loss| loss.scope == scope && loss.item == item));
+            assert!(losses
+                .iter()
+                .any(|loss| loss.scope == scope && loss.item == item));
         }
         let certainty: String = sqlx::query_scalar(
             "SELECT stop_certainty FROM close_cleanup_failures WHERE attempt_id = ?1",
-        ).bind(attempt.as_str()).fetch_one(fixture.db.pool()).await.unwrap();
+        )
+        .bind(attempt.as_str())
+        .fetch_one(fixture.db.pool())
+        .await
+        .unwrap();
         assert_eq!(certainty, "shutdown_uncertain");
-        let failures = fixture.db.list_close_cleanup_failures(attempt.as_str()).await.unwrap();
+        let failures = fixture
+            .db
+            .list_close_cleanup_failures(attempt.as_str())
+            .await
+            .unwrap();
         assert_eq!(failures.len(), 1);
         let events: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM coordinator_watch_events WHERE mandatory_failure_occurrence_id = ?1",
         ).bind(&failures[0].occurrence.failure_occurrence_id).fetch_one(fixture.db.pool()).await.unwrap();
         assert_eq!(events, 1);
-        assert_eq!(close_row_counts(&fixture).await, vec![1, 1, 0, 1, 0, 0, 0, 0, 1]);
-        assert!(!fixture.db.get_conversation(TARGET_ID).await.unwrap().archived);
-        assert_eq!(fixture.db.get_conversation_work_scope_context(TARGET_ID).await.unwrap().1, WorkScopeLifecycle::Active);
+        assert_eq!(
+            close_row_counts(&fixture).await,
+            vec![1, 1, 0, 1, 0, 0, 0, 0, 1]
+        );
+        assert!(
+            !fixture
+                .db
+                .get_conversation(TARGET_ID)
+                .await
+                .unwrap()
+                .archived
+        );
+        assert_eq!(
+            fixture
+                .db
+                .get_conversation_work_scope_context(TARGET_ID)
+                .await
+                .unwrap()
+                .1,
+            WorkScopeLifecycle::Active
+        );
         assert_eq!(physical_snapshot(&git.root), physical_before_admission);
         assert_eq!(directory_identity(&git.worktree), git.checkout_identity);
         assert_eq!(directory_identity(&git.admin), git.admin_identity);
         let before_replay = durable_native_close_rows(&fixture, &run).await;
         let replay = tokio::time::timeout(Duration::from_secs(10), tool.run(input, context))
-            .await.expect("blocked exact-source replay must be bounded");
+            .await
+            .expect("blocked exact-source replay must be bounded");
         assert!(replay.is_success(), "{}", replay.output());
         let replay: Value = serde_json::from_str(&replay.output()).unwrap();
         assert_eq!(replay["status"], "replay");
         assert_eq!(replay["admitted"], admitted["admitted"]);
-        assert_eq!(durable_native_close_rows(&fixture, &run).await, before_replay);
+        assert_eq!(
+            durable_native_close_rows(&fixture, &run).await,
+            before_replay
+        );
         assert_eq!(physical_snapshot(&git.root), physical_before_admission);
         git.assert_untargeted_state_preserved();
     } else {

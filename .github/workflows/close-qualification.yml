@@ -78,8 +78,8 @@ jobs:
           set -euo pipefail
           mkdir -p evidence
           git rev-parse HEAD | tee evidence/source.sha
-          pnpm --dir ui exec vitest run src/components/WorkActions.test.tsx 2>&1 | tee evidence/close-work-actions-tests.log
-          pnpm --dir ui exec vitest run src/pages/ProductConversationPage.test.tsx 2>&1 | tee evidence/close-product-page-tests.log
+          (cd ui && pnpm exec vitest run src/components/WorkActions.test.tsx) 2>&1 | tee evidence/close-work-actions-tests.log
+          (cd ui && pnpm exec vitest run src/pages/ProductConversationPage.test.tsx) 2>&1 | tee evidence/close-product-page-tests.log
           ./dev.py check --lanes tsc,ui-lint 2>&1 | tee evidence/frontend-checks.log
       - uses: actions/upload-artifact@v6
         if: always()

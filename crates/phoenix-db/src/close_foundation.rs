@@ -11388,7 +11388,9 @@ mod tests {
                 snapshot: scope_snapshot.clone(),
                 losses: vec![
                     CloseLossItem::UntrackedNonIgnoredPath(non_utf8_path.clone()),
-                    CloseLossItem::IgnoredPath(GitPathIdentity::from_bytes(b"ignored.bin".to_vec())),
+                    CloseLossItem::IgnoredPath(GitPathIdentity::from_bytes(
+                        b"ignored.bin".to_vec(),
+                    )),
                     CloseLossItem::StagedTrackedPath(lossy_left.clone()),
                     CloseLossItem::StagedTrackedPath(lossy_right.clone()),
                     CloseLossItem::DetachedUnreachableCommit(oid.clone()),
@@ -11694,7 +11696,7 @@ mod tests {
                 .into_iter()
                 .map(|loss| loss.item)
                 .collect::<Vec<_>>(),
-            vec![second_loss]
+            vec![second_loss.clone()]
         );
 
         let attempt_id = CloseAttemptId::parse("attempt-changed-confirmation").unwrap();
@@ -11713,7 +11715,10 @@ mod tests {
             .to_string()
             .contains("cannot be confirmed for destructive retirement"));
         let after_confirmation = db.get_close_obligation(attempt_id.as_str()).await.unwrap();
-        assert_eq!(after_confirmation.phase(), ClosePhase::AwaitingLossConfirmation);
+        assert_eq!(
+            after_confirmation.phase(),
+            ClosePhase::AwaitingLossConfirmation
+        );
         assert_eq!(after_confirmation.snapshot(), Some(&second_token));
         assert_eq!(
             db.list_close_retirement_losses(attempt_id.as_str())
@@ -18107,12 +18112,24 @@ mod tests {
         let db = Database::open_in_memory().await.unwrap();
         create_root(&db, "root").await;
         let scope = allocate_scope_worktree(&db, "root").await;
-        db.begin_close_foundation(&product_id("root"), &transcript_id("root"), "attempt-lossy-dispatch")
-            .await
-            .unwrap();
-        set_close_phase(&db, "attempt-lossy-dispatch", ClosePhase::AwaitingRetirementInspection).await;
-        let snapshot = CloseRetirementSnapshot::parse("loss-generation", "loss-fingerprint").unwrap();
-        let loss = CloseLossItem::UntrackedNonIgnoredPath(GitPathIdentity::from_bytes(b"retained-loss".to_vec()));
+        db.begin_close_foundation(
+            &product_id("root"),
+            &transcript_id("root"),
+            "attempt-lossy-dispatch",
+        )
+        .await
+        .unwrap();
+        set_close_phase(
+            &db,
+            "attempt-lossy-dispatch",
+            ClosePhase::AwaitingRetirementInspection,
+        )
+        .await;
+        let snapshot =
+            CloseRetirementSnapshot::parse("loss-generation", "loss-fingerprint").unwrap();
+        let loss = CloseLossItem::UntrackedNonIgnoredPath(GitPathIdentity::from_bytes(
+            b"retained-loss".to_vec(),
+        ));
         db.replace_close_inspection(ReplaceCloseInspectionRequest {
             attempt_id: CloseAttemptId::parse("attempt-lossy-dispatch").unwrap(),
             scopes: vec![ReplaceCloseInspectionScopeRequest {
@@ -18123,11 +18140,13 @@ mod tests {
         })
         .await
         .unwrap();
-        sqlx::query("UPDATE close_obligations SET phase = 'retirement_requested' WHERE attempt_id = ?1")
-            .bind("attempt-lossy-dispatch")
-            .execute(db.pool())
-            .await
-            .unwrap();
+        sqlx::query(
+            "UPDATE close_obligations SET phase = 'retirement_requested' WHERE attempt_id = ?1",
+        )
+        .bind("attempt-lossy-dispatch")
+        .execute(db.pool())
+        .await
+        .unwrap();
         let snapshot = current_test_snapshot(&db, "attempt-lossy-dispatch").await;
         let resource = RetiredResourceIdentity::parse(
             RetiredResourceKind::Worktree,
@@ -18143,20 +18162,38 @@ mod tests {
         )
         .await;
 
-        let rejected = db.record_close_retirement_dispatch(RecordCloseRetirementDispatchRequest {
-            attempt_id: CloseAttemptId::parse("attempt-lossy-dispatch").unwrap(),
-            scope,
-            snapshot,
-            resource,
-        }).await;
-        assert!(matches!(rejected, Err(DbError::CloseFoundationPrecondition(message)) if message.contains("retains inspected loss")));
-        assert_eq!(db.get_close_obligation("attempt-lossy-dispatch").await.unwrap().phase(), ClosePhase::RetirementRequested);
-        assert_eq!(db.list_close_retirement_losses("attempt-lossy-dispatch").await.unwrap().len(), 1);
-        let dispatches: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM close_retirement_resource_dispatches WHERE attempt_id = ?1")
-            .bind("attempt-lossy-dispatch")
-            .fetch_one(db.pool())
-            .await
-            .unwrap();
+        let rejected = db
+            .record_close_retirement_dispatch(RecordCloseRetirementDispatchRequest {
+                attempt_id: CloseAttemptId::parse("attempt-lossy-dispatch").unwrap(),
+                scope,
+                snapshot,
+                resource,
+            })
+            .await;
+        assert!(
+            matches!(rejected, Err(DbError::CloseFoundationPrecondition(message)) if message.contains("retains inspected loss"))
+        );
+        assert_eq!(
+            db.get_close_obligation("attempt-lossy-dispatch")
+                .await
+                .unwrap()
+                .phase(),
+            ClosePhase::RetirementRequested
+        );
+        assert_eq!(
+            db.list_close_retirement_losses("attempt-lossy-dispatch")
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        let dispatches: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM close_retirement_resource_dispatches WHERE attempt_id = ?1",
+        )
+        .bind("attempt-lossy-dispatch")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
         assert_eq!(dispatches, 0);
     }
 
@@ -18938,8 +18975,14 @@ mod tests {
         assert!(exact_confirmation
             .to_string()
             .contains("cannot be confirmed for destructive retirement"));
-        let after_confirmation = db.get_close_obligation("attempt-confirm-loss").await.unwrap();
-        assert_eq!(after_confirmation.phase(), ClosePhase::AwaitingLossConfirmation);
+        let after_confirmation = db
+            .get_close_obligation("attempt-confirm-loss")
+            .await
+            .unwrap();
+        assert_eq!(
+            after_confirmation.phase(),
+            ClosePhase::AwaitingLossConfirmation
+        );
         assert_eq!(after_confirmation.snapshot(), obligation.snapshot());
         assert_eq!(
             db.list_close_retirement_losses("attempt-confirm-loss")
@@ -19000,12 +19043,8 @@ mod tests {
         let obligation = db.get_close_obligation("attempt-lossy").await.unwrap();
         assert_eq!(obligation.phase(), ClosePhase::AwaitingRetirementInspection);
         let mut tx = db.pool().begin().await.unwrap();
-        let phase_guard = set_close_phase_tx(
-            &mut tx,
-            "attempt-lossy",
-            ClosePhase::RetirementRequested,
-        )
-        .await;
+        let phase_guard =
+            set_close_phase_tx(&mut tx, "attempt-lossy", ClosePhase::RetirementRequested).await;
         assert!(matches!(
             phase_guard,
             Err(DbError::CloseFoundationPrecondition(message))

@@ -2,6 +2,24 @@
 
 ## Current publication and active gate
 
+### f955 terminal failure fully classified; focused corrections reviewed
+
+Personally verified exact f955 automatic45248004989 **completed/failure**, watcher84 exited1 and independently at zsh. Full/final-failed logs and exact runtime artifacts retained `/tmp/close-f955c8fb8`. Actor **48 passed / 2 failed / 0 ignored**: both new content/rollback journeys failed **before Close ingress**, writing `.git/info/exclude` into missing info directory (fixture explicitly uses empty Git template). Correction creates this fixture directory first; no behavior assertion relaxed. Required production-detector real Worktree **1 passed / 0 failed / 0 ignored**, nobody65534 CapEff0, personally read actual log.
+
+Other introduced runtime fixture failures: unsupported dirty-status supplied leaf still treated status as final leaf though exact ignored enumeration now follows; corrected refusal boundary retains deadline/no-scratch/no-further-leaf checks. Changed ignored fingerprint correctly returns typed `ReinspectionRequired`, not Err; expectation now matches exact refusal while retaining file/quarantine assertions. Coordinator goal explicit migration ledger missed182; added only exact registered `(182, close_ignored_loss_category)`. Independent source review passed all three corrections. DB compile/format/Corepack corrections above also reviewed. Domain21/0 and specs passed; DB/migration suites and UI tests remain **nonexecution**, content/rollback assertions remain **unreached**, not passes. No local validation executed. Next correction publication is qualified as incomplete interim; pre-anchor fresh retry is still owed.
+
+### f955 early causal classification: DB test move and exact formatting correction prepared
+
+Downloaded exact-source DB and format artifacts while run45248004989 remains active. Domain wire/category tests **21 passed / 0 failed / 0 ignored**, including expected embedded-NUL panic (not failure). The database test binary **did not compile**: sole E0382 in `changed_loss_confirmation_inspection_replaces_evidence_and_token_atomically`, first `vec![second_loss]` moved the item needed for the final unchanged-loss assertion. Dirty correction clones only that first expected item, retaining both exact persisted-loss assertions. Other DB/migration log failures repeat this compilation diagnostic; no migration182 or DB runtime pass can be claimed.
+
+Applied the hosted `format/hosted-format.patch` verbatim using git apply after check; no local formatter executed. Independent source review confirmed the Rust delta is the formatting-only hosted proposal plus the single ownership clone; no safety/assertion weakening. Runtime actor step is failed but its final evidence is not yet available; the required separate production-detector step reports completed/success, not yet personally log-classified. Specifications passed. Publication remains blocked until whole-run terminal evidence and actual runtime failure logs are inspected.
+
+### f955 blocker interim slice published; hosted qualification active with frontend setup failure
+
+Published `f955c8fb811834fc04b4acee1e5e59ba194e975a` (hooks disabled) after terminal a584 classification. Automatic run [45248004989](https://github.com/scottopell/phoenix-ide/actions/runs/45248004989), sole watcher `@84` / `close-f955c8fb8-watch`, evidence `/tmp/close-f955c8fb8`. Prior watcher83 exited0 and zsh verified before watcher84. No manual dispatch/rerun. DB and specs still active; no next publication until terminal exact-head classification.
+
+Frontend job stopped **before any tests**: the artifact `frontend/close-work-actions-tests.log` shows `ERR_PNPM_BAD_PM_VERSION`, Corepack invoked from root selected default pnpm12 before `--dir ui` could select UI pin11. Dependencies installed successfully with working-directory ui. Dirty two-command correction now uses `(cd ui && pnpm exec vitest run <exact-file>)`, preserving root evidence tee and pipefail. Independent source review verified actual cwd selects pinned11 and subsequent dev.py lanes also run in UI_DIR. This is an introduced workflow setup defect, not UI test evidence. No tests/typecheck/lint ran; correction not published until terminal classification.
+
 ### Terminal a584 verified success; blocker-only interim slice ready for hosted qualification
 
 Personally verified automatic run45238902877 **completed / success**, exact `a584e727beef9cd1dcae7371b3cd0c47c905b6be`. Final failed log is empty, full terminal log and artifacts retained `/tmp/close-a584e727b`. Foundation **261/0/0 ignored**, including all six actual new-admission/historical regression executions; actor **48/0**; required production-detector real Worktree **1/0/0 ignored** under nobody UID65534 and CapEff0; exact formatting patch0bytes; both jobs passed. Watcher exited0 and `@83` independently verified at zsh. This closes the selector/admission qualification gate, not broader delivery.
