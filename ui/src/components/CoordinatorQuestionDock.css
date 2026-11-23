@@ -190,8 +190,8 @@
 
   .coordinator-question-dock__dialog .modal-overlay {
     position: fixed;
-    top: var(--coordinator-question-viewport-top, 0px);
-    left: var(--coordinator-question-viewport-left, 0px);
+    top: var(--coordinator-question-viewport-top, 0);
+    left: var(--coordinator-question-viewport-left, 0);
     width: var(--coordinator-question-viewport-width, 100vw);
     height: var(--coordinator-question-viewport-height, 100dvh);
     box-sizing: border-box;

@@ -114,8 +114,12 @@ async function trial(version, base, viewport, mode, run, isolation = false) {
     }
     if (p === '/api/conversation-reads/snapshot' && route.request().method() === 'POST') return json({ conversation, messages, agent_working: false, presentation_mode: 'idle', context_window_size: 128000 });
     if (p === '/api/conversation-reads/stream' && route.request().method() === 'GET') return route.fulfill({ contentType: 'text/event-stream', body: `event: init\ndata: ${JSON.stringify(init)}\n\n` });
-    if (p === '/api/conversations' || p === '/api/conversations/archived' || p === '/api/coordinator/watches' || p === '/api/coordinator/close-watches' || p === '/api/coordinator/bash/live' || p.endsWith('/reminders') || p.endsWith('/fork-proposals')) return json([]);
+    if (p === '/api/conversations' || p === '/api/conversations/archived') return json({ conversations: [] });
+    if (p === '/api/coordinator/watches' || p === '/api/coordinator/close-watches' || p === '/api/coordinator/bash/live' || p.endsWith('/reminders') || p.endsWith('/fork-proposals')) return json([]);
     if (p === '/api/product-conversations') return json({ product_conversations: [], coordinator: null });
+    if (p === '/api/env') return json({ home_dir: '/tmp/question-qualification' });
+    if (p === '/api/recent-management-root-suggestions') return json({ suggestions: [] });
+    if (p === '/api/product-conversations/creation') return json({ product_creations: [], next_cursor: null });
     if (p === '/api/discovery/services') return json({ services: [] });
     if (p === '/api/deployment') return json({
       build: { version: 'question-qualification', git_sha: 'synthetic-question-qualification', started_at: timestamp, uptime_seconds: 60 },
@@ -205,6 +209,7 @@ try {
   const viewports = [{ width: 393, height: 852 }, { width: 1440, height: 900 }];
   for (const viewport of viewports) {
     for (const [version, url] of versions) if (!await trial(version, url, viewport, 'cold-global', 0, true)) throw new Error('History isolation or surface journey failed');
+    for (const [version, url] of versions) if (!await trial(version, url, viewport, 'warm-notification', -1)) throw new Error('Warm route fixture preflight failed');
   }
   for (const viewport of viewports) {
     for (const mode of ['cold-global', 'cold-link', 'warm-notification']) {
