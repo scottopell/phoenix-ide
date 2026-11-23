@@ -2,6 +2,8 @@
 
 //! Public native Close qualification; all Git and SQLite state is disposable.
 //! REQ-WL-002/002f: original Worktree and independent WorkScope retirement.
+//! The positive lifecycle journey controls writer observations, not host /proc availability.
+//! Live Linux writer-detector availability remains a separate qualification gate.
 
 use super::*;
 use phoenix_core::domain::close::{
@@ -397,7 +399,15 @@ async fn run_public_worktree_close(journey: WorktreeJourney) {
     let stop_before_admission = !matches!(journey, WorktreeJourney::Retire);
     let fixture = CloseFixture::new().await;
     let (scope, original_worktree) = git.register(&fixture).await;
-    let backend = CloseFixture::backend(fixture.db.clone());
+    let mut backend = CloseFixture::backend(fixture.db.clone());
+    if matches!(journey, WorktreeJourney::Retire) {
+        // Qualify public admission and real Git/filesystem retirement independently
+        // of ambient runner processes. Production inspection gaps remain blocking;
+        // deterministic Linux detector tests qualify that separate safety boundary.
+        Arc::get_mut(&mut backend)
+            .expect("fresh Worktree journey manager must be uniquely owned")
+            .clean_close_writer_fixture = true;
+    }
     let retriever = Arc::new(fixture.db.fts_retriever());
     let read_service =
         crate::api::global_read::GlobalReadService::new(fixture.db.clone(), retriever);

@@ -18572,6 +18572,27 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn linux_descriptor_scan_retains_attributed_unavailable_inventory() {
+        let temp = tempfile::tempdir().unwrap();
+        let quarantine = temp.path().join("quarantine");
+        let proc_root = temp.path().join("proc");
+        std::fs::create_dir(&quarantine).unwrap();
+        // SAFETY: geteuid has no preconditions.
+        let process = fake_linux_process(&proc_root, 1274, unsafe { libc::geteuid() }, 44);
+        std::fs::remove_dir(process.join("fd")).unwrap();
+        assert!(matches!(
+            super::quarantine_has_open_descriptors_in(&quarantine, &proc_root).unwrap(),
+            super::ExternalWriterEvidence::Blocked(super::CloseWriterObservation::InspectionGap {
+                detector: super::CloseWriterDetector::LinuxDescriptor,
+                pid: Some(1274),
+                reason: super::CloseWriterGap::Unavailable,
+            })
+        ));
+        assert!(quarantine.is_dir());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn linux_cwd_scan_proves_namespace_authority_and_fails_closed_on_gaps() {
         let temp = tempfile::tempdir().unwrap();
         let quarantine = temp.path().join("quarantine");
