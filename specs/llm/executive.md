@@ -48,6 +48,43 @@ specifications, dev.py tests, and API end-to-end tests. Six checks were skipped:
 four unchanged UI lanes and optional ast-grep/cargo-deny, which were unavailable.
 No production deployment is claimed.
 
+## Gemini / Anthropic model-switch qualification (2026-11-23)
+
+The running development server reporting build
+`13e96eaf91bd545c702ab75fccc9be45ecd69280-dirty` passed a real API conversation through
+Gemini 4 Neon → Claude Opus 5.5 → Gemini 4 Neon, with no compaction. Each leg
+called `read_file` once on a different temporary file containing a random UUID;
+the second and third replies reproduced all earlier values from conversation
+history plus their newly read value. Switches used the normal `upgrade-model`
+endpoint, preserved the transcript, and reached idle before the next leg.
+
+The stronger run used low / high / low effort and a small private-reasoning
+instruction before Opus's tool call. SQLite metadata observation confirmed
+active private replay for both `chat_completions` Gemini signatures and
+Anthropic's Opus response. All six provider generation requests succeeded over
+HTTP/SSE (four Gemini, two Opus). All capacity plans were ordinary with no input
+reduction, no continuation message was created, and both private stores were
+empty after settlement and at the switches. Conversation:
+`3692be2a-d991-45d3-a335-6fbbdd154745`; local metadata-only evidence is
+`/tmp/phoenix-live-provider-switch-thinking-report.json`. No private payloads
+were inspected or saved in the probe report.
+
+An earlier low-effort run also completed all three tool/history assertions.
+Opus emitted no private thinking for that trivial task, motivating the stronger
+run. Its records contain six successful generations plus an initial 0-ms auth
+error followed by automatic recovery; the initial probe's blanket no-auth-error
+assertion rejected that metadata. The stronger run had six successes and no
+error outcomes. Neither run qualifies hidden-reasoning continuity across model
+changes: Phoenix deliberately retires that state under its current contract.
+
+Current upstream Anthropic guidance recommends retaining complete thinking
+across completed turns and model switches so the server can use compatible
+blocks, including when switching back. Phoenix's active-exchange-only retention
+is allowed outside tool use but differs from that recommendation. Task 41024
+tracks a deliberate retention-policy/specification revision. See
+[thinking preservation](https://platform.claude.com/docs/en/build-with-claude/thinking#preserving-thinking-blocks)
+and [preserved thinking](https://platform.claude.com/docs/en/build-with-claude/preserved-thinking#switch-models-and-back).
+
 ## Tool discovery integration (2026-11-20)
 
 REQ-LLM-004n and [the discovery contract](tool-discovery.allium) distinguish eager
