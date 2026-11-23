@@ -19,6 +19,7 @@
 import type { InputOrigin } from '../api';
 import type { HistoricalUnit } from './renderUnits';
 import { isSignificantText } from '../hooks/useDensity';
+import { emberTrackingLabel, emberTrackingObservation } from './emberTrackingObservation';
 
 export type ChapterKind = 'prompt' | 'prose' | 'boundary';
 
@@ -102,10 +103,11 @@ export function buildConversationChapters(historicalUnits: HistoricalUnit[]): Ch
         if (unit.message.origin?.kind === 'subscription_event') break;
         const text = userText(unit);
         if (text.trim().length === 0) break;
+        const tracking = unit.kind === 'user' ? emberTrackingObservation(unit.message) : null;
         chapters.push({
           unitIndex,
           kind: 'prompt',
-          label: truncateLabel(text),
+          label: truncateLabel(tracking ? emberTrackingLabel(tracking) : text),
           sequenceId: unit.kind === 'user' ? unit.message.sequence_id : undefined,
           target: unit.kind === 'user'
             ? { kind: 'persisted', messageId: unit.message.message_id, transcriptId: unit.message.conversation_id }
