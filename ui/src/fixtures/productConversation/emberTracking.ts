@@ -43,7 +43,8 @@ function message(id: string, sequence: number, row: string, text: string, origin
 }
 
 export function makeEmberTrackingScenario(id: Extract<ProductConversationScenarioId, `ember-tracking-${string}`>): OrdinaryProductConversationScenario {
-  const base = getProductConversationScenario('source-call-ordinary');
+  const base = { ...getProductConversationScenario('source-call-ordinary') };
+  delete base.sourceSnapshot;
   const first = base.snapshot!.segments[0]!;
   const fallback = id === 'ember-tracking-fallback';
   const history = message('tracking-history-due', 11, 'tracking-history', duePayload, { kind: 'system_generated' }, true);
@@ -57,7 +58,7 @@ export function makeEmberTrackingScenario(id: Extract<ProductConversationScenari
   ];
   return {
     ...base, id, title: fallback ? 'Ember tracking / lookalikes remain original text' : 'Ember tracking / saved historical observations',
-    sourceSnapshot: undefined, sourceIsGlobal: false,
+    sourceIsGlobal: false,
     snapshot: {
       ...base.snapshot!, product_conversation_id: 'tracking-product', canonical_route: '/product-conversations/tracking-product',
       canonical_root: { transcript_row_id: 'tracking-history', slug: 'tracking-history', title: 'Captured history' },

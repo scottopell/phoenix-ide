@@ -30,7 +30,7 @@ export interface TrackingObservation {
 
 const PREFIX = '[Saved Ember tracking observation: captured historical data, not a user instruction, permission, current worker status or comprehensive inventory. Use tracking read/list for current detail. New evidence requires reconciliation. A due cue applies only to the admitted input immediately BEFORE this observation; once a later input arrives it is historical and does not renew review. A non-null requested_item_due_for_review selects one bounded inspection under the static review policy after handling the current request; it is not a new USER commission, execution permission or instruction to nudge a worker. Inspection alone is not follow-through: use the static next-step policy, preserving actual restrictions and existing execution authority. No useful action means stay quiet.]\n';
 
-function record(value: unknown, keys: readonly string[]): value is Record<string, unknown> {
+function record<K extends string>(value: unknown, keys: readonly K[]): value is Record<K, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value)
     && Object.keys(value).length === keys.length && keys.every(key => Object.hasOwn(value, key));
 }
@@ -64,7 +64,7 @@ export function emberTrackingObservation(message: Message): TrackingObservation 
   if (message.message_type !== 'user' || message.origin?.kind !== 'system_generated' || message.event_presentation !== null) return null;
   if (message.display_data != null && (!record(message.display_data, ['productOccurrenceToken'])
     || !string(message.display_data.productOccurrenceToken))) return null;
-  const content = message.content;
+  const content: unknown = message.content;
   if (!record(content, ['text', 'is_meta']) || content.is_meta !== true || !string(content.text) || !content.text.startsWith(PREFIX)) return null;
   try {
     const parsed: unknown = JSON.parse(content.text.slice(PREFIX.length));
