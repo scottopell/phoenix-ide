@@ -18,4 +18,4 @@ The ADHD text is an original adaptation of the presentation ideas in [ayghri/i-h
 | --- | --- | --- |
 | REQ-LL-001 | Implemented; focused checks pass | Catalog/parser tests, creation/replay API test, migration preservation test, UI submission test, desktop/mobile browser checks and draft reload |
 | REQ-LL-002 | Experimental; static checks and one live sample pass | Prompt composition and operational-guidance checks; a new ADHD conversation using gpt-6-luna returned three direct numbered PR-review steps without tools. Broader model/style quality remains unverified. |
-| REQ-LL-003 | Implemented; validation in progress | Coordinator-only API with idle/current-head persistence guard, runtime invalidation, prompt inspection and UI save/retry coverage |
+| REQ-LL-003 | Implemented; focused UI and responsive browser checks pass | Coordinator-only API with idle/current-head and pending-work persistence guards, synchronized runtime invalidation, prompt inspection, restart/continuation and UI save/retry coverage. Independent adversarial review found no remaining actionable defects; broad backend checks and CI are in progress. |

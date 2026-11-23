@@ -35,7 +35,7 @@ export function CoordinatorLanguageControl() {
   };
 
   return (
-    <section aria-label="Ember language">
+    <section className="coordinator-language-control" aria-label="Ember language">
       <label>
         Ember language{' '}
         <select aria-label="Ember language" value={view?.language ?? ''} disabled={loading || saving || !view} onChange={event => void save(event.target.value)}>

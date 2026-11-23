@@ -69,6 +69,33 @@
   gap: 8px;
 }
 
+.coordinator-language-control {
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.coordinator-language-control label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-weight: 600;
+}
+
+.coordinator-language-control select {
+  min-height: 40px;
+  padding: 6px 10px;
+  color: var(--text-primary);
+  background: var(--bg-primary);
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  font: inherit;
+}
+
+.coordinator-language-control p {
+  margin: 6px 0;
+  color: var(--text-secondary);
+}
+
 .global-active-watches {
   display: grid;
   flex: 0 0 auto;
