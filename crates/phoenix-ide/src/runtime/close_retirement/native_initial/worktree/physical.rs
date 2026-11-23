@@ -27,9 +27,9 @@ use super::super::super::{
     ensure_no_ignored_content_with_status_leaf_until, inspect_worktree_at_with_git_leaf_until,
     observe_administrative_dir_incarnation, quarantine_has_external_writer_until,
     quarantine_has_external_writer_until_with_self_descriptor,
-    SelfDeletionDescriptorBorrow,
     remove_identity_bound_directory_with_driver, stop_bound_fsmonitor_with_leaf_until,
-    worktree_quarantine_path, CloseWriterProbe, WorktreeDeletionDriver, WorktreeMutationExecutor,
+    worktree_quarantine_path, CloseWriterProbe, SelfDeletionDescriptorBorrow,
+    WorktreeDeletionDriver, WorktreeMutationExecutor,
 };
 use super::git_leaf::{
     bind_shared_root_command, require_absent, run_git_leaf, GitLeafTarget, RetainedRootLocation,
@@ -625,17 +625,16 @@ impl PhysicalDeletionDriver<'_> {
         object: &Path,
         self_descriptor: Option<&SelfDeletionDescriptorBorrow<'_>>,
     ) -> Result<(), String> {
-        let evidence = self.custody.writer_probe.observe_until(
-            object,
-            self.deadline(),
-            |path, deadline| {
-                quarantine_has_external_writer_until_with_self_descriptor(
-                    path,
-                    deadline,
-                    self_descriptor,
-                )
-            },
-        );
+        let evidence =
+            self.custody
+                .writer_probe
+                .observe_until(object, self.deadline(), |path, deadline| {
+                    quarantine_has_external_writer_until_with_self_descriptor(
+                        path,
+                        deadline,
+                        self_descriptor,
+                    )
+                });
         if self
             .custody
             .writer_probe

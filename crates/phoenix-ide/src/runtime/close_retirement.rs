@@ -6044,7 +6044,9 @@ impl OwnedDeletionSlot {
         self.validate()?;
         let stat = deletion_descriptor_stat(&self.retained)?;
         if stat.st_mode & libc::S_IFMT != libc::S_IFDIR {
-            return Err("self-descriptor exemption requires the live owned directory object".into());
+            return Err(
+                "self-descriptor exemption requires the live owned directory object".into(),
+            );
         }
         Ok(SelfDeletionDescriptorBorrow {
             witness: self,
@@ -8938,7 +8940,7 @@ fn quarantine_has_open_descriptors_with_info_reader_until_scoped(
                             .and_then(|value| value.parse::<libc::pid_t>().ok());
                         let fd = descriptor
                             .file_name()
-                            .and_then(|name| name.to_str())
+                            .to_str()
                             .and_then(|value| value.parse::<libc::c_int>().ok());
                         pid.zip(fd).is_some_and(|(pid, fd)| {
                             self_descriptor_borrow_matches(
@@ -9305,9 +9307,8 @@ fn mac_inspect_open_descriptors_until(
             writer_scan_check(deadline)?;
             continue;
         }
-        if let Some(authority) =
-            mac_descriptor_authority(stat.vst_mode, info.file.open_flags)
-                .map_err(WriterScanError::from)?
+        if let Some(authority) = mac_descriptor_authority(stat.vst_mode, info.file.open_flags)
+            .map_err(WriterScanError::from)?
         {
             writer_scan_check(deadline)?;
             return Ok(Some((candidate, authority)));
@@ -18931,11 +18932,8 @@ mod tests {
         // An exempt slot must not stop inventory inspection before other authority.
         let mixed_process = exact_proc.join(pid.to_string());
         let extra_fd = borrow.fd + 100;
-        std::os::unix::fs::symlink(
-            &quarantine,
-            mixed_process.join(format!("fd/{extra_fd}")),
-        )
-        .unwrap();
+        std::os::unix::fs::symlink(&quarantine, mixed_process.join(format!("fd/{extra_fd}")))
+            .unwrap();
         std::fs::write(
             mixed_process.join(format!("fdinfo/{extra_fd}")),
             "flags:\t0100000\n",
@@ -18964,9 +18962,7 @@ mod tests {
                 Some(&borrow),
             )
             .unwrap(),
-            super::ExternalWriterEvidence::Blocked(super::CloseWriterObservation::Authority {
-                ..
-            })
+            super::ExternalWriterEvidence::Blocked(super::CloseWriterObservation::Authority { .. })
         ));
 
         let other_pid_proc = temp.path().join("other-pid-proc");
@@ -18980,9 +18976,7 @@ mod tests {
                 Some(&borrow),
             )
             .unwrap(),
-            super::ExternalWriterEvidence::Blocked(super::CloseWriterObservation::Authority {
-                ..
-            })
+            super::ExternalWriterEvidence::Blocked(super::CloseWriterObservation::Authority { .. })
         ));
 
         let other_parent = super::open_deletion_parent(other.parent().unwrap()).unwrap();
@@ -19012,9 +19006,7 @@ mod tests {
                 Some(&mismatched_borrow),
             )
             .unwrap(),
-            super::ExternalWriterEvidence::Blocked(super::CloseWriterObservation::Authority {
-                ..
-            })
+            super::ExternalWriterEvidence::Blocked(super::CloseWriterObservation::Authority { .. })
         ));
 
         // Keeping the FD alive must not excuse replacement of its witnessed slot.
