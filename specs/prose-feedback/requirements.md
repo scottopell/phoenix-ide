@@ -215,9 +215,10 @@ AND close the notes panel
 
 WHEN user taps Send (header) or Send All (notes panel)
 THE SYSTEM SHALL format all notes as a structured message:
-  - Header: "Review notes for `{absolute_file_path}`:"
-  - For each note: "> Line {N}: `{raw_line_content}`" followed by the note text
-  - The raw line content SHALL be the exact text from the file (untruncated) to ensure greppability
+  - Notes grouped under a heading naming each file
+  - For each note: its line number and the quoted raw line content, followed by the note text
+  - The quoted line content SHALL be the exact text from the file, cut to at most 200 UTF-16 code units with an ellipsis marking a cut, so it stays greppable without unbounded size
+  - A cut SHALL NOT split a character: the quoted text SHALL contain no lone surrogate
   - Notes separated by blank lines
 AND inject the formatted text into the message input field
 AND clear all notes
@@ -227,7 +228,7 @@ WHEN formatted notes are injected into message input
 THE SYSTEM SHALL append to any existing draft text (with blank line separator if draft is non-empty)
 AND focus the message input
 
-**Rationale:** Injecting into the input field rather than auto-sending gives users a chance to add context or edit before sending. The structured format with absolute paths and raw content helps the AI precisely locate and understand the feedback context. Including the complete raw line content ensures the AI can grep for exact matches in the codebase.
+**Rationale:** Injecting into the input field rather than auto-sending gives users a chance to add context or edit before sending. The structured format with file paths and raw content helps the AI precisely locate and understand the feedback context. A 200-unit prefix of the line is still an exact, greppable substring, while a minified line cannot paste unbounded text into the conversation. A split character would become a lone surrogate, which the server's JSON parser rejects, failing the whole send.
 
 ---
 
