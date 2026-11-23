@@ -6623,6 +6623,9 @@ def cmd_check(
     CARGO_TEST_TIMEOUT, cargo_test_timeout_source = (
         _cargo_test_timeout_secs() if "rust" in active else (DEFAULT_CARGO_TEST_TIMEOUT_SECS, None)
     )
+    DEVPY_TEST_TIMEOUT, devpy_test_timeout_source = (
+        _devpy_test_timeout_secs() if "devpy" in active else (DEFAULT_DEVPY_TEST_TIMEOUT_SECS, None)
+    )
     if _CHECK_PROFILE is not None:
         _CHECK_PROFILE.metadata["active_lanes"] = sorted(active)
     if lanes is not None and not active:
@@ -6638,6 +6641,11 @@ def cmd_check(
         reporter.info(
             f"cargo test budget: {CARGO_TEST_TIMEOUT}s "
             f"({CARGO_TEST_TIMEOUT_ENV} from {cargo_test_timeout_source})"
+        )
+    if devpy_test_timeout_source is not None:
+        reporter.info(
+            f"dev.py unit-test budget: {DEVPY_TEST_TIMEOUT}s "
+            f"({DEVPY_TEST_TIMEOUT_ENV} from {devpy_test_timeout_source})"
         )
     if skipped:
         ran = ", ".join(sorted(active))
@@ -7592,7 +7600,7 @@ def cmd_check(
             ]
         if os.environ.get("PHOENIX_CHECK_DIAGNOSTIC_DIR"):
             unittest_cmd.append("-v")
-        run_step("dev.py unit tests", unittest_cmd)
+        run_step("dev.py unit tests", unittest_cmd, timeout=DEVPY_TEST_TIMEOUT)
 
     # Bootstrap UI deps so eslint / tsc / vitest can run on a fresh checkout.
     # Skipped when no UI lane runs, so a non-UI change never needs pnpm.
@@ -7903,9 +7911,11 @@ def cmd_check(
     # Each lane starts only after its predecessor finishes. A lane wedged in
     # Python therefore cannot leave every later lane parked on a lock or multiply
     # the join timeout. daemon=True lets the interpreter exit after recording the
-    # one stuck lane; subprocess steps have their own CHECK_TIMEOUT kill budget.
+    # one stuck lane; subprocess steps have their own kill budget.
     # Launcher build, codegen, and test compilation each have CHECK_TIMEOUT.
-    LANE_JOIN_TIMEOUT = max(CHECK_TIMEOUT * 6, CHECK_TIMEOUT * 3 + CARGO_TEST_TIMEOUT) + 30
+    LANE_JOIN_TIMEOUT = max(
+        CHECK_TIMEOUT * 6, CHECK_TIMEOUT * 3 + CARGO_TEST_TIMEOUT, DEVPY_TEST_TIMEOUT
+    ) + 30
     with _check_interrupt_handlers(interrupted):
         stuck = _run_check_threads_sequentially(
             threads, LANE_JOIN_TIMEOUT, interrupted=interrupted
@@ -10293,41 +10303,54 @@ def native_prod_deploy(
 
 CARGO_TEST_TIMEOUT_ENV = "PHOENIX_CHECK_CARGO_TEST_TIMEOUT_SECS"
 DEFAULT_CARGO_TEST_TIMEOUT_SECS = 900
-# Keep the lane join (two 600s steps + this budget + 30s) within Python's
-# platform-supported Thread.join timeout, even for an extreme override.
+# The Rust lane can spend two 600s steps plus this budget before its 30s join grace.
 MAX_CARGO_TEST_TIMEOUT_SECS = int(threading.TIMEOUT_MAX) - 1230
+DEVPY_TEST_TIMEOUT_ENV = "PHOENIX_CHECK_DEVPY_TEST_TIMEOUT_SECS"
+DEFAULT_DEVPY_TEST_TIMEOUT_SECS = 600
+MAX_DEVPY_TEST_TIMEOUT_SECS = int(threading.TIMEOUT_MAX) - 30
 
 
-def _cargo_test_timeout_secs(environ: dict[str, str] | None = None) -> tuple[int, str | None]:
-    """Return the `check` cargo-test step budget and where an override came from.
-
-    The process environment wins over the gitignored, per-host `.phoenix-ide.env`
-    so a single run can be adjusted without editing the file. An override that is
-    not a positive integer is a configuration error, not a reason to fall back.
-    """
+def _check_test_timeout_secs(
+    name: str, default: int, maximum: int, environ: dict[str, str] | None = None
+) -> tuple[int, str | None]:
+    """Read a step budget; process environment takes precedence over the host file."""
     environ = os.environ if environ is None else environ
     source = None
-    raw = environ.get(CARGO_TEST_TIMEOUT_ENV)
+    raw = environ.get(name)
     if raw is not None:
         source = "environment"
     else:
         file_env: dict[str, str] = {}
         loaded = _load_env_file(file_env)
-        raw = file_env.get(CARGO_TEST_TIMEOUT_ENV)
+        raw = file_env.get(name)
         if raw is not None:
             source = loaded
     if raw is None or raw.strip() == "":
-        return DEFAULT_CARGO_TEST_TIMEOUT_SECS, None
+        return default, None
     try:
         value = int(raw.strip())
     except ValueError:
         value = 0
-    if not 0 < value <= MAX_CARGO_TEST_TIMEOUT_SECS:
+    if not 0 < value <= maximum:
         raise SystemExit(
-            f"{CARGO_TEST_TIMEOUT_ENV} must be a positive integer number of seconds "
-            f"at most {MAX_CARGO_TEST_TIMEOUT_SECS}; got {raw!r} from {source}"
+            f"{name} must be a positive integer number of seconds "
+            f"at most {maximum}; got {raw!r} from {source}"
         )
     return value, source
+
+
+def _cargo_test_timeout_secs(environ: dict[str, str] | None = None) -> tuple[int, str | None]:
+    return _check_test_timeout_secs(
+        CARGO_TEST_TIMEOUT_ENV, DEFAULT_CARGO_TEST_TIMEOUT_SECS,
+        MAX_CARGO_TEST_TIMEOUT_SECS, environ,
+    )
+
+
+def _devpy_test_timeout_secs(environ: dict[str, str] | None = None) -> tuple[int, str | None]:
+    return _check_test_timeout_secs(
+        DEVPY_TEST_TIMEOUT_ENV, DEFAULT_DEVPY_TEST_TIMEOUT_SECS,
+        MAX_DEVPY_TEST_TIMEOUT_SECS, environ,
+    )
 
 
 def _load_env_file(env: dict[str, str], filename: str = ".phoenix-ide.env") -> str | None:
