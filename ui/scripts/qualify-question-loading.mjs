@@ -224,7 +224,7 @@ async function trial(version, base, viewport, mode, run, isolation = false) {
     results.push(record);
     await context.close();
   }
-  console.log(JSON.stringify({ name, ok: record.ok, question_ms: record.question_usable_ms, transcript_ms: record.transcript_ready_ms, error: record.error }));
+  console.log(JSON.stringify({ name, ok: record.ok, question_ms: record.question_usable_ms, transcript_observed_ms: record.transcript_visible_after_question_interaction_ms, error: record.error }));
   return record.ok;
 }
 try {
