@@ -144,6 +144,16 @@ function CoordinatorQuestionCard({
           if (mobile) returnToConversation();
         }}
         onKeyDownCapture={(event) => {
+          const target = event.target;
+          const editing = target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement
+            || (target instanceof HTMLElement && target.isContentEditable);
+          if (event.key === '?' && !editing) {
+            event.preventDefault();
+            event.stopPropagation();
+            if (mobile) returnToConversation();
+            window.dispatchEvent(new CustomEvent('toggle-shortcut-help'));
+            return;
+          }
           if (!mobile || event.key !== 'Escape') return;
           if (event.currentTarget.querySelector('.confirm-dialog')) {
             event.preventDefault();

@@ -16,6 +16,24 @@ export async function qualifyQuestionSurface({ page, out, questions, setQuestion
     bottom: el.getBoundingClientRect().bottom, height: innerHeight,
   }));
   const transcript = page.locator('#messages');
+  const confirmGeometry = async name => {
+    await page.locator('.confirm-dialog').waitFor({ state: 'visible' });
+    const bounds = await dialog.evaluate(el => {
+      const rect = node => { const r = node.getBoundingClientRect(); return { top: r.top, left: r.left, right: r.right, bottom: r.bottom, height: r.height }; };
+      const overlay = el.querySelector('.modal-overlay');
+      const confirm = el.querySelector('.confirm-dialog');
+      return { dialog: rect(el), overlay: rect(overlay), confirm: rect(confirm),
+        covered: overlay.contains(document.elementFromPoint(innerWidth / 2, 100)),
+        controls: [...confirm.querySelectorAll('button')].map(button => ({ ...rect(button), hit: button.contains(document.elementFromPoint(button.getBoundingClientRect().x + button.clientWidth / 2, button.getBoundingClientRect().y + button.clientHeight / 2)) })) };
+    });
+    assert.ok(Math.abs(bounds.overlay.top - bounds.dialog.top) <= 1 && Math.abs(bounds.overlay.bottom - bounds.dialog.bottom) <= 1, 'Confirmation must cover the full question viewport');
+    assert.equal(bounds.covered, true, 'Question content must be covered by confirmation');
+    for (const control of bounds.controls) {
+      assert.ok(control.top >= bounds.dialog.top && control.bottom <= bounds.dialog.bottom && control.hit, 'Confirmation controls must be onscreen and hit-testable without scrolling');
+    }
+    await screenshot(name);
+    evidence.push({ journey: name, bounds });
+  };
   const settledScrollTop = () => transcript.evaluate(el => new Promise((resolve, reject) => {
     let previous = el.scrollTop, stable = 0, frames = 0;
     const sample = () => {
@@ -75,7 +93,7 @@ export async function qualifyQuestionSurface({ page, out, questions, setQuestion
   assert.equal(await dialog.evaluate(el => el.open), true);
   assert.equal(await custom.evaluate(el => el === document.activeElement), false);
   await page.getByRole('button', { name: 'Dismiss', exact: true }).click();
-  await page.locator('.confirm-dialog').waitFor({ state: 'visible' });
+  await confirmGeometry('confirmation');
   await page.keyboard.press('Escape');
   await page.locator('.confirm-dialog').waitFor({ state: 'detached' });
   assert.equal(await dialog.evaluate(el => el.open), true);
@@ -87,8 +105,25 @@ export async function qualifyQuestionSurface({ page, out, questions, setQuestion
   assert.deepEqual(reduced.scrollables, ['coordinator-question-dock__scroller']);
   await page.locator('.question-actions').scrollIntoViewIfNeeded();
   await screenshot('reduced-viewport');
+  await page.getByRole('button', { name: 'Dismiss', exact: true }).click();
+  await confirmGeometry('confirmation-reduced-viewport');
+  await page.keyboard.press('Escape');
+  await page.locator('.confirm-dialog').waitFor({ state: 'detached' });
   await page.setViewportSize(original);
   evidence.push({ journey: 'reduced viewport (not OS keyboard)', reduced });
+  await page.locator('.question-panel').focus();
+  await page.keyboard.press('?');
+  await page.locator('.shortcut-help-panel').waitFor({ state: 'visible' });
+  assert.equal(await dialog.evaluate(el => el.open), false);
+  assert.equal(await page.locator('.shortcut-help-panel').evaluate(el => {
+    const r = el.getBoundingClientRect();
+    return el.contains(document.elementFromPoint(r.x + r.width / 2, r.y + 20));
+  }), true);
+  await page.keyboard.press('Escape');
+  await page.locator('.shortcut-help-panel').waitFor({ state: 'detached' });
+  await launcher.click();
+  assert.equal(await custom.inputValue(), retained);
+  evidence.push({ journey: 'global shortcut help releases native modality and preserves answer on reopen' });
   // Feed identity changes are delivered through the real HTTP polling boundary.
   const request = { ...questions[0], request_id: 'journey-wizard', questions: [
     { header: 'First', question: 'Choose or write a custom answer', options: [{ label: 'One' }, { label: 'Two' }], multiSelect: false },

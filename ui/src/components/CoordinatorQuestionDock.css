@@ -189,8 +189,12 @@
   }
 
   .coordinator-question-dock__dialog .modal-overlay {
-    position: absolute;
-    inset: 0;
+    position: fixed;
+    top: var(--coordinator-question-viewport-top, 0px);
+    left: var(--coordinator-question-viewport-left, 0px);
+    width: var(--coordinator-question-viewport-width, 100vw);
+    height: var(--coordinator-question-viewport-height, 100dvh);
+    box-sizing: border-box;
     z-index: 2;
     display: flex;
     align-items: center;

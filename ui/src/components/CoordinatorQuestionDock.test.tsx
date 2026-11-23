@@ -189,6 +189,30 @@ describe('Ember questions (REQ-AUQ-011)', () => {
     expect(screen.getByRole('button', { name: 'Submit' })).toBeEnabled();
   });
 
+  it('releases mobile modality for shortcut help without consuming typed question marks', async () => {
+    mobile = true;
+    const toggleHelp = vi.fn();
+    window.addEventListener('toggle-shortcut-help', toggleHelp);
+    act(() => receiveCoordinatorQuestions([open('q-1', 'Merge now?')]));
+    const view = render(<CoordinatorQuestionDock />);
+    try {
+      const dialog = screen.getByRole('dialog');
+      const panel = document.querySelector('.question-panel')!;
+      fireEvent.click(screen.getByTitle('Select First'));
+      fireEvent.keyDown(screen.getByRole('textbox', { name: 'Write a custom answer' }), { key: '?' });
+      expect(toggleHelp).not.toHaveBeenCalled();
+      expect(dialog).toHaveAttribute('open');
+      fireEvent.keyDown(panel, { key: '?' });
+      expect(toggleHelp).toHaveBeenCalledOnce();
+      expect(dialog).not.toHaveAttribute('open');
+      fireEvent.click(screen.getByRole('button', { name: 'Answer Ember’s question' }));
+      expect(screen.getByTitle('Select First')).toHaveClass('selected');
+    } finally {
+      view.unmount();
+      window.removeEventListener('toggle-shortcut-help', toggleHelp);
+    }
+  });
+
   it('clears a dismiss confirmation on Return and retains the selection when reopened', async () => {
     mobile = true;
     const dismiss = vi.spyOn(api, 'dismissCoordinatorQuestion');
