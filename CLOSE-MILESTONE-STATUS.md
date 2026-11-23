@@ -2,6 +2,22 @@
 
 ## Current publication and active gate
 
+### Terminal d78c1ed5e: selector-only failure classified; disjoint blocker source prepared
+
+Personally verified run45230247643 **completed / failure**, exact d78c1ed5e6c32e63797755cf2a0ce1d6d360e59a. Sole failing step is the exact six-selector inventory prefix; compilation passed, complete foundation suite skipped. Native Close suite57/0 does not cover six new included tests. Specification/Allium and formatting gates pass. Required real production-detector Worktree **1/0/0 ignored** with nobody/caps0 passes again; actor and existing physical/Stop/safety gates passed. Sole watcher exited1; `@82` verified zsh before next watcher. Full terminal logs and dedicated evidence retained `/tmp/close-d78c1ed5e`.
+
+In parallel, disjoint source/test preparation advanced ignored leaf inventory/fingerprints and submodule mapping, domain/forward182 migration, shared exact-attempt no-loss admission guards, retired DB/HTTP discard admission, and UI retained blockers. Review corrected migration rebuild/fixture issues and added source-bound atomic pre-retirement blocker terminalization; source review/integration still ongoing. **Not yet published/validated**; pre-anchor explicit retry remains a concrete coupling gap, no fabricated shutdown proof or Retry affordance. This preparation is not held behind selector qualification. Next publication is only reviewed one-line selector repair plus status; prepared implementation remains separate dirty work until reviewed.
+
+### d78c1ed5e active: compile fixed, specification/format pass; exact selector prefix correction ready
+
+Run45230247643 still active (runtime matcher/actor). Personally read hosted artifacts: DB **compilation passed**; inventory includes all six new tests under **`close_foundation::tests::native_retry::`**, not `native_close::source_fence::tests::`. The source file is `include!`d by close_foundation.rs into `tests::native_retry`. Existing exact inventory guard used the wrong prefix; corrected one line after evidence and independent review. All six suffixes match hosted inventory exactly. Selected-test regex already includes them; complete foundation suite selects them but is skipped on this inventory failure. Successful `native_close::` suite **57/0** does NOT execute these six. Prior review claims that it did, or that old selectors existed, were incorrect. No new-admission/historical regression pass is claimed.
+
+Hosted **Allium + specification shape + dev.py unit tests all pass**, and exact hosted-format.patch is empty (0 bytes). No additional source repair identified. Hold corrective publication until personally classifying full exact terminal run; sole watcher remains `@82`. Evidence `/tmp/close-d78c1ed5e/{db/,specifications/,format/}`. Remaining broader blocker-only source implementation untouched.
+
+### Current d78c1ed5e corrective publication: automatic qualification running
+
+Committed/pushed `d78c1ed5e6c32e63797755cf2a0ce1d6d360e59a` with hooks disabled after exact prior terminal classification and review. [Automatic run45230247643](https://github.com/scottopell/phoenix-ide/actions/runs/45230247643) active; sole watcher `close-d78c1ed5e-watch` pane `@82`, evidence `/tmp/close-d78c1ed5e`. Prior watcher `@81` verified zsh/exited1 before starting this watcher. No new test/parser/format pass claimed; await exact terminal evidence before further publication. No local build/test/script/fmt/SQL/native experiment, manual rerun, merge or deploy.
+
 ### Terminal d38ab1253 classified; reviewed compile/baseline/format correction ready
 
 Personally verified run45223536108 **completed / failure**, exact `d38ab1253df0d4e53e564f23d2418a1144365bc9`. Watcher exited1, pane `@81` returned zsh before next publication. Sole DB root cause E0369 in the new no-mutation test; affected DB suites did not execute. Allium parsing passed; only new analyse finding is the exact renamed external startup listener tuple. **Specification shape and dev.py unit tests passed.** Required formatting failed with the exact one-line proposal now applied. All remaining runtime/focused gates passed: actor **48/0**, production-detector Worktree **1/0/0 ignored** under nobody/all IDs65534/own group/caps0, controlled physical and both Stop journeys, exact live self-descriptor safety regression. Full logs and exact dedicated evidence retained `/tmp/close-d38ab1253/{full-run.log,final-failed.log,final-run.json,exact/,db/,specifications/,format/}`.
