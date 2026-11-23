@@ -18,6 +18,31 @@ Provider defaults are preserved by omitting an unset effort override.
 Model-contract, registry-registration, and provider-wire fixtures cover these
 additions; they do not establish account entitlement or live provider acceptance.
 
+## Added-model parallel Work review (2026-11-23)
+
+All added model IDs deliberately retain the unqualified single-Work-writer
+parent policy. No new parallel Work qualification is granted by model-family
+or version similarity, including for the new default GPT-6.2 Sol.
+
+| Exact resolved parent model ID | Review decision |
+| --- | --- |
+| `gpt-6.2-astra` | Single Work writer; parallel Work unqualified |
+| `gpt-6.2-sol` | Single Work writer; parallel Work unqualified |
+| `gpt-6.1-terra` | Single Work writer; parallel Work unqualified |
+| `claude-fable-5-2` | Single Work writer; parallel Work unqualified |
+| `claude-haiku-5-5` | Single Work writer; parallel Work unqualified |
+| `google/gemini-4-neon` | Single Work writer; parallel Work unqualified |
+| `google/gemini-4-hydrogen` | Single Work writer; parallel Work unqualified |
+| `google/gemini-4-carbon` | Single Work writer; parallel Work unqualified |
+| `google/gemini-4-argon` | Single Work writer; parallel Work unqualified |
+
+The exact-ID qualification, effective `spawn_agents` guidance and input schema,
+and runtime batch-admission regressions cover these entries. Existing SQLite
+admission coverage enforces the single active Work writer across calls. Parallel
+Work support requires a separate disposable parent probe with two overlapping
+Work children writing separate files under the repository's model-addition
+review policy.
+
 ## Codex bridge live qualification (2026-11-23)
 
 Phoenix's native Codex login authenticated GPT-6.2 Sol on both HTTP/SSE and

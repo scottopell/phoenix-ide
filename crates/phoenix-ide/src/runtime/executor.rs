@@ -31894,29 +31894,60 @@ mod work_subagent_cwd_guard_tests {
     }
 
     #[tokio::test]
-    async fn gpt_6_luna_parent_remains_sequential() {
-        let worktree = TempDir::new().expect("worktree tempdir");
-        let (spawn_tx, mut spawn_rx) = mpsc::channel::<SubAgentSpawnRequest>(1);
-        let (cancel_tx, _cancel_rx) = mpsc::channel(1);
-        let mut rt = runtime_in_work_mode(worktree.path()).with_spawn_channels(spawn_tx, cancel_tx);
-        rt.context.model_id = "gpt-6-luna".to_string();
+    async fn unqualified_builtin_parent_models_remain_sequential() {
+        let registry = Arc::new(ModelRegistry::new(&phoenix_llm::LlmConfig {
+            openai_api_key: Some("test-key".into()),
+            anthropic_api_key: Some("test-key".into()),
+            openai_responses_base_url: Some("https://gateway.example/v1/responses".into()),
+            openai_chat_completions_base_url: Some(
+                "https://gateway.example/v1/chat/completions".into(),
+            ),
+            ..Default::default()
+        }));
+        for parent_model in [
+            "gpt-6-luna",
+            "gpt-6.2-astra",
+            "gpt-6.2-sol",
+            "gpt-6.1-terra",
+            "claude-fable-5-2",
+            "claude-haiku-5-5",
+            "google/gemini-4-neon",
+            "google/gemini-4-hydrogen",
+            "google/gemini-4-carbon",
+            "google/gemini-4-argon",
+        ] {
+            let worktree = TempDir::new().expect("worktree tempdir");
+            let (spawn_tx, mut spawn_rx) = mpsc::channel::<SubAgentSpawnRequest>(1);
+            let (cancel_tx, _cancel_rx) = mpsc::channel(1);
+            let mut rt =
+                runtime_in_work_mode(worktree.path()).with_spawn_channels(spawn_tx, cancel_tx);
+            rt.llm_registry = Arc::clone(&registry);
+            rt.context.model_id = parent_model.to_string();
+            assert!(
+                rt.llm_registry.is_builtin_model(parent_model),
+                "{parent_model}"
+            );
 
-        let result = rt
-            .prepare_spawn_and_wait(spawn_tool(SpawnAgentsInput {
-                tasks: vec![
-                    luna_work_task("first partition"),
-                    luna_work_task("second partition"),
-                ],
-            }))
-            .await
-            .expect("Luna rejection is a tool result");
+            let result = rt
+                .prepare_spawn_and_wait(spawn_tool(SpawnAgentsInput {
+                    tasks: vec![
+                        luna_work_task("first partition"),
+                        luna_work_task("second partition"),
+                    ],
+                }))
+                .await
+                .expect("unqualified parent rejection is a tool result");
 
-        let Some(Event::ToolComplete { result, .. }) = result else {
-            panic!("expected ToolComplete rejection");
-        };
-        let text = tool_result_text(&result);
-        assert!(text.contains("Only one Work sub-agent"), "{text}");
-        assert!(spawn_rx.try_recv().is_err());
+            let Some(Event::ToolComplete { result, .. }) = result else {
+                panic!("expected ToolComplete rejection for {parent_model}");
+            };
+            let text = tool_result_text(&result);
+            assert!(
+                text.contains("Only one Work sub-agent"),
+                "{parent_model}: {text}"
+            );
+            assert!(spawn_rx.try_recv().is_err(), "{parent_model}");
+        }
     }
 
     #[tokio::test]
