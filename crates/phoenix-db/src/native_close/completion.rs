@@ -179,7 +179,8 @@ impl Database {
             Err(error) => return LocalAuthorityResult::DurableFactEstablished(Err(error.into())),
         };
         let result = async {
-            let admitted = require_initial_identity_tx(&mut tx, command, receipt, live_source).await?;
+            let admitted =
+                require_initial_identity_tx(&mut tx, command, receipt, live_source).await?;
             let completion = NativeCloseCompletionReceipt {
                 origin: receipt.clone(),
                 successor: NativeCloseRunRef {

@@ -197,7 +197,7 @@
       "trigger": "PhoenixStartupObservedCloseRun",
       "listening_rules": [
         "ReadOnlyObservationConfirmsStoppedConversationShutdown",
-        "StartupDoesNotDispatchRearmOrRefundCompletionRetry",
+        "StartupCannotAdmitCloseSuccessor",
         "StartupObservesInterruptedCloseWithoutRecovery",
         "StartupReobservesStoppedCloseWithoutDuplicateFailure"
       ]

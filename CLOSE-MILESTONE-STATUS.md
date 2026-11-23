@@ -2,6 +2,22 @@
 
 ## Current publication and active gate
 
+### Terminal d38ab1253 classified; reviewed compile/baseline/format correction ready
+
+Personally verified run45223536108 **completed / failure**, exact `d38ab1253df0d4e53e564f23d2418a1144365bc9`. Watcher exited1, pane `@81` returned zsh before next publication. Sole DB root cause E0369 in the new no-mutation test; affected DB suites did not execute. Allium parsing passed; only new analyse finding is the exact renamed external startup listener tuple. **Specification shape and dev.py unit tests passed.** Required formatting failed with the exact one-line proposal now applied. All remaining runtime/focused gates passed: actor **48/0**, production-detector Worktree **1/0/0 ignored** under nobody/all IDs65534/own group/caps0, controlled physical and both Stop journeys, exact live self-descriptor safety regression. Full logs and exact dedicated evidence retained `/tmp/close-d38ab1253/{full-run.log,final-failed.log,final-run.json,exact/,db/,specifications/,format/}`.
+
+Corrective source remains limited to full event Debug snapshot equality in test, exact existing baseline startup-rule rename, and hosted line wrap. Independent source review found no blocker, diff check passes. This is compile/baseline/format repair, not a new production policy or a claim the new admission tests passed. Broader simplification remains incomplete.
+
+### d38ab1253 early failures classified; corrective source reviewed, awaiting terminal run
+
+At current check run45223536108 remains active in same-server queue qualification. DB test compilation fails E0369: new rejection regression compares `Vec<PendingWatchEvent>`, whose DTO has no PartialEq. DB tests are nonexecution, not failures of the new admission policy. Prepared correction compares complete Debug snapshots (all exposed fields, existing repository convention); no production DTO change. Hosted Allium **parse passed**, analyse rejected only changed `PhoenixStartupObservedCloseRun` listener tuple: baseline retained removed automatic-specific rule name. Prepared exact one-name baseline replacement with `StartupCannotAdmitCloseSuccessor`, retaining all four exact sorted listeners, no wildcard/new suppression. Specification-shape pass is not yet established. Exact hosted format patch applied (one completion.rs line wrap). Independent corrective source review found no blocker; `git diff --check` passes. No local validator run and no corrective commit/push before exact terminal classification.
+
+Runtime actor ownership and required production-detector Worktree steps have succeeded again; still retrieve dedicated logs and final artifacts before asserting exact counts. Sole watcher remains `@81`; no duplicate watcher. Remaining public gates and final formatting/run conclusion are pending.
+
+### Current exact source d38ab1253: automatic hosted qualification active
+
+Published `d38ab1253df0d4e53e564f23d2418a1144365bc9`, [automatic run45223536108](https://github.com/scottopell/phoenix-ide/actions/runs/45223536108), in progress. One watcher `close-d38ab1253-watch` / pane `@81`, evidence `/tmp/close-d38ab1253`; prior watcher `@80` exited0 before this watcher started. Checkback scheduled. Personally classify exact terminal source, specification gate, no-new-admission/historical tests, production Worktree regression and formatting before further publication. No current-head test or parser success is claimed.
+
 ### Simplification slice: reviewed source and coupled contract, hosted validation next
 
 New native automatic metadata-only successor admission is rejected before writes; exact pre-existing receipts remain replayable and historical finalization/source/cancellation safety is retained. No runtime loop was removed (the DB API had no runtime caller). Negative no-mutation and six historical/rejection selectors are mandatory in hosted inventory. Historical tests seed legacy data, not new production admission. Independent source review caught and corrected a fixture's double consumption of its allowance; final review found no remaining blocker.

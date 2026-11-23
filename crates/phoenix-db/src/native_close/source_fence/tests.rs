@@ -2715,7 +2715,11 @@ async fn initial_all_success_interruption_does_not_admit_automatic_completion_su
     assert_eq!(db.get_close_run(&run).await.unwrap().status, CloseRunStatus::Stopped);
     assert_eq!(db.get_close_obligation(run.attempt_id.as_str()).await.unwrap(), obligation_before);
     assert_eq!(db.list_close_cleanup_failures(run.attempt_id.as_str()).await.unwrap(), failures_before);
-    assert_eq!(db.pending_coordinator_watch_events(100).await.unwrap(), events_before);
+    // Compare every exposed field without adding equality to the production DTO.
+    assert_eq!(
+        format!("{:?}", db.pending_coordinator_watch_events(100).await.unwrap()),
+        format!("{events_before:?}")
+    );
 }
 
 #[tokio::test]
