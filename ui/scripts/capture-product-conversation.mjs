@@ -514,12 +514,18 @@ async function assertEmberTracking(page, id, viewport, outDir) {
     throw new Error('Raw original was not preserved byte-for-byte as a producer envelope and payload');
   }
   await page.context().grantPermissions(['clipboard-read', 'clipboard-write']);
+  await page.screenshot({ path: `${outDir}/${id}--${viewport.name}--raw.png`, fullPage: true });
+  const copyButton = due.getByRole('button', { name: 'Copy system observation' });
+  await copyButton.scrollIntoViewIfNeeded();
+  await copyButton.focus();
   const beforeCopyScroll = await scroller.evaluate(element => element.scrollTop);
-  await due.getByRole('button', { name: 'Copy system observation' }).click();
+  await copyButton.click();
   await due.getByRole('button', { name: 'Copied!' }).waitFor();
   const copied = await page.evaluate(() => navigator.clipboard.readText());
   if (copied !== original) throw new Error('Copy did not preserve the original producer payload');
-  if (Math.abs((await scroller.evaluate(element => element.scrollTop)) - beforeCopyScroll) > 3) throw new Error('Copy jumped the transcript scroller');
+  const afterCopyScroll = await scroller.evaluate(element => element.scrollTop);
+  if (Math.abs(afterCopyScroll - beforeCopyScroll) > 3) throw new Error(`Copy jumped the transcript scroller: ${beforeCopyScroll} -> ${afterCopyScroll}`);
+  measurements.push({ id, viewport: viewport.name, beforeCopyScroll, afterCopyScroll });
   await page.screenshot({ path: `${outDir}/${id}--${viewport.name}--expanded.png`, fullPage: true });
   await summary.focus();
   await summary.press('Enter');

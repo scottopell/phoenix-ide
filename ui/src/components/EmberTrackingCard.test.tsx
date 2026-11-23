@@ -34,7 +34,9 @@ describe('Ember tracking message presentation', () => {
     expect(container.querySelector('details')).toHaveAttribute('open');
     expect(screen.getByText(/Historical snapshot only/)).toBeVisible();
     fireEvent.click(screen.getByText('Raw original payload'));
-    expect(screen.getByText(rawText)).toBeVisible();
+    const original = container.querySelector('pre');
+    expect(original).toBeVisible();
+    expect(original?.textContent).toBe(rawText);
   });
   it('auto-expands nested raw payload and highlights an active Find hit in the message-text fragment', () => {
     const { container } = render(<UserMessage message={message()} activeHighlight={{ owner: 'message-text', fragmentId: 'message-text', start: 1, end: 6 }} />);
