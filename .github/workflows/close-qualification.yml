@@ -512,6 +512,7 @@ jobs:
             linux_readonly_descriptor_position_changes_are_not_writer_gaps
             linux_descriptor_scan_retains_inventory_and_descriptor_gaps
             linux_descriptor_scan_retains_attributed_unavailable_inventory
+            linux_descriptor_scan_exempts_only_the_exact_live_self_borrow
             linux_cwd_scan_proves_namespace_authority_and_fails_closed_on_gaps
             linux_mapping_scan_requires_writable_shared_authority
             linux_pid_reuse_during_observation_retains_gap

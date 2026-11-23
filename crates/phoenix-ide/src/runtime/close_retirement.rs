@@ -6005,8 +6005,57 @@ struct OwnedDeletionSlot {
     identity: DeletionEntryIdentity,
 }
 
+// Keep the owning slot borrowed through the synchronous scan: no dup or raw-fd lease.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn deletion_descriptor_device(stat: &libc::stat) -> u64 {
+    #[cfg(target_os = "macos")]
+    {
+        // libproc exposes the same dev_t bits unsigned, unlike fstat's signed dev_t.
+        u64::from(stat.st_dev as u32)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        stat.st_dev as u64
+    }
+}
+
+struct SelfDeletionDescriptorBorrow<'a> {
+    #[cfg(unix)]
+    witness: &'a OwnedDeletionSlot,
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pid: libc::pid_t,
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fd: libc::c_int,
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    device: u64,
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    inode: u64,
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    kind: libc::mode_t,
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    _borrow: std::marker::PhantomData<&'a ()>,
+}
+
 #[cfg(unix)]
 impl OwnedDeletionSlot {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn self_descriptor_borrow(&self) -> Result<SelfDeletionDescriptorBorrow<'_>, String> {
+        use std::os::fd::AsRawFd as _;
+        self.validate()?;
+        let stat = deletion_descriptor_stat(&self.retained)?;
+        if stat.st_mode & libc::S_IFMT != libc::S_IFDIR {
+            return Err("self-descriptor exemption requires the live owned directory object".into());
+        }
+        Ok(SelfDeletionDescriptorBorrow {
+            witness: self,
+            pid: unsafe { libc::getpid() },
+            fd: self.retained.as_raw_fd(),
+            device: deletion_descriptor_device(&stat),
+            inode: stat.st_ino as u64,
+            kind: stat.st_mode & libc::S_IFMT,
+        })
+    }
+
     fn capture(
         parent: &std::sync::Arc<std::os::fd::OwnedFd>,
         name: &std::ffi::CStr,
@@ -6617,7 +6666,12 @@ trait WorktreeDeletionDriver: WorktreeMutationExecutor {
         object_identity: Option<(u64, u64)>,
     ) -> Result<(), String>;
     fn observe_identity(&mut self, object: &Path) -> Result<String, String>;
-    fn after_move(&mut self, root: &Path, object: &Path) -> Result<(), String>;
+    fn after_move(
+        &mut self,
+        root: &Path,
+        object: &Path,
+        self_descriptor: Option<&SelfDeletionDescriptorBorrow<'_>>,
+    ) -> Result<(), String>;
 }
 
 struct CallbackWorktreeDeletionDriver<'a, F, B, A, O, E> {
@@ -6666,7 +6720,12 @@ where
         (self.observe)(object)
     }
 
-    fn after_move(&mut self, root: &Path, object: &Path) -> Result<(), String> {
+    fn after_move(
+        &mut self,
+        root: &Path,
+        object: &Path,
+        _self_descriptor: Option<&SelfDeletionDescriptorBorrow<'_>>,
+    ) -> Result<(), String> {
         self.after.take().expect("one final move")(root, object)
     }
 }
@@ -6865,7 +6924,11 @@ fn remove_identity_bound_directory_with_driver<D: WorktreeDeletionDriver>(
         ));
     }
     check_directory_deletion_deadline(deadline)?;
-    executor.after_move(&tombstone_root, &tombstone)?;
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    let self_descriptor = Some(object_witness.self_descriptor_borrow()?);
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    let self_descriptor: Option<SelfDeletionDescriptorBorrow<'_>> = None;
+    executor.after_move(&tombstone_root, &tombstone, self_descriptor.as_ref())?;
     check_directory_deletion_deadline(deadline)?;
     root_witness.validate()?;
     object_witness.validate()?;
@@ -7806,9 +7869,25 @@ fn quarantine_has_external_writer_until(
     path: &Path,
     deadline: std::time::Instant,
 ) -> Result<ExternalWriterEvidence, String> {
+    quarantine_has_external_writer_until_with_self_descriptor(path, deadline, None)
+}
+
+fn quarantine_has_external_writer_until_with_self_descriptor(
+    path: &Path,
+    deadline: std::time::Instant,
+    self_descriptor: Option<&SelfDeletionDescriptorBorrow<'_>>,
+) -> Result<ExternalWriterEvidence, String> {
     check_directory_deletion_deadline(Some(deadline))?;
+    let descriptor_evidence = quarantine_has_open_descriptors_until_with_self_descriptor(
+        path,
+        deadline,
+        self_descriptor,
+    )?;
+    check_directory_deletion_deadline(Some(deadline))?;
+    if descriptor_evidence.blocks_retirement() {
+        return Ok(descriptor_evidence);
+    }
     for probe in [
-        quarantine_has_open_descriptors_until,
         quarantine_has_process_cwd_until,
         quarantine_has_writable_mappings_until,
     ] {
@@ -8653,6 +8732,23 @@ fn linux_writer_scan_until(
     Ok(ExternalWriterEvidence::NoPositiveEvidence)
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn self_descriptor_borrow_matches(
+    borrow: &SelfDeletionDescriptorBorrow<'_>,
+    pid: libc::pid_t,
+    fd: libc::c_int,
+    device: u64,
+    inode: u64,
+    kind: libc::mode_t,
+) -> bool {
+    pid == borrow.pid
+        && fd == borrow.fd
+        && device == borrow.device
+        && inode == borrow.inode
+        && kind == borrow.kind
+        && borrow.witness.validate().is_ok()
+}
+
 fn descriptor_authority(
     is_directory: bool,
     is_regular_file: bool,
@@ -8725,7 +8821,20 @@ fn quarantine_has_open_descriptors_with_info_reader_until(
     path: &Path,
     proc_root: &Path,
     deadline: std::time::Instant,
+    read_info: impl FnMut(&Path) -> std::io::Result<String>,
+) -> Result<ExternalWriterEvidence, String> {
+    quarantine_has_open_descriptors_with_info_reader_until_scoped(
+        path, proc_root, deadline, read_info, None,
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn quarantine_has_open_descriptors_with_info_reader_until_scoped(
+    path: &Path,
+    proc_root: &Path,
+    deadline: std::time::Instant,
     mut read_info: impl FnMut(&Path) -> std::io::Result<String>,
+    self_descriptor: Option<&SelfDeletionDescriptorBorrow<'_>>,
 ) -> Result<ExternalWriterEvidence, String> {
     use std::os::unix::fs::MetadataExt as _;
     // SAFETY: geteuid has no preconditions.
@@ -8822,6 +8931,29 @@ fn quarantine_has_open_descriptors_with_info_reader_until(
                 if let Some(authority) =
                     descriptor_authority(metadata.is_dir(), metadata.is_file(), access)
                 {
+                    let is_exact_self_borrow = self_descriptor.is_some_and(|borrow| {
+                        let pid = process
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            .and_then(|value| value.parse::<libc::pid_t>().ok());
+                        let fd = descriptor
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            .and_then(|value| value.parse::<libc::c_int>().ok());
+                        pid.zip(fd).is_some_and(|(pid, fd)| {
+                            self_descriptor_borrow_matches(
+                                borrow,
+                                pid,
+                                fd,
+                                metadata.dev() as u64,
+                                metadata.ino(),
+                                metadata.mode() & libc::S_IFMT,
+                            )
+                        })
+                    });
+                    if is_exact_self_borrow {
+                        continue;
+                    }
                     return Ok(Some((candidate, authority)));
                 }
                 if !metadata.is_file() {
@@ -9123,6 +9255,7 @@ fn mac_inspect_open_descriptors_until(
     pid: libc::pid_t,
     canonical: &Path,
     deadline: std::time::Instant,
+    self_descriptor: Option<&SelfDeletionDescriptorBorrow<'_>>,
 ) -> Result<Option<(PathBuf, CloseWriterAuthority)>, WriterScanError> {
     use std::ffi::CStr;
     use std::os::unix::ffi::OsStrExt as _;
@@ -9157,8 +9290,23 @@ fn mac_inspect_open_descriptors_until(
             writer_scan_check(deadline)?;
             return Err(WriterScanError::Gap(CloseWriterGap::DescriptorChanged));
         }
+        let stat = info.vnode.vip_vi.vi_stat;
+        let is_exact_self_borrow = self_descriptor.is_some_and(|borrow| {
+            self_descriptor_borrow_matches(
+                borrow,
+                pid,
+                descriptor.proc_fd,
+                stat.vst_dev as u64,
+                stat.vst_ino,
+                stat.vst_mode & libc::S_IFMT as _,
+            )
+        });
+        if is_exact_self_borrow {
+            writer_scan_check(deadline)?;
+            continue;
+        }
         if let Some(authority) =
-            mac_descriptor_authority(info.vnode.vip_vi.vi_stat.vst_mode, info.file.open_flags)
+            mac_descriptor_authority(stat.vst_mode, info.file.open_flags)
                 .map_err(WriterScanError::from)?
         {
             writer_scan_check(deadline)?;
@@ -9183,11 +9331,22 @@ fn quarantine_has_open_descriptors_mac_until(
     path: &Path,
     deadline: std::time::Instant,
 ) -> Result<ExternalWriterEvidence, String> {
+    quarantine_has_open_descriptors_mac_until_scoped(path, deadline, None)
+}
+
+#[cfg(target_os = "macos")]
+fn quarantine_has_open_descriptors_mac_until_scoped(
+    path: &Path,
+    deadline: std::time::Instant,
+    self_descriptor: Option<&SelfDeletionDescriptorBorrow<'_>>,
+) -> Result<ExternalWriterEvidence, String> {
     mac_writer_scan_until(
         path,
         CloseWriterDetector::MacDescriptor,
         deadline,
-        |pid, canonical| mac_inspect_open_descriptors_until(pid, canonical, deadline),
+        |pid, canonical| {
+            mac_inspect_open_descriptors_until(pid, canonical, deadline, self_descriptor)
+        },
     )
 }
 
@@ -9201,12 +9360,22 @@ fn quarantine_has_open_descriptors_until(
     path: &Path,
     deadline: std::time::Instant,
 ) -> Result<ExternalWriterEvidence, String> {
+    quarantine_has_open_descriptors_until_with_self_descriptor(path, deadline, None)
+}
+
+#[cfg(target_os = "linux")]
+fn quarantine_has_open_descriptors_until_with_self_descriptor(
+    path: &Path,
+    deadline: std::time::Instant,
+    self_descriptor: Option<&SelfDeletionDescriptorBorrow<'_>>,
+) -> Result<ExternalWriterEvidence, String> {
     check_directory_deletion_deadline(Some(deadline))?;
-    let result = quarantine_has_open_descriptors_with_info_reader_until(
+    let result = quarantine_has_open_descriptors_with_info_reader_until_scoped(
         path,
         Path::new("/proc"),
         deadline,
         |path| std::fs::read_to_string(path),
+        self_descriptor,
     );
     check_directory_deletion_deadline(Some(deadline))?;
     result
@@ -9219,6 +9388,25 @@ fn quarantine_has_open_descriptors_until(
 ) -> Result<ExternalWriterEvidence, String> {
     check_directory_deletion_deadline(Some(deadline))?;
     quarantine_has_open_descriptors_mac_until(path, deadline)
+}
+
+#[cfg(target_os = "macos")]
+fn quarantine_has_open_descriptors_until_with_self_descriptor(
+    path: &Path,
+    deadline: std::time::Instant,
+    self_descriptor: Option<&SelfDeletionDescriptorBorrow<'_>>,
+) -> Result<ExternalWriterEvidence, String> {
+    check_directory_deletion_deadline(Some(deadline))?;
+    quarantine_has_open_descriptors_mac_until_scoped(path, deadline, self_descriptor)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn quarantine_has_open_descriptors_until_with_self_descriptor(
+    path: &Path,
+    deadline: std::time::Instant,
+    _self_descriptor: Option<&SelfDeletionDescriptorBorrow<'_>>,
+) -> Result<ExternalWriterEvidence, String> {
+    quarantine_has_open_descriptors_until(path, deadline)
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -14960,7 +15148,12 @@ mod tests {
         fn observe_identity(&mut self, object: &std::path::Path) -> Result<String, String> {
             observe_administrative_dir_incarnation(object)
         }
-        fn after_move(&mut self, _: &std::path::Path, _: &std::path::Path) -> Result<(), String> {
+        fn after_move(
+            &mut self,
+            _: &std::path::Path,
+            _: &std::path::Path,
+            _: Option<&super::SelfDeletionDescriptorBorrow<'_>>,
+        ) -> Result<(), String> {
             Ok(())
         }
     }
@@ -15582,6 +15775,7 @@ mod tests {
                 &mut self,
                 _: &std::path::Path,
                 _: &std::path::Path,
+                _: Option<&super::SelfDeletionDescriptorBorrow<'_>>,
             ) -> Result<(), String> {
                 panic!("failed final move must not continue the deletion graph")
             }
@@ -18659,6 +18853,215 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_descriptor_scan_exempts_only_the_exact_live_self_borrow() {
+        let temp = tempfile::tempdir().unwrap();
+        let quarantine = temp.path().join("quarantine");
+        let other = temp.path().join("other");
+        std::fs::create_dir(&quarantine).unwrap();
+        std::fs::create_dir(&other).unwrap();
+        let parent = super::open_deletion_parent(quarantine.parent().unwrap()).unwrap();
+        let name = std::ffi::CString::new("quarantine").unwrap();
+        let identity = super::DeletionEntryIdentity::from_stat(
+            &super::deletion_slot_stat(&parent, &name).unwrap(),
+        );
+        let witness = super::OwnedDeletionSlot::capture(&parent, &name, identity).unwrap();
+        let borrow = witness.self_descriptor_borrow().unwrap();
+        // SAFETY: geteuid and getpid have no preconditions.
+        let uid = unsafe { libc::geteuid() };
+        let pid = unsafe { libc::getpid() };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+
+        let make_proc = |root: &Path, process_pid: u32, fd: i32, target: &Path| {
+            let process = fake_linux_process(root, process_pid, uid, 44);
+            std::os::unix::fs::symlink(target, process.join(format!("fd/{fd}"))).unwrap();
+            std::fs::write(
+                process.join(format!("fdinfo/{fd}")),
+                "pos:\t0\nflags:\t0100000\n",
+            )
+            .unwrap();
+        };
+
+        let ordinary_proc = temp.path().join("ordinary-proc");
+        make_proc(&ordinary_proc, pid as u32, borrow.fd, &quarantine);
+        assert!(matches!(
+            super::quarantine_has_open_descriptors_with_info_reader_until(
+                &quarantine,
+                &ordinary_proc,
+                deadline,
+                |path| std::fs::read_to_string(path),
+            )
+            .unwrap(),
+            super::ExternalWriterEvidence::Blocked(super::CloseWriterObservation::Authority {
+                authority: super::CloseWriterAuthority::DirectoryDescriptor(_),
+                ..
+            })
+        ));
+
+        let exact_proc = temp.path().join("exact-proc");
+        make_proc(&exact_proc, pid as u32, borrow.fd, &quarantine);
+        assert_eq!(
+            super::quarantine_has_open_descriptors_with_info_reader_until_scoped(
+                &quarantine,
+                &exact_proc,
+                deadline,
+                |path| std::fs::read_to_string(path),
+                Some(&borrow),
+            )
+            .unwrap(),
+            super::ExternalWriterEvidence::NoPositiveEvidence
+        );
+
+        for _ in 0..2 {
+            assert_eq!(
+                super::quarantine_has_open_descriptors_with_info_reader_until_scoped(
+                    &quarantine,
+                    &exact_proc,
+                    deadline,
+                    |path| std::fs::read_to_string(path),
+                    Some(&borrow),
+                )
+                .unwrap(),
+                super::ExternalWriterEvidence::NoPositiveEvidence
+            );
+        }
+        // An exempt slot must not stop inventory inspection before other authority.
+        let mixed_process = exact_proc.join(pid.to_string());
+        let extra_fd = borrow.fd + 100;
+        std::os::unix::fs::symlink(
+            &quarantine,
+            mixed_process.join(format!("fd/{extra_fd}")),
+        )
+        .unwrap();
+        std::fs::write(
+            mixed_process.join(format!("fdinfo/{extra_fd}")),
+            "flags:\t0100000\n",
+        )
+        .unwrap();
+        assert!(matches!(
+            super::quarantine_has_open_descriptors_with_info_reader_until_scoped(
+                &quarantine,
+                &exact_proc,
+                deadline,
+                |path| std::fs::read_to_string(path),
+                Some(&borrow),
+            )
+            .unwrap(),
+            super::ExternalWriterEvidence::Blocked(super::CloseWriterObservation::Authority { .. })
+        ));
+
+        let duplicate_proc = temp.path().join("duplicate-proc");
+        make_proc(&duplicate_proc, pid as u32, borrow.fd + 1, &quarantine);
+        assert!(matches!(
+            super::quarantine_has_open_descriptors_with_info_reader_until_scoped(
+                &quarantine,
+                &duplicate_proc,
+                deadline,
+                |path| std::fs::read_to_string(path),
+                Some(&borrow),
+            )
+            .unwrap(),
+            super::ExternalWriterEvidence::Blocked(super::CloseWriterObservation::Authority {
+                ..
+            })
+        ));
+
+        let other_pid_proc = temp.path().join("other-pid-proc");
+        make_proc(&other_pid_proc, pid as u32 + 1, borrow.fd, &quarantine);
+        assert!(matches!(
+            super::quarantine_has_open_descriptors_with_info_reader_until_scoped(
+                &quarantine,
+                &other_pid_proc,
+                deadline,
+                |path| std::fs::read_to_string(path),
+                Some(&borrow),
+            )
+            .unwrap(),
+            super::ExternalWriterEvidence::Blocked(super::CloseWriterObservation::Authority {
+                ..
+            })
+        ));
+
+        let other_parent = super::open_deletion_parent(other.parent().unwrap()).unwrap();
+        let other_name = std::ffi::CString::new("other").unwrap();
+        let other_identity = super::DeletionEntryIdentity::from_stat(
+            &super::deletion_slot_stat(&other_parent, &other_name).unwrap(),
+        );
+        let other_witness =
+            super::OwnedDeletionSlot::capture(&other_parent, &other_name, other_identity).unwrap();
+        let other_borrow = other_witness.self_descriptor_borrow().unwrap();
+        let mismatched_borrow = super::SelfDeletionDescriptorBorrow {
+            witness: &other_witness,
+            pid: borrow.pid,
+            fd: borrow.fd,
+            device: other_borrow.device,
+            inode: other_borrow.inode,
+            kind: other_borrow.kind,
+        };
+        let mismatch_proc = temp.path().join("mismatch-proc");
+        make_proc(&mismatch_proc, pid as u32, borrow.fd, &quarantine);
+        assert!(matches!(
+            super::quarantine_has_open_descriptors_with_info_reader_until_scoped(
+                &quarantine,
+                &mismatch_proc,
+                deadline,
+                |path| std::fs::read_to_string(path),
+                Some(&mismatched_borrow),
+            )
+            .unwrap(),
+            super::ExternalWriterEvidence::Blocked(super::CloseWriterObservation::Authority {
+                ..
+            })
+        ));
+
+        // Keeping the FD alive must not excuse replacement of its witnessed slot.
+        let retained_path = temp.path().join("retained-quarantine");
+        std::fs::rename(&quarantine, &retained_path).unwrap();
+        std::fs::create_dir(&quarantine).unwrap();
+        let replaced_proc = temp.path().join("replaced-proc");
+        make_proc(&replaced_proc, pid as u32, borrow.fd, &retained_path);
+        assert!(matches!(
+            super::quarantine_has_open_descriptors_with_info_reader_until_scoped(
+                &retained_path,
+                &replaced_proc,
+                deadline,
+                |path| std::fs::read_to_string(path),
+                Some(&borrow),
+            )
+            .unwrap(),
+            super::ExternalWriterEvidence::Blocked(super::CloseWriterObservation::Authority { .. })
+        ));
+
+        let uncertain_proc = temp.path().join("uncertain-proc");
+        let uncertain = fake_linux_process(&uncertain_proc, pid as u32, uid, 44);
+        std::os::unix::fs::symlink(&quarantine, uncertain.join(format!("fd/{}", borrow.fd)))
+            .unwrap();
+        assert!(matches!(
+            super::quarantine_has_open_descriptors_with_info_reader_until_scoped(
+                &quarantine,
+                &uncertain_proc,
+                deadline,
+                |path| std::fs::read_to_string(path),
+                Some(&borrow),
+            )
+            .unwrap(),
+            super::ExternalWriterEvidence::Blocked(super::CloseWriterObservation::InspectionGap {
+                reason: super::CloseWriterGap::DescriptorChanged,
+                ..
+            })
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn mac_self_descriptor_device_preserves_unsigned_libproc_bits() {
+        // SAFETY: libc::stat is plain integer storage, initialized before use.
+        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+        stat.st_dev = 0x80000001_u32 as i32;
+        assert_eq!(super::deletion_descriptor_device(&stat), 0x80000001_u64);
     }
 
     #[cfg(target_os = "linux")]

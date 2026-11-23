@@ -26,6 +26,8 @@ use std::path::{Path, PathBuf};
 use super::super::super::{
     ensure_no_ignored_content_with_status_leaf_until, inspect_worktree_at_with_git_leaf_until,
     observe_administrative_dir_incarnation, quarantine_has_external_writer_until,
+    quarantine_has_external_writer_until_with_self_descriptor,
+    SelfDeletionDescriptorBorrow,
     remove_identity_bound_directory_with_driver, stop_bound_fsmonitor_with_leaf_until,
     worktree_quarantine_path, CloseWriterProbe, WorktreeDeletionDriver, WorktreeMutationExecutor,
 };
@@ -618,11 +620,21 @@ impl PhysicalDeletionDriver<'_> {
         )
     }
 
-    fn check_external_writers(&mut self, object: &Path) -> Result<(), String> {
+    fn check_external_writers(
+        &mut self,
+        object: &Path,
+        self_descriptor: Option<&SelfDeletionDescriptorBorrow<'_>>,
+    ) -> Result<(), String> {
         let evidence = self.custody.writer_probe.observe_until(
             object,
             self.deadline(),
-            quarantine_has_external_writer_until,
+            |path, deadline| {
+                quarantine_has_external_writer_until_with_self_descriptor(
+                    path,
+                    deadline,
+                    self_descriptor,
+                )
+            },
         );
         if self
             .custody
@@ -803,7 +815,12 @@ impl WorktreeDeletionDriver for PhysicalDeletionDriver<'_> {
         }
     }
 
-    fn after_move(&mut self, _root: &Path, object: &Path) -> Result<(), String> {
+    fn after_move(
+        &mut self,
+        _root: &Path,
+        object: &Path,
+        self_descriptor: Option<&SelfDeletionDescriptorBorrow<'_>>,
+    ) -> Result<(), String> {
         if self.administrative {
             let owner = self
                 .custody
@@ -818,7 +835,7 @@ impl WorktreeDeletionDriver for PhysicalDeletionDriver<'_> {
             // denotes the ORIGINAL common-dir, not object/../.. in the residue.
             return self.location().registration().validate_at(object);
         }
-        self.check_external_writers(object)?;
+        self.check_external_writers(object, self_descriptor)?;
         self.verify_confirmed_snapshot()?;
         require_absent(self.location().original_path())
     }
