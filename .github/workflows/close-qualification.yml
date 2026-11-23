@@ -47,6 +47,47 @@ jobs:
           path: evidence/
           if-no-files-found: error
           retention-days: 14
+  frontend:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      PHOENIX_CHECK_ALL: '1'
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.sha }}
+      - uses: pnpm/action-setup@v5
+        with:
+          package_json_file: ui/package.json
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 26
+          cache: pnpm
+          cache-dependency-path: ui/pnpm-lock.yaml
+      - uses: astral-sh/setup-uv@v7
+      - name: Upgrade corepack
+        run: |
+          npm i -g corepack@latest
+          corepack enable
+      - name: Install locked UI dependencies
+        run: pnpm install --frozen-lockfile
+        working-directory: ui
+      - name: Validate exact-source Close frontend
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          git rev-parse HEAD | tee evidence/source.sha
+          pnpm --dir ui exec vitest run src/components/WorkActions.test.tsx 2>&1 | tee evidence/close-work-actions-tests.log
+          pnpm --dir ui exec vitest run src/pages/ProductConversationPage.test.tsx 2>&1 | tee evidence/close-product-page-tests.log
+          ./dev.py check --lanes tsc,ui-lint 2>&1 | tee evidence/frontend-checks.log
+      - uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: close-frontend-${{ github.sha }}-${{ github.run_attempt }}
+          path: evidence/
+          if-no-files-found: error
+          retention-days: 14
   database:
     runs-on: ubuntu-latest
     # The exact-source DB and runtime suites share this job. Hosted cold builds
@@ -92,16 +133,26 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y tmux coreutils
           { tmux -V; /usr/bin/timeout --version; } | tee evidence/tmux-versions.log
+      - name: Validate Close loss wire and identity contract
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p phoenix-core --lib domain::close::tests:: -- --nocapture --test-threads=1 2>&1 | tee evidence/close-domain.log
+          grep -E 'test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored;' evidence/close-domain.log
+          grep -F 'test domain::close::tests::enums_expose_exact_persisted_strings ... ok' evidence/close-domain.log
       - name: Compile database tests and inventory exact selectors
         shell: bash
         run: |
           set -euo pipefail
           cargo test -p phoenix-db --lib --no-run 2>&1 | tee evidence/compile.log
           cargo test -p phoenix-db --lib -- --list 2>&1 | tee evidence/inventory.log
-          grep -E '^close_foundation::tests::.*: test$|^migrations::close_completion_allowance_tests::migration_172_.*: test$|^migrations::tests::migration_(180|181)_.*: test$|^native_close::.*: test$' evidence/inventory.log > evidence/selected-tests.txt
+          grep -E '^close_foundation::tests::.*: test$|^migrations::close_completion_allowance_tests::migration_172_.*: test$|^migrations::tests::migration_(180|181|182)_.*: test$|^native_close::.*: test$' evidence/inventory.log > evidence/selected-tests.txt
           test -s evidence/selected-tests.txt
           grep -F 'close_foundation::tests::inspection_aggregate_validator_preserves_exact_content_and_empty_generation_rules: test' evidence/selected-tests.txt
           for test in \
+            initial_effect_admission_rejects_retained_losses_even_in_anomalous_phase \
+            initial_loss_inspection_is_retained_and_terminalized_atomically_without_dispatch \
+            initial_loss_terminalization_guards_authority_and_rolls_back_late_failure \
             first_effect_refuses_missing_dispatch_mismatched_binding_and_completed_resource \
             first_effect_callback_is_refused_on_source_loss_and_preserves_exact_result \
             first_effect_callback_holds_writer_reservation_against_source_update \
@@ -129,6 +180,7 @@ jobs:
           grep -Fx 'close_foundation::tests::native_retry::migration_179_populated_upgrade_preserves_retry_and_adds_initial_source_authority: test' evidence/selected-tests.txt
           grep -F 'migration_180_upgrades_authentic_179_initial_source_fence_schema: test' evidence/selected-tests.txt
           grep -F 'migration_181_adds_unbackfilled_initial_completion_successor_authority: test' evidence/selected-tests.txt
+          grep -Fx 'migrations::tests::migration_182_preserves_existing_losses_and_adds_ignored_category: test' evidence/selected-tests.txt
           grep -F 'native_retry_success_requires_exact_live_receipt_effect_and_evidence_before_replay: test' evidence/selected-tests.txt
           grep -F 'native_retry_finalizes_exact_g1_successes_without_rebinding_current_g2: test' evidence/selected-tests.txt
           grep -F 'retry_interruption_uses_pending_effect_not_successful_prior_resource: test' evidence/selected-tests.txt
@@ -244,6 +296,13 @@ jobs:
           set -euo pipefail
           cargo test -p phoenix-db --lib migrations::tests::migration_181_adds_unbackfilled_initial_completion_successor_authority -- --exact --nocapture --test-threads=1 2>&1 | tee evidence/migration181.log
           grep -E 'test result: ok\. 1 passed; 0 failed; 0 ignored;' evidence/migration181.log
+      - name: Execute populated ignored-loss migration upgrade
+        if: success()
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p phoenix-db --lib migrations::tests::migration_182_preserves_existing_losses_and_adds_ignored_category -- --exact --nocapture --test-threads=1 2>&1 | tee evidence/migration182.log
+          grep -E 'test result: ok\. 1 passed; 0 failed; 0 ignored;' evidence/migration182.log
       - name: Execute complete Close foundation module
         if: success()
         shell: bash
@@ -284,6 +343,9 @@ jobs:
           cargo test -p phoenix-db --lib native_close:: -- --nocapture --test-threads=1 2>&1 | tee evidence/native-close-db.log
           grep -E 'test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored;' evidence/native-close-db.log
           for test in \
+            initial_effect_admission_rejects_retained_losses_even_in_anomalous_phase \
+            initial_loss_inspection_is_retained_and_terminalized_atomically_without_dispatch \
+            initial_loss_terminalization_guards_authority_and_rolls_back_late_failure \
             first_effect_refuses_missing_dispatch_mismatched_binding_and_completed_resource \
             first_effect_callback_is_refused_on_source_loss_and_preserves_exact_result \
             first_effect_callback_holds_writer_reservation_against_source_update; do
@@ -365,6 +427,8 @@ jobs:
           done
           test -s evidence/runtime-selected-tests.txt
           for test in \
+            registered_native_close_with_loss_content_stops_incomplete_without_retirement \
+            registered_native_close_loss_classification_rollback_retries_without_recollection \
             registered_native_close_physically_retires_worktree_only_and_replays_without_effects \
             registered_native_close_with_production_detector_retires_worktree_and_replays \
             registered_native_close_after_acknowledged_source_stop_preserves_real_worktree \
@@ -423,6 +487,8 @@ jobs:
           (cd crates/phoenix-ide && "$PHOENIX_RUNTIME_TEST_BINARY" native_close_admission_tests:: --skip registered_native_close_with_production_detector_retires_worktree_and_replays --nocapture --test-threads=1) 2>&1 | tee evidence/native-close-runtime-actor.log
           grep -E 'test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored;' evidence/native-close-runtime-actor.log
           for test in \
+            registered_native_close_with_loss_content_stops_incomplete_without_retirement \
+            registered_native_close_loss_classification_rollback_retries_without_recollection \
             registered_native_close_physically_retires_worktree_only_and_replays_without_effects \
             registered_native_close_after_acknowledged_source_stop_preserves_real_worktree \
             registered_native_close_after_source_stop_preserves_reused_path_and_original_checkout; do
@@ -501,6 +567,11 @@ jobs:
             native_driver_preserves_bound_root_after_failed_final_move
             fsmonitor_stop_only_accepts_proven_no_daemon_or_success
             fsmonitor_unsupported_platform_requires_the_exact_git_source_diagnostic
+            ignored_content_changes_fingerprint_and_is_an_exact_linked_worktree_blocker
+            named_nested_submodule_reports_exact_ignored_blocker_and_changes_fingerprint
+            ignored_directory_inventory_preserves_each_leaf_identity
+            ignored_status_and_exact_paths_change_canonical_snapshot
+            porcelain_loss_parser_distinguishes_loss_categories_and_leaves_collapsed_ignored_paths_for_enumeration
             supplied_leaf_full_inspection_matches_legacy_canonical_clean_snapshot
             supplied_leaf_inspection_refuses_unsupported_state_without_scratch_mutation
             shared_inspection_keeps_legacy_dirty_content_observation

@@ -4157,10 +4157,15 @@ fn inspect_worktree_at_with_policy_until(
         return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
     }
     let mut observation = canonical_status_observation(&output.stdout);
+    let ignored_paths = observe_ignored_paths_with_leaf_until(path, deadline, git_leaf)?;
+    append_ignored_paths(&mut observation, &ignored_paths);
     if policy == WorktreeInspectionPolicy::ReadOnlyClean && !observation.is_empty() {
         return Err("native worktree inspection does not yet support dirty status".to_string());
     }
     let mut losses = parse_status_losses(&output.stdout);
+    losses.extend(ignored_paths.iter().cloned().map(CloseLossItem::IgnoredPath));
+    losses.sort_by_key(|loss| (loss.category().as_str(), loss.identity().value()));
+    losses.dedup();
     let hidden_dirty = match policy {
         WorktreeInspectionPolicy::Legacy => {
             observe_hidden_worktree_changes_with_leaf_until(path, deadline, git_leaf)?
@@ -4348,6 +4353,7 @@ fn observe_detached_head_and_submodules_with_leaf_until(
                 b"staged" => CloseLossItem::StagedTrackedPath(path),
                 b"unstaged" => CloseLossItem::UnstagedTrackedPath(path),
                 b"untracked" => CloseLossItem::UntrackedNonIgnoredPath(path),
+                b"ignored" => CloseLossItem::IgnoredPath(path),
                 b"submodule" => CloseLossItem::InitializedSubmoduleState(path),
                 b"detached" => CloseLossItem::DetachedUnreachableCommit(
                     GitOidIdentity::parse_hex(String::from_utf8_lossy(path.as_bytes()).trim())
@@ -5305,7 +5311,9 @@ fn observe_initialized_submodules_with_leaf_until(
                 String::from_utf8_lossy(&status.stderr).trim()
             ));
         }
+        let ignored_paths = observe_ignored_paths_with_leaf_until(&submodule_path, deadline, git_leaf)?;
         let mut submodule_losses = parse_status_losses(&status.stdout);
+        submodule_losses.extend(ignored_paths.iter().cloned().map(CloseLossItem::IgnoredPath));
         for hidden in
             observe_hidden_worktree_changes_with_leaf_until(&submodule_path, deadline, git_leaf)?
         {
@@ -5315,6 +5323,7 @@ fn observe_initialized_submodules_with_leaf_until(
             }
         }
         let mut submodule_status = canonical_status_observation(&status.stdout);
+        append_ignored_paths(&mut submodule_status, &ignored_paths);
         submodule_status.extend_from_slice(&observe_dirty_content_with_leaf_until(
             &submodule_path,
             &submodule_losses,
@@ -5417,6 +5426,7 @@ fn observe_initialized_submodules_with_leaf_until(
                 CloseLossItem::StagedTrackedPath(path) => (b"staged".as_slice(), path),
                 CloseLossItem::UnstagedTrackedPath(path) => (b"unstaged".as_slice(), path),
                 CloseLossItem::UntrackedNonIgnoredPath(path) => (b"untracked".as_slice(), path),
+                CloseLossItem::IgnoredPath(path) => (b"ignored".as_slice(), path),
                 _ => continue,
             };
             let full_path = join_git_paths(&relative_path, nested_path.as_bytes())?;
@@ -5425,6 +5435,17 @@ fn observe_initialized_submodules_with_leaf_until(
                     b"SUBMODULE_LOSS\0".as_slice(),
                     category,
                     b"\0".as_slice(),
+                    full_path.as_slice(),
+                ]
+                .concat(),
+                Vec::new(),
+            ));
+        }
+        for nested_path in &ignored_paths {
+            let full_path = join_git_paths(&relative_path, nested_path.as_bytes())?;
+            observation.push((
+                [
+                    b"SUBMODULE_LOSS\0ignored\0".as_slice(),
                     full_path.as_slice(),
                 ]
                 .concat(),
@@ -10071,11 +10092,49 @@ fn ensure_no_ignored_content_with_status_leaf_until(
     Ok(())
 }
 
+fn observe_ignored_paths_with_leaf_until(
+    repository: &Path,
+    deadline: std::time::Instant,
+    git_leaf: &mut WorktreeGitLeaf<'_>,
+) -> Result<Vec<GitPathIdentity>, String> {
+    let output = run_bounded_git_command_with_leaf_until(
+        repository,
+        &["ls-files", "--others", "--ignored", "--exclude-standard", "-z", "--"],
+        None,
+        deadline,
+        "exact ignored-path inspection",
+        git_leaf,
+    )?;
+    if !output.status.success() {
+        return Err(format!(
+            "cannot enumerate exact ignored paths: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let mut paths = output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+        .map(|path| GitPathIdentity::from_bytes(path.to_vec()))
+        .collect::<Vec<_>>();
+    paths.sort_by_key(|path| path.as_bytes().to_vec());
+    paths.dedup();
+    Ok(paths)
+}
+
+fn append_ignored_paths(observation: &mut Vec<u8>, paths: &[GitPathIdentity]) {
+    for path in paths {
+        observation.extend_from_slice(b"IGNORED_PATH\0");
+        observation.extend_from_slice(path.as_bytes());
+        observation.push(0);
+    }
+}
+
 fn canonical_status_observation(status: &[u8]) -> Vec<u8> {
     let mut observation = Vec::with_capacity(status.len());
     let mut rows = status.split(|byte| *byte == 0);
     while let Some(row) = rows.next() {
-        if row.len() < 4 || &row[..2] == b"!!" {
+        if row.len() < 4 {
             continue;
         }
         observation.extend_from_slice(row);
@@ -10684,6 +10743,8 @@ fn parse_status_losses(status: &[u8]) -> Vec<CloseLossItem> {
         let path = GitPathIdentity::from_bytes(row[3..].to_vec());
         match &row[..2] {
             b"??" => losses.push(CloseLossItem::UntrackedNonIgnoredPath(path)),
+            // Porcelain may collapse an ignored directory; exact files are read
+            // separately with ls-files before any blocker rows are materialized.
             b"!!" => {}
             xy => {
                 let unmerged = matches!(xy, b"DD" | b"AU" | b"UD" | b"UA" | b"DU" | b"AA" | b"UU");
@@ -11075,7 +11136,8 @@ mod tests {
         both_worktree_paths_absent, canonical_status_observation,
         complete_persisted_worktree_administrative_cleanup, exact_worktree_administrative_dir,
         git_path_from_observation, inspect_and_remove_exact_worktree_with_hook, inspect_worktree,
-        observe_administrative_dir_incarnation, observe_worktree_fingerprint, parse_status_losses,
+        append_ignored_paths, observe_administrative_dir_incarnation,
+        observe_ignored_paths_with_leaf_until, observe_worktree_fingerprint, parse_status_losses,
         planned_administrative_dir_is_absent, remove_directory_contents_at_with_hook,
         remove_exact_worktree_administrative_dir_with_hook, remove_identity_bound_directory,
         remove_quarantine_then_administrative_dir,
@@ -16037,7 +16099,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn ignored_content_preserves_linked_worktree_without_a_loss_item() {
+    fn ignored_content_changes_fingerprint_and_is_an_exact_linked_worktree_blocker() {
         let temp = tempfile::tempdir().unwrap();
         let target = linked_close_worktree(&temp);
         std::fs::write(target.join(".gitignore"), "cache/\n").unwrap();
@@ -16047,13 +16109,22 @@ mod tests {
         let confirmed = test_worktree_snapshot(&identity, &target);
         std::fs::create_dir(target.join("cache")).unwrap();
         std::fs::write(target.join("cache/unique"), "preserve").unwrap();
+        std::fs::write(target.join("cache/another"), "also preserve").unwrap();
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
         let (fresh, losses) = runtime.block_on(inspect_worktree(&identity)).unwrap();
-        assert_eq!(fresh.fingerprint(), confirmed.fingerprint());
-        assert!(losses.is_empty());
+        assert_ne!(fresh.fingerprint(), confirmed.fingerprint());
+        let ignored_paths = losses
+            .iter()
+            .filter_map(|loss| match loss {
+                CloseLossItem::IgnoredPath(path) => Some(path.as_bytes()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(ignored_paths, [b"cache/another".as_slice(), b"cache/unique".as_slice()]);
+        assert_eq!(losses.len(), 2);
         let common = super::exact_worktree_common_git_dir(&target).unwrap();
         let administrative = super::exact_worktree_administrative_dir(&target, &common).unwrap();
         let incarnation = observe_administrative_dir_incarnation(&administrative).unwrap();
@@ -16071,14 +16142,18 @@ mod tests {
         )
         .err()
         .expect("ignored data must prevent deletion");
-        assert!(error.contains("ignored content"), "{error}");
+        assert!(
+            error.contains("fresh confirmation is required"),
+            "changed ignored inventory must refuse deletion: {error}"
+        );
         assert!(target.join("cache/unique").exists());
+        assert!(target.join("cache/another").exists());
         assert!(!worktree_quarantine_path(&identity).unwrap().exists());
     }
 
     #[cfg(unix)]
     #[test]
-    fn named_nested_submodule_preserves_ignored_content_under_identical_fingerprint() {
+    fn named_nested_submodule_reports_exact_ignored_blocker_and_changes_fingerprint() {
         let temp = tempfile::tempdir().unwrap();
         let subrepo = temp.path().join("subrepo");
         initialize_repository(&subrepo);
@@ -16153,8 +16228,16 @@ mod tests {
         assert!(super::ensure_no_ignored_content(&target)
             .unwrap_err()
             .contains("ignored content"));
-        let fresh = test_worktree_snapshot(&identity, &target);
-        assert_eq!(fresh.fingerprint(), confirmed.fingerprint());
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (fresh, losses) = runtime.block_on(inspect_worktree(&identity)).unwrap();
+        assert_ne!(fresh.fingerprint(), confirmed.fingerprint());
+        assert!(losses.iter().any(|loss| matches!(
+            loss,
+            CloseLossItem::IgnoredPath(path) if path.as_bytes() == b"deps/child/build/unique"
+        )));
         assert!(target.join("deps/child/build/unique").exists());
     }
 
@@ -16265,10 +16348,10 @@ mod tests {
                     }
                     calls.push(operation.to_string());
                     let stdout = match operation {
-                        // Ignored content stays outside the canonical fingerprint.
-                        "Git status inspection" => b"!! ignored/file\0".to_vec(),
+                        "Git status inspection" => Vec::new(),
+                        "exact ignored-path inspection" => Vec::new(),
                         "Git index path inspection" => b".git/index\n".to_vec(),
-                        "hidden-index inspection" => b"H tracked\0".to_vec(),
+                        "hidden-index inspection" => Vec::new(),
                         "detached head inspection" => b"refs/heads/main\n".to_vec(),
                         "gitlink inspection" => index.clone(),
                         unexpected => panic!("unexpected Git leaf: {unexpected}"),
@@ -16293,7 +16376,7 @@ mod tests {
                 }
                 .unwrap();
                 assert!(result.1.is_empty());
-                let mut expected_calls = vec!["Git status inspection"];
+                let mut expected_calls = vec!["Git status inspection", "exact ignored-path inspection"];
                 if !native {
                     expected_calls.push("Git index path inspection");
                 }
@@ -16312,7 +16395,11 @@ mod tests {
             canonical.extend_from_slice(&index);
             canonical.push(0);
             assert_eq!(results[0], snapshot_for(&canonical));
-            assert_eq!(results[1], results[0]);
+            let mut native_canonical =
+                b"HEAD_SYMBOLIC\0refs/heads/main\0SUBMODULE_GITLINK_INDEX\0\0".to_vec();
+            native_canonical.extend_from_slice(&index);
+            native_canonical.push(0);
+            assert_eq!(results[1], snapshot_for(&native_canonical));
             snapshots.push(results.pop().unwrap());
         }
         assert_ne!(
@@ -16408,7 +16495,9 @@ mod tests {
                         return Ok(synthetic_inspection_output(stdout.to_vec(), success));
                     }
                     let stdout = match operation {
-                        "Git status inspection" | "gitlink inspection" => Vec::new(),
+                        "Git status inspection"
+                        | "exact ignored-path inspection"
+                        | "gitlink inspection" => Vec::new(),
                         "hidden-index inspection" => b"H tracked\0".to_vec(),
                         "detached head inspection" => b"refs/heads/main\n".to_vec(),
                         unexpected => panic!("unexpected Git leaf: {unexpected}"),
@@ -16449,6 +16538,7 @@ mod tests {
                     assert_eq!(leaf_deadline, deadline);
                     let stdout = match operation {
                         "Git status inspection" => b" M tracked\0".to_vec(),
+                        "exact ignored-path inspection" => Vec::new(),
                         "Git index path inspection" => b".git/index\n".to_vec(),
                         "hidden-index inspection" => b"H tracked\0".to_vec(),
                         "detached head inspection" => b"refs/heads/main\n".to_vec(),
@@ -16500,6 +16590,7 @@ mod tests {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         for stop in [
             "Git status inspection",
+            "exact ignored-path inspection",
             "hidden-index inspection",
             "detached head inspection",
             "gitlink inspection",
@@ -16517,7 +16608,7 @@ mod tests {
                         return Err("supplied leaf refused".to_string());
                     }
                     let stdout = match operation {
-                        "Git status inspection" => Vec::new(),
+                        "Git status inspection" | "exact ignored-path inspection" => Vec::new(),
                         "hidden-index inspection" => b"H tracked\0".to_vec(),
                         "detached head inspection" => b"refs/heads/main\n".to_vec(),
                         unexpected => panic!("unexpected Git leaf: {unexpected}"),
@@ -16623,6 +16714,7 @@ mod tests {
                 }
                 "gitlink inspection" | "dirty index inspection" => Vec::new(),
                 "Git status inspection" => b"?? untracked\0".to_vec(),
+                "exact ignored-path inspection" => Vec::new(),
                 "Git index path inspection" => b".git/missing-index\n".to_vec(),
                 "Git submodule HEAD inspection" => {
                     if command
@@ -16660,7 +16752,14 @@ mod tests {
                 .unwrap();
         assert_eq!(bindings.len(), 3);
         assert!(bindings.contains_key(Path::new("module/nested")));
-        assert_eq!(calls.len(), 24);
+        assert_eq!(calls.len(), 26);
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|(_, operation)| operation == "exact ignored-path inspection")
+                .count(),
+            2
+        );
         assert_eq!(
             calls
                 .iter()
@@ -19402,9 +19501,9 @@ mod tests {
     }
 
     #[test]
-    fn porcelain_loss_parser_distinguishes_loss_categories_and_ignores_ignored_paths() {
+    fn porcelain_loss_parser_distinguishes_loss_categories_and_leaves_collapsed_ignored_paths_for_enumeration() {
         let losses =
-            parse_status_losses(b"M  staged\0 M unstaged\0MM both\0?? untracked\0!! ignored\0");
+            parse_status_losses(b"M  staged\0 M unstaged\0MM both\0?? untracked\0!! ignored/\0");
         assert_eq!(losses.len(), 5);
         assert!(losses.iter().any(|loss| matches!(loss, CloseLossItem::StagedTrackedPath(path) if path.as_bytes() == b"staged")));
         assert!(losses.iter().any(|loss| matches!(loss, CloseLossItem::UnstagedTrackedPath(path) if path.as_bytes() == b"unstaged")));
@@ -19413,18 +19512,39 @@ mod tests {
         assert!(losses.iter().any(|loss| matches!(loss, CloseLossItem::UntrackedNonIgnoredPath(path) if path.as_bytes() == b"untracked")));
     }
 
+    #[cfg(unix)]
     #[test]
-    fn ignored_paths_do_not_change_canonical_snapshot() {
+    fn ignored_directory_inventory_preserves_each_leaf_identity() {
+        let (temp, _) = synthetic_inspection_repository();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        let mut leaf = |command: std::process::Command, _, operation: &str| {
+            assert_eq!(operation, "exact ignored-path inspection");
+            let args = command.get_args().map(|arg| arg.to_string_lossy().into_owned()).collect::<Vec<_>>();
+            assert!(args.ends_with(&["ls-files", "--others", "--ignored", "--exclude-standard", "-z", "--"].map(str::to_owned)));
+            Ok(synthetic_inspection_output(b"out/cache/a\0out/cache/b\0".to_vec(), true))
+        };
+        let paths = observe_ignored_paths_with_leaf_until(temp.path(), deadline, &mut leaf).unwrap();
+        assert_eq!(paths.iter().map(GitPathIdentity::as_bytes).collect::<Vec<_>>(), [b"out/cache/a".as_slice(), b"out/cache/b".as_slice()]);
+    }
+
+    #[test]
+    fn ignored_status_and_exact_paths_change_canonical_snapshot() {
         let clean = snapshot_for(&canonical_status_observation(b""));
-        let ignored = snapshot_for(&canonical_status_observation(b"!! target/log.txt\0"));
-        assert_eq!(clean, ignored);
+        let collapsed = canonical_status_observation(b"!! target/\0");
+        assert_ne!(clean, snapshot_for(&collapsed));
+
+        let exact = vec![GitPathIdentity::from_bytes(b"target/a.log".to_vec())];
+        let mut with_exact = collapsed;
+        append_ignored_paths(&mut with_exact, &exact);
+        assert_ne!(clean, snapshot_for(&with_exact));
+        assert!(with_exact.windows(b"IGNORED_PATH\0target/a.log\0".len()).any(|window| window == b"IGNORED_PATH\0target/a.log\0"));
     }
 
     #[test]
     fn canonical_status_preserves_rename_source_record() {
         assert_eq!(
             canonical_status_observation(b"R  new-name.txt\0old-name.txt\0!! ignored\0"),
-            b"R  new-name.txt\0old-name.txt\0"
+            b"R  new-name.txt\0old-name.txt\0!! ignored\0"
         );
     }
 

@@ -12,6 +12,7 @@ use sqlx::{Row, Sqlite, Transaction};
 use uuid::Uuid;
 
 use super::{NativeCloseCommand, NativeCloseIntent};
+use crate::close_foundation::ensure_close_retirement_loss_free_tx;
 use crate::workflow::LocalAuthorityResult;
 use crate::{
     BindCloseWorktreeFinalTombstoneObjectRequest, BindCloseWorktreeFinalTombstoneRequest,
@@ -1083,6 +1084,105 @@ impl Database {
         match result {
             Ok(()) => match tx.commit().await {
                 Ok(()) => LocalAuthorityResult::DurableFactEstablished(Ok(())),
+                Err(_) => LocalAuthorityResult::DurableFactUnclassified,
+            },
+            Err(error) => match tx.rollback().await {
+                Ok(()) => LocalAuthorityResult::DurableFactEstablished(Err(error)),
+                Err(_) => LocalAuthorityResult::DurableFactUnclassified,
+            },
+        }
+    }
+
+    /// Persists the exact initial inspection and terminals a loss-bearing result atomically.
+    /// Loss rows remain inspectable; no retirement effects are admitted.
+    pub async fn terminalize_native_close_initial_losses(
+        &self,
+        command: &NativeCloseCommand,
+        receipt: &NativeCloseReceipt,
+        live_source: &phoenix_core::domain::sm_state::ConvState,
+        request: ReplaceCloseInspectionRequest,
+        empty_generation: Option<&str>,
+        detail: &str,
+    ) -> LocalAuthorityResult<DbResult<CloseObligation>> {
+        let mut tx = match self.pool.begin_with("BEGIN IMMEDIATE").await {
+            Ok(tx) => tx,
+            Err(error) => return LocalAuthorityResult::DurableFactEstablished(Err(error.into())),
+        };
+        let result = async {
+            let (admitted, _) = require_initial_execution_tx(
+                &mut tx, command, receipt, live_source, ClosePhase::AwaitingRetirementInspection,
+            ).await?;
+            if request.attempt_id != admitted.attempt_id || detail.trim().is_empty()
+                || !request.scopes.iter().any(|scope| !scope.losses.is_empty())
+            {
+                return Err(DbError::CloseFoundationPrecondition(
+                    "loss terminalization requires the exact initial inspection with retained losses".into(),
+                ));
+            }
+            self.replace_close_inspection_tx(&mut tx, &request, empty_generation).await?;
+            let scope_rows = sqlx::query(
+                "SELECT scope, captured_worktree_identity, captured_worktree_fingerprint, captured_worktree_locator\n                 FROM close_attempt_scopes WHERE attempt_id = ?1 ORDER BY scope",
+            ).bind(admitted.attempt_id.as_str()).fetch_all(&mut *tx).await?;
+            let work_scope_resource = |scope: &WorkScopeId| -> DbResult<RetiredResourceIdentity> {
+                RetiredResourceIdentity::parse(
+                    RetiredResourceKind::WorkScope,
+                    phoenix_core::domain::close::LossItemIdentity::Opaque(
+                        phoenix_core::domain::close::OpaqueIdentity::parse(scope.as_str())
+                            .map_err(|error| DbError::CloseFoundationPrecondition(error.to_string()))?,
+                    ),
+                ).map_err(|error| DbError::CloseFoundationPrecondition(error.to_string()))
+            };
+            let authority_scope = request.scopes.iter().find(|scope| !scope.losses.is_empty())
+                .map(|scope| scope.scope.clone()).ok_or_else(|| DbError::CloseFoundationPrecondition("loss scope missing".into()))?;
+            let authority_resource = work_scope_resource(&authority_scope)?;
+            let mut remaining_resources = Vec::new();
+            for row in scope_rows {
+                let scope = WorkScopeId::parse(row.try_get::<String, _>("scope")?)
+                    .map_err(|error| DbError::CloseFoundationPrecondition(error.to_string()))?;
+                remaining_resources.push(CloseCleanupFailureResource {
+                    scope: scope.clone(), resource: work_scope_resource(&scope)?,
+                    disposition: CloseCleanupResourceDisposition::Unknown,
+                });
+                if let (Some(id), Some(fingerprint), Some(locator)) = (
+                    row.try_get::<Option<String>, _>("captured_worktree_identity")?,
+                    row.try_get::<Option<String>, _>("captured_worktree_fingerprint")?,
+                    row.try_get::<Option<String>, _>("captured_worktree_locator")?,
+                ) {
+                    let identity = WorktreeIdentity::from_parts(
+                        WorktreeId::parse(id).map_err(|error| DbError::CloseFoundationPrecondition(error.to_string()))?,
+                        WorktreeFingerprint::parse(fingerprint).map_err(|error| DbError::CloseFoundationPrecondition(error.to_string()))?,
+                        GitPathIdentity::decode_exact(&locator).map_err(|error| DbError::CloseFoundationPrecondition(error.to_string()))?,
+                    );
+                    remaining_resources.push(CloseCleanupFailureResource {
+                        scope, resource: RetiredResourceIdentity::parse(
+                            RetiredResourceKind::Worktree,
+                            phoenix_core::domain::close::LossItemIdentity::Worktree(identity),
+                        ).map_err(|error| DbError::CloseFoundationPrecondition(error.to_string()))?,
+                        disposition: CloseCleanupResourceDisposition::Unknown,
+                    });
+                }
+            }
+            let run = phoenix_core::domain::close::CloseRunRef {
+                attempt_id: admitted.attempt_id.clone(), ordinal: CloseRunOrdinal::INITIAL,
+            };
+            let terminal = TerminalizeInitialCloseCleanupFailureRequest {
+                failure_occurrence_id: run.failure_occurrence_id(),
+                attempt_id: admitted.attempt_id,
+                source_product_conversation_id: receipt.admitted.target.clone(),
+                authority: CloseCleanupFailureAuthority::CapturedScope {
+                    scope: authority_scope, resource: authority_resource,
+                },
+                remaining_resources,
+                reason: RetirementFailureReason::ManualRepairRequired,
+                detail: detail.to_owned(),
+                stop_certainty: CloseStopCertainty::ShutdownUncertain,
+                occurred_at_us: chrono::Utc::now().timestamp_micros(),
+            };
+            Database::terminalize_close_run_cleanup_failure_inner_tx(&mut tx, &run, &terminal).await
+        }.await;
+        match result {
+            Ok(obligation) => match tx.commit().await {
+                Ok(()) => LocalAuthorityResult::DurableFactEstablished(Ok(obligation)),
                 Err(_) => LocalAuthorityResult::DurableFactUnclassified,
             },
             Err(error) => match tx.rollback().await {
@@ -2216,6 +2316,7 @@ async fn require_initial_execution_tx(
     .ok_or_else(|| DbError::CloseFoundationPrecondition(
         "exact admitted initial Close run is missing or mismatched".into(),
     ))?;
+    ensure_close_retirement_loss_free_tx(tx, admitted.attempt_id.as_str()).await?;
     let phase_raw: String = row.try_get("phase")?;
     let phase = phoenix_core::domain::close::ClosePhase::from_db_str(&phase_raw)
         .ok_or_else(|| DbError::Serialization("unknown close phase".into()))?;

@@ -385,104 +385,17 @@ pub(crate) async fn list_fork_proposals(
 /// Abandon a Work or Branch conversation: delete worktree, optionally delete branch,
 /// capture diff snapshot, transition to Terminal.
 /// Single-phase endpoint -- the frontend confirms via a dialog before calling this.
-#[allow(clippy::too_many_lines)]
-/// Confirms destructive loss retirement against one exact persisted server
-/// inspection. This contract deliberately accepts no client path or inventory.
+/// Retired compatibility endpoint. Reject before consulting state or performing
+/// inspection/mutation; native Close owns loss-bearing outcomes.
 pub(crate) async fn confirm_close_loss_retirement(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-    Json(request): Json<ConfirmCloseLossRetirementRequest>,
+    State(_state): State<AppState>,
+    Path(_id): Path<String>,
+    Json(_request): Json<ConfirmCloseLossRetirementRequest>,
 ) -> Result<Json<SuccessResponse>, AppError> {
-    let attempt_id = phoenix_core::domain::close::CloseAttemptId::parse(request.attempt_id)
-        .map_err(|error| AppError::TypedBadRequest {
-            message: error.to_string(),
-            error_type: "invalid_close_attempt".to_string(),
-        })?;
-    let snapshot = phoenix_core::domain::close::CloseRetirementSnapshot::parse(
-        request.inspection_generation,
-        request.inspection_fingerprint,
-    )
-    .map_err(|error| AppError::TypedBadRequest {
-        message: error.to_string(),
-        error_type: "invalid_close_snapshot".to_string(),
-    })?;
-    let attempt = state
-        .db
-        .get_close_obligation(attempt_id.as_str())
-        .await
-        .map_err(|error| AppError::NotFound(error.to_string()))?;
-    let aggregate = state
-        .db
-        .get_ordinary_product_conversation(attempt.product_conversation_id())
-        .await
-        .map_err(|error| AppError::Internal(error.to_string()))?;
-    let active_transcript = aggregate
-        .segments
-        .last()
-        .map(|segment| segment.transcript_row.conversation.id.as_str());
-    if active_transcript != Some(id.as_str()) {
-        return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
-            "Close confirmation is accepted only from the active aggregate transcript",
-            "inactive_close_transcript",
-        ))));
-    }
-    let fresh_snapshot = state
-        .runtime
-        .inspect_close_retirement_only(attempt_id.clone())
-        .await
-        .map_err(|error| {
-            AppError::Conflict(Box::new(ConflictErrorResponse::new(
-                error,
-                "close_inspection_failed",
-            )))
-        })?;
-    if fresh_snapshot == snapshot {
-        state
-            .db
-            .confirm_close_loss_retirement(&attempt_id, &fresh_snapshot)
-            .await
-            .map_err(|error| {
-                AppError::Conflict(Box::new(ConflictErrorResponse::new(
-                    error.to_string(),
-                    "stale_close_inspection",
-                )))
-            })?;
-    } else {
-        let fresh_obligation = state
-            .db
-            .get_close_obligation(attempt_id.as_str())
-            .await
-            .map_err(|error| AppError::Internal(error.to_string()))?;
-        if fresh_obligation.phase() != phoenix_core::domain::close::ClosePhase::RetirementRequested
-        {
-            return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
-                "Close confirmation does not match fresh server inspection",
-                "stale_close_inspection",
-            ))));
-        }
-    }
-    if let Err(error) = state
-        .runtime
-        .retire_close_runtime_resources(attempt_id.clone())
-        .await
-    {
-        let current = state
-            .db
-            .get_close_obligation(attempt_id.as_str())
-            .await
-            .map_err(|db_error| AppError::Internal(db_error.to_string()))?;
-        let error_type = if current.close_outcome()
-            == Some(phoenix_core::domain::close::CloseCompletionOutcome::CloseIncomplete)
-        {
-            "close_incomplete"
-        } else {
-            "close_retirement_needs_repair"
-        };
-        return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
-            error, error_type,
-        ))));
-    }
-    Ok(Json(SuccessResponse { success: true }))
+    Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
+        "Loss retirement confirmation is no longer supported; native Close owns loss-bearing outcomes and will retain them for explicit recovery",
+        "native_close_loss_retirement_only",
+    ))))
 }
 
 pub(crate) async fn confirm_close_stop_work(

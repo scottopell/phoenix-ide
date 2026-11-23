@@ -941,6 +941,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "native_initial_completion_retry_admission",
         sql: include_str!("migrations/native_initial_completion_retry_admission.sql"),
     },
+    Migration {
+        version: 182,
+        name: "close_ignored_loss_category",
+        sql: include_str!("migrations/close_ignored_loss_category.sql"),
+    },
 ];
 
 const MIGRATION_158: &str = r"
@@ -16139,7 +16144,7 @@ mod tests {
             .unwrap()
             .is_empty());
         assert_eq!(run_through_for_test(db.pool(), 152).await.unwrap(), 1);
-        assert_eq!(run_pending_migrations(db.pool()).await.unwrap(), 27);
+        assert_eq!(run_pending_migrations(db.pool()).await.unwrap(), 28);
         assert_eq!(run_pending_migrations(db.pool()).await.unwrap(), 0);
         let ledger: Vec<(i64, String)> = sqlx::query_as(
             "SELECT version, name FROM _migrations WHERE version >= 150 ORDER BY version",
@@ -16183,6 +16188,7 @@ mod tests {
                 (179, "native_initial_source_fence".into()),
                 (180, "native_initial_completed_interruption".into()),
                 (181, "native_initial_completion_retry_admission".into()),
+                (182, "close_ignored_loss_category".into()),
             ]
         );
     }
@@ -16476,6 +16482,197 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn migration_182_preserves_existing_losses_and_adds_ignored_category() {
+        let pool = test_pool().await;
+        setup_real_pre_172_schema(&pool).await;
+        run_through_for_test(&pool, 181).await.unwrap();
+        let db = crate::Database::from_pool_for_tests(pool.clone(), String::new());
+        let conversation = db
+            .create_conversation("ignored-migration", "ignored", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let scope = db
+            .get_conversation("ignored-migration")
+            .await
+            .unwrap()
+            .attached_work_scope_id
+            .unwrap();
+        sqlx::query(
+            "UPDATE work_scopes
+             SET environment_kind = 'allocated_worktree', cwd = '/tmp',
+                 worktree_path = '/tmp/ignored-migration-worktree',
+                 worktree_id = 'ignored-migration-worktree-id',
+                 worktree_fingerprint = 'ignored-migration-worktree-fingerprint',
+                 branch_name = 'ignored-migration-branch', base_branch = 'main'
+             WHERE id = ?1",
+        )
+        .bind(scope.as_str())
+        .execute(&pool)
+        .await
+        .unwrap();
+        db.begin_close_foundation(
+            &conversation.product_conversation_id,
+            &phoenix_core::domain::close::TranscriptConversationId::parse("ignored-migration")
+                .unwrap(),
+            "ignored-migration-attempt",
+        )
+        .await
+        .unwrap();
+        for phase in [
+            "awaiting_stop_work_confirmation",
+            "settling_active_work",
+            "awaiting_retirement_inspection",
+        ] {
+            sqlx::query("UPDATE close_obligations SET phase = ?1 WHERE attempt_id = 'ignored-migration-attempt'")
+                .bind(phase)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        sqlx::query(
+            "INSERT INTO close_retirement_inspections (attempt_id, scope, generation, fingerprint, inspected_at)
+             VALUES ('ignored-migration-attempt', ?1, 'g1', 'fp1', '2026-01-01T00:00:00Z')",
+        )
+        .bind(scope.as_str())
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO close_retirement_losses
+                (attempt_id, scope, generation, category, identity_kind, identity_codec, identity_value)
+             VALUES ('ignored-migration-attempt', ?1, 'g1', 'untracked_non_ignored_paths',
+                     'git_path', 'git_path_bytes_hex_v1', 'git_path_bytes_hex_v1:6f6c64')",
+        )
+        .bind(scope.as_str())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let external_trigger_names = [
+            "close_obligations_require_loss_consistent_branch_from_inspection",
+            "close_cleanup_failure_completion_requires_disposition",
+            "native_close_source_fence_requires_exact_plan",
+            "close_cleanup_failures_require_initial_authority",
+        ];
+        let external_triggers_before: Vec<(String, String)> = sqlx::query_as(
+            "SELECT name, sql FROM sqlite_schema
+             WHERE type = 'trigger' AND name IN (?1, ?2, ?3, ?4) ORDER BY name",
+        )
+        .bind(external_trigger_names[0])
+        .bind(external_trigger_names[1])
+        .bind(external_trigger_names[2])
+        .bind(external_trigger_names[3])
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(external_triggers_before.len(), external_trigger_names.len());
+        assert_eq!(run_through_for_test(&pool, 182).await.unwrap(), 1);
+        assert_eq!(run_through_for_test(&pool, 182).await.unwrap(), 0);
+        let existing: (String, String) = sqlx::query_as(
+            "SELECT category, identity_value FROM close_retirement_losses WHERE attempt_id = 'ignored-migration-attempt'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            existing,
+            (
+                "untracked_non_ignored_paths".into(),
+                "git_path_bytes_hex_v1:6f6c64".into()
+            )
+        );
+        sqlx::query(
+            "INSERT INTO close_retirement_losses
+                (attempt_id, scope, generation, category, identity_kind, identity_codec, identity_value)
+             VALUES ('ignored-migration-attempt', ?1, 'g1', 'ignored',
+                     'git_path', 'git_path_bytes_hex_v1', 'git_path_bytes_hex_v1:69676e6f726564')",
+        )
+        .bind(scope.as_str())
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM close_retirement_losses WHERE category = 'ignored'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            1
+        );
+        let trigger: String = sqlx::query_scalar(
+            "SELECT sql FROM sqlite_schema WHERE type = 'trigger' AND name = 'close_obligations_invalidate_inspection_on_reentry'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(trigger.contains("DELETE FROM close_retirement_inspections"));
+        for name in [
+            "close_obligations_require_loss_consistent_branch_from_inspection",
+            "close_cleanup_failures_require_initial_authority",
+        ] {
+            let definition: String = sqlx::query_scalar(
+                "SELECT sql FROM sqlite_schema WHERE type = 'trigger' AND name = ?1",
+            )
+            .bind(name)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert!(definition.contains("close_retirement_losses"), "{name}");
+        }
+        let external_triggers_after: Vec<(String, String)> = sqlx::query_as(
+            "SELECT name, sql FROM sqlite_schema
+             WHERE type = 'trigger' AND name IN (?1, ?2, ?3, ?4) ORDER BY name",
+        )
+        .bind(external_trigger_names[0])
+        .bind(external_trigger_names[1])
+        .bind(external_trigger_names[2])
+        .bind(external_trigger_names[3])
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(external_triggers_after, external_triggers_before);
+        sqlx::query(
+            "UPDATE close_obligations
+             SET phase = 'awaiting_loss_confirmation', inspection_generation = ?1,
+                 inspection_fingerprint = ?2
+             WHERE attempt_id = 'ignored-migration-attempt'",
+        )
+        .bind(format!("v1{}:{}2:g1", scope.as_str().len(), scope.as_str()))
+        .bind(format!("v1{}:{}3:fp1", scope.as_str().len(), scope.as_str()))
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert!(sqlx::query(
+            "DELETE FROM close_retirement_losses
+             WHERE attempt_id = 'ignored-migration-attempt' AND category = 'ignored'",
+        )
+        .execute(&pool)
+        .await
+        .is_err());
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM close_retirement_losses WHERE category = 'ignored'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            1
+        );
+        for query in [
+            "EXPLAIN UPDATE close_obligations SET phase = phase WHERE attempt_id = 'ignored-migration-attempt'",
+            "EXPLAIN INSERT INTO close_cleanup_failures (failure_occurrence_id, attempt_id, cleanup_run_ordinal, source_product_conversation_id, authority_kind, occurred_at_us, reason, detail, stop_certainty) SELECT 'missing', 'missing', 2, 'missing', 'attempt_interrupted', 1, 'interrupted', 'missing', 'shutdown_uncertain' WHERE 0",
+        ] {
+            sqlx::query(query).fetch_all(&pool).await.unwrap();
+        }
+        assert!(sqlx::query("PRAGMA foreign_key_check")
+            .fetch_all(&pool)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
     async fn migration_180_upgrades_authentic_179_initial_source_fence_schema() {
         let pool = test_pool().await;
         setup_real_pre_172_schema(&pool).await;
@@ -16542,6 +16739,7 @@ mod tests {
         let ledger = compiled_migration_ledger();
         assert!(ledger.windows(2).all(|pair| pair[0].0 < pair[1].0));
         let expected_tail = [
+            (182, "close_ignored_loss_category"),
             (181, "native_initial_completion_retry_admission"),
             (180, "native_initial_completed_interruption"),
             (179, "native_initial_source_fence"),
@@ -20868,6 +21066,7 @@ mod tests {
                 (179, "native_initial_source_fence"),
                 (180, "native_initial_completed_interruption"),
                 (181, "native_initial_completion_retry_admission"),
+                (182, "close_ignored_loss_category"),
             ]
         );
         let goal = MIGRATIONS
@@ -20881,7 +21080,7 @@ mod tests {
         assert!(goal
             .sql
             .contains("CREATE TABLE conversation_goal_coordinator_receipts"));
-        assert_eq!(MIGRATIONS.len(), 178);
+        assert_eq!(MIGRATIONS.len(), 179);
     }
 
     #[tokio::test]
@@ -20897,7 +21096,7 @@ mod tests {
         }
         sqlx::query("UPDATE product_creation_jobs SET status = 'published', published_product_id = 'deleted-product', published_conversation_id = 'deleted-transcript' WHERE request_id = 'orphan-image'")
             .execute(&pool).await.unwrap();
-        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 31);
+        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 32);
         let identity: Vec<(String, String)> = sqlx::query_as(
             "SELECT request_id, data_sha256 FROM product_creation_image_replay_identity ORDER BY request_id",
         ).fetch_all(&pool).await.unwrap();
@@ -20951,7 +21150,7 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 31);
+        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 32);
         let retained: (String, String, String) = sqlx::query_as(
             "SELECT status, published_product_id, published_conversation_id
              FROM product_creation_jobs WHERE request_id = 'orphan-text'",
@@ -24125,7 +24324,7 @@ mod close_completion_allowance_tests {
             2
         );
 
-        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 10);
+        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 11);
         let migrated: (i64, i64) = sqlx::query_as(
             "SELECT (SELECT COUNT(*) FROM close_original_retirement_anchors WHERE attempt_id = ?1),
                     (SELECT COUNT(*) FROM close_retirement_anchor_exclusions WHERE attempt_id = ?1)"

@@ -93,6 +93,7 @@ pub(super) struct NativeCloseInitialContinuation {
     #[cfg(test)]
     inventory_preparation_test_barrier: Option<InventoryPreparationTestBarrier>,
     inspection_failure: Option<NativeInitialInspectionFailureIntent>,
+    loss_terminalization: Option<NativeInitialLossTerminalizationIntent>,
     pub(super) terminal_observation_retry: bool,
     pub(super) authority: RuntimeSettlementAuthority,
     pub(super) _target_gate: std::sync::Arc<tokio::sync::OwnedMutexGuard<()>>,
@@ -116,6 +117,7 @@ pub(super) enum NativeCloseInitialContinuationPhase {
     CollectingInspection,
     InspectionRequired,
     ClassifyingInspectionFailure,
+    ClassifyingLosses,
     ObservingTerminal,
     ExitObservationOnly,
     ClassifyingExitInterruption,
@@ -127,6 +129,12 @@ struct NativeInitialInspectionFailureIntent {
     scope: phoenix_core::work_scope::WorkScopeId,
     reason: phoenix_core::domain::close::RetirementFailureReason,
     detail: String,
+}
+
+#[derive(Debug, Clone)]
+struct NativeInitialLossTerminalizationIntent {
+    request: phoenix_db::ReplaceCloseInspectionRequest,
+    empty_generation: Option<String>,
 }
 
 enum InventoryCapture {
@@ -350,6 +358,7 @@ impl NativeCloseInitialContinuation {
                 | NativeCloseInitialContinuationPhase::RetiringProcesses
                 | NativeCloseInitialContinuationPhase::RuntimeProcessesDone
                 | NativeCloseInitialContinuationPhase::ClassifyingInspectionFailure
+                | NativeCloseInitialContinuationPhase::ClassifyingLosses
                 | NativeCloseInitialContinuationPhase::ObservingTerminal
                 | NativeCloseInitialContinuationPhase::ClassifyingExitInterruption
         )
@@ -842,6 +851,14 @@ impl NativeCloseInitialContinuation {
                     .iter()
                     .map(|scope| scope.losses.len())
                     .sum();
+                if loss_count > 0 {
+                    self.loss_terminalization = Some(NativeInitialLossTerminalizationIntent {
+                        request: collected.request,
+                        empty_generation: collected.empty_generation,
+                    });
+                    self.phase = Phase::ClassifyingLosses;
+                    return Ok(self.phase);
+                }
                 match self
                     .db
                     .replace_native_close_initial_inspection(
@@ -908,6 +925,40 @@ impl NativeCloseInitialContinuation {
                     }
                     LocalAuthorityResult::DurableFactEstablished(Err(error)) => {
                         tracing::warn!(%error, "native Close failure classification definitely rolled back; retaining owner and retrying classification only");
+                        Ok(self.phase)
+                    }
+                    LocalAuthorityResult::DurableFactUnclassified => {
+                        Err(NativeCloseApplicationError::FatalAuthority)
+                    }
+                }
+            }
+            Phase::ClassifyingLosses => {
+                let intent = self
+                    .loss_terminalization
+                    .as_ref()
+                    .expect("loss classification phase owns exact inspection intent");
+                match self
+                    .db
+                    .terminalize_native_close_initial_losses(
+                        &self.command,
+                        &self.receipt,
+                        live_source,
+                        intent.request.clone(),
+                        intent.empty_generation.as_deref(),
+                        "initial inspection found retained content blockers; no retirement effects were run",
+                    )
+                    .await
+                {
+                    LocalAuthorityResult::DurableFactEstablished(Ok(_obligation)) => {
+                        self.loss_terminalization = None;
+                        self.phase = Phase::ObservingTerminal;
+                        if self.release_if_exactly_terminal().await {
+                            self.phase = Phase::Finished;
+                        }
+                        Ok(self.phase)
+                    }
+                    LocalAuthorityResult::DurableFactEstablished(Err(error)) => {
+                        tracing::warn!(%error, "native Close loss terminalization definitely rolled back; retaining owner and retrying terminalization only");
                         Ok(self.phase)
                     }
                     LocalAuthorityResult::DurableFactUnclassified => {
@@ -1018,6 +1069,7 @@ where
                     #[cfg(test)]
                     inventory_preparation_test_barrier: None,
                     inspection_failure: None,
+                    loss_terminalization: None,
                     terminal_observation_retry: false,
                     authority,
                     _target_gate: std::sync::Arc::new(target_gate),

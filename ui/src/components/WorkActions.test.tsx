@@ -343,6 +343,59 @@ describe('WorkControlBar — persisted Close recovery', () => {
     );
   });
 
+  it('keeps needs-repair retries scoped to the repair phase and preserves exact loss rows', async () => {
+    const snapshot = closeSnapshot('needs_repair', [{
+      scope: 'repo',
+      resource_kind: 'worktree',
+      identity: '/work/tree',
+      reason: 'inspection_failed',
+      detail: 'cleanup incomplete',
+    }]);
+    vi.mocked(api.getProductConversationSnapshot).mockResolvedValue({
+      ...snapshot,
+      close: {
+        ...snapshot.close,
+        run_status: 'running',
+        failure: null,
+        losses: [
+          { scope: 'repo', generation: '7', category: 'ignored', identity: 'git_path_bytes_hex_v1:7461726765742f69676e6f7265642e62696e' },
+          { scope: 'repo', generation: '7', category: 'modified', identity: 'git_path_bytes_hex_v1:626164ff' },
+        ],
+      },
+    } as never);
+
+    renderWithProviders(
+      <WorkControlBar conversationId="conv-stopped" convModeLabel="Work" phaseType="idle" continuedInConvId={null} prStatusHandle={prStatusHandle()} />,
+    );
+
+    const status = await screen.findByLabelText('Close repair required');
+    expect(status).toHaveTextContent('repo: target/ignored.bin · ignored');
+    expect(status).toHaveTextContent('repo: bad\\xff · modified');
+    expect(status).toHaveTextContent('repo: worktree · /work/tree · inspection failed — cleanup incomplete');
+    expect(screen.queryByRole('button', { name: /discard exact items/i })).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Retry exact Close attempt' })).toBeVisible();
+  });
+
+  it('shows awaiting loss rows without offering confirmation', async () => {
+    const snapshot = closeSnapshot('awaiting_loss_confirmation');
+    vi.mocked(api.getProductConversationSnapshot).mockResolvedValue({
+      ...snapshot,
+      close: { ...snapshot.close, losses: [{ scope: 'repo', generation: '8', category: 'modified', identity: 'src/main.rs' }] },
+    } as never);
+
+    renderWithProviders(
+      <WorkControlBar conversationId="conv-losses" convModeLabel="Work" phaseType="idle" continuedInConvId={null} prStatusHandle={prStatusHandle()} />,
+    );
+
+    const status = await screen.findByLabelText('Close incomplete');
+    expect(status).toHaveTextContent('Close blocked — content retained');
+    expect(status).toHaveTextContent('Close will not discard these items.');
+    expect(status).not.toHaveTextContent('awaiting loss confirmation');
+    expect(status).toHaveTextContent('repo: src/main.rs · modified');
+    expect(screen.queryByRole('button', { name: /discard exact items/i })).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Keep work and cancel Close' })).toBeVisible();
+  });
+
   it('requires the attempt-bound stop-work action before settlement', async () => {
     vi.mocked(api.getProductConversationSnapshot).mockResolvedValue(
       closeSnapshot('awaiting_stop_work_confirmation') as never,

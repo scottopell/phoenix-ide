@@ -343,6 +343,8 @@ pub enum LossCategory {
     StagedTrackedPaths,
     UnstagedTrackedPaths,
     UntrackedNonIgnoredPaths,
+    #[serde(rename = "ignored")]
+    IgnoredPaths,
     InitializedSubmoduleState,
     DetachedUnreachableCommits,
 }
@@ -354,6 +356,7 @@ impl LossCategory {
             Self::StagedTrackedPaths => "staged_tracked_paths",
             Self::UnstagedTrackedPaths => "unstaged_tracked_paths",
             Self::UntrackedNonIgnoredPaths => "untracked_non_ignored_paths",
+            Self::IgnoredPaths => "ignored",
             Self::InitializedSubmoduleState => "initialized_submodule_state",
             Self::DetachedUnreachableCommits => "detached_unreachable_commits",
         }
@@ -1158,6 +1161,7 @@ pub enum CloseLossItem {
     StagedTrackedPath(GitPathIdentity),
     UnstagedTrackedPath(GitPathIdentity),
     UntrackedNonIgnoredPath(GitPathIdentity),
+    IgnoredPath(GitPathIdentity),
     InitializedSubmoduleState(GitPathIdentity),
     DetachedUnreachableCommit(GitOidIdentity),
 }
@@ -1169,6 +1173,7 @@ impl CloseLossItem {
             Self::StagedTrackedPath(_) => LossCategory::StagedTrackedPaths,
             Self::UnstagedTrackedPath(_) => LossCategory::UnstagedTrackedPaths,
             Self::UntrackedNonIgnoredPath(_) => LossCategory::UntrackedNonIgnoredPaths,
+            Self::IgnoredPath(_) => LossCategory::IgnoredPaths,
             Self::InitializedSubmoduleState(_) => LossCategory::InitializedSubmoduleState,
             Self::DetachedUnreachableCommit(_) => LossCategory::DetachedUnreachableCommits,
         }
@@ -1180,6 +1185,7 @@ impl CloseLossItem {
             Self::StagedTrackedPath(identity)
             | Self::UnstagedTrackedPath(identity)
             | Self::UntrackedNonIgnoredPath(identity)
+            | Self::IgnoredPath(identity)
             | Self::InitializedSubmoduleState(identity) => {
                 LossItemIdentity::GitPath(identity.clone())
             }
@@ -1573,6 +1579,18 @@ mod tests {
 
     #[test]
     fn enums_expose_exact_persisted_strings() {
+        for category in [
+            LossCategory::StagedTrackedPaths,
+            LossCategory::UnstagedTrackedPaths,
+            LossCategory::UntrackedNonIgnoredPaths,
+            LossCategory::IgnoredPaths,
+            LossCategory::InitializedSubmoduleState,
+            LossCategory::DetachedUnreachableCommits,
+        ] {
+            let value = serde_json::Value::String(category.as_str().to_owned());
+            assert_eq!(serde_json::to_value(category).unwrap(), value);
+            assert_eq!(serde_json::from_value::<LossCategory>(value).unwrap(), category);
+        }
         assert_eq!(
             LossCategory::StagedTrackedPaths.as_str(),
             "staged_tracked_paths"
@@ -1758,6 +1776,14 @@ mod tests {
         assert_eq!(staged.category(), LossCategory::StagedTrackedPaths);
         assert_eq!(staged.identity(), LossItemIdentity::GitPath(path.clone()));
 
+        let ignored = CloseLossItem::IgnoredPath(path.clone());
+        assert_eq!(ignored.category(), LossCategory::IgnoredPaths);
+        assert_eq!(ignored.category().as_str(), "ignored");
+        assert_eq!(ignored.identity(), LossItemIdentity::GitPath(path.clone()));
+        assert_eq!(
+            serde_json::to_value(&ignored).unwrap(),
+            serde_json::json!({"category": "ignored_path", "identity": path.clone()})
+        );
         let detached = CloseLossItem::DetachedUnreachableCommit(oid.clone());
         assert_eq!(
             detached.category(),

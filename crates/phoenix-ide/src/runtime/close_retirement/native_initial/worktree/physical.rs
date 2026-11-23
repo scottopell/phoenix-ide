@@ -598,8 +598,8 @@ impl PhysicalDeletionDriver<'_> {
             });
             return Err(detail);
         }
-        // The canonical fingerprint deliberately excludes ignored paths. The
-        // separate guard is required even when full snapshot equality holds.
+        // Ignored leaves are fingerprinted and reported as losses during
+        // inspection; this guard independently refuses physical deletion.
         ensure_no_ignored_content_with_status_leaf_until(&path, deadline, |_, deadline| {
             let owner = self
                 .custody

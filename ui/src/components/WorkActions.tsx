@@ -12,6 +12,7 @@ import { derivePrRailAvailability } from './prRailAvailability';
 import { prReviewState } from './prReviewState';
 import { useIsCompactLayout } from '../hooks';
 import { subscribeCloseSnapshotChanged } from '../notifications';
+import { displayLossIdentity } from './closeLossIdentity';
 import './WorkActions.css';
 
 interface WorkControlBarProps {
@@ -35,56 +36,62 @@ function InfoHint({ text }: { text: string }) {
   );
 }
 
-function displayLossIdentity(identity: string): string {
-  const prefix = 'git_path_bytes_hex_v1:';
-  if (!identity.startsWith(prefix)) return identity;
-  const hex = identity.slice(prefix.length);
-  if (!/^(?:[0-9a-f]{2})+$/i.test(hex)) return identity;
-  const bytes = new Uint8Array(hex.match(/../g)?.map((pair) => Number.parseInt(pair, 16)) ?? []);
-  try {
-    return new TextDecoder('utf-8', { fatal: true }).decode(bytes);
-  } catch {
-    return Array.from(bytes, (byte) => byte >= 0x20 && byte < 0x7f
-      ? String.fromCharCode(byte)
-      : `\\x${byte.toString(16).padStart(2, '0')}`).join('');
-  }
-}
-
 function CloseStatusPanel({
   snapshot,
   busy,
-  onConfirmLosses,
   onConfirmStopWork,
   onCancel,
   onRetry,
 }: {
   snapshot: ProductConversationSnapshotView;
   busy: boolean;
-  onConfirmLosses: () => void;
   onConfirmStopWork: () => void;
   onCancel: () => void;
   onRetry: () => void;
 }) {
   const close = snapshot.close;
-  if (!close || close.run_status === 'stopped' || close.phase === 'completed') return null;
-  if (close.phase === 'awaiting_loss_confirmation') {
+  if (!close || close.phase === 'completed') return null;
+  if (close.phase === 'awaiting_loss_confirmation' || close.run_status === 'stopped') {
+    const stopped = close.run_status === 'stopped';
     return (
-      <section className="work-actions-close-status" aria-label="Close loss confirmation">
-        <strong>⚠ Closing will discard these exact items</strong>
-        <ul>
-          {close.losses.map((loss) => (
-            <li key={`${loss.scope}:${loss.generation}:${loss.category}:${loss.identity}`}>
-              <code>{loss.scope}: {displayLossIdentity(loss.identity)}</code> · {loss.category.replaceAll('_', ' ')}
-            </li>
-          ))}
-        </ul>
-        <p>No patch, stash, commit, branch deletion, or PR mutation will be created.</p>
-        <button type="button" className="work-actions-btn work-actions-btn--danger" disabled={busy} onClick={onConfirmLosses}>
-          {busy ? 'Closing…' : 'Discard exact items and close'}
-        </button>
-        <button type="button" className="work-actions-btn" disabled={busy} onClick={onCancel}>
-          Keep work and cancel Close
-        </button>
+      <section className="work-actions-close-status" aria-label={close.phase === 'needs_repair' ? 'Close repair required' : 'Close incomplete'}>
+        <strong>{stopped
+          ? close.failure?.stop_certainty.kind === 'conversation_and_processes_stopped'
+            ? '⚠ Close incomplete — disk retained'
+            : '⚠ Close incomplete — shutdown could not be confirmed'
+          : close.phase === 'needs_repair' ? '⚠ Close needs repair' : '⚠ Close blocked — content retained'}</strong>
+        {close.phase === 'awaiting_loss_confirmation' && (
+          <p>Close will not discard these items. Any cleanup must happen separately under the owning agent’s authority.</p>
+        )}
+        {close.losses.length > 0 && (
+          <>
+            <p>Exact work items:</p>
+            <ul>
+              {close.losses.map((loss) => (
+                <li key={`${loss.scope}:${loss.generation}:${loss.category}:${loss.identity}`}>
+                  <code>{loss.scope}: {displayLossIdentity(loss.identity)}</code> · {loss.category.replaceAll('_', ' ')}
+                </li>
+              ))}
+            </ul>
+          </>
+        )}
+        {close.residuals.length > 0 && (
+          <ul>
+            {close.residuals.map((residual) => (
+              <li key={`${residual.scope}:${residual.resource_kind}:${residual.identity}`}>
+                <code>{residual.scope}: {residual.resource_kind.replaceAll('_', ' ')} · {residual.identity}</code>
+                {' · '}{residual.reason.replaceAll('_', ' ')}
+                {residual.detail ? ` — ${residual.detail}` : ''}
+              </li>
+            ))}
+          </ul>
+        )}
+        {close.failure && <p>{close.failure.reason.replaceAll('_', ' ')} — {close.failure.detail}</p>}
+        {close.phase === 'awaiting_loss_confirmation' && (
+          <button type="button" className="work-actions-btn" disabled={busy} onClick={onCancel}>
+            Keep work and cancel Close
+          </button>
+        )}
       </section>
     );
   }
@@ -107,6 +114,15 @@ function CloseStatusPanel({
       <section className="work-actions-close-status" aria-label="Close repair required">
         <strong>⚠ Close needs repair</strong>
         <p>Phoenix stopped before it could prove every owned resource was retired.</p>
+        {close.losses.length > 0 && (
+          <ul>
+            {close.losses.map((loss) => (
+              <li key={`${loss.scope}:${loss.generation}:${loss.category}:${loss.identity}`}>
+                <code>{loss.scope}: {displayLossIdentity(loss.identity)}</code> · {loss.category.replaceAll('_', ' ')}
+              </li>
+            ))}
+          </ul>
+        )}
         <ul>
           {close.residuals.map((residual) => (
             <li key={`${residual.scope}:${residual.resource_kind}:${residual.identity}`}>
@@ -202,7 +218,7 @@ function ResolveLink({
 }
 
 function closeHintText(): string {
-  return 'Closes this conversation and retires Phoenix-owned resources. Exact tracked, untracked, submodule, or detached work loss requires confirmation. Phoenix does not create recovery artifacts or move/delete branches or PRs.';
+  return 'Closes this conversation and retires Phoenix-owned resources. Exact tracked, untracked, submodule, or detached work is retained and shown when Close cannot complete. Phoenix does not create recovery artifacts or move/delete branches or PRs.';
 }
 
 type CompactFallbackStatus = {
@@ -617,27 +633,6 @@ export function WorkControlBar({
     }
   };
 
-  const confirmCloseLosses = async () => {
-    const close = closeSnapshot?.close;
-    const inspection = close?.confirmation_snapshot;
-    if (!close || !inspection) return;
-    setError(null);
-    setAbandoning(true);
-    try {
-      await api.confirmCloseLossRetirement(conversationId, {
-        attempt_id: close.attempt_id,
-        inspection_generation: inspection.generation,
-        inspection_fingerprint: inspection.fingerprint,
-      });
-      setCloseSnapshot(null);
-      onCloseCompleted?.();
-    } catch (err) {
-      await surfaceCloseConflict(err, 'Failed to confirm Close losses');
-    } finally {
-      setAbandoning(false);
-    }
-  };
-
   const cancelClose = async () => {
     setError(null);
     setAbandoning(true);
@@ -724,7 +719,6 @@ export function WorkControlBar({
     <CloseStatusPanel
       snapshot={closeSnapshot}
       busy={closeResolutionBusy}
-      onConfirmLosses={() => { void confirmCloseLosses(); }}
       onConfirmStopWork={() => { void confirmCloseStopWork(); }}
       onCancel={() => { void cancelClose(); }}
       onRetry={() => { void retryClose(); }}

@@ -363,6 +363,153 @@ async fn assert_no_initial_inspection_artifacts(f: &Fixture, receipt: &NativeClo
 }
 
 #[tokio::test]
+async fn initial_effect_admission_rejects_retained_losses_even_in_anomalous_phase() {
+    let f = Fixture::new().await;
+    let scope = crate::close_foundation::allocate_scope_worktree(&f.db, "first-target").await;
+    let (command, receipt, live_source) = prepared_initial(&f).await;
+    f.db.settle_native_close_initial(&command, &receipt, &live_source)
+        .await.established().unwrap().unwrap();
+    let inspection = ReplaceCloseInspectionRequest {
+        attempt_id: receipt.admitted.attempt_id.clone(),
+        scopes: vec![crate::ReplaceCloseInspectionScopeRequest {
+            scope,
+            snapshot: phoenix_core::domain::close::CloseRetirementSnapshot::parse(
+                "loss-generation", "loss-fingerprint",
+            ).unwrap(),
+            losses: vec![phoenix_core::domain::close::CloseLossItem::UntrackedNonIgnoredPath(
+                phoenix_core::domain::close::GitPathIdentity::from_bytes(b"retained-loss".to_vec()),
+            )],
+        }],
+    };
+    f.db.replace_native_close_initial_inspection(
+        &command, &receipt, &live_source, inspection, None,
+    ).await.established().unwrap().unwrap();
+    assert_eq!(initial_phase(&f, &receipt).await, ClosePhase::AwaitingLossConfirmation.as_str());
+
+    // Reproduce legacy/anomalous retained state while preserving the loss-confirmation phase guard.
+    sqlx::query("UPDATE close_obligations SET phase = 'retirement_requested' WHERE attempt_id = ?1")
+        .bind(receipt.admitted.attempt_id.as_str()).execute(f.db.pool()).await.unwrap();
+    let retained_losses = f.db.list_close_retirement_losses(receipt.admitted.attempt_id.as_str())
+        .await.unwrap();
+    assert!(!retained_losses.is_empty());
+    let before_captures: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM close_attempt_direct_turn_settlement_captures WHERE attempt_id = ?1",
+    ).bind(receipt.admitted.attempt_id.as_str()).fetch_one(f.db.pool()).await.unwrap();
+    assert!(matches!(
+        f.db.prepare_native_close_initial_execution(&command, &receipt, &live_source).await,
+        LocalAuthorityResult::DurableFactEstablished(Err(DbError::CloseFoundationPrecondition(_)))
+    ));
+    assert_eq!(initial_phase(&f, &receipt).await, ClosePhase::RetirementRequested.as_str());
+    let after_captures: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM close_attempt_direct_turn_settlement_captures WHERE attempt_id = ?1",
+    ).bind(receipt.admitted.attempt_id.as_str()).fetch_one(f.db.pool()).await.unwrap();
+    assert_eq!(after_captures, before_captures);
+}
+
+#[tokio::test]
+async fn initial_loss_inspection_is_retained_and_terminalized_atomically_without_dispatch() {
+    let f = Fixture::new().await;
+    let scope = crate::close_foundation::allocate_scope_worktree(&f.db, "first-target").await;
+    let (command, receipt, live_source) = prepared_initial(&f).await;
+    f.db.settle_native_close_initial(&command, &receipt, &live_source)
+        .await.established().unwrap().unwrap();
+    let request = ReplaceCloseInspectionRequest {
+        attempt_id: receipt.admitted.attempt_id.clone(),
+        scopes: vec![crate::ReplaceCloseInspectionScopeRequest {
+            scope,
+            snapshot: phoenix_core::domain::close::CloseRetirementSnapshot::parse(
+                "loss-generation", "loss-fingerprint",
+            ).unwrap(),
+            losses: vec![
+                phoenix_core::domain::close::CloseLossItem::UntrackedNonIgnoredPath(
+                    phoenix_core::domain::close::GitPathIdentity::from_bytes(b"dirty-file".to_vec()),
+                ),
+                phoenix_core::domain::close::CloseLossItem::IgnoredPath(
+                    phoenix_core::domain::close::GitPathIdentity::from_bytes(b"ignored-file".to_vec()),
+                ),
+            ],
+        }],
+    };
+    let result = f.db.terminalize_native_close_initial_losses(
+        &command, &receipt, &live_source, request, None, "unconfirmed dirty-file loss",
+    ).await.established().unwrap().unwrap();
+    assert_eq!(result.phase(), ClosePhase::Completed);
+    assert_eq!(result.close_outcome(), Some(phoenix_core::domain::close::CloseCompletionOutcome::CloseIncomplete));
+    assert_eq!(initial_phase(&f, &receipt).await, ClosePhase::Completed.as_str());
+    assert_eq!(f.db.list_close_retirement_losses(receipt.admitted.attempt_id.as_str()).await.unwrap().len(), 2);
+    let certainty: String = sqlx::query_scalar(
+        "SELECT stop_certainty FROM close_cleanup_failures WHERE attempt_id = ?1",
+    ).bind(receipt.admitted.attempt_id.as_str()).fetch_one(f.db.pool()).await.unwrap();
+    assert_eq!(certainty, "shutdown_uncertain");
+    let dispatches: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM close_retirement_resource_dispatches WHERE attempt_id = ?1",
+    ).bind(receipt.admitted.attempt_id.as_str()).fetch_one(f.db.pool()).await.unwrap();
+    assert_eq!(dispatches, 0);
+}
+
+#[tokio::test]
+async fn initial_loss_terminalization_guards_authority_and_rolls_back_late_failure() {
+    let f = Fixture::new().await;
+    let scope = crate::close_foundation::allocate_scope_worktree(&f.db, "first-target").await;
+    let (command, receipt, live_source) = prepared_initial(&f).await;
+    f.db.settle_native_close_initial(&command, &receipt, &live_source)
+        .await.established().unwrap().unwrap();
+    let request = ReplaceCloseInspectionRequest {
+        attempt_id: receipt.admitted.attempt_id.clone(),
+        scopes: vec![crate::ReplaceCloseInspectionScopeRequest {
+            scope,
+            snapshot: phoenix_core::domain::close::CloseRetirementSnapshot::parse(
+                "loss-rollback-generation", "loss-rollback-fingerprint",
+            ).unwrap(),
+            losses: vec![phoenix_core::domain::close::CloseLossItem::UntrackedNonIgnoredPath(
+                phoenix_core::domain::close::GitPathIdentity::from_bytes(b"retained-loss".to_vec()),
+            )],
+        }],
+    };
+    let before = initial_finalization_snapshot(&f, &receipt).await;
+    let mut wrong_receipt = receipt.clone();
+    wrong_receipt.request_id = Uuid::new_v4();
+    for (proof, source) in [(&wrong_receipt, &live_source), (&receipt, &ConvState::Idle)] {
+        assert!(matches!(
+            f.db.terminalize_native_close_initial_losses(
+                &command, proof, source, request.clone(), None, "unconfirmed loss",
+            ).await,
+            LocalAuthorityResult::DurableFactEstablished(Err(DbError::CloseFoundationPrecondition(_)))
+        ));
+        assert_eq!(initial_finalization_snapshot(&f, &receipt).await, before);
+        assert_eq!(initial_phase(&f, &receipt).await, ClosePhase::AwaitingRetirementInspection.as_str());
+        assert_no_initial_inspection_artifacts(&f, &receipt).await;
+    }
+
+    sqlx::query(
+        "CREATE TRIGGER reject_initial_loss_terminalization BEFORE INSERT ON coordinator_watch_events
+         WHEN NEW.route_kind = 'mandatory_close_failure'
+         BEGIN SELECT RAISE(ABORT, 'injected initial loss terminalization failure'); END",
+    ).execute(f.db.pool()).await.unwrap();
+    let rollback = f.db.terminalize_native_close_initial_losses(
+        &command, &receipt, &live_source, request.clone(), None, "unconfirmed loss",
+    ).await;
+    let LocalAuthorityResult::DurableFactEstablished(Err(error)) = rollback else {
+        panic!("late terminalization failure must be a definitely rolled-back error");
+    };
+    assert!(error.to_string().contains("injected initial loss terminalization failure"));
+    assert_eq!(initial_finalization_snapshot(&f, &receipt).await, before);
+    assert_no_initial_inspection_artifacts(&f, &receipt).await;
+    sqlx::query("DROP TRIGGER reject_initial_loss_terminalization")
+        .execute(f.db.pool()).await.unwrap();
+
+    let terminal = f.db.terminalize_native_close_initial_losses(
+        &command, &receipt, &live_source, request, None, "unconfirmed loss",
+    ).await.established().unwrap().unwrap();
+    assert_eq!(terminal.phase(), ClosePhase::Completed);
+    assert_eq!(f.db.list_close_retirement_losses(receipt.admitted.attempt_id.as_str()).await.unwrap().len(), 1);
+    let dispatches: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM close_retirement_resource_dispatches WHERE attempt_id = ?1",
+    ).bind(receipt.admitted.attempt_id.as_str()).fetch_one(f.db.pool()).await.unwrap();
+    assert_eq!(dispatches, 0);
+}
+
+#[tokio::test]
 #[allow(clippy::too_many_lines)]
 async fn initial_inspection_and_inventory_require_exact_live_source_and_receipt() {
     let f = Fixture::new().await;

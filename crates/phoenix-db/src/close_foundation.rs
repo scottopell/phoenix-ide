@@ -560,6 +560,7 @@ fn parse_loss_category(value: &str) -> DbResult<LossCategory> {
         "staged_tracked_paths" => Ok(LossCategory::StagedTrackedPaths),
         "unstaged_tracked_paths" => Ok(LossCategory::UnstagedTrackedPaths),
         "untracked_non_ignored_paths" => Ok(LossCategory::UntrackedNonIgnoredPaths),
+        "ignored" => Ok(LossCategory::IgnoredPaths),
         "initialized_submodule_state" => Ok(LossCategory::InitializedSubmoduleState),
         "detached_unreachable_commits" => Ok(LossCategory::DetachedUnreachableCommits),
         other => Err(DbError::Serialization(format!(
@@ -695,6 +696,9 @@ fn parse_close_loss_item(
         }
         (LossCategory::UntrackedNonIgnoredPaths, LossItemIdentity::GitPath(path)) => {
             Ok(CloseLossItem::UntrackedNonIgnoredPath(path))
+        }
+        (LossCategory::IgnoredPaths, LossItemIdentity::GitPath(path)) => {
+            Ok(CloseLossItem::IgnoredPath(path))
         }
         (LossCategory::InitializedSubmoduleState, LossItemIdentity::GitPath(path)) => {
             Ok(CloseLossItem::InitializedSubmoduleState(path))
@@ -1629,11 +1633,39 @@ pub(crate) async fn close_obligation_for_update(
     .ok_or_else(|| DbError::CloseFoundationNotFound(attempt_id.to_string()))
 }
 
+pub(crate) async fn ensure_close_retirement_loss_free_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    attempt_id: &str,
+) -> DbResult<()> {
+    let has_retained_loss: bool = sqlx::query_scalar(
+        "SELECT EXISTS(
+             SELECT 1 FROM close_retirement_losses loss
+             JOIN close_retirement_inspections inspection
+               ON inspection.attempt_id = loss.attempt_id
+              AND inspection.scope = loss.scope
+              AND inspection.generation = loss.generation
+             WHERE loss.attempt_id = ?1
+         )",
+    )
+    .bind(attempt_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    if has_retained_loss {
+        return Err(close_precondition(format!(
+            "attempt {attempt_id} retains inspected loss and cannot admit retirement"
+        )));
+    }
+    Ok(())
+}
+
 pub(crate) async fn set_close_phase_tx(
     tx: &mut Transaction<'_, Sqlite>,
     attempt_id: &str,
     phase: ClosePhase,
 ) -> DbResult<()> {
+    if phase == ClosePhase::RetirementRequested {
+        ensure_close_retirement_loss_free_tx(tx, attempt_id).await?;
+    }
     sqlx::query("UPDATE close_obligations SET phase = ?2 WHERE attempt_id = ?1")
         .bind(attempt_id)
         .bind(phase.as_str())
@@ -3254,55 +3286,18 @@ impl Database {
         Ok(())
     }
 
-    /// Confirms the exact loss snapshot before admitting resource retirement.
+    /// Rejects the retired legacy permission to confirm deletion of retained content.
     ///
     /// # Errors
-    /// Returns [`DbError`] when the attempt is not awaiting loss confirmation,
-    /// the supplied snapshot is stale, or no persisted loss remains to confirm.
+    /// Always returns [`DbError`]; retained loss evidence is not deletion authority.
     pub async fn confirm_close_loss_retirement(
         &self,
-        attempt_id: &CloseAttemptId,
-        snapshot: &CloseRetirementSnapshot,
+        _attempt_id: &CloseAttemptId,
+        _snapshot: &CloseRetirementSnapshot,
     ) -> DbResult<CloseObligation> {
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        let obligation = close_obligation_for_update(&mut tx, attempt_id.as_str()).await?;
-        if obligation.phase() != ClosePhase::AwaitingLossConfirmation {
-            return Err(close_precondition(format!(
-                "attempt {attempt_id} is not awaiting loss confirmation"
-            )));
-        }
-        if obligation.snapshot() != Some(snapshot) {
-            return Err(close_precondition(format!(
-                "attempt {attempt_id} loss confirmation snapshot is stale"
-            )));
-        }
-        let has_loss: bool = sqlx::query_scalar(
-            "SELECT EXISTS(
-                 SELECT 1 FROM close_retirement_losses loss
-                 JOIN close_retirement_inspections inspection
-                   ON inspection.attempt_id = loss.attempt_id
-                  AND inspection.scope = loss.scope
-                  AND inspection.generation = loss.generation
-                 WHERE loss.attempt_id = ?1
-               )",
-        )
-        .bind(attempt_id.as_str())
-        .fetch_one(&mut *tx)
-        .await?;
-        if !has_loss {
-            return Err(close_precondition(format!(
-                "attempt {attempt_id} has no exact loss evidence to confirm"
-            )));
-        }
-        set_close_phase_tx(
-            &mut tx,
-            attempt_id.as_str(),
-            ClosePhase::RetirementRequested,
-        )
-        .await?;
-        let confirmed = close_obligation_for_update(&mut tx, attempt_id.as_str()).await?;
-        tx.commit().await?;
-        Ok(confirmed)
+        Err(close_precondition(
+            "retained loss cannot be confirmed for destructive retirement",
+        ))
     }
 
     /// Reads the current Close authority, including a stopped outcome, from one `SQLite` snapshot.
@@ -4627,6 +4622,7 @@ impl Database {
                 request.attempt_id
             )));
         }
+        ensure_close_retirement_loss_free_tx(&mut tx, request.attempt_id.as_str()).await?;
         Self::insert_close_retirement_dispatch_tx(&mut tx, &request).await?;
         tx.commit().await?;
         Ok(())
@@ -8233,6 +8229,7 @@ impl Database {
         let phase = if request.scopes.iter().any(|scope| !scope.losses.is_empty()) {
             ClosePhase::AwaitingLossConfirmation
         } else {
+            ensure_close_retirement_loss_free_tx(tx, request.attempt_id.as_str()).await?;
             ClosePhase::RetirementRequested
         };
         sqlx::query(
@@ -11391,6 +11388,7 @@ mod tests {
                 snapshot: scope_snapshot.clone(),
                 losses: vec![
                     CloseLossItem::UntrackedNonIgnoredPath(non_utf8_path.clone()),
+                    CloseLossItem::IgnoredPath(GitPathIdentity::from_bytes(b"ignored.bin".to_vec())),
                     CloseLossItem::StagedTrackedPath(lossy_left.clone()),
                     CloseLossItem::StagedTrackedPath(lossy_right.clone()),
                     CloseLossItem::DetachedUnreachableCommit(oid.clone()),
@@ -11412,11 +11410,16 @@ mod tests {
         assert_eq!(inspections[0].snapshot.clone(), scope_snapshot.clone());
 
         let losses = db.list_close_retirement_losses("attempt-1").await.unwrap();
-        assert_eq!(losses.len(), 4);
+        assert_eq!(losses.len(), 5);
         assert!(losses.iter().all(|loss| loss.snapshot == scope_snapshot));
         assert!(losses.iter().any(|loss| {
             loss.item == CloseLossItem::UntrackedNonIgnoredPath(non_utf8_path.clone())
         }));
+        assert!(losses.iter().any(|loss| {
+            loss.item
+                == CloseLossItem::IgnoredPath(GitPathIdentity::from_bytes(b"ignored.bin".to_vec()))
+        }));
+
         assert!(losses
             .iter()
             .any(|loss| loss.item == CloseLossItem::StagedTrackedPath(lossy_left.clone())));
@@ -11699,12 +11702,28 @@ mod tests {
             .confirm_close_loss_retirement(&attempt_id, &first_token)
             .await
             .unwrap_err();
-        assert!(stale.to_string().contains("snapshot is stale"));
-        let confirmed = db
+        assert!(stale
+            .to_string()
+            .contains("cannot be confirmed for destructive retirement"));
+        let confirmation = db
             .confirm_close_loss_retirement(&attempt_id, &second_token)
             .await
-            .unwrap();
-        assert_eq!(confirmed.phase(), ClosePhase::RetirementRequested);
+            .unwrap_err();
+        assert!(confirmation
+            .to_string()
+            .contains("cannot be confirmed for destructive retirement"));
+        let after_confirmation = db.get_close_obligation(attempt_id.as_str()).await.unwrap();
+        assert_eq!(after_confirmation.phase(), ClosePhase::AwaitingLossConfirmation);
+        assert_eq!(after_confirmation.snapshot(), Some(&second_token));
+        assert_eq!(
+            db.list_close_retirement_losses(attempt_id.as_str())
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|loss| loss.item)
+                .collect::<Vec<_>>(),
+            vec![second_loss]
+        );
     }
 
     #[tokio::test]
@@ -18084,6 +18103,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn generic_dispatch_rejects_retained_loss_in_anomalous_retirement_phase_without_writes() {
+        let db = Database::open_in_memory().await.unwrap();
+        create_root(&db, "root").await;
+        let scope = allocate_scope_worktree(&db, "root").await;
+        db.begin_close_foundation(&product_id("root"), &transcript_id("root"), "attempt-lossy-dispatch")
+            .await
+            .unwrap();
+        set_close_phase(&db, "attempt-lossy-dispatch", ClosePhase::AwaitingRetirementInspection).await;
+        let snapshot = CloseRetirementSnapshot::parse("loss-generation", "loss-fingerprint").unwrap();
+        let loss = CloseLossItem::UntrackedNonIgnoredPath(GitPathIdentity::from_bytes(b"retained-loss".to_vec()));
+        db.replace_close_inspection(ReplaceCloseInspectionRequest {
+            attempt_id: CloseAttemptId::parse("attempt-lossy-dispatch").unwrap(),
+            scopes: vec![ReplaceCloseInspectionScopeRequest {
+                scope: scope.clone(),
+                snapshot: snapshot.clone(),
+                losses: vec![loss],
+            }],
+        })
+        .await
+        .unwrap();
+        sqlx::query("UPDATE close_obligations SET phase = 'retirement_requested' WHERE attempt_id = ?1")
+            .bind("attempt-lossy-dispatch")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let snapshot = current_test_snapshot(&db, "attempt-lossy-dispatch").await;
+        let resource = RetiredResourceIdentity::parse(
+            RetiredResourceKind::Worktree,
+            LossItemIdentity::Worktree(current_test_worktree(&db, &scope).await),
+        )
+        .unwrap();
+        capture_test_inventory(
+            &db,
+            "attempt-lossy-dispatch",
+            &scope,
+            &snapshot,
+            vec![resource.clone()],
+        )
+        .await;
+
+        let rejected = db.record_close_retirement_dispatch(RecordCloseRetirementDispatchRequest {
+            attempt_id: CloseAttemptId::parse("attempt-lossy-dispatch").unwrap(),
+            scope,
+            snapshot,
+            resource,
+        }).await;
+        assert!(matches!(rejected, Err(DbError::CloseFoundationPrecondition(message)) if message.contains("retains inspected loss")));
+        assert_eq!(db.get_close_obligation("attempt-lossy-dispatch").await.unwrap().phase(), ClosePhase::RetirementRequested);
+        assert_eq!(db.list_close_retirement_losses("attempt-lossy-dispatch").await.unwrap().len(), 1);
+        let dispatches: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM close_retirement_resource_dispatches WHERE attempt_id = ?1")
+            .bind("attempt-lossy-dispatch")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(dispatches, 0);
+    }
+
+    #[tokio::test]
     async fn worktree_cleanup_plan_round_trips_exact_path_and_rejects_divergence() {
         let db = Database::open_in_memory().await.unwrap();
         create_root(&db, "root").await;
@@ -18848,16 +18925,29 @@ mod tests {
                 &stale,
             )
             .await,
-            Err(DbError::CloseFoundationPrecondition(message)) if message.contains("snapshot is stale")
+            Err(DbError::CloseFoundationPrecondition(message))
+                if message.contains("cannot be confirmed for destructive retirement")
         ));
-        let confirmed = db
+        let exact_confirmation = db
             .confirm_close_loss_retirement(
                 &CloseAttemptId::parse("attempt-confirm-loss").unwrap(),
                 obligation.snapshot().unwrap(),
             )
             .await
-            .unwrap();
-        assert_eq!(confirmed.phase(), ClosePhase::RetirementRequested);
+            .unwrap_err();
+        assert!(exact_confirmation
+            .to_string()
+            .contains("cannot be confirmed for destructive retirement"));
+        let after_confirmation = db.get_close_obligation("attempt-confirm-loss").await.unwrap();
+        assert_eq!(after_confirmation.phase(), ClosePhase::AwaitingLossConfirmation);
+        assert_eq!(after_confirmation.snapshot(), obligation.snapshot());
+        assert_eq!(
+            db.list_close_retirement_losses("attempt-confirm-loss")
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[tokio::test]
@@ -18909,6 +18999,28 @@ mod tests {
         .is_err());
         let obligation = db.get_close_obligation("attempt-lossy").await.unwrap();
         assert_eq!(obligation.phase(), ClosePhase::AwaitingRetirementInspection);
+        let mut tx = db.pool().begin().await.unwrap();
+        let phase_guard = set_close_phase_tx(
+            &mut tx,
+            "attempt-lossy",
+            ClosePhase::RetirementRequested,
+        )
+        .await;
+        assert!(matches!(
+            phase_guard,
+            Err(DbError::CloseFoundationPrecondition(message))
+                if message.contains("retains inspected loss")
+        ));
+        tx.rollback().await.unwrap();
+        let obligation = db.get_close_obligation("attempt-lossy").await.unwrap();
+        assert_eq!(obligation.phase(), ClosePhase::AwaitingRetirementInspection);
+        assert_eq!(
+            db.list_close_retirement_losses("attempt-lossy")
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[tokio::test]

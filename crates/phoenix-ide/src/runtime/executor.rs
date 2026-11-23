@@ -3461,7 +3461,8 @@ where
                             pending_native_close_initial = Some(continuation);
                             native_close_step_ready = false;
                         }
-                        Ok(native_close::NativeCloseInitialContinuationPhase::ClassifyingInspectionFailure
+                        Ok(native_close::NativeCloseInitialContinuationPhase::ClassifyingLosses
+                            | native_close::NativeCloseInitialContinuationPhase::ClassifyingInspectionFailure
                             | native_close::NativeCloseInitialContinuationPhase::ClassifyingExitInterruption
                             | native_close::NativeCloseInitialContinuationPhase::ObservingTerminal) => {
                             pending_native_close_initial = Some(continuation);

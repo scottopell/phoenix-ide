@@ -28,6 +28,16 @@ async fn registered_native_close_physically_retires_worktree_only_and_replays_wi
 }
 
 #[tokio::test]
+async fn registered_native_close_with_loss_content_stops_incomplete_without_retirement() {
+    run_public_worktree_close(WorktreeJourney::RetainContentBlockers).await;
+}
+
+#[tokio::test]
+async fn registered_native_close_loss_classification_rollback_retries_without_recollection() {
+    run_public_worktree_close(WorktreeJourney::RetryLossClassification).await;
+}
+
+#[tokio::test]
 async fn registered_native_close_with_production_detector_retires_worktree_and_replays() {
     // Global dispatch reaches the physical worker's native thread. This exact test
     // also runs in its own hosted invocation; no production logging/exporters.
@@ -54,6 +64,8 @@ async fn registered_native_close_after_source_stop_preserves_reused_path_and_ori
 enum WorktreeJourney {
     Retire,
     RetireWithProductionDetector,
+    RetainContentBlockers,
+    RetryLossClassification,
     StopBeforeAdmission,
     StopBeforeAdmissionWithReusedPath,
 }
@@ -416,8 +428,25 @@ async fn run_public_worktree_close(journey: WorktreeJourney) {
     );
     let fixture = CloseFixture::new().await;
     let (scope, original_worktree) = git.register(&fixture).await;
+    let retry_loss_classification = matches!(journey, WorktreeJourney::RetryLossClassification);
+    let content_blocked = matches!(
+        journey,
+        WorktreeJourney::RetainContentBlockers | WorktreeJourney::RetryLossClassification
+    );
+    if content_blocked {
+        std::fs::write(git.repo.join(".git/info/exclude"), b"build/\n").unwrap();
+        std::fs::create_dir(git.worktree.join("build")).unwrap();
+        std::fs::write(git.worktree.join("build/a.bin"), b"retained build a").unwrap();
+        std::fs::write(git.worktree.join("build/b.bin"), b"retained build b").unwrap();
+        std::fs::write(git.worktree.join("tracked.txt"), b"unpreserved edits\n").unwrap();
+    }
     let mut backend = CloseFixture::backend(fixture.db.clone());
-    if matches!(journey, WorktreeJourney::Retire) {
+    if matches!(
+        journey,
+        WorktreeJourney::Retire
+            | WorktreeJourney::RetainContentBlockers
+            | WorktreeJourney::RetryLossClassification
+    ) {
         // Qualify public admission and real Git/filesystem retirement independently
         // of ambient runner processes. Production inspection gaps remain blocking;
         // deterministic Linux detector tests qualify that separate safety boundary.
@@ -466,6 +495,11 @@ async fn run_public_worktree_close(journey: WorktreeJourney) {
     )
     .with_fatal_local_authority_fence(Arc::clone(&backend.fatal_local_authority_fence))
     .with_native_task_admission_database(fixture.db.clone());
+
+    let (phase_tx, mut phases) = mpsc::unbounded_channel();
+    if retry_loss_classification {
+        actor.native_close_phase_observer = Some(phase_tx);
+    }
 
     let (sender, receiver) = mpsc::channel(4);
     let (watch_tx, state_rx) = tokio::sync::watch::channel(fixture.state.clone());
@@ -533,12 +567,105 @@ async fn run_public_worktree_close(journey: WorktreeJourney) {
     // This call crosses registered coordinator ingress, application service,
     // RuntimeManager source admission, and the real actor's run_inner loop.
     // No worker, private Git adapter, alternate delete, or process is supplied.
-    let output = tokio::time::timeout(
-        Duration::from_secs(10),
-        tool.run(input.clone(), context.clone()),
-    )
-    .await
-    .expect("public native Close must return a bounded admission result");
+    if retry_loss_classification {
+        sqlx::query(
+            "CREATE TRIGGER reject_loss_classification_outbox BEFORE INSERT ON coordinator_watch_events
+             WHEN NEW.route_kind = 'mandatory_close_failure'
+             BEGIN SELECT RAISE(ABORT, 'injected loss classification outbox failure'); END",
+        )
+        .execute(fixture.db.pool())
+        .await
+        .unwrap();
+    }
+    let mut close = Box::pin(tool.run(input.clone(), context.clone()));
+    if retry_loss_classification {
+        use native_close::NativeCloseInitialContinuationPhase as Phase;
+
+        tokio::select! {
+            _ = close.as_mut() => panic!("loss classification cannot reply while its outbox fails"),
+            () = async {
+                await_native_close_phase(&mut phases, Phase::ClassifyingLosses).await;
+                // The first signal stores the collected intent. The next completed
+                // step reports ClassifyingLosses only after definite rollback.
+                let phase = tokio::time::timeout(Duration::from_secs(10), phases.recv())
+                    .await
+                    .expect("periodic loss classification must run")
+                    .expect("owning actor must retain its phase observer");
+                assert_eq!(phase, Phase::ClassifyingLosses);
+            } => {}
+        }
+        let attempt: String = sqlx::query_scalar(
+            "SELECT attempt_id FROM native_close_initial_receipts WHERE request_id = ?1",
+        )
+        .bind(fixture.command.request_id().to_string())
+        .fetch_one(fixture.db.pool())
+        .await
+        .unwrap();
+        let run = CloseRunRef::initial(CloseAttemptId::parse(&attempt).unwrap());
+        assert_eq!(
+            fixture.db.get_close_obligation(&attempt).await.unwrap().phase(),
+            ClosePhase::AwaitingRetirementInspection
+        );
+        assert_eq!(
+            fixture.db.get_close_run(&run).await.unwrap().status,
+            CloseRunStatus::Running
+        );
+        assert!(fixture
+            .db
+            .list_close_retirement_losses(&attempt)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(fixture
+            .db
+            .list_close_cleanup_failures(&attempt)
+            .await
+            .unwrap()
+            .is_empty());
+        let outbox_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM coordinator_watch_events WHERE route_kind = 'mandatory_close_failure'",
+        )
+        .fetch_one(fixture.db.pool())
+        .await
+        .unwrap();
+        assert_eq!(outbox_count, 0);
+        assert_no_initial_inspection_writes(&fixture.db, &attempt).await;
+        assert_eq!(backend.fatal_local_authority_fence.owner_count(), 1);
+        assert!(!backend.fatal_local_authority_fence.fatal_authority_loss_is_latched());
+        let admission = backend.conversation_admission(fixture.target.as_str()).await;
+        assert!(Arc::clone(&admission).try_lock_owned().is_err());
+        assert_eq!(physical_snapshot(&git.root), physical_before_admission);
+
+        // A recollection would add a fourth loss. Retry must use the already
+        // collected three-item intent, not this changed filesystem observation.
+        std::fs::write(
+            git.worktree.join("build/after-inspection.bin"),
+            b"not in collected intent",
+        )
+        .unwrap();
+        sqlx::query("DROP TRIGGER reject_loss_classification_outbox")
+            .execute(fixture.db.pool())
+            .await
+            .unwrap();
+    }
+    let output = tokio::time::timeout(Duration::from_secs(10), close.as_mut())
+        .await
+        .expect("public native Close must return a bounded admission result");
+    drop(close);
+    if retry_loss_classification {
+        use native_close::NativeCloseInitialContinuationPhase as Phase;
+
+        while let Ok(phase) = phases.try_recv() {
+            assert!(
+                matches!(
+                    phase,
+                    Phase::ClassifyingLosses | Phase::ObservingTerminal | Phase::Finished
+                ),
+                "classification retry must not recollect or dispatch: {phase:?}"
+            );
+        }
+        std::fs::remove_file(git.worktree.join("build/after-inspection.bin")).unwrap();
+    }
     if stop_before_admission {
         assert!(
             !output.is_success(),
@@ -600,6 +727,55 @@ async fn run_public_worktree_close(journey: WorktreeJourney) {
             git.run(&git.repo, &["worktree", "list", "--porcelain", "-z"]),
             registrations_before_admission
         );
+        git.assert_untargeted_state_preserved();
+    } else if content_blocked {
+        use phoenix_core::domain::close::{CloseLossItem, GitPathIdentity};
+
+        assert!(output.is_success(), "{}", output.output());
+        let admitted: Value = serde_json::from_str(&output.output()).unwrap();
+        assert_eq!(admitted["status"], "newly_admitted");
+        let attempt =
+            CloseAttemptId::parse(admitted["admitted"]["attempt_id"].as_str().unwrap()).unwrap();
+        let run = CloseRunRef::initial(attempt.clone());
+        // Public ingress releases the response only after exact terminal observation.
+        let obligation = fixture.db.get_close_obligation(attempt.as_str()).await.unwrap();
+        assert_eq!(obligation.phase(), ClosePhase::Completed);
+        assert_eq!(obligation.close_outcome(), Some(CloseCompletionOutcome::CloseIncomplete));
+        assert_eq!(fixture.db.get_close_run(&run).await.unwrap().status, CloseRunStatus::Stopped);
+        let losses = fixture.db.list_close_retirement_losses(attempt.as_str()).await.unwrap();
+        assert_eq!(losses.len(), 3);
+        for item in [
+            CloseLossItem::UnstagedTrackedPath(GitPathIdentity::from_bytes(b"tracked.txt".to_vec())),
+            CloseLossItem::IgnoredPath(GitPathIdentity::from_bytes(b"build/a.bin".to_vec())),
+            CloseLossItem::IgnoredPath(GitPathIdentity::from_bytes(b"build/b.bin".to_vec())),
+        ] {
+            assert!(losses.iter().any(|loss| loss.scope == scope && loss.item == item));
+        }
+        let certainty: String = sqlx::query_scalar(
+            "SELECT stop_certainty FROM close_cleanup_failures WHERE attempt_id = ?1",
+        ).bind(attempt.as_str()).fetch_one(fixture.db.pool()).await.unwrap();
+        assert_eq!(certainty, "shutdown_uncertain");
+        let failures = fixture.db.list_close_cleanup_failures(attempt.as_str()).await.unwrap();
+        assert_eq!(failures.len(), 1);
+        let events: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM coordinator_watch_events WHERE mandatory_failure_occurrence_id = ?1",
+        ).bind(&failures[0].occurrence.failure_occurrence_id).fetch_one(fixture.db.pool()).await.unwrap();
+        assert_eq!(events, 1);
+        assert_eq!(close_row_counts(&fixture).await, vec![1, 1, 0, 1, 0, 0, 0, 0, 1]);
+        assert!(!fixture.db.get_conversation(TARGET_ID).await.unwrap().archived);
+        assert_eq!(fixture.db.get_conversation_work_scope_context(TARGET_ID).await.unwrap().1, WorkScopeLifecycle::Active);
+        assert_eq!(physical_snapshot(&git.root), physical_before_admission);
+        assert_eq!(directory_identity(&git.worktree), git.checkout_identity);
+        assert_eq!(directory_identity(&git.admin), git.admin_identity);
+        let before_replay = durable_native_close_rows(&fixture, &run).await;
+        let replay = tokio::time::timeout(Duration::from_secs(10), tool.run(input, context))
+            .await.expect("blocked exact-source replay must be bounded");
+        assert!(replay.is_success(), "{}", replay.output());
+        let replay: Value = serde_json::from_str(&replay.output()).unwrap();
+        assert_eq!(replay["status"], "replay");
+        assert_eq!(replay["admitted"], admitted["admitted"]);
+        assert_eq!(durable_native_close_rows(&fixture, &run).await, before_replay);
+        assert_eq!(physical_snapshot(&git.root), physical_before_admission);
         git.assert_untargeted_state_preserved();
     } else {
         assert!(output.is_success(), "{}", output.output());
