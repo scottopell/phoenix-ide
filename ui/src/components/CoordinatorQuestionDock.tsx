@@ -37,26 +37,6 @@ function useMobileQuestionLayout(): boolean {
   return mobile;
 }
 
-function inertOutsideDialog(dialog: HTMLDialogElement): () => void {
-  const changed: Array<{ element: HTMLElement; inert: boolean }> = [];
-  let active: HTMLElement = dialog;
-  let parent = active.parentElement;
-
-  while (parent) {
-    for (const child of Array.from(parent.children)) {
-      if (!(child instanceof HTMLElement) || child === active) continue;
-      changed.push({ element: child, inert: child.inert });
-      child.inert = true;
-    }
-    active = parent;
-    parent = active.parentElement;
-  }
-
-  return () => {
-    for (const { element, inert } of changed) element.inert = inert;
-  };
-}
-
 function setVisualViewportBounds(dialog: HTMLDialogElement): () => void {
   const viewport = window.visualViewport;
   const update = () => {
@@ -76,18 +56,6 @@ function setVisualViewportBounds(dialog: HTMLDialogElement): () => void {
     viewport?.removeEventListener('scroll', update);
     window.removeEventListener('resize', update);
   };
-}
-
-function showDialog(dialog: HTMLDialogElement, modal: boolean): void {
-  if (dialog.open) dialog.close();
-  if (modal && typeof dialog.showModal === 'function') {
-    dialog.showModal();
-  } else if (!modal && typeof dialog.show === 'function') {
-    dialog.show();
-  } else {
-    dialog.setAttribute('open', '');
-    if (modal) dialog.dataset['fallbackModal'] = '';
-  }
 }
 
 function CoordinatorQuestionCard({
@@ -117,19 +85,23 @@ function CoordinatorQuestionCard({
       return;
     }
 
-    const restoreInert = mobile ? inertOutsideDialog(dialog) : undefined;
     const clearViewportBounds = mobile ? setVisualViewportBounds(dialog) : undefined;
-    showDialog(dialog, mobile);
+    if (mobile) dialog.showModal();
+    else dialog.show();
+
+    dialog.querySelector<HTMLElement>('.confirm-dialog .btn-secondary')?.focus({ preventScroll: true });
 
     const focusFrame = mobile
-      ? requestAnimationFrame(() => dialog.querySelector<HTMLElement>('.question-panel')?.focus({ preventScroll: true }))
+      ? requestAnimationFrame(() => {
+          if (!dialog.querySelector('.confirm-dialog')) {
+            dialog.querySelector<HTMLElement>('.question-panel')?.focus({ preventScroll: true });
+          }
+        })
       : undefined;
 
     return () => {
       if (focusFrame !== undefined) cancelAnimationFrame(focusFrame);
       clearViewportBounds?.();
-      restoreInert?.();
-      delete dialog.dataset['fallbackModal'];
       if (dialog.open) dialog.close();
     };
   }, [expanded, mobile]);

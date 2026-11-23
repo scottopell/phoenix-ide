@@ -92,7 +92,9 @@ async function trial(version, base, viewport, mode, run, isolation = false) {
     if (p === '/api/coordinator/questions' && route.request().method() === 'GET') { feedLoaded = true; return json(pendingQuestions); }
     if (/\/api\/coordinator\/questions\/[^/]+\/(answer|dismiss)$/.test(p) && route.request().method() === 'POST') {
       if (answerError) return route.fulfill({ status: 409, contentType: 'application/json', body: JSON.stringify({ error: 'Question is obsolete. Refresh before answering.' }) });
-      pendingQuestions = []; return json({ success: true });
+      const requestId = decodeURIComponent(p.split('/').at(-2));
+      pendingQuestions = pendingQuestions.filter(question => question.request_id !== requestId);
+      return json({ success: true });
     }
     if (p === '/api/global/coordinator') return json({ conversation, created: false });
     if (p === '/api/global/coordinator/reads/route' && route.request().method() === 'POST') {
@@ -129,9 +131,10 @@ async function trial(version, base, viewport, mode, run, isolation = false) {
   const record = { name, version, viewport, mode, run, isolation, conditions, synthetic: true, requests: [], diagnostics, unknown };
   try {
     if (mode === 'warm-notification') {
+      const feedResponse = page.waitForResponse(response => new URL(response.url()).pathname === '/api/coordinator/questions');
       await page.goto(`${base}/conversations`, { waitUntil: 'domcontentloaded' });
-      await page.waitForFunction(() => document.querySelector('.desktop-layout, .app-layout, nav') !== null);
-      if (!feedLoaded) await page.waitForResponse(response => response.url().includes('/api/coordinator/questions'));
+      await page.locator('.layout-main').waitFor({ state: 'visible' });
+      await (await feedResponse).finished();
       if (!feedLoaded) throw new Error('Warm shell did not acquire question feed');
     }
     const before = metrics(await cdp.send('Performance.getMetrics'));
@@ -151,6 +154,7 @@ async function trial(version, base, viewport, mode, run, isolation = false) {
     record.question_usable_ms = performance.now() - start;
     record.history_replied_at_question_usable = historyReplied;
     if (isolation && historyReplied) throw new Error('Controlled history replied before question interaction');
+    if (isolation && await page.getByText(marker, { exact: true }).count()) throw new Error('Transcript bypassed controlled history gate');
     release();
     // Return without dismissing on candidate mobile; baseline has no modal.
     const returnButton = page.getByRole('button', { name: 'Return to conversation', exact: true });
@@ -162,15 +166,15 @@ async function trial(version, base, viewport, mode, run, isolation = false) {
     record.history_requested = historyPending;
     longTasks.push(...await page.evaluate(() => window.__questionLongTasks));
     record.long_tasks = longTasks;
-    await page.screenshot({ path: path.join(out, `${name}-conversation.png`) });
+    await page.screenshot({ animations: 'disabled', path: path.join(out, `${name}-conversation.png`) });
     const launcher = page.getByRole('button', { name: /Answer Ember/ });
     if (await launcher.isVisible()) await launcher.click();
     if (await custom.inputValue() !== 'Disposable retained custom answer') throw new Error('Return lost custom answer');
-    await page.screenshot({ path: path.join(out, `${name}-question.png`) });
+    await page.screenshot({ animations: 'disabled', path: path.join(out, `${name}-question.png`) });
     if (version === 'candidate' && isolation && viewport.width === 393) {
       await qualifyQuestionSurface({ page, out, questions,
         setQuestions: next => { pendingQuestions = next; },
-        setAnswerError: value => { answerFails = value; },
+        setAnswerError: value => { answerError = value; },
       });
     }
     if (unknown.length) throw new Error(`Unmodelled requests: ${JSON.stringify(unknown)}`);
@@ -178,7 +182,7 @@ async function trial(version, base, viewport, mode, run, isolation = false) {
     record.ok = true;
   } catch (error) {
     record.ok = false; record.error = String(error); failed = true;
-    await page.screenshot({ path: path.join(out, `${name}-failure.png`) }).catch(() => {});
+    await page.screenshot({ animations: 'disabled', path: path.join(out, `${name}-failure.png`) }).catch(() => {});
   } finally {
     release();
     record.requests = [...requests.values()];
@@ -191,6 +195,7 @@ async function trial(version, base, viewport, mode, run, isolation = false) {
 }
 try {
   for (const viewport of [{ width: 393, height: 852 }, { width: 1440, height: 900 }]) {
+    for (const [version, url] of versions) if (!await trial(version, url, viewport, 'cold-global', 0, true)) throw new Error('History isolation or surface journey failed');
     for (const mode of ['cold-global', 'cold-link', 'warm-notification']) {
       // Alternate exact base/candidate within each trial to bound host drift.
       for (let run = -1; run < runs; run++) {
@@ -199,7 +204,6 @@ try {
         }
       }
     }
-    for (const [version, url] of versions) if (!await trial(version, url, viewport, 'cold-global', 0, true)) throw new Error('History isolation failed');
   }
 } catch (error) { failed = true; console.error(error); }
 finally {

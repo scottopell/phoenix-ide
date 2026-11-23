@@ -26,6 +26,25 @@ function setMobile(next: boolean): void {
   act(() => mediaListeners.forEach((listener) => listener()));
 }
 
+function mockAnimationFrames(): () => void {
+  const frames = new Map<number, FrameRequestCallback>();
+  let nextId = 0;
+  vi.spyOn(window, 'requestAnimationFrame').mockImplementation((callback) => {
+    frames.set(++nextId, callback);
+    return nextId;
+  });
+  vi.spyOn(window, 'cancelAnimationFrame').mockImplementation((id) => {
+    frames.delete(id);
+  });
+  return () => {
+    act(() => {
+      const pending = [...frames.values()];
+      frames.clear();
+      for (const callback of pending) callback(0);
+    });
+  };
+}
+
 function restoreProperty(target: object, key: PropertyKey, descriptor: PropertyDescriptor | undefined): void {
   if (descriptor) Object.defineProperty(target, key, descriptor);
   else Reflect.deleteProperty(target, key);
@@ -168,6 +187,85 @@ describe('Ember questions (REQ-AUQ-011)', () => {
     expect(document.querySelector('.question-panel')).toBe(panel);
     expect(screen.getByTitle('Select First')).toHaveClass('selected');
     expect(screen.getByRole('button', { name: 'Submit' })).toBeEnabled();
+  });
+
+  it('clears a dismiss confirmation on Return and retains the selection when reopened', async () => {
+    mobile = true;
+    const dismiss = vi.spyOn(api, 'dismissCoordinatorQuestion');
+    act(() => receiveCoordinatorQuestions([open('q-1', 'Merge now?')]));
+    render(<CoordinatorQuestionDock />);
+
+    const dialog = screen.getByRole('dialog');
+    const panel = document.querySelector('.question-panel');
+    fireEvent.click(screen.getByTitle('Select First'));
+    fireEvent.click(screen.getByRole('button', { name: 'Dismiss' }));
+    expect(screen.getByText('Dismiss structured questions?')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Return to conversation' }));
+    expect(dialog).not.toHaveAttribute('open');
+    expect(screen.queryByText('Dismiss structured questions?')).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Answer Ember’s question' }));
+    await waitFor(() => expect(panel).toHaveFocus());
+    expect(dialog).toHaveAttribute('open');
+    expect(document.querySelector('.question-panel')).toBe(panel);
+    expect(screen.queryByText('Dismiss structured questions?')).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Cancel', exact: true })).not.toBeInTheDocument();
+    expect(screen.getByTitle('Select First')).toHaveClass('selected');
+    expect(screen.getByRole('button', { name: 'Submit' })).toBeEnabled();
+    expect(dismiss).not.toHaveBeenCalled();
+  });
+
+  it('does not let the pending mobile focus frame steal focus from confirmation Cancel', () => {
+    const flushFrames = mockAnimationFrames();
+    mobile = true;
+    act(() => receiveCoordinatorQuestions([open('q-1', 'Merge now?')]));
+    render(<CoordinatorQuestionDock />);
+
+    const dialog = screen.getByRole('dialog');
+    fireEvent.click(screen.getByRole('button', { name: 'Dismiss' }));
+    const cancel = screen.getByRole('button', { name: 'Cancel', exact: true });
+    expect(cancel).toHaveFocus();
+
+    flushFrames();
+
+    expect(cancel).toHaveFocus();
+    expect(dialog).toHaveAttribute('open');
+    expect(dialog).toContainElement(cancel);
+    expect(showModal).toHaveBeenCalledOnce();
+  });
+
+  it('refocuses confirmation Cancel when crossing from desktop to the mobile modal', () => {
+    const flushFrames = mockAnimationFrames();
+    act(() => receiveCoordinatorQuestions([open('q-1', 'Merge now?')]));
+    render(<CoordinatorQuestionDock />);
+
+    const dialog = screen.getByRole('dialog');
+    const panel = document.querySelector('.question-panel');
+    fireEvent.click(screen.getByRole('button', { name: 'Dismiss' }));
+    const cancel = screen.getByRole('button', { name: 'Cancel', exact: true });
+    expect(cancel).toHaveFocus();
+    showModal.mockImplementationOnce(function (this: HTMLDialogElement) {
+      this.setAttribute('open', '');
+      this.querySelector<HTMLElement>('.question-panel')?.focus();
+    });
+
+    setMobile(true);
+
+    expect(showModal).toHaveBeenCalledOnce();
+    expect(screen.getByRole('dialog')).toBe(dialog);
+    expect(dialog).toHaveAttribute('open');
+    expect(document.querySelector('.question-panel')).toBe(panel);
+    expect(dialog).toContainElement(cancel);
+    expect(cancel).toHaveFocus();
+    flushFrames();
+    expect(cancel).toHaveFocus();
+
+    fireEvent.click(cancel);
+    expect(screen.queryByText('Dismiss structured questions?')).not.toBeInTheDocument();
+    expect(dialog).toHaveAttribute('open');
+    expect(screen.queryByRole('button', { name: 'Answer Ember’s question' })).not.toBeInTheDocument();
+    expect(showModal).toHaveBeenCalledOnce();
   });
 
   it('treats Escape and the native cancel request as Return, never as Dismiss', async () => {

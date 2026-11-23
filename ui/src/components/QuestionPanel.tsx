@@ -94,6 +94,9 @@ export function QuestionPanel({
     isError: boolean;
   } | null>(null);
   const [showConfirmDismiss, setShowConfirmDismiss] = useState(false);
+  useEffect(() => {
+    if (!active) setShowConfirmDismiss(false);
+  }, [active]);
   const confirmDismissVisibleRef = useRef(showConfirmDismiss);
   useLayoutEffect(() => {
     confirmDismissVisibleRef.current = showConfirmDismiss;
@@ -631,7 +634,7 @@ export function QuestionPanel({
         )}
 
         <ConfirmDialog
-          visible={showConfirmDismiss}
+          visible={active && showConfirmDismiss}
           title="Dismiss structured questions?"
           message={actions.dismissConfirmMessage}
           confirmText="Dismiss"

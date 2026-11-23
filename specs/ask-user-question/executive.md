@@ -41,4 +41,22 @@ selected labels, preview content, and user notes.
 | **REQ-AUQ-011:** Answer Coordinator Questions Outside the Transcript | 🔄 In review | `GET /api/coordinator/questions`, answer/dismiss endpoints, retrying reply delivery in input discovery sent with the `coordinator_question_reply` input origin under a reserved `coordinator-question-reply:` message id, with delivery recorded by acceptance triggers on `durable_turns` and `steering_messages`; `CoordinatorQuestionDock` on Ember's page, Ember entry count, question notifications (5 s poll, which also runs in hidden tabs so notifications arrive; opens `/global`). Unit and runtime tests; not checked in a browser; not deployed. |
 | **REQ-AUQ-012:** Withdraw and List Coordinator Questions | 🔄 In review | `withdraw_user_question`, `list_user_questions`; database and tool tests. Not deployed. |
 
-**Progress:** 9 of 12 complete; REQ-AUQ-010 to REQ-AUQ-012 in review
+| **REQ-AUQ-013:** Focused Mobile Coordinator Questions | 🔄 Qualification pending | Native mobile modal, one content scroller, non-destructive Return, retained request input, inactive keyboard scopes, visual viewport bounds. Hosted browser journeys and pinned-base loading comparison are being qualified in PR #1151. |
+
+**Progress:** 9 of 13 complete; REQ-AUQ-010 to REQ-AUQ-012 in review, REQ-AUQ-013 qualification pending.
+
+## Mobile surface qualification
+
+The conversation stays mounted and continues loading behind the native modal.
+The question feed already mounts independently of transcript history; the focused
+surface is not a transcript-fetch cancellation or a proven loading optimization.
+The hosted comparison uses production bundles, intercepted synthetic HTTP payloads,
+4× CPU slowdown, 400 ms modeled API latency and throttled asset requests. A client
+EventSource fixture excludes real SSE transport and server/database latency.
+
+Qualification is incomplete: run 45281357729 completed mobile cold/global and
+cold/deep-link trials but stopped at an invalid mobile warm-shell selector before
+history isolation and surface journeys. Its screenshots also captured an opening
+animation rather than settled opacity. Follow-up harness corrections and focus
+regressions require a new exact-head hosted run. No real iPhone keyboard or
+production loading-cause claim is established.

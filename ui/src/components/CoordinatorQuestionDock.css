@@ -73,12 +73,7 @@
   }
 
   .coordinator-question-dock__dialog::backdrop {
-    background: color-mix(in srgb, var(--bg-primary) 76%, transparent);
-    backdrop-filter: blur(3px);
-  }
-
-  .coordinator-question-dock__dialog[data-fallback-modal] {
-    z-index: 1000;
+    background: var(--bg-primary);
   }
 
   .coordinator-question-dock__surface {
