@@ -4945,7 +4945,8 @@ impl Database {
         language: phoenix_core::llm_language::LlmLanguage,
     ) -> DbResult<bool> {
         let result = sqlx::query(
-            "UPDATE conversations SET llm_language = ?1 WHERE id = ?2 AND coordinator_head = 1 AND runtime_role = 'coordinator' AND state_kind = 'idle'",
+            "UPDATE conversations SET llm_language = ?1 WHERE id = ?2 AND coordinator_head = 1 AND runtime_role = 'coordinator' AND state_kind = 'idle'
+             AND NOT EXISTS (SELECT 1 FROM durable_turns WHERE conversation_id = ?2 AND disposition = 'Runtime' AND terminal_kind IS NULL AND owns_conversation = 1)",
         )
         .bind(language.as_str())
         .bind(conversation_id)
@@ -22707,6 +22708,72 @@ mod tests {
                 .await
                 .unwrap();
         assert!(!columns.iter().any(|column| column == "conversation_kind"));
+    }
+
+    #[tokio::test]
+    async fn coordinator_language_persists_and_follows_only_current_head() {
+        use phoenix_core::llm_language::LlmLanguage;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("language.db");
+        let db = Database::open(path.to_str().unwrap()).await.unwrap();
+        migrations::run_pending_migrations(db.pool()).await.unwrap();
+        let coordinator = db
+            .get_or_create_coordinator(None, LlmLanguage::Caveman)
+            .await
+            .unwrap();
+        db.create_conversation("language-ordinary", "ordinary", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        assert!(!db
+            .set_idle_coordinator_language("language-ordinary", LlmLanguage::Adhd)
+            .await
+            .unwrap());
+        assert!(db
+            .set_idle_coordinator_language(&coordinator.id, LlmLanguage::Adhd)
+            .await
+            .unwrap());
+        db.pool().close().await;
+        let db = Database::open(path.to_str().unwrap()).await.unwrap();
+        assert_eq!(
+            db.get_or_create_coordinator(None, LlmLanguage::Caveman)
+                .await
+                .unwrap()
+                .llm_language,
+            LlmLanguage::Adhd
+        );
+        db.update_conversation_state(
+            &coordinator.id,
+            &ConvState::ContextExhausted {
+                summary: "handoff".into(),
+            },
+        )
+        .await
+        .unwrap();
+        let ContinueOutcome::Created(successor) =
+            db.continue_conversation(&coordinator.id).await.unwrap()
+        else {
+            panic!("expected continuation")
+        };
+        assert_eq!(successor.llm_language, LlmLanguage::Adhd);
+        db.update_conversation_state(&coordinator.id, &ConvState::Idle)
+            .await
+            .unwrap();
+        assert!(!db
+            .set_idle_coordinator_language(&coordinator.id, LlmLanguage::Caveman)
+            .await
+            .unwrap());
+        assert!(db
+            .set_idle_coordinator_language(&successor.id, LlmLanguage::Caveman)
+            .await
+            .unwrap());
+        assert_eq!(
+            db.get_conversation(&coordinator.id)
+                .await
+                .unwrap()
+                .llm_language,
+            LlmLanguage::Adhd
+        );
+        db.pool().close().await;
     }
 
     #[tokio::test]
