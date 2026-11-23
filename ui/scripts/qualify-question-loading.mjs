@@ -118,7 +118,7 @@ async function trial(version, base, viewport, mode, run, isolation = false) {
     if (p === '/api/product-conversations') return json({ product_conversations: [], coordinator: null });
     if (p === '/api/discovery/services') return json({ services: [] });
     if (p === '/api/deployment') return json({
-      build: { version: 'question-qualification', git_sha: version === 'candidate' ? process.env.CANDIDATE_SHA : process.env.BASELINE_SHA, started_at: timestamp, uptime_seconds: 60 },
+      build: { version: 'question-qualification', git_sha: 'synthetic-question-qualification', started_at: timestamp, uptime_seconds: 60 },
       network: { bind_address: '127.0.0.1', socket_activated: false, tls: { enabled: false, mode: null, cert_path: null, key_path: null, ca_cert_path: null, hosts: [] } },
       log: { stdout: true, file: null, fatal_file: null }, instance_id: null, local_access: false,
       installation_ownership: { kind: 'development' }, sampled_at: timestamp,
