@@ -490,28 +490,46 @@ async fn mutation_executor_rechecks_same_original_source_for_every_owned_effect(
             &runtime,
         );
         let first = Arc::clone(&worker_calls);
-        executor.execute(move || {
-            first.fetch_add(1, Ordering::SeqCst);
-            Ok(())
-        }).unwrap();
+        executor
+            .execute(move || {
+                first.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+            .unwrap();
         assert_eq!(worker_calls.load(Ordering::SeqCst), 1);
         let _ = controller.revoke();
         let second = Arc::clone(&worker_calls);
-        let refusal = executor.execute(move || {
-            second.fetch_add(1, Ordering::SeqCst);
-            Ok(())
-        }).unwrap_err();
+        let refusal = executor
+            .execute(move || {
+                second.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+            .unwrap_err();
         let third = Arc::clone(&worker_calls);
-        assert_eq!(executor.execute(move || {
-            third.fetch_add(1, Ordering::SeqCst);
-            Ok(())
-        }).unwrap_err(), refusal);
+        assert_eq!(
+            executor
+                .execute(move || {
+                    third.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                })
+                .unwrap_err(),
+            refusal
+        );
         drop(executor);
         assert_eq!(worker_calls.load(Ordering::SeqCst), 1);
         assert_eq!(continuation.original_effect.deadline, original_deadline);
-        assert_eq!(continuation.original_effect.receipt.request_id, original_receipt);
-        assert!(!continuation.original_effect.leaf_release_pending_classification);
-    }).await.unwrap();
+        assert_eq!(
+            continuation.original_effect.receipt.request_id,
+            original_receipt
+        );
+        assert!(
+            !continuation
+                .original_effect
+                .leaf_release_pending_classification
+        );
+    })
+    .await
+    .unwrap();
     assert_eq!(calls.load(Ordering::SeqCst), 1);
 }
 
@@ -538,13 +556,21 @@ async fn mutation_executor_classifies_syscall_failure_before_separately_admitted
         });
         assert_eq!(result.unwrap_err(), "confirmed syscall failure");
         let second = Arc::clone(&worker_calls);
-        executor.execute(move || {
-            second.fetch_add(1, Ordering::SeqCst);
-            Ok(())
-        }).unwrap();
+        executor
+            .execute(move || {
+                second.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+            .unwrap();
         drop(executor);
         assert_eq!(continuation.original_effect.deadline, original_deadline);
-        assert!(!continuation.original_effect.leaf_release_pending_classification);
-    }).await.unwrap();
+        assert!(
+            !continuation
+                .original_effect
+                .leaf_release_pending_classification
+        );
+    })
+    .await
+    .unwrap();
     assert_eq!(calls.load(Ordering::SeqCst), 2);
 }

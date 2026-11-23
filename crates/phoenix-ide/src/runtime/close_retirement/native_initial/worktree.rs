@@ -1,5 +1,5 @@
-//! Original native Worktree's read-only Git first-effect sink. No deletion path is
-//! exposed: later Git probes and filesystem effects still need their own fences.
+//! Original native Worktree custody across individually admitted Git, metadata
+//! and physical mutation leaves, retaining one source context and deadline.
 
 use std::{
     path::{Component, Path, PathBuf},
@@ -288,6 +288,25 @@ pub(crate) struct OriginalWorktreeEffectContext {
 }
 
 impl OriginalWorktreeEffectContext {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        db: Database,
+        command: NativeCloseCommand,
+        receipt: NativeCloseReceipt,
+        live_source: ConvState,
+        scope: WorkScopeId,
+        snapshot: CloseRetirementSnapshot,
+        resource: RetiredResourceIdentity,
+        source_entry: SourceEntryWorker,
+        deadline: Instant,
+        fatal: Arc<FatalLocalAuthorityFence>,
+    ) -> Self {
+        Self {
+            db, command, receipt, live_source, scope, snapshot, resource,
+            source_entry, deadline, fatal, leaf_release_pending_classification: false,
+        }
+    }
+
     pub(crate) fn deadline(&self) -> Instant {
         self.deadline
     }
@@ -516,7 +535,10 @@ fn run_status(
     runtime: &tokio::runtime::Handle,
     authority: &mut WorkerAuthority,
 ) -> Result<Output, String> {
-    let owner = custody.prepared.as_ref().expect("worker owns prepared lock");
+    let owner = custody
+        .prepared
+        .as_ref()
+        .expect("worker owns prepared lock");
     let command = status_command(
         &owner.prepared.inspection_path,
         &owner.git_dir,
@@ -676,6 +698,27 @@ fn retain_unclassified(custody: WorkerCustody) -> ! {
     loop {
         std::thread::park();
         std::hint::black_box(&custody);
+    }
+}
+
+mod metadata;
+mod physical;
+pub(crate) use physical::{WorktreePhysicalObservation, WorktreePhysicalOutcome};
+
+impl NativeWorktreeGit {
+    pub(crate) fn into_continuation(
+        self,
+        original_effect: OriginalWorktreeEffectContext,
+    ) -> Result<NativeWorktreeGitContinuation, String> {
+        if self.prepared.deadline != original_effect.deadline
+            || original_effect.resource.kind() != RetiredResourceKind::Worktree
+            || !matches!(original_effect.resource.identity(),
+                LossItemIdentity::Worktree(identity) if identity == &self.prepared.identity)
+        {
+            return Err("original Worktree continuation identity or deadline differs".into());
+        }
+        check_deadline(original_effect.deadline)?;
+        Ok(NativeWorktreeGitContinuation { owner: self, original_effect })
     }
 }
 

@@ -1,5 +1,5 @@
 //! Source-owned initial Close admission and bounded runtime-process retirement.
-//! Worktree/scope cleanup, completion and retry are not dispatched here.
+//! Continues original Worktree/scope cleanup and completion under the same source.
 
 mod post_retirement;
 mod process_retirement;
@@ -88,6 +88,7 @@ pub(super) struct NativeCloseInitialContinuation {
     process_retirement: Option<process_retirement::ProcessRetirement>,
     post_retirement: Option<post_retirement::PostRetirement>,
     source_entry: Option<source_entry::SourceEntryWorker>,
+    original_entry_deadline: Option<std::time::Instant>,
     backend: std::sync::Arc<crate::runtime::RuntimeManager>,
     #[cfg(test)]
     inventory_preparation_test_barrier: Option<InventoryPreparationTestBarrier>,
@@ -225,6 +226,9 @@ impl NativeCloseInitialContinuation {
                 return Err(NativeCloseApplicationError::FatalAuthority);
             }
         };
+        // Preserve the exact capture deadline for post-process workers, never
+        // refresh it when handing off to physical Worktree retirement.
+        self.original_entry_deadline = Some(deadline.into_std());
         let mut original = source_entry::SourceEntryController::new(self.command.clone(), deadline);
         if original.revalidate(live_state, &self.command) != source_entry::ActorEntryResult::Updated
         {
@@ -510,6 +514,8 @@ impl NativeCloseInitialContinuation {
                 &self.db,
                 &self.backend,
                 live_source,
+                self.source_entry.as_ref(),
+                self.original_entry_deadline,
             )
             .await
         {
@@ -1007,6 +1013,7 @@ where
                     process_retirement: None,
                     post_retirement: None,
                     source_entry: None,
+                    original_entry_deadline: None,
                     backend: std::sync::Arc::clone(backend),
                     #[cfg(test)]
                     inventory_preparation_test_barrier: None,

@@ -1,6 +1,24 @@
 # Unified Close acceptance milestone
 
-## Latest candidate and terminal gate
+## Current publication and active gate
+
+Published `51cf8c7a3c2f895f5581e687c3b3567111e1af50` — **Preserve original Close authority through Worktree effect leaves**. Hooks-disabled commit/push succeeded. Automatic exact-head run [45091273681](https://github.com/scottopell/phoenix-ide/actions/runs/45091273681) is completed/failure, personally classified against exact SHA: all runtime/qualification steps passed; only exact-source formatting failed. Watcher `close-51cf8c7a3-watch` (`@67`) exited 1, process exit verified; evidence `/tmp/close-51cf8c7a3/{final-run.json,final-failed.log,watch-exit-status}`. Its hosted formatting proposal was applied/merged preserving the new integration; no local formatter. No watcher is active until the next automatically triggered exact-head run.
+
+Frozen published source review: `/tmp/close-worktree-leaf-prerequisites-v2.patch`, SHA256 `ff8794c75cb6518904037309b9d0373cd77b03ec6edf36aee4c707eab839cd0c`, base `a165d91bc4c42e099237d9cccb84af49a0f629db`. Final independent review found no concrete blocker; hosted compilation/tests passed and formatting alone failed as classified above. That publication excluded the then-residual physical scaffold and public fixture. They are now integrated in the dirty candidate described below; that change has no hosted compile/runtime proof yet.
+
+## Current physical acceptance candidate (not yet published or qualified)
+
+Accountable integrator owns aggregate wiring/review/publication. All child batches have returned; **no active delegate writers**. Completed disjoint ownership:
+- Physical/recovery/safety writers: `close_retirement.rs`, `native_initial/worktree/{physical.rs,git_leaf.rs,mutation.rs}`. Actual clean-linked checkout and exact admin retirement now authored, not residual scaffold. Shared filesystem/Git-leaf safety dependency serialized integration.
+- Metadata writer: `phoenix-db/src/native_close/initial.rs`, `native_initial/worktree/metadata.rs`, `executor/native_close/source_entry.rs`. Original metadata source lease acquired after DB writer/validation, retained across mutation/commit and parked on unknown release; independent review found no remaining blocker.
+- Actor writer: `executor/native_close.rs` and `native_close/post_retirement.rs`. Original dispatch -> retained preparation -> physical observation -> durable Worktree success -> independent WorkScope success -> final completion. Pending observation/preparation returns control to actor for Stop/fatal processing.
+- Public fixture writer: `native_close_admission_tests/worktree_physical.rs`, three registered-tool journeys: positive real linked checkout/admin deletion with terminal/History/WorkScope/replay proof; acknowledged Stop preservation; Stop plus reused-path preservation. Full hard assertions retained. Parent wired module/factories; no execution yet.
+
+The three reviewed mutation-boundary blockers have source fixes: descriptor-relative no-follow slot identity rechecked inside each admitted unlink; retained reservation descriptor plus non-overwrite descriptor-relative relocation; immutable checkout and registration witness rechecked inside admitted rename. New regression source covers replacement/symlink/destination collisions. Additional fixes: scoped confirmed Worktree snapshot selected through original aggregate/anchor provenance (not compared to aggregate fingerprint); immutable admin `gitdir`/`commondir` witness before/after relocation; strict known unsupported-fsmonitor classification; correct probe ordinal; nonblocking actor readiness; fixture expected-registration baseline and terminal response contract.
+
+**Concrete remaining gate:** independent review of the final repaired descriptor graph, exact full candidate source review and hosted compilation/disposable public-path runtime proof. Production source is being prepared as candidate, not deployed; no real-user retirement performed. No acceptance claim. Hosted formatting of new source is still unverified. Keep `retry_close_safely`; no merge/deploy/release action.
+
+## Historical prerequisite candidate and terminal gate
 
 Published repair checkpoint: `a165d91bc4c42e099237d9cccb84af49a0f629db`. Automatic run [45084756106](https://github.com/scottopell/phoenix-ide/actions/runs/45084756106) is **completed / failure**, personally classified against exact HEAD. Every runtime/qualification step passed, including the Bash Stop handback and original Worktree continuation tests. Only exact-source formatting failed. Evidence: `/tmp/close-a165d91bc/{final-run.json,final-failed.log,watch-exit-status}`. Watcher exited 1; process exit verified. Exact-head hosted formatting proposal downloaded and applied; no local formatter or fixture execution.
 

@@ -85,9 +85,10 @@ impl ProcessRetirement {
     /// including a captured Worktree when no process resources were present.
     pub(super) fn has_original_effects(&self) -> bool {
         self.has_resources()
-            || self.inventory.iter().any(|item| {
-                item.resource.kind() == RetiredResourceKind::Worktree
-            })
+            || self
+                .inventory
+                .iter()
+                .any(|item| item.resource.kind() == RetiredResourceKind::Worktree)
     }
 
     pub(super) fn captured_binding(
@@ -524,13 +525,11 @@ mod tests {
                     WorktreeFingerprint::parse("fingerprint").unwrap(),
                     GitPathIdentity::from_bytes(b"linked".to_vec()),
                 )),
-            ).unwrap(),
+            )
+            .unwrap(),
         };
-        let worktree = ProcessRetirement::new(
-            vec![resource],
-            vec![scope.clone()],
-            snapshot.clone(),
-        );
+        let worktree =
+            ProcessRetirement::new(vec![resource], vec![scope.clone()], snapshot.clone());
         assert!(!worktree.has_resources());
         assert!(worktree.has_original_effects());
         let no_physical_resources = ProcessRetirement::new(Vec::new(), vec![scope], snapshot);

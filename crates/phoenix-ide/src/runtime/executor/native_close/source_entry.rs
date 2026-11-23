@@ -37,6 +37,13 @@ pub(crate) struct SourceEntryWorker {
     shared: Arc<Shared>,
 }
 
+/// Borrowed, non-cloneable source custody for one admitted first effect.
+/// The private guard cannot be unlocked, modified, or reminted by its holder.
+#[must_use = "retain source custody through the effect and confirmed transaction release"]
+pub(crate) struct SourceEntryLease<'a> {
+    _guard: MutexGuard<'a, Eligibility>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ActorEntryResult {
     Updated,
@@ -113,7 +120,7 @@ impl SourceEntryController {
     }
 
     /// Closes admission immediately, then performs the actor's state transition
-    /// without waiting for a worker's synchronous first-effect callback. On Busy,
+    /// without waiting for a worker's first-effect callback or metadata lease. On Busy,
     /// the caller must retain and defer the source event, then retry this method
     /// before applying it; the atomic flag already refuses later worker entrants.
     pub(crate) fn revoke(&mut self) -> ActorEntryResult {
@@ -189,6 +196,24 @@ impl SourceEntryWorker {
         exact_original: &NativeCloseCommand,
         effect: impl FnOnce() -> T,
     ) -> WorkerEntryResult<T> {
+        let lease = match self.try_acquire_first_effect(exact_original) {
+            WorkerEntryResult::Ran(lease) => lease,
+            WorkerEntryResult::Busy => return WorkerEntryResult::Busy,
+            WorkerEntryResult::Refused => return WorkerEntryResult::Refused,
+        };
+        let result = effect();
+        drop(lease);
+        WorkerEntryResult::Ran(result)
+    }
+
+    /// Acquire source custody only at the actual effect sink, after any writer
+    /// wait and exact DB validation. The borrowed guard must span the mutation
+    /// and transaction release; an unknown release must retain it indefinitely.
+    /// This never waits, and workers cannot establish eligibility themselves.
+    pub(crate) fn try_acquire_first_effect(
+        &self,
+        exact_original: &NativeCloseCommand,
+    ) -> WorkerEntryResult<SourceEntryLease<'_>> {
         let guard = match try_lock(&self.shared) {
             LockAttempt::Acquired(guard) => guard,
             LockAttempt::Busy => return WorkerEntryResult::Busy,
@@ -208,7 +233,7 @@ impl SourceEntryWorker {
                 .store(true, std::sync::atomic::Ordering::Release);
             return WorkerEntryResult::Refused;
         }
-        WorkerEntryResult::Ran(effect())
+        WorkerEntryResult::Ran(SourceEntryLease { _guard: guard })
     }
 }
 
@@ -416,6 +441,58 @@ mod tests {
         assert_eq!(
             worker.try_first_effect(&command, || ()),
             WorkerEntryResult::Refused
+        );
+    }
+
+    #[test]
+    fn borrowed_metadata_lease_defers_actor_revoke_until_explicit_release() {
+        let (state, command, _) = fixture();
+        let mut controller = SourceEntryController::new(
+            command.clone(),
+            Instant::now() + std::time::Duration::from_secs(5),
+        );
+        let worker = controller.worker();
+        assert_eq!(
+            controller.revalidate(&state, &command),
+            ActorEntryResult::Updated
+        );
+        let lease = match worker.try_acquire_first_effect(&command) {
+            WorkerEntryResult::Ran(lease) => lease,
+            _ => panic!("eligible exact metadata entry must acquire its lease"),
+        };
+        // Deterministic interleaving: the actor cannot apply its source event
+        // while metadata owns the lease, including an unclassified DB release.
+        assert_eq!(controller.revoke(), ActorEntryResult::Busy);
+        let retained_unknown_release = Some(lease);
+        assert_eq!(controller.revoke(), ActorEntryResult::Busy);
+        drop(retained_unknown_release);
+        assert_eq!(controller.revoke(), ActorEntryResult::Updated);
+        assert!(matches!(
+            worker.try_acquire_first_effect(&command),
+            WorkerEntryResult::Refused
+        ));
+    }
+
+    #[test]
+    fn actor_revoke_before_metadata_lease_refuses_entry() {
+        let (state, command, _) = fixture();
+        let mut controller = SourceEntryController::new(
+            command.clone(),
+            Instant::now() + std::time::Duration::from_secs(5),
+        );
+        let worker = controller.worker();
+        assert_eq!(
+            controller.revalidate(&state, &command),
+            ActorEntryResult::Updated
+        );
+        assert_eq!(controller.revoke(), ActorEntryResult::Updated);
+        assert!(matches!(
+            worker.try_acquire_first_effect(&command),
+            WorkerEntryResult::Refused
+        ));
+        assert_eq!(
+            controller.revalidate(&state, &command),
+            ActorEntryResult::Refused
         );
     }
 

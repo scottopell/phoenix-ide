@@ -22,6 +22,8 @@ mod bash_native_success;
 mod bash_stage2_stop_ack;
 mod bash_stage2_unknown_release;
 mod registered_disposable_path;
+#[cfg(target_os = "linux")]
+mod worktree_physical;
 
 const TARGET_ID: &str = "native-close-target";
 

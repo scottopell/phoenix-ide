@@ -713,8 +713,10 @@ impl Database {
             request.snapshot.clone(),
             request.resource.clone(),
             InitialWorktreeMetadata::Plan(request),
+            || Ok(()),
         )
         .await
+        .0
     }
 
     /// Binds the exact final worktree tombstone under the source-owned initial run.
@@ -734,8 +736,10 @@ impl Database {
             request.snapshot.clone(),
             request.resource.clone(),
             InitialWorktreeMetadata::Tombstone(request),
+            || Ok(()),
         )
         .await
+        .0
     }
 
     /// Binds the exact worktree tombstone object under the source-owned initial run.
@@ -755,11 +759,103 @@ impl Database {
             request.snapshot.clone(),
             request.resource.clone(),
             InitialWorktreeMetadata::TombstoneObject(request),
+            || Ok(()),
+        )
+        .await
+        .0
+    }
+
+    /// Records a cleanup plan only if the original source still enters inside
+    /// the writer transaction, after exact receipt and dispatch validation.
+    ///
+    /// `entry` must be a short, nonblocking in-memory gate: no I/O, SQL, waits,
+    /// or nested writer. Do not hold a source lock while awaiting this method.
+    /// Its error refuses the write. Its successful lease is retained across the
+    /// metadata mutation and commit/rollback, then returned with the classification
+    /// (also on unknown release). The caller must retain that lease on unclassified
+    /// release and independently supervise cancellation/panic; a callback result
+    /// alone does not prove writer release. No `Send` bound is required for a
+    /// borrowed thread-local source guard used with synchronous `block_on`.
+    pub async fn record_native_close_initial_worktree_cleanup_plan_with_entry<F, L>(
+        &self,
+        command: &NativeCloseCommand,
+        receipt: &NativeCloseReceipt,
+        live_source: &phoenix_core::domain::sm_state::ConvState,
+        request: RecordCloseWorktreeCleanupPlanRequest,
+        entry: F,
+    ) -> (LocalAuthorityResult<DbResult<()>>, Option<L>)
+    where
+        F: FnOnce() -> DbResult<L>,
+    {
+        self.write_native_close_initial_worktree_metadata(
+            command,
+            receipt,
+            live_source,
+            request.attempt_id.clone(),
+            request.scope.clone(),
+            request.snapshot.clone(),
+            request.resource.clone(),
+            InitialWorktreeMetadata::Plan(request),
+            entry,
         )
         .await
     }
 
-    async fn write_native_close_initial_worktree_metadata(
+    /// Entry-gated final-root binding. The callback and supervision contract is
+    /// identical to `record_native_close_initial_worktree_cleanup_plan_with_entry`.
+    pub async fn bind_native_close_initial_worktree_final_tombstone_with_entry<F, L>(
+        &self,
+        command: &NativeCloseCommand,
+        receipt: &NativeCloseReceipt,
+        live_source: &phoenix_core::domain::sm_state::ConvState,
+        request: BindCloseWorktreeFinalTombstoneRequest,
+        entry: F,
+    ) -> (LocalAuthorityResult<DbResult<()>>, Option<L>)
+    where
+        F: FnOnce() -> DbResult<L>,
+    {
+        self.write_native_close_initial_worktree_metadata(
+            command,
+            receipt,
+            live_source,
+            request.attempt_id.clone(),
+            request.scope.clone(),
+            request.snapshot.clone(),
+            request.resource.clone(),
+            InitialWorktreeMetadata::Tombstone(request),
+            entry,
+        )
+        .await
+    }
+
+    /// Entry-gated final-object binding. The callback and supervision contract is
+    /// identical to `record_native_close_initial_worktree_cleanup_plan_with_entry`.
+    pub async fn bind_native_close_initial_worktree_final_tombstone_object_with_entry<F, L>(
+        &self,
+        command: &NativeCloseCommand,
+        receipt: &NativeCloseReceipt,
+        live_source: &phoenix_core::domain::sm_state::ConvState,
+        request: BindCloseWorktreeFinalTombstoneObjectRequest,
+        entry: F,
+    ) -> (LocalAuthorityResult<DbResult<()>>, Option<L>)
+    where
+        F: FnOnce() -> DbResult<L>,
+    {
+        self.write_native_close_initial_worktree_metadata(
+            command,
+            receipt,
+            live_source,
+            request.attempt_id.clone(),
+            request.scope.clone(),
+            request.snapshot.clone(),
+            request.resource.clone(),
+            InitialWorktreeMetadata::TombstoneObject(request),
+            entry,
+        )
+        .await
+    }
+
+    async fn write_native_close_initial_worktree_metadata<F, L>(
         &self,
         command: &NativeCloseCommand,
         receipt: &NativeCloseReceipt,
@@ -769,11 +865,21 @@ impl Database {
         snapshot: phoenix_core::domain::close::CloseRetirementSnapshot,
         resource: RetiredResourceIdentity,
         metadata: InitialWorktreeMetadata,
-    ) -> LocalAuthorityResult<DbResult<()>> {
+        entry: F,
+    ) -> (LocalAuthorityResult<DbResult<()>>, Option<L>)
+    where
+        F: FnOnce() -> DbResult<L>,
+    {
         let mut tx = match self.pool.begin_with("BEGIN IMMEDIATE").await {
             Ok(tx) => tx,
-            Err(error) => return LocalAuthorityResult::DurableFactEstablished(Err(error.into())),
+            Err(error) => {
+                return (
+                    LocalAuthorityResult::DurableFactEstablished(Err(error.into())),
+                    None,
+                );
+            }
         };
+        let mut lease = None;
         let result = async {
             let (admitted, _) = require_initial_execution_tx(
                 &mut tx,
@@ -792,6 +898,11 @@ impl Database {
             }
             require_initial_original_dispatch_tx(&mut tx, &admitted, &scope, &snapshot, &resource)
                 .await?;
+            // Lock order is SQLite writer -> short source-entry callback. The
+            // callback must not wait, perform I/O or SQL, or open another writer.
+            // A refusal rolls back without touching any metadata. Successful
+            // source custody spans the SQL mutation and transaction release.
+            lease = Some(entry()?);
             match metadata {
                 InitialWorktreeMetadata::Plan(request) => {
                     Self::record_close_worktree_cleanup_plan_tx(&mut tx, request).await
@@ -805,7 +916,7 @@ impl Database {
             }
         }
         .await;
-        match result {
+        let classification = match result {
             Ok(()) => match tx.commit().await {
                 Ok(()) => LocalAuthorityResult::DurableFactEstablished(Ok(())),
                 Err(_) => LocalAuthorityResult::DurableFactUnclassified,
@@ -814,7 +925,9 @@ impl Database {
                 Ok(()) => LocalAuthorityResult::DurableFactEstablished(Err(error)),
                 Err(_) => LocalAuthorityResult::DurableFactUnclassified,
             },
-        }
+        };
+        // In particular, an unknown release must not drop source custody here.
+        (classification, lease)
     }
 
     /// Retires one exact original WorkScope in the same transaction as its success proof.
@@ -2230,4 +2343,295 @@ pub(super) fn decode_run_ref(row: &sqlx::sqlite::SqliteRow) -> DbResult<NativeCl
 }
 
 #[cfg(test)]
-mod tests;
+mod tests {
+    // Reuse the native-initial fixtures and legacy API compatibility coverage.
+    include!("initial/tests.rs");
+
+    #[tokio::test]
+    async fn worktree_metadata_entry_runs_after_validation_and_refusal_writes_nothing() {
+        use std::cell::Cell;
+
+        let f = Fixture::new().await;
+        let (command, receipt, live_source, expected) = captured_initial_retirement(&f).await;
+        let worktree = expected
+            .iter()
+            .find(|item| item.resource.kind() == RetiredResourceKind::Worktree)
+            .unwrap();
+        let plan = || crate::RecordCloseWorktreeCleanupPlanRequest {
+            attempt_id: receipt.admitted.attempt_id.clone(),
+            scope: worktree.scope.clone(),
+            snapshot: worktree.snapshot.clone(),
+            resource: worktree.resource.clone(),
+            administrative_dir_incarnation: "entry-gated-admin".into(),
+            administrative_dir: "/tmp/entry-gated-admin".into(),
+        };
+        let entries = Cell::new(0);
+        let refuse = || -> DbResult<()> {
+            entries.set(entries.get() + 1);
+            Err(DbError::CloseFoundationPrecondition(
+                "source revoked at entry".into(),
+            ))
+        };
+
+        // A valid source snapshot is not enough: the exact original dispatch
+        // must be durable before even the short source gate can be invoked.
+        assert!(matches!(
+            f.db.record_native_close_initial_worktree_cleanup_plan_with_entry(
+                &command,
+                &receipt,
+                &live_source,
+                plan(),
+                refuse,
+            )
+            .await,
+            (LocalAuthorityResult::DurableFactEstablished(Err(_)), None)
+        ));
+        assert_eq!(entries.get(), 0);
+        f.db.record_native_close_initial_retirement_dispatch(
+            &command,
+            &receipt,
+            &live_source,
+            initial_dispatch_request(&receipt, worktree),
+        )
+        .await
+        .established()
+        .unwrap()
+        .unwrap();
+
+        assert!(matches!(
+            f.db.record_native_close_initial_worktree_cleanup_plan_with_entry(
+                &command,
+                &receipt,
+                &live_source,
+                plan(),
+                refuse,
+            )
+            .await,
+            (LocalAuthorityResult::DurableFactEstablished(Err(_)), None)
+        ));
+        assert_eq!(entries.get(), 1);
+        let mut foreign_receipt = receipt.clone();
+        foreign_receipt.request_id = Uuid::nil();
+        assert!(matches!(
+            f.db.record_native_close_initial_worktree_cleanup_plan_with_entry(
+                &command,
+                &foreign_receipt,
+                &live_source,
+                plan(),
+                refuse,
+            )
+            .await,
+            (LocalAuthorityResult::DurableFactEstablished(Err(_)), None)
+        ));
+        assert_eq!(entries.get(), 1);
+        assert!(f
+            .db
+            .close_worktree_cleanup_plan(
+                &receipt.admitted.attempt_id,
+                &worktree.scope,
+                &worktree.snapshot,
+                &worktree.resource,
+            )
+            .await
+            .unwrap()
+            .is_none());
+
+        // A successful entry writes and releases the same transaction. Existing
+        // no-callback wrappers remain covered by the adjacent legacy API tests.
+        struct Lease<'a>(&'a Cell<bool>);
+        impl Drop for Lease<'_> {
+            fn drop(&mut self) {
+                self.0.set(true);
+            }
+        }
+        let dropped = Cell::new(false);
+        let (classification, lease) = f
+            .db
+            .record_native_close_initial_worktree_cleanup_plan_with_entry(
+                &command,
+                &receipt,
+                &live_source,
+                plan(),
+                || Ok(Lease(&dropped)),
+            )
+            .await;
+        classification.established().unwrap().unwrap();
+        assert!(lease.is_some());
+        assert!(!dropped.get(), "lease must outlive the SQL mutation and commit");
+        assert!(f
+            .db
+            .close_worktree_cleanup_plan(
+                &receipt.admitted.attempt_id,
+                &worktree.scope,
+                &worktree.snapshot,
+                &worktree.resource,
+            )
+            .await
+            .unwrap()
+            .is_some());
+        drop(lease);
+        assert!(dropped.get());
+        // Entry can succeed but the mutation can still refuse. The same lease
+        // must survive the rollback, not just the successful commit path.
+        dropped.set(false);
+        let (classification, lease) = f
+            .db
+            .bind_native_close_initial_worktree_final_tombstone_object_with_entry(
+                &command,
+                &receipt,
+                &live_source,
+                crate::BindCloseWorktreeFinalTombstoneObjectRequest {
+                    attempt_id: receipt.admitted.attempt_id.clone(),
+                    scope: worktree.scope.clone(),
+                    snapshot: worktree.snapshot.clone(),
+                    resource: worktree.resource.clone(),
+                    object_device: 29,
+                    object_inode: 31,
+                },
+                || Ok(Lease(&dropped)),
+            )
+            .await;
+        assert!(matches!(
+            classification,
+            LocalAuthorityResult::DurableFactEstablished(Err(_))
+        ));
+        assert!(lease.is_some());
+        assert!(
+            !dropped.get(),
+            "lease must outlive a refused mutation's rollback"
+        );
+        drop(lease);
+        assert!(dropped.get());
+
+        let root = || crate::BindCloseWorktreeFinalTombstoneRequest {
+            attempt_id: receipt.admitted.attempt_id.clone(),
+            scope: worktree.scope.clone(),
+            snapshot: worktree.snapshot.clone(),
+            resource: worktree.resource.clone(),
+            tombstone: crate::CloseWorktreeFinalTombstone {
+                root: "/tmp/entry-gated-tombstone".into(),
+                device: 17,
+                inode: 23,
+                object_device: None,
+                object_inode: None,
+            },
+        };
+        assert!(matches!(
+            f.db.bind_native_close_initial_worktree_final_tombstone_with_entry(
+                &command,
+                &receipt,
+                &live_source,
+                root(),
+                refuse,
+            )
+            .await,
+            (LocalAuthorityResult::DurableFactEstablished(Err(_)), None)
+        ));
+        let retained = f
+            .db
+            .close_worktree_cleanup_plan(
+                &receipt.admitted.attempt_id,
+                &worktree.scope,
+                &worktree.snapshot,
+                &worktree.resource,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(retained.final_tombstone.is_none());
+        f.db.bind_native_close_initial_worktree_final_tombstone_with_entry(
+            &command,
+            &receipt,
+            &live_source,
+            root(),
+            || Ok(()),
+        )
+        .await
+        .0
+        .established()
+        .unwrap()
+        .unwrap();
+        let object = || crate::BindCloseWorktreeFinalTombstoneObjectRequest {
+            attempt_id: receipt.admitted.attempt_id.clone(),
+            scope: worktree.scope.clone(),
+            snapshot: worktree.snapshot.clone(),
+            resource: worktree.resource.clone(),
+            object_device: 29,
+            object_inode: 31,
+        };
+        assert!(matches!(
+            f.db.bind_native_close_initial_worktree_final_tombstone_object_with_entry(
+                &command,
+                &receipt,
+                &live_source,
+                object(),
+                refuse,
+            )
+            .await,
+            (LocalAuthorityResult::DurableFactEstablished(Err(_)), None)
+        ));
+        let retained = f
+            .db
+            .close_worktree_cleanup_plan(
+                &receipt.admitted.attempt_id,
+                &worktree.scope,
+                &worktree.snapshot,
+                &worktree.resource,
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .final_tombstone
+            .unwrap();
+        assert_eq!((retained.object_device, retained.object_inode), (None, None));
+        f.db.bind_native_close_initial_worktree_final_tombstone_object_with_entry(
+            &command,
+            &receipt,
+            &live_source,
+            object(),
+            || Ok(()),
+        )
+        .await
+        .0
+        .established()
+        .unwrap()
+        .unwrap();
+        let retained = f
+            .db
+            .close_worktree_cleanup_plan(
+                &receipt.admitted.attempt_id,
+                &worktree.scope,
+                &worktree.snapshot,
+                &worktree.resource,
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .final_tombstone
+            .unwrap();
+        assert_eq!((retained.device, retained.inode), (17, 23));
+        assert_eq!(
+            (retained.object_device, retained.object_inode),
+            (Some(29), Some(31))
+        );
+        assert_eq!(entries.get(), 3);
+
+        // A captured source snapshot must not authorize entry after the stored
+        // coordinator source has changed. Validation refuses before the gate.
+        f.db.update_conversation_state(&f.coordinator, &ConvState::Idle)
+            .await
+            .unwrap();
+        assert!(matches!(
+            f.db.record_native_close_initial_worktree_cleanup_plan_with_entry(
+                &command,
+                &receipt,
+                &live_source,
+                plan(),
+                refuse,
+            )
+            .await,
+            (LocalAuthorityResult::DurableFactEstablished(Err(_)), None)
+        ));
+        assert_eq!(entries.get(), 3);
+    }
+}

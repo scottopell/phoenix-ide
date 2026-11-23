@@ -4,11 +4,11 @@
 //! Unknown writer release parks that worker stack (including descriptor and
 //! repository custody); it never becomes an ordinary traversal error or retry.
 
+use super::super::super::WorktreeMutationExecutor;
 use super::{
     NativeCloseInitialEntryRelease, NativeCloseInitialFirstEffectError,
     OriginalWorktreeEffectContext, WorkerEntryResult,
 };
-use super::super::super::WorktreeMutationExecutor;
 
 pub(super) struct OriginalWorktreeMutationExecutor<'a> {
     original: &'a mut OriginalWorktreeEffectContext,
@@ -85,7 +85,9 @@ impl WorktreeMutationExecutor for OriginalWorktreeMutationExecutor<'_> {
             | Err(NativeCloseInitialFirstEffectError::Rejected {
                 error,
                 release: NativeCloseInitialEntryRelease::Confirmed,
-            }) => self.refuse(format!("native Worktree mutation authorization refused: {error}")),
+            }) => self.refuse(format!(
+                "native Worktree mutation authorization refused: {error}"
+            )),
             // Classified above. Keep this branch fail-closed if the release
             // classification is extended, rather than permitting traversal.
             entry => self.retain_unknown(entry),

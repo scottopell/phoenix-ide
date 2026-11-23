@@ -321,6 +321,12 @@ jobs:
             grep -F "native_close_admission_tests::bash_native_success::$test: test" evidence/runtime-selected-tests.txt
           done
           test -s evidence/runtime-selected-tests.txt
+          for test in \
+            registered_native_close_physically_retires_worktree_only_and_replays_without_effects \
+            registered_native_close_after_acknowledged_source_stop_preserves_real_worktree \
+            registered_native_close_after_source_stop_preserves_reused_path_and_original_checkout; do
+            grep -F "native_close_admission_tests::worktree_physical::$test: test" evidence/runtime-selected-tests.txt
+          done
           for module in \
             runtime::executor::native_close::source_entry::tests:: \
             runtime::executor::native_close::process_retirement::tests:: \
@@ -331,6 +337,8 @@ jobs:
             runtime::close_retirement::native_initial::capture_binding::tests:: \
             runtime::close_retirement::native_initial::worktree::tests:: \
             runtime::close_retirement::native_initial::worktree::git_leaf::tests:: \
+            runtime::close_retirement::native_initial::worktree::metadata::tests:: \
+            runtime::close_retirement::native_initial::worktree::physical::tests:: \
             runtime::close_retirement::native_initial::worktree::admission_tests::; do
             test "$(grep -c "^${module}.*: test$" evidence/runtime-inventory.log)" -gt 0
           done
@@ -368,6 +376,12 @@ jobs:
           grep -E 'test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored;' evidence/native-close-runtime-matcher.log
           (cd crates/phoenix-ide && "$PHOENIX_RUNTIME_TEST_BINARY" native_close_admission_tests:: --nocapture --test-threads=1) 2>&1 | tee evidence/native-close-runtime-actor.log
           grep -E 'test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored;' evidence/native-close-runtime-actor.log
+          for test in \
+            registered_native_close_physically_retires_worktree_only_and_replays_without_effects \
+            registered_native_close_after_acknowledged_source_stop_preserves_real_worktree \
+            registered_native_close_after_source_stop_preserves_reused_path_and_original_checkout; do
+            grep -F "native_close_admission_tests::worktree_physical::$test ... ok" evidence/native-close-runtime-actor.log
+          done
           grep -F 'native_close_admission_tests::bash_stage2_stop_ack::bash_stage_two_stop_ack_reaches_real_second_writer_and_cleans_once ... ok' evidence/native-close-runtime-actor.log
           grep -F 'native_close_admission_tests::bash_stage2_unknown_release::bash_second_writer_injected_unknown_release_quarantines_original_owner ... ok' evidence/native-close-runtime-actor.log
           grep -F 'native_close_admission_tests::bash_stage2_unknown_release::bash_second_writer_unknown_release_retains_owner_after_public_close_waiter_drop ... ok' evidence/native-close-runtime-actor.log
@@ -394,6 +408,8 @@ jobs:
             runtime::close_retirement::native_initial::capture_binding::tests:: \
             runtime::close_retirement::native_initial::worktree::tests:: \
             runtime::close_retirement::native_initial::worktree::git_leaf::tests:: \
+            runtime::close_retirement::native_initial::worktree::metadata::tests:: \
+            runtime::close_retirement::native_initial::worktree::physical::tests:: \
             runtime::close_retirement::native_initial::worktree::admission_tests::; do
             log="evidence/${module//::/-}.log"
             (cd crates/phoenix-ide && "$PHOENIX_RUNTIME_TEST_BINARY" "$module" --nocapture --test-threads=1) 2>&1 | tee "$log"
@@ -408,6 +424,16 @@ jobs:
           failed=0
           tests=(
             expired_original_deadline_does_not_spawn_git_or_a_sentinel_effect
+            admitted_unlink_revalidates_file_directory_and_symlink_private_slots
+            admitted_object_and_final_root_unlinks_preserve_empty_replacements
+            admitted_final_rename_rejects_replaced_source_root_and_occupied_object
+            mutation_executor_refusal_stops_private_rename_and_later_unlink
+            recursive_mutation_walk_uses_same_executor_for_every_rename_and_unlink
+            root_object_mutations_are_admitted_separately_from_durable_bind_callbacks
+            compensating_tombstone_cleanup_requires_its_own_mutation_admission
+            native_driver_preserves_bound_root_after_failed_final_move
+            fsmonitor_stop_only_accepts_proven_no_daemon_or_success
+            fsmonitor_unsupported_platform_requires_the_exact_git_source_diagnostic
             supplied_leaf_full_inspection_matches_legacy_canonical_clean_snapshot
             supplied_leaf_inspection_refuses_unsupported_state_without_scratch_mutation
             shared_inspection_keeps_legacy_dirty_content_observation
