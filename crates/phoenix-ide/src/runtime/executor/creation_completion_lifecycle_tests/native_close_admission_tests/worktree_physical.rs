@@ -627,7 +627,7 @@ async fn run_public_worktree_close(journey: WorktreeJourney) {
             obligation.close_outcome(),
             Some(CloseCompletionOutcome::Archived),
             "public Worktree Close retained cleanup attention; durable evidence: {}",
-            durable_native_close_rows(&fixture, &run).await,
+            worktree_close_failure_evidence(&fixture, &run).await,
         );
         assert_eq!(
             fixture.db.get_close_run(&run).await.unwrap().status,
@@ -945,6 +945,23 @@ async fn durable_target_rows(fixture: &CloseFixture) -> Value {
     })
 }
 
+// Failure diagnostics must not replace the original outcome with a query panic.
+// Keep replay snapshots below strict: query failures there remain test failures.
+async fn worktree_close_failure_evidence(fixture: &CloseFixture, run: &CloseRunRef) -> String {
+    let evidence = fixture
+        .db
+        .list_close_retirement_evidence(run.attempt_id.as_str())
+        .await;
+    let history = sqlx::query_as::<_, (String, Option<String>, Option<String>)>(
+        "SELECT proof_kind, residual_reason, detail
+         FROM close_retirement_resource_history WHERE attempt_id = ?1 ORDER BY history_id",
+    )
+    .bind(run.attempt_id.as_str())
+    .fetch_all(fixture.db.pool())
+    .await;
+    format!("retirement evidence: {evidence:?}; retirement history: {history:?}")
+}
+
 async fn durable_native_close_rows(fixture: &CloseFixture, run: &CloseRunRef) -> Value {
     let attempt = run.attempt_id.as_str();
     let obligation = fixture.db.get_close_obligation(attempt).await.unwrap();
@@ -980,15 +997,18 @@ async fn durable_native_close_rows(fixture: &CloseFixture, run: &CloseRunRef) ->
     .fetch_all(fixture.db.pool())
     .await
     .unwrap();
-    let accepted_at_us: i64 = sqlx::query_scalar(
-        "SELECT accepted_at_us FROM native_close_initial_receipts WHERE attempt_id = ?1",
+    let receipt: String = sqlx::query_scalar(
+        "SELECT json_array(request_id, source_transcript_id, source_message_id,
+                           source_tool_use_id, request_fingerprint, product_conversation_id,
+                           attempt_id, run_ordinal, intent)
+         FROM native_close_initial_receipts WHERE attempt_id = ?1",
     )
     .bind(attempt)
     .fetch_one(fixture.db.pool())
     .await
     .unwrap();
-    let run_times: (String, Option<String>) = sqlx::query_as(
-        "SELECT CAST(started_at AS TEXT), CAST(completed_at AS TEXT)
+    let run_times: (i64, Option<i64>) = sqlx::query_as(
+        "SELECT created_at_us, ended_at_us
          FROM close_runs WHERE attempt_id = ?1 AND run_ordinal = ?2",
     )
     .bind(attempt)
@@ -1019,7 +1039,7 @@ async fn durable_native_close_rows(fixture: &CloseFixture, run: &CloseRunRef) ->
     .unwrap();
     serde_json::json!({
         "counts": close_row_counts(fixture).await,
-        "accepted_at_us": accepted_at_us,
+        "receipt": receipt,
         "run_times": run_times,
         "process_successes": process_successes,
         "history": history,
