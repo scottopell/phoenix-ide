@@ -118,7 +118,7 @@ runSurfaceCapture({
       await page.getByRole('button', { name: 'Settings', exact: true }).click();
       const settings = page.getByRole('dialog', { name: 'Settings', exact: true });
       await settings.waitFor({ state: 'visible' });
-      await settings.getByRole('radiogroup', { name: 'LLM language', exact: true }).waitFor();
+      await settings.getByRole('button', { name: 'View prompts →', exact: true }).waitFor();
       await settings.getByRole('checkbox', { name: 'Disable browser notifications' }).waitFor();
       if (await settings.locator('.settings-section__error').count()) throw new Error('Settings fixture contains a load error');
       const popup = await settings.evaluate(el => {

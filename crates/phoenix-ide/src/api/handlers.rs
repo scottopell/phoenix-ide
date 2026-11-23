@@ -189,6 +189,10 @@ pub fn create_router(state: AppState) -> Router {
             get(get_existing_coordinator).post(ensure_coordinator),
         )
         .route(
+            "/api/global/coordinator/language",
+            get(get_coordinator_language).put(update_coordinator_language),
+        )
+        .route(
             "/api/global/coordinator/route/{conversation}",
             get(resolve_coordinator_route),
         )
@@ -1683,6 +1687,58 @@ struct LlmLanguageSettingRequest {
     language: String,
 }
 
+async fn get_coordinator_language(
+    State(state): State<AppState>,
+) -> Result<Json<LlmLanguageSettingResponse>, AppError> {
+    let id = state
+        .db
+        .coordinator_conversation_id()
+        .await
+        .map_err(|error| AppError::Internal(error.to_string()))?
+        .ok_or_else(|| AppError::NotFound("Coordinator has not been created".into()))?;
+    let conversation = state
+        .db
+        .get_conversation(&id)
+        .await
+        .map_err(|error| AppError::Internal(error.to_string()))?;
+    Ok(Json(llm_language_setting_response(
+        conversation.llm_language,
+    )))
+}
+
+// REQ-LL-003
+async fn update_coordinator_language(
+    State(state): State<AppState>,
+    Json(req): Json<LlmLanguageSettingRequest>,
+) -> Result<Json<LlmLanguageSettingResponse>, AppError> {
+    let language = crate::llm_language::LlmLanguage::parse(&req.language)
+        .ok_or_else(|| AppError::BadRequest("Unknown Ember language".into()))?;
+    let id = state
+        .db
+        .coordinator_conversation_id()
+        .await
+        .map_err(|error| AppError::Internal(error.to_string()))?
+        .ok_or_else(|| AppError::NotFound("Coordinator has not been created".into()))?;
+    let admission = state
+        .runtime
+        .mutation_admission(&id)
+        .await
+        .map_err(map_admission_db_error)?;
+    let _admission = admission.lock().await;
+    if !state
+        .runtime
+        .change_idle_coordinator_language(&id, language)
+        .await
+        .map_err(|error| AppError::Internal(error.to_string()))?
+    {
+        return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
+            "Ember must be idle to change language. Wait for it to finish starting or working, or stop it, then try again.",
+            "coordinator_language_busy",
+        ))));
+    }
+    Ok(Json(llm_language_setting_response(language)))
+}
+
 fn llm_language_setting_response(
     lang: crate::llm_language::LlmLanguage,
 ) -> LlmLanguageSettingResponse {
@@ -2577,49 +2633,47 @@ mod product_creation_acceptance_tests {
     async fn replay_preserves_default_language_but_rejects_explicit_language_change() {
         use phoenix_core::llm_language::LlmLanguage;
 
-        let state = hard_delete_cascade_tests::make_test_state().await;
-        state
-            .db
-            .set_default_llm_language(LlmLanguage::Caveman)
-            .await
-            .unwrap();
-        let directory = tempfile::tempdir().unwrap();
-        let app = create_router(state.clone());
-        let request_id = uuid::Uuid::new_v4().to_string();
-        let body = request_body(&request_id, directory.path().to_str().unwrap());
-        let first = post_creation(&app, &body).await;
-        assert_eq!(first.status(), StatusCode::ACCEPTED);
-        let receipt = json_body(first).await;
+        for language in [LlmLanguage::Caveman, LlmLanguage::Adhd] {
+            let state = hard_delete_cascade_tests::make_test_state().await;
+            state.db.set_default_llm_language(language).await.unwrap();
+            let directory = tempfile::tempdir().unwrap();
+            let app = create_router(state.clone());
+            let request_id = uuid::Uuid::new_v4().to_string();
+            let body = request_body(&request_id, directory.path().to_str().unwrap());
+            let first = post_creation(&app, &body).await;
+            assert_eq!(first.status(), StatusCode::ACCEPTED);
+            let receipt = json_body(first).await;
 
-        state
-            .db
-            .set_default_llm_language(LlmLanguage::PhoenixNative)
-            .await
-            .unwrap();
-        let replay = post_creation(&app, &body).await;
-        assert_eq!(replay.status(), StatusCode::ACCEPTED);
-        assert_eq!(json_body(replay).await, receipt);
+            state
+                .db
+                .set_default_llm_language(LlmLanguage::PhoenixNative)
+                .await
+                .unwrap();
+            let replay = post_creation(&app, &body).await;
+            assert_eq!(replay.status(), StatusCode::ACCEPTED);
+            assert_eq!(json_body(replay).await, receipt);
 
-        let mut explicit = body;
-        explicit["llm_language"] = serde_json::json!("caveman");
-        let same_language = post_creation(&app, &explicit).await;
-        assert_eq!(same_language.status(), StatusCode::ACCEPTED);
-        assert_eq!(json_body(same_language).await, receipt);
+            let mut explicit = body;
+            explicit["llm_language"] = serde_json::json!(language.as_str());
+            let same_language = post_creation(&app, &explicit).await;
+            assert_eq!(same_language.status(), StatusCode::ACCEPTED);
+            assert_eq!(json_body(same_language).await, receipt);
 
-        explicit["llm_language"] = serde_json::json!("phoenix-native");
-        let conflict = post_creation(&app, &explicit).await;
-        assert_eq!(conflict.status(), StatusCode::CONFLICT);
-        assert_eq!(
-            json_body(conflict).await["error_type"],
-            "product_creation_request_conflict"
-        );
-        let job = state
-            .db
-            .get_product_creation_job(&request_id)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(job.intent.llm_language, LlmLanguage::Caveman);
+            explicit["llm_language"] = serde_json::json!("phoenix-native");
+            let conflict = post_creation(&app, &explicit).await;
+            assert_eq!(conflict.status(), StatusCode::CONFLICT);
+            assert_eq!(
+                json_body(conflict).await["error_type"],
+                "product_creation_request_conflict"
+            );
+            let job = state
+                .db
+                .get_product_creation_job(&request_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(job.intent.llm_language, language);
+        }
     }
 
     #[tokio::test]
@@ -13527,6 +13581,127 @@ pub(crate) mod hard_delete_cascade_tests {
         )
         .await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn coordinator_language_is_independent_and_requires_idle_head() {
+        use phoenix_core::llm_language::LlmLanguage;
+        let state = make_test_state().await;
+        assert!(super::get_coordinator_language(State(state.clone()))
+            .await
+            .is_err());
+        let coordinator = state
+            .db
+            .get_or_create_coordinator(None, LlmLanguage::Caveman)
+            .await
+            .unwrap();
+        let Json(initial) = super::get_coordinator_language(State(state.clone()))
+            .await
+            .unwrap();
+        assert_eq!(initial.language, "caveman");
+        let global = state.db.get_default_llm_language().await.unwrap();
+        let Json(saved) = super::update_coordinator_language(
+            State(state.clone()),
+            Json(super::LlmLanguageSettingRequest {
+                language: "adhd".into(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(saved.language, "adhd");
+        assert_eq!(
+            state
+                .db
+                .get_conversation(&coordinator.id)
+                .await
+                .unwrap()
+                .llm_language,
+            LlmLanguage::Adhd
+        );
+        assert_eq!(state.db.get_default_llm_language().await.unwrap(), global);
+        let Json(prompt) =
+            super::get_system_prompt(State(state.clone()), Path(coordinator.id.clone()))
+                .await
+                .unwrap();
+        assert!(prompt.system_prompt.contains(
+            phoenix_core::llm_language::response_style_guidance(LlmLanguage::Adhd)
+        ));
+        assert!(super::update_coordinator_language(
+            State(state.clone()),
+            Json(super::LlmLanguageSettingRequest {
+                language: "unknown".into()
+            })
+        )
+        .await
+        .is_err());
+        state
+            .db
+            .update_conversation_state(&coordinator.id, &ConvState::LlmRequesting { attempt: 1 })
+            .await
+            .unwrap();
+        let refused = super::update_coordinator_language(
+            State(state.clone()),
+            Json(super::LlmLanguageSettingRequest {
+                language: "caveman".into(),
+            }),
+        )
+        .await;
+        assert!(matches!(refused, Err(AppError::Conflict(_))));
+        assert_eq!(
+            state
+                .db
+                .get_conversation(&coordinator.id)
+                .await
+                .unwrap()
+                .llm_language,
+            LlmLanguage::Adhd
+        );
+        assert!(!state
+            .db
+            .set_idle_coordinator_language("missing", LlmLanguage::Caveman)
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn coordinator_language_save_recreates_warm_runtime() {
+        use phoenix_core::llm_language::LlmLanguage;
+        let state = make_test_state().await;
+        let home = tempfile::tempdir().unwrap();
+        state
+            .db
+            .initialize_coordinator_work_scope(home.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let coordinator = state
+            .db
+            .get_or_create_coordinator(None, LlmLanguage::Caveman)
+            .await
+            .unwrap();
+        let before = state.runtime.get_or_create(&coordinator.id).await.unwrap();
+        let Json(saved) = super::update_coordinator_language(
+            State(state.clone()),
+            Json(super::LlmLanguageSettingRequest {
+                language: "adhd".into(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(saved.language, "adhd");
+        assert!(state
+            .runtime
+            .try_get_handle(&coordinator.id)
+            .await
+            .is_none());
+        let after = state.runtime.get_or_create(&coordinator.id).await.unwrap();
+        assert!(!before.event_tx.same_channel(&after.event_tx));
+        assert_eq!(*after.state_rx.borrow(), ConvState::Idle);
+        assert!(state
+            .db
+            .get_messages(&coordinator.id)
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]

@@ -118,6 +118,29 @@ describe('Sidebar — ProductConversation navigation', () => {
 
 
 
+  it('opens New without discarding the saved draft language or recovery identity', async () => {
+    localStorage.setItem('phoenix-new-conversation-draft', 'Resume this draft');
+    localStorage.setItem('phoenix-create-llm-language', 'adhd');
+    sessionStorage.setItem('phoenix-active-product-create-request', 'request-pending');
+    function NavigationProbe() {
+      return <output data-testid="new-location">{useLocation().pathname}</output>;
+    }
+    const { getByRole, getByTestId } = render(
+      <MemoryRouter initialEntries={['/c/existing']}>
+        <Sidebar collapsed={false} onToggle={vi.fn()} conversations={[]} archivedConversations={[]}
+          activeSlug="existing" onConversationCreated={vi.fn()} />
+        <NavigationProbe />
+      </MemoryRouter>,
+    );
+    await waitFor(() => expect(apiMock.listProductConversations).toHaveBeenCalled());
+    fireEvent.click(getByRole('button', { name: '+ New' }));
+    expect(getByTestId('new-location')).toHaveTextContent('/new');
+    expect(localStorage.getItem('phoenix-new-conversation-draft')).toBe('Resume this draft');
+    expect(localStorage.getItem('phoenix-create-llm-language')).toBe('adhd');
+    expect(sessionStorage.getItem('phoenix-active-product-create-request')).toBe('request-pending');
+    sessionStorage.removeItem('phoenix-active-product-create-request');
+  });
+
   it('shows a History aggregate with no Archived terminology or legacy Archive action', async () => {
     const { container, getByRole, getAllByText, queryByText, queryByTitle } = render(
       <MemoryRouter initialEntries={['/product-conversations/pc-archived']}>

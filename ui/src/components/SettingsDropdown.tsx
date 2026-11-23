@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useId, useLayoutEffect, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { api, type CodexLoginPreflight, type LlmLanguageSetting, type NotificationSettings } from '../api';
+import { api, type CodexLoginPreflight, type NotificationSettings } from '../api';
 import { refreshModels } from '../modelsPoller';
 import { clearCodexQuota, setCodexQuota, useCodexQuota } from '../codexQuota';
 import { CodexQuotaBlock } from './CodexQuotaBlock';
@@ -472,142 +472,16 @@ function NotificationsSection() {
   );
 }
 
-function llmLanguageMeta(setting: LlmLanguageSetting, lang: string) {
-  return setting.languages.find((entry) => entry.id === lang);
-}
-
-function llmLanguageLabel(setting: LlmLanguageSetting, lang: string): string {
-  return llmLanguageMeta(setting, lang)?.label ?? lang;
-}
-
-function llmLanguageTooltip(setting: LlmLanguageSetting, lang: string): string {
-  return llmLanguageMeta(setting, lang)?.description ?? lang;
-}
-
-/**
- * Global default LLM language. Applied only to NEW conversations; existing
- * conversations stay in whatever language they were created with, and chain
- * continuations / sub-agents inherit from their parent.
- */
 function LlmLanguageSection({ onCloseMenu }: { onCloseMenu: () => void }) {
   const navigate = useNavigate();
-  const [setting, setSetting] = useState<LlmLanguageSetting | null>(null);
-  const [saving, setSaving] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  // Monotonic save id (mirrors NotificationsSection): rapid clicks issue
-  // multiple PUTs and we apply only the latest response, so out-of-order
-  // completions don't overwrite the user's current selection.
-  const latestSaveRef = useRef(0);
-  // Live mirror of `setting`, read in the click handler so rapid clicks
-  // (Phoenix → Caveman → Phoenix) compare against the value the previous
-  // click just installed rather than a stale closure capture — without
-  // putting side effects inside a setState updater.
-  const settingRef = useRef<LlmLanguageSetting | null>(null);
-  // Last server-confirmed value — used to roll back the optimistic
-  // selection if the latest PUT fails.
-  const confirmedRef = useRef<LlmLanguageSetting | null>(null);
-  const mountedRef = useRef(true);
-
-  useEffect(() => {
-    mountedRef.current = true;
-    return () => { mountedRef.current = false; };
-  }, []);
-
-  useEffect(() => {
-    api.getLlmLanguageSetting()
-      .then((loaded) => {
-        if (!mountedRef.current) return;
-        confirmedRef.current = loaded;
-        settingRef.current = loaded;
-        setSetting(loaded);
-      })
-      .catch((err) => {
-        if (!mountedRef.current) return;
-        setError(err instanceof Error ? err.message : 'Failed to load LLM language');
-      });
-  }, []);
-
-  const select = useCallback((next: string) => {
-    // Read the live value via ref, not a closure — captures stale state.
-    const current = settingRef.current;
-    if (!current || current.language === next) return;
-
-    const saveId = latestSaveRef.current + 1;
-    latestSaveRef.current = saveId;
-
-    // Optimistic local update. Pure setState (no side effects inside the
-    // updater); the PUT is fired from the handler scope.
-    const optimistic = { ...current, language: next };
-    settingRef.current = optimistic;
-    setSetting(optimistic);
-    setSaving(true);
-    setError(null);
-
-    api.updateLlmLanguageSetting(next)
-      .then((saved) => {
-        // Only the latest save's response is allowed to mutate state.
-        // Earlier PUTs that arrive out of order are dropped on the floor.
-        if (!mountedRef.current || latestSaveRef.current !== saveId) return;
-        confirmedRef.current = saved;
-        settingRef.current = saved;
-        setSetting(saved);
-        setSaving(false);
-      })
-      .catch((err: unknown) => {
-        if (!mountedRef.current || latestSaveRef.current !== saveId) return;
-        // Roll back to the last server-confirmed value so the UI matches the server.
-        if (confirmedRef.current) {
-          settingRef.current = confirmedRef.current;
-          setSetting(confirmedRef.current);
-        }
-        setError(err instanceof Error ? err.message : 'Failed to save LLM language');
-        setSaving(false);
-      });
-  }, []);
-
-  if (!setting && !error) return null;
-
   return (
     <section className="settings-section">
       <h3 className="settings-section__title">LLM Language</h3>
-      <div className="settings-section__hint">
-        Sets the voice Phoenix uses with the model (system prompt, tool
-        descriptions). Applies to new conversations only.
-      </div>
-      {setting && (
-        <div
-          className="settings-theme-row"
-          role="radiogroup"
-          aria-label="LLM language"
-        >
-          {setting.available.map((lang) => {
-            const active = setting.language === lang;
-            return (
-              <button
-                key={lang}
-                type="button"
-                role="radio"
-                aria-checked={active}
-                className={`settings-theme-btn${active ? ' active' : ''}`}
-                onClick={() => select(lang)}
-                disabled={saving}
-                title={llmLanguageTooltip(setting, lang)}
-              >
-                {llmLanguageLabel(setting, lang)}
-              </button>
-            );
-          })}
-        </div>
-      )}
-      <button
-        type="button"
-        className="settings-inline-btn settings-about-link"
-        onClick={() => { onCloseMenu(); navigate('/settings/llm-language'); }}
-      >
+      <div className="settings-section__hint">Choose a language when starting each conversation.</div>
+      <button type="button" className="settings-inline-btn settings-about-link"
+        onClick={() => { onCloseMenu(); navigate('/settings/llm-language'); }}>
         View prompts →
       </button>
-      {saving && <div className="settings-section__hint">Saving…</div>}
-      {error && <div className="settings-section__error">{error}</div>}
     </section>
   );
 }
