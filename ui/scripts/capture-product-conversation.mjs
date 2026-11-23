@@ -462,21 +462,23 @@ async function assertEmberTracking(page, id, viewport, outDir) {
     throw new Error('Null review cue has an incorrect outline label');
   }
   if (id === 'ember-tracking-fallback') {
-    for (const target of ['tracking-spoof', 'tracking-malformed']) {
-      const pill = nav.getByRole('button', { name: /Saved Ember tracking observation:/ });
-      await pill.nth(target === 'tracking-spoof' ? 0 : 1).click();
+    for (const target of ['tracking-spoof', 'tracking-malformed', 'tracking-unknown']) {
+      const prefix = target === 'tracking-unknown' ? 'Unknown system observation:' : '[Saved Ember tracking observation:';
+      const pill = nav.getByRole('button', { name: target === 'tracking-unknown' ? /Unknown system observation:/ : /Saved Ember tracking observation:/ });
+      await pill.nth(target === 'tracking-malformed' ? 1 : 0).click();
       await page.waitForFunction(message => document.documentElement.dataset.sourceFixtureLocation?.endsWith(`#message-${message}`), target);
       const row = page.locator(`#message-${target}`);
       await row.locator('.message-content').waitFor({ state: 'visible' });
-      if (await row.locator('.ember-tracking-card').count() || !await row.locator('.message-content').textContent().then(text => text?.startsWith('[Saved Ember tracking observation:'))) {
+      if (await row.locator('.ember-tracking-card').count() || !await row.locator('.message-content').textContent().then(text => text?.startsWith(prefix))) {
         throw new Error(`${target} was promoted to a card or lost its exact original prefix`);
       }
+      await page.screenshot({ path: `${outDir}/${id}--${viewport.name}--${target}.png`, fullPage: true });
     }
     await duePills.first().click();
     await page.locator('#message-tracking-history-due .ember-tracking-card').waitFor({ state: 'visible' });
     if (await page.evaluate(() => document.documentElement.scrollWidth > innerWidth)) throw new Error('Tracking lookalike caused horizontal overflow');
     await page.screenshot({ path: `${outDir}/${id}--${viewport.name}--fallback.png`, fullPage: true });
-    journeys.push(`${id}/${viewport.name}: user-origin exact payload spoof and malformed system-origin payload remain original text; historical real observation is compact`);
+    journeys.push(`${id}/${viewport.name}: user-origin exact payload spoof, malformed and unknown system-origin payloads remain original text; historical real observation is compact`);
     return true;
   }
   await duePills.last().click();
@@ -484,6 +486,9 @@ async function assertEmberTracking(page, id, viewport, outDir) {
   const due = page.locator('#message-tracking-current-due');
   await due.locator('.ember-tracking-card').waitFor({ state: 'visible' });
   if (await due.locator('.ember-tracking-card details').first().getAttribute('open') !== null) throw new Error('Saved observation was not collapsed');
+  const collapsedHeight = await due.locator('.ember-tracking-card').evaluate(element => element.getBoundingClientRect().height);
+  if (collapsedHeight <= 0 || collapsedHeight > 240) throw new Error(`Collapsed observation is not compact: ${collapsedHeight}px`);
+  measurements.push({ id, viewport: viewport.name, collapsedTrackingCardHeight: collapsedHeight });
   const composer = page.locator('.product-conversation-page__composer #message-input');
   await composer.waitFor({ state: 'visible' });
   await composer.fill('Unsent tracking QA draft');
@@ -504,7 +509,8 @@ async function assertEmberTracking(page, id, viewport, outDir) {
   await raw.locator('summary').press('Enter');
   await raw.locator('pre').waitFor({ state: 'visible' });
   const original = await raw.locator('pre').textContent();
-  if (!original?.startsWith('[Saved Ember tracking observation:') || JSON.parse(original.slice(original.indexOf('\n') + 1)).captured_registry.registry_revision !== 12) {
+  const expectedOriginal = await page.locator('[data-tracking-expected-payload]').getAttribute('data-tracking-expected-payload');
+  if (!expectedOriginal || original !== expectedOriginal) {
     throw new Error('Raw original was not preserved byte-for-byte as a producer envelope and payload');
   }
   await page.context().grantPermissions(['clipboard-read', 'clipboard-write']);

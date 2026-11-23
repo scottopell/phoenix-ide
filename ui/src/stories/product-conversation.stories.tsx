@@ -1,5 +1,5 @@
 import { makeMobileContinuationScenario, makeVirtualizedReactionScenario } from '../fixtures/productConversation/scenarios';
-import { makeEmberTrackingScenario } from '../fixtures/productConversation/emberTracking';
+import { duePayload, makeEmberTrackingScenario } from '../fixtures/productConversation/emberTracking';
 import type { Story } from '@ladle/react';
 import {
   getProductConversationScenario,
@@ -79,7 +79,9 @@ CompactEventsRedacted.storyName = 'compact-events-redacted';
 
 const trackingObservations = makeEmberTrackingScenario('ember-tracking-observations');
 const trackingFallback = makeEmberTrackingScenario('ember-tracking-fallback');
-export const EmberTrackingObservations: Story = () => <ProductConversationFixture scenario={trackingObservations} />;
+export const EmberTrackingObservations: Story = () => <ProductConversationFixture scenario={trackingObservations}>
+  <output hidden data-tracking-expected-payload={duePayload} />
+</ProductConversationFixture>;
 EmberTrackingObservations.storyName = 'ember-tracking-observations';
 export const EmberTrackingFallback: Story = () => <ProductConversationFixture scenario={trackingFallback} />;
 EmberTrackingFallback.storyName = 'ember-tracking-fallback';

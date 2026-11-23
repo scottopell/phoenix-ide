@@ -61,6 +61,7 @@ jobs:
           PLAYWRIGHT_INSTALLED_ONLY: '1'
           CAPTURE_STORIES: ember-tracking-observations,ember-tracking-fallback
           CAPTURE_VIEWPORT: tracking-393-dark
+          PRODUCT_CONVERSATION_QA_OUT: qa-artifacts/tracking-mobile
         run: node scripts/capture-product-conversation.mjs
       - name: Ember tracking saved observation / desktop journey
         working-directory: ui
@@ -69,6 +70,7 @@ jobs:
           PLAYWRIGHT_INSTALLED_ONLY: '1'
           CAPTURE_STORIES: ember-tracking-observations,ember-tracking-fallback
           CAPTURE_VIEWPORT: desktop-dark
+          PRODUCT_CONVERSATION_QA_OUT: qa-artifacts/tracking-desktop
         run: node scripts/capture-product-conversation.mjs
       - uses: actions/upload-artifact@v4
         if: always()
