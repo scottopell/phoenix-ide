@@ -202,7 +202,7 @@ async function assertTranscriptGeometry(page, id, viewport, theme) {
       display: getComputedStyle(required.transcript).display,
       transcript: box(required.transcript), mainArea: box(required.mainArea), chatView: box(required.chatView),
       virtualTranscript: box(required.virtualTranscript), title: box(required.title), composer: box(required.composer),
-      visibleRealMessageRow: rows.some((row) => row.querySelector('.message.user, .message.agent') && intersects(box(row), viewportBox)),
+      visibleRealMessageRow: rows.some((row) => row.querySelector('.message.user, .message.agent, .message.meta') && intersects(box(row), viewportBox)),
       positiveRows: rows.filter((row) => { const rect = row.getBoundingClientRect(); return rect.width > 0 && rect.height > 0; }).length,
       horizontalOverflow: document.documentElement.scrollWidth > window.innerWidth,
       documentOverflow: document.documentElement.scrollWidth > window.innerWidth || document.documentElement.scrollHeight > window.innerHeight,

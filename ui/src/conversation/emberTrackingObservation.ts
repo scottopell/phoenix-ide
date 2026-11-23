@@ -63,7 +63,7 @@ function observation(value: unknown): value is TrackingObservation {
 export function emberTrackingObservation(message: Message): TrackingObservation | null {
   if (message.message_type !== 'user' || message.origin?.kind !== 'system_generated' || message.event_presentation !== null) return null;
   if (message.display_data != null && (!record(message.display_data, ['productOccurrenceToken'])
-    || !string(message.display_data.productOccurrenceToken))) return null;
+    || !string(message.display_data['productOccurrenceToken']))) return null;
   const content: unknown = message.content;
   if (!record(content, ['text', 'is_meta']) || content.is_meta !== true || !string(content.text) || !content.text.startsWith(PREFIX)) return null;
   try {

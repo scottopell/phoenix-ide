@@ -20,10 +20,12 @@ describe('saved Ember tracking observation recognizer', () => {
   });
   it('rejects copied user text, non-meta messages, unsupported attachments and alternate envelopes', () => {
     expect(emberTrackingObservation({ ...message(), origin: { kind: 'user_api' } })).toBeNull();
-    expect(emberTrackingObservation({ ...message(), origin: undefined })).toBeNull();
+    const missingOrigin = message();
+    delete missingOrigin.origin;
+    expect(emberTrackingObservation(missingOrigin)).toBeNull();
     expect(emberTrackingObservation({ ...message(), content: { text: EMBER_TRACKING_PREFIX + JSON.stringify(observation) } })).toBeNull();
     expect(emberTrackingObservation({ ...message(), content: { ...(message().content as object), images: [{ data: 'x', media_type: 'image/png' }] } as Message['content'] })).toBeNull();
-    expect(emberTrackingObservation({ ...message(), content: { ...(message().content as object), llm_text: 'expanded' } as Message['content'] })).toBeNull();
+    expect(emberTrackingObservation({ ...message(), content: { text: EMBER_TRACKING_PREFIX + JSON.stringify(observation), is_meta: true, llm_text: 'expanded' } as Message['content'] })).toBeNull();
     expect(emberTrackingObservation({ ...message(), content: { text: '[Saved Ember tracking observation: spoof]\n' + JSON.stringify(observation), is_meta: true } as Message['content'] })).toBeNull();
     expect(emberTrackingObservation({ ...message(), message_type: 'system' })).toBeNull();
   });
