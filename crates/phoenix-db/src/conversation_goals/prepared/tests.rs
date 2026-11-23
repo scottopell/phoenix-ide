@@ -351,6 +351,7 @@ async fn goal_preparation_migration_follows_conversation_tool_migrations() {
             (179, "native_initial_source_fence".into()),
             (180, "native_initial_completed_interruption".into()),
             (181, "native_initial_completion_retry_admission".into()),
+            (182, "close_ignored_loss_category".into()),
         ]
     );
 }

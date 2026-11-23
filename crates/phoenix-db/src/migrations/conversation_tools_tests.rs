@@ -576,6 +576,7 @@ async fn registered_fresh_upgrade_slack_children_ledger_and_reentry() {
                     (179, "native_initial_source_fence"),
                     (180, "native_initial_completed_interruption"),
                     (181, "native_initial_completion_retry_admission"),
+                    (182, "close_ignored_loss_category"),
                 ]
             );
             drop(conn);

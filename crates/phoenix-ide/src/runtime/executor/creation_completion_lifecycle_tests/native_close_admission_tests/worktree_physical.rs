@@ -33,6 +33,11 @@ async fn registered_native_close_with_loss_content_stops_incomplete_without_reti
 }
 
 #[tokio::test]
+async fn registered_native_close_captured_loss_can_be_reinspected_after_separate_cleanup() {
+    run_public_worktree_close(WorktreeJourney::ReinspectCapturedLossAfterCleanup).await;
+}
+
+#[tokio::test]
 async fn registered_native_close_loss_classification_rollback_retries_without_recollection() {
     run_public_worktree_close(WorktreeJourney::RetryLossClassification).await;
 }
@@ -65,6 +70,7 @@ enum WorktreeJourney {
     Retire,
     RetireWithProductionDetector,
     RetainContentBlockers,
+    ReinspectCapturedLossAfterCleanup,
     RetryLossClassification,
     StopBeforeAdmission,
     StopBeforeAdmissionWithReusedPath,
@@ -431,7 +437,9 @@ async fn run_public_worktree_close(journey: WorktreeJourney) {
     let retry_loss_classification = matches!(journey, WorktreeJourney::RetryLossClassification);
     let content_blocked = matches!(
         journey,
-        WorktreeJourney::RetainContentBlockers | WorktreeJourney::RetryLossClassification
+        WorktreeJourney::RetainContentBlockers
+            | WorktreeJourney::RetryLossClassification
+            | WorktreeJourney::ReinspectCapturedLossAfterCleanup
     );
     if content_blocked {
         std::fs::create_dir_all(git.repo.join(".git/info")).unwrap();
@@ -447,6 +455,7 @@ async fn run_public_worktree_close(journey: WorktreeJourney) {
         WorktreeJourney::Retire
             | WorktreeJourney::RetainContentBlockers
             | WorktreeJourney::RetryLossClassification
+            | WorktreeJourney::ReinspectCapturedLossAfterCleanup
     ) {
         // Qualify public admission and real Git/filesystem retirement independently
         // of ambient runner processes. Production inspection gaps remain blocking;
@@ -835,6 +844,113 @@ async fn run_public_worktree_close(journey: WorktreeJourney) {
         );
         assert_eq!(physical_snapshot(&git.root), physical_before_admission);
         git.assert_untargeted_state_preserved();
+        if matches!(journey, WorktreeJourney::ReinspectCapturedLossAfterCleanup) {
+            use crate::runtime::close_retirement::captured_loss_retry::collect_captured_loss_retry_inspection;
+
+            let retained = fixture
+                .db
+                .read_native_close_captured_loss_retry_context(&fixture.target, &run)
+                .await
+                .unwrap();
+            assert_eq!(retained.initial_command(), &fixture.command);
+            assert_eq!(retained.failed_run(), &run);
+            assert_eq!(retained.losses(), losses.as_slice());
+            assert_eq!(retained.failure(), &failures[0].occurrence);
+            assert_eq!(retained.scopes().len(), 1);
+            assert_eq!(retained.scopes()[0].scope, scope);
+            assert_eq!(
+                retained.scopes()[0].captured_worktree,
+                Some(CapturedWorktreeIdentity::Resolved(original_worktree.clone()))
+            );
+            assert_eq!(retained.inspections().len(), 1);
+            assert_eq!(retained.inspections()[0].target.scope, scope);
+
+            let dirty = collect_captured_loss_retry_inspection(&retained)
+                .await
+                .unwrap();
+            assert_eq!(dirty.initial_command, fixture.command);
+            assert_eq!(dirty.failed_run, run);
+            assert_eq!(dirty.request.attempt_id, attempt);
+            assert_eq!(dirty.request.scopes.len(), 1);
+            assert_eq!(dirty.request.scopes[0].scope, scope);
+            assert_eq!(dirty.request.scopes[0].losses.len(), losses.len());
+            for loss in &losses {
+                assert!(dirty.request.scopes[0].losses.contains(&loss.item));
+            }
+            assert_ne!(
+                &dirty.request.scopes[0].snapshot,
+                &retained.inspections()[0].snapshot
+            );
+            assert_eq!(physical_snapshot(&git.root), physical_before_admission);
+            assert_eq!(durable_native_close_rows(&fixture, &run).await, before_replay);
+
+            // Separate fixture cleanup, not a native Close retirement effect.
+            std::fs::write(git.worktree.join("tracked.txt"), b"durable content\n").unwrap();
+            std::fs::remove_file(git.worktree.join("build/a.bin")).unwrap();
+            std::fs::remove_file(git.worktree.join("build/b.bin")).unwrap();
+            std::fs::remove_dir(git.worktree.join("build")).unwrap();
+            let physical_after_cleanup = physical_snapshot(&git.root);
+
+            let clean = collect_captured_loss_retry_inspection(&retained)
+                .await
+                .unwrap();
+            assert_eq!(clean.initial_command, fixture.command);
+            assert_eq!(clean.failed_run, run);
+            assert_eq!(clean.request.attempt_id, attempt);
+            assert_eq!(clean.request.scopes.len(), dirty.request.scopes.len());
+            assert_eq!(clean.request.scopes[0].scope, dirty.request.scopes[0].scope);
+            assert!(clean.request.scopes[0].losses.is_empty());
+            assert_ne!(
+                clean.request.scopes[0].snapshot.generation(),
+                dirty.request.scopes[0].snapshot.generation()
+            );
+            assert_ne!(
+                clean.request.scopes[0].snapshot.fingerprint(),
+                dirty.request.scopes[0].snapshot.fingerprint()
+            );
+            assert_ne!(
+                &clean.request.scopes[0].snapshot,
+                &retained.inspections()[0].snapshot
+            );
+            assert_eq!(
+                fixture
+                    .db
+                    .read_native_close_captured_loss_retry_context(&fixture.target, &run)
+                    .await
+                    .unwrap(),
+                retained
+            );
+            assert_eq!(
+                fixture
+                    .db
+                    .list_close_retirement_losses(attempt.as_str())
+                    .await
+                    .unwrap(),
+                losses
+            );
+            assert_eq!(
+                fixture
+                    .db
+                    .list_close_cleanup_failures(attempt.as_str())
+                    .await
+                    .unwrap(),
+                failures
+            );
+            assert_eq!(durable_native_close_rows(&fixture, &run).await, before_replay);
+            assert_eq!(
+                close_row_counts(&fixture).await,
+                vec![1, 1, 0, 1, 0, 0, 0, 0, 1],
+                "reinspection alone grants no new run, anchor, inventory, dispatch or retirement"
+            );
+            assert_eq!(physical_snapshot(&git.root), physical_after_cleanup);
+            assert_eq!(directory_identity(&git.worktree), git.checkout_identity);
+            assert_eq!(directory_identity(&git.admin), git.admin_identity);
+            assert_eq!(
+                git.run(&git.repo, &["worktree", "list", "--porcelain", "-z"]),
+                registrations_before_admission
+            );
+            git.assert_untargeted_state_preserved();
+        }
     } else {
         assert!(output.is_success(), "{}", output.output());
         let admitted: Value = serde_json::from_str(&output.output()).unwrap();
@@ -1245,11 +1361,21 @@ async fn durable_native_close_rows(fixture: &CloseFixture, run: &CloseRunRef) ->
     let obligation = fixture.db.get_close_obligation(attempt).await.unwrap();
     let persisted_run = fixture.db.get_close_run(run).await.unwrap();
     let scopes = fixture.db.list_close_attempt_scopes(attempt).await.unwrap();
-    let expected = fixture
-        .db
-        .list_close_expected_retirement_resources(attempt)
-        .await
-        .unwrap();
+    // A content-blocked initial run has no sealed inventory. The authority
+    // reader correctly refuses that state; snapshot the actual rows instead of
+    // inventing an empty authoritative inventory or ignoring a reader error.
+    let expected: Vec<String> = sqlx::query_scalar(
+        "SELECT json_array(attempt_id, scope, inspection_generation,
+                           inspection_fingerprint, resource_kind, identity_kind,
+                           identity_codec, quote(identity_value))
+         FROM close_expected_retirement_resources WHERE attempt_id = ?1
+         ORDER BY scope, inspection_generation, inspection_fingerprint,
+                  resource_kind, identity_kind, identity_value",
+    )
+    .bind(attempt)
+    .fetch_all(fixture.db.pool())
+    .await
+    .unwrap();
     let evidence = fixture
         .db
         .list_close_retirement_evidence(attempt)

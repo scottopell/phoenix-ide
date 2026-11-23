@@ -191,6 +191,9 @@ fn append_field(bytes: &mut Vec<u8>, value: &[u8]) {
     bytes.extend_from_slice(value);
 }
 
+mod captured_loss_retry;
+pub use captured_loss_retry::NativeCloseCapturedLossRetryContext;
+
 mod completion;
 pub use completion::{NativeCloseCompletionReceipt, NativeCloseCompletionResult};
 
