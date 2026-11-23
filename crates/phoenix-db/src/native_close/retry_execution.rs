@@ -328,6 +328,8 @@ impl Database {
                     "native retry metadata requires its exact original running worktree plan",
                 ));
             }
+            Self::require_native_close_retry_members_quiescent_tx(&mut tx, &admitted.attempt_id)
+                .await?;
             let run = CloseRunRef {
                 attempt_id: admitted.attempt_id.clone(),
                 ordinal: admitted.run_ordinal,
@@ -416,6 +418,7 @@ impl Database {
                 "native retry dispatch requires its exact latest running plan",
             ));
         }
+        Self::require_native_close_retry_members_quiescent_tx(tx, &admitted.attempt_id).await?;
         let run = CloseRunRef {
             attempt_id: admitted.attempt_id.clone(),
             ordinal: admitted.run_ordinal,
@@ -496,6 +499,7 @@ impl Database {
                 "native WorkScope retirement requires its latest running plan",
             ));
         }
+        Self::require_native_close_retry_members_quiescent_tx(tx, &admitted.attempt_id).await?;
         let run = CloseRunRef {
             attempt_id: admitted.attempt_id.clone(),
             ordinal: admitted.run_ordinal,
@@ -763,6 +767,12 @@ impl Database {
             }
             return Ok(obligation);
         }
+        if matches!(
+            request.stop_certainty,
+            CloseStopCertainty::ConversationAndProcessesStopped { .. }
+        ) {
+            Self::require_native_close_retry_members_quiescent_tx(tx, &run.attempt_id).await?;
+        }
         Self::insert_and_finish_close_resource_failure_tx(tx, &run, request, obligation).await
     }
 
@@ -854,6 +864,11 @@ impl Database {
                 "native retry execution requires its exact latest running plan",
             ));
         }
+        // Initial settlement is historical evidence, not authority to retire a
+        // member that has acquired new durable work since assessment/admission.
+        // Keep failure classification on the identity-only path: discovering
+        // live work must not prevent recording an honest incomplete outcome.
+        Self::require_native_close_retry_members_quiescent_tx(tx, &admitted.attempt_id).await?;
         Ok(plan.effect_count)
     }
 

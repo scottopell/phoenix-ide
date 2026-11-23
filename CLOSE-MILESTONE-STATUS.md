@@ -1,5 +1,18 @@
 # Unified Close acceptance milestone
 
+## Current qualification and durable-member retry fence
+
+- Published base `e72cd00e81dbd1d9abe618e89cd508137ad6bae5` is executing automatic hosted run [45266230371](https://github.com/scottopell/phoenix-ide/actions/runs/45266230371). Exact SHA/status checked: database in progress; frontend and specifications completed successfully at job level. Their e72 artifacts have not yet been personally classified. Sole watcher `@88` / `close-e72cd00e8-watch` remains active; evidence directory `/tmp/close-e72cd00e8`.
+- Prior exact39821 run45257098758 is terminal failure, not active. Its classified evidence is retained `/tmp/close-39821ca11`: frontend WorkActions113 and ProductConversationPage218 passed; typecheck/lint executed successfully; hosted formatting patch empty. Database/migration stale182 fixture failures and public snapshot-helper failures are repaired in e72 but require that exact run's execution proof.
+- Reviewed bounded follow-on source gates existing anchored explicit retry on **current durable captured-member obligations**, using the existing settlement counter in the same admission/mutation transaction. Historical original retirement proof is not current quiescence. Exact receipt replay remains observation-only; uncertain failure may still terminalize honestly, while fresh definitely-stopped placement requires the durable fence. This is not process proof and does not replay stop effects.
+- Four new source-only regressions cover refusal before new admission, unchanged receipt replay, dispatch/success/finalization fences, and uncertain failure versus false stopped placement. The fixture inserts schema-valid independent durable ownership below ordinary turn admission, without disabling triggers. Workflow inventory and actual execution gates use the four exact test names. Independent source review found no concrete blocker; compilation, runtime behavior and formatting remain unverified until hosted execution.
+- **Full captured-loss retry remains unfinished:** e72's read-only original-context reader and test-only finite reinspection do not admit a successor or reclaim disk. Distinct immutable captured-origin admission, fresh positive shutdown evidence, source/Stop fences, successor-bound retirement and the public separate-cleanup → explicit-retry → reclaimed-disk → truthful-History → replay journey are still owed. No fabricated original anchor or process-epoch stop authority is permitted.
+- No local build/test/formatter/script/SQL/UI execution, manual CI rerun/cancel/dispatch, merge, deployment, or real-user destructive action. Reviewed source corrections may queue only while preserving the active exact-head run and without replacing an unclassified pending source. The earlier active-run statements below are historical and superseded by this section.
+
+## Historical captured-loss evidence slice
+
+The following describes the preceding publication; current run ownership and unfinished acceptance are stated above.
+
 ## Current qualification and captured-loss evidence slice
 
 - Exact `a6bb83389063678c485b7eed96ef505665afb469`, run `45255463741`, is terminal **failure**. Its original watcher exited on a GitHub HTTP 500; sole resumed watcher `@86` subsequently exited with the terminal result. Full logs and exact artifacts are retained under `/tmp/close-a6bb83389`.

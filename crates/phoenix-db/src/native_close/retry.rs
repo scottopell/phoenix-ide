@@ -1,7 +1,7 @@
-//! Explicit native retry admission. No runtime or tool owns this dormant entry point yet.
+//! Source-owned explicit native retry admission and fresh durable-member fencing.
 
 use phoenix_core::domain::close::{
-    CloseRunRef, CloseRunStatus, RetiredResourceKind, RetirementOutcome,
+    CloseAttemptId, CloseRunRef, CloseRunStatus, RetiredResourceKind, RetirementOutcome,
 };
 use sha2::{Digest, Sha256};
 use sqlx::{Sqlite, Transaction};
@@ -34,6 +34,25 @@ fn refused(message: &str) -> DbError {
 }
 
 impl Database {
+    /// Rechecks current work of the immutable captured members, not their old
+    /// captured state or the original run's settlement receipts. This is a
+    /// durable-member gate only; live process/resource proof is independently
+    /// required by the runtime owner. It does not acknowledge or stop any work.
+    pub(super) async fn require_native_close_retry_members_quiescent_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        attempt: &CloseAttemptId,
+    ) -> DbResult<()> {
+        let active =
+            Self::count_close_settlement_active_participants_tx(tx, attempt.as_str()).await?;
+        if active != 0 {
+            return Err(refused(&format!(
+                "attempt {} still has {active} active durable captured member obligation(s)",
+                attempt
+            )));
+        }
+        Ok(())
+    }
+
     /// Commits adoption, successor, original-bound plan and source receipt together.
     /// A replay validates source authority before consulting the durable receipt;
     /// fresh admission additionally compares the assessed proof inside the write transaction.
@@ -130,6 +149,7 @@ impl Database {
                 "retry requires the exact latest stopped incomplete Close",
             ));
         }
+        Self::require_native_close_retry_members_quiescent_tx(tx, &failed_run.attempt_id).await?;
         let request = assessment.request();
         if request.failed_run != failed_run || request.requested_by != CloseRetryRequestedBy::User {
             return Err(refused(

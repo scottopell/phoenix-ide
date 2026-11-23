@@ -265,7 +265,11 @@ jobs:
             exact_initial_process_entry_rejects_stopped_and_restored_source_without_handoff \
             exact_initial_process_entry_requires_original_binding_and_preserves_local_refusal \
             exact_initial_process_entry_revalidates_after_independent_writer_revokes_source \
-            exact_initial_process_entry_releases_writer_before_retained_cleanup_finishes; do
+            exact_initial_process_entry_releases_writer_before_retained_cleanup_finishes \
+            native_retry_new_admission_requires_current_captured_member_quiescence \
+            native_retry_exact_receipt_replay_ignores_new_member_work_without_effects \
+            native_retry_live_execution_rechecks_current_captured_member_quiescence \
+            native_retry_member_work_allows_uncertain_failure_but_not_stopped_placement; do
             grep -F "close_foundation::tests::native_retry::$test: test" evidence/selected-tests.txt
           done
       - name: Execute migration176 populated upgrade and authority regressions
@@ -325,7 +329,11 @@ jobs:
             exact_initial_process_entry_rejects_stopped_and_restored_source_without_handoff \
             exact_initial_process_entry_requires_original_binding_and_preserves_local_refusal \
             exact_initial_process_entry_revalidates_after_independent_writer_revokes_source \
-            exact_initial_process_entry_releases_writer_before_retained_cleanup_finishes; do
+            exact_initial_process_entry_releases_writer_before_retained_cleanup_finishes \
+            native_retry_new_admission_requires_current_captured_member_quiescence \
+            native_retry_exact_receipt_replay_ignores_new_member_work_without_effects \
+            native_retry_live_execution_rechecks_current_captured_member_quiescence \
+            native_retry_member_work_allows_uncertain_failure_but_not_stopped_placement; do
             grep -F "test close_foundation::tests::native_retry::$test ... ok" evidence/close-foundation.log
           done
       - name: Execute migration172 regression module selectors
