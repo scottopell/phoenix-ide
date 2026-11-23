@@ -75,5 +75,40 @@ both HTTP/SSE and WebSockets. The ignored runtime probe
 real ToolSearch handler, 65 frozen deferred synthetic schemas, canonical SQLite
 selection ownership, deferred execution, and persisted final OK. Transport
 metrics confirm all three requests used WebSockets. No external tool side
-effects or other app credentials were used. Final owner checks, review, and
-repository validation remain in progress.
+effects or other app credentials were used. A per-process random UUID appears
+only in the deferred schema as a required constant. The initial request omits
+it, and the first actual function invocation must return it exactly. This
+stronger live probe passed in 8.30 seconds, so guessing a tool name and argument
+cannot satisfy the end-to-end assertion.
+
+Final owner checks passed: 384 core tests, 513 LLM tests, 13 discovery persistence
+tests, and all five runtime provider-policy tests. The actual-adapter live probe
+passed both transports and settled next turns in 15.70 seconds. Live inference
+used Phoenix's own Codex credential and GPT-6.2 Sol; it does not establish other
+model entitlements or a particular account plan.
+
+Isolated adversarial review of
+`67d702eb67ca0af59d019990fc8f8aca0fc8ff65..171d4a22a062f7dc1ccac88471285d8ea2aba300`
+found no actionable issues. Anchored review of the test-only follow-up
+`171d4a22a062f7dc1ccac88471285d8ea2aba300..13e96eaf91bd545c702ab75fccc9be45ecd69280`
+also found no actionable issues. The reviewer inspected the nonce assertion,
+native owner and argument witnesses, route qualification, private replay,
+settled history, SQLite classification, and ordinary-history negative cases;
+live execution evidence comes from the parent agent's runs.
+
+The follow-up broad command
+`PHOENIX_CHECK_WORKERS=8 PHOENIX_CHECK_BASE=67d702eb67ca0af59d019990fc8f8aca0fc8ff65 PHOENIX_CHECK_CARGO_TEST_TIMEOUT_SECS=3600 NEXTEST_FAILURE_OUTPUT=final ./dev.py check`
+completed successfully in 2,894.2 seconds: 13 executed checks passed and six
+were skipped. Rust tests, clippy, generated-binding freshness, format, task and
+spec validation, dev.py tests, and real-binary API end-to-end tests all passed.
+The four UI lanes were unchanged; optional ast-grep/cargo-deny were unavailable.
+The prior broad-run browser failures did not recur. The broad run compiled
+before the final test-only nonce addition; that stronger ignored test passed
+live separately, and the later broad clippy stage checked the updated source.
+
+Final format/task/Allium/spec checks passed (five checks). The idle development
+server was rebuilt with its configured Datadog tracing feature and restarted
+on the same database and ports. Its API reports `already_signed_in=true`,
+`bridge_loaded_at_startup=true`, and `restart_required_after_login=false`.
+Task 41023 captures the ordinary dev restart's missing tracing build feature
+and premature startup report. Production was not changed.

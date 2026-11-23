@@ -35,8 +35,15 @@ replay, and a complete SQLite/runtime loop using the real search handler over
 selection, deferred execution, and final `OK` persisted correctly. The observed
 namespaced native call is qualified under
 [ADR-274](../adrs/274_qualify-codex-namespaced-native-search-calls.md); ordinary
-function history remains ordinary. All 513 LLM unit tests pass. Final follow-up
-checks and independent review are in progress.
+function history remains ordinary. A random proof value available only in the
+deferred schema was returned on the first function invocation, proving schema
+retrieval. The deferred function is synthetic; no external MCP service was
+invoked. All 513 LLM unit tests, 384 core tests, 13 discovery persistence tests,
+and five runtime provider-policy tests pass. Isolated adversarial review and
+anchored review of the proof follow-up found no actionable issues.
+The follow-up broad check passed all 13 executed checks, including Rust tests
+and API end-to-end tests; four unchanged UI checks and optional unavailable
+ast-grep/cargo-deny were skipped.
 
 Initial qualification on 2026-11-20: core, tool-context, registry,
 and persistence tests pass. Real SQLite/runtime tests passed local and
@@ -66,4 +73,4 @@ failure diagnostics. See
 
 | Requirement | Status | Verification and limits |
 | --- | --- | --- |
-| REQ-LLM-004n | Complete | Live Codex adapter and SQLite runtime, prior hosted/fallback live cases, and focused regressions pass. Final follow-up checks/review in progress; earlier broad-run exceptions classified above. |
+| REQ-LLM-004n | Complete | Live Codex adapter and SQLite runtime with schema-only proof, prior hosted/fallback live cases, focused regressions, and isolated review pass. Earlier broad-run exceptions are classified above. |

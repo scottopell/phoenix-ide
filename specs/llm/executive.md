@@ -33,9 +33,20 @@ and a new turn after private settlement on both transports. The SQLite runtime
 probe also passed: its real search handler selected from 65 frozen deferred
 schemas, committed native owner/result evidence, admitted and executed the
 selected function, and persisted the final `OK`; all three requests used
-WebSockets. Full LLM unit coverage passed (513 tests), including exact namespace,
-mode, argument witness, and ordinary-history negatives. Final regression checks
-and independent review are in progress. No production deployment is claimed.
+WebSockets. A random proof value present only in the deferred schema had to be
+returned on the first function invocation; the initial request omitted it.
+This proves actual schema retrieval rather than a guessed function call. The
+deferred function is synthetic; no external MCP service was invoked.
+
+Full LLM unit coverage passed (513 tests), including exact namespace, mode,
+argument witness, and ordinary-history negatives. Core coverage (384 tests),
+13 discovery persistence tests, and all five runtime provider-policy tests also
+passed. Isolated adversarial review of the production fix and an anchored review
+of the schema-proof follow-up found no actionable issues. The broad repository
+check passed: 13 executed checks, including Rust tests, clippy, bindings,
+specifications, dev.py tests, and API end-to-end tests. Six checks were skipped:
+four unchanged UI lanes and optional ast-grep/cargo-deny, which were unavailable.
+No production deployment is claimed.
 
 ## Tool discovery integration (2026-11-20)
 
