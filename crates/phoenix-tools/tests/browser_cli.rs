@@ -189,50 +189,16 @@ fn fixture() -> String {
     )
 }
 
-fn oversized_snapshot_fixture() -> (String, std::thread::JoinHandle<()>) {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    listener.set_nonblocking(true).unwrap();
-    let url = format!("http://{}/oversized", listener.local_addr().unwrap());
-    let server = std::thread::spawn(move || {
-        let prefix =
-            b"<!doctype html><title>Oversized snapshot</title><button id='increment' aria-label='";
-        let label = "x".repeat(9 * 1024 * 1024);
-        let suffix = b"'>Increment</button><script>window.clicks = 0;</script>";
-        wait_for_observation("oversized page requested", || {
-            let (mut stream, _) = match listener.accept() {
-                Ok(connection) => connection,
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return None,
-                Err(error) => panic!("oversized fixture accept: {error}"),
-            };
-            stream.set_nonblocking(false).unwrap();
-            stream
-                .set_read_timeout(Some(Duration::from_secs(5)))
-                .unwrap();
-            let mut reader = BufReader::new(&mut stream);
-            let mut line = String::new();
-            if reader.read_line(&mut line).is_err() || !line.starts_with("GET /oversized ") {
-                return None; // Chrome may open an idle preconnection first.
-            }
-            loop {
-                line.clear();
-                if reader.read_line(&mut line).unwrap() == 0 || line == "\r\n" {
-                    break;
-                }
-            }
-            drop(reader);
-            write!(
-                stream,
-                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                prefix.len() + label.len() + suffix.len()
-            )
-            .unwrap();
-            stream.write_all(prefix).unwrap();
-            stream.write_all(label.as_bytes()).unwrap();
-            stream.write_all(suffix).unwrap();
-            Some(())
-        });
-    });
-    (url, server)
+fn oversized_snapshot_fixture() -> tempfile::NamedTempFile {
+    let mut file = tempfile::Builder::new().suffix(".html").tempfile().unwrap();
+    write!(
+        file,
+        "<!doctype html><title>Oversized snapshot</title><button id='increment' aria-label='{}'>Increment</button>",
+        "x".repeat(9 * 1024 * 1024)
+    )
+    .unwrap();
+    file.flush().unwrap();
+    file
 }
 
 fn reference(tree: &str, name: &str) -> String {
@@ -2517,9 +2483,9 @@ fn lost_chrome_reports_state_loss_and_open_replaces_only_browser_lifetime() {
     for force_snapshot_failure in [false, true] {
         let cli = BrowserCli::new();
         let opened = if force_snapshot_failure {
-            let (url, server) = oversized_snapshot_fixture();
+            let page = oversized_snapshot_fixture();
+            let url = format!("file://{}", page.path().display());
             let failed = cli.ok(&["open", &url]);
-            server.join().unwrap();
             assert_eq!(failed["result"]["navigation"], "succeeded", "{failed}");
             assert_eq!(failed["result"]["url"], url);
             assert_eq!(failed["result"]["title"], "Oversized snapshot");
