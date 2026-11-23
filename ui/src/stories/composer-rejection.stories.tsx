@@ -6,7 +6,7 @@ import { DraftContext } from '../conversation/DraftContext';
 import { DraftStore } from '../conversation/DraftStore';
 import '../index.css';
 
-const original = `  Synthetic draft A\n@missing/${'long-reference-'.repeat(18)}.ts\n  `;
+const original = `  Synthetic draft A\n/broken-skill-${'long-reference-'.repeat(18)}.ts\n  `;
 const attachment: FileAttachment = {
   original_name: 'synthetic-recovery-notes.txt', media_type: 'text/plain',
   size_bytes: 42, stored_path: '/synthetic-fixture/recovery-notes.txt',
@@ -46,7 +46,7 @@ export function DeferredRejection() {
           setPending(false);
           reject?.(new ExpansionError({
             error: 'Synthetic expansion rejection: the missing reference cannot be expanded. The original text and attachment must remain available without replacing the newer draft.',
-            error_type: 'file_not_found', reference: '@missing/synthetic-reference.ts',
+            error_type: 'skill_invocation_failed', reference: '/broken-skill',
           }));
         }}>Reject pending A</button>
         <ConnectedInputArea slug="composer-rejection" scopeKey="composer-rejection" uploadConversationId={undefined} cwd={undefined}

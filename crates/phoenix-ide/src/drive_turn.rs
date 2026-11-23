@@ -539,7 +539,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn prompt_expansion_preserves_display_reference_and_expands_llm_text() {
+    fn prompt_expansion_leaves_at_file_tokens_literal() {
         let runtime_env = PhoenixRuntimeEnvironment::detect();
         let directory = runtime_env
             .tmp_subdir("drive-turn-tests")
@@ -552,7 +552,7 @@ mod tests {
         let expanded = expand_prompt(prompt, &directory).unwrap();
 
         assert_eq!(expanded.display_text, prompt);
-        assert!(expanded.llm_text.contains("EXPANSION_SECRET_7419"));
+        assert_eq!(expanded.llm_text, prompt);
         std::fs::remove_dir_all(directory).unwrap();
     }
 

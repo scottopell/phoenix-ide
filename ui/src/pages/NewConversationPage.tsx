@@ -168,7 +168,7 @@ export function NewConversationPage({ desktopMode }: NewConversationPageProps = 
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  // Inline reference autocomplete (@file, ./path, /skill). The composer renders
+  // Inline reference autocomplete (./path, /skill). The composer renders
   // both a desktop and a mobile textarea (one hidden by CSS);
   // `inlineRefTextarea` tracks whichever is focused so trigger detection reads
   // the right caret.
@@ -191,15 +191,15 @@ export function NewConversationPage({ desktopMode }: NewConversationPageProps = 
   };
   const handleSend = async () => {
     // The Send buttons are disabled while an expansion error is shown; gate the
-    // keyboard (Enter) path too so a stale broken @reference can't be resubmitted
+    // keyboard (Enter) path too so a stale broken /skill reference can't be resubmitted
     // before it's corrected.
     if (ir.expansionError) return;
     ir.reset();
     try {
       await conv.handleSend();
     } catch (err) {
-      // The create endpoint expands the first message and rejects unresolvable
-      // `@file` references with the same 422 as a chat send. Surface it inline
+      // The create endpoint expands the first message and rejects a failed
+      // `/skill` invocation with the same 422 as a chat send. Surface it inline
       // next to the composer (REQ-IR-007) instead of the page-level error,
       // which on mobile renders up in the settings area away from the input.
       if (err instanceof ExpansionError) {

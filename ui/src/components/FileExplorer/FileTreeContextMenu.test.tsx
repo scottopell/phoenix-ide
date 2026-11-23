@@ -17,8 +17,8 @@ function setupTree(rootPath = '/repo/project') {
   root.className = 'ft-root';
   root.dataset['rootPath'] = rootPath;
   root.innerHTML = `
-    <div class="ft-item" data-path="${rootPath}/src/main.rs" data-is-directory="false" data-is-text="true" role="button" tabindex="0">main.rs</div>
-    <div class="ft-item" data-path="${rootPath}/src" data-is-directory="true" data-is-text="false" role="button" tabindex="0" aria-expanded="true">src</div>
+    <div class="ft-item" data-path="${rootPath}/src/main.rs" data-is-directory="false" role="button" tabindex="0">main.rs</div>
+    <div class="ft-item" data-path="${rootPath}/src" data-is-directory="true" role="button" tabindex="0" aria-expanded="true">src</div>
   `;
   document.body.appendChild(root);
   return root;
@@ -43,7 +43,7 @@ describe('FileTreeContextMenu', () => {
 
     expect(screen.getByText('Copy relative path')).toBeInTheDocument();
     expect(screen.getByText('Copy absolute path')).toBeInTheDocument();
-    expect(screen.getByText('Insert @file reference')).toBeInTheDocument();
+    expect(screen.queryByText(/@file/)).not.toBeInTheDocument();
     expect(screen.getByText('Insert ./path reference')).toBeInTheDocument();
   });
 
@@ -87,22 +87,6 @@ describe('FileTreeContextMenu', () => {
     fireEvent.click(screen.getByText('Copy absolute path'));
 
     expect(copyToClipboard).toHaveBeenCalledWith('/repo/project/src/main.rs');
-  });
-
-  it('dispatches insert-draft event with @file reference', () => {
-    const root = setupTree();
-    const handler = vi.fn();
-    window.addEventListener('phoenix:insert-draft', handler);
-    render(<FileTreeContextMenu />);
-
-    const fileItem = root.querySelector('[data-path="/repo/project/src/main.rs"]') as HTMLElement;
-    fireEvent.contextMenu(fileItem, { clientX: 100, clientY: 100 });
-    fireEvent.click(screen.getByText('Insert @file reference'));
-
-    expect(handler).toHaveBeenCalledWith(
-      expect.objectContaining({ detail: { text: '@src/main.rs ' } }),
-    );
-    window.removeEventListener('phoenix:insert-draft', handler);
   });
 
   it('dispatches insert-draft event with ./path reference', () => {

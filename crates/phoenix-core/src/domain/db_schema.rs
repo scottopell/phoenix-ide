@@ -1133,7 +1133,7 @@ pub struct UserContent {
     pub images: Vec<ImageData>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub files: Vec<FileAttachment>,
-    /// Expanded text delivered to the LLM (REQ-IR-001).
+    /// Expanded text delivered to the LLM (REQ-IR-006).
     /// `None` means no expansion occurred and `text` is used verbatim for the LLM.
     /// `Some` holds the fully resolved form (e.g. `<file path="…">…</file>` blocks).
     /// `#[serde(default)]` handles old DB rows that predate this field.
@@ -1175,7 +1175,7 @@ impl UserContent {
     }
 
     /// Create a user message where `display_text` is stored/shown and `llm_text`
-    /// is the expanded form delivered to the LLM (REQ-IR-001, REQ-IR-006).
+    /// is the expanded form delivered to the LLM (REQ-IR-006).
     pub fn with_expansion(
         display_text: impl Into<String>,
         llm_text: impl Into<String>,

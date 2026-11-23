@@ -59,7 +59,7 @@ export interface ComposerFocusRequest {
 interface InputAreaProps {
   /**
    * Working directory the conversation operates in. Scopes inline reference
-   * autocomplete (`@file`, `./path`, `/skill`) to the same root that
+   * autocomplete (`./path`, `/skill`) to the same root that
    * `message_expander::expand` resolves against at send time. `undefined`
    * disables autocomplete fetching.
    */
@@ -432,9 +432,7 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
   const handleDrop = async (e: DragEvent) => {
     const types = Array.from(e.dataTransfer.types);
 
-    // File-tree → composer drag: insert an @file reference for files (include
-    // contents at send time) or a ./path reference for directories (point the
-    // AI at the path without expansion, since @ expansion rejects trailing /).
+    // File-tree → composer drag: insert a ./path reference (REQ-IR-008).
     // Checked before the OS Files path so the two drop modes don't conflict.
     if (types.includes(FILE_TREE_DRAG_TYPE)) {
       e.preventDefault();
@@ -442,14 +440,8 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
       const raw = e.dataTransfer.getData(FILE_TREE_DRAG_TYPE);
       if (raw) {
         try {
-          const payload = JSON.parse(raw) as { relativePath: string; isDirectory: boolean; isText: boolean };
-          // @ expansion is text-only and tokenizes at whitespace — directories,
-          // non-text files, and paths with spaces use ./path so the AI gets a
-          // pointer without a blocked expansion attempt at send time.
-          const useAtRef = !payload.isDirectory && payload.isText && !/\s/.test(payload.relativePath);
-          const ref = useAtRef
-            ? `@${payload.relativePath} `
-            : `./${payload.relativePath} `;
+          const payload = JSON.parse(raw) as { relativePath: string };
+          const ref = `./${payload.relativePath} `;
           window.dispatchEvent(new CustomEvent('phoenix:insert-draft', { detail: { text: ref } }));
         } catch {
           // Malformed drag payload — silently ignore
@@ -498,7 +490,7 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
     if (!text && images.length === 0 && files.length === 0 && !hasAnnotations) return;
     if (!acceptsChatMessage || isUploadingFiles) return;
     // The Send button is disabled while an expansion error is shown; gate the
-    // keyboard (Enter) path too so a stale broken @reference isn't resubmitted
+    // keyboard (Enter) path too so a stale broken /skill reference isn't resubmitted
     // before it's corrected (REQ-IR-007).
     if (expansionError) return;
     // Allow send while agent is working — the server will queue it as a

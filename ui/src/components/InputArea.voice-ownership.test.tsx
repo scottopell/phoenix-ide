@@ -88,7 +88,7 @@ describe('InputArea with real VoiceRecorder submission ownership', () => {
 
   it.each(['start failure', 'cancelled request'] as const)('releases composer ownership after a %s', async outcome => {
     const store = new DraftStore();
-    store.dispatch('conversation', { type: 'set_draft', text: '@missing.ts' });
+    store.dispatch('conversation', { type: 'set_draft', text: '/broken-skill' });
     let reject!: (error: Error) => void;
     const pending = new Promise<void>((_resolve, rejectPromise) => { reject = rejectPromise; });
     render(<Harness store={store} send={vi.fn(() => pending)} />);
@@ -110,29 +110,29 @@ describe('InputArea with real VoiceRecorder submission ownership', () => {
     }
 
     await act(async () => reject(new ExpansionError({
-      error: 'Missing file', error_type: 'file_not_found', reference: '@missing.ts',
+      error: 'Skill failed', error_type: 'skill_invocation_failed', reference: '/broken-skill',
     })));
     expect(store.getRejected('conversation')).toEqual([
-      expect.objectContaining({ text: '@missing.ts' }),
+      expect.objectContaining({ text: '/broken-skill' }),
     ]);
     fireEvent.click(screen.getByText('Unsent message'));
     expect(screen.getByRole('button', { name: 'Restore unsent message' })).toBeEnabled();
     fireEvent.click(screen.getByRole('button', { name: 'Restore unsent message' }));
-    expect(screen.getByRole('textbox')).toHaveValue('@missing.ts');
-    expect(store.getSnapshot('conversation').draft).toBe('@missing.ts');
+    expect(screen.getByRole('textbox')).toHaveValue('/broken-skill');
+    expect(store.getSnapshot('conversation').draft).toBe('/broken-skill');
     act(() => {
       recognition.started();
       recognition.result('stale text', true);
       recognition.end();
     });
-    expect(screen.getByRole('textbox')).toHaveValue('@missing.ts');
+    expect(screen.getByRole('textbox')).toHaveValue('/broken-skill');
     fireEvent.change(screen.getByRole('textbox'), { target: { value: 'editable after request' } });
     expect(store.getSnapshot('conversation').draft).toBe('editable after request');
   });
 
   it('retains rejected recording A separately while recording B survives stale A callbacks and ends normally', async () => {
     const store = new DraftStore();
-    store.dispatch('conversation', { type: 'set_draft', text: '@missing.ts' });
+    store.dispatch('conversation', { type: 'set_draft', text: '/broken-skill' });
     let reject!: (error: Error) => void;
     const pending = new Promise<void>((_resolve, rejectPromise) => { reject = rejectPromise; });
     const send = vi.fn(() => pending);
@@ -142,25 +142,25 @@ describe('InputArea with real VoiceRecorder submission ownership', () => {
     act(() => a.started());
     act(() => a.result('A final', true));
     act(() => a.result('A interim'));
-    expect(screen.getByRole('textbox')).toHaveValue('@missing.ts A final A interim');
+    expect(screen.getByRole('textbox')).toHaveValue('/broken-skill A final A interim');
     fireEvent.click(screen.getByRole('button', { name: 'Send message' }));
-    expect(send).toHaveBeenCalledExactlyOnceWith('@missing.ts A final A interim', [], []);
+    expect(send).toHaveBeenCalledExactlyOnceWith('/broken-skill A final A interim', [], []);
     expect(a.abort).toHaveBeenCalledTimes(1);
     expect(screen.getByRole('textbox')).toHaveValue('');
 
     const b = startRecording();
     expect(screen.getByRole('button', { name: 'Requesting permission...' })).toBeDisabled();
     await act(async () => reject(new ExpansionError({
-      error: 'Missing file', error_type: 'file_not_found', reference: '@missing.ts',
+      error: 'Skill failed', error_type: 'skill_invocation_failed', reference: '/broken-skill',
     })));
     expect(screen.getByRole('textbox')).toHaveValue('');
     expect(store.getRejected('conversation')).toEqual([
-      expect.objectContaining({ text: '@missing.ts A final A interim', images: [], files: [] }),
+      expect.objectContaining({ text: '/broken-skill A final A interim', images: [], files: [] }),
     ]);
     fireEvent.click(screen.getByText('Unsent message'));
     expect(screen.getByRole('button', { name: 'Restore unsent message' })).toBeDisabled();
     const unsent = screen.getByText('Unsent message').closest('details')!;
-    expect(within(unsent).getByText('@missing.ts A final A interim')).toBeInTheDocument();
+    expect(within(unsent).getByText('/broken-skill A final A interim')).toBeInTheDocument();
 
     act(() => b.started());
     act(() => b.result('B interim'));
@@ -189,7 +189,7 @@ describe('InputArea with real VoiceRecorder submission ownership', () => {
     expect(screen.getByRole('textbox')).toHaveValue('B final');
     expect(store.getSnapshot('conversation').draft).toBe('B final');
     expect(screen.getByRole('button', { name: 'Start voice input' })).toBeEnabled();
-    expect(store.getRejected('conversation')[0]?.text).toBe('@missing.ts A final A interim');
+    expect(store.getRejected('conversation')[0]?.text).toBe('/broken-skill A final A interim');
     expect(screen.getByRole('button', { name: 'Restore unsent message' })).toBeDisabled();
     expect(send).toHaveBeenCalledTimes(1);
   });

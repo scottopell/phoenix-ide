@@ -533,7 +533,7 @@ pub enum Event {
     UserMessage {
         /// Display text — stored in DB and shown in history (REQ-IR-006).
         text: String,
-        /// Expanded text delivered to the LLM when `@` references are present (REQ-IR-001).
+        /// Expanded text delivered to the LLM when a `/skill` expands (REQ-IR-006).
         /// `None` means no expansion — `text` is used verbatim.
         llm_text: Option<String>,
         images: Vec<ImageData>,

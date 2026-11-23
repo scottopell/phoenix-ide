@@ -380,7 +380,7 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
         sequence_id: Math.max(0, ...currentMessages.map(message => message.sequence_id)) + 1,
         message_type: 'user', content: { text: body.text ?? '' }, created_at: new Date().toISOString(),
       };
-      if (scenario.sendFailure === 'before-acceptance') return Response.json({ error: 'Fixture expansion rejected', error_type: 'file_not_found', reference: '@missing.ts' }, { status: 422 });
+      if (scenario.sendFailure === 'before-acceptance') return Response.json({ error: 'Fixture expansion rejected', error_type: 'skill_invocation_failed', reference: '/broken-skill' }, { status: 422 });
       if (scenario.sendFailure === 'after-acceptance') latestEventSource?.emitMessage(lastSubmittedMessage);
       if (scenario.sendFailure) return Response.json({ error: 'Fixture send failure' }, { status: 503 });
       return Response.json({ queued: false, already_persisted: true });

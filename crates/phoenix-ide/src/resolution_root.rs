@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 //! The single source of truth for where a conversation's inline references
-//! (`@file`, `./path`, `/skill`) resolve.
+//! (`./path`, `/skill`) resolve.
 //!
 //! `WorkingDir` reads a live filesystem directory; `GitTree` reads a branch's
 //! committed tree via `git ls-tree` / `git cat-file` with no worktree required.
@@ -32,7 +32,7 @@ use crate::api::handlers::{fuzzy_score_path, search_files_in_root};
 use crate::api::{FileSearchEntry, FileViewerKind};
 use crate::git_ops::{run_git, run_git_bytes};
 
-/// Outcome of resolving a single `@file` reference's content.
+/// Outcome of reading one file's content from the root.
 pub enum FileResolution {
     /// File exists and is UTF-8 text.
     Text(String),
@@ -124,8 +124,8 @@ impl ResolutionRoot {
         }
     }
 
-    /// Resolve a single `@file` reference's content. `rel` is the reference
-    /// token exactly as typed (e.g. `src/main.rs`).
+    /// Read one file's content. `rel` is a root-relative path (e.g.
+    /// `src/main.rs`).
     pub fn read_file(&self, rel: &str) -> FileResolution {
         match self {
             Self::WorkingDir(dir) => {
