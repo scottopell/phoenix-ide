@@ -59,7 +59,9 @@ async function trial(version, base, viewport, mode, run, isolation = false) {
   const diagnostics = [];
   const unknown = [];
   const longTasks = [];
-  let start = performance.now();
+  const trialEpoch = performance.now();
+  let start = trialEpoch;
+  let requestPhase = mode === 'warm-notification' ? 'setup' : 'navigation';
   let release;
   const gate = new Promise(resolve => { release = resolve; });
   let historyPending = false;
@@ -75,9 +77,9 @@ async function trial(version, base, viewport, mode, run, isolation = false) {
   });
   page.on('pageerror', error => diagnostics.push({ type: 'pageerror', message: error.message }));
   page.on('console', message => { if (message.type() === 'error' || message.type() === 'warning') diagnostics.push({ type: message.type(), message: message.text() }); });
-  cdp.on('Network.requestWillBeSent', event => requests.set(event.requestId, { url: event.request.url, method: event.request.method, started_ms: performance.now() - start, resource: event.type }));
-  cdp.on('Network.responseReceived', event => { const item = requests.get(event.requestId); if (item) Object.assign(item, { status: event.response.status, response_ms: performance.now() - start, mime: event.response.mimeType, from_cache: event.response.fromDiskCache ?? false }); });
-  cdp.on('Network.loadingFinished', event => { const item = requests.get(event.requestId); if (item) Object.assign(item, { completed_ms: performance.now() - start, encoded_bytes: event.encodedDataLength }); });
+  cdp.on('Network.requestWillBeSent', event => requests.set(event.requestId, { url: event.request.url, method: event.request.method, started_ms: performance.now() - trialEpoch, phase: requestPhase, resource: event.type }));
+  cdp.on('Network.responseReceived', event => { const item = requests.get(event.requestId); if (item) Object.assign(item, { status: event.response.status, response_ms: performance.now() - trialEpoch, mime: event.response.mimeType, from_cache: event.response.fromDiskCache ?? false }); });
+  cdp.on('Network.loadingFinished', event => { const item = requests.get(event.requestId); if (item) Object.assign(item, { completed_ms: performance.now() - trialEpoch, encoded_bytes: event.encodedDataLength }); });
   await page.route('**/api/**', async route => {
     const url = new URL(route.request().url());
     const p = url.pathname;
@@ -151,7 +153,15 @@ async function trial(version, base, viewport, mode, run, isolation = false) {
     }
     const before = metrics(await cdp.send('Performance.getMetrics'));
     start = performance.now();
-    if (mode === 'warm-notification') await page.evaluate(() => window.dispatchEvent(new CustomEvent('phoenix:navigate-to-conversation', { detail: { route: '/global' } })));
+    record.navigation_started_after_trial_ms = start - trialEpoch;
+    record.clock_contract = 'Requests use one immutable Node trial epoch; subtract navigation_started_after_trial_ms for navigation offsets. Long tasks use the document Performance clock and a separately captured SPA boundary; do not align the two clocks as exact timestamps.';
+    requestPhase = 'navigation';
+    let documentNavigationBoundary = 0;
+    if (mode === 'warm-notification') documentNavigationBoundary = await page.evaluate(() => {
+      const boundary = performance.now();
+      window.dispatchEvent(new CustomEvent('phoenix:navigate-to-conversation', { detail: { route: '/global' } }));
+      return boundary;
+    });
     else await page.goto(`${base}${mode === 'cold-link' ? `/global/${id}` : '/global'}`, { waitUntil: 'commit' });
     // The pinned baseline renders the card without the candidate-only dock wrapper.
     const panel = page.locator('.question-panel');
@@ -172,12 +182,19 @@ async function trial(version, base, viewport, mode, run, isolation = false) {
     const returnButton = page.getByRole('button', { name: 'Return to conversation', exact: true });
     if (await returnButton.isVisible()) await returnButton.click();
     await page.getByText(marker, { exact: true }).waitFor({ state: 'visible', timeout: 45000 });
-    record.transcript_ready_ms = performance.now() - start;
+    record.transcript_visible_after_question_interaction_ms = performance.now() - start;
+    record.observation_completed_after_trial_ms = performance.now() - trialEpoch;
     const after = metrics(await cdp.send('Performance.getMetrics'));
     record.metrics_delta = Object.fromEntries(['TaskDuration', 'ScriptDuration', 'LayoutDuration', 'RecalcStyleDuration', 'JSHeapUsedSize'].map(key => [key, after[key] - before[key]]));
     record.history_requested = historyPending;
+    record.document_navigation_boundary_ms = documentNavigationBoundary;
     longTasks.push(...await page.evaluate(() => window.__questionLongTasks));
-    record.long_tasks = longTasks;
+    record.long_tasks = longTasks.map(task => ({
+      document_start_ms: task.start, duration: task.duration,
+      navigation_relative_start_ms: task.start - documentNavigationBoundary,
+      phase: task.start >= documentNavigationBoundary ? 'navigation'
+        : task.start + task.duration > documentNavigationBoundary ? 'overlapping-setup' : 'setup',
+    }));
     await page.screenshot({ animations: 'disabled', path: path.join(out, `${name}-conversation.png`) });
     const launcher = page.getByRole('button', { name: /Answer Ember/ });
     if (await launcher.isVisible()) await launcher.click();
@@ -188,6 +205,11 @@ async function trial(version, base, viewport, mode, run, isolation = false) {
         setQuestions: next => { pendingQuestions = next; },
         setAnswerError: value => { answerError = value; },
       });
+    }
+    for (const request of requests.values()) {
+      if (request.response_ms < request.started_ms || request.completed_ms < request.started_ms || request.completed_ms < request.response_ms) {
+        throw new Error(`Request clock moved backwards: ${request.url}`);
+      }
     }
     if (unknown.length) throw new Error(`Unmodelled requests: ${JSON.stringify(unknown)}`);
     if (diagnostics.some(item => item.type === 'pageerror')) throw new Error('Production UI reported page errors');
