@@ -87,5 +87,5 @@ None outstanding. The previous doc debt — unmapped IDs 005..007 — is resolve
 ## Cross-Spec Relationships
 
 - **`specs/bedrock/`**: bedrock is the source of `core_status` transitions that trigger both drain hooks. Steering queue storage remains orthogonal to bedrock, while the explicit `SteerDrainedUserMessages` arms own the exact transcript batch, next state, and post-commit LLM action.
-- **`specs/inline-references/`**: `@file` expansion runs as part of the same `expand()` call used by the normal send path, populating `llm_text` and `skill_invocation` on the `SteerEntry`. Expansion happens once at enqueue time; drained entries are not re-expanded.
+- **`specs/inline-references/`**: `/skill` expansion runs as part of the same `expand()` call used by the normal send path, populating `llm_text` and `skill_invocation` on the `SteerEntry`. Expansion happens once at enqueue time; drained entries are not re-expanded.
 - **`specs/sse_wire/`**: `init` carries the authoritative durable steering queue, while `steer_message_queued` and `steer_message_cancelled` are live-only latency projections at the current stream watermark. They do not enter replay; reconnect reconstructs the queue from the database. Persistence-before-broadcast applies. Drained entries surface through the normal `message` path and remove the matching queued identity client-side.

@@ -38,7 +38,7 @@ const rejectedFile: FileAttachment = {
   original_name: 'notes.txt', stored_path: '/uploads/a/notes.txt', media_type: 'text/plain', size_bytes: 42,
 };
 
-function RecoveryHarness({ send, scope = 'a', initialDraft = '  @missing.ts\n', initialImages = [] }: {
+function RecoveryHarness({ send, scope = 'a', initialDraft = '  /broken-skill\n', initialImages = [] }: {
   send: (text: string, images: ImageData[], files: FileAttachment[]) => Promise<void>;
   scope?: string;
   initialDraft?: string;
@@ -71,7 +71,7 @@ function ConnectedRecoveryHarness({ store, send, scope = 'a', initialFiles = [re
 }
 
 async function rejectExpansion(pending: ReturnType<typeof deferredSend>) {
-  await act(async () => pending.reject(new ExpansionError({ error: 'Missing file', error_type: 'file_not_found', reference: '@missing.ts' })));
+  await act(async () => pending.reject(new ExpansionError({ error: 'Skill failed', error_type: 'skill_invocation_failed', reference: '/broken-skill' })));
 }
 
 describe('editable annotation cards', () => {
@@ -159,7 +159,7 @@ describe('InputArea rejected submission ownership', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Send message' }));
     expect(screen.getByRole('textbox')).toHaveValue('');
     await rejectExpansion(pending);
-    expect(screen.getByRole('textbox')).toHaveValue('  @missing.ts\n');
+    expect(screen.getByRole('textbox')).toHaveValue('  /broken-skill\n');
     expect(screen.getByText('notes.txt')).toBeInTheDocument();
   });
 
@@ -188,7 +188,7 @@ describe('InputArea rejected submission ownership', () => {
     expect(screen.queryByLabelText('Attached files')).not.toBeInTheDocument();
     fireEvent.change(screen.getByRole('textbox'), { target: { value: '' } });
     fireEvent.click(screen.getByRole('button', { name: 'Restore unsent message' }));
-    expect(screen.getByRole('textbox')).toHaveValue('  @missing.ts\n');
+    expect(screen.getByRole('textbox')).toHaveValue('  /broken-skill\n');
     expect(screen.getByLabelText('Attached files')).toHaveTextContent('notes.txt');
   });
 
@@ -213,7 +213,7 @@ describe('InputArea rejected submission ownership', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Send message' }));
     act(() => { retired?.onSpeech?.('late'); retired?.onInterim?.('late'); retired?.onEnd?.(); });
     await rejectExpansion(pending);
-    expect(screen.getByRole('textbox')).toHaveValue('  @missing.ts final partial');
+    expect(screen.getByRole('textbox')).toHaveValue('  /broken-skill final partial');
   });
 
   it('uses the atomic store revision even when external insertion and deletion have not rendered', async () => {
@@ -225,7 +225,7 @@ describe('InputArea rejected submission ownership', () => {
     await act(async () => {
       store.dispatch('a', { type: 'append_draft', text: 'external' });
       store.dispatch('a', { type: 'clear_draft' });
-      pending.reject(new ExpansionError({ error: 'Missing file', error_type: 'file_not_found', reference: '@missing.ts' }));
+      pending.reject(new ExpansionError({ error: 'Skill failed', error_type: 'skill_invocation_failed', reference: '/broken-skill' }));
     });
     expect(screen.getByRole('textbox')).toHaveValue('');
     expect(store.getRejected('a')).toHaveLength(1);
@@ -258,10 +258,10 @@ describe('InputArea rejected submission ownership', () => {
   it.each(['', 'new conversation draft'])('does not resurrect a pending send after hard-delete (fresh draft: %j)', async freshDraft => {
     const pending = deferredSend();
     const store = new DraftStore();
-    store.dispatch('a', { type: 'set_draft', text: '  deleted @missing.ts\n' });
+    store.dispatch('a', { type: 'set_draft', text: '  deleted /broken-skill\n' });
     render(<ConnectedRecoveryHarness store={store} send={pending.send} />);
     fireEvent.click(screen.getByRole('button', { name: 'Send message' }));
-    expect(pending.send).toHaveBeenCalledWith('deleted @missing.ts', [], [rejectedFile]);
+    expect(pending.send).toHaveBeenCalledWith('deleted /broken-skill', [], [rejectedFile]);
 
     act(() => {
       // The hard-delete cascade removes the draft lifetime, not just its text.
@@ -1288,7 +1288,7 @@ describe('InputArea file-tree drag-and-drop', () => {
     };
   }
 
-  it('inserts @file reference for text files on custom-type drop', () => {
+  it('inserts ./path for text files on custom-type drop', () => {
     const handler = vi.fn();
     window.addEventListener('phoenix:insert-draft', handler);
     renderForDnd();
@@ -1296,12 +1296,12 @@ describe('InputArea file-tree drag-and-drop', () => {
     const footer = document.getElementById('input-area')!;
     const dropEvent = makeDropEvent(
       [FILE_TREE_DRAG_TYPE],
-      { [FILE_TREE_DRAG_TYPE]: JSON.stringify({ relativePath: 'src/main.rs', isDirectory: false, isText: true }) },
+      { [FILE_TREE_DRAG_TYPE]: JSON.stringify({ relativePath: 'src/main.rs', isDirectory: false }) },
     );
     fireEvent.drop(footer, dropEvent as unknown as React.DragEvent);
 
     expect(handler).toHaveBeenCalledWith(
-      expect.objectContaining({ detail: { text: '@src/main.rs ' } }),
+      expect.objectContaining({ detail: { text: './src/main.rs ' } }),
     );
     window.removeEventListener('phoenix:insert-draft', handler);
   });
@@ -1314,7 +1314,7 @@ describe('InputArea file-tree drag-and-drop', () => {
     const footer = document.getElementById('input-area')!;
     const dropEvent = makeDropEvent(
       [FILE_TREE_DRAG_TYPE],
-      { [FILE_TREE_DRAG_TYPE]: JSON.stringify({ relativePath: 'src', isDirectory: true, isText: false }) },
+      { [FILE_TREE_DRAG_TYPE]: JSON.stringify({ relativePath: 'src', isDirectory: true }) },
     );
     fireEvent.drop(footer, dropEvent as unknown as React.DragEvent);
 
@@ -1332,7 +1332,7 @@ describe('InputArea file-tree drag-and-drop', () => {
     const footer = document.getElementById('input-area')!;
     const dropEvent = makeDropEvent(
       [FILE_TREE_DRAG_TYPE],
-      { [FILE_TREE_DRAG_TYPE]: JSON.stringify({ relativePath: 'assets/logo.png', isDirectory: false, isText: false }) },
+      { [FILE_TREE_DRAG_TYPE]: JSON.stringify({ relativePath: 'assets/logo.png', isDirectory: false }) },
     );
     fireEvent.drop(footer, dropEvent as unknown as React.DragEvent);
 
@@ -1350,7 +1350,7 @@ describe('InputArea file-tree drag-and-drop', () => {
     const footer = document.getElementById('input-area')!;
     const dropEvent = makeDropEvent(
       [FILE_TREE_DRAG_TYPE],
-      { [FILE_TREE_DRAG_TYPE]: JSON.stringify({ relativePath: 'src/test data/input.ts', isDirectory: false, isText: true }) },
+      { [FILE_TREE_DRAG_TYPE]: JSON.stringify({ relativePath: 'src/test data/input.ts', isDirectory: false }) },
     );
     fireEvent.drop(footer, dropEvent as unknown as React.DragEvent);
 

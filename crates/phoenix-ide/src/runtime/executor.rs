@@ -1728,7 +1728,7 @@ fn render_messages<'a>(
                 {
                     continue;
                 }
-                // Use llm_text when expansion occurred (REQ-IR-001, REQ-IR-006):
+                // Use llm_text when expansion occurred (REQ-IR-006):
                 // the model sees the fully resolved form while the DB stores the shorthand.
                 let mut text_for_llm = match &msg.origin {
                     phoenix_core::domain::db_schema::InputOrigin::InternalConversation {

@@ -44,6 +44,7 @@ Allowing gaps does not approve an ID allocation, decision, or publication.
 
 | ADR | Title | Status | Affects |
 | --- | --- | --- | --- |
+| [274](274_remove-at-file-inclusion.md) | Remove `@file` content inclusion and leave `@` literal | Accepted | REQ-IR-001, REQ-IR-004, REQ-IR-006, REQ-IR-007, REQ-IR-010, REQ-FE-011 |
 | [273](273_fixed-rc9-preparation-without-publication-authority.md) | Fixed RC9 preparation without publication authority | Accepted | REQ-DESKTOP-REL-014 |
 | [272](272_bound-exhaustive-backup-verification-to-fifteen-minutes.md) | Bound exhaustive backup verification to fifteen minutes | Accepted; qualifies ADR-263 | REQ-LDD-029, REQ-LDD-031 |
 | [271](271_gate-ordinary-publication-on-exact-source-ci.md) | Gate ordinary publication on exact merged-source CI | Accepted | REQ-DESKTOP-REL-015 |

@@ -954,13 +954,13 @@ describe('ConversationPage message delivery reconciliation', () => {
   it('rolls back an optimistic phase when expansion rejects before a turn starts', async () => {
     vi.spyOn(api, 'sendMessage').mockRejectedValue(new ExpansionError({
       error: 'No matching reference',
-      error_type: 'file_not_found',
-      reference: '@missing',
+      error_type: 'skill_invocation_failed',
+      reference: '/broken-skill',
     }));
     const { store } = renderPage(makeConversation());
 
     const textbox = await screen.findByRole('textbox');
-    fireEvent.change(textbox, { target: { value: '@missing' } });
+    fireEvent.change(textbox, { target: { value: '/broken-skill' } });
     fireEvent.click(screen.getByRole('button', { name: /send/i }));
 
     await waitFor(() => expect(store.getSnapshot(slug).phase.type).toBe('idle'));

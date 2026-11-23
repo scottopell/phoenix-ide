@@ -2,15 +2,14 @@
 
 ## Architecture Overview
 
-Inline references are trigger patterns the user types in the message input that either (a) expand to inject content before the message reaches the LLM, or (b) complete a path and leave it as literal text for the agent to act on. The two behaviors are structurally distinct and intentionally so:
+Inline references are trigger patterns the user types in the message input that either (a) expand to inject content before the message reaches the LLM, or (b) complete a path and leave it as literal text for the agent to act on. The two behaviors are structurally distinct and intentionally so. `@` has no expansion meaning (REQ-IR-010, ADR-274):
 
 | Trigger | Behavior | Goes through `MessageExpander`? |
 |---|---|---|
-| `@path/to/file` | File contents injected into LLM message | Yes |
 | `/skill-name` | Skill instructions injected into LLM message | Yes |
 | `./path/to/file` | Path left as literal text; agent reads as needed | No |
 
-For expansion references (`@`, `/`), a `MessageExpander` layer in `send_chat` resolves them before emitting `Event::UserMessage`, producing `display_text` (stored, shown in history) and `llm_text` (delivered to LLM). For path references (`./`), autocomplete assists the user in typing a correct path, but no server-side transformation occurs at send time.
+For skill references (`/`), a `MessageExpander` layer in `send_chat` resolves them before emitting `Event::UserMessage`, producing `display_text` (stored, shown in history) and `llm_text` (delivered to LLM). For path references (`./`), autocomplete assists the user in typing a correct path, but no server-side transformation occurs at send time.
 
 ## Data Model
 
@@ -28,24 +27,6 @@ struct ExpandedMessage {
 `display_text` is what arrives in `send_chat` from the client. `llm_text` is what gets threaded into `Event::UserMessage`. The state machine and DB see only `display_text`; the LLM message-building path uses `llm_text`.
 
 ## Expansion Types
-
-### REQ-IR-001 Implementation: File Reference (`@path`)
-
-Syntax: `@path/to/file` anywhere in message text.
-
-Resolution:
-1. Scan message text for `@`-prefixed tokens
-2. Resolve each path relative to the conversation's `working_dir`
-3. Read file contents
-4. Replace the token in `llm_text` with a structured block:
-
-```
-<file path="src/main.rs">
-[file contents]
-</file>
-```
-
-File lookup uses `working_dir` from the conversation record. Paths may be absolute or relative. Symlinks are followed. Expansion inlines file *contents as text*, so the gate is content-based: files whose bytes contain a NUL or are not valid UTF-8 are rejected with a user-visible error. This is a distinct axis from viewer-openability — an image is viewer-openable but not includable as text, and a text-content file with a binary-looking extension is includable. The `@` autocomplete shows an extension-based "binary" hint (everything but `viewer.kind == "text"`) as an up-front prediction; the content check at expansion time is the authority.
 
 ### REQ-IR-002 and REQ-IR-003 Implementation: Skill Reference (`/skill-name`)
 
@@ -71,7 +52,7 @@ Skill loading is **always context loading first**. Argument substitution is addi
 
 Autocomplete candidates are a pure function of a **resolution root** — the same
 root the first message's references expand against. `ResolutionRoot` is the
-single type that answers "where do `@file` / `./path` / `/skill` resolve":
+single type that answers "where do `./path` / `/skill` resolve":
 
 - `WorkingDir(dir)` — read the live filesystem. Used by Direct conversations and
   by every in-conversation composer (the conversation already resolves against
@@ -155,21 +136,19 @@ cache and the in-flight staleness guards key on a composite (cwd + mode + branch
 so switching workflow or branch refetches against the new root, and a late
 response from a previous root is discarded.
 
-Both `@` and `./` triggers open the same `InlineAutocomplete` component. Trigger detection inspects the text around the cursor on each `onChange`:
+The `./` and `/` triggers open the same `InlineAutocomplete` component. Trigger detection inspects the text around the cursor on each `onChange`:
 
-- `@<partial>` anywhere in the text → open in `expand` mode
 - `./` followed by any characters anywhere in the text → open in `path` mode
 - `/^<partial>` at start of text → open in `skill` mode (REQ-IR-005)
 
 The component is mode-agnostic: it receives items and a query, renders a filtered fuzzy-matched list, and calls back with the selected value. On selection:
 
-- `expand` mode: inserts `@resolved/path` — which will be expanded at send time
 - `path` mode: inserts `./resolved/path` — plain text, no send-time processing
 - `skill` mode: inserts `/skill-name ` with `argument_hint` as ghost text
 
 ### REQ-IR-008 Implementation (path reference, no expansion)
 
-`./` completion is purely a frontend assist. No backend call is made at send time. The inserted `./path/to/file` string travels to the LLM as-is. The file search endpoint is used identically to the `@` autocomplete — the only difference is what gets inserted and what happens at send time (nothing).
+`./` completion is purely a frontend assist. No backend call is made at send time. The inserted `./path/to/file` string travels to the LLM as-is. The file search endpoint supplies the candidates; nothing happens at send time.
 
 Because there is no expansion, REQ-IR-007 error handling does not apply. The agent receives the path and is responsible for reading it.
 
@@ -186,17 +165,11 @@ enum ExpansionResult {
 }
 
 enum ExpansionError {
-    FileNotFound { path: String },
-    FileNotText { path: String },
-    SkillNotFound { name: String, available: Vec<String> },
+    SkillInvocationFailed { name: String, error: String },
 }
 ```
 
 Errors map to HTTP 422 responses with a structured body the frontend surfaces inline (not a toast — inline error in the input area, blocking send).
-
-## Expansion Order
-
-When a message contains both a `/skill-name` prefix and `@file` references, skill expansion runs first (it transforms the full message body), then file references are resolved within the resulting text. This allows skill content that itself contains `@`-references, though that is an edge case.
 
 ## Non-Goals (tracked in Task 571)
 

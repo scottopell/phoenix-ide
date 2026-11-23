@@ -1,13 +1,13 @@
 #![allow(clippy::wildcard_enum_match_arm)]
-//! Message expansion layer for inline references (REQ-IR-001 through REQ-IR-007)
+//! Message expansion layer for inline references (REQ-IR-002 through REQ-IR-010)
 //!
-//! Resolves `@path/to/file` and `/skill-name` tokens in user messages before they
-//! reach the LLM, producing a `display_text` (stored in DB, shown in history) and
-//! an `llm_text` (delivered to the model with file/skill contents injected).
+//! Resolves `/skill-name` tokens in user messages before they reach the LLM,
+//! producing a `display_text` (stored in DB, shown in history) and an
+//! `llm_text` (delivered to the model with the skill's instructions injected).
 //!
-//! Path (`./`) references are not expanded here — they are autocomplete-only (Task 572).
+//! `@` and `./` tokens are never expanded: they reach the model as literal text.
 
-use crate::resolution_root::{FileResolution, ResolutionRoot};
+use crate::resolution_root::ResolutionRoot;
 use crate::system_prompt::discover_skills;
 
 /// The result of expanding a user message.
@@ -19,7 +19,7 @@ use crate::system_prompt::discover_skills;
 pub struct ExpandedMessage {
     /// Original user text — stored and displayed (REQ-IR-006)
     pub display_text: String,
-    /// Fully resolved text delivered to the LLM (REQ-IR-001)
+    /// Fully resolved text delivered to the LLM (REQ-IR-006)
     pub llm_text: String,
     /// If the message triggered a skill invocation, this contains the details.
     /// The chat handler uses this to persist as `MessageContent::Skill` instead
@@ -30,10 +30,6 @@ pub struct ExpandedMessage {
 /// Errors produced during expansion (REQ-IR-007)
 #[derive(Debug, Clone, PartialEq)]
 pub enum ExpansionError {
-    /// `@` reference points to a file that does not exist or cannot be read
-    FileNotFound { path: String },
-    /// `@` reference points to a binary file
-    FileNotText { path: String },
     /// Skill was found but invocation failed (e.g., file read error)
     SkillInvocationFailed { name: String, error: String },
 }
@@ -41,10 +37,6 @@ pub enum ExpansionError {
 impl std::fmt::Display for ExpansionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::FileNotFound { path } => write!(f, "File not found: {path}"),
-            Self::FileNotText { path } => {
-                write!(f, "File is binary and cannot be included: {path}")
-            }
             Self::SkillInvocationFailed { name, error } => {
                 write!(f, "Skill '{name}' failed: {error}")
             }
@@ -56,16 +48,13 @@ impl ExpansionError {
     /// Short machine-readable type string for the frontend
     pub fn error_type(&self) -> &'static str {
         match self {
-            Self::FileNotFound { .. } => "file_not_found",
-            Self::FileNotText { .. } => "file_not_text",
             Self::SkillInvocationFailed { .. } => "skill_invocation_failed",
         }
     }
 
-    /// The reference token that caused the error (`@path` or `/skill-name`)
+    /// The reference token that caused the error (`/skill-name`)
     pub fn reference(&self) -> String {
         match self {
-            Self::FileNotFound { path } | Self::FileNotText { path } => format!("@{path}"),
             Self::SkillInvocationFailed { name, .. } => format!("/{name}"),
         }
     }
@@ -84,13 +73,12 @@ struct InlineReference {
 
 /// Sorted, non-overlapping byte ranges covering markdown code regions in
 /// `text` — fenced code blocks, indented code blocks, and inline code spans.
-/// Used by the tokenizer to skip sigils that fall inside code, so a user
-/// pasting a stack trace with `@src/main.rs:42` inside a fence doesn't
-/// trigger file expansion.
+/// Used by the tokenizer to skip sigils that fall inside code, so a pasted
+/// `/path` inside a fence is never taken for a skill invocation.
 ///
 /// Unclosed fences: `pulldown-cmark` auto-closes at EOF, which here means
 /// the masked range extends to the end of `text` — conservative by design
-/// (any `@` after an unterminated triple-backtick fence is treated as code,
+/// (any sigil after an unterminated triple-backtick fence is treated as code,
 /// not prose).
 fn masked_code_ranges(text: &str) -> Vec<std::ops::Range<usize>> {
     use pulldown_cmark::{Event, Parser, Tag, TagEnd};
@@ -209,126 +197,16 @@ fn tokenize_references(text: &str, sigils: &[char]) -> Vec<InlineReference> {
     refs
 }
 
-/// Known file extensions that indicate an @ token is an intentional file reference.
-/// A token like @AGENTS.md is a file reference; @username is not.
-const PATH_LIKE_EXTENSIONS: &[&str] = &[
-    "rs", "ts", "tsx", "js", "jsx", "py", "go", "md", "json", "yaml", "yml", "toml", "txt", "css",
-    "scss", "html", "htm", "sh", "bash", "sql", "xml", "allium", "cfg", "conf", "env", "lock",
-    "mod", "sum", "c", "h", "cpp", "hpp", "java", "kt", "swift", "rb", "php", "ex", "exs", "hs",
-    "ml", "zig", "scala", "proto", "graphql", "vue", "svelte", "csv", "log",
-];
-
-/// Determine whether a token after @ looks like an intentional file path reference.
-/// Path references must have a path-token shape before slash/extension heuristics apply.
-fn looks_like_file_path(token: &str) -> bool {
-    if !has_path_token_shape(token) {
-        return false;
-    }
-
-    if token.contains('/') {
-        return true;
-    }
-
-    if let Some(ext) = token.rsplit('.').next() {
-        if ext != token {
-            let ext = ext.to_ascii_lowercase();
-            return PATH_LIKE_EXTENSIONS.contains(&ext.as_str());
-        }
-    }
-
-    false
-}
-
-fn has_path_token_shape(token: &str) -> bool {
-    if token.is_empty() || token.contains("//") {
-        return false;
-    }
-
-    if !token.chars().all(is_path_token_char) {
-        return false;
-    }
-
-    if token.ends_with('/')
-        || token.ends_with('.')
-        || token.ends_with(',')
-        || token.ends_with('\'')
-        || token.ends_with(':')
-        || token.ends_with('!')
-    {
-        return false;
-    }
-
-    if token.starts_with('/') {
-        return token
-            .split('/')
-            .skip(1)
-            .all(|component| !component.is_empty() && path_component_has_valid_groups(component));
-    }
-
-    token
-        .split('/')
-        .all(|component| !component.is_empty() && path_component_has_valid_groups(component))
-}
-
-fn path_component_has_valid_groups(component: &str) -> bool {
-    let mut stack = Vec::new();
-    let mut previous_open = None;
-
-    for c in component.chars() {
-        match c {
-            '(' | '[' => stack.push(c),
-            ')' => {
-                if stack.last() != Some(&'(') || previous_open == Some('(') {
-                    return false;
-                }
-                stack.pop();
-            }
-            ']' => {
-                if stack.last() != Some(&'[') || previous_open == Some('[') {
-                    return false;
-                }
-                stack.pop();
-            }
-            _ => {}
-        }
-        previous_open = matches!(c, '(' | '[').then_some(c);
-    }
-
-    stack.is_empty()
-}
-
-fn is_path_token_char(c: char) -> bool {
-    !c.is_control()
-        && !matches!(
-            c,
-            '"' | '`' | ';' | '<' | '>' | '{' | '}' | '\\' | '|' | '?'
-        )
-}
-
-/// Expand all inline references in `text` against `root`.
+/// Expand a `/skill-name` invocation in `text` against `root`.
 ///
-/// Tokenizes the ORIGINAL text once for both `@` and `/` sigils, then:
-/// 1. Checks for skill invocations (`/` sigil, validated against discovered skills).
-///    Skill expansion replaces the entire message, so it takes priority and file
-///    references in the original text are not expanded.
-/// 2. If no skill matched, expands `@file` references by inlining file contents.
-///
-/// Tokenizing the original text (not skill-expanded text) prevents skill output
-/// from accidentally introducing `@` tokens that trigger file expansion.
-///
-/// `root` is the conversation's [`ResolutionRoot`] — the same value the
-/// composer's autocomplete discovered candidates against, so a reference that
-/// autocompleted will resolve here.
-///
-/// Returns `Ok(ExpandedMessage)` when all references resolve successfully.
-/// Returns the first `Err(ExpansionError)` encountered when any reference fails.
+/// When the first unmasked `/` token names a conversation skill discovered
+/// under `root`, the skill's instructions (with the remaining text as
+/// arguments) replace the message for the model. Otherwise the text is
+/// delivered unchanged.
 pub fn expand(text: &str, root: &ResolutionRoot) -> Result<ExpandedMessage, ExpansionError> {
-    let refs = tokenize_references(text, &['/', '@']);
+    let refs = tokenize_references(text, &['/']);
 
-    // --- Skill expansion (REQ-IR-002, REQ-IR-003) ----------------------------
-    // Check for skill invocation first. Skill expansion replaces the entire
-    // message, so it takes priority over file references.
-    if let Some(skill_ref) = refs.iter().find(|r| r.sigil == '/') {
+    if let Some(skill_ref) = refs.first() {
         // `skills_view` materializes a branch's committed `SKILL.md` files for a
         // GitTree root; keep it alive through `invoke_skill`, which reads them
         // back from the same paths.
@@ -343,71 +221,28 @@ pub fn expand(text: &str, root: &ResolutionRoot) -> Result<ExpandedMessage, Expa
             // boundary.
             #[allow(clippy::string_slice)]
             let arguments = text[skill_ref.span.end..].trim_start();
-            match crate::skills::invoke_skill(
+            return match crate::skills::invoke_skill(
                 &skill_ref.token,
                 arguments,
                 crate::skills::SkillAudience::Conversation,
                 &skills,
             ) {
-                Ok(invocation) => {
-                    return Ok(ExpandedMessage {
-                        display_text: text.to_string(),
-                        llm_text: invocation.body.clone(),
-                        skill_invocation: Some(invocation),
-                    });
-                }
-                Err(e) => {
-                    return Err(ExpansionError::SkillInvocationFailed {
-                        name: skill_ref.token.clone(),
-                        error: e,
-                    });
-                }
-            }
+                Ok(invocation) => Ok(ExpandedMessage {
+                    display_text: text.to_string(),
+                    llm_text: invocation.body.clone(),
+                    skill_invocation: Some(invocation),
+                }),
+                Err(e) => Err(ExpansionError::SkillInvocationFailed {
+                    name: skill_ref.token.clone(),
+                    error: e,
+                }),
+            };
         }
-    }
-
-    // --- File reference expansion (REQ-IR-001, REQ-IR-007) ---------------------
-    // Collect (span, replacement) for each resolvable `@reference`, then splice
-    // them into the original text by span in reverse order. Splicing by the
-    // tokenizer's recorded spans — rather than a global string replace — means
-    // only the occurrences the tokenizer accepted are expanded: an identical
-    // literal sitting inside a masked code region (which the tokenizer skipped)
-    // is left untouched (`NoExpansionInsideCode`).
-    let mut replacements: Vec<(std::ops::Range<usize>, String)> = Vec::new();
-    for file_ref in refs.iter().filter(|r| r.sigil == '@') {
-        // ClassifyAtReference: only treat path-like tokens as file references.
-        // Bare words (@username, @param) pass through as literal text.
-        if !looks_like_file_path(&file_ref.token) {
-            continue;
-        }
-
-        let file_text = match root.read_file(&file_ref.token) {
-            FileResolution::Text(text) => text,
-            FileResolution::Binary => {
-                return Err(ExpansionError::FileNotText {
-                    path: file_ref.token.clone(),
-                });
-            }
-            FileResolution::NotFound => {
-                return Err(ExpansionError::FileNotFound {
-                    path: file_ref.token.clone(),
-                });
-            }
-        };
-
-        let block = format!("<file path=\"{}\">\n{file_text}\n</file>", file_ref.token);
-        replacements.push((file_ref.span.clone(), block));
-    }
-
-    let mut llm_text = text.to_string();
-    // Reverse so each splice leaves earlier spans' byte offsets valid.
-    for (span, block) in replacements.into_iter().rev() {
-        llm_text.replace_range(span, &block);
     }
 
     Ok(ExpandedMessage {
         display_text: text.to_string(),
-        llm_text,
+        llm_text: text.to_string(),
         skill_invocation: None,
     })
 }
@@ -635,149 +470,41 @@ mod tests {
     }
 
     #[test]
-    fn test_expand_single_file_ref() {
+    fn test_expand_at_file_reference_is_literal() {
+        // `@path` names an existing text file, yet nothing is read or inlined.
         let tmp = make_tmp();
-        fs::write(tmp.path().join("hello.txt"), "contents here").unwrap();
+        fs::write(tmp.path().join("hello.txt"), "SECRET-CONTENTS").unwrap();
+        fs::create_dir_all(tmp.path().join("src")).unwrap();
+        fs::write(tmp.path().join("src/main.rs"), "fn main() {}").unwrap();
 
-        let result = expand("check @hello.txt please", &root(tmp.path())).unwrap();
-        assert_eq!(result.display_text, "check @hello.txt please");
-        assert!(result.llm_text.contains("<file path=\"hello.txt\">"));
-        assert!(result.llm_text.contains("contents here"));
-        assert!(result.llm_text.contains("</file>"));
-        assert!(result.skill_invocation.is_none());
-    }
-
-    #[test]
-    fn test_expand_multiple_refs() {
-        let tmp = make_tmp();
-        fs::write(tmp.path().join("a.txt"), "aaa").unwrap();
-        fs::write(tmp.path().join("b.txt"), "bbb").unwrap();
-
-        let result = expand("@a.txt and @b.txt", &root(tmp.path())).unwrap();
-        assert!(result.llm_text.contains("<file path=\"a.txt\">"));
-        assert!(result.llm_text.contains("<file path=\"b.txt\">"));
-        assert!(result.llm_text.contains("aaa"));
-        assert!(result.llm_text.contains("bbb"));
-    }
-
-    #[test]
-    fn test_expand_display_text_unchanged() {
-        let tmp = make_tmp();
-        fs::write(tmp.path().join("f.txt"), "x").unwrap();
-
-        let result = expand("see @f.txt", &root(tmp.path())).unwrap();
-        // display_text is exactly what the user typed
-        assert_eq!(result.display_text, "see @f.txt");
-    }
-
-    #[test]
-    fn test_expand_leaves_same_ref_inside_code_fence_untouched() {
-        // A real `@hello.txt` reference plus the identical literal inside a
-        // fenced code block: only the real (tokenized) one expands; the masked
-        // copy must survive verbatim (NoExpansionInsideCode).
-        let tmp = make_tmp();
-        fs::write(tmp.path().join("hello.txt"), "REALCONTENT").unwrap();
-
-        let input = "see @hello.txt\n```\ntrace @hello.txt here\n```";
-        let result = expand(input, &root(tmp.path())).unwrap();
-
-        // Exactly one expansion (the reference outside the fence).
-        assert_eq!(
-            result.llm_text.matches("<file path=\"hello.txt\">").count(),
-            1,
-            "only the out-of-code reference should expand: {}",
-            result.llm_text
-        );
-        assert!(result.llm_text.contains("REALCONTENT"));
-        // The in-fence occurrence is preserved verbatim, not turned into a block.
-        assert!(
-            result.llm_text.contains("trace @hello.txt here"),
-            "fenced occurrence must survive: {}",
-            result.llm_text
-        );
-    }
-
-    // -------------------------------------------------------------------------
-    // expand — error path (REQ-IR-007)
-    // -------------------------------------------------------------------------
-
-    #[test]
-    fn test_expand_missing_file_error() {
-        let tmp = make_tmp();
-        let bare = "@nonexistent-literal-chat-file";
-        let result = expand(bare, &root(tmp.path())).unwrap();
-        assert_eq!(result.display_text, bare);
-        assert_eq!(result.llm_text, bare);
-        assert!(result.skill_invocation.is_none());
-        for path in [
-            "missing.rs",
-            "nonexistent-literal-chat-file.txt",
-            "missing/file.txt",
+        for input in [
+            "check @hello.txt please",
+            "@hello.txt and @src/main.rs and @hello.txt",
+            "missing @nope/missing.rs is fine",
         ] {
-            let err = expand(&format!("check @{path}"), &root(tmp.path())).unwrap_err();
-            assert_eq!(
-                err,
-                ExpansionError::FileNotFound {
-                    path: path.to_string()
-                }
-            );
+            let result = expand(input, &root(tmp.path())).unwrap();
+            assert_eq!(result.display_text, input);
+            assert_eq!(result.llm_text, input);
+            assert!(result.skill_invocation.is_none());
         }
     }
 
     #[test]
-    fn test_expand_binary_file_error() {
+    fn test_expand_binary_at_reference_is_literal() {
         let tmp = make_tmp();
-        // Write a file with a null byte -- triggers binary detection.
-        // Uses .txt extension so ClassifyAtReference treats it as a file reference.
         fs::write(tmp.path().join("bin.txt"), b"hello\x00world").unwrap();
-
-        let err = expand("check @bin.txt", &root(tmp.path())).unwrap_err();
-        assert_eq!(
-            err,
-            ExpansionError::FileNotText {
-                path: "bin.txt".to_string()
-            }
-        );
+        let result = expand("check @bin.txt", &root(tmp.path())).unwrap();
+        assert_eq!(result.llm_text, "check @bin.txt");
     }
 
     #[test]
-    fn test_error_type_strings() {
-        assert_eq!(
-            ExpansionError::FileNotFound {
-                path: "x".to_string()
-            }
-            .error_type(),
-            "file_not_found"
-        );
-        assert_eq!(
-            ExpansionError::FileNotText {
-                path: "x".to_string()
-            }
-            .error_type(),
-            "file_not_text"
-        );
-        assert_eq!(
-            ExpansionError::SkillInvocationFailed {
-                name: "x".to_string(),
-                error: "oops".to_string()
-            }
-            .error_type(),
-            "skill_invocation_failed"
-        );
-    }
-
-    #[test]
-    fn test_error_reference_token() {
-        let err = ExpansionError::FileNotFound {
-            path: "src/foo.rs".to_string(),
-        };
-        assert_eq!(err.reference(), "@src/foo.rs");
-
-        let err2 = ExpansionError::SkillInvocationFailed {
+    fn test_error_type_and_reference() {
+        let err = ExpansionError::SkillInvocationFailed {
             name: "my-skill".to_string(),
             error: "read failed".to_string(),
         };
-        assert_eq!(err2.reference(), "/my-skill");
+        assert_eq!(err.error_type(), "skill_invocation_failed");
+        assert_eq!(err.reference(), "/my-skill");
     }
 
     // -------------------------------------------------------------------------
@@ -1003,182 +730,5 @@ mod tests {
         assert_eq!(result.display_text, "hello world");
         assert_eq!(result.llm_text, "hello world");
         assert!(result.skill_invocation.is_none());
-    }
-
-    // --- ClassifyAtReference / AtTokenPassThrough (REQ-IR-007) ----
-
-    #[test]
-    fn test_bare_at_word_passes_through() {
-        let tmp = make_tmp();
-        let result = expand("hello @username how are you", &root(tmp.path())).unwrap();
-        assert_eq!(result.llm_text, "hello @username how are you");
-    }
-
-    #[test]
-    fn test_at_param_passes_through() {
-        let tmp = make_tmp();
-        let result = expand("use @param annotation", &root(tmp.path())).unwrap();
-        assert_eq!(result.llm_text, "use @param annotation");
-    }
-
-    #[test]
-    fn test_fastapi_decorator_passes_through() {
-        let tmp = make_tmp();
-        let input = r#"@app.get("/.well-known/api-catalog", include_in_schema=False)"#;
-        let result = expand(input, &root(tmp.path())).unwrap();
-        assert_eq!(result.llm_text, input);
-    }
-
-    #[test]
-    fn test_pasted_fastapi_route_snippet_passes_through() {
-        let tmp = make_tmp();
-        let input = r#"Can you review this route?
-
-@app.get("/.well-known/api-catalog", include_in_schema=False)
-def api_catalog():
-    return {"ok": True}
-"#;
-        let result = expand(input, &root(tmp.path())).unwrap();
-        assert_eq!(result.llm_text, input);
-    }
-
-    #[test]
-    fn test_at_with_extension_treated_as_file_ref() {
-        let tmp = make_tmp();
-        // This has .md extension -- looks like a file, should try to resolve
-        let result = expand("check @MISSING.md please", &root(tmp.path()));
-        assert!(result.is_err()); // FileNotFound because the file doesn't exist
-    }
-
-    #[test]
-    fn test_at_with_slash_treated_as_file_ref() {
-        let tmp = make_tmp();
-        // Contains / -- looks like a path, should try to resolve
-        let result = expand("check @src/main.rs please", &root(tmp.path()));
-        assert!(result.is_err()); // FileNotFound
-    }
-
-    #[test]
-    fn test_at_existing_file_with_extension_expands() {
-        let tmp = make_tmp();
-        fs::write(tmp.path().join("test.txt"), "file content").unwrap();
-        let result = expand("see @test.txt here", &root(tmp.path())).unwrap();
-        assert!(result.llm_text.contains("file content"));
-        assert!(result.llm_text.contains("<file"));
-    }
-
-    #[test]
-    fn test_framework_route_paths_expand() {
-        let tmp = make_tmp();
-        fs::create_dir_all(tmp.path().join("app/routes/[slug]")).unwrap();
-        fs::create_dir_all(tmp.path().join("app/routes/(auth)")).unwrap();
-        fs::create_dir_all(tmp.path().join("app/shop/[[...slug]]")).unwrap();
-        fs::create_dir_all(tmp.path().join("docs")).unwrap();
-        fs::create_dir_all(tmp.path().join("data")).unwrap();
-        fs::write(tmp.path().join("app/routes/[slug].tsx"), "slug route").unwrap();
-        fs::write(tmp.path().join("app/routes/[slug]/$id.tsx"), "id route").unwrap();
-        fs::write(
-            tmp.path().join("app/routes/(auth)/login.tsx"),
-            "login route",
-        )
-        .unwrap();
-        fs::write(
-            tmp.path().join("app/shop/[[...slug]]/page.tsx"),
-            "shop route",
-        )
-        .unwrap();
-        fs::create_dir_all(tmp.path().join("fixtures")).unwrap();
-        fs::write(tmp.path().join("docs/café.md"), "unicode doc").unwrap();
-        fs::write(tmp.path().join("docs/what's-new.md"), "apostrophe doc").unwrap();
-        fs::write(tmp.path().join("docs/important!.md"), "important doc").unwrap();
-        fs::write(tmp.path().join("data/foo,bar.csv"), "comma data").unwrap();
-        fs::write(
-            tmp.path().join("fixtures/2026-06-23T12:00:00Z.json"),
-            "timestamp fixture",
-        )
-        .unwrap();
-
-        let result = expand(
-            "see @app/routes/[slug].tsx and @app/routes/[slug]/$id.tsx and @app/routes/(auth)/login.tsx and @app/shop/[[...slug]]/page.tsx and @docs/café.md and @docs/what's-new.md and @docs/important!.md and @data/foo,bar.csv and @fixtures/2026-06-23T12:00:00Z.json",
-            &root(tmp.path()),
-        )
-        .unwrap();
-
-        assert!(result.llm_text.contains("slug route"));
-        assert!(result.llm_text.contains("id route"));
-        assert!(result.llm_text.contains("login route"));
-        assert!(result.llm_text.contains("shop route"));
-        assert!(result.llm_text.contains("unicode doc"));
-        assert!(result.llm_text.contains("apostrophe doc"));
-        assert!(result.llm_text.contains("important doc"));
-        assert!(result.llm_text.contains("comma data"));
-        assert!(result.llm_text.contains("timestamp fixture"));
-    }
-
-    #[test]
-    fn test_looks_like_file_path_function() {
-        assert!(looks_like_file_path("src/main.rs"));
-        assert!(looks_like_file_path("AGENTS.md"));
-        assert!(looks_like_file_path("config.toml"));
-        assert!(looks_like_file_path("test.txt"));
-        assert!(looks_like_file_path("foo/bar"));
-        assert!(looks_like_file_path("app/routes/[slug].tsx"));
-        assert!(looks_like_file_path("app/routes/(auth)/login.tsx"));
-        assert!(looks_like_file_path("app/routes/[slug]/$id.tsx"));
-        assert!(looks_like_file_path("app/shop/[[...slug]]/page.tsx"));
-        assert!(looks_like_file_path("docs/café.md"));
-        assert!(looks_like_file_path("docs/what's-new.md"));
-        assert!(looks_like_file_path("docs/important!.md"));
-        assert!(looks_like_file_path("data/foo,bar.csv"));
-        assert!(looks_like_file_path("fixtures/2026-06-23T12:00:00Z.json"));
-        assert!(!looks_like_file_path("username"));
-        assert!(!looks_like_file_path("param"));
-        assert!(!looks_like_file_path("override"));
-        assert!(!looks_like_file_path("TODO"));
-        assert!(!looks_like_file_path(
-            "app.get(\"/.well-known/api-catalog\","
-        ));
-        assert!(!looks_like_file_path("src/main.rs,"));
-        assert!(!looks_like_file_path("foo/bar)"));
-        assert!(!looks_like_file_path("notes.md:"));
-        assert!(!looks_like_file_path("app/shop/[[slug]/page.tsx"));
-        assert!(!looks_like_file_path("docs/what's-new.md'"));
-        assert!(!looks_like_file_path("docs/important.md!"));
-    }
-
-    #[test]
-    fn test_bazel_label_passes_through() {
-        let tmp = make_tmp();
-        let result = expand(
-            "build @+go_fast+go_fast//:go_fast.exe target",
-            &root(tmp.path()),
-        )
-        .unwrap();
-        assert_eq!(
-            result.llm_text,
-            "build @+go_fast+go_fast//:go_fast.exe target"
-        );
-    }
-
-    #[test]
-    fn test_bare_bazel_label_passes_through() {
-        let tmp = make_tmp();
-        let result = expand("run @//pkg:target please", &root(tmp.path())).unwrap();
-        assert_eq!(result.llm_text, "run @//pkg:target please");
-    }
-
-    #[test]
-    fn test_url_after_at_passes_through() {
-        let tmp = make_tmp();
-        let result = expand("see @https://example.com/docs", &root(tmp.path())).unwrap();
-        assert_eq!(result.llm_text, "see @https://example.com/docs");
-    }
-
-    #[test]
-    fn test_looks_like_file_path_rejects_double_slash() {
-        assert!(!looks_like_file_path("+go_fast+go_fast//:go_fast.exe"));
-        assert!(!looks_like_file_path("//pkg:target"));
-        assert!(!looks_like_file_path("repo//pkg:target"));
-        assert!(!looks_like_file_path("https://example.com/docs"));
     }
 }

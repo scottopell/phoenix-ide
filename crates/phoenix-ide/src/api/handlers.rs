@@ -19538,8 +19538,49 @@ mod chat_authority_tests {
 
     #[tokio::test]
     async fn public_chat_default_still_expands_and_rejects_unknown_policy() {
+        use phoenix_core::domain::sm_event::PreparedDirectTurnPayload;
+        use phoenix_workflow::ConversationAuthority;
         let state = make_state().await;
         let cwd = tempfile::tempdir().unwrap();
+        let skill_dir = cwd.path().join(".claude/skills/probe-skill");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: probe-skill\ndescription: Probe\n---\nPROBE-SKILL-BODY $ARGUMENTS",
+        )
+        .unwrap();
+        let text = "/probe-skill see @README.md";
+        for (index, policy) in [None, Some("expand_references")].into_iter().enumerate() {
+            let id = format!("expand-{index}");
+            state
+                .db
+                .create_conversation(&id, &id, cwd.path().to_str().unwrap(), true, None, None)
+                .await
+                .unwrap();
+            let mut body = serde_json::json!({"text": text, "message_id": "m"});
+            if let Some(policy) = policy {
+                body["expansion_policy"] = serde_json::json!(policy);
+            }
+            assert_eq!(
+                public_chat_post(&state, &id, &body).await.status(),
+                StatusCode::OK
+            );
+            let turn = state
+                .db
+                .workflow_repository()
+                .load_active_runtime_turn(&ConversationAuthority(id.clone()))
+                .await
+                .unwrap()
+                .expect("expanded chat accepted");
+            let payload =
+                PreparedDirectTurnPayload::from_exact_bytes(turn.prepared.payload()).unwrap();
+            assert_eq!(payload.submitted.text, text);
+            let llm_text = payload.delivery.llm_text.expect("skill expansion");
+            assert!(
+                llm_text.contains("PROBE-SKILL-BODY see @README.md"),
+                "{llm_text}"
+            );
+        }
         state
             .db
             .create_conversation(
@@ -19552,17 +19593,6 @@ mod chat_authority_tests {
             )
             .await
             .unwrap();
-        for policy in [None, Some("expand_references")] {
-            let mut body = serde_json::json!({"text": "@nonexistent-literal-chat-file.txt", "message_id": "m"});
-            if let Some(policy) = policy {
-                body["expansion_policy"] = serde_json::json!(policy);
-            }
-            let response = public_chat_post(&state, "expand", &body).await;
-            assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
-            let error = literal_chat_body(response).await;
-            assert_eq!(error["error_type"], "file_not_found");
-            assert_eq!(error["reference"], "@nonexistent-literal-chat-file.txt");
-        }
         let mut body = serde_json::json!({"text": "plain text", "message_id": "m"});
         for (policy, expected_status) in [
             (

@@ -21,7 +21,7 @@ This spec governs the **conversation experience** — list, chat view, compositi
 - `specs/ask-user-question/` — `QuestionPanel`, `TaskApprovalReader` rendering
 - `specs/browser-tool/` — `BrowserViewPanel` rendering
 - `specs/notifications/` — toast + browser notification policy
-- `specs/inline-references/` — `@file`, `/skill` autocomplete inside InputArea
+- `specs/inline-references/` — `./path`, `/skill` autocomplete inside InputArea
 - `specs/keyboard-interaction/` — global keyboard shortcuts
 
 Surfaces that do not yet have their own spec (TerminalPanel, TasksPanel, SkillsPanel, ConversationSettings, RenameDialog, MessageContextMenu, ImageAttachments) are tracked as a follow-up; this document does NOT claim coverage of them just because they live in `ui/src/components/`.

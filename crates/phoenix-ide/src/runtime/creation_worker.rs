@@ -4445,52 +4445,6 @@ mod product_creation_delivery_replay_tests {
     }
 
     #[tokio::test]
-    async fn objective_expansion_failure_exhausts_bounded_delivery_retries() {
-        let root = tempfile::tempdir().unwrap();
-        let db = Database::open_in_memory().await.unwrap();
-        let request_id = "req-expansion-failure";
-        let conversation_id = "conv-expansion-failure";
-        let manager = test_runtime_manager(db.clone());
-        let (_, _, publish_lease_until) = seed_retry_identity_delivery(
-            &db,
-            root.path().to_str().unwrap(),
-            request_id,
-            conversation_id,
-            "Read @missing.md",
-        )
-        .await;
-        let mut claim_time = publish_lease_until + chrono::Duration::seconds(1);
-
-        for attempt in 1..=4 {
-            let delivery =
-                claim_delivery_attempt(&db, request_id, &attempt.to_string(), claim_time).await;
-            let error = Box::pin(deliver_product_creation_objective(&manager, &delivery))
-                .await
-                .unwrap_err();
-            assert!(error.contains("missing.md"));
-            let job = product_creation_job(&db, request_id).await;
-            assert_eq!(
-                job.status,
-                if attempt < 4 {
-                    "delivery_pending"
-                } else {
-                    "delivery_failed"
-                }
-            );
-            assert_eq!(job.last_error.as_deref(), Some(error.as_str()));
-            if attempt < 4 {
-                claim_time = job.delivery_retry_at.unwrap() + chrono::Duration::seconds(1);
-            } else {
-                assert!(job.delivery_retry_at.is_none());
-            }
-        }
-        assert_eq!(
-            global_objective_artifact_counts(&db, request_id).await,
-            (0, 0)
-        );
-    }
-
-    #[tokio::test]
     async fn internal_creation_objective_is_literal_agent_content() {
         let root = tempfile::tempdir().unwrap();
         let db = Database::open_in_memory().await.unwrap();
@@ -4515,7 +4469,7 @@ mod product_creation_delivery_replay_tests {
                 tool_use_id: "create-call".into(),
             },
         };
-        // Neither a missing @file nor an unknown /skill may be expanded for agent input.
+        // Neither an @token nor an unknown /skill may be expanded for agent input.
         for objective in ["Read @missing.md", "/missing-skill @missing.md"] {
             let expanded = expand_product_creation_objective(
                 &manager,
@@ -4593,7 +4547,13 @@ mod product_creation_delivery_replay_tests {
     #[tokio::test]
     async fn initial_objective_expands_against_published_conversation_root() {
         let root = tempfile::tempdir().unwrap();
-        std::fs::write(root.path().join("notes.md"), "published root contents").unwrap();
+        let skill_dir = root.path().join(".claude/skills/probe-skill");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: probe-skill\ndescription: Probe\n---\npublished root contents $ARGUMENTS",
+        )
+        .unwrap();
         let db = Database::open_in_memory().await.unwrap();
         db.create_conversation(
             "expanded-product-objective",
@@ -4625,16 +4585,16 @@ mod product_creation_delivery_replay_tests {
             let expanded = expand_product_creation_objective(
                 &manager,
                 "expanded-product-objective",
-                "Read @notes.md",
+                "/probe-skill read @notes.md",
                 &origin,
             )
             .await
             .unwrap();
-            assert_eq!(expanded.display_text, "Read @notes.md");
+            assert_eq!(expanded.display_text, "/probe-skill read @notes.md");
             assert!(expanded
                 .llm_text
                 .as_deref()
-                .is_some_and(|text| text.contains("published root contents")));
+                .is_some_and(|text| text.contains("published root contents read @notes.md")));
         }
     }
 

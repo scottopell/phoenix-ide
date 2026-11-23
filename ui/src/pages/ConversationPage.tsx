@@ -1423,7 +1423,7 @@ function ConversationPageContent({
         if (err instanceof ExpansionError) {
           // Don't mark as failed — InputArea restores the draft and shows
           // an inline error so the user can fix or remove the broken
-          // @reference (REQ-IR-007). Keeping the message in the queue as
+          // /skill reference (REQ-IR-007). Keeping the message in the queue as
           // "failed" would duplicate it alongside the restored draft.
           dismissRef.current(localId);
           rollbackOptimisticPhase();

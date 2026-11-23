@@ -992,10 +992,10 @@ export interface TaskAvailabilityResponse {
   available: boolean;
 }
 
-/** Expansion error returned by the server when an @reference or /skill fails (REQ-IR-007) */
+/** Expansion error returned by the server when a /skill fails (REQ-IR-007) */
 export interface ExpansionErrorDetail {
   error: string;
-  error_type: 'file_not_found' | 'file_not_text' | 'skill_invocation_failed';
+  error_type: 'skill_invocation_failed';
   reference: string;
 }
 
@@ -1858,7 +1858,7 @@ export const api = {
           throw new ConflictError(err as ConflictErrorDetail);
         }
         // The first message is expanded at create time even on the attachment
-        // path, so an unresolvable `@file`/`/skill` reference comes back as 422
+        // path, so a failed `/skill` invocation comes back as 422
         // (REQ-IR-007) — surface it as ExpansionError like the JSON path does.
         if (resp.status === 422) {
           throw new ExpansionError(err as ExpansionErrorDetail);
@@ -1878,7 +1878,7 @@ export const api = {
         throw new ConflictError(err as ConflictErrorDetail);
       }
       // The first message is expanded at create time, same as a chat send, so
-      // an unresolvable `@file` reference comes back as 422 (REQ-IR-007).
+      // a failed `/skill` invocation comes back as 422 (REQ-IR-007).
       if (resp.status === 422) {
         throw new ExpansionError(err as ExpansionErrorDetail);
       }
