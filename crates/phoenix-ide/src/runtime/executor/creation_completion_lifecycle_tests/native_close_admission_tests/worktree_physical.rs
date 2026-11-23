@@ -986,7 +986,24 @@ async fn worktree_close_failure_evidence(fixture: &CloseFixture, run: &CloseRunR
     .bind(run.attempt_id.as_str())
     .fetch_all(fixture.db.pool())
     .await;
-    format!("retirement evidence: {evidence:?}; retirement history: {history:?}")
+    let scopes = fixture
+        .db
+        .list_close_attempt_scopes(run.attempt_id.as_str())
+        .await;
+    let mut writers = Vec::new();
+    if let Ok(captured) = &scopes {
+        for scope in captured {
+            let observations = fixture
+                .db
+                .list_close_writer_observations(run, &scope.scope)
+                .await;
+            writers.push(format!("scope {:?}: {observations:?}", scope.scope));
+        }
+    }
+    let scanner_pid = std::process::id();
+    format!(
+        "retirement evidence: {evidence:?}; retirement history: {history:?}; scanner_pid: {scanner_pid}; captured scopes: {scopes:?}; writer observations: {writers:?}"
+    )
 }
 
 async fn durable_native_close_rows(fixture: &CloseFixture, run: &CloseRunRef) -> Value {
