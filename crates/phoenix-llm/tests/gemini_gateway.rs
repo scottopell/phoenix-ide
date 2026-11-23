@@ -44,7 +44,13 @@ async fn gemini_gateway_signed_tool_rounds() {
                 cache_key: PromptCacheKey::ephemeral(),
             };
             let (tx, mut rx) = tokio::sync::mpsc::channel(128);
-            let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+            let drain = tokio::spawn(async move {
+                while tokio::time::timeout(std::time::Duration::from_secs(660), rx.recv())
+                    .await
+                    .expect("live gateway stream closes within its request deadline")
+                    .is_some()
+                {}
+            });
             let response = if streaming {
                 client.complete_streaming(&request, &tx).await
             } else {
@@ -227,7 +233,13 @@ async fn complete_image_probe(
 ) -> phoenix_core::domain::llm_types::LlmResponse {
     if streaming {
         let (tx, mut rx) = tokio::sync::mpsc::channel(128);
-        let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        let drain = tokio::spawn(async move {
+            while tokio::time::timeout(std::time::Duration::from_secs(660), rx.recv())
+                .await
+                .expect("live gateway image stream closes within its request deadline")
+                .is_some()
+            {}
+        });
         let response = client
             .complete_streaming(request, &tx)
             .await

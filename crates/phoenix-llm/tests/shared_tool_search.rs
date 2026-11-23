@@ -72,7 +72,13 @@ fn initial_request(effort: EffectiveEffort) -> LlmRequest {
 async fn complete(service: &dyn LlmService, request: &LlmRequest, streaming: bool) -> LlmResponse {
     if streaming {
         let (tx, mut rx) = tokio::sync::mpsc::channel(128);
-        let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        let drain = tokio::spawn(async move {
+            while tokio::time::timeout(std::time::Duration::from_secs(660), rx.recv())
+                .await
+                .expect("live shared search stream closes within its request deadline")
+                .is_some()
+            {}
+        });
         let response = service.complete_streaming(request, &tx).await;
         drop(tx);
         drain.await.unwrap();
