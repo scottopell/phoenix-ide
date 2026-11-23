@@ -516,6 +516,7 @@ async function assertEmberTracking(page, id, viewport, outDir) {
   }
   await page.context().grantPermissions(['clipboard-read', 'clipboard-write']);
   await page.screenshot({ path: `${outDir}/${id}--${viewport.name}--raw.png`, fullPage: true });
+  await scroller.evaluate(element => { element.scrollTop = Math.min(100, element.scrollHeight - element.clientHeight); });
   const mobileCopy = viewport.width <= 768;
   if (!mobileCopy) {
     await summary.scrollIntoViewIfNeeded();
@@ -527,6 +528,7 @@ async function assertEmberTracking(page, id, viewport, outDir) {
   await copyButton.scrollIntoViewIfNeeded();
   await copyButton.focus();
   const beforeCopyScroll = await scroller.evaluate(element => element.scrollTop);
+  if (beforeCopyScroll <= 0) throw new Error('Copy stability must start at a nonzero transcript reading position');
   await copyButton.click();
   if (mobileCopy) await due.getByRole('button', { name: 'Copied!' }).waitFor();
   await page.waitForFunction(expected => navigator.clipboard.readText().then(text => text === expected), expectedOriginal);
