@@ -330,6 +330,7 @@ jobs:
             runtime::close_retirement::native_initial::supervision::tests:: \
             runtime::close_retirement::native_initial::capture_binding::tests:: \
             runtime::close_retirement::native_initial::worktree::tests:: \
+            runtime::close_retirement::native_initial::worktree::git_leaf::tests:: \
             runtime::close_retirement::native_initial::worktree::admission_tests::; do
             test "$(grep -c "^${module}.*: test$" evidence/runtime-inventory.log)" -gt 0
           done
@@ -392,6 +393,7 @@ jobs:
             runtime::close_retirement::native_initial::supervision::tests:: \
             runtime::close_retirement::native_initial::capture_binding::tests:: \
             runtime::close_retirement::native_initial::worktree::tests:: \
+            runtime::close_retirement::native_initial::worktree::git_leaf::tests:: \
             runtime::close_retirement::native_initial::worktree::admission_tests::; do
             log="evidence/${module//::/-}.log"
             (cd crates/phoenix-ide && "$PHOENIX_RUNTIME_TEST_BINARY" "$module" --nocapture --test-threads=1) 2>&1 | tee "$log"
@@ -406,6 +408,17 @@ jobs:
           failed=0
           tests=(
             expired_original_deadline_does_not_spawn_git_or_a_sentinel_effect
+            supplied_leaf_full_inspection_matches_legacy_canonical_clean_snapshot
+            supplied_leaf_inspection_refuses_unsupported_state_without_scratch_mutation
+            shared_inspection_keeps_legacy_dirty_content_observation
+            supplied_leaf_inspection_checks_administrative_incarnation_before_git
+            supplied_leaf_inspection_propagates_refusal_at_every_git_leaf
+            supplied_leaf_inspection_rejects_expired_deadline_before_repository_access
+            expired_git_leaf_does_not_enter_the_caller
+            expired_legacy_git_wrappers_do_not_access_a_repository
+            recursive_worktree_inspections_share_each_git_leaf_and_deadline
+            ignored_inspection_stops_at_a_refused_git_leaf
+            registry_common_directory_and_fsmonitor_use_individual_git_leaves
             bounded_child_waits_for_pipe_eof_until_deadline_after_direct_child_exits
             expired_original_fsmonitor_deadline_refuses_before_repository_access
             worktree_effect_receives_the_original_absolute_deadline

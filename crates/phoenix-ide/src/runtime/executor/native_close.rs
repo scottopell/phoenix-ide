@@ -190,7 +190,7 @@ impl Drop for NativeCloseInitialContinuation {
 
 impl NativeCloseInitialContinuation {
     /// Opens eligibility only from the actor's actual source and the capture's
-    /// original deadline, before the first original process lease is reserved.
+    /// original deadline, before any original process or Worktree effect.
     pub(super) async fn ensure_source_entry(
         &mut self,
         controller: &mut Option<source_entry::SourceEntryController>,
@@ -201,7 +201,7 @@ impl NativeCloseInitialContinuation {
             || !self
                 .process_retirement
                 .as_ref()
-                .is_some_and(process_retirement::ProcessRetirement::has_resources)
+                .is_some_and(process_retirement::ProcessRetirement::has_original_effects)
         {
             return Ok(());
         }

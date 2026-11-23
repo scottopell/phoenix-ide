@@ -511,128 +511,28 @@ impl NativeWorktreeGitContinuation {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn run_status(
     custody: &mut WorkerCustody,
     runtime: &tokio::runtime::Handle,
     authority: &mut WorkerAuthority,
 ) -> Result<Output, String> {
-    let owner = custody
-        .prepared
-        .as_ref()
-        .expect("worker owns prepared lock");
-    let original_effect = custody
-        .original_effect
-        .as_mut()
-        .expect("worker owns original effect context");
-    let resource = &original_effect.resource;
-    let prepared = &owner.prepared;
-    let deadline = original_effect.deadline();
-    assert_eq!(
-        deadline, prepared.deadline,
-        "original effect context must retain prepared deadline"
+    let owner = custody.prepared.as_ref().expect("worker owns prepared lock");
+    let command = status_command(
+        &owner.prepared.inspection_path,
+        &owner.git_dir,
+        &owner.prepared.common_git_dir,
     );
-    let path = &prepared.inspection_path;
-    let binding = observe_administrative_dir_incarnation(&prepared.common_git_dir);
-    let git_dir = captured_git_directory(path, &prepared.identity);
-    if Instant::now() >= deadline
-        || resource.kind() != RetiredResourceKind::Worktree
-        || !matches!(resource.identity(), LossItemIdentity::Worktree(identity) if identity == &prepared.identity)
-        || binding.as_deref() != Ok(prepared.common_git_dir_incarnation.as_str())
-        || git_dir.as_deref() != Ok(owner.git_dir.as_path())
-        || observe_administrative_dir_incarnation(&owner.git_dir).as_deref()
-            != Ok(owner.git_dir_incarnation.as_str())
-        || common_directory(&owner.git_dir).as_deref() != Ok(prepared.common_git_dir.as_path())
-        || verify_linked_registration(&owner.git_dir, &prepared.common_git_dir, path).is_err()
-    {
-        authority.armed = false;
-        return Err("prepared Worktree binding changed or original deadline expired".into());
-    }
-    let git_dir = &owner.git_dir;
-    let child_slot = &custody.child;
-    let mut git = status_command(path, git_dir, &prepared.common_git_dir);
-    // The worker retains the original lock while the database waits for its
-    // writer. Command construction cannot start fsmonitor or spawn Git.
-    let entry = original_effect.admitted_leaf(runtime, || {
-        check_deadline(deadline)?;
-        if captured_git_directory(path, &prepared.identity).as_deref() != Ok(git_dir.as_path())
-            || observe_administrative_dir_incarnation(git_dir).as_deref()
-                != Ok(owner.git_dir_incarnation.as_str())
-            || common_directory(git_dir).as_deref() != Ok(prepared.common_git_dir.as_path())
-            || verify_linked_registration(git_dir, &prepared.common_git_dir, path).is_err()
-            || observe_administrative_dir_incarnation(&prepared.common_git_dir).as_deref()
-                != Ok(prepared.common_git_dir_incarnation.as_str())
-        {
-            return Err("captured Worktree Git binding changed before authorized spawn".into());
-        }
-        check_deadline(deadline)?;
-        let mut child_guard = child_slot
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        git.spawn()
-            .map(|child| {
-                *child_guard = Some(child);
-            })
-            .map_err(|error| error.to_string())
-    });
-    let release_confirmed = match &entry {
-        Ok((_, NativeCloseInitialEntryRelease::Confirmed))
-        | Err(NativeCloseInitialFirstEffectError::NotStarted(_))
-        | Err(NativeCloseInitialFirstEffectError::Rejected {
-            release: NativeCloseInitialEntryRelease::Confirmed,
-            ..
-        }) => true,
-        _ => false,
-    };
-    if release_confirmed {
-        original_effect.classify_confirmed_release();
-    }
-    match entry {
-        Ok((WorkerEntryResult::Ran(Ok(())), NativeCloseInitialEntryRelease::Confirmed)) => {
-            let result = wait_confirmed_status(custody, deadline);
-            authority.armed = false;
-            result
-        }
-        Ok((WorkerEntryResult::Ran(Ok(())), NativeCloseInitialEntryRelease::Unconfirmed(_))) => {
-            // The writer's release is unknown. Never kill the child or unlock
-            // the repository under unclassified authority, even at deadline.
-            original_effect
-                .fatal
-                .close("native_close_initial_worktree_unknown_writer_release");
-            retain_unclassified(std::mem::replace(custody, WorkerCustody::empty()));
-        }
-        Ok((_, NativeCloseInitialEntryRelease::Unconfirmed(_)))
-        | Err(NativeCloseInitialFirstEffectError::Rejected {
-            release: NativeCloseInitialEntryRelease::Unconfirmed(_),
-            ..
-        }) => {
-            original_effect
-                .fatal
-                .close("native_close_initial_worktree_unknown_writer_release");
-            retain_unclassified(std::mem::replace(custody, WorkerCustody::empty()))
-        }
-        Err(NativeCloseInitialFirstEffectError::NotStarted(error))
-        | Err(NativeCloseInitialFirstEffectError::Rejected {
-            error,
-            release: NativeCloseInitialEntryRelease::Confirmed,
-        }) => {
-            authority.armed = false;
-            Err(format!(
-                "native Worktree Git authorization refused: {error}"
-            ))
-        }
-        Ok((
-            WorkerEntryResult::Busy | WorkerEntryResult::Refused,
-            NativeCloseInitialEntryRelease::Confirmed,
-        )) => {
-            authority.armed = false;
-            Err("original Close source unavailable at Worktree Git spawn".into())
-        }
-        Ok((WorkerEntryResult::Ran(Err(error)), NativeCloseInitialEntryRelease::Confirmed)) => {
-            authority.armed = false;
-            Err(error)
-        }
-    }
+    let deadline = owner.prepared.deadline;
+    let output = git_leaf::run_git_leaf(
+        custody,
+        runtime,
+        authority,
+        command,
+        deadline,
+        "Git status",
+        git_leaf::GitLeafTarget::CapturedRoot,
+    )?;
+    git_leaf::require_success(output, "Git status")
 }
 
 fn status_command(path: &Path, git_dir: &Path, common_git_dir: &Path) -> Command {
@@ -685,20 +585,20 @@ fn status_command(path: &Path, git_dir: &Path, common_git_dir: &Path) -> Command
     command
 }
 
-fn wait_confirmed_status(custody: &mut WorkerCustody, deadline: Instant) -> Result<Output, String> {
+fn wait_confirmed_git(custody: &mut WorkerCustody, deadline: Instant) -> Result<Output, String> {
     let mut slot = custody
         .child
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let child = slot.as_mut().expect("confirmed child in custody");
-    let Some(stdout) = child.stdout.take() else {
+    // Check the pair before taking either handle: even malformed caller stdio
+    // must not drop one pipe while retaining the other under unknown completion.
+    if child.stdout.is_none() || child.stderr.is_none() {
         drop(slot);
         retain_incomplete_status(custody);
-    };
-    let Some(stderr) = child.stderr.take() else {
-        drop(slot);
-        retain_incomplete_status(custody);
-    };
+    }
+    let stdout = child.stdout.take().expect("checked stdout pipe");
+    let stderr = child.stderr.take().expect("checked stderr pipe");
     custody.stdout_reader = Some(std::thread::spawn(move || {
         super::super::read_git_pipe(stdout, Some(STDOUT_LIMIT))
     }));
@@ -755,15 +655,6 @@ fn wait_confirmed_status(custody: &mut WorkerCustody, deadline: Instant) -> Resu
         .expect("joined reader")
         .map_err(|error| error.to_string())?;
     slot.take();
-    if !status.success() {
-        let detail = String::from_utf8_lossy(&stderr);
-        let detail = detail.trim();
-        return Err(if detail.is_empty() {
-            format!("Git status exited with {status}")
-        } else {
-            format!("Git status exited with {status}: {detail}")
-        });
-    }
     Ok(Output {
         status,
         stdout,
@@ -787,6 +678,9 @@ fn retain_unclassified(custody: WorkerCustody) -> ! {
         std::hint::black_box(&custody);
     }
 }
+
+mod git_leaf;
+mod mutation;
 
 #[cfg(test)]
 mod admission_tests;

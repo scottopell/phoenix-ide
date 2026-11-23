@@ -4074,36 +4074,107 @@ async fn inspect_worktree_at_until(
     if std::time::Instant::now() >= deadline {
         return Err("worktree inspection exceeded its deadline".to_string());
     }
-    let fingerprint_path = path.clone();
-    let expected_fingerprint = identity.fingerprint().as_str().to_owned();
-    let fingerprint_valid = tokio::task::spawn_blocking(move || {
-        if std::time::Instant::now() >= deadline {
-            return Err("worktree inspection exceeded its deadline".to_string());
-        }
-        Ok(observe_worktree_fingerprint(&fingerprint_path).as_deref()
-            == Some(expected_fingerprint.as_str()))
+    let identity = identity.clone();
+    tokio::task::spawn_blocking(move || {
+        inspect_worktree_at_with_policy_until(
+            &identity,
+            &path,
+            deadline,
+            WorktreeInspectionPolicy::Legacy,
+            &mut run_bounded_spawned_git,
+        )
     })
     .await
-    .map_err(|error| error.to_string())??;
-    if !fingerprint_valid {
+    .map_err(|error| error.to_string())?
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WorktreeInspectionPolicy {
+    Legacy,
+    ReadOnlyClean,
+}
+
+/// Synchronous inspection for a future native worker. Call outside SQLite writer
+/// admission: only the supplied Git leaf may enter spawn admission. Filesystem
+/// checks are cooperative with the same absolute deadline, not interruptible IO.
+/// Until native scratch-index mutation has its own authority, refuse hidden
+/// suppression, every gitlink (including uninitialized ones), detached HEAD and
+/// dirty status. Successful results use the full legacy observation builder, not
+/// a status-only clean proof or a separate snapshot generation.
+/// Ignored content retains legacy snapshot semantics; deletion still needs the
+/// separate ignored-content guard and its own exact mutation authority.
+#[allow(dead_code)] // Prepared seam; native physical execution is not wired yet.
+fn inspect_worktree_at_with_git_leaf_until(
+    identity: &WorktreeIdentity,
+    path: &Path,
+    deadline: std::time::Instant,
+    git_leaf: &mut WorktreeGitLeaf<'_>,
+) -> Result<(CloseRetirementSnapshot, Vec<CloseLossItem>), String> {
+    inspect_worktree_at_with_policy_until(
+        identity,
+        path,
+        deadline,
+        WorktreeInspectionPolicy::ReadOnlyClean,
+        git_leaf,
+    )
+}
+
+fn inspect_worktree_at_with_policy_until(
+    identity: &WorktreeIdentity,
+    path: &Path,
+    deadline: std::time::Instant,
+    policy: WorktreeInspectionPolicy,
+    git_leaf: &mut WorktreeGitLeaf<'_>,
+) -> Result<(CloseRetirementSnapshot, Vec<CloseLossItem>), String> {
+    if std::time::Instant::now() >= deadline {
+        return Err("worktree inspection exceeded its deadline".to_string());
+    }
+    if observe_worktree_fingerprint(path).as_deref() != Some(identity.fingerprint().as_str()) {
         return Err("captured worktree administrative incarnation changed".to_string());
     }
-    let status_path = path.clone();
-    let output =
-        tokio::task::spawn_blocking(move || run_bounded_git_status_until(&status_path, deadline))
-            .await
-            .map_err(|error| error.to_string())??;
+    let output = run_bounded_git_status_with_leaf_until(path, deadline, git_leaf)?;
     if !output.status.success() {
         return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
     }
     let mut observation = canonical_status_observation(&output.stdout);
+    if policy == WorktreeInspectionPolicy::ReadOnlyClean && !observation.is_empty() {
+        return Err("native worktree inspection does not yet support dirty status".to_string());
+    }
     let mut losses = parse_status_losses(&output.stdout);
-    let hidden_path = path.clone();
-    let hidden_dirty = tokio::task::spawn_blocking(move || {
-        observe_hidden_worktree_changes_until(&hidden_path, deadline)
-    })
-    .await
-    .map_err(|error| error.to_string())??;
+    let hidden_dirty = match policy {
+        WorktreeInspectionPolicy::Legacy => {
+            observe_hidden_worktree_changes_with_leaf_until(path, deadline, git_leaf)?
+        }
+        WorktreeInspectionPolicy::ReadOnlyClean => {
+            // Unlike the legacy hidden-change observer, this probe does not copy
+            // or mutate an index, even temporarily. Refuse suppression itself,
+            // rather than treating a clean porcelain result as sufficient proof.
+            let flags = run_bounded_git_command_with_leaf_until(
+                path,
+                &["ls-files", "-v", "-z", "--"],
+                None,
+                deadline,
+                "hidden-index inspection",
+                git_leaf,
+            )?;
+            if !flags.status.success() {
+                return Err(format!(
+                    "cannot inspect hidden index flags: {}",
+                    String::from_utf8_lossy(&flags.stderr).trim()
+                ));
+            }
+            // `-v` lowercases any assume-unchanged tag, not only `H`.
+            if flags.stdout.split(|byte| *byte == 0).any(|row| {
+                row.first().is_some_and(|flag| *flag == b'S' || flag.is_ascii_lowercase())
+            }) {
+                return Err(
+                    "native worktree inspection does not yet support hidden index suppression"
+                        .to_string(),
+                );
+            }
+            Vec::new()
+        }
+    };
     for path in hidden_dirty {
         observation.extend_from_slice(b"HIDDEN_UNSTAGED\\0");
         observation.extend_from_slice(path.as_bytes());
@@ -4112,16 +4183,17 @@ async fn inspect_worktree_at_until(
     }
     losses.sort_by_key(|loss| (loss.category().as_str(), loss.identity().value()));
     losses.dedup();
-    let content_path = path.clone();
-    let content_losses = losses.clone();
-    let content_observation = tokio::task::spawn_blocking(move || {
-        observe_dirty_content_until(&content_path, &content_losses, deadline)
-    })
-    .await
-    .map_err(|error| error.to_string())??;
+    let content_observation =
+        observe_dirty_content_with_leaf_until(path, &losses, deadline, git_leaf)?;
     observation.extend_from_slice(&content_observation);
-    observe_detached_head_and_submodules_until(&path, &mut observation, &mut losses, deadline)
-        .await?;
+    observe_detached_head_and_submodules_with_leaf_until(
+        path,
+        &mut observation,
+        &mut losses,
+        deadline,
+        policy,
+        git_leaf,
+    )?;
     let snapshot = snapshot_for(&observation);
     if std::time::Instant::now() >= deadline {
         return Err("worktree inspection exceeded its deadline".to_string());
@@ -4129,69 +4201,89 @@ async fn inspect_worktree_at_until(
     Ok((snapshot, losses))
 }
 
-async fn observe_detached_head_and_submodules_until(
+fn observe_detached_head_and_submodules_with_leaf_until(
     path: &Path,
     observation: &mut Vec<u8>,
     losses: &mut Vec<CloseLossItem>,
     deadline: std::time::Instant,
+    policy: WorktreeInspectionPolicy,
+    git_leaf: &mut WorktreeGitLeaf<'_>,
 ) -> Result<(), String> {
     if std::time::Instant::now() >= deadline {
         return Err("detached head inspection exceeded its deadline".to_string());
     }
-    let path = path.to_path_buf();
-    let observed = tokio::task::spawn_blocking(
-        move || -> Result<(WorktreeObservation, Vec<Vec<u8>>), String> {
-            if std::time::Instant::now() >= deadline {
-                return Err("detached head inspection exceeded its deadline".to_string());
+    let (observed, unreachable) = {
+        if std::time::Instant::now() >= deadline {
+            return Err("detached head inspection exceeded its deadline".to_string());
+        }
+        let mut visited = std::collections::HashSet::new();
+        visited.insert(path.canonicalize().map_err(|error| error.to_string())?);
+        let symbolic = run_bounded_git_command_with_leaf_until(
+            path,
+            &["symbolic-ref", "-q", "HEAD"],
+            None,
+            deadline,
+            "detached head inspection",
+            git_leaf,
+        )?;
+        let mut result = Vec::new();
+        let mut detached_head = None;
+        if symbolic.status.success() {
+            result.push((
+                b"HEAD_SYMBOLIC".to_vec(),
+                symbolic.stdout.trim_ascii().to_vec(),
+            ));
+        } else {
+            if policy == WorktreeInspectionPolicy::ReadOnlyClean {
+                return Err(
+                    "native worktree inspection does not yet support detached HEAD".to_string(),
+                );
             }
-            let mut visited = std::collections::HashSet::new();
-            visited.insert(path.canonicalize().map_err(|error| error.to_string())?);
-            let symbolic = run_bounded_git_command_until(
-                &path,
-                &["symbolic-ref", "-q", "HEAD"],
+            let head = run_bounded_git_command_with_leaf_until(
+                path,
+                &["rev-parse", "--verify", "HEAD"],
                 None,
                 deadline,
                 "detached head inspection",
+                git_leaf,
             )?;
-            let mut result = Vec::new();
-            let mut detached_head = None;
-            if symbolic.status.success() {
-                result.push((
-                    b"HEAD_SYMBOLIC".to_vec(),
-                    symbolic.stdout.trim_ascii().to_vec(),
-                ));
-            } else {
-                let head = run_bounded_git_command_until(
-                    &path,
-                    &["rev-parse", "--verify", "HEAD"],
-                    None,
-                    deadline,
-                    "detached head inspection",
+            if !head.status.success() {
+                return Err(String::from_utf8_lossy(&head.stderr).trim().to_string());
+            }
+            let head_oid = head.stdout.trim_ascii().to_vec();
+            result.push((b"HEAD".to_vec(), head_oid.clone()));
+            let evidence =
+                detached_reachability_evidence_with_leaf_until(path, &head_oid, deadline, git_leaf)?;
+            result.push((b"DETACHED".to_vec(), evidence.clone()));
+            detached_head = evidence.is_empty().then_some(head_oid);
+        }
+        match policy {
+            WorktreeInspectionPolicy::Legacy => {
+                observe_initialized_submodules_with_leaf_until(
+                    path, &[], &mut result, deadline, &mut visited, git_leaf,
                 )?;
-                if !head.status.success() {
-                    return Err(String::from_utf8_lossy(&head.stderr).trim().to_string());
+            }
+            WorktreeInspectionPolicy::ReadOnlyClean => {
+                let gitlinks = observe_gitlink_index_with_leaf_until(
+                    path, &[], &mut result, deadline, git_leaf,
+                )?;
+                if !gitlinks.is_empty() {
+                    return Err(
+                        "native worktree inspection does not yet support gitlinks".to_string(),
+                    );
                 }
-                let head_oid = head.stdout.trim_ascii().to_vec();
-                result.push((b"HEAD".to_vec(), head_oid.clone()));
-                let evidence = detached_reachability_evidence_until(&path, &head_oid, deadline)?;
-                result.push((b"DETACHED".to_vec(), evidence.clone()));
-                detached_head = evidence.is_empty().then_some(head_oid);
             }
-            observe_initialized_submodules(&path, &[], &mut result, deadline, &mut visited)?;
-            let unreachable = if let Some(head_oid) = detached_head {
-                detached_unreachable_commits_until(&path, &head_oid, deadline)?
-            } else {
-                Vec::new()
-            };
-            if std::time::Instant::now() >= deadline {
-                return Err("detached head inspection exceeded its deadline".to_string());
-            }
-            Ok((result, unreachable))
-        },
-    )
-    .await
-    .map_err(|error| error.to_string())??;
-    let (observed, unreachable) = observed;
+        }
+        let unreachable = if let Some(head_oid) = detached_head {
+            detached_unreachable_commits_with_leaf_until(path, &head_oid, deadline, git_leaf)?
+        } else {
+            Vec::new()
+        };
+        if std::time::Instant::now() >= deadline {
+            return Err("detached head inspection exceeded its deadline".to_string());
+        }
+        (result, unreachable)
+    };
     let head_oid = observed
         .iter()
         .find_map(|(tag, value)| (tag == b"HEAD").then_some(value.clone()));
@@ -4242,21 +4334,35 @@ async fn observe_detached_head_and_submodules_until(
 
 type WorktreeObservation = Vec<(Vec<u8>, Vec<u8>)>;
 
+#[cfg(test)]
 fn detached_head_is_unreachable(
     repository: &Path,
     observation: &mut WorktreeObservation,
     relative_path: &[u8],
     deadline: std::time::Instant,
 ) -> Result<bool, String> {
+    detached_head_is_unreachable_with_leaf_until(
+        repository, observation, relative_path, deadline, &mut run_bounded_spawned_git,
+    )
+}
+
+fn detached_head_is_unreachable_with_leaf_until(
+    repository: &Path,
+    observation: &mut WorktreeObservation,
+    relative_path: &[u8],
+    deadline: std::time::Instant,
+    git_leaf: &mut WorktreeGitLeaf<'_>,
+) -> Result<bool, String> {
     if std::time::Instant::now() >= deadline {
         return Err("detached head inspection exceeded its deadline".to_string());
     }
-    let symbolic = run_bounded_git_command_until(
+    let symbolic = run_bounded_git_command_with_leaf_until(
         repository,
         &["symbolic-ref", "-q", "HEAD"],
         None,
         deadline,
         "detached head inspection",
+        git_leaf,
     )?;
     let detached = !symbolic.status.success();
     if !detached {
@@ -4265,18 +4371,20 @@ fn detached_head_is_unreachable(
         }
         return Ok(false);
     }
-    let head = run_bounded_git_command_until(
+    let head = run_bounded_git_command_with_leaf_until(
         repository,
         &["rev-parse", "--verify", "HEAD"],
         None,
         deadline,
         "detached head inspection",
+        git_leaf,
     )?;
     if !head.status.success() {
         return Err(String::from_utf8_lossy(&head.stderr).trim().to_string());
     }
     let head_oid = head.stdout.trim_ascii().to_vec();
-    let evidence = detached_reachability_evidence_until(repository, &head_oid, deadline)?;
+    let evidence =
+        detached_reachability_evidence_with_leaf_until(repository, &head_oid, deadline, git_leaf)?;
     if std::time::Instant::now() >= deadline {
         return Err("detached head inspection exceeded its deadline".to_string());
     }
@@ -4300,21 +4408,34 @@ fn detached_unreachable_commits(
     )
 }
 
+#[cfg(test)]
 fn detached_unreachable_commits_until(
     repository: &Path,
     head_oid: &[u8],
     deadline: std::time::Instant,
 ) -> Result<Vec<Vec<u8>>, String> {
+    detached_unreachable_commits_with_leaf_until(
+        repository, head_oid, deadline, &mut run_bounded_spawned_git,
+    )
+}
+
+fn detached_unreachable_commits_with_leaf_until(
+    repository: &Path,
+    head_oid: &[u8],
+    deadline: std::time::Instant,
+    git_leaf: &mut WorktreeGitLeaf<'_>,
+) -> Result<Vec<Vec<u8>>, String> {
     if std::time::Instant::now() >= deadline {
         return Err("detached commit reachability exceeded its deadline".to_string());
     }
     let head_text = std::str::from_utf8(head_oid).map_err(|error| error.to_string())?;
-    let stash = run_bounded_git_command_until(
+    let stash = run_bounded_git_command_with_leaf_until(
         repository,
         &["show-ref", "--verify", "--quiet", "refs/stash"],
         None,
         deadline,
         "detached commit reachability",
+        git_leaf,
     )?;
     let stash_exists = stash.status.success();
     let mut arguments = vec![
@@ -4328,12 +4449,13 @@ fn detached_unreachable_commits_until(
     if stash_exists {
         arguments.push("refs/stash");
     }
-    let output = run_bounded_git_command_until(
+    let output = run_bounded_git_command_with_leaf_until(
         repository,
         &arguments,
         None,
         deadline,
         "detached commit reachability",
+        git_leaf,
     )?;
     if !output.status.success() {
         return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
@@ -4346,16 +4468,28 @@ fn detached_unreachable_commits_until(
         .collect())
 }
 
+#[cfg(test)]
 fn detached_reachability_evidence_until(
     repository: &Path,
     head_oid: &[u8],
     deadline: std::time::Instant,
 ) -> Result<Vec<u8>, String> {
+    detached_reachability_evidence_with_leaf_until(
+        repository, head_oid, deadline, &mut run_bounded_spawned_git,
+    )
+}
+
+fn detached_reachability_evidence_with_leaf_until(
+    repository: &Path,
+    head_oid: &[u8],
+    deadline: std::time::Instant,
+    git_leaf: &mut WorktreeGitLeaf<'_>,
+) -> Result<Vec<u8>, String> {
     if std::time::Instant::now() >= deadline {
         return Err("detached reachability evidence exceeded its deadline".to_string());
     }
     let head_text = std::str::from_utf8(head_oid).map_err(|error| error.to_string())?;
-    let reachable = run_bounded_git_command_until(
+    let reachable = run_bounded_git_command_with_leaf_until(
         repository,
         &[
             "for-each-ref",
@@ -4370,6 +4504,7 @@ fn detached_reachability_evidence_until(
         None,
         deadline,
         "detached reachability evidence",
+        git_leaf,
     )?;
     if !reachable.status.success() {
         return Err(String::from_utf8_lossy(&reachable.stderr)
@@ -4379,12 +4514,13 @@ fn detached_reachability_evidence_until(
     if !reachable.stdout.is_empty() {
         return Ok(reachable.stdout);
     }
-    let listing = run_bounded_git_command_until(
+    let listing = run_bounded_git_command_with_leaf_until(
         repository,
         &["worktree", "list", "--porcelain", "-z"],
         None,
         deadline,
         "detached reachability evidence",
+        git_leaf,
     )?;
     if !listing.status.success() {
         return Err(String::from_utf8_lossy(&listing.stderr).trim().to_string());
@@ -4395,12 +4531,13 @@ fn detached_reachability_evidence_until(
     let repository = repository
         .canonicalize()
         .map_err(|error| format!("cannot canonicalize inspected worktree: {error}"))?;
-    let git_dir = run_bounded_git_command_until(
+    let git_dir = run_bounded_git_command_with_leaf_until(
         &repository,
         &["rev-parse", "--absolute-git-dir"],
         None,
         deadline,
         "detached reachability evidence",
+        git_leaf,
     )?;
     if !git_dir.status.success() {
         return Err(String::from_utf8_lossy(&git_dir.stderr).trim().to_string());
@@ -4554,19 +4691,28 @@ fn capture_git_directory_bindings_until(
     root: &Path,
     deadline: std::time::Instant,
 ) -> Result<std::collections::BTreeMap<PathBuf, PathBuf>, String> {
+    capture_git_directory_bindings_with_leaf_until(root, deadline, &mut run_bounded_spawned_git)
+}
+
+fn capture_git_directory_bindings_with_leaf_until(
+    root: &Path,
+    deadline: std::time::Instant,
+    git_leaf: &mut WorktreeGitLeaf<'_>,
+) -> Result<std::collections::BTreeMap<PathBuf, PathBuf>, String> {
     check_directory_deletion_deadline(Some(deadline))?;
     fn capture(
         repository: &Path,
         relative: &Path,
         deadline: std::time::Instant,
         bindings: &mut std::collections::BTreeMap<PathBuf, PathBuf>,
+        git_leaf: &mut WorktreeGitLeaf<'_>,
     ) -> Result<(), String> {
         check_directory_deletion_deadline(Some(deadline))?;
         bindings.insert(
             relative.to_path_buf(),
             git_directory_for_worktree_until(repository, deadline)?,
         );
-        let (_, gitlinks) = index_gitlinks(repository, deadline)?;
+        let (_, gitlinks) = index_gitlinks_with_leaf_until(repository, deadline, git_leaf)?;
         for gitlink in gitlinks {
             check_directory_deletion_deadline(Some(deadline))?;
             let path = path_buf_from_git_bytes(gitlink.path.as_bytes());
@@ -4574,13 +4720,13 @@ fn capture_git_directory_bindings_until(
             if !submodule.join(".git").exists() {
                 continue;
             }
-            capture(&submodule, &relative.join(path), deadline, bindings)?;
+            capture(&submodule, &relative.join(path), deadline, bindings, git_leaf)?;
         }
         Ok(())
     }
 
     let mut bindings = std::collections::BTreeMap::new();
-    capture(root, Path::new(""), deadline, &mut bindings)?;
+    capture(root, Path::new(""), deadline, &mut bindings, git_leaf)?;
     check_directory_deletion_deadline(Some(deadline))?;
     Ok(bindings)
 }
@@ -4631,9 +4777,32 @@ fn bind_git_command_to_worktree_until(
     Ok(())
 }
 
+/// Executes one prepared Git command, not an enclosing inspection. A native
+/// callback owns spawn admission, child supervision and output collection under
+/// its original effect context. It may return only after confirmed writer release
+/// and completed child/pipe custody. Unknown release or unresolved completion must
+/// retain the calling stack without returning or unwinding (including scratch
+/// index owners held by enclosing helpers).
+/// Helpers call this outside any SQLite writer callback and never refresh the
+/// supplied absolute deadline. Legacy callers use `run_bounded_spawned_git`.
+type WorktreeGitLeaf<'a> = dyn FnMut(
+        std::process::Command,
+        std::time::Instant,
+        &str,
+    ) -> Result<std::process::Output, String>
+    + 'a;
+
 fn run_bounded_git_status_until(
     repository: &Path,
     deadline: std::time::Instant,
+) -> Result<std::process::Output, String> {
+    run_bounded_git_status_with_leaf_until(repository, deadline, &mut run_bounded_spawned_git)
+}
+
+fn run_bounded_git_status_with_leaf_until(
+    repository: &Path,
+    deadline: std::time::Instant,
+    git_leaf: &mut WorktreeGitLeaf<'_>,
 ) -> Result<std::process::Output, String> {
     if std::time::Instant::now() >= deadline {
         return Err("Git status inspection exceeded its deadline".to_string());
@@ -4658,7 +4827,7 @@ fn run_bounded_git_status_until(
         use std::os::unix::process::CommandExt as _;
         command.process_group(0);
     }
-    run_bounded_spawned_git(command, deadline, "Git status inspection")
+    execute_worktree_git_leaf_until(command, deadline, "Git status inspection", git_leaf)
 }
 
 // This read-only registry query starts from captured Git metadata, not a
@@ -4666,6 +4835,18 @@ fn run_bounded_git_status_until(
 fn list_registered_worktrees_in_common_directory_until(
     common_git_dir: &Path,
     deadline: std::time::Instant,
+) -> Result<std::process::Output, String> {
+    list_registered_worktrees_in_common_directory_with_leaf_until(
+        common_git_dir,
+        deadline,
+        &mut run_bounded_spawned_git,
+    )
+}
+
+fn list_registered_worktrees_in_common_directory_with_leaf_until(
+    common_git_dir: &Path,
+    deadline: std::time::Instant,
+    git_leaf: &mut WorktreeGitLeaf<'_>,
 ) -> Result<std::process::Output, String> {
     check_directory_deletion_deadline(Some(deadline))?;
     let mut command = phoenix_core::git::command();
@@ -4681,7 +4862,12 @@ fn list_registered_worktrees_in_common_directory_until(
         use std::os::unix::process::CommandExt as _;
         command.process_group(0);
     }
-    run_bounded_spawned_git(command, deadline, "exact Worktree registration inspection")
+    execute_worktree_git_leaf_until(
+        command,
+        deadline,
+        "exact Worktree registration inspection",
+        git_leaf,
+    )
 }
 
 fn run_bounded_git_command_until(
@@ -4690,6 +4876,24 @@ fn run_bounded_git_command_until(
     index: Option<&Path>,
     deadline: std::time::Instant,
     operation: &str,
+) -> Result<std::process::Output, String> {
+    run_bounded_git_command_with_leaf_until(
+        repository,
+        arguments,
+        index,
+        deadline,
+        operation,
+        &mut run_bounded_spawned_git,
+    )
+}
+
+fn run_bounded_git_command_with_leaf_until(
+    repository: &Path,
+    arguments: &[&str],
+    index: Option<&Path>,
+    deadline: std::time::Instant,
+    operation: &str,
+    git_leaf: &mut WorktreeGitLeaf<'_>,
 ) -> Result<std::process::Output, String> {
     if std::time::Instant::now() >= deadline {
         return Err(format!("{operation} exceeded its deadline"));
@@ -4708,9 +4912,10 @@ fn run_bounded_git_command_until(
         use std::os::unix::process::CommandExt as _;
         command.process_group(0);
     }
-    run_bounded_spawned_git(command, deadline, operation)
+    execute_worktree_git_leaf_until(command, deadline, operation, git_leaf)
 }
 
+#[cfg(test)]
 fn run_bounded_git_paths_until(
     repository: &Path,
     arguments: &[&str],
@@ -4719,6 +4924,29 @@ fn run_bounded_git_paths_until(
     index: &Path,
     deadline: std::time::Instant,
     operation: &str,
+) -> Result<std::process::Output, String> {
+    run_bounded_git_paths_with_leaf_until(
+        repository,
+        arguments,
+        paths,
+        literal_pathspec,
+        index,
+        deadline,
+        operation,
+        &mut run_bounded_spawned_git,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_bounded_git_paths_with_leaf_until(
+    repository: &Path,
+    arguments: &[&str],
+    paths: &[Vec<u8>],
+    literal_pathspec: bool,
+    index: &Path,
+    deadline: std::time::Instant,
+    operation: &str,
+    git_leaf: &mut WorktreeGitLeaf<'_>,
 ) -> Result<std::process::Output, String> {
     // `Command::args` accepts path OsStrings, preserving bytes on Unix.
     let mut command = phoenix_core::git::command_with_config(&[("core.fsmonitor", "false")]);
@@ -4737,7 +4965,19 @@ fn run_bounded_git_paths_until(
         use std::os::unix::process::CommandExt as _;
         command.process_group(0);
     }
-    run_bounded_spawned_git(command, deadline, operation)
+    execute_worktree_git_leaf_until(command, deadline, operation, git_leaf)
+}
+
+fn execute_worktree_git_leaf_until(
+    command: std::process::Command,
+    deadline: std::time::Instant,
+    operation: &str,
+    git_leaf: &mut WorktreeGitLeaf<'_>,
+) -> Result<std::process::Output, String> {
+    if std::time::Instant::now() >= deadline {
+        return Err(format!("{operation} exceeded its deadline"));
+    }
+    git_leaf(command, deadline, operation)
 }
 
 fn run_bounded_spawned_git(
@@ -4854,16 +5094,26 @@ struct IndexedGitlink {
 
 type IndexedGitlinks = (Vec<u8>, Vec<IndexedGitlink>);
 
+#[cfg(test)]
 fn index_gitlinks(
     repository: &Path,
     deadline: std::time::Instant,
 ) -> Result<IndexedGitlinks, String> {
-    let output = run_bounded_git_command_until(
+    index_gitlinks_with_leaf_until(repository, deadline, &mut run_bounded_spawned_git)
+}
+
+fn index_gitlinks_with_leaf_until(
+    repository: &Path,
+    deadline: std::time::Instant,
+    git_leaf: &mut WorktreeGitLeaf<'_>,
+) -> Result<IndexedGitlinks, String> {
+    let output = run_bounded_git_command_with_leaf_until(
         repository,
         &["ls-files", "--stage", "-z", "--"],
         None,
         deadline,
         "gitlink inspection",
+        git_leaf,
     )?;
     if !output.status.success() {
         return Err(format!(
@@ -4910,22 +5160,37 @@ fn index_gitlinks(
     Ok((output.stdout, gitlinks.into_values().collect()))
 }
 
+fn observe_gitlink_index_with_leaf_until(
+    repository: &Path,
+    relative_prefix: &[u8],
+    observation: &mut WorktreeObservation,
+    deadline: std::time::Instant,
+    git_leaf: &mut WorktreeGitLeaf<'_>,
+) -> Result<Vec<IndexedGitlink>, String> {
+    let (index_observation, gitlinks) =
+        index_gitlinks_with_leaf_until(repository, deadline, git_leaf)?;
+    observation.push((
+        [b"SUBMODULE_GITLINK_INDEX\0".as_slice(), relative_prefix].concat(),
+        index_observation,
+    ));
+    Ok(gitlinks)
+}
+
 #[allow(clippy::too_many_lines)]
-fn observe_initialized_submodules(
+fn observe_initialized_submodules_with_leaf_until(
     repository: &Path,
     relative_prefix: &[u8],
     observation: &mut WorktreeObservation,
     deadline: std::time::Instant,
     visited: &mut std::collections::HashSet<PathBuf>,
+    git_leaf: &mut WorktreeGitLeaf<'_>,
 ) -> Result<(), String> {
     if std::time::Instant::now() >= deadline {
         return Err("Git submodule inspection exceeded its aggregate deadline".to_string());
     }
-    let (index_observation, gitlinks) = index_gitlinks(repository, deadline)?;
-    observation.push((
-        [b"SUBMODULE_GITLINK_INDEX\0".as_slice(), relative_prefix].concat(),
-        index_observation,
-    ));
+    let gitlinks = observe_gitlink_index_with_leaf_until(
+        repository, relative_prefix, observation, deadline, git_leaf,
+    )?;
     for gitlink in gitlinks {
         if std::time::Instant::now() >= deadline {
             return Err("Git submodule inspection exceeded its aggregate deadline".to_string());
@@ -4985,7 +5250,8 @@ fn observe_initialized_submodules(
             return Err("initialized submodule graph contains a cycle".to_string());
         }
 
-        let status = run_bounded_git_status_until(&submodule_path, deadline)?;
+        let status =
+            run_bounded_git_status_with_leaf_until(&submodule_path, deadline, git_leaf)?;
         if !status.status.success() {
             return Err(format!(
                 "cannot inspect initialized submodule {}: {}",
@@ -4994,36 +5260,41 @@ fn observe_initialized_submodules(
             ));
         }
         let mut submodule_losses = parse_status_losses(&status.stdout);
-        for hidden in observe_hidden_worktree_changes_until(&submodule_path, deadline)? {
+        for hidden in
+            observe_hidden_worktree_changes_with_leaf_until(&submodule_path, deadline, git_leaf)?
+        {
             let loss = CloseLossItem::UnstagedTrackedPath(hidden);
             if !submodule_losses.contains(&loss) {
                 submodule_losses.push(loss);
             }
         }
         let mut submodule_status = canonical_status_observation(&status.stdout);
-        submodule_status.extend_from_slice(&observe_dirty_content_until(
+        submodule_status.extend_from_slice(&observe_dirty_content_with_leaf_until(
             &submodule_path,
             &submodule_losses,
             deadline,
+            git_leaf,
         )?);
         observation.push((
             [b"SUBMODULE_STATUS\0".as_slice(), relative_path.as_slice()].concat(),
             submodule_status,
         ));
 
-        let symbolic_head = run_bounded_git_command_until(
+        let symbolic_head = run_bounded_git_command_with_leaf_until(
             &submodule_path,
             &["symbolic-ref", "-q", "HEAD"],
             None,
             deadline,
             "Git submodule HEAD inspection",
+            git_leaf,
         )?;
-        let submodule_head = run_bounded_git_command_until(
+        let submodule_head = run_bounded_git_command_with_leaf_until(
             &submodule_path,
             &["rev-parse", "--verify", "HEAD"],
             None,
             deadline,
             "Git submodule HEAD inspection",
+            git_leaf,
         )?;
         if !submodule_head.status.success() && symbolic_head.status.success() {
             observation.push((
@@ -5054,8 +5325,9 @@ fn observe_initialized_submodules(
             ]
             .concat(),
         ));
-        let detached_loss =
-            detached_head_is_unreachable(&submodule_path, observation, &relative_path, deadline)?;
+        let detached_loss = detached_head_is_unreachable_with_leaf_until(
+            &submodule_path, observation, &relative_path, deadline, git_leaf,
+        )?;
         let gitlink_changed = gitlink.stage_zero_oid.as_deref() != Some(submodule_head_oid);
         if gitlink_changed || gitlink.has_unmerged_stage {
             observation.push((
@@ -5068,9 +5340,9 @@ fn observe_initialized_submodules(
             ));
         }
         if detached_loss {
-            for oid in
-                detached_unreachable_commits_until(&submodule_path, submodule_head_oid, deadline)?
-            {
+            for oid in detached_unreachable_commits_with_leaf_until(
+                &submodule_path, submodule_head_oid, deadline, git_leaf,
+            )? {
                 observation.push((
                     [b"SUBMODULE_LOSS\0detached\0".as_slice(), oid.as_slice()].concat(),
                     Vec::new(),
@@ -5106,12 +5378,13 @@ fn observe_initialized_submodules(
                 Vec::new(),
             ));
         }
-        observe_initialized_submodules(
+        observe_initialized_submodules_with_leaf_until(
             &submodule_path,
             &relative_path,
             observation,
             deadline,
             visited,
+            git_leaf,
         )?;
     }
     if std::time::Instant::now() >= deadline {
@@ -5461,12 +5734,21 @@ fn exact_worktree_common_git_dir_until(
     worktree: &Path,
     deadline: std::time::Instant,
 ) -> Result<PathBuf, String> {
-    let output = run_bounded_git_command_until(
+    exact_worktree_common_git_dir_with_leaf_until(worktree, deadline, &mut run_bounded_spawned_git)
+}
+
+fn exact_worktree_common_git_dir_with_leaf_until(
+    worktree: &Path,
+    deadline: std::time::Instant,
+    git_leaf: &mut WorktreeGitLeaf<'_>,
+) -> Result<PathBuf, String> {
+    let output = run_bounded_git_command_with_leaf_until(
         worktree,
         &["rev-parse", "--path-format=absolute", "--git-common-dir"],
         None,
         deadline,
         "Git common-directory inspection",
+        git_leaf,
     )?;
     if !output.status.success() {
         return Err("captured worktree is not server-owned Git worktree".to_string());
@@ -5556,31 +5838,106 @@ unsafe fn renameat_exclusive(
     -1
 }
 
+/// Mandatory per-syscall admission for shared worktree deletion leaves.
+///
+/// Implementations execute the owned effect synchronously to completion or refuse
+/// it without calling it; effects must not outlive this call. An executor error
+/// (including an unknown outcome after execution) stops traversal without retry
+/// or compensation. Native callers can reenter their original effect context here;
+/// identity observations and durable custody callbacks stay outside it.
+trait WorktreeMutationExecutor {
+    fn execute<T, F>(&mut self, effect: F) -> Result<T, String>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> Result<T, String> + Send + 'static;
+}
+
+/// Compatibility only: legacy callers retain their existing direct execution.
+struct DirectWorktreeMutationExecutor;
+
+impl WorktreeMutationExecutor for DirectWorktreeMutationExecutor {
+    fn execute<T, F>(&mut self, effect: F) -> Result<T, String>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> Result<T, String> + Send + 'static,
+    {
+        effect()
+    }
+}
+
 #[cfg(unix)]
+#[allow(dead_code, reason = "legacy direct-execution signature retained for compatibility")]
 fn bind_deletion_entry_to_private_slot(
     directory: libc::c_int,
     name: &std::ffi::CStr,
     expected: &libc::stat,
 ) -> Result<(std::ffi::CString, libc::stat), String> {
+    use std::os::fd::FromRawFd as _;
+
+    // Duplicate before constructing any 'static mutation closure. Invalid legacy
+    // descriptors produce an OS error rather than an invalid BorrowedFd.
+    // SAFETY: fcntl validates the input descriptor and returns a new owned fd.
+    let duplicate = unsafe { libc::fcntl(directory, libc::F_DUPFD_CLOEXEC, 0) };
+    if duplicate < 0 {
+        return Err(format!(
+            "cannot duplicate deletion descriptor: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    // SAFETY: duplicate is newly owned on success above.
+    let directory = unsafe { std::os::fd::OwnedFd::from_raw_fd(duplicate) };
+    bind_deletion_entry_to_private_slot_with_executor(
+        &std::sync::Arc::new(directory),
+        name,
+        expected,
+        None,
+        &mut DirectWorktreeMutationExecutor,
+    )
+}
+
+#[cfg(unix)]
+fn bind_deletion_entry_to_private_slot_with_executor<E: WorktreeMutationExecutor>(
+    directory: &std::sync::Arc<std::os::fd::OwnedFd>,
+    name: &std::ffi::CStr,
+    expected: &libc::stat,
+    deadline: Option<std::time::Instant>,
+    executor: &mut E,
+) -> Result<(std::ffi::CString, libc::stat), String> {
+    use std::os::fd::AsRawFd as _;
+
     let slot = std::ffi::CString::new(format!(
         ".phoenix-delete-entry-{}",
         uuid::Uuid::new_v4().simple()
     ))
     .expect("generated deletion slot contains no NUL");
-    // SAFETY: the descriptor and C strings are valid. Exclusive rename
-    // cannot overwrite another entry at the unpredictable destination.
-    if unsafe { renameat_exclusive(directory, name.as_ptr(), slot.as_ptr()) } < 0 {
-        return Err(format!(
-            "cannot bind deletion entry to private slot: {}",
-            std::io::Error::last_os_error()
-        ));
-    }
+    let effect_directory = std::sync::Arc::clone(directory);
+    let effect_name = name.to_owned();
+    let effect_slot = slot.clone();
+    executor.execute(move || {
+        check_directory_deletion_deadline(deadline)?;
+        // SAFETY: the effect owns the descriptor and C strings. Exclusive
+        // rename cannot overwrite another entry at the private destination.
+        if unsafe {
+            renameat_exclusive(
+                effect_directory.as_raw_fd(),
+                effect_name.as_ptr(),
+                effect_slot.as_ptr(),
+            )
+        } < 0
+        {
+            return Err(format!(
+                "cannot bind deletion entry to private slot: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        Ok(())
+    })?;
 
     let mut moved = std::mem::MaybeUninit::<libc::stat>::uninit();
     // SAFETY: descriptor and slot are valid; moved points to writable storage.
     if unsafe {
         libc::fstatat(
-            directory,
+            directory.as_raw_fd(),
             slot.as_ptr(),
             moved.as_mut_ptr(),
             libc::AT_SYMLINK_NOFOLLOW,
@@ -5640,6 +5997,30 @@ fn remove_directory_contents_at_with_hook_and_deadline<H>(
 ) -> Result<(), String>
 where
     H: FnMut(libc::c_int, &std::ffi::CStr),
+{
+    check_directory_deletion_deadline(deadline)?;
+    let directory = directory
+        .try_clone()
+        .map_err(|error| format!("cannot duplicate deletion descriptor: {error}"))?;
+    remove_directory_contents_at_with_hook_and_deadline_with_executor(
+        &std::sync::Arc::new(directory),
+        after_inspection,
+        deadline,
+        &mut DirectWorktreeMutationExecutor,
+    )
+}
+
+#[cfg(unix)]
+#[allow(clippy::too_many_lines)]
+fn remove_directory_contents_at_with_hook_and_deadline_with_executor<H, E>(
+    directory: &std::sync::Arc<std::os::fd::OwnedFd>,
+    after_inspection: &mut H,
+    deadline: Option<std::time::Instant>,
+    executor: &mut E,
+) -> Result<(), String>
+where
+    H: FnMut(libc::c_int, &std::ffi::CStr),
+    E: WorktreeMutationExecutor,
 {
     use std::ffi::CStr;
     use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
@@ -5709,8 +6090,13 @@ where
             let metadata = unsafe { metadata.assume_init() };
             after_inspection(directory.as_raw_fd(), name);
             check_directory_deletion_deadline(deadline)?;
-            let (slot, moved) =
-                bind_deletion_entry_to_private_slot(directory.as_raw_fd(), name, &metadata)?;
+            let (slot, moved) = bind_deletion_entry_to_private_slot_with_executor(
+                directory,
+                name,
+                &metadata,
+                deadline,
+                executor,
+            )?;
             if moved.st_mode & libc::S_IFMT == libc::S_IFDIR {
                 check_directory_deletion_deadline(deadline)?;
                 // SAFETY: openat does not follow the private slot because O_NOFOLLOW is set.
@@ -5728,7 +6114,7 @@ where
                     ));
                 }
                 // SAFETY: child is a newly owned descriptor on success above.
-                let child = unsafe { OwnedFd::from_raw_fd(child) };
+                let child = std::sync::Arc::new(unsafe { OwnedFd::from_raw_fd(child) });
                 let mut opened = std::mem::MaybeUninit::<libc::stat>::uninit();
                 // SAFETY: child is valid and opened points to writable storage.
                 if unsafe { libc::fstat(child.as_raw_fd(), opened.as_mut_ptr()) } < 0 {
@@ -5744,31 +6130,42 @@ where
                         "private deletion slot was replaced before descriptor binding".to_string(),
                     );
                 }
-                remove_directory_contents_at_with_hook_and_deadline(
+                remove_directory_contents_at_with_hook_and_deadline_with_executor(
                     &child,
                     after_inspection,
                     deadline,
+                    executor,
                 )?;
                 check_directory_deletion_deadline(deadline)?;
-                // SAFETY: unlinkat targets only the unpredictable identity-checked slot.
-                if unsafe {
-                    libc::unlinkat(directory.as_raw_fd(), slot.as_ptr(), libc::AT_REMOVEDIR)
-                } < 0
-                {
-                    return Err(format!(
-                        "cannot remove identity-bound deletion subdirectory: {}",
-                        std::io::Error::last_os_error()
-                    ));
-                }
+                let directory = std::sync::Arc::clone(directory);
+                executor.execute(move || {
+                    check_directory_deletion_deadline(deadline)?;
+                    // SAFETY: effect owns the descriptor and private slot name.
+                    if unsafe {
+                        libc::unlinkat(directory.as_raw_fd(), slot.as_ptr(), libc::AT_REMOVEDIR)
+                    } < 0
+                    {
+                        return Err(format!(
+                            "cannot remove identity-bound deletion subdirectory: {}",
+                            std::io::Error::last_os_error()
+                        ));
+                    }
+                    Ok(())
+                })?;
             } else {
                 check_directory_deletion_deadline(deadline)?;
-                // SAFETY: unlinkat targets only the unpredictable identity-checked slot.
-                if unsafe { libc::unlinkat(directory.as_raw_fd(), slot.as_ptr(), 0) } < 0 {
-                    return Err(format!(
-                        "cannot remove identity-bound deletion entry: {}",
-                        std::io::Error::last_os_error()
-                    ));
-                }
+                let directory = std::sync::Arc::clone(directory);
+                executor.execute(move || {
+                    check_directory_deletion_deadline(deadline)?;
+                    // SAFETY: effect owns the descriptor and private slot name.
+                    if unsafe { libc::unlinkat(directory.as_raw_fd(), slot.as_ptr(), 0) } < 0 {
+                        return Err(format!(
+                            "cannot remove identity-bound deletion entry: {}",
+                            std::io::Error::last_os_error()
+                        ));
+                    }
+                    Ok(())
+                })?;
             }
         }
     })();
@@ -5779,20 +6176,39 @@ where
 }
 
 fn reserve_private_tombstone(root: &Path, description: &str) -> Result<(), String> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt as _;
-        let mut builder = std::fs::DirBuilder::new();
-        builder
-            .mode(0o700)
-            .create(root)
-            .map_err(|error| format!("cannot reserve private {description} tombstone: {error}"))
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = (root, description);
-        Err("identity-bound deletion is unsupported on this platform".to_string())
-    }
+    reserve_private_tombstone_with_executor(
+        root,
+        description,
+        None,
+        &mut DirectWorktreeMutationExecutor,
+    )
+}
+
+fn reserve_private_tombstone_with_executor<E: WorktreeMutationExecutor>(
+    root: &Path,
+    description: &str,
+    deadline: Option<std::time::Instant>,
+    executor: &mut E,
+) -> Result<(), String> {
+    let root = root.to_path_buf();
+    let description = description.to_string();
+    executor.execute(move || {
+        check_directory_deletion_deadline(deadline)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt as _;
+            let mut builder = std::fs::DirBuilder::new();
+            builder
+                .mode(0o700)
+                .create(root)
+                .map_err(|error| format!("cannot reserve private {description} tombstone: {error}"))
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (root, description);
+            Err("identity-bound deletion is unsupported on this platform".to_string())
+        }
+    })
 }
 
 #[cfg(unix)]
@@ -5858,10 +6274,31 @@ where
     )
 }
 
+#[allow(dead_code, reason = "legacy direct-execution signature retained for compatibility")]
 fn remove_empty_tombstone_before_deadline(tombstone: &Path, deadline: Option<std::time::Instant>) {
+    let _ = remove_empty_tombstone_before_deadline_with_executor(
+        tombstone,
+        deadline,
+        &mut DirectWorktreeMutationExecutor,
+    );
+}
+
+fn remove_empty_tombstone_before_deadline_with_executor<E: WorktreeMutationExecutor>(
+    tombstone: &Path,
+    deadline: Option<std::time::Instant>,
+    executor: &mut E,
+) -> Result<(), String> {
     if check_directory_deletion_deadline(deadline).is_ok() {
-        let _ = std::fs::remove_dir(tombstone);
+        let tombstone = tombstone.to_path_buf();
+        executor.execute(move || {
+            check_directory_deletion_deadline(deadline)?;
+            // Best effort only after an admitted mutation failed. Admission
+            // refusal itself propagates and must not trigger another mutation.
+            let _ = std::fs::remove_dir(tombstone);
+            Ok(())
+        })?;
     }
+    Ok(())
 }
 
 // This helper accepts a budget but does not establish original physical authority or ownership.
@@ -5872,7 +6309,7 @@ fn remove_identity_bound_directory_with_deadline<F, B, A, O>(
     expected_identity: &str,
     observe_identity: O,
     before_final_move: F,
-    mut bind_root: B,
+    bind_root: B,
     after_identity_observation: A,
     description: &str,
     deadline: Option<std::time::Instant>,
@@ -5882,6 +6319,42 @@ where
     B: FnMut(&Path, (u64, u64), Option<(u64, u64)>) -> Result<(), String>,
     A: FnOnce(&Path, &Path) -> Result<(), String>,
     O: Fn(&Path) -> Result<String, String>,
+{
+    remove_identity_bound_directory_with_deadline_with_executor(
+        deletion_target,
+        tombstone_root,
+        expected_identity,
+        observe_identity,
+        before_final_move,
+        bind_root,
+        after_identity_observation,
+        description,
+        deadline,
+        &mut DirectWorktreeMutationExecutor,
+    )
+}
+
+// Admission surrounds individual mutations, never recursive traversal or durable
+// bind_root callbacks: those callbacks may themselves need a database writer.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn remove_identity_bound_directory_with_deadline_with_executor<F, B, A, O, E>(
+    deletion_target: &Path,
+    tombstone_root: Option<&Path>,
+    expected_identity: &str,
+    observe_identity: O,
+    before_final_move: F,
+    mut bind_root: B,
+    after_identity_observation: A,
+    description: &str,
+    deadline: Option<std::time::Instant>,
+    executor: &mut E,
+) -> Result<(), String>
+where
+    F: FnOnce(&Path),
+    B: FnMut(&Path, (u64, u64), Option<(u64, u64)>) -> Result<(), String>,
+    A: FnOnce(&Path, &Path) -> Result<(), String>,
+    O: Fn(&Path) -> Result<String, String>,
+    E: WorktreeMutationExecutor,
 {
     check_directory_deletion_deadline(deadline)?;
     before_final_move(deletion_target);
@@ -5900,7 +6373,12 @@ where
     check_directory_deletion_deadline(deadline)?;
     if !tombstone_root.exists() {
         check_directory_deletion_deadline(deadline)?;
-        reserve_private_tombstone(&tombstone_root, description)?;
+        reserve_private_tombstone_with_executor(
+            &tombstone_root,
+            description,
+            deadline,
+            executor,
+        )?;
     }
     #[cfg(not(unix))]
     {
@@ -5917,12 +6395,20 @@ where
     };
     check_directory_deletion_deadline(deadline)?;
     if let Err(error) = bind_root(&tombstone_root, verified_root, None) {
-        remove_empty_tombstone_before_deadline(&tombstone_root, deadline);
+        remove_empty_tombstone_before_deadline_with_executor(&tombstone_root, deadline, executor)?;
         return Err(error);
     }
     check_directory_deletion_deadline(deadline)?;
-    if let Err(error) = std::fs::rename(deletion_target, &tombstone) {
-        remove_empty_tombstone_before_deadline(&tombstone_root, deadline);
+    let source = deletion_target.to_path_buf();
+    let destination = tombstone.clone();
+    // Keep syscall failure distinct from executor refusal: refusal must return
+    // immediately, without even a compensating tombstone cleanup admission.
+    let rename_result = executor.execute(move || {
+        check_directory_deletion_deadline(deadline)?;
+        Ok(std::fs::rename(source, destination))
+    })?;
+    if let Err(error) = rename_result {
+        remove_empty_tombstone_before_deadline_with_executor(&tombstone_root, deadline, executor)?;
         return Err(format!(
             "cannot move {description} into private final tombstone: {error}"
         ));
@@ -5948,9 +6434,11 @@ where
     after_identity_observation(&tombstone_root, &tombstone)?;
     check_directory_deletion_deadline(deadline)?;
     #[cfg(unix)]
+    let mut retained_descriptors = Vec::new();
+    #[cfg(unix)]
     {
         use std::ffi::CString;
-        use std::os::fd::FromRawFd as _;
+        use std::os::fd::{AsRawFd as _, FromRawFd as _};
         use std::os::unix::ffi::OsStrExt as _;
 
         check_directory_deletion_deadline(deadline)?;
@@ -5971,12 +6459,16 @@ where
             ));
         }
         // SAFETY: root_descriptor is newly owned on success above.
-        let root_descriptor = unsafe { std::os::fd::OwnedFd::from_raw_fd(root_descriptor) };
+        let root_descriptor =
+            std::sync::Arc::new(unsafe { std::os::fd::OwnedFd::from_raw_fd(root_descriptor) });
+        // Keep the original descriptor alive through release classification,
+        // including the final root-removal effect below this lexical block.
+        retained_descriptors.push(std::sync::Arc::clone(&root_descriptor));
         let mut opened_root = std::mem::MaybeUninit::<libc::stat>::uninit();
         // SAFETY: descriptor is open and fstat initializes opened_root on success.
         if unsafe {
             libc::fstat(
-                std::os::fd::AsRawFd::as_raw_fd(&root_descriptor),
+                root_descriptor.as_raw_fd(),
                 opened_root.as_mut_ptr(),
             )
         } < 0
@@ -6003,7 +6495,7 @@ where
         // SAFETY: openat is rooted in the private descriptor and O_NOFOLLOW rejects replacement links.
         let object_descriptor = unsafe {
             libc::openat(
-                std::os::fd::AsRawFd::as_raw_fd(&root_descriptor),
+                root_descriptor.as_raw_fd(),
                 tombstone_name.as_ptr(),
                 libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
             )
@@ -6015,12 +6507,14 @@ where
             ));
         }
         // SAFETY: object_descriptor is newly owned on success above.
-        let object_descriptor = unsafe { std::os::fd::OwnedFd::from_raw_fd(object_descriptor) };
+        let object_descriptor =
+            std::sync::Arc::new(unsafe { std::os::fd::OwnedFd::from_raw_fd(object_descriptor) });
+        retained_descriptors.push(std::sync::Arc::clone(&object_descriptor));
         let mut opened_object = std::mem::MaybeUninit::<libc::stat>::uninit();
         // SAFETY: descriptor is open and fstat initializes opened_object on success.
         if unsafe {
             libc::fstat(
-                std::os::fd::AsRawFd::as_raw_fd(&object_descriptor),
+                object_descriptor.as_raw_fd(),
                 opened_object.as_mut_ptr(),
             )
         } < 0
@@ -6038,30 +6532,42 @@ where
                 tombstone.display()
             ));
         }
-        remove_directory_contents_at_with_hook_and_deadline(
+        remove_directory_contents_at_with_hook_and_deadline_with_executor(
             &object_descriptor,
             &mut |_, _| {},
             deadline,
+            executor,
         )?;
         check_directory_deletion_deadline(deadline)?;
-        // SAFETY: unlinkat is rooted at the still-open private directory and does not follow names.
-        if unsafe {
-            libc::unlinkat(
-                std::os::fd::AsRawFd::as_raw_fd(&root_descriptor),
-                tombstone_name.as_ptr(),
-                libc::AT_REMOVEDIR,
-            )
-        } < 0
-        {
-            return Err(format!(
-                "cannot unlink identity-bound {description}: {}",
-                std::io::Error::last_os_error()
-            ));
-        }
+        let description = description.to_string();
+        executor.execute(move || {
+            check_directory_deletion_deadline(deadline)?;
+            // SAFETY: effect owns the verified root descriptor and object name.
+            if unsafe {
+                libc::unlinkat(
+                    root_descriptor.as_raw_fd(),
+                    tombstone_name.as_ptr(),
+                    libc::AT_REMOVEDIR,
+                )
+            } < 0
+            {
+                return Err(format!(
+                    "cannot unlink identity-bound {description}: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+            Ok(())
+        })?;
     }
     check_directory_deletion_deadline(deadline)?;
-    std::fs::remove_dir(&tombstone_root)
-        .map_err(|error| format!("cannot remove empty {description} tombstone: {error}"))?;
+    let description = description.to_string();
+    executor.execute(move || {
+        check_directory_deletion_deadline(deadline)?;
+        std::fs::remove_dir(&tombstone_root)
+            .map_err(|error| format!("cannot remove empty {description} tombstone: {error}"))
+    })?;
+    #[cfg(unix)]
+    drop(retained_descriptors);
     check_directory_deletion_deadline(deadline)
 }
 
@@ -6538,6 +7044,26 @@ fn remove_exact_worktree_administrative_dir_with_hook_and_deadline<F>(
 where
     F: FnOnce(&Path),
 {
+    remove_exact_worktree_administrative_dir_with_hook_and_deadline_with_executor(
+        administrative_dir,
+        expected_incarnation,
+        before_final_move,
+        deadline,
+        &mut DirectWorktreeMutationExecutor,
+    )
+}
+
+fn remove_exact_worktree_administrative_dir_with_hook_and_deadline_with_executor<F, E>(
+    administrative_dir: &Path,
+    expected_incarnation: &str,
+    before_final_move: F,
+    deadline: Option<std::time::Instant>,
+    executor: &mut E,
+) -> Result<(), String>
+where
+    F: FnOnce(&Path),
+    E: WorktreeMutationExecutor,
+{
     check_directory_deletion_deadline(deadline)?;
     let quarantine = administrative_dir_quarantine_path(administrative_dir, expected_incarnation)?;
     reject_administrative_final_tombstone_residuals(&quarantine, deadline)?;
@@ -6560,8 +7086,13 @@ where
                 return Err("worktree administrative-directory incarnation changed".to_string());
             }
             check_directory_deletion_deadline(deadline)?;
-            std::fs::rename(administrative_dir, &quarantine).map_err(|error| {
-                format!("cannot quarantine exact worktree administrative directory: {error}")
+            let source = administrative_dir.to_path_buf();
+            let destination = quarantine.clone();
+            executor.execute(move || {
+                check_directory_deletion_deadline(deadline)?;
+                std::fs::rename(source, destination).map_err(|error| {
+                    format!("cannot quarantine exact worktree administrative directory: {error}")
+                })
             })?;
             quarantine
         }
@@ -6574,11 +7105,13 @@ where
     }
     check_directory_deletion_deadline(deadline)?;
     let final_tombstone = fresh_administrative_dir_final_tombstone_path(&deletion_target);
-    reserve_private_tombstone(
+    reserve_private_tombstone_with_executor(
         &final_tombstone,
         "retired worktree administrative directory",
+        deadline,
+        executor,
     )?;
-    remove_identity_bound_directory_with_deadline(
+    remove_identity_bound_directory_with_deadline_with_executor(
         &deletion_target,
         Some(&final_tombstone),
         expected_incarnation,
@@ -6588,6 +7121,7 @@ where
         |_, _| Ok(()),
         "retired worktree administrative directory",
         deadline,
+        executor,
     )
 }
 
@@ -6692,12 +7226,24 @@ fn stop_bound_fsmonitor_daemons_with_admission_until(
             String::from_utf8_lossy(&submodules.stderr).trim()
         ));
     }
-    let worktree = run_bounded_git_command_until(
+    stop_bound_fsmonitor_with_leaf_until(path, deadline, &mut run_bounded_spawned_git)
+}
+
+/// Stops only this bound repository's daemon. Native callers must enumerate
+/// initialized submodules and invoke this leaf for each one; the legacy recursive
+/// `submodule foreach` helper above launches descendants outside leaf admission.
+fn stop_bound_fsmonitor_with_leaf_until(
+    path: &Path,
+    deadline: std::time::Instant,
+    git_leaf: &mut WorktreeGitLeaf<'_>,
+) -> Result<FsmonitorStop, String> {
+    let worktree = run_bounded_git_command_with_leaf_until(
         path,
         &["fsmonitor--daemon", "stop"],
         None,
         deadline,
         "worktree fsmonitor shutdown",
+        git_leaf,
     )?;
     classify_fsmonitor_stop(&worktree)
 }
@@ -8767,10 +9313,19 @@ fn ensure_no_ignored_content_until(
     path: &Path,
     deadline: std::time::Instant,
 ) -> Result<(), String> {
+    ensure_no_ignored_content_with_git_leaf_until(path, deadline, &mut run_bounded_spawned_git)
+}
+
+fn ensure_no_ignored_content_with_git_leaf_until(
+    path: &Path,
+    deadline: std::time::Instant,
+    git_leaf: &mut WorktreeGitLeaf<'_>,
+) -> Result<(), String> {
     fn inspect(
         path: &Path,
         deadline: std::time::Instant,
         visited: &mut std::collections::HashSet<PathBuf>,
+        git_leaf: &mut WorktreeGitLeaf<'_>,
     ) -> Result<(), String> {
         if std::time::Instant::now() >= deadline {
             return Err("ignored-content inspection exceeded its deadline".into());
@@ -8779,24 +9334,12 @@ fn ensure_no_ignored_content_until(
         if !visited.insert(canonical) {
             return Err("initialized submodule graph contains a cycle".into());
         }
-        let status = run_bounded_git_status_until(path, deadline)?;
-        if !status.status.success() {
-            return Err(format!(
-                "cannot inspect ignored content: {}",
-                String::from_utf8_lossy(&status.stderr).trim()
-            ));
-        }
-        if status
-            .stdout
-            .split(|byte| *byte == 0)
-            .any(|row| row.starts_with(b"!! "))
-        {
-            return Err(format!(
-                "ignored content at {} has no exact discard authority; worktree preserved",
-                path.display()
-            ));
-        }
-        let (_, gitlinks) = index_gitlinks(path, deadline)?;
+        ensure_no_ignored_content_with_status_leaf_until(
+            path,
+            deadline,
+            |path, deadline| run_bounded_git_status_with_leaf_until(path, deadline, git_leaf),
+        )?;
+        let (_, gitlinks) = index_gitlinks_with_leaf_until(path, deadline, git_leaf)?;
         for gitlink in gitlinks {
             if std::time::Instant::now() >= deadline {
                 return Err("ignored-content inspection exceeded its deadline".into());
@@ -8807,12 +9350,48 @@ fn ensure_no_ignored_content_until(
                 .try_exists()
                 .map_err(|error| error.to_string())?
             {
-                inspect(&submodule, deadline, visited)?;
+                inspect(&submodule, deadline, visited, git_leaf)?;
             }
         }
         Ok(())
     }
-    inspect(path, deadline, &mut std::collections::HashSet::new())
+    inspect(path, deadline, &mut std::collections::HashSet::new(), git_leaf)
+}
+
+/// One ignored-content status leaf, with execution supplied explicitly by the caller.
+///
+/// This is deliberately not the recursive ignored-content inspection: a native
+/// caller must admit every submodule probe separately, using its captured binding.
+/// A clean result here alone is never full inspection or removal authority.
+fn ensure_no_ignored_content_with_status_leaf_until(
+    path: &Path,
+    deadline: std::time::Instant,
+    status_leaf: impl FnOnce(&Path, std::time::Instant) -> Result<std::process::Output, String>,
+) -> Result<(), String> {
+    if std::time::Instant::now() >= deadline {
+        return Err("ignored-content inspection exceeded its deadline".into());
+    }
+    let status = status_leaf(path, deadline)?;
+    if std::time::Instant::now() >= deadline {
+        return Err("ignored-content inspection exceeded its deadline".into());
+    }
+    if !status.status.success() {
+        return Err(format!(
+            "cannot inspect ignored content: {}",
+            String::from_utf8_lossy(&status.stderr).trim()
+        ));
+    }
+    if status
+        .stdout
+        .split(|byte| *byte == 0)
+        .any(|row| row.starts_with(b"!! "))
+    {
+        return Err(format!(
+            "ignored content at {} has no exact discard authority; worktree preserved",
+            path.display()
+        ));
+    }
+    Ok(())
 }
 
 fn canonical_status_observation(status: &[u8]) -> Vec<u8> {
@@ -8834,14 +9413,23 @@ fn canonical_status_observation(status: &[u8]) -> Vec<u8> {
     observation
 }
 
+#[cfg(test)]
 fn observe_hidden_worktree_changes_until(
     repository: &Path,
     deadline: std::time::Instant,
 ) -> Result<Vec<GitPathIdentity>, String> {
+    observe_hidden_worktree_changes_with_leaf_until(repository, deadline, &mut run_bounded_spawned_git)
+}
+
+fn observe_hidden_worktree_changes_with_leaf_until(
+    repository: &Path,
+    deadline: std::time::Instant,
+    git_leaf: &mut WorktreeGitLeaf<'_>,
+) -> Result<Vec<GitPathIdentity>, String> {
     if std::time::Instant::now() >= deadline {
         return Err("hidden worktree inspection exceeded its deadline".into());
     }
-    let index_path = git_index_path(repository, deadline)?;
+    let index_path = git_index_path_with_leaf_until(repository, deadline, git_leaf)?;
     if !index_path.exists() {
         if std::time::Instant::now() >= deadline {
             return Err("hidden worktree inspection exceeded its deadline".into());
@@ -8863,12 +9451,13 @@ fn observe_hidden_worktree_changes_until(
     std::fs::copy(&index_path, private_index.path())
         .map_err(|error| format!("cannot copy Git index for hidden-change inspection: {error}"))?;
     let private_index = private_index.path();
-    let flags = run_bounded_git_command_until(
+    let flags = run_bounded_git_command_with_leaf_until(
         repository,
         &["ls-files", "-v", "-z", "--"],
         Some(private_index),
         deadline,
         "hidden-index inspection",
+        git_leaf,
     )?;
     if !flags.status.success() {
         return Err(format!(
@@ -8883,7 +9472,8 @@ fn observe_hidden_worktree_changes_until(
         }
         return Ok(Vec::new());
     }
-    let sparse_absent = sparse_checkout_absent_paths(repository, &candidates, deadline)?;
+    let sparse_absent =
+        sparse_checkout_absent_paths_with_leaf_until(repository, &candidates, deadline, git_leaf)?;
 
     let mut dirty = BTreeSet::new();
     for batch in candidates.chunks(256) {
@@ -8899,7 +9489,7 @@ fn observe_hidden_worktree_changes_until(
             continue;
         }
         // Path arguments are OsStrings below so non-UTF-8 paths remain literal.
-        let clear = run_bounded_git_paths_until(
+        let clear = run_bounded_git_paths_with_leaf_until(
             repository,
             &["update-index", "--no-assume-unchanged", "--"],
             &batch_paths,
@@ -8907,6 +9497,7 @@ fn observe_hidden_worktree_changes_until(
             private_index,
             deadline,
             "hidden-index flag clearing",
+            git_leaf,
         )?;
         if !clear.status.success() {
             return Err(format!(
@@ -8914,7 +9505,7 @@ fn observe_hidden_worktree_changes_until(
                 String::from_utf8_lossy(&clear.stderr).trim()
             ));
         }
-        let clear_skip = run_bounded_git_paths_until(
+        let clear_skip = run_bounded_git_paths_with_leaf_until(
             repository,
             &["update-index", "--no-skip-worktree", "--"],
             &batch_paths,
@@ -8922,6 +9513,7 @@ fn observe_hidden_worktree_changes_until(
             private_index,
             deadline,
             "hidden-index flag clearing",
+            git_leaf,
         )?;
         if !clear_skip.status.success() {
             return Err(format!(
@@ -8929,12 +9521,13 @@ fn observe_hidden_worktree_changes_until(
                 String::from_utf8_lossy(&clear_skip.stderr).trim()
             ));
         }
-        let diff = run_bounded_git_command_until(
+        let diff = run_bounded_git_command_with_leaf_until(
             repository,
             &["diff-files", "--raw", "-z", "--no-ext-diff"],
             Some(private_index),
             deadline,
             "hidden worktree comparison",
+            git_leaf,
         )?;
         if !diff.status.success() {
             return Err(format!(
@@ -8985,10 +9578,22 @@ fn hidden_index_candidates(entries: &[u8]) -> Vec<HiddenIndexCandidate> {
         .collect()
 }
 
+#[cfg(test)]
 fn sparse_checkout_absent_paths(
     repository: &Path,
     candidates: &[HiddenIndexCandidate],
     deadline: std::time::Instant,
+) -> Result<BTreeSet<Vec<u8>>, String> {
+    sparse_checkout_absent_paths_with_leaf_until(
+        repository, candidates, deadline, &mut run_bounded_spawned_git,
+    )
+}
+
+fn sparse_checkout_absent_paths_with_leaf_until(
+    repository: &Path,
+    candidates: &[HiddenIndexCandidate],
+    deadline: std::time::Instant,
+    git_leaf: &mut WorktreeGitLeaf<'_>,
 ) -> Result<BTreeSet<Vec<u8>>, String> {
     let skip_absent = candidates
         .iter()
@@ -9004,7 +9609,7 @@ fn sparse_checkout_absent_paths(
         return Ok(BTreeSet::new());
     }
 
-    let sparse_patterns = git_index_path(repository, deadline)?
+    let sparse_patterns = git_index_path_with_leaf_until(repository, deadline, git_leaf)?
         .parent()
         .ok_or("Git index has no parent directory")?
         .join("info")
@@ -9013,11 +9618,13 @@ fn sparse_checkout_absent_paths(
         return Ok(BTreeSet::new());
     }
 
-    let sparse_matches = git_sparse_checkout_selected_paths(
+    let cone = git_sparse_checkout_cone_mode_with_leaf_until(repository, deadline, git_leaf)?;
+    let sparse_matches = git_sparse_checkout_selected_paths_with_leaf_until(
         repository,
         &skip_absent,
-        git_sparse_checkout_cone_mode(repository, deadline)?,
+        cone,
         deadline,
+        git_leaf,
     )?
     .into_iter()
     .collect::<BTreeSet<_>>();
@@ -9027,25 +9634,48 @@ fn sparse_checkout_absent_paths(
         .collect())
 }
 
+#[cfg(test)]
 fn git_sparse_checkout_cone_mode(
     repository: &Path,
     deadline: std::time::Instant,
 ) -> Result<bool, String> {
-    let output = run_bounded_git_command_until(
+    git_sparse_checkout_cone_mode_with_leaf_until(repository, deadline, &mut run_bounded_spawned_git)
+}
+
+fn git_sparse_checkout_cone_mode_with_leaf_until(
+    repository: &Path,
+    deadline: std::time::Instant,
+    git_leaf: &mut WorktreeGitLeaf<'_>,
+) -> Result<bool, String> {
+    let output = run_bounded_git_command_with_leaf_until(
         repository,
         &["config", "--bool", "--get", "core.sparseCheckoutCone"],
         None,
         deadline,
         "sparse-checkout cone inspection",
+        git_leaf,
     )?;
     Ok(output.status.success() && output.stdout.trim_ascii() == b"true")
 }
 
+#[cfg(test)]
 fn git_sparse_checkout_selected_paths(
     repository: &Path,
     paths: &[Vec<u8>],
     cone: bool,
     deadline: std::time::Instant,
+) -> Result<Vec<Vec<u8>>, String> {
+    git_sparse_checkout_selected_paths_with_leaf_until(
+        repository, paths, cone, deadline, &mut run_bounded_spawned_git,
+    )
+}
+
+fn git_sparse_checkout_selected_paths_with_leaf_until(
+    repository: &Path,
+    paths: &[Vec<u8>],
+    cone: bool,
+    deadline: std::time::Instant,
+    git_leaf: &mut WorktreeGitLeaf<'_>,
 ) -> Result<Vec<Vec<u8>>, String> {
     const OPERATION: &str = "sparse-checkout rule inspection";
     if std::time::Instant::now() >= deadline {
@@ -9095,7 +9725,7 @@ fn git_sparse_checkout_selected_paths(
         use std::os::unix::process::CommandExt as _;
         command.process_group(0);
     }
-    let output = run_bounded_spawned_git(command, deadline, OPERATION)?;
+    let output = execute_worktree_git_leaf_until(command, deadline, OPERATION, git_leaf)?;
     if !output.status.success() {
         return Err(format!(
             "cannot inspect sparse-checkout rules: {}",
@@ -9126,13 +9756,23 @@ fn raw_diff_paths(raw: &[u8]) -> Vec<Vec<u8>> {
     paths
 }
 
+#[cfg(test)]
 fn git_index_path(repository: &Path, deadline: std::time::Instant) -> Result<PathBuf, String> {
-    let output = run_bounded_git_command_until(
+    git_index_path_with_leaf_until(repository, deadline, &mut run_bounded_spawned_git)
+}
+
+fn git_index_path_with_leaf_until(
+    repository: &Path,
+    deadline: std::time::Instant,
+    git_leaf: &mut WorktreeGitLeaf<'_>,
+) -> Result<PathBuf, String> {
+    let output = run_bounded_git_command_with_leaf_until(
         repository,
         &["rev-parse", "--git-path", "index"],
         None,
         deadline,
         "Git index path inspection",
+        git_leaf,
     )?;
     if !output.status.success() {
         return Err(format!(
@@ -9149,10 +9789,20 @@ fn git_index_path(repository: &Path, deadline: std::time::Instant) -> Result<Pat
     })
 }
 
+#[cfg(test)]
 fn observe_dirty_content_until(
     repository: &Path,
     losses: &[CloseLossItem],
     deadline: std::time::Instant,
+) -> Result<Vec<u8>, String> {
+    observe_dirty_content_with_leaf_until(repository, losses, deadline, &mut run_bounded_spawned_git)
+}
+
+fn observe_dirty_content_with_leaf_until(
+    repository: &Path,
+    losses: &[CloseLossItem],
+    deadline: std::time::Instant,
+    git_leaf: &mut WorktreeGitLeaf<'_>,
 ) -> Result<Vec<u8>, String> {
     if std::time::Instant::now() >= deadline {
         return Err("dirty content inspection exceeded its deadline".into());
@@ -9171,7 +9821,8 @@ fn observe_dirty_content_until(
         .collect::<Vec<_>>();
     paths.sort();
     paths.dedup();
-    let staged_entries = staged_index_entries_for_paths_until(repository, &paths, deadline)?;
+    let staged_entries =
+        staged_index_entries_for_paths_with_leaf_until(repository, &paths, deadline, git_leaf)?;
     for path in paths {
         if std::time::Instant::now() >= deadline {
             return Err("dirty content inspection exceeded its deadline".into());
@@ -9253,10 +9904,22 @@ fn observe_dirty_content_until(
     Ok(observation)
 }
 
+#[cfg(test)]
 fn staged_index_entries_for_paths_until(
     repository: &Path,
     paths: &[Vec<u8>],
     deadline: std::time::Instant,
+) -> Result<std::collections::BTreeMap<Vec<u8>, Vec<Vec<u8>>>, String> {
+    staged_index_entries_for_paths_with_leaf_until(
+        repository, paths, deadline, &mut run_bounded_spawned_git,
+    )
+}
+
+fn staged_index_entries_for_paths_with_leaf_until(
+    repository: &Path,
+    paths: &[Vec<u8>],
+    deadline: std::time::Instant,
+    git_leaf: &mut WorktreeGitLeaf<'_>,
 ) -> Result<std::collections::BTreeMap<Vec<u8>, Vec<Vec<u8>>>, String> {
     if std::time::Instant::now() >= deadline {
         return Err("dirty index inspection exceeded its deadline".into());
@@ -9279,7 +9942,8 @@ fn staged_index_entries_for_paths_until(
             use std::os::unix::process::CommandExt as _;
             command.process_group(0);
         }
-        let output = run_bounded_spawned_git(command, deadline, "dirty index inspection")?;
+        let output =
+            execute_worktree_git_leaf_until(command, deadline, "dirty index inspection", git_leaf)?;
         if !output.status.success() {
             return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
         }
@@ -13693,6 +14357,325 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[derive(Default)]
+    struct RecordingWorktreeMutationExecutor {
+        attempts: usize,
+        executed: usize,
+        refuse_at: Option<usize>,
+        in_effect: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[cfg(unix)]
+    impl super::WorktreeMutationExecutor for RecordingWorktreeMutationExecutor {
+        fn execute<T, F>(&mut self, effect: F) -> Result<T, String>
+        where
+            T: Send + 'static,
+            F: FnOnce() -> Result<T, String> + Send + 'static,
+        {
+            use std::sync::atomic::Ordering::SeqCst;
+
+            self.attempts += 1;
+            // Refuse only this admission, deliberately not latching: an erroneous
+            // later admission would run and be observable in the assertions.
+            if self.refuse_at == Some(self.attempts) {
+                return Err("test mutation admission refused".to_string());
+            }
+            assert!(!self.in_effect.swap(true, SeqCst));
+            self.executed += 1;
+            // Exercise the owned Send + 'static seam, including fd/name custody
+            // and errno handling, on a thread different from the descriptor walk.
+            let result = std::thread::spawn(effect).join().expect("mutation panicked");
+            assert!(self.in_effect.swap(false, SeqCst));
+            result
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mutation_executor_refusal_stops_private_rename_and_later_unlink() {
+        for refuse_at in [1, 2] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().join("root");
+            std::fs::create_dir(&root).unwrap();
+            std::fs::write(root.join("sentinel"), b"preserve").unwrap();
+            let descriptor = std::sync::Arc::new(open_directory(&root));
+            let mut executor = RecordingWorktreeMutationExecutor {
+                refuse_at: Some(refuse_at),
+                ..Default::default()
+            };
+
+            let error = super::remove_directory_contents_at_with_hook_and_deadline_with_executor(
+                &descriptor,
+                &mut |_, _| {},
+                None,
+                &mut executor,
+            )
+            .unwrap_err();
+
+            assert_eq!(error, "test mutation admission refused");
+            assert_eq!(executor.attempts, refuse_at);
+            assert_eq!(executor.executed, refuse_at - 1);
+            assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
+            let preserved = if refuse_at == 1 {
+                root.join("sentinel")
+            } else {
+                preserved_private_slot(&root)
+            };
+            assert_eq!(std::fs::read(preserved).unwrap(), b"preserve");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recursive_mutation_walk_uses_same_executor_for_every_rename_and_unlink() {
+        // A single-child chain makes mutation ordering deterministic: three
+        // private renames followed by three unlinks from the leaf outward.
+        for refuse_at in (1..=6).map(Some).chain(std::iter::once(None)) {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().join("root");
+            std::fs::create_dir_all(root.join("nested/deeper")).unwrap();
+            std::fs::write(root.join("nested/deeper/owned"), b"preserve").unwrap();
+            let descriptor = std::sync::Arc::new(open_directory(&root));
+            let mut executor = RecordingWorktreeMutationExecutor {
+                refuse_at,
+                ..Default::default()
+            };
+
+            let result = super::remove_directory_contents_at_with_hook_and_deadline_with_executor(
+                &descriptor,
+                &mut |_, _| {},
+                Some(std::time::Instant::now() + std::time::Duration::from_secs(30)),
+                &mut executor,
+            );
+
+            if let Some(refused) = refuse_at {
+                assert_eq!(result.unwrap_err(), "test mutation admission refused");
+                assert_eq!(executor.attempts, refused);
+                assert_eq!(executor.executed, refused - 1);
+                assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
+                if refused <= 4 {
+                    let nested = if refused == 1 {
+                        root.join("nested")
+                    } else {
+                        preserved_private_slot(&root)
+                    };
+                    let deeper = if refused <= 2 {
+                        nested.join("deeper")
+                    } else {
+                        preserved_private_slot(&nested)
+                    };
+                    let leaf = if refused <= 3 {
+                        deeper.join("owned")
+                    } else {
+                        preserved_private_slot(&deeper)
+                    };
+                    assert_eq!(std::fs::read(leaf).unwrap(), b"preserve");
+                }
+            } else {
+                result.unwrap();
+                assert_eq!(executor.attempts, 6);
+                assert_eq!(executor.executed, 6);
+                assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn root_object_mutations_are_admitted_separately_from_durable_bind_callbacks() {
+        use std::sync::atomic::Ordering::SeqCst;
+
+        // Reserve, move object, bind entry, unlink entry, unlink object, remove
+        // root. Refusal at any leaf must stop the graph without compensating
+        // cleanup or any later mutation. In particular, move refusal leaves root.
+        for refuse_at in (1..=6).map(Some).chain(std::iter::once(None)) {
+            let temp = tempfile::tempdir().unwrap();
+            let target = temp.path().join("target");
+            let root = temp.path().join("tombstone");
+            std::fs::create_dir(&target).unwrap();
+            std::fs::write(target.join("sentinel"), b"preserve").unwrap();
+            let identity = observe_administrative_dir_incarnation(&target).unwrap();
+            let mut executor = RecordingWorktreeMutationExecutor {
+                refuse_at,
+                ..Default::default()
+            };
+            let in_effect = std::sync::Arc::clone(&executor.in_effect);
+            let mut bound_objects = Vec::new();
+
+            let result = super::remove_identity_bound_directory_with_deadline_with_executor(
+                &target,
+                Some(&root),
+                &identity,
+                observe_administrative_dir_incarnation,
+                |_| assert!(!in_effect.load(SeqCst)),
+                |_, _, object| {
+                    assert!(!in_effect.load(SeqCst), "nested durable writer admission");
+                    bound_objects.push(object.is_some());
+                    Ok(())
+                },
+                |_, _| {
+                    assert!(!in_effect.load(SeqCst));
+                    Ok(())
+                },
+                "test directory",
+                None,
+                &mut executor,
+            );
+
+            if let Some(refused) = refuse_at {
+                assert_eq!(result.unwrap_err(), "test mutation admission refused");
+                assert_eq!(executor.attempts, refused);
+                assert_eq!(executor.executed, refused - 1);
+                assert_eq!(target.exists(), refused <= 2);
+                assert_eq!(root.exists(), refused >= 2);
+                assert_eq!(root.join("object").exists(), (3..=5).contains(&refused));
+                if refused <= 4 {
+                    let preserved = match refused {
+                        1 | 2 => target.join("sentinel"),
+                        3 => root.join("object/sentinel"),
+                        _ => preserved_private_slot(&root.join("object")),
+                    };
+                    assert_eq!(std::fs::read(preserved).unwrap(), b"preserve");
+                }
+                let expected_bindings = match refused {
+                    1 => vec![],
+                    2 => vec![false],
+                    _ => vec![false, true],
+                };
+                assert_eq!(bound_objects, expected_bindings);
+            } else {
+                result.unwrap();
+                assert_eq!(executor.attempts, 6);
+                assert_eq!(executor.executed, 6);
+                assert_eq!(bound_objects, vec![false, true]);
+                assert!(!target.exists());
+                assert!(!root.exists());
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn compensating_tombstone_cleanup_requires_its_own_mutation_admission() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("target");
+        let root = temp.path().join("tombstone");
+        std::fs::create_dir(&target).unwrap();
+        let mut executor = RecordingWorktreeMutationExecutor {
+            refuse_at: Some(2),
+            ..Default::default()
+        };
+
+        let error = super::remove_identity_bound_directory_with_deadline_with_executor(
+            &target,
+            Some(&root),
+            "unused",
+            |_| panic!("failed custody bind must not move or inspect object"),
+            |_| {},
+            |_, _, _| Err("test durable bind failed".to_string()),
+            |_, _| panic!("failed custody bind must not delete object"),
+            "test directory",
+            None,
+            &mut executor,
+        )
+        .unwrap_err();
+
+        assert_eq!(error, "test mutation admission refused");
+        assert_eq!(executor.attempts, 2);
+        assert_eq!(executor.executed, 1);
+        assert!(target.is_dir());
+        assert!(root.is_dir());
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_object_move_admits_compensation_but_executor_refusal_does_not() {
+        for refuse_at in [Some(3), None] {
+            let temp = tempfile::tempdir().unwrap();
+            let target = temp.path().join("missing-target");
+            let root = temp.path().join("tombstone");
+            let mut executor = RecordingWorktreeMutationExecutor {
+                refuse_at,
+                ..Default::default()
+            };
+
+            let error = super::remove_identity_bound_directory_with_deadline_with_executor(
+                &target,
+                Some(&root),
+                "unused",
+                |_| panic!("failed move must not inspect an object"),
+                |_| {},
+                |_, _, _| Ok(()),
+                |_, _| panic!("failed move must not delete an object"),
+                "test directory",
+                None,
+                &mut executor,
+            )
+            .unwrap_err();
+
+            // Reservation and the failed rename ran; cleanup has independent
+            // admission, unlike the immediate return on move admission refusal.
+            assert_eq!(executor.attempts, 3);
+            if refuse_at.is_some() {
+                assert_eq!(error, "test mutation admission refused");
+                assert_eq!(executor.executed, 2);
+                assert!(root.is_dir());
+            } else {
+                assert!(error.contains("cannot move test directory into private final tombstone"));
+                assert_eq!(executor.executed, 3);
+                assert!(!root.exists());
+            }
+            assert!(!target.exists());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exact_admin_deletion_threads_executor_through_quarantine_and_final_deletion() {
+        // Admin quarantine adds one mutation before the six root/object leaves.
+        for refuse_at in (1..=7).map(Some).chain(std::iter::once(None)) {
+            let temp = tempfile::tempdir().unwrap();
+            let registration = temp.path().join("registration");
+            std::fs::create_dir(&registration).unwrap();
+            std::fs::write(registration.join("sentinel"), b"preserve").unwrap();
+            let identity = observe_administrative_dir_incarnation(&registration).unwrap();
+            let quarantine = super::administrative_dir_quarantine_path(&registration, &identity)
+                .unwrap();
+            let mut executor = RecordingWorktreeMutationExecutor {
+                refuse_at,
+                ..Default::default()
+            };
+
+            let result =
+                super::remove_exact_worktree_administrative_dir_with_hook_and_deadline_with_executor(
+                    &registration,
+                    &identity,
+                    |_| {},
+                    None,
+                    &mut executor,
+                );
+
+            if let Some(refused) = refuse_at {
+                assert_eq!(result.unwrap_err(), "test mutation admission refused");
+                assert_eq!(executor.attempts, refused);
+                assert_eq!(executor.executed, refused - 1);
+                assert_eq!(registration.exists(), refused == 1);
+                assert_eq!(quarantine.exists(), (2..=3).contains(&refused));
+                if refused <= 3 {
+                    let preserved = if refused == 1 { &registration } else { &quarantine };
+                    assert_eq!(std::fs::read(preserved.join("sentinel")).unwrap(), b"preserve");
+                }
+            } else {
+                result.unwrap();
+                assert_eq!(executor.attempts, 7);
+                assert_eq!(executor.executed, 7);
+                assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 0);
+            }
+        }
+    }
+
+    #[cfg(unix)]
     #[test]
     fn expired_directory_deletion_deadline_preserves_entries_before_inspection() {
         let temp = tempfile::tempdir().unwrap();
@@ -14197,6 +15180,457 @@ mod tests {
             marker.exists(),
             "fixture handshake confirms descendant launch"
         );
+    }
+
+    // These fixtures author only filesystem metadata and synthetic Git outputs;
+    // no Git process, SQLite admission or native executor is involved.
+    #[cfg(unix)]
+    fn synthetic_inspection_repository() -> (tempfile::TempDir, WorktreeIdentity) {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(temp.path().join(".git")).unwrap();
+        std::fs::write(temp.path().join(".git/HEAD"), b"ref: refs/heads/main\n").unwrap();
+        std::fs::write(temp.path().join(".git/index"), b"synthetic-index").unwrap();
+        let identity = WorktreeIdentity::from_parts(
+            WorktreeId::parse("supplied-leaf-inspection").unwrap(),
+            WorktreeFingerprint::parse(observe_worktree_fingerprint(temp.path()).unwrap()).unwrap(),
+            GitPathIdentity::from_bytes(b"synthetic-inspection-path".to_vec()),
+        );
+        (temp, identity)
+    }
+
+    #[cfg(unix)]
+    fn synthetic_inspection_output(stdout: Vec<u8>, success: bool) -> std::process::Output {
+        use std::os::unix::process::ExitStatusExt as _;
+        std::process::Output {
+            status: std::process::ExitStatus::from_raw(if success { 0 } else { 1 << 8 }),
+            stdout,
+            stderr: Vec::new(),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn supplied_leaf_full_inspection_matches_legacy_canonical_clean_snapshot() {
+        let (temp, identity) = synthetic_inspection_repository();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let mut snapshots = Vec::new();
+        for oid in [
+            "1111111111111111111111111111111111111111",
+            "2222222222222222222222222222222222222222",
+        ] {
+            let index = format!("100644 {oid} 0\ttracked\0").into_bytes();
+            let mut results = Vec::new();
+            for native in [false, true] {
+                let mut calls = Vec::new();
+                let mut leaf = |command: std::process::Command, leaf_deadline, operation: &str| {
+                    assert_eq!(leaf_deadline, deadline);
+                    assert_eq!(command.get_current_dir(), Some(temp.path()));
+                    if native {
+                        assert!(!command.get_envs().any(|(key, value)| {
+                            key == "GIT_INDEX_FILE" && value.is_some()
+                        }));
+                        assert!(!command.get_args().any(|arg| arg == "update-index"));
+                    }
+                    calls.push(operation.to_string());
+                    let stdout = match operation {
+                        // Ignored content stays outside the canonical fingerprint.
+                        "Git status inspection" => b"!! ignored/file\0".to_vec(),
+                        "Git index path inspection" => b".git/index\n".to_vec(),
+                        "hidden-index inspection" => b"H tracked\0".to_vec(),
+                        "detached head inspection" => b"refs/heads/main\n".to_vec(),
+                        "gitlink inspection" => index.clone(),
+                        unexpected => panic!("unexpected Git leaf: {unexpected}"),
+                    };
+                    Ok(synthetic_inspection_output(stdout, true))
+                };
+                let result = if native {
+                    super::inspect_worktree_at_with_git_leaf_until(
+                        &identity, temp.path(), deadline, &mut leaf,
+                    )
+                } else {
+                    super::inspect_worktree_at_with_policy_until(
+                        &identity,
+                        temp.path(),
+                        deadline,
+                        super::WorktreeInspectionPolicy::Legacy,
+                        &mut leaf,
+                    )
+                }
+                .unwrap();
+                assert!(result.1.is_empty());
+                let mut expected_calls = vec!["Git status inspection"];
+                if !native {
+                    expected_calls.push("Git index path inspection");
+                }
+                expected_calls.extend([
+                    "hidden-index inspection", "detached head inspection", "gitlink inspection",
+                ]);
+                assert_eq!(calls, expected_calls);
+                results.push(result.0);
+            }
+            // Independent byte fixture pins the pre-existing framing, including
+            // the root gitlink-index record even when there are no gitlinks.
+            let mut canonical = b"HEAD_SYMBOLIC\0refs/heads/main\0SUBMODULE_GITLINK_INDEX\0\0".to_vec();
+            canonical.extend_from_slice(&index);
+            canonical.push(0);
+            assert_eq!(results[0], snapshot_for(&canonical));
+            assert_eq!(results[1], results[0]);
+            snapshots.push(results.pop().unwrap());
+        }
+        assert_ne!(snapshots[0], snapshots[1], "clean status alone is not a snapshot");
+        assert_eq!(std::fs::read(temp.path().join(".git/index")).unwrap(), b"synthetic-index");
+        assert_eq!(std::fs::read_dir(temp.path().join(".git")).unwrap().count(), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn supplied_leaf_inspection_refuses_unsupported_state_without_scratch_mutation() {
+        let (temp, identity) = synthetic_inspection_repository();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        for (stop, stdout, success, reason) in [
+            ("Git status inspection", b" M tracked\0".as_slice(), true, "dirty status"),
+            ("Git status inspection", b"?? untracked\0".as_slice(), true, "dirty status"),
+            ("hidden-index inspection", b"h tracked\0".as_slice(), true, "hidden index suppression"),
+            ("hidden-index inspection", b"S tracked\0".as_slice(), true, "hidden index suppression"),
+            ("hidden-index inspection", b"s tracked\0".as_slice(), true, "hidden index suppression"),
+            ("hidden-index inspection", b"m tracked\0".as_slice(), true, "hidden index suppression"),
+            ("detached head inspection", b"".as_slice(), false, "detached HEAD"),
+            ("gitlink inspection", b"160000 1111111111111111111111111111111111111111 0\tmissing-module\0".as_slice(), true, "gitlinks"),
+            ("gitlink inspection", b"160000 1111111111111111111111111111111111111111 2\tconflicted-module\0".as_slice(), true, "gitlinks"),
+        ] {
+            let mut stopped = false;
+            let error = super::inspect_worktree_at_with_git_leaf_until(
+                &identity, temp.path(), deadline,
+                &mut |command: std::process::Command, leaf_deadline, operation: &str| {
+                    assert_eq!(leaf_deadline, deadline);
+                    assert!(!stopped, "inspection continued after unsupported state");
+                    assert!(!command.get_envs().any(|(key, value)| key == "GIT_INDEX_FILE" && value.is_some()));
+                    assert!(!command.get_args().any(|arg| arg == "update-index"));
+                    if operation == stop {
+                        stopped = true;
+                        return Ok(synthetic_inspection_output(stdout.to_vec(), success));
+                    }
+                    let stdout = match operation {
+                        "Git status inspection" | "gitlink inspection" => Vec::new(),
+                        "hidden-index inspection" => b"H tracked\0".to_vec(),
+                        "detached head inspection" => b"refs/heads/main\n".to_vec(),
+                        unexpected => panic!("unexpected Git leaf: {unexpected}"),
+                    };
+                    Ok(synthetic_inspection_output(stdout, true))
+                },
+            )
+            .unwrap_err();
+            assert!(stopped);
+            assert!(error.contains(reason), "{error}");
+            assert_eq!(std::fs::read(temp.path().join(".git/index")).unwrap(), b"synthetic-index");
+            assert_eq!(std::fs::read_dir(temp.path().join(".git")).unwrap().count(), 2);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shared_inspection_keeps_legacy_dirty_content_observation() {
+        let (temp, identity) = synthetic_inspection_repository();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let index = b"100644 1111111111111111111111111111111111111111 0\ttracked\0";
+        let mut snapshots = Vec::new();
+        for contents in [b"first".as_slice(), b"second".as_slice()] {
+            std::fs::write(temp.path().join("tracked"), contents).unwrap();
+            let mut dirty_index_observed = false;
+            let (snapshot, losses) = super::inspect_worktree_at_with_policy_until(
+                &identity,
+                temp.path(),
+                deadline,
+                super::WorktreeInspectionPolicy::Legacy,
+                &mut |_: std::process::Command, leaf_deadline, operation: &str| {
+                    assert_eq!(leaf_deadline, deadline);
+                    let stdout = match operation {
+                        "Git status inspection" => b" M tracked\0".to_vec(),
+                        "Git index path inspection" => b".git/index\n".to_vec(),
+                        "hidden-index inspection" => b"H tracked\0".to_vec(),
+                        "detached head inspection" => b"refs/heads/main\n".to_vec(),
+                        "gitlink inspection" => index.to_vec(),
+                        "dirty index inspection" => {
+                            dirty_index_observed = true;
+                            index.to_vec()
+                        }
+                        unexpected => panic!("unexpected Git leaf: {unexpected}"),
+                    };
+                    Ok(synthetic_inspection_output(stdout, true))
+                },
+            )
+            .unwrap();
+            assert!(dirty_index_observed);
+            assert_eq!(
+                losses,
+                vec![CloseLossItem::UnstagedTrackedPath(
+                    GitPathIdentity::from_bytes(b"tracked".to_vec()),
+                )],
+            );
+            snapshots.push(snapshot);
+        }
+        assert_ne!(snapshots[0], snapshots[1]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn supplied_leaf_inspection_checks_administrative_incarnation_before_git() {
+        let (temp, identity) = synthetic_inspection_repository();
+        std::fs::write(temp.path().join(".git/HEAD"), b"ref: refs/heads/replaced\n").unwrap();
+        let error = super::inspect_worktree_at_with_git_leaf_until(
+            &identity,
+            temp.path(),
+            std::time::Instant::now() + std::time::Duration::from_secs(30),
+            &mut |_, _, _| panic!("changed incarnation entered the Git leaf"),
+        )
+        .unwrap_err();
+        assert_eq!(error, "captured worktree administrative incarnation changed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn supplied_leaf_inspection_propagates_refusal_at_every_git_leaf() {
+        let (temp, identity) = synthetic_inspection_repository();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        for stop in [
+            "Git status inspection", "hidden-index inspection",
+            "detached head inspection", "gitlink inspection",
+        ] {
+            let mut stopped = false;
+            let error = super::inspect_worktree_at_with_git_leaf_until(
+                &identity, temp.path(), deadline,
+                &mut |_: std::process::Command, leaf_deadline, operation: &str| {
+                    assert_eq!(leaf_deadline, deadline);
+                    assert!(!stopped);
+                    if operation == stop {
+                        stopped = true;
+                        return Err("supplied leaf refused".to_string());
+                    }
+                    let stdout = match operation {
+                        "Git status inspection" => Vec::new(),
+                        "hidden-index inspection" => b"H tracked\0".to_vec(),
+                        "detached head inspection" => b"refs/heads/main\n".to_vec(),
+                        unexpected => panic!("unexpected Git leaf: {unexpected}"),
+                    };
+                    Ok(synthetic_inspection_output(stdout, true))
+                },
+            )
+            .unwrap_err();
+            assert!(stopped);
+            assert_eq!(error, "supplied leaf refused");
+        }
+    }
+
+    #[test]
+    fn supplied_leaf_inspection_rejects_expired_deadline_before_repository_access() {
+        let identity = WorktreeIdentity::from_parts(
+            WorktreeId::parse("expired-supplied-inspection").unwrap(),
+            WorktreeFingerprint::parse("captured-incarnation").unwrap(),
+            GitPathIdentity::from_bytes(b"unopened-repository".to_vec()),
+        );
+        let error = super::inspect_worktree_at_with_git_leaf_until(
+            &identity,
+            Path::new("must-not-access-a-repository"),
+            std::time::Instant::now(),
+            &mut |_, _, _| panic!("expired inspection entered the Git leaf"),
+        )
+        .unwrap_err();
+        assert_eq!(error, "worktree inspection exceeded its deadline");
+    }
+
+    #[test]
+    fn expired_git_leaf_does_not_enter_the_caller() {
+        let deadline = std::time::Instant::now();
+        let mut calls = 0;
+        let error = super::execute_worktree_git_leaf_until(
+            std::process::Command::new("must-not-spawn"),
+            deadline,
+            "supervised probe",
+            &mut |_, _, _| {
+                calls += 1;
+                Err("must not enter the callback".to_string())
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error, "supervised probe exceeded its deadline");
+        assert_eq!(calls, 0);
+    }
+
+    #[test]
+    fn expired_legacy_git_wrappers_do_not_access_a_repository() {
+        let repository = Path::new("must-not-access-a-repository");
+        let deadline = std::time::Instant::now();
+        assert!(super::index_gitlinks(repository, deadline).is_err());
+        assert!(super::git_index_path(repository, deadline).is_err());
+        assert!(super::git_sparse_checkout_cone_mode(repository, deadline).is_err());
+        assert!(super::run_bounded_git_paths_until(
+            repository,
+            &["update-index"],
+            &[],
+            true,
+            Path::new("must-not-access-an-index"),
+            deadline,
+            "expired path probe",
+        )
+        .is_err());
+        assert!(super::sparse_checkout_absent_paths(
+            repository,
+            &[super::HiddenIndexCandidate {
+                flag: super::HiddenIndexFlag::SkipWorktree,
+                path: b"absent".to_vec(),
+            }],
+            deadline,
+        )
+        .is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recursive_worktree_inspections_share_each_git_leaf_and_deadline() {
+        use std::os::unix::process::ExitStatusExt as _;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let module = root.join("module");
+        let nested = module.join("nested");
+        for repository in [root, module.as_path(), nested.as_path()] {
+            std::fs::create_dir_all(repository.join(".git")).unwrap();
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let oid = "1111111111111111111111111111111111111111";
+        let mut calls = Vec::new();
+        // No Git process is needed: every output comes from this one leaf.
+        let mut git_leaf = |command: std::process::Command, leaf_deadline, operation: &str| {
+            assert_eq!(leaf_deadline, deadline);
+            let repository = command.get_current_dir().unwrap().to_path_buf();
+            calls.push((repository.clone(), operation.to_string()));
+            let stdout = match operation {
+                "gitlink inspection" if repository == root => {
+                    format!("160000 {oid} 0\tmodule\0").into_bytes()
+                }
+                "gitlink inspection" if repository == module => {
+                    format!("160000 {oid} 0\tnested\0").into_bytes()
+                }
+                "gitlink inspection" | "dirty index inspection" => Vec::new(),
+                "Git status inspection" => b"?? untracked\0".to_vec(),
+                "Git index path inspection" => b".git/missing-index\n".to_vec(),
+                "Git submodule HEAD inspection" => {
+                    if command.get_args().any(|argument| argument == "symbolic-ref") {
+                        b"refs/heads/main\n".to_vec()
+                    } else {
+                        format!("{oid}\n").into_bytes()
+                    }
+                }
+                "detached head inspection" => b"refs/heads/main\n".to_vec(),
+                unexpected => panic!("unexpected Git leaf: {unexpected}"),
+            };
+            Ok(std::process::Output {
+                status: std::process::ExitStatus::from_raw(0),
+                stdout,
+                stderr: Vec::new(),
+            })
+        };
+        let mut observation = Vec::new();
+        super::observe_initialized_submodules_with_leaf_until(
+            root,
+            &[],
+            &mut observation,
+            deadline,
+            &mut std::collections::HashSet::new(),
+            &mut git_leaf,
+        )
+        .unwrap();
+        super::ensure_no_ignored_content_with_git_leaf_until(root, deadline, &mut git_leaf).unwrap();
+        let bindings = super::capture_git_directory_bindings_with_leaf_until(
+            root,
+            deadline,
+            &mut git_leaf,
+        )
+        .unwrap();
+        assert_eq!(bindings.len(), 3);
+        assert!(bindings.contains_key(Path::new("module/nested")));
+        assert_eq!(calls.len(), 24);
+        assert_eq!(calls.iter().filter(|(_, operation)| operation == "gitlink inspection").count(), 9);
+        assert!(observation.iter().any(|(key, _)| {
+            key == b"SUBMODULE_LOSS\0untracked\0module/nested/untracked"
+        }));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ignored_inspection_stops_at_a_refused_git_leaf() {
+        use std::os::unix::process::ExitStatusExt as _;
+
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(temp.path().join(".git")).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let mut calls = Vec::new();
+        let error = super::ensure_no_ignored_content_with_git_leaf_until(
+            temp.path(),
+            deadline,
+            &mut |_, leaf_deadline, operation| {
+                assert_eq!(leaf_deadline, deadline);
+                calls.push(operation.to_string());
+                if operation == "gitlink inspection" {
+                    return Err("original worker admission refused".to_string());
+                }
+                Ok(std::process::Output {
+                    status: std::process::ExitStatus::from_raw(0),
+                    stdout: Vec::new(),
+                    stderr: Vec::new(),
+                })
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error, "original worker admission refused");
+        assert_eq!(calls, ["Git status inspection", "gitlink inspection"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn registry_common_directory_and_fsmonitor_use_individual_git_leaves() {
+        use std::os::unix::process::ExitStatusExt as _;
+
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(temp.path().join(".git")).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let expected_common = temp.path().join(".git").canonicalize().unwrap();
+        let mut common_output = expected_common.as_os_str().as_encoded_bytes().to_vec();
+        common_output.push(b'\n');
+        let mut calls = Vec::new();
+        let mut git_leaf = |command: std::process::Command, leaf_deadline, operation: &str| {
+            assert_eq!(leaf_deadline, deadline);
+            assert!(!command.get_args().any(|argument| argument == "foreach"));
+            calls.push(operation.to_string());
+            Ok(std::process::Output {
+                status: std::process::ExitStatus::from_raw(0),
+                stdout: if operation == "Git common-directory inspection" {
+                    common_output.clone()
+                } else {
+                    Vec::new()
+                },
+                stderr: Vec::new(),
+            })
+        };
+        let common = super::exact_worktree_common_git_dir_with_leaf_until(
+            temp.path(), deadline, &mut git_leaf,
+        )
+        .unwrap();
+        assert_eq!(common, expected_common);
+        super::list_registered_worktrees_in_common_directory_with_leaf_until(
+            &common, deadline, &mut git_leaf,
+        )
+        .unwrap();
+        assert_eq!(
+            super::stop_bound_fsmonitor_with_leaf_until(temp.path(), deadline, &mut git_leaf)
+                .unwrap(),
+            super::FsmonitorStop::Stopped,
+        );
+        assert_eq!(calls, [
+            "Git common-directory inspection",
+            "exact Worktree registration inspection",
+            "worktree fsmonitor shutdown",
+        ]);
     }
 
     #[test]

@@ -1,6 +1,19 @@
 # Unified Close acceptance milestone
 
-## Current checkpoint
+## Latest candidate and terminal gate
+
+Published repair checkpoint: `a165d91bc4c42e099237d9cccb84af49a0f629db`. Automatic run [45084756106](https://github.com/scottopell/phoenix-ide/actions/runs/45084756106) is **completed / failure**, personally classified against exact HEAD. Every runtime/qualification step passed, including the Bash Stop handback and original Worktree continuation tests. Only exact-source formatting failed. Evidence: `/tmp/close-a165d91bc/{final-run.json,final-failed.log,watch-exit-status}`. Watcher exited 1; process exit verified. Exact-head hosted formatting proposal downloaded and applied; no local formatter or fixture execution.
+
+Reviewed follow-on candidate (not physical activation):
+- Mandatory per-mutation filesystem executor, native original-context refusal latch/unknown-release retention, and root/object descriptors held through final release classification.
+- Worktree-only original-source eligibility and regression.
+- Shared per-command Git callback plumbing through inspection, registration/common-directory and root fsmonitor leaves; native child supervisor retains the same receipt/source/deadline and waits only after confirmed release.
+- Canonical full-snapshot inspection with mandatory Git callback. The native read-only subset refuses dirty state, hidden suppression, detached HEAD and all gitlinks; legacy observation framing remains shared. Ignored-content deletion proof remains separate.
+- Independent static reviews found one invalid synthetic common-directory response and newly orphaned legacy wrappers; both corrected. Hosted selectors now include the new Git supervisor and eleven shared-helper regressions. Compilation/execution/formatting of this candidate remain unverified.
+
+Physical Worktree deletion remains blanket-blocked. Unwired `physical.rs` is residual-only, and the public positive `worktree_physical.rs` fixture is still unwired/unexecuted. Neither is included in this prerequisite publication. Required next integration: original-context metadata/source boundary without nested SQLite writers; relocation-aware root binding; shared orchestration avoiding overlapping mutable context borrows; root fsmonitor/writer evidence and full-snapshot rechecks; retained physical observation and exact Worktree then independent WorkScope success. No acceptance claim, main merge, deploy, release or real-user destructive action.
+
+## Historical checkpoint (superseded by the section above)
 
 - Branch: `feat/unified-close-receipts`.
 - Published HEAD: `28dac533252755af1ee1fe936f6a3c32cc98db22`.

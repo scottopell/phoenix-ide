@@ -81,6 +81,15 @@ impl ProcessRetirement {
         })
     }
 
+    /// The actor opens one original live-source cell for every physical stage,
+    /// including a captured Worktree when no process resources were present.
+    pub(super) fn has_original_effects(&self) -> bool {
+        self.has_resources()
+            || self.inventory.iter().any(|item| {
+                item.resource.kind() == RetiredResourceKind::Worktree
+            })
+    }
+
     pub(super) fn captured_binding(
         &self,
     ) -> (
@@ -494,6 +503,40 @@ impl NativeCloseInitialContinuation {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn worktree_only_inventory_needs_original_source_without_process_leases() {
+        use phoenix_core::domain::close::{
+            CloseAttemptId, CloseRetirementSnapshot, GitPathIdentity, LossItemIdentity,
+            RetiredResourceIdentity, WorktreeFingerprint, WorktreeId, WorktreeIdentity,
+        };
+
+        let scope = WorkScopeId::parse("scope").unwrap();
+        let snapshot = CloseRetirementSnapshot::parse("original", "fingerprint").unwrap();
+        let resource = CloseExpectedRetirementResource {
+            attempt_id: CloseAttemptId::parse("attempt").unwrap(),
+            scope: scope.clone(),
+            snapshot: snapshot.clone(),
+            resource: RetiredResourceIdentity::parse(
+                RetiredResourceKind::Worktree,
+                LossItemIdentity::Worktree(WorktreeIdentity::from_parts(
+                    WorktreeId::parse("linked").unwrap(),
+                    WorktreeFingerprint::parse("fingerprint").unwrap(),
+                    GitPathIdentity::from_bytes(b"linked".to_vec()),
+                )),
+            ).unwrap(),
+        };
+        let worktree = ProcessRetirement::new(
+            vec![resource],
+            vec![scope.clone()],
+            snapshot.clone(),
+        );
+        assert!(!worktree.has_resources());
+        assert!(worktree.has_original_effects());
+        let no_physical_resources = ProcessRetirement::new(Vec::new(), vec![scope], snapshot);
+        assert!(!no_physical_resources.has_resources());
+        assert!(!no_physical_resources.has_original_effects());
+    }
 
     #[tokio::test]
     async fn dropped_entry_reply_still_latches_fatal_writer_classification() {

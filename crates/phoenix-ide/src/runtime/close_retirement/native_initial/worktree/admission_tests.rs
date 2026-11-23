@@ -156,9 +156,13 @@ impl Fixture {
             message_id: "original-worktree-message".into(),
             tool_use_id: "original-worktree-call".into(),
         };
-        let intent = NativeCloseIntent::Initial { target: target.product_conversation_id };
+        let intent = NativeCloseIntent::Initial {
+            target: target.product_conversation_id,
+        };
         let live_source = executing_state(&source_call, &intent);
-        db.update_conversation_state(&source.id, &live_source).await.unwrap();
+        db.update_conversation_state(&source.id, &live_source)
+            .await
+            .unwrap();
         let command = NativeCloseCommand::new(source.id, source_call, intent).unwrap();
         let NativeCloseInitialResult::NewlyAdmitted(receipt) = db
             .apply_native_close_initial(&command)
@@ -170,9 +174,15 @@ impl Fixture {
             panic!("expected original admission")
         };
         db.prepare_native_close_initial_execution(&command, &receipt, &live_source)
-            .await.established().unwrap().unwrap();
+            .await
+            .established()
+            .unwrap()
+            .unwrap();
         db.settle_native_close_initial(&command, &receipt, &live_source)
-            .await.established().unwrap().unwrap();
+            .await
+            .established()
+            .unwrap()
+            .unwrap();
         db.replace_native_close_initial_inspection(
             &command,
             &receipt,
@@ -181,10 +191,15 @@ impl Fixture {
                 attempt_id: receipt.admitted.attempt_id.clone(),
                 scopes: vec![ReplaceCloseInspectionScopeRequest {
                     scope: scope.clone(),
-                    snapshot: CloseRetirementSnapshot::parse("original-generation", "original-fingerprint").unwrap(),
+                    snapshot: CloseRetirementSnapshot::parse(
+                        "original-generation",
+                        "original-fingerprint",
+                    )
+                    .unwrap(),
                     losses: vec![],
                 }],
-            }, None,
+            },
+            None,
         )
         .await
         .established()
@@ -212,20 +227,21 @@ impl Fixture {
                 &command,
                 &receipt,
                 &live_source,
-            CaptureCloseRetirementInventoryRequest {
-                attempt_id: receipt.admitted.attempt_id.clone(), snapshot,
-                scopes: vec![CaptureCloseRetirementInventoryScopeRequest {
-                    scope,
-                    inventory: CloseOwnedResourceInventory {
-                        worktree: Some(identity.clone()),
-                        work_scopes: BTreeSet::new(),
-                        bash_process_groups: BTreeSet::new(),
-                        tmux_servers: BTreeSet::new(),
-                        pty_sessions: BTreeSet::new(),
-                        browser_sessions: BTreeSet::new(),
-                        equivalent_live_resources: BTreeSet::new(),
-                    },
-                }],
+                CaptureCloseRetirementInventoryRequest {
+                    attempt_id: receipt.admitted.attempt_id.clone(),
+                    snapshot,
+                    scopes: vec![CaptureCloseRetirementInventoryScopeRequest {
+                        scope,
+                        inventory: CloseOwnedResourceInventory {
+                            worktree: Some(identity.clone()),
+                            work_scopes: BTreeSet::new(),
+                            bash_process_groups: BTreeSet::new(),
+                            tmux_servers: BTreeSet::new(),
+                            pty_sessions: BTreeSet::new(),
+                            browser_sessions: BTreeSet::new(),
+                            equivalent_live_resources: BTreeSet::new(),
+                        },
+                    }],
                 },
             )
             .await
@@ -237,29 +253,57 @@ impl Fixture {
             .find(|entry| entry.resource.kind() == RetiredResourceKind::Worktree)
             .unwrap();
         db.record_native_close_initial_retirement_dispatch(
-            &command, &receipt, &live_source,
+            &command,
+            &receipt,
+            &live_source,
             RecordCloseRetirementDispatchRequest {
-                attempt_id: receipt.admitted.attempt_id.clone(), scope: resource.scope.clone(),
-                snapshot: resource.snapshot.clone(), resource: resource.resource.clone(),
+                attempt_id: receipt.admitted.attempt_id.clone(),
+                scope: resource.scope.clone(),
+                snapshot: resource.snapshot.clone(),
+                resource: resource.resource.clone(),
             },
-        ).await.established().unwrap().unwrap();
+        )
+        .await
+        .established()
+        .unwrap()
+        .unwrap();
         // The one deadline starts after fixture setup and is never refreshed.
         let deadline = Instant::now() + budget;
-        let prepared = prepare_original_worktree_git_until(&identity, deadline).unwrap().unwrap();
+        let prepared = prepare_original_worktree_git_until(&identity, deadline)
+            .unwrap()
+            .unwrap();
         let mut controller = SourceEntryController::new(command.clone(), deadline.into());
         let _ = controller.revalidate(&live_source, &command);
         let first = prepared.spawn_status(
-            tokio::runtime::Handle::current(), db.clone(), command, receipt, live_source,
-            resource.scope, resource.snapshot, resource.resource, controller.worker(),
+            tokio::runtime::Handle::current(),
+            db.clone(),
+            command,
+            receipt,
+            live_source,
+            resource.scope,
+            resource.snapshot,
+            resource.resource,
+            controller.worker(),
             FatalLocalAuthorityFence::new(),
         );
-        Self { _files: files, db, controller, first }
+        Self {
+            _files: files,
+            db,
+            controller,
+            first,
+        }
     }
 
     async fn completed_first(&mut self) -> NativeWorktreeGitContinuation {
-        let output = self.first.observe().await.expect("genuine original admission must run Git status");
+        let output = self
+            .first
+            .observe()
+            .await
+            .expect("genuine original admission must run Git status");
         assert!(output.status.success());
-        self.first.take_for_continuation().expect("completed worker transfers original context")
+        self.first
+            .take_for_continuation()
+            .expect("completed worker transfers original context")
     }
 }
 
@@ -274,7 +318,10 @@ async fn second_status_reuses_original_authority_and_rechecks_after_wait() {
     let snapshot = continuation.original_effect.snapshot.clone();
     let deadline = continuation.original_effect.deadline;
     let mut second = continuation.spawn_status(tokio::runtime::Handle::current());
-    second.observe().await.expect("unchanged original authority permits second status");
+    second
+        .observe()
+        .await
+        .expect("unchanged original authority permits second status");
     let same = second.take_for_continuation().unwrap();
     assert_eq!(same.original_effect.receipt.request_id, request);
     assert_eq!(same.original_effect.scope, scope);
@@ -301,14 +348,21 @@ async fn refuses_second_callback(reason: ReentryRefusal) {
     let mut fixture = Fixture::new(budget).await;
     let mut continuation = fixture.completed_first().await;
     match reason {
-        ReentryRefusal::ControllerRevoked => { let _ = fixture.controller.revoke(); }
+        ReentryRefusal::ControllerRevoked => {
+            let _ = fixture.controller.revoke();
+        }
         ReentryRefusal::ReceiptChanged => {
             continuation.original_effect.receipt.request_id = uuid::Uuid::new_v4();
         }
         ReentryRefusal::DurableSourceLost => {
-            fixture.db.update_conversation_state(
-                continuation.original_effect.command.source_transcript_id(), &ConvState::Idle,
-            ).await.unwrap();
+            fixture
+                .db
+                .update_conversation_state(
+                    continuation.original_effect.command.source_transcript_id(),
+                    &ConvState::Idle,
+                )
+                .await
+                .unwrap();
         }
         ReentryRefusal::OriginalDeadlineExpired => {
             tokio::time::sleep_until(continuation.original_effect.deadline.into()).await;
@@ -328,27 +382,50 @@ async fn refuses_second_callback(reason: ReentryRefusal) {
             Ok((_, NativeCloseInitialEntryRelease::Confirmed))
             | Err(NativeCloseInitialFirstEffectError::NotStarted(_))
             | Err(NativeCloseInitialFirstEffectError::Rejected {
-                release: NativeCloseInitialEntryRelease::Confirmed, ..
+                release: NativeCloseInitialEntryRelease::Confirmed,
+                ..
             }) => true,
             _ => false,
         };
-        assert!(confirmed, "isolated negative fixture must release its database writer");
+        assert!(
+            confirmed,
+            "isolated negative fixture must release its database writer"
+        );
         continuation.original_effect.classify_confirmed_release();
         (entry, continuation)
-    }).await.unwrap();
-    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0,
-        "a second operation cannot reuse prior admission after authority loss");
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "a second operation cannot reuse prior admission after authority loss"
+    );
     match reason {
         ReentryRefusal::ControllerRevoked | ReentryRefusal::OriginalDeadlineExpired => {
-            assert!(matches!(entry, Ok((WorkerEntryResult::Refused, NativeCloseInitialEntryRelease::Confirmed))));
+            assert!(matches!(
+                entry,
+                Ok((
+                    WorkerEntryResult::Refused,
+                    NativeCloseInitialEntryRelease::Confirmed
+                ))
+            ));
         }
         ReentryRefusal::ReceiptChanged | ReentryRefusal::DurableSourceLost => {
-            assert!(matches!(entry, Err(NativeCloseInitialFirstEffectError::Rejected {
-                release: NativeCloseInitialEntryRelease::Confirmed, ..
-            })));
+            assert!(matches!(
+                entry,
+                Err(NativeCloseInitialFirstEffectError::Rejected {
+                    release: NativeCloseInitialEntryRelease::Confirmed,
+                    ..
+                })
+            ));
         }
     }
-    assert!(!continuation.original_effect.leaf_release_pending_classification);
+    assert!(
+        !continuation
+            .original_effect
+            .leaf_release_pending_classification
+    );
     // Also exercise the production supervisor with that same refused context;
     // the direct callback check above proves the spawn boundary stays closed.
     let mut second = continuation.spawn_status(tokio::runtime::Handle::current());
@@ -386,7 +463,88 @@ async fn second_status_rechecks_registration_after_status_wait() {
     std::fs::write(&replacement, bytes).unwrap();
     std::fs::rename(&replacement, &marker).unwrap();
     let mut second = continuation.spawn_status(tokio::runtime::Handle::current());
-    let error = second.observe().await.expect_err("replacement registration cannot authorize Git");
+    let error = second
+        .observe()
+        .await
+        .expect_err("replacement registration cannot authorize Git");
     assert!(error.contains("binding changed"), "{error}");
     assert!(second.take_for_continuation().is_none());
+}
+
+#[tokio::test]
+async fn mutation_executor_rechecks_same_original_source_for_every_owned_effect() {
+    use super::super::super::WorktreeMutationExecutor as _;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let mut fixture = Fixture::new(Duration::from_secs(60)).await;
+    let mut continuation = fixture.completed_first().await;
+    let mut controller = fixture.controller;
+    let runtime = tokio::runtime::Handle::current();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let worker_calls = Arc::clone(&calls);
+    tokio::task::spawn_blocking(move || {
+        let original_deadline = continuation.original_effect.deadline;
+        let original_receipt = continuation.original_effect.receipt.request_id;
+        let mut executor = super::mutation::OriginalWorktreeMutationExecutor::new(
+            &mut continuation.original_effect,
+            &runtime,
+        );
+        let first = Arc::clone(&worker_calls);
+        executor.execute(move || {
+            first.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }).unwrap();
+        assert_eq!(worker_calls.load(Ordering::SeqCst), 1);
+        let _ = controller.revoke();
+        let second = Arc::clone(&worker_calls);
+        let refusal = executor.execute(move || {
+            second.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }).unwrap_err();
+        let third = Arc::clone(&worker_calls);
+        assert_eq!(executor.execute(move || {
+            third.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }).unwrap_err(), refusal);
+        drop(executor);
+        assert_eq!(worker_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(continuation.original_effect.deadline, original_deadline);
+        assert_eq!(continuation.original_effect.receipt.request_id, original_receipt);
+        assert!(!continuation.original_effect.leaf_release_pending_classification);
+    }).await.unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn mutation_executor_classifies_syscall_failure_before_separately_admitted_compensation() {
+    use super::super::super::WorktreeMutationExecutor as _;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let mut fixture = Fixture::new(Duration::from_secs(60)).await;
+    let mut continuation = fixture.completed_first().await;
+    let runtime = tokio::runtime::Handle::current();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let worker_calls = Arc::clone(&calls);
+    tokio::task::spawn_blocking(move || {
+        let original_deadline = continuation.original_effect.deadline;
+        let mut executor = super::mutation::OriginalWorktreeMutationExecutor::new(
+            &mut continuation.original_effect,
+            &runtime,
+        );
+        let first = Arc::clone(&worker_calls);
+        let result = executor.execute(move || {
+            first.fetch_add(1, Ordering::SeqCst);
+            Err::<(), _>("confirmed syscall failure".to_string())
+        });
+        assert_eq!(result.unwrap_err(), "confirmed syscall failure");
+        let second = Arc::clone(&worker_calls);
+        executor.execute(move || {
+            second.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }).unwrap();
+        drop(executor);
+        assert_eq!(continuation.original_effect.deadline, original_deadline);
+        assert!(!continuation.original_effect.leaf_release_pending_classification);
+    }).await.unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
 }

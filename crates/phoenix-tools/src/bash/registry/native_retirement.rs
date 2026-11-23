@@ -12,7 +12,9 @@ use super::{
     record_handle_in_report, retirement_target_has_live_member, BashRetirementTarget,
     BashTeardownGeneration, CascadeBashReport, RegisteredHandle, ResourceScopeKeyHandles,
 };
-use crate::bash::handle::{Handle, HandleId, NativeBashSignal, NativeBashSignalError, WaiterSettlement};
+use crate::bash::handle::{
+    Handle, HandleId, NativeBashSignal, NativeBashSignalError, WaiterSettlement,
+};
 
 #[derive(Debug, Error)]
 pub enum NativeBashRetirementError {
@@ -184,7 +186,10 @@ impl NativeBashRetirement {
         let handle = Arc::clone(&self._handle);
         if handle.handle_id != self.target.handle_id
             || handle.launch_identity != self.target.launch_identity
-            || self._registry_writer.handles.contains_key(&handle.handle_id)
+            || self
+                ._registry_writer
+                .handles
+                .contains_key(&handle.handle_id)
         {
             return Err(NativeBashRetirementError::OriginalMembershipMismatch);
         }

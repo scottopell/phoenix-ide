@@ -271,7 +271,9 @@ impl BashEntryContext {
                     Ok((admission, NativeCloseInitialEntryRelease::Confirmed)) => {
                         problem = match admission {
                             WorkerEntryResult::Ran(Ok(())) => None,
-                            WorkerEntryResult::Ran(Err(error)) => Some(format!("Bash group signal failed: {error}")),
+                            WorkerEntryResult::Ran(Err(error)) => {
+                                Some(format!("Bash group signal failed: {error}"))
+                            }
                             WorkerEntryResult::Busy | WorkerEntryResult::Refused => {
                                 confirmed_group_refusal = true;
                                 Some("live source unavailable, expired or revoked before Bash group signal".into())

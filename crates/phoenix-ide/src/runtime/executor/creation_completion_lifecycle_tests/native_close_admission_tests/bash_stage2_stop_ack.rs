@@ -285,7 +285,11 @@ async fn bash_stage_two_stop_ack_reaches_real_second_writer_and_cleans_once() {
         .expect("the same original handle is publicly addressable again");
     assert!(Arc::ptr_eq(&returned.handle, &original.handle));
     assert!(
-        backend.bash_handles().reserve_spawn(&work_key).await.is_err(),
+        backend
+            .bash_handles()
+            .reserve_spawn(&work_key)
+            .await
+            .is_err(),
         "compensated handback must not reopen the sealed scope"
     );
 
