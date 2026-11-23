@@ -4946,7 +4946,8 @@ impl Database {
     ) -> DbResult<bool> {
         let result = sqlx::query(
             "UPDATE conversations SET llm_language = ?1 WHERE id = ?2 AND coordinator_head = 1 AND runtime_role = 'coordinator' AND state_kind = 'idle'
-             AND NOT EXISTS (SELECT 1 FROM durable_turns WHERE conversation_id = ?2 AND disposition = 'Runtime' AND terminal_kind IS NULL AND owns_conversation = 1)",
+             AND NOT EXISTS (SELECT 1 FROM durable_turns WHERE conversation_id = ?2 AND disposition = 'Runtime' AND terminal_kind IS NULL AND owns_conversation = 1)
+             AND NOT EXISTS (SELECT 1 FROM steering_messages WHERE conversation_id = ?2)",
         )
         .bind(language.as_str())
         .bind(conversation_id)
@@ -22774,6 +22775,51 @@ mod tests {
             LlmLanguage::Adhd
         );
         db.pool().close().await;
+    }
+
+    #[tokio::test]
+    async fn coordinator_language_refuses_queued_work_while_idle() {
+        use phoenix_core::{domain::sm_event::SteerEntry, llm_language::LlmLanguage};
+        let db = Database::open_in_memory().await.unwrap();
+        let coordinator = db
+            .get_or_create_coordinator(None, LlmLanguage::Caveman)
+            .await
+            .unwrap();
+        let entry = SteerEntry {
+            origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
+            text: "pending input".into(),
+            llm_text: None,
+            images: vec![],
+            files: vec![],
+            message_id: "queued-language".into(),
+            user_agent: None,
+            skill_invocation: None,
+        };
+        db.append_steering_entry(&coordinator.id, &entry, "fingerprint")
+            .await
+            .unwrap();
+        assert!(!db
+            .set_idle_coordinator_language(&coordinator.id, LlmLanguage::Adhd)
+            .await
+            .unwrap());
+        assert_eq!(
+            db.get_steering_queue(&coordinator.id).await.unwrap().len(),
+            1
+        );
+        assert_eq!(
+            db.get_conversation(&coordinator.id)
+                .await
+                .unwrap()
+                .llm_language,
+            LlmLanguage::Caveman
+        );
+        db.remove_steering_entry(&coordinator.id, &entry.message_id)
+            .await
+            .unwrap();
+        assert!(db
+            .set_idle_coordinator_language(&coordinator.id, LlmLanguage::Adhd)
+            .await
+            .unwrap());
     }
 
     #[tokio::test]
