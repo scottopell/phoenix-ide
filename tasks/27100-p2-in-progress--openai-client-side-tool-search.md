@@ -52,3 +52,28 @@ Implemented route-qualified native OpenAI hosted search on direct Responses, nat
 - Broad command: `PHOENIX_CHECK_BASE=15ec903e20eb4e46ad419b07d56c959867fc9a0a PHOENIX_CHECK_CARGO_TEST_TIMEOUT_SECS=3600 ./dev.py check`. Twelve checks passed, six were skipped and one failed (Rust tests). Passed checks included clippy, format, generated-binding freshness, specifications, dev.py tests, task validation and end-to-end. UI lanes were unchanged; optional ast-grep/cargo-deny were unavailable. Rust ran 6,342 tests: 6,339 passed, three failed. The migration fixture assumed exactly one pending migration; it now targets version169 and all five owning replay tests pass. Both browser failures passed isolated reruns (2/2) and the full Chrome-enabled browser_cli file (37/37, no skips). Their broad-run cause is unproven and tracked in task41021; lost failure excerpts are tracked in task41022. The broad Rust run was not repeated after these test-only corrections. Final DB all-target clippy and the five format/task/spec checks also passed.
 
 Phoenix-native Codex credentials were absent, so live bridge entitlement remains untested. No other app's credentials were borrowed. No production deployment is claimed.
+
+## Live Codex follow-up (2026-11-23)
+
+Reopened for the requested live bridge qualification. User completed Phoenix's
+own native OpenAI login and explicitly authorized limited synthetic inference.
+GPT-6.2 Sol authenticated successfully over HTTP/SSE and WebSockets. Initial
+live probes found the exact response `function_call` namespace `tool_search`,
+name `tool_search_tool`, which the original mocks missed. Wire experiments
+verified native `tool_search_output` loads its trusted schema and completes the
+function/final-reply exchange; canonical settled native history remains valid.
+
+The fix qualifies only this native-client representation, shares its typed
+parser with canonical receipt classification, preserves complete active private
+output, and keeps unqualified/ordinary function history ordinary. ADR-274 and
+the normative discovery contract record the boundary. All 513 LLM unit tests
+and 13 discovery persistence tests pass.
+
+The actual adapter probe passed complete native loops and settled next turns on
+both HTTP/SSE and WebSockets. The ignored runtime probe
+`codex_native_discovery_runtime_sqlite_roundtrip` passed using the actual bridge,
+real ToolSearch handler, 65 frozen deferred synthetic schemas, canonical SQLite
+selection ownership, deferred execution, and persisted final OK. Transport
+metrics confirm all three requests used WebSockets. No external tool side
+effects or other app credentials were used. Final owner checks, review, and
+repository validation remain in progress.

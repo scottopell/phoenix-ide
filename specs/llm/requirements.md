@@ -900,6 +900,12 @@ THE SYSTEM SHALL execute the lookup through the shared local discovery engine
 AND SHALL return typed selected schemas in native `tool_search_output` at their discovery position
 AND SHALL NOT insert newly discovered deferred schemas into the leading Codex declaration prefix.
 
+WHEN a qualified Codex native client search arrives as `tool_search_call` or the exact namespaced function `tool_search.tool_search_tool`
+THE SYSTEM SHALL project it to the same executable discovery operation and native-client receipt
+AND SHALL retain its original private envelope during the active exchange
+AND SHALL reconstruct settled native discovery using canonical native call/result items
+AND SHALL NOT infer native discovery from an ordinary function name or an unqualified route.
+
 WHEN a compatible Chat Completions route uses local discovery
 THE SYSTEM SHALL expose an eager ordinary `tool_search` function and withhold undiscovered deferred schemas
 AND SHALL add authenticated selected schemas to subsequent request declarations

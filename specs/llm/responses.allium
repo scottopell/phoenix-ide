@@ -308,6 +308,10 @@ contract ResponsesToolContinuation {
         -- Client output must match the authentic owner/call/result receipt.
         -- Stored Function/OpenAiClient identity selects historical result
         -- encoding even for failed/empty results after active replay retires.
+        -- Qualified Codex namespaced function tool_search.tool_search_tool
+        -- projects to the same native lookup. Its complete original private
+        -- item remains intact; ordinary functions never gain native meaning by
+        -- name alone. Settled native history uses canonical search items.
         -- These obligations are refined in tool-discovery.allium.
 
     @invariant ReasoningItemsContinuePrivately

@@ -5,7 +5,7 @@ use phoenix_core::domain::llm_types::{
     ContentBlock, LlmMessage, LlmRequest, MessageRole, ToolDefinition,
 };
 use phoenix_core::domain::tool_discovery::{
-    ToolDiscoveryMode, ToolDiscoveryProtocol, TOOL_SEARCH_NAME,
+    native_client_search_call, ToolDiscoveryMode, ToolDiscoveryProtocol, TOOL_SEARCH_NAME,
 };
 
 use super::{
@@ -244,21 +244,40 @@ pub(super) fn validate_results(request: &LlmRequest) -> Result<(), LlmError> {
             ));
         }
     }
+    validate_private_calls(request)
+}
+
+fn validate_private_calls(request: &LlmRequest) -> Result<(), LlmError> {
     for set in request
         .output_replay
         .iter()
         .filter_map(phoenix_core::domain::responses_replay::ProviderResponseSet::as_responses)
     {
         for item in &set.output_items {
-            if item.get("type").and_then(Value::as_str) != Some("tool_search_call")
-                || item.get("execution").and_then(Value::as_str) != Some("client")
-            {
-                continue;
+            if item.get("type").and_then(Value::as_str) == Some("function_call") {
+                let call_id = item.get("call_id").and_then(Value::as_str);
+                let canonical_owner = set.public_content.iter().any(|block| matches!(block,
+                    ContentBlock::ToolUse { id, name, .. } if Some(id.as_str())==call_id && name==TOOL_SEARCH_NAME
+                ));
+                let native_record =
+                    request
+                        .tool_availability
+                        .discovery_results()
+                        .iter()
+                        .any(|result| {
+                            result.protocol == ToolDiscoveryProtocol::OpenAiClient
+                                && result.owner_message_id == set.owner_message_id
+                                && Some(result.tool_call_id.as_str()) == call_id
+                        });
+                if !canonical_owner && !native_record {
+                    continue;
+                }
             }
-            let call_id = item
-                .get("call_id")
-                .and_then(Value::as_str)
-                .ok_or_else(|| LlmError::invalid_request("Native search call has no identity"))?;
+            let Some(call) = native_client_search_call(item)
+                .map_err(|_| LlmError::invalid_request("Malformed private native search call"))?
+            else {
+                continue;
+            };
             let records = request
                 .tool_availability
                 .discovery_results()
@@ -266,10 +285,13 @@ pub(super) fn validate_results(request: &LlmRequest) -> Result<(), LlmError> {
                 .filter(|result| {
                     result.protocol == ToolDiscoveryProtocol::OpenAiClient
                         && result.owner_message_id == set.owner_message_id
-                        && result.tool_call_id == call_id
+                        && result.tool_call_id == call.call_id
                 })
                 .count();
-            if records != 1 {
+            let owners = set.public_content.iter().filter(|block| matches!(block,
+                ContentBlock::ToolUse { id, name, input } if id==&call.call_id && name==TOOL_SEARCH_NAME && input==&call.arguments
+            )).count();
+            if records != 1 || owners != 1 {
                 return Err(LlmError::invalid_request(
                     "Native search result has no authenticated discovery record",
                 ));
@@ -286,8 +308,21 @@ pub(super) enum SearchProjection {
 
 pub(super) fn append_projection(
     item: &Value,
+    mode: ToolDiscoveryMode,
     content: &mut Vec<ContentBlock>,
 ) -> Result<bool, LlmError> {
+    if mode == ToolDiscoveryMode::OpenAiClient {
+        if let Some(call) = native_client_search_call(item).map_err(|_| {
+            LlmError::invalid_response("Malformed native Responses tool search item")
+        })? {
+            content.push(ContentBlock::ToolUse {
+                id: call.call_id,
+                name: TOOL_SEARCH_NAME.into(),
+                input: call.arguments,
+            });
+            return Ok(true);
+        }
+    }
     let Some(projection) = project_output(item)? else {
         return Ok(false);
     };

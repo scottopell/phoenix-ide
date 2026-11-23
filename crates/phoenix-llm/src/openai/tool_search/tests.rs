@@ -12,6 +12,10 @@ fn deferred() -> ToolDefinition {
     }
 }
 
+fn codex_search_alias(call_id: &str) -> Value {
+    json!({"type":"function_call","id":"search-item","namespace":"tool_search","name":"tool_search_tool","call_id":call_id,"arguments":"{\"query\":\"issues\"}","encrypted_content":"opaque-native-search","provider_extension":null})
+}
+
 fn request(mode: ToolDiscoveryMode) -> LlmRequest {
     let mut request = LlmRequest {
         system: vec![],
@@ -288,6 +292,184 @@ fn active_native_call_keeps_opaque_envelope_and_requires_its_authenticated_resul
 }
 
 #[test]
+fn native_alias_requires_exact_mode_namespace_and_authenticated_argument_witness() {
+    for mode in [
+        ToolDiscoveryMode::Eager,
+        ToolDiscoveryMode::OpenAiHosted,
+        ToolDiscoveryMode::OpenAiClient,
+    ] {
+        for namespace in ["tool_search", "another_namespace"] {
+            let mut alias = codex_search_alias("search-call");
+            alias["namespace"] = json!(namespace);
+            let response = super::super::normalize_responses_api_response_with_evidence(
+                serde_json::from_value(json!({"id":"r-alias","model":"gpt-6.2-sol","status":"completed","output":[alias.clone()],"usage":{"input_tokens":10,"output_tokens":5}})).unwrap(),
+                false, mode,
+            ).unwrap();
+            let expected = if mode == ToolDiscoveryMode::OpenAiClient && namespace == "tool_search"
+            {
+                TOOL_SEARCH_NAME
+            } else {
+                "tool_search_tool"
+            };
+            assert!(
+                matches!(&response.content[..], [ContentBlock::ToolUse { name, input, .. }] if name==expected && input==&json!({"query":"issues"}))
+            );
+            let Some(phoenix_core::domain::provider_replay::ProviderReplayUpdate::Responses(set)) =
+                response.provider_replay
+            else {
+                panic!("alias is replayed losslessly");
+            };
+            assert_eq!(set.output_items, vec![alias]);
+        }
+    }
+    let mut request = discovered_request();
+    request.output_replay.push(
+        phoenix_core::domain::responses_replay::ResponsesResponseSet {
+            response_id: "r-native-alias".into(),
+            model: "gpt-6.2-sol".into(),
+            owner_message_id: "owner".into(),
+            public_content: request.messages[0].content.clone(),
+            output_items: vec![codex_search_alias("search-call")],
+        }
+        .into(),
+    );
+    super::super::validate_responses_replay(&request, "gpt-6.2-sol").unwrap();
+    let wire = serde_json::to_value(super::super::translate_to_backend_request(
+        "gpt-6.2-sol",
+        &request,
+        true,
+        true,
+    ))
+    .unwrap();
+    assert!(wire["input"]
+        .as_array()
+        .unwrap()
+        .contains(&codex_search_alias("search-call")));
+    let mut missing_record = request.clone();
+    missing_record.tool_availability = missing_record
+        .tool_availability
+        .with_discovery(ToolDiscoveryMode::OpenAiClient, vec![])
+        .unwrap();
+    assert!(super::super::validate_responses_replay(&missing_record, "gpt-6.2-sol").is_err());
+    let phoenix_core::domain::responses_replay::ProviderResponseSet::Responses(set) =
+        &mut request.output_replay[0]
+    else {
+        panic!("Responses replay");
+    };
+    set.output_items[0]["arguments"] = json!("{\"query\":\"changed\"}");
+    assert!(super::super::validate_responses_replay(&request, "gpt-6.2-sol").is_err());
+}
+
+#[test]
+fn native_alias_malformed_arguments_are_rejected_without_payloads() {
+    for arguments in [json!("[]"), json!("PRIVATE_BAD_ARGUMENTS"), json!({})] {
+        let mut alias = codex_search_alias("search-call");
+        alias["arguments"] = arguments;
+        let error = super::super::normalize_responses_api_response_with_evidence(
+            serde_json::from_value(json!({"id":"r-alias","model":"gpt-6.2-sol","status":"completed","output":[alias],"usage":{"input_tokens":10,"output_tokens":5}})).unwrap(),
+            false, ToolDiscoveryMode::OpenAiClient,
+        ).unwrap_err();
+        assert_eq!(error.kind, crate::LlmErrorKind::InvalidResponse);
+        assert!(!error.message.contains("PRIVATE_BAD_ARGUMENTS"));
+    }
+}
+
+#[test]
+fn earlier_ordinary_alias_history_is_not_upgraded_when_native_discovery_activates() {
+    for past_mode in [ToolDiscoveryMode::Eager, ToolDiscoveryMode::OpenAiHosted] {
+        for arguments in [
+            json!("{\"query\":\"issues\"}"),
+            json!("invalid ordinary function JSON"),
+        ] {
+            let mut alias = codex_search_alias("historical-call");
+            alias["arguments"] = arguments;
+            let response = super::super::normalize_responses_api_response_with_evidence(
+            serde_json::from_value(json!({"id":"ordinary-response","model":"gpt-6.2-sol","status":"completed","output":[alias.clone()],"usage":{"input_tokens":10,"output_tokens":5}})).unwrap(),
+            false, past_mode,
+        ).unwrap();
+            assert!(
+                matches!(&response.content[..], [ContentBlock::ToolUse { name, .. }] if name=="tool_search_tool")
+            );
+            let Some(phoenix_core::domain::provider_replay::ProviderReplayUpdate::Responses(set)) =
+                response.provider_replay
+            else {
+                panic!("ordinary private replay retained");
+            };
+            let mut request = request(ToolDiscoveryMode::OpenAiClient);
+            request.tool_availability = ToolAvailability::all(vec![tool_search_definition()])
+                .with_discovery(ToolDiscoveryMode::OpenAiClient, vec![])
+                .unwrap();
+            assert!(!request.tool_availability.is_callable("lookup_issue"));
+            request.messages = vec![
+                LlmMessage {
+                    source_message_id: Some("ordinary-owner".into()),
+                    role: MessageRole::Assistant,
+                    content: response.content,
+                },
+                LlmMessage {
+                    source_message_id: Some("ordinary-result".into()),
+                    role: MessageRole::User,
+                    content: vec![ContentBlock::ToolResult {
+                        tool_use_id: "historical-call".into(),
+                        content: "Unknown tool".into(),
+                        is_error: true,
+                        images: vec![],
+                    }],
+                },
+            ];
+            request
+                .output_replay
+                .push(set.with_owner_message_id("ordinary-owner".into()).into());
+            super::super::validate_responses_replay(&request, "gpt-6.2-sol").unwrap();
+            for retain_private in [true, false] {
+                if !retain_private {
+                    request.output_replay.clear();
+                }
+                let wire = serde_json::to_value(super::super::translate_to_backend_request(
+                    "gpt-6.2-sol",
+                    &request,
+                    true,
+                    true,
+                ))
+                .unwrap();
+                let input = wire["input"].as_array().unwrap();
+                assert!(input.iter().any(|item| item["type"] == "function_call"
+                    && item["name"] == "tool_search_tool"
+                    && item["call_id"] == "historical-call"));
+                assert!(input
+                    .iter()
+                    .any(|item| item["type"] == "function_call_output"
+                        && item["call_id"] == "historical-call"));
+                assert!(!input.iter().any(|item| item["type"] == "tool_search_call"
+                    || item["type"] == "tool_search_output"));
+                if retain_private {
+                    assert!(input.contains(&alias));
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn native_receipt_does_not_allow_its_owner_to_change_to_ordinary_alias() {
+    let mut tampered = discovered_request();
+    if let ContentBlock::ToolUse { name, .. } = &mut tampered.messages[0].content[0] {
+        *name = "tool_search_tool".into();
+    }
+    tampered.output_replay.push(
+        phoenix_core::domain::responses_replay::ResponsesResponseSet {
+            response_id: "tampered-native-response".into(),
+            model: "gpt-6.2-sol".into(),
+            owner_message_id: "owner".into(),
+            public_content: tampered.messages[0].content.clone(),
+            output_items: vec![codex_search_alias("search-call")],
+        }
+        .into(),
+    );
+    assert!(super::super::validate_responses_replay(&tampered, "gpt-6.2-sol").is_err());
+}
+
+#[test]
 fn withdrawn_native_client_schema_remains_historical_with_an_explicit_restriction() {
     let mut request = discovered_request();
     let records = request.tool_availability.discovery_results().to_vec();
@@ -394,7 +576,7 @@ fn official_hosted_history_keeps_withdrawn_schema_and_communicates_current_polic
 }
 
 #[tokio::test]
-async fn codex_transport_carries_authenticated_native_search_continuation() {
+async fn codex_http_sse_normalizes_native_alias_and_carries_authenticated_result() {
     use axum::{extract::State, http::HeaderMap, routing::post, Json, Router};
     use std::{collections::BTreeMap, sync::Arc};
     use tokio::sync::Mutex;
@@ -407,7 +589,7 @@ async fn codex_transport_carries_authenticated_native_search_continuation() {
             ([("content-type", "text/event-stream")], format!("event: response.completed\ndata: {}\n\n", json!({
                 "type":"response.completed", "response":{
                     "id":"r-native-continuation", "model":"gpt-6.2-sol", "status":"completed",
-                    "output":[{"type":"function_call","id":"item-issue","call_id":"issue-call","name":"lookup_issue","arguments":"{\"id\":42}"}],
+                    "output":[codex_search_alias("new-search")],
                     "usage":{"input_tokens":10,"output_tokens":5}
                 }
             })))
@@ -452,12 +634,14 @@ async fn codex_transport_carries_authenticated_native_search_continuation() {
         .unwrap();
         assert!(!response.end_turn);
         assert!(
-            matches!(&response.content[..], [ContentBlock::ToolUse { id, name, input }] if id=="issue-call" && name=="lookup_issue" && input==&json!({"id":42}))
+            matches!(&response.content[..], [ContentBlock::ToolUse { id, name, input }] if id=="new-search" && name==TOOL_SEARCH_NAME && input==&json!({"query":"issues"}))
         );
-        assert!(matches!(
-            response.provider_replay,
-            Some(phoenix_core::domain::provider_replay::ProviderReplayUpdate::Responses(_))
-        ));
+        let Some(phoenix_core::domain::provider_replay::ProviderReplayUpdate::Responses(set)) =
+            response.provider_replay
+        else {
+            panic!("private alias retained");
+        };
+        assert_eq!(set.output_items, vec![codex_search_alias("new-search")]);
     }
     let requests = captured.lock().await;
     assert_eq!(requests.len(), 2);
@@ -492,7 +676,7 @@ async fn codex_websocket_native_search_continues_with_only_authenticated_result_
     use tokio::sync::Mutex;
 
     let captured = Arc::new(Mutex::new(Vec::<Value>::new()));
-    let raw_search = json!({"type":"tool_search_call","id":"search-item","execution":"client","call_id":"search-call","status":"in_progress","arguments":{"query":"issues"},"encrypted_content":"opaque-native-search"});
+    let raw_search = codex_search_alias("search-call");
     let outputs = vec![
         ("r-search", raw_search.clone()),
         (

@@ -14,6 +14,7 @@ use phoenix_llm::{LlmError, LlmResponse};
 use std::sync::Mutex;
 
 mod discovery;
+mod live_codex_discovery;
 
 const CONVERSATION: &str = "provider-tool-withdrawal";
 const MCP_TOOL: &str = "mcp__slack__read_thread";

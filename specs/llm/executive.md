@@ -18,6 +18,25 @@ Provider defaults are preserved by omitting an unset effort override.
 Model-contract, registry-registration, and provider-wire fixtures cover these
 additions; they do not establish account entitlement or live provider acceptance.
 
+## Codex bridge live qualification (2026-11-23)
+
+Phoenix's native Codex login authenticated GPT-6.2 Sol on both HTTP/SSE and
+WebSockets. Live testing exposed the bridge's namespaced
+`tool_search.tool_search_tool` function representation. The qualified adapter
+maps it to native client discovery, retains its complete private envelope, and
+returns native schema-bearing `tool_search_output`. Ordinary function history
+keeps its original protocol. [ADR-274](../adrs/274_qualify-codex-namespaced-native-search-calls.md)
+records this verified representation.
+
+The live adapter probe passed search, deferred function execution, final reply,
+and a new turn after private settlement on both transports. The SQLite runtime
+probe also passed: its real search handler selected from 65 frozen deferred
+schemas, committed native owner/result evidence, admitted and executed the
+selected function, and persisted the final `OK`; all three requests used
+WebSockets. Full LLM unit coverage passed (513 tests), including exact namespace,
+mode, argument witness, and ordinary-history negatives. Final regression checks
+and independent review are in progress. No production deployment is claimed.
+
 ## Tool discovery integration (2026-11-20)
 
 REQ-LLM-004n and [the discovery contract](tool-discovery.allium) distinguish eager
@@ -130,7 +149,7 @@ Tool availability is separated from retained declarations and historical calls. 
 | **REQ-LLM-003a:** Model Discovery | ✅ Complete | Opportunistic backend-scoped `/v1/models` discovery, falls back to configured models |
 | **REQ-LLM-003b:** Typed Model Effort Capability Registry | ✅ Complete | Constructor-validated known-native, unknown, unsupported, and supported-level capability states |
 | **REQ-LLM-004:** Request Format | ✅ Complete | LlmRequest with system, messages, tools |
-| **REQ-LLM-004n:** Route-Qualified Tool Discovery | ✅ Complete | Hosted gateway and 12 shared-fallback live cases pass; SQLite runtime, reopen/retry, accounting, policy, and native HTTP/SSE/WebSocket fixtures pass. Review withdrawal finding fixed. Broad-run exceptions are classified above; live Codex entitlement remains untested. |
+| **REQ-LLM-004n:** Route-Qualified Tool Discovery | ✅ Complete | Hosted gateway, 12 fallback live cases, and live Codex HTTP/SSE/WebSocket plus SQLite runtime pass. Native namespaced response qualification and ordinary-history negatives pass; final follow-up checks/review in progress. Earlier broad-run exceptions are classified above. |
 | **REQ-LLM-004a–004e:** Reasoning Effort Lifecycle | ✅ Complete | Native omission, explicit overrides, atomic switches, subagent inheritance, and provider translation |
 | **REQ-LLM-004f:** Output Budget Resolution and Reservation | Implemented; qualification in progress | Concrete model output maxima flow through runtime context, ordinary and continuation requests, provider serialization, and reservation. External HTTP definitions require `max_output_tokens`; no effort-based cap or 4k continuation override. Native Codex retains wire omission. |
 | **REQ-LLM-004g:** Fast Request Speed | ✅ Complete | Capability-gated per-conversation Standard/Fast selection maps to each supported route's native control: Responses `priority` or direct Anthropic `speed: fast` with its feature header. Effective speed is persisted per turn for historical pricing, successful Anthropic responses must confirm Fast, continuations preserve it, and subagents default to Standard. |

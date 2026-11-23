@@ -107,6 +107,16 @@ contract QualifiedToolDiscovery {
         -- carry selected schemas. Stored per-call protocol controls historical
         -- result encoding, including failed and empty results after settlement.
 
+    @invariant NativeClientCallProjectionIsQualified
+        -- Qualified Codex client search accepts a native tool_search_call or
+        -- exactly function_call namespace tool_search, name tool_search_tool,
+        -- with a nonempty call identity and object arguments decoded from its
+        -- JSON string. Both project to one native-client lookup and receipt.
+        -- Active private replay retains the original complete item. Settled
+        -- native discovery reconstructs canonical tool_search_call/output.
+        -- Other namespaces, names, routes, and ordinary function-search history
+        -- do not acquire native meaning from this projection.
+
     @invariant HostedPolicyUsesQualifiedCandidates
         -- Hosted search receives only permitted candidate definitions, using
         -- auto/none selection rather than allowed_tools names for deferred

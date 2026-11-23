@@ -256,7 +256,11 @@ pub async fn complete(
     })?;
 
     let mut response = bind_responses_model(
-        normalize_responses_api_response(responses_response)?,
+        normalize_responses_api_response_with_evidence(
+            responses_response,
+            false,
+            request.tool_availability.discovery_mode(),
+        )?,
         request_name.as_str(),
     )?;
     let raw: serde_json::Value =
@@ -409,6 +413,7 @@ impl ResponsesReasoningUsage {
 
 /// Accumulates state across Responses API SSE stream events.
 struct ResponsesStreamAccumulator {
+    discovery_mode: ToolDiscoveryMode,
     usage_observation: UsageObservation,
     input_tokens: u32,
     output_tokens: u32,
@@ -482,6 +487,7 @@ fn output_item_has_non_reasoning_output(item: &serde_json::Value) -> bool {
 impl ResponsesStreamAccumulator {
     fn new(dispatch_at: Instant, request: &LlmRequest) -> Self {
         Self {
+            discovery_mode: request.tool_availability.discovery_mode(),
             input_tokens: 0,
             output_tokens: 0,
             usage_observation: UsageObservation::default(),
@@ -863,6 +869,7 @@ impl ResponsesStreamAccumulator {
                 },
             },
             self.observed_non_reasoning_output,
+            self.discovery_mode,
         )?;
         response.usage_observation = self.usage_observation;
         telemetry.attach_success(&mut response);
@@ -2614,13 +2621,15 @@ fn check_responses_output_budget(resp: &ResponsesApiResponse) -> Result<(), LlmE
 }
 
 /// Normalize `ResponsesApiResponse` to `LlmResponse`.
+#[cfg(test)]
 fn normalize_responses_api_response(resp: ResponsesApiResponse) -> Result<LlmResponse, LlmError> {
-    normalize_responses_api_response_with_evidence(resp, false)
+    normalize_responses_api_response_with_evidence(resp, false, ToolDiscoveryMode::Eager)
 }
 
 fn normalize_responses_api_response_with_evidence(
     resp: ResponsesApiResponse,
     observed_non_reasoning_output: bool,
+    discovery_mode: ToolDiscoveryMode,
 ) -> Result<LlmResponse, LlmError> {
     check_responses_output_budget(&resp)?;
 
@@ -2629,7 +2638,7 @@ fn normalize_responses_api_response_with_evidence(
     let mut content = Vec::new();
 
     for output in resp.output {
-        if tool_search::append_projection(&output.0, &mut content)? {
+        if tool_search::append_projection(&output.0, discovery_mode, &mut content)? {
             continue;
         }
         let output: ResponsesOutputView = serde_json::from_value(output.0).map_err(|_| {
@@ -8366,6 +8375,7 @@ mod tests {
                 Some(16),
             ),
             true,
+            ToolDiscoveryMode::Eager,
         )
         .expect_err("observed visible output cannot disappear at the terminal boundary");
         assert_eq!(err.kind, crate::LlmErrorKind::ServerError);

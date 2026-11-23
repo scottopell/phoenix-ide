@@ -28,7 +28,17 @@ the validated selected definitions.
 
 ## Status Summary
 
-Implementation has focused and live qualification. Core, tool-context, registry,
+Live Codex qualification on 2026-11-23 passed using Phoenix's own login and
+GPT-6.2 Sol: actual adapter loops on HTTP/SSE and WebSockets, settled next-turn
+replay, and a complete SQLite/runtime loop using the real search handler over
+65 deferred schemas. All three runtime requests used WebSockets and the native
+selection, deferred execution, and final `OK` persisted correctly. The observed
+namespaced native call is qualified under
+[ADR-274](../adrs/274_qualify-codex-namespaced-native-search-calls.md); ordinary
+function history remains ordinary. All 513 LLM unit tests pass. Final follow-up
+checks and independent review are in progress.
+
+Initial qualification on 2026-11-20: core, tool-context, registry,
 and persistence tests pass. Real SQLite/runtime tests passed local and
 native-client search through tool execution and reopen/retry; schema accounting
 and all five `provider_tool_policy_tests` also pass. The shared fallback passed
@@ -56,4 +66,4 @@ failure diagnostics. See
 
 | Requirement | Status | Verification and limits |
 | --- | --- | --- |
-| REQ-LLM-004n | Complete | Runtime, persistence, accounting, policy, hosted gateway, 12 fallback live cases, and native HTTP/SSE/WebSocket tests pass. Review finding fixed; broad-run exceptions classified above. Codex live unavailable. |
+| REQ-LLM-004n | Complete | Live Codex adapter and SQLite runtime, prior hosted/fallback live cases, and focused regressions pass. Final follow-up checks/review in progress; earlier broad-run exceptions classified above. |
