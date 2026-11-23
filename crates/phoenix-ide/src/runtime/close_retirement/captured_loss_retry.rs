@@ -92,8 +92,17 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         for arguments in [
             vec!["init", "--quiet"],
-            vec!["-c", "user.name=Test", "-c", "user.email=test@example.invalid",
-                 "commit", "--quiet", "--allow-empty", "-m", "base"],
+            vec![
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "--quiet",
+                "--allow-empty",
+                "-m",
+                "base",
+            ],
         ] {
             let output = phoenix_core::git::command()
                 .args(arguments)
@@ -106,15 +115,19 @@ mod tests {
             WorktreeId::parse("captured-retry-tree").unwrap(),
             WorktreeFingerprint::parse(
                 super::super::observe_worktree_fingerprint(directory.path()).unwrap(),
-            ).unwrap(),
+            )
+            .unwrap(),
             GitPathIdentity::from_bytes(directory.path().as_os_str().as_bytes().to_vec()),
         );
-        (directory, CloseAttemptScope {
-            attempt_id: CloseAttemptId::parse("captured-retry-attempt").unwrap(),
-            scope: WorkScopeId::parse("captured-retry-scope").unwrap(),
-            captured_worktree: Some(CapturedWorktreeIdentity::Resolved(identity)),
-            captured_at: chrono::Utc::now(),
-        })
+        (
+            directory,
+            CloseAttemptScope {
+                attempt_id: CloseAttemptId::parse("captured-retry-attempt").unwrap(),
+                scope: WorkScopeId::parse("captured-retry-scope").unwrap(),
+                captured_worktree: Some(CapturedWorktreeIdentity::Resolved(identity)),
+                captured_at: chrono::Utc::now(),
+            },
+        )
     }
 
     #[tokio::test]
@@ -122,16 +135,25 @@ mod tests {
         let (directory, captured) = fixture();
         let path = directory.path().join("keep");
         std::fs::write(&path, b"retained loss").unwrap();
-        let first = inspect_captured_scope(&captured, "first").await.unwrap().unwrap();
+        let first = inspect_captured_scope(&captured, "first")
+            .await
+            .unwrap()
+            .unwrap();
         assert!(first.losses.iter().any(|loss| matches!(
             loss, CloseLossItem::UntrackedNonIgnoredPath(path) if path.as_bytes() == b"keep"
         )));
         std::fs::write(&path, b"changed retained loss").unwrap();
-        let second = inspect_captured_scope(&captured, "second").await.unwrap().unwrap();
+        let second = inspect_captured_scope(&captured, "second")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(first.losses, second.losses);
         assert_ne!(first.snapshot.fingerprint(), second.snapshot.fingerprint());
         std::fs::remove_file(path).unwrap();
-        let clean = inspect_captured_scope(&captured, "clean").await.unwrap().unwrap();
+        let clean = inspect_captured_scope(&captured, "clean")
+            .await
+            .unwrap()
+            .unwrap();
         assert!(clean.losses.is_empty());
         assert_eq!(clean.snapshot.generation(), "clean");
     }
@@ -140,34 +162,49 @@ mod tests {
     async fn unresolved_identity_is_not_resolved_from_its_locator() {
         let (directory, mut captured) = fixture();
         captured.captured_worktree = Some(CapturedWorktreeIdentity::Unresolved {
-            locator: GitPathIdentity::from_bytes(
-                directory.path().as_os_str().as_bytes().to_vec(),
-            ),
+            locator: GitPathIdentity::from_bytes(directory.path().as_os_str().as_bytes().to_vec()),
         });
-        assert!(matches!(inspect_captured_scope(&captured, "unresolved").await,
+        assert!(matches!(
+            inspect_captured_scope(&captured, "unresolved").await,
             Err(NativeInitialInspectionFailure::Scope {
-                reason: RetirementFailureReason::IdentityNotProven, ..
-            })));
+                reason: RetirementFailureReason::IdentityNotProven,
+                ..
+            })
+        ));
         captured.captured_worktree = None;
         assert!(inspect_captured_scope(&captured, "no-worktree")
-            .await.unwrap().is_none());
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]
     async fn missing_or_replaced_original_identity_is_refused() {
         let (directory, captured) = fixture();
-        std::fs::rename(directory.path().join(".git"), directory.path().join("old-git"))
-            .unwrap();
-        assert!(matches!(inspect_captured_scope(&captured, "missing").await,
+        std::fs::rename(
+            directory.path().join(".git"),
+            directory.path().join("old-git"),
+        )
+        .unwrap();
+        assert!(matches!(
+            inspect_captured_scope(&captured, "missing").await,
             Err(NativeInitialInspectionFailure::Scope {
-                reason: RetirementFailureReason::IdentityNotProven, ..
-            })));
+                reason: RetirementFailureReason::IdentityNotProven,
+                ..
+            })
+        ));
         std::fs::create_dir(directory.path().join(".git")).unwrap();
-        std::fs::write(directory.path().join(".git/HEAD"), b"ref: refs/heads/main\n")
-            .unwrap();
-        assert!(matches!(inspect_captured_scope(&captured, "replacement").await,
+        std::fs::write(
+            directory.path().join(".git/HEAD"),
+            b"ref: refs/heads/main\n",
+        )
+        .unwrap();
+        assert!(matches!(
+            inspect_captured_scope(&captured, "replacement").await,
             Err(NativeInitialInspectionFailure::Scope {
-                reason: RetirementFailureReason::IdentityNotProven, ..
-            })));
+                reason: RetirementFailureReason::IdentityNotProven,
+                ..
+            })
+        ));
     }
 }

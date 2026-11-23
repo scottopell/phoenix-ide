@@ -860,7 +860,9 @@ async fn run_public_worktree_close(journey: WorktreeJourney) {
             assert_eq!(retained.scopes()[0].scope, scope);
             assert_eq!(
                 retained.scopes()[0].captured_worktree,
-                Some(CapturedWorktreeIdentity::Resolved(original_worktree.clone()))
+                Some(CapturedWorktreeIdentity::Resolved(
+                    original_worktree.clone()
+                ))
             );
             assert_eq!(retained.inspections().len(), 1);
             assert_eq!(retained.inspections()[0].target.scope, scope);
@@ -882,7 +884,10 @@ async fn run_public_worktree_close(journey: WorktreeJourney) {
                 &retained.inspections()[0].snapshot
             );
             assert_eq!(physical_snapshot(&git.root), physical_before_admission);
-            assert_eq!(durable_native_close_rows(&fixture, &run).await, before_replay);
+            assert_eq!(
+                durable_native_close_rows(&fixture, &run).await,
+                before_replay
+            );
 
             // Separate fixture cleanup, not a native Close retirement effect.
             std::fs::write(git.worktree.join("tracked.txt"), b"durable content\n").unwrap();
@@ -936,7 +941,10 @@ async fn run_public_worktree_close(journey: WorktreeJourney) {
                     .unwrap(),
                 failures
             );
-            assert_eq!(durable_native_close_rows(&fixture, &run).await, before_replay);
+            assert_eq!(
+                durable_native_close_rows(&fixture, &run).await,
+                before_replay
+            );
             assert_eq!(
                 close_row_counts(&fixture).await,
                 vec![1, 1, 0, 1, 0, 0, 0, 0, 1],

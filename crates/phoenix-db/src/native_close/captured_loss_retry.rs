@@ -102,10 +102,9 @@ impl Database {
         failed_run: &CloseRunRef,
     ) -> DbResult<NativeCloseCapturedLossRetryContext> {
         let mut tx = self.pool.begin().await?;
-        let context = Self::read_native_close_captured_loss_retry_context_tx(
-            &mut tx, target, failed_run,
-        )
-        .await?;
+        let context =
+            Self::read_native_close_captured_loss_retry_context_tx(&mut tx, target, failed_run)
+                .await?;
         tx.commit().await?;
         Ok(context)
     }
@@ -147,7 +146,9 @@ impl Database {
         .fetch_one(&mut **tx)
         .await?;
         if !eligible {
-            return Err(refused("captured loss retry requires an effect-free latest stopped native initial loss"));
+            return Err(refused(
+                "captured loss retry requires an effect-free latest stopped native initial loss",
+            ));
         }
         let receipts = sqlx::query(
             "SELECT * FROM native_close_initial_receipts
@@ -157,7 +158,9 @@ impl Database {
         .fetch_all(&mut **tx)
         .await?;
         let [receipt] = receipts.as_slice() else {
-            return Err(refused("captured loss origin requires exactly one initial receipt"));
+            return Err(refused(
+                "captured loss origin requires exactly one initial receipt",
+            ));
         };
         let initial_command = NativeCloseCommand::new(
             receipt.try_get("source_transcript_id")?,
@@ -165,7 +168,9 @@ impl Database {
                 message_id: receipt.try_get("source_message_id")?,
                 tool_use_id: receipt.try_get("source_tool_use_id")?,
             },
-            NativeCloseIntent::Initial { target: target.clone() },
+            NativeCloseIntent::Initial {
+                target: target.clone(),
+            },
         )
         .map_err(decode_error)?;
         if receipt.try_get::<String, _>("request_id")? != initial_command.request_id().to_string()
@@ -184,25 +189,40 @@ impl Database {
         if projection.obligation.attempt_id() != &failed_run.attempt_id
             || projection.losses.is_empty()
         {
-            return Err(refused("captured loss origin is not the active retained loss attempt"));
+            return Err(refused(
+                "captured loss origin is not the active retained loss attempt",
+            ));
         }
-        let snapshot = projection.obligation.snapshot().cloned()
+        let snapshot = projection
+            .obligation
+            .snapshot()
+            .cloned()
             .ok_or_else(|| refused("captured loss inspection snapshot is absent"))?;
         validate_close_retirement_inspection_aggregate(&snapshot, &projection.inspections)?;
         let scopes = read_captured_scopes_tx(tx, failed_run).await?;
-        let inspected: Vec<_> = projection.inspections.iter()
-            .map(|inspection| &inspection.target.scope).collect();
-        let captured: Vec<_> = scopes.iter().filter(|scope| scope.captured_worktree.is_some())
-            .map(|scope| &scope.scope).collect();
-        if scopes.is_empty() || inspected != captured
+        let inspected: Vec<_> = projection
+            .inspections
+            .iter()
+            .map(|inspection| &inspection.target.scope)
+            .collect();
+        let captured: Vec<_> = scopes
+            .iter()
+            .filter(|scope| scope.captured_worktree.is_some())
+            .map(|scope| &scope.scope)
+            .collect();
+        if scopes.is_empty()
+            || inspected != captured
             || projection.losses.iter().any(|loss| {
                 !projection.inspections.iter().any(|inspection| {
                     loss.attempt_id == inspection.attempt_id
-                        && loss.scope == inspection.target.scope && loss.snapshot == inspection.snapshot
+                        && loss.scope == inspection.target.scope
+                        && loss.snapshot == inspection.snapshot
                 })
             })
         {
-            return Err(refused("captured loss inspection does not cover the original worktree scopes"));
+            return Err(refused(
+                "captured loss inspection does not cover the original worktree scopes",
+            ));
         }
         let failure_row = sqlx::query(
             "SELECT failure.* FROM close_cleanup_failures failure
@@ -218,23 +238,32 @@ impl Database {
         .fetch_optional(&mut **tx)
         .await?
         .ok_or_else(|| refused("captured loss initial failure occurrence is absent"))?;
-        let authority_scope = WorkScopeId::parse(failure_row.try_get::<String, _>("scope")?)
-            .map_err(decode_error)?;
-        if !projection.losses.iter().any(|loss| loss.scope == authority_scope) {
-            return Err(refused("captured failure authority does not identify a retained loss scope"));
+        let authority_scope =
+            WorkScopeId::parse(failure_row.try_get::<String, _>("scope")?).map_err(decode_error)?;
+        if !projection
+            .losses
+            .iter()
+            .any(|loss| loss.scope == authority_scope)
+        {
+            return Err(refused(
+                "captured failure authority does not identify a retained loss scope",
+            ));
         }
         let mut remaining_resources = Vec::new();
         for scope in &scopes {
             remaining_resources.push(CloseCleanupFailureResource {
-                scope: scope.scope.clone(), resource: scope_resource(&scope.scope)?,
+                scope: scope.scope.clone(),
+                resource: scope_resource(&scope.scope)?,
                 disposition: CloseCleanupResourceDisposition::Unknown,
             });
             if let Some(CapturedWorktreeIdentity::Resolved(identity)) = &scope.captured_worktree {
                 remaining_resources.push(CloseCleanupFailureResource {
                     scope: scope.scope.clone(),
                     resource: RetiredResourceIdentity::parse(
-                        RetiredResourceKind::Worktree, LossItemIdentity::Worktree(identity.clone()),
-                    ).map_err(decode_error)?,
+                        RetiredResourceKind::Worktree,
+                        LossItemIdentity::Worktree(identity.clone()),
+                    )
+                    .map_err(decode_error)?,
                     disposition: CloseCleanupResourceDisposition::Unknown,
                 });
             }
@@ -244,7 +273,8 @@ impl Database {
             attempt_id: failed_run.attempt_id.clone(),
             source_product_conversation_id: target.clone(),
             authority: CloseCleanupFailureAuthority::CapturedScope {
-                resource: scope_resource(&authority_scope)?, scope: authority_scope,
+                resource: scope_resource(&authority_scope)?,
+                scope: authority_scope,
             },
             remaining_resources,
             reason: RetirementFailureReason::ManualRepairRequired,
@@ -255,11 +285,18 @@ impl Database {
         if failure.detail.trim().is_empty()
             || !Self::retained_close_cleanup_failure_matches_tx(tx, failed_run, &failure).await?
         {
-            return Err(refused("captured loss failure differs from its full original captured identities"));
+            return Err(refused(
+                "captured loss failure differs from its full original captured identities",
+            ));
         }
         Ok(NativeCloseCapturedLossRetryContext {
-            initial_command, failed_run: failed_run.clone(), snapshot, scopes,
-            inspections: projection.inspections, losses: projection.losses, failure,
+            initial_command,
+            failed_run: failed_run.clone(),
+            snapshot,
+            scopes,
+            inspections: projection.inspections,
+            losses: projection.losses,
+            failure,
         })
     }
 }
@@ -276,45 +313,55 @@ async fn read_captured_scopes_tx(
     .bind(run.attempt_id.as_str())
     .fetch_all(&mut **tx)
     .await?;
-    rows.into_iter().map(|row| {
-        let captured_worktree = match (
-            row.try_get::<Option<String>, _>("captured_worktree_identity")?,
-            row.try_get::<Option<String>, _>("captured_worktree_fingerprint")?,
-            row.try_get::<Option<String>, _>("captured_worktree_locator")?,
-        ) {
-            (Some(_), Some(_), Some(_)) => {
-                let resource = parse_cleanup_resource_identity(&row)?;
-                let LossItemIdentity::Worktree(identity) = resource.identity() else {
-                    return Err(refused("captured worktree decoder returned a different identity kind"));
-                };
-                Some(CapturedWorktreeIdentity::Resolved(identity.clone()))
-            }
-            (None, None, Some(locator)) => Some(CapturedWorktreeIdentity::Unresolved {
-                locator: GitPathIdentity::decode_exact(&locator).map_err(decode_error)?,
-            }),
-            (None, None, None) => None,
-            _ => return Err(refused("captured loss scope contains a partial worktree identity")),
-        };
-        let captured_at: String = row.try_get("captured_at")?;
-        Ok(CloseAttemptScope {
-            attempt_id: run.attempt_id.clone(),
-            scope: WorkScopeId::parse(row.try_get::<String, _>("scope")?).map_err(decode_error)?,
-            captured_worktree,
-            captured_at: chrono::DateTime::parse_from_rfc3339(&captured_at)
-                .map_err(decode_error)?.with_timezone(&chrono::Utc),
+    rows.into_iter()
+        .map(|row| {
+            let captured_worktree = match (
+                row.try_get::<Option<String>, _>("captured_worktree_identity")?,
+                row.try_get::<Option<String>, _>("captured_worktree_fingerprint")?,
+                row.try_get::<Option<String>, _>("captured_worktree_locator")?,
+            ) {
+                (Some(_), Some(_), Some(_)) => {
+                    let resource = parse_cleanup_resource_identity(&row)?;
+                    let LossItemIdentity::Worktree(identity) = resource.identity() else {
+                        return Err(refused(
+                            "captured worktree decoder returned a different identity kind",
+                        ));
+                    };
+                    Some(CapturedWorktreeIdentity::Resolved(identity.clone()))
+                }
+                (None, None, Some(locator)) => Some(CapturedWorktreeIdentity::Unresolved {
+                    locator: GitPathIdentity::decode_exact(&locator).map_err(decode_error)?,
+                }),
+                (None, None, None) => None,
+                _ => {
+                    return Err(refused(
+                        "captured loss scope contains a partial worktree identity",
+                    ))
+                }
+            };
+            let captured_at: String = row.try_get("captured_at")?;
+            Ok(CloseAttemptScope {
+                attempt_id: run.attempt_id.clone(),
+                scope: WorkScopeId::parse(row.try_get::<String, _>("scope")?)
+                    .map_err(decode_error)?,
+                captured_worktree,
+                captured_at: chrono::DateTime::parse_from_rfc3339(&captured_at)
+                    .map_err(decode_error)?
+                    .with_timezone(&chrono::Utc),
+            })
         })
-    }).collect()
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    use crate::workflow::LocalAuthorityResult;
     use phoenix_core::domain::close::CloseLossItem;
     use phoenix_core::domain::llm_types::ContentBlock;
     use phoenix_core::domain::sm_state::{AssistantMessage, ConvState, ToolCall, ToolInput};
     use phoenix_core::llm_language::LlmLanguage;
-    use crate::workflow::LocalAuthorityResult;
 
     fn established<T: std::fmt::Debug>(result: LocalAuthorityResult<DbResult<T>>) -> T {
         match result {
@@ -325,94 +372,172 @@ mod tests {
 
     async fn retained_loss_origin() -> (Database, NativeCloseCommand, CloseRunRef) {
         let database = Database::open_in_memory().await.unwrap();
-        let owner = database.get_or_create_coordinator(None, LlmLanguage::default()).await.unwrap();
-        let product = database.create_conversation(
-            "captured-loss-target", "captured-loss-target", "/tmp", true, None, None,
-        ).await.unwrap();
-        let work_scope = crate::close_foundation::allocate_scope_worktree(
-            &database, &product.id,
-        ).await;
+        let owner = database
+            .get_or_create_coordinator(None, LlmLanguage::default())
+            .await
+            .unwrap();
+        let product = database
+            .create_conversation(
+                "captured-loss-target",
+                "captured-loss-target",
+                "/tmp",
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let work_scope =
+            crate::close_foundation::allocate_scope_worktree(&database, &product.id).await;
         let command = NativeCloseCommand::new(
             owner.id.clone(),
-            SourceToolCall { message_id: "loss-message".into(), tool_use_id: "loss-call".into() },
-            NativeCloseIntent::Initial { target: product.product_conversation_id },
-        ).unwrap();
+            SourceToolCall {
+                message_id: "loss-message".into(),
+                tool_use_id: "loss-call".into(),
+            },
+            NativeCloseIntent::Initial {
+                target: product.product_conversation_id,
+            },
+        )
+        .unwrap();
         let input = command.intent().source_input();
         let live = ConvState::ToolExecuting {
-            current_tool: ToolCall::new("loss-call", ToolInput::Unknown {
-                name: "close_conversation".into(), input: input.clone(),
-            }),
-            remaining_tools: Vec::new(), completed_results: Vec::new(), pending_sub_agents: Vec::new(),
+            current_tool: ToolCall::new(
+                "loss-call",
+                ToolInput::Unknown {
+                    name: "close_conversation".into(),
+                    input: input.clone(),
+                },
+            ),
+            remaining_tools: Vec::new(),
+            completed_results: Vec::new(),
+            pending_sub_agents: Vec::new(),
             assistant_message: AssistantMessage::new(
                 "loss-message".into(),
                 vec![ContentBlock::ToolUse {
-                    id: "loss-call".into(), name: "close_conversation".into(), input,
-                }], None, None,
+                    id: "loss-call".into(),
+                    name: "close_conversation".into(),
+                    input,
+                }],
+                None,
+                None,
             ),
         };
-        database.update_conversation_state(&owner.id, &live).await.unwrap();
+        database
+            .update_conversation_state(&owner.id, &live)
+            .await
+            .unwrap();
         let super::super::NativeCloseInitialResult::NewlyAdmitted(receipt) =
             established(database.apply_native_close_initial(&command).await)
-        else { panic!("expected initial admission") };
-        established(database.prepare_native_close_initial_execution(&command, &receipt, &live).await);
-        established(database.settle_native_close_initial(&command, &receipt, &live).await);
+        else {
+            panic!("expected initial admission")
+        };
+        established(
+            database
+                .prepare_native_close_initial_execution(&command, &receipt, &live)
+                .await,
+        );
+        established(
+            database
+                .settle_native_close_initial(&command, &receipt, &live)
+                .await,
+        );
         let run = CloseRunRef {
-            attempt_id: receipt.admitted.attempt_id.clone(), ordinal: CloseRunOrdinal::INITIAL,
+            attempt_id: receipt.admitted.attempt_id.clone(),
+            ordinal: CloseRunOrdinal::INITIAL,
         };
         let inspection = crate::ReplaceCloseInspectionRequest {
             attempt_id: run.attempt_id.clone(),
             scopes: vec![crate::ReplaceCloseInspectionScopeRequest {
                 scope: work_scope,
-                snapshot: CloseRetirementSnapshot::parse("loss-generation", "loss-fingerprint").unwrap(),
+                snapshot: CloseRetirementSnapshot::parse("loss-generation", "loss-fingerprint")
+                    .unwrap(),
                 losses: vec![CloseLossItem::UntrackedNonIgnoredPath(
                     GitPathIdentity::from_bytes(b"dirty-file".to_vec()),
                 )],
             }],
         };
-        established(database.terminalize_native_close_initial_losses(
-            &command, &receipt, &live, inspection, None, "unconfirmed dirty-file loss",
-        ).await);
+        established(
+            database
+                .terminalize_native_close_initial_losses(
+                    &command,
+                    &receipt,
+                    &live,
+                    inspection,
+                    None,
+                    "unconfirmed dirty-file loss",
+                )
+                .await,
+        );
         (database, command, run)
     }
 
     #[tokio::test]
     async fn exact_loss_origin_is_read_only_and_keeps_original_captured_identity() {
         let (db, command, run) = retained_loss_origin().await;
-        let before = db.list_close_cleanup_failures(run.attempt_id.as_str()).await.unwrap();
-        let context = db.read_native_close_captured_loss_retry_context(
-            command.intent().target(), &run,
-        ).await.unwrap();
+        let before = db
+            .list_close_cleanup_failures(run.attempt_id.as_str())
+            .await
+            .unwrap();
+        let context = db
+            .read_native_close_captured_loss_retry_context(command.intent().target(), &run)
+            .await
+            .unwrap();
         assert_eq!(context.initial_command(), &command);
         assert_eq!(context.failed_run(), &run);
         assert_eq!(context.losses().len(), 1);
         assert_eq!(context.inspections().len(), 1);
-        assert_eq!(context.scopes(), db.list_close_attempt_scopes(run.attempt_id.as_str()).await.unwrap());
+        assert_eq!(
+            context.scopes(),
+            db.list_close_attempt_scopes(run.attempt_id.as_str())
+                .await
+                .unwrap()
+        );
         assert_eq!(context.failure(), &before[0].occurrence);
         let scope = &context.scopes()[0].scope;
         sqlx::query("UPDATE work_scopes SET worktree_fingerprint = 'replacement' WHERE id = ?1")
-            .bind(scope.as_str()).execute(db.pool()).await.unwrap();
-        let reread = db.read_native_close_captured_loss_retry_context(
-            command.intent().target(), &run,
-        ).await.unwrap();
+            .bind(scope.as_str())
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let reread = db
+            .read_native_close_captured_loss_retry_context(command.intent().target(), &run)
+            .await
+            .unwrap();
         assert_eq!(reread, context);
-        assert_eq!(db.list_close_cleanup_failures(run.attempt_id.as_str()).await.unwrap(), before);
+        assert_eq!(
+            db.list_close_cleanup_failures(run.attempt_id.as_str())
+                .await
+                .unwrap(),
+            before
+        );
         let runs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM close_runs WHERE attempt_id = ?1")
-            .bind(run.attempt_id.as_str()).fetch_one(db.pool()).await.unwrap();
+            .bind(run.attempt_id.as_str())
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
         assert_eq!(runs, 1);
     }
 
     #[tokio::test]
-    async fn exact_observe_receipt_keeps_completed_initial_loss_origin_readable() {
+    async fn retained_observe_receipt_does_not_replace_initial_loss_provenance() {
         let (db, command, run) = retained_loss_origin().await;
-        let before = db.read_native_close_captured_loss_retry_context(
-            command.intent().target(), &run,
-        ).await.unwrap();
-        let failures = db.list_close_cleanup_failures(run.attempt_id.as_str()).await.unwrap();
+        let before = db
+            .read_native_close_captured_loss_retry_context(command.intent().target(), &run)
+            .await
+            .unwrap();
+        let failures = db
+            .list_close_cleanup_failures(run.attempt_id.as_str())
+            .await
+            .unwrap();
         let receipt_counts: (i64, i64) = sqlx::query_as(
             "SELECT COUNT(*), COUNT(CASE WHEN intent = 'initial' THEN 1 END)
              FROM native_close_initial_receipts WHERE attempt_id = ?1 AND run_ordinal = 1",
         )
-        .bind(run.attempt_id.as_str()).fetch_one(db.pool()).await.unwrap();
+        .bind(run.attempt_id.as_str())
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
         assert_eq!(receipt_counts, (1, 1));
 
         let observe = NativeCloseCommand::new(
@@ -426,45 +551,92 @@ mod tests {
                 attempt_id: run.attempt_id.clone(),
                 run_ordinal: run.ordinal,
             },
-        ).unwrap();
-        let input = observe.intent().source_input();
-        let live = ConvState::ToolExecuting {
-            current_tool: ToolCall::new("observe-loss-call", ToolInput::Unknown {
-                name: "close_conversation".into(), input: input.clone(),
-            }),
-            remaining_tools: Vec::new(), completed_results: Vec::new(), pending_sub_agents: Vec::new(),
-            assistant_message: AssistantMessage::new(
-                "observe-loss-message".into(),
-                vec![ContentBlock::ToolUse {
-                    id: "observe-loss-call".into(), name: "close_conversation".into(), input,
-                }], None, None,
-            ),
-        };
-        db.update_conversation_state(observe.source_transcript_id(), &live).await.unwrap();
-        let super::super::NativeCloseObserveResult::Observed(observation) =
-            established(db.apply_native_close_observe(&observe).await)
-        else { panic!("expected a new exact observation receipt") };
-        assert_eq!(observation.receipt.request_id, observe.request_id());
-        assert_eq!(observation.receipt.referenced, NativeCloseRunRef {
+        )
+        .unwrap();
+        let referenced = NativeCloseRunRef {
             target: command.intent().target().clone(),
-            attempt_id: run.attempt_id.clone(), run_ordinal: run.ordinal,
-        });
+            attempt_id: run.attempt_id.clone(),
+            run_ordinal: run.ordinal,
+        };
+        // Exercise the reader with an additional schema-valid retained receipt.
+        // This lower-level fixture does not assert Observe source admission or
+        // replace the original command: ordinary replacement must suppress it
+        // (covered separately below). Receipt lookup must select the initial
+        // provenance, not accidentally decode this Observe as a second origin.
+        let mut tx = db.pool().begin_with("BEGIN IMMEDIATE").await.unwrap();
+        super::super::receipts::adopt_and_insert_receipt_tx(&mut tx, &observe, &referenced)
+            .await
+            .unwrap();
+        assert_eq!(
+            super::super::receipts::read_receipt_tx(&mut tx, &observe)
+                .await
+                .unwrap(),
+            Some(referenced)
+        );
+        tx.commit().await.unwrap();
 
-        let after = db.read_native_close_captured_loss_retry_context(
-            command.intent().target(), &run,
-        ).await.unwrap();
+        let after = db
+            .read_native_close_captured_loss_retry_context(command.intent().target(), &run)
+            .await
+            .unwrap();
         assert_eq!(after, before);
         assert_eq!(after.initial_command(), &command);
         assert_ne!(after.initial_command(), &observe);
-        assert_eq!(db.list_close_cleanup_failures(run.attempt_id.as_str()).await.unwrap(), failures);
+        assert_eq!(
+            db.list_close_cleanup_failures(run.attempt_id.as_str())
+                .await
+                .unwrap(),
+            failures
+        );
         let counts: (i64, i64, i64, i64) = sqlx::query_as(
             "SELECT COUNT(*), COUNT(CASE WHEN intent = 'initial' THEN 1 END),
                     COUNT(CASE WHEN intent = 'observe' THEN 1 END),
                     (SELECT COUNT(*) FROM close_runs WHERE attempt_id = ?1)
              FROM native_close_initial_receipts WHERE attempt_id = ?1 AND run_ordinal = 1",
         )
-        .bind(run.attempt_id.as_str()).fetch_one(db.pool()).await.unwrap();
+        .bind(run.attempt_id.as_str())
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
         assert_eq!(counts, (2, 1, 1, 1));
+    }
+
+    #[tokio::test]
+    async fn original_source_replacement_suppresses_captured_loss_origin() {
+        let (db, command, run) = retained_loss_origin().await;
+        let before = db
+            .list_close_cleanup_failures(run.attempt_id.as_str())
+            .await
+            .unwrap();
+        db.read_native_close_captured_loss_retry_context(command.intent().target(), &run)
+            .await
+            .unwrap();
+        db.update_conversation_state(command.source_transcript_id(), &ConvState::Idle)
+            .await
+            .unwrap();
+        assert!(matches!(
+            db.read_native_close_captured_loss_retry_context(command.intent().target(), &run)
+                .await,
+            Err(DbError::CloseFoundationPrecondition(_))
+        ));
+        assert_eq!(
+            db.list_close_cleanup_failures(run.attempt_id.as_str())
+                .await
+                .unwrap(),
+            before
+        );
+        let counts: (i64, i64, i64) = sqlx::query_as(
+            "SELECT
+                (SELECT COUNT(*) FROM close_runs WHERE attempt_id = ?1),
+                (SELECT COUNT(*) FROM close_run_retry_effects WHERE attempt_id = ?1),
+                (SELECT COUNT(*) FROM close_completion_retry_allowances
+                 WHERE attempt_id = ?1 AND suppressed = 1)",
+        )
+        .bind(run.attempt_id.as_str())
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(counts, (1, 0, 1));
     }
 
     #[tokio::test]
@@ -474,8 +646,13 @@ mod tests {
             &ProductConversationId::parse("wrong-target").unwrap(), &run,
         ).await, Err(DbError::CloseFoundationPrecondition(message))
             if message == "captured loss retry requires an effect-free latest stopped native initial loss"));
-        sqlx::query("UPDATE close_completion_retry_allowances SET suppressed = 1 WHERE attempt_id = ?1")
-            .bind(run.attempt_id.as_str()).execute(db.pool()).await.unwrap();
+        sqlx::query(
+            "UPDATE close_completion_retry_allowances SET suppressed = 1 WHERE attempt_id = ?1",
+        )
+        .bind(run.attempt_id.as_str())
+        .execute(db.pool())
+        .await
+        .unwrap();
         assert!(matches!(db.read_native_close_captured_loss_retry_context(
             command.intent().target(), &run,
         ).await, Err(DbError::CloseFoundationPrecondition(message))
@@ -486,13 +663,22 @@ mod tests {
     async fn missing_origin_and_noninitial_runs_are_refused_read_only() {
         let db = Database::open_in_memory().await.unwrap();
         let target = ProductConversationId::parse("missing-target").unwrap();
-        let attempt_id = phoenix_core::domain::close::CloseAttemptId::parse("missing-attempt").unwrap();
+        let attempt_id =
+            phoenix_core::domain::close::CloseAttemptId::parse("missing-attempt").unwrap();
         for ordinal in [CloseRunOrdinal::INITIAL, CloseRunOrdinal::parse(2).unwrap()] {
-            let run = CloseRunRef { attempt_id: attempt_id.clone(), ordinal };
-            assert!(db.read_native_close_captured_loss_retry_context(&target, &run).await.is_err());
+            let run = CloseRunRef {
+                attempt_id: attempt_id.clone(),
+                ordinal,
+            };
+            assert!(db
+                .read_native_close_captured_loss_retry_context(&target, &run)
+                .await
+                .is_err());
         }
         let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM close_runs")
-            .fetch_one(db.pool()).await.unwrap();
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
         assert_eq!(count, 0);
     }
 }

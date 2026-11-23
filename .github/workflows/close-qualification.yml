@@ -352,7 +352,8 @@ jobs:
           grep -E 'test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored;' evidence/native-close-db.log
           for test in \
             exact_loss_origin_is_read_only_and_keeps_original_captured_identity \
-            exact_observe_receipt_keeps_completed_initial_loss_origin_readable \
+            retained_observe_receipt_does_not_replace_initial_loss_provenance \
+            original_source_replacement_suppresses_captured_loss_origin \
             wrong_target_and_durable_suppression_refuse_loss_origin \
             missing_origin_and_noninitial_runs_are_refused_read_only; do
             grep -F "native_close::captured_loss_retry::tests::$test: test" evidence/inventory.log
