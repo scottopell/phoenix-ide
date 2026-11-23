@@ -150,7 +150,11 @@ impl DisposableGit {
         };
         git.run(
             &git.repo,
-            &["init", "--initial-branch=main", "--template=../empty-template"],
+            &[
+                "init",
+                "--initial-branch=main",
+                "--template=../empty-template",
+            ],
         );
         for (key, value) in [
             ("user.name", "Disposable Close Fixture"),
@@ -192,7 +196,9 @@ impl DisposableGit {
         git.sibling_admin = git.administrative_directory(&git.sibling);
         assert_ne!(git.admin, git.sibling_admin);
         assert!(git.admin.starts_with(git.repo.join(".git/worktrees")));
-        assert!(git.sibling_admin.starts_with(git.repo.join(".git/worktrees")));
+        assert!(git
+            .sibling_admin
+            .starts_with(git.repo.join(".git/worktrees")));
         git.checkout_identity = directory_identity(&git.worktree);
         git.admin_identity = directory_identity(&git.admin);
         assert_ne!(git.checkout_identity, directory_identity(&git.sibling));
@@ -221,7 +227,10 @@ impl DisposableGit {
         );
         let output = Command::new("git")
             .env_clear()
-            .env("PATH", std::env::var_os("PATH").expect("Git is available on PATH"))
+            .env(
+                "PATH",
+                std::env::var_os("PATH").expect("Git is available on PATH"),
+            )
             .env("HOME", self.root.join("home"))
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
@@ -335,9 +344,15 @@ impl DisposableGit {
         assert_ne!(replacement_admin, self.admin);
         assert_ne!(replacement_fingerprint, self.fingerprint);
         assert_ne!(directory_identity(&self.worktree), self.checkout_identity);
-        assert_eq!(directory_identity(&retained_original), self.checkout_identity);
+        assert_eq!(
+            directory_identity(&retained_original),
+            self.checkout_identity
+        );
         assert_eq!(directory_identity(&self.admin), self.admin_identity);
-        assert_eq!(self.administrative_directory(&retained_original), self.admin);
+        assert_eq!(
+            self.administrative_directory(&retained_original),
+            self.admin
+        );
         self.original_refs = self.run(
             &self.repo,
             &["for-each-ref", "--format=%(refname) %(objectname)"],
@@ -351,7 +366,10 @@ impl DisposableGit {
 
     fn assert_untargeted_state_preserved(&self) {
         assert_eq!(
-            self.run(&self.repo, &["for-each-ref", "--format=%(refname) %(objectname)"]),
+            self.run(
+                &self.repo,
+                &["for-each-ref", "--format=%(refname) %(objectname)"]
+            ),
             self.original_refs
         );
         assert_eq!(
@@ -495,7 +513,10 @@ async fn run_public_worktree_close(journey: WorktreeJourney) {
     .await
     .expect("public native Close must return a bounded admission result");
     if stop_before_admission {
-        assert!(!output.is_success(), "an acknowledged Stop cannot admit Close");
+        assert!(
+            !output.is_success(),
+            "an acknowledged Stop cannot admit Close"
+        );
         let rejection: Value = serde_json::from_str(&output.output()).unwrap();
         assert_eq!(rejection["code"], "source_refused");
         assert_eq!(close_row_counts(&fixture).await, vec![0; 9]);
@@ -509,7 +530,14 @@ async fn run_public_worktree_close(journey: WorktreeJourney) {
                 .1,
             WorkScopeLifecycle::Active
         );
-        assert!(!fixture.db.get_conversation(TARGET_ID).await.unwrap().archived);
+        assert!(
+            !fixture
+                .db
+                .get_conversation(TARGET_ID)
+                .await
+                .unwrap()
+                .archived
+        );
         assert_eq!(physical_snapshot(&git.root), physical_before_admission);
         assert_eq!(directory_identity(&git.admin), git.admin_identity);
         if let Some(reused) = &reused_path {
@@ -517,8 +545,14 @@ async fn run_public_worktree_close(journey: WorktreeJourney) {
                 directory_identity(&reused.retained_original),
                 git.checkout_identity
             );
-            assert_eq!(git.administrative_directory(&reused.retained_original), git.admin);
-            assert_eq!(git.administrative_directory(&git.worktree), reused.replacement_admin);
+            assert_eq!(
+                git.administrative_directory(&reused.retained_original),
+                git.admin
+            );
+            assert_eq!(
+                git.administrative_directory(&git.worktree),
+                reused.replacement_admin
+            );
             assert_eq!(
                 phoenix_core::git::observe_linked_worktree_fingerprint(&git.worktree).as_deref(),
                 Some(reused.replacement_fingerprint.as_str())
@@ -621,7 +655,9 @@ async fn run_public_worktree_close(journey: WorktreeJourney) {
         assert_eq!(captured[0].scope, scope);
         assert_eq!(
             captured[0].captured_worktree,
-            Some(CapturedWorktreeIdentity::Resolved(original_worktree.clone()))
+            Some(CapturedWorktreeIdentity::Resolved(
+                original_worktree.clone()
+            ))
         );
         let expected = fixture
             .db
@@ -774,7 +810,11 @@ async fn run_public_worktree_close(journey: WorktreeJourney) {
             .filter(|message| message.message_id == outcome_message_id)
             .collect();
         assert_eq!(close_messages.len(), 1);
-        assert_eq!(messages.len(), 1, "History contains exactly the Close outcome");
+        assert_eq!(
+            messages.len(),
+            1,
+            "History contains exactly the Close outcome"
+        );
         assert_eq!(
             close_messages[0].content.to_json(),
             phoenix_core::domain::db_schema::MessageContent::system(format!(

@@ -1023,7 +1023,9 @@ impl RuntimeManager {
             db: self.db().clone(),
             runtime: tokio::runtime::Handle::current(),
             run: CloseRunRef::initial(receipt.admitted.attempt_id.clone()),
-            scope, snapshot, resource,
+            scope,
+            snapshot,
+            resource,
         }
     }
 
@@ -5879,7 +5881,15 @@ unsafe fn renameat_exclusive(
     destination: *const libc::c_char,
 ) -> libc::c_int {
     // SAFETY: caller supplies valid descriptors and NUL-terminated names.
-    unsafe { libc::renameatx_np(directory, source, destination_directory, destination, libc::RENAME_EXCL) }
+    unsafe {
+        libc::renameatx_np(
+            directory,
+            source,
+            destination_directory,
+            destination,
+            libc::RENAME_EXCL,
+        )
+    }
 }
 
 #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
@@ -5904,7 +5914,11 @@ struct DeletionEntryIdentity {
 impl DeletionEntryIdentity {
     #[allow(clippy::cast_sign_loss, clippy::unnecessary_cast)]
     fn from_stat(stat: &libc::stat) -> Self {
-        Self { device: stat.st_dev as u64, inode: stat.st_ino as u64, kind: stat.st_mode & libc::S_IFMT }
+        Self {
+            device: stat.st_dev as u64,
+            inode: stat.st_ino as u64,
+            kind: stat.st_mode & libc::S_IFMT,
+        }
     }
 
     fn pair(self) -> (u64, u64) {
@@ -5918,7 +5932,10 @@ fn deletion_descriptor_stat(descriptor: &std::os::fd::OwnedFd) -> Result<libc::s
     let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
     // SAFETY: descriptor is retained and stat is writable.
     if unsafe { libc::fstat(descriptor.as_raw_fd(), stat.as_mut_ptr()) } < 0 {
-        return Err(format!("cannot identify retained deletion descriptor: {}", std::io::Error::last_os_error()));
+        return Err(format!(
+            "cannot identify retained deletion descriptor: {}",
+            std::io::Error::last_os_error()
+        ));
     }
     // SAFETY: fstat initialized stat.
     Ok(unsafe { stat.assume_init() })
@@ -5932,8 +5949,19 @@ fn deletion_slot_stat(
     use std::os::fd::AsRawFd as _;
     let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
     // SAFETY: parent/name are retained; no symlink is followed.
-    if unsafe { libc::fstatat(parent.as_raw_fd(), name.as_ptr(), stat.as_mut_ptr(), libc::AT_SYMLINK_NOFOLLOW) } < 0 {
-        return Err(format!("cannot revalidate deletion slot: {}", std::io::Error::last_os_error()));
+    if unsafe {
+        libc::fstatat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            stat.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    } < 0
+    {
+        return Err(format!(
+            "cannot revalidate deletion slot: {}",
+            std::io::Error::last_os_error()
+        ));
     }
     // SAFETY: fstatat initialized stat.
     Ok(unsafe { stat.assume_init() })
@@ -5943,14 +5971,25 @@ fn deletion_slot_stat(
 fn open_deletion_parent(path: &Path) -> Result<std::sync::Arc<std::os::fd::OwnedFd>, String> {
     use std::os::fd::FromRawFd as _;
     use std::os::unix::ffi::OsStrExt as _;
-    let path = std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|_| "deletion parent contains NUL")?;
+    let path = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| "deletion parent contains NUL")?;
     // SAFETY: path is a valid C string; reject a symlink at the parent slot.
-    let fd = unsafe { libc::open(path.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC) };
+    let fd = unsafe {
+        libc::open(
+            path.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
     if fd < 0 {
-        return Err(format!("cannot retain deletion parent: {}", std::io::Error::last_os_error()));
+        return Err(format!(
+            "cannot retain deletion parent: {}",
+            std::io::Error::last_os_error()
+        ));
     }
     // SAFETY: fd is newly owned.
-    Ok(std::sync::Arc::new(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) }))
+    Ok(std::sync::Arc::new(unsafe {
+        std::os::fd::OwnedFd::from_raw_fd(fd)
+    }))
 }
 
 /// Pins BOTH the entry and its parent, not merely the parent descriptor. Each
@@ -5979,16 +6018,26 @@ impl OwnedDeletionSlot {
         } else {
             // Retain symlinks themselves and avoid opening FIFOs/devices for I/O.
             #[cfg(target_os = "linux")]
-            { libc::O_PATH | libc::O_NOFOLLOW }
+            {
+                libc::O_PATH | libc::O_NOFOLLOW
+            }
             #[cfg(target_os = "macos")]
-            { libc::O_EVTONLY | libc::O_SYMLINK }
+            {
+                libc::O_EVTONLY | libc::O_SYMLINK
+            }
             #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-            { return Err("retained deletion slots unsupported on this Unix platform".into()); }
+            {
+                return Err("retained deletion slots unsupported on this Unix platform".into());
+            }
         };
         // SAFETY: parent/name are live; flags do not follow the entry symlink.
-        let fd = unsafe { libc::openat(parent.as_raw_fd(), name.as_ptr(), flags | libc::O_CLOEXEC) };
+        let fd =
+            unsafe { libc::openat(parent.as_raw_fd(), name.as_ptr(), flags | libc::O_CLOEXEC) };
         if fd < 0 {
-            return Err(format!("cannot retain deletion slot: {}", std::io::Error::last_os_error()));
+            return Err(format!(
+                "cannot retain deletion slot: {}",
+                std::io::Error::last_os_error()
+            ));
         }
         // SAFETY: fd is newly owned.
         let retained = std::sync::Arc::new(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) });
@@ -6004,9 +6053,12 @@ impl OwnedDeletionSlot {
     }
 
     fn validate(&self) -> Result<(), String> {
-        if DeletionEntryIdentity::from_stat(&deletion_descriptor_stat(&self.parent)?) != self.parent_identity
-            || DeletionEntryIdentity::from_stat(&deletion_descriptor_stat(&self.retained)?) != self.identity
-            || DeletionEntryIdentity::from_stat(&deletion_slot_stat(&self.parent, &self.name)?) != self.identity
+        if DeletionEntryIdentity::from_stat(&deletion_descriptor_stat(&self.parent)?)
+            != self.parent_identity
+            || DeletionEntryIdentity::from_stat(&deletion_descriptor_stat(&self.retained)?)
+                != self.identity
+            || DeletionEntryIdentity::from_stat(&deletion_slot_stat(&self.parent, &self.name)?)
+                != self.identity
         {
             return Err("identity-bound deletion slot was replaced; replacement preserved".into());
         }
@@ -6017,10 +6069,17 @@ impl OwnedDeletionSlot {
         use std::os::fd::AsRawFd as _;
         check_directory_deletion_deadline(deadline)?;
         self.validate()?;
-        let flags = if self.identity.kind == libc::S_IFDIR { libc::AT_REMOVEDIR } else { 0 };
+        let flags = if self.identity.kind == libc::S_IFDIR {
+            libc::AT_REMOVEDIR
+        } else {
+            0
+        };
         // SAFETY: self retains descriptor/name/identity through this syscall.
         if unsafe { libc::unlinkat(self.parent.as_raw_fd(), self.name.as_ptr(), flags) } < 0 {
-            return Err(format!("cannot unlink identity-bound deletion slot: {}", std::io::Error::last_os_error()));
+            return Err(format!(
+                "cannot unlink identity-bound deletion slot: {}",
+                std::io::Error::last_os_error()
+            ));
         }
         Ok(())
     }
@@ -6046,10 +6105,19 @@ impl OwnedWorktreeRenameLeaf {
         let object = std::ffi::CString::new("object").expect("static name");
         // SAFETY: self retains both verified descriptors and names. The kernel
         // supplies non-overwrite semantics; the source identity check is separate.
-        if unsafe { renameat_exclusive(self.source.parent.as_raw_fd(), self.source.name.as_ptr(), self.root.retained.as_raw_fd(), object.as_ptr()) } < 0 {
+        if unsafe {
+            renameat_exclusive(
+                self.source.parent.as_raw_fd(),
+                self.source.name.as_ptr(),
+                self.root.retained.as_raw_fd(),
+                object.as_ptr(),
+            )
+        } < 0
+        {
             return Ok(Err(std::io::Error::last_os_error()));
         }
-        let moved = DeletionEntryIdentity::from_stat(&deletion_slot_stat(&self.root.retained, &object)?);
+        let moved =
+            DeletionEntryIdentity::from_stat(&deletion_slot_stat(&self.root.retained, &object)?);
         if moved != self.source.identity {
             return Err("final tombstone object differs from owned rename source".into());
         }
@@ -6317,7 +6385,11 @@ where
             let (slot, moved) = bind_deletion_entry_to_private_slot_with_executor(
                 directory, name, &metadata, deadline, executor,
             )?;
-            let witness = OwnedDeletionSlot::capture(directory, &slot, DeletionEntryIdentity::from_stat(&moved))?;
+            let witness = OwnedDeletionSlot::capture(
+                directory,
+                &slot,
+                DeletionEntryIdentity::from_stat(&moved),
+            )?;
             if witness.identity.kind == libc::S_IFDIR {
                 remove_directory_contents_at_with_hook_and_deadline_with_executor(
                     &witness.retained,
@@ -6458,8 +6530,13 @@ fn remove_empty_tombstone_before_deadline_with_executor<E: WorktreeMutationExecu
     {
         use std::os::unix::ffi::OsStrExt as _;
         let parent = open_deletion_parent(tombstone.parent().ok_or("tombstone has no parent")?)?;
-        let name = std::ffi::CString::new(tombstone.file_name().ok_or("tombstone has no name")?.as_bytes())
-            .map_err(|_| "tombstone name contains NUL")?;
+        let name = std::ffi::CString::new(
+            tombstone
+                .file_name()
+                .ok_or("tombstone has no name")?
+                .as_bytes(),
+        )
+        .map_err(|_| "tombstone name contains NUL")?;
         let stat = deletion_slot_stat(&parent, &name)?;
         let identity = DeletionEntryIdentity::from_stat(&stat);
         if identity.kind != libc::S_IFDIR {
@@ -6563,8 +6640,7 @@ impl<F, B, A, O, E: WorktreeMutationExecutor> WorktreeMutationExecutor
     }
 }
 
-impl<F, B, A, O, E> WorktreeDeletionDriver
-    for CallbackWorktreeDeletionDriver<'_, F, B, A, O, E>
+impl<F, B, A, O, E> WorktreeDeletionDriver for CallbackWorktreeDeletionDriver<'_, F, B, A, O, E>
 where
     F: FnOnce(&Path),
     B: FnMut(&Path, (u64, u64), Option<(u64, u64)>) -> Result<(), String>,
@@ -6577,7 +6653,12 @@ where
         Ok(())
     }
 
-    fn bind_root(&mut self, root: &Path, identity: (u64, u64), object: Option<(u64, u64)>) -> Result<(), String> {
+    fn bind_root(
+        &mut self,
+        root: &Path,
+        identity: (u64, u64),
+        object: Option<(u64, u64)>,
+    ) -> Result<(), String> {
         (self.bind)(root, identity, object)
     }
 
@@ -6642,7 +6723,11 @@ fn remove_identity_bound_directory_with_driver<D: WorktreeDeletionDriver>(
 }
 
 #[cfg(unix)]
-#[allow(clippy::too_many_lines, clippy::cast_sign_loss, clippy::unnecessary_cast)]
+#[allow(
+    clippy::too_many_lines,
+    clippy::cast_sign_loss,
+    clippy::unnecessary_cast
+)]
 fn remove_identity_bound_directory_with_driver<D: WorktreeDeletionDriver>(
     deletion_target: &Path,
     tombstone_root: Option<&Path>,
@@ -6670,15 +6755,27 @@ fn remove_identity_bound_directory_with_driver<D: WorktreeDeletionDriver>(
     use std::os::fd::AsRawFd as _;
     use std::os::unix::ffi::OsStrExt as _;
     let parent_descriptor = open_deletion_parent(parent)?;
-    let source_name = std::ffi::CString::new(deletion_target.file_name().ok_or("missing deletion leaf")?.as_bytes())
-        .map_err(|_| "deletion source name contains NUL")?;
-    let source_identity = DeletionEntryIdentity::from_stat(&deletion_slot_stat(&parent_descriptor, &source_name)?);
+    let source_name = std::ffi::CString::new(
+        deletion_target
+            .file_name()
+            .ok_or("missing deletion leaf")?
+            .as_bytes(),
+    )
+    .map_err(|_| "deletion source name contains NUL")?;
+    let source_identity =
+        DeletionEntryIdentity::from_stat(&deletion_slot_stat(&parent_descriptor, &source_name)?);
     if source_identity.kind != libc::S_IFDIR {
         return Err("final deletion source is not a no-follow directory".into());
     }
-    let source_witness = OwnedDeletionSlot::capture(&parent_descriptor, &source_name, source_identity)?;
-    let root_name = std::ffi::CString::new(tombstone_root.file_name().ok_or("missing tombstone leaf")?.as_bytes())
-        .map_err(|_| "tombstone name contains NUL")?;
+    let source_witness =
+        OwnedDeletionSlot::capture(&parent_descriptor, &source_name, source_identity)?;
+    let root_name = std::ffi::CString::new(
+        tombstone_root
+            .file_name()
+            .ok_or("missing tombstone leaf")?
+            .as_bytes(),
+    )
+    .map_err(|_| "tombstone name contains NUL")?;
     // Creation and descriptor binding complete in one admitted callback, before
     // the durable root bind or any move. Never reopen this reservation by path.
     let root_witness = if fresh_root || !tombstone_root.exists() {
@@ -6686,15 +6783,28 @@ fn remove_identity_bound_directory_with_driver<D: WorktreeDeletionDriver>(
         executor.execute(move || {
             check_directory_deletion_deadline(deadline)?;
             // SAFETY: descriptor/name are owned; mkdirat never replaces an entry.
-            if unsafe { libc::mkdirat(parent_descriptor.as_raw_fd(), root_name.as_ptr(), 0o700) } < 0 {
-                return Err(format!("cannot reserve private tombstone: {}", std::io::Error::last_os_error()));
+            if unsafe { libc::mkdirat(parent_descriptor.as_raw_fd(), root_name.as_ptr(), 0o700) }
+                < 0
+            {
+                return Err(format!(
+                    "cannot reserve private tombstone: {}",
+                    std::io::Error::last_os_error()
+                ));
             }
             let stat = deletion_slot_stat(&parent_descriptor, &root_name)?;
-            OwnedDeletionSlot::capture(&parent_descriptor, &root_name, DeletionEntryIdentity::from_stat(&stat))
+            OwnedDeletionSlot::capture(
+                &parent_descriptor,
+                &root_name,
+                DeletionEntryIdentity::from_stat(&stat),
+            )
         })?
     } else {
         let stat = deletion_slot_stat(&parent_descriptor, &root_name)?;
-        OwnedDeletionSlot::capture(&parent_descriptor, &root_name, DeletionEntryIdentity::from_stat(&stat))?
+        OwnedDeletionSlot::capture(
+            &parent_descriptor,
+            &root_name,
+            DeletionEntryIdentity::from_stat(&stat),
+        )?
     };
     let root_stat = deletion_descriptor_stat(&root_witness.retained)?;
     validate_private_tombstone_root(
@@ -6716,11 +6826,14 @@ fn remove_identity_bound_directory_with_driver<D: WorktreeDeletionDriver>(
     check_directory_deletion_deadline(deadline)?;
     // Keep syscall failure distinct from executor refusal: refusal must return
     // immediately, without even a compensating tombstone cleanup admission.
-    let rename_result = executor.rename_to_tombstone(OwnedWorktreeRenameLeaf {
-        source_path: deletion_target.to_path_buf(),
-        source: source_witness.clone(),
-        root: root_witness.clone(),
-    }, deadline)?;
+    let rename_result = executor.rename_to_tombstone(
+        OwnedWorktreeRenameLeaf {
+            source_path: deletion_target.to_path_buf(),
+            source: source_witness.clone(),
+            root: root_witness.clone(),
+        },
+        deadline,
+    )?;
     if let Err(error) = rename_result {
         // Legacy callers may clean their empty reservation. Native Close stops
         // at the first failed syscall and retains the bound root as evidence.
@@ -14664,14 +14777,29 @@ mod tests {
 
     #[cfg(unix)]
     impl super::WorktreeDeletionDriver for BoundaryDeletionDriver {
-        fn allows_existing_root(&self) -> bool { false }
-        fn cleanup_after_failure(&self) -> bool { false }
-        fn before_move(&mut self, _: &std::path::Path) -> Result<(), String> { Ok(()) }
-        fn bind_root(&mut self, _: &std::path::Path, _: (u64, u64), _: Option<(u64, u64)>) -> Result<(), String> { Ok(()) }
+        fn allows_existing_root(&self) -> bool {
+            false
+        }
+        fn cleanup_after_failure(&self) -> bool {
+            false
+        }
+        fn before_move(&mut self, _: &std::path::Path) -> Result<(), String> {
+            Ok(())
+        }
+        fn bind_root(
+            &mut self,
+            _: &std::path::Path,
+            _: (u64, u64),
+            _: Option<(u64, u64)>,
+        ) -> Result<(), String> {
+            Ok(())
+        }
         fn observe_identity(&mut self, object: &std::path::Path) -> Result<String, String> {
             observe_administrative_dir_incarnation(object)
         }
-        fn after_move(&mut self, _: &std::path::Path, _: &std::path::Path) -> Result<(), String> { Ok(()) }
+        fn after_move(&mut self, _: &std::path::Path, _: &std::path::Path) -> Result<(), String> {
+            Ok(())
+        }
     }
 
     #[cfg(unix)]
@@ -14695,7 +14823,9 @@ mod tests {
             let mut executor = BoundaryReplacingExecutor {
                 attempts: 0,
                 before_effect: Box::new(move |attempt| {
-                    if attempt != 2 { return; }
+                    if attempt != 2 {
+                        return;
+                    }
                     let slot = preserved_private_slot(&effect_root);
                     std::fs::rename(&slot, &effect_displaced).unwrap();
                     match kind {
@@ -14706,13 +14836,20 @@ mod tests {
                 }),
             };
             let error = super::remove_directory_contents_at_with_hook_and_deadline_with_executor(
-                &std::sync::Arc::new(open_directory(&root)), &mut |_, _| {}, None, &mut executor,
-            ).unwrap_err();
+                &std::sync::Arc::new(open_directory(&root)),
+                &mut |_, _| {},
+                None,
+                &mut executor,
+            )
+            .unwrap_err();
             assert!(error.contains("slot was replaced"), "{kind}: {error}");
             assert_eq!(executor.attempts, 2, "no later leaf or compensation");
             let slot = preserved_private_slot(&root);
             assert!(std::fs::symlink_metadata(&displaced).is_ok());
-            assert!(std::fs::symlink_metadata(&slot).is_ok(), "replacement survives");
+            assert!(
+                std::fs::symlink_metadata(&slot).is_ok(),
+                "replacement survives"
+            );
             if kind == "file" {
                 assert_eq!(std::fs::read(slot).unwrap(), b"replacement");
                 assert_eq!(std::fs::read(displaced).unwrap(), b"original");
@@ -14738,15 +14875,27 @@ mod tests {
             let mut driver = BoundaryDeletionDriver(BoundaryReplacingExecutor {
                 attempts: 0,
                 before_effect: Box::new(move |attempt| {
-                    if attempt != replace_at { return; }
-                    let slot = if replace_at == 3 { effect_root.join("object") } else { effect_root.clone() };
+                    if attempt != replace_at {
+                        return;
+                    }
+                    let slot = if replace_at == 3 {
+                        effect_root.join("object")
+                    } else {
+                        effect_root.clone()
+                    };
                     std::fs::rename(&slot, &effect_displaced).unwrap();
                     std::fs::create_dir(&slot).unwrap();
                 }),
             });
             let error = super::remove_identity_bound_directory_with_driver(
-                &source, Some(&root), &identity, "test", None, &mut driver,
-            ).unwrap_err();
+                &source,
+                Some(&root),
+                &identity,
+                "test",
+                None,
+                &mut driver,
+            )
+            .unwrap_err();
             assert!(error.contains("slot was replaced"), "{error}");
             assert_eq!(driver.0.attempts, replace_at);
             assert!(displaced.is_dir());
@@ -14758,7 +14907,13 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn admitted_final_rename_rejects_replaced_source_root_and_occupied_object() {
-        for replacement in ["source-directory", "source-symlink", "root-directory", "root-symlink", "occupied-object"] {
+        for replacement in [
+            "source-directory",
+            "source-symlink",
+            "root-directory",
+            "root-symlink",
+            "occupied-object",
+        ] {
             let temp = tempfile::tempdir().unwrap();
             let source = temp.path().join("source");
             let root = temp.path().join("root");
@@ -14776,13 +14931,19 @@ mod tests {
             let mut driver = BoundaryDeletionDriver(BoundaryReplacingExecutor {
                 attempts: 0,
                 before_effect: Box::new(move |attempt| {
-                    if attempt != 2 { return; }
+                    if attempt != 2 {
+                        return;
+                    }
                     if replacement == "occupied-object" {
                         // Empty directory would be overwritten by ordinary rename.
                         std::fs::create_dir(effect_root.join("object")).unwrap();
                         return;
                     }
-                    let slot = if replacement.starts_with("source") { &effect_source } else { &effect_root };
+                    let slot = if replacement.starts_with("source") {
+                        &effect_source
+                    } else {
+                        &effect_root
+                    };
                     std::fs::rename(slot, &effect_displaced).unwrap();
                     if replacement.ends_with("symlink") {
                         std::os::unix::fs::symlink(&effect_external, slot).unwrap();
@@ -14791,13 +14952,32 @@ mod tests {
                     }
                 }),
             });
-            assert!(super::remove_identity_bound_directory_with_driver(
-                &source, Some(&root), &identity, "test", None, &mut driver,
-            ).is_err(), "{replacement}");
+            assert!(
+                super::remove_identity_bound_directory_with_driver(
+                    &source,
+                    Some(&root),
+                    &identity,
+                    "test",
+                    None,
+                    &mut driver,
+                )
+                .is_err(),
+                "{replacement}"
+            );
             assert_eq!(driver.0.attempts, 2, "no compensation or later deletion");
-            assert_eq!(std::fs::read(external.join("sentinel")).unwrap(), b"external");
-            assert!(!external.join("object").exists(), "root symlink must not redirect rename");
-            let original = if replacement.starts_with("source") { &displaced } else { &source };
+            assert_eq!(
+                std::fs::read(external.join("sentinel")).unwrap(),
+                b"external"
+            );
+            assert!(
+                !external.join("object").exists(),
+                "root symlink must not redirect rename"
+            );
+            let original = if replacement.starts_with("source") {
+                &displaced
+            } else {
+                &source
+            };
             assert_eq!(std::fs::read(original.join("owned")).unwrap(), b"original");
             assert!(std::fs::symlink_metadata(&root).is_ok());
             if replacement == "occupied-object" {
@@ -15013,13 +15193,18 @@ mod tests {
         let root = temp.path().join("tombstone");
         let mut executor = RecordingWorktreeMutationExecutor::default();
         let error = super::remove_identity_bound_directory_with_deadline_with_executor(
-            &target, Some(&root), "unused",
+            &target,
+            Some(&root),
+            "unused",
             |_| panic!("missing source must not inspect an object"),
             |_| {},
             |_, _, _| panic!("missing source must not bind a reservation"),
             |_, _| panic!("missing source must not delete an object"),
-            "test directory", None, &mut executor,
-        ).unwrap_err();
+            "test directory",
+            None,
+            &mut executor,
+        )
+        .unwrap_err();
         assert!(error.contains("cannot revalidate deletion slot"));
         assert_eq!(executor.attempts, 0);
         assert_eq!(executor.executed, 0);
@@ -15230,7 +15415,11 @@ mod tests {
             fn observe_identity(&mut self, _: &std::path::Path) -> Result<String, String> {
                 panic!("failed final move must not observe or delete an object")
             }
-            fn after_move(&mut self, _: &std::path::Path, _: &std::path::Path) -> Result<(), String> {
+            fn after_move(
+                &mut self,
+                _: &std::path::Path,
+                _: &std::path::Path,
+            ) -> Result<(), String> {
                 panic!("failed final move must not continue the deletion graph")
             }
         }
@@ -15258,8 +15447,14 @@ mod tests {
 
         assert!(error.contains("cannot revalidate deletion slot"));
         assert_eq!(driver.effects, 2, "no compensating rmdir may be admitted");
-        assert!(root.is_dir(), "bound empty final root remains recovery evidence");
-        assert_eq!(std::fs::read(displaced.join("sentinel")).unwrap(), b"preserve\n");
+        assert!(
+            root.is_dir(),
+            "bound empty final root remains recovery evidence"
+        );
+        assert_eq!(
+            std::fs::read(displaced.join("sentinel")).unwrap(),
+            b"preserve\n"
+        );
     }
 
     #[cfg(unix)]
@@ -16314,7 +16509,8 @@ mod tests {
             b"fatal: fsmonitor--daemon is not supported on this platform\n".as_slice(),
             b"fatal: fsmonitor--daemon not supported\n".as_slice(),
             b"fatal: permission denied\n".as_slice(),
-            b"fatal: fsmonitor--daemon not supported on this platform\nwarning: unknown failure\n".as_slice(),
+            b"fatal: fsmonitor--daemon not supported on this platform\nwarning: unknown failure\n"
+                .as_slice(),
             b" fatal: fsmonitor--daemon not supported on this platform\n".as_slice(),
             b"fatal: fsmonitor--daemon not supported on this platform\n\n".as_slice(),
         ] {

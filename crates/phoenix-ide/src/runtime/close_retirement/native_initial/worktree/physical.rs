@@ -4,10 +4,12 @@
 //! SQLite writer. Unsupported states remain preserved, never successful absence.
 
 use std::{
+    fmt::Write as _,
     sync::{Arc, Mutex},
     thread::JoinHandle,
 };
 
+use sha2::{Digest, Sha256};
 use tokio::sync::watch;
 
 use phoenix_core::{
@@ -22,19 +24,17 @@ use phoenix_db::validate_close_retirement_inspection_aggregate;
 use std::path::{Path, PathBuf};
 
 use super::super::super::{
-    CloseWriterProbe, WorktreeDeletionDriver, WorktreeMutationExecutor,
-    administrative_final_residue_prefix,
-    ensure_no_ignored_content_with_status_leaf_until, inspect_worktree_at_with_git_leaf_until,
-    observe_administrative_dir_incarnation, quarantine_has_external_writer_until,
-    remove_identity_bound_directory_with_driver, stop_bound_fsmonitor_with_leaf_until,
-    worktree_quarantine_path,
+    ensure_no_ignored_content_with_status_leaf_until,
+    inspect_worktree_at_with_git_leaf_until, observe_administrative_dir_incarnation,
+    quarantine_has_external_writer_until, remove_identity_bound_directory_with_driver,
+    stop_bound_fsmonitor_with_leaf_until, worktree_quarantine_path, CloseWriterProbe,
+    WorktreeDeletionDriver, WorktreeMutationExecutor,
 };
-use super::{NativeWorktreeGitContinuation, WorkerAuthority, WorkerCustody};
 use super::git_leaf::{
-    GitLeafTarget, RetainedRootLocation, bind_shared_root_command,
-    require_absent, run_git_leaf,
+    bind_shared_root_command, require_absent, run_git_leaf, GitLeafTarget, RetainedRootLocation,
 };
 use super::mutation::OriginalWorktreeMutationExecutor;
+use super::{NativeWorktreeGitContinuation, WorkerAuthority, WorkerCustody};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum WorktreePhysicalOutcome {
@@ -76,9 +76,9 @@ impl NativeWorktreeGitContinuation {
         runtime: tokio::runtime::Handle,
         mut writer_probe: CloseWriterProbe,
     ) -> WorktreePhysicalObservation {
-        writer_probe.persistence_uncertain.get_or_insert_with(|| {
-            Arc::new(std::sync::atomic::AtomicBool::new(false))
-        });
+        writer_probe
+            .persistence_uncertain
+            .get_or_insert_with(|| Arc::new(std::sync::atomic::AtomicBool::new(false)));
         let (ready_tx, ready) = watch::channel(false);
         let fatal = Arc::clone(&self.original_effect.fatal);
         // Custody exists before installing the thread, not inside an async body.
@@ -143,10 +143,9 @@ impl WorktreePhysicalObservation {
     pub(crate) async fn observe(&self) -> Result<WorktreePhysicalOutcome, String> {
         let mut ready = self.ready.clone();
         while !*ready.borrow() {
-            ready
-                .changed()
-                .await
-                .map_err(|_| "native physical Worktree worker ended without classification".to_string())?;
+            ready.changed().await.map_err(|_| {
+                "native physical Worktree worker ended without classification".to_string()
+            })?;
         }
         self.state
             .result
@@ -162,7 +161,9 @@ fn run_physical_worker(state: &PhysicalState, runtime: &tokio::runtime::Handle) 
         .custody
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let custody = slot.as_mut().expect("physical custody installed before spawn");
+    let custody = slot
+        .as_mut()
+        .expect("physical custody installed before spawn");
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         retire_clean_linked_worktree(custody, runtime)
     }));
@@ -185,9 +186,11 @@ fn run_physical_worker(state: &PhysicalState, runtime: &tokio::runtime::Handle) 
         || custody.git.stdout_reader.is_some()
         || custody.git.stderr_reader.is_some()
         || !release_classified
-        || custody.writer_probe.persistence_uncertain.as_ref().is_some_and(|uncertain| {
-            uncertain.load(std::sync::atomic::Ordering::SeqCst)
-        })
+        || custody
+            .writer_probe
+            .persistence_uncertain
+            .as_ref()
+            .is_some_and(|uncertain| uncertain.load(std::sync::atomic::Ordering::SeqCst))
     {
         retain_unclassified_physical(custody);
     }
@@ -205,12 +208,19 @@ fn retire_clean_linked_worktree(
     custody: &mut PhysicalCustody,
     runtime: &tokio::runtime::Handle,
 ) -> Result<WorktreePhysicalOutcome, String> {
-    if custody.writer_probe.persistence_uncertain.as_ref().is_some_and(|uncertain| {
-        uncertain.load(std::sync::atomic::Ordering::SeqCst)
-    }) {
+    if custody
+        .writer_probe
+        .persistence_uncertain
+        .as_ref()
+        .is_some_and(|uncertain| uncertain.load(std::sync::atomic::Ordering::SeqCst))
+    {
         retain_unclassified_physical(custody);
     }
-    let original = custody.git.original_effect.as_ref().expect("original physical context");
+    let original = custody
+        .git
+        .original_effect
+        .as_ref()
+        .expect("original physical context");
     let probe = &custody.writer_probe;
     if probe.run.attempt_id != original.receipt.admitted.attempt_id
         || probe.run.ordinal != original.receipt.admitted.run_ordinal
@@ -219,7 +229,8 @@ fn retire_clean_linked_worktree(
         || probe.resource != original.resource
     {
         return Ok(WorktreePhysicalOutcome::Residual {
-            detail: "writer probe does not match original Worktree run binding; target preserved".into(),
+            detail: "writer probe does not match original Worktree run binding; target preserved"
+                .into(),
         });
     }
     // Read the exact original confirmation on this retained worker before any
@@ -229,7 +240,11 @@ fn retire_clean_linked_worktree(
         Ok(snapshot) => Some(snapshot),
         Err(detail) => return Ok(WorktreePhysicalOutcome::Residual { detail }),
     };
-    let owner = custody.git.prepared.as_ref().expect("original physical owner");
+    let owner = custody
+        .git
+        .prepared
+        .as_ref()
+        .expect("original physical owner");
     let path = owner.prepared.inspection_path.clone();
     let identity = owner.prepared.identity.clone();
     let administrative_dir = owner.git_dir.clone();
@@ -241,7 +256,9 @@ fn retire_clean_linked_worktree(
     let qualification = (|| {
         require_absent(&worktree_quarantine_path(&identity)?)?;
         ensure_no_administrative_residue(
-            &administrative_dir, &administrative_incarnation, deadline,
+            &administrative_dir,
+            &administrative_incarnation,
+            deadline,
         )?;
         RetainedRootLocation::capture(owner)
     })();
@@ -258,34 +275,58 @@ fn retire_clean_linked_worktree(
         mutation_refusal: None,
     };
     if let Err(detail) = driver.verify_confirmed_snapshot() {
-        return Ok(driver.failure.take().unwrap_or(WorktreePhysicalOutcome::Residual { detail }));
+        return Ok(driver
+            .failure
+            .take()
+            .unwrap_or(WorktreePhysicalOutcome::Residual { detail }));
     }
     driver.custody.authority.armed = true;
     if let Err(detail) = driver.original().record_cleanup_plan(
-        runtime, administrative_dir.clone(), administrative_incarnation.clone(),
+        runtime,
+        administrative_dir.clone(),
+        administrative_incarnation.clone(),
     ) {
         return Ok(WorktreePhysicalOutcome::Residual { detail });
     }
     let deletion = remove_identity_bound_directory_with_driver(
-        &path, None, &expected, "native captured worktree", Some(deadline), &mut driver,
+        &path,
+        None,
+        &expected,
+        "native captured worktree",
+        Some(deadline),
+        &mut driver,
     );
     if let Err(detail) = deletion {
-        return Ok(driver.failure.take().unwrap_or_else(|| WorktreePhysicalOutcome::Residual {
-            detail: driver.retained_detail(detail),
-        }));
+        return Ok(driver
+            .failure
+            .take()
+            .unwrap_or_else(|| WorktreePhysicalOutcome::Residual {
+                detail: driver.retained_detail(detail),
+            }));
     }
     // No Git is spawned after checkout deletion. Administrative removal uses
     // the immutable registration bytes, captured common-dir identity and same lock.
     driver.administrative = true;
     driver.root = None;
-    let administrative_root = administrative_dir.parent().expect("captured registration parent").join(
-        format!("{}{}", administrative_final_residue_prefix(&administrative_incarnation), uuid::Uuid::new_v4()),
-    );
+    let administrative_root = administrative_dir
+        .parent()
+        .expect("captured registration parent")
+        .join(format!(
+            "{}{}",
+            administrative_final_residue_prefix(&administrative_incarnation),
+            uuid::Uuid::new_v4()
+        ));
     if let Err(detail) = remove_identity_bound_directory_with_driver(
-        &administrative_dir, Some(&administrative_root), &administrative_incarnation,
-        "native worktree administrative directory", Some(deadline), &mut driver,
+        &administrative_dir,
+        Some(&administrative_root),
+        &administrative_incarnation,
+        "native worktree administrative directory",
+        Some(deadline),
+        &mut driver,
     ) {
-        return Ok(WorktreePhysicalOutcome::Residual { detail: driver.retained_detail(detail) });
+        return Ok(WorktreePhysicalOutcome::Residual {
+            detail: driver.retained_detail(detail),
+        });
     }
     if let Err(detail) = driver.verify_retired_paths(&administrative_dir) {
         return Ok(WorktreePhysicalOutcome::Residual { detail });
@@ -297,14 +338,25 @@ fn read_confirmed_worktree_snapshot(
     custody: &PhysicalCustody,
     runtime: &tokio::runtime::Handle,
 ) -> Result<CloseRetirementSnapshot, String> {
-    let original = custody.git.original_effect.as_ref().expect("original physical context");
-    let owner = custody.git.prepared.as_ref().expect("original physical owner");
+    let original = custody
+        .git
+        .original_effect
+        .as_ref()
+        .expect("original physical context");
+    let owner = custody
+        .git
+        .prepared
+        .as_ref()
+        .expect("original physical owner");
     super::check_deadline(original.deadline())?;
     if original.resource.kind() != RetiredResourceKind::Worktree
         || !matches!(original.resource.identity(), LossItemIdentity::Worktree(identity)
             if identity == &owner.prepared.identity)
     {
-        return Err("original Worktree resource does not match captured physical owner; target preserved".into());
+        return Err(
+            "original Worktree resource does not match captured physical owner; target preserved"
+                .into(),
+        );
     }
     let snapshot = runtime.block_on(async {
         let attempt = original.receipt.admitted.attempt_id.as_str();
@@ -364,18 +416,35 @@ fn select_confirmed_worktree_snapshot(
     original_snapshot: &CloseRetirementSnapshot,
     inspections: &[CloseInspection],
 ) -> Result<CloseRetirementSnapshot, String> {
-    if inspections.iter().any(|inspection| &inspection.attempt_id != attempt) {
+    if inspections
+        .iter()
+        .any(|inspection| &inspection.attempt_id != attempt)
+    {
         return Err("Close inspection belongs to a different attempt; target preserved".into());
     }
     // Verify BOTH generation and fingerprint for the entire original aggregate.
     // A later same-content reinspection must not become original confirmation.
     validate_close_retirement_inspection_aggregate(original_snapshot, inspections)
         .map_err(|error| error.to_string())?;
-    let mut matching = inspections.iter().filter(|inspection| &inspection.target.scope == scope);
+    let mut matching = inspections
+        .iter()
+        .filter(|inspection| &inspection.target.scope == scope);
     match (matching.next(), matching.next()) {
         (Some(inspection), None) => Ok(inspection.snapshot.clone()),
-        _ => Err("Close requires exactly one original confirmed Worktree inspection; target preserved".into()),
+        _ => Err(
+            "Close requires exactly one original confirmed Worktree inspection; target preserved"
+                .into(),
+        ),
     }
+}
+
+fn administrative_final_residue_prefix(incarnation: &str) -> String {
+    let digest = Sha256::digest(incarnation.as_bytes());
+    let mut suffix = String::with_capacity(16);
+    for byte in &digest[..8] {
+        write!(&mut suffix, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    format!(".phoenix-admin-delete-{suffix}-")
 }
 
 fn ensure_no_administrative_residue(
@@ -383,19 +452,30 @@ fn ensure_no_administrative_residue(
     incarnation: &str,
     deadline: std::time::Instant,
 ) -> Result<(), String> {
-    let registrations = administrative_dir.parent()
+    let registrations = administrative_dir
+        .parent()
         .ok_or_else(|| "captured worktree administrative directory has no parent".to_string())?;
     if administrative_dir.file_name().is_some_and(|name| {
-        name.as_encoded_bytes().starts_with(b".phoenix-admin-delete-")
+        name.as_encoded_bytes()
+            .starts_with(b".phoenix-admin-delete-")
     }) {
-        return Err("native physical retirement does not resume administrative final residues".into());
+        return Err(
+            "native physical retirement does not resume administrative final residues".into(),
+        );
     }
     let prefix = administrative_final_residue_prefix(incarnation);
     for entry in std::fs::read_dir(registrations).map_err(|error| error.to_string())? {
         super::check_deadline(deadline)?;
         let entry = entry.map_err(|error| error.to_string())?;
-        if entry.file_name().as_encoded_bytes().starts_with(prefix.as_bytes()) {
-            return Err(format!("captured administrative final residue survives at {}; worktree preserved", entry.path().display()));
+        if entry
+            .file_name()
+            .as_encoded_bytes()
+            .starts_with(prefix.as_bytes())
+        {
+            return Err(format!(
+                "captured administrative final residue survives at {}; worktree preserved",
+                entry.path().display()
+            ));
         }
     }
     super::check_deadline(deadline)
@@ -417,20 +497,37 @@ struct PhysicalDeletionDriver<'a> {
 
 impl PhysicalDeletionDriver<'_> {
     fn original(&mut self) -> &mut super::OriginalWorktreeEffectContext {
-        self.custody.git.original_effect.as_mut().expect("original physical context")
+        self.custody
+            .git
+            .original_effect
+            .as_mut()
+            .expect("original physical context")
     }
 
     fn deadline(&self) -> std::time::Instant {
-        self.custody.git.original_effect.as_ref().expect("original physical context").deadline()
+        self.custody
+            .git
+            .original_effect
+            .as_ref()
+            .expect("original physical context")
+            .deadline()
     }
 
     fn location(&self) -> &RetainedRootLocation {
-        self.custody.location.as_ref().expect("captured relocation witness")
+        self.custody
+            .location
+            .as_ref()
+            .expect("captured relocation witness")
     }
 
     fn retained_detail(&self, detail: String) -> String {
-        format!("{detail}; retained native cleanup target at {}",
-            self.root.as_deref().unwrap_or_else(|| self.location().path()).display())
+        format!(
+            "{detail}; retained native cleanup target at {}",
+            self.root
+                .as_deref()
+                .unwrap_or_else(|| self.location().path())
+                .display()
+        )
     }
 
     fn git_leaf(
@@ -439,26 +536,53 @@ impl PhysicalDeletionDriver<'_> {
         deadline: std::time::Instant,
         operation: &str,
     ) -> Result<std::process::Output, String> {
-        let owner = self.custody.git.prepared.as_ref().expect("original physical owner");
-        let location = self.custody.location.as_ref().expect("captured relocation witness");
+        let owner = self
+            .custody
+            .git
+            .prepared
+            .as_ref()
+            .expect("original physical owner");
+        let location = self
+            .custody
+            .location
+            .as_ref()
+            .expect("captured relocation witness");
         bind_shared_root_command(&mut command, owner, location)?;
         run_git_leaf(
-            &mut self.custody.git, self.runtime, &mut self.custody.authority,
-            command, deadline, operation, GitLeafTarget::RetainedRoot(location),
+            &mut self.custody.git,
+            self.runtime,
+            &mut self.custody.authority,
+            command,
+            deadline,
+            operation,
+            GitLeafTarget::RetainedRoot(location),
         )
     }
 
     fn verify_confirmed_snapshot(&mut self) -> Result<(), String> {
         let path = self.location().path().to_path_buf();
-        let owner = self.custody.git.prepared.as_ref().expect("original physical owner");
+        let owner = self
+            .custody
+            .git
+            .prepared
+            .as_ref()
+            .expect("original physical owner");
         self.location().validate(owner)?;
         let identity = owner.prepared.identity.clone();
-        let confirmed = self.custody.confirmed_worktree_snapshot.as_ref()
-            .ok_or_else(|| "original confirmed Worktree inspection is unavailable; target preserved".to_string())?
+        let confirmed = self
+            .custody
+            .confirmed_worktree_snapshot
+            .as_ref()
+            .ok_or_else(|| {
+                "original confirmed Worktree inspection is unavailable; target preserved"
+                    .to_string()
+            })?
             .clone();
         let deadline = self.deadline();
         let (fresh, losses) = inspect_worktree_at_with_git_leaf_until(
-            &identity, &path, deadline,
+            &identity,
+            &path,
+            deadline,
             &mut |command, deadline, operation| self.git_leaf(command, deadline, operation),
         )?;
         if !losses.is_empty() {
@@ -468,30 +592,53 @@ impl PhysicalDeletionDriver<'_> {
             let detail = self.retained_detail(
                 "worktree changed after Close inspection confirmation; fresh confirmation is required".into(),
             );
-            self.failure = Some(WorktreePhysicalOutcome::ReinspectionRequired { detail: detail.clone() });
+            self.failure = Some(WorktreePhysicalOutcome::ReinspectionRequired {
+                detail: detail.clone(),
+            });
             return Err(detail);
         }
         // The canonical fingerprint deliberately excludes ignored paths. The
         // separate guard is required even when full snapshot equality holds.
         ensure_no_ignored_content_with_status_leaf_until(&path, deadline, |_, deadline| {
-            let owner = self.custody.git.prepared.as_ref().expect("original physical owner");
-            let command = super::status_command(&path, &owner.git_dir, &owner.prepared.common_git_dir);
+            let owner = self
+                .custody
+                .git
+                .prepared
+                .as_ref()
+                .expect("original physical owner");
+            let command =
+                super::status_command(&path, &owner.git_dir, &owner.prepared.common_git_dir);
             self.git_leaf(command, deadline, "ignored-content inspection")
         })?;
-        self.location().validate(self.custody.git.prepared.as_ref().expect("original physical owner"))
+        self.location().validate(
+            self.custody
+                .git
+                .prepared
+                .as_ref()
+                .expect("original physical owner"),
+        )
     }
 
     fn check_external_writers(&mut self, object: &Path) -> Result<(), String> {
         let evidence = self.custody.writer_probe.observe_until(
-            object, self.deadline(), quarantine_has_external_writer_until,
+            object,
+            self.deadline(),
+            quarantine_has_external_writer_until,
         );
-        if self.custody.writer_probe.persistence_uncertain.as_ref().is_some_and(|uncertain| {
-            uncertain.load(std::sync::atomic::Ordering::SeqCst)
-        }) {
+        if self
+            .custody
+            .writer_probe
+            .persistence_uncertain
+            .as_ref()
+            .is_some_and(|uncertain| uncertain.load(std::sync::atomic::Ordering::SeqCst))
+        {
             retain_unclassified_physical(self.custody);
         }
         if evidence?.blocks_retirement() {
-            return Err(format!("external writer holds confirmed worktree at {}; durable evidence retained", object.display()));
+            return Err(format!(
+                "external writer holds confirmed worktree at {}; durable evidence retained",
+                object.display()
+            ));
         }
         Ok(())
     }
@@ -522,7 +669,8 @@ impl WorktreeMutationExecutor for PhysicalDeletionDriver<'_> {
         }
         self.custody.authority.armed = true;
         let runtime = self.runtime;
-        let result = OriginalWorktreeMutationExecutor::new(self.original(), runtime).execute(effect);
+        let result =
+            OriginalWorktreeMutationExecutor::new(self.original(), runtime).execute(effect);
         if let Err(detail) = &result {
             self.mutation_refusal = Some(detail.clone());
         }
@@ -545,8 +693,14 @@ impl WorktreeDeletionDriver for PhysicalDeletionDriver<'_> {
         leaf: super::super::super::OwnedWorktreeRenameLeaf,
         deadline: Option<std::time::Instant>,
     ) -> Result<std::io::Result<()>, String> {
-        let registration = self.administrative.then(|| self.location().registration().clone());
-        let checkout = if self.administrative { None } else { Some(self.location().checkout_rename_witness()?) };
+        let registration = self
+            .administrative
+            .then(|| self.location().registration().clone());
+        let checkout = if self.administrative {
+            None
+        } else {
+            Some(self.location().checkout_rename_witness()?)
+        };
         let original_checkout = self.location().original_path().to_path_buf();
         let moved_checkout = self.location().path().to_path_buf();
         self.execute(move || {
@@ -569,8 +723,15 @@ impl WorktreeDeletionDriver for PhysicalDeletionDriver<'_> {
     fn before_move(&mut self, source: &Path) -> Result<(), String> {
         self.custody.authority.armed = true;
         if self.administrative {
-            let owner = self.custody.git.prepared.as_ref().expect("original physical owner");
-            self.location().registration().validate_rename_source(source)?;
+            let owner = self
+                .custody
+                .git
+                .prepared
+                .as_ref()
+                .expect("original physical owner");
+            self.location()
+                .registration()
+                .validate_rename_source(source)?;
             ensure_no_administrative_residue(source, &owner.git_dir_incarnation, self.deadline())?;
             require_absent(self.location().original_path())?;
             return require_absent(self.location().path());
@@ -580,11 +741,14 @@ impl WorktreeDeletionDriver for PhysicalDeletionDriver<'_> {
         }
         let deadline = self.deadline();
         let stopped = stop_bound_fsmonitor_with_leaf_until(
-            source, deadline,
+            source,
+            deadline,
             &mut |command, deadline, operation| self.git_leaf(command, deadline, operation),
         );
         if let Err(detail) = stopped {
-            self.failure = Some(WorktreePhysicalOutcome::StopFailed { detail: detail.clone() });
+            self.failure = Some(WorktreePhysicalOutcome::StopFailed {
+                detail: detail.clone(),
+            });
             return Err(detail);
         }
         self.verify_confirmed_snapshot()
@@ -607,11 +771,20 @@ impl WorktreeDeletionDriver for PhysicalDeletionDriver<'_> {
             // identity/snapshot proofs refuse deletion. Metadata refusal stops
             // here, without another effect or compensating mutation.
             self.original().bind_final_object(runtime, device, inode)?;
-            let owner = self.custody.git.prepared.as_ref().expect("original physical owner");
-            self.custody.location.as_mut().expect("captured relocation witness")
+            let owner = self
+                .custody
+                .git
+                .prepared
+                .as_ref()
+                .expect("original physical owner");
+            self.custody
+                .location
+                .as_mut()
+                .expect("captured relocation witness")
                 .confirm_owned_move(owner, &root.join("object"), (device, inode))
         } else {
-            self.original().bind_final_root(runtime, root.to_path_buf(), identity.0, identity.1)
+            self.original()
+                .bind_final_root(runtime, root.to_path_buf(), identity.0, identity.1)
         }
     }
 
@@ -619,7 +792,13 @@ impl WorktreeDeletionDriver for PhysicalDeletionDriver<'_> {
         if self.administrative {
             observe_administrative_dir_incarnation(object)
         } else {
-            self.location().validate(self.custody.git.prepared.as_ref().expect("original physical owner"))?;
+            self.location().validate(
+                self.custody
+                    .git
+                    .prepared
+                    .as_ref()
+                    .expect("original physical owner"),
+            )?;
             phoenix_core::git::observe_linked_worktree_fingerprint(object)
                 .ok_or_else(|| "cannot observe retained Worktree fingerprint".into())
         }
@@ -627,7 +806,12 @@ impl WorktreeDeletionDriver for PhysicalDeletionDriver<'_> {
 
     fn after_move(&mut self, _root: &Path, object: &Path) -> Result<(), String> {
         if self.administrative {
-            let owner = self.custody.git.prepared.as_ref().expect("original physical owner");
+            let owner = self
+                .custody
+                .git
+                .prepared
+                .as_ref()
+                .expect("original physical owner");
             require_absent(&owner.git_dir)?;
             require_absent(self.location().original_path())?;
             require_absent(self.location().path())?;
@@ -686,12 +870,19 @@ mod tests {
 
     #[test]
     fn confirmed_content_uses_exact_scoped_snapshot_not_metadata_aggregate() {
-        let inspections = [inspection("scope-a", "g1", "content-a"), inspection("scope-b", "g1", "content-b")];
+        let inspections = [
+            inspection("scope-a", "g1", "content-a"),
+            inspection("scope-b", "g1", "content-b"),
+        ];
         let original = aggregate(&inspections);
         let unchanged_original = original.clone();
         let confirmed = select_confirmed_worktree_snapshot(
-            &inspections[1].attempt_id, &inspections[1].target.scope, &original, &inspections,
-        ).unwrap();
+            &inspections[1].attempt_id,
+            &inspections[1].target.scope,
+            &original,
+            &inspections,
+        )
+        .unwrap();
         assert_eq!(confirmed, inspections[1].snapshot);
         assert_ne!(confirmed.fingerprint(), original.fingerprint());
         assert_eq!(original, unchanged_original);
@@ -707,8 +898,12 @@ mod tests {
         ] {
             inspections[0].snapshot = replacement;
             assert!(select_confirmed_worktree_snapshot(
-                &inspections[0].attempt_id, &inspections[0].target.scope, &original, &inspections,
-            ).is_err());
+                &inspections[0].attempt_id,
+                &inspections[0].target.scope,
+                &original,
+                &inspections,
+            )
+            .is_err());
         }
     }
 
@@ -720,18 +915,34 @@ mod tests {
         let inspections = [first.clone()];
         let original = aggregate(&inspections);
         assert!(select_confirmed_worktree_snapshot(
-            &attempt, &WorkScopeId::parse("missing-scope").unwrap(), &original, &inspections,
-        ).is_err());
+            &attempt,
+            &WorkScopeId::parse("missing-scope").unwrap(),
+            &original,
+            &inspections,
+        )
+        .is_err());
         assert!(select_confirmed_worktree_snapshot(
-            &CloseAttemptId::parse("other-attempt").unwrap(), &scope, &original, &inspections,
-        ).is_err());
+            &CloseAttemptId::parse("other-attempt").unwrap(),
+            &scope,
+            &original,
+            &inspections,
+        )
+        .is_err());
         let duplicate = [first.clone(), first];
         assert!(select_confirmed_worktree_snapshot(
-            &attempt, &scope, &aggregate(&duplicate), &duplicate,
-        ).is_err());
+            &attempt,
+            &scope,
+            &aggregate(&duplicate),
+            &duplicate,
+        )
+        .is_err());
         assert!(select_confirmed_worktree_snapshot(
-            &attempt, &scope, &CloseRetirementSnapshot::parse("g1", "no-worktree").unwrap(), &[],
-        ).is_err());
+            &attempt,
+            &scope,
+            &CloseRetirementSnapshot::parse("g1", "no-worktree").unwrap(),
+            &[],
+        )
+        .is_err());
     }
 
     fn completed_observation() -> WorktreePhysicalObservation {
@@ -746,6 +957,36 @@ mod tests {
             }),
             ready,
             _worker: None,
+        }
+    }
+
+    #[test]
+    fn administrative_final_prefix_is_stable_and_incarnation_bound() {
+        let prefix = administrative_final_residue_prefix("v1:17:29");
+        assert_eq!(prefix, administrative_final_residue_prefix("v1:17:29"));
+        assert_ne!(prefix, administrative_final_residue_prefix("v1:17:30"));
+        let suffix = prefix.strip_prefix(".phoenix-admin-delete-").unwrap();
+        let digest = suffix.strip_suffix('-').unwrap();
+        assert_eq!(digest.len(), 16);
+        assert!(digest.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn administrative_final_random_children_are_recognized() {
+        let incarnation = "v1:17:29";
+        let prefix = administrative_final_residue_prefix(incarnation);
+        for random_suffix in [
+            "8cf54d97-6d67-490a-b70d-df3c033fe744",
+            "2793fd85-931e-437a-8f11-df2bc6e5d64a",
+        ] {
+            let name = format!("{prefix}{random_suffix}");
+            assert!(name.as_bytes().starts_with(prefix.as_bytes()));
+            let result = ensure_no_administrative_residue(
+                &Path::new("/captured/common/worktrees").join(name),
+                incarnation,
+                std::time::Instant::now() + std::time::Duration::from_secs(30),
+            );
+            assert!(result.unwrap_err().contains("does not resume"));
         }
     }
 
@@ -776,10 +1017,9 @@ mod tests {
         let result = observation.state.result.lock().unwrap().take();
         observation.state.ready.send_replace(false);
         let mut pending = Box::pin(observation.observe());
-        let polled = std::future::poll_fn(|context| {
-            std::task::Poll::Ready(pending.as_mut().poll(context))
-        })
-        .await;
+        let polled =
+            std::future::poll_fn(|context| std::task::Poll::Ready(pending.as_mut().poll(context)))
+                .await;
         assert!(polled.is_pending());
         drop(pending);
         *observation.state.result.lock().unwrap() = result;
@@ -846,6 +1086,8 @@ mod tests {
             std::time::Instant::now() + std::time::Duration::from_secs(60),
             |_, _| Ok(status_output(1, b"", b"cannot inspect captured index")),
         );
-        assert!(result.unwrap_err().contains("cannot inspect captured index"));
+        assert!(result
+            .unwrap_err()
+            .contains("cannot inspect captured index"));
     }
 }

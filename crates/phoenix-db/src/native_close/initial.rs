@@ -2445,9 +2445,8 @@ mod tests {
             }
         }
         let dropped = Cell::new(false);
-        let (classification, lease) = f
-            .db
-            .record_native_close_initial_worktree_cleanup_plan_with_entry(
+        let (classification, lease) =
+            f.db.record_native_close_initial_worktree_cleanup_plan_with_entry(
                 &command,
                 &receipt,
                 &live_source,
@@ -2457,7 +2456,10 @@ mod tests {
             .await;
         classification.established().unwrap().unwrap();
         assert!(lease.is_some());
-        assert!(!dropped.get(), "lease must outlive the SQL mutation and commit");
+        assert!(
+            !dropped.get(),
+            "lease must outlive the SQL mutation and commit"
+        );
         assert!(f
             .db
             .close_worktree_cleanup_plan(
@@ -2474,9 +2476,8 @@ mod tests {
         // Entry can succeed but the mutation can still refuse. The same lease
         // must survive the rollback, not just the successful commit path.
         dropped.set(false);
-        let (classification, lease) = f
-            .db
-            .bind_native_close_initial_worktree_final_tombstone_object_with_entry(
+        let (classification, lease) =
+            f.db.bind_native_close_initial_worktree_final_tombstone_object_with_entry(
                 &command,
                 &receipt,
                 &live_source,
@@ -2527,9 +2528,8 @@ mod tests {
             .await,
             (LocalAuthorityResult::DurableFactEstablished(Err(_)), None)
         ));
-        let retained = f
-            .db
-            .close_worktree_cleanup_plan(
+        let retained =
+            f.db.close_worktree_cleanup_plan(
                 &receipt.admitted.attempt_id,
                 &worktree.scope,
                 &worktree.snapshot,
@@ -2570,9 +2570,8 @@ mod tests {
             .await,
             (LocalAuthorityResult::DurableFactEstablished(Err(_)), None)
         ));
-        let retained = f
-            .db
-            .close_worktree_cleanup_plan(
+        let retained =
+            f.db.close_worktree_cleanup_plan(
                 &receipt.admitted.attempt_id,
                 &worktree.scope,
                 &worktree.snapshot,
@@ -2583,7 +2582,10 @@ mod tests {
             .unwrap()
             .final_tombstone
             .unwrap();
-        assert_eq!((retained.object_device, retained.object_inode), (None, None));
+        assert_eq!(
+            (retained.object_device, retained.object_inode),
+            (None, None)
+        );
         f.db.bind_native_close_initial_worktree_final_tombstone_object_with_entry(
             &command,
             &receipt,
@@ -2596,9 +2598,8 @@ mod tests {
         .established()
         .unwrap()
         .unwrap();
-        let retained = f
-            .db
-            .close_worktree_cleanup_plan(
+        let retained =
+            f.db.close_worktree_cleanup_plan(
                 &receipt.admitted.attempt_id,
                 &worktree.scope,
                 &worktree.snapshot,

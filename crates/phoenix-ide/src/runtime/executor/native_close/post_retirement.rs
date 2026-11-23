@@ -1,5 +1,11 @@
 //! Source-owned post-process continuation over the captured original inventory.
 
+use super::source_entry::SourceEntryWorker;
+#[cfg(unix)]
+use crate::runtime::close_retirement::native_initial::worktree::{
+    prepare_original_worktree_git_until, NativeWorktreeGit, OriginalWorktreeEffectContext,
+    WorktreePhysicalObservation, WorktreePhysicalOutcome,
+};
 use phoenix_core::domain::close::{
     CloseExpectedRetirementResource, CloseObligation, CloseRetirementSnapshot, CloseRunRef,
     CloseStopCertainty, LossItemIdentity, RetiredResourceKind, RetirementFailureReason,
@@ -13,12 +19,6 @@ use phoenix_db::{
     CloseCleanupFailureAuthority, CloseCleanupResourceDisposition, Database, DbError, DbResult,
     RecordCloseRetirementDispatchRequest, RecordCloseRetirementEvidenceRequest,
     TerminalizeInitialCloseCleanupFailureRequest,
-};
-use super::source_entry::SourceEntryWorker;
-#[cfg(unix)]
-use crate::runtime::close_retirement::native_initial::worktree::{
-    prepare_original_worktree_git_until, NativeWorktreeGit, OriginalWorktreeEffectContext,
-    WorktreePhysicalObservation, WorktreePhysicalOutcome,
 };
 
 enum AuthoritativeCommand<T> {
@@ -125,7 +125,8 @@ pub(super) struct PostRetirement {
     scope_index: usize,
     worktree_index: usize,
     #[cfg(unix)]
-    worktree_preparation: Option<tokio::task::JoinHandle<Result<Option<NativeWorktreeGit>, String>>>,
+    worktree_preparation:
+        Option<tokio::task::JoinHandle<Result<Option<NativeWorktreeGit>, String>>>,
     #[cfg(unix)]
     physical: Option<WorktreePhysicalObservation>,
     pending_failure: Option<TerminalizeInitialCloseCleanupFailureRequest>,
@@ -253,10 +254,18 @@ impl PostRetirement {
         }
 
         if self.worktree_index < self.worktree_targets.len() {
-            return self.step_worktree(
-                command, receipt, db, backend, live_source, source_entry, original_deadline,
-                resource,
-            ).await;
+            return self
+                .step_worktree(
+                    command,
+                    receipt,
+                    db,
+                    backend,
+                    live_source,
+                    source_entry,
+                    original_deadline,
+                    resource,
+                )
+                .await;
         }
 
         if matches!(&self.stage, Stage::Dispatch) {
@@ -418,7 +427,9 @@ impl PostRetirement {
         if matches!(self.stage, Stage::WorktreeDispatch) {
             return match run_authoritative_command(&mut self.stage, || {
                 db.record_native_close_initial_retirement_dispatch(
-                    command, receipt, live_source,
+                    command,
+                    receipt,
+                    live_source,
                     RecordCloseRetirementDispatchRequest {
                         attempt_id: resource.attempt_id.clone(),
                         scope: resource.scope.clone(),
@@ -426,7 +437,9 @@ impl PostRetirement {
                         resource: resource.resource.clone(),
                     },
                 )
-            }).await {
+            })
+            .await
+            {
                 AuthoritativeCommand::Established(Ok(())) => {
                     self.stage = Stage::WorktreePreparing;
                     Ok(PostRetirementStep::Retiring)
@@ -437,12 +450,16 @@ impl PostRetirement {
         }
 
         if matches!(self.stage, Stage::WorktreeFailure) {
-            return self.persist_worktree_failure(command, receipt, db, live_source, &resource).await;
+            return self
+                .persist_worktree_failure(command, receipt, db, live_source, &resource)
+                .await;
         }
         if matches!(self.stage, Stage::WorktreeEvidence) {
             return match run_authoritative_command(&mut self.stage, || {
                 db.record_native_close_initial_retirement_evidence(
-                    command, receipt, live_source,
+                    command,
+                    receipt,
+                    live_source,
                     RecordCloseRetirementEvidenceRequest {
                         attempt_id: resource.attempt_id.clone(),
                         scope: resource.scope.clone(),
@@ -452,7 +469,9 @@ impl PostRetirement {
                         detail: None,
                     },
                 )
-            }).await {
+            })
+            .await
+            {
                 AuthoritativeCommand::Established(Ok(())) => {
                     // Only persistence retries are permitted after the worker's
                     // Retired observation; physical execution is never repeated.
@@ -480,7 +499,10 @@ impl PostRetirement {
                     }));
                     return Ok(PostRetirementStep::Retiring);
                 }
-                let preparation = self.worktree_preparation.as_mut().expect("retained preparation");
+                let preparation = self
+                    .worktree_preparation
+                    .as_mut()
+                    .expect("retained preparation");
                 if !preparation.is_finished() {
                     // Keep the same preparation and stage while the actor services
                     // Stop/fatal events; never reprepare the original target.
@@ -506,9 +528,15 @@ impl PostRetirement {
                     }
                 };
                 let original_effect = OriginalWorktreeEffectContext::new(
-                    db.clone(), command.clone(), receipt.clone(), live_source.clone(),
-                    resource.scope.clone(), resource.snapshot.clone(), resource.resource.clone(),
-                    source_entry.clone(), deadline,
+                    db.clone(),
+                    command.clone(),
+                    receipt.clone(),
+                    live_source.clone(),
+                    resource.scope.clone(),
+                    resource.snapshot.clone(),
+                    resource.resource.clone(),
+                    source_entry.clone(),
+                    deadline,
                     std::sync::Arc::clone(&backend.fatal_local_authority_fence),
                 );
                 let continuation = match prepared.into_continuation(original_effect) {
@@ -519,15 +547,22 @@ impl PostRetirement {
                     }
                 };
                 let probe = backend.native_initial_close_writer_probe(
-                    receipt, resource.scope.clone(), resource.snapshot.clone(), resource.resource.clone(),
+                    receipt,
+                    resource.scope.clone(),
+                    resource.snapshot.clone(),
+                    resource.resource.clone(),
                 );
                 // Install and retain observation synchronously before the next
                 // actor await. Cancellation cannot discard or restart the worker.
-                self.physical = Some(continuation.spawn_physical(tokio::runtime::Handle::current(), probe));
+                self.physical =
+                    Some(continuation.spawn_physical(tokio::runtime::Handle::current(), probe));
                 self.stage = Stage::WorktreePhysical;
                 return Ok(PostRetirementStep::Retiring);
             }
-            let observation = self.physical.as_ref().expect("physical stage retains observer");
+            let observation = self
+                .physical
+                .as_ref()
+                .expect("physical stage retains observer");
             if !observation.is_ready() {
                 // Observation must not park the actor behind retained physical
                 // work, including an unclassified worker with fatal custody.
@@ -547,8 +582,10 @@ impl PostRetirement {
         #[cfg(not(unix))]
         {
             let _ = (backend, source_entry, original_deadline);
-            self.fail_worktree(RetirementFailureReason::ManualRepairRequired,
-                "native physical Worktree retirement is unavailable on this platform".into());
+            self.fail_worktree(
+                RetirementFailureReason::ManualRepairRequired,
+                "native physical Worktree retirement is unavailable on this platform".into(),
+            );
             Ok(PostRetirementStep::Retiring)
         }
     }
@@ -562,17 +599,23 @@ impl PostRetirement {
         resource: &CloseExpectedRetirementResource,
     ) -> DbResult<PostRetirementStep> {
         if self.pending_failure.is_none() {
-            let mut remaining = db.expected_close_cleanup_failure_resources(
-                resource.attempt_id.as_str(), &resource.scope, &resource.resource,
-            ).await?;
+            let mut remaining = db
+                .expected_close_cleanup_failure_resources(
+                    resource.attempt_id.as_str(),
+                    &resource.scope,
+                    &resource.resource,
+                )
+                .await?;
             for item in &mut remaining {
                 if item.disposition != CloseCleanupResourceDisposition::Failed {
                     item.disposition = CloseCleanupResourceDisposition::Unattempted;
                 }
             }
-            let (reason, detail, occurred_at_us) = self.failure.as_ref().expect("retained typed failure");
+            let (reason, detail, occurred_at_us) =
+                self.failure.as_ref().expect("retained typed failure");
             self.pending_failure = Some(TerminalizeInitialCloseCleanupFailureRequest {
-                failure_occurrence_id: CloseRunRef::initial(resource.attempt_id.clone()).failure_occurrence_id(),
+                failure_occurrence_id: CloseRunRef::initial(resource.attempt_id.clone())
+                    .failure_occurrence_id(),
                 attempt_id: resource.attempt_id.clone(),
                 source_product_conversation_id: receipt.admitted.target.clone(),
                 authority: CloseCleanupFailureAuthority::ExpectedResource {
@@ -591,10 +634,21 @@ impl PostRetirement {
                 occurred_at_us: *occurred_at_us,
             });
         }
-        let request = self.pending_failure.as_ref().expect("retained failure request").clone();
+        let request = self
+            .pending_failure
+            .as_ref()
+            .expect("retained failure request")
+            .clone();
         match run_authoritative_command(&mut self.stage, || {
-            db.terminalize_native_close_initial_resource_failure(command, receipt, live_source, request)
-        }).await {
+            db.terminalize_native_close_initial_resource_failure(
+                command,
+                receipt,
+                live_source,
+                request,
+            )
+        })
+        .await
+        {
             AuthoritativeCommand::Established(Ok(obligation)) => {
                 self.stage = Stage::Completed(obligation.clone());
                 Ok(PostRetirementStep::Completed(obligation))
@@ -721,7 +775,8 @@ mod tests {
             panic!("canceled writer must prevent later effects");
             #[allow(unreachable_code)]
             std::future::ready(LocalAuthorityResult::DurableFactEstablished(()))
-        }).await;
+        })
+        .await;
         assert!(matches!(later, AuthoritativeCommand::FatalAuthority));
     }
 
@@ -735,10 +790,18 @@ mod tests {
         second_tree.scope = second_scope.scope.clone();
         // Deliberately scramble inventory order: execution must use captured
         // scope order, without reducing or reconstructing resource identities.
-        let inventory = vec![second_tree, first_scope.clone(), first_tree, second_scope.clone()];
+        let inventory = vec![
+            second_tree,
+            first_scope.clone(),
+            first_tree,
+            second_scope.clone(),
+        ];
         let cursor = PostRetirement::new(
-            inventory.clone(), vec![first_scope.scope, second_scope.scope], first_scope.snapshot,
-        ).unwrap();
+            inventory.clone(),
+            vec![first_scope.scope, second_scope.scope],
+            first_scope.snapshot,
+        )
+        .unwrap();
         (cursor, inventory)
     }
 
@@ -751,13 +814,20 @@ mod tests {
         cursor.stage = Stage::WorktreePhysical;
         cursor.accept_physical_outcome(WorktreePhysicalOutcome::Retired);
         assert!(matches!(cursor.stage, Stage::WorktreeEvidence));
-        assert_eq!(cursor.current(), Some(&inventory[2]), "observation alone cannot advance");
+        assert_eq!(
+            cursor.current(),
+            Some(&inventory[2]),
+            "observation alone cannot advance"
+        );
         assert_eq!(cursor.scope_index, 0);
         // Simulate only the confirmed evidence writer's success branch.
         cursor.advance_worktree();
         assert!(matches!(cursor.stage, Stage::WorktreeDispatch));
         assert_eq!(cursor.current(), Some(&inventory[0]));
-        assert_eq!(cursor.scope_index, 0, "no WorkScope before the later Worktree");
+        assert_eq!(
+            cursor.scope_index, 0,
+            "no WorkScope before the later Worktree"
+        );
         cursor.accept_physical_outcome(WorktreePhysicalOutcome::Retired);
         cursor.advance_worktree();
         assert!(matches!(cursor.stage, Stage::Dispatch));
@@ -769,12 +839,24 @@ mod tests {
     #[test]
     fn every_physical_failure_retains_failed_identity_and_stops_before_later_scopes() {
         let failures = [
-            (WorktreePhysicalOutcome::StopFailed { detail: "stop refused".into() },
-                RetirementFailureReason::RemovalFailed),
-            (WorktreePhysicalOutcome::ReinspectionRequired { detail: "drift".into() },
-                RetirementFailureReason::IdentityNotProven),
-            (WorktreePhysicalOutcome::Residual { detail: "retained".into() },
-                RetirementFailureReason::ManualRepairRequired),
+            (
+                WorktreePhysicalOutcome::StopFailed {
+                    detail: "stop refused".into(),
+                },
+                RetirementFailureReason::RemovalFailed,
+            ),
+            (
+                WorktreePhysicalOutcome::ReinspectionRequired {
+                    detail: "drift".into(),
+                },
+                RetirementFailureReason::IdentityNotProven,
+            ),
+            (
+                WorktreePhysicalOutcome::Residual {
+                    detail: "retained".into(),
+                },
+                RetirementFailureReason::ManualRepairRequired,
+            ),
         ];
         for (outcome, reason) in failures {
             let (mut cursor, inventory) = two_scope_cursor();
@@ -784,7 +866,10 @@ mod tests {
             assert_eq!(cursor.failure.as_ref().unwrap().0, reason);
             assert_eq!(cursor.current(), Some(&inventory[2]));
             assert_eq!((cursor.worktree_index, cursor.scope_index), (0, 0));
-            assert!(cursor.pending_failure.is_none(), "failure is retained before any writer await");
+            assert!(
+                cursor.pending_failure.is_none(),
+                "failure is retained before any writer await"
+            );
         }
     }
 

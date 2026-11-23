@@ -302,8 +302,17 @@ impl OriginalWorktreeEffectContext {
         fatal: Arc<FatalLocalAuthorityFence>,
     ) -> Self {
         Self {
-            db, command, receipt, live_source, scope, snapshot, resource,
-            source_entry, deadline, fatal, leaf_release_pending_classification: false,
+            db,
+            command,
+            receipt,
+            live_source,
+            scope,
+            snapshot,
+            resource,
+            source_entry,
+            deadline,
+            fatal,
+            leaf_release_pending_classification: false,
         }
     }
 
@@ -718,7 +727,10 @@ impl NativeWorktreeGit {
             return Err("original Worktree continuation identity or deadline differs".into());
         }
         check_deadline(original_effect.deadline)?;
-        Ok(NativeWorktreeGitContinuation { owner: self, original_effect })
+        Ok(NativeWorktreeGitContinuation {
+            owner: self,
+            original_effect,
+        })
     }
 }
 

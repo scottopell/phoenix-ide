@@ -244,12 +244,12 @@ pub(super) struct CapturedRegistration {
 
 impl CapturedRegistration {
     fn capture(owner: &NativeWorktreeGit) -> Result<Self, String> {
-        let (_, backlink) = phoenix_core::git::read_worktree_registration_file(
-            &owner.git_dir.join("gitdir"),
-        ).map_err(|error| error.to_string())?;
-        let (_, commondir) = phoenix_core::git::read_worktree_registration_file(
-            &owner.git_dir.join("commondir"),
-        ).map_err(|error| error.to_string())?;
+        let (_, backlink) =
+            phoenix_core::git::read_worktree_registration_file(&owner.git_dir.join("gitdir"))
+                .map_err(|error| error.to_string())?;
+        let (_, commondir) =
+            phoenix_core::git::read_worktree_registration_file(&owner.git_dir.join("commondir"))
+                .map_err(|error| error.to_string())?;
         let witness = Self {
             original_path: owner.git_dir.clone(),
             incarnation: owner.git_dir_incarnation.clone(),
@@ -286,12 +286,12 @@ impl CapturedRegistration {
     pub(super) fn validate_at(&self, path: &std::path::Path) -> Result<(), String> {
         let incarnation = observe_administrative_dir_incarnation(path)?;
         let common_incarnation = observe_administrative_dir_incarnation(&self.common_path)?;
-        let (_, backlink) = phoenix_core::git::read_worktree_registration_file(
-            &path.join("gitdir"),
-        ).map_err(|error| error.to_string())?;
-        let (_, commondir) = phoenix_core::git::read_worktree_registration_file(
-            &path.join("commondir"),
-        ).map_err(|error| error.to_string())?;
+        let (_, backlink) =
+            phoenix_core::git::read_worktree_registration_file(&path.join("gitdir"))
+                .map_err(|error| error.to_string())?;
+        let (_, commondir) =
+            phoenix_core::git::read_worktree_registration_file(&path.join("commondir"))
+                .map_err(|error| error.to_string())?;
         self.validate_records(&incarnation, &common_incarnation, &backlink, &commondir)
     }
 
@@ -316,9 +316,12 @@ pub(super) struct CheckoutRenameWitness {
 impl CheckoutRenameWitness {
     pub(super) fn validate_source(&self, source: &std::path::Path) -> Result<(), String> {
         if source != self.path || directory_identity(source)? != self.identity {
-            return Err("checkout rename source differs from captured directory incarnation".into());
+            return Err(
+                "checkout rename source differs from captured directory incarnation".into(),
+            );
         }
-        self.registration.validate_rename_source(&self.registration.original_path)?;
+        self.registration
+            .validate_rename_source(&self.registration.original_path)?;
         let (_, pointer) = phoenix_core::git::read_worktree_registration_file(&source.join(".git"))
             .map_err(|error| error.to_string())?;
         if pointer != self.pointer {
@@ -345,24 +348,31 @@ impl RetainedRootLocation {
     pub(super) fn capture(owner: &NativeWorktreeGit) -> Result<Self, String> {
         validate_root(owner)?;
         let path = &owner.prepared.inspection_path;
-        if *path != super::super::super::path_buf_from_git_bytes(
-            owner.prepared.identity.locator().as_bytes(),
-        ) {
+        if *path
+            != super::super::super::path_buf_from_git_bytes(
+                owner.prepared.identity.locator().as_bytes(),
+            )
+        {
             return Err("native physical retirement does not resume relocated worktrees".into());
         }
         let pointer = super::super::super::path_buf_from_git_bytes(&super::captured_pointer(
             &owner.prepared.identity,
         )?);
         if !pointer.is_absolute() {
-            return Err("native physical retirement requires an absolute Git registration pointer".into());
+            return Err(
+                "native physical retirement requires an absolute Git registration pointer".into(),
+            );
         }
         let registration = CapturedRegistration::capture(owner)?;
         let location = Self {
             original_path: path.clone(),
             current_path: path.clone(),
             current_identity: directory_identity(path)?,
-            checkout_pointer: phoenix_core::git::read_worktree_registration_file(&path.join(".git"))
-                .map_err(|error| error.to_string())?.1,
+            checkout_pointer: phoenix_core::git::read_worktree_registration_file(
+                &path.join(".git"),
+            )
+            .map_err(|error| error.to_string())?
+            .1,
             registration,
             moved: false,
         };
@@ -408,13 +418,20 @@ impl RetainedRootLocation {
             return Err("retained Worktree relocation binding changed".into());
         }
         let registrations = prepared.common_git_dir.join("worktrees");
-        let registrations_metadata = std::fs::symlink_metadata(&registrations)
-            .map_err(|error| error.to_string())?;
+        let registrations_metadata =
+            std::fs::symlink_metadata(&registrations).map_err(|error| error.to_string())?;
         if !registrations_metadata.is_dir()
             || registrations_metadata.file_type().is_symlink()
-            || registrations.canonicalize().map_err(|error| error.to_string())? != registrations
+            || registrations
+                .canonicalize()
+                .map_err(|error| error.to_string())?
+                != registrations
             || owner.git_dir.parent() != Some(registrations.as_path())
-            || owner.git_dir.canonicalize().map_err(|error| error.to_string())? != owner.git_dir
+            || owner
+                .git_dir
+                .canonicalize()
+                .map_err(|error| error.to_string())?
+                != owner.git_dir
         {
             return Err("retained Worktree registration escaped captured repository".into());
         }
@@ -422,7 +439,11 @@ impl RetainedRootLocation {
         if self.moved {
             require_absent(&self.original_path)?;
         } else {
-            verify_linked_registration(&owner.git_dir, &prepared.common_git_dir, &self.original_path)?;
+            verify_linked_registration(
+                &owner.git_dir,
+                &prepared.common_git_dir,
+                &self.original_path,
+            )?;
         }
         check_deadline(prepared.deadline)
     }
@@ -455,8 +476,14 @@ impl RetainedRootLocation {
 pub(super) fn require_absent(path: &std::path::Path) -> Result<(), String> {
     match std::fs::symlink_metadata(path) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(format!("cannot prove path absent at {}: {error}", path.display())),
-        Ok(_) => Err(format!("post-inspection entry survives at {}; retained object preserved", path.display())),
+        Err(error) => Err(format!(
+            "cannot prove path absent at {}: {error}",
+            path.display()
+        )),
+        Ok(_) => Err(format!(
+            "post-inspection entry survives at {}; retained object preserved",
+            path.display()
+        )),
     }
 }
 
@@ -485,15 +512,25 @@ pub(super) fn bind_shared_root_command(
     location: &RetainedRootLocation,
 ) -> Result<(), String> {
     if command.get_current_dir() != Some(location.path())
-        || command.get_envs().find(|(key, _)| *key == "GIT_DIR").and_then(|(_, value)| value)
+        || command
+            .get_envs()
+            .find(|(key, _)| *key == "GIT_DIR")
+            .and_then(|(_, value)| value)
             != Some(owner.git_dir.as_os_str())
     {
         return Err("shared inspection attempted to redirect retained root".into());
     }
     for name in [
-        "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-        "GIT_CEILING_DIRECTORIES", "GIT_DISCOVERY_ACROSS_FILESYSTEM", "GIT_NAMESPACE",
-        "GIT_SHALLOW_FILE", "GIT_PREFIX", "GIT_IMPLICIT_WORK_TREE", "GIT_QUARANTINE_PATH",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_CEILING_DIRECTORIES",
+        "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+        "GIT_NAMESPACE",
+        "GIT_SHALLOW_FILE",
+        "GIT_PREFIX",
+        "GIT_IMPLICIT_WORK_TREE",
+        "GIT_QUARANTINE_PATH",
         "GIT_CONFIG",
     ] {
         command.env_remove(name);
@@ -503,7 +540,8 @@ pub(super) fn bind_shared_root_command(
             command.env_remove(name);
         }
     }
-    command.env("GIT_COMMON_DIR", &owner.prepared.common_git_dir)
+    command
+        .env("GIT_COMMON_DIR", &owner.prepared.common_git_dir)
         .env("GIT_WORK_TREE", location.path())
         .env("GIT_OPTIONAL_LOCKS", "0");
     Ok(())
@@ -614,23 +652,51 @@ mod tests {
         let validate = |admin: &str, common: &str, backlink: &[u8], commondir: &[u8]| {
             witness.validate_records(admin, common, backlink, commondir)
         };
-        assert!(validate(&witness.incarnation, &witness.common_incarnation,
-            &witness.backlink, &witness.commondir).is_ok());
+        assert!(validate(
+            &witness.incarnation,
+            &witness.common_incarnation,
+            &witness.backlink,
+            &witness.commondir
+        )
+        .is_ok());
         // Even equivalent spellings are not the captured immutable records.
         for (backlink, commondir) in [
             (b"/other/.git\n".as_slice(), witness.commondir.as_slice()),
-            (b"/captured/root/.git\r\n".as_slice(), witness.commondir.as_slice()),
+            (
+                b"/captured/root/.git\r\n".as_slice(),
+                witness.commondir.as_slice(),
+            ),
             (witness.backlink.as_slice(), b"../../\n".as_slice()),
-            (witness.backlink.as_slice(), b"/captured/common\n".as_slice()),
+            (
+                witness.backlink.as_slice(),
+                b"/captured/common\n".as_slice(),
+            ),
         ] {
-            assert!(validate(&witness.incarnation, &witness.common_incarnation,
-                backlink, commondir).is_err());
+            assert!(validate(
+                &witness.incarnation,
+                &witness.common_incarnation,
+                backlink,
+                commondir
+            )
+            .is_err());
         }
-        assert!(validate("git_admin_dir_v1:17:30", &witness.common_incarnation,
-            &witness.backlink, &witness.commondir).is_err());
-        assert!(validate(&witness.incarnation, "git_admin_dir_v1:17:32",
-            &witness.backlink, &witness.commondir).is_err());
-        assert!(witness.validate_rename_source(Path::new("/moved/object")).is_err());
+        assert!(validate(
+            "git_admin_dir_v1:17:30",
+            &witness.common_incarnation,
+            &witness.backlink,
+            &witness.commondir
+        )
+        .is_err());
+        assert!(validate(
+            &witness.incarnation,
+            "git_admin_dir_v1:17:32",
+            &witness.backlink,
+            &witness.commondir
+        )
+        .is_err());
+        assert!(witness
+            .validate_rename_source(Path::new("/moved/object"))
+            .is_err());
     }
 
     #[cfg(unix)]
@@ -700,12 +766,19 @@ mod tests {
     #[test]
     fn checkout_rename_rechecks_immutable_source_and_registration_after_admission() {
         use crate::runtime::close_retirement::{
-            DeletionEntryIdentity, OwnedDeletionSlot, OwnedWorktreeRenameLeaf,
-            WorktreeMutationExecutor as _, deletion_slot_stat, open_deletion_parent,
+            deletion_slot_stat, open_deletion_parent, DeletionEntryIdentity, OwnedDeletionSlot,
+            OwnedWorktreeRenameLeaf, WorktreeMutationExecutor as _,
         };
         use std::os::unix::fs::PermissionsExt as _;
         // Plain bounded filesystem records, not a native/SQLite/Git fixture.
-        for change in ["none", "checkout", "pointer", "backlink", "commondir", "common"] {
+        for change in [
+            "none",
+            "checkout",
+            "pointer",
+            "backlink",
+            "commondir",
+            "common",
+        ] {
             let temp = tempfile::tempdir().unwrap();
             let source = temp.path().join("checkout");
             let root = temp.path().join("root");
@@ -722,43 +795,51 @@ mod tests {
             std::fs::write(admin.join("commondir"), b"../..\n").unwrap();
             let source_identity = directory_identity(&source).unwrap();
             let checkout = CheckoutRenameWitness {
-                path: source.clone(), identity: source_identity, pointer: pointer.clone(),
+                path: source.clone(),
+                identity: source_identity,
+                pointer: pointer.clone(),
                 registration: CapturedRegistration {
                     original_path: admin.clone(),
                     incarnation: observe_administrative_dir_incarnation(&admin).unwrap(),
                     common_path: common.clone(),
                     common_incarnation: observe_administrative_dir_incarnation(&common).unwrap(),
-                    backlink, commondir: b"../..\n".to_vec(),
+                    backlink,
+                    commondir: b"../..\n".to_vec(),
                 },
             };
             assert!(checkout.validate_source(&source).is_ok());
             let parent = open_deletion_parent(temp.path()).unwrap();
             let capture = |name: &str| {
                 let name = std::ffi::CString::new(name).unwrap();
-                let identity = DeletionEntryIdentity::from_stat(&deletion_slot_stat(&parent, &name).unwrap());
+                let identity =
+                    DeletionEntryIdentity::from_stat(&deletion_slot_stat(&parent, &name).unwrap());
                 OwnedDeletionSlot::capture(&parent, &name, identity).unwrap()
             };
             let leaf = OwnedWorktreeRenameLeaf {
-                source_path: source.clone(), source: capture("checkout"), root: capture("root"),
+                source_path: source.clone(),
+                source: capture("checkout"),
+                root: capture("root"),
             };
             let effect_source = source.clone();
             let effect_common = common.clone();
-            let mut executor = RenameBoundaryExecutor(Some(Box::new(move || {
-                match change {
-                    "checkout" => {
-                        std::fs::rename(&effect_source, effect_source.with_file_name("old-checkout")).unwrap();
-                        std::fs::create_dir(&effect_source).unwrap();
-                        std::fs::write(effect_source.join(".git"), pointer).unwrap();
-                    }
-                    "pointer" => std::fs::write(effect_source.join(".git"), b"gitdir: /replacement\n").unwrap(),
-                    "backlink" => std::fs::write(admin.join("gitdir"), b"/replacement/.git\n").unwrap(),
-                    "commondir" => std::fs::write(admin.join("commondir"), b"../../\n").unwrap(),
-                    "common" => {
-                        std::fs::rename(&effect_common, effect_common.with_file_name("old-common")).unwrap();
-                        std::fs::create_dir(&effect_common).unwrap();
-                    }
-                    _ => {}
+            let mut executor = RenameBoundaryExecutor(Some(Box::new(move || match change {
+                "checkout" => {
+                    std::fs::rename(&effect_source, effect_source.with_file_name("old-checkout"))
+                        .unwrap();
+                    std::fs::create_dir(&effect_source).unwrap();
+                    std::fs::write(effect_source.join(".git"), pointer).unwrap();
                 }
+                "pointer" => {
+                    std::fs::write(effect_source.join(".git"), b"gitdir: /replacement\n").unwrap()
+                }
+                "backlink" => std::fs::write(admin.join("gitdir"), b"/replacement/.git\n").unwrap(),
+                "commondir" => std::fs::write(admin.join("commondir"), b"../../\n").unwrap(),
+                "common" => {
+                    std::fs::rename(&effect_common, effect_common.with_file_name("old-common"))
+                        .unwrap();
+                    std::fs::create_dir(&effect_common).unwrap();
+                }
+                _ => {}
             })));
             // Same proof then owned-leaf sequence as PhysicalDeletionDriver's
             // checkout branch, inside the executor, not at preparation time.
@@ -769,7 +850,10 @@ mod tests {
             if change == "none" {
                 result.unwrap().unwrap();
                 assert!(!source.exists());
-                assert_eq!(directory_identity(&root.join("object")).unwrap(), source_identity);
+                assert_eq!(
+                    directory_identity(&root.join("object")).unwrap(),
+                    source_identity
+                );
             } else {
                 assert!(result.is_err(), "{change}");
                 assert!(source.is_dir(), "mismatched source must not move: {change}");
@@ -794,20 +878,33 @@ mod tests {
         location.moved = true;
         assert!(location.check_move_identity((17, 29)).is_err());
         assert_eq!(location.original_path(), Path::new(ROOT));
-        assert_eq!(location.registration.backlink.as_slice(), b"/captured/root/.git\n");
+        assert_eq!(
+            location.registration.backlink.as_slice(),
+            b"/captured/root/.git\n"
+        );
     }
 
     #[test]
     fn relocated_root_routing_changes_only_worktree_location_not_administration() {
         let relocated = Path::new("/captured/.phoenix-delete-random/object");
         let mut command = root_command();
-        command.current_dir(relocated).env("GIT_WORK_TREE", relocated);
-        assert!(validate_root_command(&command, relocated, Path::new(GIT), Path::new(COMMON)).is_ok());
+        command
+            .current_dir(relocated)
+            .env("GIT_WORK_TREE", relocated);
+        assert!(
+            validate_root_command(&command, relocated, Path::new(GIT), Path::new(COMMON)).is_ok()
+        );
         assert!(validate(&command).is_err());
         for name in ["GIT_DIR", "GIT_COMMON_DIR"] {
             let mut command = root_command();
-            command.current_dir(relocated).env("GIT_WORK_TREE", relocated).env(name, "/replacement");
-            assert!(validate_root_command(&command, relocated, Path::new(GIT), Path::new(COMMON)).is_err());
+            command
+                .current_dir(relocated)
+                .env("GIT_WORK_TREE", relocated)
+                .env(name, "/replacement");
+            assert!(
+                validate_root_command(&command, relocated, Path::new(GIT), Path::new(COMMON))
+                    .is_err()
+            );
         }
     }
 
