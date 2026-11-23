@@ -341,7 +341,7 @@ fn truncate(s: &str, max_len: usize) -> String {
     if s.len() <= max_len {
         s.to_string()
     } else {
-        format!("{}...", s.get(..max_len.saturating_sub(3)).unwrap_or(s))
+        phoenix_core::text_bounds::truncate_with_marker(s, max_len.saturating_sub(3), "...")
     }
 }
 
@@ -352,6 +352,19 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
     use tokio_util::sync::CancellationToken;
+
+    #[test]
+    fn task_summary_truncation_respects_multibyte_cap() {
+        let task = "日".repeat(200);
+        let shown = truncate(&task, 100);
+        assert!(shown.len() <= 100, "{}", shown.len());
+        assert!(shown.ends_with("..."));
+        assert_eq!(truncate("short task", 100), "short task");
+        assert_eq!(
+            truncate(&"a".repeat(120), 100),
+            format!("{}...", "a".repeat(97))
+        );
+    }
 
     fn test_context() -> ToolContext {
         ToolContext::new(

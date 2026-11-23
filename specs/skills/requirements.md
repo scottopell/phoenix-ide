@@ -74,7 +74,12 @@ THE SYSTEM SHALL replace `$ARGUMENTS` with the full argument string
 WHEN the skill body contains positional placeholders (`$ARGUMENTS[1]`,
 `$ARGUMENTS[2]`, or shorthand `$1`, `$2`)
 THE SYSTEM SHALL replace each with the corresponding whitespace-delimited
-argument token
+argument token, where `$N` takes every consecutive digit (`$10` is the tenth
+token) and a placeholder with no corresponding token is left as written
+
+WHEN substituted argument text itself contains placeholder-shaped text
+(`$2`, `$ARGUMENTS`)
+THE SYSTEM SHALL deliver that text verbatim rather than substituting it again
 
 WHEN the skill body contains named placeholders matching argument names
 defined in the skill's frontmatter

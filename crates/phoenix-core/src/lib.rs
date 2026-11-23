@@ -18,4 +18,5 @@ pub mod sse_lines;
 pub mod subagent_qualification;
 pub mod task_handoff;
 pub mod task_source;
+pub mod text_bounds;
 pub mod work_scope;
