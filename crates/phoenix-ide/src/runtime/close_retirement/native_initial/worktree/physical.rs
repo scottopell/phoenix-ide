@@ -24,11 +24,10 @@ use phoenix_db::validate_close_retirement_inspection_aggregate;
 use std::path::{Path, PathBuf};
 
 use super::super::super::{
-    ensure_no_ignored_content_with_status_leaf_until,
-    inspect_worktree_at_with_git_leaf_until, observe_administrative_dir_incarnation,
-    quarantine_has_external_writer_until, remove_identity_bound_directory_with_driver,
-    stop_bound_fsmonitor_with_leaf_until, worktree_quarantine_path, CloseWriterProbe,
-    WorktreeDeletionDriver, WorktreeMutationExecutor,
+    ensure_no_ignored_content_with_status_leaf_until, inspect_worktree_at_with_git_leaf_until,
+    observe_administrative_dir_incarnation, quarantine_has_external_writer_until,
+    remove_identity_bound_directory_with_driver, stop_bound_fsmonitor_with_leaf_until,
+    worktree_quarantine_path, CloseWriterProbe, WorktreeDeletionDriver, WorktreeMutationExecutor,
 };
 use super::git_leaf::{
     bind_shared_root_command, require_absent, run_git_leaf, GitLeafTarget, RetainedRootLocation,

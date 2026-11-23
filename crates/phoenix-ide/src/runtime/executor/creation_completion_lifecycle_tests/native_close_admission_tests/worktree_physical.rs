@@ -578,7 +578,10 @@ async fn run_public_worktree_close(journey: WorktreeJourney) {
         assert!(output.is_success(), "{}", output.output());
         let admitted: Value = serde_json::from_str(&output.output()).unwrap();
         assert_eq!(admitted["status"], "newly_admitted");
-        assert_eq!(admitted["admitted"]["product_conversation_id"], TARGET_ID);
+        assert_eq!(
+            admitted["admitted"]["product_conversation_id"],
+            fixture.target.as_str()
+        );
         assert_eq!(admitted["admitted"]["run_ordinal"], 1);
         assert!(
             admitted.get("closed").is_none(),
@@ -616,7 +619,7 @@ async fn run_public_worktree_close(journey: WorktreeJourney) {
         assert_eq!(receipt.2, fixture.source.message_id);
         assert_eq!(receipt.3, fixture.source.tool_use_id);
         assert_eq!(receipt.4, fixture.command.fingerprint());
-        assert_eq!(receipt.5, TARGET_ID);
+        assert_eq!(receipt.5, fixture.target.as_str());
         assert_eq!(receipt.6, attempt.as_str());
         assert_eq!(receipt.7, 1);
         assert_eq!(receipt.8, "initial");
