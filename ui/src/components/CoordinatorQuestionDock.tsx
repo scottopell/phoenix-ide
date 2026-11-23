@@ -1,10 +1,4 @@
-// REQ-AUQ-011: answer Ember's open questions on Ember's page.
-//
-// Ember keeps working while a question is open, so the panel sits above the
-// conversation instead of replacing the composer: the user can still message
-// Ember, and answer whenever they are ready. One question shows at a time,
-// oldest first, with a count of the rest.
-
+import { useEffect, useId, useMemo, useRef, useState } from 'react';
 import { api } from '../api';
 import type { CoordinatorQuestion } from '../api';
 import { forgetCoordinatorQuestion, useCoordinatorQuestions } from '../coordinator/coordinatorQuestions';
@@ -15,6 +9,8 @@ import type { QuestionPanelActions } from './questionPanelActions';
 import { Toast } from './Toast';
 import './CoordinatorQuestionDock.css';
 
+const MOBILE_QUESTION_QUERY = '(max-width: 768px)';
+
 function coordinatorQuestionActions(requestId: string): QuestionPanelActions {
   return {
     submitAnswers: (answers, annotations) => api.answerCoordinatorQuestion(requestId, answers, annotations),
@@ -22,6 +18,76 @@ function coordinatorQuestionActions(requestId: string): QuestionPanelActions {
     dismissedMessage: 'Question dismissed. Ember will be told.',
     dismissConfirmMessage: 'No answer will be sent. Ember is told you dismissed it and keeps working without it.',
   };
+}
+
+function useMobileQuestionLayout(): boolean {
+  const [mobile, setMobile] = useState(() =>
+    typeof window.matchMedia === 'function' && window.matchMedia(MOBILE_QUESTION_QUERY).matches,
+  );
+
+  useEffect(() => {
+    if (typeof window.matchMedia !== 'function') return;
+    const query = window.matchMedia(MOBILE_QUESTION_QUERY);
+    const update = () => setMobile(query.matches);
+    update();
+    query.addEventListener('change', update);
+    return () => query.removeEventListener('change', update);
+  }, []);
+
+  return mobile;
+}
+
+function inertOutsideDialog(dialog: HTMLDialogElement): () => void {
+  const changed: Array<{ element: HTMLElement; inert: boolean }> = [];
+  let active: HTMLElement = dialog;
+  let parent = active.parentElement;
+
+  while (parent) {
+    for (const child of Array.from(parent.children)) {
+      if (!(child instanceof HTMLElement) || child === active) continue;
+      changed.push({ element: child, inert: child.inert });
+      child.inert = true;
+    }
+    active = parent;
+    parent = active.parentElement;
+  }
+
+  return () => {
+    for (const { element, inert } of changed) element.inert = inert;
+  };
+}
+
+function setVisualViewportBounds(dialog: HTMLDialogElement): () => void {
+  const viewport = window.visualViewport;
+  const update = () => {
+    dialog.style.setProperty('--coordinator-question-viewport-top', `${viewport?.offsetTop ?? 0}px`);
+    dialog.style.setProperty('--coordinator-question-viewport-left', `${viewport?.offsetLeft ?? 0}px`);
+    dialog.style.setProperty('--coordinator-question-viewport-width', `${viewport?.width ?? window.innerWidth}px`);
+    dialog.style.setProperty('--coordinator-question-viewport-height', `${viewport?.height ?? window.innerHeight}px`);
+  };
+
+  update();
+  viewport?.addEventListener('resize', update);
+  viewport?.addEventListener('scroll', update);
+  window.addEventListener('resize', update);
+
+  return () => {
+    viewport?.removeEventListener('resize', update);
+    viewport?.removeEventListener('scroll', update);
+    window.removeEventListener('resize', update);
+  };
+}
+
+function showDialog(dialog: HTMLDialogElement, modal: boolean): void {
+  if (dialog.open) dialog.close();
+  if (modal && typeof dialog.showModal === 'function') {
+    dialog.showModal();
+  } else if (!modal && typeof dialog.show === 'function') {
+    dialog.show();
+  } else {
+    dialog.setAttribute('open', '');
+    if (modal) dialog.dataset['fallbackModal'] = '';
+  }
 }
 
 function CoordinatorQuestionCard({
@@ -33,20 +99,115 @@ function CoordinatorQuestionCard({
   waiting: number;
   showToast: (message: string, duration?: number) => void;
 }) {
+  const dialogRef = useRef<HTMLDialogElement>(null);
+  const launcherRef = useRef<HTMLButtonElement>(null);
+  const titleId = useId();
+  const descriptionId = useId();
+  const mobile = useMobileQuestionLayout();
+  const [expanded, setExpanded] = useState(true);
+  const actions = useMemo(() => coordinatorQuestionActions(question.request_id), [question.request_id]);
   const forget = () => forgetCoordinatorQuestion(question.request_id);
+
+  useEffect(() => {
+    const dialog = dialogRef.current;
+    if (!dialog) return;
+
+    if (mobile && !expanded) {
+      if (dialog.open) dialog.close();
+      return;
+    }
+
+    const restoreInert = mobile ? inertOutsideDialog(dialog) : undefined;
+    const clearViewportBounds = mobile ? setVisualViewportBounds(dialog) : undefined;
+    showDialog(dialog, mobile);
+
+    const focusFrame = mobile
+      ? requestAnimationFrame(() => dialog.querySelector<HTMLElement>('.question-panel')?.focus({ preventScroll: true }))
+      : undefined;
+
+    return () => {
+      if (focusFrame !== undefined) cancelAnimationFrame(focusFrame);
+      clearViewportBounds?.();
+      restoreInert?.();
+      delete dialog.dataset['fallbackModal'];
+      if (dialog.open) dialog.close();
+    };
+  }, [expanded, mobile]);
+
+  useEffect(() => {
+    if (!mobile || expanded) return;
+    const frame = requestAnimationFrame(() => launcherRef.current?.focus({ preventScroll: true }));
+    return () => cancelAnimationFrame(frame);
+  }, [expanded, mobile]);
+
+  const returnToConversation = () => setExpanded(false);
+
   return (
     <section className="coordinator-question-dock" aria-label="Ember's questions">
-      <p className="coordinator-question-dock__meta">
-        <span>Ember asked {formatRelativeTime(question.asked_at)}. Ember keeps working while you decide.</span>
-        {waiting > 0 && <span className="coordinator-question-dock__more">{waiting} more waiting</span>}
-      </p>
-      <QuestionPanel
-        questions={question.questions}
-        actions={coordinatorQuestionActions(question.request_id)}
-        showToast={showToast}
-        onAnswered={forget}
-        onDismissed={forget}
-      />
+      {mobile && !expanded && (
+        <button
+          ref={launcherRef}
+          type="button"
+          className="coordinator-question-dock__launcher"
+          onClick={() => setExpanded(true)}
+          aria-label="Answer Ember’s question"
+        >
+          <span>Answer Ember’s question</span>
+          {waiting > 0 && <span className="coordinator-question-dock__launcher-count">+{waiting}</span>}
+        </button>
+      )}
+
+      <dialog
+        ref={dialogRef}
+        className="coordinator-question-dock__dialog"
+        aria-labelledby={titleId}
+        aria-describedby={descriptionId}
+        onCancel={(event) => {
+          event.preventDefault();
+          if (mobile) returnToConversation();
+        }}
+        onKeyDownCapture={(event) => {
+          if (!mobile || event.key !== 'Escape') return;
+          if (event.currentTarget.querySelector('.confirm-dialog')) return;
+          event.preventDefault();
+          event.stopPropagation();
+          returnToConversation();
+        }}
+        onMouseDown={(event) => {
+          if (mobile && event.target === event.currentTarget) returnToConversation();
+        }}
+      >
+        <div className="coordinator-question-dock__surface">
+          <header className="coordinator-question-dock__mobile-header">
+            <div>
+              <h2 id={titleId}>Ember has a question</h2>
+              <p>Answer now or return without losing your choices.</p>
+            </div>
+            <button
+              type="button"
+              className="coordinator-question-dock__return"
+              onClick={returnToConversation}
+              aria-label="Return to conversation"
+            >
+              Return to conversation
+            </button>
+          </header>
+
+          <div className="coordinator-question-dock__scroller">
+            <p id={descriptionId} className="coordinator-question-dock__meta">
+              <span>Ember asked {formatRelativeTime(question.asked_at)}. Ember keeps working while you decide.</span>
+              {waiting > 0 && <span className="coordinator-question-dock__more">{waiting} more waiting</span>}
+            </p>
+            <QuestionPanel
+              questions={question.questions}
+              actions={actions}
+              showToast={showToast}
+              onAnswered={forget}
+              onDismissed={forget}
+            />
+          </div>
+        </div>
+      </dialog>
     </section>
   );
 }
