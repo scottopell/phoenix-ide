@@ -106,6 +106,7 @@ async fn assert_native_fatal_sink_is_disposed_without_result(name: &str, input: 
         &callable_names,
         &[],
         &[],
+        phoenix_core::domain::tool_discovery::ToolDiscoveryMode::Eager,
     )
     .await
     .unwrap();

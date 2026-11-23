@@ -183,6 +183,19 @@ impl LlmServiceImpl {
 
 #[async_trait]
 impl LlmService for LlmServiceImpl {
+    fn tool_discovery_mode(&self) -> phoenix_core::domain::tool_discovery::ToolDiscoveryMode {
+        use phoenix_core::domain::tool_discovery::ToolDiscoveryMode;
+        match self.spec.backend.api_format() {
+            ApiFormat::Anthropic if self.spec.supports_tool_search => ToolDiscoveryMode::Anthropic,
+            ApiFormat::Anthropic => ToolDiscoveryMode::Eager,
+            ApiFormat::OpenAIResponses => openai::native_tool_search_mode(
+                &self.spec,
+                self.use_codex_backend,
+                self.openai_responses_base_url.as_deref(),
+            ),
+            ApiFormat::OpenAIChatCompletions => ToolDiscoveryMode::Local,
+        }
+    }
     async fn count_input(
         &self,
         request: &LlmRequest,
@@ -568,7 +581,7 @@ mod tests {
             system: vec![],
             messages: vec![],
             provider_replay: None,
-            responses_replay: Vec::new(),
+            output_replay: Vec::new(),
             tool_availability: phoenix_core::domain::tool_availability::ToolAvailability::all(
                 vec![],
             ),

@@ -778,6 +778,7 @@ impl ModelRegistry {
         config: &LlmConfig,
     ) -> String {
         const PREFERRED: &[&str] = &[
+            "gpt-6.2-sol",
             "gpt-6.1-sol",
             "claude-sonnet-5",
             "claude-sonnet-4-6",
@@ -1143,6 +1144,17 @@ impl ModelRegistry {
         spec: &super::ModelSpec,
         config: &LlmConfig,
     ) -> Option<Arc<dyn LlmService>> {
+        if spec.backend == ModelBackend::OpenAIChatCompletions
+            && spec.source == ModelSource::BuiltIn
+            && config
+                .openai_chat_completions_base_url
+                .as_deref()
+                .is_none_or(|url| url == "https://api.openai.com/v1/chat/completions")
+        {
+            tracing::debug!(model = %spec.id, "skipping built-in gateway model without a Chat Completions endpoint");
+            return None;
+        }
+
         if spec.backend == ModelBackend::OpenAIResponses && openai_config_is_chat_only(config) {
             tracing::debug!(
                 model = %spec.id,
@@ -2017,6 +2029,33 @@ mod tests {
     use std::collections::HashSet;
 
     #[test]
+    fn gemini_builtins_require_a_configured_gateway_and_keep_google_identity() {
+        let mut config = LlmConfig {
+            openai_api_key: Some("test-key".into()),
+            ..Default::default()
+        };
+        let without_endpoint = ModelRegistry::new(&config);
+        config.openai_chat_completions_base_url =
+            Some("https://api.openai.com/v1/chat/completions".into());
+        let openai_endpoint = ModelRegistry::new(&config);
+        config.openai_chat_completions_base_url =
+            Some("https://gateway.example/v1/chat/completions".into());
+        let registry = ModelRegistry::new(&config);
+        for model in [
+            "google/gemini-4-neon",
+            "google/gemini-4-hydrogen",
+            "google/gemini-4-carbon",
+            "google/gemini-4-argon",
+        ] {
+            assert!(without_endpoint.get(model).is_none());
+            assert!(openai_endpoint.get(model).is_none());
+            assert!(registry.get(model).is_some());
+            assert_eq!(registry.context_window(model), 1_048_576);
+            assert_eq!(registry.provider_display_name(model), "Google");
+        }
+    }
+
+    #[test]
     fn actual_outbound_model_name_survives_registry_logging_and_request_overrides() {
         let overrides = RequestModelOverrides::parse(
             r#"{"openai_responses":{"gpt-6-luna":"gpt-6-astra"}}"#,
@@ -2165,7 +2204,15 @@ mod tests {
             ModelRegistry::new_with_codex_catalog(&config, None),
             ModelRegistry::new_with_codex_catalog(&config, Some(&unrelated)),
         ] {
-            for id in ["gpt-6-astra", "gpt-6.1-sol", "gpt-6-sol", "gpt-6-luna"] {
+            for id in [
+                "gpt-6.2-astra",
+                "gpt-6.2-sol",
+                "gpt-6.1-terra",
+                "gpt-6-astra",
+                "gpt-6.1-sol",
+                "gpt-6-sol",
+                "gpt-6-luna",
+            ] {
                 assert!(
                     registry.get(id).is_some(),
                     "missing supported built-in {id}"
@@ -2370,11 +2417,11 @@ mod tests {
         let both = HashSet::from(["gpt-6-sol".to_string(), "gpt-6-luna".to_string()]);
         assert_eq!(
             ModelRegistry::new_with_codex_catalog(&config, Some(&only_luna)).default_model_id(),
-            "gpt-6.1-sol"
+            "gpt-6.2-sol"
         );
         assert_eq!(
             ModelRegistry::new_with_codex_catalog(&config, Some(&both)).default_model_id(),
-            "gpt-6.1-sol"
+            "gpt-6.2-sol"
         );
     }
 
@@ -2715,20 +2762,20 @@ mod tests {
     }
 
     #[test]
-    fn product_default_prefers_gpt_61_sol_without_overriding_explicit_defaults() {
+    fn product_default_prefers_gpt_62_sol_without_overriding_explicit_defaults() {
         let mut config = LlmConfig {
             anthropic_api_key: Some("test-key".into()),
             openai_api_key: Some("test-key".into()),
             ..Default::default()
         };
         let registry = ModelRegistry::new(&config);
-        assert_eq!(registry.default_model_id(), "gpt-6.1-sol");
+        assert_eq!(registry.default_model_id(), "gpt-6.2-sol");
         assert_eq!(
-            registry.effective_effort("gpt-6.1-sol", None),
-            phoenix_core::domain::llm_types::EffectiveEffort::native_known(ModelEffort::Medium)
+            registry.effective_effort("gpt-6.2-sol", None),
+            phoenix_core::domain::llm_types::EffectiveEffort::native_unknown()
         );
         assert_eq!(
-            registry.effective_effort("gpt-6.1-sol", Some(ModelEffort::High)),
+            registry.effective_effort("gpt-6.2-sol", Some(ModelEffort::High)),
             phoenix_core::domain::llm_types::EffectiveEffort::explicit(ModelEffort::High)
         );
 
@@ -3287,7 +3334,15 @@ mod tests {
         );
 
         assert!(outcome.credential_loaded);
-        for id in ["gpt-6-astra", "gpt-6.1-sol", "gpt-6-sol", "gpt-6-luna"] {
+        for id in [
+            "gpt-6.2-astra",
+            "gpt-6.2-sol",
+            "gpt-6.1-terra",
+            "gpt-6-astra",
+            "gpt-6.1-sol",
+            "gpt-6-sol",
+            "gpt-6-luna",
+        ] {
             assert!(
                 registry.get(id).is_some(),
                 "missing supported built-in {id}"
@@ -3461,7 +3516,7 @@ mod tests {
             ..Default::default()
         };
         let registry = ModelRegistry::new(&config);
-        assert_eq!(registry.default_model_id(), "gpt-6.1-sol");
+        assert_eq!(registry.default_model_id(), "gpt-6.2-sol");
     }
 
     /// `pick_default_model` must not pin to a configured `DEFAULT_MODEL` that

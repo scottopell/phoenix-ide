@@ -868,6 +868,16 @@ const MIGRATIONS: &[Migration] = &[
         name: "coordinator_user_questions",
         sql: include_str!("migrations/coordinator_user_questions.sql"),
     },
+    Migration {
+        version: 169,
+        name: "chat_completions_signature_replay",
+        sql: include_str!("migrations/chat_completions_signature_replay.sql"),
+    },
+    Migration {
+        version: 170,
+        name: "tool_discovery",
+        sql: include_str!("migrations/tool_discovery.sql"),
+    },
 ];
 
 const MIGRATION_138: &str = concat!(

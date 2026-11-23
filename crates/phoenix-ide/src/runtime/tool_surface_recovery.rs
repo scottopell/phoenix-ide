@@ -317,7 +317,7 @@ async fn ember_watch_list_recovery() {
             messages: messages.clone(),
             provider_replay: (!anthropic.is_empty())
                 .then(|| AnthropicReplayPayload::new(anthropic.clone()).unwrap()),
-            responses_replay: responses.clone(),
+            output_replay: responses.clone(),
             tool_availability: ToolAvailability::all(definitions.clone()),
             max_tokens: 1536,
             effective_effort: phoenix_llm::EffectiveEffort::explicit(ModelEffort::High),
@@ -388,7 +388,8 @@ async fn ember_watch_list_recovery() {
         }
         match replay {
             Some(ProviderReplayUpdate::Anthropic(set)) => anthropic.push(set),
-            Some(ProviderReplayUpdate::Responses(set)) => responses.push(set),
+            Some(ProviderReplayUpdate::Responses(set)) => responses.push(set.into()),
+            Some(ProviderReplayUpdate::ChatCompletions(set)) => responses.push(set.into()),
             Some(ProviderReplayUpdate::Clear) => {
                 anthropic.clear();
                 responses.clear();

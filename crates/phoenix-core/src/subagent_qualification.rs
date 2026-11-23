@@ -53,6 +53,15 @@ mod tests {
             assert!(supports_parallel_work_subagents(qualified), "{qualified}");
         }
         for unqualified in [
+            "gpt-6.2-astra",
+            "gpt-6.2-sol",
+            "gpt-6.1-terra",
+            "claude-fable-5-2",
+            "claude-haiku-5-5",
+            "google/gemini-4-neon",
+            "google/gemini-4-hydrogen",
+            "google/gemini-4-carbon",
+            "google/gemini-4-argon",
             "gpt-5.6-luna",
             "gpt-6-luna",
             "gpt-6-astra-preview",

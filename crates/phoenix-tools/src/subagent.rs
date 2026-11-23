@@ -618,13 +618,41 @@ mod tests {
         }
 
         for model in [
+            "gpt-6.2-astra",
+            "gpt-6.2-sol",
+            "gpt-6.1-terra",
+            "claude-fable-5-2",
+            "claude-haiku-5-5",
+            "google/gemini-4-neon",
+            "google/gemini-4-hydrogen",
+            "google/gemini-4-carbon",
+            "google/gemini-4-argon",
             "gpt-5.6-luna",
             "gpt-6-luna",
             "gpt-6-astra-preview",
             "claude-opus-5",
         ] {
             let tool = SpawnAgentsTool::new().with_parallel_work_capability(model);
-            assert!(tool.description().contains("one at a time per parent"));
+            let schema = tool.input_schema();
+            let mode_guidance = schema["properties"]["tasks"]["items"]["properties"]["mode"]
+                ["description"]
+                .as_str()
+                .unwrap();
+            for guidance in [tool.description().as_str(), mode_guidance] {
+                assert!(guidance.contains("one at a time per parent"), "{model}");
+                assert!(
+                    guidance.contains("at most one Work task per call"),
+                    "{model}"
+                );
+                assert!(
+                    guidance.contains("wait for the active Work child to finish"),
+                    "{model}"
+                );
+                assert!(
+                    !guidance.contains("Work sub-agents may run in parallel"),
+                    "{model}"
+                );
+            }
         }
     }
 

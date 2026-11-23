@@ -33,7 +33,7 @@ pub async fn generate_title(
             content: vec![ContentBlock::text(prompt)],
         }],
         provider_replay: None,
-        responses_replay: Vec::new(),
+        output_replay: Vec::new(),
         tool_availability: phoenix_core::domain::tool_availability::ToolAvailability::all(vec![]),
         max_tokens: max_output_tokens.map_or(50, |limit| limit.min(50)), // Title should be very short
         effective_effort,

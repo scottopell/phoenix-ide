@@ -57,6 +57,7 @@ enum MessageRole { user | assistant }
 -- A compatible endpoint's wire format alone does not prove feature support.
 enum NativeToolRestrictionSupport { supported | unsupported | unknown }
 enum ToolAdmissionStatus { admitted | unavailable }
+enum ToolDiscoveryMode { eager | anthropic | openai_hosted | openai_client | local }
 
 -- The discriminant of an internal ContentBlock. The string values are
 -- exactly ContentBlock::type_tag() in types.rs — the serde `type` tag of
@@ -186,6 +187,7 @@ value ToolDeclaration {
     name: String
     description: String
     input_schema: Any
+    defer_loading: Boolean
 }
 
 -- A provider-agnostic completion request. `tool_count` is derived from
@@ -232,6 +234,7 @@ value TokenChunk {
 entity ToolAvailability {
     declarations: List<ToolDeclaration>
     callable_names: List<String>
+    discovery_mode: ToolDiscoveryMode
 }
 
 -- A route identifies the concrete provider endpoint and execution protocol,
@@ -466,6 +469,9 @@ contract ToolHistoryIntegrity {
         -- executing it or removing the assistant turn.
         -- Tool implementations and MCP servers own argument-value validation;
         -- this admission contract binds a call to its declared tool schema.
+        -- Discovery also requires the originating request's actual advertised
+        -- names. A retained full catalog and a successful search are not
+        -- substitutes for that request snapshot or current execution authority.
 
     @invariant PrivateReplaySurvivesProjection
         -- Provider-private continuation data belongs to its originating
@@ -494,6 +500,9 @@ contract ProviderRequestProjection {
         -- current tool policy. A provider switch preserves retained declarations,
         -- current callable names, and public call/result history. Request policy
         -- is a snapshot of that authority, not a second mutable authority.
+        -- Discovery derives an advertised subset without expanding permission.
+        -- Local/native-client selection receipts retain authenticated schemas;
+        -- public search text and process-local indexes do not own those facts.
 
     @invariant WireControlsBelongToTarget
         -- Only the selected adapter emits native controls supported by its exact

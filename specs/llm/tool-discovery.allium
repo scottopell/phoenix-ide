@@ -1,0 +1,199 @@
+-- allium: 3
+-- Route-qualified native and local tool discovery.
+-- Governs REQ-LLM-004n with ToolHistoryIntegrity and ProviderRequestProjection.
+
+use "./llm.allium" as llm
+
+enum DiscoveryProtocol { function | openai_client }
+enum DiscoveryOutcome { success | error }
+enum DiscoveryReceiptStatus { proposed | committed }
+
+value ToolSearchQuery {
+    text: String
+    limit: Integer
+}
+
+value CapturedDiscoverySchema {
+    name: String
+    description: String
+    input_schema: Any
+    defer_loading: Boolean
+}
+
+entity ToolDiscoveryRequest {
+    conversation_id: String
+    mode: llm/ToolDiscoveryMode
+    search_installed: Boolean
+    frozen_catalog: List<CapturedDiscoverySchema>
+    permission_names: List<String>
+    advertised_names: List<String>
+}
+
+entity ToolDiscoveryReceipt {
+    conversation_id: String
+    owner_message_id: String
+    tool_call_id: String
+    result_message_id: String
+    protocol: DiscoveryProtocol
+    outcome: DiscoveryOutcome
+    status: DiscoveryReceiptStatus
+    tools: List<CapturedDiscoverySchema>
+
+    transitions status {
+        proposed -> committed
+        terminal: committed
+    }
+}
+
+config {
+    default_result_limit: Integer = 8
+    max_result_limit: Integer = 20
+    max_query_bytes: Integer = 512
+}
+
+contract QualifiedToolDiscovery {
+    @invariant ModeBelongsToResolvedRoute
+        -- Eager sends authentic declarations without discovery. Anthropic
+        -- retains its native server search. Qualified direct OpenAI and
+        -- Responses gateway routes use hosted native tool_search/defer_loading.
+        -- Codex bridge uses native execution:client search. Compatible Chat
+        -- routes use an ordinary local function. A surface without its required
+        -- executable search tool uses eager loading instead of hiding schemas.
+        -- Family labels, aliases, and shared wire syntax do not grant native
+        -- feature support. Preparation and dispatch share one resolved service.
+
+    @invariant DiscoveryNeverGrantsPermission
+        -- Full permission policy and actual advertised names are separate
+        -- request snapshots. Selection is limited to the frozen permitted
+        -- catalog. Execution additionally requires advertisement, matching
+        -- originating schema, and current live authority. Removed, disabled,
+        -- or schema-rewritten tools cannot gain admission through a receipt.
+
+    @invariant CanonicalCommitOwnsSelection
+        -- The accepted owning tool-round transaction validates a successful
+        -- search's input and derived names-only public result against the same
+        -- frozen catalog used by the executor. It commits the result parent,
+        -- ordered complete schema child rows, canonical tool message, and state
+        -- atomically. A failed or empty result still has a protocol-bearing
+        -- parent with no selected children. Duplicate adoption verifies the
+        -- immutable existing record instead of recomputing it from a new catalog.
+        -- Public result JSON is never parsed into execution authority.
+
+    @invariant RestartUsesCommittedEvidence
+        -- Visible results load only through their authentic owner, call, and
+        -- result-message identities. Restart/retry reconstructs from committed
+        -- normalized rows, not an index or guessed schemas. Current policy and
+        -- schema checks determine which captured tools are advertised anew.
+        -- Compaction and model/route changes preserve historical pairing under
+        -- the shared history contract; missing authentic schema is an error.
+
+    @invariant ProtocolLoadingAndAdmissionStayAligned
+        -- OpenAiClient admits eager tools plus current-schema selections from
+        -- openai_client receipts only. Ordinary function receipts and deferred
+        -- historical names do not establish native loading; their original
+        -- function_call/output history stays intact and a new native search can
+        -- load the tools. Local physically advertises schemas, so it may reuse
+        -- either receipt protocol and authentic historical declarations, subject
+        -- to current permission and schema checks. Retaining a record for wire
+        -- history is distinct from permitting that record to expand admission.
+
+    @invariant NativeWirePlacementPreservesMeaning
+        -- Hosted OpenAI server search is consumed by provider-native replay,
+        -- never dispatched as a local ToolUse. Accepted whole output envelopes
+        -- retain search_call/search_output within the unsettled exchange.
+        -- Native Codex client results emit typed schemas in tool_search_output
+        -- at discovery, not in newly prepended deferred declarations. Ordinary
+        -- local function results expose names; subsequent function declarations
+        -- carry selected schemas. Stored per-call protocol controls historical
+        -- result encoding, including failed and empty results after settlement.
+
+    @invariant NativeClientCallProjectionIsQualified
+        -- Qualified Codex client search accepts a native tool_search_call or
+        -- exactly function_call namespace tool_search, name tool_search_tool,
+        -- with a nonempty call identity and object arguments decoded from its
+        -- JSON string. Both project to one native-client lookup and receipt.
+        -- Active private replay retains the original complete item. Settled
+        -- native discovery reconstructs canonical tool_search_call/output.
+        -- Other namespaces, names, routes, and ordinary function-search history
+        -- do not acquire native meaning from this projection.
+
+    @invariant HostedPolicyUsesQualifiedCandidates
+        -- Hosted search receives only permitted candidate definitions, using
+        -- auto/none selection rather than allowed_tools names for deferred
+        -- functions. Independent execution admission and advisory restrictions
+        -- still apply. Historical calls and their private witnesses remain
+        -- intact when current candidates shrink.
+
+    @invariant CapacityCountsActualPlacement
+        -- Local counts include actual advertised schemas. Native client counts
+        -- include schemas in their tool_search_output positions and the stable
+        -- leading declaration prefix. Hosted counts follow provider-supported
+        -- counting semantics. Hidden full catalogs never masquerade as local
+        -- advertised schema tokens; private replay overhead remains accounted.
+}
+
+-- valid_query(query) -> Boolean checks trimmed nonempty text, bounded UTF-8
+-- bytes, result bounds, and the declared input shape without unknown fields.
+-- select_schemas(request, query) -> List<CapturedDiscoverySchema> is bounded,
+-- deterministic lexical matching over deferred permitted frozen definitions;
+-- it excludes search itself and breaks equal scores by authentic tool name.
+-- accepted_owned_search(request, receipt) -> Boolean establishes canonical
+-- owner/call/result identity and atomic admission; successful selections also
+-- validate the query and derived result against the frozen request catalog.
+
+rule MissingSearchUsesEagerLoading {
+    when: PrepareDiscoveryRequest(request)
+    requires: request.mode in { openai_client, local }
+    requires: request.search_installed = false
+    ensures: request.mode = eager
+}
+
+rule SuccessfulSearchSelectionCommitted {
+    when: CommitOwnedSearchResult(request, query, receipt)
+    requires: request.mode in { openai_client, local }
+    requires: receipt.outcome = success
+    requires: receipt.status = proposed
+    requires: valid_query(query)
+    requires: accepted_owned_search(request, receipt)
+    ensures: receipt.tools = select_schemas(request, query)
+    ensures: receipt.status = committed
+}
+
+rule FailedSearchProtocolCommitted {
+    when: CommitOwnedSearchFailure(request, receipt)
+    requires: request.mode in { openai_client, local }
+    requires: receipt.outcome = error
+    requires: receipt.status = proposed
+    requires: accepted_owned_search(request, receipt)
+    ensures: receipt.tools.count = 0
+    ensures: receipt.status = committed
+}
+
+invariant SearchResultCountIsBounded {
+    for receipt in ToolDiscoveryReceipts:
+        receipt.tools.count <= config.max_result_limit
+}
+
+invariant FailedSearchHasNoSelectedSchemas {
+    for receipt in ToolDiscoveryReceipts where receipt.outcome = error:
+        receipt.tools.count = 0
+}
+
+surface ToolDiscoveryBoundary {
+    facing: PhoenixRuntime
+    context request: ToolDiscoveryRequest
+    context receipt: ToolDiscoveryReceipt
+    contracts:
+        fulfils QualifiedToolDiscovery
+        demands llm/ToolHistoryIntegrity
+        demands llm/ProviderRequestProjection
+    exposes:
+        request.mode
+        request.advertised_names
+        receipt.protocol
+        receipt.outcome
+    provides:
+        PrepareDiscoveryRequest(request)
+        CommitOwnedSearchResult(request, query, receipt)
+        CommitOwnedSearchFailure(request, receipt)
+}

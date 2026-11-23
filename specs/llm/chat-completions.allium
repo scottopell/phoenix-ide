@@ -33,6 +33,7 @@ enum ChatStreamStatus { accumulating | done | failed }
 enum ChatFinishReason { stop | tool_calls | length | content_filter | other }
 enum ChatMessageRole { system | user | assistant | tool }
 enum ChatContentKind { text | image_url }
+enum ChatToolResultImageSupport { supported | unsupported }
 
 ------------------------------------------------------------
 -- Value Types
@@ -42,6 +43,7 @@ value ChatUsage {
     prompt_tokens: Integer
     completion_tokens: Integer
     cached_prompt_tokens: Integer
+    total_tokens: Integer?
 }
 
 value ChatToolCall {
@@ -145,6 +147,19 @@ contract ChatToolContinuation {
         -- Failure is represented in tool-message content; there is no portable
         -- Anthropic is_error field. Keep the original error evidence.
 
+    @invariant ToolResultImagesFollowQualifiedModelRoute
+        -- Built-in Google gateway models on a configured compatible endpoint
+        -- support multimodal tool-role content. Preserve the tool-result text
+        -- (including any error prefix), followed by every image in source order
+        -- as image_url data URLs, within the original tool_call_id message.
+        -- Omit empty text parts from multimodal results; an image-only result
+        -- contains only image_url parts rather than a fabricated text value.
+        -- Empty-image results remain plain text. Select support from the
+        -- registered model and endpoint, never its remapped request spelling
+        -- or display family. External models and the public OpenAI route do
+        -- not inherit this capability from Chat compatibility. Retry/restart
+        -- projection preserves the same images and private signed-call replay.
+
     @invariant SelectionDoesNotRewriteMessages
         -- tools describes functions the model may call on the current request;
         -- tool_choice controls new generation, not historical tool-call identity.
@@ -173,6 +188,18 @@ contract ChatToolContinuation {
         -- describing the restriction, and enforce unavailable results locally.
         -- Use verified basic tool_choice controls where available; do not send
         -- allowed_tools speculatively, or erase history to conceal rejection.
+
+@invariant SignedGoogleToolCallsStayPrivateAndDurable
+    -- Retain extra_content.google.thought_signature separately from public
+    -- ToolUse content and tool arguments. Bind each signature to its exact
+    -- call ID and durable assistant-message identity plus public-content
+    -- witness. Persist signatures as ordered child rows with the accepted
+    -- execution transition before executing tools. Retry and restart restore
+    -- them unchanged only to the authenticated owning tool calls. A removed,
+    -- duplicated, malformed, or rewritten owner fails before provider I/O.
+    -- Streaming signatures may arrive after argument fragments. Assemble
+    -- them before accepting the response; reject changed signature or response
+    -- identity. Keep replay until settlement or authoritative abandonment.
 
     @invariant ReasoningContractIsRouteSpecific
         -- First-party Chat Completions does not use the Responses reasoning-item
@@ -311,7 +338,7 @@ rule ChatStreamingRequested {
 }
 
 rule UnsupportedProviderBlockLoggedAndDropped {
-    when: TranslateChatContent(block)
+    when: TranslateChatContent(block, image_support)
 
     requires: block.kind not in { text, image, tool_use, tool_result }
 
@@ -333,10 +360,11 @@ rule AssistantImageLoggedAndDropped {
 }
 
 rule ToolResultImagesLoggedAndDropped {
-    when: TranslateChatContent(block)
+    when: TranslateChatContent(block, image_support)
 
     requires: block.kind = tool_result
     requires: block.tool_result_images.count > 0
+    requires: image_support = unsupported
 
     ensures: ChatDroppedProviderBlock.created(
         block_kind: tool_result,
@@ -347,6 +375,11 @@ rule ToolResultImagesLoggedAndDropped {
 ------------------------------------------------------------
 -- Rules — response normalization
 ------------------------------------------------------------
+
+-- A supplied total_tokens is prompt plus all generated tokens. Output usage
+-- equals total_tokens minus prompt_tokens; without a total, completion_tokens
+-- supplies output usage. A total below prompt plus completion is invalid.
+-- reasoning_tokens is an informational subset of normalized output usage.
 
 rule ChatTextNormalized {
     when: NormalizeChatResponse(response)
@@ -530,6 +563,7 @@ surface ChatCompletionsBoundary {
 
     context request: llm/LlmRequest
     context endpoint: ChatEndpoint
+    context image_support: ChatToolResultImageSupport
     context chat_request: ChatRequest
     context message: ChatWireMessage
     context response: ChatResponse
@@ -562,7 +596,7 @@ surface ChatCompletionsBoundary {
         ResolveChatEndpoint(configured_url?)
         TranslateChatRequest(request, choice)
         TranslateStreamingChatRequest(request, choice)
-        TranslateChatContent(block)
+        TranslateChatContent(block, image_support)
         TranslateAssistantChatContent(block)
         NormalizeChatResponse(response)
         ChatStreamEventReceived(stream, generation_kind?)

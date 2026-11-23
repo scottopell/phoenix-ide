@@ -134,6 +134,7 @@ async fn uncertain_registered_setting_closes_authority_and_stops_https_superviso
         &callable_names,
         &[],
         &[],
+        phoenix_core::domain::tool_discovery::ToolDiscoveryMode::Eager,
     )
     .await
     .unwrap();

@@ -22,6 +22,7 @@ mod terminal_command_history;
 mod terminal_last_command;
 mod think;
 pub mod tmux;
+mod tool_search;
 pub mod work_scope_inventory;
 
 pub use ask_user_question::AskUserQuestionTool;
@@ -57,6 +58,7 @@ pub use tmux::{
     TmuxError, TmuxLifecycleEvent, TmuxLifecycleSink, TmuxRegistry, TmuxRunTool, TmuxServer,
     TmuxTool,
 };
+pub use tool_search::ToolSearch;
 
 use async_trait::async_trait;
 use serde_json::Value;
@@ -347,6 +349,7 @@ pub struct ToolContext {
     direct_turn_id: Option<phoenix_core::domain::sm_event::DirectTurnTurnId>,
     svg_assistant_message_id: Option<String>,
     svg_artifact_store: Option<Arc<dyn present_svg::SvgArtifactStore>>,
+    tool_search_catalog: Arc<[phoenix_core::domain::llm_types::ToolDefinition]>,
 }
 
 impl ToolContext {
@@ -444,6 +447,7 @@ impl ToolContext {
             svg_assistant_message_id: None,
             svg_artifact_store: None,
             llm_metrics_tx: None,
+            tool_search_catalog: Arc::from([]),
         }
     }
 
@@ -501,7 +505,22 @@ impl ToolContext {
             direct_turn_id: None,
             svg_assistant_message_id: None,
             svg_artifact_store: None,
+            tool_search_catalog: Arc::from([]),
         }
+    }
+
+    #[must_use]
+    pub fn with_tool_search_catalog(
+        mut self,
+        catalog: Vec<phoenix_core::domain::llm_types::ToolDefinition>,
+    ) -> Self {
+        self.tool_search_catalog = catalog.into();
+        self
+    }
+
+    #[must_use]
+    pub fn tool_search_catalog(&self) -> &[phoenix_core::domain::llm_types::ToolDefinition] {
+        &self.tool_search_catalog
     }
 
     #[must_use]
@@ -840,6 +859,7 @@ fn read_only_tools() -> Vec<Arc<dyn Tool>> {
         Arc::new(SearchTool),
         Arc::new(KeywordSearchTool),
         Arc::new(ReadImageTool),
+        Arc::new(ToolSearch),
     ]
 }
 
@@ -1546,6 +1566,7 @@ mod tests {
             "search",
             "keyword_search",
             "read_image",
+            "tool_search",
         ]
         .into_iter()
         .collect();

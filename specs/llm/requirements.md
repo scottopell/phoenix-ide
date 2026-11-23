@@ -49,13 +49,19 @@ WHEN client requests model list
 THE SYSTEM SHALL return only models that are currently available
 
 WHEN selecting a product default without an available explicit `DEFAULT_MODEL` override
-THE SYSTEM SHALL prefer exact `gpt-6.1-sol` when registered
+THE SYSTEM SHALL prefer exact `gpt-6.2-sol` when registered
 AND SHALL retain available provider fallback choices when that model is unavailable
 AND SHALL NOT replace explicit conversation, task, or specialized worker choices
 
-THE built-in OpenAI Responses catalog SHALL contain `gpt-5.6-luna`, `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-6-astra`, `gpt-6.1-sol`, `gpt-6-luna`, and `gpt-6-sol`
+THE built-in OpenAI Responses catalog SHALL contain `gpt-5.6-luna`, `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-6-astra`, `gpt-6.1-sol`, `gpt-6.1-terra`, `gpt-6.2-astra`, `gpt-6.2-sol`, `gpt-6-luna`, and `gpt-6-sol`
 AND SHALL NOT contain `gpt-5.4-mini`, `gpt-5.4`, or `gpt-5.5`
 AND provider discovery SHALL NOT introduce a model that is absent from both the built-in and operator-configured catalogs
+
+THE built-in Google gateway catalog SHALL include `google/gemini-4-neon`, `google/gemini-4-hydrogen`, `google/gemini-4-carbon`, and `google/gemini-4-argon`
+AND SHALL use an explicitly configured OpenAI Chat Completions-compatible endpoint with Google provider-family metadata
+AND SHALL NOT register these gateway models against the default OpenAI API endpoint
+
+THE built-in Anthropic catalog SHALL include `claude-fable-5-2`, `claude-opus-5-5`, `claude-sonnet-5-5`, and `claude-haiku-5-5`
 
 WHEN an exact operator-configured route uses an identifier that is also a legacy built-in identifier
 THE SYSTEM SHALL preserve the exact operator-configured route rather than replace its identifier
@@ -164,6 +170,11 @@ AND SHALL log unsupported provider-specific content blocks before dropping them
 WHEN request includes images
 THE SYSTEM SHALL encode appropriately for provider
 AND respect provider's image size limits
+
+WHEN a built-in Google gateway model receives images in a tool result
+THE SYSTEM SHALL preserve those images in the owning tool-role message
+AND SHALL preserve the original call identity, error text, and image order
+AND SHALL NOT infer multimodal tool-result support for other compatible routes
 
 **Rationale:** Consistent request format enables the state machine to work with any provider.
 
@@ -393,6 +404,11 @@ AND SHALL replay each block unchanged at its validated original ordinal
 AND SHALL retain all required private response sets until the exchange settles or is authoritatively abandoned
 AND SHALL reject missing, rewritten, malformed, unknown, unsigned, or incorrectly positioned replay state before provider I/O
 
+WHEN a Chat Completions tool call carries a Google thought signature
+THE SYSTEM SHALL retain the signature privately with its exact tool-call identity and owning assistant-message witness
+AND SHALL restore it as `extra_content.google.thought_signature` only on that validated tool call
+AND SHALL preserve it across streaming assembly, retry, and restart without adding it to tool arguments or public transcript content
+
 WHEN the accepted response starts or extends private replay
 THE SYSTEM SHALL persist replay mutation with the active execution-state transition before tool execution
 AND SHALL apply replay mutation only after stale-generation and reducer admission checks
@@ -414,6 +430,10 @@ AND SHALL preserve final text and tool calls
 
 WHEN a Chat Completions response reports cached prompt tokens
 THE SYSTEM SHALL split cached tokens from uncached input tokens without double counting
+
+WHEN a Chat Completions response reports total prompt-and-generation token usage
+THE SYSTEM SHALL include separately reported reasoning in normalized output usage exactly once
+AND SHALL reject totals smaller than the reported prompt plus completion counts
 
 **Rationale:** Normalized responses enable provider-agnostic state machine logic.
 
@@ -862,3 +882,63 @@ AND SHALL identify the deliberate change in request diagnostics
 AND SHALL NOT promise provider cache residency, hit rate, or cross-model reuse.
 
 For Codex-auth, direct API, and compatible gateway routes, cache controls SHALL be selected from that route's verified capabilities rather than inferred from protocol name alone.
+
+### REQ-LLM-004n: Route-Qualified Tool Discovery
+
+WHEN a request has tools eligible for deferred discovery
+THE SYSTEM SHALL select a discovery mode from the resolved model, provider route, and installed tool surface
+AND SHALL distinguish eager loading, native Anthropic search, OpenAI hosted search, OpenAI client-executed search, and local function-based search
+AND SHALL use eager loading when the selected surface cannot execute the required search mechanism rather than hide tools behind an unavailable search.
+
+WHEN an OpenAI direct API or qualified Responses-compatible route supports hosted tool search
+THE SYSTEM SHALL declare native `tool_search` with deferred eligible function definitions
+AND SHALL preserve hosted search output in the accepted exchange's private Responses envelopes
+AND SHALL NOT execute hosted search as a local function.
+
+WHEN a Codex bridge route uses native client-executed tool search
+THE SYSTEM SHALL execute the lookup through the shared local discovery engine
+AND SHALL return typed selected schemas in native `tool_search_output` at their discovery position
+AND SHALL NOT insert newly discovered deferred schemas into the leading Codex declaration prefix.
+
+WHEN a qualified Codex native client search arrives as `tool_search_call` or the exact namespaced function `tool_search.tool_search_tool`
+THE SYSTEM SHALL project it to the same executable discovery operation and native-client receipt
+AND SHALL retain its original private envelope during the active exchange
+AND SHALL reconstruct settled native discovery using canonical native call/result items
+AND SHALL NOT infer native discovery from an ordinary function name or an unqualified route.
+
+WHEN a compatible Chat Completions route uses local discovery
+THE SYSTEM SHALL expose an eager ordinary `tool_search` function and withhold undiscovered deferred schemas
+AND SHALL add authenticated selected schemas to subsequent request declarations
+AND SHALL keep the public search result a compact names-only summary rather than duplicate full schemas in public tool text.
+
+WHEN local or native client-executed search runs
+THE SYSTEM SHALL validate and bound its query and result count
+AND SHALL deterministically search the permitted catalog frozen for its originating provider request
+AND SHALL NOT use a mutable process-local index or arbitrary public result JSON as catalog or execution authority.
+
+WHEN an owned tool round accepts a search result
+THE SYSTEM SHALL atomically persist its protocol identity and selected schema rows with the canonical tool-result message and execution state
+AND SHALL validate successful selections against the originating query, frozen catalog, and derived public summary
+AND SHALL retain a parent record for empty or failed results so their function or native-client protocol remains distinguishable
+AND SHALL preserve immutable selections across duplicate adoption, retry, and restart.
+
+WHEN preparing or executing a discovered tool
+THE SYSTEM SHALL keep full permission policy separate from the actual advertised-name snapshot
+AND SHALL require the originating request's permission, advertisement, and authentic schema as well as current execution authority
+AND SHALL revoke stale selections when their tool is removed, disabled, or has a different schema
+AND SHALL preserve authentic historical call/result pairing without inventing missing declarations.
+
+WHEN native Codex client search restores history from another discovery mode
+THE SYSTEM SHALL admit deferred tools only from current-schema native-client loading records
+AND SHALL NOT promote ordinary function-search records or historical-only deferred names into native-loaded execution authority
+AND SHALL preserve the ordinary records' original function-call protocol while allowing a new native search to load those tools.
+
+WHEN local function discovery prepares a request
+THE SYSTEM MAY reuse authentic selections from either stored protocol and authentic historical declarations
+PROVIDED THAT the schemas are physically advertised and still satisfy current policy and schema validation.
+
+WHEN estimating or counting a discovery-enabled request
+THE SYSTEM SHALL account for schemas at their actual provider-visible placement
+AND SHALL NOT count a hidden local catalog as if every schema were advertised.
+
+**Rationale:** Large tool catalogs should consume model context only as needed, while discovery preserves provider-native caching, durable conversation evidence, and independent execution permissions.
