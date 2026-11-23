@@ -12,6 +12,7 @@ import {
 import { useDensity } from '../hooks/useDensity';
 import { useRegisterFocusScope } from '../hooks/useFocusScope';
 import { formatGitShaForDisplay } from '../utils';
+import { safePrefix, safeSuffix } from '../utils/textBounds';
 
 type BrowserPermission = NotificationPermission | 'unsupported';
 
@@ -48,7 +49,7 @@ const GearIcon = () => (
 function shortAccount(id: string | null): string {
   if (!id) return 'unknown';
   if (id.length <= 12) return id;
-  return `${id.slice(0, 4)}…${id.slice(-4)}`;
+  return `${safePrefix(id, 4)}…${safeSuffix(id, 4)}`;
 }
 
 export function SettingsDropdown({

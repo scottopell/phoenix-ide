@@ -19,6 +19,7 @@
 import type { InputOrigin } from '../api';
 import type { HistoricalUnit } from './renderUnits';
 import { isSignificantText } from '../hooks/useDensity';
+import { safePrefix } from '../utils/textBounds';
 
 export type ChapterKind = 'prompt' | 'prose' | 'boundary';
 
@@ -57,7 +58,7 @@ const LABEL_MAX_CHARS = 40;
 export function truncateLabel(text: string, max = LABEL_MAX_CHARS): string {
   const oneLine = text.replace(/\s+/g, ' ').trim();
   if (oneLine.length <= max) return oneLine;
-  return `${oneLine.slice(0, max - 1).trimEnd()}…`;
+  return `${safePrefix(oneLine, max - 1).trimEnd()}…`;
 }
 
 function userText(unit: Extract<HistoricalUnit, { kind: 'user' | 'pending_user' }>): string {

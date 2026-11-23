@@ -55,6 +55,7 @@ import { MermaidDiagram } from './MermaidDiagram';
 import { StreamingBlocks } from './StreamingMessage';
 import './ReadFileResultView.css';
 import './MessageComponents.css';
+import { safePrefix } from '../utils/textBounds';
 
 const CheckIcon = () => (
   <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
@@ -2043,7 +2044,7 @@ function boundedReadFileLines(lines: ReadFileLine[]): { lines: ReadFileLine[]; t
     if (remainingChars <= 0) break;
     const lineWasTruncated = line.content.length > remainingChars;
     const content = lineWasTruncated
-      ? `${line.content.slice(0, remainingChars)}…`
+      ? `${safePrefix(line.content, remainingChars)}…`
       : line.content;
     visible.push({ ...line, content });
     remainingChars -= Math.min(line.content.length, remainingChars);
@@ -2916,7 +2917,7 @@ function ToolUseBlockImpl({ block, result, onOpenFile, knownResultIds, toolStart
   const displayResult = useMemo(() => {
     const maxDisplayLen = 5000;
     return resultText.length > maxDisplayLen
-      ? resultText.slice(0, maxDisplayLen) + `\n... (${resultText.length - maxDisplayLen} more chars)`
+      ? safePrefix(resultText, maxDisplayLen) + `\n... (${resultText.length - maxDisplayLen} more chars)`
       : resultText;
   }, [resultText]);
 
@@ -3216,7 +3217,7 @@ function getToolResultText(result: Message | undefined): string {
 
 function summarizeToolInput(name: string, input: Record<string, unknown>, display?: string): string {
   const formatted = formatToolInput(name, input, display).display.replace(/^\$\s*/, '').replace(/\s+/g, ' ').trim();
-  return formatted.length > 120 ? `${formatted.slice(0, 119)}…` : formatted;
+  return formatted.length > 120 ? `${safePrefix(formatted, 119)}…` : formatted;
 }
 
 function countToolUses(messages: Message[]): number {
@@ -3281,7 +3282,7 @@ const ChildAgentActivity = memo(function ChildAgentActivity({ message, toolResul
           if (!text) return null;
           return (
             <div key={`${message.message_id}-text-${idx}`} className="subagent-activity-event agent-text">
-              <MarkdownRenderer mode="conversation" components={markdownComponents} urlTransform={CONVERSATION_MARKDOWN_URL_TRANSFORM}>{text.length > 900 ? `${text.slice(0, 900)}…` : text}</MarkdownRenderer>
+              <MarkdownRenderer mode="conversation" components={markdownComponents} urlTransform={CONVERSATION_MARKDOWN_URL_TRANSFORM}>{text.length > 900 ? `${safePrefix(text, 900)}…` : text}</MarkdownRenderer>
             </div>
           );
         }
@@ -3503,7 +3504,7 @@ function SubAgentSummary({ results, revealRequest = null, activeHighlight = null
 /** Truncate text with ellipsis */
 function truncate(text: string, maxLen: number): string {
   if (text.length <= maxLen) return text;
-  return text.slice(0, maxLen - 1) + '…';
+  return safePrefix(text, maxLen - 1) + '…';
 }
 
 const ExternalLinkIcon = () => (

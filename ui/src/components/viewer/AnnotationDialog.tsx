@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { X } from 'lucide-react';
+import { safePrefix } from '../../utils/textBounds';
 
 interface AnnotationDialogProps {
   /** Header label, e.g. "Line 42" or "src/foo.rs (file-level)". */
@@ -72,7 +73,7 @@ export function AnnotationDialog({
         </div>
         {lineContent && (
           <div className="annotation-dialog-preview">
-            {lineContent.slice(0, 100)}
+            {safePrefix(lineContent, 100)}
             {lineContent.length > 100 && '…'}
           </div>
         )}

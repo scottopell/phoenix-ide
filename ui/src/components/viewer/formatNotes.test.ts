@@ -141,6 +141,23 @@ describe('formatNotesForSend', () => {
     expect(out).toMatch(/`x{200}…`/);
   });
 
+  it('never splits an emoji at the quoted-line cap, so the send stays valid JSON', () => {
+    // The emoji's two UTF-16 units straddle the 200-unit cap.
+    const line = `${'x'.repeat(199)}😀 tail`;
+    const out = formatNotesForSend([
+      note({
+        anchor: { kind: 'file', filePath: 'a.txt', lineNumber: 1 },
+        lineContent: line,
+        body: 'note',
+      }),
+    ])!;
+    expect(out).toContain(`\`${'x'.repeat(199)}…\``);
+    expect(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/.test(out)).toBe(false);
+    // The server parses this body with a strict JSON parser; a lone surrogate
+    // escape would be rejected. Round-trip check on the JS side.
+    expect(JSON.parse(JSON.stringify({ text: out })).text).toBe(out);
+  });
+
   it('uses a longer backtick delimiter when source line contains backticks', () => {
     // `array.length` and `` `keyword` `` are common in code reviews;
     // the wrapper must pick a fence longer than any inner backtick

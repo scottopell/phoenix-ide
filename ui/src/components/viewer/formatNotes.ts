@@ -1,4 +1,5 @@
 import type { ReviewNote } from '../../contexts/ReviewNotesContext';
+import { QUOTED_LINE_MAX_UNITS, safePrefix } from '../../utils/textBounds';
 
 /**
  * Format a review-notes pile into a single markdown blob suitable for
@@ -82,7 +83,9 @@ export function formatNotesForSend(notes: ReviewNote[]): string | null {
 }
 
 function formatLineEntry(label: string, lineContent: string, body: string): string {
-  const quoted = lineContent.length > 200 ? `${lineContent.slice(0, 200)}…` : lineContent;
+  const quoted = lineContent.length > QUOTED_LINE_MAX_UNITS
+    ? `${safePrefix(lineContent, QUOTED_LINE_MAX_UNITS)}…`
+    : lineContent;
   return `- **${label}**: ${wrapInCodeSpan(quoted)}\n  ${body.replace(/\n/g, '\n  ')}`;
 }
 

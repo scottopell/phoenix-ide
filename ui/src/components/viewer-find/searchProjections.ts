@@ -11,6 +11,7 @@ import { buildSectionItems, lineTextAt as diffLineTextAt } from '../viewer/pierr
 import { findLiteralMatches, type ViewerFindMatch } from './literalMatch';
 import { formatToolInput, skillResultVisibleText } from '../toolInputDisplay';
 import { buildBrowserProfileVisibleText } from '../BrowserProfileResponseView';
+import { safePrefix } from '../../utils/textBounds';
 
 export interface SearchableSourceMatch<TTarget> {
   sourceId: string;
@@ -968,7 +969,7 @@ function formatVisibleMillis(ms: number): string {
 
 function compactBashTailText(parts: string[]): string {
   const text = parts.join(' · ');
-  return text.length > 140 ? `${text.slice(0, 139)}…` : text;
+  return text.length > 140 ? `${safePrefix(text, 139)}…` : text;
 }
 
 function bashVisibleSearchText(

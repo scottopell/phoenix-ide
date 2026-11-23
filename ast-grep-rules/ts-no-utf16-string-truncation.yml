@@ -1,0 +1,34 @@
+id: ts-no-utf16-string-truncation
+language: TypeScript
+severity: error
+message: |
+  String truncation with slice/substring/substr counts UTF-16 code units and
+  can split a surrogate pair (emoji, astral CJK). The lone surrogate renders
+  as U+FFFD and, once JSON-encoded, makes the server reject the whole request.
+  Use safePrefix / safeSuffix from ui/src/utils/textBounds.ts instead.
+note: "Anti-pattern: UTF-16 truncation that can leave a lone surrogate"
+ignores:
+  - "**/*.test.ts"
+  - "**/*.test.tsx"
+  - "**/textBounds.ts"
+rule:
+  all:
+    - any:
+        - pattern: $S.slice($$$)
+        - pattern: $S.substring($$$)
+        - pattern: $S.substr($$$)
+    # An array slice that is then joined is not a string cut.
+    - not:
+        inside:
+          kind: member_expression
+          stopBy: neighbor
+          has: { field: property, regex: '^join$' }
+    # The truncation idioms: the cut sits next to an ellipsis marker, or cuts
+    # the string produced by .join(...).
+    - any:
+        - inside: { kind: template_string, stopBy: end, regex: '…|\.\.\.' }
+        - inside:
+            kind: binary_expression
+            stopBy: neighbor
+            has: { any: [ { kind: string }, { kind: template_string } ], regex: '…|\.\.\.' }
+        - has: { field: function, has: { field: object, pattern: $X.join($$$) } }
