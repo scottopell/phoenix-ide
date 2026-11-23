@@ -2622,7 +2622,8 @@ describe('ProductConversationPage', () => {
       expect(status).toHaveTextContent('Failure close-failure:2:stopped-close');
       expect(status).toHaveTextContent(lifecycle === 'history' ? 'Conversation and processes stopped.' : 'Shutdown uncertain.');
       fireEvent.click(screen.getByText('Exact work items (1)'));
-      expect(screen.getByText('scope-loss: src/retained.rs · modified')).toBeVisible();
+      expect(screen.getByText('scope-loss: src/retained.rs')).toBeVisible();
+      expect(screen.getByText('scope-loss: src/retained.rs').closest('li')).toHaveTextContent('scope-loss: src/retained.rs · modified');
       expect(status).toHaveTextContent('scope-residual: worktree · tree:retained · ownership conflict — still live');
       fireEvent.click(screen.getByText('Residual resources (1)'));
       fireEvent.click(screen.getByText('Remaining resources (4)'));
@@ -2711,7 +2712,8 @@ describe('ProductConversationPage', () => {
     expect(status).toHaveTextContent('Close incomplete — shutdown could not be confirmed');
     expect(status).toHaveTextContent('Shutdown uncertain.');
     fireEvent.click(screen.getByText('Exact work items (1)'));
-    expect(screen.getByText('repo: target/cache/item.bin · ignored')).toBeVisible();
+    expect(screen.getByText('repo: target/cache/item.bin')).toBeVisible();
+    expect(screen.getByText('repo: target/cache/item.bin').closest('li')).toHaveTextContent('repo: target/cache/item.bin · ignored');
     expect(status).toHaveTextContent('Run 2 · stopped. No automatic retry.');
     expect(status).not.toHaveTextContent('Closed — cleanup needs attention');
     expect(screen.getByTestId('product-conversation-close-incomplete')).toBeVisible();

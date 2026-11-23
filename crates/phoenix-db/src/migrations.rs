@@ -16639,7 +16639,11 @@ mod tests {
              WHERE attempt_id = 'ignored-migration-attempt'",
         )
         .bind(format!("v1{}:{}2:g1", scope.as_str().len(), scope.as_str()))
-        .bind(format!("v1{}:{}3:fp1", scope.as_str().len(), scope.as_str()))
+        .bind(format!(
+            "v1{}:{}3:fp1",
+            scope.as_str().len(),
+            scope.as_str()
+        ))
         .execute(&pool)
         .await
         .unwrap();

@@ -2,6 +2,16 @@
 
 ## Current publication and active gate
 
+### Serialization reconciled; coalesced reviewed corrections can queue safely
+
+Recovered primary “after current run finishes” directions were scoped to named diagnostic publications; not a permanent ban on queuing a corrective head. Keep actual exact-head evidence and no manual cancellation/rerun. Existing workflow `concurrency: close-qualification-${{ github.ref }}` / `cancel-in-progress: false` serializes the next automatic run without concurrent qualification. One watcher85 remains attached to active a6bb; do not attach another watcher until that process exits. Coalesce the omitted hosted migration-format hunk with now-observed frontend correction rather than wait a complete cycle just for formatting.
+
+Current a6bb frontend actual results: WorkActions **33/0**; ProductConversationPage **214 passed / 4 failed**, all four `getByText` assertions incorrectly combine the code identity with a sibling category text node. Reviewed correction asserts actual code identity visible after disclosure plus complete parent-li text/category; retains every remount/certainty/resource assertion. No fresh UI pass yet. Retry preparation proceeds separately: new unpublished read-only DB captured-origin reader and fixtures; SQL nonexistent intent column caught/fixed by independent review. Runtime expected-resource prototype cannot consume a true pre-anchor context and must not be shipped as usable retry or used to fabricate expected rows. Fresh admission/schema/quiescence coupling remains open.
+
+### a6bb correction run active; one omitted formatting hunk remains dirty
+
+Published `a6bb83389063678c485b7eed96ef505665afb469`; automatic [45255463741](https://github.com/scottopell/phoenix-ide/actions/runs/45255463741), sole watcher85 / `close-a6bb83389-watch`, evidence `/tmp/close-a6bb83389`. Prior watcher84 personally verified exited1/zsh. Corrective assertions/setup and most hosted formatting are in this exact run. **Integration mistake:** explicit staging omitted `crates/phoenix-db/src/migrations.rs`, leaving its exact hosted one-bind formatting wrap dirty. Expect that format gate to remain red; it is not a runtime fix. Do not bypass terminal gate with another immediate publication; classify this exact run's actual tests first, then include the preserved formatting hunk with any required corrections. No local formatter/tests executed. Pre-anchor explicit retry remains open.
+
 ### f955 terminal failure fully classified; focused corrections reviewed
 
 Personally verified exact f955 automatic45248004989 **completed/failure**, watcher84 exited1 and independently at zsh. Full/final-failed logs and exact runtime artifacts retained `/tmp/close-f955c8fb8`. Actor **48 passed / 2 failed / 0 ignored**: both new content/rollback journeys failed **before Close ingress**, writing `.git/info/exclude` into missing info directory (fixture explicitly uses empty Git template). Correction creates this fixture directory first; no behavior assertion relaxed. Required production-detector real Worktree **1 passed / 0 failed / 0 ignored**, nobody65534 CapEff0, personally read actual log.
