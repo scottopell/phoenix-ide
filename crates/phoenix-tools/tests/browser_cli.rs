@@ -179,18 +179,26 @@ impl Drop for BrowserCli {
 }
 
 fn fixture() -> String {
-    fixture_with_script("")
-}
-
-fn fixture_with_script(script: &str) -> String {
     let html = r#"<!doctype html><title>CLI browser journey</title>
 <label>Name <input id="name" aria-label="Name"></label>
 <button id="increment" onclick="window.clicks += 1; console.log('clicked', window.clicks)">Increment</button>
-<script>window.clicks = 0; console.error('navigation-marker');"#;
+<script>window.clicks = 0; console.error('navigation-marker');</script>"#;
     format!(
         "data:text/html;base64,{}",
-        base64::engine::general_purpose::STANDARD.encode(format!("{html}{script}</script>"))
+        base64::engine::general_purpose::STANDARD.encode(html)
     )
+}
+
+fn oversized_snapshot_fixture() -> tempfile::NamedTempFile {
+    let mut file = tempfile::Builder::new().suffix(".html").tempfile().unwrap();
+    write!(
+        file,
+        "<!doctype html><title>Oversized snapshot</title><button id='increment' aria-label='{}'>Increment</button>",
+        "x".repeat(9 * 1024 * 1024)
+    )
+    .unwrap();
+    file.flush().unwrap();
+    file
 }
 
 fn reference(tree: &str, name: &str) -> String {
@@ -2340,8 +2348,7 @@ impl LiveEvidence {
         );
         assert_eq!(
             cli.eval(
-                r"document.querySelector('#increment').removeAttribute('aria-label');
-                for (let i = 0; i < 150; i++) {
+                r"for (let i = 0; i < 150; i++) {
                     const button = document.createElement('button');
                     button.textContent = 'Large snapshot control ' + i;
                     document.body.append(button);
@@ -2375,6 +2382,8 @@ impl LiveEvidence {
         let resources = live_resources(cli);
         let sentinel = resources.0.join("old-lifetime-sentinel");
         std::fs::write(&sentinel, b"old browser state").unwrap();
+        assert!(uuid::Uuid::parse_str(opened["lifetime"].as_str().unwrap()).is_ok());
+        assert!(uuid::Uuid::parse_str(opened["browser_lifetime"].as_str().unwrap()).is_ok());
         Self {
             daemon_lifetime: opened["lifetime"]
                 .as_str()
@@ -2436,6 +2445,7 @@ impl RetiredEvidence {
         let browser_lifetime = reopened["browser_lifetime"]
             .as_str()
             .expect("replacement browser identity");
+        assert!(uuid::Uuid::parse_str(browser_lifetime).is_ok());
         assert_ne!(browser_lifetime, live.browser_lifetime);
         assert!(
             !live.sentinel.exists(),
@@ -2470,19 +2480,42 @@ fn lost_chrome_reports_state_loss_and_open_replaces_only_browser_lifetime() {
         return;
     }
     let ordinary = fixture();
-    let failed_snapshot = fixture_with_script(
-        "document.querySelector('#increment').ariaLabel = 'x'.repeat(9 * 1024 * 1024);",
-    );
-    for (url, force_snapshot_failure) in [(&ordinary, false), (&failed_snapshot, true)] {
+    for force_snapshot_failure in [false, true] {
         let cli = BrowserCli::new();
-        let opened = cli.ok(&["open", url]);
-        if force_snapshot_failure {
-            assert_eq!(opened["result"]["snapshot"]["status"], "error", "{opened}");
+        let opened = if force_snapshot_failure {
+            let page = oversized_snapshot_fixture();
+            let url = format!("file://{}", page.path().display());
+            let failed = cli.ok(&["open", &url]);
+            assert_eq!(failed["result"]["navigation"], "succeeded", "{failed}");
+            assert_eq!(failed["result"]["url"], url);
+            assert_eq!(failed["result"]["title"], "Oversized snapshot");
+            assert_eq!(failed["result"]["snapshot"]["status"], "error", "{failed}");
             assert!(
-                opened["result"]["snapshot"]["result"]["text"].is_null(),
-                "{opened}"
+                failed["result"]["snapshot"]["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("Space limit exceeded"),
+                "{failed}"
             );
-        }
+            assert!(
+                failed["result"]["snapshot"]["result"]["text"].is_null(),
+                "{failed}"
+            );
+            assert_eq!(
+                cli.eval("document.querySelector('#increment').getAttribute('aria-label').length"),
+                9 * 1024 * 1024
+            );
+            let recovered = cli.ok(&["open", &ordinary]);
+            assert_eq!(recovered["lifetime"], failed["lifetime"]);
+            assert_eq!(recovered["browser_lifetime"], failed["browser_lifetime"]);
+            assert_eq!(
+                recovered["result"]["snapshot"]["status"], "success",
+                "{recovered}"
+            );
+            recovered
+        } else {
+            cli.ok(&["open", &ordinary])
+        };
         let live = LiveEvidence::capture(&cli, &opened);
         let killed = live.kill();
         let retired = killed.retire(&cli);

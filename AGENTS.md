@@ -172,6 +172,11 @@ The cargo-test step budget defaults to 900s; slow hosts can raise it with
 `PHOENIX_CHECK_CARGO_TEST_TIMEOUT_SECS` in the environment or in the gitignored
 `.phoenix-ide.env` (the environment wins).
 
+The dev.py Python unit-test step defaults to 600s; slow hosts can raise it with
+`PHOENIX_CHECK_DEVPY_TEST_TIMEOUT_SECS` in the environment or in the gitignored
+`.phoenix-ide.env` (the process environment wins). For one run, use e.g.
+`PHOENIX_CHECK_DEVPY_TEST_TIMEOUT_SECS=1800 ./dev.py check --lanes devpy`.
+
 For a low-resource check, set `PHOENIX_CHECK_WORKERS=1 ./dev.py check …`.
 The process-environment override must be a nonempty positive ASCII integer;
 invalid values fail before check setup. Unset means four, clamped to available

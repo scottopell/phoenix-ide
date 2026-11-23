@@ -129,13 +129,14 @@ class QualificationOutputTests(unittest.TestCase):
                     env = {} if diagnostic is None else {"PHOENIX_CHECK_DIAGNOSTIC_DIR": diagnostic}
                     run_step = mock.Mock()
                     namespace = dict(os=os, sys=sys, ROOT=ROOT, profile_work=profile is not None,
-                                     _CHECK_PROFILE=profile, run_step=run_step)
+                                     _CHECK_PROFILE=profile, DEVPY_TEST_TIMEOUT=1800,
+                                     run_step=run_step)
                     with mock.patch.dict(os.environ, env, clear=True):
                         exec(code, namespace)
                     prefix = ([sys.executable, "-m", "unittest"] if profile is None else
                               [sys.executable, str(ROOT / "scripts" / "python_unittest_profile.py")])
                     expected = prefix + ["discover", "tests/devpy"] + (["-v"] if diagnostic else [])
-                    run_step.assert_called_once_with("dev.py unit tests", expected)
+                    run_step.assert_called_once_with("dev.py unit tests", expected, timeout=1800)
 
     def test_unittest_capture_retains_verbose_summary_skips_and_completion(self):
         for returncode, ending in ((0, "OK (skipped=1)"),
