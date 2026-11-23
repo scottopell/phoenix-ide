@@ -10,6 +10,11 @@ use phoenix_llm::{LlmConfig, LlmService, ToolDefinition};
 const MODEL: &str = "gpt-6.2-sol";
 const REPORT_TOOL: &str = "mcp__numbers__report_number";
 
+fn schema_proof() -> &'static str {
+    static PROOF: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    PROOF.get_or_init(|| uuid::Uuid::new_v4().to_string())
+}
+
 struct LiveCodexClient {
     service: Arc<dyn LlmService>,
     requests: Mutex<Vec<LlmRequest>>,
@@ -65,7 +70,10 @@ fn report_definition() -> ToolDefinition {
     ToolDefinition {
         name: REPORT_TOOL.into(),
         description: "Report the requested number.".into(),
-        input_schema: serde_json::json!({"type":"object","properties":{"number":{"type":"integer"}},"required":["number"],"additionalProperties":false}),
+        input_schema: serde_json::json!({"type":"object","properties":{
+            "number":{"type":"integer"},
+            "proof":{"type":"string","const":schema_proof(),"description":"Required verification value; use exactly the const from this schema."}
+        },"required":["number","proof"],"additionalProperties":false}),
         defer_loading: true,
     }
 }
@@ -93,7 +101,10 @@ impl ToolExecutor for SyntheticNumbers {
             assert_eq!(output.output(), expected);
             Some(output)
         } else if name == REPORT_TOOL {
-            assert_eq!(input, serde_json::json!({"number":7}));
+            assert_eq!(
+                input,
+                serde_json::json!({"number":7,"proof":schema_proof()})
+            );
             self.executions.lock().unwrap().push(input);
             Some(ToolOutput::success("{\"reported\":7}"))
         } else {
@@ -218,6 +229,7 @@ async fn codex_native_discovery_runtime_sqlite_roundtrip() {
             .declarations()
             .iter()
             .any(|tool| tool.name == REPORT_TOOL));
+        assert!(!format!("{initial:?}").contains(schema_proof()));
         let metrics = initial
             .telemetry
             .as_ref()
@@ -280,7 +292,7 @@ async fn codex_native_discovery_runtime_sqlite_roundtrip() {
     accept_tool(&mut runtime).await;
     assert_eq!(
         &*tools.executions.lock().unwrap(),
-        &[serde_json::json!({"number":7})]
+        &[serde_json::json!({"number":7,"proof":schema_proof()})]
     );
     let (_, final_outcome) = runtime.llm_outcome_rx.try_recv().unwrap();
     assert!(
