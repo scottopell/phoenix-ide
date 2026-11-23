@@ -1,4 +1,4 @@
-//! Source-owned initial all-success interruption and completion-only successor admission.
+//! Source-owned initial all-success interruption and historical completion receipt replay.
 
 use phoenix_core::domain::close::{CloseObligation, CloseRunOrdinal, CloseRunRef};
 use phoenix_core::domain::sm_state::ConvState;
@@ -166,8 +166,8 @@ impl Database {
         }
     }
 
-    /// Consumes the original operation's allowance and admits only run two, without effects.
-    /// Revalidates live and durable source identity before consulting automatic replay.
+    /// Replays an existing historical completion receipt; never creates a new successor.
+    /// Revalidates live and durable source identity before consulting retained history.
     pub async fn admit_native_close_initial_completion_retry(
         &self,
         command: &NativeCloseCommand,
@@ -194,38 +194,9 @@ impl Database {
             if read_completion_receipt_tx(&mut tx, command, &completion).await? {
                 return Ok(NativeCloseCompletionResult::Replay(completion));
             }
-            require_positive_initial_retirement_tx(&mut tx, command, &admitted).await?;
-            require_stopped_initial_interruption_tx(&mut tx, &admitted).await?;
-            let now = chrono::Utc::now().timestamp_micros();
-            sqlx::query(
-                "INSERT INTO native_close_completion_retry_admissions
-                 (attempt_id, origin_request_id, origin_request_fingerprint, product_conversation_id,
-                  failed_run_ordinal, successor_run_ordinal, admitted_at_us)
-                 VALUES (?1, ?2, ?3, ?4, 1, 2, ?5)",
-            )
-            .bind(admitted.attempt_id.as_str())
-            .bind(command.request_id().to_string())
-            .bind(command.fingerprint())
-            .bind(admitted.target.as_str())
-            .bind(now)
-            .execute(&mut *tx)
-            .await?;
-            sqlx::query(
-                "INSERT INTO close_runs
-                 (attempt_id, run_ordinal, status, created_at_us, retry_requested_by,
-                  retry_observed_at_us, precondition_resolution, safety_evidence, retry_evidence_kind)
-                 VALUES (?1, 2, 'running', ?2, 'global', ?2, ?3, ?4, 'verified_completion')",
-            )
-            .bind(admitted.attempt_id.as_str())
-            .bind(now)
-            .bind("exact native initial all-success interruption with no remaining effects")
-            .bind("native_close_initial_complete_retirement_proofs and exact automatic admission")
-            .execute(&mut *tx)
-            .await?;
-            if !read_completion_receipt_tx(&mut tx, command, &completion).await? {
-                return Err(precondition("automatic completion successor binding is missing"));
-            }
-            Ok(NativeCloseCompletionResult::NewlyAdmitted(completion))
+            Err(precondition(
+                "new automatic completion successor admission is disabled",
+            ))
         }
         .await;
         match result {

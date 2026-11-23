@@ -2654,8 +2654,72 @@ async fn completion_retry_rows(db: &Database, run: &CloseRunRef) -> (i64, i64, i
     (admissions, runs, plans, effects)
 }
 
+// Reconstruct a successor admitted by the removed automatic-admission SQL. This is
+// historical persisted state, seeded with its original transaction shape and the
+// normal initial receipt/origin/failure provenance produced by the fixture.
+async fn seed_historical_completion_successor(
+    db: &Database,
+    command: &NativeCloseCommand,
+    receipt: &crate::native_close::NativeCloseReceipt,
+    run: &CloseRunRef,
+) {
+    let mut tx = db.pool().begin_with("BEGIN IMMEDIATE").await.unwrap();
+    let now = Utc::now().timestamp_micros();
+    // The historical admission trigger consumes the unused allowance atomically.
+    sqlx::query(
+        "INSERT INTO native_close_completion_retry_admissions
+         (attempt_id, origin_request_id, origin_request_fingerprint, product_conversation_id,
+          failed_run_ordinal, successor_run_ordinal, admitted_at_us)
+         VALUES (?1, ?2, ?3, ?4, 1, 2, ?5)",
+    )
+    .bind(run.attempt_id.as_str())
+    .bind(command.request_id().to_string())
+    .bind(command.fingerprint())
+    .bind(receipt.admitted.target.as_str())
+    .bind(now)
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO close_runs
+         (attempt_id, run_ordinal, status, created_at_us, retry_requested_by,
+          retry_observed_at_us, precondition_resolution, safety_evidence, retry_evidence_kind)
+         VALUES (?1, 2, 'running', ?2, 'global', ?2, ?3, ?4, 'verified_completion')",
+    )
+    .bind(run.attempt_id.as_str())
+    .bind(now)
+    .bind("exact native initial all-success interruption with no remaining effects")
+    .bind("native_close_initial_complete_retirement_proofs and exact automatic admission")
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+}
+
 #[tokio::test]
-async fn live_all_success_interruption_admits_exactly_one_effect_free_completion_successor() {
+async fn initial_all_success_interruption_does_not_admit_automatic_completion_successor() {
+    let (db, command, receipt, source, run) = all_complete_initial_source_fence_fixture().await;
+    assert!(db.interrupt_native_close_initial_after_retirement(&command, &receipt, &source)
+        .await.established().unwrap().is_ok());
+    let obligation_before = db.get_close_obligation(run.attempt_id.as_str()).await.unwrap();
+    let failures_before = db.list_close_cleanup_failures(run.attempt_id.as_str()).await.unwrap();
+    let rows_before = completion_retry_rows(&db, &run).await;
+    let budget_before = source_fence_allowance(&db, &run).await;
+    let events_before = db.pending_coordinator_watch_events(100).await.unwrap();
+
+    assert!(db.admit_native_close_initial_completion_retry(&command, &receipt, &source)
+        .await.established().unwrap().is_err());
+
+    assert_eq!(completion_retry_rows(&db, &run).await, rows_before);
+    assert_eq!(source_fence_allowance(&db, &run).await, budget_before);
+    assert_eq!(db.get_close_run(&run).await.unwrap().status, CloseRunStatus::Stopped);
+    assert_eq!(db.get_close_obligation(run.attempt_id.as_str()).await.unwrap(), obligation_before);
+    assert_eq!(db.list_close_cleanup_failures(run.attempt_id.as_str()).await.unwrap(), failures_before);
+    assert_eq!(db.pending_coordinator_watch_events(100).await.unwrap(), events_before);
+}
+
+#[tokio::test]
+async fn historical_live_all_success_completion_replay_is_effect_free() {
     let (db, command, receipt, source, run) = all_complete_initial_source_fence_fixture().await;
     let successes = sqlx::query_scalar::<_, i64>(
         "SELECT COUNT(*) FROM close_retirement_resources WHERE attempt_id = ?1",
@@ -2677,9 +2741,10 @@ async fn live_all_success_interruption_admits_exactly_one_effect_free_completion
         .await.established().unwrap().is_ok());
     assert_eq!(db.list_close_cleanup_failures(run.attempt_id.as_str()).await.unwrap(), failures);
 
-    let crate::native_close::NativeCloseCompletionResult::NewlyAdmitted(completion) =
+    seed_historical_completion_successor(&db, &command, &receipt, &run).await;
+    let crate::native_close::NativeCloseCompletionResult::Replay(completion) =
         db.admit_native_close_initial_completion_retry(&command, &receipt, &source)
-            .await.established().unwrap().unwrap() else { panic!("expected new completion admission"); };
+            .await.established().unwrap().unwrap() else { panic!("expected historical completion replay"); };
     assert_eq!(completion.origin, receipt);
     assert_eq!(completion.successor.attempt_id, run.attempt_id);
     assert_eq!(completion.successor.target, *command.intent().target());
@@ -2717,18 +2782,19 @@ async fn live_all_success_interruption_admits_exactly_one_effect_free_completion
 }
 
 #[tokio::test]
-async fn concurrent_completion_admissions_share_one_successor() {
+async fn concurrent_historical_completion_replays_share_one_successor() {
     let (db, command, receipt, source, run) = all_complete_initial_source_fence_fixture().await;
     assert!(db.interrupt_native_close_initial_after_retirement(&command, &receipt, &source)
         .await.established().unwrap().is_ok());
+    seed_historical_completion_successor(&db, &command, &receipt, &run).await;
     let (left, right) = tokio::join!(
         db.admit_native_close_initial_completion_retry(&command, &receipt, &source),
         db.admit_native_close_initial_completion_retry(&command, &receipt, &source),
     );
-    use crate::native_close::NativeCloseCompletionResult::{NewlyAdmitted, Replay};
+    use crate::native_close::NativeCloseCompletionResult::Replay;
     let left = left.established().unwrap().unwrap();
     let right = right.established().unwrap().unwrap();
-    assert!(matches!((&left, &right), (NewlyAdmitted(a), Replay(b)) | (Replay(a), NewlyAdmitted(b)) if a == b));
+    assert!(matches!((&left, &right), (Replay(a), Replay(b)) if a == b));
     assert_eq!(completion_retry_rows(&db, &run).await, (1, 2, 0, 0));
     assert_eq!(source_fence_allowance(&db, &run).await, Some((1, 0)));
 }
@@ -2759,13 +2825,14 @@ async fn completion_admission_without_proof_or_with_suppressed_allowance_changes
 }
 
 #[tokio::test]
-async fn stale_source_refuses_completion_replay_and_startup_revokes_handoff() {
+async fn stale_source_refuses_historical_completion_replay_and_startup_revokes_handoff() {
     let (db, command, receipt, source, run) = all_complete_initial_source_fence_fixture().await;
     assert!(db.interrupt_native_close_initial_after_retirement(&command, &receipt, &source)
         .await.established().unwrap().is_ok());
-    let crate::native_close::NativeCloseCompletionResult::NewlyAdmitted(completion) =
+    seed_historical_completion_successor(&db, &command, &receipt, &run).await;
+    let crate::native_close::NativeCloseCompletionResult::Replay(completion) =
         db.admit_native_close_initial_completion_retry(&command, &receipt, &source)
-            .await.established().unwrap().unwrap() else { panic!("expected new admission"); };
+            .await.established().unwrap().unwrap() else { panic!("expected historical replay"); };
     write_source_fence_state(&db, &command, &ConvState::Idle, false).await.unwrap();
     assert!(db.admit_native_close_initial_completion_retry(&command, &receipt, &source)
         .await.established().unwrap().is_err());
@@ -2779,10 +2846,11 @@ async fn stale_source_refuses_completion_replay_and_startup_revokes_handoff() {
     let (db, command, receipt, source, run) = all_complete_initial_source_fence_fixture().await;
     assert!(db.interrupt_native_close_initial_after_retirement(&command, &receipt, &source)
         .await.established().unwrap().is_ok());
+    seed_historical_completion_successor(&db, &command, &receipt, &run).await;
     assert!(matches!(
         db.admit_native_close_initial_completion_retry(&command, &receipt, &source)
             .await.established().unwrap().unwrap(),
-        crate::native_close::NativeCloseCompletionResult::NewlyAdmitted(_)
+        crate::native_close::NativeCloseCompletionResult::Replay(_)
     ));
     db.reset_all_to_idle().await.unwrap();
     write_source_fence_state(&db, &command, &source, false).await.unwrap();
@@ -2793,13 +2861,14 @@ async fn stale_source_refuses_completion_replay_and_startup_revokes_handoff() {
 }
 
 #[tokio::test]
-async fn idle_source_after_admission_stops_effect_free_successor_with_mandatory_failure() {
+async fn idle_source_after_historical_completion_replay_stops_effect_free_successor_with_mandatory_failure() {
     let (db, command, receipt, source, run) = all_complete_initial_source_fence_fixture().await;
     assert!(db.interrupt_native_close_initial_after_retirement(&command, &receipt, &source)
         .await.established().unwrap().is_ok());
-    let crate::native_close::NativeCloseCompletionResult::NewlyAdmitted(completion) =
+    seed_historical_completion_successor(&db, &command, &receipt, &run).await;
+    let crate::native_close::NativeCloseCompletionResult::Replay(completion) =
         db.admit_native_close_initial_completion_retry(&command, &receipt, &source)
-            .await.established().unwrap().unwrap() else { panic!("expected new admission"); };
+            .await.established().unwrap().unwrap() else { panic!("expected historical replay"); };
     write_source_fence_state(&db, &command, &ConvState::Idle, false).await.unwrap();
     let successor = CloseRunRef { attempt_id: run.attempt_id.clone(), ordinal: completion.successor.run_ordinal };
     assert_eq!(db.get_close_run(&successor).await.unwrap().status, CloseRunStatus::Stopped);
@@ -2817,13 +2886,14 @@ async fn idle_source_after_admission_stops_effect_free_successor_with_mandatory_
 }
 
 #[tokio::test]
-async fn uncertain_completion_failure_cannot_rewrite_history_disposition() {
+async fn historical_uncertain_completion_failure_cannot_rewrite_history_disposition() {
     let (db, command, receipt, source, run) = all_complete_initial_source_fence_fixture().await;
     assert!(db.interrupt_native_close_initial_after_retirement(&command, &receipt, &source)
         .await.established().unwrap().is_ok());
+    seed_historical_completion_successor(&db, &command, &receipt, &run).await;
     assert!(matches!(db.admit_native_close_initial_completion_retry(&command, &receipt, &source)
         .await.established().unwrap().unwrap(),
-        crate::native_close::NativeCloseCompletionResult::NewlyAdmitted(_)));
+        crate::native_close::NativeCloseCompletionResult::Replay(_)));
     write_source_fence_state(&db, &command, &ConvState::Idle, false).await.unwrap();
     let before = db.get_close_obligation(run.attempt_id.as_str()).await.unwrap();
     assert_eq!(before.close_outcome(), Some(CloseCompletionOutcome::ArchivedCleanupAttention));

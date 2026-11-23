@@ -39,6 +39,7 @@ Allowing gaps does not approve an ID allocation, decision, or publication.
 | ADR | Title | Status | Affects |
 | --- | --- | --- | --- |
 | [244](244_native-task-approval-source-snapshot-and-receipt.md) | Bind native task approval to canonical source, snapshot and receipt | Proposed | REQ-TAT-001–008; REQ-PROJ-003; REQ-BED-028/046; REQ-COMP-001/002; REQ-DWF-043 |
+| [246](246_close-uses-exact-blockers-and-explicit-retry-only.md) | Close uses exact blockers and explicit retry only | Accepted; supersedes 245's automatic completion policy and 088's in-Close discard/disposable alternative | REQ-WL-002/002a/002b/002c/002d/002e/002f/004; REQ-BED-029 |
 | [245](245_unified-close-idempotence-and-bounded-completion-retry.md) | Unified Close is idempotent with one bounded completion-only retry | Proposed | REQ-WL-002f; REQ-BED-029; `close_conversation`, retained Close operation and run identity |
 | [242](242_execution-bound-own-goal-creation-and-enable.md) | Execution-bound own Goal creation and explicit continuation enable | Accepted | REQ-SGT-001–008; REQ-GOAL-AC-001–004 |
 | [230](230_simplify-macos-deployment-to-candidate-migration-and-manual-recovery.md) | Simplify macOS deployment to candidate migration and manual recovery | Accepted | REQ-LDD-001–032, REQ-PD-031, REQ-COMP-021, REQ-SDC-001–023, REQ-RU-008 |
@@ -254,7 +255,7 @@ Consult the relevant ADRs before starting work of each kind.
 | Changing Codex route admission or private continuation account identity | 085, preserving 062's advisory discovery policy |
 | Changing MCP credential removal or restart recovery | 086, within 034's compatibility scope |
 | Changing automatic HTTP connection recovery or Slack connection-health reporting | 240, within 034 and 086's recovery scope |
-| Specifying Close failure, startup observation, History cleanup attention, mandatory Global failure delivery, or explicit safe retry | 088 supersedes the Close recovery/finalization consequences of 026/040/041/042/080; retain their identity and ownership safeguards |
+| Specifying native Close, exact blockers, failure, startup observation, History cleanup attention, mandatory Global failure delivery, or explicit safe retry | 246 supersedes 245's automatic completion-only policy and 088's in-Close discard/disposable alternative; retain 088's bounded execution/lifecycle policy, 241's writer evidence, and the identity/ownership safeguards of 026/040/041/042/080 |
 | Creating or restructuring Phoenix spec artifacts | 000 |
 | Deciding whether to create a new `design.md` | 000 |
 | Migrating legacy `specs/*/design.md` content | 000, 001, 002, 003, 004, 005, 006 |

@@ -11,8 +11,9 @@ This spec governs the product-facing **Close conversation** action for Git-backe
 It owns:
 
 - the exact retirement-inspection and loss-warning contract for Close on a Git-backed conversation;
-- the exact loss categories that require confirmation before destructive retirement;
-- the requirement that Close retire Phoenix-owned WorkScope resources and the worktree without creating automatic recovery artifacts and without mutating repository refs or PRs;
+- the exact content and ownership blockers that prevent destructive retirement;
+- the requirement that Close retire the exact registered Phoenix-owned WorkScope resources and worktree without creating automatic recovery artifacts and without mutating repository refs or PRs;
+- the exact blocker contract for data that Close cannot safely preserve or retire, including ignored/build content and active writers;
 - the advisory use of PR state to guide the user toward closing when work appears shipped.
 
 It does **not** own:
@@ -21,7 +22,7 @@ It does **not** own:
 - PR feedback freshness, explicit active-PR targeting, auto-fix, and remediation context — the `pr-association` spec;
 - UI placement, wording variants, or action-bar composition — the `work-actions-bar` spec owns those concerns.
 
-Compatibility adapters for `abandon` and `mark_merged` SHALL map those inputs into the one Close flow, preserving the confirmation and loss-safety contract, and SHALL NOT expose them as writable lifecycle choices.
+Compatibility adapters for `abandon` and `mark_merged` SHALL map those inputs into the one Close flow, preserving its blocker, safe-retry, and lifecycle contract, and SHALL NOT expose them as writable lifecycle choices.
 
 ---
 
@@ -35,7 +36,7 @@ AND SHALL move the conversation to read-only History only through that Close flo
 
 WHEN legacy clients, stored intents, or migration adapters still reference `abandon` or `mark_merged`
 THE SYSTEM SHALL treat those values only as deprecated compatibility inputs
-AND SHALL require them to execute the same confirmation, loss inspection, cancellation, and finalization contract as Close
+AND SHALL require them to execute the same blocker inspection, cancellation, and finalization contract as Close
 AND SHALL NOT expose those deprecated verbs as current writable lifecycle choices in ordinary product surfaces
 
 **Rationale:** The user-facing distinction between “abandoned” and “merged” conflated repository interpretation with lifecycle. The durable product truth is simpler: the conversation is either still Open or the user explicitly closed it into History.
@@ -48,73 +49,47 @@ WHEN bedrock requests retirement inspection for one exact Close attempt
 THE SYSTEM SHALL inspect every attached `WorkScope` that owns a Git-backed worktree
 AND SHALL bind each evidence set to that original Close authority, exact run ordinal, and exact attached `WorkScope` identity
 AND SHALL inspect only state whose durability depends on that scope's attached worktree and owned resources
-AND SHALL classify loss risk into these independent categories:
-- staged tracked paths
-- unstaged tracked paths, including conflicted or otherwise unmerged paths
-- untracked non-ignored paths
-- dirty or untracked state inside initialized submodule checkouts
-- detached commits not reachable from any ref under `refs/heads/*`, `refs/remotes/*`, `refs/tags/*`, or `refs/stash`
-
-THE SYSTEM SHALL exclude ignored paths from the loss inventory
-AND SHALL treat LFS-tracked edits as ordinary tracked changes within the tracked-path categories
-AND SHALL treat local branches, remote-tracking branches, tags, and stash entries as durable refs rather than as loss
+AND SHALL identify every content or commit that Close cannot preserve, including staged and unstaged tracked paths, conflicted or unmerged paths, untracked paths, ignored paths (including build output), dirty or untracked state in initialized submodules, and detached commits not reachable from any ref under `refs/heads/*`, `refs/remotes/*`, `refs/tags/*`, or `refs/stash`
+AND SHALL treat LFS-tracked edits as ordinary tracked changes
+AND SHALL treat local branches, remote-tracking branches, tags, and stash entries as durable refs rather than loss
 AND SHALL treat reflog-only detached commits as at-risk detached commits
-AND SHALL scope nested-repository inspection only to declared submodules rather than recursively inventing preservation rules for arbitrary nested repositories
+AND SHALL scope nested-repository inspection only to declared submodules
 
-WHEN any one or more of those categories are present
-THE SYSTEM SHALL return an exact categorized inventory with one materialized loss row per exact `(attached_workscope_identity, category, item_identity)`
-AND SHALL include every relevant path row and every detached-commit identity rather than collapsing multiple items into one category summary
-AND SHALL require explicit discard confirmation before destructive retirement begins
+WHEN any content or commit cannot be shown to be preserved under the original Close authority
+THE SYSTEM SHALL report an exact blocker inventory with one materialized row per exact `(attached_workscope_identity, category, item_identity)`
+AND SHALL include every relevant path and detached-commit identity rather than collapsing multiple items into a category summary
+AND SHALL block destructive retirement while those blockers remain
+AND SHALL NOT provide an in-Close discard, salvage, or cleanup path for them
+AND SHALL require any separate cleanup to be performed by its owner under separate authority, followed by fresh Close inspection
+AND SHALL NOT infer permission to discard ignored or build content from `.gitignore`, its absence, or any other repository metadata
 
-WHEN no category is present
-AND fresh identity and reconstruction evidence proves that the targeted disposable state is reconstructible without losing unique work
-THE SYSTEM SHALL allow retirement to proceed without a discard confirmation
-
-WHEN reconstruction or loss evidence is uncertain
-THE SYSTEM SHALL preserve the targeted state and require a concrete proposal and explicit discard decision before deleting it
-AND SHALL NOT equate a clean status result, ignored-path exclusion, durable branch presence, or lack of inspection evidence with proof of reconstructibility
+WHEN inspection is incomplete or identity is uncertain
+THE SYSTEM SHALL preserve the target and report a concrete blocker rather than infer safe deletion
 
 WHEN multiple attached `WorkScope`s own Git-backed worktrees
-THE SYSTEM SHALL determine confirmation from the union of their exact per-scope inventories
+THE SYSTEM SHALL determine blockers from the union of their exact per-scope inventories
 AND SHALL NOT treat missing inspection evidence for any attached worktree-owning scope as a no-loss result
 
-**Rationale:** Phoenix owns the disposable environment, not repository history. Loss inspection must warn exactly about worktree-only risk without conflating it with durable refs the user still owns.
+**Rationale:** Phoenix owns the disposable environment, not repository history. Inspection must identify exact at-risk worktree content without treating durable refs as loss or metadata as discard permission.
 
 ---
 
-### REQ-WL-002a: Retirement Inspection Binds Confirmation to One Exact Workspace Generation
+### REQ-WL-002a: Blocker Projection Is Bound to the Exact Close Inspection
 
 WHEN retirement inspection completes for attached Git-backed `WorkScope`s
-THE SYSTEM SHALL produce one inspection generation and workspace fingerprint with the categorized results for each exact attached worktree-owning scope
+THE SYSTEM SHALL produce one inspection generation and workspace fingerprint with exact blocker results for every attached worktree-owning scope
+AND SHALL present Retry and Stop as the available choices when a blocker prevents progress
+AND SHALL NOT expose an in-Close discard, salvage, or repair choice
 
-WHEN that inspection requires discard confirmation
-THE SYSTEM SHALL expose one concrete user-facing discard-confirmation affordance that issues `UserConfirmsCloseAfterRetirementInspection(product_conversation, attempt_id, run_ordinal, inspection_generation, inspection_fingerprint)`
-AND SHALL expose that affordance only while the exact active Close obligation for that `product_conversation` remains in `awaiting_loss_confirmation`
-AND SHALL bind that affordance to the exact active Close-attempt identity, running run ordinal, inspection generation, and workspace fingerprint held on that Close obligation
-AND SHALL NOT expose that affordance for any stale inspection, completed Close attempt, superseded Close attempt, or non-active transcript row within the same product conversation
-
-WHEN the user confirms discard after a warning-producing inspection
-THE SYSTEM SHALL bind that confirmation to the exact inspection generation and workspace fingerprint that justified the warning
-AND SHALL route the confirmation through the same atomic recomputation boundary that decides whether destructive retirement may begin
-
-WHEN the workspace changes after inspection and before destructive retirement begins
-THE SYSTEM SHALL invalidate the outstanding confirmation
-AND SHALL require reinspection before retirement may proceed
-
-WHEN the user declines to continue from that warning state before destructive retirement begins
-THE SYSTEM SHALL preserve bedrock's pre-retirement `UserCancelsClose(product_conversation, attempt_id, run_ordinal)` cancellation path as the only cancel affordance
-AND SHALL NOT reinterpret that cancellation as a discard confirmation
+WHEN the workspace or its ownership/permission evidence changes before a later mutation attempt
+THE SYSTEM SHALL re-inspect and project newly observed failures as exact blockers
+AND SHALL NOT treat a prior inspection or user choice as permission to mutate changed targets
 
 WHEN a product conversation has no attached `WorkScope` that owns a Git-backed worktree
-THE SYSTEM SHALL skip worktree-loss inspection
-AND SHALL emit the no-confirmation inspection outcome for that exact Close attempt
-AND SHALL NOT require a discard confirmation that implies worktree-owned loss
-AND SHALL NOT let the presence of other attached non-worktree scopes bypass inspection for any simultaneously attached worktree-owning scope
+THE SYSTEM SHALL skip worktree-content inspection for that attempt
+AND SHALL NOT let the absence of a worktree-owning scope bypass shutdown/retirement of any attached independently registered WorkScope
 
-WHEN a discard-confirmation request arrives with a stale, mismatched, or no-longer-active generation/fingerprint pair
-THE SYSTEM SHALL treat it as a typed inspection-mismatch path that returns the Close flow to reinspection rather than beginning destructive retirement
-
-**Rationale:** The confirmation is only trustworthy for the exact inspected workspace. A changed workspace must not inherit stale approval to discard different state.
+**Rationale:** Inspection informs the exact Close decision; it is neither discard authorization nor a guarantee that later mutations will succeed.
 
 ---
 
@@ -166,14 +141,21 @@ AND SHALL otherwise report typed residual evidence rather than silently treating
 WHEN a Close run encounters its first failure or is interrupted
 THE SYSTEM SHALL stop all further Close effects for that run across all targeted scopes
 AND SHALL retain exact successful steps, failed-step identity, residual resources, and confirmed or uncertain shutdown as durable evidence
-AND SHALL NOT continue to a later step, replay the failed step, or invoke automatic repair, except for the single fresh completion-only successor narrowly allowed by REQ-WL-002f when exact proof establishes all originally planned effects durably succeeded and no resource/destructive effects remain
+AND SHALL NOT continue to a later step, replay a failed step automatically, or invoke automatic repair
+AND MAY move a definitely stopped conversation from Open to History only when shutdown is positively confirmed and every unresolved blocker is conspicuously retained as incomplete, with its exact evidence and the ordinary explicit safe-retry/Stop affordances
+AND SHALL keep uncertain shutdown Open with `CloseIncomplete` before any positive shutdown/History commit; later uncertainty SHALL preserve already committed History, prior positive shutdown evidence, and truthful cleanup attention rather than reopen execution
+
+WHEN mutation-boundary inspection cannot be completed or its evidence cannot be durably retained
+THE SYSTEM SHALL preserve the target, stop further effects, and enter the exact run's typed failure boundary rather than silently leave it running or treat missing evidence as a clear inspection
+AND if durable terminalization is unavailable SHALL close process authority and report the storage failure without guessing success or retrying effects
+
 
 WHEN Phoenix starts with an interrupted Close run
 THE SYSTEM SHALL observe its retained identities and residual state only
 AND SHALL NOT reseal and dispatch cleanup, stop processes, remove resources, or resume the interrupted run
 
 WHEN an explicit fresh safe retry is admitted under REQ-WL-002c
-THE SYSTEM SHALL reinspect the exact remaining targets and prove reconstructibility immediately before destructive worktree removal
+THE SYSTEM SHALL reinspect the exact remaining targets and establish that no unresolved blocker remains immediately before destructive worktree removal
 AND SHALL safely retire a tmux server only when its sealed socket path and Phoenix-controlled server token identify the same server
 AND SHALL leave process-epoch resources that have no live in-memory permit untouched
 AND SHALL stop on ambiguous tmux, worktree, ownership, or shutdown evidence rather than guessing continuity
@@ -186,7 +168,7 @@ CONFIRMED retirement SHALL NOT create a branch, tag, commit, stash, patch, diff 
 THE SYSTEM SHALL leave every branch, tag, stash, remote-tracking ref, and pull request untouched
 AND SHALL NOT create, rename, move, fast-forward, merge, delete, push, close, or retarget any branch or pull request as a side effect of Close or retirement
 
-**Rationale:** Retirement reclaims only proven Phoenix-owned disposable resources. A failed run ends rather than converging automatically, except for the single proof-gated completion-only successor in REQ-WL-002f; exact evidence constrains any explicitly admitted resource retry. Repository management and automatic backup creation are not Close effects.
+**Rationale:** Close acts only on resources registered to the exact WorkScope and never treats a partial observation as a preservation guarantee. A failed run stops; unresolved data remains a visible blocker for an explicit retry or Stop decision. Repository management and automatic backup creation are not Close effects.
 
 ---
 
@@ -265,18 +247,15 @@ WHEN a Close run is stopped with `CloseIncomplete` or `cleanup_attention`
 THE SYSTEM SHALL permit read-only investigation of its exact failure and remaining resources
 AND SHALL NOT treat investigation, notification receipt, startup, elapsed time, or an external precondition change as retry authority
 
-WHEN the user or Global explicitly requests a safe retry
-THE SYSTEM SHALL admit it only after fresh read-only evidence proves that the failed precondition has resolved and the exact remaining effects are safe under the original Close authority
-AND SHALL issue `CloseSafeRetryRequested(product_conversation, attempt_id, failed_run_ordinal, safety_evidence)` only for the retained non-native user/Global modern retry adapter on an operation not yet bound to native admission
-AND SHALL route native `close_conversation` retry exclusively through `CloseConversationRequested` and the atomic exact-plan/receipt/admission contract below, never the retained generic event
-AND SHALL NOT treat that retained modern adapter as the legacy HTTP compatibility path or expand either adapter's permissions
+WHEN the user explicitly requests a safe retry through native `close_conversation`
+THE SYSTEM SHALL admit it only after fresh evidence establishes that the failed precondition has resolved and the exact remaining effects are safe under the original Close authority
 AND SHALL create a fresh durable run with a new monotonically increasing run ordinal under that original `attempt_id`
 AND SHALL retain the stopped run unchanged and bind new inspection, effects, failures, and outcomes to the fresh run ordinal
 AND SHALL permit at most one running Close run for that operation
 AND SHALL reject stale or repeated admission for the same failed run
 
 THE SYSTEM SHALL restrict that fresh run to the exact remaining resources and effect kinds authorized by the original Close
-AND SHALL freshly verify ownership, identity, shutdown, reconstructibility, loss risk, and resolved failure preconditions before dispatch
+AND SHALL freshly verify ownership, identity, shutdown, absence of unresolved blockers, and resolved failure preconditions before dispatch
 AND SHALL NOT repeat an unresolved failure, replay already-completed effects, expand the target set, reopen the conversation from History, or resume the failed run
 AND SHALL stop the fresh run at its first failure under the same contract as normal Close
 
@@ -303,15 +282,21 @@ AND SHALL NOT derive that additional authority from the original Close, Global's
 
 ---
 
-### REQ-WL-002f: Unified Close Is Idempotent with One Bounded Completion Retry
+### REQ-WL-002f: Unified Native Close Is Idempotent and Explicitly Retried
 
-WHEN a trusted, proven current Coordinator source requests Close for an ordinary ProductConversation
-THE SYSTEM SHALL provide one unified `close_conversation` operation for initial Close, exact retained-operation observation, and explicit safe retry of an exact failed run, without exposing `retry_close_safely` as a second admission authority
-AND SHALL derive authority from server-verified source identity and the current Coordinator, never caller-supplied authorizer identity
-AND for an initial request to an Open ProductConversation without retained work requiring observation or an exact reference, SHALL capture exactly one ordinary ProductConversation/latest-row admission snapshot and atomically persist the trusted source-derived request identity with its Close-attempt and run identity
-AND SHALL make duplicate, concurrent, replayed, and lost-response observations return that same retained operation/result without allocating another identity, changing topology, or admitting another run
-AND SHALL reject absent or stale references for a retained action without selecting a latest fallback or creating an operation
-AND SHALL preserve existing active, failed, completed, and cancelled references as exact attempt, run ordinal, and ProductConversation identities
+WHEN the trusted current Coordinator requests Close for an ordinary ProductConversation
+THE SYSTEM SHALL expose one native `close_conversation` operation for initial Close, observation of its retained result, and an explicit safe retry of an exact stopped run
+AND SHALL derive authority from server-verified Coordinator/source identity, never caller-supplied authorizer identity
+AND SHALL atomically bind the request to the exact ProductConversation, captured latest-row identity, Close attempt, and run
+AND SHALL make duplicate, concurrent, replayed, and lost-response calls idempotently return that same retained operation/result without changing topology or implicitly admitting a retry
+AND SHALL reject absent or stale retained references without choosing a latest fallback or creating another operation
+AND SHALL preserve exact attempt, run ordinal, request, and target identity across retries
+AND SHALL present explicit **Retry** and **Stop** decisions for a stopped incomplete Close; neither observation, startup, elapsed time, metadata, nor external state change SHALL authorize retry
+
+WHEN the Close inspection and retirement decision is made
+THE SYSTEM SHALL produce one authoritative blocker decision and a user-facing projection from that same decision, naming the exact affected files or commits and the operational reason (writer/permission/layout/error/deadline)
+AND SHALL recheck relevant identities and permissions at each mutation boundary and add newly observed failures as concrete blockers
+AND SHALL NOT claim that an earlier snapshot guarantees later mutation success
 
 WHEN a supported transaction writer performs the first complete retirement capture for a Close attempt
 THE SYSTEM SHALL atomically capture its full inventory and establish one immutable original-snapshot anchor for the exact inspection generation and fingerprint
@@ -339,51 +324,42 @@ AND SHALL atomically retain the failure, residual evidence, stopped run, outcome
 AND generic legacy failure ingress SHALL NOT bypass native initial source authority; source-owned inspection and interruption classification SHALL retain their separately proven authority boundaries
 AND a resource-failure path SHALL NOT invent an unresolved resource when all resources already have successful proof.
 
-WHEN an authorized explicit action requests retry of an exact retained failed Close run and fresh read-only safety proof establishes the retry is safe under the original authority
-THE SYSTEM SHALL admit at most one exact successor run with the next ordinal under the original Close authority
-AND duplicate observations SHALL report that retained successor rather than admit another run
-AND SHALL retain the failed run's immutable evidence and exact snapshot, scope, loss, and effect boundaries
-AND SHALL atomically persist the exact immutable typed remaining-effect plan or positive verified-completion provenance with the successor and request receipt, dispatching only that run-bound plan rather than generic initial settlement or inspection
-AND SHALL keep verified-completion explicit retry observation-only with zero resource-effect rows; a resource-bearing explicit retry SHALL exclude every already completed effect and recheck the exact admitted safety/identity before each remaining effect
-AND SHALL include independent `WorkScope` retirement in the typed remaining-effect vocabulary alongside tmux and worktree retirement, binding its sealed expected resource identity and exact original scope, original authority/gate generation, fresh safety evidence, plan order, and fingerprint
-AND SHALL order each pending scope retirement after pending resource effects in that scope, satisfy prior successes from retained proof without redispatch, freshly verify no distinct live owner or live scoped resource before scope retirement, and persist its exact success/failure against its admitted row
-AND SHALL support a scope-only remaining plan without redoing prior tmux/worktree success, and count the scope's independent durable outcome in full-plan completion and automatic-completion proof; pending scope retirement SHALL NOT qualify as zero-effect verified completion
-AND SHALL intentionally exclude process-epoch stop effects from this retry vocabulary; missing original live in-memory permits SHALL remain fail-closed and SHALL NOT be recreated from durable identities, adoption, restart, or generic fallback
+WHEN the user explicitly requests retry of an exact retained failed Close run
+THE SYSTEM SHALL create a fresh bounded run under the original Close authority only after fresh evidence establishes that the exact remaining effects are safe
+AND SHALL retain the failed run unchanged and bind new inspection, effects, failures, and outcomes to a new monotonically increasing run ordinal
+AND SHALL admit at most one running run, reject stale/repeated retry admission for the same failed run, and never replay a completed effect or expand the original target set
+AND SHALL recheck exact ownership, identity, shutdown, loss blockers, writer/permission state, and resolved failure preconditions at each relevant mutation boundary
+AND SHALL stop on any unresolved or newly observed blocker, retaining already completed effects and truthful residual state
+AND SHALL NOT resume a stopped run or create automatic metadata-only completion, repair, salvage, or disposable-state classification
+AND SHALL atomically persist the exact immutable typed remaining-effect plan or positive verified-completion provenance with the successor run and native request receipt
+AND SHALL dispatch only that exact run-bound plan, never generic initial settlement or inspection as an alternative dispatch path
+AND duplicate or lost-response observations SHALL return the retained successor and receipt without admitting another run
+AND a verified-completion explicit retry SHALL be observation-only with zero resource-effect rows, supported by positive persisted proof of every original resource and independent WorkScope outcome and confirmed conversation-and-owned-process shutdown
+AND SHALL NOT infer verified completion from an interruption label, an empty unproven plan, unknown outcomes, missing evidence, or an unfinished scope
+AND SHALL include independent `WorkScope` retirement alongside tmux and worktree retirement in the typed remaining-effect vocabulary, binding each row's exact original scope, sealed expected resource identity, original authority/gate generation, fresh safety evidence, order, and fingerprint
+AND SHALL order scope retirement after pending resource effects in that scope, satisfy prior successes from retained proof without redispatch, freshly verify no distinct live owner or live scoped resource, and persist exact success/failure against the admitted row
+AND SHALL support a scope-only remaining plan without repeating tmux/worktree successes and count the independent scope outcome in full-plan completeness
+AND SHALL exclude process-epoch stop effects from the retry vocabulary; missing original live in-memory permits SHALL remain fail-closed and SHALL NOT be recreated from durable identities, adoption, restart, or generic fallback
+AND SHALL connect each admitted run to definite successful or failed terminalization; inability to persist terminal state SHALL close process authority and report the failure rather than leave an authorized Running run or guess success
 
-WHEN the original Close operation has a remaining automatic completion-retry budget
-AND fresh exact retained proof establishes that every originally planned effect durably succeeded and no resource or destructive effects remain
-AND a live admitted source remains authorized, unsuppressed, and freshly proves conversation-and-owned-process shutdown
-THE SYSTEM SHALL atomically consume that budget while admitting at most one fresh completion-only successor run
-AND SHALL make that budget durable and nonrenewable across explicit retry, repeated call, progress, continuation, restart, lost response, or Coordinator replacement
-AND SHALL create the single allowance only with the original operation, never when adopting a retained operation without an original allowance
-AND SHALL require the exact stopped latest run to have typed `AttemptInterrupted` primary failure authority with zero resource-failure children (not zero primary failures or mandatory deliveries), and positive persisted provenance from a nonempty exact resource plan with every effect durably successful, a verified-completion plan with zero effects and preserved positive completion provenance, or the original native initial run's exact retained receipt, original inspection anchor, complete sealed captured scope/resource inventory, exact dispatch membership, every original resource and independent WorkScope success, and confirmed conversation/owned-process shutdown
-AND SHALL retain all-success initial interruption as a truthful unsuccessful outcome with its own mandatory delivery and no fabricated resource-failure child; confirmed shutdown permits History/cleanup attention, not successful Close completion
-AND SHALL revalidate current live authority separately from original completion proof under the original scope and nonrenewable budget
-AND SHALL NOT infer eligibility from an interruption label alone, an empty unproven plan, unknown effect result, or incomplete proof
-AND SHALL NOT create a hidden resource or bootstrap retry to make an initial run eligible
-AND SHALL NOT automatically admit resource-plan or destructive effects, replay a completed effect, or guess an unknown failure
-AND SHALL remain observation-only at startup and SHALL NOT dispatch or rearm automatic retry there
-AND SHALL leave legacy or adopted operations without an allowance unchanged and ineligible; startup bookkeeping SHALL be conditional on an existing allowance and SHALL NOT fabricate or backfill one
-AND SHALL connect live completion-only admission to one owned read-only observation and a definite successful or failed finalization, never silently drop an admitted Running successor on authority/proof loss; inability to establish durable terminal state SHALL close process authority rather than guess success or retry
+WHEN the user chooses Stop for a stopped incomplete Close
+THE SYSTEM SHALL keep unresolved targets and evidence intact, preserve truthful lifecycle state, and end further Close effects for that operation
 
-WHEN Stop, pause, cancellation, or source replacement revoking original authority is durably admitted
-THE SYSTEM SHALL disable pending automatic retry and fence racing callbacks
-AND SHALL NOT allow a repeated Close request or newer request to clear suppression or rearm a cancelled attempt
-AND SHALL truthfully report exhausted budget, ineligibility, or unavailable durable storage without blind retry loops
-AND SHALL atomically stop an admitted but unfinished automatic successor with its coherent exact-run failure and mandatory once-per-run delivery if suppression wins, preserving completed effects and the consumed allowance
-AND SHALL let a losing callback observe that retained terminal disposition rather than leave the successor running or finalize through suppression
-AND SHALL bind these postconditions directly to exact Close cancellation and the owning durable Stop/pause/source-fence admission transaction, not an optional later notification; source replacement or loss of the admitted live permit SHALL terminalize any unfinished automatic successor through the same fenced failure boundary
-AND SHALL apply cancellation to exact stopped retained and admitted completion-only runs without undoing successful effects, reopening History, or discarding truthful residual attention
-AND for exact retained cancellation of an explicit successor, SHALL atomically settle lifecycle using the same stable shutdown proof as its failure while preserving the terminal cancelled outcome: prior History stays History; prior Open with positive conversation-and-owned-process shutdown enters History with cleanup attention; prior Open without that proof stays Open with typed CloseIncomplete
-AND SHALL persist that lifecycle/attention disposition, exact failure/resource evidence and delivery with cancellation, publish History only on a real Open-to-History commit, and SHALL NOT rely on a later failure event whose classifier excludes completed operations to repair lifecycle
+WHEN Stop, pause, exact cancellation, or source replacement/loss revoking admitted authority is durably admitted for an exact explicit retry
+THE SYSTEM SHALL fence racing effects, terminalize any unfinished exact run, and atomically retain its coherent failure, typed affected-resource evidence or intentional no-resource-failure case, residuals, cancelled outcome where applicable, lifecycle/attention disposition, and mandatory once-per-run failure outbox
+AND exact cancellation of an already stopped retained explicit retry SHALL atomically settle that same shutdown-based lifecycle/attention and cancelled operation outcome while preserving the stopped run's immutable evidence and once-per-run delivery identity
+AND SHALL bind those postconditions directly to the owning durable Stop/pause/cancellation/source-fence admission transaction rather than an optional later callback or failure event
+AND SHALL preserve successful effects and prior History; prior Open with stable positive conversation-and-owned-process shutdown SHALL enter History with cleanup attention, while prior Open without that proof SHALL remain Open with typed `CloseIncomplete`
+AND SHALL publish entry to History only on an actual Open-to-History commit and let losing callbacks observe the retained terminal disposition without finalizing through suppression
+AND SHALL NOT let observation, a repeated Close request, or source replacement clear suppression or rearm a cancelled attempt
+AND inability to persist that terminal disposition SHALL close process authority and report the storage failure, not permit further effects or assume terminal success
 
-WHEN a completion-only successor commits its successful outcome
-THE SYSTEM SHALL atomically record completion, clear matching cleanup attention, persist its exact outcome message, and publish entry to History only if that commit actually moves the ProductConversation from Open to History
-AND SHALL retain History with truthful attention if a later failed successor has uncertain residual observations; it SHALL NOT reopen settled execution
+WHEN an explicitly admitted verified-completion run commits success
+THE SYSTEM SHALL atomically record its completion, clear only matching cleanup attention, retain its exact outcome message, and publish entry to History only if that commit actually transitions Open to History
 
-Repeated observation SHALL NOT supply stop-work/loss confirmation, cancel-and-rearm authority, reopen History, or bypass existing sealed gates, live permits, fingerprints, loss guards, or once-per-run failure delivery. A new operation after cancellation SHALL require the exact cancelled predecessor and explicit new Close intent. Direct HTTP behavior SHALL remain unchanged, and Close SHALL NOT bypass Stop/pause admission, mutate branches or PRs, or create recovery artifacts.
+Repeated observation SHALL NOT supply stop-work/loss confirmation or retry authority, reopen History, or bypass existing sealed gates, live permits, fingerprints, blocker decisions, or once-per-run failure delivery. A new operation after cancellation SHALL require the exact cancelled predecessor and explicit new Close intent. Direct HTTP behavior SHALL remain unchanged, and Close SHALL NOT bypass Stop/pause admission, mutate branches or PRs, or create recovery artifacts.
 
-**Rationale:** One retained operation identity makes tool retries safe without turning observation into fresh destructive authority. A single atomic, proof-gated completion-only retry handles the narrow case where all planned work is already durable, while preserving explicit authority for every resource/destructive retry.
+**Rationale:** One retained operation identity makes repeated native calls safe without turning observation or metadata into fresh destructive authority. Every retry remains an explicit user decision bounded by original authority and fresh exact evidence.
 
 ---
 

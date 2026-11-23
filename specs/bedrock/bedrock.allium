@@ -140,21 +140,17 @@ value ApprovedTaskWriteAuthority {
 
 contract NativeCloseApplication {
     resolve_native_close_intent_read_only: (source: Parent, target: ProductConversation, intent: NativeCloseIntent) -> NativeCloseResolution
-    assess_completion_retry_read_only: (receipt: CloseRequestReceipt) -> CloseCompletionAssessment
-    observe_completion_only_read_only: (admission: CloseCompletionRetryAdmission) -> CloseCompletionObservation
 
     @invariant CloseRequestCorrelationIsNotAuthorization
         -- Receipt lookup/replay requires independently verified current Coordinator
         -- and trusted source evidence first. Request identity is derived from that
         -- trusted source, not model input. It never supplies execution authority.
 
-    @invariant CompletionRetryBudgetCannotBeReplenishedOrRearmed
-        -- One original operation owns at most one automatic successor admission.
-        -- No explicit retry, new request, continuation, progress, restart, receipt
-        -- replay, or Coordinator replacement creates/refunds/resets an allowance.
-        -- Adopted legacy operations without an original allowance cannot mint one.
-        -- Stop/pause/cancel suppression and live permit fencing serialize with both
-        -- admission and finalization; a racing callback cannot cross that boundary.
+    @invariant EverySuccessorRequiresExplicitRetry
+        -- Observation, startup, metadata and external cleanup never admit a run.
+        -- Even a zero-effect verified-completion plan requires explicit Retry.
+        -- Stop/pause/cancel and live permit fencing serialize with admission and
+        -- finalization; a racing callback cannot cross that boundary.
 
     @invariant ImmutablePlanAndFailureProvenance
         -- Every native explicit admission persists an immutable exact plan and its
@@ -250,7 +246,6 @@ enum ClosePhase {
     | settling_active_work
     | cancel_requested_during_settlement
     | awaiting_retirement_inspection
-    | awaiting_loss_confirmation
     | retirement_requested
     | close_incomplete
     | cleanup_attention
@@ -311,8 +306,8 @@ entity CloseObligation {
     -- revoke a previously admitted non-native run or alter its exact authority.
     native_managed: Boolean = false
     outcome: CloseOutcome when phase = completed
-    inspection_generation: String? when phase in { awaiting_retirement_inspection, awaiting_loss_confirmation, retirement_requested, close_incomplete, cleanup_attention } or (phase = completed and outcome = archived)
-    inspection_fingerprint: String? when phase in { awaiting_retirement_inspection, awaiting_loss_confirmation, retirement_requested, close_incomplete, cleanup_attention } or (phase = completed and outcome = archived)
+    inspection_generation: String? when phase in { awaiting_retirement_inspection, retirement_requested, close_incomplete, cleanup_attention } or (phase = completed and outcome = archived)
+    inspection_fingerprint: String? when phase in { awaiting_retirement_inspection, retirement_requested, close_incomplete, cleanup_attention } or (phase = completed and outcome = archived)
 
     transitions phase {
         awaiting_blocker_resolution -> awaiting_stop_work_confirmation
@@ -323,12 +318,8 @@ entity CloseObligation {
         settling_active_work -> cancel_requested_during_settlement
         settling_active_work -> awaiting_retirement_inspection
         cancel_requested_during_settlement -> completed
-        awaiting_retirement_inspection -> awaiting_loss_confirmation
         awaiting_retirement_inspection -> retirement_requested
         awaiting_retirement_inspection -> completed
-        awaiting_loss_confirmation -> awaiting_retirement_inspection
-        awaiting_loss_confirmation -> retirement_requested
-        awaiting_loss_confirmation -> completed
         awaiting_blocker_resolution -> close_incomplete
         awaiting_blocker_resolution -> cleanup_attention
         awaiting_stop_work_confirmation -> close_incomplete
@@ -339,8 +330,6 @@ entity CloseObligation {
         cancel_requested_during_settlement -> cleanup_attention
         awaiting_retirement_inspection -> close_incomplete
         awaiting_retirement_inspection -> cleanup_attention
-        awaiting_loss_confirmation -> close_incomplete
-        awaiting_loss_confirmation -> cleanup_attention
         retirement_requested -> close_incomplete
         retirement_requested -> cleanup_attention
         close_incomplete -> settling_active_work
@@ -420,19 +409,6 @@ variant NativeCloseUnavailable : NativeCloseResolution {
     reason: String
 }
 
-entity CloseCompletionAssessment {
-    kind: CompletionEligible | CompletionObserved | CompletionNotEligible
-}
-variant CompletionEligible : CloseCompletionAssessment {
-    proof: CloseCompletionProof
-}
-variant CompletionObserved : CloseCompletionAssessment {
-    retained_successor: CloseRun
-}
-variant CompletionNotEligible : CloseCompletionAssessment {
-    reason: ineligible | exhausted | suppressed | unavailable
-}
-
 -- Immutable, normalized explicit-retry plan. Resource rows carry exact retained
 -- identities/scopes/fingerprints, never a caller-supplied list or new discovery.
 entity CloseRetryPlan {
@@ -489,54 +465,6 @@ entity CloseRequestReceipt {
     admitted_run: CloseRun
 }
 
--- Exactly one allowance belongs to an original Close obligation. Consumed and
--- suppressed are durable monotonic facts, independent of later successor runs.
-entity CloseCompletionRetryAllowance {
-    obligation: CloseObligation
-    consumed: Boolean = false
-    suppressed: Boolean = false
-}
-
--- This immutable record is the consumed allowance's single successor binding.
-entity CloseCompletionRetryAdmission {
-    allowance: CloseCompletionRetryAllowance
-    failed_run: CloseRun
-    successor: CloseRun
-    source_identity: String
-    callback_token: String
-    process_epoch: String
-}
-
--- The same live admitted service owns the completion-only observation. Unknown
--- probes, definite failure, and unavailable storage are not Ready observations.
-entity CloseCompletionObservation {
-    kind: CompletionReady | CompletionObservationFailed
-}
-variant CompletionReady : CloseCompletionObservation {
-    observed_at: Timestamp
-}
-variant CompletionObservationFailed : CloseCompletionObservation {
-    reason: String
-}
-
-
--- Server-produced read-only evidence names the exact durable plan producer.
--- Counts are checked against normalized persisted effect records, not supplied by
--- the caller. Zero effects only qualifies through a prior verified-completion
--- run whose retained chain terminates in a nonempty successful resource plan.
-entity CloseCompletionProof {
-    failed_run: CloseRun
-    provenance: completed_resource_plan | prior_verified_completion | original_initial_retirement
-    planned_effect_count: Integer
-    succeeded_effect_count: Integer
-    primary_failure: CloseRunFailure
-    resource_failure_child_count: Integer
-    planned_effects_fingerprint: String
-    completed_effects_fingerprint: String
-    observed_at: Timestamp
-    all_planned_effects_durably_succeeded: Boolean
-    no_resource_or_destructive_effects_remain: Boolean
-}
 
 entity CloseAttemptMember {
     obligation: CloseObligation
@@ -2628,7 +2556,6 @@ rule UserRequestsCloseConversation {
                 settling_active_work,
                 cancel_requested_during_settlement,
                 awaiting_retirement_inspection,
-                awaiting_loss_confirmation,
                 retirement_requested,
                 close_incomplete, cleanup_attention
             }
@@ -2638,7 +2565,6 @@ rule UserRequestsCloseConversation {
         phase: awaiting_blocker_resolution,
         native_managed: false
     )
-    ensures: CloseCompletionRetryAllowance.created(obligation: CloseObligation{product_conversation: conversation.product_conversation, attempt_id: attempt_id}, consumed: false, suppressed: false)
     ensures: CloseRun.created(
         obligation: CloseObligation{product_conversation: conversation.product_conversation, attempt_id: attempt_id},
         ordinal: 1,
@@ -2717,27 +2643,13 @@ rule CloseObligationCanBeCancelledBeforeSettlementStarts {
     requires: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase in {
         awaiting_blocker_resolution,
         awaiting_stop_work_confirmation,
-        awaiting_retirement_inspection,
-        awaiting_loss_confirmation
+        awaiting_retirement_inspection
     }
     -- Capture the exact unfinished sets in pre-state. Filter is pure selection,
     -- not a post-state condition that can become vacuous after status changes.
-    let unfinished_automatic = filter(CloseCompletionRetryAdmissions, a => a.allowance.obligation = obligation and a.successor.status = running)
     let unfinished_explicit = filter(CloseExplicitRetryAdmissions, a => a.successor.obligation = obligation and a.successor.status = running)
-    ensures: AutomaticCompletionCallbackAuthorityInvalidated(obligation)
-    ensures: not AutomaticCompletionRetryMayRearm(obligation)
+    ensures: CloseCallbackAuthorityInvalidated(obligation)
     ensures:
-        for allowance in CloseCompletionRetryAllowances:
-            if allowance.obligation = obligation:
-                allowance.suppressed = true
-        for admission in unfinished_automatic:
-            admission.successor.status = stopped
-            let automatic_failure = CloseRunFailure.created(run: admission.successor, failed_step: "completion_only", reason: "completion_fenced", authority_kind: explicitly_suppressed, shutdown: observed_close_shutdown(admission.successor), residual_evidence: observed_close_residuals(admission.successor))
-            for evidence in exact_failed_resource_evidence(admission.successor):
-                CloseResourceFailure.created(failure: automatic_failure, resource_identity: evidence.resource_identity, scope_identity: evidence.scope_identity, reason: evidence.reason)
-            CloseFailureGlobalDelivery.created(failure: automatic_failure, status: pending)
-            AllFurtherCloseEffectAuthorityRevoked(admission.successor)
-            CloseFailureRecorded(obligation.product_conversation, obligation.attempt_id, admission.successor.ordinal)
         for admission in unfinished_explicit:
             admission.successor.status = stopped
             let explicit_failure = CloseRunFailure.created(run: admission.successor, failed_step: "exact_retry", reason: "source_fenced", authority_kind: explicitly_suppressed, shutdown: observed_close_shutdown(admission.successor), residual_evidence: observed_close_residuals(admission.successor))
@@ -2761,22 +2673,9 @@ rule CloseObligationQueuesCancellationDuringSettlement {
     requires: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase = settling_active_work
     -- Capture the exact unfinished sets in pre-state. Filter is pure selection,
     -- not a post-state condition that can become vacuous after status changes.
-    let unfinished_automatic = filter(CloseCompletionRetryAdmissions, a => a.allowance.obligation = obligation and a.successor.status = running)
     let unfinished_explicit = filter(CloseExplicitRetryAdmissions, a => a.successor.obligation = obligation and a.successor.status = running)
-    ensures: AutomaticCompletionCallbackAuthorityInvalidated(obligation)
-    ensures: not AutomaticCompletionRetryMayRearm(obligation)
+    ensures: CloseCallbackAuthorityInvalidated(obligation)
     ensures:
-        for allowance in CloseCompletionRetryAllowances:
-            if allowance.obligation = obligation:
-                allowance.suppressed = true
-        for admission in unfinished_automatic:
-            admission.successor.status = stopped
-            let automatic_failure = CloseRunFailure.created(run: admission.successor, failed_step: "completion_only", reason: "completion_fenced", authority_kind: explicitly_suppressed, shutdown: observed_close_shutdown(admission.successor), residual_evidence: observed_close_residuals(admission.successor))
-            for evidence in exact_failed_resource_evidence(admission.successor):
-                CloseResourceFailure.created(failure: automatic_failure, resource_identity: evidence.resource_identity, scope_identity: evidence.scope_identity, reason: evidence.reason)
-            CloseFailureGlobalDelivery.created(failure: automatic_failure, status: pending)
-            AllFurtherCloseEffectAuthorityRevoked(admission.successor)
-            CloseFailureRecorded(obligation.product_conversation, obligation.attempt_id, admission.successor.ordinal)
         for admission in unfinished_explicit:
             admission.successor.status = stopped
             let explicit_failure = CloseRunFailure.created(run: admission.successor, failed_step: "exact_retry", reason: "source_fenced", authority_kind: explicitly_suppressed, shutdown: observed_close_shutdown(admission.successor), residual_evidence: observed_close_residuals(admission.successor))
@@ -2789,7 +2688,7 @@ rule CloseObligationQueuesCancellationDuringSettlement {
     ensures: CloseSettlementCancellationQueued(product_conversation, attempt_id, run_ordinal)
 }
 
--- Retained failures and an admitted automatic completion successor remain
+-- Retained failures and an admitted explicit retry successor remain
 -- cancellable by exact identity, including cleanup-only work already in History.
 -- Cancellation is not resource cleanup and never undoes earlier successful work.
 rule ExactRetainedCloseCancellationDoesNotRearmOrReopenHistory {
@@ -2806,25 +2705,12 @@ rule ExactRetainedCloseCancellationDoesNotRearmOrReopenHistory {
     -- retains any already committed positive shutdown proof; uncertainty cannot
     -- erase it. A stopped run reuses its retained failure, never creates a second.
     requires: obligation.phase in { close_incomplete, cleanup_attention, retirement_requested }
-    requires: run.status = stopped or exists CloseCompletionRetryAdmission{successor: run} or exists CloseExplicitRetryAdmission{successor: run}
+    requires: run.status = stopped or exists CloseExplicitRetryAdmission{successor: run}
     -- Capture the exact unfinished sets in pre-state. Filter is pure selection,
     -- not a post-state condition that can become vacuous after status changes.
-    let unfinished_automatic = filter(CloseCompletionRetryAdmissions, a => a.allowance.obligation = obligation and a.successor.status = running)
     let unfinished_explicit = filter(CloseExplicitRetryAdmissions, a => a.successor.obligation = obligation and a.successor.status = running)
-    ensures: AutomaticCompletionCallbackAuthorityInvalidated(obligation)
-    ensures: not AutomaticCompletionRetryMayRearm(obligation)
+    ensures: CloseCallbackAuthorityInvalidated(obligation)
     ensures:
-        for allowance in CloseCompletionRetryAllowances:
-            if allowance.obligation = obligation:
-                allowance.suppressed = true
-        for admission in unfinished_automatic:
-            admission.successor.status = stopped
-            let automatic_failure = CloseRunFailure.created(run: admission.successor, failed_step: "completion_only", reason: "completion_fenced", authority_kind: explicitly_suppressed, shutdown: observed_close_shutdown(admission.successor), residual_evidence: observed_close_residuals(admission.successor))
-            for evidence in exact_failed_resource_evidence(admission.successor):
-                CloseResourceFailure.created(failure: automatic_failure, resource_identity: evidence.resource_identity, scope_identity: evidence.scope_identity, reason: evidence.reason)
-            CloseFailureGlobalDelivery.created(failure: automatic_failure, status: pending)
-            AllFurtherCloseEffectAuthorityRevoked(admission.successor)
-            CloseFailureRecorded(obligation.product_conversation, obligation.attempt_id, admission.successor.ordinal)
         for admission in unfinished_explicit:
             admission.successor.status = stopped
             let explicit_failure = CloseRunFailure.created(run: admission.successor, failed_step: "exact_retry", reason: "source_fenced", authority_kind: explicitly_suppressed, shutdown: observed_close_shutdown(admission.successor), residual_evidence: observed_close_residuals(admission.successor))
@@ -2955,47 +2841,11 @@ rule RetirementInspectionShowsNoConfirmationRequired {
     ensures: ResourceRetirementRequested(product_conversation, attempt_id, run_ordinal)
 }
 
-rule RetirementInspectionRequiresLossConfirmation {
-    when: RetirementInspectionRequiresConfirmation(product_conversation, attempt_id, run_ordinal, inspection_generation, inspection_fingerprint)
-    requires: run_ordinal = 1
-    requires: CloseRun{obligation: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}, ordinal: run_ordinal}.status = running
-    requires: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase = awaiting_retirement_inspection
-    ensures: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase = awaiting_loss_confirmation
-    ensures: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.inspection_generation = inspection_generation
-    ensures: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.inspection_fingerprint = inspection_fingerprint
-}
-
-rule FreshRetryCannotInheritOrExpandDiscardAuthority {
-    when: RetirementInspectionRequiresConfirmation(product_conversation, attempt_id, run_ordinal, inspection_generation, inspection_fingerprint)
-    let run = CloseRun{obligation: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}, ordinal: run_ordinal}
-    requires: run.status = running
-    requires: run_ordinal > 1
-    ensures: CloseRunFailed(product_conversation, attempt_id, run_ordinal,
-        failed_step: "retry_loss_inspection", reason: "discard_requires_proposal", authority_kind: execution_failure,
-        shutdown: observed_close_shutdown(run), residual_evidence: observed_close_residuals(run), resource_failures: exact_failed_resource_evidence(run))
-    ensures: ConcreteCloseRepairProposalRequired(product_conversation, attempt_id)
-}
-
-rule BoundLossConfirmationRequestsRetirement {
-    when: ResourceRetirementRequested(product_conversation, attempt_id, run_ordinal)
-    requires: CloseRun{obligation: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}, ordinal: run_ordinal}.status = running
-    requires: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase = awaiting_loss_confirmation
-    ensures: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase = retirement_requested
-
-    @guidance
-        -- Crossing into retirement_requested commits Close past the user-cancellable
-        -- phase boundary. Work-lifecycle owns the atomic re-inspection decision at the
-        -- confirmation click and emits ResourceRetirementRequested only when the freshly
-        -- recomputed inspection still matches the stored evidence for this exact attempt.
-}
-
-rule ChangedInspectionInvalidatesOutstandingConfirmation {
-    when: RetirementInspectionChanged(product_conversation, attempt_id, run_ordinal)
-    requires: CloseRun{obligation: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}, ordinal: run_ordinal}.status = running
-    requires: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase = awaiting_loss_confirmation
-    ensures: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase = awaiting_retirement_inspection
-    ensures: RetirementInspectionRequested(product_conversation, attempt_id, run_ordinal)
-}
+-- Work Lifecycle's RetirementBlockerDecisionCaptured(decision) produces either
+-- the clear inspection event above or CloseRetirementStepFailed with exact typed
+-- resource failures. Its projection reads that same decision. The shared stopped
+-- run/failure/outbox boundary below owns lifecycle disposition and Retry/Stop.
+-- Separate owner cleanup never supplies an inspection event or retry admission.
 
 rule CloseRetirementCompletionFinalizesAggregateHistory {
     when: ResourceRetirementCompleted(product_conversation, attempt_id, run_ordinal)
@@ -3191,14 +3041,10 @@ rule ReadOnlyObservationConfirmsStoppedConversationShutdown {
 -- REQ-WL-002c: this command is supplied only by an explicit user or Global
 -- operator action. PhoenixStartupObservedCloseRun and notification acceptance
 -- never supply it. Its safety evidence is produced by read-only investigation.
--- REQ-WL-002f qualifies a separate, single automatic completion-only successor:
--- fresh exact retained proof must establish every originally planned effect is
--- durably successful and no resource/destructive effect remains. Its per-original-
--- operation budget is consumed atomically with successor admission and is never
--- replenished. Stop/pause/cancel durably suppresses pending admission. Duplicate
--- `close_conversation` requests observe their retained operation/result; they do
--- not become explicit retry authority. Startup may observe/bookkeep, never dispatch.
--- This exception does not resume a stopped run or modify explicit retry semantics.
+-- REQ-WL-002f: duplicate `close_conversation` requests observe their retained
+-- operation/result and do not supply explicit Retry. Every successor, including
+-- zero-effect verified completion, requires explicit intent and fresh positive
+-- original-authority proof. Startup only observes and never admits a successor.
 
 -- REQ-WL-002f: authorization is checked before receipt lookup/replay. The source
 -- identity is captured for correlation; it never grants authority by itself.
@@ -3274,12 +3120,11 @@ rule NativeCloseRequestCreatesOneExactInitialReceipt {
         for transcript_row in Parents where product_conversation = target:
             CloseAttemptMember.created(obligation: obligation, transcript_row: transcript_row, continuation_ordinal: continuation_ordinal(target, transcript_row))
         CloseRequestReceipt.created(request_id: request_id, request_fingerprint: request_fingerprint, source_identity: source_identity(source), obligation: obligation, admitted_run: run)
-        CloseCompletionRetryAllowance.created(obligation: obligation, consumed: false, suppressed: false)
         CloseEvaluationRequested(target, attempt_id, 1)
 
     @guidance
         -- The trusted request binding, fresh server attempt identity, original
-        -- admission/snapshot, and allowance are one atomic decision. Serialize
+        -- admission/snapshot are one atomic decision. Serialize
         -- concurrent requests at this boundary; a losing request observes the
         -- admitted operation, never allocates another identity or snapshot.
         -- Retained failed/cancelled/History operations use observation or an exact
@@ -3296,7 +3141,6 @@ rule NativeCloseRequestAdoptsOnlyAnExactRetainedOperation {
     ensures: CloseRequestReceipt.created(request_id: request_id, request_fingerprint: request_fingerprint, source_identity: source_identity(source), obligation: run.obligation, admitted_run: run)
     ensures: SameRetainedCloseOperationAndResultReturned(run)
     ensures: not CloseRunCreated(run.obligation)
-    ensures: not CloseCompletionRetryAllowanceCreated(run.obligation)
     ensures: OriginalCloseAuthorityAndTargetsUnchanged(run.obligation)
 }
 
@@ -3445,173 +3289,14 @@ rule ExactExplicitRetryDuplicateObservesRetainedSuccessor {
     ensures: failed_run.status = stopped
 }
 
-rule AutomaticCompletionRetryDoesNotGuessAfterNegativeOrUnavailableAssessment {
-    when: CloseCompletionRetryRequested(live_source, receipt, callback_token, process_epoch)
-    requires: authorized_current_proven_source(live_source, receipt.obligation.product_conversation)
-    let assessment = assess_completion_retry_read_only(receipt)
-    requires: assessment.kind != CompletionEligible
-    ensures:
-        if assessment.kind = CompletionObserved:
-            ExistingCompletionSuccessorObserved(assessment.retained_successor)
-        else if assessment.kind = CompletionNotEligible:
-            AutomaticCompletionRetryNotAdmitted(receipt.obligation, assessment.reason)
-    ensures: not CloseRunCreatedByAssessment(receipt.obligation)
-    ensures: not AutomaticAllowanceChangedByAssessment(receipt.obligation)
-    ensures: not CloseResourceEffectDispatchedByAssessment(receipt.obligation)
-}
-
-rule AutomaticCompletionOnlyRetryConsumesOneAllowanceAtomically {
-    when: CloseCompletionRetryRequested(live_source, receipt, callback_token, process_epoch)
-    requires: authorized_current_proven_source(live_source, receipt.obligation.product_conversation)
-    let assessment = assess_completion_retry_read_only(receipt)
-    requires: assessment.kind = CompletionEligible
-    let proof = assessment.proof
-    let obligation = receipt.obligation
-    let failed_run = proof.failed_run
-    let allowance = CloseCompletionRetryAllowance{obligation: obligation}
-    let prior_phase = obligation.phase
-    let prior_lifecycle = obligation.product_conversation.lifecycle
-    requires: authorized_current_proven_source(live_source, obligation.product_conversation)
-    requires: source_identity(live_source) = receipt.source_identity
-    requires: obligation.phase in { close_incomplete, cleanup_attention }
-    requires: conversation_and_owned_process_shutdown_confirmed(failed_run)
-    requires: receipt.admitted_run.obligation = obligation
-    requires: failed_run.obligation = obligation
-    requires: failed_run.status = stopped
-    requires: failed_run.ordinal = latest_close_run_ordinal(obligation)
-    requires:
-        (failed_run.ordinal > 1 and proof.provenance != original_initial_retirement)
-        or (failed_run.ordinal = 1 and proof.provenance = original_initial_retirement
-            and exact_native_initial_receipt_and_original_retirement_proof(proof, receipt))
-    requires: not CloseRuns.any(r => r.obligation = obligation and r.ordinal > failed_run.ordinal)
-    requires: not exists CloseRun{obligation: obligation, status: running}
-    requires: proof.all_planned_effects_durably_succeeded
-    requires: proof.no_resource_or_destructive_effects_remain
-    requires: proof.primary_failure = CloseRunFailure{run: failed_run}
-    requires: proof.primary_failure.authority_kind = attempt_interrupted
-    requires: proof.primary_failure.resource_failures.count = 0
-    requires: proof.resource_failure_child_count = proof.primary_failure.resource_failures.count
-    requires: proof.succeeded_effect_count = proof.planned_effect_count
-    requires:
-        (proof.provenance = completed_resource_plan and proof.planned_effect_count > 0)
-        or (proof.provenance = prior_verified_completion and proof.planned_effect_count = 0
-            and prior_verified_completion_chain_has_positive_resource_provenance(failed_run))
-        or (proof.provenance = original_initial_retirement and proof.planned_effect_count > 0
-            and exact_native_initial_receipt_and_original_retirement_proof(proof, receipt))
-    requires: exact_interrupted_run_has_positive_persisted_completion_provenance(proof)
-    requires: proof.planned_effects_fingerprint = retained_planned_effects_fingerprint(failed_run)
-    requires: proof.completed_effects_fingerprint = retained_successful_effects_fingerprint(failed_run)
-    requires: exact_original_members_scopes_and_authority_match(proof, obligation)
-    requires: proof.completed_effects_fingerprint = proof.planned_effects_fingerprint
-    requires: exact_fresh_retained_completion_proof(proof, failed_run, receipt)
-    requires: allowance.consumed = false
-    requires: allowance.suppressed = false
-    requires: callback_token_and_epoch_are_current(callback_token, process_epoch, obligation)
-    ensures:
-        let successor = CloseRun.created(obligation: obligation, ordinal: failed_run.ordinal + 1, status: running)
-        let admission = CloseCompletionRetryAdmission.created(allowance: allowance, failed_run: failed_run, successor: successor, source_identity: source_identity(live_source), callback_token: callback_token, process_epoch: process_epoch)
-        allowance.consumed = true
-        CloseCompletionOnlyRunAdmitted(admission)
-        not CloseResourceEffectDispatched(successor)
-        not CloseSettlementRequested(obligation.product_conversation, obligation.attempt_id, successor.ordinal)
-        not RetirementInspectionRequested(obligation.product_conversation, obligation.attempt_id, successor.ordinal)
-    ensures: failed_run.status = stopped
-    ensures: AllPriorRunEvidenceUnchanged(obligation)
-    ensures: obligation.phase = prior_phase
-    ensures: obligation.product_conversation.lifecycle = prior_lifecycle
-    ensures: not AdditionalMandatoryGlobalDeliveryCreated(failed_run)
-}
-
--- exact_native_initial_receipt_and_original_retirement_proof binds ordinal one
--- to the retained Initial receipt, immutable original inspection anchor, exact
--- sealed captured scopes/inventories, canonical original snapshot, exact dispatch
--- membership, all durable original resource successes and independent WorkScope
--- success, and confirmed conversation/owned-process shutdown. Missing, residual,
--- foreign or ambiguous evidence fails closed. It does not grant current live
--- authority or override Stop/pause/cancellation/revoking source replacement.
--- All-success interruption retains its unsuccessful failure/outbox with zero
--- fabricated resource children; startup can observe it, never dispatch a retry.
-
--- The live admission event has exactly this owned read-only driver. It never
--- enters the resource-retirement dispatcher. Each definite return is Ready or
--- Failed; authority loss is failure, not a guard that silently drops the work.
-rule LiveCompletionOnlyAdmissionDrivesOneObservation {
-    when: CloseCompletionOnlyRunAdmitted(admission)
-    requires: admission.successor.status = running
-    ensures:
-        if not exact_completion_only_admission_and_live_permit_valid(admission.successor.obligation, admission.successor):
-            CloseCompletionOnlyFinalizationFailed(admission.successor, "source_authority_lost", source_authority_lost)
-        else:
-            let observation = observe_completion_only_read_only(admission)
-            if observation.kind = CompletionReady:
-                CloseCompletionOnlyFinalizationReady(admission.successor.obligation, admission.failed_run, admission.successor)
-            else if observation.kind = CompletionObservationFailed:
-                CloseCompletionOnlyFinalizationFailed(admission.successor, observation.reason, completion_failure)
-    ensures: not CloseResourceEffectDispatched(admission.successor)
-}
-
-rule CompletionOnlyReadyCannotSilentlyLoseAuthorityOrPositiveProof {
-    when: CloseCompletionOnlyFinalizationReady(obligation, failed_run, successor)
-    requires: successor.status = running
-    requires: not exact_completion_only_admission_and_live_permit_valid(obligation, successor)
-        or not fresh_completion_only_observation_proves_all_original_effects_durably_succeeded(successor)
-        or not conversation_and_owned_process_shutdown_confirmed(successor)
-    ensures: CloseCompletionOnlyFinalizationFailed(successor, "finalization_authority_or_proof_lost", completion_failure)
-}
-
-rule CompletionOnlyRunFinalizesWithoutRedispatchingEffects {
-    when: CloseCompletionOnlyFinalizationReady(obligation, failed_run, successor)
-    let prior_lifecycle = obligation.product_conversation.lifecycle
-    let allowance = CloseCompletionRetryAllowance{obligation: obligation}
-    requires: successor.obligation = obligation
-    requires: successor.ordinal = failed_run.ordinal + 1
-    requires: successor.status = running
-    requires: allowance.consumed
-    requires: not allowance.suppressed
-    requires: exact_completion_only_admission_and_live_permit_valid(obligation, successor)
-    requires: fresh_completion_only_observation_proves_all_original_effects_durably_succeeded(successor)
-    requires: conversation_and_owned_process_shutdown_confirmed(successor)
-    ensures: successor.status = completed
-    ensures: obligation.phase = completed
-    ensures: obligation.outcome = archived
-    ensures: obligation.product_conversation.lifecycle = history
-    ensures: CloseOutcomeSystemMessagePersisted(obligation.product_conversation, obligation.attempt_id, successor.ordinal)
-    ensures: AllRequiredResourcesRetired(successor)
-    ensures: ProductConversationHistoryCleanupAttentionCleared(obligation.product_conversation)
-    ensures:
-        if prior_lifecycle = open:
-            ProductConversationEnteredHistory(obligation.product_conversation, obligation.attempt_id)
-    ensures: AllPriorRunEvidenceUnchanged(obligation)
-    ensures: not CloseResourceEffectDispatched(successor)
-
-    @guidance
-        -- Finalization commits only the already-proven completion and truthful
-        -- lifecycle outcome. It never emits CloseSafeRetryAdmitted, settlement,
-        -- or retirement inspection. A failed/interrupted successor follows the
-        -- existing first-failure/outbox rules and cannot refund its allowance.
-}
-
-rule StopPauseOrCancelSuppressesPendingCompletionRetry {
+rule SourceFenceAtomicallyStopsUnfinishedExplicitRetries {
     when: CloseSourceFenceRequested(obligation, cause)
     requires: cause in { stop, pause, source_replaced, process_authority_closed }
     -- Capture the exact unfinished sets in pre-state. Filter is pure selection,
     -- not a post-state condition that can become vacuous after status changes.
-    let unfinished_automatic = filter(CloseCompletionRetryAdmissions, a => a.allowance.obligation = obligation and a.successor.status = running)
     let unfinished_explicit = filter(CloseExplicitRetryAdmissions, a => a.successor.obligation = obligation and a.successor.status = running)
-    ensures: AutomaticCompletionCallbackAuthorityInvalidated(obligation)
-    ensures: not AutomaticCompletionRetryMayRearm(obligation)
+    ensures: CloseCallbackAuthorityInvalidated(obligation)
     ensures:
-        for allowance in CloseCompletionRetryAllowances:
-            if allowance.obligation = obligation:
-                allowance.suppressed = true
-        for admission in unfinished_automatic:
-            admission.successor.status = stopped
-            let automatic_failure = CloseRunFailure.created(run: admission.successor, failed_step: "completion_only", reason: "completion_fenced", authority_kind: explicitly_suppressed, shutdown: observed_close_shutdown(admission.successor), residual_evidence: observed_close_residuals(admission.successor))
-            for evidence in exact_failed_resource_evidence(admission.successor):
-                CloseResourceFailure.created(failure: automatic_failure, resource_identity: evidence.resource_identity, scope_identity: evidence.scope_identity, reason: evidence.reason)
-            CloseFailureGlobalDelivery.created(failure: automatic_failure, status: pending)
-            AllFurtherCloseEffectAuthorityRevoked(admission.successor)
-            CloseFailureRecorded(obligation.product_conversation, obligation.attempt_id, admission.successor.ordinal)
         for admission in unfinished_explicit:
             admission.successor.status = stopped
             let explicit_failure = CloseRunFailure.created(run: admission.successor, failed_step: "exact_retry", reason: "source_fenced", authority_kind: explicitly_suppressed, shutdown: observed_close_shutdown(admission.successor), residual_evidence: observed_close_residuals(admission.successor))
@@ -3622,31 +3307,16 @@ rule StopPauseOrCancelSuppressesPendingCompletionRetry {
             CloseFailureRecorded(obligation.product_conversation, obligation.attempt_id, admission.successor.ordinal)
 
     @guidance
-        -- Suppression, callback fencing, and stopping any admitted still-running
-        -- completion successor with its once-per-run failure/outbox are one durable
+        -- Callback fencing and stopping any admitted still-running
+        -- explicit successor with its once-per-run failure/outbox are one durable
         -- decision serialized with admission and finalization. A finalized run is
         -- not rewritten; a losing callback only observes the retained disposition.
 }
 
-rule CompletionOnlyFinalizationFailureStopsWithoutEffectsOrRefund {
-    when: CloseCompletionOnlyFinalizationFailed(successor, reason, authority_kind)
-    let admission = CloseCompletionRetryAdmission{successor: successor}
-    requires: successor.status = running
-    ensures: CloseRunFailed(successor.obligation.product_conversation, successor.obligation.attempt_id, successor.ordinal, failed_step: "completion_only", reason: reason, authority_kind: authority_kind, shutdown: observed_close_shutdown(successor), residual_evidence: observed_close_residuals(successor), resource_failures: {})
-    ensures: admission.allowance.consumed = true
-    ensures: not CloseResourceEffectDispatched(successor)
-}
-
-rule StartupDoesNotDispatchRearmOrRefundCompletionRetry {
+rule StartupCannotAdmitCloseSuccessor {
     when: PhoenixStartupObservedCloseRun(run)
-    for allowance in CloseCompletionRetryAllowances where obligation = run.obligation:
-        let was_consumed = allowance.consumed
-        let was_suppressed = allowance.suppressed
-        ensures: allowance.consumed = was_consumed
-        ensures: allowance.suppressed = was_suppressed
-    ensures: not StartupAutomaticCompletionRetryAdmitted(run.obligation)
-    ensures: not AutomaticCompletionRetryMayRearm(run.obligation)
-    ensures: not CloseCompletionRetryAllowanceCreated(run.obligation)
+    ensures: not CloseRunCreated(run.obligation)
+    ensures: not FreshCloseRunDispatched(run.obligation.product_conversation, run.obligation.attempt_id)
 }
 
 rule GenericRetryIngressCannotAdmitNativeManagedOperation {
@@ -3697,7 +3367,6 @@ rule SafeRetryOfIncompleteShutdownStartsFreshSettlement {
     let run = CloseRun{obligation: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}, ordinal: run_ordinal}
     requires: trusted_exact_non_native_retry_admission(run)
     requires: not exists CloseExplicitRetryAdmission{successor: run}
-    requires: not exists CloseCompletionRetryAdmission{successor: run}
     requires: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase = close_incomplete
     ensures: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase = settling_active_work
     ensures: CloseSettlementRequested(product_conversation, attempt_id, run_ordinal)
@@ -3708,7 +3377,6 @@ rule SafeRetryOfHistoryCleanupStartsFreshInspection {
     let run = CloseRun{obligation: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}, ordinal: run_ordinal}
     requires: trusted_exact_non_native_retry_admission(run)
     requires: not exists CloseExplicitRetryAdmission{successor: run}
-    requires: not exists CloseCompletionRetryAdmission{successor: run}
     requires: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase = cleanup_attention
     requires: product_conversation.lifecycle = history
     ensures: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase = awaiting_retirement_inspection
@@ -4371,15 +4039,6 @@ rule ModeChangeNotification {
 --       receipt identity, model-supplied IDs and saved Goal suspension grant no
 --       permission to resume; source identity rotation invalidates pending permits.
 --
---   assess_completion_retry_read_only(receipt) -> CloseCompletionAssessment
---       Observe an existing immutable completion admission first. Otherwise report
---       absent/consumed allowance as exhausted and suppressed allowance as
---       suppressed. Eligibility requires the exact positive proof below; proof
---       absence is ineligible, storage/authority read failure is unavailable.
---       Only eligible carries a proof; only observed carries its exact successor.
---       This read-only decision never consumes, creates or refunds an allowance,
---       and the atomic admission rechecks every proof/authority/token/budget guard.
---
 --   exact_retry_plan_is_safe_and_complete(plan, obligation) -> Boolean
 --       Closed resource vocabulary includes tmux, worktree, AND independent
 --       WorkScope retirement. A pending scope is not implied retired by its
@@ -4395,7 +4054,7 @@ rule ModeChangeNotification {
 --       that scope; failure stops before committing a scope-retired outcome.
 --       Every scope success is a normalized exact planned-effect success, included
 --       in completion counts/fingerprints and all-required-resources proof. Neither
---       worker success nor automatic completion may omit an unretired scope.
+--       worker success nor explicit verified completion may omit an unretired scope.
 --       Process-epoch stop effects are intentionally not added to this vocabulary:
 --       missing original live permits fail closed; durable resource identifiers,
 --       receipt adoption or a new process epoch never authorize rediscovery/signals.
@@ -4404,7 +4063,16 @@ rule ModeChangeNotification {
 --       effects under original scopes/authority and fresh sealed identity/loss
 --       proof. The verified-completion variant has zero resource rows and points
 --       to the exact same-obligation predecessor whose positive persisted chain
---       proves all original resource effects durably succeeded. Neither is a
+--       proves all original resource effects durably succeeded. An original native
+--       initial run instead requires its exact retained Initial receipt, immutable
+--       original inspection anchor, complete sealed captured scope/inventory,
+--       canonical original snapshot, exact dispatch membership, every original
+--       resource and independent WorkScope success, and confirmed conversation
+--       and owned-process shutdown. This evidence never replaces current live
+--       authority. Counts/fingerprints derive from retained normalized records;
+--       missing, unknown, inaccessible or inconsistent evidence fails closed.
+--       An all-success interruption retains its unsuccessful primary failure and
+--       mandatory outbox without fabricating resource failures. Neither plan is a
 --       generic settlement/inspection recipe or caller authorization. Candidate
 --       plans are read-only classifications; admission creates an immutable copy
 --       and normalized exact effect rows in its own transaction. The worker reads
@@ -4429,30 +4097,7 @@ rule ModeChangeNotification {
 --       Joins the immutable failed/successor/plan binding to fresh actual live
 --       source/Coordinator and original authority plus the admitted callback token
 --       and process epoch. Stored strings only correlate, never recreate permits.
---       Checks serialize with suppression and every effect/finalization commit.
---
---   exact_interrupted_run_has_positive_persisted_completion_provenance(proof)
---       -> Boolean
---       Exact stopped latest ordinal>1 has a mandatory typed primary failure
---       whose authority_kind is attempt_interrupted and resource_failures.count
---       is zero. This maps to close_cleanup_failures.authority_kind and ZERO
---       close_cleanup_failure_resources, not absence of the primary/outbox. A
---       reason/failed_step string or interruption label cannot prove authority.
---       For completed_resource_plan the source is this exact failed run, with nonempty persisted plan and every exact effect's
---       durable success. For prior_verified_completion this exact failed run has
---       a persisted verified-completion admission and no resource effects; its
---       immutable predecessor chain supplies the positive nonempty successful
---       plan provenance. No label/empty plan alone qualifies, nor can observation,
---       continuation, restart or a new call fabricate that provenance.
---
---   exact_fresh_retained_completion_proof(proof, failed_run, receipt) -> Boolean
---       Read-only server verification of normalized persisted plan/success/failure
---       records for this exact operation, member snapshot and scope identities;
---       checked atomically with admission. Fingerprints and counts are derived
---       from those records, never caller assertions. Missing, unknown, changed,
---       inaccessible or inconsistent evidence fails closed (unavailable on read
---       failure), never vacuous success. Original target/resource authority cannot
---       expand. No cleanup/effect dispatch is permitted to produce this evidence.
+--       Checks serialize with cancellation/source fencing and every effect/finalization commit.
 --
 --   fresh_safe_retry_evidence(evidence: CloseRetrySafetyEvidence) -> Boolean
 --       True only when read-only investigation freshly verifies the exact original
@@ -4630,26 +4275,6 @@ rule ServerRestartPendingContinuation {
 ------------------------------------------------------------
 -- Invariants
 ------------------------------------------------------------
-
-invariant CloseCompletionRetryAllowanceIsUnique {
-    for a in CloseCompletionRetryAllowances:
-        for b in CloseCompletionRetryAllowances:
-            a.obligation = b.obligation implies a = b
-}
-
-invariant AutomaticCompletionRetryHasOneExactSuccessor {
-    for a in CloseCompletionRetryAdmissions:
-        a.allowance.consumed
-        and a.failed_run.obligation = a.allowance.obligation
-        and a.successor.obligation = a.allowance.obligation
-        and a.successor.ordinal = a.failed_run.ordinal + 1
-}
-
-invariant AutomaticCompletionRetryAllowanceHasOneAdmission {
-    for a in CloseCompletionRetryAdmissions:
-        for b in CloseCompletionRetryAdmissions:
-            a.allowance = b.allowance implies a = b
-}
 
 invariant ExplicitRetryAdmissionBindsItsExactPlan {
     for admission in CloseExplicitRetryAdmissions:
@@ -4871,7 +4496,6 @@ invariant ProductConversationHasAtMostOneActiveCloseAttempt {
             settling_active_work,
             cancel_requested_during_settlement,
             awaiting_retirement_inspection,
-            awaiting_loss_confirmation,
             retirement_requested,
             close_incomplete, cleanup_attention
         }) <= 1
@@ -4924,23 +4548,21 @@ surface CloseSourceFenceAdmissions {
         -- Every real durable Stop/pause admission affecting this operation, current
         -- source replacement, and process-authority closure invokes this decision
         -- inside its owning admission transaction BEFORE acknowledging the fence.
-        -- Its callback invalidation, existing allowance suppression, and terminal
-        -- automatic AND explicit successor/failure/resource-child/outbox
+        -- Its callback invalidation and terminal
+        -- explicit successor/failure/resource-child/outbox
         -- postconditions commit together, serialized with
         -- Close admission/finalization. It is not an after-commit advisory event,
-        -- an HTTP queued receipt, or something each adapter may omit. No allowance
-        -- is fabricated if absent. Source loss does not require a new source's
+        -- an HTTP queued receipt, or something each adapter may omit.
+        -- Source loss does not require a new source's
         -- authorization to revoke the old source's authority.
 }
 
-surface NativeCloseLiveCompletionDriver {
+surface NativeCloseExactRetryDriver {
     facing runtime: RuntimeExecutor
     context receipt: CloseRequestReceipt
     contracts:
         fulfils NativeCloseApplication
     provides:
-        CloseCompletionRetryRequested(live_source, receipt, callback_token, process_epoch)
-            when exact_live_native_service_owns_callback(runtime, live_source, receipt, callback_token, process_epoch)
         ExactCloseRetryPlanExecuted(admission)
             when exact_owned_retry_plan_execution_succeeded(runtime, admission)
         ExactCloseRetryPlanFailed(admission, failed_step, reason, authority_kind, resource_failures)
@@ -4949,14 +4571,9 @@ surface NativeCloseLiveCompletionDriver {
             -- has an intentional empty set. No classification by residual strings.
 
     @guarantee OwnedLiveObservationAndExactPlanExecution
-        -- The same live shared native application service handles newly admitted
-        -- or retained requests and the exact terminal run it observes. It supplies
-        -- at most the existing allowance's one assessment callback while its source,
-        -- callback token and process epoch are still live; startup cannot supply it.
-        -- CloseCompletionOnlyRunAdmitted is consumed by the read-only driver rule;
-        -- observe_completion_only_read_only returns CompletionReady only for fresh
-        -- exact positive shutdown/completion evidence, otherwise a typed failure.
-        -- It never dispatches a resource effect or generic settlement/inspection.
+        -- The live shared native application service observes retained requests
+        -- without admitting successors. Only explicit Retry can admit an exact
+        -- plan under current live source authority; startup cannot supply it.
         -- ExactCloseRetryPlanExecutionRequested is the worker's owned input. For a
         -- resource variant it executes only normalized admitted rows in exact plan
         -- order, rechecking authority/identity/safety before each effect, persisting
@@ -4971,7 +4588,7 @@ surface NativeCloseLiveCompletionDriver {
         -- variant performs observation only, with positive predecessor provenance.
         -- Every definite worker result supplies Executed or Failed for that exact
         -- admission; source loss supplies failure or the atomic source-fence path.
-        -- That fence captures both explicit and automatic unfinished successors in
+        -- That fence captures unfinished explicit successors in
         -- pre-state and terminalizes them independently of worker callback delivery.
         -- No result is silently discarded while its run remains Running. If durable
         -- terminal state itself cannot be established, process authority closes
@@ -5195,7 +4812,6 @@ surface UserConversation {
                         settling_active_work,
                         cancel_requested_during_settlement,
                         awaiting_retirement_inspection,
-                        awaiting_loss_confirmation,
                         retirement_requested,
                         close_incomplete, cleanup_attention
                      }
@@ -5206,24 +4822,12 @@ surface UserConversation {
                     awaiting_blocker_resolution,
                     awaiting_stop_work_confirmation,
                     awaiting_retirement_inspection,
-                    awaiting_loss_confirmation,
                     settling_active_work,
                     cancel_requested_during_settlement
                  }
         UserConfirmsStopWorkAndContinueClosing(conversation.product_conversation, close.attempt_id, latest_close_run_ordinal(close))
             when exists close in CloseObligation{product_conversation: conversation.product_conversation}
                  and close.phase = awaiting_stop_work_confirmation
-        UserConfirmsCloseAfterRetirementInspection(
-            conversation.product_conversation,
-            close.attempt_id,
-            latest_close_run_ordinal(close),
-            close.inspection_generation,
-            close.inspection_fingerprint
-        )
-            when exists close in CloseObligation{product_conversation: conversation.product_conversation}
-                 and close.phase = awaiting_loss_confirmation
-                 and close.inspection_generation != absent
-                 and close.inspection_fingerprint != absent
 
     @guarantee IdempotentMessages
         -- Duplicate message submissions (same message_id) are

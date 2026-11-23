@@ -3,21 +3,18 @@
 --
 -- Phoenix WorkScope Retirement: Behavioural Specification
 --
--- Scope: Git-backed Close retirement inspection, exact loss classification,
+-- Scope: Git-backed Close inspection, exact content and operational blockers,
 --        WorkScope-owned resource retirement, and PR-state advisory guidance.
 --
 -- Includes:
---   - classification of exact worktree-loss categories for an attached
---     Git-backed WorkScope;
---   - generation/fingerprint-bound discard confirmation;
+--   - one authoritative exact blocker decision and its user-facing projection;
+--   - ignored/build content as blockers, never inferred discard permission;
 --   - one stop-on-first-failure retirement run, observation-only startup,
 --     and explicit fresh safe retry under original Close authority;
---   - PR-state guidance that may encourage Close but never blocks it.
---   - one source-bound, idempotent `close_conversation` request and a single
---     exact-proof completion-only successor exception to explicit safe retry.
--- Unified operation identity, retained replay, durable retry budget/suppression,
--- and the completion-only admission evidence are specified normatively by
--- REQ-WL-002f and ADR-245; startup remains observation-only.
+--   - PR-state guidance that may encourage Close but never blocks it;
+--   - one source-bound, idempotent `close_conversation` request, with no
+--     automatic successor, in-Close discard, salvage, repair, or classifier.
+-- Owner cleanup requires separate authority and fresh Close inspection.
 --
 -- Excludes:
 --   - root lifecycle legality, close-obligation orchestration, and ProductConversation
@@ -68,16 +65,25 @@ enum WorkScopeKind {
     | conversation
 }
 
-enum LossCategory {
+enum BlockerCategory {
     staged_tracked_paths
     | unstaged_tracked_paths
     | untracked_non_ignored_paths
+    | ignored_paths
     | initialized_submodule_state
     | detached_unreachable_commits
+    | external_writer
+    | permission_denied
+    | unsupported_layout
+    | inspection_error
+    | deadline_exceeded
+    | identity_uncertain
+    | ownership_conflict
 }
 
 enum RetiredResourceKind {
-    worktree
+    work_scope
+    | worktree
     | bash_process_group
     | tmux_server
     | pty_session
@@ -136,12 +142,32 @@ external entity Worktree {
     identity: WorktreeIdentity
 }
 
-external entity RetirementLossCategoryRow {
+external entity RetirementBlockerRow {
     attempt: RetirementAttempt
     inspection: RetirementInspection
-    category: LossCategory
+    category: BlockerCategory
     item_identity: String
+    reason: String
 }
+
+external entity RetirementBlockerDecision {
+    product_conversation: bedrock/ProductConversation
+    attempt_id: String
+    run_ordinal: Integer
+    inspection: RetirementInspection
+}
+
+external entity RetirementDecisionScopeInspection {
+    decision: RetirementBlockerDecision
+    attempt: RetirementAttempt
+    inspection: RetirementInspection
+}
+
+-- RetirementDecisionScopeInspection is the immutable complete membership relation
+-- from one aggregate decision to its exact per-scope snapshots, including scopes
+-- with no blocker rows. Decision, membership, inspections and rows are captured
+-- atomically; later inspection creates a new decision and never rewrites members.
+-- This is an evidence binding, not a replacement blocker persistence subsystem.
 
 external entity RetiredResource {
     attempt: RetirementAttempt
@@ -175,18 +201,34 @@ external entity RestartRepairEvidenceAdoption {
 -- Rules
 ------------------------------------------------------------
 
--- REQ-WL-002f narrowly qualifies one fresh completion-only successor when
--- exact retained proof shows all originally planned effects durably succeeded
--- and no resource/destructive effects remain. It does not resume the stopped
--- run, replenish the per-operation budget, or authorize startup dispatch.
--- All other resource/destructive retries remain explicit and freshly proven.
--- Ordinal-one native Initial interruption qualifies only through its exact
--- retained receipt, original anchor, sealed captured scope/resource inventory,
--- exact dispatch membership, every original resource and independent WorkScope
--- success, and confirmed shutdown. Original proof does not grant live authority.
--- All-success interruption remains unsuccessful with mandatory delivery and no
--- fabricated resource failure. Stop/pause/cancel/revoking source replacement
--- suppress automatic admission; startup only observes and never rearms it.
+-- REQ-WL-002f: Bedrock owns native source verification, exact request/attempt/run
+-- receipts and idempotent replay. Observation never admits another run. Every
+-- successor requires explicit Retry, fresh safety evidence and original authority,
+-- even when only final metadata remains. Stop/pause/cancellation fence effects;
+-- startup, elapsed time, source replacement and changed preconditions cannot
+-- authorize work. All-success interruption is still unsuccessful, with mandatory
+-- delivery and no invented resource failure. History never reopens on retry.
+-- Explicit admission atomically retains an immutable typed remaining-effect plan
+-- or positive verified-completion provenance, successor and native receipt. Only
+-- that run-bound plan dispatches; no generic initial settlement/inspection fallback
+-- is an effect authority. Zero-effect completion needs positive persisted proof of
+-- all original resource AND independent WorkScope successes and owned shutdown;
+-- an empty plan, interruption label or unknown outcome proves nothing. Each scope
+-- is an independent ordered outcome after its pending resources, including in a
+-- scope-only plan. Process-epoch stop effects are not retry-plan vocabulary.
+-- Stop/pause/cancellation/source-fence admission directly and atomically settles
+-- unfinished explicit retries: exact terminal failure, residual/resource evidence,
+-- cancelled outcome when applicable, shutdown-based lifecycle/attention and the
+-- once-per-run outbox. Exact cancellation of a stopped retained explicit retry
+-- settles the same lifecycle/attention and cancelled operation outcome atomically,
+-- preserving immutable stopped-run evidence and delivery identity. No optional
+-- notification or later callback repairs this.
+-- Prior History and positive shutdown evidence survive uncertainty; prior Open
+-- enters History only with stable positive owned shutdown, otherwise remains
+-- Open/CloseIncomplete. Publish History only on an actual Open-to-History commit.
+-- Losing callbacks read that terminal disposition and cannot bypass suppression.
+-- Unavailable terminal storage closes process authority and reports failure; it
+-- never leaves authority to execute a Running successor or guesses completion.
 
 rule ChatOnlyCloseSkipsWorktreeInspection {
     when: RetirementInspectionRequested(product_conversation, attempt_id, run_ordinal)
@@ -222,9 +264,9 @@ rule RetirementInspectionRequestCreatesAttemptBoundEvidence {
                     fingerprint: current_retirement_inspection_fingerprint(product_conversation, scope_binding.scope)
                 }
             )
-            and for category in current_retirement_loss_categories(product_conversation, scope_binding.scope):
-                for item_identity in current_retirement_loss_item_identities(product_conversation, scope_binding.scope, category):
-                    RetirementLossCategoryRow.created(
+            and for category in current_retirement_blocker_categories(product_conversation, scope_binding.scope):
+                for item_identity in current_retirement_blocker_item_identities(product_conversation, scope_binding.scope, category):
+                    RetirementBlockerRow.created(
                         attempt: RetirementAttempt{
                             attempt_id: attempt_id, run_ordinal: run_ordinal,
                             product_conversation: product_conversation,
@@ -239,18 +281,24 @@ rule RetirementInspectionRequestCreatesAttemptBoundEvidence {
                             fingerprint: current_retirement_inspection_fingerprint(product_conversation, scope_binding.scope)
                         },
                         category: category,
-                        item_identity: item_identity
+                        item_identity: item_identity,
+                        reason: current_retirement_blocker_reason(product_conversation, scope_binding.scope, category, item_identity)
                     )
 
+    ensures: RetirementInspectionEvidenceCaptured(product_conversation, attempt_id, run_ordinal)
+
     @guidance
-        -- Before selecting the with-loss or without-loss inspection outcome, Phoenix
+        -- Before selecting the blocked or clear inspection outcome, Phoenix
         -- materializes one exact RetirementAttempt plus its exact RetirementInspection
-        -- and categorized loss inventory for every attached Git-backed scope bound
-        -- to this Close attempt_id. Each RetirementLossCategoryRow is one exact
+        -- and categorized blocker inventory for every attached Git-backed scope bound
+        -- to this Close attempt_id. Each RetirementBlockerRow is one exact
         -- (scope, category, item_identity) row, so every at-risk path or detached commit
         -- becomes distinct evidence rather than collapsing multiple items into one
-        -- category summary. Outcome selection then reads this attempt-bound evidence
-        -- rather than recomputing from an untyped side channel.
+        -- category summary. Operational impediments name the exact affected expected
+        -- resource or scope when a path cannot be inspected, without inventing files
+        -- or writer identities. Incomplete inspection always creates a blocker.
+        -- Evidence capture and decision creation share one atomic snapshot; neither
+        -- outcome selection nor projection recomputes through a separate side channel.
 }
 
 rule CloseWithoutAttachedWorkScopeCompletesRetirementIdempotently {
@@ -268,109 +316,88 @@ rule CloseWithoutAttachedWorkScopeCompletesRetirementIdempotently {
         -- without inventing residual work or requiring a synthetic WorkScope.
 }
 
-rule GitBackedInspectionWithoutLossRequestsRetirement {
-    when: RetirementInspectionRequested(product_conversation, attempt_id, run_ordinal)
+rule GitBackedInspectionWithoutBlockersRequestsRetirement {
+    when: RetirementBlockerDecisionCaptured(decision)
+    let product_conversation = decision.product_conversation
+    let attempt_id = decision.attempt_id
+    let run_ordinal = decision.run_ordinal
     requires: bedrock/CloseRun{obligation: bedrock/CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}, ordinal: run_ordinal}.status = running
     requires: exists AttachedWorkScope{product_conversation: product_conversation, owns_git_worktree: true}
     requires:
         for scope_binding in attached_worktree_scopes(product_conversation):
             exists RetirementAttempt{attempt_id: attempt_id, run_ordinal: run_ordinal, product_conversation: product_conversation, scope: scope_binding.scope, inspection: RetirementInspection}
-    requires: not exists RetirementLossCategoryRow{attempt: RetirementAttempt{attempt_id: attempt_id, run_ordinal: run_ordinal, product_conversation: product_conversation, scope: AttachedWorkScope.scope, inspection: RetirementInspection}, inspection: RetirementInspection, category: staged_tracked_paths}
-    requires: not exists RetirementLossCategoryRow{attempt: RetirementAttempt{attempt_id: attempt_id, run_ordinal: run_ordinal, product_conversation: product_conversation, scope: AttachedWorkScope.scope, inspection: RetirementInspection}, inspection: RetirementInspection, category: unstaged_tracked_paths}
-    requires: not exists RetirementLossCategoryRow{attempt: RetirementAttempt{attempt_id: attempt_id, run_ordinal: run_ordinal, product_conversation: product_conversation, scope: AttachedWorkScope.scope, inspection: RetirementInspection}, inspection: RetirementInspection, category: untracked_non_ignored_paths}
-    requires: not exists RetirementLossCategoryRow{attempt: RetirementAttempt{attempt_id: attempt_id, run_ordinal: run_ordinal, product_conversation: product_conversation, scope: AttachedWorkScope.scope, inspection: RetirementInspection}, inspection: RetirementInspection, category: initialized_submodule_state}
-    requires: not exists RetirementLossCategoryRow{attempt: RetirementAttempt{attempt_id: attempt_id, run_ordinal: run_ordinal, product_conversation: product_conversation, scope: AttachedWorkScope.scope, inspection: RetirementInspection}, inspection: RetirementInspection, category: detached_unreachable_commits}
+    requires: exact_retirement_blocker_decision(product_conversation, attempt_id, run_ordinal) = decision
+    requires: not inspection_has_blockers(decision)
+    ensures: RetirementBlockerProjectionAvailable(decision)
     ensures: RetirementInspectionCompletedWithoutConfirmation(
         product_conversation,
         attempt_id,
         run_ordinal,
-        inspection_generation: aggregate_inspection_generation(attempt_bound_scope_inspections(product_conversation, attempt_id, run_ordinal)),
-        inspection_fingerprint: aggregate_inspection_fingerprint(attempt_bound_scope_inspections(product_conversation, attempt_id, run_ordinal))
+        inspection_generation: decision.inspection.generation,
+        inspection_fingerprint: decision.inspection.fingerprint
     )
 
     @guidance
-        -- The inspection must classify exactly five independent loss categories:
-        -- staged tracked paths; unstaged tracked/conflicted/unmerged paths;
-        -- untracked non-ignored paths; dirty or untracked state inside
-        -- initialized submodules; and detached commits unreachable from
-        -- refs/heads/*, refs/remotes/*, refs/tags/*, or refs/stash.
-        -- Ignored paths are excluded. LFS-tracked edits are ordinary tracked
-        -- changes. Local branches, tags, remotes, and stash are durable refs.
-        -- Reflog-only detached commits are at-risk detached commits.
+        -- The decision covers the union of all exact attached-scope inventories.
+        -- Staged, unstaged/conflicted/unmerged, untracked, ignored/build paths,
+        -- dirty/untracked initialized-submodule state and unreachable detached
+        -- commits block when preservation cannot be proven. No repository metadata
+        -- grants discard permission. Nested repositories are inspected only as
+        -- declared submodules. LFS edits are tracked changes; branches, remote refs,
+        -- tags and stash are durable refs, but reflog-only detached commits are not.
+        -- Writers, permission/layout errors, inspection gaps and deadlines also
+        -- block. A clear content inventory is not proof that mutation will succeed.
 }
 
-rule GitBackedInspectionWithLossRequiresConfirmation {
-    when: RetirementInspectionRequested(product_conversation, attempt_id, run_ordinal)
+rule GitBackedInspectionWithBlockersStopsRun {
+    when: RetirementBlockerDecisionCaptured(decision)
+    let product_conversation = decision.product_conversation
+    let attempt_id = decision.attempt_id
+    let run_ordinal = decision.run_ordinal
+    requires: bedrock/CloseRun{obligation: bedrock/CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}, ordinal: run_ordinal}.status = running
+    requires: exact_retirement_blocker_decision(product_conversation, attempt_id, run_ordinal) = decision
+    requires: inspection_has_blockers(decision)
+    ensures: RetirementBlockerProjectionAvailable(decision)
+    ensures: CloseRetirementStepFailed(product_conversation, attempt_id, run_ordinal,
+        authority_kind: resource_failure,
+        resource_failures: exact_retirement_failure_evidence(product_conversation, attempt_id, run_ordinal))
+
+    @guidance
+        -- The same decision supplies the actual stop decision, exact failure children
+        -- and projection. Retry and Stop are the choices, not discard/salvage/repair.
+        -- Owner cleanup occurs under separate authority outside Close, followed by
+        -- fresh inspection and explicit safe-retry admission. A file's ignored or
+        -- build status never makes it disposable. A blocker is not deletion consent.
+}
+
+rule InspectionEvidenceProducesOneBlockerDecision {
+    when: RetirementInspectionEvidenceCaptured(product_conversation, attempt_id, run_ordinal)
     requires: bedrock/CloseRun{obligation: bedrock/CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}, ordinal: run_ordinal}.status = running
     requires: exists AttachedWorkScope{product_conversation: product_conversation, owns_git_worktree: true}
-    requires:
-        for scope_binding in attached_worktree_scopes(product_conversation):
-            exists RetirementAttempt{attempt_id: attempt_id, run_ordinal: run_ordinal, product_conversation: product_conversation, scope: scope_binding.scope, inspection: RetirementInspection}
-    requires:
-        exists RetirementLossCategoryRow{attempt: RetirementAttempt{attempt_id: attempt_id, run_ordinal: run_ordinal, product_conversation: product_conversation, scope: AttachedWorkScope.scope, inspection: RetirementInspection}, inspection: RetirementInspection, category: staged_tracked_paths}
-        or exists RetirementLossCategoryRow{attempt: RetirementAttempt{attempt_id: attempt_id, run_ordinal: run_ordinal, product_conversation: product_conversation, scope: AttachedWorkScope.scope, inspection: RetirementInspection}, inspection: RetirementInspection, category: unstaged_tracked_paths}
-        or exists RetirementLossCategoryRow{attempt: RetirementAttempt{attempt_id: attempt_id, run_ordinal: run_ordinal, product_conversation: product_conversation, scope: AttachedWorkScope.scope, inspection: RetirementInspection}, inspection: RetirementInspection, category: untracked_non_ignored_paths}
-        or exists RetirementLossCategoryRow{attempt: RetirementAttempt{attempt_id: attempt_id, run_ordinal: run_ordinal, product_conversation: product_conversation, scope: AttachedWorkScope.scope, inspection: RetirementInspection}, inspection: RetirementInspection, category: initialized_submodule_state}
-        or exists RetirementLossCategoryRow{attempt: RetirementAttempt{attempt_id: attempt_id, run_ordinal: run_ordinal, product_conversation: product_conversation, scope: AttachedWorkScope.scope, inspection: RetirementInspection}, inspection: RetirementInspection, category: detached_unreachable_commits}
-    ensures: RetirementInspectionRequiresConfirmation(
-        product_conversation,
-        attempt_id,
-        run_ordinal,
-        inspection_generation: aggregate_inspection_generation(attempt_bound_scope_inspections(product_conversation, attempt_id, run_ordinal)),
-        inspection_fingerprint: aggregate_inspection_fingerprint(attempt_bound_scope_inspections(product_conversation, attempt_id, run_ordinal))
-    )
+    requires: all_targeted_scope_inspection_evidence_captured(product_conversation, attempt_id, run_ordinal)
+    ensures:
+        let decision = RetirementBlockerDecision.created(
+            product_conversation: product_conversation,
+            attempt_id: attempt_id,
+            run_ordinal: run_ordinal,
+            inspection: RetirementInspection {
+                generation: aggregate_inspection_generation(attempt_bound_scope_inspections(product_conversation, attempt_id, run_ordinal)),
+                fingerprint: aggregate_inspection_fingerprint(attempt_bound_scope_inspections(product_conversation, attempt_id, run_ordinal))
+            }
+        )
+        for scope_binding in captured_worktree_scope_bindings(product_conversation, attempt_id):
+            RetirementDecisionScopeInspection.created(
+                decision: decision,
+                attempt: RetirementAttempt{attempt_id: attempt_id, run_ordinal: run_ordinal, product_conversation: product_conversation, scope: scope_binding.scope},
+                inspection: exact_captured_scope_inspection(product_conversation, attempt_id, run_ordinal, scope_binding.scope)
+            )
+        RetirementBlockerDecisionCaptured(decision)
 
     @guidance
-        -- Each RetirementLossCategoryRow is one exact (category, item_identity) row
-        -- in the inventory, bound both to one exact RetirementInspection and to the
-        -- RetirementAttempt for the product conversation plus attached WorkScope being
-        -- retired.
-        -- Categories coexist independently. Paths and detached-commit identities
-        -- are surfaced without synthesizing a branch, tag, stash, patch, or diff
-        -- snapshot as a recovery artifact.
-}
-
-rule LossConfirmationRecomputesInspectionBeforeRetirement {
-    when: UserConfirmsCloseAfterRetirementInspection(product_conversation, attempt_id, run_ordinal, inspection_generation, inspection_fingerprint)
-    requires: bedrock/CloseRun{obligation: bedrock/CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}, ordinal: run_ordinal}.status = running
-    requires: bedrock/CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase = awaiting_loss_confirmation
-    requires: bedrock/CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.inspection_generation = inspection_generation
-    requires: bedrock/CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.inspection_fingerprint = inspection_fingerprint
-    let fresh_scope_inspections = recompute_all_targeted_scope_inspections(product_conversation, attempt_id, run_ordinal)
-    let fresh_generation = aggregate_inspection_generation(fresh_scope_inspections)
-    let fresh_fingerprint = aggregate_inspection_fingerprint(fresh_scope_inspections)
-    requires: fresh_generation = inspection_generation
-    requires: fresh_fingerprint = inspection_fingerprint
-    ensures: RetirementInspectionRecomputed(product_conversation, attempt_id, run_ordinal, fresh_generation, fresh_fingerprint)
-    ensures: ResourceRetirementRequested(product_conversation, attempt_id, run_ordinal)
-
-    @guidance
-        -- The only user-facing discard-confirmation control is bound to the exact
-        -- active Close obligation plus its stored inspection generation/fingerprint.
-        -- The click re-runs the authoritative retirement inspection for every targeted
-        -- attached WorkScope and derives one fresh aggregate pair inside the same atomic decision boundary that decides whether Close may enter
-        -- retirement_requested. Phoenix compares the freshly recomputed generation and
-        -- fingerprint against the stored inspection evidence from the outstanding Close
-        -- obligation before requesting destructive retirement, so an async watcher
-        -- notification cannot race ahead or lag behind the decision.
-}
-
-rule LossConfirmationDetectsChangedInspection {
-    when: UserConfirmsCloseAfterRetirementInspection(product_conversation, attempt_id, run_ordinal, inspection_generation, inspection_fingerprint)
-    requires: bedrock/CloseRun{obligation: bedrock/CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}, ordinal: run_ordinal}.status = running
-    requires: bedrock/CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase = awaiting_loss_confirmation
-    requires:
-        bedrock/CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.inspection_generation != inspection_generation
-        or bedrock/CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.inspection_fingerprint != inspection_fingerprint
-        or aggregate_inspection_generation(recompute_all_targeted_scope_inspections(product_conversation, attempt_id, run_ordinal)) != inspection_generation
-        or aggregate_inspection_fingerprint(recompute_all_targeted_scope_inspections(product_conversation, attempt_id, run_ordinal)) != inspection_fingerprint
-    ensures: RetirementInspectionChanged(product_conversation, attempt_id, run_ordinal)
-
-    @guidance
-        -- If the confirmation payload no longer matches either the active Close
-        -- obligation's stored inspection evidence or the just-in-time recomputation,
-        -- Close does not cross into retirement_requested. The typed mismatch event
-        -- sends the flow back through inspection so the user sees the new loss set.
+        -- One decision per exact aggregate inspection snapshot; replay reads it.
+        -- The projection references its normalized blocker rows, never a second
+        -- independently computed inventory or classifier. A missing target inventory
+        -- is a concrete inspection-error blocker, not an empty/clear inspection.
 }
 
 rule RetirementRequestedRetiresOwnedResources {
@@ -406,7 +433,7 @@ rule RetirementRequestedCreatesPerResourceEvidence {
             if exists CloseRetirementAuthority{product_conversation: product_conversation, scope: scope_binding.scope}
                and not blocked_by_distinct_open_product_or_identity_conflict(product_conversation, scope_binding.scope)
                and retirement_step_succeeds_for_pending_resource(product_conversation, scope_binding.scope)
-               and fresh_reconstructible_or_explicit_discard_authority(product_conversation, attempt_id, run_ordinal):
+               and fresh_exact_retirement_authority_without_blockers(product_conversation, attempt_id, run_ordinal):
                 RetiredResource.created(
                     attempt: RetirementAttempt{attempt_id: attempt_id, run_ordinal: run_ordinal, product_conversation: product_conversation, scope: scope_binding.scope},
                     product_conversation: product_conversation,
@@ -460,7 +487,7 @@ rule AmbiguousPrivateDirectoryIdentityPreservesSafeLeftover {
         -- a safe leftover for repair. Concurrent malicious mutation inside that private
         -- namespace and mutation outside Phoenix ownership are unsupported.
         --
-        -- Immediately before moving the confirmed worktree into quarantine,
+        -- Immediately before moving the inspected worktree into quarantine,
         -- Phoenix stops every Git fsmonitor daemon bound to that worktree or to
         -- an initialized submodule beneath it, and waits a bounded time for each
         -- to exit. The open-descriptor scan after quarantine therefore sees only
@@ -690,7 +717,8 @@ rule RestartRepairConflictRoutesTypedRepair {
         -- A later Close attempt may bind fresh retained restart evidence for the
         -- same repository, but only from a new exact attempt. When identity is
         -- inaccessible, identity is incomplete, a replacement appears, or the active
-        -- attempt does not match, Phoenix routes to typed repair instead of guessing continuity from the
+        -- attempt does not match, Phoenix reports a concrete blocker for separate
+        -- owner investigation instead of guessing continuity from the
         -- path or silently adopting a stale absence observation.
 }
 
@@ -775,18 +803,58 @@ rule RetirementFailureStopsBeforeAnyFurtherStep {
     @guidance
         -- Stop/failure persistence is the step's commit boundary, not a delayed
         -- background callback. No other scope's step can execute after this failure.
+        -- The failure's exact blocker rows and user projection come from this
+        -- owning decision, including newly observed operational impediments.
+        -- Confirmed conversation-and-owned-process shutdown permits History only
+        -- with conspicuous incomplete/disk-retained cleanup attention, exact
+        -- blockers and explicit Retry/Stop. Uncertain shutdown before any positive
+        -- History commit stays visible Open/CloseIncomplete. Later uncertainty
+        -- preserves committed History and prior positive evidence, never reopening
+        -- execution or implying that retained resources were retired.
+        -- Stop preserves unresolved targets/evidence and ends further Close effects;
+        -- it is not discard, successful cleanup, or permission to open the gate.
 }
 
-rule UnprovenReconstructibilityPreservesWorktree {
+rule MutationBoundaryBlockersPreserveWorktree {
     when: ResourceRetirementRequested(product_conversation, attempt_id, run_ordinal)
     requires: bedrock/CloseRun{obligation: bedrock/CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}, ordinal: run_ordinal}.status = running
     requires: pending_step_deletes_worktree(product_conversation, attempt_id, run_ordinal)
-    requires: not fresh_reconstructible_or_explicit_discard_authority(product_conversation, attempt_id, run_ordinal)
+    let decision = mutation_boundary_blocker_decision(product_conversation, attempt_id, run_ordinal)
+    requires: exists decision
+    requires: inspection_has_blockers(decision)
+    ensures: RetirementBlockerProjectionAvailable(decision)
     ensures: WorktreePreserved(product_conversation, attempt_id, run_ordinal)
     ensures: CloseRetirementStepFailed(product_conversation, attempt_id, run_ordinal,
         authority_kind: resource_failure,
         resource_failures: exact_retirement_failure_evidence(product_conversation, attempt_id, run_ordinal))
-    ensures: ConcreteCloseRepairProposalRequired(product_conversation, attempt_id)
+
+    @guidance
+        -- Close preserves the target and stops. It neither proposes nor executes
+        -- repair/discard/salvage as a Close phase. Separate owner-authorized cleanup
+        -- cannot be inferred from Retry; retry requires fresh blocker inspection.
+}
+
+rule MutationBoundaryInspectionFailureCannotLeaveAuthorizedRunningRun {
+    when: ResourceRetirementRequested(product_conversation, attempt_id, run_ordinal)
+    requires: bedrock/CloseRun{obligation: bedrock/CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}, ordinal: run_ordinal}.status = running
+    requires: pending_step_deletes_worktree(product_conversation, attempt_id, run_ordinal)
+    let decision = mutation_boundary_blocker_decision(product_conversation, attempt_id, run_ordinal)
+    requires: not exists decision
+    ensures: WorktreePreserved(product_conversation, attempt_id, run_ordinal)
+    ensures:
+        if terminal_failure_storage_available(product_conversation, attempt_id, run_ordinal):
+            CloseRetirementStepFailed(product_conversation, attempt_id, run_ordinal,
+                authority_kind: resource_failure,
+                resource_failures: exact_retirement_failure_evidence(product_conversation, attempt_id, run_ordinal))
+        else:
+            CloseProcessAuthorityClosedAndStorageFailureReported(product_conversation, attempt_id, run_ordinal)
+
+    @guidance
+        -- An inspection/storage error is not a clear decision or a silently
+        -- dropped request. Stop further effects immediately. If terminal storage
+        -- works, the shared exact-run failure/outbox boundary commits the error;
+        -- otherwise revoke process authority and report the persistence failure.
+        -- Neither branch retries effects or claims successful terminalization.
 }
 
 rule PrStatusObservedAsAdvisoryCloseGuidance {
@@ -800,11 +868,94 @@ rule PrStatusObservedAsAdvisoryCloseGuidance {
 }
 
 ------------------------------------------------------------
--- Helpers (pure predicates referenced by restart-repair rules)
+-- Helpers
 ------------------------------------------------------------
 --
 -- Allium has no formal helper-function declaration; this block defines the
 -- complete semantics of each bare helper used above.
+--
+--   current_retirement_blocker_categories(product_conversation, scope)
+--       -> Set<BlockerCategory>
+--   current_retirement_blocker_item_identities(product_conversation, scope, category)
+--       -> Set<String>
+--   current_retirement_blocker_reason(product_conversation, scope, category, item)
+--       -> String
+--       Read one coherent exact inspection snapshot, materializing one row per
+--       (scope, category, item). Content includes ignored/build files; operational
+--       blockers retain concrete writer/permission/layout/error/deadline reasons.
+--       An uninspectable target names its expected scope/resource as a gap, never
+--       disappears from the inventory. No disposable-state classifier is consulted.
+--
+--   captured_worktree_scope_bindings(product_conversation, attempt_id)
+--       -> List<AttachedWorkScope>
+--       Exactly the immutable original captured worktree-owning scope set for the
+--       attempt, not current attachments; ordered by opaque scope identity bytes.
+--       No new attachment expands a decision and no detached scope disappears.
+--
+--   decision_captured_worktree_scope(decision: RetirementBlockerDecision,
+--       scope: WorkScope) -> Boolean
+--       True iff scope is in captured_worktree_scope_bindings for the decision's
+--       exact conversation and attempt. Never inferred from blocker-row presence.
+--
+--   exact_captured_scope_inspection(product_conversation, attempt_id, run_ordinal,
+--       scope: WorkScope) -> RetirementInspection
+--       Returns that captured scope's exact immutable inspection, including an
+--       inspection-gap snapshot where applicable. It never observes live state.
+--
+--   terminal_failure_storage_available(product_conversation, attempt_id,
+--       run_ordinal) -> Boolean
+--       True only if the owning exact-run failure transaction can commit its
+--       terminal state, typed evidence and mandatory outbox together. Otherwise
+--       CloseProcessAuthorityClosedAndStorageFailureReported revokes process
+--       effect authority and surfaces the storage failure without claiming a
+--       durable terminal state. No subsequent effect is authorized in either case.
+--
+--   all_targeted_scope_inspection_evidence_captured(product_conversation,
+--       attempt_id, run_ordinal) -> Boolean
+--       True only after each captured worktree scope has an exact inspection and
+--       all of its normalized blocker rows, including any inspection-gap row.
+--       Missing/conflicting target identity is materialized as an exact blocker,
+--       not silently omitted. Evidence and decision are one atomic capture.
+--
+--   exact_retirement_blocker_decision(product_conversation, attempt_id, run_ordinal)
+--       -> RetirementBlockerDecision?
+--       Returns the unique decision for the active exact aggregate inspection.
+--       Its generation/fingerprint bind the ordered complete per-scope snapshots
+--       named by RetirementDecisionScopeInspection, including clear scopes. Every
+--       member names the exact run/scope attempt; no later active inspection can
+--       change this decision's membership or the blocker rows it consumes.
+--       Absence/ambiguity cannot authorize retirement. Replays return the retained
+--       decision. Fresh mutation-boundary observations create a new bound snapshot,
+--       retaining earlier decisions and rows without replacing original authority.
+--
+--   mutation_boundary_blocker_decision(product_conversation, attempt_id, run_ordinal)
+--       -> RetirementBlockerDecision?
+--       Freshly inspects exact original remaining targets and relevant ownership,
+--       identity, permissions and writer state immediately before mutation. It
+--       captures new normalized rows, the complete immutable per-scope inspection
+--       membership relation and their aggregate decision atomically.
+--       Missing/incomplete inspection is a gap blocker; inability to persist it
+--       preserves the target and fails the step. It never grants live source or
+--       process permission, expands targets, or authorizes independent owner cleanup.
+--       This same decision is consumed by the effect gate, failure and projection.
+--       All consumers share the result of one owned boundary observation, not
+--       independent calls that inspect or persist competing snapshots. Absence
+--       selects MutationBoundaryInspectionFailureCannotLeaveAuthorizedRunningRun.
+--
+--   explicit_user_retry_admission_for_run(run: bedrock/CloseRun) -> Boolean
+--       True only for fresh bounded admission from an explicit user Retry of the
+--       exact stopped predecessor, under original authority and fresh safe evidence.
+--       Native admission retains exact request/target/source binding. An exact
+--       previously admitted non-native run may finish across native adoption;
+--       adoption never creates a generic fallback or automatic successor.
+--
+--   inspection_has_blockers(decision: RetirementBlockerDecision) -> Boolean
+--       True iff any RetirementBlockerRow matches a member's exact attempt and
+--       inspection in RetirementDecisionScopeInspection{decision: decision}.
+--       No row from another snapshot or decision is included, and no category is
+--       filtered out. Projection
+--       reads exactly these rows, including reason, without recomputing a classifier.
+--       Both admission and failure consumers use this same authoritative decision.
 --
 --   selected_next_retirement_scope(product_conversation, attempt_id, run_ordinal)
 --       -> List<AttachedWorkScope>
@@ -826,16 +977,17 @@ rule PrStatusObservedAsAdvisoryCloseGuidance {
 --       -> Boolean
 --       True when the selected next step would remove a worktree or retained leftover.
 --
---   fresh_reconstructible_or_explicit_discard_authority(
+--   fresh_exact_retirement_authority_without_blockers(
 --       product_conversation, attempt_id, run_ordinal) -> Boolean
---       Requires fresh exact ownership and identity for the selected target. For
---       deletion it requires proof of reconstruction without unique-work loss, or
---       an exact generation-bound explicit user discard decision. Clean Git status
---       alone is insufficient; ignored paths may be omitted from the inventory but
---       not from reconstructibility analysis. A retry additionally requires its fresh
---       safety proof: changed risk or unique/uncertain discard needs a separately
---       approved concrete proposal and cannot inherit the failed run's confirmation.
---       For a nondeleting step, only exact ownership/effect authority is required.
+--       Requires fresh exact ownership, identity, live effect permission and
+--       resolved failure preconditions for the selected original-authority target.
+--       Deletion additionally requires a complete fresh blocker decision with no
+--       unresolved content or operational blocker, including ignored/build paths.
+--       There is no discard override, disposable classifier or inherited consent.
+--       Identity and permission are rechecked at every relevant mutation boundary;
+--       an earlier snapshot never guarantees a later mutation. Newly observed
+--       blockers are retained with exact rows and projected from that same decision.
+--       Missing live permits remain failure, not a reason to reconstruct authority.
 --
 --   exact_prior_completed_resource(product_conversation, attempt_id, run_ordinal,
 --       scope: WorkScope) -> RetiredResource?
@@ -864,21 +1016,10 @@ rule PrStatusObservedAsAdvisoryCloseGuidance {
 --       attempt_id: String,
 --       run_ordinal: Integer
 --   ) -> List<(WorkScope, RetirementInspection)>
---       Returns exactly the persisted inspections bound to the attempt that
---       produced its RetirementLossCategoryRow set, ordered by the opaque
---       WorkScope identity's canonical bytes. Inspection values and category rows
---       are one atomic evidence snapshot; this helper never observes live state.
---
---   recompute_all_targeted_scope_inspections(
---       product_conversation: bedrock/ProductConversation,
---       attempt_id: String,
---       run_ordinal: Integer
---   ) -> List<(WorkScope, RetirementInspection)>
---       Recomputes one exact RetirementInspection for every distinct attached
---       worktree-owning scope captured by attempt_id, and no other scope. The list
---       is ordered by the opaque WorkScope identity's canonical bytes. A missing,
---       duplicate, ambiguous, or uninspectable captured target fails closed rather
---       than returning a partial list.
+--       Returns the complete active per-scope inspection snapshot for this exact
+--       run, ordered by the opaque WorkScope identity's canonical bytes. Older
+--       retained snapshots are excluded, not overwritten. Inspection values and
+--       blocker rows share one atomic capture; this helper never observes live state.
 --
 --   aggregate_inspection_generation(
 --       inspections: List<(WorkScope, RetirementInspection)>
@@ -925,6 +1066,7 @@ rule PrStatusObservedAsAdvisoryCloseGuidance {
 --   exact_restart_repair_evidence(
 --       product_conversation: bedrock/ProductConversation,
 --       attempt_id: String,
+--       run_ordinal: Integer,
 --       scope: WorkScope
 --   ) -> gitrep/RestartRepairEvidence?
 --       The latest_restart_repair_evidence row for product_conversation and scope
@@ -947,6 +1089,7 @@ rule PrStatusObservedAsAdvisoryCloseGuidance {
 --       evidence: gitrep/RestartRepairEvidence,
 --       product_conversation: bedrock/ProductConversation,
 --       attempt_id: String,
+--       run_ordinal: Integer,
 --       scope: WorkScope
 --   ) -> Boolean
 --       True iff the active Close authority names product_conversation and scope,
@@ -974,6 +1117,7 @@ rule PrStatusObservedAsAdvisoryCloseGuidance {
 --   exact_active_retirement_attempt(
 --       product_conversation: bedrock/ProductConversation,
 --       attempt_id: String,
+--       run_ordinal: Integer,
 --       scope: WorkScope
 --   ) -> Boolean
 --       True iff attempt_id/run_ordinal names the original Close authority
@@ -996,6 +1140,55 @@ rule PrStatusObservedAsAdvisoryCloseGuidance {
 ------------------------------------------------------------
 -- Invariants
 ------------------------------------------------------------
+
+invariant EverySuccessorRequiresExplicitRetry {
+    for run in bedrock/CloseRun:
+        run.ordinal > 1 implies explicit_user_retry_admission_for_run(run)
+}
+
+invariant ExactInspectionHasOneBlockerDecision {
+    for left in RetirementBlockerDecision:
+        for right in RetirementBlockerDecision:
+            left.product_conversation = right.product_conversation
+            and left.attempt_id = right.attempt_id
+            and left.run_ordinal = right.run_ordinal
+            and left.inspection = right.inspection
+            implies left = right
+}
+
+invariant BlockerDecisionHasCompleteExactScopeMembership {
+    for decision in RetirementBlockerDecision:
+        for scope_binding in captured_worktree_scope_bindings(decision.product_conversation, decision.attempt_id):
+            exists RetirementDecisionScopeInspection{
+                decision: decision,
+                attempt: RetirementAttempt{product_conversation: decision.product_conversation, attempt_id: decision.attempt_id, run_ordinal: decision.run_ordinal, scope: scope_binding.scope}
+            }
+}
+
+invariant BlockerDecisionScopeMembershipIsExact {
+    for member in RetirementDecisionScopeInspection:
+        member.attempt.product_conversation = member.decision.product_conversation
+        and member.attempt.attempt_id = member.decision.attempt_id
+        and member.attempt.run_ordinal = member.decision.run_ordinal
+        and decision_captured_worktree_scope(member.decision, member.attempt.scope)
+}
+
+invariant BlockerDecisionScopeMembershipIsUnique {
+    for member in RetirementDecisionScopeInspection:
+        for other in RetirementDecisionScopeInspection:
+            other.decision = member.decision and other.attempt.scope = member.attempt.scope
+            implies other = member
+}
+
+invariant ExactBlockerRowsAreUnique {
+    for left in RetirementBlockerRow:
+        for right in RetirementBlockerRow:
+            left.attempt = right.attempt
+            and left.inspection = right.inspection
+            and left.category = right.category
+            and left.item_identity = right.item_identity
+            implies left = right
+}
 
 invariant CleanupAuthorityComesFromCommittedCloseOperation {
     for a in AttachedWorkScope:
