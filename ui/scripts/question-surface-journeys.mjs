@@ -158,26 +158,25 @@ export async function qualifyQuestionSurface({ page, out, questions, setQuestion
   await screenshot('reload-ready');
   evidence.push({ journey: 'reload reacquires pending question and permits custom input (not a latency measurement)' });
 
-  // Use the app's notification navigation bridge to React Router, not synthetic
-  // pushState. Both routes are supported by the driver's exact transcript fixture.
+  // Navigate query variants of the canonical transcript; /global is a redirect.
   const historyStart = page.url();
-  const alternatePath = new URL(historyStart).pathname === '/global' ? '/global/question-qualification' : '/global';
+  const alternatePath = `${new URL(historyStart).pathname}?question-journey=history`;
   await page.evaluate(route => window.dispatchEvent(new CustomEvent('phoenix:navigate-to-conversation', { detail: { route } })), alternatePath);
-  await page.waitForURL(url => url.pathname === alternatePath);
+  await page.waitForURL(url => `${url.pathname}${url.search}` === alternatePath);
   await dialog.waitFor({ state: 'visible' });
   await page.goBack();
   await page.waitForURL(historyStart);
   await dialog.waitFor({ state: 'visible' });
   assert.equal(await dialog.evaluate(el => el.matches(':modal')), true);
   await page.goForward();
-  await page.waitForURL(url => url.pathname === alternatePath);
+  await page.waitForURL(url => `${url.pathname}${url.search}` === alternatePath);
   await dialog.waitFor({ state: 'visible' });
   await custom.fill('Usable after browser Forward');
   assert.equal(await custom.inputValue(), 'Usable after browser Forward');
   assert.equal(await dialog.evaluate(el => el.matches(':modal')), true);
   assert.equal(mutations.length, beforeReload, 'Reload/history traversal must not answer or dismiss');
   await screenshot('history-forward');
-  evidence.push({ journey: 'real router navigation and browser Back/Forward between current and exact Ember transcript routes', from: historyStart, to: page.url() });
+  evidence.push({ journey: 'real router navigation and browser Back/Forward between canonical Ember transcript query variants', from: historyStart, to: page.url() });
   page.off('request', recordMutation);
-  await fs.writeFile(path.join(out, 'question-surface-journeys.json'), JSON.stringify({ evidence, limitations: ['Hosted Chromium, not real iPhone/keyboard.', 'History qualification covers two Ember routes only; it does not claim browser Back is native dialog cancel or that drafts survive page reload.'] }, null, 2));
+  await fs.writeFile(path.join(out, 'question-surface-journeys.json'), JSON.stringify({ evidence, limitations: ['Hosted Chromium, not real iPhone/keyboard.', 'History qualification covers query variants of one Ember transcript only; it does not claim browser Back is native dialog cancel or that drafts survive page reload.'] }, null, 2));
 }

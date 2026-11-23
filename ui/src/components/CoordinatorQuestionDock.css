@@ -188,6 +188,22 @@
     cursor: pointer;
   }
 
+  .coordinator-question-dock__dialog .modal-overlay {
+    position: absolute;
+    inset: 0;
+    z-index: 2;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: max(16px, env(safe-area-inset-top)) max(16px, env(safe-area-inset-right)) max(16px, env(safe-area-inset-bottom)) max(16px, env(safe-area-inset-left));
+    background: rgb(0 0 0 / 70%);
+  }
+
+  .coordinator-question-dock__dialog .confirm-dialog {
+    max-height: 100%;
+    overflow-y: auto;
+  }
+
   .coordinator-question-dock__launcher:hover,
   .coordinator-question-dock__launcher:focus-visible {
     background: color-mix(in srgb, var(--accent-blue) 20%, var(--bg-primary));

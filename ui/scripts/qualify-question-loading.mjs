@@ -132,9 +132,10 @@ async function trial(version, base, viewport, mode, run, isolation = false) {
   try {
     if (mode === 'warm-notification') {
       const feedResponse = page.waitForResponse(response => new URL(response.url()).pathname === '/api/coordinator/questions');
-      await page.goto(`${base}/conversations`, { waitUntil: 'domcontentloaded' });
+      await page.goto(`${base}/`, { waitUntil: 'domcontentloaded' });
       await page.locator('.layout-main').waitFor({ state: 'visible' });
       await (await feedResponse).finished();
+      await page.locator('.ember-entry.has-questions').first().waitFor({ state: 'attached' });
       if (!feedLoaded) throw new Error('Warm shell did not acquire question feed');
     }
     const before = metrics(await cdp.send('Performance.getMetrics'));

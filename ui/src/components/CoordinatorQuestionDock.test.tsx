@@ -210,7 +210,7 @@ describe('Ember questions (REQ-AUQ-011)', () => {
     expect(dialog).toHaveAttribute('open');
     expect(document.querySelector('.question-panel')).toBe(panel);
     expect(screen.queryByText('Dismiss structured questions?')).not.toBeInTheDocument();
-    expect(screen.queryByRole('button', { name: 'Cancel', exact: true })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Cancel' })).not.toBeInTheDocument();
     expect(screen.getByTitle('Select First')).toHaveClass('selected');
     expect(screen.getByRole('button', { name: 'Submit' })).toBeEnabled();
     expect(dismiss).not.toHaveBeenCalled();
@@ -224,7 +224,7 @@ describe('Ember questions (REQ-AUQ-011)', () => {
 
     const dialog = screen.getByRole('dialog');
     fireEvent.click(screen.getByRole('button', { name: 'Dismiss' }));
-    const cancel = screen.getByRole('button', { name: 'Cancel', exact: true });
+    const cancel = screen.getByRole('button', { name: 'Cancel' });
     expect(cancel).toHaveFocus();
 
     flushFrames();
@@ -243,7 +243,7 @@ describe('Ember questions (REQ-AUQ-011)', () => {
     const dialog = screen.getByRole('dialog');
     const panel = document.querySelector('.question-panel');
     fireEvent.click(screen.getByRole('button', { name: 'Dismiss' }));
-    const cancel = screen.getByRole('button', { name: 'Cancel', exact: true });
+    const cancel = screen.getByRole('button', { name: 'Cancel' });
     expect(cancel).toHaveFocus();
     showModal.mockImplementationOnce(function (this: HTMLDialogElement) {
       this.setAttribute('open', '');
