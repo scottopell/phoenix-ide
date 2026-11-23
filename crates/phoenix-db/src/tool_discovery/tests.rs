@@ -506,7 +506,7 @@ async fn child_write_failure_does_not_publish_messages_or_partial_selection() {
 
 #[tokio::test]
 async fn native_client_protocol_survives_private_replay_retirement() {
-    for error in [false, true] {
+    for (error, namespaced) in [(false, false), (false, true), (true, false), (true, true)] {
         let db = Database::open_in_memory().await.unwrap();
         create(&db).await;
         prepare(
@@ -538,9 +538,11 @@ async fn native_client_protocol_survives_private_replay_retirement() {
             model: "gpt-6.2-sol".into(),
             owner_message_id: assistant.message_id.clone(),
             public_content: public.clone(),
-            output_items: vec![
-                serde_json::json!({"type":"tool_search_call","execution":"client","call_id":"search-call","arguments":{"query":"issues"},"status":"completed"}),
-            ],
+            output_items: vec![if namespaced {
+                serde_json::json!({"type":"function_call","namespace":"tool_search","name":"tool_search_tool","call_id":"search-call","arguments":"{\"query\":\"issues\"}","status":"completed"})
+            } else {
+                serde_json::json!({"type":"tool_search_call","execution":"client","call_id":"search-call","arguments":{"query":"issues"},"status":"completed"})
+            }],
         });
         let mut tx = db.pool().begin().await.unwrap();
         crate::responses_replay::append_tx(&mut tx, CONVERSATION, &set)

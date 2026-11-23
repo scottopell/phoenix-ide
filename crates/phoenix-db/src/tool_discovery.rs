@@ -5,8 +5,9 @@ use phoenix_core::domain::{
     llm_types::{ContentBlock, ToolDefinition},
     tool_availability::{ToolAvailability, ToolPolicyMessage},
     tool_discovery::{
-        search_tools, tool_search_definition, tool_search_result_text, ToolDiscoveryMode,
-        ToolDiscoveryProtocol, ToolDiscoveryResult, ToolSearchQuery, TOOL_SEARCH_NAME,
+        native_client_search_call, search_tools, tool_search_definition, tool_search_result_text,
+        ToolDiscoveryMode, ToolDiscoveryProtocol, ToolDiscoveryResult, ToolSearchQuery,
+        TOOL_SEARCH_NAME,
     },
 };
 use sqlx::{Row, Sqlite, Transaction};
@@ -69,14 +70,13 @@ async fn protocol_tx(
         if item.get("call_id").and_then(serde_json::Value::as_str) != Some(call_id) {
             continue;
         }
-        match item.get("type").and_then(serde_json::Value::as_str) {
-            Some("tool_search_call")
-                if item.get("execution").and_then(serde_json::Value::as_str) == Some("client") =>
-            {
-                native = true;
-            }
-            Some("function_call") => ordinary = true,
-            _ => {}
+        if native_client_search_call(&item)
+            .map_err(DbError::Serialization)?
+            .is_some()
+        {
+            native = true;
+        } else if item.get("type").and_then(serde_json::Value::as_str) == Some("function_call") {
+            ordinary = true;
         }
     }
     if native && ordinary {

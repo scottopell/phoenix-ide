@@ -33,6 +33,48 @@ pub enum ToolDiscoveryProtocol {
     OpenAiClient,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct NativeToolSearchCall {
+    pub call_id: String,
+    pub arguments: serde_json::Value,
+}
+
+/// # Errors
+/// Rejects malformed native client calls without including provider content.
+pub fn native_client_search_call(
+    item: &serde_json::Value,
+) -> Result<Option<NativeToolSearchCall>, String> {
+    let arguments = match item.get("type").and_then(serde_json::Value::as_str) {
+        Some("tool_search_call")
+            if item.get("execution").and_then(serde_json::Value::as_str) == Some("client") =>
+        {
+            item.get("arguments").cloned()
+        }
+        Some("function_call")
+            if item.get("namespace").and_then(serde_json::Value::as_str) == Some("tool_search")
+                && item.get("name").and_then(serde_json::Value::as_str)
+                    == Some("tool_search_tool") =>
+        {
+            item.get("arguments")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|raw| serde_json::from_str(raw).ok())
+        }
+        _ => return Ok(None),
+    };
+    let arguments = arguments
+        .filter(serde_json::Value::is_object)
+        .ok_or("Native tool search arguments must be an object")?;
+    let call_id = item
+        .get("call_id")
+        .and_then(serde_json::Value::as_str)
+        .filter(|id| !id.is_empty())
+        .ok_or("Native tool search call has no identity")?;
+    Ok(Some(NativeToolSearchCall {
+        call_id: call_id.to_owned(),
+        arguments,
+    }))
+}
+
 #[derive(Clone, Debug)]
 pub struct ToolDiscoveryResult {
     pub owner_message_id: String,
@@ -149,6 +191,33 @@ pub fn tool_search_result_text(tools: &[ToolDefinition]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_search_call_formats_have_one_typed_projection() {
+        let canonical = serde_json::json!({"type":"tool_search_call","execution":"client","call_id":"call","arguments":{"query":"issues"}});
+        let namespaced = serde_json::json!({"type":"function_call","namespace":"tool_search","name":"tool_search_tool","call_id":"call","arguments":"{\"query\":\"issues\"}"});
+        let expected = Some(NativeToolSearchCall {
+            call_id: "call".into(),
+            arguments: serde_json::json!({"query":"issues"}),
+        });
+        assert_eq!(native_client_search_call(&canonical).unwrap(), expected);
+        assert_eq!(native_client_search_call(&namespaced).unwrap(), expected);
+        for key in ["namespace", "name", "type"] {
+            let mut ordinary = namespaced.clone();
+            ordinary[key] = serde_json::json!("other");
+            assert!(native_client_search_call(&ordinary).unwrap().is_none());
+        }
+        for (key, value) in [
+            ("arguments", serde_json::json!("invalid JSON")),
+            ("arguments", serde_json::json!("[]")),
+            ("arguments", serde_json::json!({"query":"issues"})),
+            ("call_id", serde_json::json!("")),
+        ] {
+            let mut malformed = namespaced.clone();
+            malformed[key] = value;
+            assert!(native_client_search_call(&malformed).is_err());
+        }
+    }
 
     fn tool(name: &str, description: &str, schema: serde_json::Value) -> ToolDefinition {
         ToolDefinition {
