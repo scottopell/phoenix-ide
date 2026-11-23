@@ -2,6 +2,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { performance } from 'node:perf_hooks';
 import { chromium } from 'playwright';
+import { qualifyQuestionSurface } from './question-surface-journeys.mjs';
 
 // Synthetic HTTP isolation of the production UI, not server or iPhone latency.
 const out = path.resolve(process.env.QUESTION_QA_OUT ?? 'qa-artifacts/question-loading');
@@ -12,7 +13,7 @@ const id = 'question-qualification';
 const timestamp = '2026-01-01T12:00:00Z';
 const marker = 'QUESTION QUALIFICATION TRANSCRIPT TAIL';
 const conversation = { id, slug: id, title: 'Disposable long question history', model: 'fixture', connection: 'fixture', archived: false, favorited: false, task: false, agent_working: false, mode: 'explore', cwd: '/tmp/question-qualification', execution_mode: 'explore', work_scope_key: null, created_at: timestamp, updated_at: timestamp };
-const messages = Array.from({ length: 100 }, (_, n) => ({ message_id: `question-message-${n}`, conversation_id: id, sequence_id: n + 1, message_type: n % 2 ? 'agent' : 'user', content: n % 2 ? { text: n === 99 ? marker : `Historical analysis ${n}.\n\n${'Bounded **synthetic** historical detail, not production data. '.repeat(100)}`, thinking: null, usage: null } : { text: `Synthetic request ${n}`, is_meta: false }, display_data: null, usage_data: null, event_presentation: null, created_at: timestamp, origin: { kind: n % 2 ? 'unknown_historical' : 'user_api' }, ...(n % 2 ? { state_snapshot: { type: 'idle' } } : {}) }));
+const messages = Array.from({ length: 100 }, (_, n) => ({ message_id: `question-message-${n}`, conversation_id: id, sequence_id: n + 1, message_type: n % 2 ? 'agent' : 'user', content: n % 2 ? [{ type: 'text', text: n === 99 ? marker : `Historical analysis ${n}.\n\n${'Bounded **synthetic** historical detail, not production data. '.repeat(100)}` }] : { text: `Synthetic request ${n}`, is_meta: false }, display_data: null, usage_data: null, event_presentation: null, created_at: timestamp, origin: { kind: n % 2 ? 'unknown_historical' : 'user_api' }, ...(n % 2 ? { state_snapshot: { type: 'idle' } } : {}) }));
 const snapshot = { product_conversation_id: 'question-product', canonical_route: `/global/${id}`, requested_transcript_row_id: id, canonical_root: { transcript_row_id: id, slug: id, title: conversation.title }, latest_transcript_row_id: id, writable_transcript_row_id: id, latest_opening: { status: 'none' }, updated_at: timestamp, segments: [{ transcript_row_id: id, segment_ordinal: 0, slug: id, title: conversation.title, messages }], boundaries: [], before: null, has_older: false };
 const questions = [{ request_id: 'question-request-1', coordinator_product_conversation_id: 'question-product', asked_at: timestamp, questions: [{ header: 'Scope', question: `Which bounded qualification scope should be used?\n\n${'This long synthetic description explains the choices without changing release scope or granting approval. '.repeat(24)}`, options: [{ label: 'Automatic', description: 'Use the bounded disposable qualification only.' }, { label: 'Manual', description: 'Keep release operations separately owned.' }], multiSelect: false }, { header: 'Surfaces', question: 'Select the requested surfaces.', options: [{ label: 'Mobile', description: '393px viewport.' }, { label: 'Desktop', description: '1440px viewport.' }], multiSelect: true }] }];
 const exactReadReference = route => JSON.parse(route.request().postData() ?? '{}').reference;
@@ -30,6 +31,28 @@ async function trial(version, base, viewport, mode, run, isolation = false) {
   const cdp = await context.newCDPSession(page);
   await cdp.send('Network.enable');
   await cdp.send('Performance.enable');
+  // Keep fixture streams open logically, as the existing Ladle fixtures do.
+  // HTTP snapshots/assets remain real requests; SSE transport is not measured.
+  await page.addInitScript(({ init, latency }) => {
+    class FixtureEventSource extends EventTarget {
+      static CONNECTING = 0; static OPEN = 1; static CLOSED = 2;
+      CONNECTING = 0; OPEN = 1; CLOSED = 2; readyState = 0;
+      onopen = null; onmessage = null; onerror = null;
+      constructor(url) {
+        super(); this.url = String(url); this.withCredentials = false;
+        this.timer = setTimeout(() => {
+          if (this.readyState === 2) return;
+          this.readyState = 1;
+          const open = new Event('open'); this.onopen?.(open); this.dispatchEvent(open);
+          if (this.url.includes('/conversation-reads/stream')) {
+            this.dispatchEvent(new MessageEvent('init', { data: JSON.stringify(init) }));
+          }
+        }, latency);
+      }
+      close() { clearTimeout(this.timer); this.readyState = 2; }
+    }
+    window.EventSource = FixtureEventSource;
+  }, { init, latency: conditions.latency_ms });
   await cdp.send('Emulation.setCPUThrottlingRate', { rate: conditions.cpu });
   await cdp.send('Network.emulateNetworkConditions', { offline: false, latency: conditions.latency_ms, downloadThroughput: conditions.bytes_per_second, uploadThroughput: conditions.bytes_per_second });
   const requests = new Map();
@@ -61,7 +84,7 @@ async function trial(version, base, viewport, mode, run, isolation = false) {
     const json = data => route.fulfill({ contentType: 'application/json', body: JSON.stringify(data) });
     // CDP throttles real bundle requests; intercepted API latency is modeled explicitly.
     await new Promise(resolve => setTimeout(resolve, conditions.latency_ms));
-    if (p === '/api/telemetry/product-conversation-open' || p === '/api/telemetry/conversation-open') return route.fulfill({ status: 204, body: '' });
+    if (p === '/api/telemetry/product-conversation-open' || p === '/api/telemetry/conversation-open' || p === '/api/telemetry/conversation-view') return route.fulfill({ status: 204, body: '' });
     if (p === '/api/product-conversations/events') return route.fulfill({ contentType: 'text/event-stream', body: ': synthetic aggregate stream\n\n' });
     if (p === '/api/product-conversations/question-product/read') return json({ state: 'read' });
     if (p.endsWith('/proposals')) return json({ proposals: [] });
@@ -144,6 +167,12 @@ async function trial(version, base, viewport, mode, run, isolation = false) {
     if (await launcher.isVisible()) await launcher.click();
     if (await custom.inputValue() !== 'Disposable retained custom answer') throw new Error('Return lost custom answer');
     await page.screenshot({ path: path.join(out, `${name}-question.png`) });
+    if (version === 'candidate' && isolation && viewport.width === 393) {
+      await qualifyQuestionSurface({ page, out, questions,
+        setQuestions: next => { pendingQuestions = next; },
+        setAnswerError: value => { answerFails = value; },
+      });
+    }
     if (unknown.length) throw new Error(`Unmodelled requests: ${JSON.stringify(unknown)}`);
     if (diagnostics.some(item => item.type === 'pageerror')) throw new Error('Production UI reported page errors');
     record.ok = true;
