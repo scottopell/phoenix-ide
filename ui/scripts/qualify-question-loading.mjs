@@ -116,6 +116,13 @@ async function trial(version, base, viewport, mode, run, isolation = false) {
     if (p === '/api/conversation-reads/stream' && route.request().method() === 'GET') return route.fulfill({ contentType: 'text/event-stream', body: `event: init\ndata: ${JSON.stringify(init)}\n\n` });
     if (p === '/api/conversations' || p === '/api/conversations/archived' || p === '/api/coordinator/watches' || p === '/api/coordinator/close-watches' || p === '/api/coordinator/bash/live' || p.endsWith('/reminders') || p.endsWith('/fork-proposals')) return json([]);
     if (p === '/api/product-conversations') return json({ product_conversations: [], coordinator: null });
+    if (p === '/api/discovery/services') return json({ services: [] });
+    if (p === '/api/deployment') return json({
+      build: { version: 'question-qualification', git_sha: version === 'candidate' ? process.env.CANDIDATE_SHA : process.env.BASELINE_SHA, started_at: timestamp, uptime_seconds: 60 },
+      network: { bind_address: '127.0.0.1', socket_activated: false, tls: { enabled: false, mode: null, cert_path: null, key_path: null, ca_cert_path: null, hosts: [] } },
+      log: { stdout: true, file: null, fatal_file: null }, instance_id: null, local_access: false,
+      installation_ownership: { kind: 'development' }, sampled_at: timestamp,
+    });
     if (p === '/api/models') return json({ models: [], default: '', llm_configured: false, credential_status: 'not_configured' });
     if (p === '/api/codex/login/preflight') return json({ auth_path: '/tmp/disposable', already_signed_in: false, bridge_loaded_at_startup: false, restart_required_after_login: false, account_id: null, account_email: null });
     if (p === '/api/global/coordinator/language' || p === '/api/settings/llm-language') return json({ language: 'en', available: ['en'], languages: [{ id: 'en', label: 'English' }] });
@@ -195,8 +202,11 @@ async function trial(version, base, viewport, mode, run, isolation = false) {
   return record.ok;
 }
 try {
-  for (const viewport of [{ width: 393, height: 852 }, { width: 1440, height: 900 }]) {
+  const viewports = [{ width: 393, height: 852 }, { width: 1440, height: 900 }];
+  for (const viewport of viewports) {
     for (const [version, url] of versions) if (!await trial(version, url, viewport, 'cold-global', 0, true)) throw new Error('History isolation or surface journey failed');
+  }
+  for (const viewport of viewports) {
     for (const mode of ['cold-global', 'cold-link', 'warm-notification']) {
       // Alternate exact base/candidate within each trial to bound host drift.
       for (let run = -1; run < runs; run++) {
