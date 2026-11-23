@@ -1,4 +1,6 @@
 import { ConversationEventCard } from './ConversationEventCard';
+import { EmberTrackingCard } from './EmberTrackingCard';
+import { emberTrackingObservation } from '../conversation/emberTrackingObservation';
 import { SvgArtifactAccessContext } from '../contexts/SvgArtifactAccessContext';
 import { SvgArtifactCard } from './SvgArtifactCard';
 import { svgArtifactFromResult } from './svgArtifact';
@@ -388,6 +390,7 @@ function UserMessageImpl({ message, activeHighlight = null }: { message: Message
   const files = content.files || [];
   const isMeta = content.is_meta === true || inputOriginPresentation(message.origin).className === 'meta';
   const timestamp = message.created_at;
+  const trackingObservation = emberTrackingObservation(message);
 
   const body = (
     <div className="message-content">
@@ -422,7 +425,7 @@ function UserMessageImpl({ message, activeHighlight = null }: { message: Message
   }
 
   return (
-    <div id={`message-${message.message_id}`} className={`message ${isMeta ? 'meta' : 'user'}`} data-sequence-id={message.sequence_id}>
+    <div id={`message-${message.message_id}`} className={`message ${isMeta ? 'meta' : 'user'}${trackingObservation ? ' ember-tracking-message' : ''}`} data-sequence-id={message.sequence_id}>
       <div className="message-header">
         <span className="message-header-meta">
           <InputSender origin={message.origin} />
@@ -437,7 +440,7 @@ function UserMessageImpl({ message, activeHighlight = null }: { message: Message
           <MessageCopyButton message={message} title={message.origin?.kind === 'system_generated' ? 'Copy system observation' : 'Copy input message'} />
         </span>
       </div>
-      {body}
+      {trackingObservation ? <EmberTrackingCard observation={trackingObservation} originalText={text} activeHighlight={activeHighlight} /> : body}
     </div>
   );
 }

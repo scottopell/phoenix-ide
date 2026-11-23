@@ -451,6 +451,92 @@ async function assertRecallAndWork(page, viewport, outDir) {
   journeys.push(`Work and Recall ${viewport.name}: typed content visible; Recall in bounds and closes`);
 }
 
+async function assertEmberTracking(page, id, viewport, outDir) {
+  const scroller = page.locator('.virtual-transcript');
+  const nav = page.locator('#conversation-nav');
+  const cardLabel = 'Ember tracking · captured snapshot · 5';
+  const duePills = nav.getByRole('button', { name: new RegExp(cardLabel) });
+  await page.waitForFunction(() => document.querySelectorAll('#conversation-nav .conversation-nav-item').length >= 3);
+  if (await duePills.count() !== (id === 'ember-tracking-fallback' ? 1 : 2)) throw new Error('Historical and current observations need truthful outline anchors');
+  if (await nav.getByRole('button', { name: /Ember tracking · captured snapshot · 4/ }).count() !== (id === 'ember-tracking-fallback' ? 0 : 1)) {
+    throw new Error('Null review cue has an incorrect outline label');
+  }
+  if (id === 'ember-tracking-fallback') {
+    for (const target of ['tracking-spoof', 'tracking-malformed']) {
+      const pill = nav.getByRole('button', { name: /Saved Ember tracking observation:/ });
+      await pill.nth(target === 'tracking-spoof' ? 0 : 1).click();
+      await page.waitForFunction(message => document.documentElement.dataset.sourceFixtureLocation?.endsWith(`#message-${message}`), target);
+      const row = page.locator(`#message-${target}`);
+      await row.locator('.message-content').waitFor({ state: 'visible' });
+      if (await row.locator('.ember-tracking-card').count() || !await row.locator('.message-content').textContent().then(text => text?.startsWith('[Saved Ember tracking observation:'))) {
+        throw new Error(`${target} was promoted to a card or lost its exact original prefix`);
+      }
+    }
+    await duePills.first().click();
+    await page.locator('#message-tracking-history-due .ember-tracking-card').waitFor({ state: 'visible' });
+    if (await page.evaluate(() => document.documentElement.scrollWidth > innerWidth)) throw new Error('Tracking lookalike caused horizontal overflow');
+    await page.screenshot({ path: `${outDir}/${id}--${viewport.name}--fallback.png`, fullPage: true });
+    journeys.push(`${id}/${viewport.name}: user-origin exact payload spoof and malformed system-origin payload remain original text; historical real observation is compact`);
+    return true;
+  }
+  await duePills.last().click();
+  await page.waitForFunction(() => document.documentElement.dataset.sourceFixtureLocation?.endsWith('#message-tracking-current-due'));
+  const due = page.locator('#message-tracking-current-due');
+  await due.locator('.ember-tracking-card').waitFor({ state: 'visible' });
+  if (await due.locator('.ember-tracking-card details').first().getAttribute('open') !== null) throw new Error('Saved observation was not collapsed');
+  const composer = page.locator('.product-conversation-page__composer #message-input');
+  await composer.waitFor({ state: 'visible' });
+  await composer.fill('Unsent tracking QA draft');
+  await composer.focus();
+  if (!await composer.evaluate(element => document.activeElement === element)) throw new Error('Composer focus was lost');
+  if (await page.evaluate(() => document.documentElement.scrollWidth > innerWidth)) throw new Error('Tracking presentation caused horizontal overflow');
+  await page.screenshot({ path: `${outDir}/${id}--${viewport.name}--collapsed.png`, fullPage: true });
+
+  const details = due.locator('.ember-tracking-card > details');
+  const summary = details.locator(':scope > summary');
+  await summary.focus();
+  await summary.press('Enter');
+  await page.waitForFunction(() => document.querySelector('#message-tracking-current-due .ember-tracking-card > details')?.open === true);
+  await details.getByText('3 entries omitted from captured page; more were available at capture.', { exact: true }).waitFor();
+  await details.getByText('Review deployment evidence before release · requested work · tracking at capture · review flagged', { exact: true }).waitFor();
+  const raw = details.locator(':scope > details');
+  await raw.locator('summary').focus();
+  await raw.locator('summary').press('Enter');
+  await raw.locator('pre').waitFor({ state: 'visible' });
+  const original = await raw.locator('pre').textContent();
+  if (!original?.startsWith('[Saved Ember tracking observation:') || JSON.parse(original.slice(original.indexOf('\n') + 1)).captured_registry.registry_revision !== 12) {
+    throw new Error('Raw original was not preserved byte-for-byte as a producer envelope and payload');
+  }
+  await page.context().grantPermissions(['clipboard-read', 'clipboard-write']);
+  const beforeCopyScroll = await scroller.evaluate(element => element.scrollTop);
+  await due.getByRole('button', { name: 'Copy system observation' }).click();
+  await due.getByRole('button', { name: 'Copied!' }).waitFor();
+  const copied = await page.evaluate(() => navigator.clipboard.readText());
+  if (copied !== original) throw new Error('Copy did not preserve the original producer payload');
+  if (Math.abs((await scroller.evaluate(element => element.scrollTop)) - beforeCopyScroll) > 3) throw new Error('Copy jumped the transcript scroller');
+  await page.screenshot({ path: `${outDir}/${id}--${viewport.name}--expanded.png`, fullPage: true });
+  await summary.focus();
+  await summary.press('Enter');
+  await page.waitForFunction(() => document.querySelector('#message-tracking-current-due .ember-tracking-card > details')?.open === false);
+
+  await nav.getByRole('button', { name: /Ember tracking · captured snapshot · 4/ }).click();
+  await page.locator('#message-tracking-current-null .ember-tracking-card').waitFor({ state: 'visible' });
+  if (await page.locator('#message-tracking-current-null .ember-tracking-topic').count()) throw new Error('Null cue incorrectly advertises a review topic');
+  await duePills.first().click();
+  await page.waitForFunction(() => document.documentElement.dataset.sourceFixtureLocation?.endsWith('#message-tracking-history-due'));
+  await page.locator('#message-tracking-history-due .ember-tracking-card').waitFor({ state: 'visible' });
+  if (await composer.inputValue() !== 'Unsent tracking QA draft' || !await composer.isEnabled()) throw new Error('Historical selection changed latest composer ownership');
+  const historicalLocation = await page.locator('html').getAttribute('data-source-fixture-location');
+  if (!historicalLocation?.includes('#message-tracking-history-due')) throw new Error('Historical selection did not retain exact message target');
+  await page.reload({ waitUntil: 'networkidle' });
+  await page.waitForSelector(`[data-product-conversation-fixture-ready="${id}"]`);
+  await page.waitForFunction((expected) => document.documentElement.dataset.sourceFixtureLocation === expected, historicalLocation);
+  await page.locator('#message-tracking-history-due .ember-tracking-card').waitFor({ state: 'visible' });
+  await page.screenshot({ path: `${outDir}/${id}--${viewport.name}--history-reload.png`, fullPage: true });
+  journeys.push(`${id}/${viewport.name}: continued historical and current observations, compact outline/anchors, keyboard disclosure/raw original, exact copy, null cue, historical reload and latest composer ownership; virtual transcript scroller stays stable during copy`);
+  return true;
+}
+
 async function writeReport(outDir) {
   const report = [
     '# ProductConversation deterministic browser UAT', '',
@@ -473,19 +559,25 @@ runSurfaceCapture({
   viewportMatrix: [
     { name: 'desktop-light', width: 1440, height: 900 }, { name: 'desktop-dark', width: 1440, height: 900 },
     { name: 'mobile-light', width: 390, height: 844, isMobile: true, hasTouch: true }, { name: 'mobile-dark', width: 390, height: 844, isMobile: true, hasTouch: true },
+    { name: 'tracking-393-dark', width: 393, height: 852, isMobile: true, hasTouch: true },
   ],
   urlForStory: ({ storyKey, id, viewport }) => {
     const theme = viewport.name.endsWith('-light') ? 'light' : 'dark';
     const fixtureHash = id === 'long-history-110-messages' ? '#message-long-older-target' : '';
     const baseUrl = process.env.LADLE_URL ?? `http://127.0.0.1:${process.env.LADLE_PORT ?? 61123}/`;
     return buildLadleStoryUrl(baseUrl, storyKey, { fixtureTheme: theme, fixtureHash,
-      ...(['ordinary-lazy-history', 'global-lazy-history'].includes(id) ? { fixtureBrowserHistory: '1' } : {}),
+      ...(['ordinary-lazy-history', 'global-lazy-history', 'ember-tracking-continued', 'ember-tracking-fallback'].includes(id) ? { fixtureBrowserHistory: '1' } : {}),
     });
   },
   preparePage: async ({ page }) => {
     await page.route('**/api/**', route => route.abort('blockedbyclient'));
   },
   captureStory: async ({ page, id, outDir, viewport }) => {
+    if (id === 'ember-tracking-observations' || id === 'ember-tracking-fallback') {
+      const theme = await fixtureValue(page, 'theme') ?? 'dark';
+      await assertTranscriptGeometry(page, id, viewport, theme);
+      return assertEmberTracking(page, id, viewport, outDir);
+    }
     if (id === 'composer-focus') {
       await captureComposerFocus({ page, outDir, viewport });
       return false;

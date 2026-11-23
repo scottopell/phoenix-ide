@@ -28,6 +28,8 @@ List/detail results SHALL identify captured registry/item revisions, counts, omi
 
 The writer SHALL reject saved data that cannot be fully inspected through supported reads. Complete serialized detail results SHALL remain below the executor's tool-output clipping limit, preserving valid JSON, lossless accepted notes and honest child pagination even with escaped text.
 
+The conversation UI SHALL present recognized system-generated saved tracking observations as compact, collapsed-by-default historical snapshot cards with captured counts and optional captured review topics. Structured historical details, original safety language and raw payload SHALL remain available on deliberate expansion, and copy SHALL preserve the original message. Navigation labels SHALL remain compact while retaining exact message targets. Recognition SHALL require authoritative system-generated origin and a supported valid observation payload; copied ordinary user text, malformed observations and unknown system inputs SHALL retain their generic presentation. The presentation SHALL NOT change stored or model-delivered content, imply live worker state or user approval, or change tracking/scanner execution semantics.
+
 ### REQ-TRACK-006: Prefix-preserving continuity
 
 At existing admitted Coordinator turn/wakeup boundaries THE SYSTEM SHALL append changed bounded tracking observations to durable transcript tails. It SHALL NOT change system instructions, prepend changing state, rewrite earlier messages or repeatedly append unchanged state during model/tool loops. Current registry data SHALL remain recoverable after continuation independently of its summary. Observations SHALL be labelled captured historical data, never user instructions or current worker status.
