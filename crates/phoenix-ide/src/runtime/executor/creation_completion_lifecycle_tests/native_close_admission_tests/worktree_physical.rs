@@ -3,7 +3,7 @@
 //! Public native Close qualification; all Git and SQLite state is disposable.
 //! REQ-WL-002/002f: original Worktree and independent WorkScope retirement.
 //! The positive lifecycle journey controls writer observations, not host /proc availability.
-//! Live Linux writer-detector availability remains a separate qualification gate.
+//! The production-detector journey is a separate required public acceptance gate.
 
 use super::*;
 use phoenix_core::domain::close::{
@@ -28,6 +28,19 @@ async fn registered_native_close_physically_retires_worktree_only_and_replays_wi
 }
 
 #[tokio::test]
+async fn registered_native_close_with_production_detector_retires_worktree_and_replays() {
+    // Global dispatch reaches the physical worker's native thread. This exact test
+    // also runs in its own hosted invocation; no production logging/exporters.
+    tracing_subscriber::fmt()
+        .with_env_filter("phoenix_ide::runtime::close_retirement=debug")
+        .with_writer(std::io::stderr)
+        .with_ansi(false)
+        .try_init()
+        .expect("production-detector journey requires scanner diagnostics");
+    run_public_worktree_close(WorktreeJourney::RetireWithProductionDetector).await;
+}
+
+#[tokio::test]
 async fn registered_native_close_after_acknowledged_source_stop_preserves_real_worktree() {
     run_public_worktree_close(WorktreeJourney::StopBeforeAdmission).await;
 }
@@ -40,6 +53,7 @@ async fn registered_native_close_after_source_stop_preserves_reused_path_and_ori
 #[derive(Clone, Copy)]
 enum WorktreeJourney {
     Retire,
+    RetireWithProductionDetector,
     StopBeforeAdmission,
     StopBeforeAdmissionWithReusedPath,
 }
@@ -396,7 +410,10 @@ async fn run_public_worktree_close(journey: WorktreeJourney) {
     use tokio_util::sync::CancellationToken;
 
     let mut git = DisposableGit::new();
-    let stop_before_admission = !matches!(journey, WorktreeJourney::Retire);
+    let stop_before_admission = matches!(
+        journey,
+        WorktreeJourney::StopBeforeAdmission | WorktreeJourney::StopBeforeAdmissionWithReusedPath
+    );
     let fixture = CloseFixture::new().await;
     let (scope, original_worktree) = git.register(&fixture).await;
     let mut backend = CloseFixture::backend(fixture.db.clone());

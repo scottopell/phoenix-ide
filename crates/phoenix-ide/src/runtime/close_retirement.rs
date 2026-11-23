@@ -8253,6 +8253,17 @@ fn linux_process_is_zombie(status: &str) -> Result<bool, String> {
 }
 
 #[cfg(target_os = "linux")]
+fn linux_writer_io_diagnostic(operation: &str, path: &Path, error: &std::io::Error) {
+    tracing::debug!(
+        operation,
+        path = %path.display(),
+        error_kind = ?error.kind(),
+        raw_os_error = ?error.raw_os_error(),
+        "Linux Close writer scan I/O failed"
+    );
+}
+
+#[cfg(target_os = "linux")]
 fn linux_zombie_has_no_sibling_threads_until(
     process: &Path,
     status: &str,
@@ -8265,8 +8276,12 @@ fn linux_zombie_has_no_sibling_threads_until(
             .filter_map(|line| line.strip_prefix("Threads:"));
         if counts.next().map(str::trim) != Some("1")
             || counts.next().is_some()
-            || !linux_process_is_zombie(sample).map_err(|_| CloseWriterGap::Unavailable)?
+            || !linux_process_is_zombie(sample).map_err(|error| {
+                tracing::debug!(operation = "zombie_state_parse", path = %process.display(), %error);
+                CloseWriterGap::Unavailable
+            })?
         {
+            tracing::debug!(operation = "zombie_single_thread_validate", path = %process.display());
             return Err(CloseWriterGap::Unavailable.into());
         }
         Ok(())
@@ -8277,31 +8292,56 @@ fn linux_zombie_has_no_sibling_threads_until(
     writer_scan_check(deadline)?;
     let tasks_result = std::fs::read_dir(process.join("task"));
     writer_scan_check(deadline)?;
-    let mut tasks = tasks_result.map_err(|_| CloseWriterGap::Unavailable)?;
+    let mut tasks = tasks_result.map_err(|error| {
+        linux_writer_io_diagnostic("zombie_task_read_dir", &process.join("task"), &error);
+        CloseWriterGap::Unavailable
+    })?;
     writer_scan_check(deadline)?;
     let task_result = tasks.next();
     writer_scan_check(deadline)?;
     let task = task_result
-        .ok_or(CloseWriterGap::Unavailable)?
-        .map_err(|_| CloseWriterGap::Unavailable)?;
+        .ok_or_else(|| {
+            tracing::debug!(operation = "zombie_task_inventory_empty", path = %process.display());
+            CloseWriterGap::Unavailable
+        })?
+        .map_err(|error| {
+            linux_writer_io_diagnostic("zombie_task_entry", &process.join("task"), &error);
+            CloseWriterGap::Unavailable
+        })?;
     if Some(task.file_name().as_os_str()) != process.file_name() {
+        tracing::debug!(
+            operation = "zombie_task_identity",
+            path = %process.display(),
+            task = ?task.file_name()
+        );
         return Err(CloseWriterGap::Unavailable.into());
     }
     writer_scan_check(deadline)?;
     let sibling = tasks.next();
     writer_scan_check(deadline)?;
     if sibling.is_some() {
+        if let Some(Err(error)) = &sibling {
+            linux_writer_io_diagnostic("zombie_sibling_entry", &process.join("task"), error);
+        }
+        tracing::debug!(operation = "zombie_sibling_present", path = %process.display());
         return Err(CloseWriterGap::Unavailable.into());
     }
     writer_scan_check(deadline)?;
     let after_result = std::fs::read_to_string(process.join("status"));
     writer_scan_check(deadline)?;
-    let after = after_result.map_err(|_| CloseWriterGap::Unavailable)?;
+    let after = after_result.map_err(|error| {
+        linux_writer_io_diagnostic("zombie_status_reread", &process.join("status"), &error);
+        CloseWriterGap::Unavailable
+    })?;
     validate(&after)?;
-    if LinuxProcessEffectiveUid::parse_status(status).map_err(|_| CloseWriterGap::Unavailable)?
-        != LinuxProcessEffectiveUid::parse_status(&after)
-            .map_err(|_| CloseWriterGap::Unavailable)?
-    {
+    if LinuxProcessEffectiveUid::parse_status(status).map_err(|error| {
+        tracing::debug!(operation = "zombie_uid_parse_before", path = %process.display(), %error);
+        CloseWriterGap::Unavailable
+    })? != LinuxProcessEffectiveUid::parse_status(&after).map_err(|error| {
+        tracing::debug!(operation = "zombie_uid_parse_after", path = %process.display(), %error);
+        CloseWriterGap::Unavailable
+    })? {
+        tracing::debug!(operation = "zombie_uid_changed", path = %process.display());
         return Err(CloseWriterGap::Unavailable.into());
     }
     Ok(())
@@ -8320,9 +8360,11 @@ fn linux_process_owner_until(
     let status = match status_result {
         Ok(status) => status,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            linux_writer_io_diagnostic("owner_status_read", &process.path().join("status"), &error);
             return Ok(LinuxProcessOwner::Vanished);
         }
         Err(error) => {
+            linux_writer_io_diagnostic("owner_status_read", &process.path().join("status"), &error);
             tracing::debug!(
                 "cannot attribute process {} {inventory} inventory from kernel credentials: {error}",
                 process.file_name().to_string_lossy()
@@ -8333,6 +8375,8 @@ fn linux_process_owner_until(
     let process_effective_uid =
         LinuxProcessEffectiveUid::parse_status(&status).map_err(|error| {
             tracing::debug!(
+                operation = "owner_uid_parse",
+                path = %process.path().join("status").display(),
                 "cannot attribute process {} {inventory} inventory from kernel credentials: {error}",
                 process.file_name().to_string_lossy()
             );
@@ -8347,7 +8391,16 @@ fn linux_process_owner_until(
         if process_effective_uid == LinuxProcessEffectiveUid(effective_uid) {
             // Exclude only a positively single-task zombie, not a zombie leader
             // whose live sibling threads may still retain shared write authority.
-            if linux_process_is_zombie(&status).map_err(|_| CloseWriterGap::Unavailable)? {
+            if linux_process_is_zombie(&status).map_err(|error| {
+                tracing::debug!(
+                    operation = "owner_state_parse",
+                    path = %process.path().join("status").display(),
+                    inventory,
+                    ?process_effective_uid,
+                    %error
+                );
+                CloseWriterGap::Unavailable
+            })? {
                 linux_zombie_has_no_sibling_threads_until(&process.path(), &status, deadline)?;
                 LinuxProcessOwner::Zombie
             } else {
@@ -8370,26 +8423,52 @@ fn linux_writer_process_until(
         .file_name()
         .and_then(|name| name.to_str())
         .and_then(|name| name.parse().ok())
-        .ok_or(CloseWriterGap::Malformed)?;
+        .ok_or_else(|| {
+            tracing::debug!(operation = "process_pid_parse", path = %process.display());
+            CloseWriterGap::Malformed
+        })?;
     writer_scan_check(deadline)?;
     let stat_result = std::fs::read_to_string(process.join("stat"));
     writer_scan_check(deadline)?;
-    let stat = stat_result.map_err(|_| CloseWriterGap::Unavailable)?;
-    let (_, tail) = stat.rsplit_once(')').ok_or(CloseWriterGap::Malformed)?;
+    let stat = stat_result.map_err(|error| {
+        linux_writer_io_diagnostic("process_stat_read", &process.join("stat"), &error);
+        CloseWriterGap::Unavailable
+    })?;
+    let (_, tail) = stat.rsplit_once(')').ok_or_else(|| {
+        tracing::debug!(operation = "process_stat_tail_parse", pid, path = %process.display());
+        CloseWriterGap::Malformed
+    })?;
     let start_ticks = tail
         .split_whitespace()
         .nth(19)
-        .ok_or(CloseWriterGap::Malformed)?
+        .ok_or_else(|| {
+            tracing::debug!(operation = "process_start_ticks_missing", pid, path = %process.display());
+            CloseWriterGap::Malformed
+        })?
         .parse::<u64>()
-        .map_err(|_| CloseWriterGap::Malformed)?;
+        .map_err(|error| {
+            tracing::debug!(
+                operation = "process_start_ticks_parse",
+                pid,
+                path = %process.display(),
+                %error
+            );
+            CloseWriterGap::Malformed
+        })?;
     writer_scan_check(deadline)?;
     let executable_result = std::fs::read_link(process.join("exe"));
     writer_scan_check(deadline)?;
-    let executable = executable_result.map_err(|_| CloseWriterGap::Unavailable)?;
+    let executable = executable_result.map_err(|error| {
+        linux_writer_io_diagnostic("process_exe_read_link", &process.join("exe"), &error);
+        tracing::debug!(operation = "process_identity_incomplete", pid, start_ticks);
+        CloseWriterGap::Unavailable
+    })?;
     Ok(CloseWriterProcess {
         pid,
-        incarnation: OpaqueIdentity::parse(format!("{boot_id}:{start_ticks}"))
-            .map_err(|_| CloseWriterGap::Malformed)?,
+        incarnation: OpaqueIdentity::parse(format!("{boot_id}:{start_ticks}")).map_err(|_| {
+            tracing::debug!(operation = "process_incarnation_parse", pid, start_ticks);
+            CloseWriterGap::Malformed
+        })?,
         executable,
     })
 }
@@ -8435,17 +8514,30 @@ fn linux_writer_scan_until(
     check_directory_deletion_deadline(Some(deadline))?;
     let boot_result = std::fs::read_to_string(proc_root.join("sys/kernel/random/boot_id"));
     check_directory_deletion_deadline(Some(deadline))?;
-    let Ok(boot_id) = boot_result else {
-        return Ok(writer_gap(detector, None, CloseWriterGap::Unavailable));
+    let boot_id = match boot_result {
+        Ok(boot_id) => boot_id,
+        Err(error) => {
+            linux_writer_io_diagnostic(
+                "boot_id_read",
+                &proc_root.join("sys/kernel/random/boot_id"),
+                &error,
+            );
+            return Ok(writer_gap(detector, None, CloseWriterGap::Unavailable));
+        }
     };
     if boot_id.trim().is_empty() {
+        tracing::debug!(operation = "boot_id_empty", path = %proc_root.display());
         return Ok(writer_gap(detector, None, CloseWriterGap::Malformed));
     }
     check_directory_deletion_deadline(Some(deadline))?;
     let inventory = std::fs::read_dir(proc_root);
     check_directory_deletion_deadline(Some(deadline))?;
-    let Ok(mut processes) = inventory else {
-        return Ok(writer_gap(detector, None, CloseWriterGap::Unavailable));
+    let mut processes = match inventory {
+        Ok(processes) => processes,
+        Err(error) => {
+            linux_writer_io_diagnostic("process_read_dir", proc_root, &error);
+            return Ok(writer_gap(detector, None, CloseWriterGap::Unavailable));
+        }
     };
     loop {
         check_directory_deletion_deadline(Some(deadline))?;
@@ -8454,8 +8546,12 @@ fn linux_writer_scan_until(
         let Some(process_result) = next else {
             break;
         };
-        let Ok(process) = process_result else {
-            return Ok(writer_gap(detector, None, CloseWriterGap::Unavailable));
+        let process = match process_result {
+            Ok(process) => process,
+            Err(error) => {
+                linux_writer_io_diagnostic("process_inventory_entry", proc_root, &error);
+                return Ok(writer_gap(detector, None, CloseWriterGap::Unavailable));
+            }
         };
         let Some(pid) = process
             .file_name()
@@ -8470,7 +8566,10 @@ fn linux_writer_scan_until(
             Err(WriterScanError::Stopped(message)) => return Err(message),
             Ok(LinuxProcessOwner::Unrelated | LinuxProcessOwner::Zombie) => continue,
             Ok(LinuxProcessOwner::Relevant) => {}
-            _ => return Ok(writer_gap(detector, Some(pid), CloseWriterGap::Unavailable)),
+            result => {
+                tracing::debug!(operation = "owner_before", detector = detector.as_str(), pid, ?result);
+                return Ok(writer_gap(detector, Some(pid), CloseWriterGap::Unavailable));
+            }
         }
         let before_result = linux_writer_process_until(&process.path(), boot_id.trim(), deadline);
         check_directory_deletion_deadline(Some(deadline))?;
@@ -8478,7 +8577,13 @@ fn linux_writer_scan_until(
             Ok(identity) => identity,
             Err(WriterScanError::Stopped(message)) => return Err(message),
             Err(WriterScanError::Gap(reason)) => {
-                return Ok(writer_gap(detector, Some(pid), reason))
+                tracing::debug!(
+                    operation = "identity_before",
+                    detector = detector.as_str(),
+                    pid,
+                    ?reason
+                );
+                return Ok(writer_gap(detector, Some(pid), reason));
             }
         };
         let observed_result = inspect(&process.path(), &canonical);
@@ -8487,7 +8592,14 @@ fn linux_writer_scan_until(
             Ok(observed) => observed,
             Err(WriterScanError::Stopped(message)) => return Err(message),
             Err(WriterScanError::Gap(reason)) => {
-                return Ok(writer_gap(detector, Some(pid), reason))
+                tracing::debug!(
+                    operation = "inspect_process",
+                    detector = detector.as_str(),
+                    pid,
+                    ?before,
+                    ?reason
+                );
+                return Ok(writer_gap(detector, Some(pid), reason));
             }
         };
         let after = linux_writer_process_until(&process.path(), boot_id.trim(), deadline);
@@ -8506,6 +8618,14 @@ fn linux_writer_scan_until(
         if !matches!(after, Ok(ref identity) if identity == &before)
             || !matches!(owner_after, Ok(LinuxProcessOwner::Relevant))
         {
+            tracing::debug!(
+                operation = "process_revalidation",
+                detector = detector.as_str(),
+                pid,
+                ?before,
+                ?after,
+                ?owner_after
+            );
             return Ok(writer_gap(
                 detector,
                 Some(pid),
@@ -8615,7 +8735,10 @@ fn quarantine_has_open_descriptors_with_info_reader_until(
             writer_scan_check(deadline)?;
             let inventory = std::fs::read_dir(process.join("fd"));
             writer_scan_check(deadline)?;
-            let mut descriptors = inventory.map_err(|_| CloseWriterGap::Unavailable)?;
+            let mut descriptors = inventory.map_err(|error| {
+                linux_writer_io_diagnostic("fd_read_dir", &process.join("fd"), &error);
+                CloseWriterGap::Unavailable
+            })?;
             loop {
                 writer_scan_check(deadline)?;
                 let next = descriptors.next();
@@ -8623,38 +8746,72 @@ fn quarantine_has_open_descriptors_with_info_reader_until(
                 let Some(descriptor_result) = next else {
                     break;
                 };
-                let descriptor = descriptor_result.map_err(|_| CloseWriterGap::Unavailable)?;
+                let descriptor = descriptor_result.map_err(|error| {
+                    linux_writer_io_diagnostic("fd_inventory_entry", &process.join("fd"), &error);
+                    CloseWriterGap::Unavailable
+                })?;
                 writer_scan_check(deadline)?;
                 let candidate_result = std::fs::read_link(descriptor.path());
                 writer_scan_check(deadline)?;
-                let candidate = candidate_result.map_err(|_| CloseWriterGap::DescriptorChanged)?;
+                let candidate = candidate_result.map_err(|error| {
+                    linux_writer_io_diagnostic("fd_read_link", &descriptor.path(), &error);
+                    CloseWriterGap::DescriptorChanged
+                })?;
                 if !path_is_within(&candidate, canonical) {
                     continue;
                 }
                 writer_scan_check(deadline)?;
                 let metadata_result = std::fs::metadata(descriptor.path());
                 writer_scan_check(deadline)?;
-                let metadata = metadata_result.map_err(|_| CloseWriterGap::DescriptorChanged)?;
+                let metadata = metadata_result.map_err(|error| {
+                    linux_writer_io_diagnostic("fd_metadata", &descriptor.path(), &error);
+                    CloseWriterGap::DescriptorChanged
+                })?;
                 let info_path = process.join("fdinfo").join(descriptor.file_name());
                 writer_scan_check(deadline)?;
                 let info_result = read_info(&info_path);
                 writer_scan_check(deadline)?;
-                let info = info_result.map_err(|_| CloseWriterGap::DescriptorChanged)?;
-                let access = linux_fd_access(&info)?;
+                let info = info_result.map_err(|error| {
+                    linux_writer_io_diagnostic("fdinfo_read", &info_path, &error);
+                    CloseWriterGap::DescriptorChanged
+                })?;
+                let access = linux_fd_access(&info).inspect_err(|reason| {
+                    tracing::debug!(
+                        operation = "fdinfo_access_parse",
+                        path = %info_path.display(),
+                        ?reason
+                    );
+                })?;
                 writer_scan_check(deadline)?;
                 let repeated_result = std::fs::metadata(descriptor.path());
                 writer_scan_check(deadline)?;
-                let repeated = repeated_result.map_err(|_| CloseWriterGap::DescriptorChanged)?;
+                let repeated = repeated_result.map_err(|error| {
+                    linux_writer_io_diagnostic("fd_metadata_repeat", &descriptor.path(), &error);
+                    CloseWriterGap::DescriptorChanged
+                })?;
                 writer_scan_check(deadline)?;
                 let repeated_link = std::fs::read_link(descriptor.path());
                 writer_scan_check(deadline)?;
                 let repeated_info = read_info(&info_path);
                 writer_scan_check(deadline)?;
-                let repeated_info = repeated_info.map_err(|_| CloseWriterGap::DescriptorChanged)?;
+                let repeated_info = repeated_info.map_err(|error| {
+                    linux_writer_io_diagnostic("fdinfo_read_repeat", &info_path, &error);
+                    CloseWriterGap::DescriptorChanged
+                })?;
+                if let Err(error) = &repeated_link {
+                    linux_writer_io_diagnostic("fd_read_link_repeat", &descriptor.path(), error);
+                }
                 if (metadata.dev(), metadata.ino()) != (repeated.dev(), repeated.ino())
                     || repeated_link.ok().as_ref() != Some(&candidate)
-                    || linux_fd_access(&repeated_info)? != access
+                    || linux_fd_access(&repeated_info).inspect_err(|reason| {
+                        tracing::debug!(
+                            operation = "fdinfo_access_parse_repeat",
+                            path = %info_path.display(),
+                            ?reason
+                        );
+                    })? != access
                 {
+                    tracing::debug!(operation = "fd_revalidation", path = %descriptor.path().display());
                     return Err(CloseWriterGap::DescriptorChanged.into());
                 }
                 if let Some(authority) =
@@ -8663,6 +8820,7 @@ fn quarantine_has_open_descriptors_with_info_reader_until(
                     return Ok(Some((candidate, authority)));
                 }
                 if !metadata.is_file() {
+                    tracing::debug!(operation = "fd_type_unsupported", path = %descriptor.path().display());
                     return Err(CloseWriterGap::Unsupported.into());
                 }
             }

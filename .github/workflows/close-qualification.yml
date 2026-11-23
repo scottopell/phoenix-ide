@@ -323,6 +323,7 @@ jobs:
           test -s evidence/runtime-selected-tests.txt
           for test in \
             registered_native_close_physically_retires_worktree_only_and_replays_without_effects \
+            registered_native_close_with_production_detector_retires_worktree_and_replays \
             registered_native_close_after_acknowledged_source_stop_preserves_real_worktree \
             registered_native_close_after_source_stop_preserves_reused_path_and_original_checkout; do
             grep -F "native_close_admission_tests::worktree_physical::$test: test" evidence/runtime-selected-tests.txt
@@ -378,6 +379,7 @@ jobs:
           grep -E 'test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored;' evidence/native-close-runtime-actor.log
           for test in \
             registered_native_close_physically_retires_worktree_only_and_replays_without_effects \
+            registered_native_close_with_production_detector_retires_worktree_and_replays \
             registered_native_close_after_acknowledged_source_stop_preserves_real_worktree \
             registered_native_close_after_source_stop_preserves_reused_path_and_original_checkout; do
             grep -F "native_close_admission_tests::worktree_physical::$test ... ok" evidence/native-close-runtime-actor.log
@@ -415,6 +417,19 @@ jobs:
             (cd crates/phoenix-ide && "$PHOENIX_RUNTIME_TEST_BINARY" "$module" --nocapture --test-threads=1) 2>&1 | tee "$log"
             grep -E 'test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored;' "$log"
           done
+      - name: Required public Worktree retirement with production writer detector
+        if: success() || failure()
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          test -n "${PHOENIX_RUNTIME_TEST_BINARY:-}"
+          test_name='runtime::executor::creation_completion_lifecycle_tests::native_close_admission_tests::worktree_physical::registered_native_close_with_production_detector_retires_worktree_and_replays'
+          grep -Fx "$test_name: test" evidence/runtime-selected-tests.txt
+          (cd crates/phoenix-ide && "$PHOENIX_RUNTIME_TEST_BINARY" "$test_name" --exact --nocapture --test-threads=1) 2>&1 | tee evidence/public-worktree-production-detector.log
+          grep -F "$test_name ... ok" evidence/public-worktree-production-detector.log
+          grep -F 'test result: ok. 1 passed; 0 failed; 0 ignored;' evidence/public-worktree-production-detector.log
+
       - name: Qualify original-deadline worktree inspection prerequisites
         if: success() || failure()
         shell: bash
