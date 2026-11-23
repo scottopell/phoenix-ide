@@ -8567,7 +8567,12 @@ fn linux_writer_scan_until(
             Ok(LinuxProcessOwner::Unrelated | LinuxProcessOwner::Zombie) => continue,
             Ok(LinuxProcessOwner::Relevant) => {}
             result => {
-                tracing::debug!(operation = "owner_before", detector = detector.as_str(), pid, ?result);
+                tracing::debug!(
+                    operation = "owner_before",
+                    detector = detector.as_str(),
+                    pid,
+                    ?result
+                );
                 return Ok(writer_gap(detector, Some(pid), CloseWriterGap::Unavailable));
             }
         }

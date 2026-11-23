@@ -430,6 +430,14 @@ jobs:
           grep -F "$test_name ... ok" evidence/public-worktree-production-detector.log
           grep -F 'test result: ok. 1 passed; 0 failed; 0 ignored;' evidence/public-worktree-production-detector.log
 
+      - name: Retain bounded failing writer-process attribution
+        if: success() || failure()
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          timeout 10s node scripts/ci/close-writer-process-diagnostic.mjs evidence/public-worktree-production-detector.log > evidence/public-worktree-process-attribution.jsonl
+
       - name: Qualify original-deadline worktree inspection prerequisites
         if: success() || failure()
         shell: bash
