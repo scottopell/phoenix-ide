@@ -164,11 +164,20 @@ function CoordinatorQuestionCard({
         aria-describedby={descriptionId}
         onCancel={(event) => {
           event.preventDefault();
+          const confirmCancel = event.currentTarget.querySelector<HTMLButtonElement>('.confirm-dialog .btn-secondary');
+          if (confirmCancel) {
+            confirmCancel.click();
+            return;
+          }
           if (mobile) returnToConversation();
         }}
         onKeyDownCapture={(event) => {
           if (!mobile || event.key !== 'Escape') return;
-          if (event.currentTarget.querySelector('.confirm-dialog')) return;
+          if (event.currentTarget.querySelector('.confirm-dialog')) {
+            event.preventDefault();
+            return;
+          }
+          if (event.target instanceof HTMLInputElement || event.target instanceof HTMLTextAreaElement) return;
           event.preventDefault();
           event.stopPropagation();
           returnToConversation();
@@ -204,6 +213,7 @@ function CoordinatorQuestionCard({
               showToast={showToast}
               onAnswered={forget}
               onDismissed={forget}
+              active={!mobile || expanded}
             />
           </div>
         </div>

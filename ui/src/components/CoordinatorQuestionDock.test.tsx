@@ -6,6 +6,7 @@ import {
   receiveCoordinatorQuestions,
   resetCoordinatorQuestionsForTest,
 } from '../coordinator/coordinatorQuestions';
+import { FocusScopeProvider, useFocusScope } from '../hooks/useFocusScope';
 import { CoordinatorQuestionDock } from './CoordinatorQuestionDock';
 import { EmberEntry } from './EmberEntry';
 
@@ -28,6 +29,11 @@ function setMobile(next: boolean): void {
 function restoreProperty(target: object, key: PropertyKey, descriptor: PropertyDescriptor | undefined): void {
   if (descriptor) Object.defineProperty(target, key, descriptor);
   else Reflect.deleteProperty(target, key);
+}
+
+function ActiveScope() {
+  const { activeScope } = useFocusScope();
+  return <output data-testid="active-scope">{activeScope ?? 'none'}</output>;
 }
 
 function open(requestId: string, text: string): CoordinatorQuestion {
@@ -181,6 +187,55 @@ describe('Ember questions (REQ-AUQ-011)', () => {
     expect(window.location.href).toBe(routeBeforeCancel);
     expect(screen.getByRole('button', { name: 'Answer Ember’s question' })).toBeInTheDocument();
     expect(dismiss).not.toHaveBeenCalled();
+  });
+
+  it('native cancel cancels the nested confirmation without returning from the question', () => {
+    mobile = true;
+    act(() => receiveCoordinatorQuestions([open('q-1', 'Merge now?')]));
+    render(<CoordinatorQuestionDock />);
+
+    const dialog = screen.getByRole('dialog');
+    fireEvent.click(screen.getByRole('button', { name: 'Dismiss' }));
+    expect(screen.getByText('Dismiss structured questions?')).toBeInTheDocument();
+
+    const cancel = new Event('cancel', { cancelable: true });
+    fireEvent(dialog, cancel);
+
+    expect(cancel.defaultPrevented).toBe(true);
+    expect(screen.queryByText('Dismiss structured questions?')).not.toBeInTheDocument();
+    expect(dialog).toHaveAttribute('open');
+    expect(screen.queryByRole('button', { name: 'Answer Ember’s question' })).not.toBeInTheDocument();
+  });
+
+  it('lets QuestionPanel blur and refocus from the first Escape in its input', async () => {
+    mobile = true;
+    act(() => receiveCoordinatorQuestions([open('q-1', 'Merge now?')]));
+    render(<CoordinatorQuestionDock />);
+
+    const dialog = screen.getByRole('dialog');
+    const input = screen.getByRole('textbox', { name: 'Write a custom answer' });
+    const panel = document.querySelector('.question-panel');
+    input.focus();
+    fireEvent.keyDown(input, { key: 'Escape' });
+
+    expect(panel).toHaveFocus();
+    expect(dialog).toHaveAttribute('open');
+    expect(screen.queryByRole('button', { name: 'Answer Ember’s question' })).not.toBeInTheDocument();
+  });
+
+  it('releases the question focus scope when Return closes the mounted panel', async () => {
+    mobile = true;
+    act(() => receiveCoordinatorQuestions([open('q-1', 'Merge now?')]));
+    render(
+      <FocusScopeProvider>
+        <ActiveScope />
+        <CoordinatorQuestionDock />
+      </FocusScopeProvider>,
+    );
+
+    await waitFor(() => expect(screen.getByTestId('active-scope')).toHaveTextContent('question-panel'));
+    fireEvent.click(screen.getByRole('button', { name: 'Return to conversation' }));
+    await waitFor(() => expect(screen.getByTestId('active-scope')).toHaveTextContent('none'));
   });
 
   it('keeps the dismiss confirmation inside the mobile dialog and lets Escape cancel only the confirmation', () => {

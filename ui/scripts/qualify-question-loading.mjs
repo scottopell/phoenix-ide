@@ -61,7 +61,10 @@ async function trial(version, base, viewport, mode, run, isolation = false) {
     const json = data => route.fulfill({ contentType: 'application/json', body: JSON.stringify(data) });
     // CDP throttles real bundle requests; intercepted API latency is modeled explicitly.
     await new Promise(resolve => setTimeout(resolve, conditions.latency_ms));
-    if (p === '/api/telemetry/product-conversation-open') return route.fulfill({ status: 204, body: '' });
+    if (p === '/api/telemetry/product-conversation-open' || p === '/api/telemetry/conversation-open') return route.fulfill({ status: 204, body: '' });
+    if (p === '/api/product-conversations/events') return route.fulfill({ contentType: 'text/event-stream', body: ': synthetic aggregate stream\n\n' });
+    if (p === '/api/product-conversations/question-product/read') return json({ state: 'read' });
+    if (p.endsWith('/proposals')) return json({ proposals: [] });
     if (p === '/api/auth/status') return json({ auth_required: false, authenticated: true });
     if (p === '/api/coordinator/questions' && route.request().method() === 'GET') { feedLoaded = true; return json(pendingQuestions); }
     if (/\/api\/coordinator\/questions\/[^/]+\/(answer|dismiss)$/.test(p) && route.request().method() === 'POST') {
@@ -90,10 +93,10 @@ async function trial(version, base, viewport, mode, run, isolation = false) {
     if (p === '/api/product-conversations') return json({ product_conversations: [], coordinator: null });
     if (p === '/api/models') return json({ models: [], default: '', llm_configured: false, credential_status: 'not_configured' });
     if (p === '/api/codex/login/preflight') return json({ auth_path: '/tmp/disposable', already_signed_in: false, bridge_loaded_at_startup: false, restart_required_after_login: false, account_id: null, account_email: null });
-    if (p === '/api/coordinator/language' || p === '/api/settings/llm-language') return json({ language: 'en', available: ['en'], languages: [{ id: 'en', label: 'English' }] });
+    if (p === '/api/global/coordinator/language' || p === '/api/settings/llm-language') return json({ language: 'en', available: ['en'], languages: [{ id: 'en', label: 'English' }] });
     if (p.endsWith('/automatic-continuation')) return json({ aggregate: { kind: 'coordinator', product_conversation_id: 'question-product' }, auto_continue_on_context_exhaustion: false, admission: null });
     if (p === '/api/reminders/due') return json({ cursor: timestamp, instances: [] });
-    if (p === '/api/notifications/settings') return json({ enabled: false, sound: false, desktop: false, push: false });
+    if (p === '/api/settings/notifications') return json({ enabled: false, sound: false, desktop: false, push: false });
     if (p.endsWith('/system-prompt')) return json({ prompt: '' });
     if (p.endsWith('/inventory')) return json({ scope_key: 'fixture', bash: [], tmux: null, browser: null });
     if (p.endsWith('/read-state')) return json({});
@@ -119,7 +122,6 @@ async function trial(version, base, viewport, mode, run, isolation = false) {
     const automatic = panel.locator('.question-option').filter({ hasText: 'Automatic' }).first();
     await automatic.click();
     if (!await automatic.evaluate(el => el.classList.contains('selected'))) throw new Error('Option click did not update selection');
-    await panel.locator('.question-option').filter({ hasText: 'Other' }).first().click();
     const custom = panel.getByRole('textbox', { name: 'Write a custom answer' });
     await custom.fill('Disposable retained custom answer');
     if (await custom.inputValue() !== 'Disposable retained custom answer') throw new Error('Custom answer was not usable');
