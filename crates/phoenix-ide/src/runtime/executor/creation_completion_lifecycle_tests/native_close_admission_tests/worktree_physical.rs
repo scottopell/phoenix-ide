@@ -625,7 +625,9 @@ async fn run_public_worktree_close(journey: WorktreeJourney) {
         assert_eq!(receipt.8, "initial");
         assert_eq!(
             obligation.close_outcome(),
-            Some(CloseCompletionOutcome::Archived)
+            Some(CloseCompletionOutcome::Archived),
+            "public Worktree Close retained cleanup attention; durable evidence: {}",
+            durable_native_close_rows(&fixture, &run).await,
         );
         assert_eq!(
             fixture.db.get_close_run(&run).await.unwrap().status,
@@ -958,12 +960,12 @@ async fn durable_native_close_rows(fixture: &CloseFixture, run: &CloseRunRef) ->
         .list_close_retirement_evidence(attempt)
         .await
         .unwrap();
-    let anchor: (String, String) = sqlx::query_as(
+    let anchor: Option<(String, String)> = sqlx::query_as(
         "SELECT inspection_generation, inspection_fingerprint
          FROM close_original_retirement_anchors WHERE attempt_id = ?1",
     )
     .bind(attempt)
-    .fetch_one(fixture.db.pool())
+    .fetch_optional(fixture.db.pool())
     .await
     .unwrap();
     // quote preserves identity values even if their storage class is BLOB.
