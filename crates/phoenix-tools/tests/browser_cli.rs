@@ -179,18 +179,60 @@ impl Drop for BrowserCli {
 }
 
 fn fixture() -> String {
-    fixture_with_script("")
-}
-
-fn fixture_with_script(script: &str) -> String {
     let html = r#"<!doctype html><title>CLI browser journey</title>
 <label>Name <input id="name" aria-label="Name"></label>
 <button id="increment" onclick="window.clicks += 1; console.log('clicked', window.clicks)">Increment</button>
-<script>window.clicks = 0; console.error('navigation-marker');"#;
+<script>window.clicks = 0; console.error('navigation-marker');</script>"#;
     format!(
         "data:text/html;base64,{}",
-        base64::engine::general_purpose::STANDARD.encode(format!("{html}{script}</script>"))
+        base64::engine::general_purpose::STANDARD.encode(html)
     )
+}
+
+fn oversized_snapshot_fixture() -> (String, std::thread::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let url = format!("http://{}/oversized", listener.local_addr().unwrap());
+    let server = std::thread::spawn(move || {
+        let prefix =
+            b"<!doctype html><title>Oversized snapshot</title><button id='increment' aria-label='";
+        let label = "x".repeat(9 * 1024 * 1024);
+        let suffix = b"'>Increment</button><script>window.clicks = 0;</script>";
+        wait_for_observation("oversized page requested", || {
+            let (mut stream, _) = match listener.accept() {
+                Ok(connection) => connection,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return None,
+                Err(error) => panic!("oversized fixture accept: {error}"),
+            };
+            stream.set_nonblocking(false).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut reader = BufReader::new(&mut stream);
+            let mut line = String::new();
+            if reader.read_line(&mut line).is_err() || !line.starts_with("GET /oversized ") {
+                return None; // Chrome may open an idle preconnection first.
+            }
+            loop {
+                line.clear();
+                if reader.read_line(&mut line).unwrap() == 0 || line == "\r\n" {
+                    break;
+                }
+            }
+            drop(reader);
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                prefix.len() + label.len() + suffix.len()
+            )
+            .unwrap();
+            stream.write_all(prefix).unwrap();
+            stream.write_all(label.as_bytes()).unwrap();
+            stream.write_all(suffix).unwrap();
+            Some(())
+        });
+    });
+    (url, server)
 }
 
 fn reference(tree: &str, name: &str) -> String {
@@ -2340,8 +2382,7 @@ impl LiveEvidence {
         );
         assert_eq!(
             cli.eval(
-                r"document.querySelector('#increment').removeAttribute('aria-label');
-                for (let i = 0; i < 150; i++) {
+                r"for (let i = 0; i < 150; i++) {
                     const button = document.createElement('button');
                     button.textContent = 'Large snapshot control ' + i;
                     document.body.append(button);
@@ -2375,6 +2416,8 @@ impl LiveEvidence {
         let resources = live_resources(cli);
         let sentinel = resources.0.join("old-lifetime-sentinel");
         std::fs::write(&sentinel, b"old browser state").unwrap();
+        assert!(uuid::Uuid::parse_str(opened["lifetime"].as_str().unwrap()).is_ok());
+        assert!(uuid::Uuid::parse_str(opened["browser_lifetime"].as_str().unwrap()).is_ok());
         Self {
             daemon_lifetime: opened["lifetime"]
                 .as_str()
@@ -2436,6 +2479,7 @@ impl RetiredEvidence {
         let browser_lifetime = reopened["browser_lifetime"]
             .as_str()
             .expect("replacement browser identity");
+        assert!(uuid::Uuid::parse_str(browser_lifetime).is_ok());
         assert_ne!(browser_lifetime, live.browser_lifetime);
         assert!(
             !live.sentinel.exists(),
@@ -2470,19 +2514,42 @@ fn lost_chrome_reports_state_loss_and_open_replaces_only_browser_lifetime() {
         return;
     }
     let ordinary = fixture();
-    let failed_snapshot = fixture_with_script(
-        "document.querySelector('#increment').ariaLabel = 'x'.repeat(9 * 1024 * 1024);",
-    );
-    for (url, force_snapshot_failure) in [(&ordinary, false), (&failed_snapshot, true)] {
+    for force_snapshot_failure in [false, true] {
         let cli = BrowserCli::new();
-        let opened = cli.ok(&["open", url]);
-        if force_snapshot_failure {
-            assert_eq!(opened["result"]["snapshot"]["status"], "error", "{opened}");
+        let opened = if force_snapshot_failure {
+            let (url, server) = oversized_snapshot_fixture();
+            let failed = cli.ok(&["open", &url]);
+            server.join().unwrap();
+            assert_eq!(failed["result"]["navigation"], "succeeded", "{failed}");
+            assert_eq!(failed["result"]["url"], url);
+            assert_eq!(failed["result"]["title"], "Oversized snapshot");
+            assert_eq!(failed["result"]["snapshot"]["status"], "error", "{failed}");
             assert!(
-                opened["result"]["snapshot"]["result"]["text"].is_null(),
-                "{opened}"
+                failed["result"]["snapshot"]["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("Space limit exceeded"),
+                "{failed}"
             );
-        }
+            assert!(
+                failed["result"]["snapshot"]["result"]["text"].is_null(),
+                "{failed}"
+            );
+            assert_eq!(
+                cli.eval("document.querySelector('#increment').getAttribute('aria-label').length"),
+                9 * 1024 * 1024
+            );
+            let recovered = cli.ok(&["open", &ordinary]);
+            assert_eq!(recovered["lifetime"], failed["lifetime"]);
+            assert_eq!(recovered["browser_lifetime"], failed["browser_lifetime"]);
+            assert_eq!(
+                recovered["result"]["snapshot"]["status"], "success",
+                "{recovered}"
+            );
+            recovered
+        } else {
+            cli.ok(&["open", &ordinary])
+        };
         let live = LiveEvidence::capture(&cli, &opened);
         let killed = live.kill();
         let retired = killed.retire(&cli);
