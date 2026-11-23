@@ -1624,6 +1624,25 @@ export const api = {
     return resp.json();
   },
 
+  async getCoordinatorLanguage(): Promise<LlmLanguageSetting> {
+    const resp = await fetch('/api/global/coordinator/language');
+    if (!resp.ok) throw new Error('Failed to load Ember language');
+    return resp.json();
+  },
+
+  async updateCoordinatorLanguage(language: string): Promise<LlmLanguageSetting> {
+    const resp = await fetch('/api/global/coordinator/language', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ language }),
+    });
+    if (!resp.ok) {
+      const failure = await resp.json().catch(() => null) as { error?: string } | null;
+      throw new Error(failure?.error ?? 'Failed to save Ember language');
+    }
+    return resp.json();
+  },
+
   async resolveCoordinatorRoute(conversation: string): Promise<{ coordinator_id: string | null }> {
     const resp = await fetch(
       '/api/global/coordinator/reads/route', exactReadRequest(conversation),

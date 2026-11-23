@@ -261,6 +261,8 @@ pub struct SubAgentCancelRequest {
 pub enum EvictionReason {
     /// Recreate the runtime after a model or inference-configuration update.
     ModelUpgrade { model_changed: bool },
+    /// Recreate the idle Coordinator with its newly saved language.
+    LanguageChanged,
     /// Async creation finished provisioning cwd/mode/model metadata; recreate
     /// any shell runtime so it uses the provisioned conversation row.
     CreationProvisioned,
@@ -7075,6 +7077,7 @@ impl RuntimeManager {
                     .or_insert(model_changed);
             }
             EvictionReason::CreationProvisioned
+            | EvictionReason::LanguageChanged
             | EvictionReason::SteeringReconciliation
             | EvictionReason::RecoveryReconciliation
             | EvictionReason::SubAgentTerminalBeforeDispatch => {}

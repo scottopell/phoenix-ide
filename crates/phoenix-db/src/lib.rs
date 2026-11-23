@@ -4935,6 +4935,25 @@ impl Database {
             .map_err(DbError::Sqlx)
     }
 
+    /// Change only the idle current Coordinator's language.
+    ///
+    /// # Errors
+    /// Returns a database error when the update fails.
+    pub async fn set_idle_coordinator_language(
+        &self,
+        conversation_id: &str,
+        language: phoenix_core::llm_language::LlmLanguage,
+    ) -> DbResult<bool> {
+        let result = sqlx::query(
+            "UPDATE conversations SET llm_language = ?1 WHERE id = ?2 AND coordinator_head = 1 AND runtime_role = 'coordinator' AND state_kind = 'idle'",
+        )
+        .bind(language.as_str())
+        .bind(conversation_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
     /// Whether this conversation belongs to the durable Coordinator chain.
     ///
     /// # Errors

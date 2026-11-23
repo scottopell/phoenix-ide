@@ -23,3 +23,14 @@ WHEN a conversation uses ADHD
 THE SYSTEM SHALL retain Phoenix operational instructions and add response guidance that leads with the answer or next action, numbers sequential steps, keeps visible groups small, anchors ongoing work in its goal and state, suppresses tangents, and makes verified progress clear.
 
 THE guidance SHALL preserve completeness, uncertainty, user-requested depth, tool contracts, authorization and evidence standards; avoid invented timings and unnecessary user homework; and apply to ordinary conversations, the Coordinator, and its research agents.
+
+### REQ-LL-003: Change Ember's language independently
+
+THE SYSTEM SHALL offer an Ember-specific language selector after Coordinator creation, showing its saved language and the shared catalog.
+
+WHEN the user changes Ember's language while its current transcript is idle
+THE SYSTEM SHALL persist the selection for that Coordinator, apply it to subsequent requests and continuations, and preserve its identity, history and authority.
+
+THE SYSTEM SHALL reject a change while Ember is working or its current transcript changes during the save, explain the refusal, and retain the saved selection. The control SHALL expose loading and save failures with a retry path.
+
+Changing Ember's language SHALL NOT change the global default, ordinary conversations, or already-created research agents.

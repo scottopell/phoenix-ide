@@ -2,6 +2,7 @@ import { lazy, Suspense, useCallback, useEffect, useRef, useState, type ReactNod
 import { Link, useLocation, useNavigate, useParams } from 'react-router-dom';
 import { api, type ActiveCoordinatorWatch, type LiveCoordinatorBashHandle } from '../api';
 import { AutomaticContinuationControl } from '../components/AutomaticContinuationControl';
+import { CoordinatorLanguageControl } from '../components/CoordinatorLanguageControl';
 import { CoordinatorQuestionDock } from '../components/CoordinatorQuestionDock';
 import { COORDINATOR_QUICK_ACTION } from './coordinatorBriefing';
 import './CoordinatorPage.css';
@@ -256,6 +257,7 @@ export function CoordinatorPage({ fixtureData }: { fixtureData?: CoordinatorPage
     ),
     details: (
       <div className="global-statebar-activity__details">
+        <CoordinatorLanguageControl />
         <AutomaticContinuationControl
           scope={{ kind: 'coordinator' }}
           onStatusChange={handleAutomaticContinuationStatus}

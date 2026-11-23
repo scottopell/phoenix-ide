@@ -100,7 +100,7 @@ async fn fixture(prefix: u32, populated: bool) -> SqlitePool {
 
 #[tokio::test]
 async fn adhd_language_migration_preserves_jobs_and_children() {
-    let pool = fixture(167, true).await;
+    let pool = fixture(168, true).await;
     let before: Vec<(String, String)> = sqlx::query_as(
         "SELECT request_id, llm_language FROM product_creation_jobs ORDER BY request_id",
     )
@@ -111,7 +111,7 @@ async fn adhd_language_migration_preserves_jobs_and_children() {
         .fetch_one(&pool)
         .await
         .unwrap();
-    assert_eq!(run_pending_migrations(&pool).await.unwrap(), 1);
+    assert_eq!(run_through_for_test(&pool, 169).await.unwrap(), 1);
     let after: Vec<(String, String)> = sqlx::query_as(
         "SELECT request_id, llm_language FROM product_creation_jobs ORDER BY request_id",
     )
