@@ -1,4 +1,4 @@
-# ADR-271: Preserve Gemini tool signatures through Chat Completions
+# ADR-276: Preserve Gemini tool signatures through Chat Completions
 
 - **Status:** Accepted
 - **Date:** 2026-11-20

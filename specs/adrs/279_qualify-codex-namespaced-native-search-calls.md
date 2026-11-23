@@ -1,4 +1,4 @@
-# ADR-274: Qualify Codex's namespaced native search call
+# ADR-279: Qualify Codex's namespaced native search call
 
 - **Status:** Accepted
 - **Date:** 2026-11-23
@@ -58,7 +58,7 @@ and final response rather than only accepting the first search call.
 
 ## References
 
-- [ADR-273](273_native-openai-and-shared-local-tool-discovery.md).
+- [ADR-278](278_native-openai-and-shared-local-tool-discovery.md).
 - [Discovery contract](../llm/tool-discovery.allium).
 - [OpenAI native client search](https://developers.openai.com/api/docs/guides/tools-tool-search).
 - [Upstream Codex tool router](https://github.com/openai/codex/blob/main/codex-rs/core/src/tools/router.rs).

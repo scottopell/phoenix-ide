@@ -8,6 +8,6 @@ Implement a typed, route-qualified image-preserving tool-result representation. 
 
 ## Completion evidence
 
-Implemented in `1ec3d0f66`; ADR-272 records route qualification. The shared Chat projection preserves ordered images, tool IDs, and error text for built-in Gemini models without changing unqualified routes. It omits empty text parts on image-only results: a paired gateway probe confirmed that including an empty text part caused HTTP 400 while the same image alone succeeded.
+Implemented in `1ec3d0f66`; ADR-277 records route qualification. The shared Chat projection preserves ordered images, tool IDs, and error text for built-in Gemini models without changing unqualified routes. It omits empty text parts on image-only results: a paired gateway probe confirmed that including an empty text part caused HTTP 400 while the same image alone succeeded.
 
 Validation on 2026-11-20: all 495 LLM unit tests passed; all three provider-policy runtime tests passed, including image/signature preservation across SQLite reopen and retry; all four Gemini models identified the synthetic magenta image through the real adapter in both streaming modes. The live test covers text-plus-image and image-only results with restored serialized content/signatures. `PHOENIX_CHECK_BASE=03641fcd6 ./dev.py check` passed all available checks, including the broad Rust suite and end-to-end tests. Optional ast-grep and cargo-deny checks were skipped because those tools were not installed. Independent source review found no actionable defect. No production deployment was performed.

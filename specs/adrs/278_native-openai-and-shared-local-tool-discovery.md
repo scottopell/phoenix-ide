@@ -1,4 +1,4 @@
-# ADR-273: Use native OpenAI discovery with a shared local selector
+# ADR-278: Use native OpenAI discovery with a shared local selector
 
 - **Status:** Accepted
 - **Date:** 2026-11-20

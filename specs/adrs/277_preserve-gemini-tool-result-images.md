@@ -1,4 +1,4 @@
-# ADR-272: Preserve Gemini tool-result images
+# ADR-277: Preserve Gemini tool-result images
 
 - **Status:** Accepted
 - **Date:** 2026-11-20
@@ -42,6 +42,6 @@ Adding another model or external-route capability requires explicit qualificatio
 - [LLM requirements](../llm/requirements.md), REQ-LLM-004.
 - [Chat Completions contract](../llm/chat-completions.allium).
 - [Browser tool requirements](../browser-tool/requirements.md), REQ-BT-003/006.
-- [ADR-271](271_preserve-gemini-tool-signatures-through-chat-completions.md).
+- [ADR-276](276_preserve-gemini-tool-signatures-through-chat-completions.md).
 - `ChatRoute::for_model`, `chat_tool_result_content`, and
   `gemini_gateway_tool_result_images`.

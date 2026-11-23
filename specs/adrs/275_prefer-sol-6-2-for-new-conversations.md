@@ -1,4 +1,4 @@
-# ADR-270: Prefer Sol 6.2 for new conversations
+# ADR-275: Prefer Sol 6.2 for new conversations
 
 - **Status:** Accepted
 - **Date:** 2026-11-20

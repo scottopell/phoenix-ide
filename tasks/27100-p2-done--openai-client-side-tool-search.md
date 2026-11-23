@@ -65,7 +65,7 @@ function/final-reply exchange; canonical settled native history remains valid.
 
 The fix qualifies only this native-client representation, shares its typed
 parser with canonical receipt classification, preserves complete active private
-output, and keeps unqualified/ordinary function history ordinary. ADR-274 and
+output, and keeps unqualified/ordinary function history ordinary. ADR-279 and
 the normative discovery contract record the boundary. All 513 LLM unit tests
 and 13 discovery persistence tests pass.
 

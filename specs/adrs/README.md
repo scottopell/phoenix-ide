@@ -49,11 +49,11 @@ Allowing gaps does not approve an ID allocation, decision, or publication.
 | [272](272_bound-exhaustive-backup-verification-to-fifteen-minutes.md) | Bound exhaustive backup verification to fifteen minutes | Accepted; qualifies ADR-263 | REQ-LDD-029, REQ-LDD-031 |
 | [271](271_gate-ordinary-publication-on-exact-source-ci.md) | Gate ordinary publication on exact merged-source CI | Accepted | REQ-DESKTOP-REL-015 |
 | [270](270_publish-fixed-rc8-through-rebuilt-release-path.md) | Publish fixed RC8 through the rebuilt release path | Accepted | REQ-DESKTOP-REL-002/010/014 |
-| [274](274_qualify-codex-namespaced-native-search-calls.md) | Qualify Codex's namespaced native search calls | Accepted | REQ-LLM-004n, REQ-LLM-005 |
-| [273](273_native-openai-and-shared-local-tool-discovery.md) | Use native OpenAI discovery with a shared local selector | Accepted | REQ-LLM-004i/004j/004m/004n, REQ-LLM-005 |
-| [272](272_preserve-gemini-tool-result-images.md) | Preserve Gemini tool-result images | Accepted | REQ-LLM-004, REQ-BT-003, REQ-BT-006 |
-| [271](271_preserve-gemini-tool-signatures-through-chat-completions.md) | Preserve Gemini tool signatures through Chat Completions | Accepted | REQ-LLM-002–005, REQ-LLM-007 |
-| [270](270_prefer-sol-6-2-for-new-conversations.md) | Prefer Sol 6.2 for new conversations | Accepted | REQ-LLM-003 |
+| [279](279_qualify-codex-namespaced-native-search-calls.md) | Qualify Codex's namespaced native search calls | Accepted | REQ-LLM-004n, REQ-LLM-005 |
+| [278](278_native-openai-and-shared-local-tool-discovery.md) | Use native OpenAI discovery with a shared local selector | Accepted | REQ-LLM-004i/004j/004m/004n, REQ-LLM-005 |
+| [277](277_preserve-gemini-tool-result-images.md) | Preserve Gemini tool-result images | Accepted | REQ-LLM-004, REQ-BT-003, REQ-BT-006 |
+| [276](276_preserve-gemini-tool-signatures-through-chat-completions.md) | Preserve Gemini tool signatures through Chat Completions | Accepted | REQ-LLM-002–005, REQ-LLM-007 |
+| [275](275_prefer-sol-6-2-for-new-conversations.md) | Prefer Sol 6.2 for new conversations | Accepted | REQ-LLM-003 |
 | [269](269_external-models-in-user-toml.md) | Load external model definitions from user TOML at startup | Accepted | REQ-LLM-003c, REQ-AG-010 |
 | [264](264_scan-only-coordinator-history-with-host-owned-batches.md) | Scan only Coordinator history through bounded host-owned batches | Accepted | REQ-SCAN-001–008, REQ-TRACK-004–007 |
 | [263](263_verify-native-backup-and-bound-predecessor-recovery-for-macos-deploy.md) | Verify a native backup and bound predecessor recovery for macOS deploy | Accepted; qualifies ADR-230 | REQ-LDD-002/004/009/029–031, REQ-PD-010, REQ-COMP-021 |

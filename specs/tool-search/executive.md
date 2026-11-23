@@ -34,7 +34,7 @@ replay, and a complete SQLite/runtime loop using the real search handler over
 65 deferred schemas. All three runtime requests used WebSockets and the native
 selection, deferred execution, and final `OK` persisted correctly. The observed
 namespaced native call is qualified under
-[ADR-274](../adrs/274_qualify-codex-namespaced-native-search-calls.md); ordinary
+[ADR-279](../adrs/279_qualify-codex-namespaced-native-search-calls.md); ordinary
 function history remains ordinary. A random proof value available only in the
 deferred schema was returned on the first function invocation, proving schema
 retrieval. The deferred function is synthetic; no external MCP service was
@@ -69,7 +69,7 @@ and all five owning tests pass. Both browser lifecycle failures passed isolated
 reruns and the complete Chrome-enabled integration file (37/37); their original
 cause remains unproven (task 41021). Task 41022 tracks preserving the original
 failure diagnostics. See
-[ADR-273](../adrs/273_native-openai-and-shared-local-tool-discovery.md).
+[ADR-278](../adrs/278_native-openai-and-shared-local-tool-discovery.md).
 
 | Requirement | Status | Verification and limits |
 | --- | --- | --- |

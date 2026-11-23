@@ -25,7 +25,7 @@ WebSockets. Live testing exposed the bridge's namespaced
 `tool_search.tool_search_tool` function representation. The qualified adapter
 maps it to native client discovery, retains its complete private envelope, and
 returns native schema-bearing `tool_search_output`. Ordinary function history
-keeps its original protocol. [ADR-274](../adrs/274_qualify-codex-namespaced-native-search-calls.md)
+keeps its original protocol. [ADR-279](../adrs/279_qualify-codex-namespaced-native-search-calls.md)
 records this verified representation.
 
 The live adapter probe passed search, deferred function execution, final reply,
@@ -101,7 +101,7 @@ Codex result placement avoids adding newly loaded schemas to the leading prefix;
 Chat requests add authenticated selected schemas to their function declarations.
 Codex native admission requires native-client loading evidence; ordinary search
 history remains ordinary and can require a new native search after a mode switch.
-[ADR-273](../adrs/273_native-openai-and-shared-local-tool-discovery.md) records the
+[ADR-278](../adrs/278_native-openai-and-shared-local-tool-discovery.md) records the
 choice and its costs.
 
 Integration qualification has focused and live evidence. The actual Phoenix
@@ -171,7 +171,7 @@ streaming and non-streaming modes across all four models.
 The SQLite runtime regression also checks that image-bearing error results retain
 their call identity, text, and pixels in follow-up requests after reopen and retry.
 Database regressions cover reopen, immutable replay, migration, receipts, and
-settlement. [ADR-271](../adrs/271_preserve-gemini-tool-signatures-through-chat-completions.md)
+settlement. [ADR-276](../adrs/276_preserve-gemini-tool-signatures-through-chat-completions.md)
 records the integration decision.
 
 ## Requirements Summary
