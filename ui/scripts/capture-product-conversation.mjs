@@ -516,12 +516,20 @@ async function assertEmberTracking(page, id, viewport, outDir) {
   }
   await page.context().grantPermissions(['clipboard-read', 'clipboard-write']);
   await page.screenshot({ path: `${outDir}/${id}--${viewport.name}--raw.png`, fullPage: true });
-  const copyButton = due.getByRole('button', { name: 'Copy system observation' });
+  const mobileCopy = viewport.width <= 768;
+  if (!mobileCopy) {
+    await summary.scrollIntoViewIfNeeded();
+    await summary.click({ button: 'right' });
+  }
+  const copyButton = mobileCopy
+    ? due.getByRole('button', { name: 'Copy system observation' })
+    : page.getByRole('button', { name: 'Copy as Markdown', exact: true });
   await copyButton.scrollIntoViewIfNeeded();
   await copyButton.focus();
   const beforeCopyScroll = await scroller.evaluate(element => element.scrollTop);
   await copyButton.click();
-  await due.getByRole('button', { name: 'Copied!' }).waitFor();
+  if (mobileCopy) await due.getByRole('button', { name: 'Copied!' }).waitFor();
+  await page.waitForFunction(expected => navigator.clipboard.readText().then(text => text === expected), expectedOriginal);
   const copied = await page.evaluate(() => navigator.clipboard.readText());
   if (copied !== original) throw new Error('Copy did not preserve the original producer payload');
   const afterCopyScroll = await scroller.evaluate(element => element.scrollTop);
