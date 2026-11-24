@@ -695,12 +695,13 @@ if sys.argv[1:] == ["--build-identity"]:
                 helper._backup_proof(backup, real_clock() + 1)
 
     def test_backup_default_deadline_uses_named_budget(self):
+        self.assertEqual(helper.BACKUP_VERIFICATION_TIMEOUT_SECS, 1200.0)
         diagnostics = {}
         with mock.patch.object(helper.time, "monotonic", return_value=123.0):
             backup = helper.create_verified_database_backup(
                 str(self.database), self.root, diagnostics=diagnostics,
             )
-        self.assertEqual(diagnostics["deadline"], 123.0 + helper.BACKUP_VERIFICATION_TIMEOUT_SECS)
+        self.assertEqual(diagnostics["deadline"], 123.0 + 1200.0)
         self.assertTrue(backup.exists())
 
     def test_activation_backup_and_proof_share_one_deterministic_deadline(self):

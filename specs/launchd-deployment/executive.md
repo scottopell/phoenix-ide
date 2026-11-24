@@ -7,7 +7,7 @@ validates exact candidate artifacts and checks backup capacity for an existing
 database before disruption; it quarantines the canonical plist and observes
 predecessor stop. For an existing database it holds a bounded SQLite
 `BEGIN IMMEDIATE` writer reservation across backup verification and durable
-boundary recording, retaining the fsynced native backup and transaction proof. Backup verification checks integrity, then compares source and backup metadata and typed stored rows in lockstep, including rowid/primary-key identity and persisted FTS5 shadow rows. Unsupported virtual-table modules and tables shadowing every rowid alias fail closed. Backup creation, integrity, equivalence, fsync and proof hashing share a 900-second deadline.
+boundary recording, retaining the fsynced native backup and transaction proof. Backup verification checks integrity, then compares source and backup metadata and typed stored rows in lockstep, including rowid/primary-key identity and persisted FTS5 shadow rows. Unsupported virtual-table modules and tables shadowing every rowid alias fail closed. Backup creation, integrity, equivalence, fsync and proof hashing share a 1200-second deadline.
 Only a true first install with absent database and no managed predecessor,
 installed binary/plist or loaded service omits the backup: private proof records
 `database_source: absent`, `backup: null`, with path absence rechecked before
@@ -341,3 +341,8 @@ helper commands are not recovery APIs.
 ## Path and recovery identity correction
 
 SQLite capacity, backup source and writer reservation use encoded file URIs. Regression fixtures include URI metacharacters and control characters in directory and database names, verify actual rows and writer exclusion, and reject missing sources without creating siblings. Preboundary predecessor recovery publishes and bootstraps the canonical plist so the loaded path satisfies the unchanged normal-restart same-file check. A composition regression executes the actual restart validator with mocked loaded-path inspection; it is not a live-launchd recovery/restart qualification. ADR-265 records the ordering correction and the original fixture blind spots.
+
+
+## Bounded verification budget adjustment
+
+The shared backup-verification limit is 1200 seconds; candidate migration remains 600 seconds. Exhaustive integrity, typed-row comparison, fsync, hashing and fail-closed recovery are unchanged. A production preboundary attempt exceeded 900 seconds while comparison was progressing: backup took 48.27 seconds and integrity 578.50 seconds, versus the prior successful 47.86/434.14-second phases and 361.44-second comparison. The 1200-second limit is a bounded operational allowance, not a guaranteed outage bound. Another timeout requires diagnosis rather than repeated increases. Historical measurements below/above retain their original budgets.
