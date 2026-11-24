@@ -95,7 +95,10 @@ impl std::io::Write for PhysicalCloseDiagnosticWriter {
             buffer.clear();
             buffer.extend_from_slice(&bytes[bytes.len() - LIMIT..]);
         } else {
-            let excess = buffer.len().saturating_add(bytes.len()).saturating_sub(LIMIT);
+            let excess = buffer
+                .len()
+                .saturating_add(bytes.len())
+                .saturating_sub(LIMIT);
             buffer.drain(..excess);
             buffer.extend_from_slice(bytes);
         }

@@ -1,5 +1,12 @@
 # Unified Close acceptance milestone
 
+## Integrated1497 terminal: behavior gates pass; hosted formatting correction requires fresh CI
+
+Exact head `1497af5a4cf221aa773cfd0c148df34eb61aa5b5` completed automatic Close Qualification **45477991582** with failure only at `Require exact source formatting`; frontend and specifications passed. All preceding behavior gates passed, including actual initial public production-detector retirement, captured-loss cleanup → explicit retry → reclaim → replay, and all four named causal Stop tests (each one passed/zero failed/zero ignored). Source-pinned artifacts retained under `/tmp/close-1497af5a4/artifacts/` establish both owner190 migrations, anchored/captured origin readers, permanent-member deletion regression, unified source-refusal tool regression and full DB/runtime/tool gates. The captured-loss success does not establish the cause of1068's refusal or justify a flake label.
+
+Broader PR CI **45478002370** failed its early Rust formatting gate, preventing downstream native lint/build qualification. The follow-up applies exactly the hosted four-hunk patch, independently reviewed: three line-wrap changes and one single-expression match-arm block simplification, without semantic change. No local formatter or executable validation is used. Fresh automatic exact-head Close and broader CI remain required; no merge-ready, installation or deployment claim is made. PR #1161 remains draft.
+
+
 ## Integrated1068 terminal: captured-loss retry refusal; diagnostic/lint candidate unqualified
 
 Exact head `1068c2da76f2c6886f89aca21ec5f71381b17d4d` completed automatic Close Qualification **45457483295** and broader PR CI **45457498208** with failure. Early source formatting passed. The actual public captured-loss clean retry failed with `storage_rejected`; its underlying assessment/admission cause remains unproven. Initial public production-detector retirement, all four causal Stop cases, and migrations passed on that head. Prior90ba behavior success does not establish that this refusal is a flake. Terminal logs and artifacts are retained under `/tmp/close-1068c2da7/`.

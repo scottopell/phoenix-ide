@@ -109,9 +109,7 @@ impl super::PreparedBashRetirement {
                 NativeBashSignalError::Expired => NativeBashRetirementError::DeadlineExpired,
                 error @ NativeBashSignalError::WrongPhase
                 | error @ NativeBashSignalError::NotStopped
-                | error @ NativeBashSignalError::Io(_) => {
-                    NativeBashRetirementError::Native(error)
-                }
+                | error @ NativeBashSignalError::Io(_) => NativeBashRetirementError::Native(error),
             })?
             .ok_or(NativeBashRetirementError::NoLiveLeader)?;
         if Instant::now() >= deadline {
@@ -217,10 +215,7 @@ impl NativeBashRetirement {
         let handle = Arc::clone(&self.handle);
         if handle.handle_id != self.target.handle_id
             || handle.launch_identity != self.target.launch_identity
-            || self
-                .registry_writer
-                .handles
-                .contains_key(&handle.handle_id)
+            || self.registry_writer.handles.contains_key(&handle.handle_id)
         {
             return Err(NativeBashRetirementError::OriginalMembershipMismatch);
         }

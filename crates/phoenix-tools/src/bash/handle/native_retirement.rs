@@ -146,10 +146,7 @@ impl Handle {
             };
             if supported != 0 {
                 let error = io::Error::last_os_error();
-                if matches!(
-                    error.raw_os_error(),
-                    Some(libc::EINVAL | libc::ENOSYS)
-                ) {
+                if matches!(error.raw_os_error(), Some(libc::EINVAL | libc::ENOSYS)) {
                     return Err(NativeBashSignalError::Unsupported);
                 }
                 return Err(NativeBashSignalError::Io(error));
