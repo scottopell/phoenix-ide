@@ -245,73 +245,217 @@ export async function qualifyDesktopPlacement({ page, out, version }) {
   const dialog = page.locator('.coordinator-question-dock__dialog');
   const panel = page.locator('.coordinator-question-dock .question-panel');
   const dock = page.locator('.coordinator-question-dock');
-  const frames = () => page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
-  const geometry = () => page.evaluate(() => {
-    const rect = el => { const r = el.getBoundingClientRect(); return { x:r.x,y:r.y,width:r.width,height:r.height,bottom:r.bottom }; };
-    const dock = document.querySelector('.coordinator-question-dock');
-    const dialog = dock.querySelector('dialog');
-    const meta = dock.querySelector('.coordinator-question-dock__meta');
-    const messages = document.querySelector('#messages');
-    return { dock:rect(dock), dialog:rect(dialog), meta:rect(meta), dockScrollTop:dock.scrollTop, windowScrollY:scrollY, transcriptScrollTop:messages?.scrollTop, modal:dialog.matches(':modal'), activeClass:document.activeElement?.className };
-  });
-  await page.waitForFunction(() => document.activeElement?.matches('.coordinator-question-dock .question-panel'));
-  await frames();
-  const initial = await geometry();
-  await fs.writeFile(`${out}/${version}-desktop-placement-initial.json`,JSON.stringify(initial,null,2));
-  await page.screenshot({path:`${out}/${version}-desktop-placement-initial.png`});
-  const headerInitiallyClipped = initial.meta.y < initial.dock.y - 1;
-  if (version === 'candidate') {
-    assert.equal(headerInitiallyClipped,false);
-    assert.ok(initial.dialog.y >= -1);
-    assert.equal(initial.dockScrollTop,0);
-  }
-  // Intended dock scrolling must expose both the metadata and the final controls.
-  await dock.evaluate(el => {el.scrollTop=0;});
-  assert.ok(await page.locator('.coordinator-question-dock__meta').evaluate(el=>el.getBoundingClientRect().y>=0));
-  const first = panel.locator('.question-option').first();
-  await first.click();
-  const custom = panel.getByRole('textbox',{name:'Write a custom answer'});
-  await custom.fill('placement preserved answer');
+  const meta = dock.locator('.coordinator-question-dock__meta');
+  const custom = panel.getByRole('textbox', { name: 'Write a custom answer' });
   const composer = page.locator('#message-input');
-  await composer.fill('placement preserved composer draft');
-  await page.setViewportSize({width:393,height:852});
-  await frames();
-  await page.locator('#messages').evaluate(el => {el.scrollTop=10000;});
-  const settledTranscriptScroll = () => page.locator('#messages').evaluate(el => new Promise((resolve,reject)=>{let last=el.scrollTop,stable=0,count=0;const tick=()=>{const current=el.scrollTop;stable=Math.abs(current-last)<.5?stable+1:0;last=current;if(stable>=5)resolve(current);else if(++count>120)reject(new Error('Transcript scroll not settled'));else requestAnimationFrame(tick);};requestAnimationFrame(tick);}));
-  const transcriptScroll = await settledTranscriptScroll();
-  await page.getByRole('button',{name:'Return to conversation'}).click();
-  const launcher=page.getByRole('button',{name:/Answer Ember/});
-  await page.waitForFunction(() => document.activeElement?.matches('.coordinator-question-dock__launcher'));
-  await launcher.click();
-  await page.waitForFunction(() => document.activeElement?.matches('.coordinator-question-dock .question-panel'));
-  await frames();
-  const reopened=await geometry();
-  if(version==='candidate') assert.ok(reopened.dialog.y>=0);
-  assert.equal(await custom.inputValue(),'placement preserved answer');
-  assert.equal(await composer.inputValue(),'placement preserved composer draft');
-  assert.equal(await settledTranscriptScroll(),transcriptScroll);
-  const transitions=[];
-  for(const viewport of [{width:393,height:852},{width:1280,height:720}]) {
-    await page.setViewportSize(viewport);
-    await frames();
-    assert.equal(await dialog.evaluate(el=>el.open),true);
-    await page.waitForFunction(() => document.activeElement?.matches('.coordinator-question-dock .question-panel'));
-    const g=await geometry();transitions.push({viewport,...g});
-    assert.equal(g.modal,viewport.width===393);
-    assert.equal(await custom.inputValue(),'placement preserved answer');
-    if(version==='candidate') {
-      assert.ok(g.meta.y>=g.dock.y-1);
-      assert.ok(g.dialog.y>=-1);
+  const transcript = page.locator('#messages');
+  const frames = () => page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+  // Intersect each clipping axis with its ancestor's client box. A native modal
+  // escapes its DOM ancestors' clips, but not clips inside the top-layer dialog.
+  const bounds = locator => locator.evaluate(el => {
+    const rect = node => { const r = node.getBoundingClientRect(); return { x: r.x, y: r.y, left: r.left, top: r.top, right: r.right, bottom: r.bottom, width: r.width, height: r.height }; };
+    const r = rect(el);
+    const clip = { left: 0, top: 0, right: innerWidth, bottom: innerHeight };
+    const clips = [];
+    const modal = el.closest('dialog:modal');
+    for (let ancestor = el.parentElement; ancestor; ancestor = ancestor.parentElement) {
+      const style = getComputedStyle(ancestor), a = rect(ancestor);
+      const x = /^(auto|scroll|hidden|clip)$/.test(style.overflowX);
+      const y = /^(auto|scroll|hidden|clip)$/.test(style.overflowY);
+      if (x || y) {
+        const client = { left: a.left + ancestor.clientLeft, top: a.top + ancestor.clientTop };
+        client.right = client.left + ancestor.clientWidth;
+        client.bottom = client.top + ancestor.clientHeight;
+        if (x) { clip.left = Math.max(clip.left, client.left); clip.right = Math.min(clip.right, client.right); }
+        if (y) { clip.top = Math.max(clip.top, client.top); clip.bottom = Math.min(clip.bottom, client.bottom); }
+        clips.push({ className: ancestor.className, x, y, client });
+      }
+      if (ancestor === modal) break;
     }
+    const fullyVisible = r.width > 0 && r.height > 0 && r.left >= clip.left - 1 && r.right <= clip.right + 1 && r.top >= clip.top - 1 && r.bottom <= clip.bottom + 1;
+    const points = [[.5, .5], [.2, .2], [.8, .8]].map(([x, y]) => {
+      const px = r.left + r.width * x, py = r.top + r.height * y;
+      return { x: px, y: py, hit: el.contains(document.elementFromPoint(px, py)) };
+    });
+    return { rect: r, clip, clips, fullyVisible, points, hit: fullyVisible && points.every(point => point.hit) };
+  });
+  const geometry = async () => ({
+    meta: await bounds(meta),
+    ...await dialog.evaluate(el => {
+      const r = el.getBoundingClientRect(), dock = el.closest('.coordinator-question-dock');
+      return { dialog: { x: r.x, y: r.y, bottom: r.bottom, width: r.width, height: r.height }, modal: el.matches(':modal'), dockScrollTop: dock.scrollTop, windowScrollY: scrollY, transcriptScrollTop: document.querySelector('#messages')?.scrollTop, activeClass: document.activeElement?.className };
+    }),
+  });
+  const top = async () => {
+    await dock.evaluate(el => {
+      const modal = el.querySelector('dialog:modal');
+      for (const node of [el, ...el.querySelectorAll('*')]) {
+        if (modal && !modal.contains(node)) continue;
+        if (/(auto|scroll)/.test(getComputedStyle(node).overflowY)) node.scrollTop = 0;
+      }
+    });
+    await frames();
+  };
+  // Scroll only the question's intended scroll containers, not the document or
+  // background transcript. Sample before Playwright click can auto-scroll it.
+  const reveal = async locator => {
+    await locator.evaluate(el => {
+      const boundary = el.closest('dialog:modal') ?? el.closest('.coordinator-question-dock');
+      for (let ancestor = el.parentElement; ancestor; ancestor = ancestor.parentElement) {
+        if (/(auto|scroll)/.test(getComputedStyle(ancestor).overflowY) && ancestor.scrollHeight > ancestor.clientHeight) {
+          const r = el.getBoundingClientRect(), a = ancestor.getBoundingClientRect();
+          ancestor.scrollTop += (r.top + r.bottom) / 2 - (a.top + ancestor.clientTop + ancestor.clientHeight / 2);
+        }
+        if (ancestor === boundary) break;
+      }
+    });
+    await frames();
+    const result = await bounds(locator);
+    assert.equal(result.hit, true, `Control must be fully visible and hit-testable: ${JSON.stringify(result)}`);
+    return result;
+  };
+  const actionBounds = async () => {
+    const results = [];
+    for (const button of await panel.locator('.question-actions button:visible').all()) {
+      results.push({ text: await button.innerText(), ...await reveal(button) });
+    }
+    assert.ok(results.length > 0, 'Expected question action buttons');
+    return results;
+  };
+  const retained = async () => {
+    assert.equal(await custom.inputValue(), 'placement preserved answer');
+    assert.equal(await composer.inputValue(), 'placement preserved composer draft');
+  };
+  const mutations = [];
+  const recordMutation = req => {
+    if (req.method() === 'POST' && /\/api\/coordinator\/questions\/[^/]+\/(answer|dismiss)$/.test(new URL(req.url()).pathname)) mutations.push(req.url());
+  };
+  page.on('request', recordMutation);
+  try {
+    await page.waitForFunction(() => document.activeElement?.matches('.coordinator-question-dock .question-panel'));
+    await frames();
+    // Capture the untouched opening before any scroll, fill, or repair.
+    const initial = await geometry();
+    await fs.writeFile(`${out}/${version}-desktop-placement-initial.json`, JSON.stringify(initial, null, 2));
+    await page.screenshot({ animations: 'disabled', path: `${out}/${version}-desktop-placement-initial.png` });
+    assert.equal(initial.meta.fullyVisible, version !== 'baseline', 'Same full-metadata oracle must reject the known clipped baseline and accept candidate opening');
+    if (version === 'candidate') assert.equal(initial.dockScrollTop, 0);
+    await top();
+    assert.equal((await bounds(meta)).fullyVisible, true, 'Full metadata must be visible at intended scroll top');
+    const first = panel.locator('.question-option').first();
+    const desktopOption = await reveal(first);
+    await first.click();
+    await custom.fill('placement preserved answer');
+    await composer.fill('placement preserved composer draft');
+    const desktopActions = await actionBounds();
+    await top();
+
+    await page.setViewportSize({ width: 393, height: 852 });
+    await frames();
+    await page.getByRole('button', { name: 'Return to conversation' }).click();
+    const launcher = page.getByRole('button', { name: /Answer Ember/ });
+    await page.waitForFunction(() => document.activeElement?.matches('.coordinator-question-dock__launcher'));
+    // Establish an interior reading position only while the mobile transcript is
+    // accessible. No comparison of raw scroll pixels across viewport changes.
+    await transcript.hover();
+    await page.mouse.wheel(0, 100000);
+    await page.waitForFunction(() => {
+      const el = document.querySelector('#messages');
+      return el && el.scrollHeight - el.clientHeight - el.scrollTop < 2;
+    });
+    await page.mouse.wheel(0, -400);
+    await page.waitForFunction(() => {
+      const el = document.querySelector('#messages');
+      return el && el.scrollTop > 0 && el.scrollHeight - el.clientHeight - el.scrollTop > 100;
+    });
+    const settledTranscriptScroll = () => transcript.evaluate(el => new Promise((resolve, reject) => {
+      let last = el.scrollTop, stable = 0, count = 0;
+      const tick = () => {
+        const current = el.scrollTop;
+        stable = Math.abs(current - last) < .5 ? stable + 1 : 0;
+        last = current;
+        if (stable >= 5) resolve(current);
+        else if (++count > 120) reject(new Error('Transcript scroll not settled'));
+        else requestAnimationFrame(tick);
+      };
+      requestAnimationFrame(tick);
+    }));
+    const transcriptScroll = await settledTranscriptScroll();
+    assert.equal(await transcript.evaluate(el => el.scrollTop > 0 && el.scrollHeight - el.clientHeight - el.scrollTop > 100), true, 'Reading position must remain interior after settling');
+    await launcher.click();
+    await page.waitForFunction(() => document.activeElement?.matches('.coordinator-question-dock .question-panel'));
+    const reopenedImmediate = await transcript.evaluate(el => el.scrollTop);
+    assert.ok(Math.abs(reopenedImmediate - transcriptScroll) <= 2, 'Reopen immediately moved reading position within mobile viewport');
+    const reopenedScroll = await settledTranscriptScroll();
+    assert.ok(Math.abs(reopenedScroll - transcriptScroll) <= 2, 'Reopen moved reading position within mobile viewport');
+    await retained();
+    const reopened = await geometry();
+    if (version === 'candidate') assert.equal(reopened.meta.fullyVisible, true, 'Reopen must reveal full metadata before repairs');
+    await page.getByRole('button', { name: 'Return to conversation' }).click();
+    await page.waitForFunction(() => document.activeElement?.matches('.coordinator-question-dock__launcher'));
+    const returnedImmediate = await transcript.evaluate(el => el.scrollTop);
+    assert.ok(Math.abs(returnedImmediate - transcriptScroll) <= 2, 'Return immediately moved reading position within mobile viewport');
+    const returnedScroll = await settledTranscriptScroll();
+    assert.ok(Math.abs(returnedScroll - transcriptScroll) <= 2, 'Return moved reading position within mobile viewport');
+    await retained();
+    await launcher.click();
+    await page.waitForFunction(() => document.activeElement?.matches('.coordinator-question-dock .question-panel'));
+    await top();
+    const transitions = [];
+    let secondStepAnswered = false;
+    for (const viewport of [{ width: 393, height: 852 }, { width: 768, height: 852 }, { width: 769, height: 852 }, { width: 768, height: 852 }, { width: 1280, height: 720 }]) {
+      await page.setViewportSize(viewport);
+      await frames();
+      assert.equal(await dialog.evaluate(el => el.open), true);
+      await page.waitForFunction(() => document.activeElement?.matches('.coordinator-question-dock .question-panel'));
+      const opening = await geometry();
+      assert.equal(opening.modal, viewport.width <= 768);
+      if (version === 'candidate') assert.equal(opening.meta.fullyVisible, true, 'Candidate transition must reveal full metadata without repairs');
+      await retained();
+      await top();
+      const atTop = await bounds(meta);
+      assert.equal(atTop.fullyVisible, true, 'Full metadata at scroll top');
+      const option = await reveal(first);
+      const actions = await actionBounds();
+      await page.screenshot({ animations: 'disabled', path: `${out}/${version}-desktop-placement-${viewport.width}x${viewport.height}-actions.png` });
+      // Next/Back exercise the browser UI's focus/scroll reveal, not feed setters
+      // or answer endpoints. Preserve both steps' answers on the round trip.
+      const next = panel.getByRole('button', { name: 'Next', exact: true });
+      let stepRoundTrip = null;
+      if (await next.count()) {
+        await reveal(next);
+        await next.click();
+        await frames();
+        const nextOpening = await geometry();
+        const nextOption = panel.locator('.question-option').first();
+        const nextOptionBounds = await reveal(nextOption);
+        if (secondStepAnswered) assert.equal(await nextOption.evaluate(el => el.classList.contains('selected')), true, 'Second-step answer must survive Back/Next and resize');
+        else {
+          await nextOption.click();
+          assert.equal(await nextOption.evaluate(el => el.classList.contains('selected')), true);
+          secondStepAnswered = true;
+        }
+        const nextActions = await actionBounds();
+        const back = panel.getByRole('button', { name: 'Back', exact: true });
+        await reveal(back);
+        await back.click();
+        await frames();
+        const backOpening = await geometry();
+        await retained();
+        const backOption = await reveal(first);
+        stepRoundTrip = { nextOpening, nextOption: nextOptionBounds, nextActions, backOpening, backOption };
+      }
+      transitions.push({ viewport, opening, atTop, option, actions, stepRoundTrip });
+      // Start the next resize from an intentional top position, not the action
+      // scroll used above; a retained user scroll is not an opening defect.
+      await top();
+    }
+    assert.deepEqual(mutations, [], 'Placement, Return, reopen, and Next/Back must not answer or dismiss');
+    await fs.writeFile(`${out}/${version}-desktop-placement.json`, JSON.stringify({ initial, headerInitiallyClipped: !initial.meta.fullyVisible, desktopOption, desktopActions, reopened, transitions, readingPosition: { viewport: { width: 393, height: 852 }, before: transcriptScroll, reopenedImmediate, reopened: reopenedScroll, returnedImmediate, returned: returnedScroll }, answersAndDraftPreserved: true, launcherFocusRestored: true, mutations, limitations: ['Hosted Chromium, not a real mobile device or OS keyboard.', 'Reading-position assertions apply only to reopen/Return within one unchanged mobile viewport, not cross-viewport pixels.'] }, null, 2));
+    await composer.fill('');
+    await page.setViewportSize({ width: 1280, height: 900 });
+    await frames();
+  } finally {
+    page.off('request', recordMutation);
   }
-  await dock.evaluate(el=>{el.scrollTop=el.scrollHeight;});
-  const actions=panel.locator('.question-actions');
-  assert.ok(await actions.evaluate(el=>{const r=el.getBoundingClientRect(),d=el.closest('.coordinator-question-dock').getBoundingClientRect();return r.y>=Math.max(0,d.y)-1&&r.bottom<=Math.min(innerHeight,d.bottom)+1;}));
-  await page.screenshot({path:`${out}/${version}-desktop-placement-actions.png`});
-  await dock.evaluate(el=>{el.scrollTop=0;});
-  await page.screenshot({path:`${out}/${version}-desktop-placement-resized.png`});
-  await composer.fill('');
-  await page.setViewportSize({width:1280,height:900});
-  await frames();
-  await fs.writeFile(`${out}/${version}-desktop-placement.json`,JSON.stringify({initial,headerInitiallyClipped,reopened,transitions,transcriptScroll,answersAndDraftPreserved:true,launcherFocusRestored:true},null,2));
 }

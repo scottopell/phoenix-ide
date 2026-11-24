@@ -153,6 +153,10 @@ describe('QuestionPanel focus lifecycle', () => {
 
     focus.mockClear();
     view.rerender(content(undefined, false));
+    screen.getByRole('button', { name: 'Outside' }).focus();
+    flushFrame();
+    expect(focus).not.toHaveBeenCalled();
+    expect(screen.getByRole('button', { name: 'Outside' })).toHaveFocus();
     view.rerender(content(undefined, true));
     flushFrame();
     expect(focus).toHaveBeenLastCalledWith({ preventScroll: true });

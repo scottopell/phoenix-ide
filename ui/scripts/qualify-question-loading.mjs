@@ -202,7 +202,7 @@ async function trial(version, base, viewport, mode, run, isolation = false, read
     if (viewport.width === 1280) {
       await page.getByText(marker, {exact:true}).waitFor({state:'visible',timeout:45000});
       await qualifyDesktopPlacement({ page, out, version });
-    }
+    } else {
     const automatic = panel.locator('.question-option').filter({ hasText: 'Automatic' }).first();
     await automatic.click();
     if (!await automatic.evaluate(el => el.classList.contains('selected'))) throw new Error('Option click did not update selection');
@@ -248,6 +248,7 @@ async function trial(version, base, viewport, mode, run, isolation = false, read
         setQuestions: next => { pendingQuestions = next; },
         setAnswerError: value => { answerError = value; },
       });
+    }
     }
     for (const request of requests.values()) {
       if (request.response_ms < request.started_ms || request.completed_ms < request.started_ms || request.completed_ms < request.response_ms) {
