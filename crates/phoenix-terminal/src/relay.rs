@@ -223,8 +223,10 @@ where
         on_resize,
         stop_rx,
         retirement_requested,
-        ws_closed,
-        writer_outcome,
+        WriterCompletion {
+            ws_closed,
+            writer_outcome,
+        },
         conv_id,
     );
 
@@ -311,19 +313,28 @@ where
     }
 }
 
+/// Shared exit publication and reader wakeup for the writer.
+struct WriterCompletion {
+    ws_closed: Arc<tokio::sync::Notify>,
+    writer_outcome: Arc<Mutex<Option<RelayExit>>>,
+}
+
 async fn relay_writer<W>(
     mut pty_write: W,
     mut ws_incoming: impl futures::Stream<Item = Vec<u8>> + Unpin,
     on_resize: impl Fn(Dims),
     mut stop_rx: tokio::sync::watch::Receiver<StopReason>,
     retirement_requested: TerminalRetirementRequest,
-    ws_closed: Arc<tokio::sync::Notify>,
-    writer_outcome: Arc<Mutex<Option<RelayExit>>>,
+    completion: WriterCompletion,
     conv_id: &str,
 ) -> RelayExit
 where
     W: AsyncWrite + Unpin,
 {
+    let WriterCompletion {
+        ws_closed,
+        writer_outcome,
+    } = completion;
     // Publish our exit reason to the shared slot, wake the reader, and
     // return. Must be called immediately before returning so the reader
     // sees our reason if the select races to the reader first.

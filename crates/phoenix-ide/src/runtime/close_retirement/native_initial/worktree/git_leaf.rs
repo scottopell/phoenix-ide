@@ -20,6 +20,7 @@ use super::{
 /// The revalidator runs both before SQLite admission and inside the admitted
 /// spawn callback, so a preflight-only submodule check is not sufficient.
 pub(super) enum GitLeafTarget<'a> {
+    #[cfg(test)]
     CapturedRoot,
     RetainedRoot(&'a RetainedRootLocation),
     // Native nested-target wiring is deliberately separate from this adapter.
@@ -198,7 +199,9 @@ impl GitLeafTarget<'_> {
     fn validate_binding(&self, owner: &NativeWorktreeGit) -> Result<(), String> {
         match self {
             Self::RetainedRoot(location) => location.validate(owner),
-            Self::CapturedRoot | Self::RevalidateTarget(_) => validate_root(owner),
+            #[cfg(test)]
+            Self::CapturedRoot => validate_root(owner),
+            Self::RevalidateTarget(_) => validate_root(owner),
         }
     }
 
@@ -212,6 +215,7 @@ impl GitLeafTarget<'_> {
             return Err("native Worktree Git leaf requires a prepared Git command".into());
         }
         match self {
+            #[cfg(test)]
             Self::CapturedRoot => validate_root_command(
                 command,
                 &owner.prepared.inspection_path,
@@ -605,6 +609,7 @@ fn validate_root_command(
     Err("Git leaf has no operation".into())
 }
 
+#[cfg(test)]
 pub(super) fn require_success(output: Output, operation: &str) -> Result<Output, String> {
     if !output.status.success() {
         let detail = String::from_utf8_lossy(&output.stderr);

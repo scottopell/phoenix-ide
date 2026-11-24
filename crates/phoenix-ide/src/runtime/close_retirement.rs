@@ -39,11 +39,10 @@ use phoenix_tools::{
 use super::creation_worker::RepositoryMutationLock;
 use super::RuntimeManager;
 use crate::db::{
-    AdmitCloseSafeRetryRequest, BindCloseWorktreeFinalTombstoneObjectRequest,
-    BindCloseWorktreeFinalTombstoneRequest, CaptureCloseRetirementInventoryRequest,
-    CaptureCloseRetirementInventoryScopeRequest, CloseCleanupFailureAuthority,
-    CloseCleanupFailureResource, CloseCleanupResourceDisposition, CloseProcessResourceKind,
-    CloseProcessStepOutcome, CloseProcessStepSuccess, CloseRetryRequestedBy, CloseSafeRetryEffect,
+    BindCloseWorktreeFinalTombstoneObjectRequest, BindCloseWorktreeFinalTombstoneRequest,
+    CaptureCloseRetirementInventoryRequest, CaptureCloseRetirementInventoryScopeRequest,
+    CloseCleanupFailureAuthority, CloseCleanupFailureResource, CloseCleanupResourceDisposition,
+    CloseProcessResourceKind, CloseProcessStepOutcome, CloseProcessStepSuccess, CloseSafeRetryEffect,
     CloseWorktreeFinalTombstone, RecordCloseRetirementDispatchRequest,
     RecordCloseRetirementEvidenceRequest, RecordCloseWorktreeCleanupPlanRequest,
     ReplaceCloseInspectionRequest, ReplaceCloseInspectionScopeRequest,
@@ -289,7 +288,6 @@ impl std::fmt::Display for CloseLeaseFailure {
 }
 
 /// Read-only candidate assessment, not admission, dispatch, or completion authority.
-#[allow(dead_code)]
 #[derive(Debug)]
 pub(crate) struct NativeCloseRetryAssessment {
     pub original: StoppedCloseOriginalRetirementProof,
@@ -297,18 +295,11 @@ pub(crate) struct NativeCloseRetryAssessment {
     pub safety_evidence: String,
 }
 
-#[derive(Clone, Copy)]
-enum CloseRetryReceiptSource {
-    GenericRetryHistory,
-    OriginalSnapshotOnly,
-}
-
 struct CloseRetryLiveEvidence<'a> {
     scopes: &'a [CloseAttemptScope],
     expected: &'a [CloseExpectedRetirementResource],
     worktree_snapshots: &'a [(CloseRetirementTarget, CloseRetirementSnapshot)],
     retired: &'a [CloseRetiredResource],
-    receipt_source: CloseRetryReceiptSource,
 }
 
 #[allow(clippy::too_many_lines)]
@@ -901,11 +892,6 @@ impl CloseProcessStepExecutor for LiveCloseProcessStepExecutor<'_> {
             outcome,
         })
     }
-}
-
-enum CloseSafeRetryTmuxError {
-    Failed(String),
-    PersistenceOrUncertain(String),
 }
 
 fn close_safe_retry_effect_rank(effect: &CloseSafeRetryEffect) -> u8 {
@@ -1924,97 +1910,7 @@ impl RuntimeManager {
         Ok(())
     }
 
-    /// Explicit Global-only safe retry; callers must never use this as startup recovery.
-    #[allow(clippy::too_many_lines)]
-    pub async fn retry_close_runtime_resources(
-        &self,
-        failed_run: CloseRunRef,
-    ) -> Result<(), String> {
-        let attempt_id = failed_run.attempt_id.clone();
-        let _execution = self
-            .close_retirement_execution
-            .lock(attempt_id.as_str())
-            .await;
-        let failure = self
-            .db()
-            .list_close_cleanup_failures(attempt_id.as_str())
-            .await
-            .map_err(|error| error.to_string())?
-            .into_iter()
-            .find(|failure| failure.run_ordinal == failed_run.ordinal)
-            .ok_or_else(|| {
-                format!(
-                    "Close run {} has no exact retained failure",
-                    failed_run.ordinal.get()
-                )
-            })?;
-        let completion_only = matches!(
-            failure.occurrence.authority,
-            CloseCleanupFailureAuthority::AttemptInterrupted
-        );
-        let plan = if completion_only {
-            if !self
-                .db()
-                .close_retry_verified_completion_eligible(&failed_run)
-                .await
-                .map_err(|error| error.to_string())?
-            {
-                return Err(
-                    "attempt-level interruption has no verified completion authority".into(),
-                );
-            }
-            Vec::new()
-        } else {
-            close_safe_retry_effects(&failure.occurrence.remaining_resources)?
-        };
-        let snapshot = self
-            .db()
-            .get_close_obligation(attempt_id.as_str())
-            .await
-            .map_err(|error| error.to_string())?
-            .snapshot()
-            .cloned()
-            .ok_or_else(|| "safe retry lacks original retirement snapshot".to_string())?;
-        let evidence = if completion_only {
-            "prior resource-plan run has exact durable success for every planned effect; this fresh run performs completion only".to_string()
-        } else {
-            self.validate_close_safe_retry(&attempt_id, &snapshot, &plan)
-                .await?
-        };
-        let request = AdmitCloseSafeRetryRequest {
-            failed_run,
-            requested_by: CloseRetryRequestedBy::Global,
-            observed_at_us: chrono::Utc::now().timestamp_micros(),
-            precondition_resolution: format!("fresh read-only exact resource checks: {evidence}"),
-            safety_evidence: evidence,
-            remaining_effects: plan,
-        };
-        let run = self
-            .db()
-            .admit_close_safe_retry(&request)
-            .await
-            .map_err(|error| error.to_string())?;
-        let plan = self
-            .db()
-            .list_close_safe_retry_effects(&run)
-            .await
-            .map_err(|error| error.to_string())?;
-        if !plan.is_empty() {
-            self.execute_close_safe_retry(&run, &snapshot, &plan)
-                .await?;
-        }
-        let broadcasters = self.close_retirement_broadcasters(&attempt_id).await?;
-        self.db()
-            .complete_close_safe_retry(&run)
-            .await
-            .map_err(|error| error.to_string())?;
-        self.discard_close_resource_leases(&attempt_id).await;
-        Self::publish_close_retirement_updates(broadcasters, true);
-        Ok(())
-    }
-
     /// Assesses an exact stopped native operation without admitting or executing a successor.
-    #[allow(dead_code)]
     pub(crate) async fn assess_native_close_retry(
         &self,
         failed_run: &CloseRunRef,
@@ -2038,7 +1934,6 @@ impl RuntimeManager {
                     expected: &original.resources,
                     worktree_snapshots: &worktree_snapshots,
                     retired: &original.outcomes,
-                    receipt_source: CloseRetryReceiptSource::OriginalSnapshotOnly,
                 },
             )
             .await?;
@@ -2047,51 +1942,6 @@ impl RuntimeManager {
             remaining_effects,
             safety_evidence,
         })
-    }
-
-    async fn validate_close_safe_retry(
-        &self,
-        attempt_id: &CloseAttemptId,
-        snapshot: &CloseRetirementSnapshot,
-        plan: &[CloseSafeRetryEffect],
-    ) -> Result<String, String> {
-        let scopes = self
-            .db()
-            .list_close_attempt_scopes(attempt_id.as_str())
-            .await
-            .map_err(|error| error.to_string())?;
-        let expected = self
-            .db()
-            .list_close_expected_retirement_resources(attempt_id.as_str())
-            .await
-            .map_err(|error| error.to_string())?;
-        let inspections = self
-            .db()
-            .list_close_retirement_inspections(attempt_id.as_str())
-            .await
-            .map_err(|error| error.to_string())?;
-        let worktree_snapshots = inspections
-            .iter()
-            .map(|inspection| (inspection.target.clone(), inspection.snapshot.clone()))
-            .collect::<Vec<_>>();
-        let retired = self
-            .db()
-            .list_close_retirement_evidence(attempt_id.as_str())
-            .await
-            .map_err(|error| error.to_string())?;
-        self.validate_close_safe_retry_with_evidence(
-            attempt_id,
-            snapshot,
-            plan,
-            CloseRetryLiveEvidence {
-                scopes: &scopes,
-                expected: &expected,
-                worktree_snapshots: &worktree_snapshots,
-                retired: &retired,
-                receipt_source: CloseRetryReceiptSource::GenericRetryHistory,
-            },
-        )
-        .await
     }
 
     #[allow(clippy::too_many_lines)]
@@ -2107,7 +1957,6 @@ impl RuntimeManager {
             expected,
             worktree_snapshots,
             retired,
-            receipt_source,
         } = evidence;
         for effect in plan {
             if !expected
@@ -2249,14 +2098,7 @@ impl RuntimeManager {
                                     RetirementOutcome::Retired
                                         | RetirementOutcome::AbsenceAdopted { .. }
                                 )
-                        }) || (matches!(
-                            receipt_source,
-                            CloseRetryReceiptSource::GenericRetryHistory
-                        ) && self
-                            .db()
-                            .close_resource_has_retry_success(attempt_id, scope, &target.resource)
-                            .await
-                            .map_err(|error| error.to_string())?);
+                        });
                         let dispatched = self
                             .db()
                             .close_retirement_resource_was_dispatched(
@@ -2381,218 +2223,6 @@ impl RuntimeManager {
             return Err("safe retry has no verifiable scope observations".into());
         }
         Ok(observations.join("; "))
-    }
-
-    async fn execute_close_safe_retry(
-        &self,
-        run: &CloseRunRef,
-        snapshot: &CloseRetirementSnapshot,
-        plan: &[CloseSafeRetryEffect],
-    ) -> Result<(), String> {
-        for index in close_safe_retry_execution_order(plan) {
-            let effect = &plan[index];
-            if effect.resource.kind() != RetiredResourceKind::TmuxServer {
-                continue;
-            }
-            match self.retry_close_tmux(run, snapshot, effect).await {
-                Ok(()) => {}
-                Err(CloseSafeRetryTmuxError::Failed(detail)) => {
-                    return self
-                        .terminalize_close_safe_retry_failure(run, snapshot, effect, &detail)
-                        .await;
-                }
-                Err(CloseSafeRetryTmuxError::PersistenceOrUncertain(detail)) => {
-                    return Err(format!(
-                        "retry tmux effect may have completed but exact success was not durably established; startup observation will classify the still-running run: {detail}"
-                    ));
-                }
-            }
-        }
-        let durable_plan = plan
-            .iter()
-            .filter(|effect| {
-                matches!(
-                    effect.resource.kind(),
-                    RetiredResourceKind::Worktree | RetiredResourceKind::WorkScope
-                )
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        if durable_plan.is_empty() {
-            return Ok(());
-        }
-        if let Err(detail) = self
-            .retire_close_worktrees_and_scopes(run, snapshot, Some(&durable_plan))
-            .await
-        {
-            let retained = self
-                .db()
-                .get_close_run(run)
-                .await
-                .map_err(|error| error.to_string())?;
-            if retained.status == CloseRunStatus::Running {
-                return Err(format!(
-                    "retry execution stopped before further effects; startup observation will classify the still-running exact run: {detail}"
-                ));
-            }
-            return Err(detail);
-        }
-        Ok(())
-    }
-
-    #[allow(clippy::too_many_lines)]
-    async fn retry_close_tmux(
-        &self,
-        run: &CloseRunRef,
-        snapshot: &CloseRetirementSnapshot,
-        effect: &CloseSafeRetryEffect,
-    ) -> Result<(), CloseSafeRetryTmuxError> {
-        let LossItemIdentity::Opaque(value) = effect.resource.identity() else {
-            return Err(CloseSafeRetryTmuxError::Failed(
-                "tmux retry identity is not opaque".into(),
-            ));
-        };
-        let identity = TmuxServerInstanceIdentity::parse_stable_identity(value.as_str())
-            .ok_or_else(|| {
-                CloseSafeRetryTmuxError::Failed("tmux retry identity is malformed".to_string())
-            })?;
-        let key = ResourceScopeKey::Work(effect.scope.clone());
-        let captured = self
-            .db()
-            .list_close_attempt_scopes(run.attempt_id.as_str())
-            .await
-            .map_err(|error| CloseSafeRetryTmuxError::Failed(error.to_string()))?
-            .into_iter()
-            .find(|captured| captured.scope == effect.scope)
-            .ok_or_else(|| {
-                CloseSafeRetryTmuxError::Failed("tmux retry scope was not captured".to_string())
-            })?;
-        let legacy_path = match captured.captured_worktree {
-            Some(CapturedWorktreeIdentity::Resolved(id)) => Some(worktree_path(&id)),
-            _ => None,
-        };
-        let discovery = self
-            .tmux_registry()
-            .discover_persistent_identity(
-                &key,
-                legacy_path.as_deref(),
-                None,
-                phoenix_tools::tmux::registry::close_deadline(),
-            )
-            .await
-            .map_err(|error| CloseSafeRetryTmuxError::Failed(error.to_string()))?;
-        if !matches!(discovery, PersistentTmuxDiscovery::Exact(ref observed) if observed == &identity)
-            && !matches!(
-                discovery,
-                PersistentTmuxDiscovery::EndpointAbsent | PersistentTmuxDiscovery::ServerAbsent
-            )
-        {
-            return Err(CloseSafeRetryTmuxError::Failed(
-                "tmux retry discovery found an ambiguous or different server".into(),
-            ));
-        }
-        let rehydrated = self
-            .tmux_registry()
-            .rehydrate_retirement(
-                &key,
-                &identity,
-                phoenix_tools::tmux::registry::close_deadline(),
-            )
-            .await
-            .map_err(|error| CloseSafeRetryTmuxError::Failed(error.to_string()))?;
-        match rehydrated {
-            TmuxRetirementRehydration::Permit(permit) => {
-                let outcome = self
-                    .tmux_registry()
-                    .complete_retirement(&permit)
-                    .await
-                    .map_err(|error| {
-                        CloseSafeRetryTmuxError::PersistenceOrUncertain(error.to_string())
-                    })?;
-                match tmux_retirement_outcome(outcome) {
-                    Ok(RetirementOutcome::Retired) => self
-                        .record_close_retired(
-                            run,
-                            snapshot,
-                            &effect.scope,
-                            effect.resource.clone(),
-                            "exact retry tmux permit retirement",
-                        )
-                        .await
-                        .map_err(CloseSafeRetryTmuxError::PersistenceOrUncertain),
-                    Ok(RetirementOutcome::AbsenceAdopted { .. }) => self
-                        .record_close_absence_adopted(
-                            run,
-                            snapshot,
-                            &effect.scope,
-                            effect.resource.clone(),
-                            "exact retry tmux permit absence",
-                        )
-                        .await
-                        .map_err(CloseSafeRetryTmuxError::PersistenceOrUncertain),
-                    Ok(RetirementOutcome::Residual { .. }) => Err(CloseSafeRetryTmuxError::Failed(
-                        "tmux retry remains residual".into(),
-                    )),
-                    Err((_, detail)) => Err(CloseSafeRetryTmuxError::Failed(detail)),
-                }
-            }
-            TmuxRetirementRehydration::AbsenceVerified => self
-                .record_close_absence_adopted(
-                    run,
-                    snapshot,
-                    &effect.scope,
-                    effect.resource.clone(),
-                    "exact retry tmux absence",
-                )
-                .await
-                .map_err(CloseSafeRetryTmuxError::PersistenceOrUncertain),
-            TmuxRetirementRehydration::Residual { reason } => {
-                Err(CloseSafeRetryTmuxError::Failed(reason))
-            }
-        }
-    }
-
-    async fn terminalize_close_safe_retry_failure(
-        &self,
-        run: &CloseRunRef,
-        snapshot: &CloseRetirementSnapshot,
-        failed: &CloseSafeRetryEffect,
-        detail: &str,
-    ) -> Result<(), String> {
-        let progress = self
-            .db()
-            .close_safe_retry_progress(run)
-            .await
-            .map_err(|error| error.to_string())?;
-        if !progress.pending.contains(failed) {
-            return Err("retry failure is not a pending exact-run effect".into());
-        }
-        let remaining_resources = progress
-            .pending
-            .iter()
-            .map(|effect| CloseCleanupFailureResource {
-                scope: effect.scope.clone(),
-                resource: effect.resource.clone(),
-                disposition: if effect == failed {
-                    CloseCleanupResourceDisposition::Failed
-                } else {
-                    CloseCleanupResourceDisposition::Unattempted
-                },
-            })
-            .collect();
-        self.terminalize_close_cleanup_failure(
-            run,
-            CloseCleanupFailureAuthority::ExpectedResource {
-                scope: failed.scope.clone(),
-                snapshot: snapshot.clone(),
-                resource: failed.resource.clone(),
-            },
-            remaining_resources,
-            RetirementFailureReason::IdentityNotProven,
-            detail,
-            CloseStopCertainty::ShutdownUncertain,
-        )
-        .await
     }
 
     async fn validate_close_worktrees_before_runtime_retirement(
@@ -4127,7 +3757,6 @@ enum WorktreeInspectionPolicy {
 /// a status-only clean proof or a separate snapshot generation.
 /// Ignored content retains legacy snapshot semantics; deletion still needs the
 /// separate ignored-content guard and its own exact mutation authority.
-#[allow(dead_code)] // Prepared seam; native physical execution is not wired yet.
 fn inspect_worktree_at_with_git_leaf_until(
     identity: &WorktreeIdentity,
     path: &Path,
@@ -4734,15 +4363,6 @@ fn git_directory_for_worktree_until(
         .expect("exactly one candidate exists"))
 }
 
-fn capture_git_directory_bindings(
-    root: &Path,
-) -> Result<std::collections::BTreeMap<PathBuf, PathBuf>, String> {
-    capture_git_directory_bindings_until(
-        root,
-        std::time::Instant::now() + std::time::Duration::from_secs(10),
-    )
-}
-
 fn capture_git_directory_bindings_until(
     root: &Path,
     deadline: std::time::Instant,
@@ -4793,17 +4413,6 @@ fn capture_git_directory_bindings_with_leaf_until(
     Ok(bindings)
 }
 
-fn verify_git_directory_bindings(
-    root: &Path,
-    expected: &std::collections::BTreeMap<PathBuf, PathBuf>,
-) -> Result<(), String> {
-    verify_git_directory_bindings_until(
-        root,
-        expected,
-        std::time::Instant::now() + std::time::Duration::from_secs(10),
-    )
-}
-
 fn verify_git_directory_bindings_until(
     root: &Path,
     expected: &std::collections::BTreeMap<PathBuf, PathBuf>,
@@ -4850,6 +4459,7 @@ fn bind_git_command_to_worktree_until(
 type WorktreeGitLeaf<'a> = dyn FnMut(std::process::Command, std::time::Instant, &str) -> Result<std::process::Output, String>
     + 'a;
 
+#[cfg(test)]
 fn run_bounded_git_status_until(
     repository: &Path,
     deadline: std::time::Instant,
@@ -4925,23 +4535,6 @@ fn list_registered_worktrees_in_common_directory_with_leaf_until(
         deadline,
         "exact Worktree registration inspection",
         git_leaf,
-    )
-}
-
-fn run_bounded_git_command_until(
-    repository: &Path,
-    arguments: &[&str],
-    index: Option<&Path>,
-    deadline: std::time::Instant,
-    operation: &str,
-) -> Result<std::process::Output, String> {
-    run_bounded_git_command_with_leaf_until(
-        repository,
-        arguments,
-        index,
-        deadline,
-        operation,
-        &mut run_bounded_spawned_git,
     )
 }
 
@@ -6496,6 +6089,7 @@ where
     check_directory_deletion_deadline(deadline)
 }
 
+#[cfg(test)]
 fn reserve_private_tombstone(root: &Path, description: &str) -> Result<(), String> {
     reserve_private_tombstone_with_executor(
         root,
@@ -6546,19 +6140,7 @@ fn validate_private_tombstone_root(
     Ok(())
 }
 
-#[cfg(unix)]
-fn tombstone_identity(root: &Path) -> Result<(u64, u64), String> {
-    use std::os::unix::fs::MetadataExt as _;
-    let metadata = std::fs::symlink_metadata(root)
-        .map_err(|error| format!("cannot identify private final tombstone: {error}"))?;
-    validate_private_tombstone_root(
-        metadata.is_dir(),
-        metadata.uid(),
-        u64::from(metadata.mode()),
-    )?;
-    Ok((metadata.dev(), metadata.ino()))
-}
-
+#[cfg(test)]
 #[allow(
     clippy::cast_sign_loss,
     clippy::too_many_lines,
@@ -7592,13 +7174,7 @@ fn classify_fsmonitor_stop(output: &std::process::Output) -> Result<FsmonitorSto
     ))
 }
 
-fn stop_bound_fsmonitor_daemons(path: &Path) -> Result<FsmonitorStop, String> {
-    stop_bound_fsmonitor_daemons_until(
-        path,
-        std::time::Instant::now() + std::time::Duration::from_secs(5),
-    )
-}
-
+#[cfg(test)]
 fn stop_bound_fsmonitor_daemons_until(
     path: &Path,
     deadline: std::time::Instant,
@@ -7802,13 +7378,6 @@ impl CloseWriterProbe {
         check_directory_deletion_deadline(Some(deadline))?;
         Ok(evidence)
     }
-
-    fn retain(&self, evidence: ExternalWriterEvidence) -> Result<ExternalWriterEvidence, String> {
-        self.retain_until(
-            evidence,
-            std::time::Instant::now() + std::time::Duration::from_secs(30),
-        )
-    }
 }
 
 /// A single retry target's observed external-writer status, as seen by the
@@ -7946,14 +7515,7 @@ fn quarantine_has_external_writer(path: &Path) -> Result<ExternalWriterEvidence,
     )
 }
 
-#[cfg(target_os = "linux")]
-fn quarantine_has_writable_mappings(path: &Path) -> Result<ExternalWriterEvidence, String> {
-    // SAFETY: `geteuid` has no preconditions.
-    let effective_uid = unsafe { libc::geteuid() };
-    quarantine_has_writable_mappings_in(path, Path::new("/proc"), effective_uid)
-}
-
-#[cfg(target_os = "linux")]
+#[cfg(all(test, target_os = "linux"))]
 fn quarantine_has_writable_mappings_in(
     path: &Path,
     proc_root: &Path,
@@ -8020,14 +7582,6 @@ fn quarantine_has_writable_mappings_in_until(
             }
             Ok(None)
         },
-    )
-}
-
-#[cfg(target_os = "macos")]
-fn quarantine_has_writable_mappings(path: &Path) -> Result<ExternalWriterEvidence, String> {
-    quarantine_has_writable_mappings_mac_until(
-        path,
-        std::time::Instant::now() + std::time::Duration::from_secs(30),
     )
 }
 
@@ -8142,14 +7696,7 @@ fn quarantine_has_writable_mappings(_path: &Path) -> Result<ExternalWriterEviden
     Err("writable memory-mapping inspection is unsupported on this platform".to_string())
 }
 
-#[cfg(target_os = "linux")]
-fn quarantine_has_process_cwd(path: &Path) -> Result<ExternalWriterEvidence, String> {
-    // SAFETY: `geteuid` has no preconditions.
-    let effective_uid = unsafe { libc::geteuid() };
-    quarantine_has_process_cwd_in(path, Path::new("/proc"), effective_uid)
-}
-
-#[cfg(target_os = "linux")]
+#[cfg(all(test, target_os = "linux"))]
 fn quarantine_has_process_cwd_in(
     path: &Path,
     proc_root: &Path,
@@ -8194,13 +7741,6 @@ fn quarantine_has_process_cwd_in_until(
 }
 
 #[cfg(target_os = "macos")]
-fn macos_all_pids() -> Option<Vec<i32>> {
-    macos_all_pids_with(|buffer, buffer_bytes| unsafe {
-        libc::proc_listpids(1, 0, buffer, buffer_bytes)
-    })
-}
-
-#[cfg(target_os = "macos")]
 fn macos_all_pids_until(deadline: std::time::Instant) -> Result<Vec<i32>, WriterScanError> {
     macos_all_pids_with_until(
         |buffer, buffer_bytes| unsafe { libc::proc_listpids(1, 0, buffer, buffer_bytes) },
@@ -8208,7 +7748,7 @@ fn macos_all_pids_until(deadline: std::time::Instant) -> Result<Vec<i32>, Writer
     )
 }
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(test)]
 fn macos_all_pids_with(mut list: impl FnMut(*mut libc::c_void, i32) -> i32) -> Option<Vec<i32>> {
     macos_all_pids_with_until(
         &mut list,
@@ -8252,14 +7792,6 @@ fn macos_all_pids_with_until(
             .filter(|capacity| *capacity <= 1_048_576)
             .ok_or(WriterScanError::Gap(CloseWriterGap::Unavailable))?;
     }
-}
-
-#[cfg(target_os = "macos")]
-fn quarantine_has_process_cwd(path: &Path) -> Result<ExternalWriterEvidence, String> {
-    quarantine_has_process_cwd_mac_until(
-        path,
-        std::time::Instant::now() + std::time::Duration::from_secs(30),
-    )
 }
 
 #[cfg(target_os = "macos")]
@@ -8590,7 +8122,7 @@ fn linux_writer_process_until(
     })
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(test, target_os = "linux"))]
 fn linux_writer_scan(
     path: &Path,
     proc_root: &Path,
@@ -8825,12 +8357,7 @@ fn linux_fd_access(info: &str) -> Result<CloseDescriptorAccess, CloseWriterGap> 
     }
 }
 
-#[cfg(target_os = "linux")]
-fn quarantine_has_open_descriptors(path: &Path) -> Result<ExternalWriterEvidence, String> {
-    quarantine_has_open_descriptors_in(path, Path::new("/proc"))
-}
-
-#[cfg(target_os = "linux")]
+#[cfg(all(test, target_os = "linux"))]
 fn quarantine_has_open_descriptors_in(
     path: &Path,
     proc_root: &Path,
@@ -8840,7 +8367,7 @@ fn quarantine_has_open_descriptors_in(
     })
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(test, target_os = "linux"))]
 fn quarantine_has_open_descriptors_with_info_reader(
     path: &Path,
     proc_root: &Path,
@@ -8854,7 +8381,7 @@ fn quarantine_has_open_descriptors_with_info_reader(
     )
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(test, target_os = "linux"))]
 fn quarantine_has_open_descriptors_with_info_reader_until(
     path: &Path,
     proc_root: &Path,
@@ -9113,23 +8640,6 @@ fn stable_writer_observation(
 }
 
 #[cfg(target_os = "macos")]
-fn mac_writer_scan(
-    path: &Path,
-    detector: CloseWriterDetector,
-    mut inspect: impl FnMut(
-        libc::pid_t,
-        &Path,
-    ) -> Result<Option<(PathBuf, CloseWriterAuthority)>, CloseWriterGap>,
-) -> Result<ExternalWriterEvidence, String> {
-    mac_writer_scan_until(
-        path,
-        detector,
-        std::time::Instant::now() + std::time::Duration::from_secs(30),
-        |pid, canonical| inspect(pid, canonical).map_err(WriterScanError::from),
-    )
-}
-
-#[cfg(target_os = "macos")]
 fn mac_writer_scan_until(
     path: &Path,
     detector: CloseWriterDetector,
@@ -9353,14 +8863,6 @@ fn mac_inspect_open_descriptors_until(
     }
     writer_scan_check(deadline)?;
     Ok(None)
-}
-
-#[cfg(target_os = "macos")]
-fn quarantine_has_open_descriptors(path: &Path) -> Result<ExternalWriterEvidence, String> {
-    quarantine_has_open_descriptors_mac_until(
-        path,
-        std::time::Instant::now() + std::time::Duration::from_secs(30),
-    )
 }
 
 #[cfg(target_os = "macos")]
@@ -9624,9 +9126,9 @@ type ExternalWriterEffect =
 /// of launching the real fsmonitor shutdown or scanning the host `/proc`.
 ///
 /// Production always uses [`CloseWorktreeEffects::production`], whose fields are
-/// the real functions; there is no test-only global switch. The decision logic
-/// in [`quarantine_and_remove_exact_worktree_with_effects`] is identical whether
-/// the real or an injected adapter is supplied.
+/// the real functions; there is no test-only global switch. The shared decision
+/// logic in [`quarantine_and_remove_exact_worktree_with_repository_lock_until`]
+/// is identical whether the real or an injected adapter is supplied.
 pub(super) struct CloseWorktreeEffects {
     stop_fsmonitor: StopFsmonitorEffect,
     first_submodule_spawn_admission: Option<SubmoduleSpawnAdmissionEffect>,
@@ -9698,6 +9200,7 @@ where
     .await
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_lines)]
 #[allow(clippy::too_many_arguments)]
 async fn quarantine_and_remove_exact_worktree_with_effects<F, B>(
@@ -9728,6 +9231,7 @@ where
     .await
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 async fn quarantine_and_remove_exact_worktree_with_effects_until<F, B>(
     identity: &WorktreeIdentity,
@@ -13552,10 +13056,14 @@ mod tests {
             let completion =
                 manager.complete_close_resource_lease(&fixture.run, &fixture.snapshot, scope, &[]);
             tokio::pin!(completion);
-            tokio::select! {
-                _ = hook.entered.notified() => {},
-                result = &mut completion => panic!("completion escaped pause: {result:?}"),
-            }
+            tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                tokio::select! {
+                    _ = hook.entered.notified() => {},
+                    result = &mut completion => panic!("completion escaped pause: {result:?}"),
+                }
+            })
+            .await
+            .expect("live completion did not reach its pause within the watchdog");
             assert!(
                 manager.close_retirement_leases.try_lock().is_err(),
                 "live completion must retain the store guard across its await"

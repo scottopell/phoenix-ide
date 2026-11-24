@@ -7,8 +7,12 @@ use super::{
 use crate::runtime::native_close_application::{
     retry_command_from_executing_source, NativeCloseApplicationError,
 };
-use phoenix_core::domain::close::{CloseAttemptId, CloseRunOrdinal, CloseRunRef};
+use phoenix_core::domain::close::CloseRunRef;
+#[cfg(test)]
+use phoenix_core::domain::close::{CloseAttemptId, CloseRunOrdinal};
+#[cfg(test)]
 use phoenix_core::domain::db_schema::SourceToolCall;
+#[cfg(test)]
 use phoenix_core::domain::product_conversation::ProductConversationId;
 use phoenix_db::native_close::{
     NativeCloseCommand, NativeCloseIntent, NativeCloseRetryOriginKind, NativeCloseRetryResult,
@@ -289,6 +293,7 @@ where
         self.handle_native_close_retry_prepared(request, None).await
     }
 
+    #[cfg(test)]
     async fn handle_native_close_retry_prepared(
         &mut self,
         request: crate::runtime::native_close_application::NativeCloseRetryRequest,
@@ -332,6 +337,7 @@ where
 {
     /// Runs the retry solely in the acknowledged source actor; gate ownership
     /// transferred with the request is retained through durable classification.
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     async fn execute_native_close_retry(
         &mut self,

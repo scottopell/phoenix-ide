@@ -9,9 +9,9 @@ use phoenix_tools::tmux::registry::TmuxRegistry;
 use std::path::PathBuf;
 
 use crate::terminal::session::TerminalRetirementPermit;
-use phoenix_core::domain::close::{
-    CloseRetirementSnapshot, RetiredResourceIdentity, RetiredResourceKind,
-};
+#[cfg(test)]
+use phoenix_core::domain::close::CloseRetirementSnapshot;
+use phoenix_core::domain::close::{RetiredResourceIdentity, RetiredResourceKind};
 use phoenix_core::work_scope::{ResourceScopeKey, WorkScopeId};
 use phoenix_tools::browser::session::BrowserRetirementPermit;
 use phoenix_tools::tmux::registry::{
@@ -759,7 +759,9 @@ pub(super) struct ReopeningHook {
 impl ReopeningHook {
     async fn pause(&self) {
         self.entered.notify_one();
-        self.release.notified().await;
+        tokio::time::timeout(std::time::Duration::from_secs(30), self.release.notified())
+            .await
+            .expect("reopening hook was not released");
     }
 }
 
@@ -873,10 +875,14 @@ mod tests {
         {
             let acquisition = store.acquire(key.clone(), registries.clone(), None, None);
             tokio::pin!(acquisition);
-            tokio::select! {
-                _ = hook.entered.notified() => {},
-                result = &mut acquisition => panic!("acquisition escaped pause: {result:?}"),
-            }
+            tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                tokio::select! {
+                    _ = hook.entered.notified() => {},
+                    result = &mut acquisition => panic!("acquisition escaped pause: {result:?}"),
+                }
+            })
+            .await
+            .expect("acquisition never reached its pause");
         }
         assert!(matches!(
             store.acquiring.get(&key),
@@ -926,10 +932,14 @@ mod tests {
         {
             let acquisition = store.acquire(key.clone(), registries.clone(), None, None);
             tokio::pin!(acquisition);
-            tokio::select! {
-                _ = hook.entered.notified() => {},
-                result = &mut acquisition => panic!("acquisition escaped pause: {result:?}"),
-            }
+            tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                tokio::select! {
+                    _ = hook.entered.notified() => {},
+                    result = &mut acquisition => panic!("acquisition escaped pause: {result:?}"),
+                }
+            })
+            .await
+            .expect("acquisition never reached its pause");
         }
         hook.release.notify_one();
         assert!(store
@@ -989,10 +999,14 @@ mod tests {
         {
             let future = store.acquire(key.clone(), registries.clone(), None, None);
             tokio::pin!(future);
-            tokio::select! {
-                _ = acquisition.entered.notified() => {},
-                result = &mut future => panic!("acquisition escaped pause: {result:?}"),
-            }
+            tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                tokio::select! {
+                    _ = acquisition.entered.notified() => {},
+                    result = &mut future => panic!("acquisition escaped pause: {result:?}"),
+                }
+            })
+            .await
+            .expect("acquisition never reached its pause");
         }
         acquisition.release.notify_one();
         assert!(store
@@ -1015,10 +1029,14 @@ mod tests {
         {
             let future = store.finish_acquisition(&key);
             tokio::pin!(future);
-            tokio::select! {
-                _ = retry.entered.notified() => {},
-                result = &mut future => panic!("retry escaped pause: {result:?}"),
-            }
+            tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                tokio::select! {
+                    _ = retry.entered.notified() => {},
+                    result = &mut future => panic!("retry escaped pause: {result:?}"),
+                }
+            })
+            .await
+            .expect("acquisition retry never reached its pause");
         }
         assert!(matches!(
             store.acquiring.get(&key),
@@ -1048,10 +1066,14 @@ mod tests {
         {
             let acquisition = store.acquire(key.clone(), registries.clone(), None, None);
             tokio::pin!(acquisition);
-            tokio::select! {
-                _ = hook.entered.notified() => {},
-                result = &mut acquisition => panic!("acquisition escaped pause: {result:?}"),
-            }
+            tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                tokio::select! {
+                    _ = hook.entered.notified() => {},
+                    result = &mut acquisition => panic!("acquisition escaped pause: {result:?}"),
+                }
+            })
+            .await
+            .expect("acquisition never reached its pause");
         }
         hook.release.notify_one();
         assert!(store
@@ -1420,10 +1442,14 @@ mod tests {
         {
             let reopening = store.cancel_attempt(&first.0, registries.clone());
             tokio::pin!(reopening);
-            tokio::select! {
-                _ = hook.entered.notified() => {},
-                result = &mut reopening => panic!("reopening escaped pause: {result:?}"),
-            }
+            tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                tokio::select! {
+                    _ = hook.entered.notified() => {},
+                    result = &mut reopening => panic!("reopening escaped pause: {result:?}"),
+                }
+            })
+            .await
+            .expect("reopening never reached its pause");
         }
         assert!(store.is_reopening(&first.0));
         assert!(store.complete.is_empty());
@@ -1457,10 +1483,14 @@ mod tests {
         {
             let reopening = store.cancel_attempt(&key.0, registries.clone());
             tokio::pin!(reopening);
-            tokio::select! {
-                _ = hook.entered.notified() => {},
-                result = &mut reopening => panic!("reopening escaped pause: {result:?}"),
-            }
+            tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                tokio::select! {
+                    _ = hook.entered.notified() => {},
+                    result = &mut reopening => panic!("reopening escaped pause: {result:?}"),
+                }
+            })
+            .await
+            .expect("reopening never reached its pause");
         }
         let scope = ResourceScopeKey::Work(key.1.clone());
         assert!(!tmux_fenced(&registries, &scope).await);

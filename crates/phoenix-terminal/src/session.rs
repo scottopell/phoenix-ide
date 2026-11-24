@@ -355,6 +355,11 @@ impl PreparedTerminalRetirement {
     /// Synchronously claim the exact Close retirement as its first effect.
     /// Every failure returns this original owner intact; this method performs no
     /// allocation, logging, waiting, notification, or resource teardown.
+    ///
+    /// # Errors
+    /// Returns the original owner and an entry error if the registry is busy or
+    /// poisoned, the deadline expired, the target is stale, or retirement was
+    /// already requested. No first effect is performed on failure.
     pub fn try_enter(
         self,
     ) -> Result<EnteredTerminalRetirement, (Self, TerminalRetirementEntryError)> {
@@ -384,23 +389,74 @@ impl EnteredTerminalRetirement {
 }
 
 impl PreparedTerminalRetirement {
-    /// Legacy completion and exact retained-evidence resolution. This may wait
-    /// before its first effect and must not be used as a synchronous entry fence.
-    /// Call `try_enter` at the source-owned fence for the bounded entry path.
-    pub async fn complete(self) -> TerminalRetirementOutcome {
-        let original = &self.original;
-        let target = self.target;
-        if tokio::time::Instant::now() >= original.deadline {
-            return TerminalRetirementOutcome::Residual {
-                reason: "terminal retirement deadline elapsed before teardown".into(),
-            };
-        }
+    // Keep the exact-target check and teardown notification under one registry lock.
+    fn request_teardown(
+        registry: &ActiveTerminals,
+        original: &OriginalTerminalRetirementTarget,
+        target: &Arc<TerminalHandle>,
+    ) -> Result<Arc<tokio::sync::Semaphore>, TerminalRetirementOutcome> {
         let attach_permit = {
-            let map = self.registry.0.lock().expect("terminal registry poisoned");
+            let map = registry.0.lock().expect("terminal registry poisoned");
             // The synchronous registry lock is not preemptible by Tokio timeouts.
             if tokio::time::Instant::now() >= original.deadline {
-                return TerminalRetirementOutcome::Residual {
+                return Err(TerminalRetirementOutcome::Residual {
                     reason: "terminal retirement deadline elapsed before teardown".into(),
+                });
+            }
+            let valid = map
+                .retirements
+                .get(&original.work_scope)
+                .is_some_and(|state| {
+                    state.generation == original.generation.0
+                        && state.owner == Some(TerminalRetirementOwner::Close)
+                })
+                && map
+                    .handles
+                    .get(&original.work_scope)
+                    .is_some_and(|current| Arc::ptr_eq(current, target));
+            if !valid {
+                let observed_absence = !map.handles.contains_key(&original.work_scope)
+                    && map
+                        .retirements
+                        .get(&original.work_scope)
+                        .is_some_and(|state| {
+                            state.generation == original.generation.0
+                                && state.owner == Some(TerminalRetirementOwner::Close)
+                        })
+                    && original
+                        .child_exit
+                        .as_ref()
+                        .is_some_and(ChildExitReceipt::exited);
+                return Err(if observed_absence {
+                    TerminalRetirementOutcome::Retired
+                } else {
+                    TerminalRetirementOutcome::Residual {
+                        reason: "prepared terminal generation or exact handle became stale".into(),
+                    }
+                });
+            }
+            // This is atomic with the first TearDown notification and therefore
+            // cannot be overwritten by relay setup.
+            target.stop_tx.send_replace(StopReason::TearDown);
+            Arc::clone(&target.attach_permit)
+        };
+        Ok(attach_permit)
+    }
+
+    // Consume relay authority so it is released before the removed handle is dropped.
+    fn remove_retired_target(
+        registry: &ActiveTerminals,
+        original: &OriginalTerminalRetirementTarget,
+        target: &Arc<TerminalHandle>,
+        relay_authority: tokio::sync::OwnedSemaphorePermit,
+    ) -> TerminalRetirementOutcome {
+        let removed = {
+            let mut map = registry.0.lock().expect("terminal registry poisoned");
+            if tokio::time::Instant::now() >= original.deadline {
+                drop(map);
+                drop(relay_authority);
+                return TerminalRetirementOutcome::Residual {
+                    reason: "terminal retirement deadline elapsed before registry removal".into(),
                 };
             }
             let valid = map
@@ -413,32 +469,39 @@ impl PreparedTerminalRetirement {
                 && map
                     .handles
                     .get(&original.work_scope)
-                    .is_some_and(|current| Arc::ptr_eq(current, &target));
+                    .is_some_and(|current| Arc::ptr_eq(current, target));
             if !valid {
-                let observed_absence = map.handles.get(&original.work_scope).is_none()
-                    && map
-                        .retirements
-                        .get(&original.work_scope)
-                        .is_some_and(|state| {
-                            state.generation == original.generation.0
-                                && state.owner == Some(TerminalRetirementOwner::Close)
-                        })
-                    && original
-                        .child_exit
-                        .as_ref()
-                        .is_some_and(ChildExitReceipt::exited);
-                return if observed_absence {
-                    TerminalRetirementOutcome::Retired
-                } else {
-                    TerminalRetirementOutcome::Residual {
-                        reason: "prepared terminal generation or exact handle became stale".into(),
-                    }
+                drop(map);
+                drop(relay_authority);
+                return TerminalRetirementOutcome::Residual {
+                    reason: "exact terminal changed before conditional removal".into(),
                 };
             }
-            // This is atomic with the first TearDown notification and therefore
-            // cannot be overwritten by relay setup.
-            target.stop_tx.send_replace(StopReason::TearDown);
-            Arc::clone(&target.attach_permit)
+            map.handles.remove(&original.work_scope)
+        };
+        drop(relay_authority);
+        drop(removed);
+        TerminalRetirementOutcome::Retired
+    }
+
+    /// Legacy completion and exact retained-evidence resolution. This may wait
+    /// before its first effect and must not be used as a synchronous entry fence.
+    /// Call `try_enter` at the source-owned fence for the bounded entry path.
+    ///
+    /// # Panics
+    /// Panics if the registry or master descriptor mutex is poisoned, or if the
+    /// captured terminal handle has no original child exit receipt.
+    pub async fn complete(self) -> TerminalRetirementOutcome {
+        let original = &self.original;
+        let target = self.target;
+        if tokio::time::Instant::now() >= original.deadline {
+            return TerminalRetirementOutcome::Residual {
+                reason: "terminal retirement deadline elapsed before teardown".into(),
+            };
+        }
+        let attach_permit = match Self::request_teardown(&self.registry, original, &target) {
+            Ok(attach_permit) => attach_permit,
+            Err(outcome) => return outcome,
         };
         let Ok(Ok(relay_authority)) =
             tokio::time::timeout_at(original.deadline, attach_permit.acquire_owned()).await
@@ -473,7 +536,7 @@ impl PreparedTerminalRetirement {
                     .get(&original.work_scope)
                     .is_some_and(|current| Arc::ptr_eq(current, &target))
             {
-                let observed_absence = map.handles.get(&original.work_scope).is_none()
+                let observed_absence = !map.handles.contains_key(&original.work_scope)
                     && map
                         .retirements
                         .get(&original.work_scope)
@@ -511,38 +574,7 @@ impl PreparedTerminalRetirement {
                 reason: "terminal child exit was not observed before the original deadline; exact handle retained".into(),
             };
         }
-        let removed = {
-            let mut map = self.registry.0.lock().expect("terminal registry poisoned");
-            if tokio::time::Instant::now() >= original.deadline {
-                drop(map);
-                drop(relay_authority);
-                return TerminalRetirementOutcome::Residual {
-                    reason: "terminal retirement deadline elapsed before registry removal".into(),
-                };
-            }
-            let valid = map
-                .retirements
-                .get(&original.work_scope)
-                .is_some_and(|state| {
-                    state.generation == original.generation.0
-                        && state.owner == Some(TerminalRetirementOwner::Close)
-                })
-                && map
-                    .handles
-                    .get(&original.work_scope)
-                    .is_some_and(|current| Arc::ptr_eq(current, &target));
-            if !valid {
-                drop(map);
-                drop(relay_authority);
-                return TerminalRetirementOutcome::Residual {
-                    reason: "exact terminal changed before conditional removal".into(),
-                };
-            }
-            map.handles.remove(&original.work_scope)
-        };
-        drop(relay_authority);
-        drop(removed);
-        TerminalRetirementOutcome::Retired
+        Self::remove_retired_target(&self.registry, original, &target, relay_authority)
     }
 }
 
@@ -1110,6 +1142,14 @@ impl ActiveTerminals {
     /// Prepare an inert exact owner leaf outside any persistence transaction.
     /// The permit's mutable reporting projection is checked against its immutable
     /// original binding; a caller cannot redirect it by editing public fields.
+    ///
+    /// # Errors
+    /// Returns an error if the permit is not Close-owned, its reporting projection
+    /// differs from its original binding, it belongs to another registry, it has
+    /// no physical target, its deadline expired, or its exact target or fence is stale.
+    ///
+    /// # Panics
+    /// Panics if the terminal registry mutex is poisoned.
     pub fn prepare_retirement(
         &self,
         permit: &TerminalRetirementPermit,

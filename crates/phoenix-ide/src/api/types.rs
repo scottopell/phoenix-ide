@@ -1159,9 +1159,10 @@ pub enum ChainDeleteOutcome {
     AlreadyAbsent,
 }
 
-/// Exact server-observed inspection snapshot required to confirm destructive
-/// loss retirement. The request intentionally carries no filesystem path.
+/// Frozen compatibility wire shape for the reject-only loss-retirement route.
+/// Fields remain required for deserialization but never authorize retirement.
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)] // Preserve the rejected legacy request contract without reading its fields.
 pub struct ConfirmCloseLossRetirementRequest {
     pub attempt_id: String,
     pub inspection_generation: String,

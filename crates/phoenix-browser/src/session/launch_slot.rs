@@ -447,7 +447,13 @@ impl LaunchSlot {
         let state = self.state.clone().write_owned().await;
         let ready_session = match &*state {
             LaunchState::Ready(session) => Some(session.clone().write_owned().await),
-            _ => None,
+            #[cfg(test)]
+            LaunchState::InjectedPending(_) => None,
+            LaunchState::Reserved
+            | LaunchState::PreSpawnFailed(_)
+            | LaunchState::UnobservableAttempt(_)
+            | LaunchState::Pending(_)
+            | LaunchState::Stopped => None,
         };
         (LaunchStateGuard(state), ready_session)
     }
@@ -555,8 +561,8 @@ fn spawn_profile_cleanup(
     #[cfg(test)] gate: Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>,
 ) -> JoinHandle<Result<(), BrowserError>> {
     tokio::task::spawn_blocking(move || {
-        let _custody = custody;
-        let _ = &_custody.0;
+        let custody_guard = custody;
+        let _ = &custody_guard.0;
         #[cfg(test)]
         if let Some((entered, release)) = gate {
             entered.send(()).expect("cleanup test waits for entry");

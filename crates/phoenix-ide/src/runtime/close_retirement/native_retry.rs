@@ -1,6 +1,7 @@
+#[cfg(test)]
+use phoenix_core::domain::close::RetiredResourceKind;
 use phoenix_core::domain::close::{
-    CloseRunRef, CloseStopCertainty, LossItemIdentity, RetiredResourceKind,
-    RetirementFailureReason, RetirementOutcome,
+    CloseRunRef, CloseStopCertainty, LossItemIdentity, RetirementFailureReason, RetirementOutcome,
 };
 use phoenix_core::work_scope::{ResourceScopeKey, WorkScopeRetirementPrecondition};
 use phoenix_db::native_close::{
@@ -14,11 +15,15 @@ use phoenix_db::{
 use phoenix_tools::tmux::registry::{
     PersistentTmuxDiscovery, TmuxRetirementRehydration, TmuxServerInstanceIdentity,
 };
+#[cfg(test)]
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
+#[cfg(test)]
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tokio::{runtime::Handle, task};
 
+#[cfg(test)]
 use crate::db::{
     BindCloseWorktreeFinalTombstoneObjectRequest, BindCloseWorktreeFinalTombstoneRequest,
     RecordCloseWorktreeCleanupPlanRequest,
@@ -79,6 +84,7 @@ fn unclassified_native_retry_error(
     NativeRetryExecutionError::Unclassified
 }
 
+#[cfg(test)]
 fn classify_native_retry_execution(
     result: Result<(), NativeRetryExecutionError>,
 ) -> LocalAuthorityResult<Result<(), String>> {
@@ -147,6 +153,7 @@ impl super::RuntimeManager {
         )
     }
 
+    #[cfg(test)]
     pub(crate) async fn execute_native_close_retry(
         &self,
         command: &NativeCloseCommand,
@@ -158,6 +165,7 @@ impl super::RuntimeManager {
         )
     }
 
+    #[cfg(test)]
     async fn execute_native_close_retry_inner(
         &self,
         command: &NativeCloseCommand,
@@ -217,6 +225,7 @@ impl super::RuntimeManager {
         }
     }
 
+    #[cfg(test)]
     #[allow(clippy::too_many_lines)]
     pub(crate) async fn native_retry_tmux(
         &self,
@@ -524,6 +533,7 @@ impl super::RuntimeManager {
         }
     }
 
+    #[cfg(test)]
     async fn native_retry_scope(
         &self,
         command: &NativeCloseCommand,
@@ -609,6 +619,7 @@ impl super::RuntimeManager {
 
     // Keep original-plan binding, source fencing, and destructive callbacks in order.
     #[allow(clippy::too_many_lines)]
+    #[cfg(test)]
     async fn native_retry_worktree(
         &self,
         command: &NativeCloseCommand,
@@ -883,6 +894,7 @@ impl super::RuntimeManager {
         }
     }
 
+    #[cfg(test)]
     fn native_retry_metadata(
         result: LocalAuthorityResult<crate::db::DbResult<()>>,
     ) -> Result<(), NativeRetryExecutionError> {

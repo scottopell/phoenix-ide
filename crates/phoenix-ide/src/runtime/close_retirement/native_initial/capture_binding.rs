@@ -18,6 +18,7 @@ pub(in crate::runtime::close_retirement) struct CaptureEvidenceBinding {
     deadline: tokio::time::Instant,
 }
 
+#[cfg(test)]
 #[derive(Debug)]
 pub(in crate::runtime::close_retirement) struct OriginalWorktreeCapture<'a> {
     pub(in crate::runtime::close_retirement) identity: &'a WorktreeIdentity,
@@ -27,6 +28,7 @@ pub(in crate::runtime::close_retirement) struct OriginalWorktreeCapture<'a> {
 }
 
 impl CaptureEvidenceBinding {
+    #[cfg(test)]
     pub(in crate::runtime::close_retirement) fn select_worktree(
         &self,
         scope: &WorkScopeId,
@@ -55,6 +57,7 @@ impl CaptureEvidenceBinding {
         })
     }
 
+    #[cfg(test)]
     pub(in crate::runtime::close_retirement) fn snapshot(&self) -> &CloseRetirementSnapshot {
         &self.aggregate
     }

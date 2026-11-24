@@ -497,7 +497,7 @@ async fn direct_new_initial_returns_continuation_owning_reply_gate_and_owner() {
         .await;
     let mut continuation = match admission {
         Ok(native_close::NativeCloseInitialAdmission::Continued {
-            result: NativeCloseInitialResult::NewlyAdmitted(receipt),
+            _result: NativeCloseInitialResult::NewlyAdmitted(receipt),
             continuation,
         }) => {
             assert_eq!(continuation.receipt, receipt);
@@ -719,9 +719,9 @@ async fn direct_initial_replay_sends_exact_receipt_without_pending_work() {
         .await;
     assert!(matches!(
         admission,
-        Ok(native_close::NativeCloseInitialAdmission::Finished(
-            NativeCloseInitialResult::Replay(ref replay)
-        )) if replay == &receipt
+        Ok(native_close::NativeCloseInitialAdmission::Finished {
+            _result: NativeCloseInitialResult::Replay(ref replay),
+        }) if replay == &receipt
     ));
     assert_eq!(
         reply.await.unwrap(),
@@ -1253,7 +1253,7 @@ async fn admit_initial_continuation(
         .unwrap();
     match admission {
         native_close::NativeCloseInitialAdmission::Continued {
-            result: NativeCloseInitialResult::NewlyAdmitted(receipt),
+            _result: NativeCloseInitialResult::NewlyAdmitted(receipt),
             continuation,
         } => {
             assert_eq!(continuation.receipt, receipt);
@@ -1796,36 +1796,35 @@ async fn run_acknowledged_stop_revokes_captured_terminal_entry(
     );
     // InMemoryStorage lets actor Stop settle independently. Durable ToolExecuting
     // source is NOT changed: DB rejection must not mask a broken live source gate.
-    enum HeldWriter {
-        Pool(sqlx::Transaction<'static, sqlx::Sqlite>),
-        Independent(sqlx::SqliteConnection),
-    }
-    let writer = match independent_writer_path {
+    // Keep the independent connection outside its borrowed SQLx transaction so
+    // rollback and connection closure have explicit, separate ownership boundaries.
+    let mut independent_connection = match independent_writer_path {
         Some(path) => {
             let options = sqlx::sqlite::SqliteConnectOptions::new()
                 .filename(path)
                 .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
                 .busy_timeout(Duration::ZERO);
-            let mut connection = sqlx::SqliteConnection::connect_with(&options)
+            let connection = sqlx::SqliteConnection::connect_with(&options)
                 .await
                 .unwrap();
-            sqlx::query("BEGIN IMMEDIATE")
-                .execute(&mut connection)
-                .await
-                .unwrap();
+            Some(connection)
+        }
+        None => None,
+    };
+    let writer = match independent_connection.as_mut() {
+        Some(connection) => {
+            let writer = connection.begin_with("BEGIN IMMEDIATE").await.unwrap();
             // Explicitly distinguish external SQLite writer contention from an
             // exhausted application pool: acquire and return a pool connection now.
             drop(fixture.db.pool().acquire().await.unwrap());
-            HeldWriter::Independent(connection)
+            writer
         }
-        None => HeldWriter::Pool(
-            fixture
-                .db
-                .pool()
-                .begin_with("BEGIN IMMEDIATE")
-                .await
-                .unwrap(),
-        ),
+        None => fixture
+            .db
+            .pool()
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .unwrap(),
     };
     resume.send(()).unwrap();
     // In the independent-writer variant, this proves that the same entry
@@ -1847,15 +1846,9 @@ async fn run_acknowledged_stop_revokes_captured_terminal_entry(
     };
     untouched();
     // Release before DB assertions/teardown; continue the SAME entry future.
-    match writer {
-        HeldWriter::Pool(writer) => writer.rollback().await.unwrap(),
-        HeldWriter::Independent(mut connection) => {
-            sqlx::query("ROLLBACK")
-                .execute(&mut connection)
-                .await
-                .unwrap();
-            connection.close().await.unwrap();
-        }
+    writer.rollback().await.unwrap();
+    if let Some(connection) = independent_connection {
+        connection.close().await.unwrap();
     }
     tokio::time::timeout(Duration::from_secs(30), completed_rx)
         .await

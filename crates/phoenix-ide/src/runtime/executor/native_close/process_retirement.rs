@@ -13,7 +13,7 @@ use crate::runtime::close_retirement::native_initial::{
 use futures::FutureExt;
 use phoenix_core::domain::close::{
     AbsenceBasis, CloseExpectedRetirementResource, CloseRunRef, LossItemIdentity,
-    RetiredResourceIdentity, RetiredResourceKind, RetirementOutcome,
+    RetiredResourceKind, RetirementOutcome,
 };
 use phoenix_core::work_scope::WorkScopeId;
 use phoenix_db::workflow::LocalAuthorityResult;
@@ -45,8 +45,8 @@ fn spawn_retained_entry(
 
 #[derive(Debug)]
 enum BlockedProcess {
-    Worker(NativeInitialStepError),
-    Join(String),
+    Worker { _error: NativeInitialStepError },
+    Join { _error: String },
 }
 
 pub(super) struct ProcessRetirement {
@@ -269,8 +269,14 @@ impl NativeCloseInitialContinuation {
                     Ok(Err(NativeInitialStepError::FatalAuthority)) => {
                         return Err(NativeCloseApplicationError::FatalAuthority)
                     }
-                    Ok(Err(error)) => progress.blocked = Some(BlockedProcess::Worker(error)),
-                    Err(error) => progress.blocked = Some(BlockedProcess::Join(error.to_string())),
+                    Ok(Err(error)) => {
+                        progress.blocked = Some(BlockedProcess::Worker { _error: error })
+                    }
+                    Err(error) => {
+                        progress.blocked = Some(BlockedProcess::Join {
+                            _error: error.to_string(),
+                        })
+                    }
                 }
                 if progress.blocked.is_some() {
                     self.phase = Phase::ProcessRetirementBlocked;
@@ -313,8 +319,10 @@ impl NativeCloseInitialContinuation {
                 }
                 other => {
                     let blocked = match other {
-                        Ok(Err(error)) => BlockedProcess::Worker(error),
-                        Err(error) => BlockedProcess::Join(error.to_string()),
+                        Ok(Err(error)) => BlockedProcess::Worker { _error: error },
+                        Err(error) => BlockedProcess::Join {
+                            _error: error.to_string(),
+                        },
                         Ok(Ok(_)) => unreachable!("prepared owner handled above"),
                     };
                     progress.blocked = Some(blocked);
@@ -325,9 +333,9 @@ impl NativeCloseInitialContinuation {
             // No SQLite callback waits for locks or polls an effect. Missing DB
             // return/release keeps the independently retained owner quarantined.
             let Some(source_entry) = self.source_entry.clone() else {
-                progress.blocked = Some(BlockedProcess::Worker(
-                    NativeInitialStepError::FatalAuthority,
-                ));
+                progress.blocked = Some(BlockedProcess::Worker {
+                    _error: NativeInitialStepError::FatalAuthority,
+                });
                 return Err(NativeCloseApplicationError::FatalAuthority);
             };
             let db = self.db.clone();
@@ -359,8 +367,12 @@ impl NativeCloseInitialContinuation {
                 Ok(Err(NativeInitialStepError::FatalAuthority)) => {
                     return Err(NativeCloseApplicationError::FatalAuthority)
                 }
-                Ok(Err(error)) => progress.blocked = Some(BlockedProcess::Worker(error)),
-                Err(error) => progress.blocked = Some(BlockedProcess::Join(format!("{error:?}"))),
+                Ok(Err(error)) => progress.blocked = Some(BlockedProcess::Worker { _error: error }),
+                Err(error) => {
+                    progress.blocked = Some(BlockedProcess::Join {
+                        _error: format!("{error:?}"),
+                    })
+                }
             }
             if progress.blocked.is_some() {
                 self.phase = Phase::ProcessRetirementBlocked;

@@ -2772,6 +2772,13 @@ impl BrowserSessionManager {
         hit
     }
 
+    /// Prepare retirement of the exact browser instance captured by the permit.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the permit is invalid, the deadline is extended or
+    /// expires, the fence is stale, the captured session or durable launch
+    /// identity changes, or a retirement attempt appears during preparation.
     pub async fn prepare_retirement_resource(
         self: &Arc<Self>,
         permit: &BrowserRetirementPermit,
@@ -2851,6 +2858,30 @@ impl BrowserSessionManager {
                 selection: PreparedRetirementSelection::Existing(existing),
             });
         }
+        let selection = self
+            .prepare_new_retirement_selection(permit, expected, &slot, effective_deadline)
+            .await?;
+        Ok(BrowserPreparedRetirement {
+            manager: self.clone(),
+            identity: expected.clone(),
+            slot,
+            scope,
+            current_kill,
+            teardown_failed,
+            audience,
+            deadline: effective_deadline,
+            selection,
+        })
+    }
+
+    async fn prepare_new_retirement_selection(
+        &self,
+        permit: &BrowserRetirementPermit,
+        expected: &BrowserSessionInstanceIdentity,
+        slot: &CapturedLaunchSlot,
+        effective_deadline: tokio::time::Instant,
+    ) -> Result<PreparedRetirementSelection, String> {
+        // Acquire the exact captured launch and revalidate after waiting for the gate.
         let gate = tokio::time::timeout_at(
             effective_deadline,
             slot.0.retirement_gate.clone().lock_owned(),
@@ -2905,17 +2936,7 @@ impl BrowserSessionManager {
                 return Err("browser retirement attempt appeared while preparing".into());
             }
         }
-        Ok(BrowserPreparedRetirement {
-            manager: self.clone(),
-            identity: expected.clone(),
-            slot,
-            scope,
-            current_kill,
-            teardown_failed,
-            audience,
-            deadline: effective_deadline,
-            selection: PreparedRetirementSelection::New { gate, launch },
-        })
+        Ok(PreparedRetirementSelection::New { gate, launch })
     }
 
     pub async fn begin_retirement(&self, work_scope: &ResourceScopeKey) -> BrowserRetirementPermit {

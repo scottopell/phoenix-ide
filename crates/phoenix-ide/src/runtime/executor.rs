@@ -3718,7 +3718,7 @@ where
                             }
                             let result = self.admit_native_close_initial(&backend, source, target, admitted, target_gate, response).await;
                             let (fatal, continuation) = match result {
-                                Ok(native_close::NativeCloseInitialAdmission::Finished(_)) => (false, None),
+                                Ok(native_close::NativeCloseInitialAdmission::Finished { .. }) => (false, None),
                                 Ok(native_close::NativeCloseInitialAdmission::Continued { continuation, .. }) => (false, Some(continuation)),
                                 Err(error) => (matches!(error, super::native_close_application::NativeCloseApplicationError::FatalAuthority), None),
                             };

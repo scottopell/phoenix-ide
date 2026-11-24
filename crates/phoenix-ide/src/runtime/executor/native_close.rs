@@ -178,9 +178,11 @@ impl InventoryCapture {
 }
 
 pub(super) enum NativeCloseInitialAdmission {
-    Finished(NativeCloseInitialResult),
+    Finished {
+        _result: NativeCloseInitialResult,
+    },
     Continued {
-        result: NativeCloseInitialResult,
+        _result: NativeCloseInitialResult,
         continuation: NativeCloseInitialContinuation,
     },
 }
@@ -1076,7 +1078,7 @@ where
                     _response: Some(response),
                 };
                 Ok(NativeCloseInitialAdmission::Continued {
-                    result,
+                    _result: result,
                     continuation,
                 })
             }
@@ -1084,7 +1086,7 @@ where
                 authority.owner = None;
                 drop(target_gate);
                 let _ = response.send(Ok(result.clone()));
-                Ok(NativeCloseInitialAdmission::Finished(result))
+                Ok(NativeCloseInitialAdmission::Finished { _result: result })
             }
             LocalAuthorityResult::DurableFactEstablished(Err(_)) => {
                 authority.owner = None;

@@ -11,11 +11,14 @@ mod supervision;
 #[cfg(unix)]
 pub(crate) mod worktree;
 
+#[cfg(test)]
 use super::verify_observed_process_identities;
+#[cfg(test)]
 use super::{CloseProcessStepExecutor, RetirementFailureReason};
+#[cfg(test)]
+use phoenix_core::domain::close::{CloseRetirementSnapshot, LossItemIdentity};
 use phoenix_core::domain::close::{
-    CloseRetirementSnapshot, LossItemIdentity, OpaqueIdentity, RetiredResourceIdentity,
-    RetiredResourceKind, RetirementOutcome,
+    OpaqueIdentity, RetiredResourceIdentity, RetiredResourceKind, RetirementOutcome,
 };
 use phoenix_db::{CloseProcessResourceKind, CloseProcessStepOutcome};
 
@@ -40,6 +43,7 @@ impl NativeInitialProcessStep {
         }
     }
 
+    #[cfg(test)]
     const fn process_kind(self) -> Option<CloseProcessResourceKind> {
         match self {
             Self::Bash => Some(CloseProcessResourceKind::BashProcessGroup),
@@ -71,6 +75,7 @@ pub(crate) enum NativeInitialStepError {
     MissingLease,
     AlreadyEntered,
     SealedInventoryMismatch,
+    #[cfg(test)]
     InvalidSealedInventory(String),
     /// Executor-provided evidence is preserved verbatim; it is never inferred.
     ProcessFailure {
@@ -79,17 +84,20 @@ pub(crate) enum NativeInitialStepError {
         detail: String,
     },
     /// The tmux executor currently supplies no resource-attributed failure evidence.
+    #[cfg(test)]
     Unattributed {
         kind: RetiredResourceKind,
         reason: RetirementFailureReason,
         detail: String,
     },
+    #[cfg(test)]
     ObservationMismatch {
         kind: RetiredResourceKind,
         detail: String,
     },
 }
 
+#[cfg(test)]
 fn expected_resources<'a>(
     inventory: &'a [RetiredResourceIdentity],
     kind: RetiredResourceKind,
@@ -100,10 +108,12 @@ fn expected_resources<'a>(
         .collect()
 }
 
+#[cfg(test)]
 fn inventories_match(left: &[RetiredResourceIdentity], right: &[RetiredResourceIdentity]) -> bool {
     left.len() == right.len() && left.iter().all(|resource| right.contains(resource))
 }
 
+#[cfg(test)]
 fn validate_inventory(inventory: &[RetiredResourceIdentity]) -> Result<(), String> {
     let mut seen = Vec::new();
     for resource in inventory {
@@ -131,6 +141,7 @@ fn validate_inventory(inventory: &[RetiredResourceIdentity]) -> Result<(), Strin
     Ok(())
 }
 
+#[cfg(test)]
 fn verify_process_observation(
     observed: &[OpaqueIdentity],
     expected: &[&RetiredResourceIdentity],
@@ -145,6 +156,7 @@ fn verify_process_observation(
     verify_observed_process_identities(observed, &expected)
 }
 
+#[cfg(test)]
 fn verify_tmux_observation(
     observed: &[RetiredResourceIdentity],
     expected: &[&RetiredResourceIdentity],
@@ -176,6 +188,7 @@ fn verify_tmux_observation(
 
 // This is process-epoch custody only: it does not synchronize with source
 // revocation or authorize nested/stale-source work.
+#[cfg(test)]
 fn enter_native_initial_kind(
     lease_resources: &[RetiredResourceIdentity],
     lease_snapshot: Option<&CloseRetirementSnapshot>,
@@ -209,6 +222,7 @@ fn enter_native_initial_kind(
     Ok(())
 }
 
+#[cfg(test)]
 async fn execute_one_kind<E: CloseProcessStepExecutor>(
     executor: &mut E,
     step: NativeInitialProcessStep,

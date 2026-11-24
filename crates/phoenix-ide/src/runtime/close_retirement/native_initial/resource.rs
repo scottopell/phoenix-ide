@@ -124,10 +124,10 @@ impl TerminalCustodyState {
 
 pub(crate) struct NativeInitialResourceRecord {
     pub(crate) expected: CloseExpectedRetirementResource,
-    pub(crate) observer: ResourceObserver,
+    pub(crate) _observer: ResourceObserver,
     state: Arc<AtomicU8>,
-    pub(crate) terminal: TerminalCustodySlot,
-    pub(crate) bash: BashCustodySlot,
+    pub(crate) _terminal: TerminalCustodySlot,
+    pub(crate) _bash: BashCustodySlot,
     _browser_custody: Arc<std::sync::Mutex<Option<BrowserRetirementCustody>>>,
 }
 
@@ -718,10 +718,10 @@ impl RuntimeManager {
                 .native_initial_supervisors
                 .push(NativeInitialResourceRecord {
                     expected: expected.clone(),
-                    observer: observer.clone(),
+                    _observer: observer.clone(),
                     state,
-                    terminal: Arc::clone(&terminal),
-                    bash: Arc::clone(&bash),
+                    _terminal: Arc::clone(&terminal),
+                    _bash: Arc::clone(&bash),
                     _browser_custody: Arc::clone(&browser_custody),
                 });
         }

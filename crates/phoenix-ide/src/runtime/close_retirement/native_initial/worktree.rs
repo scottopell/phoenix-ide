@@ -268,12 +268,14 @@ fn verify_linked_registration(
 /// this record keyed by that resource across observer cancellation/retry. Fresh
 /// construction is not an at-most-once gate. Dropping an observer cannot cancel
 /// the worker; dropping this record after completion loses continuation custody.
+#[cfg(test)]
 pub(crate) struct WorktreeGitObservation {
     state: Arc<Mutex<OperationState>>,
     ready: tokio::sync::watch::Receiver<bool>,
     _worker: std::thread::JoinHandle<()>,
 }
 
+#[cfg(test)]
 struct OperationState {
     result: Option<Result<Output, String>>,
     continuation: Option<NativeWorktreeGitContinuation>,
@@ -424,6 +426,7 @@ pub(crate) struct NativeWorktreeGitContinuation {
     pub(crate) original_effect: OriginalWorktreeEffectContext,
 }
 
+#[cfg(test)]
 impl WorktreeGitObservation {
     /// Reads a copy; neither the caller nor its cancelled future owns the lock.
     pub(crate) async fn observe(&self) -> Result<Output, String> {
@@ -491,6 +494,7 @@ impl Drop for WorkerAuthority {
     }
 }
 
+#[cfg(test)]
 impl NativeWorktreeGit {
     /// Starts the worker before yielding to the caller. Only the synchronous
     /// SQLite + original-source callback can call `Command::spawn`; neither a
@@ -531,6 +535,7 @@ impl NativeWorktreeGit {
     }
 }
 
+#[cfg(test)]
 impl NativeWorktreeGitContinuation {
     /// Re-enters the same database and live-source gates after the preceding
     /// child and its pipe readers have completed. The original owner, receipt,
@@ -593,6 +598,7 @@ impl NativeWorktreeGitContinuation {
     }
 }
 
+#[cfg(test)]
 fn run_status(
     custody: &mut WorkerCustody,
     runtime: &tokio::runtime::Handle,
