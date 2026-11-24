@@ -79,6 +79,7 @@ export async function qualifyQuestionSurface({ page, out, questions, setQuestion
   assert.deepEqual(mutations, [], 'Return/reopen must not answer or dismiss');
   await launcher.click();
   const initial = await geometry();
+  await fs.writeFile(`${out}/${version}-desktop-placement-initial.json`,JSON.stringify(initial,null,2));
   assert.equal(initial.modal, true);
   await page.evaluate(() => window.dispatchEvent(new KeyboardEvent('keydown', { key: '?', bubbles: true })));
   assert.equal(await page.locator('.shortcut-help-panel').count(), 0, 'Global help outside native mobile modal must remain suppressed');
@@ -242,7 +243,7 @@ export async function qualifyDesktopShortcuts({ page, out }) {
 }
 
 export async function qualifyDesktopPlacement({ page, out, version }) {
-  const dialog = page.locator('.coordinator-question-dialog');
+  const dialog = page.locator('.coordinator-question-dock__dialog');
   const panel = page.locator('.coordinator-question-dock .question-panel');
   const dock = page.locator('.coordinator-question-dock');
   const frames = () => page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
@@ -269,7 +270,7 @@ export async function qualifyDesktopPlacement({ page, out, version }) {
   assert.ok(await page.locator('.coordinator-question-dock__meta').evaluate(el=>el.getBoundingClientRect().y>=0));
   const first = panel.locator('.question-option').first();
   await first.click();
-  const custom = panel.locator('input.question-custom-input');
+  const custom = panel.getByRole('textbox',{name:'Write a custom answer'});
   await custom.fill('placement preserved answer');
   const composer = page.locator('#message-input');
   await composer.fill('placement preserved composer draft');
@@ -304,8 +305,7 @@ export async function qualifyDesktopPlacement({ page, out, version }) {
   }
   await dock.evaluate(el=>{el.scrollTop=el.scrollHeight;});
   const actions=panel.locator('.question-actions');
-  await actions.scrollIntoViewIfNeeded();
-  assert.ok(await actions.evaluate(el=>{const r=el.getBoundingClientRect();return r.y>=0&&r.bottom<=innerHeight;}));
+  assert.ok(await actions.evaluate(el=>{const r=el.getBoundingClientRect(),d=el.closest('.coordinator-question-dock').getBoundingClientRect();return r.y>=Math.max(0,d.y)-1&&r.bottom<=Math.min(innerHeight,d.bottom)+1;}));
   await page.screenshot({path:`${out}/${version}-desktop-placement-actions.png`});
   await dock.evaluate(el=>{el.scrollTop=0;});
   await page.screenshot({path:`${out}/${version}-desktop-placement-resized.png`});
