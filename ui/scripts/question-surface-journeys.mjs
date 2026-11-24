@@ -79,7 +79,6 @@ export async function qualifyQuestionSurface({ page, out, questions, setQuestion
   assert.deepEqual(mutations, [], 'Return/reopen must not answer or dismiss');
   await launcher.click();
   const initial = await geometry();
-  await fs.writeFile(`${out}/${version}-desktop-placement-initial.json`,JSON.stringify(initial,null,2));
   assert.equal(initial.modal, true);
   await page.evaluate(() => window.dispatchEvent(new KeyboardEvent('keydown', { key: '?', bubbles: true })));
   assert.equal(await page.locator('.shortcut-help-panel').count(), 0, 'Global help outside native mobile modal must remain suppressed');
@@ -258,6 +257,7 @@ export async function qualifyDesktopPlacement({ page, out, version }) {
   await page.waitForFunction(() => document.activeElement?.matches('.coordinator-question-dock .question-panel'));
   await frames();
   const initial = await geometry();
+  await fs.writeFile(`${out}/${version}-desktop-placement-initial.json`,JSON.stringify(initial,null,2));
   await page.screenshot({path:`${out}/${version}-desktop-placement-initial.png`});
   const headerInitiallyClipped = initial.meta.y < initial.dock.y - 1;
   if (version === 'candidate') {
