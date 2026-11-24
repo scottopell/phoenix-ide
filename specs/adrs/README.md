@@ -458,4 +458,4 @@ Goals schema extraction and refusal of unsupported migration lineages are govern
 
 Goal admission requires explicit automatic continuation without locking existing Goal management or the OFF gesture: [192](192_goal-admission-requires-explicit-auto-continue.md), implementing REQ-GOAL-AC-001–004.
 
-Exact installed predecessor retention with same-transaction verified database recovery evidence is governed by [ADR-281](281_retain-exact-installed-predecessor-for-manual-recovery.md), implementing REQ-LDD-034 and REQ-COMP-023.
+Exact installed predecessor retention with same-transaction verified database recovery evidence is governed by [281](281_retain-exact-installed-predecessor-for-manual-recovery.md), implementing REQ-LDD-034 and REQ-COMP-023.

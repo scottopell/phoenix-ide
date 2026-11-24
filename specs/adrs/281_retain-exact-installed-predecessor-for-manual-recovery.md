@@ -1,10 +1,20 @@
 # ADR-281: Retain the exact installed predecessor with deployment recovery evidence
 
+- **Status:** Accepted
+- **Date:** 2026-11-24
+- **Affects:** REQ-LDD-032, REQ-LDD-034, REQ-COMP-023
+
 ## Context
 
 On 2026-11-24, RC13 production recovery assessment found that successful launchd deployment retained its verified database backup and predecessor hash/identity proof but deleted the transaction-owned exact predecessor executable. Retained signed/notarized distribution bytes were not the actual installed predecessor: installation ad-hoc signs the candidate and binds the resulting installed hash. Source identity alone could not establish the claimed exact retained binary/database recovery pair.
 
 The delivery owner commissioned a narrow retention correction and immediate private preservation of existing installed RC13 bytes, without service mutation, new database snapshots or a recovery framework. Capacity and backup decisions remain separate gates.
+
+## Options considered
+
+1. Retain distribution bytes and source identity only: insufficient to recover the exact installed executable after installation signing changes its bytes.
+2. Retain and verify the existing transaction-owned predecessor executable and transaction-local proof: uses the existing mechanism and preserves the exact binary/database binding without automatic recovery.
+3. Add a separate archive or rollback framework: more lifecycle machinery than the identified retention defect requires.
 
 ## Decision
 
