@@ -807,18 +807,27 @@ def _preflight_backup_capacity(database_path: str, directory: Path, additional_r
     return required
 
 
+def transaction_proof_path(manifest: Manifest) -> Path:
+    candidate = Path(manifest.candidate_binary)
+    return candidate.with_name(f"{candidate.name}.proof.json")
+
+
 def write_proof(manifest: Manifest, **fields) -> None:
-    path = Path(manifest.status_path).with_suffix(".proof.json")
+    projection_path = Path(manifest.status_path).with_suffix(".proof.json")
+    transaction_path = transaction_proof_path(manifest)
     previous = {}
-    if path.is_file() and not path.is_symlink():
+    if transaction_path.is_file() and not transaction_path.is_symlink():
         try:
-            loaded = json.loads(path.read_text())
+            loaded = json.loads(transaction_path.read_text())
             if loaded.get("transaction_id") == manifest.transaction_id:
                 previous = loaded
         except (OSError, ValueError, AttributeError):
             pass
     previous.update({"transaction_id": manifest.transaction_id, "updated_at": utc_now(), **fields})
-    atomic_write(path, (json.dumps(previous, indent=2) + "\n").encode())
+    payload = (json.dumps(previous, indent=2) + "\n").encode()
+    atomic_write(transaction_path, payload)
+    if projection_path != transaction_path:
+        atomic_write(projection_path, payload)
 
 
 def capture_predecessor(manifest: Manifest, launchctl: "Launchctl") -> dict | None:
@@ -1008,6 +1017,16 @@ def activate(manifest: Manifest) -> str:
             if predecessor is not None and (observed_service[0] not in {"running", "active"}
                                             or observed_service[1] != predecessor["pid"]):
                 raise ActivationError("captured predecessor changed before stop")
+            if predecessor is not None:
+                saved_binary = Path(manifest.candidate_binary).parent / "previous-phoenix-ide"
+                if (saved_binary.is_symlink() or not saved_binary.is_file()
+                        or sha256(saved_binary) != predecessor["binary_sha256"]):
+                    raise ActivationError("saved predecessor binary is missing or differs from authenticated predecessor")
+                predecessor["saved_binary_path"] = str(saved_binary)
+                with saved_binary.open("rb") as stream:
+                    os.fsync(stream.fileno())
+                fsync_dir(saved_binary.parent)
+
             write_proof(manifest, phase="preparing", predecessor=predecessor,
                         recovery_eligible=predecessor is not None, boundary="not_crossed",
                         database_source="absent" if source_absent else "existing",
@@ -1184,11 +1203,10 @@ def activate(manifest: Manifest) -> str:
                 warn_committed("Committed deployment claim no longer matches; inspect ownership manually")
         if claim_released:
             candidate = Path(manifest.candidate_binary)
-            for path in (candidate, candidate.parent / "previous-phoenix-ide"):
-                try:
-                    path.unlink(missing_ok=True)
-                except OSError as exc:
-                    warn_committed(f"Committed deployment left temporary binary {path}: {exc}")
+            try:
+                candidate.unlink(missing_ok=True)
+            except OSError as exc:
+                warn_committed(f"Committed deployment left temporary binary {candidate}: {exc}")
         try:
             print(f"{manifest.transaction_id}: committed", flush=True)
         except (OSError, ValueError):

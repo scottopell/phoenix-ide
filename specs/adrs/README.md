@@ -457,3 +457,5 @@ Generated handoff readability and explicit source authority are governed by [ADR
 Goals schema extraction and refusal of unsupported migration lineages are governed by [187](187_goal-main-migration-identity-reconciliation.md), implementing REQ-COMP-020 without extending deployment compatibility. [ADR-246](246_admit-exact-canonical-158-before-156-ledger.md) qualifies only its predecessor-continuity rule for the exact canonical 158-high ledger whose sole missing embedded predecessor in the post-129 registered tail is migration 156.
 
 Goal admission requires explicit automatic continuation without locking existing Goal management or the OFF gesture: [192](192_goal-admission-requires-explicit-auto-continue.md), implementing REQ-GOAL-AC-001–004.
+
+Exact installed predecessor retention with same-transaction verified database recovery evidence is governed by [ADR-281](281_retain-exact-installed-predecessor-for-manual-recovery.md), implementing REQ-LDD-034 and REQ-COMP-023.
