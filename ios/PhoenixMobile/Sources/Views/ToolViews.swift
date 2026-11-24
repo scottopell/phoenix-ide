@@ -213,8 +213,10 @@ struct BashResult {
         // `partial` is the live trailing un-newlined line (progress bars,
         // prompts); without it a command that hasn't flushed a newline
         // renders as silent.
+        // Lines are strings in model-facing results (REQ-BASH-004); results
+        // stored before that carry `{ offset, bytes }` objects.
         var text = (json["lines"]?.arrayValue ?? [])
-            .compactMap { $0["bytes"]?.stringValue }
+            .compactMap { $0.stringValue ?? $0["bytes"]?.stringValue }
             .joined(separator: "\n")
         if let partial = json["partial"]?.stringValue, !partial.isEmpty {
             text = text.isEmpty ? partial : text + "\n" + partial

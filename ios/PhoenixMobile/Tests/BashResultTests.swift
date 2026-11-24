@@ -18,4 +18,18 @@ final class BashResultTests: XCTestCase {
         XCTAssertFalse(result.isFailure)
         XCTAssertEqual(result.headline, "exited 0 · 50ms")
     }
+
+    func testStringLinesRenderAsOutput() throws {
+        let result = try XCTUnwrap(BashResult(
+            resultText: "{\"status\":\"exited\",\"exit_code\":0,\"lines\":[\"hello\",\"\",\"world\"]}"))
+
+        XCTAssertEqual(result.outputText, "hello\n\nworld")
+    }
+
+    func testPersistedObjectLinesStillRender() throws {
+        let result = try XCTUnwrap(BashResult(
+            resultText: "{\"status\":\"exited\",\"exit_code\":0,\"lines\":[{\"offset\":0,\"bytes\":\"hello\"},{\"offset\":1,\"bytes\":\"world\"}]}"))
+
+        XCTAssertEqual(result.outputText, "hello\nworld")
+    }
 }
