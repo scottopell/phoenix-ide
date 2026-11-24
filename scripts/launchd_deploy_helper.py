@@ -23,12 +23,12 @@ import urllib.request
 from pathlib import Path
 from typing import Callable
 
-HANDOFF_PROTOCOL_VERSION = 3
+HANDOFF_PROTOCOL_VERSION = 4
 DEPLOY_HELPER_LABEL_PREFIX = "com.phoenix-ide.deploy"
 DEFAULT_TRANSITION_TIMEOUT_SECS = 30.0
 DEFAULT_HEALTH_TIMEOUT_SECS = 120.0
 MIGRATION_TIMEOUT_SECS = 600
-BACKUP_VERIFICATION_TIMEOUT_SECS = 900.0
+BACKUP_VERIFICATION_TIMEOUT_SECS = 1200.0
 FULL_GIT_SHA_RE = re.compile(r"[0-9a-f]{40}")
 HASH_RE = re.compile(r"[0-9a-f]{64}")
 TERMINAL_STATES = {"committed", "precondition_failed", "failed"}
@@ -66,6 +66,7 @@ class Manifest:
     uid: int
     health_url: str
     health_insecure_tls: bool
+    additional_reserve_bytes: int
     active_path: str
     status_path: str
     deployed_sha_path: str
@@ -171,6 +172,8 @@ def verify_staged(path: str, expected_hash: str, description: str) -> Path:
 
 
 def validate_manifest_identities(manifest: Manifest) -> None:
+    if type(manifest.additional_reserve_bytes) is not int or manifest.additional_reserve_bytes < 0:
+        raise ActivationError("additional reserve must be a nonnegative integer")
     if type(manifest.manifest_version) is not int or manifest.manifest_version != HANDOFF_PROTOCOL_VERSION:
         raise ActivationError("unsupported deployment manifest")
     if not isinstance(manifest.expected, Identity):
@@ -772,26 +775,30 @@ def create_verified_database_backup(database_path: str, directory: Path, *, time
         raise
 
 
-def _first_install_capacity(database_path: str) -> int:
+def _first_install_admission(database_path: str, additional_reserve_bytes: int) -> dict[str, int]:
     path = Path(database_path)
     if not path.is_absolute() or os.path.lexists(path):
         raise ActivationError("first-install database must still be absent")
     if not path.parent.is_dir():
         raise ActivationError("first-install database parent must be an existing directory")
-    reserve = 16 * 1024 * 1024
+    required = 16 * 1024 * 1024 + additional_reserve_bytes
     available = shutil.disk_usage(path.parent).free
-    if available < reserve:
+    if available < required:
         raise ActivationError(
-            f"insufficient space for first-install database and deploy overhead: need {reserve} bytes, have {available}"
+            f"insufficient space for first-install database and deploy overhead: need {required} bytes, have {available}"
         )
-    return reserve
+    return {"required_bytes": required, "available_bytes": available}
 
 
-def _preflight_backup_capacity(database_path: str, directory: Path) -> int:
+def _first_install_capacity(database_path: str, additional_reserve_bytes: int = 0) -> int:
+    return _first_install_admission(database_path, additional_reserve_bytes)["required_bytes"]
+
+
+def _preflight_backup_capacity(database_path: str, directory: Path, additional_reserve_bytes: int = 0) -> int:
     database_bytes = _database_size_bytes(database_path)
     # Native backup may need one full DB copy; 16 MiB covers bounded status,
     # service, journal, and filesystem metadata overhead without a size floor.
-    required = database_bytes + 16 * 1024 * 1024
+    required = database_bytes + 16 * 1024 * 1024 + additional_reserve_bytes
     available = shutil.disk_usage(directory).free
     if available < required:
         raise ActivationError(
@@ -800,18 +807,27 @@ def _preflight_backup_capacity(database_path: str, directory: Path) -> int:
     return required
 
 
+def transaction_proof_path(manifest: Manifest) -> Path:
+    candidate = Path(manifest.candidate_binary)
+    return candidate.with_name(f"{candidate.name}.proof.json")
+
+
 def write_proof(manifest: Manifest, **fields) -> None:
-    path = Path(manifest.status_path).with_suffix(".proof.json")
+    projection_path = Path(manifest.status_path).with_suffix(".proof.json")
+    transaction_path = transaction_proof_path(manifest)
     previous = {}
-    if path.is_file() and not path.is_symlink():
+    if transaction_path.is_file() and not transaction_path.is_symlink():
         try:
-            loaded = json.loads(path.read_text())
+            loaded = json.loads(transaction_path.read_text())
             if loaded.get("transaction_id") == manifest.transaction_id:
                 previous = loaded
         except (OSError, ValueError, AttributeError):
             pass
     previous.update({"transaction_id": manifest.transaction_id, "updated_at": utc_now(), **fields})
-    atomic_write(path, (json.dumps(previous, indent=2) + "\n").encode())
+    payload = (json.dumps(previous, indent=2) + "\n").encode()
+    atomic_write(transaction_path, payload)
+    if projection_path != transaction_path:
+        atomic_write(projection_path, payload)
 
 
 def capture_predecessor(manifest: Manifest, launchctl: "Launchctl") -> dict | None:
@@ -944,17 +960,17 @@ def _backup_proof(path: Path, deadline: float, diagnostics: dict | None = None) 
             "backup_sha256": digest.hexdigest()}
 
 
-def _reserve_before_boundary(database_path: str, directory: Path) -> int:
-    # Backup bytes are already durable and retained; only the residual bounded
-    # operational reserve remains to be checked at the irreversible boundary.
+def _reserve_before_boundary(database_path: str, directory: Path, additional_reserve_bytes: int = 0) -> dict[str, int]:
     database_bytes = _database_size_bytes(database_path)
-    available = shutil.disk_usage(directory).free
-    reserve = 16 * 1024 * 1024 + min(database_bytes, 64 * 1024 * 1024)
-    if available < reserve:
+    available = min(shutil.disk_usage(directory).free,
+                    shutil.disk_usage(Path(database_path).parent).free)
+    required = 16 * 1024 * 1024 + min(database_bytes, 64 * 1024 * 1024) + additional_reserve_bytes
+    if available < required:
         raise ActivationError(
-            f"insufficient residual deploy space before migration boundary: need {reserve} bytes, have {available}"
+            f"insufficient residual deploy space before migration boundary: need {required} bytes, have {available}"
         )
-    return database_bytes + reserve
+    return {"available_bytes": available, "required_bytes": required,
+            "additional_reserve_bytes": additional_reserve_bytes}
 
 
 def activate(manifest: Manifest) -> str:
@@ -989,9 +1005,9 @@ def activate(manifest: Manifest) -> str:
             backup_directory = Path(manifest.candidate_binary).parent
             source_absent = not os.path.lexists(database_path)
             if source_absent:
-                _first_install_capacity(database_path)
+                _first_install_capacity(database_path, manifest.additional_reserve_bytes)
             else:
-                _preflight_backup_capacity(database_path, backup_directory)
+                _preflight_backup_capacity(database_path, backup_directory, manifest.additional_reserve_bytes)
             predecessor = capture_predecessor(manifest, launchctl)
             observed_service = launchctl.inspect()
             if source_absent and (predecessor is not None or observed_service != ("not_loaded", None)
@@ -1001,9 +1017,20 @@ def activate(manifest: Manifest) -> str:
             if predecessor is not None and (observed_service[0] not in {"running", "active"}
                                             or observed_service[1] != predecessor["pid"]):
                 raise ActivationError("captured predecessor changed before stop")
+            if predecessor is not None:
+                saved_binary = Path(manifest.candidate_binary).parent / "previous-phoenix-ide"
+                if (saved_binary.is_symlink() or not saved_binary.is_file()
+                        or sha256(saved_binary) != predecessor["binary_sha256"]):
+                    raise ActivationError("saved predecessor binary is missing or differs from authenticated predecessor")
+                predecessor["saved_binary_path"] = str(saved_binary)
+                with saved_binary.open("rb") as stream:
+                    os.fsync(stream.fileno())
+                fsync_dir(saved_binary.parent)
+
             write_proof(manifest, phase="preparing", predecessor=predecessor,
                         recovery_eligible=predecessor is not None, boundary="not_crossed",
-                        database_source="absent" if source_absent else "existing")
+                        database_source="absent" if source_absent else "existing",
+                        additional_reserve_bytes=manifest.additional_reserve_bytes)
             previous_plist = Path(manifest.candidate_plist).parent / "previous.plist"
             if os.path.lexists(previous_plist):
                 raise ActivationError("previous plist already exists; activation cannot be replayed")
@@ -1029,16 +1056,19 @@ def activate(manifest: Manifest) -> str:
                         captured_pid=predecessor["pid"] if predecessor else None,
                         captured_pid_gone=(captured_stop if predecessor else False))
             if source_absent:
-                _first_install_capacity(database_path)
+                _first_install_capacity(database_path, manifest.additional_reserve_bytes)
                 backup_proof = None
                 write_proof(manifest, phase="source_absent", backup=None)
                 phase = "migration_started"
-                _first_install_capacity(database_path)
+                admission = _first_install_admission(database_path, manifest.additional_reserve_bytes)
+                write_proof(manifest, admission_available_bytes=admission["available_bytes"],
+                            admission_required_bytes=admission["required_bytes"],
+                            additional_reserve_bytes=manifest.additional_reserve_bytes)
                 boundary_attempted = True
                 write_proof(manifest, phase=phase, boundary="attempted", backup=None)
                 write_status(manifest, phase)
             else:
-                _preflight_backup_capacity(database_path, backup_directory)
+                _preflight_backup_capacity(database_path, backup_directory, manifest.additional_reserve_bytes)
                 with sqlite_writer_guard(database_path):
                     backup_deadline = time.monotonic() + BACKUP_VERIFICATION_TIMEOUT_SECS
                     verifier_diagnostics = {}
@@ -1055,7 +1085,10 @@ def activate(manifest: Manifest) -> str:
                     write_proof(manifest, phase="backup_verified", backup=backup_proof)
                     print(f"{manifest.transaction_id}: verified SQLite backup retained at {backup}", flush=True)
                     phase = "migration_started"
-                    _reserve_before_boundary(database_path, backup_directory)
+                    admission = _reserve_before_boundary(database_path, backup_directory, manifest.additional_reserve_bytes)
+                    write_proof(manifest, admission_available_bytes=admission["available_bytes"],
+                                admission_required_bytes=admission["required_bytes"],
+                                additional_reserve_bytes=admission["additional_reserve_bytes"])
                     boundary_attempted = True
                     write_proof(manifest, phase=phase, boundary="attempted", backup=backup_proof)
                     write_status(manifest, phase)
@@ -1170,11 +1203,10 @@ def activate(manifest: Manifest) -> str:
                 warn_committed("Committed deployment claim no longer matches; inspect ownership manually")
         if claim_released:
             candidate = Path(manifest.candidate_binary)
-            for path in (candidate, candidate.parent / "previous-phoenix-ide"):
-                try:
-                    path.unlink(missing_ok=True)
-                except OSError as exc:
-                    warn_committed(f"Committed deployment left temporary binary {path}: {exc}")
+            try:
+                candidate.unlink(missing_ok=True)
+            except OSError as exc:
+                warn_committed(f"Committed deployment left temporary binary {candidate}: {exc}")
         try:
             print(f"{manifest.transaction_id}: committed", flush=True)
         except (OSError, ValueError):

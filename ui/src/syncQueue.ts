@@ -78,27 +78,6 @@ export class SyncQueue {
       }
     }
   }
-  
-  isRetryableError(error: unknown): boolean {
-    if (error instanceof TypeError && error.message.includes('fetch')) {
-      return true;
-    }
-    
-    if (error instanceof Error) {
-      const message = error.message.toLowerCase();
-      if (
-        message.includes('network') ||
-        message.includes('timeout') ||
-        message.includes('503') ||
-        message.includes('502') ||
-        message.includes('504')
-      ) {
-        return true;
-      }
-    }
-    
-    return false;
-  }
 }
 
 export const syncQueue = new SyncQueue();

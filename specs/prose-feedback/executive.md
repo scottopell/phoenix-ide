@@ -44,7 +44,7 @@ Task approval is a separate component, `TaskApprovalReader`, not part of the Met
 | **REQ-PF-006:** Select Content for Annotation | ✅ Complete | Long-press with 10px threshold |
 | **REQ-PF-007:** Add Annotation Note | ✅ Complete | Dialog with keyboard shortcuts |
 | **REQ-PF-008:** View and Manage Notes | ✅ Complete | Badge, notes panel, jump-to-line |
-| **REQ-PF-009:** Send Notes to Conversation | ✅ Complete | Grouped by file; quoted line capped at 200 UTF-16 units on a character boundary (`safePrefix`, ADR-275) |
+| **REQ-PF-009:** Send Notes to Conversation | ✅ Complete | Grouped by file; quoted line capped at 200 UTF-16 units on a character boundary (`safePrefix`, ADR-282) |
 | **REQ-PF-010:** Unsaved Notes Warning | ✅ Complete | Confirmation dialog |
 | **REQ-PF-011:** Note Persistence Within Session | ✅ Complete | Notes cleared on close |
 | **REQ-PF-012:** Responsive Layout | ✅ Complete | Mobile overlay; desktop per `specs/file-explorer/` |

@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest';
 import type { ContentBlock, ConversationState, Message } from '../../api';
 import type { QueuedMessage } from '../../hooks/useMessageQueue';
 import type { RenderUnit } from '../../conversation/renderUnits';
+import { buildDiffSearchProjection } from './diffSearchProjection';
 import {
   buildAgentTextFragments,
   buildKeywordSearchOutputProjection,
@@ -10,7 +11,6 @@ import {
   buildReadFileOutputProjection,
   buildSearchOutputProjection,
   buildConversationSearchProjection,
-  buildDiffSearchProjection,
   buildFileSearchProjection,
   buildMarkdownDisplayBlocks,
   buildMarkdownFileSearchProjection,

@@ -1,4 +1,5 @@
 import { makeMobileContinuationScenario, makeVirtualizedReactionScenario } from '../fixtures/productConversation/scenarios';
+import { duePayload, makeEmberTrackingScenario } from '../fixtures/productConversation/emberTracking';
 import type { Story } from '@ladle/react';
 import {
   getProductConversationScenario,
@@ -75,6 +76,15 @@ CompactEventsGlobal.storyName = 'compact-events-global';
 const compactRedacted = makeCompactEventsScenario(false, true);
 export const CompactEventsRedacted: Story = () => <ProductConversationFixture scenario={compactRedacted} />;
 CompactEventsRedacted.storyName = 'compact-events-redacted';
+
+const trackingObservations = makeEmberTrackingScenario('ember-tracking-observations');
+const trackingFallback = makeEmberTrackingScenario('ember-tracking-fallback');
+export const EmberTrackingObservations: Story = () => <ProductConversationFixture scenario={trackingObservations}>
+  <output hidden data-tracking-expected-payload={duePayload} />
+</ProductConversationFixture>;
+EmberTrackingObservations.storyName = 'ember-tracking-observations';
+export const EmberTrackingFallback: Story = () => <ProductConversationFixture scenario={trackingFallback} />;
+EmberTrackingFallback.storyName = 'ember-tracking-fallback';
 
 const reminderBase = getProductConversationScenario('mobile-open');
 const reminderOwner = reminderBase.snapshot?.product_conversation_id;

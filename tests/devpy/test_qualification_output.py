@@ -129,13 +129,24 @@ class QualificationOutputTests(unittest.TestCase):
                     env = {} if diagnostic is None else {"PHOENIX_CHECK_DIAGNOSTIC_DIR": diagnostic}
                     run_step = mock.Mock()
                     namespace = dict(os=os, sys=sys, ROOT=ROOT, profile_work=profile is not None,
-                                     _CHECK_PROFILE=profile, run_step=run_step)
+                                     _CHECK_PROFILE=profile, DEVPY_TEST_TIMEOUT=1800,
+                                     run_step=run_step)
                     with mock.patch.dict(os.environ, env, clear=True):
                         exec(code, namespace)
                     prefix = ([sys.executable, "-m", "unittest"] if profile is None else
                               [sys.executable, str(ROOT / "scripts" / "python_unittest_profile.py")])
                     expected = prefix + ["discover", "tests/devpy"] + (["-v"] if diagnostic else [])
-                    run_step.assert_called_once_with("dev.py unit tests", expected)
+                    run_step.assert_called_once_with("dev.py unit tests", expected, timeout=1800)
+
+    def test_rust_capture_keeps_early_panic_before_passing_test_tail(self):
+        payload = ("thread 'lost_chrome' panicked: EXPECTED_CAUSAL_ASSERTION\n"
+                   + "PASS later_test\n" * 400 + "1 failed\n")
+        result, _ = self.execute(payload, 101, name="cargo test")
+        raw = (self.directory / "cargo-test.full.log").read_bytes()
+        self.assertEqual(result, 101)
+        self.assertTrue(raw.startswith(payload.encode()))
+        self.assertIn(b"EXPECTED_CAUSAL_ASSERTION", raw)
+        self.assertIn(b"payload COMPLETE", raw)
 
     def test_unittest_capture_retains_verbose_summary_skips_and_completion(self):
         for returncode, ending in ((0, "OK (skipped=1)"),
@@ -182,7 +193,8 @@ class QualificationOutputTests(unittest.TestCase):
         self.assertEqual(self.dev._check_diagnostic_log_path("dev.py unit tests", diagnostic),
                          self.directory / "devpy-unit-tests.full.log")
         self.assertIsNone(self.dev._check_diagnostic_log_path("dev.py unit tests", {}))
-        self.assertIsNone(self.dev._check_diagnostic_log_path("cargo test", diagnostic))
+        self.assertEqual(self.dev._check_diagnostic_log_path("cargo test", diagnostic),
+                         self.directory / "cargo-test.full.log")
         self.assertIsNone(self.dev._check_diagnostic_log_path("cargo clippy", {"PHOENIX_GOAL_REUSE_DIR": str(self.directory)}))
 
     def test_newline_free_stream_uses_bounded_reads_spool_and_byte_tail(self):

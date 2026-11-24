@@ -1,13 +1,17 @@
 # Native macOS launchd Deployment — Executive Status
 
+## Exact predecessor retention correction
+
+REQ-LDD-034 / REQ-COMP-023 retain the authenticated installed predecessor executable in its existing transaction directory, with saved path plus existing identity/hash proof and same-transaction verified database backup. Missing, differing or symlink saved bytes refuse before disruption; committed cleanup removes only the temporary candidate. Transaction-local proof is authoritative and written before the shared latest-status projection; subsequent attempts cannot overwrite an earlier recovery binding. Disposable coverage exercises successful retention, failure evidence, terminal replay refusal, first-install non-claims and restart artifact preservation. Hosted exact-head qualification remains required before release; existing RC13 transactions are not retroactively complete recovery bundles. ADR-281 records the decision. macOS published-release helper/source binding requires a new supported release; immutable RC14 is unchanged.
+
 ## Current reality
 
-The protocol-3 deploy helper implements ordinary local/published deployment. It
+The protocol-4 deploy helper implements ordinary local/published deployment. It
 validates exact candidate artifacts and checks backup capacity for an existing
 database before disruption; it quarantines the canonical plist and observes
 predecessor stop. For an existing database it holds a bounded SQLite
 `BEGIN IMMEDIATE` writer reservation across backup verification and durable
-boundary recording, retaining the fsynced native backup and transaction proof. Backup verification checks integrity, then compares source and backup metadata and typed stored rows in lockstep, including rowid/primary-key identity and persisted FTS5 shadow rows. Unsupported virtual-table modules and tables shadowing every rowid alias fail closed. Backup creation, integrity, equivalence, fsync and proof hashing share a 900-second deadline.
+boundary recording, retaining the fsynced native backup and transaction proof. Backup verification checks integrity, then compares source and backup metadata and typed stored rows in lockstep, including rowid/primary-key identity and persisted FTS5 shadow rows. Unsupported virtual-table modules and tables shadowing every rowid alias fail closed. Backup creation, integrity, equivalence, fsync and proof hashing share a 1200-second deadline.
 Only a true first install with absent database and no managed predecessor,
 installed binary/plist or loaded service omits the backup: private proof records
 `database_source: absent`, `backup: null`, with path absence rechecked before
@@ -341,3 +345,12 @@ helper commands are not recovery APIs.
 ## Path and recovery identity correction
 
 SQLite capacity, backup source and writer reservation use encoded file URIs. Regression fixtures include URI metacharacters and control characters in directory and database names, verify actual rows and writer exclusion, and reject missing sources without creating siblings. Preboundary predecessor recovery publishes and bootstraps the canonical plist so the loaded path satisfies the unchanged normal-restart same-file check. A composition regression executes the actual restart validator with mocked loaded-path inspection; it is not a live-launchd recovery/restart qualification. ADR-265 records the ordering correction and the original fixture blind spots.
+
+
+## Bounded verification budget adjustment
+
+The shared backup-verification limit is 1200 seconds; candidate migration remains 600 seconds. Exhaustive integrity, typed-row comparison, fsync, hashing and fail-closed recovery are unchanged. A production preboundary attempt exceeded 900 seconds while comparison was progressing: backup took 48.27 seconds and integrity 578.50 seconds, versus the prior successful 47.86/434.14-second phases and 361.44-second comparison. The 1200-second limit is a bounded operational allowance, not a guaranteed outage bound. Another timeout requires diagnosis rather than repeated increases. Historical measurements below/above retain their original budgets.
+
+## Requested reserve admission
+
+REQ-LDD-033 is implemented by `--additional-reserve-bytes` in the existing deploy command and required protocol-4 manifest. `_reserve_before_boundary` samples both backup and database filesystem capacity after backup under the writer reservation; `_first_install_admission` checks the database filesystem before first-install boundary attempt. Proof records `additional_reserve_bytes`, `admission_required_bytes`, `admission_available_bytes`. Unit regressions cover exact threshold, late capacity loss, distinct filesystems, first install, invalid/missing manifest input, ordinary/controller forwarding and nonlaunchd refusal. Protocol-4 handoff fixtures and the materialized release-helper qualifier are aligned. ADR-280 records the deliberate helper protocol break. This source change is not an installed-production claim; published RC13 uses protocol 3 and cannot enforce this option.

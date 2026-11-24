@@ -59,7 +59,6 @@ import {
 } from '../hooks';
 import { useToast } from '../hooks/useToast';
 import { useFocusScope } from '../hooks/useFocusScope';
-import { beginNewProductConversationIntent } from '../hooks/useCreateConversation';
 import { Toast } from '../components/Toast';
 import { useAppMachine } from '../hooks/useAppMachine';
 import { ConnectedStateBar } from '../components/StateBar';
@@ -93,15 +92,6 @@ import {
 
 // Conditional overlays / heavy panels — code-split so the default render path
 // (chat view with no overlay open) doesn't pay their bundle cost.
-// - FileViewer + MetaViewer bodies, TaskApprovalReader: pull in react-syntax-highlighter
-// - TerminalPanel: pulls in xterm + addon (large)
-// - CredentialHelperPanel, FirstTaskWelcome: rarely mounted
-const FileViewer = lazy(() =>
-  import('../components/FileViewer').then((m) => ({ default: m.FileViewer })),
-);
-const ConversationDiffViewer = lazy(() =>
-  import('../components/viewer/ConversationDiffViewer').then((m) => ({ default: m.ConversationDiffViewer })),
-);
 const TaskApprovalReader = lazy(() =>
   import('../components/TaskApprovalReader').then((m) => ({ default: m.TaskApprovalReader })),
 );
@@ -114,15 +104,11 @@ const CredentialHelperPanel = lazy(() =>
 const TerminalPanel = lazy(() =>
   import('../components/TerminalPanel').then((m) => ({ default: m.TerminalPanel })),
 );
-const BrowserViewPanel = lazy(() =>
-  import('../components/BrowserViewPanel').then((m) => ({ default: m.BrowserViewPanel })),
-);
-const ProcessInspectorPanel = lazy(() =>
-  import('../components/ProcessInspectorPanel').then((m) => ({ default: m.ProcessInspectorPanel })),
-);
-const MessageViewer = lazy(() =>
-  import('../components/MessageViewer').then((m) => ({ default: m.MessageViewer })),
-);
+import {
+  ConversationViewerOverlays,
+  ConversationViewerSplitPane,
+  NarrowDesktopViewerHost,
+} from '../components/viewer/ConversationViewerHost';
 import { ReviewNotesProvider } from '../contexts/ReviewNotesContext';
 import { useViewerRestorationSettled, useViewerSlot } from '../contexts/ViewerSlotContext';
 import { useConversationReadiness } from '../contexts/useConversationReadiness';
@@ -1940,7 +1926,6 @@ function ConversationPageContent({
         // ignore — non-fatal
       }
     }
-    beginNewProductConversationIntent();
     navigate('/new');
   }, [creationFailedDraft, navigate]);
   const handleDeleteProvisioningConversation = useCallback(async () => {
@@ -2143,74 +2128,41 @@ function ConversationPageContent({
     );
   }
 
-  // Narrow desktop (1025-1279px): the active viewer (prose reader OR
-  // diff viewer) replaces conversation content as a full-screen pane.
-  // Wide desktop (≥1280px) renders it as a split-pane sibling inside
-  // the main return below (task 08654).
-  if (isDesktop && !isWideDesktop) {
-    if (openFileState) {
-      const prs = openFileState;
-      return (
-        <div id="app">
-          <Suspense fallback={null}>
-            <FileViewer
-              filePath={prs.path}
-              rootDir={prs.rootDir}
-              onClose={handleCloseFileViewer}
-              onSendNotes={handleSendNotes}
-              patchContext={prs.patchContext ?? undefined}
-              focus={prs.focus}
-              inline
-            />
-          </Suspense>
-        </div>
-      );
-    }
-    if (paneDiffOpen && conversationId) {
-      return (
-        <div id="app">
-          <Suspense fallback={null}>
-            <ConversationDiffViewer
-              conversationId={conversationId}
-              target={diffTarget}
-              activePrIdentity={activePrIdentity}
-              onClose={handleCloseDiff}
-              onSendNotes={handleSendNotes}
-              inline
-            />
-          </Suspense>
-        </div>
-      );
-    }
-    if (browserViewerOpen && conversationId) {
-      return (
-        <div id="app">
-          <Suspense fallback={null}>
-            <BrowserViewPanel
-              conversationId={conversationId}
-              onClose={handleCloseBrowserView}
-              inline
-              takeover
-            />
-          </Suspense>
-        </div>
-      );
-    }
-    if (messageViewerOpen && messageSlot) {
-      return (
-        <div id="app">
-          <Suspense fallback={null}>
-            <MessageViewer
-              sequenceId={messageSlot.sequenceId}
-              messages={viewableMessages}
-              onClose={handleCloseMessageViewer}
-              onSendNotes={handleSendNotes}
-              inline
-            />
-          </Suspense>
-        </div>
-      );
-    }
+  const hasNarrowDesktopViewer = isDesktop && !isWideDesktop && (
+    openFileState !== null
+    || (paneDiffOpen && Boolean(conversationId))
+    || (browserViewerOpen && Boolean(conversationId))
+    || (messageViewerOpen && messageSlot !== null)
+  );
+  const viewerHostBaseProps = {
+    conversationId,
+    isDesktop,
+    isWideDesktop,
+    openFileState,
+    proseSlot,
+    paneDiffOpen,
+    fullscreenDiffOpen,
+    diffTarget,
+    activePrIdentity,
+    browserViewerOpen,
+    inspectViewerOpen,
+    inspectSlot,
+    messageViewerOpen,
+    messageSlot,
+    viewableMessages,
+    writableComposerMounted,
+    onCloseFileViewer: handleCloseFileViewer,
+    onCloseDiff: handleCloseDiff,
+    onCloseBrowserView: handleCloseBrowserView,
+    onCloseInspector: handleCloseInspector,
+    onCloseMessageViewer: handleCloseMessageViewer,
+    onSendNotes: handleSendNotes,
+    onSendFocusedNotes: handleSendFocusedNotes,
+    onPresentationChange: viewerSlot.setPresentation,
+  };
+
+  if (hasNarrowDesktopViewer) {
+    return <NarrowDesktopViewerHost {...viewerHostBaseProps} showSplitPaneViewer={false} />;
   }
 
   // REQ-SEED-003: seed parent breadcrumb. Rendered above the message list
@@ -2832,178 +2784,15 @@ function ConversationPageContent({
         />
       )}
 
-      {/* Mobile prose reader overlay — reads URL-driven state from
-          FileExplorerProvider so cold reload (e.g. iOS PWA return) restores
-          the exact file the user was viewing. */}
-      {!isDesktop && openFileState && (
-        <Suspense fallback={null}>
-          <FileViewer
-            filePath={openFileState.path}
-            rootDir={openFileState.rootDir}
-            onClose={handleCloseFileViewer}
-            onSendNotes={handleSendNotes}
-            patchContext={openFileState.patchContext ?? undefined}
-            focus={openFileState.focus}
-          />
-        </Suspense>
-      )}
-      {/* Fullscreen diff takeover: dismissible review surface above app chrome.
-          Pane presentation remains available for intentional split-pane callers. */}
-      {fullscreenDiffOpen && conversationId && (
-        <Suspense fallback={null}>
-          <ConversationDiffViewer
-            conversationId={conversationId}
-            target={diffTarget}
-            activePrIdentity={activePrIdentity}
-            onClose={handleCloseDiff}
-            onSendNotes={handleSendNotes}
-            takeover
-          />
-        </Suspense>
-      )}
-      {paneDiffOpen && !showSplitPaneViewer && conversationId && (
-        <Suspense fallback={null}>
-          <ConversationDiffViewer
-            conversationId={conversationId}
-            target={diffTarget}
-            activePrIdentity={activePrIdentity}
-            onClose={handleCloseDiff}
-            onSendNotes={handleSendNotes}
-          />
-        </Suspense>
-      )}
-      {/* Browser view overlay: same fallback role as the diff overlay above
-          — mobile, narrow desktop, or any case where the split pane is
-          unavailable. REQ-BT-018. */}
-      {browserViewerOpen && !showSplitPaneViewer && conversationId && (
-        <Suspense fallback={null}>
-          <div className="browser-view-overlay">
-            <BrowserViewPanel
-              conversationId={conversationId}
-              onClose={handleCloseBrowserView}
-            />
-          </div>
-        </Suspense>
-      )}
-      {/* Process inspector overlay: mobile, narrow desktop, or any case where
-          the split pane is unavailable (REQ-PINSP-007). */}
-      {inspectViewerOpen && inspectSlot && !showSplitPaneViewer && (
-        <Suspense fallback={null}>
-          <ProcessInspectorPanel
-            handleId={inspectSlot.handleId}
-            conversationId={conversationId}
-            onClose={handleCloseInspector}
-          />
-        </Suspense>
-      )}
-      {messageViewerOpen && messageSlot && !showSplitPaneViewer && (
-        <Suspense fallback={null}>
-          <MessageViewer
-            sequenceId={messageSlot.sequenceId}
-            messages={viewableMessages}
-            onClose={handleCloseMessageViewer}
-            onSendNotes={writableComposerMounted
-              ? (isWideDesktop && messageSlot.presentation === 'fullscreen' ? handleSendFocusedNotes : handleSendNotes)
-              : undefined}
-            presentation={messageSlot.presentation}
-            canTogglePresentation={isWideDesktop}
-            onPresentationChange={viewerSlot.setPresentation}
-          />
-        </Suspense>
-      )}
-      {showSplitPaneViewer && (
-        <>
-          <div
-            className="viewer-pane-divider"
-            title="Drag to resize the viewer pane • Double-click to collapse"
-            role="separator"
-            aria-orientation="vertical"
-            aria-label="Resize viewer pane"
-            aria-valuemin={VIEWER_PANE_MIN}
-            aria-valuemax={VIEWER_PANE_MAX}
-            aria-valuenow={viewerPane.collapsed ? 0 : viewerPane.size}
-            tabIndex={0}
-            onPointerDown={(e) => viewerPane.startDrag(e, 'x', true, handleViewerLiveResize)}
-            onDoubleClick={() => viewerPane.setCollapsed(!viewerPane.collapsed)}
-            onKeyDown={(e) => {
-              // Keyboard resize for the WAI-ARIA `separator` pattern.
-              // ArrowLeft / ArrowRight nudge ±32px; Home / End clamp
-              // to min / max; Enter / Space toggle collapse. setSize
-              // applies the same clamp the drag path uses.
-              const STEP = 32;
-              if (e.key === 'ArrowLeft') {
-                e.preventDefault();
-                viewerPane.setSize(viewerPane.size + STEP);
-              } else if (e.key === 'ArrowRight') {
-                e.preventDefault();
-                viewerPane.setSize(viewerPane.size - STEP);
-              } else if (e.key === 'Home') {
-                e.preventDefault();
-                viewerPane.setSize(VIEWER_PANE_MAX);
-              } else if (e.key === 'End') {
-                e.preventDefault();
-                viewerPane.setSize(VIEWER_PANE_MIN);
-              } else if (e.key === 'Enter' || e.key === ' ') {
-                e.preventDefault();
-                viewerPane.setCollapsed(!viewerPane.collapsed);
-              }
-            }}
-          />
-          <div className="conversation-viewer-pane">
-            <Suspense fallback={null}>
-              {paneDiffOpen && conversationId ? (
-                <ConversationDiffViewer
-                  conversationId={conversationId}
-                  target={diffTarget}
-                  activePrIdentity={activePrIdentity}
-                  onClose={handleCloseDiff}
-                  onSendNotes={handleSendNotes}
-                  inline
-                />
-              ) : splitPanePrs ? (
-                <FileViewer
-                  filePath={splitPanePrs.path}
-                  rootDir={splitPanePrs.rootDir}
-                  onClose={handleCloseFileViewer}
-                  onSendNotes={isWideDesktop && proseSlot?.presentation === 'fullscreen' ? handleSendFocusedNotes : handleSendNotes}
-                  patchContext={splitPanePrs.patchContext ?? undefined}
-                  focus={splitPanePrs.focus}
-                  presentation={proseSlot?.presentation ?? 'pane'}
-                  canTogglePresentation
-                  onPresentationChange={viewerSlot.setPresentation}
-                  inline
-                />
-              ) : browserViewerOpen && conversationId ? (
-                <BrowserViewPanel
-                  conversationId={conversationId}
-                  onClose={handleCloseBrowserView}
-                  inline
-                />
-              ) : inspectViewerOpen && inspectSlot ? (
-                <ProcessInspectorPanel
-                  handleId={inspectSlot.handleId}
-                  conversationId={conversationId}
-                  onClose={handleCloseInspector}
-                  inline
-                />
-              ) : messageViewerOpen && messageSlot ? (
-                <MessageViewer
-                  sequenceId={messageSlot.sequenceId}
-                  messages={viewableMessages}
-                  onClose={handleCloseMessageViewer}
-                  onSendNotes={writableComposerMounted
-                    ? (isWideDesktop && messageSlot.presentation === 'fullscreen' ? handleSendFocusedNotes : handleSendNotes)
-                    : undefined}
-                  presentation={messageSlot.presentation}
-                  canTogglePresentation
-                  onPresentationChange={viewerSlot.setPresentation}
-                  inline
-                />
-              ) : null}
-            </Suspense>
-          </div>
-        </>
-      )}
+      <ConversationViewerOverlays {...viewerHostBaseProps} showSplitPaneViewer={showSplitPaneViewer} />
+      <ConversationViewerSplitPane
+        {...viewerHostBaseProps}
+        showSplitPaneViewer={showSplitPaneViewer}
+        viewerPane={viewerPane}
+        minSize={VIEWER_PANE_MIN}
+        maxSize={VIEWER_PANE_MAX}
+        onLiveResize={handleViewerLiveResize}
+      />
     </div>
     {/* Fork proposal review modal — full-screen, driven by the ForkProposals
         store's openProposalId (REQ-PROJ-034 / 037). */}

@@ -73,6 +73,8 @@ export const productConversationScenarioDefinitions = [
   { id: 'compact-events-ordinary', title: 'Compact ordinary events', viewport: 'desktop', state: 'ready' },
   { id: 'compact-events-global', title: 'Compact Global events', viewport: 'desktop', state: 'ready' },
   { id: 'compact-events-redacted', title: 'Redacted event evidence', viewport: 'desktop', state: 'ready' },
+  { id: 'ember-tracking-observations', title: 'Saved Ember tracking observations across continued history', viewport: 'desktop', state: 'ready' },
+  { id: 'ember-tracking-fallback', title: 'Untrusted and malformed Ember tracking lookalikes', viewport: 'desktop', state: 'ready' },
   { id: 'composer-focus', title: 'Composer focus ownership', viewport: 'desktop', state: 'ready' },
   { id: 'reminders-compact-due', title: 'Compact due reminder disclosure', viewport: 'mobile', state: 'ready' },
   { id: 'reminders-compact-scheduled', title: 'Compact scheduled reminder disclosure', viewport: 'mobile', state: 'ready' },

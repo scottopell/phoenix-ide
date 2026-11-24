@@ -110,6 +110,9 @@ mod tests {
                 .unwrap(),
             "emoji"
         );
+        crate::migrations::run_pending_migrations(db.pool())
+            .await
+            .unwrap();
         drop(db);
         let reopened = Database::open(path.to_str().unwrap()).await.unwrap();
         assert_eq!(

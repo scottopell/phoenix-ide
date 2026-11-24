@@ -1,4 +1,4 @@
-# ADR-275: Cap quoted review lines at 200 UTF-16 units on a character boundary
+# ADR-282: Cap quoted review lines at 200 UTF-16 units on a character boundary
 
 - **Status:** Accepted
 - **Date:** 2026-11-23

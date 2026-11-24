@@ -231,6 +231,8 @@ The canonical registry shall preserve migrations 130 `continuation_handoff_candi
 
 Routine macOS deployment SHALL delegate database eligibility, migrations and reconciliation to the selected candidate. For an existing database it SHALL take and verify a native SQLite backup of the stopped source before the candidate boundary under REQ-LDD-029. Only a proven first install with absent database and no managed predecessor or installed binary/plist/service MAY proceed with transaction-matched absence proof (`database_source: absent`, `backup: null`) and a preboundary absence recheck instead. An existing database SHALL NOT bypass backup verification. Neither path adds schema-specific admission or rehearsal; the existing-database path holds a bounded `BEGIN IMMEDIATE` writer reservation through backup verification and boundary recording, while maintenance excludes external database writers even after candidate handoff. Only a positively proven unchanged predecessor MAY restart automatically before the boundary under REQ-LDD-030; attempted or uncertain candidate writes SHALL forbid fallback. Unresolved failures SHALL retain diagnostics and ownership for manual operator recovery under REQ-LDD-030–031. No migration peak-space, general availability or downgrade guarantee follows from routine deployment.
 
+MacOS deploy handoff protocol 4 SHALL require a nonnegative integer `additional_reserve_bytes` and enforce it at the candidate boundary under REQ-LDD-033. Older deploy helpers or manifests SHALL be rejected before disruption rather than interpreted as a zero-reserve request. The separate restart handoff protocol is unaffected.
+
 ### REQ-COMP-022 — Canonical migration 158-to-156 reconciliation
 
 WHEN the embedded migration registry contains canonical migrations 156 `remote_coordinator_goals` and 158 `federated_conversation_actions`
@@ -243,3 +245,7 @@ AND SHALL apply migration 156 through the ordinary forward-migration path withou
 THE SYSTEM SHALL NOT infer support for any other missing registered predecessor in the post-129 tail, wrong identity, unknown migration, conflict detected by the lineage schema-evidence validators, or ledger whose highest recorded migration exceeds 158 from this reconciliation.
 
 **Rationale:** The supported canonical source ledger contains migration 158 without migration 156. Exact admission of that post-129 predecessor-registry shape preserves ordinary forward migration while retaining fail-closed rejection for damaged or ambiguous registered tails.
+
+### REQ-COMP-023 — Exact predecessor retention for manual deployment recovery
+
+For an authenticated macOS managed predecessor, deployment SHALL retain the exact saved installed predecessor executable with its identity/hash proof and the same transaction's verified preboundary database backup after commit or unresolved failure, as specified by `../launchd-deployment/requirements.md` REQ-LDD-034. Matching release/source identity alone SHALL NOT be reported as verified retained exact binary bytes. This is a manual matching offline recovery artifact guarantee, not automatic rollback, backup archival/pruning, cross-host portability, or an expanded downgrade guarantee.

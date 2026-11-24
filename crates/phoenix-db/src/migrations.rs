@@ -868,7 +868,49 @@ const MIGRATIONS: &[Migration] = &[
         name: "coordinator_user_questions",
         sql: include_str!("migrations/coordinator_user_questions.sql"),
     },
+    Migration {
+        version: 169,
+        name: "chat_completions_signature_replay",
+        sql: include_str!("migrations/chat_completions_signature_replay.sql"),
+    },
+    Migration {
+        version: 170,
+        name: "tool_discovery",
+        sql: include_str!("migrations/tool_discovery.sql"),
+    },
+    Migration {
+        version: 171,
+        name: "adhd_llm_language",
+        sql: "",
+    },
 ];
+
+async fn run_migration_171(pool: &SqlitePool, migration: &Migration) -> DbResult<()> {
+    let mut guard = WritableSchemaGuard::enable(pool).await?;
+    let result = async {
+        let mut tx = guard.connection().begin().await?;
+        let schema: String = sqlx::query_scalar(
+            "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'product_creation_jobs'",
+        ).fetch_one(&mut *tx).await?;
+        let old = "llm_language IN ('phoenix-native', 'caveman')";
+        if schema.matches(old).count() != 1 {
+            return Err(DbError::Serialization("migration 171 found unexpected language CHECK".into()));
+        }
+        sqlx::query("UPDATE sqlite_schema SET sql = ?1 WHERE type = 'table' AND name = 'product_creation_jobs'")
+            .bind(schema.replacen(old, "llm_language IN ('phoenix-native', 'caveman', 'adhd')", 1))
+            .execute(&mut *tx).await?;
+        let version: i64 = sqlx::query_scalar("PRAGMA schema_version").fetch_one(&mut *tx).await?;
+        sqlx::query(sqlx::AssertSqlSafe(format!("PRAGMA schema_version = {}", version + 1)))
+            .execute(&mut *tx).await?;
+        sqlx::query("INSERT INTO _migrations (version, name) VALUES (?1, ?2)")
+            .bind(migration.version).bind(migration.name).execute(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(())
+    }.await;
+    let restore = guard.disable().await;
+    result?;
+    restore
+}
 
 const MIGRATION_138: &str = concat!(
     include_str!("conversation_goals/execution_candidate.sql"),
@@ -12545,6 +12587,12 @@ async fn run_migration_list(pool: &SqlitePool, migrations: &[Migration]) -> DbRe
 
         if migration.version == 132 {
             run_migration_132(pool, migration).await?;
+            applied += 1;
+            continue;
+        }
+
+        if migration.version == 171 {
+            run_migration_171(pool, migration).await?;
             applied += 1;
             continue;
         }

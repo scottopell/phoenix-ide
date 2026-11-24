@@ -169,6 +169,7 @@ async fn terminal_self_tool(
         &callable,
         &[],
         &[],
+        phoenix_core::domain::tool_discovery::ToolDiscoveryMode::Eager,
     )
     .await
     .unwrap();
@@ -580,6 +581,7 @@ async fn database_runtime_mixed_self_goal_round_refuses_both_intents_in_either_o
                 &callable,
                 &[],
                 &[],
+                phoenix_core::domain::tool_discovery::ToolDiscoveryMode::Eager,
             )
             .await
             .unwrap();

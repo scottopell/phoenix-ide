@@ -4702,6 +4702,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn coordinator_language_refuses_accepted_undispatched_turn() {
+        use phoenix_core::llm_language::LlmLanguage;
+        let db = Database::open_in_memory().await.unwrap();
+        let coordinator = db
+            .get_or_create_coordinator(None, LlmLanguage::Adhd)
+            .await
+            .unwrap();
+        let repo = db.workflow_repository();
+        let accepted = repo
+            .accept_authoritative_turn(&input(&coordinator.id, "pending-language", 1))
+            .await
+            .established()
+            .unwrap()
+            .unwrap();
+        let TurnOutcome::Created { turn_id, .. } = accepted.outcome else {
+            panic!("expected accepted turn")
+        };
+        assert_eq!(
+            db.get_conversation(&coordinator.id).await.unwrap().state,
+            ConvState::Idle
+        );
+        assert!(!db
+            .set_idle_coordinator_language(&coordinator.id, LlmLanguage::Caveman)
+            .await
+            .unwrap());
+        assert_eq!(
+            db.get_conversation(&coordinator.id)
+                .await
+                .unwrap()
+                .llm_language,
+            LlmLanguage::Adhd
+        );
+        repo.terminalize_authoritative_turn(&TerminalizeAuthoritativeTurnInput {
+            command: TurnCommand::Cancel {
+                turn_id,
+                expected_generation: 0,
+            },
+            projection: None,
+            provider_replay_settlement:
+                phoenix_core::domain::provider_replay::ProviderReplaySettlement::Preserve,
+        })
+        .await
+        .unwrap();
+        assert!(db
+            .set_idle_coordinator_language(&coordinator.id, LlmLanguage::Caveman)
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
     async fn close_admission_fence_preserves_admitted_turn_and_refuses_the_next_one() {
         let db = Database::open_in_memory().await.unwrap();
         db.create_conversation("conv-fenced", "Fenced", "/tmp", true, None, None)

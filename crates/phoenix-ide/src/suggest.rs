@@ -42,7 +42,7 @@ pub async fn suggest_commands(
             content: vec![ContentBlock::text(query)],
         }],
         provider_replay: None,
-        responses_replay: Vec::new(),
+        output_replay: Vec::new(),
         tool_availability: phoenix_core::domain::tool_availability::ToolAvailability::all(vec![]),
         max_tokens: max_output_tokens
             .map_or(MAX_SUGGEST_TOKENS, |limit| limit.min(MAX_SUGGEST_TOKENS)),

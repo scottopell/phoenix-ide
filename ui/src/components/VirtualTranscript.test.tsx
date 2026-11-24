@@ -1,4 +1,4 @@
-import { useCallback, useLayoutEffect, useRef, useState, type ReactElement } from 'react';
+import { StrictMode, useCallback, useLayoutEffect, useRef, useState, type ReactElement } from 'react';
 import { initialTranscriptPositioningState, reduceTranscriptPositioning, transcriptPositioningCommandKey, type TranscriptPositioningInput, type TranscriptPositioningEvent } from '../conversation/transcriptPositioning';
 import type { HistoryScrollCommand } from '../conversation/historyExpansion';
 
@@ -2501,5 +2501,66 @@ describe('VirtualTranscript', () => {
     expect(screen.getByTestId('mounted-b')).toBe(originalB);
     expect(screen.getByTestId('mounted-c')).toBe(originalC);
     expect(rowIndexes()).toEqual([0, 1, 2, 3]);
+  });
+
+  it('retains scroller binding and updates range on scroll under React StrictMode', () => {
+    render(
+      <StrictMode>
+        <VirtualTranscript
+          ariaLabel="Transcript"
+          items={makeItems(40, 20)}
+          getKey={(item) => item.id}
+          estimatedExtent={20}
+          overscan={20}
+          initialTail={false}
+          renderItem={renderRow}
+        />
+      </StrictMode>,
+    );
+    const scroller = document.querySelector<HTMLElement>('.virtual-transcript')!;
+    expect(rowIndexes()[0]).toBe(0);
+
+    scroller.scrollTop = 500;
+    fireEvent.scroll(scroller);
+
+    expect(rowIndexes()[0]).toBeGreaterThan(15);
+  });
+
+  it('skips row re-renders when a scroll tick keeps the rendered range unchanged while still reporting onRangeChange', () => {
+    const renderCalls = vi.fn();
+    const ranges: VirtualTranscriptPhysicalSnapshot[] = [];
+    const stableRenderItem = (item: TestItem) => {
+      renderCalls(item.id);
+      return renderRow(item);
+    };
+    render(
+      <VirtualTranscript
+        ariaLabel="Transcript"
+        items={makeItems(40, 20)}
+        getKey={(item) => item.id}
+        estimatedExtent={20}
+        overscan={200}
+        initialTail={false}
+        renderItem={stableRenderItem}
+        onRangeChange={(snapshot) => ranges.push(snapshot)}
+      />,
+    );
+    const scroller = document.querySelector<HTMLElement>('.virtual-transcript')!;
+    const callsAfterMount = renderCalls.mock.calls.length;
+
+    // Crossing one row boundary renders only the newly entering row, not unchanged rows.
+    scroller.scrollTop = 5;
+    fireEvent.scroll(scroller);
+    expect(renderCalls.mock.calls.length).toBe(callsAfterMount + 1);
+
+    // Scrolling within the same rendered range skips React row renders while still notifying onRangeChange.
+    const callsAfterBoundary = renderCalls.mock.calls.length;
+    const rangesBeforeSameRangeScroll = ranges.length;
+    scroller.scrollTop = 10;
+    fireEvent.scroll(scroller);
+
+    expect(renderCalls.mock.calls.length).toBe(callsAfterBoundary);
+    expect(ranges.length).toBeGreaterThan(rangesBeforeSameRangeScroll);
+    expect(ranges.at(-1)?.viewportTop).toBe(10);
   });
 });

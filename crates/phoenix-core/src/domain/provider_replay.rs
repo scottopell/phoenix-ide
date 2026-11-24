@@ -1,12 +1,12 @@
 //! Provider replay data model for active private response sets.
 //!
-//! These types capture the private (non-public) blocks that Anthropic embeds in
+//! The Anthropic-specific types capture the private (non-public) blocks that Anthropic embeds in
 //! streaming responses — extended thinking blocks and redacted-thinking blocks —
 //! so they can be replayed verbatim on the next turn. The model requires the
 //! exact blocks it emitted; replaying a summarised or absent version breaks the
 //! chain-of-thought context.
 //!
-//! Serde discipline (all types):
+//! Serde attributes on the Anthropic-specific types:
 //! - `#[serde(deny_unknown_fields)]` — forward-incompatible JSON is a hard error
 //!   rather than silent data loss.
 //! - No `#[serde(default)]` — every field must be present in the JSON.
@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 pub enum ProviderReplayUpdate {
     Anthropic(AnthropicResponseSet),
     Responses(super::responses_replay::ResponsesResponseSet),
+    ChatCompletions(super::responses_replay::ChatResponseSet),
     Clear,
 }
 
@@ -30,6 +31,9 @@ impl ProviderReplayUpdate {
         match self {
             Self::Anthropic(set) => Self::Anthropic(set.with_owner_message_id(owner_message_id)),
             Self::Responses(set) => Self::Responses(set.with_owner_message_id(owner_message_id)),
+            Self::ChatCompletions(set) => {
+                Self::ChatCompletions(set.with_owner_message_id(owner_message_id))
+            }
             Self::Clear => Self::Clear,
         }
     }

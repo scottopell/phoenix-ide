@@ -26,15 +26,6 @@ export function formatGitShaForDisplay(gitSha: string): string {
   return `${match[1]!.slice(0, 12)}${match[2] ?? ''}`;
 }
 
-export function escapeHtml(str: string): string {
-  if (!str) return '';
-  return str
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;');
-}
-
 export function formatRelativeTime(isoStr: string): string {
   if (!isoStr) return '';
   const date = new Date(isoStr);
@@ -420,31 +411,4 @@ export function parseConversationState(raw: unknown): ConversationState {
       console.warn(`Unknown conversation state type: ${String(type)}`);
       return invalidStateError(`Unknown state: ${String(type)}`);
   }
-}
-
-export function renderMarkdown(text: string): string {
-  if (!text) return '';
-
-  // Escape HTML first
-  let html = escapeHtml(text);
-
-  // Code blocks
-  html = html.replace(/```([\s\S]*?)```/g, '<pre><code>$1</code></pre>');
-
-  // Inline code
-  html = html.replace(/`([^`]+)`/g, '<code>$1</code>');
-
-  // Bold
-  html = html.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
-
-  // Italic
-  html = html.replace(/\*([^*]+)\*/g, '<em>$1</em>');
-
-  // Line breaks to paragraphs
-  const paragraphs = html.split(/\n\n+/);
-  html = paragraphs
-    .map((p) => (p.trim() ? `<p>${p.replace(/\n/g, '<br>')}</p>` : ''))
-    .join('');
-
-  return html;
 }

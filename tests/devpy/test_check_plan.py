@@ -40,6 +40,7 @@ class CheckPlanTests(unittest.TestCase):
         self.addCleanup(env_patch.stop)
         os.environ.pop("PHOENIX_CHECK_WORKERS", None)
         os.environ.pop("CARGO_TARGET_DIR", None)
+        os.environ.pop("PHOENIX_CHECK_DIAGNOSTIC_DIR", None)
         self.dev = load_devpy()
 
     def test_git_config_key_validation_preserves_url_subsections(self):
@@ -1150,6 +1151,81 @@ class CargoTestTimeoutTests(unittest.TestCase):
             with self.subTest(raw=raw), self._with_file(None):
                 with self.assertRaisesRegex(SystemExit, "positive integer"):
                     self.dev._cargo_test_timeout_secs({self.dev.CARGO_TEST_TIMEOUT_ENV: raw})
+
+
+class DevpyTestTimeoutTests(unittest.TestCase):
+    def setUp(self):
+        self.dev = load_devpy()
+
+    def _with_file(self, values):
+        def fake_load(env, filename=".phoenix-ide.env"):
+            if values is None:
+                return None
+            env.update(values)
+            return "/host/.phoenix-ide.env"
+        return mock.patch.object(self.dev, "_load_env_file", side_effect=fake_load)
+
+    def test_default_and_host_file(self):
+        with self._with_file(None):
+            self.assertEqual(self.dev._devpy_test_timeout_secs({}), (600, None))
+        with self._with_file({self.dev.DEVPY_TEST_TIMEOUT_ENV: "2400"}):
+            self.assertEqual(self.dev._devpy_test_timeout_secs({}),
+                             (2400, "/host/.phoenix-ide.env"))
+
+    def test_process_environment_wins_even_when_empty(self):
+        with self._with_file({self.dev.DEVPY_TEST_TIMEOUT_ENV: "2400"}):
+            self.assertEqual(
+                self.dev._devpy_test_timeout_secs({self.dev.DEVPY_TEST_TIMEOUT_ENV: "1500"}),
+                (1500, "environment"),
+            )
+            self.assertEqual(
+                self.dev._devpy_test_timeout_secs({self.dev.DEVPY_TEST_TIMEOUT_ENV: " "}),
+                (600, None),
+            )
+
+    def test_platform_max_budget_is_accepted(self):
+        maximum = self.dev.MAX_DEVPY_TEST_TIMEOUT_SECS
+        with self._with_file(None):
+            self.assertEqual(
+                self.dev._devpy_test_timeout_secs({self.dev.DEVPY_TEST_TIMEOUT_ENV: str(maximum)}),
+                (maximum, "environment"),
+            )
+        self.assertLessEqual(maximum + 30, self.dev.threading.TIMEOUT_MAX)
+
+    def test_invalid_values_fail_loud(self):
+        maximum = self.dev.MAX_DEVPY_TEST_TIMEOUT_SECS
+        for raw in ("abc", "0", "-5", "1.5", str(maximum + 1), "99999999999999999999"):
+            with self.subTest(raw=raw), self._with_file(None):
+                with self.assertRaisesRegex(SystemExit, self.dev.DEVPY_TEST_TIMEOUT_ENV):
+                    self.dev._devpy_test_timeout_secs({self.dev.DEVPY_TEST_TIMEOUT_ENV: raw})
+
+    def test_inactive_lane_ignores_invalid_budget(self):
+        with mock.patch.dict(os.environ, {self.dev.DEVPY_TEST_TIMEOUT_ENV: "invalid"}), \
+             mock.patch.object(self.dev, "_resolve_check_lanes", return_value=({"task"}, {})), \
+             mock.patch.object(self.dev, "_run_check_threads_sequentially", return_value=[]), \
+             mock.patch.object(self.dev, "_make_reporter"):
+            self.dev.cmd_check(gate=False, lanes="task")
+
+    def test_active_invalid_budget_fails_before_reporter_setup(self):
+        with mock.patch.dict(os.environ, {self.dev.DEVPY_TEST_TIMEOUT_ENV: "invalid"}), \
+             mock.patch.object(self.dev, "_resolve_check_lanes", return_value=({"devpy"}, {})), \
+             mock.patch.object(self.dev, "_make_reporter") as reporter:
+            with self.assertRaisesRegex(SystemExit, self.dev.DEVPY_TEST_TIMEOUT_ENV):
+                self.dev.cmd_check(gate=False, lanes="devpy")
+            reporter.assert_not_called()
+
+    def test_active_budget_is_reported_and_extends_lane_join(self):
+        reporter = mock.Mock()
+        with mock.patch.object(self.dev, "_resolve_check_lanes", return_value=({"devpy"}, {})), \
+             mock.patch.object(self.dev, "_devpy_test_timeout_secs",
+                               return_value=(4200, "/host/.phoenix-ide.env")), \
+             mock.patch.object(self.dev, "_make_reporter", return_value=reporter), \
+             mock.patch.object(self.dev, "_run_check_threads_sequentially", return_value=[]) as runner:
+            self.dev.cmd_check(gate=False, lanes="devpy")
+        self.assertIn(mock.call("dev.py unit-test budget: 4200s "
+                                "(PHOENIX_CHECK_DEVPY_TEST_TIMEOUT_SECS from /host/.phoenix-ide.env)"),
+                      reporter.info.call_args_list)
+        self.assertEqual(runner.call_args.args[1], 4230)
 
 
 class PruneStaleWorkspaceArtifactsTests(unittest.TestCase):

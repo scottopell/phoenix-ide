@@ -910,7 +910,7 @@ LAUNCHD_TRANSITION_TIMEOUT_SECS = 30.0
 LAUNCHD_RESTART_SHUTDOWN_TIMEOUT_SECS = 35.0
 LAUNCHD_HEALTH_TIMEOUT_SECS = 120.0
 LAUNCHD_STALE_HANDOFF_ALLOWANCE_SECS = 30.0
-LAUNCHD_HANDOFF_PROTOCOL_VERSION = 3
+LAUNCHD_HANDOFF_PROTOCOL_VERSION = 4
 LAUNCHD_RESTART_HANDOFF_PROTOCOL_VERSION = 2
 NEWSYSLOG_CONF_PATH = Path("/etc/newsyslog.d") / f"{LAUNCHD_LABEL}.conf"
 
@@ -6563,6 +6563,7 @@ class _QualificationOutputLog:
 def _check_diagnostic_log_path(name: str, env: dict[str, str]) -> Path | None:
     filenames = {
         "cargo clippy": "cargo-clippy.full.log",
+        "cargo test": "cargo-test.full.log",
         "dev.py unit tests": "devpy-unit-tests.full.log",
     }
     if name in filenames and env.get("PHOENIX_CHECK_DIAGNOSTIC_DIR"):
@@ -6623,6 +6624,9 @@ def cmd_check(
     CARGO_TEST_TIMEOUT, cargo_test_timeout_source = (
         _cargo_test_timeout_secs() if "rust" in active else (DEFAULT_CARGO_TEST_TIMEOUT_SECS, None)
     )
+    DEVPY_TEST_TIMEOUT, devpy_test_timeout_source = (
+        _devpy_test_timeout_secs() if "devpy" in active else (DEFAULT_DEVPY_TEST_TIMEOUT_SECS, None)
+    )
     if _CHECK_PROFILE is not None:
         _CHECK_PROFILE.metadata["active_lanes"] = sorted(active)
     if lanes is not None and not active:
@@ -6638,6 +6642,11 @@ def cmd_check(
         reporter.info(
             f"cargo test budget: {CARGO_TEST_TIMEOUT}s "
             f"({CARGO_TEST_TIMEOUT_ENV} from {cargo_test_timeout_source})"
+        )
+    if devpy_test_timeout_source is not None:
+        reporter.info(
+            f"dev.py unit-test budget: {DEVPY_TEST_TIMEOUT}s "
+            f"({DEVPY_TEST_TIMEOUT_ENV} from {devpy_test_timeout_source})"
         )
     if skipped:
         ran = ", ".join(sorted(active))
@@ -7592,7 +7601,7 @@ def cmd_check(
             ]
         if os.environ.get("PHOENIX_CHECK_DIAGNOSTIC_DIR"):
             unittest_cmd.append("-v")
-        run_step("dev.py unit tests", unittest_cmd)
+        run_step("dev.py unit tests", unittest_cmd, timeout=DEVPY_TEST_TIMEOUT)
 
     # Bootstrap UI deps so eslint / tsc / vitest can run on a fresh checkout.
     # Skipped when no UI lane runs, so a non-UI change never needs pnpm.
@@ -7903,9 +7912,11 @@ def cmd_check(
     # Each lane starts only after its predecessor finishes. A lane wedged in
     # Python therefore cannot leave every later lane parked on a lock or multiply
     # the join timeout. daemon=True lets the interpreter exit after recording the
-    # one stuck lane; subprocess steps have their own CHECK_TIMEOUT kill budget.
+    # one stuck lane; subprocess steps have their own kill budget.
     # Launcher build, codegen, and test compilation each have CHECK_TIMEOUT.
-    LANE_JOIN_TIMEOUT = max(CHECK_TIMEOUT * 6, CHECK_TIMEOUT * 3 + CARGO_TEST_TIMEOUT) + 30
+    LANE_JOIN_TIMEOUT = max(
+        CHECK_TIMEOUT * 6, CHECK_TIMEOUT * 3 + CARGO_TEST_TIMEOUT, DEVPY_TEST_TIMEOUT
+    ) + 30
     with _check_interrupt_handlers(interrupted):
         stuck = _run_check_threads_sequentially(
             threads, LANE_JOIN_TIMEOUT, interrupted=interrupted
@@ -10293,41 +10304,54 @@ def native_prod_deploy(
 
 CARGO_TEST_TIMEOUT_ENV = "PHOENIX_CHECK_CARGO_TEST_TIMEOUT_SECS"
 DEFAULT_CARGO_TEST_TIMEOUT_SECS = 900
-# Keep the lane join (two 600s steps + this budget + 30s) within Python's
-# platform-supported Thread.join timeout, even for an extreme override.
+# The Rust lane can spend two 600s steps plus this budget before its 30s join grace.
 MAX_CARGO_TEST_TIMEOUT_SECS = int(threading.TIMEOUT_MAX) - 1230
+DEVPY_TEST_TIMEOUT_ENV = "PHOENIX_CHECK_DEVPY_TEST_TIMEOUT_SECS"
+DEFAULT_DEVPY_TEST_TIMEOUT_SECS = 600
+MAX_DEVPY_TEST_TIMEOUT_SECS = int(threading.TIMEOUT_MAX) - 30
 
 
-def _cargo_test_timeout_secs(environ: dict[str, str] | None = None) -> tuple[int, str | None]:
-    """Return the `check` cargo-test step budget and where an override came from.
-
-    The process environment wins over the gitignored, per-host `.phoenix-ide.env`
-    so a single run can be adjusted without editing the file. An override that is
-    not a positive integer is a configuration error, not a reason to fall back.
-    """
+def _check_test_timeout_secs(
+    name: str, default: int, maximum: int, environ: dict[str, str] | None = None
+) -> tuple[int, str | None]:
+    """Read a step budget; process environment takes precedence over the host file."""
     environ = os.environ if environ is None else environ
     source = None
-    raw = environ.get(CARGO_TEST_TIMEOUT_ENV)
+    raw = environ.get(name)
     if raw is not None:
         source = "environment"
     else:
         file_env: dict[str, str] = {}
         loaded = _load_env_file(file_env)
-        raw = file_env.get(CARGO_TEST_TIMEOUT_ENV)
+        raw = file_env.get(name)
         if raw is not None:
             source = loaded
     if raw is None or raw.strip() == "":
-        return DEFAULT_CARGO_TEST_TIMEOUT_SECS, None
+        return default, None
     try:
         value = int(raw.strip())
     except ValueError:
         value = 0
-    if not 0 < value <= MAX_CARGO_TEST_TIMEOUT_SECS:
+    if not 0 < value <= maximum:
         raise SystemExit(
-            f"{CARGO_TEST_TIMEOUT_ENV} must be a positive integer number of seconds "
-            f"at most {MAX_CARGO_TEST_TIMEOUT_SECS}; got {raw!r} from {source}"
+            f"{name} must be a positive integer number of seconds "
+            f"at most {maximum}; got {raw!r} from {source}"
         )
     return value, source
+
+
+def _cargo_test_timeout_secs(environ: dict[str, str] | None = None) -> tuple[int, str | None]:
+    return _check_test_timeout_secs(
+        CARGO_TEST_TIMEOUT_ENV, DEFAULT_CARGO_TEST_TIMEOUT_SECS,
+        MAX_CARGO_TEST_TIMEOUT_SECS, environ,
+    )
+
+
+def _devpy_test_timeout_secs(environ: dict[str, str] | None = None) -> tuple[int, str | None]:
+    return _check_test_timeout_secs(
+        DEVPY_TEST_TIMEOUT_ENV, DEFAULT_DEVPY_TEST_TIMEOUT_SECS,
+        MAX_DEVPY_TEST_TIMEOUT_SECS, environ,
+    )
 
 
 def _load_env_file(env: dict[str, str], filename: str = ".phoenix-ide.env") -> str | None:
@@ -11411,6 +11435,15 @@ class ValidatedLinuxPreparedCandidate:
     release_commit: None = None
 
 
+def _nonnegative_ascii_integer(value: str) -> int:
+    if not isinstance(value, str) or re.fullmatch(r"[0-9]+", value) is None:
+        raise argparse.ArgumentTypeError("must be a nonnegative base-10 integer")
+    try:
+        return int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("integer is out of range") from exc
+
+
 @dataclasses.dataclass(frozen=True)
 class ProdDeployControllerOptions:
     enabled: bool = False
@@ -11426,6 +11459,7 @@ class ProdDeployControllerOptions:
     controller_source_commit: str | None = None
     candidate_source_root: Path | None = None
     candidate_source_commit: str | None = None
+    additional_reserve_bytes: int = 0
 
     def require_local_candidate_source(
         self,
@@ -12487,6 +12521,7 @@ def launchd_prod_deploy(
             "target_binary": str(target_binary), "target_plist": str(LAUNCHD_PLIST_PATH),
             "label": LAUNCHD_LABEL, "helper_label": label, "uid": os.getuid(),
             "health_url": health_url, "health_insecure_tls": insecure_tls,
+            "additional_reserve_bytes": controller.additional_reserve_bytes,
             "active_path": str(LAUNCHD_DEPLOY_ACTIVE_PATH), "status_path": str(LAUNCHD_DEPLOY_STATUS_PATH),
             "deployed_sha_path": str(PROD_SHA_PATH), "lock_path": str(LAUNCHD_DEPLOY_LOCK_PATH),
             "claim_lock_path": str(LAUNCHD_DEPLOY_CLAIM_LOCK_PATH), "created_at": created_at,
@@ -12960,6 +12995,8 @@ def cmd_prod_deploy(
     if controller.prepared_artifact is not None and not controller.systemd_current_schema_upgrade:
         raise SystemExit("prepared artifact deployment is supported only by protected Linux systemd mode")
     env = controller.require_backend()
+    if controller.additional_reserve_bytes and env != "launchd":
+        raise SystemExit("--additional-reserve-bytes is supported only by macOS launchd deployment")
     if controller.enabled and not release and controller.prepared_artifact is None:
         raise SystemExit("controller mode requires --release")
     compiler_cache_setup = None
@@ -12974,7 +13011,7 @@ def cmd_prod_deploy(
         print()
 
     if env == "launchd":
-        if controller.enabled or controller.candidate_source_root is not None:
+        if controller.enabled or controller.candidate_source_root is not None or controller.additional_reserve_bytes:
             launchd_prod_deploy(release, controller=controller)
         else:
             launchd_prod_deploy(
@@ -13349,6 +13386,10 @@ def main():
         "--candidate-source-commit", default=None,
         help="Expected full lowercase HEAD SHA of --candidate-source-root",
     )
+    deploy_parser.add_argument(
+        "--additional-reserve-bytes", type=_nonnegative_ascii_integer, default=0,
+        help="Keep this many extra filesystem bytes available at launchd migration admission (default: 0)",
+    )
     deploy_parser.add_argument("legacy_version", nargs="?", help=argparse.SUPPRESS)
     deploy_parser.add_argument(
         "--pretty", action="store_true", default=False,
@@ -13570,6 +13611,7 @@ def main():
                 pretty=pretty,
                 controller=ProdDeployControllerOptions(
                     enabled=args.controller_mode,
+                    additional_reserve_bytes=args.additional_reserve_bytes,
                     controller_source_commit=args.controller_source_commit,
                     candidate_source_root=getattr(args, "candidate_source_root", None),
                     candidate_source_commit=getattr(args, "candidate_source_commit", None),

@@ -450,7 +450,7 @@ impl KeywordSearchTool {
                 content: vec![ContentBlock::text(user_content)],
             }],
             provider_replay: None,
-            responses_replay: Vec::new(),
+            output_replay: Vec::new(),
             tool_availability: phoenix_core::domain::tool_availability::ToolAvailability::all(
                 vec![],
             ),

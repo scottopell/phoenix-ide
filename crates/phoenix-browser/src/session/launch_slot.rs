@@ -302,6 +302,13 @@ impl LaunchSlot {
             while let Some(event) = handler.next().await {
                 if let Err(error) = event {
                     tracing::warn!(%error, "CDP handler error");
+                    if matches!(
+                        error,
+                        chromiumoxide::error::CdpError::Ws(_)
+                            | chromiumoxide::error::CdpError::Io(_)
+                    ) {
+                        break;
+                    }
                 }
             }
         });

@@ -38,6 +38,7 @@ export interface QuestionPanelProps {
   onAnswered: () => void;
   onDismissed: () => void;
   readOnly?: boolean;
+  active?: boolean;
 }
 
 const OTHER_SENTINEL = '__other__';
@@ -58,8 +59,9 @@ export function QuestionPanel({
   onAnswered,
   onDismissed,
   readOnly = false,
+  active = true,
 }: QuestionPanelProps) {
-  useRegisterFocusScope('question-panel');
+  useRegisterFocusScope(active ? 'question-panel' : null);
 
   // --- Wizard step state ---
   const [currentStep, setCurrentStep] = useState(0);
@@ -92,6 +94,9 @@ export function QuestionPanel({
     isError: boolean;
   } | null>(null);
   const [showConfirmDismiss, setShowConfirmDismiss] = useState(false);
+  useEffect(() => {
+    if (!active) setShowConfirmDismiss(false);
+  }, [active]);
   const confirmDismissVisibleRef = useRef(showConfirmDismiss);
   useLayoutEffect(() => {
     confirmDismissVisibleRef.current = showConfirmDismiss;
@@ -340,13 +345,16 @@ export function QuestionPanel({
   const panelRef = useRef<HTMLDivElement>(null);
 
   const hasCurrentQuestion = currentQuestion !== undefined;
+  const focusedStepRef = useRef(currentStep);
   useEffect(() => {
-    if (!hasCurrentQuestion) return;
+    const stepChanged = focusedStepRef.current !== currentStep;
+    focusedStepRef.current = currentStep;
+    if (!active || !hasCurrentQuestion) return;
     const frame = requestAnimationFrame(() => {
-      if (!confirmDismissVisibleRef.current) panelRef.current?.focus();
+      if (!confirmDismissVisibleRef.current) panelRef.current?.focus({ preventScroll: !stepChanged });
     });
     return () => cancelAnimationFrame(frame);
-  }, [currentStep, hasCurrentQuestion]);
+  }, [active, currentStep, hasCurrentQuestion]);
 
   // --- Update focused preview when focusedIndex changes ---
   useEffect(() => {
@@ -419,7 +427,7 @@ export function QuestionPanel({
   // --- Keyboard handler (component-level, not document) ---
   const handleKeyDown = useCallback(
     (e: React.KeyboardEvent<HTMLDivElement>) => {
-      if (readOnly) return;
+      if (!active || readOnly) return;
       if (!currentQuestion) return;
 
       // If confirm dialog is open, don't handle
@@ -531,6 +539,7 @@ export function QuestionPanel({
       }
     },
     [
+      active,
       currentQuestion,
       showConfirmDismiss,
       expandedNotes,
@@ -628,7 +637,7 @@ export function QuestionPanel({
         )}
 
         <ConfirmDialog
-          visible={showConfirmDismiss}
+          visible={active && showConfirmDismiss}
           title="Dismiss structured questions?"
           message={actions.dismissConfirmMessage}
           confirmText="Dismiss"

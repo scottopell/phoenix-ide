@@ -336,6 +336,11 @@ if os.environ.get("TEST_PROOF_PATH"):
     assert proof["phase"] == "migration_started"
     assert proof["boundary"] == "attempted"
     assert proof["database_source"] == "existing"
+    predecessor = proof["predecessor"]
+    saved_binary = Path(predecessor["saved_binary_path"])
+    assert saved_binary.parent == Path(os.environ["TEST_PROOF_PATH"]).parent
+    assert hashlib.sha256(saved_binary.read_bytes()).hexdigest() == predecessor["binary_sha256"]
+    assert predecessor["identity"] == {{"version": "0.9", "git_sha": "{'b' * 40}"}}
     backup = proof["backup"]
     backup_path = Path(backup["backup_path"])
     assert backup_path.is_file()
@@ -350,7 +355,7 @@ if os.environ.get("TEST_PROOF_PATH"):
     Path(os.environ["TEST_PROOF_OBSERVED"]).write_text(json.dumps({{
         "transaction_id": proof["transaction_id"], "phase": proof["phase"],
         "boundary": proof["boundary"], "database_source": proof["database_source"],
-        "backup": backup, "pre_migration_contents": backup_contents,
+        "backup": backup, "predecessor": predecessor, "pre_migration_contents": backup_contents,
     }}))
 with Path(os.environ["TEST_EVENTS"]).open("a") as stream:
     stream.write("migrate\\n")
@@ -380,7 +385,7 @@ if os.environ.get("FAIL_MIGRATION"):
             target_binary=str(self.root / "installed"), target_plist=str(self.root / "installed.plist"),
             label="test.phoenix", helper_label="com.phoenix-ide.deploy.unit-test", uid=os.getuid(),
             health_url="http://127.0.0.1:18111/api/version", health_insecure_tls=False,
-            active_path=str(self.root / "active"), status_path=str(self.root / "status.json"),
+            additional_reserve_bytes=0, active_path=str(self.root / "active"), status_path=str(self.root / "status.json"),
             deployed_sha_path=str(self.root / "deployed.sha"), lock_path=str(self.root / "activate.lock"),
             claim_lock_path=str(self.root / "claim.lock"), created_at=helper.utc_now(),
         )
@@ -391,6 +396,9 @@ if sys.argv[1:] == ["--build-identity"]:
 '''.encode()
         Path(self.manifest.target_binary).write_bytes(self.previous_binary)
         Path(self.manifest.target_binary).chmod(0o755)
+        self.saved_previous = self.root / "previous-phoenix-ide"
+        self.saved_previous.write_bytes(self.previous_binary)
+        self.saved_previous.chmod(0o755)
         Path(self.manifest.target_plist).write_bytes(Path(self.manifest.candidate_plist).read_bytes())
         Path(self.manifest.active_path).write_text(self.manifest.transaction_id)
         helper.write_status(self.manifest, "prepared")
@@ -423,8 +431,6 @@ if sys.argv[1:] == ["--build-identity"]:
             return db.execute("SELECT phase FROM changes").fetchall()
 
     def test_success_invokes_migration_once_after_durable_checkpoint_and_stop(self):
-        previous_binary = self.root / "previous-phoenix-ide"
-        previous_binary.write_bytes(b"previous binary")
         self.assertEqual(self.activate(), "committed")
         backups = list(self.root.glob("database-backup-*.sqlite"))
         self.assertEqual(len(backups), 1)
@@ -441,7 +447,7 @@ if sys.argv[1:] == ["--build-identity"]:
         self.assertEqual(Path(self.manifest.deployed_sha_path).read_text(), "a" * 40 + "\n")
         self.assertFalse(Path(self.manifest.active_path).exists())
         self.assertFalse(Path(self.manifest.candidate_binary).exists())
-        self.assertFalse(previous_binary.exists())
+        self.assertEqual(self.saved_previous.read_bytes(), self.previous_binary)
         self.assertEqual(self.status()["state"], "committed")
 
     def first_install(self):
@@ -449,6 +455,47 @@ if sys.argv[1:] == ["--build-identity"]:
         Path(self.manifest.target_binary).unlink()
         Path(self.manifest.target_plist).unlink()
         self.launch.pid = None
+        self.saved_previous.unlink()
+
+    def test_boundary_capacity_accepts_exact_threshold_and_records_observation(self):
+        required = 16 * 1024 * 1024 + min(helper._database_size_bytes(str(self.database)), 64 * 1024 * 1024) + 123
+        with mock.patch.object(helper.shutil, "disk_usage", return_value=mock.Mock(free=required)):
+            admission = helper._reserve_before_boundary(str(self.database), self.root, 123)
+        self.assertEqual(required, admission["required_bytes"])
+        self.assertEqual(required, admission["available_bytes"])
+        self.assertEqual(123, admission["additional_reserve_bytes"])
+
+    def test_boundary_capacity_checks_both_database_and_backup_filesystems(self):
+        backup_directory = self.root / "separate-backup-volume"
+        required = 16 * 1024 * 1024 + min(helper._database_size_bytes(str(self.database)), 64 * 1024 * 1024) + 123
+        for scarce_path in (self.database.parent, backup_directory):
+            with self.subTest(scarce_path=scarce_path):
+                def capacity(path):
+                    return mock.Mock(free=required - 1 if Path(path) == scarce_path else required)
+                with mock.patch.object(helper.shutil, "disk_usage", side_effect=capacity) as usage:
+                    with self.assertRaisesRegex(helper.ActivationError, "insufficient residual deploy space"):
+                        helper._reserve_before_boundary(str(self.database), backup_directory, 123)
+                self.assertEqual({Path(call.args[0]) for call in usage.call_args_list},
+                                 {backup_directory, self.database.parent})
+
+    def test_boundary_capacity_rejects_shortfall(self):
+        required = 16 * 1024 * 1024 + min(helper._database_size_bytes(str(self.database)), 64 * 1024 * 1024) + 123
+        with mock.patch.object(helper.shutil, "disk_usage", return_value=mock.Mock(free=required - 1)):
+            with self.assertRaisesRegex(helper.ActivationError, f"need {required} bytes, have {required - 1}"):
+                helper._reserve_before_boundary(str(self.database), self.root, 123)
+
+    def test_shrink_after_preflight_fails_before_migration_or_database_mutation(self):
+        initial = self.database.read_bytes()
+        required = self.database.stat().st_size + 16 * 1024 * 1024 + self.manifest.additional_reserve_bytes
+        with mock.patch.object(helper.shutil, "disk_usage", side_effect=[
+            mock.Mock(free=required), mock.Mock(free=required), mock.Mock(free=0), mock.Mock(free=0),
+        ]):
+            result = self.activate()
+        self.assertEqual("failed", result)
+        self.assertNotIn(b"migration_started", self.database.read_bytes())
+        self.assertEqual(initial, self.database.read_bytes())
+        self.assertNotIn("migrate\\n", Path(self.root / "events").read_text() if (self.root / "events").exists() else "")
+        self.assertEqual("not_crossed", json.loads(Path(self.manifest.status_path).with_suffix(".proof.json").read_text())["boundary"])
 
     def test_first_install_missing_database_runs_candidate_without_backup(self):
         self.first_install()
@@ -461,6 +508,8 @@ if sys.argv[1:] == ["--build-identity"]:
         self.assertIsNone(proof["backup"])
         self.assertEqual(proof["boundary"], "crossed")
         self.assertFalse(proof["recovery_eligible"])
+        self.assertIsNone(proof["predecessor"])
+        self.assertFalse(self.saved_previous.exists())
 
     def test_missing_database_with_predecessor_rejects_before_disruption(self):
         self.database.unlink()
@@ -488,17 +537,17 @@ if sys.argv[1:] == ["--build-identity"]:
 
     def test_first_install_database_appearing_before_boundary_fails_without_candidate(self):
         self.first_install()
-        check = helper._first_install_capacity
+        check = helper._first_install_admission
         calls = 0
 
-        def appear_before_boundary(database_path):
+        def appear_before_boundary(database_path, additional_reserve_bytes=0):
             nonlocal calls
             calls += 1
             if calls == 3:
                 self.database.write_bytes(b"unexpected database")
-            return check(database_path)
+            return check(database_path, additional_reserve_bytes)
 
-        with mock.patch.object(helper, "_first_install_capacity", side_effect=appear_before_boundary):
+        with mock.patch.object(helper, "_first_install_admission", side_effect=appear_before_boundary):
             self.assertEqual(self.activate(), "failed")
         self.assertEqual(calls, 3)
         self.assertIn("must still be absent", self.status()["failure"])
@@ -516,6 +565,41 @@ if sys.argv[1:] == ["--build-identity"]:
         with mock.patch.object(helper.shutil, "disk_usage", return_value=usage) as disk_usage:
             self.assertEqual(helper._first_install_capacity(str(self.database)), 16 * 1024 * 1024)
         disk_usage.assert_called_once_with(self.database.parent)
+
+    def test_first_install_additional_reserve_boundary_accepts_exact_and_rejects_shortfall(self):
+        self.first_install()
+        additional = 123
+        required = 16 * 1024 * 1024 + additional
+        for available in (required, required - 1):
+            with self.subTest(available=available), mock.patch.object(
+                helper.shutil, "disk_usage", return_value=mock.Mock(free=available)
+            ) as disk_usage:
+                if available == required:
+                    self.assertEqual(
+                        helper._first_install_admission(str(self.database), additional),
+                        {"required_bytes": required, "available_bytes": required},
+                    )
+                else:
+                    with self.assertRaisesRegex(helper.ActivationError, f"need {required} bytes, have {available}"):
+                        helper._first_install_admission(str(self.database), additional)
+            disk_usage.assert_called_once_with(self.database.parent)
+        self.assertFalse(self.database.exists())
+
+    def test_first_install_space_shrink_at_boundary_prevents_candidate_migration(self):
+        self.first_install()
+        self.manifest = dataclasses.replace(self.manifest, additional_reserve_bytes=123)
+        required = 16 * 1024 * 1024 + self.manifest.additional_reserve_bytes
+        with mock.patch.object(helper.shutil, "disk_usage", side_effect=[
+            mock.Mock(free=required), mock.Mock(free=required), mock.Mock(free=required - 1),
+        ]):
+            self.assertEqual(self.activate(), "failed")
+        self.assertIn(f"need {required} bytes, have {required - 1}", self.status()["failure"])
+        self.assertFalse(self.database.exists())
+        self.assertFalse((self.root / "events").exists())
+        self.assertFalse(Path(self.manifest.target_binary).exists())
+        proof = json.loads((self.root / "status.proof.json").read_text())
+        self.assertEqual("not_crossed", proof["boundary"])
+        self.assertIsNone(proof["backup"])
 
     def test_first_install_insufficient_space_refuses_before_disruption(self):
         self.first_install()
@@ -695,12 +779,13 @@ if sys.argv[1:] == ["--build-identity"]:
                 helper._backup_proof(backup, real_clock() + 1)
 
     def test_backup_default_deadline_uses_named_budget(self):
+        self.assertEqual(helper.BACKUP_VERIFICATION_TIMEOUT_SECS, 1200.0)
         diagnostics = {}
         with mock.patch.object(helper.time, "monotonic", return_value=123.0):
             backup = helper.create_verified_database_backup(
                 str(self.database), self.root, diagnostics=diagnostics,
             )
-        self.assertEqual(diagnostics["deadline"], 123.0 + helper.BACKUP_VERIFICATION_TIMEOUT_SECS)
+        self.assertEqual(diagnostics["deadline"], 123.0 + 1200.0)
         self.assertTrue(backup.exists())
 
     def test_activation_backup_and_proof_share_one_deterministic_deadline(self):
@@ -855,23 +940,101 @@ if sys.argv[1:] == ["--build-identity"]:
             self.assertEqual(self.activate(), "failed")
         self.assertEqual(self.changes(), [("after guard release",)])
 
-    def test_deploy_manifest_protocol_three_accepts_and_two_rejects(self):
+    def test_deploy_manifest_protocol_four_accepts_and_three_rejects(self):
         raw = dataclasses.asdict(self.manifest)
         raw["expected"] = dataclasses.asdict(self.manifest.expected)
         path = self.root / "manifest.json"
-        raw["manifest_version"] = 3
+        raw["manifest_version"] = 4
         path.write_text(json.dumps(raw))
-        self.assertEqual(helper.Manifest.load(path).manifest_version, 3)
-        raw["manifest_version"] = 2
+        self.assertEqual(helper.Manifest.load(path).manifest_version, 4)
+        raw["manifest_version"] = 3
         path.write_text(json.dumps(raw))
         with self.assertRaisesRegex(helper.ActivationError, "unsupported deployment manifest"):
             helper.Manifest.load(path)
 
     def enable_candidate_proof_witness(self):
-        self.environment["TEST_PROOF_PATH"] = str(Path(self.manifest.status_path).with_suffix(".proof.json"))
+        self.environment["TEST_PROOF_PATH"] = str(helper.transaction_proof_path(self.manifest))
         self.environment["TEST_PROOF_OBSERVED"] = str(self.root / "candidate-proof-observed.json")
         self.environment["TEST_TRANSACTION_ID"] = self.manifest.transaction_id
         self.refresh_plist()
+
+    def test_completed_transaction_proof_survives_later_precondition_failure(self):
+        self.assertEqual(self.activate(), "committed")
+        transaction_a_proof_path = helper.transaction_proof_path(self.manifest)
+        proof_a = json.loads(transaction_a_proof_path.read_text())
+        self.assertEqual(proof_a["outcome"], "candidate_verified")
+        self.assertEqual(proof_a["predecessor"]["identity"], {"version": "0.9", "git_sha": "b" * 40})
+        self.assertEqual(proof_a["predecessor"]["binary_sha256"], helper.sha256(self.saved_previous))
+        backup_a = Path(proof_a["backup"]["backup_path"])
+        self.assertTrue(backup_a.is_file())
+        self.assertEqual(proof_a["backup"]["backup_sha256"], helper.sha256(backup_a))
+        self.assertEqual(proof_a["predecessor"]["saved_binary_path"], str(self.saved_previous))
+
+        transaction_b_dir = self.root / "transaction-b"
+        transaction_b_dir.mkdir()
+        candidate_b = transaction_b_dir / "candidate"
+        candidate_b.write_bytes(Path(self.manifest.target_binary).read_bytes())
+        candidate_b.chmod(0o700)
+        plist_b = transaction_b_dir / "candidate.plist"
+        plist_b.write_bytes(Path(self.manifest.candidate_plist).read_bytes())
+        manifest_b = dataclasses.replace(
+            self.manifest,
+            transaction_id="transaction-b",
+            helper_label=f"{helper.DEPLOY_HELPER_LABEL_PREFIX}.transaction-b",
+            candidate_binary=str(candidate_b),
+            candidate_binary_sha256=helper.sha256(candidate_b),
+            candidate_plist=str(plist_b),
+            candidate_plist_sha256=helper.sha256(plist_b),
+        )
+        helper.write_status(manifest_b, "prepared")
+        Path(manifest_b.active_path).write_text(manifest_b.transaction_id)
+        stops_before = self.launch.stops
+        with mock.patch.object(helper, "validate_pre_disruption_handoff",
+                               side_effect=helper.ActivationError("second transaction precondition rejected")):
+            with mock.patch.object(helper, "Launchctl", return_value=self.launch):
+                self.assertEqual(helper.activate(manifest_b), "precondition_failed")
+
+        proof_a_after = json.loads(transaction_a_proof_path.read_text())
+        self.assertEqual(proof_a_after["transaction_id"], self.manifest.transaction_id)
+        self.assertEqual(proof_a_after["predecessor"], proof_a["predecessor"])
+        self.assertEqual(proof_a_after["backup"], proof_a["backup"])
+        self.assertEqual(self.saved_previous.read_bytes(), self.previous_binary)
+        self.assertEqual(helper.sha256(self.saved_previous), proof_a_after["predecessor"]["binary_sha256"])
+        self.assertEqual(helper.sha256(backup_a), proof_a_after["backup"]["backup_sha256"])
+
+        current = json.loads(Path(manifest_b.status_path).with_suffix(".proof.json").read_text())
+        self.assertEqual(current["transaction_id"], manifest_b.transaction_id)
+        self.assertEqual(current["outcome"], "failed")
+        self.assertEqual(self.launch.stops, stops_before)
+
+    def test_transaction_proof_fsync_failures_abort_before_stopping_predecessor(self):
+        actual_atomic_write = helper.atomic_write
+        transaction_path = helper.transaction_proof_path(self.manifest)
+
+        def fail_transaction_file_fsync(path, data, mode=0o600):
+            if Path(path) == transaction_path:
+                raise OSError("proof file fsync failed")
+            return actual_atomic_write(path, data, mode)
+
+        with mock.patch.object(helper, "atomic_write", side_effect=fail_transaction_file_fsync):
+            self.assertEqual(self.activate(), "precondition_failed")
+        self.assertEqual(self.launch.stops, 0)
+        self.assertIn("failure proof persistence failed", self.status()["failure"])
+
+
+    def test_transaction_proof_directory_fsync_failure_aborts_before_stopping(self):
+        transaction_path = helper.transaction_proof_path(self.manifest)
+        actual_fsync_dir = helper.fsync_dir
+
+        def fail_transaction_directory_fsync(path):
+            if Path(path) == transaction_path.parent:
+                raise OSError("proof directory fsync failed")
+            return actual_fsync_dir(path)
+
+        with mock.patch.object(helper, "fsync_dir", side_effect=fail_transaction_directory_fsync):
+            self.assertEqual(self.activate(), "precondition_failed")
+        self.assertEqual(self.launch.stops, 0)
+        self.assertIn("failure proof persistence failed", self.status()["failure"])
 
     def test_candidate_reopens_durable_migration_proof_before_migrating_existing_source(self):
         self.enable_candidate_proof_witness()
@@ -893,6 +1056,9 @@ if sys.argv[1:] == ["--build-identity"]:
         backup = observed["backup"]
         final_backup = final["backup"]
         self.assertEqual(final_backup, backup)
+        self.assertEqual(final["predecessor"], observed["predecessor"])
+        self.assertEqual(final["predecessor"]["saved_binary_path"], str(self.saved_previous))
+        self.assertEqual(helper.sha256(self.saved_previous), final["predecessor"]["binary_sha256"])
         backup_path = Path(backup["backup_path"])
         self.assertTrue(backup_path.is_file())
         self.assertEqual(backup["backup_bytes"], backup_path.stat().st_size)
@@ -927,6 +1093,13 @@ if sys.argv[1:] == ["--build-identity"]:
         self.assertEqual(self.activate(), "committed")
         proof = json.loads((self.root / "status.proof.json").read_text())
         self.assertEqual(proof["outcome"], "candidate_verified")
+        self.assertTrue(proof["recovery_eligible"])
+        self.assertEqual(proof["transaction_id"], self.manifest.transaction_id)
+        self.assertEqual(proof["predecessor"]["identity"], {"version": "0.9", "git_sha": "b" * 40})
+        self.assertEqual(proof["predecessor"]["saved_binary_path"], str(self.saved_previous))
+        self.assertEqual(proof["predecessor"]["binary_sha256"], helper.sha256(self.saved_previous))
+        self.assertEqual(self.saved_previous.read_bytes(), self.previous_binary)
+        self.assertEqual(Path(proof["backup"]["backup_path"]).parent, self.saved_previous.parent)
         self.assertEqual(proof["backup"]["backup_sha256"], helper.sha256(Path(proof["backup"]["backup_path"])))
         self.assertEqual(proof["boundary"], "crossed")
 
@@ -937,6 +1110,44 @@ if sys.argv[1:] == ["--build-identity"]:
         proof = json.loads((self.root / "status.proof.json").read_text())
         self.assertFalse(proof["recovery_eligible"])
         self.assertIsNone(proof["predecessor"])
+        self.assertEqual(self.saved_previous.read_bytes(), self.previous_binary)
+
+    def test_missing_saved_predecessor_refuses_before_disruption(self):
+        self.saved_previous.unlink()
+        self.assert_saved_predecessor_refused()
+
+    def test_tampered_saved_predecessor_refuses_before_disruption(self):
+        self.saved_previous.write_bytes(b"not the authenticated predecessor")
+        self.assert_saved_predecessor_refused()
+
+    def test_saved_predecessor_must_match_freshly_captured_installed_bytes(self):
+        Path(self.manifest.target_binary).write_bytes(self.previous_binary + b"\n# changed since preparation\n")
+        self.assert_saved_predecessor_refused()
+
+    def test_symlink_saved_predecessor_refuses_before_disruption(self):
+        self.saved_previous.unlink()
+        self.saved_previous.symlink_to(self.manifest.target_binary)
+        self.assert_saved_predecessor_refused()
+
+    def assert_saved_predecessor_refused(self):
+        target = Path(self.manifest.target_binary).read_bytes()
+        canonical = Path(self.manifest.target_plist).read_bytes()
+        database = self.database.read_bytes()
+        self.assertEqual(self.activate(), "precondition_failed")
+        self.assertIn("saved predecessor binary", self.status()["failure"])
+        self.assertEqual(self.launch.stops, 0)
+        self.assertEqual(self.launch.starts, [])
+        self.assertEqual(self.launch.pid, 41)
+        self.assertEqual(Path(self.manifest.target_binary).read_bytes(), target)
+        self.assertEqual(Path(self.manifest.target_plist).read_bytes(), canonical)
+        self.assertEqual(self.database.read_bytes(), database)
+        self.assertFalse((self.root / "previous.plist").exists())
+        self.assertFalse((self.root / "events").exists())
+        self.assertFalse(list(self.root.glob("database-backup-*.sqlite")))
+        proof = json.loads((self.root / "status.proof.json").read_text())
+        self.assertEqual(proof["boundary"], "not_crossed")
+        self.assertFalse(proof.get("recovery_eligible", False))
+        self.assertNotIn("saved_binary_path", proof.get("predecessor") or {})
 
     def test_pre_stop_capacity_failure_preserves_predecessor_without_quarantine(self):
         with mock.patch.object(helper, "_preflight_backup_capacity", side_effect=helper.ActivationError("no capacity")):
@@ -950,12 +1161,12 @@ if sys.argv[1:] == ["--build-identity"]:
     def test_post_stop_capacity_failure_restores_only_verified_absent_predecessor(self):
         capacity = helper._preflight_backup_capacity
         calls = 0
-        def fail_after_stop(database_path, directory):
+        def fail_after_stop(database_path, directory, additional_reserve_bytes=0):
             nonlocal calls
             calls += 1
             if calls == 2:
                 raise helper.ActivationError("capacity changed after stop")
-            return capacity(database_path, directory)
+            return capacity(database_path, directory, additional_reserve_bytes)
         with mock.patch.object(helper, "_preflight_backup_capacity", side_effect=fail_after_stop):
             self.assertEqual(self.activate(), "failed")
         self.assertEqual(self.launch.starts, [self.manifest.target_plist])
@@ -984,12 +1195,12 @@ if sys.argv[1:] == ["--build-identity"]:
         self.launch.manifest = self.manifest
         capacity = helper._preflight_backup_capacity
         calls = 0
-        def fail_after_stop(database_path, directory):
+        def fail_after_stop(database_path, directory, additional_reserve_bytes=0):
             nonlocal calls
             calls += 1
             if calls == 2:
                 raise helper.ActivationError("capacity changed after stop")
-            return capacity(database_path, directory)
+            return capacity(database_path, directory, additional_reserve_bytes)
         def start(old_pid, *, plist_path=None):
             self.assertEqual(plist_path, self.manifest.target_plist)
             self.assertTrue(Path(plist_path).is_file())
@@ -1082,12 +1293,12 @@ if sys.argv[1:] == ["--build-identity"]:
         original_write = helper.atomic_write
         calls = 0
 
-        def fail_after_stop(database_path, directory):
+        def fail_after_stop(database_path, directory, additional_reserve_bytes=0):
             nonlocal calls
             calls += 1
             if calls == 2:
                 raise helper.ActivationError("capacity changed after stop")
-            return capacity(database_path, directory)
+            return capacity(database_path, directory, additional_reserve_bytes)
 
         def fail_canonical(path, data, mode=0o600):
             if path == Path(self.manifest.target_plist):
@@ -1317,6 +1528,22 @@ if sys.argv[1:] == ["--build-identity"]:
         self.assertTrue(self.status()["failure"].startswith("migration_started:"))
         self.assertIn("exited 7", self.status()["failure"])
         self.assertEqual(Path(self.manifest.target_binary).read_bytes(), Path(self.manifest.candidate_binary).read_bytes())
+        proof_path = self.root / "status.proof.json"
+        proof = json.loads(proof_path.read_text())
+        self.assertEqual(proof["predecessor"]["saved_binary_path"], str(self.saved_previous))
+        self.assertEqual(proof["predecessor"]["binary_sha256"], helper.sha256(self.saved_previous))
+        self.assertEqual(self.saved_previous.read_bytes(), self.previous_binary)
+        backup = Path(proof["backup"]["backup_path"])
+        self.assertEqual(helper.sha256(backup), proof["backup"]["backup_sha256"])
+        with contextlib.closing(sqlite3.connect(backup)) as database:
+            self.assertEqual(database.execute("SELECT phase FROM changes").fetchall(), [])
+        paths = [self.saved_previous, backup, proof_path, self.root / "previous.plist",
+                 Path(self.manifest.candidate_binary), Path(self.manifest.status_path), self.root / "events"]
+        before = {path: path.read_bytes() for path in paths}
+        with self.assertRaisesRegex(helper.ActivationError, "fresh prepared"):
+            self.activate()
+        self.assertEqual({path: path.read_bytes() for path in paths}, before)
+        self.assertEqual(self.launch.stops, 2)
 
     def test_migration_stderr_is_preserved_in_helper_output(self):
         self.environment["FAIL_MIGRATION"] = "1"
@@ -1507,6 +1734,23 @@ raise SystemExit(0 if result == "committed" else 1)
         self.manifest = dataclasses.replace(self.manifest, candidate_plist_sha256=helper.sha256(path))
         self.assertEqual(self.activate(), "precondition_failed")
         self.assertEqual(self.launch.stops, 0)
+
+    def test_committed_transaction_replay_preserves_retained_recovery_artifacts(self):
+        self.assertEqual(self.activate(), "committed")
+        proof_path = self.root / "status.proof.json"
+        proof = json.loads(proof_path.read_text())
+        paths = [self.saved_previous, Path(proof["backup"]["backup_path"]), proof_path,
+                 Path(self.manifest.status_path), self.root / "previous.plist", self.root / "events"]
+        before = {path: path.read_bytes() for path in paths}
+        with self.assertRaises(helper.ConcurrentDeploy):
+            self.activate()
+        Path(self.manifest.active_path).write_text(self.manifest.transaction_id)
+        with self.assertRaisesRegex(helper.ActivationError, "fresh prepared"):
+            self.activate()
+        self.assertEqual({path: path.read_bytes() for path in paths}, before)
+        self.assertEqual(self.launch.stops, 1)
+        self.assertEqual(self.launch.pid, 99)
+        self.assertEqual(self.launch.starts, [self.manifest.candidate_plist])
 
     def test_replaying_failed_transaction_is_refused(self):
         helper.write_status(self.manifest, "failed", failure="interrupted")
