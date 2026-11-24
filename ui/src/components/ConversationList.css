@@ -253,7 +253,7 @@
   }
 }
 
-/* Conversations Ember monitors fold into one group below the user's own. */
+/* Conversations Ember monitors fold into one group above the user's own. */
 .conv-monitored-group {
   list-style: none;
 }
