@@ -53,6 +53,11 @@ async fn registered_native_close_captured_loss_retry_stop_before_physical_observ
 }
 
 #[tokio::test]
+async fn registered_native_close_captured_loss_retry_stop_before_writer_refuses_dispatch() {
+    run_public_worktree_close(WorktreeJourney::CapturedLossPublicRetryStoppedBeforeWorktreeDispatch).await;
+}
+
+#[tokio::test]
 async fn registered_native_close_physically_retires_worktree_only_and_replays_without_effects() {
     run_public_worktree_close(WorktreeJourney::Retire).await;
 }
@@ -102,6 +107,7 @@ enum WorktreeJourney {
     CapturedLossPublicRetryWithProductionDetector,
     CapturedLossPublicRetryStoppedDuringAssessment,
     CapturedLossPublicRetryStoppedDuringPreparation,
+    CapturedLossPublicRetryStoppedBeforeWorktreeDispatch,
     CapturedLossPublicRetryStoppedBeforePhysicalObservation,
     RetainContentBlockers,
     ReinspectCapturedLossAfterCleanup,
@@ -474,6 +480,7 @@ async fn run_public_worktree_close(journey: WorktreeJourney) {
         WorktreeJourney::CapturedLossPublicRetryWithProductionDetector
             | WorktreeJourney::CapturedLossPublicRetryStoppedDuringAssessment
             | WorktreeJourney::CapturedLossPublicRetryStoppedDuringPreparation
+            | WorktreeJourney::CapturedLossPublicRetryStoppedBeforeWorktreeDispatch
             | WorktreeJourney::CapturedLossPublicRetryStoppedBeforePhysicalObservation
     );
     let mut captured_retry_run = None;
@@ -485,6 +492,7 @@ async fn run_public_worktree_close(journey: WorktreeJourney) {
             | WorktreeJourney::CapturedLossPublicRetryWithProductionDetector
             | WorktreeJourney::CapturedLossPublicRetryStoppedDuringAssessment
             | WorktreeJourney::CapturedLossPublicRetryStoppedDuringPreparation
+            | WorktreeJourney::CapturedLossPublicRetryStoppedBeforeWorktreeDispatch
             | WorktreeJourney::CapturedLossPublicRetryStoppedBeforePhysicalObservation
     );
     if content_blocked {
@@ -1367,6 +1375,9 @@ async fn run_public_worktree_close(journey: WorktreeJourney) {
             match journey {
                 WorktreeJourney::CapturedLossPublicRetryStoppedDuringAssessment => Some(
                     crate::runtime::executor::native_close_retry::test_hooks::Point::CapturedLossAssessmentReady,
+                ),
+                WorktreeJourney::CapturedLossPublicRetryStoppedBeforeWorktreeDispatch => Some(
+                    crate::runtime::executor::native_close_retry::test_hooks::Point::WorktreeDispatchBeforeWriter,
                 ),
                 WorktreeJourney::CapturedLossPublicRetryStoppedDuringPreparation => Some(
                     crate::runtime::executor::native_close_retry::test_hooks::Point::WorktreePreparationReady,

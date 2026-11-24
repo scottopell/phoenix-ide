@@ -146,7 +146,7 @@ jobs:
           set -euo pipefail
           cargo test -p phoenix-db --lib --no-run 2>&1 | tee evidence/compile.log
           cargo test -p phoenix-db --lib -- --list 2>&1 | tee evidence/inventory.log
-          grep -E '^close_foundation::tests::.*: test$|^migrations::close_completion_allowance_tests::migration_172_.*: test$|^migrations::tests::migration_(180|181|182|183)_.*: test$|^native_close::.*: test$' evidence/inventory.log > evidence/selected-tests.txt
+          grep -E '^close_foundation::tests::.*: test$|^migrations::close_completion_allowance_tests::migration_172_.*: test$|^migrations::retry_tmux_dispatch_tests::.*: test$|^migrations::tests::migration_(180|181|182|183)_.*: test$|^native_close::.*: test$' evidence/inventory.log > evidence/selected-tests.txt
           test -s evidence/selected-tests.txt
           grep -F 'close_foundation::tests::inspection_aggregate_validator_preserves_exact_content_and_empty_generation_rules: test' evidence/selected-tests.txt
           for test in \
@@ -637,6 +637,7 @@ jobs:
             registered_native_close_captured_loss_public_retry_with_production_detector_reclaims_and_replays \
             registered_native_close_captured_loss_retry_stop_during_assessment_preserves_worktree_and_history \
             registered_native_close_captured_loss_retry_stop_while_prepared_preserves_worktree \
+            registered_native_close_captured_loss_retry_stop_before_writer_refuses_dispatch \
             registered_native_close_captured_loss_retry_stop_before_physical_observation_retains_stopped_result; do
             test_name="runtime::executor::creation_completion_lifecycle_tests::native_close_admission_tests::worktree_physical::$test"
             grep -Fx "$test_name: test" evidence/runtime-inventory.log

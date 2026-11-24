@@ -1,5 +1,12 @@
 # Unified Close acceptance milestone
 
+## Dispatch writer custody follow-up — source review, hosted gate active
+
+- Published `4069ee8199cdf5e66695b1745edfe9fc8ee4a960` (semantic commit `510b6089b92e1f44690adf2719c8f2e5fcb70e0f` plus reviewed hosted-derived formatting). Automatic run **45329704586** is still active; frontend and specifications succeeded. The migration185 step failed its inventory whitelist before executing its two tests. The whitelist correction below does not turn that nonexecution into a pass. Evidence/watcher are retained under `/tmp/close-4069ee819/`, sole watcher `@94`.
+- Source review identified another actor-inline writer wait at Worktree dispatch. A retained/joined dispatch worker now acquires source entry only after DB validation, checks the original deadline, retains the lease through release classification, and prevents later physical preparation after Stop. Unknown release closes the fatal fence and retains custody without parking the worker forever. This follow-up has not compiled or executed.
+- New public causal regression pauses the retained worker immediately **before** writer acquisition, requires Stop ACK while held, then checks no dispatch or cleanup-plan metadata before/after Stop, worker join and replay. It does not hold SQLite or prove responsiveness under actual SQLite contention. Its exact execution selector is required in the hosted workflow.
+- Independent source review caught and corrected missing test-only cfg guards and missing dispatch-absence assertions. Remaining actor-inline evidence/finalization/admission waits, runtime tmux Stop/wait and unknown-release regressions, public end-to-end reclaim/replay execution, and full transcript-round-trip proof remain open. No merge, deployment, installed delivery or general responsiveness claim. No local builds/tests/formatters/SQL execution.
+
 ## Tmux retry custody and reached-failure correction — unqualified source
 
 This section supersedes the pending-7420 and absent-tmux statements below.

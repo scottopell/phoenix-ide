@@ -454,7 +454,10 @@ pub(super) async fn retry_after_public_capture(
             .successful
             .is_empty());
         assert!(!retry.is_finished());
-        if point == Point::WorktreePreparationReady {
+        if matches!(
+            point,
+            Point::WorktreeDispatchBeforeWriter | Point::WorktreePreparationReady
+        ) {
             assert_eq!(physical_snapshot(&git.worktree), worktree_before);
             assert_eq!(physical_snapshot(&git.admin), admin_before);
         } else {
@@ -467,6 +470,10 @@ pub(super) async fn retry_after_public_capture(
                 std::fs::symlink_metadata(&git.admin).unwrap_err().kind(),
                 std::io::ErrorKind::NotFound
             );
+        }
+
+        if point == Point::WorktreeDispatchBeforeWriter {
+            assert_no_retry_dispatch_or_cleanup_plan(&fixture, initial_run.attempt_id.as_str()).await;
         }
 
         // The worker cannot publish its result until after this ACK is observed.
@@ -504,6 +511,9 @@ pub(super) async fn retry_after_public_capture(
             serde_json::json!([]),
             "no retry effect was acknowledged as successful"
         );
+        if point == Point::WorktreeDispatchBeforeWriter {
+            assert_no_retry_dispatch_or_cleanup_plan(&fixture, initial_run.attempt_id.as_str()).await;
+        }
         let stopped_target = durable_target_rows(&fixture).await;
         let stopped_physical = physical_snapshot(&git.root);
         let failures = fixture
@@ -526,6 +536,9 @@ pub(super) async fn retry_after_public_capture(
             .unwrap();
         assert!(!refused.is_success(), "{}", refused.output());
         let refused: Value = serde_json::from_str(refused.output()).unwrap();
+        if point == Point::WorktreeDispatchBeforeWriter {
+            assert_no_retry_dispatch_or_cleanup_plan(&fixture, initial_run.attempt_id.as_str()).await;
+        }
         assert_eq!(refused["code"], "storage_rejected");
         assert_eq!(
             public_retry_rows(&fixture, initial_run.attempt_id.as_str()).await,
@@ -543,6 +556,9 @@ pub(super) async fn retry_after_public_capture(
             .expect("stopped successor exact-source receipt replay must be bounded");
         assert!(!replay.is_success(), "{}", replay.output());
         let replay: Value = serde_json::from_str(replay.output()).unwrap();
+        if point == Point::WorktreeDispatchBeforeWriter {
+            assert_no_retry_dispatch_or_cleanup_plan(&fixture, initial_run.attempt_id.as_str()).await;
+        }
         assert_eq!(replay["code"], "source_refused");
         assert_eq!(
             fixture
@@ -778,6 +794,18 @@ async fn captured_history(fixture: &CloseFixture, run: &CloseRunRef) -> Captured
             .collect(),
         outcome: serde_json::to_value(outcome).unwrap(),
     }
+}
+
+async fn assert_no_retry_dispatch_or_cleanup_plan(fixture: &CloseFixture, attempt: &str) {
+    let counts: (i64, i64) = sqlx::query_as(
+        "SELECT (SELECT COUNT(*) FROM close_retirement_resource_dispatches WHERE attempt_id = ?1),
+                (SELECT COUNT(*) FROM close_worktree_cleanup_plans WHERE attempt_id = ?1)",
+    )
+    .bind(attempt)
+    .fetch_one(fixture.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(counts, (0, 0), "pre-writer Stop must not authorize dispatch or cleanup metadata");
 }
 
 async fn public_retry_rows(fixture: &CloseFixture, attempt: &str) -> String {

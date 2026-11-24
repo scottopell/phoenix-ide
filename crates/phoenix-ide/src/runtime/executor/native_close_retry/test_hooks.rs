@@ -7,6 +7,7 @@ use tokio::sync::oneshot;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Point {
     CapturedLossAssessmentReady,
+    WorktreeDispatchBeforeWriter,
     WorktreePreparationReady,
     PhysicalBeforeObservation,
 }

@@ -1,7 +1,7 @@
 //! Joined, actor-serviced execution of the finite admitted successor plan.
 
 use super::super::native_close::source_entry::{
-    ActorEntryResult, SourceEntryController, SourceEntryWorker,
+    ActorEntryResult, SourceEntryController, SourceEntryWorker, WorkerEntryResult,
 };
 use super::super::RuntimeSettlementAuthority;
 use super::NativeRetryExecutionError;
@@ -35,6 +35,7 @@ enum Stage {
     WorktreeDispatch,
     WorktreeDraining,
     WorktreeRecordDispatch,
+    WorktreeRecordDispatchRunning,
     WorktreePreparing,
     WorktreePhysical,
     WorktreeEvidence,
@@ -58,6 +59,7 @@ pub(in crate::runtime::executor) struct AdmittedRetryCursor {
     scope_worker: Option<tokio::task::JoinHandle<Result<(), NativeRetryExecutionError>>>,
     tmux_worker: Option<tokio::task::JoinHandle<Result<(), NativeRetryExecutionError>>>,
     drain_worker: Option<tokio::task::JoinHandle<Result<(), NativeRetryNoLiveResourcesError>>>,
+    dispatch_worker: Option<tokio::task::JoinHandle<Result<(), NativeRetryExecutionError>>>,
     #[cfg(unix)]
     preparation: Option<tokio::task::JoinHandle<Result<Option<NativeWorktreeGit>, String>>>,
     #[cfg(unix)]
@@ -84,7 +86,7 @@ impl AdmittedRetryCursor {
         deadline: std::time::Instant,
     ) -> Self {
         Self { command, receipt, backend, context: None, order: Vec::new(), index: 0,
-            stage: Stage::Context, deadline, next_service: tokio::time::Instant::now(), source_entry, scope_worker: None, tmux_worker: None, drain_worker: None,
+            stage: Stage::Context, deadline, next_service: tokio::time::Instant::now(), source_entry, scope_worker: None, tmux_worker: None, drain_worker: None, dispatch_worker: None,
             #[cfg(unix)] preparation: None,
             #[cfg(unix)] physical: None,
             #[cfg(unix)] stopped_physical_outcome: None,
@@ -117,6 +119,7 @@ impl AdmittedRetryCursor {
         if let Some(worker) = self.drain_worker.take() { let _ = worker.await; }
         if let Some(worker) = self.scope_worker.take() { let _ = worker.await; }
         if let Some(worker) = self.tmux_worker.take() { let _ = worker.await; }
+        if let Some(worker) = self.dispatch_worker.take() { let _ = worker.await; }
         #[cfg(unix)]
         {
             // spawn_blocking cannot be aborted after entry. Always join it.
@@ -182,11 +185,12 @@ impl AdmittedRetryCursor {
                 ActorEntryResult::Updated => true,
                 ActorEntryResult::Busy if self.scope_worker.as_ref().is_some_and(|worker| worker.is_finished()) => false,
                 ActorEntryResult::Busy if self.tmux_worker.as_ref().is_some_and(|worker| worker.is_finished()) => false,
+                ActorEntryResult::Busy if self.dispatch_worker.as_ref().is_some_and(|worker| worker.is_finished()) => false,
                 ActorEntryResult::Busy => return Ok(false),
                 ActorEntryResult::Refused => false,
             }
         } else { false };
-        if !current && !matches!(self.stage, Stage::ScopeRunning | Stage::TmuxRunning | Stage::WorktreeDraining | Stage::WorktreePreparing | Stage::WorktreePhysical | Stage::Failure(_)) {
+        if !current && !matches!(self.stage, Stage::ScopeRunning | Stage::TmuxRunning | Stage::WorktreeDraining | Stage::WorktreeRecordDispatchRunning | Stage::WorktreePreparing | Stage::WorktreePhysical | Stage::Failure(_)) {
             self.stage = Stage::ObserveTerminal;
         }
         let stage = std::mem::replace(&mut self.stage, Stage::Fatal);
@@ -358,23 +362,75 @@ impl AdmittedRetryCursor {
                 // A separate actor pass revalidates the original source after drain
                 // and before dispatch metadata or any physical worker is entered.
                 let effect = self.effect().clone();
-                match self
-                    .backend
-                    .db()
-                    .record_native_close_retry_retirement_dispatch(
-                        &self.command,
-                        &self.receipt.admitted,
-                        &effect,
-                    )
-                    .await
-                {
-                    LocalAuthorityResult::DurableFactEstablished(Ok(())) => {
-                        self.stage = Stage::WorktreePreparing
+                let backend = Arc::clone(&self.backend);
+                let command = self.command.clone();
+                let admitted = self.receipt.admitted.clone();
+                let source_entry = self.source_entry.clone();
+                let deadline = self.deadline;
+                let runtime = tokio::runtime::Handle::current();
+                #[cfg(test)]
+                let hooks = super::test_hooks::Hooks::current();
+                self.dispatch_worker = Some(tokio::task::spawn_blocking(move || {
+                    runtime.block_on(async move {
+                        #[cfg(test)]
+                        super::test_hooks::checkpoint(
+                            hooks.as_ref(),
+                            super::test_hooks::Point::WorktreeDispatchBeforeWriter,
+                        )
+                        .await;
+                        let (dispatch, lease) = backend.db()
+                            .record_native_close_retry_retirement_dispatch_with_entry(
+                                &command, &admitted, &effect,
+                                || match source_entry.try_acquire_first_effect(&command) {
+                                    WorkerEntryResult::Ran(lease) if std::time::Instant::now() < deadline => Ok(lease),
+                                    _ => Err(crate::db::DbError::CloseFoundationPrecondition(
+                                        "original native retry source unavailable at Worktree dispatch".into(),
+                                    )),
+                                },
+                            ).await;
+                        if matches!(dispatch, LocalAuthorityResult::DurableFactUnclassified) {
+                            backend.fatal_local_authority_fence.close(
+                                "native_retry_worktree_dispatch_release_unclassified",
+                            );
+                            if let Some(lease) = lease { std::mem::forget(lease); }
+                            std::mem::forget(source_entry);
+                            return Err(NativeRetryExecutionError::Unclassified);
+                        }
+                        drop(lease);
+                        match dispatch {
+                            LocalAuthorityResult::DurableFactEstablished(Ok(())) => Ok(()),
+                            LocalAuthorityResult::DurableFactEstablished(Err(error)) => {
+                                Err(NativeRetryExecutionError::ResourceFailure(error.to_string()))
+                            }
+                            LocalAuthorityResult::DurableFactUnclassified => unreachable!(),
+                        }
+                    })
+                }));
+                self.stage = Stage::WorktreeRecordDispatchRunning;
+            }
+            Stage::WorktreeRecordDispatchRunning => {
+                let worker = self.dispatch_worker.as_ref().expect("retained Worktree dispatch worker");
+                if !worker.is_finished() {
+                    self.stage = Stage::WorktreeRecordDispatchRunning;
+                    return Ok(false);
+                }
+                let result = self.dispatch_worker.take().expect("retained Worktree dispatch worker").await;
+                if matches!(&result, Err(_) | Ok(Err(NativeRetryExecutionError::Unclassified))) {
+                    self.stage = Stage::Fatal;
+                    return Err(NativeCloseApplicationError::FatalAuthority);
+                }
+                if !current {
+                    tracing::debug!(?result, "joined Worktree dispatch after source loss; no physical preparation entered");
+                    self.stage = Stage::ObserveTerminal;
+                } else {
+                    match result {
+                        Ok(Ok(())) => self.stage = Stage::WorktreePreparing,
+                        Ok(Err(NativeRetryExecutionError::ResourceFailure(detail))) => self.stage = Stage::Failure(detail),
+                        Ok(Err(NativeRetryExecutionError::TerminalizedFailure(detail))) => {
+                            if self.accept(Err(NativeRetryExecutionError::TerminalizedFailure(detail))) { return Ok(true); }
+                        }
+                        Ok(Err(NativeRetryExecutionError::Unclassified)) | Err(_) => unreachable!("fatal dispatch result handled above"),
                     }
-                    LocalAuthorityResult::DurableFactEstablished(Err(error)) => {
-                        self.stage = Stage::Failure(error.to_string())
-                    }
-                    LocalAuthorityResult::DurableFactUnclassified => {}
                 }
             }
             Stage::WorktreePreparing => {
