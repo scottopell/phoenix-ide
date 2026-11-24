@@ -2,7 +2,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { performance } from 'node:perf_hooks';
 import { chromium } from 'playwright';
-import { qualifyQuestionSurface } from './question-surface-journeys.mjs';
+import { qualifyQuestionSurface, qualifyDesktopShortcuts } from './question-surface-journeys.mjs';
 
 // Synthetic HTTP isolation of the production UI, not server or iPhone latency.
 const out = path.resolve(process.env.QUESTION_QA_OUT ?? 'qa-artifacts/question-loading');
@@ -65,6 +65,8 @@ async function trial(version, base, viewport, mode, run, isolation = false) {
   let release;
   const gate = new Promise(resolve => { release = resolve; });
   let historyPending = false;
+  let markHistoryPending;
+  const historyStarted = new Promise(resolve => { markHistoryPending = resolve; });
   let historyReplied = false;
   let feedLoaded = false;
   let answerError = false;
@@ -75,6 +77,18 @@ async function trial(version, base, viewport, mode, run, isolation = false) {
       window.__questionLongTasks.push(...list.getEntries().map(e => ({ start: e.startTime, duration: e.duration })));
     }).observe({ type: 'longtask', buffered: true });
   });
+  await page.addInitScript(({ marker }) => {
+    window.__questionReadiness = {};
+    const sample = () => {
+      const ready = window.__questionReadiness;
+      const panel = document.querySelector('.coordinator-question-dock .question-panel');
+      const tail = [...document.querySelectorAll('#messages p')].find(el => el.textContent === marker);
+      if (ready.question_layout_document_ms === undefined && panel?.getClientRects().length) ready.question_layout_document_ms = performance.now();
+      if (ready.transcript_layout_document_ms === undefined && tail?.getClientRects().length) ready.transcript_layout_document_ms = performance.now();
+      if (ready.question_layout_document_ms === undefined || ready.transcript_layout_document_ms === undefined) requestAnimationFrame(sample);
+    };
+    requestAnimationFrame(sample);
+  }, { marker });
   page.on('pageerror', error => diagnostics.push({ type: 'pageerror', message: error.message }));
   page.on('console', message => { if (message.type() === 'error' || message.type() === 'warning') diagnostics.push({ type: message.type(), message: message.text() }); });
   cdp.on('Network.requestWillBeSent', event => requests.set(event.requestId, { url: event.request.url, method: event.request.method, started_ms: performance.now() - trialEpoch, phase: requestPhase, resource: event.type }));
@@ -106,6 +120,7 @@ async function trial(version, base, viewport, mode, run, isolation = false) {
     if (p === '/api/global/coordinator/reads/history' && route.request().method() === 'POST') {
       if (exactReadReference(route) !== id) throw new Error('Coordinator history fixture received an unexpected reference');
       historyPending = true;
+      markHistoryPending();
       if (isolation) await gate;
       historyReplied = true;
       return json(snapshot);
@@ -167,6 +182,15 @@ async function trial(version, base, viewport, mode, run, isolation = false) {
     const panel = page.locator('.question-panel');
     await panel.waitFor({ state: 'visible', timeout: 45000 });
     record.question_visible_ms = performance.now() - start;
+    if (isolation) {
+      let timeout;
+      try {
+        await Promise.race([historyStarted, new Promise((_, reject) => { timeout = setTimeout(() => reject(new Error('History never entered the held handler')), 45000); })]);
+      } finally { clearTimeout(timeout); }
+      record.history_pending_before_interaction = historyPending && !historyReplied;
+      record.history_pending_before_interaction_trial_ms = performance.now() - trialEpoch;
+      if (!record.history_pending_before_interaction) throw new Error('History must be in flight before controlled question interaction');
+    }
     const automatic = panel.locator('.question-option').filter({ hasText: 'Automatic' }).first();
     await automatic.click();
     if (!await automatic.evaluate(el => el.classList.contains('selected'))) throw new Error('Option click did not update selection');
@@ -183,6 +207,11 @@ async function trial(version, base, viewport, mode, run, isolation = false) {
     if (await returnButton.isVisible()) await returnButton.click();
     await page.getByText(marker, { exact: true }).waitFor({ state: 'visible', timeout: 45000 });
     record.transcript_visible_after_question_interaction_ms = performance.now() - start;
+    await page.waitForFunction(() => window.__questionReadiness?.question_layout_document_ms !== undefined && window.__questionReadiness?.transcript_layout_document_ms !== undefined);
+    record.independent_readiness = await page.evaluate(() => window.__questionReadiness);
+    record.independent_readiness.contract = 'First rAF observation of laid-out question panel and transcript tail, sampled independently of scripted interaction; not paint, visibility through modal, or physical usability';
+    record.independent_readiness.question_navigation_relative_ms = record.independent_readiness.question_layout_document_ms - documentNavigationBoundary;
+    record.independent_readiness.transcript_navigation_relative_ms = record.independent_readiness.transcript_layout_document_ms - documentNavigationBoundary;
     record.observation_completed_after_trial_ms = performance.now() - trialEpoch;
     const after = metrics(await cdp.send('Performance.getMetrics'));
     record.metrics_delta = Object.fromEntries(['TaskDuration', 'ScriptDuration', 'LayoutDuration', 'RecalcStyleDuration', 'JSHeapUsedSize'].map(key => [key, after[key] - before[key]]));
@@ -200,6 +229,7 @@ async function trial(version, base, viewport, mode, run, isolation = false) {
     if (await launcher.isVisible()) await launcher.click();
     if (await custom.inputValue() !== 'Disposable retained custom answer') throw new Error('Return lost custom answer');
     await page.screenshot({ animations: 'disabled', path: path.join(out, `${name}-question.png`) });
+    if (version === 'candidate' && isolation && viewport.width === 1440) await qualifyDesktopShortcuts({ page, out });
     if (version === 'candidate' && isolation && viewport.width === 393) {
       await qualifyQuestionSurface({ page, out, questions,
         setQuestions: next => { pendingQuestions = next; },

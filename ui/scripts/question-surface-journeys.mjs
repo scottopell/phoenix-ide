@@ -80,6 +80,9 @@ export async function qualifyQuestionSurface({ page, out, questions, setQuestion
   await launcher.click();
   const initial = await geometry();
   assert.equal(initial.modal, true);
+  await page.evaluate(() => window.dispatchEvent(new KeyboardEvent('keydown', { key: '?', bubbles: true })));
+  assert.equal(await page.locator('.shortcut-help-panel').count(), 0, 'Global help outside native mobile modal must remain suppressed');
+  assert.equal(await dialog.evaluate(el => el.matches(':modal')), true);
   assert.deepEqual(initial.scrollables, ['coordinator-question-dock__scroller']);
   assert.ok(initial.bottom <= initial.height + 1);
   // Native modality must reject focus on the background, not merely hide it.
@@ -214,4 +217,26 @@ export async function qualifyQuestionSurface({ page, out, questions, setQuestion
   evidence.push({ journey: 'real router navigation and browser Back/Forward between canonical Ember transcript query variants', from: historyStart, to: page.url() });
   page.off('request', recordMutation);
   await fs.writeFile(path.join(out, 'question-surface-journeys.json'), JSON.stringify({ evidence, limitations: ['Hosted Chromium, not real iPhone/keyboard.', 'History qualification covers query variants of one Ember transcript only; it does not claim browser Back is native dialog cancel or that drafts survive page reload.'] }, null, 2));
+}
+
+export async function qualifyDesktopShortcuts({ page, out }) {
+  const dialog = page.locator('.coordinator-question-dock__dialog');
+  assert.equal(await dialog.evaluate(el => el.open && !el.matches(':modal')), true);
+  const transcript = page.locator('#messages');
+  await transcript.evaluate(el => { el.tabIndex = -1; el.focus(); });
+  await page.keyboard.press('?');
+  await page.locator('.shortcut-help-panel').waitFor({ state: 'visible' });
+  await page.keyboard.press('Escape');
+  await page.locator('.shortcut-help-panel').waitFor({ state: 'detached' });
+  const composer = page.locator('#message-input');
+  await composer.focus();
+  await page.keyboard.press('Escape');
+  assert.equal(await composer.evaluate(el => el === document.activeElement), false, 'Desktop composer Escape must blur outside nonmodal question');
+  await dialog.getByRole('button', { name: 'Dismiss', exact: true }).click();
+  await page.locator('.confirm-dialog').waitFor({ state: 'visible' });
+  await page.keyboard.press('Escape');
+  await page.locator('.confirm-dialog').waitFor({ state: 'detached' });
+  assert.equal(await dialog.evaluate(el => el.open && !el.matches(':modal')), true, 'Nested confirmation Escape must not close desktop question');
+  await page.screenshot({ animations: 'disabled', path: path.join(out, 'journey-desktop-shortcuts.png') });
+  await fs.writeFile(path.join(out, 'desktop-shortcuts.json'), JSON.stringify({ outside_dock_help: true, composer_escape_blurs: true, nested_confirmation_escape: true }, null, 2));
 }

@@ -38,7 +38,7 @@ jobs:
           pnpm exec playwright install --with-deps chromium
       - name: Focused question regressions
         working-directory: candidate/ui
-        run: pnpm exec vitest run src/components/CoordinatorQuestionDock.test.tsx src/components/QuestionPanel.test.tsx
+        run: pnpm exec vitest run src/components/CoordinatorQuestionDock.test.tsx src/components/QuestionPanel.test.tsx src/hooks/useKeyboardNav.test.tsx
       - name: Build and serve baseline
         working-directory: baseline/ui
         run: |
