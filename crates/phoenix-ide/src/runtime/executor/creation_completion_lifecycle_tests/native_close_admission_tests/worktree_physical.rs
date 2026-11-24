@@ -25,7 +25,8 @@ use std::time::Duration;
 mod captured_loss_public_retry;
 
 #[tokio::test]
-async fn registered_native_close_captured_loss_public_retry_with_production_detector_reclaims_and_replays() {
+async fn registered_native_close_captured_loss_public_retry_with_production_detector_reclaims_and_replays(
+) {
     run_public_worktree_close(WorktreeJourney::CapturedLossPublicRetryWithProductionDetector).await;
 }
 
@@ -463,7 +464,11 @@ async fn run_public_worktree_close(journey: WorktreeJourney) {
         std::fs::write(git.worktree.join("build/b.bin"), b"retained build b").unwrap();
         std::fs::write(git.worktree.join("tracked.txt"), b"unpreserved edits\n").unwrap();
         if public_captured_retry {
-            std::fs::write(git.worktree.join("untracked.txt"), b"unpreserved new file\n").unwrap();
+            std::fs::write(
+                git.worktree.join("untracked.txt"),
+                b"unpreserved new file\n",
+            )
+            .unwrap();
         }
     }
     let mut backend = CloseFixture::backend(fixture.db.clone());
@@ -797,9 +802,10 @@ async fn run_public_worktree_close(journey: WorktreeJourney) {
         if public_captured_retry {
             assert!(losses.iter().any(|loss| {
                 loss.scope == scope
-                    && loss.item == CloseLossItem::UntrackedNonIgnoredPath(GitPathIdentity::from_bytes(
-                        b"untracked.txt".to_vec(),
-                    ))
+                    && loss.item
+                        == CloseLossItem::UntrackedNonIgnoredPath(GitPathIdentity::from_bytes(
+                            b"untracked.txt".to_vec(),
+                        ))
             }));
             captured_retry_run = Some(run.clone());
         }
@@ -1298,8 +1304,12 @@ async fn run_public_worktree_close(journey: WorktreeJourney) {
     );
     if let Some(run) = &captured_retry_run {
         assert!(output.is_success(), "{}", output.output());
-        captured_loss_public_retry::acknowledge_public_initial_result(&fixture, run, output.output())
-            .await;
+        captured_loss_public_retry::acknowledge_public_initial_result(
+            &fixture,
+            run,
+            output.output(),
+        )
+        .await;
     }
     event_tx.send(Event::Shutdown).await.unwrap();
     tokio::time::timeout(Duration::from_secs(10), running)
@@ -1317,8 +1327,10 @@ async fn run_public_worktree_close(journey: WorktreeJourney) {
             .read_native_close_captured_loss_retry_context(&fixture.target, &run)
             .await
             .expect("acknowledged initial result must remain eligible after source shutdown");
-        captured_loss_public_retry::retry_after_public_capture(&fixture, &git, backend, &scope, &run)
-            .await;
+        captured_loss_public_retry::retry_after_public_capture(
+            &fixture, &git, backend, &scope, &run,
+        )
+        .await;
     }
 }
 

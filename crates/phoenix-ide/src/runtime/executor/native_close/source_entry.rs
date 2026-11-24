@@ -271,16 +271,14 @@ pub(crate) fn source_matches(live_state: &ConvState, command: &NativeCloseComman
             target,
             attempt_id,
             failed_run_ordinal,
-        } => {
-            retry_command_from_executing_source(
-                live_state,
-                command.source_transcript_id(),
-                command.source(),
-                target.clone(),
-                attempt_id.clone(),
-                *failed_run_ordinal,
-            )
-        }
+        } => retry_command_from_executing_source(
+            live_state,
+            command.source_transcript_id(),
+            command.source(),
+            target.clone(),
+            attempt_id.clone(),
+            *failed_run_ordinal,
+        ),
         _ => return false,
     };
     matched.is_ok_and(|matched| matched == *command)

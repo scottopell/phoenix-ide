@@ -83,7 +83,9 @@ const FAILURE: &str = include_str!("native_close_retry_failure.sql");
 const SOURCE_FENCE: &str = include_str!("native_initial_source_fence.sql");
 
 fn unexpected(name: &str) -> DbError {
-    DbError::Serialization(format!("migration 184 found unexpected {name} source shape"))
+    DbError::Serialization(format!(
+        "migration 184 found unexpected {name} source shape"
+    ))
 }
 
 fn trigger_source<'a>(source: &'a str, name: &str) -> DbResult<&'a str> {
@@ -110,14 +112,23 @@ fn replace_exact(definition: &str, name: &str, old: &str, new: &str) -> DbResult
 // ONLY call this on a complete, asserted native SELECT, never on a combined
 // trigger. The old SELECT is retained byte-for-byte as the first UNION arm.
 fn capture_alternative(query: &str, name: &str, resources: bool) -> DbResult<String> {
-    let anchor = "JOIN close_original_retirement_anchors anchor ON anchor.attempt_id = plan.attempt_id";
+    let anchor =
+        "JOIN close_original_retirement_anchors anchor ON anchor.attempt_id = plan.attempt_id";
     let mut capture = replace_exact(query, name, anchor,
         "JOIN native_close_retry_snapshot_authorities anchor ON anchor.attempt_id = plan.attempt_id AND anchor.run_ordinal = plan.run_ordinal")?;
     if resources {
-        capture = replace_exact(&capture, name, "close_expected_retirement_resources expected",
-            "native_close_retry_resource_authorities expected")?;
-        capture = replace_exact(&capture, name, "close_retirement_inventories inventory",
-            "native_close_retry_scope_authorities inventory")?;
+        capture = replace_exact(
+            &capture,
+            name,
+            "close_expected_retirement_resources expected",
+            "native_close_retry_resource_authorities expected",
+        )?;
+        capture = replace_exact(
+            &capture,
+            name,
+            "close_retirement_inventories inventory",
+            "native_close_retry_scope_authorities inventory",
+        )?;
     }
     capture.push_str("\n      AND EXISTS (SELECT 1 FROM native_close_captured_loss_retry_plans capture_origin\n          WHERE capture_origin.attempt_id = plan.attempt_id AND capture_origin.run_ordinal = plan.run_ordinal)");
     Ok(format!("{query}\nUNION ALL\n{capture}"))
@@ -125,13 +136,22 @@ fn capture_alternative(query: &str, name: &str, resources: bool) -> DbResult<Str
 
 async fn definition(tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>, name: &str) -> DbResult<String> {
     sqlx::query_scalar("SELECT sql FROM sqlite_schema WHERE type = 'trigger' AND name = ?1")
-        .bind(name).fetch_optional(&mut **tx).await?
+        .bind(name)
+        .fetch_optional(&mut **tx)
+        .await?
         .ok_or_else(|| unexpected(name))
 }
 
-async fn install(tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>, name: &str, sql: String) -> DbResult<()> {
+async fn install(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    name: &str,
+    sql: String,
+) -> DbResult<()> {
     sqlx::query("UPDATE sqlite_schema SET sql = ?2 WHERE type = 'trigger' AND name = ?1")
-        .bind(name).bind(sql).execute(&mut **tx).await?;
+        .bind(name)
+        .bind(sql)
+        .execute(&mut **tx)
+        .await?;
     Ok(())
 }
 
@@ -141,20 +161,33 @@ async fn install(tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>, name: &str, sql: 
 // No discovery by LIKE: a missing or changed native branch aborts the transaction.
 async fn rewrite_native_guards(tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>) -> DbResult<()> {
     for (name, query) in [
-        ("close_retirement_resource_dispatches_require_authority", include_str!("native_close_retry_dispatch.sql")),
-        ("close_worktree_cleanup_plan_require_retry_authority", include_str!("native_close_retry_worktree_metadata.sql")),
-        ("close_worktree_tombstone_require_retry_authority", include_str!("native_close_retry_worktree_metadata.sql")),
+        (
+            "close_retirement_resource_dispatches_require_authority",
+            include_str!("native_close_retry_dispatch.sql"),
+        ),
+        (
+            "close_worktree_cleanup_plan_require_retry_authority",
+            include_str!("native_close_retry_worktree_metadata.sql"),
+        ),
+        (
+            "close_worktree_tombstone_require_retry_authority",
+            include_str!("native_close_retry_worktree_metadata.sql"),
+        ),
     ] {
         let old = definition(tx, name).await?;
         let query = query.trim_end();
         let rewritten = replace_exact(&old, name, query, &capture_alternative(query, name, true)?)?;
         install(tx, name, rewritten).await?;
     }
-    for name in ["native_close_retry_failure_parent_requires_exact_plan",
-        "native_close_retry_failure_child_requires_exact_pending_tail"] {
+    for name in [
+        "native_close_retry_failure_parent_requires_exact_plan",
+        "native_close_retry_failure_child_requires_exact_pending_tail",
+    ] {
         let source = trigger_source(FAILURE, name)?;
         let old = definition(tx, name).await?;
-        if old.trim_end_matches(';') != source { return Err(unexpected(name)); }
+        if old.trim_end_matches(';') != source {
+            return Err(unexpected(name));
+        }
         let query = between(source, name, " AND NOT EXISTS (\n", "\n)\nBEGIN")?;
         let rewritten = replace_exact(&old, name, query, &capture_alternative(query, name, true)?)?;
         install(tx, name, rewritten).await?;
@@ -169,28 +202,51 @@ async fn rewrite_native_guards(tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>) -> 
     let name = "close_run_retry_effects_require_remaining_authority";
     let source = trigger_source(ADMISSION, name)?;
     let old = definition(tx, name).await?;
-    if old.trim_end_matches(';') != source { return Err(unexpected(name)); }
+    if old.trim_end_matches(';') != source {
+        return Err(unexpected(name));
+    }
     let query = between(source, name, "    AND NOT EXISTS (\n", "\n    ))\nBEGIN")?;
-    let rewritten = replace_exact(&old, name, query,
-        &format!("{query}\nUNION ALL\nSELECT 1 WHERE {CAPTURE_EFFECT}"))?;
+    let rewritten = replace_exact(
+        &old,
+        name,
+        query,
+        &format!("{query}\nUNION ALL\nSELECT 1 WHERE {CAPTURE_EFFECT}"),
+    )?;
     install(tx, name, rewritten).await?;
 
     let name = "native_close_retry_plans_require_original";
     let source = trigger_source(ADMISSION, name)?;
     let old = definition(tx, name).await?;
-    if old.trim_end_matches(';') != source { return Err(unexpected(name)); }
-    let query = between(source, name, "  OR NOT EXISTS (", ")\n  OR EXISTS (SELECT 1 FROM close_retirement_anchor_exclusions")?;
+    if old.trim_end_matches(';') != source {
+        return Err(unexpected(name));
+    }
+    let query = between(
+        source,
+        name,
+        "  OR NOT EXISTS (",
+        ")\n  OR EXISTS (SELECT 1 FROM close_retirement_anchor_exclusions",
+    )?;
     // The duplicate/request/latest-run/exclusion gates outside this SELECT are
     // deliberately NOT exempted. Only the original-anchor requirement gains an arm.
-    let rewritten = replace_exact(&old, name, query,
-        &format!("{query}\nUNION ALL\nSELECT 1 WHERE {CAPTURE_HEADER}"))?;
+    let rewritten = replace_exact(
+        &old,
+        name,
+        query,
+        &format!("{query}\nUNION ALL\nSELECT 1 WHERE {CAPTURE_HEADER}"),
+    )?;
     install(tx, name, rewritten).await?;
 
     // These guards need no new authority: they bind already admitted plans and
     // effects, not anchors/inventories. Assert their actual installed sources.
     for (source, name) in [
-        (super::MIGRATION_119, "close_run_retry_successes_require_running_plan"),
-        (include_str!("native_close_source_fence.sql"), "native_close_source_fence_children_require_pending_plan"),
+        (
+            super::MIGRATION_119,
+            "close_run_retry_successes_require_running_plan",
+        ),
+        (
+            include_str!("native_close_source_fence.sql"),
+            "native_close_source_fence_children_require_pending_plan",
+        ),
         (ADMISSION, "native_close_retry_receipts_require_plan"),
     ] {
         if definition(tx, name).await?.trim_end_matches(';') != trigger_source(source, name)? {
@@ -199,11 +255,16 @@ async fn rewrite_native_guards(tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>) -> 
     }
     let name = "close_runs_require_next_ordinal";
     let source = trigger_source(ADMISSION, name)?;
-    let query = between(source, name, "    AND NOT EXISTS (\n      SELECT 1 FROM native_close_retry_plans plan\n",
-        "\n    ))\nBEGIN")?;
+    let query = between(
+        source,
+        name,
+        "    AND NOT EXISTS (\n      SELECT 1 FROM native_close_retry_plans plan\n",
+        "\n    ))\nBEGIN",
+    )?;
     let installed = definition(tx, name).await?;
     if installed.matches(query).count() != 1
-        || !installed.contains("OR NEW.run_ordinal <> COALESCE((SELECT MAX(run_ordinal) + 1") {
+        || !installed.contains("OR NEW.run_ordinal <> COALESCE((SELECT MAX(run_ordinal) + 1")
+    {
         return Err(unexpected(name));
     }
     Ok(())

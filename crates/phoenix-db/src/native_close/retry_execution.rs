@@ -169,26 +169,43 @@ impl NativeCloseRetryWorktreeMetadata {
 
 impl Database {
     async fn read_native_close_retry_authority_tx(
-        tx: &mut Transaction<'_, Sqlite>, failed_run: &CloseRunRef,
+        tx: &mut Transaction<'_, Sqlite>,
+        failed_run: &CloseRunRef,
         plan: &NativeCloseRetryPlanIdentity,
     ) -> DbResult<NativeCloseRetryAuthority> {
         if !plan.captured_origin {
-            let original = Self::read_stopped_close_original_retirement_proof_tx(tx, failed_run).await?;
+            let original =
+                Self::read_stopped_close_original_retirement_proof_tx(tx, failed_run).await?;
             let pending = super::retry::original_pending_effects_tx(tx, &original).await?;
-            return Ok(NativeCloseRetryAuthority { snapshot: original.snapshot,
-                scopes: original.scopes, resources: original.resources, pending });
+            return Ok(NativeCloseRetryAuthority {
+                snapshot: original.snapshot,
+                scopes: original.scopes,
+                resources: original.resources,
+                pending,
+            });
         }
         let scopes = super::captured_loss_retry::read_captured_scopes_tx(tx, failed_run).await?;
         let effects = super::captured_loss_admission::captured_effects(&scopes)?;
         if i64::try_from(effects.len()).ok() != Some(plan.effect_count) {
-            return Err(refused("captured retry authority differs from its finite captured set"));
+            return Err(refused(
+                "captured retry authority differs from its finite captured set",
+            ));
         }
-        let resources = effects.iter().map(|effect| CloseExpectedRetirementResource {
-            attempt_id: failed_run.attempt_id.clone(), scope: effect.scope.clone(),
-            snapshot: plan.snapshot.clone(), resource: effect.resource.clone(),
-        }).collect();
-        Ok(NativeCloseRetryAuthority { snapshot: plan.snapshot.clone(), scopes,
-            resources, pending: effects })
+        let resources = effects
+            .iter()
+            .map(|effect| CloseExpectedRetirementResource {
+                attempt_id: failed_run.attempt_id.clone(),
+                scope: effect.scope.clone(),
+                snapshot: plan.snapshot.clone(),
+                resource: effect.resource.clone(),
+            })
+            .collect();
+        Ok(NativeCloseRetryAuthority {
+            snapshot: plan.snapshot.clone(),
+            scopes,
+            resources,
+            pending: effects,
+        })
     }
 
     /// Reads an exact stopped predecessor's original snapshot context in one read-only
@@ -227,11 +244,15 @@ impl Database {
         admitted: &NativeCloseRunRef,
     ) -> DbResult<NativeCloseRetryExecutionContext> {
         let mut tx = self.pool.begin().await?;
-        let plan = Self::require_native_close_retry_plan_identity_tx(&mut tx, command, admitted).await?;
+        let plan =
+            Self::require_native_close_retry_plan_identity_tx(&mut tx, command, admitted).await?;
         if !plan.running {
-            return Err(refused("native retry context requires the exact latest running plan"));
+            return Err(refused(
+                "native retry context requires the exact latest running plan",
+            ));
         }
-        Self::require_native_close_retry_members_quiescent_tx(&mut tx, &admitted.attempt_id).await?;
+        Self::require_native_close_retry_members_quiescent_tx(&mut tx, &admitted.attempt_id)
+            .await?;
         let effect_count = plan.effect_count;
         let NativeCloseIntent::ExplicitRetry {
             failed_run_ordinal, ..

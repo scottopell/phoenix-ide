@@ -27,7 +27,9 @@ pub(super) struct NativeCloseRetryAssessment {
 
 pub(super) enum NativeCloseRetryOriginAssessment {
     Anchored(NativeCloseRetryAssessment),
-    CapturedLoss(crate::runtime::close_retirement::captured_loss_retry::CapturedLossRetryAssessment),
+    CapturedLoss(
+        crate::runtime::close_retirement::captured_loss_retry::CapturedLossRetryAssessment,
+    ),
 }
 
 pub(super) struct NativeCloseRetryContinuation {
@@ -131,7 +133,9 @@ where
             Ok(None) => {}
             Err(error) => {
                 tracing::warn!(%error, "native Close retry receipt lookup failed");
-                let _ = request.response.send(Err(NativeCloseApplicationError::Storage));
+                let _ = request
+                    .response
+                    .send(Err(NativeCloseApplicationError::Storage));
                 return None;
             }
         }

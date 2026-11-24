@@ -3276,8 +3276,9 @@ where
 
         let mut pending_native_close_initial: Option<native_close::NativeCloseInitialContinuation> =
             None;
-        let mut pending_native_close_retry: Option<native_close_retry::NativeCloseRetryContinuation> =
-            None;
+        let mut pending_native_close_retry: Option<
+            native_close_retry::NativeCloseRetryContinuation,
+        > = None;
         // Fatal authority exits must not release a continuation's source authority
         // or target gate while its owned preparation worker is still running.
         macro_rules! join_pending_native_close_before_fatal {

@@ -5,8 +5,8 @@ use phoenix_core::domain::close::{
 };
 use phoenix_core::work_scope::ResourceScopeKey;
 use phoenix_db::native_close::{
-    NativeCloseCapturedLossRetryAssessment, NativeCloseCapturedLossRetryContext, NativeCloseCommand,
-    NativeCloseIntent,
+    NativeCloseCapturedLossRetryAssessment, NativeCloseCapturedLossRetryContext,
+    NativeCloseCommand, NativeCloseIntent,
 };
 use phoenix_db::{ReplaceCloseInspectionRequest, ReplaceCloseInspectionScopeRequest};
 
@@ -47,8 +47,11 @@ impl super::RuntimeManager {
         &self,
         command: &NativeCloseCommand,
     ) -> Result<CapturedLossRetryAssessment, String> {
-        let NativeCloseIntent::ExplicitRetry { target, attempt_id, failed_run_ordinal } =
-            command.intent()
+        let NativeCloseIntent::ExplicitRetry {
+            target,
+            attempt_id,
+            failed_run_ordinal,
+        } = command.intent()
         else {
             return Err("captured-loss assessment requires explicit retry".into());
         };
@@ -63,7 +66,8 @@ impl super::RuntimeManager {
             .map_err(|error| error.to_string())?;
         self.validate_captured_loss_scope_drain(&context).await?;
         for captured in context.scopes() {
-            if let Some(CapturedWorktreeIdentity::Resolved(identity)) = &captured.captured_worktree {
+            if let Some(CapturedWorktreeIdentity::Resolved(identity)) = &captured.captured_worktree
+            {
                 validate_captured_registration(identity)?;
                 let path = super::worktree_path(identity);
                 let quarantine = super::worktree_quarantine_path(identity)?;
@@ -105,7 +109,9 @@ impl super::RuntimeManager {
     ) -> Result<(), String> {
         for captured in context.scopes() {
             match self
-                .native_initial_work_scope_precondition(&ResourceScopeKey::Work(captured.scope.clone()))
+                .native_initial_work_scope_precondition(&ResourceScopeKey::Work(
+                    captured.scope.clone(),
+                ))
                 .await
             {
                 super::NativeInitialWorkScopePrecondition::Ready(_) => {}
@@ -120,8 +126,14 @@ impl super::RuntimeManager {
 }
 
 fn require_clean_inspection(inspection: &ReplaceCloseInspectionRequest) -> Result<(), String> {
-    if inspection.scopes.iter().any(|scope| !scope.losses.is_empty()) {
-        return Err("captured-loss retry still has retained or newly observed content blockers".into());
+    if inspection
+        .scopes
+        .iter()
+        .any(|scope| !scope.losses.is_empty())
+    {
+        return Err(
+            "captured-loss retry still has retained or newly observed content blockers".into(),
+        );
     }
     Ok(())
 }
@@ -157,7 +169,9 @@ pub(crate) async fn collect_captured_loss_retry_inspection(
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     let mut scopes = Vec::with_capacity(context.scopes().len());
     for captured in context.scopes() {
-        if let Some(inspection) = inspect_captured_scope_until(captured, &generation, deadline).await? {
+        if let Some(inspection) =
+            inspect_captured_scope_until(captured, &generation, deadline).await?
+        {
             scopes.push(inspection);
         }
     }
@@ -309,15 +323,24 @@ mod tests {
     async fn clean_assessment_guard_requires_fresh_inspection_after_owner_cleanup() {
         let (directory, captured) = fixture();
         std::fs::write(directory.path().join("blocker"), b"preserve").unwrap();
-        let blocked = inspect_captured_scope(&captured, "blocked").await.unwrap().unwrap();
+        let blocked = inspect_captured_scope(&captured, "blocked")
+            .await
+            .unwrap()
+            .unwrap();
         let mut request = ReplaceCloseInspectionRequest {
             attempt_id: captured.attempt_id.clone(),
             scopes: vec![blocked],
         };
         assert!(require_clean_inspection(&request).is_err());
         std::fs::remove_file(directory.path().join("blocker")).unwrap();
-        let clean = inspect_captured_scope(&captured, "fresh-clean").await.unwrap().unwrap();
-        assert_ne!(request.scopes[0].snapshot.generation(), clean.snapshot.generation());
+        let clean = inspect_captured_scope(&captured, "fresh-clean")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(
+            request.scopes[0].snapshot.generation(),
+            clean.snapshot.generation()
+        );
         request.scopes = vec![clean];
         assert!(require_clean_inspection(&request).is_ok());
     }
@@ -355,7 +378,8 @@ mod tests {
             WorktreeId::parse("exact-linked").unwrap(),
             WorktreeFingerprint::parse(
                 super::super::observe_worktree_fingerprint(&linked).unwrap(),
-            ).unwrap(),
+            )
+            .unwrap(),
             GitPathIdentity::from_bytes(linked.as_os_str().as_bytes().to_vec()),
         );
         assert!(validate_captured_registration(&identity).is_ok());

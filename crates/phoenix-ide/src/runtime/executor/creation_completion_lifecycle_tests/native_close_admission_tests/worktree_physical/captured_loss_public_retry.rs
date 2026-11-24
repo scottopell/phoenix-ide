@@ -25,7 +25,8 @@ pub(super) async fn acknowledge_public_initial_result(
         assistant_message,
         current_tool,
         ..
-    } = &source.state else {
+    } = &source.state
+    else {
         panic!("initial Close source must still be executing");
     };
     assert_eq!(assistant_message.message_id, fixture.source.message_id);
@@ -122,7 +123,10 @@ pub(super) async fn retry_after_public_capture(
         state: executing_state(&source, &intent),
         source,
     };
-    assert_ne!(fixture.command.request_id(), initial_fixture.command.request_id());
+    assert_ne!(
+        fixture.command.request_id(),
+        initial_fixture.command.request_id()
+    );
     fixture
         .db
         .update_conversation_state(&fixture.source_transcript_id, &fixture.state)
@@ -225,13 +229,19 @@ pub(super) async fn retry_after_public_capture(
     assert!(!stale.is_success());
     let stale: Value = serde_json::from_str(stale.output()).unwrap();
     assert_eq!(stale["code"], "source_refused");
-    assert_eq!(public_retry_rows(&fixture, initial_run.attempt_id.as_str()).await, before);
+    assert_eq!(
+        public_retry_rows(&fixture, initial_run.attempt_id.as_str()).await,
+        before
+    );
 
     let still_dirty = tool.run(input.clone(), context.clone()).await;
     assert!(!still_dirty.is_success());
     let still_dirty: Value = serde_json::from_str(still_dirty.output()).unwrap();
     assert_eq!(still_dirty["code"], "storage_rejected");
-    assert_eq!(public_retry_rows(&fixture, initial_run.attempt_id.as_str()).await, before);
+    assert_eq!(
+        public_retry_rows(&fixture, initial_run.attempt_id.as_str()).await,
+        before
+    );
     assert_eq!(captured_history(&fixture, initial_run).await, historical);
     assert!(git.worktree.exists());
     assert!(git.admin.join("gitdir").is_file());
@@ -259,7 +269,10 @@ pub(super) async fn retry_after_public_capture(
     git.run(&git.worktree, &["restore", "--", "tracked.txt"]);
     std::fs::remove_file(git.worktree.join("untracked.txt")).unwrap();
     std::fs::remove_dir_all(git.worktree.join("build")).unwrap();
-    assert_eq!(public_retry_rows(&fixture, initial_run.attempt_id.as_str()).await, before);
+    assert_eq!(
+        public_retry_rows(&fixture, initial_run.attempt_id.as_str()).await,
+        before
+    );
     assert_eq!(captured_history(&fixture, initial_run).await, historical);
     assert_eq!(
         fixture
@@ -271,12 +284,14 @@ pub(super) async fn retry_after_public_capture(
     );
     assert!(git.worktree.exists());
     assert!(git.admin.join("gitdir").is_file());
-    assert!(!fixture
-        .db
-        .get_conversation(TARGET_ID)
-        .await
-        .unwrap()
-        .archived);
+    assert!(
+        !fixture
+            .db
+            .get_conversation(TARGET_ID)
+            .await
+            .unwrap()
+            .archived
+    );
 
     let completed = tokio::time::timeout(
         Duration::from_secs(10),
@@ -288,9 +303,18 @@ pub(super) async fn retry_after_public_capture(
     let admitted: Value = serde_json::from_str(completed.output()).unwrap();
     assert_eq!(admitted["action"], "explicit_retry");
     assert_eq!(admitted["status"], "newly_admitted");
-    assert_eq!(admitted["admitted"]["attempt_id"], initial_run.attempt_id.as_str());
-    assert_eq!(admitted["admitted"]["run_ordinal"], initial_run.ordinal.get() + 1);
-    assert_eq!(admitted["request_id"], fixture.command.request_id().to_string());
+    assert_eq!(
+        admitted["admitted"]["attempt_id"],
+        initial_run.attempt_id.as_str()
+    );
+    assert_eq!(
+        admitted["admitted"]["run_ordinal"],
+        initial_run.ordinal.get() + 1
+    );
+    assert_eq!(
+        admitted["request_id"],
+        fixture.command.request_id().to_string()
+    );
     let receipt = fixture
         .db
         .read_native_close_explicit_retry_receipt(&fixture.command)
@@ -307,12 +331,19 @@ pub(super) async fn retry_after_public_capture(
         fixture.db.get_close_run(&successor).await.unwrap().status,
         CloseRunStatus::Completed
     );
-    let effects = fixture.db.list_close_safe_retry_effects(&successor).await.unwrap();
+    let effects = fixture
+        .db
+        .list_close_safe_retry_effects(&successor)
+        .await
+        .unwrap();
     assert_eq!(effects.len(), 2);
-    for kind in [RetiredResourceKind::Worktree, RetiredResourceKind::WorkScope] {
-        assert!(effects.iter().any(|effect| {
-            &effect.scope == scope && effect.resource.kind() == kind
-        }));
+    for kind in [
+        RetiredResourceKind::Worktree,
+        RetiredResourceKind::WorkScope,
+    ] {
+        assert!(effects
+            .iter()
+            .any(|effect| { &effect.scope == scope && effect.resource.kind() == kind }));
     }
     let success_count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM close_run_retry_successes WHERE attempt_id = ?1 AND run_ordinal = ?2",
@@ -333,20 +364,33 @@ pub(super) async fn retry_after_public_capture(
     .await
     .unwrap();
     let successor_snapshot = CloseRetirementSnapshot::parse(generation, fingerprint).unwrap();
-    assert_ne!(successor_snapshot.generation(), captured.snapshot().generation());
-    assert_ne!(successor_snapshot.fingerprint(), captured.snapshot().fingerprint());
+    assert_ne!(
+        successor_snapshot.generation(),
+        captured.snapshot().generation()
+    );
+    assert_ne!(
+        successor_snapshot.fingerprint(),
+        captured.snapshot().fingerprint()
+    );
     assert!(!git.worktree.exists());
     assert!(!git.admin.join("gitdir").is_file());
     assert_eq!(
-        fixture.db.get_conversation_work_scope_context(TARGET_ID).await.unwrap().1,
+        fixture
+            .db
+            .get_conversation_work_scope_context(TARGET_ID)
+            .await
+            .unwrap()
+            .1,
         WorkScopeLifecycle::Retired
     );
-    assert!(fixture
-        .db
-        .get_conversation(TARGET_ID)
-        .await
-        .unwrap()
-        .archived);
+    assert!(
+        fixture
+            .db
+            .get_conversation(TARGET_ID)
+            .await
+            .unwrap()
+            .archived
+    );
     assert_eq!(
         captured_history(&fixture, initial_run).await,
         historical,
@@ -360,15 +404,27 @@ pub(super) async fn retry_after_public_capture(
         .iter()
         .all(|evidence| evidence.snapshot != *captured.snapshot()));
     assert_eq!(
-        fixture.db.read_ordinary_product_conversation_metadata(TARGET_ID).await.unwrap().lifecycle,
+        fixture
+            .db
+            .read_ordinary_product_conversation_metadata(TARGET_ID)
+            .await
+            .unwrap()
+            .lifecycle,
         OrdinaryProductConversationLifecycle::History
     );
     let messages = fixture.db.get_messages(TARGET_ID).await.unwrap();
     assert_eq!(messages.len(), 2);
-    assert_eq!(messages[0].message_id, format!("close-outcome:{}", initial_run.attempt_id));
+    assert_eq!(
+        messages[0].message_id,
+        format!("close-outcome:{}", initial_run.attempt_id)
+    );
     assert_eq!(
         messages[1].message_id,
-        format!("close-run-outcome:{}:{}", successor.ordinal.get(), successor.attempt_id)
+        format!(
+            "close-run-outcome:{}:{}",
+            successor.ordinal.get(),
+            successor.attempt_id
+        )
     );
     assert_eq!(
         messages[1].content.to_json(),
@@ -388,7 +444,10 @@ pub(super) async fn retry_after_public_capture(
     let mut expected = admitted;
     expected["status"] = serde_json::json!("replay");
     assert_eq!(replay, expected);
-    assert_eq!(public_retry_rows(&fixture, initial_run.attempt_id.as_str()).await, terminal);
+    assert_eq!(
+        public_retry_rows(&fixture, initial_run.attempt_id.as_str()).await,
+        terminal
+    );
     assert_eq!(
         serde_json::to_value(fixture.db.get_messages(TARGET_ID).await.unwrap()).unwrap(),
         messages
@@ -425,9 +484,21 @@ async fn captured_history(fixture: &CloseFixture, run: &CloseRunRef) -> Captured
         .expect("initial failed Close must retain its outcome");
     CapturedHistory {
         run: fixture.db.get_close_run(run).await.unwrap(),
-        inspections: fixture.db.list_close_inspections(&run.attempt_id).await.unwrap(),
-        losses: fixture.db.list_close_retirement_losses(&run.attempt_id).await.unwrap(),
-        failures: fixture.db.list_close_cleanup_failures(&run.attempt_id).await.unwrap(),
+        inspections: fixture
+            .db
+            .list_close_inspections(&run.attempt_id)
+            .await
+            .unwrap(),
+        losses: fixture
+            .db
+            .list_close_retirement_losses(&run.attempt_id)
+            .await
+            .unwrap(),
+        failures: fixture
+            .db
+            .list_close_cleanup_failures(&run.attempt_id)
+            .await
+            .unwrap(),
         outcome: serde_json::to_value(outcome).unwrap(),
     }
 }
