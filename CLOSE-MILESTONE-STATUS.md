@@ -1,5 +1,15 @@
 # Unified Close acceptance milestone
 
+## Hosted ed710 terminal result and next exact qualification
+
+Automatic run **45344455940**, exact `ed710d35b1216b7ef5809a261b3135f696fae79d`, completed **failure**. Production/runtime test compilation passed; frontend, specification/devpy checks and format gate passed. Full migrations172 and foundation268 tests passed; native DB80 passed/one failed. Evidence is under `/tmp/close-ed710d35b/`.
+
+The required `registered_native_close_captured_loss_public_retry_with_production_detector_reclaims_and_replays` journey and all four causal Stop cases **did not execute**: the identity wrapper rejected their selectors before launching the binary. The original initial-Close production-detector Worktree journey did execute and pass. The wrapper correction admits only those five additional exact disposable Worktree tests at both identity boundaries; private scratch, fixed flags, nobody identity, credential/capability preflight and original absolute bounds are unchanged. Independent source review verified all use the same disposable fixture, not broader Bash/Tmux suites.
+
+The actor qualification step stopped on a stale `3 passed` assertion after all six captured-loss reinspection tests passed. The assertion now requires six plus every named successful execution before the later actor suite; that later suite remains unexecuted in this run. The single DB failure was permanent member deletion while mandatory failure outbox custody remained pending. The fixture now verifies refusal/rollback, accepts the original and any source-stop failure through canonical coordinator steering, and only then tests aggregate cascade. No production/schema retention guard is removed. Both corrections are source-reviewed; hosted execution remains owed. The prior seed-build cause was not recoverable from its truncated old artifact, but this head's complete specifications check passed.
+
+Critical path: publish the reviewed fixture/qualification repairs after collecting this terminal run, then require actual captured-loss reclaim/replay, all causal Stop cases, the previously unreachable actor suite, complete DB and all existing hosted gates at the new immutable head. Task66009 remains separately tracked ordinary-tmux assembled qualification debt, not an invented additional gate. No local execution, merge, installation or deployment.
+
 ## Hosted49 terminal result and reviewed follow-up
 
 Automatic run **45337279161** for exact `49a721951bac77ca2ec8706f61a85fb5376e5982` completed **failure**. The named public captured-loss production-detector reclaim/replay journey **did not execute**: production runtime compilation failed with E0505 in the retained Worktree dispatch worker. No public journey or causal Stop pass is claimed. Full DB/runtime artifacts and failed logs are retained under `/tmp/close-49a721951/`.

@@ -18,9 +18,19 @@ source_runtime_binary=$2
 source_launcher_binary=$3
 runner_uid=$4
 shift 4
-expected_test='runtime::executor::creation_completion_lifecycle_tests::native_close_admission_tests::worktree_physical::registered_native_close_with_production_detector_retires_worktree_and_replays'
+# Admit only these exact disposable Git/Worktree cases, never a suite prefix.
+case ${1-} in
+    runtime::executor::creation_completion_lifecycle_tests::native_close_admission_tests::worktree_physical::registered_native_close_with_production_detector_retires_worktree_and_replays | \
+    runtime::executor::creation_completion_lifecycle_tests::native_close_admission_tests::worktree_physical::registered_native_close_captured_loss_public_retry_with_production_detector_reclaims_and_replays | \
+    runtime::executor::creation_completion_lifecycle_tests::native_close_admission_tests::worktree_physical::registered_native_close_captured_loss_retry_stop_during_assessment_preserves_worktree_and_history | \
+    runtime::executor::creation_completion_lifecycle_tests::native_close_admission_tests::worktree_physical::registered_native_close_captured_loss_retry_stop_while_prepared_preserves_worktree | \
+    runtime::executor::creation_completion_lifecycle_tests::native_close_admission_tests::worktree_physical::registered_native_close_captured_loss_retry_stop_before_writer_refuses_dispatch | \
+    runtime::executor::creation_completion_lifecycle_tests::native_close_admission_tests::worktree_physical::registered_native_close_captured_loss_retry_stop_before_physical_observation_retains_stopped_result)
+        expected_test=$1 ;;
+    *) echo 'identity wrapper refuses a selector outside disposable Worktree qualification' >&2; exit 2 ;;
+esac
 [[ $# == 4 && $1 == "$expected_test" && $2 == --exact && $3 == --nocapture && $4 == --test-threads=1 ]] \
-    || fail 'identity wrapper accepts only the exact disposable Worktree production-detector journey'
+    || fail 'identity wrapper requires one allowed exact disposable Worktree journey and fixed options'
 
 for binary in "$source_runtime_binary" "$source_launcher_binary"; do
     [[ -f $binary && -r $binary && -x $binary && ! -u $binary && ! -g $binary ]] \
@@ -70,9 +80,19 @@ preflight_cleanup() {
     exit "$status"
 }
 trap preflight_cleanup EXIT
-expected_test='runtime::executor::creation_completion_lifecycle_tests::native_close_admission_tests::worktree_physical::registered_native_close_with_production_detector_retires_worktree_and_replays'
+# Admit only these exact disposable Git/Worktree cases, never a suite prefix.
+case ${1-} in
+    runtime::executor::creation_completion_lifecycle_tests::native_close_admission_tests::worktree_physical::registered_native_close_with_production_detector_retires_worktree_and_replays | \
+    runtime::executor::creation_completion_lifecycle_tests::native_close_admission_tests::worktree_physical::registered_native_close_captured_loss_public_retry_with_production_detector_reclaims_and_replays | \
+    runtime::executor::creation_completion_lifecycle_tests::native_close_admission_tests::worktree_physical::registered_native_close_captured_loss_retry_stop_during_assessment_preserves_worktree_and_history | \
+    runtime::executor::creation_completion_lifecycle_tests::native_close_admission_tests::worktree_physical::registered_native_close_captured_loss_retry_stop_while_prepared_preserves_worktree | \
+    runtime::executor::creation_completion_lifecycle_tests::native_close_admission_tests::worktree_physical::registered_native_close_captured_loss_retry_stop_before_writer_refuses_dispatch | \
+    runtime::executor::creation_completion_lifecycle_tests::native_close_admission_tests::worktree_physical::registered_native_close_captured_loss_retry_stop_before_physical_observation_retains_stopped_result)
+        expected_test=$1 ;;
+    *) echo 'identity wrapper refuses a selector outside disposable Worktree qualification' >&2; exit 2 ;;
+esac
 [[ $# == 4 && $1 == "$expected_test" && $2 == --exact && $3 == --nocapture && $4 == --test-threads=1 ]] || {
-    echo 'identity wrapper accepts only the exact disposable Worktree production-detector journey' >&2
+    echo 'identity wrapper requires one allowed exact disposable Worktree journey and fixed options' >&2
     exit 2
 }
 
@@ -179,7 +199,7 @@ export PHOENIX_BASH_LAUNCH_TEST_EXE="$launcher_binary"
 export PHOENIX_BASH_LAUNCH_TEST_REQUIRED=1
 # This fixture creates absolute disposable Git paths; no checkout cwd is needed.
 cd -- "$scratch"
-# Only this exact Git/Worktree journey is admitted, not detached Bash/Tmux suites.
+# Only the allowlisted exact Git/Worktree journeys are admitted, not Bash/Tmux suites.
 # The dropped identity owns its inner deadline; workflow adds an emergency bound.
 if /usr/bin/timeout --kill-after=10s 5m "$runtime_binary" "$@" < /dev/null; then
     status=0

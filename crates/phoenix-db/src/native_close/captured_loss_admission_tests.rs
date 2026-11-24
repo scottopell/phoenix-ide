@@ -181,11 +181,39 @@ async fn captured_loss_admits_distinct_successor_without_rewriting_original_evid
     assert_captured_origin_preserved(&db, origin).await;
 }
 
+async fn accept_captured_loss_failure(db: &Database, failure_occurrence_id: &str, receipt: &str) {
+    let coordinator = db
+        .get_or_create_coordinator(None, phoenix_core::llm_language::LlmLanguage::default())
+        .await
+        .unwrap();
+    db.append_steering_entry(
+        &coordinator.id,
+        &phoenix_core::domain::sm_event::SteerEntry {
+            text: "Close failure".into(),
+            origin: phoenix_core::domain::db_schema::InputOrigin::SubscriptionEvent {
+                event_id: failure_occurrence_id.to_owned(),
+            },
+            llm_text: None,
+            images: vec![],
+            files: vec![],
+            message_id: format!("accepted-captured-loss-{receipt}"),
+            user_agent: None,
+            skill_invocation: None,
+        },
+        &format!("captured-loss-failure-receipt-{receipt}"),
+    )
+    .await
+    .unwrap();
+}
+
 #[tokio::test]
 async fn captured_loss_admitted_authority_cascades_on_permanent_member_delete() {
     let (db, assessment) = captured_loss_assessment().await;
     established(db.apply_native_close_captured_loss_retry(&assessment).await);
     let attempt = assessment.context.failed_run().attempt_id.as_str();
+    let members = db.list_close_attempt_members(attempt).await.unwrap();
+    assert!(!members.is_empty());
+
     // Stop through the owning source writer before permanent aggregate removal.
     db.update_conversation_state(
         assessment.command.source_transcript_id(),
@@ -193,8 +221,63 @@ async fn captured_loss_admitted_authority_cascades_on_permanent_member_delete() 
     )
     .await
     .unwrap();
-    let members = db.list_close_attempt_members(attempt).await.unwrap();
-    assert!(!members.is_empty());
+    // The native tool-result acknowledgement does not accept mandatory failure
+    // custody. Permanent Delete must refuse without partially removing the member.
+    let target_member = &members[0];
+    let members_before = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM conversations WHERE product_conversation_id = ?1",
+    )
+    .bind(assessment.command.intent().target().as_str())
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    let error = db
+        .delete_conversation(target_member.conversation_id.as_str())
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("FOREIGN KEY constraint failed"),
+        "{error}"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM conversations WHERE product_conversation_id = ?1",
+        )
+        .bind(assessment.command.intent().target().as_str())
+        .fetch_one(db.pool())
+        .await
+        .unwrap(),
+        members_before,
+        "failed permanent Delete must roll back the member aggregate"
+    );
+    assert!(db
+        .pending_coordinator_watch_events(16)
+        .await
+        .unwrap()
+        .iter()
+        .any(|event| event.source_occurrence_id == assessment.context.failure().failure_occurrence_id));
+
+    let original_failure = &assessment.context.failure().failure_occurrence_id;
+    accept_captured_loss_failure(&db, original_failure, "original").await;
+
+    // The owning source write can establish another mandatory failure. Settle
+    // every remaining fixture failure through the same canonical receipt API.
+    let pending = db.pending_coordinator_watch_events(64).await.unwrap();
+    for failure in db.list_close_cleanup_failures(attempt).await.unwrap() {
+        let occurrence_id = failure.occurrence.failure_occurrence_id.as_str();
+        if pending
+            .iter()
+            .any(|event| event.source_occurrence_id == occurrence_id)
+        {
+            accept_captured_loss_failure(&db, occurrence_id, occurrence_id).await;
+        }
+    }
+    assert!(db
+        .pending_coordinator_watch_events(64)
+        .await
+        .unwrap()
+        .is_empty());
+
     for member in members {
         db.delete_conversation(member.conversation_id.as_str())
             .await
