@@ -24,7 +24,7 @@ const browser = await chromium.launch({ headless: true });
 const results = [];
 let failed = false;
 
-async function trial(version, base, viewport, mode, run, isolation = false) {
+async function trial(version, base, viewport, mode, run, isolation = false, readinessOnly = false) {
   const name = `${version}-${viewport.width}-${mode}-${isolation ? 'isolation' : run}`;
   const context = await browser.newContext({ viewport, ...(viewport.width < 768 ? { isMobile: true, hasTouch: true } : {}), serviceWorkers: 'block' });
   const page = await context.newPage();
@@ -81,10 +81,14 @@ async function trial(version, base, viewport, mode, run, isolation = false) {
     window.__questionReadiness = {};
     const sample = () => {
       const ready = window.__questionReadiness;
-      const panel = document.querySelector('.coordinator-question-dock .question-panel');
-      const tail = [...document.querySelectorAll('#messages p')].find(el => el.textContent === marker);
-      if (ready.question_layout_document_ms === undefined && panel?.getClientRects().length) ready.question_layout_document_ms = performance.now();
-      if (ready.transcript_layout_document_ms === undefined && tail?.getClientRects().length) ready.transcript_layout_document_ms = performance.now();
+      if (ready.question_layout_document_ms === undefined) {
+        const panel = document.querySelector('.coordinator-question-dock .question-panel');
+        if (panel?.getClientRects().length) ready.question_layout_document_ms = performance.now();
+      }
+      if (ready.transcript_layout_document_ms === undefined) {
+        const tail = [...document.querySelectorAll('#messages p')].find(el => el.textContent === marker);
+        if (tail?.getClientRects().length) ready.transcript_layout_document_ms = performance.now();
+      }
       if (ready.question_layout_document_ms === undefined || ready.transcript_layout_document_ms === undefined) requestAnimationFrame(sample);
     };
     requestAnimationFrame(sample);
@@ -135,6 +139,7 @@ async function trial(version, base, viewport, mode, run, isolation = false) {
     if (p === '/api/coordinator/watches' || p === '/api/coordinator/close-watches' || p === '/api/coordinator/bash/live' || p.endsWith('/reminders') || p.endsWith('/fork-proposals')) return json([]);
     if (p === '/api/product-conversations') return json({ product_conversations: [], coordinator: null });
     if (p === '/api/env') return json({ home_dir: '/tmp/question-qualification' });
+    if (p === '/api/files/list' && route.request().method() === 'GET') return json({ items: [] });
     if (p === '/api/recent-management-root-suggestions') return json({ suggestions: [] });
     if (p === '/api/product-conversations/creation') return json({ product_creations: [], next_cursor: null });
     if (p === '/api/discovery/services') return json({ services: [] });
@@ -156,7 +161,7 @@ async function trial(version, base, viewport, mode, run, isolation = false) {
     unknown.push({ method: route.request().method(), path: p });
     return route.fulfill({ status: 501, contentType: 'application/json', body: JSON.stringify({ error: `Unmodelled fixture request ${p}` }) });
   });
-  const record = { name, version, viewport, mode, run, isolation, conditions, synthetic: true, requests: [], diagnostics, unknown };
+  const record = { name, version, viewport, mode, run, isolation, readiness_only_probe: readinessOnly, conditions, synthetic: true, requests: [], diagnostics, unknown };
   try {
     if (mode === 'warm-notification') {
       const feedResponse = page.waitForResponse(response => new URL(response.url()).pathname === '/api/coordinator/questions');
@@ -182,6 +187,10 @@ async function trial(version, base, viewport, mode, run, isolation = false) {
     const panel = page.locator('.question-panel');
     await panel.waitFor({ state: 'visible', timeout: 45000 });
     record.question_visible_ms = performance.now() - start;
+    if (readinessOnly) {
+      await page.waitForFunction(() => window.__questionReadiness?.question_layout_document_ms !== undefined && window.__questionReadiness?.transcript_layout_document_ms !== undefined);
+      record.readiness_observed_before_any_question_interaction = true;
+    }
     if (isolation) {
       let timeout;
       try {
@@ -212,6 +221,7 @@ async function trial(version, base, viewport, mode, run, isolation = false) {
     record.independent_readiness.contract = 'First rAF observation of laid-out question panel and transcript tail, sampled independently of scripted interaction; not paint, visibility through modal, or physical usability';
     record.independent_readiness.question_navigation_relative_ms = record.independent_readiness.question_layout_document_ms - documentNavigationBoundary;
     record.independent_readiness.transcript_navigation_relative_ms = record.independent_readiness.transcript_layout_document_ms - documentNavigationBoundary;
+    record.document_resources = await page.evaluate(() => performance.getEntriesByType('resource').map(entry => ({ url: entry.name, initiator: entry.initiatorType, started_document_ms: entry.startTime, response_end_document_ms: entry.responseEnd, duration_ms: entry.duration, transfer_bytes: entry.transferSize })));
     record.observation_completed_after_trial_ms = performance.now() - trialEpoch;
     const after = metrics(await cdp.send('Performance.getMetrics'));
     record.metrics_delta = Object.fromEntries(['TaskDuration', 'ScriptDuration', 'LayoutDuration', 'RecalcStyleDuration', 'JSHeapUsedSize'].map(key => [key, after[key] - before[key]]));
@@ -262,6 +272,12 @@ try {
   for (const viewport of viewports) {
     for (const [version, url] of versions) if (!await trial(version, url, viewport, 'cold-global', 0, true)) throw new Error('History isolation or surface journey failed');
     for (const [version, url] of versions) if (!await trial(version, url, viewport, 'warm-notification', -1)) throw new Error('Warm route fixture preflight failed');
+  }
+  // Observe both layout signals before any interaction in separate cold/warm controls.
+  for (const viewport of viewports) {
+    for (const mode of ['cold-global', 'warm-notification']) {
+      for (const [version, url] of versions) if (!await trial(version, url, viewport, mode, -2, false, true)) throw new Error('Independent readiness probe failed');
+    }
   }
   for (const viewport of viewports) {
     for (const mode of ['cold-global', 'cold-link', 'warm-notification']) {
