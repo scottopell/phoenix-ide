@@ -1,8 +1,13 @@
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// Run `git` with `args` and return trimmed stdout on success.
 fn git(args: &[&str]) -> Option<String> {
-    let out = Command::new("git").args(args).output().ok()?;
+    let out = Command::new("git")
+        .arg("--no-optional-locks")
+        .args(args)
+        .output()
+        .ok()?;
     if out.status.success() {
         String::from_utf8(out.stdout)
             .ok()
@@ -12,22 +17,47 @@ fn git(args: &[&str]) -> Option<String> {
     }
 }
 
+fn resolve_git_path(rel: &str) -> Option<PathBuf> {
+    let raw = git(&["rev-parse", "--git-path", rel])?;
+    let path = PathBuf::from(raw);
+    let abs = if path.is_absolute() {
+        path
+    } else {
+        std::env::current_dir().ok()?.join(path)
+    };
+    abs.exists().then_some(abs)
+}
+
+fn emit_rerun_if_exists(path: &Path) {
+    if path.exists() {
+        println!("cargo:rerun-if-changed={}", path.display());
+    }
+}
+
 fn main() {
     // Embed the full git SHA into the binary so the UI can surface exactly
     // which build is running. Falls back to "unknown" when git isn't
     // available (e.g. tarball builds, where .git/ is absent).
     //
-    // Rerun on every build: a rerun-if-changed path that never exists is
-    // always considered out-of-date (documented cargo behavior). The git
-    // state feeding the output cannot be enumerated as a fixed path list —
-    // unstaged edits to tracked files touch neither git metadata nor (once
-    // any directive is emitted) cargo's default package scan, and a packed
-    // ref can become loose at a path that didn't exist at build time. Both
-    // would freeze a stale SHA or, worse, a false-clean marker into the
-    // binary. Rerunning unconditionally costs two git invocations; the
-    // rustc-env value is fingerprinted, so an unchanged SHA does not
-    // recompile the crate.
-    println!("cargo:rerun-if-changed=__phoenix_git_sha_force_rerun__");
+    // Watch existing git metadata paths and workspace Rust sources instead of
+    // a nonexistent sentinel path: in Cargo, any missing rerun-if-changed path
+    // marks RunCustomBuild dirty and forces downstream rustc recompiles on
+    // every cargo invocation even when rustc-env output is unchanged.
+    println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=Cargo.toml");
+    println!("cargo:rerun-if-changed=src");
+    emit_rerun_if_exists(Path::new("../../crates"));
+
+    for git_path in ["HEAD", "index", "packed-refs", "refs/heads"] {
+        if let Some(path) = resolve_git_path(git_path) {
+            emit_rerun_if_exists(&path);
+        }
+    }
+    if let Some(sym_ref) = git(&["symbolic-ref", "-q", "HEAD"]) {
+        if let Some(path) = resolve_git_path(&sym_ref) {
+            emit_rerun_if_exists(&path);
+        }
+    }
 
     let sha = git(&["rev-parse", "HEAD"])
         .filter(|sha| {

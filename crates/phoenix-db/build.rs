@@ -1,5 +1,11 @@
+use std::path::{Path, PathBuf};
+
 fn git(args: &[&str]) -> Option<String> {
-    let output = phoenix_core::git::command().args(args).output().ok()?;
+    let output = phoenix_core::git::command()
+        .arg("--no-optional-locks")
+        .args(args)
+        .output()
+        .ok()?;
     output.status.success().then(|| {
         String::from_utf8(output.stdout)
             .ok()
@@ -7,11 +13,38 @@ fn git(args: &[&str]) -> Option<String> {
     })?
 }
 
+fn resolve_git_path(rel: &str) -> Option<PathBuf> {
+    let raw = git(&["rev-parse", "--git-path", rel])?;
+    let path = PathBuf::from(raw);
+    let abs = if path.is_absolute() {
+        path
+    } else {
+        std::env::current_dir().ok()?.join(path)
+    };
+    abs.exists().then_some(abs)
+}
+
+fn emit_rerun_if_exists(path: &Path) {
+    if path.exists() {
+        println!("cargo:rerun-if-changed={}", path.display());
+    }
+}
+
 fn main() {
-    // Git state includes refs and unstaged source edits, neither of which Cargo can
-    // express as a stable watched path. An intentionally absent path makes Cargo
-    // rerun this script without forcing rustc when the emitted values are unchanged.
-    println!("cargo:rerun-if-changed=__phoenix_db_git_identity_force_rerun__");
+    println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=Cargo.toml");
+    println!("cargo:rerun-if-changed=src");
+
+    for git_path in ["HEAD", "index", "packed-refs", "refs/heads"] {
+        if let Some(path) = resolve_git_path(git_path) {
+            emit_rerun_if_exists(&path);
+        }
+    }
+    if let Some(sym_ref) = git(&["symbolic-ref", "-q", "HEAD"]) {
+        if let Some(path) = resolve_git_path(&sym_ref) {
+            emit_rerun_if_exists(&path);
+        }
+    }
 
     let sha = git(&["rev-parse", "--verify", "HEAD^{commit}"]).filter(|sha| {
         sha.len() == 40 && sha.chars().all(|character| character.is_ascii_hexdigit())
