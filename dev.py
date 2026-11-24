@@ -6055,7 +6055,18 @@ def _command_uses_compiler_cache(command: list[str]) -> bool:
         ]
         and command[4:] in allowed_suffixes
     )
-    return direct_devpy or profiled_devpy
+    parallel_devpy = (
+        len(command) >= 4
+        and command[:3]
+        == [
+            sys.executable,
+            str(ROOT / "scripts" / "run_devpy_tests.py"),
+            "--workers",
+        ]
+        and command[3].isdigit()
+        and command[4:] in allowed_suffixes
+    )
+    return direct_devpy or profiled_devpy or parallel_devpy
 
 
 def _parse_cache_size(value: str) -> int:
@@ -7592,7 +7603,7 @@ def cmd_check(
             finish_profile(0)
 
     def check_devpy():
-        unittest_cmd = [sys.executable, "-m", "unittest", "discover", "tests/devpy"]
+        diagnostic_dir = os.environ.get("PHOENIX_CHECK_DIAGNOSTIC_DIR")
         if profile_work and _CHECK_PROFILE is not None:
             unittest_cmd = [
                 sys.executable,
@@ -7600,7 +7611,16 @@ def cmd_check(
                 "discover",
                 "tests/devpy",
             ]
-        if os.environ.get("PHOENIX_CHECK_DIAGNOSTIC_DIR"):
+        elif not diagnostic_dir and worker_budget > 1:
+            unittest_cmd = [
+                sys.executable,
+                str(ROOT / "scripts" / "run_devpy_tests.py"),
+                "--workers",
+                str(worker_budget),
+            ]
+        else:
+            unittest_cmd = [sys.executable, "-m", "unittest", "discover", "tests/devpy"]
+        if diagnostic_dir:
             unittest_cmd.append("-v")
         run_step("dev.py unit tests", unittest_cmd, timeout=DEVPY_TEST_TIMEOUT)
 

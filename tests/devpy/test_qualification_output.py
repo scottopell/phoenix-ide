@@ -125,18 +125,26 @@ class QualificationOutputTests(unittest.TestCase):
                        str(ROOT / "dev.py"), "exec")
         for diagnostic in (None, "", str(self.directory)):
             for profile in (None, self.directory / "profile"):
-                with self.subTest(diagnostic=diagnostic, profile=profile):
-                    env = {} if diagnostic is None else {"PHOENIX_CHECK_DIAGNOSTIC_DIR": diagnostic}
-                    run_step = mock.Mock()
-                    namespace = dict(os=os, sys=sys, ROOT=ROOT, profile_work=profile is not None,
-                                     _CHECK_PROFILE=profile, DEVPY_TEST_TIMEOUT=1800,
-                                     run_step=run_step)
-                    with mock.patch.dict(os.environ, env, clear=True):
-                        exec(code, namespace)
-                    prefix = ([sys.executable, "-m", "unittest"] if profile is None else
-                              [sys.executable, str(ROOT / "scripts" / "python_unittest_profile.py")])
-                    expected = prefix + ["discover", "tests/devpy"] + (["-v"] if diagnostic else [])
-                    run_step.assert_called_once_with("dev.py unit tests", expected, timeout=1800)
+                for budget in (1, 4):
+                    with self.subTest(diagnostic=diagnostic, profile=profile, budget=budget):
+                        env = {} if diagnostic is None else {"PHOENIX_CHECK_DIAGNOSTIC_DIR": diagnostic}
+                        run_step = mock.Mock()
+                        namespace = dict(os=os, sys=sys, ROOT=ROOT, profile_work=profile is not None,
+                                         _CHECK_PROFILE=profile, DEVPY_TEST_TIMEOUT=1800,
+                                         worker_budget=budget, run_step=run_step)
+                        with mock.patch.dict(os.environ, env, clear=True):
+                            exec(code, namespace)
+                        if profile is not None:
+                            expected = [sys.executable, str(ROOT / "scripts" / "python_unittest_profile.py"),
+                                        "discover", "tests/devpy"]
+                        elif not diagnostic and budget > 1:
+                            expected = [sys.executable, str(ROOT / "scripts" / "run_devpy_tests.py"),
+                                        "--workers", str(budget)]
+                        else:
+                            expected = [sys.executable, "-m", "unittest", "discover", "tests/devpy"]
+                        if diagnostic:
+                            expected.append("-v")
+                        run_step.assert_called_once_with("dev.py unit tests", expected, timeout=1800)
 
     def test_rust_capture_keeps_early_panic_before_passing_test_tail(self):
         payload = ("thread 'lost_chrome' panicked: EXPECTED_CAUSAL_ASSERTION\n"
