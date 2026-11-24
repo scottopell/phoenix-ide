@@ -119,7 +119,9 @@ impl Database {
         .fetch_one(&mut *tx)
         .await?;
         if !target_matches {
-            return Err(refused("retry origin target differs from the retained obligation"));
+            return Err(refused(
+                "retry origin target differs from the retained obligation",
+            ));
         }
         let kind = if anchored {
             Self::read_stopped_close_original_retirement_proof_tx(&mut *tx, failed_run).await?;

@@ -12,12 +12,11 @@ async fn predecessor() -> SqlitePool {
 }
 
 async fn snapshot(pool: &SqlitePool) -> (Vec<(String, String)>, Vec<(i64, String)>) {
-    let schema = sqlx::query_as(
-        "SELECT name, sql FROM sqlite_schema WHERE sql IS NOT NULL ORDER BY name",
-    )
-    .fetch_all(pool)
-    .await
-    .unwrap();
+    let schema =
+        sqlx::query_as("SELECT name, sql FROM sqlite_schema WHERE sql IS NOT NULL ORDER BY name")
+            .fetch_all(pool)
+            .await
+            .unwrap();
     let ledger = sqlx::query_as("SELECT version, name FROM _migrations ORDER BY version")
         .fetch_all(pool)
         .await

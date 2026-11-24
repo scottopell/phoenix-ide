@@ -1,5 +1,15 @@
 # Unified Close acceptance milestone
 
+## Hosted ebe68 terminal: public reclaim/replay passes; test-source follow-up unqualified
+
+Automatic run **45364424705**, exact `ebe68f6c2d1aadae8df7ed00d9716928cae92fa5`, completed **failure**. Full exact-source evidence is retained under `/tmp/close-ebe68f6c2/`; its sole watcher completed. Frontend and specifications passed. The actual named production-detector **public captured-loss cleanup/reclaim/replay journey passed** (one executed test), as did the original initial-Close physical journey.
+
+All four Stop tests reached their intended barriers and progressed through Stop, worker release and source-refused public replay, then failed on the same invalid test oracle: calling the source-gated DB receipt replay reader after Stop had revoked that exact source. The production reader correctly rejects with `Close requires its current executing source`. The test-only correction now requires that refusal and separately observes the exact durable receipt (absent before admission, retained after admission) using request/source/fingerprint/target/intent identity. Existing full-row, history, no-effect, target and physical snapshots remain intact. No production source fence is relaxed; these four corrected tests remain unqualified until hosted execution passes.
+
+Hosted DB compilation reported E0599 only for the new regression's nonexistent `context.target()` accessor; the corrected test uses `command.intent().target()`, as neighboring fixtures do. This compile failure prevented migration187 and DB routing regressions from executing; no187 deletion success is claimed. The exact hosted formatting patch (two whitespace-only hunks) was reviewed/applied without local formatter execution. Independent source review found no actionable findings in the follow-up, but had missed the original invalid accessor; execution remains required.
+
+Next: automatic exact-head qualification of the test/accessor/format corrections, including both187 regressions, typed origin tests, pending-delivery/aggregate-delete regression and all four actual Stop cases. No local executable validation, manual workflow operation, merge, install, deployment or readiness claim.
+
 ## Hosted0123 terminal result and unqualified owner/routing correction
 
 Automatic run **45352177351**, exact `0123c68c988a0d2de1a2b7b13f02a344904ad909`, completed **failure**. Exact artifacts and logs are retained under `/tmp/close-0123c68c9/`; the sole watcher exited. Full migrations172, captured-loss reinspection6 and actor51 passed. Production/runtime compilation, frontend, specifications and format passed. These results qualify0123 only, not the follow-up source below.

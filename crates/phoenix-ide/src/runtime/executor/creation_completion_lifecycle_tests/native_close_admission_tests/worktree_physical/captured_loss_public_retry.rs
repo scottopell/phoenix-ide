@@ -372,12 +372,13 @@ pub(super) async fn retry_after_public_capture(
                 public_retry_rows(&fixture, initial_run.attempt_id.as_str()).await,
                 before
             );
+            // Stop revoked the source, so the source-gated replay reader must refuse.
             assert!(fixture
                 .db
                 .read_native_close_explicit_retry_receipt(&fixture.command)
                 .await
-                .unwrap()
-                .is_none());
+                .is_err());
+            assert!(retained_public_retry_receipt(&fixture).await.is_none());
         }
         assert_eq!(close_row_counts(&fixture).await, counts_before);
         assert_eq!(durable_target_rows(&fixture).await, target_before);
@@ -564,13 +565,18 @@ pub(super) async fn retry_after_public_capture(
                 .await;
         }
         assert_eq!(replay["code"], "source_refused");
+        // Historical storage survives Stop, but the stopped source cannot replay it.
+        assert!(fixture
+            .db
+            .read_native_close_explicit_retry_receipt(&fixture.command)
+            .await
+            .is_err());
         assert_eq!(
-            fixture
-                .db
-                .read_native_close_explicit_retry_receipt(&fixture.command)
-                .await
-                .unwrap(),
-            Some(receipt),
+            retained_public_retry_receipt(&fixture).await,
+            Some((
+                receipt.attempt_id.as_str().to_owned(),
+                receipt.run_ordinal.get(),
+            )),
             "source refusal must retain the admitted successor receipt"
         );
         assert_eq!(
@@ -814,6 +820,26 @@ async fn assert_no_retry_dispatch_or_cleanup_plan(fixture: &CloseFixture, attemp
         (0, 0),
         "pre-writer Stop must not authorize dispatch or cleanup metadata"
     );
+}
+
+// Test-only durable observation; unlike replay admission, it needs no live source.
+async fn retained_public_retry_receipt(fixture: &CloseFixture) -> Option<(String, i64)> {
+    sqlx::query_as(
+        "SELECT attempt_id, run_ordinal FROM native_close_initial_receipts
+         WHERE request_id = ?1 AND source_transcript_id = ?2
+           AND source_message_id = ?3 AND source_tool_use_id = ?4
+           AND request_fingerprint = ?5 AND product_conversation_id = ?6
+           AND intent = 'explicit_retry'",
+    )
+    .bind(fixture.command.request_id().to_string())
+    .bind(fixture.command.source_transcript_id())
+    .bind(&fixture.command.source().message_id)
+    .bind(&fixture.command.source().tool_use_id)
+    .bind(fixture.command.fingerprint())
+    .bind(fixture.command.intent().target().as_str())
+    .fetch_optional(fixture.db.pool())
+    .await
+    .unwrap()
 }
 
 async fn public_retry_rows(fixture: &CloseFixture, attempt: &str) -> String {

@@ -163,7 +163,7 @@ fn captured_admission_refused(
 async fn captured_loss_origin_reader_does_not_require_a_sealed_inventory() {
     let (db, assessment) = captured_loss_assessment().await;
     let failed_run = assessment.context.failed_run();
-    let target = assessment.context.target();
+    let target = assessment.command.intent().target();
     for _ in 0..2 {
         assert_eq!(
             db.read_native_close_retry_origin_kind(target, failed_run)
