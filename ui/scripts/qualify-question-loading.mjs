@@ -183,12 +183,11 @@ async function trial(version, base, viewport, mode, run, isolation = false, read
       return boundary;
     });
     else await page.goto(`${base}${mode === 'cold-link' ? `/global/${id}` : '/global'}`, { waitUntil: 'commit' });
-    // The pinned baseline renders the card without the candidate-only dock wrapper.
     const panel = page.locator('.question-panel');
     await panel.waitFor({ state: 'visible', timeout: 45000 });
     record.question_visible_ms = performance.now() - start;
     if (readinessOnly) {
-      await page.waitForFunction(() => window.__questionReadiness?.question_layout_document_ms !== undefined && window.__questionReadiness?.transcript_layout_document_ms !== undefined);
+      await page.waitForFunction(() => window.__questionReadiness?.question_layout_document_ms !== undefined && window.__questionReadiness?.transcript_layout_document_ms !== undefined, undefined, { timeout: 45000 });
       record.readiness_observed_before_any_question_interaction = true;
     }
     if (isolation) {
@@ -216,7 +215,7 @@ async function trial(version, base, viewport, mode, run, isolation = false, read
     if (await returnButton.isVisible()) await returnButton.click();
     await page.getByText(marker, { exact: true }).waitFor({ state: 'visible', timeout: 45000 });
     record.transcript_visible_after_question_interaction_ms = performance.now() - start;
-    await page.waitForFunction(() => window.__questionReadiness?.question_layout_document_ms !== undefined && window.__questionReadiness?.transcript_layout_document_ms !== undefined);
+    await page.waitForFunction(() => window.__questionReadiness?.question_layout_document_ms !== undefined && window.__questionReadiness?.transcript_layout_document_ms !== undefined, undefined, { timeout: 45000 });
     record.independent_readiness = await page.evaluate(() => window.__questionReadiness);
     record.independent_readiness.contract = 'First rAF observation of laid-out question panel and transcript tail, sampled independently of scripted interaction; not paint, visibility through modal, or physical usability';
     record.independent_readiness.question_navigation_relative_ms = record.independent_readiness.question_layout_document_ms - documentNavigationBoundary;

@@ -40,7 +40,7 @@ selected labels, preview content, and user notes.
 | **REQ-AUQ-010:** Coordinator Questions Do Not Block Coordination | 🔄 In review | `post_user_question` replaces the blocking tool for the Coordinator; `coordinator_user_questions` table (migration 168), keyed on the Coordinator ProductConversation; prompt wording. Not deployed. |
 | **REQ-AUQ-011:** Answer Coordinator Questions Outside the Transcript | 🔄 In review | `GET /api/coordinator/questions`, answer/dismiss endpoints, retrying reply delivery in input discovery sent with the `coordinator_question_reply` input origin under a reserved `coordinator-question-reply:` message id, with delivery recorded by acceptance triggers on `durable_turns` and `steering_messages`; `CoordinatorQuestionDock` on Ember's page, Ember entry count, question notifications (5 s poll, which also runs in hidden tabs so notifications arrive; opens `/global`). Unit and runtime tests; not checked in a browser; not deployed. |
 | **REQ-AUQ-012:** Withdraw and List Coordinator Questions | 🔄 In review | `withdraw_user_question`, `list_user_questions`; database and tool tests. Not deployed. |
-| **REQ-AUQ-013:** Focused Mobile Coordinator Questions | 🔄 In review | Native mobile modal, one content scroller, non-destructive Return, retained request input, inactive keyboard scopes, visual viewport bounds. Hosted Chromium journeys and pinned-base comparison passed at `e84976f` in PR #1151; physical iPhone keyboard qualification remains unverified. |
+| **REQ-AUQ-013:** Focused Mobile Coordinator Questions | 🔄 In review | Native mobile modal, one content scroller, non-destructive Return, retained request input, inactive keyboard scopes, visual viewport bounds. Hosted Chromium journeys and pinned-base comparison passed at `09f3b07df` in PR #1151, including outside-dock desktop shortcuts and actual in-flight history isolation; physical iPhone keyboard qualification remains unverified. |
 
 **Progress:** 9 of 13 complete; REQ-AUQ-010 to REQ-AUQ-013 in review.
 
@@ -52,6 +52,65 @@ surface is not a transcript-fetch cancellation or a proven loading optimization.
 The hosted comparison uses production bundles, intercepted synthetic HTTP payloads,
 4× CPU slowdown, 400 ms modeled API latency and throttled asset requests. A client
 EventSource fixture excludes real SSE transport and server/database latency.
+
+### Integration correction and independent readiness evidence
+
+Integration review found that a desktop nonmodal `dialog.show()` still matched the
+global `dialog[open]` shortcut guard. The guard now tests native `dialog:modal`:
+background desktop transcript `?` and composer Escape work, while native mobile
+modality still excludes global shortcuts. Nested confirmation ownership is retained.
+
+[Hosted qualification 45304420256](https://github.com/scottopell/phoenix-ide/actions/runs/45304420256)
+passed at `09f3b07df186b2f01e764ba47cd5f89f94fff46d`, including merged main
+`ad27c4ba0d9a2d25a6d182e12b9d0d75bd1c5455`. All 124 records succeeded: 96 measured
+samples, eight additional independent-readiness probes, four held-history controls,
+and 16 warmup/preflight records. Each measured cell still has eight samples. The
+first rerun at `b5fc0e66e` passed the new desktop interaction assertions but stopped
+on a missing incidental `/api/files/list` fixture; its empty-directory response was
+then modeled with the real `{ items: [] }` contract.
+
+All four history controls now explicitly wait until the history handler is in
+flight and blocked, then select an option and enter custom text before releasing
+it. Both versions at both widths remain usable while that request is held, with
+no transcript tail rendered before release. This supersedes the weaker earlier
+history evidence below; it does not establish a speed improvement.
+
+Eight cold/global and warm-navigation probes observe both question and transcript
+layout signals **before any scripted answer interaction**. A rAF sampler latches
+first layout presence, not paint, unobscured visibility or physical usability.
+ResourceTiming and these signals share the document clock; warm setup resources
+can precede the SPA boundary. Node request callbacks retain a separate trial clock.
+The sampler can force layout and adds instrumented CPU work; its timings are not
+uninstrumented performance baselines. Probe usability timings are excluded from
+the measured matrix (`run >= 0 && !isolation && !readiness_only_probe`).
+
+Candidate mobile cold probe: question layout 2993ms, transcript layout 5268ms;
+warm probe: 989ms and 3502ms. These single controls are descriptive, not statistical
+speed evidence. The cold ProductConversationPage dependency graph starts around
+3022ms after coordinator resolution; history starts around 4073ms and ends 4483ms.
+Warm equivalents are approximately 1408ms, 2274ms and 2683ms relative to navigation.
+The next supported single causal measurement is a disposable, repeated alternating
+control that starts the transcript module graph on Coordinator route entry rather
+than after coordinator resolution, leaving question/history/content semantics
+unchanged. Measure whether this overlaps module acquisition and advances history
+start and independent transcript layout. Do not combine it with a render rewrite.
+The separate roughly 0.8–0.9s history-response-to-layout interval contains observed
+long tasks but lacks function attribution; no Markdown/React or production cause
+is established. No preload optimization is included in this PR.
+
+Independent source and artifact reviews found no concrete functional blocker in
+the correction. Desktop hosted journeys now explicitly verify outside-dock help,
+composer Escape and nested confirmation Escape. Mobile modal/global shortcut
+exclusion and existing nested-confirmation/retention journeys also pass. There
+are no unknown fixture routes or page errors; the intentionally injected 409 is
+the only recorded diagnostic. Available request timestamps are monotonic, but 438
+of 5953 request records lack completion; these are censored/unclassified terminal
+states, not proven hangs or successful completion. Loading failures are not
+collected. Aggregate results preserve all 124 records; four preflight names still
+overlap warmups, so there are 120 distinct standalone trial names. Physical-device,
+real transport and production-cause limits remain unchanged.
+
+### Earlier qualification (before integration correction)
 
 [Hosted qualification 45291125836](https://github.com/scottopell/phoenix-ide/actions/runs/45291125836)
 compared baseline `8a685486413fc6517f61c548e3229a2864ce6703` with candidate
