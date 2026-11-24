@@ -1,5 +1,14 @@
 # Unified Close acceptance milestone
 
+## Integrated90ba terminal: behavior gates pass; exact formatting correction pending qualification
+
+Exact head `90ba5f5d8982daeb35d2cd820168df9ffe414396` completed automatic Close Qualification **45438888784** with failure only at `Require exact source formatting`; every preceding DB/runtime/public-journey/resource/tool gate completed successfully, as did frontend and specifications. Terminal evidence is retained under `/tmp/close-90ba5f5d8/artifacts-terminal/`. Broader PR CI **45438908900** failed its early Rust formatting gate, so downstream native CI is not yet qualified on this head.
+
+The follow-up applies the exact hosted formatting artifact: one import-list line break in `runtime/close_retirement.rs`, independently source-reviewed with no token or ordering changes. No local formatter/build/test execution or weakened check is used. Fresh automatic exact-head Close Qualification and broader PR CI remain required; no merge-ready, install or deployment claim is made.
+
+Feedback from hosted checks remains authoritative; prior behavior success does not substitute for the corrected candidate's required checks. PR #1161 remains draft.
+
+
 ## Integrated9d0a1b9a8 terminal: actual Close acceptance passes; broader CI remains blocked
 
 Exact combined head `9d0a1b9a89d024b99e52c2996ddd77e7c74bfe08` passed automatic Close Qualification **45415555421** (DB, frontend, specifications; sole watcher exit0). Downloaded artifacts under `/tmp/close-9d0a1b9a8/artifacts/` have matching full source pins. Actual named logs establish initial public physical Worktree retirement; production-detector captured-loss cleanup → explicit retry → physical reclaim → replay; all four causal Stop tests (each1passed/0failed/0ignored); both owner190 migrations; anchored/captured origin readers; and `native_close_explicit_retry_rejects_untrusted_source_without_legacy_surface`. This is integrated execution evidence, not substitution by earlier branch-only passes or test inventory.
