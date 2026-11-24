@@ -9,6 +9,10 @@ message: |
 note: "Centralize Git subprocess configuration in crates/phoenix-core/src/git.rs"
 rule:
   pattern: $COMMAND::new("git")
+constraints:
+  COMMAND:
+    # Match the subprocess type, not unrelated constructors such as OsStr::new.
+    regex: '(^|::)Command$'
 ignores:
   - "**/phoenix-core/src/git.rs"
   # Cargo compiles build.rs before crate dependencies are available. This

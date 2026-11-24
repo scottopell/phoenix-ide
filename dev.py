@@ -4347,6 +4347,7 @@ _DEVPY_DEPENDENCY_PATHS = {
     ".python-version",
     "Cargo.lock",
     "Cargo.toml",
+    "ast-grep-rules/rust-no-direct-git-command.yml",
     "pyproject.toml",
     "rust-toolchain.toml",
     "specs/adrs/113_coordinator-api-recipes-are-non-exhaustive.md",

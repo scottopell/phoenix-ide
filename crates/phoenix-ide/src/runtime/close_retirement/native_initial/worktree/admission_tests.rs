@@ -52,13 +52,14 @@ struct Fixture {
 }
 
 fn fixture_git(home: &Path, args: &[&str]) {
-    let mut command = Command::new("git");
+    let mut command = phoenix_core::git::command();
     command
         .env_clear()
         .env("PATH", std::env::var_os("PATH").unwrap_or_default())
         .env("HOME", home)
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_TERMINAL_PROMPT", "0")
         .args(args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());

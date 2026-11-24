@@ -1,5 +1,13 @@
 # Unified Close acceptance milestone
 
+## Integrated16d477 terminal: DB/UI/spec pass; runtime test compile blocks journeys
+
+Exact head `16d477b919096b3f6fa1ad1630671369932f75d9` completed automatic Close run **45400233243** with failure. DB qualification, frontend and specifications passed, including the digest regression and renumbered migration execution. Hosted formatting patch is empty. Runtime test compilation reports three E0308 errors: tracking-context fixtures send an `AcknowledgedEventRequest` to main's evolved `AcknowledgedRuntimeRequest` channel. Downstream wrapper errors about an unset runtime binary are consequences of compilation failure, not executed public-journey failures. Integrated initial/captured-loss public journeys, four causal Stop cases and runtime/tool acceptance remain unexecuted. Exact logs/artifacts and the terminal sole-watcher result are retained under `/tmp/close-16d477b91/`.
+
+PR CI **45400246575** also identifies finite integration blockers: unnecessary browser mutability, two test-only native process-group helpers compiled in production, missing Errors documentation for the bounded Git-registration reader, three direct Git constructors plus an OsStr lint false positive, and duplicate unpublished task ID53019. The correction wraps all three fixture events in the actual channel variant without changing acknowledgement/retirement ownership; retains production browser custody and drain behavior; routes Git construction through the shared safe factory; constrains the lint to Command constructors with regression coverage; and renumbers only the unpublished task to53021. Historical shipped SQL is untouched. No blanket lint allowance, skipped required behavior gate, dependency downgrade or local executable validation is used.
+
+These source corrections require independent review and a new automatic exact-head hosted run. Earlier121795 journey/Stop passes remain evidence only for that branch-only head. PR #1161 remains draft; no integrated readiness, merge, installation or deployment claim is made.
+
 ## Integrated34ccafc terminal: dependency compatibility blocks Rust execution
 
 Integrated head `34ccafc49b0170269c0b91ddaf3e6b64d536dc2a` completed Close run **45397534177** with failure. Frontend (including QuestionPanel and CoordinatorQuestionDock) and specification gates passed; hosted format patch is empty. Rust compilation fails E0277 at task-approval body hashing because main's updated digest output no longer implements whole-array `LowerHex`. Consequently the combined DB, public journey and Stop tests did not execute; their earlier121795 successes are not integrated acceptance. Terminal evidence is retained under `/tmp/close-34ccafc49/{db,exact,format}/` and the sole watcher exited1.

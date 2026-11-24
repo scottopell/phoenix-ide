@@ -174,6 +174,7 @@ impl OwnedChromeGroup {
     /// The retained, unreaped child plus the exact birth-identity and process-group
     /// checks in `signal` are the authority; the numeric process-group id alone is
     /// never sufficient.
+    #[cfg(test)]
     pub(crate) fn signal_now(
         &self,
         child: &mut tokio::process::Child,
@@ -206,6 +207,7 @@ impl OwnedChromeGroup {
 
     /// Verify group completion without sending any signal. The caller owns the
     /// timing and any separately admitted signal effects.
+    #[cfg(test)]
     pub(crate) async fn verify_drained(
         &mut self,
         child: &mut tokio::process::Child,

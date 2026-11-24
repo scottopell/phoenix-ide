@@ -81,6 +81,12 @@ fn fingerprint_with_marker(metadata: &std::fs::Metadata, marker_bytes: Vec<u8>) 
 /// On Unix, no-follow/nonblocking open rejects symlinks and prevents a replaced
 /// FIFO from trapping a Close admission leaf.
 /// Descriptor metadata, rather than a preceding pathname check, owns the file kind.
+///
+/// # Errors
+///
+/// Returns an error if opening, inspecting or reading the file fails, if it is
+/// not a regular file, or if its metadata or captured contents exceed the limit.
+/// On Unix, opening a symlink is also rejected.
 pub fn read_worktree_registration_file(
     path: &Path,
 ) -> std::io::Result<(std::fs::Metadata, Vec<u8>)> {

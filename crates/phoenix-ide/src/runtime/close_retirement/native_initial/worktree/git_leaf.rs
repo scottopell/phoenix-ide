@@ -957,7 +957,7 @@ mod tests {
             vec!["-c", "alias.probe=!git -C /replacement status", "probe"],
             vec![],
         ] {
-            let mut command = Command::new("git");
+            let mut command = phoenix_core::git::command();
             command
                 .current_dir(ROOT)
                 .env("GIT_DIR", GIT)

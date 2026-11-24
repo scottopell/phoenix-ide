@@ -1845,7 +1845,7 @@ impl std::fmt::Debug for BrowserPreparedRetirement {
 
 impl BrowserPreparedRetirement {
     /// Consume the admission-time locks and retire exactly the captured slot.
-    pub async fn execute(mut self, custody: BrowserRetirementCustody) -> BrowserRetirementOutcome {
+    pub async fn execute(self, custody: BrowserRetirementCustody) -> BrowserRetirementOutcome {
         let (gate, guards) = match self.selection {
             PreparedRetirementSelection::Existing(existing) => {
                 existing.custody_group.retain(custody);
@@ -3185,7 +3185,7 @@ impl BrowserSessionManager {
             {
                 return KillSessionOutcome::Absent;
             }
-            let mut current = entry
+            let current = entry
                 .current_kill
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);

@@ -19,7 +19,6 @@ use serde_json::Value;
 use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::Duration;
 
 mod captured_loss_public_retry;
@@ -302,7 +301,7 @@ impl DisposableGit {
             cwd.starts_with(&self.root),
             "Git never targets a user's repository"
         );
-        let output = Command::new("git")
+        let output = phoenix_core::git::command()
             .env_clear()
             .env(
                 "PATH",
