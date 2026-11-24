@@ -7,7 +7,7 @@ use std::path::Path;
 use std::process::Stdio;
 use std::time::Duration;
 
-use super::backend::{TokenBoundKill, SERVER_TOKEN_VAR};
+use super::backend::{TmuxDestructiveEntry, TokenBoundKill, SERVER_TOKEN_VAR};
 use super::probe::command_output;
 use tokio::time::Instant;
 
@@ -232,8 +232,9 @@ async fn approve_helper(
     raw_deadline_ns: u64,
     expected_process: ProcessIdentity,
     report: &ServerReport,
+    enter: &mut TmuxDestructiveEntry<'_>,
 ) -> Result<(), &'static str> {
-    approve_helper_with_observer(
+    approve_helper_with_observer_and_entry(
         listener,
         nonce,
         pid,
@@ -242,10 +243,12 @@ async fn approve_helper(
         expected_process,
         report,
         |expected| report_matches_incarnation(report, expected),
+        enter,
     )
     .await
 }
 
+#[cfg(test)]
 async fn approve_helper_with_observer<F>(
     listener: &UnixListener,
     nonce: &str,
@@ -257,14 +260,42 @@ async fn approve_helper_with_observer<F>(
     observe: F,
 ) -> Result<(), &'static str>
 where
-    F: FnOnce(ProcessIdentity) -> bool,
+    F: FnMut(ProcessIdentity) -> bool,
+{
+    approve_helper_with_observer_and_entry(
+        listener,
+        nonce,
+        pid,
+        expires,
+        raw_deadline_ns,
+        expected_process,
+        report,
+        observe,
+        &mut |sink| sink(),
+    )
+    .await
+}
+
+async fn approve_helper_with_observer_and_entry<F>(
+    listener: &UnixListener,
+    nonce: &str,
+    pid: u32,
+    expires: tokio::time::Instant,
+    raw_deadline_ns: u64,
+    expected_process: ProcessIdentity,
+    report: &ServerReport,
+    observe: F,
+    enter: &mut TmuxDestructiveEntry<'_>,
+) -> Result<(), &'static str>
+where
+    F: FnMut(ProcessIdentity) -> bool,
 {
     tokio::time::timeout_at(expires, async {
         let (stream, _) = listener
             .accept()
             .await
             .map_err(|_| "close-gate accept failed")?;
-        approve_request_on_stream(
+        approve_request_on_stream_and_entry(
             stream,
             nonce,
             pid,
@@ -273,6 +304,7 @@ where
             expected_process,
             report,
             observe,
+            enter,
         )
         .await
     })
@@ -280,8 +312,9 @@ where
     .map_err(|_| "close-gate deadline elapsed")?
 }
 
+#[cfg(test)]
 async fn approve_request_on_stream<F>(
-    mut stream: UnixStream,
+    stream: UnixStream,
     nonce: &str,
     pid: u32,
     expires: tokio::time::Instant,
@@ -291,7 +324,51 @@ async fn approve_request_on_stream<F>(
     observe: F,
 ) -> Result<(), &'static str>
 where
-    F: FnOnce(ProcessIdentity) -> bool,
+    F: FnMut(ProcessIdentity) -> bool,
+{
+    approve_request_on_stream_and_entry(
+        stream,
+        nonce,
+        pid,
+        expires,
+        raw_deadline_ns,
+        expected_process,
+        report,
+        observe,
+        &mut |sink| sink(),
+    )
+    .await
+}
+
+const APPROVAL_FRAME: &[u8] = b"APPROVE\n";
+
+/// Attempt one write and advance the cursor only by bytes actually accepted.
+/// Keeping this separate makes short writes observable and safely resumable.
+fn write_approval_chunk(
+    offset: &mut usize,
+    mut write: impl FnMut(&[u8]) -> std::io::Result<usize>,
+) -> std::io::Result<()> {
+    let written = write(&APPROVAL_FRAME[*offset..])?;
+    if written == 0 {
+        return Err(std::io::ErrorKind::WriteZero.into());
+    }
+    *offset += written;
+    Ok(())
+}
+
+async fn approve_request_on_stream_and_entry<F>(
+    mut stream: UnixStream,
+    nonce: &str,
+    pid: u32,
+    expires: tokio::time::Instant,
+    raw_deadline_ns: u64,
+    expected_process: ProcessIdentity,
+    report: &ServerReport,
+    mut observe: F,
+    enter: &mut TmuxDestructiveEntry<'_>,
+) -> Result<(), &'static str>
+where
+    F: FnMut(ProcessIdentity) -> bool,
 {
     let mut request = [0u8; MAX_FRAME];
     let mut used = 0usize;
@@ -333,10 +410,32 @@ where
     {
         return Err("close-gate deadline elapsed");
     }
-    stream
-        .write_all(b"APPROVE\n")
-        .await
-        .map_err(|_| "close-gate approval write failed")?;
+    let mut offset = 0;
+    while offset < APPROVAL_FRAME.len() {
+        stream
+            .writable()
+            .await
+            .map_err(|_| "close-gate approval write failed")?;
+        let mut write_result = None;
+        enter(&mut || {
+            if Instant::now() >= expires
+                || monotonic_raw_ns().is_none_or(|now| now >= raw_deadline_ns)
+                || !observe(expected_process)
+            {
+                return Err("close-gate deadline or process incarnation changed".into());
+            }
+            write_result = Some(write_approval_chunk(&mut offset, |remaining| {
+                stream.try_write(remaining)
+            }));
+            Ok(())
+        })
+        .map_err(|_| "close-gate destructive entry refused")?;
+        match write_result {
+            Some(Ok(())) => {}
+            Some(Err(error)) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            _ => return Err("close-gate approval write failed"),
+        }
+    }
     Ok(())
 }
 
@@ -348,6 +447,27 @@ pub async fn retire_exact_on_server(
     expected_process: ProcessIdentity,
     expires: Instant,
     helper_executable: &Path,
+) -> TokenBoundKill {
+    retire_exact_on_server_with_entry(
+        socket_path,
+        config_path,
+        expected_token,
+        expected_process,
+        expires,
+        helper_executable,
+        &mut |sink| sink(),
+    )
+    .await
+}
+
+pub async fn retire_exact_on_server_with_entry(
+    socket_path: &Path,
+    config_path: &Path,
+    expected_token: &str,
+    expected_process: ProcessIdentity,
+    expires: Instant,
+    helper_executable: &Path,
+    enter: &mut TmuxDestructiveEntry<'_>,
 ) -> TokenBoundKill {
     if Instant::now() >= expires {
         return TokenBoundKill::DeadlineExceeded;
@@ -526,6 +646,7 @@ pub async fn retire_exact_on_server(
             deadline_ns,
             expected_process,
             &report,
+            enter,
         )
         .await
         .map_err(str::to_string)?;
@@ -973,5 +1094,34 @@ mod tests {
             b"0123456789abcdef0123456789abcdef 42 #(){;}:,01234567-89ab-cdef-0123-456789abcd"
         )
         .is_none());
+    }
+}
+
+#[cfg(test)]
+mod approval_write_tests {
+    use super::{write_approval_chunk, APPROVAL_FRAME};
+
+    #[test]
+    fn approval_write_resumes_after_legal_short_writes() {
+        let mut offset = 0;
+        let mut output = Vec::new();
+        for chunk_size in [2, 3, 3] {
+            write_approval_chunk(&mut offset, |remaining| {
+                let count = chunk_size.min(remaining.len());
+                output.extend_from_slice(&remaining[..count]);
+                Ok(count)
+            })
+            .unwrap();
+        }
+        assert_eq!(offset, APPROVAL_FRAME.len());
+        assert_eq!(output, APPROVAL_FRAME);
+    }
+
+    #[test]
+    fn approval_write_zero_progress_fails() {
+        let mut offset = 0;
+        let error = write_approval_chunk(&mut offset, |_| Ok(0)).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::WriteZero);
+        assert_eq!(offset, 0);
     }
 }

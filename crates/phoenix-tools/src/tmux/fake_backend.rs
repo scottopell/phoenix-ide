@@ -531,33 +531,58 @@ impl TmuxBackend for FakeTmuxBackend {
     async fn kill_server_if_process(
         &self,
         socket_path: &Path,
-        _config_path: &Path,
+        config_path: &Path,
         expected_token: &str,
         expected_process: ProcessIdentity,
         expires: Instant,
     ) -> TokenBoundKill {
+        self.kill_server_if_process_with_entry(
+            socket_path,
+            config_path,
+            expected_token,
+            expected_process,
+            expires,
+            &mut |sink| sink(),
+        )
+        .await
+        .unwrap_or_else(|reason| TokenBoundKill::Failed { reason })
+    }
+
+    async fn kill_server_if_process_with_entry(
+        &self,
+        socket_path: &Path,
+        _config_path: &Path,
+        expected_token: &str,
+        expected_process: ProcessIdentity,
+        expires: Instant,
+        enter: &mut super::backend::TmuxDestructiveEntry<'_>,
+    ) -> Result<TokenBoundKill, String> {
         if Instant::now() >= expires {
-            return TokenBoundKill::DeadlineExceeded;
+            return Ok(TokenBoundKill::DeadlineExceeded);
         }
         let mut world = self.world();
         if world.stall(socket_path).is_some() {
-            return TokenBoundKill::DeadlineExceeded;
+            return Ok(TokenBoundKill::DeadlineExceeded);
         }
         let Some(server) = world.live_server(socket_path) else {
-            return TokenBoundKill::TokenMismatch;
+            return Ok(TokenBoundKill::TokenMismatch);
         };
-        // This fake provides an atomic exact-incarnation capability. The system
-        // backend deliberately fails closed until it can supply the same contract.
         if server.process != expected_process
             || server.env.get(SERVER_TOKEN_VAR).map(String::as_str) != Some(expected_token)
         {
-            return TokenBoundKill::TokenMismatch;
+            return Ok(TokenBoundKill::TokenMismatch);
         }
         let process = server.process;
-        world.processes.insert(process, FakeProcessState::Exited);
-        world.endpoints.remove(socket_path);
-        world.kill_server_commands.push(socket_path.to_path_buf());
-        TokenBoundKill::Killed
+        enter(&mut || {
+            if Instant::now() >= expires {
+                return Err("tmux exact teardown exceeded the Close deadline".into());
+            }
+            world.processes.insert(process, FakeProcessState::Exited);
+            world.endpoints.remove(socket_path);
+            world.kill_server_commands.push(socket_path.to_path_buf());
+            Ok(())
+        })?;
+        Ok(TokenBoundKill::Killed)
     }
 
     async fn capture_pane(

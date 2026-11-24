@@ -79,7 +79,7 @@ async fn real183_to184_preserves_original_branches_and_is_idempotent() {
     let source_before = trigger(&db, "native_close_source_fence_requires_exact_plan").await;
     let header_before = trigger(&db, "native_close_retry_plans_require_original").await;
 
-    assert_eq!(run_pending_migrations(&db.pool).await.unwrap(), 1);
+    assert_eq!(run_through_for_test(&db.pool, 184).await.unwrap(), 1);
     for ((name, query), original) in native_queries.into_iter().zip(before) {
         assert_only_native_union_added(&original, &trigger(&db, name).await, query);
     }
@@ -148,7 +148,7 @@ async fn real183_to184_preserves_original_branches_and_is_idempotent() {
     .fetch_all(&db.pool)
     .await
     .unwrap();
-    assert_eq!(run_pending_migrations(&db.pool).await.unwrap(), 0);
+    assert_eq!(run_through_for_test(&db.pool, 184).await.unwrap(), 0);
     let again: Vec<(String, String)> = sqlx::query_as(
         "SELECT name, sql FROM sqlite_schema
         WHERE sql IS NOT NULL ORDER BY name",
@@ -189,7 +189,7 @@ async fn missing_or_changed_native_source_rolls_back184() {
             .await
             .unwrap();
         }
-        let error = run_pending_migrations(&db.pool)
+        let error = run_through_for_test(&db.pool, 184)
             .await
             .unwrap_err()
             .to_string();
@@ -245,10 +245,10 @@ async fn original_active_inventory(db: &Database) -> (String, String, String, St
     db.begin_close_foundation(&product, &transcript, attempt)
         .await
         .unwrap();
-    for phase in ["settling_active_work", "awaiting_retirement_inspection"] {
-        sqlx::query("UPDATE close_obligations SET phase = ?2, revision = revision + 1 WHERE attempt_id = ?1")
-            .bind(attempt).bind(phase).execute(&db.pool).await.unwrap();
-    }
+    db.begin_close_idle_settlement(attempt).await.unwrap();
+    db.advance_close_settlement_when_quiescent(attempt)
+        .await
+        .unwrap();
     db.replace_close_inspection(ReplaceCloseInspectionRequest {
         attempt_id: CloseAttemptId::parse(attempt).unwrap(),
         scopes: Vec::new(),
@@ -335,7 +335,7 @@ async fn original_active_inventory_still_rejects_arbitrary_dispatch_identity_and
         before.contains("FOREIGN KEY"),
         "183 must reach its composite FK: {before}"
     );
-    run_pending_migrations(&db.pool).await.unwrap();
+    run_through_for_test(&db.pool, 184).await.unwrap();
     for (candidate_generation, candidate_fingerprint, codec, identity) in [
         (
             generation.as_str(),
@@ -422,7 +422,7 @@ async fn original_dispatch_update_and_expected_resource_retention_survive184() {
     .await;
     for migrated in [false, true] {
         if migrated {
-            run_pending_migrations(&db.pool).await.unwrap();
+            run_through_for_test(&db.pool, 184).await.unwrap();
         }
         for column in [
             "attempt_id",
@@ -513,7 +513,7 @@ async fn original_dispatch_update_and_expected_resource_retention_survive184() {
 async fn delete_api_clears_dispatches_before_expected_resource_teardown() {
     let db = predecessor().await;
     let (attempt, scope, generation, fingerprint) = original_active_inventory(&db).await;
-    run_pending_migrations(&db.pool).await.unwrap();
+    run_through_for_test(&db.pool, 184).await.unwrap();
     dispatch(
         &db,
         &attempt,
@@ -556,7 +556,7 @@ async fn delete_api_clears_dispatches_before_expected_resource_teardown() {
 #[tokio::test]
 async fn captured_authority_schema_is_immutable_but_cascades_with_its_obligation() {
     let db = predecessor().await;
-    run_pending_migrations(&db.pool).await.unwrap();
+    run_through_for_test(&db.pool, 184).await.unwrap();
     let pool = SqlitePoolOptions::new()
         .max_connections(1)
         .connect("sqlite::memory:")

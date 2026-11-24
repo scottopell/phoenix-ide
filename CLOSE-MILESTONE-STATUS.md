@@ -1,5 +1,16 @@
 # Unified Close acceptance milestone
 
+## Tmux retry custody and reached-failure correction — unqualified source
+
+This section supersedes the pending-7420 and absent-tmux statements below.
+
+- Exact source `7420c12b98245bf3474c68fdfb1c88d77158a25b`, automatic run **45321704779**, completed **failure**. Frontend passed; database and specifications failed. The runtime acceptance path did not compile (`close_safe_retry_execution_order` lookup), so neither the public captured-loss journey nor causal Stop tests have passed. Complete artifacts and failed logs are retained in `/tmp/close-7420c12b9/`.
+- Reached DB failures were an invalid live WorkScope column lookup, captured-loss fixtures querying nonexistent columns or requiring a seal where absence is the invariant, historical writers invoked against old schemas, and stale migration counts. Source corrections use the real `work_scopes` identity/locator, public settlement APIs, explicit historical schema probes, and updated ledgers. They are not execution evidence.
+- Tmux retry now has a retained/joined worker with original absolute deadline, exact persisted dispatch, and fresh DB/source entry around irreversible approval handoff and registry cleanup. No source lease spans helper readiness/death waits. Entered approval may complete after Stop; the lease authorizes the irreversible handoff, not the later asynchronous `kill-server` instruction. Unknown writer release explicitly retains custody and closes the fatal fence without a permanently parked worker blocking join.
+- Independent source reviews caught the dispatch trigger's worktree-only exception, fatal join hang, short-write regression, source-refusal/sink-error conflation, test module/selector defects, invalid typed test resources, and remaining runtime helper privacy. Corrections include narrow migration **185** for exact original-inventory tmux dispatch, preserving the existing worktree and captured-origin arms. New DB, migration, backend, short-write, and registry refusal tests are inventoried in hosted qualification. Source review is not compile or behavioral acceptance.
+- **Remaining gates:** exact-head hosted compile, migrations, all DB/runtime/frontend/specification suites, disposable public reclaim/replay and causal Stop tests; tmux actor-level Stop/wait and unknown-release regression proof; actor-inline admission/evidence writer/finalization deadline review; full transcript-round-trip proof. No merge, installation, deployment, usable delivery, or broad Stop-responsiveness claim follows from this source slice. Validation remains hosted-only, with one watcher and no manual rerun/cancel/dispatch.
+
+
 ## Bounded retry cursor correction — source progress, not acceptance
 
 This section supersedes older pending-run and absent-cursor statements below.

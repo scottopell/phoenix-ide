@@ -88,6 +88,11 @@ pub enum TokenBoundKill {
     Failed { reason: String },
 }
 
+/// Runs a synchronous destructive sink under caller-owned source custody.
+/// The sink must not retain the lease or suspend while holding it.
+pub type TmuxDestructiveEntry<'a> =
+    dyn FnMut(&mut dyn FnMut() -> Result<(), String>) -> Result<(), String> + Send + 'a;
+
 #[async_trait]
 pub trait TmuxBackend: Send + Sync + std::fmt::Debug {
     fn binary_available(&self) -> bool;
@@ -164,6 +169,20 @@ pub trait TmuxBackend: Send + Sync + std::fmt::Debug {
         }
     }
 
+    /// Exact teardown with source entry acquired only at the destructive sink.
+    /// Unsupported backends fail closed rather than holding entry over an await.
+    async fn kill_server_if_process_with_entry(
+        &self,
+        _socket_path: &Path,
+        _config_path: &Path,
+        _expected_token: &str,
+        _expected_process: ProcessIdentity,
+        _expires: Instant,
+        _enter: &mut TmuxDestructiveEntry<'_>,
+    ) -> Result<TokenBoundKill, String> {
+        Err("backend cannot enter exact tmux teardown at its destructive sink".into())
+    }
+
     /// `Ok(None)` when tmux reports no such window.
     async fn capture_pane(
         &self,
@@ -204,6 +223,20 @@ impl SystemTmuxBackend {
             binary_available: which::which("tmux").is_ok(),
         }
     }
+}
+
+fn resolve_exact_kill_entry(
+    result: TokenBoundKill,
+    refusal: Option<String>,
+    sink_result: Option<Result<(), String>>,
+) -> Result<TokenBoundKill, String> {
+    if let Some(reason) = refusal {
+        return Err(reason);
+    }
+    if let Some(Err(reason)) = sink_result {
+        return Ok(TokenBoundKill::Failed { reason });
+    }
+    Ok(result)
 }
 
 #[async_trait]
@@ -316,31 +349,69 @@ impl TmuxBackend for SystemTmuxBackend {
         expected_process: ProcessIdentity,
         expires: Instant,
     ) -> TokenBoundKill {
+        self.kill_server_if_process_with_entry(
+            socket_path,
+            config_path,
+            expected_token,
+            expected_process,
+            expires,
+            &mut |sink| sink(),
+        )
+        .await
+        .unwrap_or_else(|reason| TokenBoundKill::Failed { reason })
+    }
+
+    async fn kill_server_if_process_with_entry(
+        &self,
+        socket_path: &Path,
+        config_path: &Path,
+        expected_token: &str,
+        expected_process: ProcessIdentity,
+        expires: Instant,
+        enter: &mut TmuxDestructiveEntry<'_>,
+    ) -> Result<TokenBoundKill, String> {
         if Instant::now() >= expires {
-            return TokenBoundKill::DeadlineExceeded;
+            return Ok(TokenBoundKill::DeadlineExceeded);
         }
         if !self.binary_available {
-            return TokenBoundKill::Failed {
+            return Ok(TokenBoundKill::Failed {
                 reason: "tmux binary unavailable".into(),
-            };
+            });
         }
         let helper_executable = match std::env::current_exe() {
             Ok(path) => path,
             Err(error) => {
-                return TokenBoundKill::Failed {
+                return Ok(TokenBoundKill::Failed {
                     reason: format!("cannot locate helper executable: {error}"),
-                }
+                })
             }
         };
-        close_gate::retire_exact_on_server(
+        let mut refusal = None;
+        let mut sink_result = None;
+        let result = close_gate::retire_exact_on_server_with_entry(
             socket_path,
             config_path,
             expected_token,
             expected_process,
             expires,
             &helper_executable,
+            &mut |sink| {
+                let entered = enter(&mut || {
+                    sink_result = Some(sink());
+                    // Keep sink failures separate from source/writer entry refusal.
+                    // The entry lease must still observe a successful sink invocation.
+                    Ok(())
+                });
+                if let Err(reason) = entered {
+                    refusal = Some(reason.clone());
+                    Err(reason)
+                } else {
+                    Ok(())
+                }
+            },
         )
-        .await
+        .await;
+        resolve_exact_kill_entry(result, refusal, sink_result)
     }
 
     async fn capture_pane(
@@ -1073,5 +1144,35 @@ mod tests {
             backend.endpoint(&socket).unwrap(),
             SocketEndpoint::Socket(_)
         ));
+    }
+}
+
+#[cfg(test)]
+mod exact_kill_entry_tests {
+    use super::{resolve_exact_kill_entry, TokenBoundKill};
+
+    #[test]
+    fn entry_refusal_remains_distinct_even_after_successful_sink() {
+        let result = resolve_exact_kill_entry(
+            TokenBoundKill::Killed,
+            Some("writer entry refused".into()),
+            Some(Ok(())),
+        );
+        assert_eq!(result, Err("writer entry refused".into()));
+    }
+
+    #[test]
+    fn sink_error_is_a_kill_failure_not_an_entry_refusal() {
+        let result = resolve_exact_kill_entry(
+            TokenBoundKill::Killed,
+            None,
+            Some(Err("approval sink failed".into())),
+        );
+        assert_eq!(
+            result,
+            Ok(TokenBoundKill::Failed {
+                reason: "approval sink failed".into(),
+            })
+        );
     }
 }

@@ -746,3 +746,160 @@ async fn native_resource_failure_rolls_back_late_outbox_and_outcome_message_erro
         &assessment.command, &receipt.admitted, request,
     ).await);
 }
+
+async fn native_tmux_retry_fixture() -> (Database, Assessment, NativeCloseReceipt, CloseSafeRetryEffect) {
+    // The generic failure fixture becomes native only after `assess` installs a
+    // real executing source and native explicit-retry admission succeeds.
+    let db = Database::open_in_memory().await.unwrap();
+    let tmux = opaque_resource(RetiredResourceKind::TmuxServer, "native-retry-tmux");
+    let failure = fixture(&db, vec![tmux], true).await;
+    let assessment = assess(&db, &failure, "tmux-retry").await;
+    let receipt = admitted(db.apply_native_close_explicit_retry(&assessment).await);
+    let effect = assessment.request.remaining_effects.iter()
+        .find(|effect| effect.resource.kind() == RetiredResourceKind::TmuxServer)
+        .expect("native retry plan includes a pending tmux effect").clone();
+    (db, assessment, receipt, effect)
+}
+
+#[tokio::test]
+async fn native_retry_tmux_dispatch_records_exact_pending_identity_and_refuses_mismatches() {
+    let (db, assessment, receipt, effect) = native_tmux_retry_fixture().await;
+    let attempt = &receipt.admitted.attempt_id;
+    let before = retry_dispatch_state(&db, attempt).await;
+    let dispatch_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM close_retirement_resource_dispatches WHERE attempt_id = ?1",
+    ).bind(attempt.as_str()).fetch_one(db.pool()).await.unwrap();
+    assert_eq!(dispatch_count, 0);
+
+    use std::cell::Cell;
+
+    let entry_calls = Cell::new(0);
+    let (entry_result, lease) = db.record_native_close_retry_retirement_dispatch_with_entry(
+        &assessment.command, &receipt.admitted, &effect, || {
+            entry_calls.set(entry_calls.get() + 1);
+            Ok("entered")
+        },
+    ).await;
+    success_recorded(entry_result);
+    assert_eq!(lease, Some("entered"));
+    assert_eq!(entry_calls.get(), 1);
+    let dispatched = retry_dispatch_state(&db, attempt).await;
+    assert_ne!(dispatched, before);
+    success_recorded(db.record_native_close_retry_retirement_dispatch(
+        &assessment.command, &receipt.admitted, &effect,
+    ).await);
+    assert_eq!(retry_dispatch_state(&db, attempt).await, dispatched);
+
+    let mut wrong_identity = effect.clone();
+    wrong_identity.resource = opaque_resource(RetiredResourceKind::TmuxServer, "forged-tmux");
+    let retained_before_refusal = migration_176_retained_state(&db).await;
+    let (wrong_identity_result, wrong_identity_lease) =
+        db.record_native_close_retry_retirement_dispatch_with_entry(
+            &assessment.command, &receipt.admitted, &wrong_identity, || {
+                entry_calls.set(entry_calls.get() + 1);
+                Ok("must not enter")
+            },
+        ).await;
+    success_refused(wrong_identity_result);
+    assert_eq!(wrong_identity_lease, None);
+    assert_eq!(entry_calls.get(), 1, "refused identity must not enter");
+    assert_eq!(migration_176_retained_state(&db).await, retained_before_refusal);
+    success_refused(db.record_native_close_retry_retirement_dispatch(
+        &assessment.command, &receipt.admitted, &wrong_identity,
+    ).await);
+    let mut wrong_kind = effect.clone();
+    wrong_kind.resource = opaque_resource(RetiredResourceKind::WorkScope, "wrong-kind-tmux");
+    success_refused(db.record_native_close_retry_retirement_dispatch(
+        &assessment.command, &receipt.admitted, &wrong_kind,
+    ).await);
+    assert_eq!(retry_dispatch_state(&db, attempt).await, dispatched);
+
+    write_source_fence_state(&db, &assessment.command, &ConvState::Idle, false).await.unwrap();
+    let retained = migration_176_retained_state(&db).await;
+    success_refused(db.record_native_close_retry_retirement_dispatch(
+        &assessment.command, &receipt.admitted, &effect,
+    ).await);
+    assert_eq!(migration_176_retained_state(&db).await, retained);
+    assert_eq!(retry_dispatch_state(&db, attempt).await, dispatched);
+}
+
+#[tokio::test]
+async fn native_retry_tmux_first_effect_requires_exact_source_dispatch_identity_and_snapshot() {
+    use std::cell::Cell;
+
+    let (db, assessment, receipt, effect) = native_tmux_retry_fixture().await;
+    use crate::native_close::{NativeCloseInitialEntryRelease, NativeCloseInitialFirstEffectError};
+
+    let live_source = db.get_conversation(assessment.command.source_transcript_id())
+        .await.unwrap().state;
+    success_recorded(db.record_native_close_retry_retirement_dispatch(
+        &assessment.command, &receipt.admitted, &effect,
+    ).await);
+    let callback_calls = Cell::new(0);
+    let (result, release) = db.with_native_close_retry_tmux_first_effect(
+        &assessment.command, &receipt.admitted, &live_source, effect.scope.clone(),
+        assessment.proof.snapshot.clone(), &effect.resource, || {
+            callback_calls.set(callback_calls.get() + 1);
+            "handed off"
+        },
+    ).await.unwrap();
+    assert_eq!(result, "handed off");
+    assert!(matches!(release, NativeCloseInitialEntryRelease::Confirmed));
+    assert_eq!(callback_calls.get(), 1);
+
+    let before = migration_176_retained_state(&db).await;
+    let wrong_identity = opaque_resource(RetiredResourceKind::TmuxServer, "forged-tmux");
+    let wrong_identity_result = db.with_native_close_retry_tmux_first_effect(
+        &assessment.command, &receipt.admitted, &live_source, effect.scope.clone(),
+        assessment.proof.snapshot.clone(), &wrong_identity, || {
+            callback_calls.set(callback_calls.get() + 1);
+        },
+    ).await;
+    assert!(matches!(wrong_identity_result,
+        Err(NativeCloseInitialFirstEffectError::Rejected { .. })));
+
+    let wrong_source = ConvState::Idle;
+    let wrong_source_result = db.with_native_close_retry_tmux_first_effect(
+        &assessment.command, &receipt.admitted, &wrong_source, effect.scope.clone(),
+        assessment.proof.snapshot.clone(), &effect.resource, || {
+            callback_calls.set(callback_calls.get() + 1);
+        },
+    ).await;
+    assert!(matches!(wrong_source_result,
+        Err(NativeCloseInitialFirstEffectError::Rejected { .. })));
+
+    let wrong_kind = opaque_resource(RetiredResourceKind::WorkScope, "wrong-kind-tmux");
+    let wrong_kind_result = db.with_native_close_retry_tmux_first_effect(
+        &assessment.command, &receipt.admitted, &live_source, effect.scope.clone(),
+        assessment.proof.snapshot.clone(), &wrong_kind, || {
+            callback_calls.set(callback_calls.get() + 1);
+        },
+    ).await;
+    assert!(matches!(wrong_kind_result,
+        Err(NativeCloseInitialFirstEffectError::Rejected { .. })));
+
+    let wrong_snapshot = CloseRetirementSnapshot::parse("forged-generation", "forged-fingerprint").unwrap();
+    let wrong_snapshot_result = db.with_native_close_retry_tmux_first_effect(
+        &assessment.command, &receipt.admitted, &live_source, effect.scope.clone(),
+        wrong_snapshot, &effect.resource, || {
+            callback_calls.set(callback_calls.get() + 1);
+        },
+    ).await;
+    assert!(matches!(wrong_snapshot_result,
+        Err(NativeCloseInitialFirstEffectError::Rejected { .. })));
+    assert_eq!(callback_calls.get(), 1);
+    assert_eq!(migration_176_retained_state(&db).await, before);
+
+    write_source_fence_state(&db, &assessment.command, &ConvState::Idle, false).await.unwrap();
+    let retained = migration_176_retained_state(&db).await;
+    let stopped_source_result = db.with_native_close_retry_tmux_first_effect(
+        &assessment.command, &receipt.admitted, &ConvState::Idle, effect.scope.clone(),
+        assessment.proof.snapshot.clone(), &effect.resource, || {
+            callback_calls.set(callback_calls.get() + 1);
+        },
+    ).await;
+    assert!(matches!(stopped_source_result,
+        Err(NativeCloseInitialFirstEffectError::Rejected { .. })));
+    assert_eq!(callback_calls.get(), 1, "source Stop must not invoke the callback");
+    assert_eq!(migration_176_retained_state(&db).await, retained);
+}

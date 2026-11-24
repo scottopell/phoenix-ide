@@ -915,7 +915,7 @@ fn close_safe_retry_effect_rank(effect: &CloseSafeRetryEffect) -> u8 {
     }
 }
 
-fn close_safe_retry_execution_order(plan: &[CloseSafeRetryEffect]) -> Vec<usize> {
+pub(super) fn close_safe_retry_execution_order(plan: &[CloseSafeRetryEffect]) -> Vec<usize> {
     let mut indices = (0..plan.len()).collect::<Vec<_>>();
     indices.sort_by_key(|&index| close_safe_retry_effect_rank(&plan[index]));
     indices

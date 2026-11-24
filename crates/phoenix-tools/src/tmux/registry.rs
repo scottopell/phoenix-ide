@@ -44,7 +44,7 @@ use tokio::sync::{OnceCell, RwLock};
 
 use super::backend::{
     ExactProcessState, GlobalEnvRead, SocketEndpoint, SocketFileIdentity, SystemTmuxBackend,
-    TmuxBackend, TokenBoundKill, SERVER_TOKEN_VAR,
+    TmuxBackend, TmuxDestructiveEntry, TokenBoundKill, SERVER_TOKEN_VAR,
 };
 use super::{parse_last_exit_marker, probe::ProbeResult};
 
@@ -258,8 +258,45 @@ impl PreparedTmuxRetirement {
     /// # Errors
     /// Returns a probe error when exact shutdown evidence cannot be read.
     pub async fn complete(self) -> Result<TmuxRetirementOutcome, TmuxError> {
+        self.complete_with_entry(|| Ok(())).await
+    }
+
+    /// Acquires source custody separately for each synchronous destructive sink.
+    /// No returned lease is held during helper readiness, shutdown observation,
+    /// or registry lock waits. The callback can refuse a stale source binding;
+    /// refusal returns `RemovalFailed` without being superseded by absence proof.
+    ///
+    /// # Errors
+    /// Returns a probe error when exact shutdown evidence cannot be read.
+    pub async fn complete_with_entry<F, Lease>(
+        self,
+        mut enter: F,
+    ) -> Result<TmuxRetirementOutcome, TmuxError>
+    where
+        F: FnMut() -> Result<Lease, String> + Send,
+    {
+        let mut with_entry = |sink: &mut dyn FnMut() -> Result<(), String>| {
+            let lease = enter()?;
+            let result = sink();
+            drop(lease);
+            result
+        };
+        self.complete_with_sink(&mut with_entry).await
+    }
+
+    /// Wrap each synchronous destructive sink, including the final registry mutation.
+    ///
+    /// # Errors
+    /// Returns a probe error when exact shutdown evidence cannot be read.
+    pub async fn complete_with_sink<F>(
+        self,
+        mut with_entry: F,
+    ) -> Result<TmuxRetirementOutcome, TmuxError>
+    where
+        F: FnMut(&mut dyn FnMut() -> Result<(), String>) -> Result<(), String> + Send,
+    {
         self.registry
-            .complete_retirement_on_entry(&self.permit, Some(self.entry), true)
+            .complete_retirement_on_entry(&self.permit, Some(self.entry), true, &mut with_entry)
             .await
     }
 }
@@ -2327,7 +2364,7 @@ impl TmuxRegistry {
             Ok(entry) => entry,
             Err(reason) => return Ok(TmuxRetirementOutcome::RemovalFailed { reason }),
         };
-        self.complete_retirement_on_entry(permit, current_entry, false)
+        self.complete_retirement_on_entry(permit, current_entry, false, &mut |sink| sink())
             .await
     }
 
@@ -2337,6 +2374,7 @@ impl TmuxRegistry {
         permit: &TmuxRetirementPermit,
         current_entry: Option<Arc<TmuxScopeEntry>>,
         exact_owner: bool,
+        enter: &mut TmuxDestructiveEntry<'_>,
     ) -> Result<TmuxRetirementOutcome, TmuxError> {
         let deadline = RetirementDeadline::new(permit.expires);
         // Keep map membership fixed through the token-bound kill on the exact
@@ -2432,15 +2470,23 @@ impl TmuxRegistry {
             let kill = if exact_owner {
                 match permit.exact_process {
                     Some(process) => {
-                        self.backend
-                            .kill_server_if_process(
+                        match self
+                            .backend
+                            .kill_server_if_process_with_entry(
                                 &permit.instance.socket_path,
                                 &self.config_path(),
                                 &permit.instance.server_token,
                                 process,
                                 permit.expires,
+                                enter,
                             )
                             .await
+                        {
+                            Ok(kill) => kill,
+                            Err(reason) => {
+                                return Ok(TmuxRetirementOutcome::RemovalFailed { reason });
+                            }
+                        }
                     }
                     None => TokenBoundKill::TokenMismatch,
                 }
@@ -2556,7 +2602,17 @@ impl TmuxRegistry {
                             });
                         };
                         if Self::matches_exact_instance(&server, permit) {
-                            server.status = ServerStatus::Gone;
+                            if let Err(reason) = enter(&mut || {
+                                if tokio::time::Instant::now() >= permit.expires {
+                                    return Err(
+                                        "tmux final authority exceeded the Close deadline".into(),
+                                    );
+                                }
+                                server.status = ServerStatus::Gone;
+                                Ok(())
+                            }) {
+                                return Ok(TmuxRetirementOutcome::RemovalFailed { reason });
+                            }
                             true
                         } else {
                             false
@@ -3130,6 +3186,9 @@ mod tests {
     use super::*;
     use crate::tmux::fake_backend::{FakeTmuxBackend, Stall};
     use tempfile::TempDir;
+
+    #[path = "prepared_retirement_entry.rs"]
+    mod prepared_retirement_entry;
 
     fn scope(id: &str) -> ResourceScopeKey {
         ResourceScopeKey::Work(phoenix_core::work_scope::WorkScopeId::parse(id).unwrap())

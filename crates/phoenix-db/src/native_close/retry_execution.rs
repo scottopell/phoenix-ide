@@ -131,6 +131,21 @@ struct NativeCloseRetryAuthority {
     pending: Vec<CloseSafeRetryEffect>,
 }
 
+enum NativeCloseRetryDispatchKind {
+    Worktree,
+    Tmux,
+}
+
+impl NativeCloseRetryDispatchKind {
+    fn for_resource(resource: &RetiredResourceIdentity) -> DbResult<Self> {
+        match resource.kind() {
+            RetiredResourceKind::Worktree => Ok(Self::Worktree),
+            RetiredResourceKind::TmuxServer => Ok(Self::Tmux),
+            _ => Err(refused("native retry dispatch requires a worktree or tmux effect")),
+        }
+    }
+}
+
 enum NativeCloseRetryWorktreeMetadata {
     Plan(RecordCloseWorktreeCleanupPlanRequest),
     Tombstone(BindCloseWorktreeFinalTombstoneRequest),
@@ -339,6 +354,47 @@ impl Database {
     where
         F: FnOnce() -> T,
     {
+        self.with_native_close_retry_resource_first_effect(
+            command, admitted, live_source, scope, snapshot, resource,
+            NativeCloseRetryDispatchKind::Worktree, first_effect,
+        ).await
+    }
+
+    /// Runs the synchronous tmux handoff only for an exact pending, dispatched retry
+    /// identity. The caller has the same supervision duties as for worktree entry.
+    pub async fn with_native_close_retry_tmux_first_effect<F, T>(
+        &self,
+        command: &NativeCloseCommand,
+        admitted: &NativeCloseRunRef,
+        live_source: &phoenix_core::domain::sm_state::ConvState,
+        scope: WorkScopeId,
+        snapshot: CloseRetirementSnapshot,
+        resource: &RetiredResourceIdentity,
+        first_effect: F,
+    ) -> Result<(T, NativeCloseInitialEntryRelease), NativeCloseInitialFirstEffectError>
+    where
+        F: FnOnce() -> T,
+    {
+        self.with_native_close_retry_resource_first_effect(
+            command, admitted, live_source, scope, snapshot, resource,
+            NativeCloseRetryDispatchKind::Tmux, first_effect,
+        ).await
+    }
+
+    async fn with_native_close_retry_resource_first_effect<F, T>(
+        &self,
+        command: &NativeCloseCommand,
+        admitted: &NativeCloseRunRef,
+        live_source: &phoenix_core::domain::sm_state::ConvState,
+        scope: WorkScopeId,
+        snapshot: CloseRetirementSnapshot,
+        resource: &RetiredResourceIdentity,
+        kind: NativeCloseRetryDispatchKind,
+        first_effect: F,
+    ) -> Result<(T, NativeCloseInitialEntryRelease), NativeCloseInitialFirstEffectError>
+    where
+        F: FnOnce() -> T,
+    {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await
             .map_err(|error| NativeCloseInitialFirstEffectError::NotStarted(error.into()))?;
         let validation = async {
@@ -346,8 +402,8 @@ impl Database {
                 live_source, command.source(), "close_conversation", &command.intent().source_input(),
             ).map_err(|_| refused("Close requires its current executing source"))?;
             let effect = CloseSafeRetryEffect { scope, resource: resource.clone() };
-            let original = Self::require_native_close_retry_pending_worktree_tx(
-                &mut tx, command, admitted, &effect,
+            let original = Self::require_native_close_retry_pending_dispatch_tx(
+                &mut tx, command, admitted, &effect, kind,
             ).await?;
             if snapshot != original {
                 return Err(refused("native retry entry requires its exact original snapshot"));
@@ -573,7 +629,7 @@ impl Database {
         (classification, lease)
     }
 
-    /// Records dispatch of one pending original-generation worktree effect under the
+    /// Records dispatch of one pending original-generation worktree or tmux effect under the
     /// exact live native command and latest running retry plan. No current inspection
     /// snapshot is accepted from the caller.
     ///
@@ -586,15 +642,35 @@ impl Database {
         admitted: &NativeCloseRunRef,
         effect: &CloseSafeRetryEffect,
     ) -> LocalAuthorityResult<DbResult<()>> {
+        self.record_native_close_retry_retirement_dispatch_with_entry(
+            command, admitted, effect, || Ok(()),
+        ).await.0
+    }
+
+    /// Acquires entry custody after exact writer validation and before inserting
+    /// dispatch. Returns a successful lease through commit or rollback, including
+    /// unclassified release. The callback must be short, nonblocking and in-memory;
+    /// callers must supervise cancellation/panic and retain uncertain custody.
+    pub async fn record_native_close_retry_retirement_dispatch_with_entry<F, L>(
+        &self,
+        command: &NativeCloseCommand,
+        admitted: &NativeCloseRunRef,
+        effect: &CloseSafeRetryEffect,
+        entry: F,
+    ) -> (LocalAuthorityResult<DbResult<()>>, Option<L>)
+    where
+        F: FnOnce() -> DbResult<L>,
+    {
         let mut tx = match self.pool.begin_with("BEGIN IMMEDIATE").await {
             Ok(tx) => tx,
-            Err(error) => return LocalAuthorityResult::DurableFactEstablished(Err(error.into())),
+            Err(error) => return (LocalAuthorityResult::DurableFactEstablished(Err(error.into())), None),
         };
+        let mut lease = None;
         let result = Self::record_native_close_retry_retirement_dispatch_tx(
-            &mut tx, command, admitted, effect,
+            &mut tx, command, admitted, effect, entry, &mut lease,
         )
         .await;
-        match result {
+        let classification = match result {
             Ok(()) => match tx.commit().await {
                 Ok(()) => LocalAuthorityResult::DurableFactEstablished(Ok(())),
                 Err(_) => LocalAuthorityResult::DurableFactUnclassified,
@@ -603,7 +679,8 @@ impl Database {
                 Ok(()) => LocalAuthorityResult::DurableFactEstablished(Err(error)),
                 Err(_) => LocalAuthorityResult::DurableFactUnclassified,
             },
-        }
+        };
+        (classification, lease)
     }
 
     async fn require_native_close_retry_pending_worktree_tx(
@@ -636,13 +713,66 @@ impl Database {
         Ok(plan.snapshot)
     }
 
-    async fn record_native_close_retry_retirement_dispatch_tx(
+    async fn require_native_close_retry_pending_tmux_tx(
         tx: &mut Transaction<'_, Sqlite>,
         command: &NativeCloseCommand,
         admitted: &NativeCloseRunRef,
         effect: &CloseSafeRetryEffect,
-    ) -> DbResult<()> {
-        let snapshot = Self::require_native_close_retry_pending_worktree_tx(tx, command, admitted, effect).await?;
+    ) -> DbResult<CloseRetirementSnapshot> {
+        if effect.resource.kind() != RetiredResourceKind::TmuxServer {
+            return Err(refused("native retry tmux entry requires a tmux server identity"));
+        }
+        let plan = Self::require_native_close_retry_plan_identity_tx(tx, command, admitted).await?;
+        if !plan.running {
+            return Err(refused("native retry tmux entry requires its exact latest running plan"));
+        }
+        Self::require_native_close_retry_members_quiescent_tx(tx, &admitted.attempt_id).await?;
+        let progress = retained_close_retry_progress_tx(tx, &CloseRunRef {
+            attempt_id: admitted.attempt_id.clone(),
+            ordinal: admitted.run_ordinal,
+        }).await?;
+        if i64::try_from(progress.successful.len() + progress.pending.len()).ok()
+            != Some(plan.effect_count)
+            || !progress.pending.contains(effect)
+        {
+            return Err(refused("native retry tmux entry requires its pending full-identity effect"));
+        }
+        Ok(plan.snapshot)
+    }
+
+    async fn require_native_close_retry_pending_dispatch_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        command: &NativeCloseCommand,
+        admitted: &NativeCloseRunRef,
+        effect: &CloseSafeRetryEffect,
+        kind: NativeCloseRetryDispatchKind,
+    ) -> DbResult<CloseRetirementSnapshot> {
+        match kind {
+            NativeCloseRetryDispatchKind::Worktree => {
+                Self::require_native_close_retry_pending_worktree_tx(tx, command, admitted, effect).await
+            }
+            NativeCloseRetryDispatchKind::Tmux => {
+                Self::require_native_close_retry_pending_tmux_tx(tx, command, admitted, effect).await
+            }
+        }
+    }
+
+    async fn record_native_close_retry_retirement_dispatch_tx<F, L>(
+        tx: &mut Transaction<'_, Sqlite>,
+        command: &NativeCloseCommand,
+        admitted: &NativeCloseRunRef,
+        effect: &CloseSafeRetryEffect,
+        entry: F,
+        lease: &mut Option<L>,
+    ) -> DbResult<()>
+    where
+        F: FnOnce() -> DbResult<L>,
+    {
+        let kind = NativeCloseRetryDispatchKind::for_resource(&effect.resource)?;
+        let snapshot = Self::require_native_close_retry_pending_dispatch_tx(
+            tx, command, admitted, effect, kind,
+        ).await?;
+        *lease = Some(entry()?);
         Self::insert_close_retirement_dispatch_tx(
             tx,
             &RecordCloseRetirementDispatchRequest {

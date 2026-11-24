@@ -192,17 +192,21 @@ impl Database {
         let effects = captured_effects(context.scopes())?;
         // Compare complete current scope identities, not merely a locator or worktree id.
         // No current topology is enumerated or substituted for the captured finite set.
-        let identities_current: bool = sqlx::query_scalar("SELECT NOT EXISTS (
-            SELECT 1 FROM close_attempt_scopes captured
-            LEFT JOIN work_scopes live ON live.id = captured.scope
-            LEFT JOIN work_scope_environments environment ON environment.work_scope_id = live.id
-            WHERE captured.attempt_id = ?1 AND (live.id IS NULL OR live.lifecycle <> 'active'
-                OR captured.captured_worktree_identity IS NOT environment.worktree_id
-                OR captured.captured_worktree_fingerprint IS NOT environment.worktree_fingerprint
-                OR (captured.captured_worktree_locator IS NOT NULL AND
-                    captured.captured_worktree_locator IS NOT
-                    'git_path_bytes_hex_v1:' || lower(hex(CAST(environment.worktree_path AS BLOB))))))")
-            .bind(attempt_id.as_str()).fetch_one(&mut **tx).await?;
+        let identities_current: bool = sqlx::query_scalar(
+            "SELECT NOT EXISTS (
+                SELECT 1 FROM close_attempt_scopes captured
+                LEFT JOIN work_scopes live ON live.id = captured.scope
+                WHERE captured.attempt_id = ?1 AND (live.id IS NULL OR live.lifecycle <> 'active'
+                    OR captured.captured_worktree_identity IS NOT live.worktree_id
+                    OR captured.captured_worktree_fingerprint IS NOT live.worktree_fingerprint
+                    OR captured.captured_worktree_locator IS NOT CASE
+                        WHEN live.environment_kind = 'allocated_worktree' THEN
+                            'git_path_bytes_hex_v1:' || lower(hex(CAST(live.worktree_path AS BLOB)))
+                    END))",
+        )
+        .bind(attempt_id.as_str())
+        .fetch_one(&mut **tx)
+        .await?;
         if !identities_current {
             return Err(refused(
                 "captured retry current scopes differ from full captured identities",

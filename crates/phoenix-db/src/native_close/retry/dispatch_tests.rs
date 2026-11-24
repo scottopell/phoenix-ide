@@ -330,9 +330,15 @@ async fn migration_177_preserves_populated_163_rows_and_rewrites_only_dispatch_a
     assert_eq!(upgraded.last().unwrap().1, "native_close_retry_dispatch");
     assert_eq!(crate::migrations::run_through_for_test(db.pool(), 177).await.unwrap(), 0);
     assert_eq!(retry_dispatch_state(&db, attempt).await, before);
-    success_recorded(db.record_native_close_retry_retirement_dispatch(
-        &assessment.command, &receipt.admitted, worktree,
-    ).await);
+    // Probe the historical 177 authority directly. Current application writers
+    // require later schema and are covered by the current-schema tests above.
+    let original = RecordCloseRetirementDispatchRequest {
+        attempt_id: attempt.clone(), scope: worktree.scope.clone(),
+        snapshot: assessment.proof.snapshot.clone(), resource: worktree.resource.clone(),
+    };
+    let mut tx = db.pool().begin().await.unwrap();
+    assert_eq!(insert_retry_dispatch_tx(&mut tx, &original).await.unwrap().rows_affected(), 1);
+    tx.commit().await.unwrap();
     let dispatches: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM close_retirement_resource_dispatches")
         .fetch_one(db.pool()).await.unwrap();
     assert_eq!(dispatches, 2);

@@ -210,6 +210,8 @@ jobs:
           done
           for test in \
             native_retry_execution_context_reads_original_typed_plan_without_mutation \
+            native_retry_tmux_dispatch_records_exact_pending_identity_and_refuses_mismatches \
+            native_retry_tmux_first_effect_requires_exact_source_dispatch_identity_and_snapshot \
             native_retry_execution_context_checks_live_source_before_retained_receipt \
             native_retry_execution_context_refuses_forged_receipt_wrong_failed_run_and_stopped_latest; do
             grep -F "close_foundation::tests::native_retry::$test: test" evidence/selected-tests.txt
@@ -272,6 +274,18 @@ jobs:
             native_retry_live_execution_rechecks_current_captured_member_quiescence \
             native_retry_member_work_allows_uncertain_failure_but_not_stopped_placement; do
             grep -F "close_foundation::tests::native_retry::$test: test" evidence/selected-tests.txt
+          done
+      - name: Require exact retry tmux dispatch migration upgrade
+        if: success() || failure()
+        shell: bash
+        run: |
+          set -euo pipefail
+          for test in \
+            real184_to185_preserves_worktree_authority_and_adds_exact_original_tmux \
+            missing_or_changed_dispatch_trigger_rolls_back185; do
+            grep -Fx "migrations::retry_tmux_dispatch_tests::$test: test" evidence/selected-tests.txt
+            cargo test -p phoenix-db --lib "migrations::retry_tmux_dispatch_tests::$test" -- --exact --nocapture --test-threads=1 2>&1 | tee "evidence/retry-tmux-migration-$test.log"
+            grep -E 'test result: ok\. 1 passed; 0 failed; 0 ignored;' "evidence/retry-tmux-migration-$test.log"
           done
       - name: Execute migration176 populated upgrade and authority regressions
         if: success()
@@ -937,6 +951,13 @@ jobs:
             tmux::close_gate::tests::helper_protocol_rejects_wrong_approval_truncated_eof_and_expired_raw_deadline
             tmux::close_gate::tests::report_parser_is_bounded_and_canonical
             tmux::backend::tests::system_exact_process_teardown_fails_closed_without_path_command
+            tmux::backend::exact_kill_entry_tests::entry_refusal_remains_distinct_even_after_successful_sink
+            tmux::backend::exact_kill_entry_tests::sink_error_is_a_kill_failure_not_an_entry_refusal
+            tmux::close_gate::approval_write_tests::approval_write_resumes_after_legal_short_writes
+            tmux::close_gate::approval_write_tests::approval_write_zero_progress_fails
+            tmux::registry::tests::prepared_retirement_entry::entry_refusal_before_kill_preserves_live_server_and_registry_entry
+            tmux::registry::tests::prepared_retirement_entry::entry_refusal_after_kill_preserves_residual_before_final_gone
+            tmux::registry::tests::prepared_retirement_entry::ordinary_prepared_complete_still_retires_without_entry_callback
           )
           for test in "${tests[@]}"; do
             grep -Fx "$test: test" evidence/tmux-inventory.log

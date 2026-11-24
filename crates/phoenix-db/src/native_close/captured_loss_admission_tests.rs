@@ -135,7 +135,17 @@ async fn assert_captured_origin_preserved(db: &Database, origin: &NativeCloseCap
         Err(DbError::CloseFoundationPrecondition(message))
             if message == "original retirement provenance is not anchored"
     ));
-    assert!(db.list_close_expected_retirement_resources(attempt).await.unwrap().is_empty());
+    // An effect-free loss stops before sealing inventory; the inventory reader
+    // requires a seal even when there are no expected-resource rows.
+    let original_rows: (i64, i64) = sqlx::query_as(
+        "SELECT (SELECT COUNT(*) FROM close_retirement_inventories WHERE attempt_id = ?1),
+                (SELECT COUNT(*) FROM close_expected_retirement_resources WHERE attempt_id = ?1)",
+    )
+    .bind(attempt)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(original_rows, (0, 0));
     assert!(db.list_close_retirement_evidence(attempt).await.unwrap().is_empty());
 }
 
