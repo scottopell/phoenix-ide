@@ -1,8 +1,5 @@
 //! Exact-instance resource fences and receipts for Close retirement.
 
-// Until capture-origin admission owns this observation, it is exercised only by
-// the assembled regression. It must not masquerade as production retry authority.
-#[cfg(test)]
 pub(crate) mod captured_loss_retry;
 mod native_retry;
 pub(crate) use native_retry::NativeInitialWorkScopePrecondition;

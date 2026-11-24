@@ -3276,11 +3276,16 @@ where
 
         let mut pending_native_close_initial: Option<native_close::NativeCloseInitialContinuation> =
             None;
+        let mut pending_native_close_retry: Option<native_close_retry::NativeCloseRetryContinuation> =
+            None;
         // Fatal authority exits must not release a continuation's source authority
         // or target gate while its owned preparation worker is still running.
         macro_rules! join_pending_native_close_before_fatal {
             () => {
                 self.revoke_native_close_source_entry().await;
+                if let Some(continuation) = pending_native_close_retry.take() {
+                    continuation.join_before_exit().await;
+                }
                 if let Some(mut continuation) = pending_native_close_initial.take() {
                     continuation.abort_and_join_inventory_preparation().await;
                 }
@@ -3295,6 +3300,9 @@ where
         macro_rules! defer_exit_until_native_close_observed {
             ($disposition:expr) => {{
                 self.revoke_native_close_source_entry().await;
+                if let Some(continuation) = pending_native_close_retry.take() {
+                    continuation.join_before_exit().await;
+                }
                 if let Some(continuation) = pending_native_close_initial.as_mut() {
                     continuation.begin_exit_interruption();
                     self.abort_external_effects().await;
@@ -3346,6 +3354,9 @@ where
                         conversation_id = %self.context.conversation_id,
                         "Exiting runtime to reconstruct an uncommitted operation from database truth"
                     );
+                    if let Some(continuation) = pending_native_close_retry.take() {
+                        continuation.join_before_exit().await;
+                    }
                     if let Some(continuation) = pending_native_close_initial.as_mut() {
                         continuation.begin_exit_interruption();
                         deferred_native_close_exit = Some(disposition);
@@ -3377,6 +3388,18 @@ where
                     tracing::error!(?boundary, "fatal local SQLite authority loss; aborting external runtime effects");
                     join_pending_native_close_before_fatal!();
                     return self.fatal_local_authority_exit();
+                }
+                assessment = async {
+                    match pending_native_close_retry.as_mut() {
+                        Some(continuation) => continuation.ready().await,
+                        None => std::future::pending().await,
+                    }
+                }, if pending_native_close_retry.is_some() => {
+                    let continuation = pending_native_close_retry.take().expect("guarded retry continuation");
+                    if self.finish_native_close_retry(continuation, assessment).await {
+                        join_pending_native_close_before_fatal!();
+                        return self.fatal_local_authority_exit();
+                    }
                 }
                 // Process shutdown closes admission without publishing fatal authority
                 // loss. Wake dormant Close phases once; a cancelled token must not
@@ -3525,7 +3548,7 @@ where
                             // Admission runs under the actual source actor. A newly
                             // admitted receipt transfers both guards into the actor's
                             // bounded continuation; replay/error paths complete here.
-                            if pending_native_close_initial.is_some() {
+                            if pending_native_close_initial.is_some() || pending_native_close_retry.is_some() {
                                 drop(admitted);
                                 drop(target_gate);
                                 let _ = response.send(Err(super::native_close_application::NativeCloseApplicationError::SourceRefused));
@@ -3562,10 +3585,11 @@ where
                             continue;
                         }
                         AcknowledgedRuntimeRequest::ExecuteNativeCloseRetry(request) => {
-                            if self.handle_native_close_retry(*request).await {
-                                join_pending_native_close_before_fatal!();
-                                return self.fatal_local_authority_exit();
+                            if pending_native_close_initial.is_some() || pending_native_close_retry.is_some() {
+                                let _ = request.response.send(Err(super::native_close_application::NativeCloseApplicationError::SourceRefused));
+                                continue;
                             }
+                            pending_native_close_retry = self.begin_native_close_retry(*request).await;
                             continue;
                         }
                         AcknowledgedRuntimeRequest::ExecuteNativeTaskApproval { command, response, admission } => {
@@ -3811,6 +3835,9 @@ where
             }
         }
 
+        if let Some(continuation) = pending_native_close_retry.take() {
+            continuation.join_before_exit().await;
+        }
         self.abort_external_effects().await;
         tracing::info!(conv_id = %self.context.conversation_id, "Conversation runtime stopped");
         if self.recovery_disposition == RuntimeRecoveryDisposition::RecreateFromDatabase {

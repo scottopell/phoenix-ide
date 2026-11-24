@@ -1,5 +1,21 @@
 # Unified Close acceptance milestone
 
+## Current source-only captured-loss integration (not delivery acceptance)
+
+This section supersedes all qualification-pending/source-absence statements below.
+
+- Published source `4afc55e3979164d29e43ed5a78faabd4b7d9bbfc`, automatic run **45310398112**, completed **failure**. Frontend/specifications passed; database qualification failed. All artifacts and failed logs are retained at `/tmp/close-4afc55e39/`. The exact hosted formatting patch was empty. No local build/test/formatter was run.
+- Concrete failures reached: canonical acknowledgement exists but a separate legacy completion-origin fence still suppresses its explicit retry allowance; historical176/179 fixtures invoke current source writers without migration183; Coordinator Goal discovery ledger omits183. Source corrections now leave allowance suppression with the receipt-aware pre-completion fence when no automatic successor was admitted, retain automatic-origin revocation/running-successor fencing, upgrade historical fixtures before current writers, and extend the discovery ledger through184. These corrections are not yet executed.
+- Current integration adds migration184's distinct immutable captured-origin plan/resources/per-scope inspection evidence, exact explicit retry admission, execution authority projection, runtime finite captured-scope assessment and original-worktree registration checks. It never creates an original-retirement anchor or authorizes old process stops. Migration rewrites are bounded to named known trigger shapes and fail closed on mismatches; dispatch identity constraints have INSERT/UPDATE membership and original reference-retention guards. Captured children now cascade only with owning aggregate deletion; standalone mutation/deletion is rejected. Admission, migration parity/cascade, exact replay, Stop/source/durable-work refusal tests are authored, not qualified.
+- A required unprivileged production-detector public regression now covers retained initial loss -> canonical initial-result acknowledgement -> fresh retry occurrence -> still-dirty refusal -> independent tracked/untracked/ignored-build remediation -> explicit retry -> physical path/registration absence -> retired WorkScope -> History result -> exact replay without new effects. It is source-only; no claim that this journey has compiled or passed.
+- Production source actor preparation now owns/joins a read-only retry-assessment continuation, allowing Stop/events during assessment while retaining request/settlement/gates. **Full retry responsiveness remains an acceptance blocker:** admitted retry resource execution still runs inline under source exclusivity. A bounded physical-effect cursor and per-destructive-sink source-entry custody, plus race regressions, are still required. Do not replace this with a detached worker or infer that the generalized source matcher alone supplies that custody.
+- Review found and corrected concrete permanent-Delete cascade and test-provenance defects. Review is source evidence only, not compile or runtime qualification. The retained stash `178f5dec9b367ebf1b78c6ff4a7eb0ca038d0951` is an older scaffold backup, already applied and not dropped; it is not the final delta.
+- Next gate is automatic hosted qualification of the exact next published source, with explicit inventories/execution of the new DB/migration/public physical tests. No manual rerun/cancel/dispatch, merge, install, deployment, or delivery-complete claim is made.
+
+## Historical acknowledgement correction notes
+
+The following describes older revisions, not current source completeness.
+
 ## Latest qualification and acknowledgement source slice
 
 This snapshot supersedes the older pending-run notes retained below.

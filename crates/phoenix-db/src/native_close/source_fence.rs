@@ -583,7 +583,12 @@ async fn fence_completion_sources_tx(
         }
         let attempt_id: String = origin.try_get("attempt_id")?;
         revoke_completion_origin_tx(tx, &attempt_id).await?;
-        if source_lost && matches!(cause, NativeSourceLossCause::UserSourceLoss) {
+        if source_lost
+            && matches!(cause, NativeSourceLossCause::UserSourceLoss)
+            && origin
+                .try_get::<Option<i64>, _>("successor_run_ordinal")?
+                .is_some()
+        {
             sqlx::query("UPDATE close_completion_retry_allowances SET suppressed = 1 WHERE attempt_id = ?1 AND suppressed = 0")
                 .bind(&attempt_id).execute(&mut **tx).await?;
         }

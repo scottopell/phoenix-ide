@@ -193,6 +193,8 @@ fn append_field(bytes: &mut Vec<u8>, value: &[u8]) {
 
 mod captured_loss_retry;
 pub use captured_loss_retry::NativeCloseCapturedLossRetryContext;
+mod captured_loss_admission;
+pub use captured_loss_admission::NativeCloseCapturedLossRetryAssessment;
 
 mod completion;
 pub use completion::{NativeCloseCompletionReceipt, NativeCloseCompletionResult};

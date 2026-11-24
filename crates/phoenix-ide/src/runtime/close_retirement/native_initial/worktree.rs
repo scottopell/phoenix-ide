@@ -127,6 +127,15 @@ fn captured_pointer(identity: &WorktreeIdentity) -> Result<Vec<u8>, String> {
     Ok(bytes)
 }
 
+pub(in crate::runtime::close_retirement) fn validate_captured_registration(
+    identity: &WorktreeIdentity,
+) -> Result<(), String> {
+    let path = worktree_path(identity);
+    let git_dir = captured_git_directory(&path, identity)?;
+    let common_git_dir = common_directory(&git_dir)?;
+    verify_linked_registration(&git_dir, &common_git_dir, &path)
+}
+
 fn captured_git_directory(path: &Path, identity: &WorktreeIdentity) -> Result<PathBuf, String> {
     let marker = std::fs::symlink_metadata(path.join(".git"))
         .map_err(|error| format!("cannot inspect captured Worktree .git: {error}"))?;

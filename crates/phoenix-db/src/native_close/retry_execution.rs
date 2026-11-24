@@ -114,10 +114,19 @@ fn original_worktree_snapshots(
 }
 
 struct NativeCloseRetryPlanIdentity {
+    captured_origin: bool,
     effect_count: i64,
     snapshot: CloseRetirementSnapshot,
     running: bool,
     created_at_us: i64,
+}
+
+// Execution authority, intentionally NOT a StoppedCloseOriginalRetirementProof.
+struct NativeCloseRetryAuthority {
+    snapshot: CloseRetirementSnapshot,
+    scopes: Vec<CloseAttemptScope>,
+    resources: Vec<CloseExpectedRetirementResource>,
+    pending: Vec<CloseSafeRetryEffect>,
 }
 
 enum NativeCloseRetryWorktreeMetadata {
@@ -159,6 +168,29 @@ impl NativeCloseRetryWorktreeMetadata {
 }
 
 impl Database {
+    async fn read_native_close_retry_authority_tx(
+        tx: &mut Transaction<'_, Sqlite>, failed_run: &CloseRunRef,
+        plan: &NativeCloseRetryPlanIdentity,
+    ) -> DbResult<NativeCloseRetryAuthority> {
+        if !plan.captured_origin {
+            let original = Self::read_stopped_close_original_retirement_proof_tx(tx, failed_run).await?;
+            let pending = super::retry::original_pending_effects_tx(tx, &original).await?;
+            return Ok(NativeCloseRetryAuthority { snapshot: original.snapshot,
+                scopes: original.scopes, resources: original.resources, pending });
+        }
+        let scopes = super::captured_loss_retry::read_captured_scopes_tx(tx, failed_run).await?;
+        let effects = super::captured_loss_admission::captured_effects(&scopes)?;
+        if i64::try_from(effects.len()).ok() != Some(plan.effect_count) {
+            return Err(refused("captured retry authority differs from its finite captured set"));
+        }
+        let resources = effects.iter().map(|effect| CloseExpectedRetirementResource {
+            attempt_id: failed_run.attempt_id.clone(), scope: effect.scope.clone(),
+            snapshot: plan.snapshot.clone(), resource: effect.resource.clone(),
+        }).collect();
+        Ok(NativeCloseRetryAuthority { snapshot: plan.snapshot.clone(), scopes,
+            resources, pending: effects })
+    }
+
     /// Reads an exact stopped predecessor's original snapshot context in one read-only
     /// transaction. Historical stopped predecessors remain readable after later runs;
     /// this context confers no admission, dispatch, or cleanup authority.
@@ -195,8 +227,12 @@ impl Database {
         admitted: &NativeCloseRunRef,
     ) -> DbResult<NativeCloseRetryExecutionContext> {
         let mut tx = self.pool.begin().await?;
-        let effect_count =
-            Self::require_native_close_retry_plan_tx(&mut tx, command, admitted).await?;
+        let plan = Self::require_native_close_retry_plan_identity_tx(&mut tx, command, admitted).await?;
+        if !plan.running {
+            return Err(refused("native retry context requires the exact latest running plan"));
+        }
+        Self::require_native_close_retry_members_quiescent_tx(&mut tx, &admitted.attempt_id).await?;
+        let effect_count = plan.effect_count;
         let NativeCloseIntent::ExplicitRetry {
             failed_run_ordinal, ..
         } = command.intent()
@@ -205,12 +241,13 @@ impl Database {
                 "native retry context requires an explicit retry intent",
             ));
         };
-        let original = Self::read_stopped_close_original_retirement_proof_tx(
+        let original = Self::read_native_close_retry_authority_tx(
             &mut tx,
             &CloseRunRef {
                 attempt_id: admitted.attempt_id.clone(),
                 ordinal: *failed_run_ordinal,
             },
+            &plan,
         )
         .await?;
         let run = CloseRunRef {
@@ -525,12 +562,13 @@ impl Database {
                 "native WorkScope retirement requires explicit retry intent",
             ));
         };
-        let original = Self::read_stopped_close_original_retirement_proof_tx(
+        let original = Self::read_native_close_retry_authority_tx(
             tx,
             &CloseRunRef {
                 attempt_id: admitted.attempt_id.clone(),
                 ordinal: *failed_run_ordinal,
             },
+            &plan,
         )
         .await?;
         if original.snapshot != plan.snapshot
@@ -542,7 +580,7 @@ impl Database {
                 "native WorkScope retirement requires exact original proof",
             ));
         }
-        let pending = super::retry::original_pending_effects_tx(tx, &original).await?;
+        let pending = &original.pending;
         if pending.iter().any(|required| {
             required.scope == effect.scope
                 && required.resource.kind() != RetiredResourceKind::WorkScope
@@ -853,25 +891,6 @@ impl Database {
 
     // Shared by success recording and finalization; receipt identity never replaces
     // current source authority, and neither boundary rebinds original G1 to current G2.
-    async fn require_native_close_retry_plan_tx(
-        tx: &mut Transaction<'_, Sqlite>,
-        command: &NativeCloseCommand,
-        admitted: &NativeCloseRunRef,
-    ) -> DbResult<i64> {
-        let plan = Self::require_native_close_retry_plan_identity_tx(tx, command, admitted).await?;
-        if !plan.running {
-            return Err(refused(
-                "native retry execution requires its exact latest running plan",
-            ));
-        }
-        // Initial settlement is historical evidence, not authority to retire a
-        // member that has acquired new durable work since assessment/admission.
-        // Keep failure classification on the identity-only path: discovering
-        // live work must not prevent recording an honest incomplete outcome.
-        Self::require_native_close_retry_members_quiescent_tx(tx, &admitted.attempt_id).await?;
-        Ok(plan.effect_count)
-    }
-
     async fn require_native_close_retry_plan_identity_tx(
         tx: &mut Transaction<'_, Sqlite>,
         command: &NativeCloseCommand,
@@ -899,8 +918,12 @@ impl Database {
         // Original G1 authority is deliberate: the obligation may retain a later G2 inspection.
         let row = sqlx::query(
             "SELECT plan.effect_count, plan.inspection_generation, plan.inspection_fingerprint,
-                    run.status = 'running' AS running, run.created_at_us FROM native_close_retry_plans plan
-             JOIN close_original_retirement_anchors anchor ON anchor.attempt_id = plan.attempt_id
+                    run.status = 'running' AS running, run.created_at_us,
+                    EXISTS (SELECT 1 FROM native_close_captured_loss_retry_plans capture
+                        WHERE capture.attempt_id = plan.attempt_id AND capture.run_ordinal = plan.run_ordinal)
+                        AS captured_origin FROM native_close_retry_plans plan
+             JOIN native_close_retry_snapshot_authorities anchor ON anchor.attempt_id = plan.attempt_id
+               AND anchor.run_ordinal = plan.run_ordinal
                AND anchor.inspection_generation = plan.inspection_generation
                AND anchor.inspection_fingerprint = plan.inspection_fingerprint
              JOIN close_runs prior ON prior.attempt_id = plan.attempt_id
@@ -932,6 +955,7 @@ impl Database {
             refused("native retry execution requires its exact latest original-bound plan")
         })?;
         Ok(NativeCloseRetryPlanIdentity {
+            captured_origin: row.try_get("captured_origin")?,
             effect_count: row.try_get("effect_count")?,
             snapshot: CloseRetirementSnapshot::parse(
                 row.try_get::<String, _>("inspection_generation")?,

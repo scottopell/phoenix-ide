@@ -406,6 +406,34 @@ jobs:
           done
           grep -Fx 'test lineage::tests::goal_tools_tests::canonical_goal_tools_prefixes_upgrade_reopen_and_remain_idempotent ... ok' evidence/lineage-tests-goal_tools_tests-.log || failed=1
           test "$failed" -eq 0
+      - name: Require captured-loss admission and migration regression execution
+        if: success() || failure()
+        shell: bash
+        run: |
+          set -euo pipefail
+          for test in \
+            captured_loss_admits_distinct_successor_without_rewriting_original_evidence \
+            captured_loss_admitted_authority_cascades_on_permanent_member_delete \
+            captured_loss_exact_replay_preserves_successor_plan_and_all_visible_facts \
+            captured_loss_refuses_wrong_scope_dirty_and_stale_assessments_atomically \
+            captured_loss_source_stop_refuses_before_admission \
+            captured_loss_new_member_creation_work_refuses_without_adopting_source \
+            captured_loss_runtime_context_uses_accepted_clean_scope_snapshot_and_finite_effects; do
+            grep -F "native_close::captured_loss_retry::tests::$test: test" evidence/inventory.log
+            cargo test -p phoenix-db --lib "native_close::captured_loss_retry::tests::$test" -- --exact --nocapture --test-threads=1 2>&1 | tee "evidence/$test.log"
+            grep -F 'test result: ok. 1 passed; 0 failed; 0 ignored;' "evidence/$test.log"
+          done
+          for test in \
+            real183_to184_preserves_original_branches_and_is_idempotent \
+            missing_or_changed_native_source_rolls_back184 \
+            captured_authority_schema_is_immutable_but_cascades_with_its_obligation \
+            delete_api_clears_dispatches_before_expected_resource_teardown \
+            original_active_inventory_still_rejects_arbitrary_dispatch_identity_and_codec \
+            original_dispatch_update_and_expected_resource_retention_survive184; do
+            grep -F "migrations::captured_loss_retry_tests::$test: test" evidence/inventory.log
+            cargo test -p phoenix-db --lib "migrations::captured_loss_retry_tests::$test" -- --exact --nocapture --test-threads=1 2>&1 | tee "evidence/$test.log"
+            grep -F 'test result: ok. 1 passed; 0 failed; 0 ignored;' "evidence/$test.log"
+          done
       - name: Qualify shared WorkScope lifecycle regression boundaries
         if: success() || failure()
         shell: bash
@@ -527,7 +555,7 @@ jobs:
           done
           # The detector-enabled acceptance has its own required identity-qualified step.
           # Keep the broader Bash/Tmux actor suite under its existing runner identity.
-          (cd crates/phoenix-ide && "$PHOENIX_RUNTIME_TEST_BINARY" native_close_admission_tests:: --skip registered_native_close_with_production_detector_retires_worktree_and_replays --nocapture --test-threads=1) 2>&1 | tee evidence/native-close-runtime-actor.log
+          (cd crates/phoenix-ide && "$PHOENIX_RUNTIME_TEST_BINARY" native_close_admission_tests:: --skip registered_native_close_with_production_detector_retires_worktree_and_replays --skip registered_native_close_captured_loss_public_retry_with_production_detector_reclaims_and_replays --nocapture --test-threads=1) 2>&1 | tee evidence/native-close-runtime-actor.log
           grep -E 'test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored;' evidence/native-close-runtime-actor.log
           for test in \
             registered_native_close_with_loss_content_stops_incomplete_without_retirement \
@@ -583,6 +611,19 @@ jobs:
           timeout --kill-after=10s 6m bash scripts/ci/close-unprivileged-qualification.sh "$GITHUB_WORKSPACE" "$PHOENIX_RUNTIME_TEST_BINARY" "$PHOENIX_BASH_LAUNCH_TEST_EXE" "$(id -u)" "$test_name" --exact --nocapture --test-threads=1 2>&1 | tee evidence/public-worktree-production-detector.log
           grep -F "$test_name ... ok" evidence/public-worktree-production-detector.log
           grep -F 'test result: ok. 1 passed; 0 failed; 0 ignored;' evidence/public-worktree-production-detector.log
+
+      - name: Required captured-loss public cleanup and explicit retry reclaim
+        if: success() || failure()
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          test -n "${PHOENIX_RUNTIME_TEST_BINARY:-}"
+          test_name='runtime::executor::creation_completion_lifecycle_tests::native_close_admission_tests::worktree_physical::registered_native_close_captured_loss_public_retry_with_production_detector_reclaims_and_replays'
+          grep -Fx "$test_name: test" evidence/runtime-inventory.log
+          timeout --kill-after=10s 6m bash scripts/ci/close-unprivileged-qualification.sh "$GITHUB_WORKSPACE" "$PHOENIX_RUNTIME_TEST_BINARY" "$PHOENIX_BASH_LAUNCH_TEST_EXE" "$(id -u)" "$test_name" --exact --nocapture --test-threads=1 2>&1 | tee evidence/public-captured-loss-retry.log
+          grep -F "$test_name ... ok" evidence/public-captured-loss-retry.log
+          grep -F 'test result: ok. 1 passed; 0 failed; 0 ignored;' evidence/public-captured-loss-retry.log
 
       - name: Retain bounded failing writer-process attribution
         if: success() || failure()

@@ -301,7 +301,7 @@ impl Database {
     }
 }
 
-async fn read_captured_scopes_tx(
+pub(super) async fn read_captured_scopes_tx(
     tx: &mut Transaction<'_, Sqlite>,
     run: &CloseRunRef,
 ) -> DbResult<Vec<CloseAttemptScope>> {
@@ -683,4 +683,5 @@ mod tests {
     }
 
     include!("initial_result_acknowledgement_tests.rs");
+    include!("captured_loss_admission_tests.rs");
 }

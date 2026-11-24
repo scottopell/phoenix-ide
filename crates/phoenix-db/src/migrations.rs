@@ -15,6 +15,7 @@ mod federated_conversation_actions;
 mod federated_subscriptions;
 mod goal_execution;
 mod local_goal_watch;
+mod native_close_captured_loss_retry;
 mod native_close_retry_dispatch;
 mod native_close_retry_failure;
 mod native_close_retry_worktree_metadata;
@@ -25,6 +26,9 @@ mod native_initial_completion_retry_admission;
 mod native_initial_source_fence;
 mod retire_commission_review;
 mod settle_historical_continuation;
+
+#[cfg(test)]
+mod captured_loss_retry_tests;
 
 #[cfg(test)]
 mod conversation_tools_tests;
@@ -950,6 +954,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 183,
         name: "native_close_initial_result_acknowledgement",
         sql: include_str!("migrations/native_close_initial_result_acknowledgement.sql"),
+    },
+    Migration {
+        version: 184,
+        name: "native_close_captured_loss_retry",
+        sql: include_str!("migrations/native_close_captured_loss_retry.sql"),
     },
 ];
 
@@ -12760,6 +12769,12 @@ async fn run_migration_list(pool: &SqlitePool, migrations: &[Migration]) -> DbRe
             continue;
         }
 
+        if migration.version == 184 {
+            native_close_captured_loss_retry::run(pool, migration).await?;
+            applied += 1;
+            continue;
+        }
+
         if migration.version == 181 {
             native_initial_completion_retry_admission::run(pool, migration).await?;
             applied += 1;
@@ -16195,6 +16210,7 @@ mod tests {
                 (181, "native_initial_completion_retry_admission".into()),
                 (182, "close_ignored_loss_category".into()),
                 (183, "native_close_initial_result_acknowledgement".into()),
+                (184, "native_close_captured_loss_retry".into()),
             ]
         );
     }
@@ -16805,6 +16821,7 @@ mod tests {
         let ledger = compiled_migration_ledger();
         assert!(ledger.windows(2).all(|pair| pair[0].0 < pair[1].0));
         let expected_tail = [
+            (184, "native_close_captured_loss_retry"),
             (183, "native_close_initial_result_acknowledgement"),
             (182, "close_ignored_loss_category"),
             (181, "native_initial_completion_retry_admission"),
@@ -21135,6 +21152,7 @@ mod tests {
                 (181, "native_initial_completion_retry_admission"),
                 (182, "close_ignored_loss_category"),
                 (183, "native_close_initial_result_acknowledgement"),
+                (184, "native_close_captured_loss_retry"),
             ]
         );
         let goal = MIGRATIONS
@@ -21148,7 +21166,7 @@ mod tests {
         assert!(goal
             .sql
             .contains("CREATE TABLE conversation_goal_coordinator_receipts"));
-        assert_eq!(MIGRATIONS.len(), 180);
+        assert_eq!(MIGRATIONS.len(), 181);
     }
 
     #[tokio::test]

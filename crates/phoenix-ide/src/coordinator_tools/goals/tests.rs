@@ -270,6 +270,8 @@ async fn native_goal_discovery_prepare_apply_read_and_replay_without_dispatch() 
             (180, "native_initial_completed_interruption".into()),
             (181, "native_initial_completion_retry_admission".into()),
             (182, "close_ignored_loss_category".into()),
+            (183, "native_close_initial_result_acknowledgement".into()),
+            (184, "native_close_captured_loss_retry".into()),
         ]
     );
     for name in [

@@ -353,6 +353,7 @@ async fn goal_preparation_migration_follows_conversation_tool_migrations() {
             (181, "native_initial_completion_retry_admission".into()),
             (182, "close_ignored_loss_category".into()),
             (183, "native_close_initial_result_acknowledgement".into()),
+            (184, "native_close_captured_loss_retry".into()),
         ]
     );
 }

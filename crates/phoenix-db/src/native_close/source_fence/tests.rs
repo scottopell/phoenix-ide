@@ -60,8 +60,8 @@ async fn write_source_fence_state(
     }
 }
 
-// Installed-prefix fixtures deliberately exercise their historical fence, not
-// migration168 origin logic or a production compatibility bypass.
+// Installed-prefix fixtures call only the pre-completion writer, after installing
+// its acknowledgement schema prerequisite.
 async fn historical_write_source_fence_state(
     db: &Database,
     command: &NativeCloseCommand,
@@ -817,6 +817,9 @@ async fn migration_179_populated_upgrade_preserves_retry_and_adds_initial_source
             .unwrap(),
         1
     );
+    // Current writers require the acknowledgement schema even without ack rows.
+    crate::migrations::run_through_for_test(retry_db.pool(), 183).await.unwrap();
+    crate::migrations::run_through_for_test(initial_db.pool(), 183).await.unwrap();
     historical_write_source_fence_state(&retry_db, &assessment.command, &ConvState::Idle)
         .await
         .unwrap();

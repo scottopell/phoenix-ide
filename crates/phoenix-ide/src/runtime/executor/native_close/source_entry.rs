@@ -1,9 +1,11 @@
-//! Actor-owned eligibility for the original native Close source's first live effect.
+//! Actor-owned eligibility for an exact native Close source's live effect.
 //!
 //! This primitive deliberately does not perform effects or persist state. The actor
 //! validates the borrowed live state; workers receive only a cloneable leaf handle.
 
-use crate::runtime::native_close_application::initial_command_from_executing_source;
+use crate::runtime::native_close_application::{
+    initial_command_from_executing_source, retry_command_from_executing_source,
+};
 use phoenix_core::domain::sm_state::ConvState;
 use phoenix_db::native_close::{NativeCloseCommand, NativeCloseIntent};
 use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
@@ -257,17 +259,31 @@ fn try_lock(shared: &Shared) -> LockAttempt<'_> {
     }
 }
 
-fn source_matches(live_state: &ConvState, command: &NativeCloseCommand) -> bool {
-    let NativeCloseIntent::Initial { target } = command.intent() else {
-        return false;
+pub(crate) fn source_matches(live_state: &ConvState, command: &NativeCloseCommand) -> bool {
+    let matched = match command.intent() {
+        NativeCloseIntent::Initial { target } => initial_command_from_executing_source(
+            live_state,
+            command.source_transcript_id(),
+            command.source(),
+            target.clone(),
+        ),
+        NativeCloseIntent::ExplicitRetry {
+            target,
+            attempt_id,
+            failed_run_ordinal,
+        } => {
+            retry_command_from_executing_source(
+                live_state,
+                command.source_transcript_id(),
+                command.source(),
+                target.clone(),
+                attempt_id.clone(),
+                *failed_run_ordinal,
+            )
+        }
+        _ => return false,
     };
-    initial_command_from_executing_source(
-        live_state,
-        command.source_transcript_id(),
-        command.source(),
-        target.clone(),
-    )
-    .is_ok_and(|matched| matched == *command)
+    matched.is_ok_and(|matched| matched == *command)
 }
 
 #[cfg(test)]

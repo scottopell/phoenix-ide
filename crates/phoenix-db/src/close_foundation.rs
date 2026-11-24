@@ -1883,7 +1883,7 @@ fn validate_begin_preconditions(
 }
 
 // These close-foundation database APIs all return the same DbError contract:
-fn encode_aggregate_snapshot_component<'a>(
+pub(crate) fn encode_aggregate_snapshot_component<'a>(
     scopes: impl IntoIterator<Item = (&'a WorkScopeId, &'a str)>,
 ) -> String {
     let mut scopes = scopes.into_iter().peekable();

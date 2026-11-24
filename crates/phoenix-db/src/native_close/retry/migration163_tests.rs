@@ -302,6 +302,8 @@ async fn migration_176_upgrade_preserves_installed_source_fence_behavior() {
     };
     let pending = db.close_safe_retry_progress(&run).await.unwrap().pending;
     let obligation = db.get_close_obligation(run.attempt_id.as_str()).await.unwrap();
+    // The current source-fence writer reads acknowledgement evidence added in 183.
+    crate::migrations::run_through_for_test(db.pool(), 183).await.unwrap();
     historical_write_source_fence_state(&db, &assessment.command, &ConvState::Idle).await.unwrap();
     assert_source_fenced(&db, &assessment, &run, &pending).await;
     assert_eq!(db.get_close_obligation(run.attempt_id.as_str()).await.unwrap(), obligation);

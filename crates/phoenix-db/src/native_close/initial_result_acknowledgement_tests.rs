@@ -41,6 +41,14 @@ async fn initial_ack_counts(db: &Database, run: &CloseRunRef) -> (i64, i64, i64,
         .bind(run.attempt_id.as_str()).fetch_one(db.pool()).await.unwrap()
 }
 
+async fn assert_initial_completion_origin_revoked(db: &Database, run: &CloseRunRef) {
+    let facts: (i64, i64) = sqlx::query_as("SELECT
+        (SELECT COUNT(*) FROM native_close_completion_retry_source_revocations WHERE attempt_id = ?1),
+        (SELECT COUNT(*) FROM native_close_completion_retry_admissions WHERE attempt_id = ?1)")
+        .bind(run.attempt_id.as_str()).fetch_one(db.pool()).await.unwrap();
+    assert_eq!(facts, (1, 0));
+}
+
 #[tokio::test]
 async fn canonical_initial_result_acknowledgement_preserves_loss_retry_origin() {
     let (db, command, run) = retained_loss_origin().await;
@@ -49,10 +57,13 @@ async fn canonical_initial_result_acknowledgement_preserves_loss_retry_origin() 
     db.persist_tool_round_and_state(command.source_transcript_id(), &assistant, &[result.clone()],
         &ConvState::Idle, checkpoint_at).await.unwrap();
     assert_eq!(initial_ack_counts(&db, &run).await, (1, 0, 1, 0));
+    assert_initial_completion_origin_revoked(&db, &run).await;
     db.read_native_close_captured_loss_retry_context(command.intent().target(), &run)
         .await.unwrap();
     // The canonical result replay cannot mint another acknowledgement or run.
     db.persist_tool_round_and_state(command.source_transcript_id(), &assistant, &[result], &ConvState::Idle, checkpoint_at).await.unwrap();
+    assert_eq!(initial_ack_counts(&db, &run).await, (1, 0, 1, 0));
+    db.update_conversation_state(command.source_transcript_id(), &ConvState::Idle).await.unwrap();
     assert_eq!(initial_ack_counts(&db, &run).await, (1, 0, 1, 0));
 }
 
@@ -158,6 +169,7 @@ async fn serial_tool_progress_preserves_initial_origin_until_canonical_acknowled
     };
     db.update_conversation_state(command.source_transcript_id(), &progressing).await.unwrap();
     assert_eq!(initial_ack_counts(&db, &run).await, (0, 0, 1, 0));
+    assert_initial_completion_origin_revoked(&db, &run).await;
     let next = FinalizedToolResult::new(&assistant.message_id, &assistant.conversation_id, 3,
         chrono::Utc::now(), &ToolResult::success("after-close".into(), "done".into()));
     db.persist_tool_round_and_state(command.source_transcript_id(), &assistant, &[result, next],
@@ -183,4 +195,20 @@ async fn stop_during_serial_tool_progress_still_suppresses_initial_origin() {
     db.update_conversation_state(command.source_transcript_id(), &ConvState::Idle).await.unwrap();
     db.persist_tool_round_and_state(command.source_transcript_id(), &assistant, &[result], &ConvState::Idle, chrono::Utc::now()).await.unwrap();
     assert_eq!(initial_ack_counts(&db, &run).await, (0, 1, 1, 0));
+}
+
+#[tokio::test]
+async fn initial_source_fence_missing_acknowledgement_schema_fails_closed() {
+    let (db, command, run) = retained_loss_origin().await;
+    let source = db.get_conversation(command.source_transcript_id()).await.unwrap().state;
+    sqlx::query("DROP TABLE native_close_initial_result_acknowledgements")
+        .execute(db.pool()).await.unwrap();
+    assert!(db.update_conversation_state(command.source_transcript_id(), &ConvState::Idle)
+        .await.is_err());
+    assert_eq!(db.get_conversation(command.source_transcript_id()).await.unwrap().state, source);
+    let facts: (i64, i64) = sqlx::query_as("SELECT
+        (SELECT suppressed FROM close_completion_retry_allowances WHERE attempt_id = ?1),
+        (SELECT COUNT(*) FROM native_close_completion_retry_source_revocations WHERE attempt_id = ?1)")
+        .bind(run.attempt_id.as_str()).fetch_one(db.pool()).await.unwrap();
+    assert_eq!(facts, (0, 0));
 }
