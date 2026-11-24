@@ -658,14 +658,19 @@ describe('ConversationList — conversations Ember monitors', () => {
     const toggle = first.getByRole('button', { name: /Ember is handling/ });
     expect(toggle).toHaveAttribute('aria-expanded', 'false');
     expect(toggle).toHaveTextContent('1');
+    expect(first.container.querySelector('#conv-list')?.firstElementChild).toContainElement(toggle);
 
     fireEvent.click(toggle);
-    expect(ids(first.container)).toEqual(['mine', 'asking', 'quiet']);
+    expect(first.container.querySelector('#conv-list')?.firstElementChild).toContainElement(toggle);
+    expect(ids(first.container)).toEqual(['quiet', 'mine', 'asking']);
     expect(first.getByRole('button', { name: /Ember is handling/ })).toHaveAttribute('aria-expanded', 'true');
     first.unmount();
 
     const second = render(list);
-    expect(ids(second.container)).toEqual(['mine', 'asking', 'quiet']);
+    expect(second.container.querySelector('#conv-list')?.firstElementChild).toContainElement(
+      second.getByRole('button', { name: /Ember is handling/ }),
+    );
+    expect(ids(second.container)).toEqual(['quiet', 'mine', 'asking']);
   });
 
   it('shows no group when nothing is monitored and keeps the open row visible', () => {
