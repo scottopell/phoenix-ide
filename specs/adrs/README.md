@@ -49,6 +49,7 @@ Allowing gaps does not approve an ID allocation, decision, or publication.
 | [272](272_bound-exhaustive-backup-verification-to-fifteen-minutes.md) | Bound exhaustive backup verification to fifteen minutes | Accepted; qualifies ADR-263 | REQ-LDD-029, REQ-LDD-031 |
 | [271](271_gate-ordinary-publication-on-exact-source-ci.md) | Gate ordinary publication on exact merged-source CI | Accepted | REQ-DESKTOP-REL-015 |
 | [270](270_publish-fixed-rc8-through-rebuilt-release-path.md) | Publish fixed RC8 through the rebuilt release path | Accepted | REQ-DESKTOP-REL-002/010/014 |
+| [280](280_enforce-requested-reserve-at-launchd-candidate-boundary.md) | Enforce requested reserve at the launchd candidate boundary | Accepted | REQ-LDD-002, REQ-LDD-004, REQ-LDD-029, REQ-LDD-033, REQ-COMP-021 |
 | [279](279_qualify-codex-namespaced-native-search-calls.md) | Qualify Codex's namespaced native search calls | Accepted | REQ-LLM-004n, REQ-LLM-005 |
 | [278](278_native-openai-and-shared-local-tool-discovery.md) | Use native OpenAI discovery with a shared local selector | Accepted | REQ-LLM-004i/004j/004m/004n, REQ-LLM-005 |
 | [277](277_preserve-gemini-tool-result-images.md) | Preserve Gemini tool-result images | Accepted | REQ-LLM-004, REQ-BT-003, REQ-BT-006 |

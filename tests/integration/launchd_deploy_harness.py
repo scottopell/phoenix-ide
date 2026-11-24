@@ -261,7 +261,7 @@ def run_scenario(root, domain, *, failure=None, first_install=False):
     active = root / "active"
     active.write_text(suffix + "\n")
     manifest = {
-        "manifest_version": 3, "transaction_id": suffix,
+        "manifest_version": 4, "additional_reserve_bytes": 123, "transaction_id": suffix,
         "source_kind": "local_head", "source_commit": fixture["source_commit"],
         "release_tag": None, "release_commit": None, "expected": expected,
         "candidate_binary": str(candidate), "candidate_binary_sha256": digest(candidate),
@@ -312,6 +312,10 @@ def run_scenario(root, domain, *, failure=None, first_install=False):
         if result["state"] != expected_state:
             raise RuntimeError(f"unexpected status: {result}; log={log.read_text()}")
         proof = json.loads(status.with_suffix(".proof.json").read_text())
+        if (proof.get("additional_reserve_bytes") != 123
+                or proof.get("admission_required_bytes", 0) < 16 * 1024 * 1024 + 123
+                or proof.get("admission_available_bytes", 0) < proof["admission_required_bytes"]):
+            raise RuntimeError("deployment lost requested reserve admission proof")
         backup = proof.get("backup")
         if proof.get("transaction_id") != suffix:
             raise RuntimeError(f"deployment lost transaction proof: {proof}")

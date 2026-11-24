@@ -95,9 +95,9 @@ def run(args: argparse.Namespace) -> int:
             [sys.executable, str(destination), "--protocol-version"],
             check=False, capture_output=True, text=True, timeout=15,
         )
-        if protocol_run.returncode != 0 or protocol_run.stdout.strip() != "3":
+        if protocol_run.returncode != 0 or protocol_run.stdout.strip() != "4":
             raise SystemExit(
-                "materialized helper does not report protocol 3 "
+                "materialized helper does not report protocol 4 "
                 f"(exit={protocol_run.returncode}, stdout={protocol_run.stdout.strip()!r})"
             )
         protocol = int(protocol_run.stdout.strip())
