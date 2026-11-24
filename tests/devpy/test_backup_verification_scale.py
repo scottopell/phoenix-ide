@@ -24,7 +24,7 @@ class FakeClock:
 
 
 class FakeHelper:
-    BACKUP_VERIFICATION_TIMEOUT_SECS = 900.0
+    BACKUP_VERIFICATION_TIMEOUT_SECS = 1200.0
 
     def __init__(self, clock, verification_seconds):
         self.clock = clock
@@ -37,7 +37,7 @@ class FakeHelper:
         yield
 
     def create_verified_database_backup(self, _database, _directory, *, timeout, diagnostics):
-        assert timeout == 900.0
+        assert timeout == 1200.0
         self.clock.now += self.verification_seconds
         return Path("tiny-backup.sqlite")
 
@@ -49,16 +49,16 @@ class FakeHelper:
 class HostedBudgetTests(unittest.TestCase):
     def test_guard_acquisition_is_outside_verification_budget(self):
         clock = FakeClock()
-        helper = FakeHelper(clock, 898.0)
+        helper = FakeHelper(clock, 1198.0)
         result = scale.run_verified_backup(helper, Path("source.sqlite"), Path("unused"), {}, clock=clock)
         _backup, _proof, guard_elapsed, verification_elapsed, envelope_elapsed = result
         self.assertEqual(guard_elapsed, 4.0)
-        self.assertEqual(verification_elapsed, 898.0)
-        self.assertEqual(envelope_elapsed, 902.0)
-        self.assertEqual(helper.deadline_seen, 914.0)
+        self.assertEqual(verification_elapsed, 1198.0)
+        self.assertEqual(envelope_elapsed, 1202.0)
+        self.assertEqual(helper.deadline_seen, 1214.0)
 
     def test_verification_over_budget_is_rejected_without_fixture_generation(self):
         clock = FakeClock()
-        helper = FakeHelper(clock, 900.001)
-        with self.assertRaisesRegex(RuntimeError, "exceeded 900.0s"):
+        helper = FakeHelper(clock, 1200.001)
+        with self.assertRaisesRegex(RuntimeError, "exceeded 1200.0s"):
             scale.run_verified_backup(helper, Path("source.sqlite"), Path("unused"), {}, clock=clock)
