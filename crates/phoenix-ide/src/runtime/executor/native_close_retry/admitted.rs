@@ -487,7 +487,9 @@ impl AdmittedRetryCursor {
                             backend.fatal_local_authority_fence.close(
                                 "native_retry_worktree_dispatch_release_unclassified",
                             );
-                            if let Some(lease) = lease { std::mem::forget(lease); }
+                            // Consume the entire option so its destructor cannot retain
+                            // a borrow while custody of the source owner is forgotten.
+                            std::mem::forget(lease);
                             std::mem::forget(source_entry);
                             return Err(NativeRetryExecutionError::Unclassified);
                         }

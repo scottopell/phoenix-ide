@@ -3,7 +3,7 @@
 use super::*;
 use crate::close_foundation::{
     CaptureCloseRetirementInventoryRequest, CaptureCloseRetirementInventoryScopeRequest,
-    ReplaceCloseInspectionRequest,
+    RecordCloseRetirementEvidenceRequest, ReplaceCloseInspectionRequest,
 };
 use crate::Database;
 use phoenix_core::domain::close::*;
@@ -526,11 +526,30 @@ async fn delete_api_clears_dispatches_before_expected_resource_teardown() {
     .await
     .unwrap();
 
-    let cancelled = db.cancel_close_before_retirement(&attempt).await.unwrap();
-    assert_eq!(cancelled.phase(), ClosePhase::Completed);
+    for expected in db
+        .list_close_expected_retirement_resources(&attempt)
+        .await
+        .unwrap()
+    {
+        db.record_close_retirement_evidence(RecordCloseRetirementEvidenceRequest {
+            attempt_id: CloseAttemptId::parse(&attempt).unwrap(),
+            snapshot: CloseRetirementSnapshot::parse(&generation, &fingerprint).unwrap(),
+            scope: expected.scope,
+            resource: expected.resource,
+            outcome: RetirementOutcome::Retired,
+            detail: None,
+        })
+        .await
+        .unwrap();
+    }
+    let completed = db
+        .complete_close_retirement(&CloseAttemptId::parse(&attempt).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(completed.phase(), ClosePhase::Completed);
     assert_eq!(
-        cancelled.close_outcome(),
-        Some(CloseCompletionOutcome::Cancelled)
+        completed.close_outcome(),
+        Some(CloseCompletionOutcome::Archived)
     );
     let dispatches_before_delete: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM close_retirement_resource_dispatches WHERE attempt_id = ?1",

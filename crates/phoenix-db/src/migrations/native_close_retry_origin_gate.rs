@@ -5,6 +5,8 @@ use sqlx::{Connection, SqlitePool};
 const TRIGGER: &str = "native_close_captured_loss_retry_origin_requires_exact_stop";
 const SOURCE_184: &str = include_str!("native_close_captured_loss_retry.sql");
 const ARCHIVE_GATE: &str = "conversation.archived <> 1 OR ";
+const OLD_STATE_GATE: &str = "conversation.state_kind NOT IN ('Idle', 'Closed', 'Error')";
+const STATE_GATE: &str = "conversation.state_kind NOT IN ('idle', 'terminal', 'error')";
 
 fn unexpected() -> DbError {
     DbError::Serialization(format!(
@@ -17,10 +19,14 @@ fn corrected_source() -> DbResult<(String, String)> {
     let (_, tail) = SOURCE_184.split_once(&start).ok_or_else(unexpected)?;
     let (body, _) = tail.split_once("\nEND;").ok_or_else(unexpected)?;
     let old = format!("{start}{body}\nEND");
-    if old.matches(ARCHIVE_GATE).count() != 1 {
+    if old.matches(ARCHIVE_GATE).count() != 1 || old.matches(OLD_STATE_GATE).count() != 1 {
         return Err(unexpected());
     }
-    let corrected = old.replacen(ARCHIVE_GATE, "", 1);
+    // Quiescence uses persisted state kinds, not Rust variant names. An uncertain
+    // stopped member may remain unarchived; neither correction grants new effects.
+    let corrected = old
+        .replacen(ARCHIVE_GATE, "", 1)
+        .replacen(OLD_STATE_GATE, STATE_GATE, 1);
     Ok((old, corrected))
 }
 
@@ -146,11 +152,16 @@ mod tests {
     }
 
     #[test]
-    fn source_rewrite_removes_only_archive_requirement() {
+    fn source_rewrite_corrects_only_member_quiescence_gate() {
         let (old, corrected) = corrected_source().unwrap();
-        assert_eq!(old.replacen(ARCHIVE_GATE, "", 1), corrected);
+        assert_eq!(
+            old.replacen(ARCHIVE_GATE, "", 1)
+                .replacen(OLD_STATE_GATE, STATE_GATE, 1),
+            corrected
+        );
         assert!(!corrected.contains("conversation.archived"));
-        assert!(corrected.contains("conversation.state_kind NOT IN ('Idle', 'Closed', 'Error')"));
+        assert!(!corrected.contains(OLD_STATE_GATE));
+        assert!(corrected.contains(STATE_GATE));
         assert!(corrected.contains("failure.stop_certainty = 'shutdown_uncertain'"));
         assert!(corrected.contains("captured-loss retry requires exact effect-free captured stop"));
     }

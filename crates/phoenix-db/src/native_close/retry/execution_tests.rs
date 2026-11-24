@@ -816,11 +816,13 @@ async fn native_retry_tmux_dispatch_records_exact_pending_identity_and_refuses_m
 
     write_source_fence_state(&db, &assessment.command, &ConvState::Idle, false).await.unwrap();
     let retained = migration_176_retained_state(&db).await;
+    let fenced_dispatch = retry_dispatch_state(&db, attempt).await;
+    assert_ne!(fenced_dispatch, dispatched, "source loss terminalizes the running retry");
     success_refused(db.record_native_close_retry_retirement_dispatch(
         &assessment.command, &receipt.admitted, &effect,
     ).await);
     assert_eq!(migration_176_retained_state(&db).await, retained);
-    assert_eq!(retry_dispatch_state(&db, attempt).await, dispatched);
+    assert_eq!(retry_dispatch_state(&db, attempt).await, fenced_dispatch);
 }
 
 #[tokio::test]

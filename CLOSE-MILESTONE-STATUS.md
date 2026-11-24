@@ -1,5 +1,16 @@
 # Unified Close acceptance milestone
 
+## Hosted49 terminal result and reviewed follow-up
+
+Automatic run **45337279161** for exact `49a721951bac77ca2ec8706f61a85fb5376e5982` completed **failure**. The named public captured-loss production-detector reclaim/replay journey **did not execute**: production runtime compilation failed with E0505 in the retained Worktree dispatch worker. No public journey or causal Stop pass is claimed. Full DB/runtime artifacts and failed logs are retained under `/tmp/close-49a721951/`.
+
+- Frontend passed. Exact migration185 and186 upgrade/source/refusal tests each executed and passed, but their schema-only coverage did not establish populated captured-loss acceptance.
+- Populated captured-loss admission still failed1811: the trigger used Rust-style `Idle/Closed/Error` instead of actual persisted `idle/terminal/error`. The unpublished branch migration186 now corrects that exact member-state predicate alongside its archive correction, preserving all stopped-origin/effect-free guards and immutable184 SQL. The exact source-rewrite selector is updated.
+- Foundation had one stale tmux post-source-fence snapshot expectation; source invalidation legitimately terminalizes the running retry. The fixture now proves fencing changes state and subsequent refused dispatch changes nothing. Migration delete fixture used cancellation after retirement admission; it now records exact expected-resource evidence and completes through supported owning APIs before asserting retained dispatch and aggregate deletion.
+- The E0505 correction consumes/forgets the entire optional lease before forgetting its owner on unknown release. Fatal fencing and uncertain custody remain intact; classified releases still drop normally. This is source-reviewed, not compile-verified.
+- Specifications failed during seed Cargo build101, with the actual compiler diagnostic evicted from the check runner's 200-line tail. Existing bounded full diagnostics capture is now enabled within the always-uploaded hosted evidence tree. The exact seed failure cause remains unclassified until complete capture is available; do not infer it solely from the separate runtime E0505.
+- Reviewed hosted formatting, independent execution of all selected public causal cases, and task66009 remain included in the next candidate. Next mandatory evidence is exact-head hosted compilation, populated DB gates, actual named public reclaim/replay plus causal Stop execution, frontend/specification/format gates. No local builds/tests/formatters/SQL execution, merge, installation or deployment.
+
 ## Current finite safety scope at published49a721951
 
 Independent read-only map of published `49a721951bac77ca2ec8706f61a85fb5376e5982` found no new demonstrated safety defect in inspected retry/tmux custody. Retry Complete latches Fatal before its DB await; unclassified completion cannot become ordinary retry. Retained tmux workers already reacquire exact DB/source entry at the actual sink, use the original deadline, latch backend fatal authority on unknown writer release, and retain uncertain custody. No replacement ownership framework is warranted.
@@ -8,7 +19,7 @@ Remaining **qualification debt**, tracked in task **66009**: assembled ordinary 
 
 Initial/retry admission, context/evidence/failure/finalization still contain actor-inline DB waits. These can delay Stop mailbox service under DB contention; no post-ACK unauthorized dispatch was demonstrated by the review. Do not claim general Stop responsiveness or label every await a safety blocker. A held-writer causal test is needed for a broader responsiveness claim; never timeout/drop a mutating DB future.
 
-Public acceptance remains the exact named production-detector **blocked → separate owner cleanup → explicit retry → fresh admission → actual reclaim → History/replay** journey. Its canonical result acknowledgement uses real `persist_tool_round_and_state`; this is not a live model/tool-executor transcript round-trip. Such a round-trip is **not an additional normative acceptance gate** (REQ-BED-016/018). Current hosted run **45337279161** qualifies49a721951; journey has not yet executed. Frontend passed; specifications failed in a devpy seed test's Cargo build, cause not yet classified; DB qualification reached migration185/186 gates without a reported prior step failure. Exact final evidence remains pending.
+Public acceptance remains the exact named production-detector **blocked → separate owner cleanup → explicit retry → fresh admission → actual reclaim → History/replay** journey. Its canonical result acknowledgement uses real `persist_tool_round_and_state`; this is not a live model/tool-executor transcript round-trip. Such a round-trip is **not an additional normative acceptance gate** (REQ-BED-016/018). Hosted run **45337279161** for49a721951 is terminal failure; its exact outcomes and reviewed follow-up are recorded above. The public journey did not execute because the runtime failed compilation.
 
 ## Reached 4069 failures — reviewed correction awaiting hosted qualification
 

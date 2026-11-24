@@ -297,7 +297,7 @@ jobs:
           for test in \
             real185_to186_preserves_origin_authority_and_is_idempotent \
             missing_or_changed_origin_trigger_rolls_back186 \
-            source_rewrite_removes_only_archive_requirement; do
+            source_rewrite_corrects_only_member_quiescence_gate; do
             grep -Fx "migrations::native_close_retry_origin_gate::tests::$test: test" evidence/selected-tests.txt
             cargo test -p phoenix-db --lib "migrations::native_close_retry_origin_gate::tests::$test" -- --exact --nocapture --test-threads=1 2>&1 | tee "evidence/retry-origin-migration-$test.log"
             grep -E 'test result: ok\. 1 passed; 0 failed; 0 ignored;' "evidence/retry-origin-migration-$test.log"
