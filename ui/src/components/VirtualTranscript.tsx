@@ -1,5 +1,6 @@
 import {
   forwardRef,
+  memo,
   useCallback,
   useEffect,
   useImperativeHandle,
@@ -638,11 +639,22 @@ function applyAnchor<T>(store: PhysicalStore<T>, anchor: PhysicalAnchor | null):
   return effectiveAnchor;
 }
 
+function recomputeViewport<T>(store: PhysicalStore<T>): { rangeChanged: boolean; pinnedChanged: boolean } {
+  const prevRange = store.range;
+  const prevPinned = store.pinned;
+  const nextRange = computeRange(store);
+  const nextPinned = computePinned(store);
+  const rangeChanged = prevRange?.startIndex !== nextRange?.startIndex || prevRange?.endIndex !== nextRange?.endIndex;
+  const pinnedChanged = prevPinned !== nextPinned;
+  store.range = nextRange;
+  store.pinned = nextPinned;
+  store.revision += 1;
+  return { rangeChanged, pinnedChanged };
+}
+
 function recompute<T>(store: PhysicalStore<T>): void {
   store.layout = buildStoreLayout(store);
-  store.range = computeRange(store);
-  store.pinned = computePinned(store);
-  store.revision += 1;
+  recomputeViewport(store);
 }
 
 function measureElementExtent(element: Element): number {
@@ -683,7 +695,7 @@ function applyPhysicalChange<T>(store: PhysicalStore<T>, anchor: PhysicalAnchor 
     anchor = applyAnchor(store, anchor);
   }
   store.activeAnchor = anchor;
-  recompute(store);
+  recomputeViewport(store);
 }
 
 function handleResizeEntries<T>({ store, publish }: StorePublisher<T>, entries: ResizeObserverEntry[]): void {
@@ -1081,7 +1093,13 @@ function VirtualTranscriptInner<T>(
     acquireContentWitness(store);
   });
 
+  const onRangeChangeRef = useRef(onRangeChange);
+  onRangeChangeRef.current = onRangeChange;
+  const lastNotifiedRangeRevisionRef = useRef(-1);
+
   useLayoutEffect(() => {
+    if (lastNotifiedRangeRevisionRef.current === store.revision) return;
+    lastNotifiedRangeRevisionRef.current = store.revision;
     onRangeChange?.(buildPhysicalSnapshot(store));
   }, [onRangeChange, store, store.range, store.revision]);
 
@@ -1222,8 +1240,13 @@ function VirtualTranscriptInner<T>(
     if (isProgrammaticScrollTop(current, current.scroller.scrollTop)) {
       current.viewportTop = current.scroller.scrollTop;
       if (current.preservedViewport) current.preservedViewport.top = current.viewportTop;
-      recompute(current);
-      publish();
+      const { rangeChanged, pinnedChanged } = recomputeViewport(current);
+      if (rangeChanged || pinnedChanged || current.pendingScrollTop !== null) {
+        publish();
+      } else {
+        lastNotifiedRangeRevisionRef.current = current.revision;
+        onRangeChangeRef.current?.(buildPhysicalSnapshot(current));
+      }
       return;
     }
     retirePosition(current);
@@ -1232,8 +1255,13 @@ function VirtualTranscriptInner<T>(
     if (current.preservedViewport) current.preservedViewport.top = current.viewportTop;
     current.viewportExtent = viewportExtentForScroller(current.scroller);
     current.activeAnchor = captureTopAnchor(current);
-    recompute(current);
-    publish();
+    const { rangeChanged, pinnedChanged } = recomputeViewport(current);
+    if (rangeChanged || pinnedChanged || current.pendingScrollTop !== null) {
+      publish();
+    } else {
+      lastNotifiedRangeRevisionRef.current = current.revision;
+      onRangeChangeRef.current?.(buildPhysicalSnapshot(current));
+    }
     scheduleWitness();
   }, [publish, scheduleWitness]);
 
@@ -1340,7 +1368,7 @@ function VirtualTranscriptInner<T>(
                 data-virtual-index={index}
                 data-virtual-key={key}
               >
-                {renderItem(item, index)}
+                <MemoizedTranscriptRow item={item} index={index} renderItem={renderItem} />
               </div>
             );
           })}
@@ -1351,6 +1379,20 @@ function VirtualTranscriptInner<T>(
     </div>
   );
 }
+
+interface TranscriptRowProps<T> {
+  item: T;
+  index: number;
+  renderItem: (item: T, index: number) => ReactNode;
+}
+
+const MemoizedTranscriptRow = memo(function TranscriptRow<T>({
+  item,
+  index,
+  renderItem,
+}: TranscriptRowProps<T>) {
+  return <>{renderItem(item, index)}</>;
+}) as <T>(props: TranscriptRowProps<T>) => ReturnType<typeof VirtualTranscriptInner>;
 
 export const VirtualTranscript = forwardRef(VirtualTranscriptInner) as <T>(
   props: VirtualTranscriptProps<T> & { ref?: React.ForwardedRef<VirtualTranscriptHandle> },

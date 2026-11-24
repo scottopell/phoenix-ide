@@ -2525,4 +2525,42 @@ describe('VirtualTranscript', () => {
 
     expect(rowIndexes()[0]).toBeGreaterThan(15);
   });
+
+  it('skips row re-renders when a scroll tick keeps the rendered range unchanged while still reporting onRangeChange', () => {
+    const renderCalls = vi.fn();
+    const ranges: VirtualTranscriptPhysicalSnapshot[] = [];
+    const stableRenderItem = (item: TestItem) => {
+      renderCalls(item.id);
+      return renderRow(item);
+    };
+    render(
+      <VirtualTranscript
+        ariaLabel="Transcript"
+        items={makeItems(40, 20)}
+        getKey={(item) => item.id}
+        estimatedExtent={20}
+        overscan={200}
+        initialTail={false}
+        renderItem={stableRenderItem}
+        onRangeChange={(snapshot) => ranges.push(snapshot)}
+      />,
+    );
+    const scroller = document.querySelector<HTMLElement>('.virtual-transcript')!;
+    const callsAfterMount = renderCalls.mock.calls.length;
+
+    // Crossing one row boundary renders only the newly entering row, not unchanged rows.
+    scroller.scrollTop = 5;
+    fireEvent.scroll(scroller);
+    expect(renderCalls.mock.calls.length).toBe(callsAfterMount + 1);
+
+    // Scrolling within the same rendered range skips React row renders while still notifying onRangeChange.
+    const callsAfterBoundary = renderCalls.mock.calls.length;
+    const rangesBeforeSameRangeScroll = ranges.length;
+    scroller.scrollTop = 10;
+    fireEvent.scroll(scroller);
+
+    expect(renderCalls.mock.calls.length).toBe(callsAfterBoundary);
+    expect(ranges.length).toBeGreaterThan(rangesBeforeSameRangeScroll);
+    expect(ranges.at(-1)?.viewportTop).toBe(10);
+  });
 });
