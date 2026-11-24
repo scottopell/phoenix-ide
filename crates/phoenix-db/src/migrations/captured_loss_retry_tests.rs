@@ -526,6 +526,21 @@ async fn delete_api_clears_dispatches_before_expected_resource_teardown() {
     .await
     .unwrap();
 
+    let cancelled = db.cancel_close_before_retirement(&attempt).await.unwrap();
+    assert_eq!(cancelled.phase(), ClosePhase::Completed);
+    assert_eq!(
+        cancelled.close_outcome(),
+        Some(CloseCompletionOutcome::Cancelled)
+    );
+    let dispatches_before_delete: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM close_retirement_resource_dispatches WHERE attempt_id = ?1",
+    )
+    .bind(&attempt)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(dispatches_before_delete, 1);
+
     db.delete_conversation("original-active").await.unwrap();
 
     for table in [

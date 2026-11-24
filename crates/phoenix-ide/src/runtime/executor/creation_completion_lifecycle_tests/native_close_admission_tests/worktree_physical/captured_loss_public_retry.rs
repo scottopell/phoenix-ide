@@ -776,17 +776,17 @@ async fn captured_history(fixture: &CloseFixture, run: &CloseRunRef) -> Captured
         run: fixture.db.get_close_run(run).await.unwrap(),
         inspections: fixture
             .db
-            .list_close_inspections(&run.attempt_id)
+            .list_close_retirement_inspections(run.attempt_id.as_str())
             .await
             .unwrap(),
         losses: fixture
             .db
-            .list_close_retirement_losses(&run.attempt_id)
+            .list_close_retirement_losses(run.attempt_id.as_str())
             .await
             .unwrap(),
         failures: fixture
             .db
-            .list_close_cleanup_failures(&run.attempt_id)
+            .list_close_cleanup_failures(run.attempt_id.as_str())
             .await
             .unwrap()
             .into_iter()

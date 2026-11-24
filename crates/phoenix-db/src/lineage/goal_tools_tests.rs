@@ -185,7 +185,7 @@ async fn canonical_goal_tools_prefixes_upgrade_reopen_and_remain_idempotent() {
             [
                 (143..=153).collect::<Vec<_>>(),
                 vec![155, 156],
-                (158..=184).collect(),
+                (158..=186).collect(),
             ]
             .concat()
         );

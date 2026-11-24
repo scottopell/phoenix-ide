@@ -30,7 +30,14 @@ async fn entry_refusal_before_kill_preserves_live_server_and_registry_entry() {
     );
     assert_eq!(fake.kill_server_count(&identity.socket_path), 0);
     assert!(fake.server(&identity.socket_path).unwrap().live);
-    assert_eq!(server.read().await.status, ServerStatus::Live);
+    let retained = registry
+        .get_existing(&work_scope)
+        .await
+        .expect("refused retirement must retain the authoritative registry entry");
+    assert!(Arc::ptr_eq(&server, &retained));
+    // begin_retirement marks the entry Gone while fencing it; refusal before
+    // the kill must preserve that fenced entry, not make it Live again.
+    assert_eq!(retained.read().await.status, ServerStatus::Gone);
 }
 
 #[tokio::test]
@@ -72,7 +79,14 @@ async fn entry_refusal_after_kill_preserves_residual_before_final_gone() {
     );
     assert_eq!(fake.kill_server_count(&identity.socket_path), 1);
     assert!(fake.server(&identity.socket_path).is_none());
-    assert_eq!(server.read().await.status, ServerStatus::Live);
+    let retained = registry
+        .get_existing(&work_scope)
+        .await
+        .expect("failed final cleanup must retain the authoritative registry entry");
+    assert!(Arc::ptr_eq(&server, &retained));
+    // Exact server absence is proven, but source-custody refusal leaves the
+    // fenced registry entry as a residual for recovery.
+    assert_eq!(retained.read().await.status, ServerStatus::Gone);
 }
 
 #[tokio::test]

@@ -146,7 +146,7 @@ jobs:
           set -euo pipefail
           cargo test -p phoenix-db --lib --no-run 2>&1 | tee evidence/compile.log
           cargo test -p phoenix-db --lib -- --list 2>&1 | tee evidence/inventory.log
-          grep -E '^close_foundation::tests::.*: test$|^migrations::close_completion_allowance_tests::migration_172_.*: test$|^migrations::retry_tmux_dispatch_tests::.*: test$|^migrations::tests::migration_(180|181|182|183)_.*: test$|^native_close::.*: test$' evidence/inventory.log > evidence/selected-tests.txt
+          grep -E '^close_foundation::tests::.*: test$|^migrations::close_completion_allowance_tests::migration_172_.*: test$|^migrations::retry_tmux_dispatch_tests::.*: test$|^migrations::native_close_retry_origin_gate::tests::.*: test$|^migrations::tests::migration_(180|181|182|183)_.*: test$|^native_close::.*: test$' evidence/inventory.log > evidence/selected-tests.txt
           test -s evidence/selected-tests.txt
           grep -F 'close_foundation::tests::inspection_aggregate_validator_preserves_exact_content_and_empty_generation_rules: test' evidence/selected-tests.txt
           for test in \
@@ -286,6 +286,19 @@ jobs:
             grep -Fx "migrations::retry_tmux_dispatch_tests::$test: test" evidence/selected-tests.txt
             cargo test -p phoenix-db --lib "migrations::retry_tmux_dispatch_tests::$test" -- --exact --nocapture --test-threads=1 2>&1 | tee "evidence/retry-tmux-migration-$test.log"
             grep -E 'test result: ok\. 1 passed; 0 failed; 0 ignored;' "evidence/retry-tmux-migration-$test.log"
+          done
+      - name: Require exact retry origin gate migration upgrade
+        if: success() || failure()
+        shell: bash
+        run: |
+          set -euo pipefail
+          for test in \
+            real185_to186_preserves_origin_authority_and_is_idempotent \
+            missing_or_changed_origin_trigger_rolls_back186 \
+            source_rewrite_removes_only_archive_requirement; do
+            grep -Fx "migrations::native_close_retry_origin_gate::tests::$test: test" evidence/selected-tests.txt
+            cargo test -p phoenix-db --lib "migrations::native_close_retry_origin_gate::tests::$test" -- --exact --nocapture --test-threads=1 2>&1 | tee "evidence/retry-origin-migration-$test.log"
+            grep -E 'test result: ok\. 1 passed; 0 failed; 0 ignored;' "evidence/retry-origin-migration-$test.log"
           done
       - name: Execute migration176 populated upgrade and authority regressions
         if: success()
