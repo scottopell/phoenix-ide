@@ -403,6 +403,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_model_text_lists_line_texts_without_echoing_the_command() {
+        let tool = BashTool;
+        let cmd = "printf 'alpha\\nbeta\\n'";
+        let result = tool
+            .run(json!({"op": "run", "cmd": cmd, "wait_seconds": 5}), ctx())
+            .await;
+        assert!(result.is_success(), "got: {}", result.output());
+        let model: Value = serde_json::from_str(result.output()).unwrap();
+        assert_eq!(model["status"], "exited");
+        assert_eq!(model["lines"], json!(["alpha", "beta"]));
+        assert!(model.get("cmd").is_none(), "run result echoed cmd: {model}");
+        let display = result.display_data().unwrap();
+        assert_eq!(display["cmd"], cmd);
+        assert_eq!(display["lines"][1], json!({"offset": 1, "bytes": "beta"}));
+    }
+
+    #[tokio::test]
     async fn run_emits_bounded_live_progress() {
         use std::sync::Mutex;
 

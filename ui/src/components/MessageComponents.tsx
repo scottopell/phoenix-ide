@@ -59,6 +59,7 @@ import { StreamingBlocks } from './StreamingMessage';
 import './ReadFileResultView.css';
 import './MessageComponents.css';
 import { safePrefix } from '../utils/textBounds';
+import { bashResultLineTexts } from './bashResultLines';
 
 const CheckIcon = () => (
   <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
@@ -1822,15 +1823,12 @@ function BashResponseView({ response }: { response: Record<string, unknown> }) {
   const waitedMs = typeof response['waited_ms'] === 'number' ? response['waited_ms'] : null;
   const durationMs = typeof response['duration_ms'] === 'number' ? response['duration_ms'] : null;
   const truncatedBefore = response['truncated_before'] === true;
-  const lines = Array.isArray(response['lines'])
-    ? (response['lines'] as Array<{ offset?: number; bytes?: string }>)
-    : [];
 
   const isExited = status === 'exited' || status === 'unregistered_exited';
   const isKilled = status === 'killed' || status === 'unregistered_killed';
   const isTombstone = status === 'tombstoned';
   const partial = typeof response['partial'] === 'string' ? response['partial'] : null;
-  const lineTexts = lines.map((l) => l.bytes ?? '');
+  const lineTexts = bashResultLineTexts(response['lines']);
   const statusText = bashStatusText(status, finalCause);
 
   return (

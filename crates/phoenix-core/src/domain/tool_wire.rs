@@ -65,6 +65,55 @@ pub enum BashResponse {
     WaiterPanicked(BashWaiterPanickedPayload),
 }
 
+/// Whether the model-facing text of a bash response repeats the command.
+/// A `run` response answers the call that carried the command, so it omits
+/// it; `peek` / `wait` / `kill` name a handle and include it (REQ-BASH-002).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BashCommandEcho {
+    Omit,
+    Include,
+}
+
+impl BashResponse {
+    /// The read window this response carries, if any.
+    #[must_use]
+    pub fn window(&self) -> Option<&BashRingWindow> {
+        match self {
+            Self::Running(p) => Some(&p.window),
+            Self::StillRunning(p) => Some(&p.window),
+            Self::KillPendingKernel(p) => Some(&p.window),
+            Self::Tombstoned(p) => Some(&p.window),
+            Self::Exited(p) | Self::Killed(p) => Some(&p.window),
+            Self::UnregisteredExited(p) | Self::UnregisteredKilled(p) => Some(&p.run.window),
+            Self::OutcomeUnknown(p) => Some(&p.run.window),
+            Self::WaiterPanicked(_) => None,
+        }
+    }
+
+    /// Compact JSON delivered to the model (REQ-BASH-004). Identical to the
+    /// typed wire shape except that `lines` lists each line's text in offset
+    /// order (line `i` has offset `start_offset + i`) and, with
+    /// [`BashCommandEcho::Omit`], `cmd` is absent.
+    #[must_use]
+    pub fn model_text(&self, echo: BashCommandEcho) -> String {
+        let mut value = serde_json::to_value(self).expect("bash responses serialize");
+        if let Some(object) = value.as_object_mut() {
+            if let Some(window) = self.window() {
+                let texts = window
+                    .lines
+                    .iter()
+                    .map(|line| serde_json::Value::String(line.bytes.clone()))
+                    .collect();
+                object.insert("lines".to_owned(), serde_json::Value::Array(texts));
+            }
+            if echo == BashCommandEcho::Omit {
+                object.remove("cmd");
+            }
+        }
+        value.to_string()
+    }
+}
+
 /// Post-launch failure, distinct from an OS spawn failure.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]
@@ -397,6 +446,126 @@ pub struct TmuxErrorResponse {
 #[cfg(test)]
 mod bash_tmux_wire_tests {
     use super::*;
+
+    fn exited_with(lines: &[&str], start: u64) -> BashResponse {
+        BashResponse::Exited(BashRunTombstonePayload {
+            handle: "h1".into(),
+            cmd: "cat <<'EOF' > big.txt\nlots of text\nEOF".into(),
+            label: None,
+            final_cause: "exited".into(),
+            exit_code: Some(0),
+            signal_number: None,
+            duration_ms: 12,
+            finished_at: "1.5".into(),
+            kill_signal_sent: None,
+            kill_attempted_at: None,
+            window: BashRingWindow {
+                start_offset: start,
+                end_offset: start + lines.len() as u64,
+                truncated_before: false,
+                lines: lines
+                    .iter()
+                    .enumerate()
+                    .map(|(i, text)| BashRingLine {
+                        offset: start + i as u64,
+                        bytes: (*text).to_owned(),
+                    })
+                    .collect(),
+                partial: None,
+            },
+        })
+    }
+
+    #[test]
+    fn model_text_lists_line_texts_and_omits_run_command() {
+        let response = exited_with(&["one", "", "three"], 40);
+        let model: serde_json::Value =
+            serde_json::from_str(&response.model_text(BashCommandEcho::Omit)).unwrap();
+        assert_eq!(model["lines"], serde_json::json!(["one", "", "three"]));
+        assert_eq!(model["start_offset"], 40);
+        assert_eq!(model["end_offset"], 43);
+        assert!(model.get("cmd").is_none());
+        assert_eq!(model["status"], "exited");
+        assert_eq!(model["exit_code"], 0);
+
+        let peek: serde_json::Value =
+            serde_json::from_str(&response.model_text(BashCommandEcho::Include)).unwrap();
+        assert_eq!(peek["cmd"], "cat <<'EOF' > big.txt\nlots of text\nEOF");
+
+        // The typed wire (UI display) keeps per-line offsets and the command.
+        let wire = serde_json::to_value(&response).unwrap();
+        assert_eq!(
+            wire["lines"][2],
+            serde_json::json!({"offset": 42, "bytes": "three"})
+        );
+        assert!(wire.get("cmd").is_some());
+    }
+
+    #[test]
+    fn model_text_is_smaller_than_wire_for_typical_output() {
+        let lines: Vec<String> = (0..200)
+            .map(|i| format!(" src/file_{i}.rs | 12 ++++--"))
+            .collect();
+        let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+        let response = exited_with(&refs, 1000);
+        let wire = serde_json::to_string(&response).unwrap();
+        let model = response.model_text(BashCommandEcho::Omit);
+        assert!(
+            model.len() * 10 < wire.len() * 8,
+            "model {} vs wire {}",
+            model.len(),
+            wire.len()
+        );
+    }
+
+    #[test]
+    fn waiter_panicked_has_no_window_and_still_omits_command() {
+        let response = BashResponse::WaiterPanicked(BashWaiterPanickedPayload {
+            handle: "h".into(),
+            cmd: "sleep 9".into(),
+            label: None,
+            error_message: "boom".into(),
+        });
+        let model: serde_json::Value =
+            serde_json::from_str(&response.model_text(BashCommandEcho::Omit)).unwrap();
+        assert!(model.get("cmd").is_none());
+        assert!(model.get("lines").is_none());
+        assert_eq!(model["error_message"], "boom");
+    }
+
+    mod model_text_proptests {
+        use super::*;
+        use proptest::prelude::*;
+
+        proptest! {
+            // The model view loses no line text and no non-line field: lines
+            // equal the wire's line bytes in order, and every other key of the
+            // wire object is present and equal except `cmd` under Omit.
+            #[test]
+            fn model_text_preserves_lines_and_fields(
+                lines in proptest::collection::vec("\\PC{0,20}", 0..30),
+                start in 0u64..10_000,
+                omit in any::<bool>(),
+            ) {
+                let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+                let response = exited_with(&refs, start);
+                let echo = if omit { BashCommandEcho::Omit } else { BashCommandEcho::Include };
+                let model: serde_json::Value = serde_json::from_str(&response.model_text(echo)).unwrap();
+                let wire = serde_json::to_value(&response).unwrap();
+                let texts: Vec<serde_json::Value> =
+                    lines.iter().map(|l| serde_json::Value::String(l.clone())).collect();
+                prop_assert_eq!(&model["lines"], &serde_json::Value::Array(texts));
+                for (key, value) in wire.as_object().unwrap() {
+                    if key == "lines" { continue; }
+                    if key == "cmd" && omit {
+                        prop_assert!(model.get("cmd").is_none());
+                        continue;
+                    }
+                    prop_assert_eq!(model.get(key), Some(value), "field {}", key);
+                }
+            }
+        }
+    }
 
     #[test]
     fn unregistered_descendants_is_a_closed_wire_state() {

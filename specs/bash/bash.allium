@@ -105,6 +105,9 @@ value RingLine {
 -- A peek/wait/run response carries this read window over the lines field.
 -- start_offset and end_offset bound the lines that were returned; the agent
 -- can use end_offset as the next call's `since` value to stream incrementally.
+-- The model-visible response lists `lines` as line texts in offset order (the
+-- line at index i has offset start_offset + i); the typed UI display keeps
+-- each RingLine.
 value ReadWindow {
     start_offset:      Integer
     end_offset:        Integer

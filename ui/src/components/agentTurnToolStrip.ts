@@ -11,6 +11,7 @@ import type { ContentBlock, Message, ToolResultContent } from '../api';
 import { svgArtifactFromResult, type SvgArtifact } from './svgArtifact';
 import type { BashToolProgress } from '../generated/sse';
 import { safePrefix } from '../utils/textBounds';
+import { bashResultLineTexts } from './bashResultLines';
 
 export interface ToolStripItem {
   svgArtifact?: SvgArtifact | null;
@@ -244,11 +245,7 @@ function bashStatusLabel(parsed: Record<string, unknown>): string | null {
 }
 
 function summarizeBashOutputTail(parsed: Record<string, unknown>): string | null {
-  const lines = Array.isArray(parsed['lines']) ? parsed['lines'] : [];
-  const bytes = lines
-    .map((line) => line && typeof line === 'object' && typeof (line as { bytes?: unknown }).bytes === 'string'
-      ? (line as { bytes: string }).bytes
-      : '')
+  const bytes = bashResultLineTexts(parsed['lines'])
     .filter((line) => line.trim().length > 0);
   const partial = typeof parsed['partial'] === 'string' ? parsed['partial'].trim() : '';
   const tailParts = bytes.slice(-2);
