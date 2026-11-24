@@ -198,3 +198,8 @@ THE SYSTEM SHALL return successful remote query data as ordinary tool output, ne
 AND SHALL mark the tool clearable under the shared stale-tool-result policy without deleting transcript evidence.
 
 THE SYSTEM SHALL retain authoritative destination and caller provenance in the successful model-visible result.
+
+THE model-visible result of local and remote queries SHALL be compact JSON that keeps every result field
+AND SHALL render each cell as a native JSON value: `null`, an integer, a finite real, or a text string
+AND SHALL render a non-finite real as `{"real": "NaN" | "+Infinity" | "-Infinity"}` and a blob summary as `{"blob_bytes": N}`
+AND SHALL NOT change the tagged cell wire between instances (REQ-RQD-008).
