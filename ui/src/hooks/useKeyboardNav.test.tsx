@@ -5,7 +5,7 @@
 // menu, modal, or popover is open. Pressing Escape while a context menu is
 // open should close the menu WITHOUT triggering navigation.
 
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { renderHook, act, fireEvent } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import type { ReactNode } from 'react';
@@ -27,9 +27,16 @@ function wrapper({ children }: { children: ReactNode }) {
 }
 
 describe('SIDE-03: global keyboard shortcut ownership', () => {
+  let modal: HTMLDialogElement | null;
   beforeEach(() => {
     mockNavigate.mockClear();
+    modal = null;
+    const query = document.querySelector.bind(document);
+    // jsdom has no native top layer; hosted Chromium covers actual show/showModal.
+    vi.spyOn(document, 'querySelector').mockImplementation((selector: string) =>
+      selector === 'dialog:modal' ? modal : query(selector));
   });
+  afterEach(() => vi.restoreAllMocks());
 
   it('does not navigate to / on Escape when a popover/menu is open', () => {
     renderHook(() => useGlobalKeyboardShortcuts(), { wrapper });
@@ -50,12 +57,41 @@ describe('SIDE-03: global keyboard shortcut ownership', () => {
     menuEl.remove();
   });
 
-  it('suppresses global shortcuts while a native dialog is open', () => {
+  it('allows outside-dock help and composer Escape with an open nonmodal dialog', () => {
+    renderHook(() => useGlobalKeyboardShortcuts(), { wrapper });
+    const help = vi.fn();
+    window.addEventListener('toggle-shortcut-help', help);
+    const dialog = document.createElement('dialog');
+    dialog.setAttribute('open', '');
+    const transcript = document.createElement('div');
+    transcript.tabIndex = 0;
+    const composer = document.createElement('textarea');
+    document.body.append(dialog, transcript, composer);
+    transcript.focus();
+    fireEvent.keyDown(transcript, { key: '?' });
+    expect(help).toHaveBeenCalledOnce();
+    composer.focus();
+    fireEvent.keyDown(composer, { key: 'Escape' });
+    expect(composer).not.toHaveFocus();
+    expect(mockNavigate).not.toHaveBeenCalled();
+    dialog.remove();
+    transcript.remove();
+    composer.remove();
+    window.removeEventListener('toggle-shortcut-help', help);
+  });
+
+  it('suppresses global help and composer Escape while a native modal is open', () => {
     const dispatchSpy = vi.spyOn(window, 'dispatchEvent');
     renderHook(() => useGlobalKeyboardShortcuts(), { wrapper });
     const dialog = document.createElement('dialog');
     dialog.setAttribute('open', '');
     document.body.appendChild(dialog);
+    modal = dialog;
+    const composer = document.createElement('textarea');
+    document.body.appendChild(composer);
+    composer.focus();
+    fireEvent.keyDown(composer, { key: 'Escape' });
+    expect(composer).toHaveFocus();
 
     act(() => {
       window.dispatchEvent(new KeyboardEvent('keydown', { key: '?', bubbles: true }));
@@ -65,6 +101,7 @@ describe('SIDE-03: global keyboard shortcut ownership', () => {
     expect(mockNavigate).not.toHaveBeenCalled();
     expect(dispatchSpy.mock.calls.some(([event]) => event.type === 'toggle-shortcut-help')).toBe(false);
     dialog.remove();
+    composer.remove();
     dispatchSpy.mockRestore();
   });
 });

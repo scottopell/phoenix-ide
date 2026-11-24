@@ -268,3 +268,27 @@ AND its prompt SHALL direct it to check that list before asking and after a
 continuation, so it does not ask again what is already open.
 
 **Rationale:** A question that no longer matters should not wait for the user.
+
+
+---
+
+### REQ-AUQ-013: Focused Mobile Coordinator Questions
+
+WHILE answering a Coordinator question on a narrow viewport
+THE client SHALL provide a focused surface with the background conversation
+noninteractive, one content scroller, and reachable answer and dismissal controls
+within the available viewport and safe areas.
+
+WHEN the user returns to the conversation without answering or dismissing
+THE client SHALL preserve that request's selections and custom input for reopening
+AND SHALL release the question's keyboard focus scope.
+
+WHILE the focused question surface is open
+THE client SHALL preserve the mounted conversation, its composer draft, and its
+reading position for return, without treating return as a semantic dismissal.
+
+WHEN a nested input or dismissal confirmation handles Escape
+THE client SHALL handle that inner context before closing the focused surface.
+
+WHEN question data is available before transcript history
+THE client SHALL allow answering without waiting for that history to load.
