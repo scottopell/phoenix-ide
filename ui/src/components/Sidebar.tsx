@@ -1,7 +1,7 @@
 import './Sidebar.css';
 import { useState, useCallback, useEffect, useRef, useSyncExternalStore } from 'react';
 import { useNavigate, useLocation } from 'react-router-dom';
-import { ApiResponseError, ConflictError, api } from '../api';
+import { api } from '../api';
 import type { Conversation, ProductConversationListRow } from '../api';
 import { ConversationList } from './ConversationList';
 import { coordinatorUnread } from '../conversation/readState';
@@ -11,34 +11,22 @@ import {
   useProductConversationList,
 } from '../conversation/productConversationList';
 import { EmberEntry } from './EmberEntry';
-import { productConversationPresentationIndicator, renamedProductConversationLocation } from './ConversationList.presentation';
-import { ConfirmDialog } from './ConfirmDialog';
-import { RenameDialog } from './RenameDialog';
+import { productConversationPresentationIndicator } from './ConversationList.presentation';
+import { ProductConversationActionDialogs } from './ProductConversationActionDialogs';
+import {
+  projectProductConversationHistory,
+  useProductConversationActions,
+} from '../hooks/useProductConversationActions';
 import { SettingsDropdown } from './SettingsDropdown';
 import { LocalServicesPanel } from './LocalServicesPanel';
 import { useTheme } from '../hooks';
-import type { CodexLoginPreflight } from '../api';
-import { subscribeModels } from '../modelsPoller';
+import { useCodexPreflight } from '../hooks/useCodexPreflight';
 import {
   getProductConversationListRevision,
-  notifyArchiveCloseConflict,
-  notifyProductConversationClosed,
-  notifyProductConversationHardDeleted,
-  notifyProductConversationListMayHaveChanged,
-  notifyProductConversationSnapshotChanged,
   subscribeProductConversationDeleted,
   subscribeProductConversationClosed,
   subscribeProductConversationListRevision,
 } from '../notifications';
-
-function projectProductConversationHistory(
-  rows: readonly ProductConversationListRow[],
-  productConversationId: string,
-): ProductConversationListRow[] {
-  return rows.map((row) => row.product_conversation_id === productConversationId
-    ? { ...row, lifecycle: { state: 'history' }, close_action: null }
-    : row);
-}
 
 const COLLAPSED_DOT_LIMIT = 9;
 const PRODUCT_REFRESH_COALESCE_MS = 50;
@@ -107,15 +95,8 @@ export function Sidebar({
 }: SidebarProps) {
   const navigate = useNavigate();
   const location = useLocation();
-  const currentLocation = useRef(location);
-  currentLocation.current = location;
   const { theme, toggleTheme } = useTheme();
-  const [codexPreflight, setCodexPreflight] = useState<CodexLoginPreflight | null>(null);
-  const refetchCodexPreflight = useCallback(() => {
-    api.codexLoginPreflight()
-      .then((p) => setCodexPreflight(p))
-      .catch(() => { /* chip just hides — non-fatal */ });
-  }, []);
+  const { codexPreflight, refetchCodexPreflight } = useCodexPreflight();
   const [showArchived, setShowArchived] = useState(false);
   const productList = useProductConversationList();
   const productConversations = productList.rows;
@@ -134,36 +115,20 @@ export function Sidebar({
   );
   const refreshScheduledRef = useRef<number | null>(null);
   const [activeProductSnapshot, setActiveProductSnapshot] = useState<Awaited<ReturnType<typeof api.getProductConversationSnapshot>> | null>(null);
-  const [productCloseTarget, setProductCloseTarget] = useState<ProductConversationListRow | null>(null);
-  const [productDeleteTarget, setProductDeleteTarget] = useState<ProductConversationListRow | null>(null);
-  const productCloseTargetRef = useRef<ProductConversationListRow | null>(null);
-  const [productCloseSubmittingId, setProductCloseSubmittingId] = useState<string | null>(null);
-  const [productCloseError, setProductCloseError] = useState<{ productId: string; message: string } | null>(null);
-  const [productDeleteSubmittingId, setProductDeleteSubmittingId] = useState<string | null>(null);
-  const [productDeleteError, setProductDeleteError] = useState<{ productId: string; message: string } | null>(null);
-  const renameSelectionRef = useRef(0);
-  const [productRenameTarget, setProductRenameTarget] = useState<Pick<ProductConversationListRow, 'product_conversation_id' | 'canonical_route' | 'canonical_root' | 'latest_transcript_row_id' | 'presentation'> | null>(null);
-  const [productRenameError, setProductRenameError] = useState<string | undefined>();
 
-  useEffect(() => {
-    productCloseTargetRef.current = productCloseTarget;
-  }, [productCloseTarget]);
+  const shouldNavigateHomeOnDelete = useCallback((row: ProductConversationListRow) => {
+    const productId = row.product_conversation_id;
+    const activeSnapshotMatches = activeProductSnapshot?.product_conversation_id === productId
+      && activeProductSnapshot.segments.some((segment) => (
+        segment.transcript_row_id === activeSlug || segment.slug === activeSlug
+      ));
+    return productRowMatchesRoute(row, activeSlug) || activeSnapshotMatches;
+  }, [activeProductSnapshot, activeSlug]);
 
-  // Fetch once at mount, and refetch whenever the credential health flips.
-  // The shared models poller fires on credential transitions (login completes,
-  // token expires, sign-out wipes), so subscribing keeps the chip in sync
-  // without a second polling loop.
-  useEffect(() => {
-    refetchCodexPreflight();
-    let lastConfigured: boolean | null = null;
-    const unsub = subscribeModels((m) => {
-      if (lastConfigured !== null && lastConfigured !== m.llm_configured) {
-        refetchCodexPreflight();
-      }
-      lastConfigured = m.llm_configured;
-    });
-    return () => { unsub(); };
-  }, [refetchCodexPreflight]);
+  const productActions = useProductConversationActions({
+    onAfterMutate: onConversationCreated,
+    shouldNavigateHomeOnDelete,
+  });
 
   const scheduleProductRefresh = useCallback(() => {
     if (refreshScheduledRef.current !== null) return;
@@ -265,150 +230,6 @@ export function Sidebar({
   const handleTerminalClick = useCallback(() => {
     navigate('/terminal');
   }, [navigate]);
-
-
-
-  const applyProductName = (renamed: ProductConversationListRow) => {
-    if (!productRenameTarget) return;
-    const latestLocation = currentLocation.current;
-    const activeRoute = renamedProductConversationLocation(
-      latestLocation.pathname, latestLocation.search, latestLocation.hash, productRenameTarget, renamed,
-    );
-    if (activeRoute) navigate(activeRoute, { replace: true, state: latestLocation.state });
-    updateProductConversationRows((rows) => rows.map((row) =>
-      row.product_conversation_id === renamed.product_conversation_id ? renamed : row));
-    notifyProductConversationSnapshotChanged(renamed.product_conversation_id);
-    notifyProductConversationListMayHaveChanged();
-    setProductRenameTarget(null);
-    setProductRenameError(undefined);
-    onConversationCreated();
-  };
-
-  const handleProductRename = async (name: string) => {
-    if (!productRenameTarget) return;
-    try {
-      applyProductName(await api.renameProductConversation(productRenameTarget.product_conversation_id, name));
-    } catch (error) {
-      setProductRenameError(error instanceof Error ? error.message : 'Failed to rename');
-    }
-  };
-
-  const handleProductGenerate = async () => {
-    if (!productRenameTarget) return;
-    try {
-      applyProductName(await api.regenerateProductConversationName(productRenameTarget.product_conversation_id));
-    } catch (error) {
-      setProductRenameError(error instanceof Error ? error.message : 'Failed to generate name');
-      throw error;
-    }
-  };
-
-
-  const handleSetProductRenameTarget = useCallback((row: ProductConversationListRow) => {
-    ++renameSelectionRef.current;
-    setProductRenameError(undefined);
-    setProductRenameTarget(row);
-  }, []);
-
-  const handleSetProductCloseTarget = useCallback((row: ProductConversationListRow) => {
-    setProductCloseError(null);
-    setProductCloseTarget(row);
-  }, []);
-
-  const handleSetProductDeleteTarget = useCallback((row: ProductConversationListRow) => {
-    setProductDeleteError(null);
-    setProductDeleteTarget(row);
-  }, []);
-
-  const handleProductClose = useCallback(async () => {
-    if (!productCloseTarget) return;
-    if (productCloseSubmittingId === productCloseTarget.product_conversation_id) return;
-    setProductCloseSubmittingId(productCloseTarget.product_conversation_id);
-    try {
-      await api.closeProductConversation(productCloseTarget.product_conversation_id);
-      updateProductConversationRows((rows) => projectProductConversationHistory(
-        rows,
-        productCloseTarget.product_conversation_id,
-      ));
-      notifyProductConversationClosed(productCloseTarget.product_conversation_id);
-      setProductCloseTarget((current) =>
-        current?.product_conversation_id === productCloseTarget.product_conversation_id ? null : current);
-      onConversationCreated();
-      void refreshProductConversationList();
-      notifyProductConversationListMayHaveChanged();
-      notifyProductConversationSnapshotChanged(productCloseTarget.product_conversation_id);
-      setProductCloseError((current) =>
-        current?.productId === productCloseTarget.product_conversation_id ? null : current);
-      setProductCloseSubmittingId((current) =>
-        current === productCloseTarget.product_conversation_id ? null : current);
-    } catch (err) {
-      if (notifyArchiveCloseConflict(productCloseTarget.canonical_root.transcript_row_id, err)) {
-        if (err instanceof ConflictError && err.detail.error_type === 'close_already_history') {
-          updateProductConversationRows((rows) => projectProductConversationHistory(
-            rows,
-            productCloseTarget.product_conversation_id,
-          ));
-        }
-        const confirmationRoute = productCloseTarget.canonical_route;
-        if (productCloseTargetRef.current?.product_conversation_id === productCloseTarget.product_conversation_id) {
-          setProductCloseTarget(null);
-          navigate(confirmationRoute);
-        }
-      } else {
-        setProductCloseError({
-          productId: productCloseTarget.product_conversation_id,
-          message: err instanceof Error ? err.message : 'Failed to close conversation',
-        });
-      }
-      setProductCloseSubmittingId((current) =>
-        current === productCloseTarget.product_conversation_id ? null : current);
-      console.error('Failed to close product conversation:', err);
-    }
-  }, [productCloseTarget, productCloseSubmittingId, onConversationCreated, navigate]);
-
-  const handleProductDelete = useCallback(async () => {
-    if (!productDeleteTarget) return;
-    const productId = productDeleteTarget.product_conversation_id;
-    if (productDeleteSubmittingId === productId) return;
-    const rootId = productDeleteTarget.canonical_root.transcript_row_id;
-    setProductDeleteSubmittingId(productId);
-    setProductDeleteError(null);
-    try {
-      const result = await api.deleteChain(rootId);
-      setProductDeleteTarget((current) =>
-        current?.product_conversation_id === productId ? null : current);
-      const deletedConversationIds = result.outcome.type === 'deleted'
-        ? result.outcome.deleted_conversation_ids
-        : [rootId, productDeleteTarget.latest_transcript_row_id];
-      notifyProductConversationHardDeleted(productId, deletedConversationIds);
-      notifyProductConversationListMayHaveChanged();
-      const activeSnapshotMatches = activeProductSnapshot?.product_conversation_id === productId
-        && activeProductSnapshot.segments.some((segment) => (
-          segment.transcript_row_id === activeSlug || segment.slug === activeSlug
-        ));
-      if (productRowMatchesRoute(productDeleteTarget, activeSlug) || activeSnapshotMatches) {
-        navigate('/');
-      }
-    } catch (error) {
-      if (error instanceof ApiResponseError && error.status === 404) {
-        setProductDeleteTarget((current) =>
-          current?.product_conversation_id === productId ? null : current);
-        notifyProductConversationHardDeleted(productId, [rootId, productDeleteTarget.latest_transcript_row_id]);
-        notifyProductConversationListMayHaveChanged();
-        if (productRowMatchesRoute(productDeleteTarget, activeSlug)) {
-          navigate('/');
-        }
-        return;
-      }
-      setProductDeleteError({
-        productId,
-        message: error instanceof Error ? error.message : 'Failed to delete conversation',
-      });
-      console.error('Failed to delete product conversation:', error);
-    } finally {
-      setProductDeleteSubmittingId((current) => current === productId ? null : current);
-    }
-  }, [productDeleteTarget, productDeleteSubmittingId, activeSlug, activeProductSnapshot, navigate]);
 
   const handleToggleArchived = useCallback(() => {
     setShowArchived((prev) => !prev);
@@ -565,54 +386,15 @@ export function Sidebar({
           onToggleArchived={handleToggleArchived}
           onNewConversation={handleNewClick}
           onProductConversationClick={(row) => navigate(row.canonical_route)}
-          onProductConversationRename={handleSetProductRenameTarget}
-          onProductConversationClose={handleSetProductCloseTarget}
-          onProductConversationDelete={handleSetProductDeleteTarget}
+          onProductConversationRename={productActions.openRename}
+          onProductConversationClose={productActions.openClose}
+          onProductConversationDelete={productActions.openDelete}
           activeSlug={activeSlug}
           sidebarMode
           listAvailability={listAvailability}
         />
       </div>
-      <ConfirmDialog
-        visible={productCloseTarget !== null}
-        title="Close Conversation"
-        message={`Close "${productCloseTarget?.presentation.display_name}"? This moves the conversation to read-only History and stops its active work.`}
-        confirmText="Close"
-        danger
-        onConfirm={handleProductClose}
-        submitting={productCloseSubmittingId === productCloseTarget?.product_conversation_id}
-        {...(productCloseError && productCloseError.productId === productCloseTarget?.product_conversation_id
-          ? { error: productCloseError.message }
-          : {})}
-        onCancel={() => { setProductCloseTarget(null); setProductCloseError(null); }}
-      />
-      <ConfirmDialog
-        visible={productDeleteTarget !== null}
-        title="Delete Conversation"
-        message="Permanently delete this conversation and all of its transcripts? This cannot be undone."
-        confirmText="Delete"
-        danger
-        onConfirm={handleProductDelete}
-        submitting={productDeleteSubmittingId === productDeleteTarget?.product_conversation_id}
-        {...(productDeleteError && productDeleteError.productId === productDeleteTarget?.product_conversation_id
-          ? { error: productDeleteError.message }
-          : {})}
-        onCancel={() => { setProductDeleteTarget(null); setProductDeleteError(null); }}
-      />
-      {!productRenameTarget && productRenameError && <div role="alert" className="error-message">{productRenameError}</div>}
-      <RenameDialog
-        visible={productRenameTarget !== null}
-        currentName={productRenameTarget?.presentation.display_name ?? ''}
-        error={productRenameError ?? undefined}
-        onRename={handleProductRename}
-        onGenerate={handleProductGenerate}
-        normalizeInput={(value) => value}
-        isValidName={(value) => value.trim().length > 0}
-        helpText="Enter a title"
-        maxLength={200}
-        onCancel={() => { ++renameSelectionRef.current; setProductRenameTarget(null); setProductRenameError(undefined); }}
-      />
-
+      <ProductConversationActionDialogs actions={productActions} />
     </aside>
   );
 }
