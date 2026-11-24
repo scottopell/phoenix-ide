@@ -40,10 +40,9 @@ selected labels, preview content, and user notes.
 | **REQ-AUQ-010:** Coordinator Questions Do Not Block Coordination | 🔄 In review | `post_user_question` replaces the blocking tool for the Coordinator; `coordinator_user_questions` table (migration 168), keyed on the Coordinator ProductConversation; prompt wording. Not deployed. |
 | **REQ-AUQ-011:** Answer Coordinator Questions Outside the Transcript | 🔄 In review | `GET /api/coordinator/questions`, answer/dismiss endpoints, retrying reply delivery in input discovery sent with the `coordinator_question_reply` input origin under a reserved `coordinator-question-reply:` message id, with delivery recorded by acceptance triggers on `durable_turns` and `steering_messages`; `CoordinatorQuestionDock` on Ember's page, Ember entry count, question notifications (5 s poll, which also runs in hidden tabs so notifications arrive; opens `/global`). Unit and runtime tests; not checked in a browser; not deployed. |
 | **REQ-AUQ-012:** Withdraw and List Coordinator Questions | 🔄 In review | `withdraw_user_question`, `list_user_questions`; database and tool tests. Not deployed. |
+| **REQ-AUQ-013:** Focused Mobile Coordinator Questions | 🔄 In review | Native mobile modal, one content scroller, non-destructive Return, retained request input, inactive keyboard scopes, visual viewport bounds. Hosted Chromium journeys and pinned-base comparison passed at `e84976f` in PR #1151; physical iPhone keyboard qualification remains unverified. |
 
-| **REQ-AUQ-013:** Focused Mobile Coordinator Questions | 🔄 Qualification pending | Native mobile modal, one content scroller, non-destructive Return, retained request input, inactive keyboard scopes, visual viewport bounds. Hosted browser journeys and pinned-base loading comparison are being qualified in PR #1151. |
-
-**Progress:** 9 of 13 complete; REQ-AUQ-010 to REQ-AUQ-012 in review, REQ-AUQ-013 qualification pending.
+**Progress:** 9 of 13 complete; REQ-AUQ-010 to REQ-AUQ-013 in review.
 
 ## Mobile surface qualification
 
@@ -54,9 +53,53 @@ The hosted comparison uses production bundles, intercepted synthetic HTTP payloa
 4× CPU slowdown, 400 ms modeled API latency and throttled asset requests. A client
 EventSource fixture excludes real SSE transport and server/database latency.
 
-Qualification is incomplete: run 45281357729 completed mobile cold/global and
-cold/deep-link trials but stopped at an invalid mobile warm-shell selector before
-history isolation and surface journeys. Its screenshots also captured an opening
-animation rather than settled opacity. Follow-up harness corrections and focus
-regressions require a new exact-head hosted run. No real iPhone keyboard or
-production loading-cause claim is established.
+[Hosted qualification 45291125836](https://github.com/scottopell/phoenix-ide/actions/runs/45291125836)
+compared baseline `8a685486413fc6517f61c548e3229a2864ce6703` with candidate
+`e84976f940eef714801f7f3dd6aae52dfbe11f2d`. All 116 synthetic trials succeeded,
+including 96 measured samples: eight per version × viewport (393×852, 1440×900)
+× entry mode (cold/global, cold/canonical-link, warm SPA notification navigation).
+The remainder are 12 warmups, four warm-route preflights and four history controls.
+Full [CI 45291126141](https://github.com/scottopell/phoenix-ide/actions/runs/45291126141)
+also passed. These receipts qualify that source revision, not subsequent commits.
+
+Question usability includes scripted option selection and custom entry. Median
+milliseconds (baseline → candidate; eight samples per cell):
+
+| Entry mode | Mobile 393px | Desktop 1440px |
+|------------|--------------|----------------|
+| Cold/global | 3443 → 3450 | 3431 → 3434 |
+| Cold/canonical-link | 3434 → 3440 | 3428 → 3444 |
+| Warm SPA notification navigation | 1497 → 1499 | 1457 → 1456 |
+
+These samples do not demonstrate faster loading. Captured request timestamps are
+monotonic where present, with setup/navigation initiation phases and an immutable
+trial clock; some requests remain incomplete at capture. Main-thread long tasks
+use a separate document clock and extend beyond question usability. Transcript
+visibility is observed after question interaction/Return, not as an independent
+first-ready measurement. No unknown fixture endpoints or page errors occurred;
+one console error is the intentionally injected answer-409/retry journey.
+
+Both versions allowed selection/custom entry before history acquisition/reply in
+all four cold/global controls. The history gate was armed, but the request began
+after the usability checkpoint and gate release: this is not evidence of
+responsiveness during an already in-flight stalled history request. The synthetic
+comparison does not identify the user's production loading cause.
+
+Candidate journeys cover retained answers plus mounted transcript scroll/composer
+draft, native modal focus exclusion, one overflowing content scroller, confirmation
+bounds/hit testing at 393×852 and 393×520, nested Escape, shortcut help, sequential
+pending requests, custom/multi-select responses, injected 409/retry, confirmed
+dismissal, withdrawal, reload and canonical-route query-variant Back/Forward.
+Settled baseline/mobile, candidate/mobile, candidate/desktop and reduced-viewport
+confirmation screenshots were inspected. Independent static source and artifact
+reviews found no remaining concrete blocker.
+
+Limits: reduced viewport is not an OS keyboard test; physical iPhone safe areas,
+keyboard and focus restoration remain unverified. History coverage is not
+close-first dialog Back behavior or draft persistence after route unmount/reload.
+Feed loading/error presentation and desktop confirmation/help journeys are not
+comprehensively browser-qualified. API interception models latency, not real API
+throughput/server work; fake EventSource excludes real SSE. Four preflight artifact
+names overlap warmup names; `results.json` retains all 116 records, while measured
+samples have distinct artifact names. No production speed or loading-cause claim
+is established.
