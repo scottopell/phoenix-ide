@@ -7,7 +7,11 @@ import { qualifyQuestionSurface, qualifyDesktopShortcuts } from './question-surf
 // Synthetic HTTP isolation of the production UI, not server or iPhone latency.
 const out = path.resolve(process.env.QUESTION_QA_OUT ?? 'qa-artifacts/question-loading');
 const runs = Number(process.env.QUESTION_QA_RUNS ?? 8);
-const versions = [['baseline', process.env.BASELINE_URL ?? 'http://127.0.0.1:4173'], ['candidate', process.env.CANDIDATE_URL ?? 'http://127.0.0.1:4174']];
+const diagnostic = process.env.QUESTION_DIAGNOSTIC === '1';
+const versions = diagnostic
+  ? [['control', process.env.CONTROL_URL ?? 'http://127.0.0.1:4173'], ['early', process.env.EARLY_URL ?? 'http://127.0.0.1:4174']]
+  : [['baseline', process.env.BASELINE_URL ?? 'http://127.0.0.1:4173'], ['candidate', process.env.CANDIDATE_URL ?? 'http://127.0.0.1:4174']];
+const measuredRuns = diagnostic ? 8 : runs;
 const conditions = { cpu: 4, latency_ms: 400, bytes_per_second: 1048576, browser: 'hosted Chromium', cache: 'fresh context per trial; warm SPA has cached shell/feed only' };
 const id = 'question-qualification';
 const timestamp = '2026-01-01T12:00:00Z';
@@ -25,7 +29,7 @@ const results = [];
 let failed = false;
 
 async function trial(version, base, viewport, mode, run, isolation = false, readinessOnly = false) {
-  const name = `${version}-${viewport.width}-${mode}-${isolation ? 'isolation' : run}`;
+  const name = `${version}-${viewport.width}-${mode}-${isolation ? `held-history-${run}` : run}`;
   const context = await browser.newContext({ viewport, ...(viewport.width < 768 ? { isMobile: true, hasTouch: true } : {}), serviceWorkers: 'block' });
   const page = await context.newPage();
   const cdp = await context.newCDPSession(page);
@@ -161,7 +165,7 @@ async function trial(version, base, viewport, mode, run, isolation = false, read
     unknown.push({ method: route.request().method(), path: p });
     return route.fulfill({ status: 501, contentType: 'application/json', body: JSON.stringify({ error: `Unmodelled fixture request ${p}` }) });
   });
-  const record = { name, version, viewport, mode, run, isolation, readiness_only_probe: readinessOnly, conditions, synthetic: true, requests: [], diagnostics, unknown };
+  const record = { name, version, viewport, mode, run, isolation, readiness_only_probe: readinessOnly, diagnostic_mode: diagnostic, conditions, synthetic: true, requests: [], diagnostics, unknown };
   try {
     if (mode === 'warm-notification') {
       const feedResponse = page.waitForResponse(response => new URL(response.url()).pathname === '/api/coordinator/questions');
@@ -186,9 +190,14 @@ async function trial(version, base, viewport, mode, run, isolation = false, read
     const panel = page.locator('.question-panel');
     await panel.waitFor({ state: 'visible', timeout: 45000 });
     record.question_visible_ms = performance.now() - start;
-    if (readinessOnly) {
-      await page.waitForFunction(() => window.__questionReadiness?.question_layout_document_ms !== undefined && window.__questionReadiness?.transcript_layout_document_ms !== undefined, undefined, { timeout: 45000 });
+    if (readinessOnly || diagnostic) {
+      await page.waitForFunction(({ heldHistory }) => {
+        const readiness = window.__questionReadiness;
+        return readiness?.question_layout_document_ms !== undefined && (heldHistory || readiness?.transcript_layout_document_ms !== undefined);
+      }, { heldHistory: isolation }, { timeout: 45000 });
       record.readiness_observed_before_any_question_interaction = true;
+      record.readiness_before_interaction = await page.evaluate(() => window.__questionReadiness);
+      record.readiness_before_interaction_scope = isolation ? 'question layout only; transcript intentionally unavailable while history is held' : 'question and transcript layout';
     }
     if (isolation) {
       let timeout;
@@ -221,6 +230,7 @@ async function trial(version, base, viewport, mode, run, isolation = false, read
     record.independent_readiness.question_navigation_relative_ms = record.independent_readiness.question_layout_document_ms - documentNavigationBoundary;
     record.independent_readiness.transcript_navigation_relative_ms = record.independent_readiness.transcript_layout_document_ms - documentNavigationBoundary;
     record.document_resources = await page.evaluate(() => performance.getEntriesByType('resource').map(entry => ({ url: entry.name, initiator: entry.initiatorType, started_document_ms: entry.startTime, response_end_document_ms: entry.responseEnd, duration_ms: entry.duration, transfer_bytes: entry.transferSize })));
+    record.transcript_module_resources = record.document_resources.filter(resource => /ConversationPage|ProductConversationPage/i.test(resource.url));
     record.observation_completed_after_trial_ms = performance.now() - trialEpoch;
     const after = metrics(await cdp.send('Performance.getMetrics'));
     record.metrics_delta = Object.fromEntries(['TaskDuration', 'ScriptDuration', 'LayoutDuration', 'RecalcStyleDuration', 'JSHeapUsedSize'].map(key => [key, after[key] - before[key]]));
@@ -238,8 +248,8 @@ async function trial(version, base, viewport, mode, run, isolation = false, read
     if (await launcher.isVisible()) await launcher.click();
     if (await custom.inputValue() !== 'Disposable retained custom answer') throw new Error('Return lost custom answer');
     await page.screenshot({ animations: 'disabled', path: path.join(out, `${name}-question.png`) });
-    if (version === 'candidate' && isolation && viewport.width === 1440) await qualifyDesktopShortcuts({ page, out });
-    if (version === 'candidate' && isolation && viewport.width === 393) {
+    if (!diagnostic && version === 'candidate' && isolation && viewport.width === 1440) await qualifyDesktopShortcuts({ page, out });
+    if (!diagnostic && version === 'candidate' && isolation && viewport.width === 393) {
       await qualifyQuestionSurface({ page, out, questions,
         setQuestions: next => { pendingQuestions = next; },
         setAnswerError: value => { answerError = value; },
@@ -258,7 +268,7 @@ async function trial(version, base, viewport, mode, run, isolation = false, read
     await page.screenshot({ animations: 'disabled', path: path.join(out, `${name}-failure.png`) }).catch(() => {});
   } finally {
     release();
-    record.requests = [...requests.values()];
+    record.requests = [...requests.values()].map(request => structuredClone(request));
     await fs.writeFile(path.join(out, `${name}.json`), JSON.stringify(record, null, 2));
     results.push(record);
     await context.close();
@@ -268,6 +278,25 @@ async function trial(version, base, viewport, mode, run, isolation = false, read
 }
 try {
   const viewports = [{ width: 393, height: 852 }, { width: 1440, height: 900 }];
+  if (diagnostic) {
+    for (const viewport of viewports) {
+      for (const mode of ['cold-global', 'warm-notification']) {
+        for (let warmup = 0; warmup < 1; warmup++) {
+          for (const [version, url] of versions) if (!await trial(version, url, viewport, mode, `warmup-${warmup}`)) throw new Error('Diagnostic warmup failed');
+        }
+        for (let run = 0; run < measuredRuns; run++) {
+          const ordered = run % 2 ? [...versions].reverse() : versions;
+          for (const [version, url] of ordered) if (!await trial(version, url, viewport, mode, run)) throw new Error('Diagnostic measured trial failed');
+        }
+      }
+      for (let run = 0; run < 4; run++) {
+        const ordered = run % 2 ? [...versions].reverse() : versions;
+        for (const [version, url] of ordered) {
+          if (!await trial(version, url, viewport, 'cold-global', `held-${run}`, true)) throw new Error('Held-history diagnostic control failed');
+        }
+      }
+    }
+  } else {
   for (const viewport of viewports) {
     for (const [version, url] of versions) if (!await trial(version, url, viewport, 'cold-global', 0, true)) throw new Error('History isolation or surface journey failed');
     for (const [version, url] of versions) if (!await trial(version, url, viewport, 'warm-notification', -1)) throw new Error('Warm route fixture preflight failed');
@@ -288,9 +317,10 @@ try {
       }
     }
   }
+  }
 } catch (error) { failed = true; console.error(error); }
 finally {
-  await fs.writeFile(path.join(out, 'results.json'), JSON.stringify({ baseline_sha: process.env.BASELINE_SHA, candidate_sha: process.env.CANDIDATE_SHA, conditions, scope: 'Synthetic intercepted HTTP, production bundles, real render and request order; excludes server/database and physical keyboard latency', results }, null, 2));
+  await fs.writeFile(path.join(out, 'results.json'), JSON.stringify({ diagnostic_mode: diagnostic, experiment: diagnostic ? { control_sha: process.env.CONTROL_SHA, early_sha: process.env.EARLY_SHA, intervention: process.env.EARLY_PATCH_DESCRIPTION, measured_runs_per_cell: 8, warmups_per_cell: 1, held_history_controls_per_variant_viewport: 4, cells: ['cold-global', 'warm-notification'], viewports: [393, 1440], acquisition_resources: 'document_resources includes resource timing entries per trial' } : null, baseline_sha: process.env.BASELINE_SHA, candidate_sha: process.env.CANDIDATE_SHA, conditions, scope: 'Synthetic intercepted HTTP, production bundles, real render and request order; excludes server/database and physical keyboard latency', results }, null, 2));
   await browser.close();
 }
 if (failed) process.exitCode = 1;

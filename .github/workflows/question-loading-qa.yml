@@ -1,84 +1,112 @@
-name: Global question loading performance
+name: Diagnostic question module acquisition experiment
+
 on:
   workflow_dispatch:
-  pull_request:
-    paths:
-      - 'ui/**'
-      - '.github/workflows/question-loading-qa.yml'
+
 permissions:
   contents: read
+
 jobs:
   compare:
     runs-on: ubuntu-latest
-    timeout-minutes: 35
+    timeout-minutes: 40
     env:
-      BASE_SHA: 8a685486413fc6517f61c548e3229a2864ce6703
+      SOURCE_SHA: 0f6e3627a24777364406c3f3718efe2431ccf16d
       PLAYWRIGHT_BROWSERS_PATH: /home/runner/.cache/ms-playwright
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
-          path: candidate
-          fetch-depth: 1
+          path: harness
           persist-credentials: false
       - uses: actions/checkout@v6
         with:
-          ref: 8a685486413fc6517f61c548e3229a2864ce6703
-          path: baseline
-          fetch-depth: 1
+          ref: 0f6e3627a24777364406c3f3718efe2431ccf16d
+          path: control
+          persist-credentials: false
+      - uses: actions/checkout@v6
+        with:
+          ref: 0f6e3627a24777364406c3f3718efe2431ccf16d
+          path: early
           persist-credentials: false
       - uses: actions/setup-node@v6
         with:
           node-version: '26'
-      - name: Install pinned UI dependencies and Chromium
-        working-directory: candidate/ui
+      - name: Install identical frozen dependencies and hosted Chromium
         run: |
           corepack enable
-          pnpm install --frozen-lockfile
-          pnpm exec playwright install --with-deps chromium
-      - name: Focused question regressions
-        working-directory: candidate/ui
-        run: pnpm exec vitest run src/components/CoordinatorQuestionDock.test.tsx src/components/QuestionPanel.test.tsx src/hooks/useKeyboardNav.test.tsx
-      - name: Build and serve baseline
-        working-directory: baseline/ui
+          (cd control/ui && pnpm install --frozen-lockfile && pnpm exec playwright install --with-deps chromium)
+          (cd early/ui && pnpm install --frozen-lockfile)
+      - name: Copy diagnostic harness to both source trees
         run: |
-          corepack enable
-          pnpm install --frozen-lockfile
-          pnpm build
-          (pnpm preview --host 127.0.0.1 --port 4173 --strictPort > /tmp/question-baseline.log 2>&1 & echo $! > /tmp/question-baseline.pid)
-      - name: Build and serve candidate
-        working-directory: candidate/ui
+          mkdir -p control/ui/scripts early/ui/scripts question-module-diagnostic
+          cp harness/ui/scripts/qualify-question-loading.mjs control/ui/scripts/
+          cp harness/ui/scripts/qualify-question-loading.mjs early/ui/scripts/
+          cp harness/ui/scripts/question-surface-journeys.mjs control/ui/scripts/
+          cp harness/ui/scripts/question-surface-journeys.mjs early/ui/scripts/
+      - name: Apply and record asserted early acquisition intervention
         run: |
-          pnpm build
-          (pnpm preview --host 127.0.0.1 --port 4174 --strictPort > /tmp/question-candidate.log 2>&1 & echo $! > /tmp/question-candidate.pid)
-      - name: Wait for static production previews
+          python3 - <<'PY'
+          from pathlib import Path
+          import json
+          target = Path('early/ui/src/pages/CoordinatorPage.tsx')
+          source = target.read_text()
+          anchor = "export function CoordinatorPage({ fixtureData }: { fixtureData?: CoordinatorPageFixtureData }) {\n"
+          if source.count(anchor) != 1:
+              raise SystemExit(f'Expected exactly one CoordinatorPage mount anchor, found {source.count(anchor)}')
+          if "void import('./ProductConversationPage');" in source:
+              raise SystemExit('Intervention already present; refusing to stack patches')
+          replacement = anchor + "  useEffect(() => { void import('./ProductConversationPage'); }, []);\n"
+          target.write_text(source.replace(anchor, replacement, 1))
+          description = "Diagnostic-only preload of CoordinatorPage's existing lazy ./ProductConversationPage module on mount; that module statically acquires ConversationPage. No rendering, API, or state semantics changed."
+          Path('question-module-diagnostic/early-intervention.diff').write_text(
+              __import__('subprocess').check_output(['git', '-C', 'early', 'diff', '--', 'ui/src/pages/CoordinatorPage.tsx'], text=True)
+          )
+          Path('question-module-diagnostic/intervention.json').write_text(json.dumps({
+              'source_sha': '0f6e3627a24777364406c3f3718efe2431ccf16d',
+              'file': 'ui/src/pages/CoordinatorPage.tsx',
+              'asserted_anchor': anchor.rstrip(),
+              'description': description,
+              'patch_diff': 'early-intervention.diff'
+          }, indent=2) + '\n')
+          PY
+      - name: Build control and early-acquisition bundles
         run: |
+          (cd control/ui && pnpm build)
+          (cd early/ui && pnpm build)
+      - name: Serve both production previews
+        run: |
+          (cd control/ui && pnpm preview --host 127.0.0.1 --port 4173 --strictPort > /tmp/question-module-control.log 2>&1 & echo $! > /tmp/question-module-control.pid)
+          (cd early/ui && pnpm preview --host 127.0.0.1 --port 4174 --strictPort > /tmp/question-module-early.log 2>&1 & echo $! > /tmp/question-module-early.pid)
           for port in 4173 4174; do
             for i in $(seq 1 60); do curl --fail --silent http://127.0.0.1:$port/ >/dev/null && break; sleep 1; done
             curl --fail --silent http://127.0.0.1:$port/ >/dev/null
           done
-      - name: Compare alternating baseline and candidate trials
-        working-directory: candidate
+      - name: Run alternating diagnostic-only cohorts
+        working-directory: control
         env:
-          BASELINE_URL: http://127.0.0.1:4173
-          CANDIDATE_URL: http://127.0.0.1:4174
-          QUESTION_QA_OUT: ${{ github.workspace }}/question-loading
-          QUESTION_QA_RUNS: '8'
-          BASELINE_SHA: 8a685486413fc6517f61c548e3229a2864ce6703
-          CANDIDATE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          QUESTION_DIAGNOSTIC: '1'
+          CONTROL_URL: http://127.0.0.1:4173
+          EARLY_URL: http://127.0.0.1:4174
+          QUESTION_QA_OUT: ${{ github.workspace }}/question-module-diagnostic
+          CONTROL_SHA: 0f6e3627a24777364406c3f3718efe2431ccf16d
+          EARLY_SHA: 0f6e3627a24777364406c3f3718efe2431ccf16d
+          EARLY_PATCH_DESCRIPTION: Diagnostic-only `import('./ProductConversationPage')` preload from CoordinatorPage mount; semantics unchanged.
         run: node ui/scripts/qualify-question-loading.mjs
-      - name: Provenance and server logs
+      - name: Collect source/build provenance and logs
         if: always()
         run: |
-          mkdir -p question-loading
-          git -C baseline rev-parse HEAD > question-loading/base-sha.txt
-          git -C candidate rev-parse HEAD > question-loading/candidate-sha.txt
-          cp /tmp/question-baseline.log question-loading/ 2>/dev/null || true
-          cp /tmp/question-candidate.log question-loading/ 2>/dev/null || true
+          mkdir -p question-module-diagnostic
+          git -C control rev-parse HEAD > question-module-diagnostic/control-sha.txt
+          git -C early rev-parse HEAD > question-module-diagnostic/early-source-sha.txt
+          git -C early diff --check > question-module-diagnostic/patch-check.txt
+          git -C early diff --stat -- ui/src/pages/CoordinatorPage.tsx > question-module-diagnostic/patch-stat.txt
+          cp /tmp/question-module-control.log question-module-diagnostic/ 2>/dev/null || true
+          cp /tmp/question-module-early.log question-module-diagnostic/ 2>/dev/null || true
+          printf '%s\n' 'Both bundles use source SHA 0f6e3627a24777364406c3f3718efe2431ccf16d and frozen ui/pnpm-lock.yaml dependencies.' > question-module-diagnostic/build-provenance.txt
       - uses: actions/upload-artifact@v6
         if: always()
         with:
-          name: global-question-loading-${{ github.run_id }}
-          path: question-loading/
+          name: question-module-diagnostic-${{ github.run_id }}
+          path: question-module-diagnostic/
           if-no-files-found: warn
           retention-days: 14
