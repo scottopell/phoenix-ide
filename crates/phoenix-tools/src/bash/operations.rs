@@ -3459,7 +3459,7 @@ mod tests {
             .as_array()
             .unwrap()
             .iter()
-            .filter_map(|line| line["bytes"].as_str())
+            .map(|line| line.as_str().expect("model lines are strings"))
             .collect::<String>();
         assert!(
             combined_output.contains("explore-ok"),
@@ -3498,9 +3498,9 @@ mod tests {
             .as_array()
             .expect("captured output window")
             .iter()
-            .all(|line| !line["bytes"]
+            .all(|line| !line
                 .as_str()
-                .unwrap_or_default()
+                .expect("model lines are strings")
                 .contains("explore-preidentity-executed")));
     }
 
