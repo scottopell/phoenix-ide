@@ -2605,7 +2605,7 @@ impl TmuxRegistry {
                             if let Err(reason) = enter(&mut || {
                                 if tokio::time::Instant::now() >= permit.expires {
                                     return Err(
-                                        "tmux final authority exceeded the Close deadline".into(),
+                                        "tmux final authority exceeded the Close deadline".into()
                                     );
                                 }
                                 server.status = ServerStatus::Gone;

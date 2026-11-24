@@ -343,10 +343,13 @@ impl super::RuntimeManager {
         deadline: std::time::Instant,
     ) -> tokio::task::JoinHandle<Result<(), NativeRetryExecutionError>> {
         use crate::runtime::executor::WorkerEntryResult;
-        use phoenix_db::native_close::{NativeCloseInitialEntryRelease, NativeCloseInitialFirstEffectError};
+        use phoenix_db::native_close::{
+            NativeCloseInitialEntryRelease, NativeCloseInitialFirstEffectError,
+        };
         let backend = Arc::clone(self);
         let runtime = Handle::current();
-        task::spawn_blocking(move || runtime.block_on(async {
+        task::spawn_blocking(move || {
+            runtime.block_on(async {
             let LossItemIdentity::Opaque(value) = effect.resource.identity() else {
                 return Err(NativeRetryExecutionError::ResourceFailure("tmux identity is not opaque".into()));
             };
@@ -439,7 +442,8 @@ impl super::RuntimeManager {
                 Ok(RetirementOutcome::Retired | RetirementOutcome::AbsenceAdopted { .. }) => Ok(()),
                 _ => Err(NativeRetryExecutionError::ResourceFailure("tmux retirement remained residual".into())),
             }
-        }))
+        })
+        })
     }
 
     pub(crate) fn spawn_native_retry_scope_with_source_entry(

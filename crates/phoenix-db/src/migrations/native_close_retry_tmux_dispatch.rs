@@ -3,7 +3,8 @@ use sqlx::{Connection, Sqlite, SqlitePool, Transaction};
 
 const INSERT_AUTHORITY: &str = "close_retirement_resource_dispatches_require_authority";
 const INSERT_MEMBERSHIP: &str = "close_retirement_resource_dispatches_require_full_membership";
-const UPDATE_MEMBERSHIP: &str = "close_retirement_resource_dispatches_updates_require_full_membership";
+const UPDATE_MEMBERSHIP: &str =
+    "close_retirement_resource_dispatches_updates_require_full_membership";
 const CAPTURE: &str = include_str!("native_close_captured_loss_retry.sql");
 const ORIGINAL: &str = include_str!("native_close_retry_dispatch.sql");
 const WORKTREE: &str = "      AND effect.resource_kind = 'worktree' AND effect.identity_kind = 'worktree'
@@ -11,7 +12,9 @@ const WORKTREE: &str = "      AND effect.resource_kind = 'worktree' AND effect.i
       AND captured.captured_worktree_fingerprint IS NOT NULL AND captured.captured_worktree_locator IS NOT NULL";
 
 fn unexpected(name: &str) -> DbError {
-    DbError::Serialization(format!("migration 185 found unexpected {name} source shape"))
+    DbError::Serialization(format!(
+        "migration 185 found unexpected {name} source shape"
+    ))
 }
 
 fn trigger(source: &str, name: &str) -> DbResult<String> {
@@ -81,7 +84,12 @@ pub(super) async fn run(pool: &SqlitePool, migration: &Migration) -> DbResult<()
 
     // Tmux has only original-inventory authority. Leave both worktree arms
     // intact, including captured environment and pending-success predicates.
-    let tmux = replace_exact(original, INSERT_AUTHORITY, WORKTREE, migration.sql.trim_end())?;
+    let tmux = replace_exact(
+        original,
+        INSERT_AUTHORITY,
+        WORKTREE,
+        migration.sql.trim_end(),
+    )?;
     let native_185 = format!("{native_184}\nUNION ALL\n{tmux}");
     let insert_185 = replace_exact(&insert_184, INSERT_AUTHORITY, &native_184, &native_185)?;
 
@@ -109,7 +117,12 @@ pub(super) async fn run(pool: &SqlitePool, migration: &Migration) -> DbResult<()
     let mut connection = pool.acquire().await?;
     let mut tx = connection.begin().await?;
     require_source(&mut tx, INSERT_AUTHORITY, &insert_184).await?;
-    require_source(&mut tx, INSERT_MEMBERSHIP, &trigger(CAPTURE, INSERT_MEMBERSHIP)?).await?;
+    require_source(
+        &mut tx,
+        INSERT_MEMBERSHIP,
+        &trigger(CAPTURE, INSERT_MEMBERSHIP)?,
+    )
+    .await?;
     require_source(&mut tx, UPDATE_MEMBERSHIP, &update_184).await?;
     sqlx::raw_sql(
         "DROP TRIGGER close_retirement_resource_dispatches_require_authority;

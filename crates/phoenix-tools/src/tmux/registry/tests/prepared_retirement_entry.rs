@@ -92,7 +92,10 @@ async fn ordinary_prepared_complete_still_retires_without_entry_callback() {
         .unwrap();
     let prepared = registry.prepare_retirement(&permit).await.unwrap();
 
-    assert_eq!(prepared.complete().await.unwrap(), TmuxRetirementOutcome::Retired);
+    assert_eq!(
+        prepared.complete().await.unwrap(),
+        TmuxRetirementOutcome::Retired
+    );
     assert_eq!(fake.kill_server_count(&identity.socket_path), 1);
     assert_eq!(server.read().await.status, ServerStatus::Gone);
 }

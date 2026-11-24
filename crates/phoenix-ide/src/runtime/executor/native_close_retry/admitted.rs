@@ -211,7 +211,9 @@ impl AdmittedRetryCursor {
                         return Ok(false);
                     }
                 };
-                self.order = crate::runtime::close_retirement::close_safe_retry_execution_order(&context.progress.pending);
+                self.order = crate::runtime::close_retirement::close_safe_retry_execution_order(
+                    &context.progress.pending,
+                );
                 self.context = Some(context);
                 self.stage = Stage::Select;
             }
@@ -223,10 +225,16 @@ impl AdmittedRetryCursor {
                     match effect.resource.kind() {
                         RetiredResourceKind::Worktree => self.stage = Stage::WorktreeDispatch,
                         RetiredResourceKind::TmuxServer => {
-                            self.tmux_worker = Some(self.backend.spawn_native_retry_tmux_with_source_entry(
-                                self.command.clone(), self.receipt.admitted.clone(),
-                                self.context.as_ref().expect("context").clone(), effect, live.clone(),
-                                self.source_entry.clone(), self.deadline));
+                            self.tmux_worker =
+                                Some(self.backend.spawn_native_retry_tmux_with_source_entry(
+                                    self.command.clone(),
+                                    self.receipt.admitted.clone(),
+                                    self.context.as_ref().expect("context").clone(),
+                                    effect,
+                                    live.clone(),
+                                    self.source_entry.clone(),
+                                    self.deadline,
+                                ));
                             self.stage = Stage::TmuxRunning;
                         }
                         RetiredResourceKind::WorkScope => {
@@ -249,26 +257,49 @@ impl AdmittedRetryCursor {
             }
             Stage::TmuxRunning => {
                 let worker = self.tmux_worker.as_ref().expect("retained tmux worker");
-                if !worker.is_finished() { self.stage = Stage::TmuxRunning; return Ok(false); }
+                if !worker.is_finished() {
+                    self.stage = Stage::TmuxRunning;
+                    return Ok(false);
+                }
                 let result = self.tmux_worker.take().expect("retained tmux worker").await;
-                if matches!(&result, Err(_) | Ok(Err(NativeRetryExecutionError::Unclassified))) {
+                if matches!(
+                    &result,
+                    Err(_) | Ok(Err(NativeRetryExecutionError::Unclassified))
+                ) {
                     self.stage = Stage::Fatal;
                     return Err(NativeCloseApplicationError::FatalAuthority);
                 }
                 if !current {
-                    tracing::debug!(?result, "joined tmux retry after source loss; no current-source success recorded");
+                    tracing::debug!(
+                        ?result,
+                        "joined tmux retry after source loss; no current-source success recorded"
+                    );
                     self.stage = Stage::ObserveTerminal;
                 } else {
                     match result {
                         Ok(Ok(())) => self.stage = Stage::TmuxEvidence,
-                        Ok(Err(error)) => if self.accept(Err(error)) { return Ok(true); },
+                        Ok(Err(error)) => {
+                            if self.accept(Err(error)) {
+                                return Ok(true);
+                            }
+                        }
                         Err(_) => self.stage = Stage::Fatal,
                     }
                 }
             }
             Stage::TmuxEvidence => {
-                let result = self.backend.native_retry_record_success(&self.command, &self.receipt.admitted, self.effect(), "joined exact native retry tmux retirement").await;
-                if self.accept(result) { return Ok(true); }
+                let result = self
+                    .backend
+                    .native_retry_record_success(
+                        &self.command,
+                        &self.receipt.admitted,
+                        self.effect(),
+                        "joined exact native retry tmux retirement",
+                    )
+                    .await;
+                if self.accept(result) {
+                    return Ok(true);
+                }
             }
             Stage::ScopeRunning => {
                 let worker = self
