@@ -910,7 +910,7 @@ LAUNCHD_TRANSITION_TIMEOUT_SECS = 30.0
 LAUNCHD_RESTART_SHUTDOWN_TIMEOUT_SECS = 35.0
 LAUNCHD_HEALTH_TIMEOUT_SECS = 120.0
 LAUNCHD_STALE_HANDOFF_ALLOWANCE_SECS = 30.0
-LAUNCHD_HANDOFF_PROTOCOL_VERSION = 3
+LAUNCHD_HANDOFF_PROTOCOL_VERSION = 4
 LAUNCHD_RESTART_HANDOFF_PROTOCOL_VERSION = 2
 NEWSYSLOG_CONF_PATH = Path("/etc/newsyslog.d") / f"{LAUNCHD_LABEL}.conf"
 
@@ -11434,6 +11434,15 @@ class ValidatedLinuxPreparedCandidate:
     release_commit: None = None
 
 
+def _nonnegative_ascii_integer(value: str) -> int:
+    if not isinstance(value, str) or re.fullmatch(r"[0-9]+", value) is None:
+        raise argparse.ArgumentTypeError("must be a nonnegative base-10 integer")
+    try:
+        return int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("integer is out of range") from exc
+
+
 @dataclasses.dataclass(frozen=True)
 class ProdDeployControllerOptions:
     enabled: bool = False
@@ -11449,6 +11458,7 @@ class ProdDeployControllerOptions:
     controller_source_commit: str | None = None
     candidate_source_root: Path | None = None
     candidate_source_commit: str | None = None
+    additional_reserve_bytes: int = 0
 
     def require_local_candidate_source(
         self,
@@ -12510,6 +12520,7 @@ def launchd_prod_deploy(
             "target_binary": str(target_binary), "target_plist": str(LAUNCHD_PLIST_PATH),
             "label": LAUNCHD_LABEL, "helper_label": label, "uid": os.getuid(),
             "health_url": health_url, "health_insecure_tls": insecure_tls,
+            "additional_reserve_bytes": controller.additional_reserve_bytes,
             "active_path": str(LAUNCHD_DEPLOY_ACTIVE_PATH), "status_path": str(LAUNCHD_DEPLOY_STATUS_PATH),
             "deployed_sha_path": str(PROD_SHA_PATH), "lock_path": str(LAUNCHD_DEPLOY_LOCK_PATH),
             "claim_lock_path": str(LAUNCHD_DEPLOY_CLAIM_LOCK_PATH), "created_at": created_at,
@@ -12983,6 +12994,8 @@ def cmd_prod_deploy(
     if controller.prepared_artifact is not None and not controller.systemd_current_schema_upgrade:
         raise SystemExit("prepared artifact deployment is supported only by protected Linux systemd mode")
     env = controller.require_backend()
+    if controller.additional_reserve_bytes and env != "launchd":
+        raise SystemExit("--additional-reserve-bytes is supported only by macOS launchd deployment")
     if controller.enabled and not release and controller.prepared_artifact is None:
         raise SystemExit("controller mode requires --release")
     compiler_cache_setup = None
@@ -12997,7 +13010,7 @@ def cmd_prod_deploy(
         print()
 
     if env == "launchd":
-        if controller.enabled or controller.candidate_source_root is not None:
+        if controller.enabled or controller.candidate_source_root is not None or controller.additional_reserve_bytes:
             launchd_prod_deploy(release, controller=controller)
         else:
             launchd_prod_deploy(
@@ -13372,6 +13385,10 @@ def main():
         "--candidate-source-commit", default=None,
         help="Expected full lowercase HEAD SHA of --candidate-source-root",
     )
+    deploy_parser.add_argument(
+        "--additional-reserve-bytes", type=_nonnegative_ascii_integer, default=0,
+        help="Keep this many extra filesystem bytes available at launchd migration admission (default: 0)",
+    )
     deploy_parser.add_argument("legacy_version", nargs="?", help=argparse.SUPPRESS)
     deploy_parser.add_argument(
         "--pretty", action="store_true", default=False,
@@ -13593,6 +13610,7 @@ def main():
                 pretty=pretty,
                 controller=ProdDeployControllerOptions(
                     enabled=args.controller_mode,
+                    additional_reserve_bytes=args.additional_reserve_bytes,
                     controller_source_commit=args.controller_source_commit,
                     candidate_source_root=getattr(args, "candidate_source_root", None),
                     candidate_source_commit=getattr(args, "candidate_source_commit", None),
