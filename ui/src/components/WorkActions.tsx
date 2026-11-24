@@ -12,6 +12,7 @@ import { derivePrRailAvailability } from './prRailAvailability';
 import { prReviewState } from './prReviewState';
 import { useIsCompactLayout } from '../hooks';
 import { subscribeCloseSnapshotChanged } from '../notifications';
+import { CloseStatusPanel } from './CloseStatusPanel';
 import './WorkActions.css';
 
 interface WorkControlBarProps {
@@ -26,6 +27,8 @@ interface WorkControlBarProps {
   prStatusHandle: ConversationPrStatusHandle;
 }
 
+type CloseActionKind = 'clean_up' | 'abandon';
+
 function InfoHint({ text }: { text: string }) {
   return (
     <details className="work-actions-info-hint">
@@ -35,112 +38,99 @@ function InfoHint({ text }: { text: string }) {
   );
 }
 
-function displayLossIdentity(identity: string): string {
-  const prefix = 'git_path_bytes_hex_v1:';
-  if (!identity.startsWith(prefix)) return identity;
-  const hex = identity.slice(prefix.length);
-  if (!/^(?:[0-9a-f]{2})+$/i.test(hex)) return identity;
-  const bytes = new Uint8Array(hex.match(/../g)?.map((pair) => Number.parseInt(pair, 16)) ?? []);
-  try {
-    return new TextDecoder('utf-8', { fatal: true }).decode(bytes);
-  } catch {
-    return Array.from(bytes, (byte) => byte >= 0x20 && byte < 0x7f
-      ? String.fromCharCode(byte)
-      : `\\x${byte.toString(16).padStart(2, '0')}`).join('');
+function UnresolvedPrSelectionAction({
+  hasActionablePrs,
+  readOnly,
+  canResumeInference,
+  onSelectPr,
+  onResumeInference,
+}: {
+  hasActionablePrs: boolean;
+  readOnly: boolean;
+  canResumeInference: boolean;
+  onSelectPr: () => void;
+  onResumeInference: () => void;
+}) {
+  if (hasActionablePrs) {
+    return (
+      <button
+        type="button"
+        className="mobile-pr-action mobile-pr-action--hero"
+        onClick={onSelectPr}
+      >
+        Select active PR
+      </button>
+    );
   }
+  return (
+    <button
+      type="button"
+      className="mobile-pr-action mobile-pr-action--hero"
+      disabled={readOnly || !canResumeInference}
+      onClick={onResumeInference}
+    >
+      Resume PR inference
+    </button>
+  );
 }
 
-function CloseStatusPanel({
-  snapshot,
-  busy,
-  onConfirmLosses,
-  onConfirmStopWork,
-  onCancel,
-  onRetry,
+function CloseConversationButton({
+  kind,
+  variant,
+  primary = false,
+  busy = false,
+  disabled,
+  hint,
+  onClick,
 }: {
-  snapshot: ProductConversationSnapshotView;
-  busy: boolean;
-  onConfirmLosses: () => void;
-  onConfirmStopWork: () => void;
-  onCancel: () => void;
-  onRetry: () => void;
+  kind: CloseActionKind;
+  variant: 'mobile-hero' | 'mobile-menu' | 'rail-secondary' | 'desktop';
+  primary?: boolean;
+  busy?: boolean;
+  disabled: boolean;
+  hint: string;
+  onClick: () => void;
 }) {
-  const close = snapshot.close;
-  if (!close || close.run_status === 'stopped' || close.phase === 'completed') return null;
-  if (close.phase === 'awaiting_loss_confirmation') {
+  const isCleanUp = kind === 'clean_up';
+  const label = busy ? 'Closing…' : 'Close conversation';
+
+  if (variant === 'desktop') {
     return (
-      <section className="work-actions-close-status" aria-label="Close loss confirmation">
-        <strong>⚠ Closing will discard these exact items</strong>
-        <ul>
-          {close.losses.map((loss) => (
-            <li key={`${loss.scope}:${loss.generation}:${loss.category}:${loss.identity}`}>
-              <code>{loss.scope}: {displayLossIdentity(loss.identity)}</code> · {loss.category.replaceAll('_', ' ')}
-            </li>
-          ))}
-        </ul>
-        <p>No patch, stash, commit, branch deletion, or PR mutation will be created.</p>
-        <button type="button" className="work-actions-btn work-actions-btn--danger" disabled={busy} onClick={onConfirmLosses}>
-          {busy ? 'Closing…' : 'Discard exact items and close'}
+      <div className="desktop-work-actions-terminal">
+        <button
+          className={`work-actions-btn ${isCleanUp ? 'work-actions-clean-up' : 'work-actions-abandon'}${primary ? ' work-actions-btn--primary' : ''}`}
+          data-testid={isCleanUp ? 'clean-up-button' : 'abandon-button'}
+          aria-label={`Close conversation. ${hint}`}
+          title={hint}
+          disabled={disabled}
+          onClick={onClick}
+        >
+          {label}
         </button>
-        <button type="button" className="work-actions-btn" disabled={busy} onClick={onCancel}>
-          Keep work and cancel Close
-        </button>
-      </section>
+        <InfoHint text={hint} />
+      </div>
     );
   }
-  if (close.phase === 'awaiting_stop_work_confirmation') {
-    return (
-      <section className="work-actions-close-status" aria-label="Close stop-work confirmation">
-        <strong>⚠ Active work must stop before closing</strong>
-        <p>Continuing will cancel the active turn for this exact Close attempt.</p>
-        <button type="button" className="work-actions-btn work-actions-btn--danger" disabled={busy} onClick={onConfirmStopWork}>
-          {busy ? 'Stopping…' : 'Stop work and continue closing'}
-        </button>
-        <button type="button" className="work-actions-btn" disabled={busy} onClick={onCancel}>
-          Keep work and cancel Close
-        </button>
-      </section>
-    );
-  }
-  if (close.phase === 'needs_repair') {
-    return (
-      <section className="work-actions-close-status" aria-label="Close repair required">
-        <strong>⚠ Close needs repair</strong>
-        <p>Phoenix stopped before it could prove every owned resource was retired.</p>
-        <ul>
-          {close.residuals.map((residual) => (
-            <li key={`${residual.scope}:${residual.resource_kind}:${residual.identity}`}>
-              <code>{residual.scope}: {residual.resource_kind.replaceAll('_', ' ')} · {residual.identity}</code>
-              {' · '}{residual.reason.replaceAll('_', ' ')}
-              {residual.detail ? ` — ${residual.detail}` : ''}
-            </li>
-          ))}
-        </ul>
-        <button type="button" className="work-actions-btn" disabled={busy} onClick={onRetry}>
-          {busy ? 'Retrying…' : 'Retry exact Close attempt'}
-        </button>
-      </section>
-    );
-  }
-  const cancellablePhases = new Set([
-    'awaiting_blocker_resolution',
-    'awaiting_stop_work_confirmation',
-    'settling_active_work',
-    'cancel_requested_during_settlement',
-    'awaiting_retirement_inspection',
-  ]);
-  if (cancellablePhases.has(close.phase)) {
-    return (
-      <section className="work-actions-close-status" aria-label="Close in progress">
-        <strong>… Close in progress</strong>
-        <p>{close.phase.replaceAll('_', ' ')}</p>
-        <button type="button" className="work-actions-btn" disabled={busy} onClick={onCancel}>
-          Keep work and cancel Close
-        </button>
-      </section>
-    );
-  }
-  return null;
+
+  const toneClass = isCleanUp ? 'mobile-pr-action--cleanup' : 'mobile-pr-action--danger';
+  const heroClass = variant === 'mobile-hero' ? ' mobile-pr-action--hero' : '';
+  return (
+    <button
+      type="button"
+      className={`mobile-pr-action ${toneClass}${heroClass}`}
+      aria-label={`Close conversation. ${hint}`}
+      title={hint}
+      disabled={disabled}
+      onClick={onClick}
+    >
+      {variant === 'rail-secondary' ? (
+        <>
+          <span className="mobile-pr-action-icon" aria-hidden="true">{isCleanUp ? '—' : '!'}</span>
+          <span>Close conversation</span>
+        </>
+      ) : label}
+    </button>
+  );
 }
 
 /** The orthogonal PR feedback coverage marker (e.g. "⚠ GitHub sign-in needed").
@@ -571,35 +561,28 @@ export function WorkControlBar({
     return false;
   };
 
-  const handleCleanUp = async (): Promise<boolean> => {
+  const runCloseVerb = async (kind: CloseActionKind): Promise<boolean> => {
+    const setBusy = kind === 'clean_up' ? setMarkingMerged : setAbandoning;
     setError(null);
-    setMarkingMerged(true);
+    setBusy(true);
     try {
       if (!(await terminalActionStillSafe())) return false;
-      await api.markMerged(conversationId);
+      if (kind === 'clean_up') {
+        await api.markMerged(conversationId);
+      } else {
+        await api.abandonTask(conversationId);
+      }
       onCloseCompleted?.();
       return true;
     } catch (err) {
       return surfaceCloseConflict(err, 'Failed to close conversation');
     } finally {
-      setMarkingMerged(false);
+      setBusy(false);
     }
   };
 
-  const handleAbandon = async (): Promise<boolean> => {
-    setError(null);
-    setAbandoning(true);
-    try {
-      if (!(await terminalActionStillSafe())) return false;
-      await api.abandonTask(conversationId);
-      onCloseCompleted?.();
-      return true;
-    } catch (err) {
-      return surfaceCloseConflict(err, 'Failed to close conversation');
-    } finally {
-      setAbandoning(false);
-    }
-  };
+  const handleCleanUp = () => runCloseVerb('clean_up');
+  const handleAbandon = () => runCloseVerb('abandon');
 
   const confirmCloseStopWork = async () => {
     const attemptId = closeSnapshot?.close?.attempt_id;
@@ -757,10 +740,18 @@ export function WorkControlBar({
               : null;
     const detailItems = [
       disposition.note?.text ?? primaryGuidance,
-      disposition.showCleanUp ? closeHintText() : null,
-      disposition.showAbandon ? closeHintText() : null,
+      (disposition.showCleanUp || disposition.showAbandon) ? closeHintText() : null,
     ].filter((item): item is string => item !== null);
     const closeFallbackPanel = () => setFallbackPanel(null);
+    const unresolvedPrSelectionControl = (
+      <UnresolvedPrSelectionAction
+        hasActionablePrs={actionablePrs.length > 0}
+        readOnly={readOnly}
+        canResumeInference={Boolean(prStatusHandle.resumeInference)}
+        onSelectPr={openSelectorFromFallback}
+        onResumeInference={() => { void resumePrInference(); }}
+      />
+    );
 
     return (
       <div
@@ -786,134 +777,47 @@ export function WorkControlBar({
         </div>
 
         {(disposition.primary !== 'none' || fallbackHasOverflowActions) && <div className="mobile-work-fallback-actions">
-          {prSelectionUnresolved && (disposition.primary === 'clean_up' || disposition.primary === 'abandon') && (
-            actionablePrs.length > 0 ? (
+          {prSelectionUnresolved && (disposition.primary === 'clean_up' || disposition.primary === 'abandon') && unresolvedPrSelectionControl}
+          {disposition.primary === 'resolve' && disposition.resolve && disposition.resolve.kind !== 'address_feedback' && (
+            explicitSelectionUnresolved
+              ? unresolvedPrSelectionControl
+              : <ResolveLink verb={disposition.resolve} primary coverageMarker={coverageMarker} />
+          )}
+          {disposition.primary === 'resolve' && disposition.resolve?.kind === 'address_feedback' && (
+            canAddressFeedback ? (
               <button
                 type="button"
                 className="mobile-pr-action mobile-pr-action--hero"
-                onClick={openSelectorFromFallback}
+                data-testid="mobile-primary-address-feedback"
+                disabled={readOnly || capturing}
+                onClick={handleAddressFeedback}
               >
-                Select active PR
+                <span>{capturing ? `Capturing ${addressFeedbackPrLabel}…` : `Address feedback${freshnessLabel ? ` · ${freshnessLabel}` : ''}`}</span>
+                <CoverageMarker marker={coverageMarker} />
               </button>
-            ) : (
+            ) : unresolvedPrSelectionControl
+          )}
+          {disposition.primary === 'review' && (
+            explicitSelectionUnresolved ? unresolvedPrSelectionControl : (
               <button
                 type="button"
                 className="mobile-pr-action mobile-pr-action--hero"
-                disabled={readOnly || !prStatusHandle.resumeInference}
-                onClick={() => void resumePrInference()}
+                aria-label="Review workspace changes"
+                onClick={() => openDiffFullscreen('workspace')}
               >
-                Resume PR inference
+                Review changes
               </button>
             )
           )}
-          {disposition.primary === 'resolve' && disposition.resolve && disposition.resolve.kind !== 'address_feedback' && !explicitSelectionUnresolved && (
-            <ResolveLink verb={disposition.resolve} primary coverageMarker={coverageMarker} />
-          )}
-          {disposition.primary === 'resolve' && disposition.resolve && disposition.resolve.kind !== 'address_feedback' && explicitSelectionUnresolved && (
-            actionablePrs.length > 0 ? (
-              <button
-                type="button"
-                className="mobile-pr-action mobile-pr-action--hero"
-                onClick={openSelectorFromFallback}
-              >
-                Select active PR
-              </button>
-            ) : (
-              <button
-                type="button"
-                className="mobile-pr-action mobile-pr-action--hero"
-                disabled={readOnly || !prStatusHandle.resumeInference}
-                onClick={() => void resumePrInference()}
-              >
-                Resume PR inference
-              </button>
-            )
-          )}
-          {disposition.primary === 'resolve' && disposition.resolve?.kind === 'address_feedback' && canAddressFeedback && (
-            <button
-              type="button"
-              className="mobile-pr-action mobile-pr-action--hero"
-              data-testid="mobile-primary-address-feedback"
-              disabled={readOnly || capturing}
-              onClick={handleAddressFeedback}
-            >
-              <span>{capturing ? `Capturing ${addressFeedbackPrLabel}…` : `Address feedback${freshnessLabel ? ` · ${freshnessLabel}` : ''}`}</span>
-              <CoverageMarker marker={coverageMarker} />
-            </button>
-          )}
-          {disposition.primary === 'resolve' && disposition.resolve?.kind === 'address_feedback' && !canAddressFeedback && (
-            actionablePrs.length > 0 ? (
-              <button
-                type="button"
-                className="mobile-pr-action mobile-pr-action--hero"
-                onClick={openSelectorFromFallback}
-              >
-                Select active PR
-              </button>
-            ) : (
-              <button
-                type="button"
-                className="mobile-pr-action mobile-pr-action--hero"
-                disabled={readOnly || !prStatusHandle.resumeInference}
-                onClick={() => void resumePrInference()}
-              >
-                Resume PR inference
-              </button>
-            )
-          )}
-          {disposition.primary === 'review' && !explicitSelectionUnresolved && (
-            <button
-              type="button"
-              className="mobile-pr-action mobile-pr-action--hero"
-              aria-label="Review workspace changes"
-              onClick={() => openDiffFullscreen('workspace')}
-            >
-              Review changes
-            </button>
-          )}
-          {disposition.primary === 'review' && explicitSelectionUnresolved && (
-            actionablePrs.length > 0 ? (
-              <button
-                type="button"
-                className="mobile-pr-action mobile-pr-action--hero"
-                onClick={openSelectorFromFallback}
-              >
-                Select active PR
-              </button>
-            ) : (
-              <button
-                type="button"
-                className="mobile-pr-action mobile-pr-action--hero"
-                disabled={readOnly || !prStatusHandle.resumeInference}
-                onClick={() => void resumePrInference()}
-              >
-                Resume PR inference
-              </button>
-            )
-          )}
-          {disposition.primary === 'clean_up' && (
-            <button
-              type="button"
-              className="mobile-pr-action mobile-pr-action--cleanup mobile-pr-action--hero"
-              aria-label={`Close conversation. ${closeHintText()}`}
-              title={closeHintText()}
+          {(disposition.primary === 'clean_up' || disposition.primary === 'abandon') && (
+            <CloseConversationButton
+              kind={disposition.primary}
+              variant="mobile-hero"
+              busy={disposition.primary === 'clean_up' ? markingMerged : abandoning}
               disabled={readOnly || isLoading}
-              onClick={handleCleanUp}
-            >
-              {markingMerged ? 'Closing…' : 'Close conversation'}
-            </button>
-          )}
-          {disposition.primary === 'abandon' && (
-            <button
-              type="button"
-              className="mobile-pr-action mobile-pr-action--danger mobile-pr-action--hero"
-              aria-label={`Close conversation. ${closeHintText()}`}
-              title={closeHintText()}
-              disabled={readOnly || isLoading}
-              onClick={handleAbandon}
-            >
-              {abandoning ? 'Closing…' : 'Close conversation'}
-            </button>
+              hint={closeHintText()}
+              onClick={() => { void runCloseVerb(disposition.primary as CloseActionKind); }}
+            />
           )}
           {fallbackHasOverflowActions && (
             <button
@@ -950,32 +854,22 @@ export function WorkControlBar({
         {fallbackMenuIsOpen && fallbackHasOverflowActions && (
           <div ref={fallbackMenuRef} id="mobile-work-fallback-more-actions" className="mobile-work-fallback-menu" aria-label="More work actions">
             {disposition.showCleanUp && disposition.primary !== 'clean_up' && (
-              <button
-                type="button"
-                className="mobile-pr-action mobile-pr-action--cleanup"
+              <CloseConversationButton
+                kind="clean_up"
+                variant="mobile-menu"
                 disabled={readOnly || isLoading}
-                aria-label={`Close conversation. ${closeHintText()}`}
-                title={closeHintText()}
-                onClick={async () => {
-                  if (await handleCleanUp()) closeFallbackPanel();
-                }}
-              >
-                Close conversation
-              </button>
+                hint={closeHintText()}
+                onClick={() => { void handleCleanUp().then((ok) => { if (ok) closeFallbackPanel(); }); }}
+              />
             )}
             {disposition.showAbandon && disposition.primary !== 'abandon' && (
-              <button
-                type="button"
-                className="mobile-pr-action mobile-pr-action--danger"
-                aria-label={`Close conversation. ${closeHintText()}`}
-                title={closeHintText()}
+              <CloseConversationButton
+                kind="abandon"
+                variant="mobile-menu"
                 disabled={readOnly || isLoading}
-                onClick={async () => {
-                  if (await handleAbandon()) closeFallbackPanel();
-                }}
-              >
-                Close conversation
-              </button>
+                hint={closeHintText()}
+                onClick={() => { void handleAbandon().then((ok) => { if (ok) closeFallbackPanel(); }); }}
+              />
             )}
           </div>
         )}
@@ -990,26 +884,14 @@ export function WorkControlBar({
       ? `${activePr.repo_owner}/${activePr.repo_name}#${activePr.pr_number}`
       : null;
     const expanded = activeIdentity !== null && expandedPrIdentity === activeIdentity;
-    const mobileHero = disposition.primary === 'clean_up' ? (
-      <button
-        type="button"
-        className="mobile-pr-action mobile-pr-action--hero mobile-pr-action--cleanup"
+    const mobileHero = (disposition.primary === 'clean_up' || disposition.primary === 'abandon') ? (
+      <CloseConversationButton
+        kind={disposition.primary}
+        variant="mobile-hero"
         disabled={readOnly || isLoading}
-        onClick={handleCleanUp}
-      >
-        Close conversation
-      </button>
-    ) : disposition.primary === 'abandon' ? (
-      <button
-        type="button"
-        className="mobile-pr-action mobile-pr-action--hero mobile-pr-action--danger"
-        aria-label={`Close conversation. ${closeHintText()}`}
-        title={closeHintText()}
-        disabled={readOnly || isLoading}
-        onClick={handleAbandon}
-      >
-        Close conversation
-      </button>
+        hint={closeHintText()}
+        onClick={() => { void runCloseVerb(disposition.primary as CloseActionKind); }}
+      />
     ) : disposition.resolve?.kind === 'address_feedback' && prSpecificActionsEnabled ? (
       <button
         type="button"
@@ -1057,28 +939,22 @@ export function WorkControlBar({
                 </a>
               )}
               {disposition.showCleanUp && disposition.primary !== 'clean_up' && (
-                <button
-                  type="button"
-                  className="mobile-pr-action mobile-pr-action--cleanup"
-                  aria-label={`Close conversation. ${closeHintText()}`}
-                  title={closeHintText()}
+                <CloseConversationButton
+                  kind="clean_up"
+                  variant="rail-secondary"
                   disabled={readOnly || isLoading}
-                  onClick={handleCleanUp}
-                >
-                  <span className="mobile-pr-action-icon" aria-hidden="true">—</span><span>Close conversation</span>
-                </button>
+                  hint={closeHintText()}
+                  onClick={() => { void handleCleanUp(); }}
+                />
               )}
               {disposition.showAbandon && disposition.primary !== 'abandon' && (
-                <button
-                  type="button"
-                  className="mobile-pr-action mobile-pr-action--danger"
-                  aria-label={`Close conversation. ${closeHintText()}`}
-                  title={closeHintText()}
+                <CloseConversationButton
+                  kind="abandon"
+                  variant="rail-secondary"
                   disabled={readOnly || isLoading}
-                  onClick={handleAbandon}
-                >
-                  <span className="mobile-pr-action-icon" aria-hidden="true">!</span><span>Close conversation</span>
-                </button>
+                  hint={closeHintText()}
+                  onClick={() => { void handleAbandon(); }}
+                />
               )}
               {prStatusHandle.activeSelection?.active_pr?.provenance === 'pinned' && prStatusHandle.resumeInference && (
                 <button
@@ -1209,34 +1085,26 @@ export function WorkControlBar({
           <ResolveLink verb={disposition.secondaryResolve} primary={false} coverageMarker={coverageMarker} />
         )}
         {disposition.showCleanUp && (
-          <div className="desktop-work-actions-terminal">
-            <button
-              className={`work-actions-btn work-actions-clean-up${primaryClass('clean_up')}`}
-              data-testid="clean-up-button"
-              aria-label={`Close conversation. ${closeHintText()}`}
-              title={closeHintText()}
-              disabled={readOnly || isLoading}
-              onClick={handleCleanUp}
-            >
-              {markingMerged ? 'Closing…' : 'Close conversation'}
-            </button>
-            <InfoHint text={closeHintText()} />
-          </div>
+          <CloseConversationButton
+            kind="clean_up"
+            variant="desktop"
+            primary={!explicitSelectionUnresolved && disposition.primary === 'clean_up'}
+            busy={markingMerged}
+            disabled={readOnly || isLoading}
+            hint={closeHintText()}
+            onClick={() => { void handleCleanUp(); }}
+          />
         )}
         {disposition.showAbandon && (
-          <div className="desktop-work-actions-terminal">
-            <button
-              className={`work-actions-btn work-actions-abandon${primaryClass('abandon')}`}
-              data-testid="abandon-button"
-              aria-label={`Close conversation. ${closeHintText()}`}
-              title={closeHintText()}
-              disabled={readOnly || isLoading}
-              onClick={handleAbandon}
-            >
-              {abandoning ? 'Closing…' : 'Close conversation'}
-            </button>
-            <InfoHint text={closeHintText()} />
-          </div>
+          <CloseConversationButton
+            kind="abandon"
+            variant="desktop"
+            primary={!explicitSelectionUnresolved && disposition.primary === 'abandon'}
+            busy={abandoning}
+            disabled={readOnly || isLoading}
+            hint={closeHintText()}
+            onClick={() => { void handleAbandon(); }}
+          />
         )}
         {note && (
           <span className={`work-actions-note desktop-work-actions-note${note.kind === 'continued' ? ' work-actions-continuation-note' : ''}${note.kind === 'checking' ? ' work-actions-checking-note' : ''}${note.kind === 'gh_unavailable' ? ' work-actions-pr-note--warning' : ''}${note.kind === 'pr_closed' || note.kind === 'pr_open_stuck' || note.kind === 'no_pr_dirty' ? ' work-actions-pr-note' : ''}`}>
