@@ -348,7 +348,7 @@ export function QuestionPanel({
   useEffect(() => {
     if (!active || !hasCurrentQuestion) return;
     const frame = requestAnimationFrame(() => {
-      if (!confirmDismissVisibleRef.current) panelRef.current?.focus();
+      if (!confirmDismissVisibleRef.current) panelRef.current?.focus({ preventScroll: true });
     });
     return () => cancelAnimationFrame(frame);
   }, [active, currentStep, hasCurrentQuestion]);

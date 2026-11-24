@@ -50,11 +50,12 @@ describe('QuestionPanel focus lifecycle', () => {
     vi.restoreAllMocks();
   });
 
-  function content(questions = [question('Q1?'), question('Q2?')]) {
+  function content(questions = [question('Q1?'), question('Q2?')], active = true) {
     return <>
       <button>Outside</button>
       <QuestionPanel
         questions={questions}
+        active={active}
         actions={blockingQuestionActions('conversation', 'request-q1')}
         showToast={() => {}}
         onAnswered={() => {}}
@@ -133,6 +134,29 @@ describe('QuestionPanel focus lifecycle', () => {
     view.rerender(<RequestBoundPanel key="second" requestId="second" text="Q1?" />);
     flushFrame();
     expect(view.container.querySelector('.question-panel')).toHaveFocus();
+  });
+
+  it('uses preventScroll when automatic focus runs on mount, step, and activation', () => {
+    const view = render(content());
+    const panel = view.container.querySelector<HTMLDivElement>('.question-panel')!;
+    const focus = vi.spyOn(panel, 'focus');
+
+    flushFrame();
+    expect(focus).toHaveBeenLastCalledWith({ preventScroll: true });
+    expect(panel).toHaveFocus();
+
+    focus.mockClear();
+    fireEvent.click(screen.getByRole('button', { name: 'Next' }));
+    flushFrame();
+    expect(focus).toHaveBeenLastCalledWith({ preventScroll: true });
+    expect(panel).toHaveFocus();
+
+    focus.mockClear();
+    view.rerender(content(undefined, false));
+    view.rerender(content(undefined, true));
+    flushFrame();
+    expect(focus).toHaveBeenLastCalledWith({ preventScroll: true });
+    expect(panel).toHaveFocus();
   });
 
   it('focuses on appearance and explicit step navigation for keyboard interaction', () => {

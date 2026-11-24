@@ -240,3 +240,77 @@ export async function qualifyDesktopShortcuts({ page, out }) {
   await page.screenshot({ animations: 'disabled', path: path.join(out, 'journey-desktop-shortcuts.png') });
   await fs.writeFile(path.join(out, 'desktop-shortcuts.json'), JSON.stringify({ outside_dock_help: true, composer_escape_blurs: true, nested_confirmation_escape: true }, null, 2));
 }
+
+export async function qualifyDesktopPlacement({ page, out, version }) {
+  const dialog = page.locator('.coordinator-question-dialog');
+  const panel = page.locator('.coordinator-question-dock .question-panel');
+  const dock = page.locator('.coordinator-question-dock');
+  const frames = () => page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+  const geometry = () => page.evaluate(() => {
+    const rect = el => { const r = el.getBoundingClientRect(); return { x:r.x,y:r.y,width:r.width,height:r.height,bottom:r.bottom }; };
+    const dock = document.querySelector('.coordinator-question-dock');
+    const dialog = dock.querySelector('dialog');
+    const meta = dock.querySelector('.coordinator-question-dock__meta');
+    const messages = document.querySelector('#messages');
+    return { dock:rect(dock), dialog:rect(dialog), meta:rect(meta), dockScrollTop:dock.scrollTop, windowScrollY:scrollY, transcriptScrollTop:messages?.scrollTop, modal:dialog.matches(':modal'), activeClass:document.activeElement?.className };
+  });
+  await page.waitForFunction(() => document.activeElement?.matches('.coordinator-question-dock .question-panel'));
+  await frames();
+  const initial = await geometry();
+  await page.screenshot({path:`${out}/${version}-desktop-placement-initial.png`});
+  const headerInitiallyClipped = initial.meta.y < initial.dock.y - 1;
+  if (version === 'candidate') {
+    assert.equal(headerInitiallyClipped,false);
+    assert.ok(initial.dialog.y >= -1);
+    assert.equal(initial.dockScrollTop,0);
+  }
+  // Intended dock scrolling must expose both the metadata and the final controls.
+  await dock.evaluate(el => {el.scrollTop=0;});
+  assert.ok(await page.locator('.coordinator-question-dock__meta').evaluate(el=>el.getBoundingClientRect().y>=0));
+  const first = panel.locator('.question-option').first();
+  await first.click();
+  const custom = panel.locator('input.question-custom-input');
+  await custom.fill('placement preserved answer');
+  const composer = page.locator('#message-input');
+  await composer.fill('placement preserved composer draft');
+  await page.locator('#messages').evaluate(el => {el.scrollTop=el.scrollHeight / 2;});
+  const transcriptScroll = await page.locator('#messages').evaluate(el=>el.scrollTop);
+  await page.setViewportSize({width:393,height:852});
+  await frames();
+  await page.getByRole('button',{name:'Return to conversation'}).click();
+  const launcher=page.getByRole('button',{name:/Answer Ember/});
+  await page.waitForFunction(() => document.activeElement?.matches('.coordinator-question-dock__launcher'));
+  await launcher.click();
+  await page.waitForFunction(() => document.activeElement?.matches('.coordinator-question-dock .question-panel'));
+  await frames();
+  const reopened=await geometry();
+  if(version==='candidate') assert.ok(reopened.dialog.y>=0);
+  assert.equal(await custom.inputValue(),'placement preserved answer');
+  assert.equal(await composer.inputValue(),'placement preserved composer draft');
+  assert.equal(await page.locator('#messages').evaluate(el=>el.scrollTop),transcriptScroll);
+  const transitions=[];
+  for(const viewport of [{width:393,height:852},{width:1280,height:720}]) {
+    await page.setViewportSize(viewport);
+    await frames();
+    assert.equal(await dialog.evaluate(el=>el.open),true);
+    await page.waitForFunction(() => document.activeElement?.matches('.coordinator-question-dock .question-panel'));
+    const g=await geometry();transitions.push({viewport,...g});
+    assert.equal(g.modal,viewport.width===393);
+    assert.equal(await custom.inputValue(),'placement preserved answer');
+    if(version==='candidate') {
+      assert.ok(g.meta.y>=g.dock.y-1);
+      assert.ok(g.dialog.y>=-1);
+    }
+  }
+  await dock.evaluate(el=>{el.scrollTop=el.scrollHeight;});
+  const actions=panel.locator('.question-actions');
+  await actions.scrollIntoViewIfNeeded();
+  assert.ok(await actions.evaluate(el=>{const r=el.getBoundingClientRect();return r.y>=0&&r.bottom<=innerHeight;}));
+  await page.screenshot({path:`${out}/${version}-desktop-placement-actions.png`});
+  await dock.evaluate(el=>{el.scrollTop=0;});
+  await page.screenshot({path:`${out}/${version}-desktop-placement-resized.png`});
+  await composer.fill('');
+  await page.setViewportSize({width:1280,height:900});
+  await frames();
+  await fs.writeFile(`${out}/${version}-desktop-placement.json`,JSON.stringify({initial,headerInitiallyClipped,reopened,transitions,transcriptScroll,answersAndDraftPreserved:true,launcherFocusRestored:true},null,2));
+}

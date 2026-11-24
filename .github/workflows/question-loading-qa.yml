@@ -12,7 +12,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 35
     env:
-      BASE_SHA: 8a685486413fc6517f61c548e3229a2864ce6703
+      BASE_SHA: 1c125f0360251d823710762f474d35ff268fa648
       PLAYWRIGHT_BROWSERS_PATH: /home/runner/.cache/ms-playwright
     steps:
       - uses: actions/checkout@v6
