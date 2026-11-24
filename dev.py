@@ -6564,6 +6564,7 @@ class _QualificationOutputLog:
 def _check_diagnostic_log_path(name: str, env: dict[str, str]) -> Path | None:
     filenames = {
         "cargo clippy": "cargo-clippy.full.log",
+        "cargo test": "cargo-test.full.log",
         "dev.py unit tests": "devpy-unit-tests.full.log",
     }
     if name in filenames and env.get("PHOENIX_CHECK_DIAGNOSTIC_DIR"):

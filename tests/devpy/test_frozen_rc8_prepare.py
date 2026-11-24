@@ -45,7 +45,7 @@ class GitFixture(unittest.TestCase):
 
     def git(self, *args):
         return subprocess.check_output(["git", "-C", str(self.repo), *args], env=self.env,
-                                       stderr=subprocess.DEVNULL).decode().strip()
+                                       input=b"", stderr=subprocess.DEVNULL).decode().strip()
 
     def write_candidate_files(self, version="0.13.2-rc.7"):
         manifest = self.repo / "crates/phoenix-ide/Cargo.toml"
@@ -61,6 +61,17 @@ class GitFixture(unittest.TestCase):
         self.git("add", ".")
         self.git("commit", "--allow-empty", "-qm", message)
         return self.git("rev-parse", "HEAD")
+
+
+class GitFixtureInputTests(unittest.TestCase):
+    def test_fixture_commands_supply_empty_input_instead_of_inheriting_terminal(self):
+        fixture = GitFixture()
+        fixture.repo = Path("/fixture")
+        fixture.env = {"GIT_AUTHOR_NAME": "fixture"}
+        with mock.patch.object(subprocess, "check_output", return_value=b"empty-tree\n") as run:
+            self.assertEqual(fixture.git("mktree"), "empty-tree")
+        run.assert_called_once_with(["git", "-C", "/fixture", "mktree"], env=fixture.env,
+                                    input=b"", stderr=subprocess.DEVNULL)
 
 
 class CandidateVerificationTests(GitFixture):
