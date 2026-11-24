@@ -214,7 +214,7 @@ pub use observe::{NativeCloseObservation, NativeCloseObserveReceipt, NativeClose
 pub use retry::{NativeCloseRetryResult, NativeCloseRetrySourceAssessment};
 pub use retry_execution::{NativeCloseRetryExecutionContext, NativeCloseRetryPreAdmissionContext};
 pub(crate) use source_fence::{
-    fence_native_retry_sources_tx, interrupt_native_retry_tx, recover_native_retry_sources_tx,
+    acknowledge_initial_result_tx, fence_native_retry_sources_tx, interrupt_native_retry_tx, recover_native_retry_sources_tx,
     NativeInitialSourceFence, NativeRetrySourceFence,
 };
 

@@ -146,7 +146,7 @@ jobs:
           set -euo pipefail
           cargo test -p phoenix-db --lib --no-run 2>&1 | tee evidence/compile.log
           cargo test -p phoenix-db --lib -- --list 2>&1 | tee evidence/inventory.log
-          grep -E '^close_foundation::tests::.*: test$|^migrations::close_completion_allowance_tests::migration_172_.*: test$|^migrations::tests::migration_(180|181|182)_.*: test$|^native_close::.*: test$' evidence/inventory.log > evidence/selected-tests.txt
+          grep -E '^close_foundation::tests::.*: test$|^migrations::close_completion_allowance_tests::migration_172_.*: test$|^migrations::tests::migration_(180|181|182|183)_.*: test$|^native_close::.*: test$' evidence/inventory.log > evidence/selected-tests.txt
           test -s evidence/selected-tests.txt
           grep -F 'close_foundation::tests::inspection_aggregate_validator_preserves_exact_content_and_empty_generation_rules: test' evidence/selected-tests.txt
           for test in \
@@ -181,6 +181,7 @@ jobs:
           grep -F 'migration_180_upgrades_authentic_179_initial_source_fence_schema: test' evidence/selected-tests.txt
           grep -F 'migration_181_adds_unbackfilled_initial_completion_successor_authority: test' evidence/selected-tests.txt
           grep -Fx 'migrations::tests::migration_182_preserves_existing_losses_and_adds_ignored_category: test' evidence/selected-tests.txt
+          grep -Fx 'migrations::tests::migration_183_adds_unbackfilled_initial_result_acknowledgements: test' evidence/selected-tests.txt
           grep -F 'native_retry_success_requires_exact_live_receipt_effect_and_evidence_before_replay: test' evidence/selected-tests.txt
           grep -F 'native_retry_finalizes_exact_g1_successes_without_rebinding_current_g2: test' evidence/selected-tests.txt
           grep -F 'retry_interruption_uses_pending_effect_not_successful_prior_resource: test' evidence/selected-tests.txt
@@ -354,6 +355,14 @@ jobs:
             exact_loss_origin_is_read_only_and_keeps_original_captured_identity \
             retained_observe_receipt_does_not_replace_initial_loss_provenance \
             original_source_replacement_suppresses_captured_loss_origin \
+            canonical_initial_result_acknowledgement_preserves_loss_retry_origin \
+            pending_canonical_round_acknowledges_finalized_initial_close_result \
+            acknowledged_initial_result_evidence_is_immutable \
+            stopped_source_before_initial_result_cannot_be_acknowledged_or_resurrected \
+            wrong_initial_result_identity_cannot_acknowledge_retained_origin \
+            initial_result_acknowledgement_rolls_back_with_canonical_transaction \
+            serial_tool_progress_preserves_initial_origin_until_canonical_acknowledgement \
+            stop_during_serial_tool_progress_still_suppresses_initial_origin \
             wrong_target_and_durable_suppression_refuse_loss_origin \
             missing_origin_and_noninitial_runs_are_refused_read_only; do
             grep -F "native_close::captured_loss_retry::tests::$test: test" evidence/inventory.log
@@ -368,6 +377,13 @@ jobs:
             first_effect_callback_holds_writer_reservation_against_source_update; do
             grep -F "test native_close::initial::tests::$test ... ok" evidence/native-close-db.log
           done
+      - name: Execute initial-result acknowledgement migration upgrade
+        if: success() || failure()
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p phoenix-db --lib migrations::tests::migration_183_adds_unbackfilled_initial_result_acknowledgements -- --exact --nocapture --test-threads=1 2>&1 | tee evidence/migration183.log
+          grep -E 'test result: ok\. 1 passed; 0 failed; 0 ignored;' evidence/migration183.log
       - name: Execute complete migrations regression module
         if: success() || failure()
         shell: bash

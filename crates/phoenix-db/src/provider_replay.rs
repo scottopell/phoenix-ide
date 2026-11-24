@@ -237,6 +237,13 @@ impl Database {
             self.goal_write_policies(),
         )
         .await?;
+        crate::native_close::acknowledge_initial_result_tx(
+            &mut tx,
+            conversation_id,
+            assistant,
+            &results,
+        )
+        .await?;
         receipt.bind_self_goal_evidence(input, &results)?;
         if let Some(proposal) = proposal {
             receipt.bind_evidence(proposal)?;

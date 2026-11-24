@@ -681,4 +681,6 @@ mod tests {
             .unwrap();
         assert_eq!(count, 0);
     }
+
+    include!("initial_result_acknowledgement_tests.rs");
 }

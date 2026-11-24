@@ -1,5 +1,16 @@
 # Unified Close acceptance milestone
 
+## Latest qualification and acknowledgement source slice
+
+This snapshot supersedes the older pending-run notes retained below.
+
+- Exact published `1691113769ab518b9c47c5b578569d27ed130a74`, automatic run **45300827365**, is terminal **success**. Artifacts: `/tmp/close-169111376/artifacts`. Personally inspected exact source, foundation **266/266**, full migrations **160/160**, native DB **65/65** including both retained-projection/source-replacement regressions, runtime actor **51/51**, separate production-detector physical test **1/1** (nobody UID65534, CapEff0), frontend **113 + 218**, executed typecheck/eslint/stylelint/spec checks, and **empty** hosted format patch. Sole watcher exited 0.
+- Older e72/run45266230371 and cf30/run45275318159 are terminal failures, not active. Both passed runtime actor **51/51** and separate physical **1/1**. cf30 also passed all four durable-member quiescence regressions; its known retained Observe fixture and exact-format failures are corrected and green at HEAD169.
+- The next source-only slice distinguishes canonical initial Close result acknowledgement from source loss/Stop. Immutable receipt-bound evidence is written atomically after canonical result rows and before state fencing, across both finalized and pending canonical-round paths. Same-assistant serial tool progress can retain the exact successful result until that checkpoint; Stop first still suppresses the origin and cannot be resurrected by a late result. Migration183 and eight acknowledgement regressions are wired into hosted validation. **This slice has not compiled or executed; source review is not qualification.**
+- This seam does **not** implement captured-loss successor admission. The complete disposable public **blocked files → separate owning-agent cleanup → explicit retry → fresh safe admission → disk reclaimed → truthful History/replay** journey remains owed. No merge/install/deploy or delivery-complete claim follows from the green prerequisite run.
+
+## Historical qualification notes
+
 ## Current qualification and durable-member retry fence
 
 - Follow-on durable-member fence was committed/pushed as `cf30f27503375fdbd2220130f4715d3bc3fb9cc4`; automatic run45275318159 is pending behind e72. It must not be replaced by another publication while pending. Its four regressions remain unexecuted.

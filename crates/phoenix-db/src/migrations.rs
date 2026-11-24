@@ -946,6 +946,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "close_ignored_loss_category",
         sql: include_str!("migrations/close_ignored_loss_category.sql"),
     },
+    Migration {
+        version: 183,
+        name: "native_close_initial_result_acknowledgement",
+        sql: include_str!("migrations/native_close_initial_result_acknowledgement.sql"),
+    },
 ];
 
 const MIGRATION_158: &str = r"
@@ -16144,7 +16149,7 @@ mod tests {
             .unwrap()
             .is_empty());
         assert_eq!(run_through_for_test(db.pool(), 152).await.unwrap(), 1);
-        assert_eq!(run_pending_migrations(db.pool()).await.unwrap(), 28);
+        assert_eq!(run_pending_migrations(db.pool()).await.unwrap(), 29);
         assert_eq!(run_pending_migrations(db.pool()).await.unwrap(), 0);
         let ledger: Vec<(i64, String)> = sqlx::query_as(
             "SELECT version, name FROM _migrations WHERE version >= 150 ORDER BY version",
@@ -16189,6 +16194,7 @@ mod tests {
                 (180, "native_initial_completed_interruption".into()),
                 (181, "native_initial_completion_retry_admission".into()),
                 (182, "close_ignored_loss_category".into()),
+                (183, "native_close_initial_result_acknowledgement".into()),
             ]
         );
     }
@@ -16677,6 +16683,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn migration_183_adds_unbackfilled_initial_result_acknowledgements() {
+        let pool = test_pool().await;
+        setup_real_pre_172_schema(&pool).await;
+        run_through_for_test(&pool, 182).await.unwrap();
+        let receipts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM native_close_initial_receipts")
+            .fetch_one(&pool).await.unwrap();
+        assert_eq!(run_through_for_test(&pool, 183).await.unwrap(), 1);
+        assert_eq!(run_through_for_test(&pool, 183).await.unwrap(), 0);
+        assert_eq!(sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM native_close_initial_result_acknowledgements")
+            .fetch_one(&pool).await.unwrap(), 0);
+        assert_eq!(sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM native_close_initial_receipts")
+            .fetch_one(&pool).await.unwrap(), receipts);
+        assert!(sqlx::query("INSERT INTO native_close_initial_result_acknowledgements
+            (request_id, request_fingerprint, attempt_id, run_ordinal, assistant_message_id, result_message_id)
+            VALUES ('missing', 'missing', 'missing', 1, 'assistant', 'result')")
+            .execute(&pool).await.is_err());
+        for name in [
+            "native_close_initial_result_acknowledgements_no_update",
+            "native_close_initial_result_acknowledgements_exact_initial",
+            "native_close_initial_result_acknowledgements_no_replacement",
+            "native_close_initial_result_acknowledgements_no_direct_delete",
+        ] {
+            assert_eq!(sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM sqlite_schema WHERE type = 'trigger' AND name = ?1")
+                .bind(name).fetch_one(&pool).await.unwrap(), 1);
+        }
+        assert!(sqlx::query("PRAGMA foreign_key_check").fetch_all(&pool).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn migration_180_upgrades_authentic_179_initial_source_fence_schema() {
         let pool = test_pool().await;
         setup_real_pre_172_schema(&pool).await;
@@ -16743,6 +16778,7 @@ mod tests {
         let ledger = compiled_migration_ledger();
         assert!(ledger.windows(2).all(|pair| pair[0].0 < pair[1].0));
         let expected_tail = [
+            (183, "native_close_initial_result_acknowledgement"),
             (182, "close_ignored_loss_category"),
             (181, "native_initial_completion_retry_admission"),
             (180, "native_initial_completed_interruption"),
@@ -21071,6 +21107,7 @@ mod tests {
                 (180, "native_initial_completed_interruption"),
                 (181, "native_initial_completion_retry_admission"),
                 (182, "close_ignored_loss_category"),
+                (183, "native_close_initial_result_acknowledgement"),
             ]
         );
         let goal = MIGRATIONS
@@ -21084,7 +21121,7 @@ mod tests {
         assert!(goal
             .sql
             .contains("CREATE TABLE conversation_goal_coordinator_receipts"));
-        assert_eq!(MIGRATIONS.len(), 179);
+        assert_eq!(MIGRATIONS.len(), 180);
     }
 
     #[tokio::test]
@@ -21100,7 +21137,7 @@ mod tests {
         }
         sqlx::query("UPDATE product_creation_jobs SET status = 'published', published_product_id = 'deleted-product', published_conversation_id = 'deleted-transcript' WHERE request_id = 'orphan-image'")
             .execute(&pool).await.unwrap();
-        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 32);
+        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 33);
         let identity: Vec<(String, String)> = sqlx::query_as(
             "SELECT request_id, data_sha256 FROM product_creation_image_replay_identity ORDER BY request_id",
         ).fetch_all(&pool).await.unwrap();
@@ -21154,7 +21191,7 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 32);
+        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 33);
         let retained: (String, String, String) = sqlx::query_as(
             "SELECT status, published_product_id, published_conversation_id
              FROM product_creation_jobs WHERE request_id = 'orphan-text'",
@@ -24328,7 +24365,7 @@ mod close_completion_allowance_tests {
             2
         );
 
-        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 11);
+        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 12);
         let migrated: (i64, i64) = sqlx::query_as(
             "SELECT (SELECT COUNT(*) FROM close_original_retirement_anchors WHERE attempt_id = ?1),
                     (SELECT COUNT(*) FROM close_retirement_anchor_exclusions WHERE attempt_id = ?1)"

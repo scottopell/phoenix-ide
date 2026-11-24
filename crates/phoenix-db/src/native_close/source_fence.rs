@@ -183,7 +183,11 @@ pub(crate) async fn fence_pre_completion_native_sources_tx(
         "SELECT receipt.attempt_id, receipt.run_ordinal, receipt.intent,
                 plan.failed_run_ordinal, run.status,
                 receipt.source_message_id, receipt.source_tool_use_id,
-                receipt.product_conversation_id, receipt.request_fingerprint
+                receipt.product_conversation_id, receipt.request_fingerprint,
+                EXISTS (SELECT 1 FROM native_close_initial_result_acknowledgements ack
+                        WHERE ack.request_id = receipt.request_id
+                          AND ack.request_fingerprint = receipt.request_fingerprint
+                          AND ack.attempt_id = receipt.attempt_id AND ack.run_ordinal = 1) AS acknowledged
          FROM native_close_initial_receipts receipt
          LEFT JOIN native_close_retry_plans plan
            ON receipt.request_id = plan.request_id
@@ -235,7 +239,13 @@ pub(crate) async fn fence_pre_completion_native_sources_tx(
         }
         let input = command.intent().source_input();
         if require_executing_source(next_state, &source, "close_conversation", &input).is_err() {
-            if matches!(cause, NativeSourceLossCause::UserSourceLoss) {
+            let acknowledged_completed_initial = !explicit_retry
+                && row.try_get::<String, _>("status")? == "stopped"
+                && (row.try_get::<bool, _>("acknowledged")?
+                    || completed_initial_result_matches(next_state, &command, run.attempt_id.as_str()));
+            if matches!(cause, NativeSourceLossCause::UserSourceLoss)
+                && !acknowledged_completed_initial
+            {
                 sqlx::query(
                     "UPDATE close_completion_retry_allowances SET suppressed = 1
                      WHERE attempt_id = ?1 AND suppressed = 0",
@@ -260,6 +270,201 @@ pub(crate) async fn fence_pre_completion_native_sources_tx(
     }
     Ok(())
 }
+// Serial tool progression retains the exact successful initial result in the
+// same assistant round before its canonical checkpoint. This is not an
+// acknowledgement and does not survive Stop/Idle or process interruption.
+fn completed_initial_result_matches(
+    state: &ConvState,
+    command: &NativeCloseCommand,
+    attempt_id: &str,
+) -> bool {
+    use phoenix_core::domain::conversation_goal::ToolRoundResult;
+    use phoenix_core::domain::db_schema::ToolOutcome;
+    use phoenix_core::domain::llm_types::ContentBlock;
+    let ConvState::ToolExecuting { assistant_message, completed_results, .. } = state else {
+        return false;
+    };
+    if assistant_message.message_id != command.source().message_id
+        || !assistant_message.content.iter().any(|block| matches!(block,
+            ContentBlock::ToolUse { id, name, input } if id == &command.source().tool_use_id
+                && name == "close_conversation" && input == &command.intent().source_input()))
+    {
+        return false;
+    }
+    completed_results.iter().any(|result| {
+        let ToolRoundResult::Finalized(result) = result else { return false; };
+        if result.tool_use_id != command.source().tool_use_id { return false; }
+        let ToolOutcome::Success { output, .. } = &result.outcome else { return false; };
+        let Ok(output) = serde_json::from_str::<serde_json::Value>(output) else { return false; };
+        output.get("action").and_then(serde_json::Value::as_str) == Some("initial")
+            && matches!(output.get("status").and_then(serde_json::Value::as_str), Some("newly_admitted" | "replay"))
+            && output.get("request_id").and_then(serde_json::Value::as_str) == Some(command.request_id().as_str())
+            && output.pointer("/admitted/product_conversation_id").and_then(serde_json::Value::as_str) == Some(command.intent().target().as_str())
+            && output.pointer("/admitted/attempt_id").and_then(serde_json::Value::as_str) == Some(attempt_id)
+            && output.pointer("/admitted/run_ordinal").and_then(serde_json::Value::as_i64) == Some(1)
+    })
+}
+
+/// Consume only canonical rows returned by the round writer in this transaction.
+/// Both finalized and pending self-goal rounds can contain a finalized Close result.
+/// A source transition alone never acknowledges a result or revives a stopped source.
+pub(crate) async fn acknowledge_initial_result_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    transcript_id: &str,
+    assistant: &crate::Message,
+    results: &[crate::Message],
+) -> DbResult<()> {
+    use phoenix_core::domain::db_schema::MessageContent;
+    use phoenix_core::domain::llm_types::ContentBlock;
+
+    let MessageContent::Agent(blocks) = &assistant.content else {
+        return Ok(());
+    };
+    let state_json: String = sqlx::query_scalar("SELECT state FROM conversations WHERE id = ?1")
+        .bind(transcript_id)
+        .fetch_one(&mut **tx)
+        .await?;
+    let current_state: ConvState = serde_json::from_str(&state_json)
+        .map_err(|error| DbError::Serialization(error.to_string()))?;
+    for row in results {
+        let MessageContent::Tool(tool_result) = &row.content else {
+            continue;
+        };
+        if row.conversation_id != transcript_id
+            || row.message_id != phoenix_core::domain::tool_result_identity::tool_result_message_id(
+                &assistant.message_id, &tool_result.tool_use_id,
+            )
+        {
+            continue;
+        }
+        if tool_result.is_error {
+            continue;
+        }
+        let Ok(output) = serde_json::from_str::<serde_json::Value>(&tool_result.content) else {
+            continue;
+        };
+        let Some((name, input)) = blocks.iter().find_map(|block| match block {
+            ContentBlock::ToolUse { id, name, input } if id == &tool_result.tool_use_id => {
+                Some((name, input))
+            }
+            _ => None,
+        }) else {
+            continue;
+        };
+        if name != "close_conversation" {
+            continue;
+        }
+        let receipts = sqlx::query(
+            "SELECT request_id, attempt_id, source_message_id, source_tool_use_id,
+                    request_fingerprint, product_conversation_id
+             FROM native_close_initial_receipts
+             WHERE source_transcript_id = ?1 AND source_message_id = ?2
+               AND source_tool_use_id = ?3 AND intent = 'initial' AND run_ordinal = 1",
+        )
+        .bind(transcript_id)
+        .bind(&assistant.message_id)
+        .bind(&tool_result.tool_use_id)
+        .fetch_all(&mut **tx)
+        .await?;
+        for receipt in receipts {
+            let target = ProductConversationId::parse(
+                receipt.try_get::<String, _>("product_conversation_id")?,
+            )
+            .map_err(|error| DbError::Serialization(error.to_string()))?;
+            let source = SourceToolCall {
+                message_id: assistant.message_id.clone(),
+                tool_use_id: tool_result.tool_use_id.clone(),
+            };
+            let command = NativeCloseCommand::new(
+                transcript_id.to_owned(),
+                source.clone(),
+                NativeCloseIntent::Initial { target: target.clone() },
+            )
+            .map_err(|error| DbError::Serialization(error.to_string()))?;
+            let request_id: String = receipt.try_get("request_id")?;
+            let attempt_id: String = receipt.try_get("attempt_id")?;
+            let fingerprint: String = receipt.try_get("request_fingerprint")?;
+            let prior: Option<(String, String)> = sqlx::query_as(
+                "SELECT assistant_message_id, result_message_id FROM native_close_initial_result_acknowledgements
+                 WHERE request_id = ?1 AND request_fingerprint = ?2 AND attempt_id = ?3 AND run_ordinal = 1",
+            )
+            .bind(&request_id).bind(&fingerprint).bind(&attempt_id)
+            .fetch_optional(&mut **tx).await?;
+            if prior.as_ref().is_some_and(|(prior_assistant, prior_result)| {
+                prior_assistant == &assistant.message_id && prior_result == &row.message_id
+            }) {
+                continue;
+            }
+            if prior.is_some() || command.fingerprint() != fingerprint
+                || input != &command.intent().source_input()
+                || output.get("action").and_then(serde_json::Value::as_str) != Some("initial")
+                || !matches!(output.get("status").and_then(serde_json::Value::as_str), Some("newly_admitted" | "replay"))
+                || output.get("request_id").and_then(serde_json::Value::as_str) != Some(request_id.as_str())
+                || output.pointer("/admitted/product_conversation_id").and_then(serde_json::Value::as_str) != Some(target.as_str())
+                || output.pointer("/admitted/attempt_id").and_then(serde_json::Value::as_str) != Some(attempt_id.as_str())
+                || output.pointer("/admitted/run_ordinal").and_then(serde_json::Value::as_i64) != Some(1)
+                || (require_executing_source(&current_state, &source, "close_conversation", &command.intent().source_input()).is_err()
+                    && !completed_initial_result_matches(&current_state, &command, &attempt_id))
+            {
+                continue;
+            }
+            let eligible: bool = sqlx::query_scalar(
+                "SELECT EXISTS(
+                    SELECT 1 FROM native_close_initial_receipts receipt
+                    JOIN close_runs run ON run.attempt_id = receipt.attempt_id AND run.run_ordinal = 1
+                    JOIN close_obligations obligation ON obligation.attempt_id = receipt.attempt_id
+                    JOIN product_conversations product ON product.id = obligation.product_conversation_id
+                    JOIN close_completion_retry_allowances allowance ON allowance.attempt_id = receipt.attempt_id
+                    WHERE receipt.request_id = ?1 AND receipt.request_fingerprint = ?2
+                      AND receipt.attempt_id = ?3 AND receipt.run_ordinal = 1
+                      AND receipt.intent = 'initial' AND receipt.source_transcript_id = ?4
+                      AND receipt.source_message_id = ?5 AND receipt.source_tool_use_id = ?6
+                      AND receipt.product_conversation_id = ?7
+                      AND run.status = 'stopped'
+                      AND run.run_ordinal = (SELECT MAX(run_ordinal) FROM close_runs WHERE attempt_id = run.attempt_id)
+                      AND obligation.native_managed = 1 AND obligation.phase = 'completed'
+                      AND product.kind = 'ordinary' AND product.ordinary_lifecycle = 'open'
+                      AND allowance.suppressed = 0
+                      AND EXISTS (SELECT 1 FROM messages assistant_message
+                          WHERE assistant_message.message_id = ?5 AND assistant_message.conversation_id = ?4)
+                      AND EXISTS (SELECT 1 FROM messages result_message
+                          WHERE result_message.message_id = ?8 AND result_message.conversation_id = ?4)
+                      AND EXISTS (SELECT 1 FROM conversations source WHERE source.id = ?4
+                          AND source.runtime_role = 'coordinator' AND source.coordinator_head = 1)
+                      AND NOT EXISTS (SELECT 1 FROM native_close_retry_plans plan WHERE plan.attempt_id = receipt.attempt_id)
+                      AND NOT EXISTS (SELECT 1 FROM close_run_retry_effects effect WHERE effect.attempt_id = receipt.attempt_id)
+                )",
+            )
+            .bind(&request_id)
+            .bind(&fingerprint)
+            .bind(&attempt_id)
+            .bind(transcript_id)
+            .bind(&assistant.message_id)
+            .bind(&tool_result.tool_use_id)
+            .bind(target.as_str())
+            .bind(&row.message_id)
+            .fetch_one(&mut **tx)
+            .await?;
+            if !eligible {
+                continue;
+            }
+            sqlx::query(
+                "INSERT INTO native_close_initial_result_acknowledgements
+                 (request_id, request_fingerprint, attempt_id, run_ordinal, assistant_message_id, result_message_id)
+                 VALUES (?1, ?2, ?3, 1, ?4, ?5)",
+            )
+            .bind(&request_id)
+            .bind(&fingerprint)
+            .bind(&attempt_id)
+            .bind(&assistant.message_id)
+            .bind(&row.message_id)
+            .execute(&mut **tx)
+            .await?;
+        }
+    }
+    Ok(())
+}
+
 async fn revoke_completion_origin_tx(
     tx: &mut Transaction<'_, Sqlite>,
     attempt_id: &str,
