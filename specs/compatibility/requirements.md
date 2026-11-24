@@ -245,3 +245,7 @@ AND SHALL apply migration 156 through the ordinary forward-migration path withou
 THE SYSTEM SHALL NOT infer support for any other missing registered predecessor in the post-129 tail, wrong identity, unknown migration, conflict detected by the lineage schema-evidence validators, or ledger whose highest recorded migration exceeds 158 from this reconciliation.
 
 **Rationale:** The supported canonical source ledger contains migration 158 without migration 156. Exact admission of that post-129 predecessor-registry shape preserves ordinary forward migration while retaining fail-closed rejection for damaged or ambiguous registered tails.
+
+### REQ-COMP-023 — Exact predecessor retention for manual deployment recovery
+
+For an authenticated macOS managed predecessor, deployment SHALL retain the exact saved installed predecessor executable with its identity/hash proof and the same transaction's verified preboundary database backup after commit or unresolved failure, as specified by `../launchd-deployment/requirements.md` REQ-LDD-034. Matching release/source identity alone SHALL NOT be reported as verified retained exact binary bytes. This is a manual matching offline recovery artifact guarantee, not automatic rollback, backup archival/pruning, cross-host portability, or an expanded downgrade guarantee.

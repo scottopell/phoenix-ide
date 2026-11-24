@@ -1,5 +1,5 @@
 -- allium: 3
--- Native macOS deployment: REQ-LDD-001–007,009–016,029–032.
+-- Native macOS deployment: REQ-LDD-001–007,009–016,029–034.
 -- Withdrawn IDs grant no alternate deployment or recovery route.
 
 config {
@@ -98,6 +98,10 @@ value TargetService {
 --   grant reclamation. Completed release is not undone by later interruption.
 -- transaction_evidence_retained(transaction) -> Boolean
 --   Manifest, helper, log, private plist and failed candidate evidence remain.
+--   Each transaction retains its own authoritative proof beside the candidate;
+--   shared latest-status proof is only a projection and later transactions
+--   cannot replace earlier transaction proofs. Authenticated predecessors retain
+--   their exact saved executable and identity/hash/path proof binding.
 -- verified_backup_retained(transaction) -> Boolean
 --   Native SQLite backup of the stopped source passed integrity and lockstep
 --   metadata/stored-row comparison, including FTS5 shadow rows and row identity,
@@ -199,6 +203,12 @@ rule ActivateCandidate {
     ensures: PredecessorStopRequested(transaction)
 
     @guidance
+        -- For an authenticated predecessor, require a regular non-symlink
+        -- transaction-owned saved executable matching the freshly observed installed
+        -- binary hash; fsync it and its directory, and record its saved path with
+        -- predecessor identity/hash in transaction-local proof before any stop.
+        -- Publish that authority before the shared latest-status projection. Refuse
+        -- missing or differing saved bytes without disrupting the service.
         -- Stage atomic binary install and the private-plist publication hard link
         -- before disruption. Persist stopping; quarantine/fsync the canonical
         -- plist into previous.plist before observed bootout. Never replay activation.
@@ -303,12 +313,16 @@ rule CommitVerifiedCandidate {
 rule CleanCommittedCopies {
     when: OwnedClaimReleased(transaction)
     requires: transaction.state = committed
-    ensures: TemporaryCandidateAndPreviousBinaryCleanupAttempted(transaction)
+    ensures: TemporaryCandidateCleanupAttempted(transaction)
 
     @guidance
         -- Cleanup errors attempt a warning and preserve committed and the job.
         -- Warning or success-report output failure cannot fail activation.
         -- Retain the private plist/helper/manifest/log as transaction evidence.
+        -- Retain the authenticated predecessor executable and its proof binding
+        -- with the same transaction's verified database backup after success or
+        -- failure. Restart and rejected helper replay do not mutate this pair.
+        -- First install and unauthenticated predecessors claim no such pair.
 }
 
 rule RecoverUnchangedPredecessor {

@@ -1,5 +1,9 @@
 # Native macOS launchd Deployment — Executive Status
 
+## Exact predecessor retention correction
+
+REQ-LDD-034 / REQ-COMP-023 retain the authenticated installed predecessor executable in its existing transaction directory, with saved path plus existing identity/hash proof and same-transaction verified database backup. Missing, differing or symlink saved bytes refuse before disruption; committed cleanup removes only the temporary candidate. Transaction-local proof is authoritative and written before the shared latest-status projection; subsequent attempts cannot overwrite an earlier recovery binding. Disposable coverage exercises successful retention, failure evidence, terminal replay refusal, first-install non-claims and restart artifact preservation. Hosted exact-head qualification remains required before release; existing RC13 transactions are not retroactively complete recovery bundles. ADR-281 records the decision. macOS published-release helper/source binding requires a new supported release; immutable RC14 is unchanged.
+
 ## Current reality
 
 The protocol-4 deploy helper implements ordinary local/published deployment. It

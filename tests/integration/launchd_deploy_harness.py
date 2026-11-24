@@ -240,7 +240,11 @@ def run_scenario(root, domain, *, failure=None, first_install=False):
     binary.write_text(server_script(previous))
     binary.chmod(0o755)
     database = root / "application.db"
+    saved_previous = root / "previous-phoenix-ide"
+    previous_sha256 = digest(binary)
     if not first_install:
+        saved_previous.write_bytes(binary.read_bytes())
+        saved_previous.chmod(0o755)
         with sqlite3.connect(database) as db:
             db.execute("CREATE TABLE migration_effects(candidate TEXT)")
     status, log, starts = root / "status.json", root / "helper.log", root / "starts"
@@ -311,7 +315,10 @@ def run_scenario(root, domain, *, failure=None, first_install=False):
         expected_state = "failed" if failure else "committed"
         if result["state"] != expected_state:
             raise RuntimeError(f"unexpected status: {result}; log={log.read_text()}")
-        proof = json.loads(status.with_suffix(".proof.json").read_text())
+        proof_path = candidate.with_name(f"{candidate.name}.proof.json")
+        proof = json.loads(proof_path.read_text())
+        if proof != json.loads(status.with_suffix(".proof.json").read_text()):
+            raise RuntimeError("latest proof projection differs from transaction authority")
         if (proof.get("additional_reserve_bytes") != 123
                 or proof.get("admission_required_bytes", 0) < 16 * 1024 * 1024 + 123
                 or proof.get("admission_available_bytes", 0) < proof["admission_required_bytes"]):
@@ -322,12 +329,21 @@ def run_scenario(root, domain, *, failure=None, first_install=False):
         if first_install:
             if proof.get("database_source") != "absent" or backup is not None or list(root.glob("database-backup-*.sqlite")):
                 raise RuntimeError(f"first install falsely claimed a verified backup: {proof}")
+            if proof.get("predecessor") is not None or proof.get("recovery_eligible") or saved_previous.exists():
+                raise RuntimeError(f"first install falsely claimed authenticated predecessor recovery: {proof}")
         else:
             if not isinstance(backup, dict):
                 raise RuntimeError(f"deployment lost transaction backup proof: {proof}")
             retained = Path(backup["backup_path"])
             if not retained.is_file() or digest(retained) != backup["backup_sha256"]:
                 raise RuntimeError(f"deployment backup artifact differs from proof: {backup}")
+            predecessor = proof.get("predecessor") or {}
+            if (predecessor.get("saved_binary_path") != str(saved_previous)
+                    or predecessor.get("identity") != previous
+                    or predecessor.get("binary_sha256") != previous_sha256
+                    or not saved_previous.is_file() or digest(saved_previous) != previous_sha256
+                    or retained.parent != saved_previous.parent):
+                raise RuntimeError(f"deployment lost authenticated same-transaction predecessor artifacts: {proof}")
         if proof.get("boundary") not in {"attempted", "crossed"}:
             raise RuntimeError(f"migration boundary omitted from proof: {proof}")
         if failure and proof.get("recovery_outcome") == "predecessor_recovered_verified":
@@ -392,6 +408,12 @@ def run_restart_scenario(root, domain):
         target_plist_path: digest(target_plist_path),
         deployed_sha: digest(deployed_sha),
     }
+    recovery_artifacts = [*root.rglob("previous-phoenix-ide"), *root.rglob("*.proof.json"),
+                          *root.rglob("database-backup-*.sqlite")]
+    if not any(path.name == "previous-phoenix-ide" for path in recovery_artifacts):
+        raise RuntimeError("restart fixture is missing retained deployment recovery artifacts")
+    for path in recovery_artifacts:
+        original_hashes[path] = digest(path)
     url = f"http://127.0.0.1:{port}/api/version"
     status = root / f"restart-status-{suffix}.json"
     log = root / f"restart-helper-{suffix}.log"
