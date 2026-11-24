@@ -3,7 +3,7 @@ import { render, screen, fireEvent, waitFor } from '@testing-library/react';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { __metaViewerFindTestables, MetaViewer } from './MetaViewer';
 import { ReviewNotesProvider } from '../../contexts/ReviewNotesContext';
-import type { MetaViewerPayload } from './metaViewerTypes';
+import type { FileTextSource, MetaViewerPayload } from './metaViewerTypes';
 import { codeViewMockState, resetCodeViewMock } from './__testutils__/codeViewMock';
 
 vi.mock('mermaid', () => ({
@@ -33,7 +33,7 @@ function renderViewer(payload: MetaViewerPayload) {
 
 const common = {
   title: 'thing',
-  absolutePath: '/tmp/project/thing',
+  source: { kind: 'file' as const, absolutePath: '/tmp/project/thing' },
   onClose: () => undefined,
   onSendNotes: () => undefined,
 };
@@ -89,7 +89,19 @@ function fireWheel(surface: HTMLElement, deltaY: number) {
   return event;
 }
 
-const textCommon = { ...common, filePath: 'thing', rootDir: '/tmp/project' };
+const textSource = (extra: Partial<FileTextSource> = {}): FileTextSource => ({
+  kind: 'file',
+  absolutePath: '/tmp/project/thing',
+  filePath: 'thing',
+  rootDir: '/tmp/project',
+  ...extra,
+});
+const textCommon = {
+  title: common.title,
+  onClose: common.onClose,
+  onSendNotes: common.onSendNotes,
+  source: textSource(),
+};
 describe('MetaViewer find identities', () => {
   it('bounds match ids for arbitrarily long file lines', () => {
     const text = `prefix ${'x'.repeat(20_000)} token`;
@@ -219,10 +231,10 @@ describe('MetaViewer payload routing', () => {
   it('restores large-text find focus to the body opener instead of the toolbar', async () => {
     renderViewer({
       ...textCommon,
+      source: textSource({ renderMode: 'plainLargeText' }),
       kind: 'html',
       language: 'html',
       content: '<p>alpha</p>\n<p>beta alpha</p>',
-      renderMode: 'plainLargeText',
       previewUrl: '/preview/tmp/project/thing',
     });
 
@@ -242,10 +254,10 @@ describe('MetaViewer payload routing', () => {
   it('clears large-text fallback marks when closing find from the toolbar', async () => {
     renderViewer({
       ...textCommon,
+      source: textSource({ renderMode: 'plainLargeText' }),
       kind: 'html',
       language: 'html',
       content: '<p>alpha</p>\n<p>beta alpha</p>',
-      renderMode: 'plainLargeText',
       previewUrl: '/preview/tmp/project/thing',
     });
 
@@ -262,10 +274,10 @@ describe('MetaViewer payload routing', () => {
   it('highlights and counts exact occurrences in large text fallback DOM source', async () => {
     renderViewer({
       ...textCommon,
+      source: textSource({ renderMode: 'plainLargeText' }),
       kind: 'html',
       language: 'html',
       content: '<p>alpha</p>\n<p>beta alpha</p>',
-      renderMode: 'plainLargeText',
       previewUrl: '/preview/tmp/project/thing',
     });
 
@@ -280,9 +292,9 @@ describe('MetaViewer payload routing', () => {
   it('uses the line-aware source viewer for a focused markdown range regardless of file size', () => {
     const { container } = renderViewer({
       ...textCommon,
+      source: textSource({ focus: { kind: 'range', startLine: 3, endLine: 5 } }),
       kind: 'markdown',
       content: '# Heading\nparagraph first line\nparagraph second line\n```ts\nconst value = 1;\n```',
-      focus: { kind: 'range', startLine: 3, endLine: 5 },
     });
 
     expect(container.querySelector('.phoenix-file-codeview')).not.toBeNull();
@@ -293,9 +305,9 @@ describe('MetaViewer payload routing', () => {
   it('enables find when a focused markdown range renders in the line-aware source viewer', async () => {
     renderViewer({
       ...textCommon,
+      source: textSource({ focus: { kind: 'range', startLine: 2, endLine: 3 } }),
       kind: 'markdown',
       content: '# Heading\nparagraph alpha\nparagraph second line',
-      focus: { kind: 'range', startLine: 2, endLine: 3 },
     });
 
     fireEvent.click(screen.getByRole('button', { name: 'Find in file' }));
@@ -308,12 +320,14 @@ describe('MetaViewer payload routing', () => {
     const largeHtml = `${'<p>line</p>\n'.repeat(2_001)}<p>tail</p>`;
     const { container } = renderViewer({
       ...textCommon,
+      source: textSource({
+        renderMode: 'plainLargeText',
+        focus: { kind: 'range', startLine: 100, endLine: 110 },
+      }),
       kind: 'html',
       language: 'html',
       content: largeHtml,
-      renderMode: 'plainLargeText',
       previewUrl: '/preview/tmp/project/thing',
-      focus: { kind: 'range', startLine: 100, endLine: 110 },
     });
 
     expect(container.querySelector('.phoenix-file-codeview')).not.toBeNull();
@@ -494,10 +508,10 @@ describe('MetaViewer payload routing', () => {
   it('skips large-text line-fragment rendering when the active occurrence is negative', () => {
     renderViewer({
       ...textCommon,
+      source: textSource({ renderMode: 'plainLargeText' }),
       kind: 'html',
       language: 'html',
       content: '<p>alpha</p>\n<p>beta</p>',
-      renderMode: 'plainLargeText',
       previewUrl: '/preview/tmp/project/thing',
     });
 
@@ -571,7 +585,7 @@ describe('MetaViewer payload routing', () => {
 
     rerender(
       <ReviewNotesProvider>
-        <MetaViewer payload={{ ...textCommon, kind: 'markdown', content: '# alpha', renderMode: 'plainLargeText' }} />
+        <MetaViewer payload={{ ...textCommon, source: textSource({ renderMode: 'plainLargeText' }), kind: 'markdown', content: '# alpha' }} />
       </ReviewNotesProvider>,
     );
     expect(screen.queryByRole('textbox', { name: 'Find in viewer' })).toBeNull();
@@ -615,7 +629,7 @@ describe('MetaViewer payload routing', () => {
   });
 
   it('keeps source-style Markdown fallbacks searchable', () => {
-    renderViewer({ ...textCommon, kind: 'markdown', content: '# alpha', renderMode: 'plainLargeText' });
+    renderViewer({ ...textCommon, source: textSource({ renderMode: 'plainLargeText' }), kind: 'markdown', content: '# alpha' });
 
     fireEvent.click(screen.getByRole('button', { name: 'Find in file' }));
     fireEvent.change(screen.getByRole('textbox', { name: 'Find in viewer' }), { target: { value: 'alpha' } });
@@ -652,11 +666,65 @@ describe('MetaViewer payload routing', () => {
 
     rerender(
       <ReviewNotesProvider>
-        <MetaViewer payload={{ ...textCommon, absolutePath: '/tmp/project/other', kind: 'text', content: 'alpha\nbeta' }} />
+        <MetaViewer payload={{ ...textCommon, source: textSource({ absolutePath: '/tmp/project/other' }), kind: 'text', content: 'alpha\nbeta' }} />
       </ReviewNotesProvider>,
     );
 
     await waitFor(() => expect(screen.queryByRole('textbox', { name: 'Find in viewer' })).toBeNull());
+  });
+
+  it('clears find state and isolates notes when switching between file and message sources', async () => {
+    const { rerender } = render(
+      <ReviewNotesProvider>
+        <MetaViewer payload={{ ...textCommon, kind: 'markdown', content: 'alpha needle' }} />
+      </ReviewNotesProvider>,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'Find in file' }));
+    fireEvent.change(screen.getByRole('textbox', { name: 'Find in viewer' }), { target: { value: 'needle' } });
+    expect(screen.getByText('1 of 1')).toBeInTheDocument();
+
+    rerender(
+      <ReviewNotesProvider>
+        <MetaViewer
+          payload={{
+            kind: 'markdown',
+            source: { kind: 'message', sequenceId: 7, messageId: 'msg-7' },
+            title: 'Agent message #7',
+            content: 'alpha needle\nsecond needle',
+            onClose: common.onClose,
+            onSendNotes: common.onSendNotes,
+          }}
+        />
+      </ReviewNotesProvider>,
+    );
+
+    await waitFor(() => expect(screen.queryByRole('textbox', { name: 'Find in viewer' })).toBeNull());
+    expect(screen.getByRole('button', { name: 'Find in message' })).toBeInTheDocument();
+  });
+
+  it('structurally forbids message sources on file-only payload variants', () => {
+    const invalidCode: MetaViewerPayload = {
+      kind: 'code',
+      // @ts-expect-error message sources cannot construct code payloads
+      source: { kind: 'message', sequenceId: 1 },
+      title: 'msg',
+      content: 'const x = 1;',
+      language: 'ts',
+      onClose: common.onClose,
+    };
+    const invalidImage: MetaViewerPayload = {
+      kind: 'image',
+      // @ts-expect-error message sources cannot construct image payloads
+      source: { kind: 'message', sequenceId: 1 },
+      title: 'msg',
+      url: '/preview/a.png',
+      mimeType: 'image/png',
+      fileName: 'a.png',
+      onClose: common.onClose,
+    };
+    expect(invalidCode.kind).toBe('code');
+    expect(invalidImage.kind).toBe('image');
   });
 
   it('replaces results when the viewed content changes under the same path and kind', async () => {

@@ -1,15 +1,15 @@
 /**
- * MetaViewer — the central viewer router.
+ * MetaViewer — the unified resolved-document viewer.
  *
- * Takes a *resolved* `MetaViewerPayload` (the loader has already fetched and
- * classified the content) and composes the shared `ViewerShell` chrome with the
- * matching body renderer. It owns the cross-cutting concerns that are the same
- * regardless of render kind — scroll restoration, copy-newline normalization,
- * select-all, jump-to-line, and the HTML source/preview toggle — and delegates
- * pure rendering to the body components.
+ * Takes a *resolved* `MetaViewerPayload` (the loader — `FileViewer` for files,
+ * `MessageViewer` for conversation messages — has already fetched/resolved and
+ * classified the content) and composes `ViewerShell` with the matching body
+ * renderer. It owns cross-cutting concerns once for all document sources:
+ * in-viewer Find (`Cmd/Ctrl+F`), copy, Escape precedence, scroll restoration,
+ * select-all, jump-to-line, focused review exit guards, and HTML/image toggles.
  *
- * Review-note lifecycle for text-like payloads lives in `useFileReviewNotes`.
- * Image payloads carry no notes.
+ * Review-note lifecycle lives in `useDocumentReviewNotes` with source-typed
+ * anchors (`file` vs `message`). Image payloads carry no notes.
  */
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
@@ -34,8 +34,13 @@ import type { SearchableSourceMatch } from '../viewer-find';
 import { NotesPanel } from './NotesPanel';
 import { AnnotationDialog } from './AnnotationDialog';
 import { CopyButton } from '../CopyButton';
-import { useFileReviewNotes } from './useFileReviewNotes';
-import { isTextLikePayload } from './metaViewerTypes';
+import { useDocumentReviewNotes } from './useDocumentReviewNotes';
+import {
+  isFileTextSource,
+  isTextLikePayload,
+  viewerScrollKey,
+  viewerSourceIdentity,
+} from './metaViewerTypes';
 import type { MetaViewerPayload, PatchContext } from './metaViewerTypes';
 import type { ReviewNote } from '../../contexts/ReviewNotesContext';
 import { MarkdownViewerBody } from './MarkdownViewerBody';
@@ -49,22 +54,26 @@ import type { ViewerBodyProps } from './AnnotatableBlock';
 import { useFocusedReviewExit } from './useFocusedReviewExit';
 
 export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
-  useRegisterFocusScope('file-viewer');
+  const { source, title, onClose, onSendNotes, inline, presentation = 'pane', canTogglePresentation = false, onPresentationChange } = payload;
+  const focusScopeId = source.kind === 'message' ? 'message-viewer' : 'file-viewer';
+  useRegisterFocusScope(focusScopeId);
 
-  const { absolutePath, title, onClose, onSendNotes, inline, presentation = 'pane', canTogglePresentation = false, onPresentationChange } = payload;
   const textLike = isTextLikePayload(payload);
   const content = textLike ? payload.content : '';
-  const patchContext: PatchContext | undefined = textLike ? payload.patchContext : undefined;
-  const focus = textLike ? payload.focus : undefined;
+  const fileTextSource = isFileTextSource(source) ? source : null;
+  const patchContext: PatchContext | undefined = fileTextSource?.patchContext;
+  const focus = fileTextSource?.focus;
   const focusLine = focus?.kind === 'line' ? focus.lineNumber : undefined;
   const focusRange = focus?.kind === 'range' ? focus : undefined;
+  const sourceKey = viewerSourceIdentity(source);
 
-  const notes = useFileReviewNotes(absolutePath, onSendNotes, patchContext);
+  const notes = useDocumentReviewNotes(source, onSendNotes);
   const supportsFocusedReview = payload.kind === 'markdown';
   const focused = supportsFocusedReview && presentation === 'fullscreen' && canTogglePresentation;
   const returnToPane = useCallback(() => onPresentationChange?.('pane'), [onPresentationChange]);
   const focusedExit = useFocusedReviewExit({
-    noteCount: notes.fileNotes.length,
+    noteCount: notes.notes.length,
+    unsavedDraft: notes.annotationDraftDirty,
     send: notes.send,
     discard: notes.clearAll,
     returnToPane,
@@ -86,20 +95,25 @@ export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
   // handle instead.
   const htmlPreview = payload.kind === 'html' && htmlViewMode === 'preview';
   const rangeSource = focusRange !== undefined && !htmlPreview;
-  const usePierreCode = payload.kind === 'code' || payload.kind === 'text' || rangeSource;
+  const usePierreCode = (payload.kind === 'code' || payload.kind === 'text' || rangeSource) && source.kind === 'file';
   const fileCodeRef = useRef<PhoenixFileCodeViewHandle>(null);
   const findButtonRef = useRef<HTMLButtonElement>(null);
   const lineRefs = useRef<Map<number, HTMLElement>>(new Map());
+  const lineRefsSourceKey = useRef(sourceKey);
+  if (lineRefsSourceKey.current !== sourceKey) {
+    lineRefs.current.clear();
+    lineRefsSourceKey.current = sourceKey;
+  }
   const contentRef = useRef<HTMLDivElement>(null);
   const scrollRestoredRef = useRef(false);
   const lastScrollTopRef = useRef(0);
 
-  const scrollKey = useMemo(() => `phoenix:prose-scroll:${absolutePath}`, [absolutePath]);
+  const scrollKey = useMemo(() => viewerScrollKey(source), [source]);
   const findSurfaceShape = htmlPreview
     ? 'html-preview'
     : rangeSource
       ? `range:${focusRange?.startLine ?? 0}-${focusRange?.endLine ?? 0}`
-      : isTextLikePayload(payload) && payload.renderMode === 'plainLargeText'
+      : fileTextSource?.renderMode === 'plainLargeText'
         ? 'plain-large-text'
         : payload.kind === 'markdown'
           ? 'rendered-markdown'
@@ -107,8 +121,8 @@ export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
             ? 'html-source'
             : usePierreCode ? 'pierre-source' : 'prose';
   const findSurfaceKey = useMemo(
-    () => createSurfaceKey(`${absolutePath}\u0000${payload.kind}\u0000${findSurfaceShape}`),
-    [absolutePath, findSurfaceShape, payload.kind],
+    () => createSurfaceKey(`${sourceKey}\u0000${payload.kind}\u0000${findSurfaceShape}`),
+    [findSurfaceShape, payload.kind, sourceKey],
   );
 
   const registerLineRef = useCallback((lineNumber: number, el: HTMLElement | null) => {
@@ -255,7 +269,12 @@ export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
   // refs the rendered body registers into `lineRefs`.
   const handleJumpTo = useCallback(
     (note: ReviewNote) => {
-      if (note.anchor.kind !== 'file' || note.anchor.filePath !== absolutePath) return;
+      const matchesSource = source.kind === 'file'
+        ? note.anchor.kind === 'file' && note.anchor.filePath === source.absolutePath
+        : note.anchor.kind === 'message'
+          && note.anchor.sequenceId === source.sequenceId
+          && (source.occurrenceToken === undefined || note.anchor.occurrenceToken === source.occurrenceToken);
+      if (!matchesSource || (note.anchor.kind !== 'file' && note.anchor.kind !== 'message')) return;
       // Pierre-backed payloads render in their own scroller; jump via the typed
       // handle. Other bodies expose DOM line refs the viewer scrolls directly.
       if (usePierreCode) {
@@ -270,13 +289,13 @@ export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
       }
       closePanel();
     },
-    [absolutePath, highlight, closePanel, usePierreCode],
+    [source, highlight, closePanel, usePierreCode],
   );
 
   // The plain-text fallback never applies to HTML preview: preview renders an
   // iframe (no per-line DOM cost), so a large HTML file must still reach it
   // rather than being stranded on the raw <pre>.
-  const largeFallback = textLike && !usePierreCode && payload.renderMode === 'plainLargeText' && !htmlPreview;
+  const largeFallback = textLike && !usePierreCode && fileTextSource?.renderMode === 'plainLargeText' && !htmlPreview;
 
   const renderedMarkdown = payload.kind === 'markdown' && !rangeSource && !largeFallback;
   const findEligible = (textLike && !htmlPreview) || largeFallback;
@@ -357,7 +376,7 @@ export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
     content,
     modifiedLines,
     highlightedLine: notes.highlightedLine,
-    onAnnotate: notes.startAnnotate,
+    onAnnotate: onSendNotes ? notes.startAnnotate : undefined,
     registerLineRef,
     findQuery: findSession ? findSession.query : '',
     activeFindOccurrence: findSession ? activeFindIndex : null,
@@ -382,10 +401,10 @@ export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
   }, [sendFind]);
 
   useViewerFindKeyboardShortcut({
-    scopeId: 'file-viewer',
+    scopeId: focusScopeId,
     onOpen: openFind,
     enabled: findEligible,
-    dialogOpen: notes.annotating !== null,
+    dialogOpen: notes.annotating !== null || notes.showPanel || focusedExit.exitTarget !== null,
   });
 
   useEffect(() => {
@@ -415,6 +434,9 @@ export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
     sendFind({ type: 'previous' });
   }, [sendFind]);
 
+  const findButtonLabel = source.kind === 'message' ? 'Find in message' : 'Find in file';
+  const copyButtonTitle = source.kind === 'message' ? 'Copy message markdown' : 'Copy file contents';
+
   const headerExtras: ReactNode = textLike ? (
     <>
       {findEligible && (
@@ -423,13 +445,13 @@ export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
           type="button"
           className="viewer-shell-btn"
           onClick={openFind}
-          aria-label="Find in file"
-          title="Find in file"
+          aria-label={findButtonLabel}
+          title={findButtonLabel}
         >
           Find
         </button>
       )}
-      <CopyButton text={content} className="viewer-shell-copy-btn" title="Copy file contents" />
+      <CopyButton text={content} className="viewer-shell-copy-btn" title={copyButtonTitle} />
       {supportsFocusedReview && canTogglePresentation && onPresentationChange && (
         <ViewerPresentationControl
           fullscreen={focused}
@@ -521,31 +543,38 @@ export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
   ) : viewerBanner ?? (findIneligibleReason ? <span>{findIneligibleReason}</span> : null);
 
   const viewerMode = focused || (payload.kind === 'image' && imageTakeover) ? 'takeover' : inline ? 'inline' : 'overlay';
+  const ariaLabel = source.kind === 'message' ? `Message viewer: ${title}` : `File viewer: ${title}`;
+  const titleTooltip = source.kind === 'message'
+    ? `Conversation message #${source.sequenceId}`
+    : source.absolutePath;
+  const sendAction = onSendNotes
+    ? (focused ? focusedExit.sendAndReturn : () => { void notes.send(); })
+    : undefined;
   const shell = (
     <ViewerShell
       closeOnEscape={!findOpen}
       onInnerEscape={closeFind}
       mode={viewerMode}
-      ariaLabel={`File viewer: ${title}`}
+      ariaLabel={ariaLabel}
       title={title}
-      titleTooltip={absolutePath}
+      titleTooltip={titleTooltip}
       headerExtras={headerExtras}
-      noteCount={notes.fileNotes.length}
+      noteCount={notes.notes.length}
       onToggleNotes={notes.togglePanel}
-      onSend={focused ? focusedExit.sendAndReturn : () => { void notes.send(); }}
+      onSend={sendAction}
       banner={banner}
-      onClose={focused ? focusedExit.requestClose : onClose}
+      onClose={focused || notes.annotationDraftDirty ? focusedExit.requestClose : onClose}
       onEscape={focused ? focusedExit.requestReturn : undefined}
       suppressCloseButtonFocus={findSession !== null}
       bodyScroll={usePierreCode ? 'children' : 'shell'}
       panel={
         notes.showPanel ? (
           <NotesPanel
-            notes={notes.fileNotes}
+            notes={notes.notes}
             onJumpTo={handleJumpTo}
             onRemove={notes.removeNote}
             onClearAll={notes.clearAll}
-            onSend={focused ? focusedExit.sendAndReturn : () => { void notes.send(); }}
+            onSend={sendAction}
             onClose={notes.closePanel}
           />
         ) : null
@@ -555,7 +584,8 @@ export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
           <AnnotationDialog
             anchorLabel={`Line ${notes.annotating.lineNumber}`}
             lineContent={notes.annotating.lineContent}
-            onSubmit={notes.submitNote}
+            onDirtyChange={notes.setAnnotationDraftDirty}
+            onSubmit={onSendNotes ? notes.submitNote : undefined}
             onCancel={notes.cancelAnnotate}
           />
         ) : null
@@ -565,18 +595,19 @@ export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
           target={focusedExit.exitTarget}
           sending={focusedExit.sending}
           error={focusedExit.error}
+          canSend={Boolean(onSendNotes)}
           onSend={() => { void focusedExit.sendAndReturn(); }}
           onDiscard={focusedExit.discardAndReturn}
           onKeepReviewing={focusedExit.keepReviewing}
         />
       ) : null}
     >
-      {usePierreCode ? (
+      {usePierreCode && source.kind === 'file' ? (
         <PhoenixFileCodeView
           ref={fileCodeRef}
-          filePath={absolutePath}
+          filePath={source.absolutePath}
           content={content}
-          notes={notes.fileNotes}
+          notes={notes.notes}
           modifiedLines={modifiedLines}
           highlightedLine={notes.highlightedLine}
           firstModifiedLine={patchContext?.firstModifiedLine ?? focusRange?.startLine ?? focusLine}
@@ -608,7 +639,7 @@ function renderBody(
   // HTML preview renders an iframe with no per-line cost, so the large-file
   // fallback must not pre-empt it; only source-like rendering falls back.
   const htmlPreview = payload.kind === 'html' && htmlViewMode === 'preview';
-  if (isTextLikePayload(payload) && payload.renderMode === 'plainLargeText' && !htmlPreview) {
+  if (isFileTextSource(payload.source) && payload.source.renderMode === 'plainLargeText' && !htmlPreview) {
     return <TextViewerBody {...bodyProps} />;
   }
 

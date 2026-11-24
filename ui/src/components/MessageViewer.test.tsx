@@ -1,6 +1,7 @@
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { describe, expect, it, vi } from 'vitest';
 import type { Message } from '../api';
+import { FocusScopeProvider } from '../hooks/useFocusScope';
 import { ReviewNotesProvider } from '../contexts/ReviewNotesContext';
 import { MessageViewer } from './MessageViewer';
 function agentTextMessage(sequenceId: number, text: string): Message {
@@ -454,5 +455,44 @@ describe('MessageViewer', () => {
     await waitFor(() => {
       expect(document.querySelector('[data-line="1"]')).toHaveClass('annotatable--highlighted');
     });
+  });
+
+  it('owns Cmd/Ctrl+F find in message view, searches canonical markdown, and closes find before viewer on Escape', async () => {
+    const onClose = vi.fn();
+    const messages = [agentTextMessage(1, '# Summary\n\nFirst needle line\n\nSecond needle line')];
+    render(
+      <FocusScopeProvider>
+        <ReviewNotesProvider>
+          <MessageViewer
+            sequenceId={1}
+            messages={messages}
+            onClose={onClose}
+            onSendNotes={vi.fn()}
+            inline
+          />
+        </ReviewNotesProvider>
+      </FocusScopeProvider>,
+    );
+
+    const shortcut = new KeyboardEvent('keydown', { key: 'f', metaKey: true, bubbles: true, cancelable: true });
+    window.dispatchEvent(shortcut);
+    expect(shortcut.defaultPrevented).toBe(true);
+
+    const input = await screen.findByRole('textbox', { name: 'Find in viewer' });
+    fireEvent.change(input, { target: { value: 'needle' } });
+    expect(screen.getByText('1 of 2')).toBeInTheDocument();
+    expect(document.querySelectorAll('.viewer-markdown [data-find-occurrence]')).toHaveLength(2);
+
+    fireEvent.click(screen.getByRole('button', { name: 'Next' }));
+    expect(screen.getByText('2 of 2')).toBeInTheDocument();
+
+    // First Escape closes Find without closing the viewer.
+    fireEvent.keyDown(window, { key: 'Escape' });
+    await waitFor(() => expect(screen.queryByRole('textbox', { name: 'Find in viewer' })).toBeNull());
+    expect(onClose).not.toHaveBeenCalled();
+
+    // Second Escape closes the viewer.
+    fireEvent.keyDown(window, { key: 'Escape' });
+    expect(onClose).toHaveBeenCalledTimes(1);
   });
 });
