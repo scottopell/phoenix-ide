@@ -1,5 +1,11 @@
 # Unified Close acceptance milestone
 
+## Integrated34ccafc terminal: dependency compatibility blocks Rust execution
+
+Integrated head `34ccafc49b0170269c0b91ddaf3e6b64d536dc2a` completed Close run **45397534177** with failure. Frontend (including QuestionPanel and CoordinatorQuestionDock) and specification gates passed; hosted format patch is empty. Rust compilation fails E0277 at task-approval body hashing because main's updated digest output no longer implements whole-array `LowerHex`. Consequently the combined DB, public journey and Stop tests did not execute; their earlier121795 successes are not integrated acceptance. Terminal evidence is retained under `/tmp/close-34ccafc49/{db,exact,format}/` and the sole watcher exited1.
+
+PR CI **45397539488** independently rejects stale numbered SQL constant identifiers: migration173 references MIGRATION_157 and174 references MIGRATION_158. The source correction renames those private constants and test references to their actual173/174 identities without altering SQL bodies, and encodes digest bytes as fixed-width lowercase hex using existing core style. A standard SHA256(abc) regression is required as an actual exact hosted execution. These are narrow integration repairs, not a migration-ledger checker bypass or dependency downgrade. Corrected source remains unqualified until its new automatic exact-head run succeeds.
+
 ## Main integration candidate: source reconciliation complete, hosted qualification owed
 
 Branch-only exact head `121795f15380df316973ce8e044dbd6ed352c642` completed automatic hosted run **45379847006** successfully. Actual named execution passed the public captured-loss reclaim/replay journey, all four causal Stop cases, initial physical Close journey, both owner-cleanup migration tests, typed origin routing, mandatory-delivery/permanent-deletion regression, and required DB/runtime/tools/UI/specification/format gates. Artifacts remain under `/tmp/close-121795f15/`; this is evidence for that immutable head, not the integrated candidate below.

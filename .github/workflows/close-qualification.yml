@@ -144,6 +144,9 @@ jobs:
           cargo test -p phoenix-core --lib domain::close::tests:: -- --nocapture --test-threads=1 2>&1 | tee evidence/close-domain.log
           grep -E 'test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored;' evidence/close-domain.log
           grep -F 'test domain::close::tests::enums_expose_exact_persisted_strings ... ok' evidence/close-domain.log
+          cargo test -p phoenix-core --lib domain::task_approval::tests::reviewed_body_sha256_preserves_fixed_width_lowercase_encoding -- --exact --nocapture --test-threads=1 2>&1 | tee evidence/task-approval-body-hash.log
+          grep -Fx 'test domain::task_approval::tests::reviewed_body_sha256_preserves_fixed_width_lowercase_encoding ... ok' evidence/task-approval-body-hash.log
+          grep -F 'test result: ok. 1 passed; 0 failed; 0 ignored;' evidence/task-approval-body-hash.log
       - name: Compile database tests and inventory exact selectors
         shell: bash
         run: |

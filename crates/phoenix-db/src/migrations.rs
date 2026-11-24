@@ -911,12 +911,12 @@ const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 173,
         name: "close_completion_allowances_and_native_retry_fence",
-        sql: MIGRATION_157,
+        sql: MIGRATION_173,
     },
     Migration {
         version: 174,
         name: "native_close_initial_receipts",
-        sql: MIGRATION_158,
+        sql: MIGRATION_174,
     },
     Migration {
         version: 175,
@@ -1000,7 +1000,7 @@ const MIGRATIONS: &[Migration] = &[
     },
 ];
 
-const MIGRATION_158: &str = r"
+const MIGRATION_174: &str = r"
 CREATE UNIQUE INDEX close_obligations_attempt_product_unique
     ON close_obligations(attempt_id, product_conversation_id);
 
@@ -1064,7 +1064,7 @@ BEGIN
 END;
 ";
 
-const MIGRATION_157: &str = r"
+const MIGRATION_173: &str = r"
 ALTER TABLE close_obligations
 ADD COLUMN native_managed INTEGER NOT NULL DEFAULT 0
     CHECK (typeof(native_managed) = 'integer' AND native_managed IN (0, 1));
@@ -24541,7 +24541,7 @@ mod close_completion_allowance_tests {
     use sqlx::sqlite::SqlitePoolOptions;
 
     use super::{
-        run_pending_migrations, tests::setup_real_pre_175_schema, MIGRATIONS, MIGRATION_157,
+        run_pending_migrations, tests::setup_real_pre_175_schema, MIGRATIONS, MIGRATION_173,
     };
 
     #[tokio::test]
@@ -24571,7 +24571,7 @@ mod close_completion_allowance_tests {
         .execute(&pool)
         .await
         .unwrap();
-        sqlx::raw_sql(MIGRATION_157).execute(&pool).await.unwrap();
+        sqlx::raw_sql(MIGRATION_173).execute(&pool).await.unwrap();
 
         let old_marker: i64 = sqlx::query_scalar(
             "SELECT native_managed FROM close_obligations WHERE attempt_id = 'preexisting'",
@@ -25302,7 +25302,7 @@ mod close_completion_allowance_tests {
 mod native_close_initial_receipt_tests {
     use sqlx::sqlite::SqlitePoolOptions;
 
-    use super::MIGRATION_158;
+    use super::MIGRATION_174;
 
     #[tokio::test]
     #[allow(clippy::too_many_lines)] // One fixture checks the full immutable receipt lifecycle.
@@ -25339,7 +25339,7 @@ mod native_close_initial_receipt_tests {
         .execute(&pool)
         .await
         .unwrap();
-        sqlx::raw_sql(MIGRATION_158).execute(&pool).await.unwrap();
+        sqlx::raw_sql(MIGRATION_174).execute(&pool).await.unwrap();
 
         let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM native_close_initial_receipts")
             .fetch_one(&pool)

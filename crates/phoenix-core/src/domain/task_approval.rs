@@ -51,7 +51,11 @@ impl ReviewedProposal {
             TaskSource::Taskmd { .. } => ReviewedTaskKind::Taskmd,
             TaskSource::PlainMarkdown { .. } => ReviewedTaskKind::PlainMarkdown,
         };
-        let body_sha256 = format!("{:x}", Sha256::digest(body.as_bytes()));
+        let mut body_sha256 = String::with_capacity(64);
+        for byte in Sha256::digest(body.as_bytes()) {
+            use std::fmt::Write as _;
+            write!(body_sha256, "{byte:02x}").expect("writing to String cannot fail");
+        }
         Self {
             occurrence,
             kind,
@@ -63,6 +67,17 @@ impl ReviewedProposal {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reviewed_body_sha256_preserves_fixed_width_lowercase_encoding() {
+        let occurrence = ProposalOccurrence::capture("assistant", "tool").unwrap();
+        let source = TaskSource::detect("plan.md").unwrap();
+        let reviewed = ReviewedProposal::capture(occurrence, &source, "abc");
+        assert_eq!(
+            reviewed.body_sha256,
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
 
     #[test]
     fn occurrence_changes_on_same_body_reproposal() {
