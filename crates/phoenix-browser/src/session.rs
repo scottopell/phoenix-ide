@@ -3874,13 +3874,13 @@ mod lifecycle_hook_tests {
         unsafe {
             libc::kill(i32::try_from(first_pid).unwrap(), libc::SIGKILL);
         }
-        let deadline = Instant::now() + std::time::Duration::from_secs(5);
-        while Instant::now() < deadline {
-            if first.write().await.is_dead() {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-        }
+        let _ = first
+            .write()
+            .await
+            .browser
+            .wait()
+            .await
+            .expect("await killed Chrome exit");
         assert!(
             first.write().await.is_dead(),
             "killed Chrome process must be detected as dead"
@@ -3924,7 +3924,7 @@ mod lifecycle_hook_tests {
             if first.write().await.is_dead() {
                 break;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            tokio::task::yield_now().await;
         }
         assert!(
             first.write().await.is_dead(),
