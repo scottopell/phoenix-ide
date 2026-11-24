@@ -85,13 +85,35 @@ impl AdmittedRetryCursor {
         source_entry: SourceEntryWorker,
         deadline: std::time::Instant,
     ) -> Self {
-        Self { command, receipt, backend, context: None, order: Vec::new(), index: 0,
-            stage: Stage::Context, deadline, next_service: tokio::time::Instant::now(), source_entry, scope_worker: None, tmux_worker: None, drain_worker: None, dispatch_worker: None,
-            #[cfg(unix)] preparation: None,
-            #[cfg(unix)] physical: None,
-            #[cfg(unix)] stopped_physical_outcome: None,
-            response: Some(response), _target_gate: target_gate, _attempt_gate: attempt_gate,
-            authority: RuntimeSettlementAuthority { owner: Some(admitted), abandoned_reason: "admitted native retry cursor lost settlement custody" } }
+        Self {
+            command,
+            receipt,
+            backend,
+            context: None,
+            order: Vec::new(),
+            index: 0,
+            stage: Stage::Context,
+            deadline,
+            next_service: tokio::time::Instant::now(),
+            source_entry,
+            scope_worker: None,
+            tmux_worker: None,
+            drain_worker: None,
+            dispatch_worker: None,
+            #[cfg(unix)]
+            preparation: None,
+            #[cfg(unix)]
+            physical: None,
+            #[cfg(unix)]
+            stopped_physical_outcome: None,
+            response: Some(response),
+            _target_gate: target_gate,
+            _attempt_gate: attempt_gate,
+            authority: RuntimeSettlementAuthority {
+                owner: Some(admitted),
+                abandoned_reason: "admitted native retry cursor lost settlement custody",
+            },
+        }
     }
 
     pub(in crate::runtime::executor) fn next_service_at(&self) -> tokio::time::Instant {
@@ -116,10 +138,18 @@ impl AdmittedRetryCursor {
     }
 
     async fn join_workers(&mut self) {
-        if let Some(worker) = self.drain_worker.take() { let _ = worker.await; }
-        if let Some(worker) = self.scope_worker.take() { let _ = worker.await; }
-        if let Some(worker) = self.tmux_worker.take() { let _ = worker.await; }
-        if let Some(worker) = self.dispatch_worker.take() { let _ = worker.await; }
+        if let Some(worker) = self.drain_worker.take() {
+            let _ = worker.await;
+        }
+        if let Some(worker) = self.scope_worker.take() {
+            let _ = worker.await;
+        }
+        if let Some(worker) = self.tmux_worker.take() {
+            let _ = worker.await;
+        }
+        if let Some(worker) = self.dispatch_worker.take() {
+            let _ = worker.await;
+        }
         #[cfg(unix)]
         {
             // spawn_blocking cannot be aborted after entry. Always join it.
@@ -183,14 +213,48 @@ impl AdmittedRetryCursor {
         let current = if let Some(controller) = controller.as_mut() {
             match controller.revalidate(live, &self.command) {
                 ActorEntryResult::Updated => true,
-                ActorEntryResult::Busy if self.scope_worker.as_ref().is_some_and(|worker| worker.is_finished()) => false,
-                ActorEntryResult::Busy if self.tmux_worker.as_ref().is_some_and(|worker| worker.is_finished()) => false,
-                ActorEntryResult::Busy if self.dispatch_worker.as_ref().is_some_and(|worker| worker.is_finished()) => false,
+                ActorEntryResult::Busy
+                    if self
+                        .scope_worker
+                        .as_ref()
+                        .is_some_and(|worker| worker.is_finished()) =>
+                {
+                    false
+                }
+                ActorEntryResult::Busy
+                    if self
+                        .tmux_worker
+                        .as_ref()
+                        .is_some_and(|worker| worker.is_finished()) =>
+                {
+                    false
+                }
+                ActorEntryResult::Busy
+                    if self
+                        .dispatch_worker
+                        .as_ref()
+                        .is_some_and(|worker| worker.is_finished()) =>
+                {
+                    false
+                }
                 ActorEntryResult::Busy => return Ok(false),
                 ActorEntryResult::Refused => false,
             }
-        } else { false };
-        if !current && !matches!(self.stage, Stage::ScopeRunning | Stage::TmuxRunning | Stage::WorktreeDraining | Stage::WorktreeRecordDispatchRunning | Stage::WorktreePreparing | Stage::WorktreePhysical | Stage::Failure(_)) {
+        } else {
+            false
+        };
+        if !current
+            && !matches!(
+                self.stage,
+                Stage::ScopeRunning
+                    | Stage::TmuxRunning
+                    | Stage::WorktreeDraining
+                    | Stage::WorktreeRecordDispatchRunning
+                    | Stage::WorktreePreparing
+                    | Stage::WorktreePhysical
+                    | Stage::Failure(_)
+            )
+        {
             self.stage = Stage::ObserveTerminal;
         }
         let stage = std::mem::replace(&mut self.stage, Stage::Fatal);
@@ -440,13 +504,23 @@ impl AdmittedRetryCursor {
                 self.stage = Stage::WorktreeRecordDispatchRunning;
             }
             Stage::WorktreeRecordDispatchRunning => {
-                let worker = self.dispatch_worker.as_ref().expect("retained Worktree dispatch worker");
+                let worker = self
+                    .dispatch_worker
+                    .as_ref()
+                    .expect("retained Worktree dispatch worker");
                 if !worker.is_finished() {
                     self.stage = Stage::WorktreeRecordDispatchRunning;
                     return Ok(false);
                 }
-                let result = self.dispatch_worker.take().expect("retained Worktree dispatch worker").await;
-                if matches!(&result, Err(_) | Ok(Err(NativeRetryExecutionError::Unclassified))) {
+                let result = self
+                    .dispatch_worker
+                    .take()
+                    .expect("retained Worktree dispatch worker")
+                    .await;
+                if matches!(
+                    &result,
+                    Err(_) | Ok(Err(NativeRetryExecutionError::Unclassified))
+                ) {
                     self.stage = Stage::Fatal;
                     return Err(NativeCloseApplicationError::FatalAuthority);
                 }
@@ -456,11 +530,19 @@ impl AdmittedRetryCursor {
                 } else {
                     match result {
                         Ok(Ok(())) => self.stage = Stage::WorktreePreparing,
-                        Ok(Err(NativeRetryExecutionError::ResourceFailure(detail))) => self.stage = Stage::Failure(detail),
-                        Ok(Err(NativeRetryExecutionError::TerminalizedFailure(detail))) => {
-                            if self.accept(Err(NativeRetryExecutionError::TerminalizedFailure(detail))) { return Ok(true); }
+                        Ok(Err(NativeRetryExecutionError::ResourceFailure(detail))) => {
+                            self.stage = Stage::Failure(detail)
                         }
-                        Ok(Err(NativeRetryExecutionError::Unclassified)) | Err(_) => unreachable!("fatal dispatch result handled above"),
+                        Ok(Err(NativeRetryExecutionError::TerminalizedFailure(detail))) => {
+                            if self
+                                .accept(Err(NativeRetryExecutionError::TerminalizedFailure(detail)))
+                            {
+                                return Ok(true);
+                            }
+                        }
+                        Ok(Err(NativeRetryExecutionError::Unclassified)) | Err(_) => {
+                            unreachable!("fatal dispatch result handled above")
+                        }
                     }
                 }
             }

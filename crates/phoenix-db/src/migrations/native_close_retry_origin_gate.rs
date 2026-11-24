@@ -7,7 +7,9 @@ const SOURCE_184: &str = include_str!("native_close_captured_loss_retry.sql");
 const ARCHIVE_GATE: &str = "conversation.archived <> 1 OR ";
 
 fn unexpected() -> DbError {
-    DbError::Serialization(format!("migration 186 found unexpected {TRIGGER} source shape"))
+    DbError::Serialization(format!(
+        "migration 186 found unexpected {TRIGGER} source shape"
+    ))
 }
 
 fn corrected_source() -> DbResult<(String, String)> {
@@ -26,12 +28,11 @@ pub(super) async fn run(pool: &SqlitePool, migration: &Migration) -> DbResult<()
     let (expected_old, corrected) = corrected_source()?;
     let mut connection = pool.acquire().await?;
     let mut tx = connection.begin().await?;
-    let installed: Option<String> = sqlx::query_scalar(
-        "SELECT sql FROM sqlite_schema WHERE type = 'trigger' AND name = ?1",
-    )
-    .bind(TRIGGER)
-    .fetch_optional(&mut *tx)
-    .await?;
+    let installed: Option<String> =
+        sqlx::query_scalar("SELECT sql FROM sqlite_schema WHERE type = 'trigger' AND name = ?1")
+            .bind(TRIGGER)
+            .fetch_optional(&mut *tx)
+            .await?;
     if installed.as_deref() != Some(expected_old.as_str()) {
         return Err(unexpected());
     }
@@ -61,16 +62,23 @@ mod tests {
             .await
             .unwrap();
         super::super::setup_real_175_for_test(&pool).await;
-        super::super::run_through_for_test(&pool, 185).await.unwrap();
+        super::super::run_through_for_test(&pool, 185)
+            .await
+            .unwrap();
         pool
     }
 
     async fn snapshot(pool: &SqlitePool) -> (Vec<(String, String)>, Vec<(i64, String)>) {
         let schema = sqlx::query_as(
             "SELECT name, sql FROM sqlite_schema WHERE sql IS NOT NULL ORDER BY name",
-        ).fetch_all(pool).await.unwrap();
+        )
+        .fetch_all(pool)
+        .await
+        .unwrap();
         let ledger = sqlx::query_as("SELECT version, name FROM _migrations ORDER BY version")
-            .fetch_all(pool).await.unwrap();
+            .fetch_all(pool)
+            .await
+            .unwrap();
         (schema, ledger)
     }
 
@@ -80,16 +88,37 @@ mod tests {
         let (old, corrected) = corrected_source().unwrap();
         let installed: String = sqlx::query_scalar(
             "SELECT sql FROM sqlite_schema WHERE type = 'trigger' AND name = ?1",
-        ).bind(TRIGGER).fetch_one(&pool).await.unwrap();
+        )
+        .bind(TRIGGER)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert_eq!(installed, old);
-        assert_eq!(super::super::run_through_for_test(&pool, 186).await.unwrap(), 1);
+        assert_eq!(
+            super::super::run_through_for_test(&pool, 186)
+                .await
+                .unwrap(),
+            1
+        );
         let installed: String = sqlx::query_scalar(
             "SELECT sql FROM sqlite_schema WHERE type = 'trigger' AND name = ?1",
-        ).bind(TRIGGER).fetch_one(&pool).await.unwrap();
+        )
+        .bind(TRIGGER)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert_eq!(installed, corrected);
         let before = snapshot(&pool).await;
-        assert_eq!(before.1.last(), Some(&(186, "native_close_retry_origin_gate".into())));
-        assert_eq!(super::super::run_through_for_test(&pool, 186).await.unwrap(), 0);
+        assert_eq!(
+            before.1.last(),
+            Some(&(186, "native_close_retry_origin_gate".into()))
+        );
+        assert_eq!(
+            super::super::run_through_for_test(&pool, 186)
+                .await
+                .unwrap(),
+            0
+        );
         assert_eq!(snapshot(&pool).await, before);
     }
 
@@ -97,14 +126,20 @@ mod tests {
     async fn missing_or_changed_origin_trigger_rolls_back186() {
         for changed in [false, true] {
             let pool = predecessor().await;
-            sqlx::raw_sql("DROP TRIGGER native_close_captured_loss_retry_origin_requires_exact_stop;")
-                .execute(&pool).await.unwrap();
+            sqlx::raw_sql(
+                "DROP TRIGGER native_close_captured_loss_retry_origin_requires_exact_stop;",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
             if changed {
                 sqlx::raw_sql("CREATE TRIGGER native_close_captured_loss_retry_origin_requires_exact_stop BEFORE INSERT ON native_close_captured_loss_retry_plans BEGIN SELECT 1; END;")
                     .execute(&pool).await.unwrap();
             }
             let before = snapshot(&pool).await;
-            let error = super::super::run_through_for_test(&pool, 186).await.unwrap_err();
+            let error = super::super::run_through_for_test(&pool, 186)
+                .await
+                .unwrap_err();
             assert!(error.to_string().contains("unexpected native_close_captured_loss_retry_origin_requires_exact_stop source shape"));
             assert_eq!(snapshot(&pool).await, before);
         }

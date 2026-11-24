@@ -473,7 +473,8 @@ pub(super) async fn retry_after_public_capture(
         }
 
         if point == Point::WorktreeDispatchBeforeWriter {
-            assert_no_retry_dispatch_or_cleanup_plan(&fixture, initial_run.attempt_id.as_str()).await;
+            assert_no_retry_dispatch_or_cleanup_plan(&fixture, initial_run.attempt_id.as_str())
+                .await;
         }
 
         // The worker cannot publish its result until after this ACK is observed.
@@ -512,7 +513,8 @@ pub(super) async fn retry_after_public_capture(
             "no retry effect was acknowledged as successful"
         );
         if point == Point::WorktreeDispatchBeforeWriter {
-            assert_no_retry_dispatch_or_cleanup_plan(&fixture, initial_run.attempt_id.as_str()).await;
+            assert_no_retry_dispatch_or_cleanup_plan(&fixture, initial_run.attempt_id.as_str())
+                .await;
         }
         let stopped_target = durable_target_rows(&fixture).await;
         let stopped_physical = physical_snapshot(&git.root);
@@ -537,7 +539,8 @@ pub(super) async fn retry_after_public_capture(
         assert!(!refused.is_success(), "{}", refused.output());
         let refused: Value = serde_json::from_str(refused.output()).unwrap();
         if point == Point::WorktreeDispatchBeforeWriter {
-            assert_no_retry_dispatch_or_cleanup_plan(&fixture, initial_run.attempt_id.as_str()).await;
+            assert_no_retry_dispatch_or_cleanup_plan(&fixture, initial_run.attempt_id.as_str())
+                .await;
         }
         assert_eq!(refused["code"], "storage_rejected");
         assert_eq!(
@@ -557,7 +560,8 @@ pub(super) async fn retry_after_public_capture(
         assert!(!replay.is_success(), "{}", replay.output());
         let replay: Value = serde_json::from_str(replay.output()).unwrap();
         if point == Point::WorktreeDispatchBeforeWriter {
-            assert_no_retry_dispatch_or_cleanup_plan(&fixture, initial_run.attempt_id.as_str()).await;
+            assert_no_retry_dispatch_or_cleanup_plan(&fixture, initial_run.attempt_id.as_str())
+                .await;
         }
         assert_eq!(replay["code"], "source_refused");
         assert_eq!(
@@ -805,7 +809,11 @@ async fn assert_no_retry_dispatch_or_cleanup_plan(fixture: &CloseFixture, attemp
     .fetch_one(fixture.db.pool())
     .await
     .unwrap();
-    assert_eq!(counts, (0, 0), "pre-writer Stop must not authorize dispatch or cleanup metadata");
+    assert_eq!(
+        counts,
+        (0, 0),
+        "pre-writer Stop must not authorize dispatch or cleanup metadata"
+    );
 }
 
 async fn public_retry_rows(fixture: &CloseFixture, attempt: &str) -> String {

@@ -54,7 +54,10 @@ async fn registered_native_close_captured_loss_retry_stop_before_physical_observ
 
 #[tokio::test]
 async fn registered_native_close_captured_loss_retry_stop_before_writer_refuses_dispatch() {
-    run_public_worktree_close(WorktreeJourney::CapturedLossPublicRetryStoppedBeforeWorktreeDispatch).await;
+    run_public_worktree_close(
+        WorktreeJourney::CapturedLossPublicRetryStoppedBeforeWorktreeDispatch,
+    )
+    .await;
 }
 
 #[tokio::test]
