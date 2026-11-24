@@ -27,7 +27,6 @@ export type AppEvent =
   | { type: 'OPERATION_QUEUED'; op: PendingOperation };
 
 export type AppEffect =
-  | { type: 'INIT_CACHE' }
   | { type: 'START_SYNC' }
   | { type: 'SCHEDULE_RETRY'; delayMs: number }
   | { type: 'CANCEL_RETRY' }
@@ -200,16 +199,3 @@ export function transition(
 }
 
 export const initialAppState: AppState = { type: 'initializing' };
-
-// Helper to check if we should show sync status
-export function shouldShowSyncStatus(state: AppState): boolean {
-  if (state.type !== 'ready') return false;
-  return state.sync.type !== 'idle';
-}
-
-// Helper to get sync progress percentage
-export function getSyncProgress(state: AppState): number | null {
-  if (state.type !== 'ready' || state.sync.type !== 'syncing') return null;
-  if (state.sync.total === 0) return 0;
-  return Math.round((state.sync.progress / state.sync.total) * 100);
-}

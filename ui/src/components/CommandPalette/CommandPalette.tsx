@@ -179,8 +179,6 @@ export function CommandPalette({ conversations, productConversations = [], activ
                     } finally {
                       closingProductIdsRef.current.delete(productId);
                     }
-                  } else if (chainRootId != null) {
-                    await api.archiveChain(chainRootId);
                   } else {
                     await api.archiveConversation(targetId);
                   }
