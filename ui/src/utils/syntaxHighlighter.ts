@@ -12,8 +12,11 @@
  * still read the code.
  */
 import { createElement as reactCreateElement, type ComponentProps } from 'react';
-import { PrismLight as BaseSyntaxHighlighter, createElement } from 'react-syntax-highlighter';
+import BaseSyntaxHighlighter from 'react-syntax-highlighter/dist/esm/prism-light';
+import createElement from 'react-syntax-highlighter/dist/esm/create-element';
 import type { createElementProps } from 'react-syntax-highlighter';
+import oneDark from 'react-syntax-highlighter/dist/esm/styles/prism/one-dark';
+import oneLight from 'react-syntax-highlighter/dist/esm/styles/prism/one-light';
 
 // Language imports — each is its own ESM file under .../languages/prism/.
 // Adding a new one here registers an alias below.
@@ -84,6 +87,5 @@ export function SyntaxHighlighter({ language, ...props }: SyntaxHighlighterProps
   return reactCreateElement(BaseSyntaxHighlighter, { language, ...props });
 }
 
-export { createElement };
+export { createElement, oneDark, oneLight };
 export type { createElementProps };
-export { oneDark, oneLight } from 'react-syntax-highlighter/dist/esm/styles/prism';
