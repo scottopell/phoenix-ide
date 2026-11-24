@@ -90,10 +90,12 @@ fn unexpected(name: &str) -> DbError {
 
 fn trigger_source<'a>(source: &'a str, name: &str) -> DbResult<&'a str> {
     let start = format!("CREATE TRIGGER {name}\n");
-    let (_, tail) = source.split_once(&start).ok_or_else(|| unexpected(name))?;
+    let (prefix, tail) = source.split_once(&start).ok_or_else(|| unexpected(name))?;
     let end = tail.find("\nEND;").ok_or_else(|| unexpected(name))?;
-    let at = source.len() - tail.len() - start.len();
-    Ok(&source[at..at + start.len() + end + "\nEND".len()])
+    let at = prefix.len();
+    source
+        .get(at..at + start.len() + end + "\nEND".len())
+        .ok_or_else(|| unexpected(name))
 }
 
 fn between<'a>(source: &'a str, name: &str, start: &str, end: &str) -> DbResult<&'a str> {
@@ -236,6 +238,12 @@ async fn rewrite_native_guards(tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>) -> 
     )?;
     install(tx, name, rewritten).await?;
 
+    verify_unchanged_native_guards(tx).await
+}
+
+async fn verify_unchanged_native_guards(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+) -> DbResult<()> {
     // These guards need no new authority: they bind already admitted plans and
     // effects, not anchors/inventories. Assert their actual installed sources.
     for (source, name) in [

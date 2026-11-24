@@ -119,6 +119,7 @@ fn precondition(message: &str) -> DbError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::native_close::NativeCloseInitialResult;
     use phoenix_core::domain::db_schema::SourceToolCall;
     use phoenix_core::domain::llm_types::ContentBlock;
     use phoenix_core::domain::sm_state::{AssistantMessage, ConvState, ToolCall, ToolInput};
@@ -184,10 +185,15 @@ mod tests {
             .unwrap();
             let receipt = match db.apply_native_close_initial(&command).await {
                 LocalAuthorityResult::DurableFactEstablished(Ok(
-                    super::super::NativeCloseInitialResult::NewlyAdmitted(receipt)
-                    | super::super::NativeCloseInitialResult::Replay(receipt),
+                    NativeCloseInitialResult::NewlyAdmitted(receipt)
+                    | NativeCloseInitialResult::Replay(receipt),
                 )) => receipt,
-                other => panic!("initial admission failed: {other:?}"),
+                other @ (LocalAuthorityResult::DurableFactEstablished(
+                    Ok(NativeCloseInitialResult::ExistingOperationNeedsExactReference(_)) | Err(_),
+                )
+                | LocalAuthorityResult::DurableFactUnclassified) => {
+                    panic!("initial admission failed: {other:?}");
+                }
             };
             Self {
                 db,

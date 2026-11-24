@@ -765,6 +765,8 @@ fn initial_dispatch_request(
 }
 
 #[tokio::test]
+// Keep pre-dispatch refusal, affine transfer, and completed reentry on the same resource.
+#[allow(clippy::too_many_lines)]
 async fn initial_worktree_entry_requires_exact_dispatch_and_refuses_completed_reentry() {
     let f = Fixture::new().await;
     let (command, receipt, live_source, expected) = captured_initial_retirement(&f).await;
@@ -1129,7 +1131,7 @@ async fn first_effect_callback_holds_writer_reservation_against_source_update() 
             .unwrap_err();
         let code = error
             .as_database_error()
-            .and_then(|db| db.code())
+            .and_then(sqlx::error::DatabaseError::code)
             .and_then(|code| code.parse::<i32>().ok());
         let _ = busy_tx.send(code.ok_or_else(|| format!("expected SQLite code 5, got {error}")));
         release_rx.await.map_err(|error| error.to_string())?;
@@ -3359,6 +3361,8 @@ async fn check_initial_resource_failure(failed_index: usize) {
 }
 
 #[tokio::test]
+// Check dispatch and live-source rejection against the same original worktree metadata.
+#[allow(clippy::too_many_lines)]
 async fn initial_worktree_metadata_requires_exact_original_dispatched_authority_and_live_source() {
     let f = Fixture::new().await;
     let (command, receipt, live_source, expected) = captured_initial_retirement(&f).await;

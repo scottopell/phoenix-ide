@@ -1,5 +1,16 @@
 # Unified Close acceptance milestone
 
+## Integrated1068 terminal: captured-loss retry refusal; diagnostic/lint candidate unqualified
+
+Exact head `1068c2da76f2c6886f89aca21ec5f71381b17d4d` completed automatic Close Qualification **45457483295** and broader PR CI **45457498208** with failure. Early source formatting passed. The actual public captured-loss clean retry failed with `storage_rejected`; its underlying assessment/admission cause remains unproven. Initial public production-detector retirement, all four causal Stop cases, and migrations passed on that head. Prior90ba behavior success does not establish that this refusal is a flake. Terminal logs and artifacts are retained under `/tmp/close-1068c2da7/`.
+
+The follow-up integrates reviewed main `9885834f049683f5e6fa9c840668bdab92eb8a01` (rc16 and hosted fixture/diagnostic repairs) through merge `730261153e4fa34724497622f0228de9763bc4f9`. It corrects reported DB/tool Clippy and runtime warnings, retains full hosted Clippy diagnostics, and captures a bounded test-only scanner/retry trace tail at strict failed public assertions. This diagnostic change does **not** fix the unidentified storage refusal or expose internal errors through the public tool. Exact focused public journeys and all four Stop cases now precede expensive DB regressions in the existing automatic workflow; required green-path acceptance gates and timeouts remain intact. If focused journeys fail, DB inventory intentionally fails fast and no downstream DB execution is claimed without its own receipt.
+
+Source-only independent review covered DB SQL/bind/replay ordering, migration helpers, Bash/tmux custody and boxed-permit consumers, and diagnostic/workflow seams. Narrow per-function argument-count/line-count stylistic exceptions retain cohesive authority transactions and regression journeys rather than introducing request wrappers solely for lint counts; no module-wide or correctness-lint suppression is added. Source review and `git diff --check` are not compile, formatter or execution proof. New hosted diagnostics may reveal additional previously truncated failures.
+
+The integrated follow-up is unqualified until automatic exact-head Close and broader PR CI results are inspected. The next causal gate is the clean captured-loss retry with retained assessment/admission diagnostics, followed by all full required checks. No local executable validation, merge to main, installation or deployment is performed. PR #1161 remains draft.
+
+
 ## Integrated90ba terminal: behavior gates pass; exact formatting correction pending qualification
 
 Exact head `90ba5f5d8982daeb35d2cd820168df9ffe414396` completed automatic Close Qualification **45438888784** with failure only at `Require exact source formatting`; every preceding DB/runtime/public-journey/resource/tool gate completed successfully, as did frontend and specifications. Terminal evidence is retained under `/tmp/close-90ba5f5d8/artifacts-terminal/`. Broader PR CI **45438908900** failed its early Rust formatting gate, so downstream native CI is not yet qualified on this head.

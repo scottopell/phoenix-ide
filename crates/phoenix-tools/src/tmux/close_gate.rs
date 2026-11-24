@@ -3,19 +3,20 @@
 //! The helper is deliberately a private protocol entry point: it never starts
 //! the application server and fails closed on every malformed/unsupported input.
 
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::Stdio;
 use std::time::Duration;
-
-use super::backend::{TmuxDestructiveEntry, TokenBoundKill, SERVER_TOKEN_VAR};
-use super::probe::command_output;
-use tokio::time::Instant;
 
 use phoenix_core::process_identity::{
     current_process_identity, process_identity_matches, ProcessIdentity,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
+use tokio::time::Instant;
+
+use super::backend::{TmuxDestructiveEntry, TokenBoundKill, SERVER_TOKEN_VAR};
+use super::probe::command_output;
 
 const HELPER_ARG: &str = "--phoenix-tmux-close-gate-v1";
 const MAX_FRAME: usize = 256;
@@ -26,6 +27,29 @@ struct ServerReport {
     nonce: String,
     pid: u32,
     token: String,
+}
+
+#[derive(Clone, Copy)]
+struct ApprovalContext<'a> {
+    nonce: &'a str,
+    pid: u32,
+    expires: tokio::time::Instant,
+    raw_deadline_ns: u64,
+    expected_process: ProcessIdentity,
+    report: &'a ServerReport,
+}
+
+impl ApprovalContext<'_> {
+    fn request_is_current(&self, observe: &mut impl FnMut(ProcessIdentity) -> bool) -> bool {
+        self.report.nonce == self.nonce
+            && self.report.pid == self.pid
+            && observe(self.expected_process)
+    }
+
+    fn deadline_elapsed(&self) -> bool {
+        Instant::now() >= self.expires
+            || monotonic_raw_ns().is_none_or(|now| now >= self.raw_deadline_ns)
+    }
 }
 
 /// Parse exactly `nonce pid token`, bounded and canonical. Tokens are UUID-shaped so
@@ -89,13 +113,13 @@ fn monotonic_raw_ns() -> Option<u64> {
             return None;
         }
         let ts = ts.assume_init();
-        if ts.tv_sec < 0 || !(0..1_000_000_000).contains(&ts.tv_nsec) {
+        if !(0..1_000_000_000).contains(&ts.tv_nsec) {
             return None;
         }
-        let n = (ts.tv_sec as u128)
+        u64::try_from(ts.tv_sec)
+            .ok()?
             .checked_mul(1_000_000_000)?
-            .checked_add(ts.tv_nsec as u128)?;
-        u64::try_from(n).ok()
+            .checked_add(u64::try_from(ts.tv_nsec).ok()?)
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
@@ -226,23 +250,13 @@ fn report_matches_incarnation(report: &ServerReport, expected: ProcessIdentity) 
 /// The caller must verify the tmux report and process incarnation before calling this.
 async fn approve_helper(
     listener: &UnixListener,
-    nonce: &str,
-    pid: u32,
-    expires: tokio::time::Instant,
-    raw_deadline_ns: u64,
-    expected_process: ProcessIdentity,
-    report: &ServerReport,
+    context: ApprovalContext<'_>,
     enter: &mut TmuxDestructiveEntry<'_>,
 ) -> Result<(), &'static str> {
     approve_helper_with_observer_and_entry(
         listener,
-        nonce,
-        pid,
-        expires,
-        raw_deadline_ns,
-        expected_process,
-        report,
-        |expected| report_matches_incarnation(report, expected),
+        context,
+        |expected| report_matches_incarnation(context.report, expected),
         enter,
     )
     .await
@@ -251,62 +265,30 @@ async fn approve_helper(
 #[cfg(test)]
 async fn approve_helper_with_observer<F>(
     listener: &UnixListener,
-    nonce: &str,
-    pid: u32,
-    expires: tokio::time::Instant,
-    raw_deadline_ns: u64,
-    expected_process: ProcessIdentity,
-    report: &ServerReport,
+    context: ApprovalContext<'_>,
     observe: F,
 ) -> Result<(), &'static str>
 where
     F: FnMut(ProcessIdentity) -> bool,
 {
-    approve_helper_with_observer_and_entry(
-        listener,
-        nonce,
-        pid,
-        expires,
-        raw_deadline_ns,
-        expected_process,
-        report,
-        observe,
-        &mut |sink| sink(),
-    )
-    .await
+    approve_helper_with_observer_and_entry(listener, context, observe, &mut |sink| sink()).await
 }
 
 async fn approve_helper_with_observer_and_entry<F>(
     listener: &UnixListener,
-    nonce: &str,
-    pid: u32,
-    expires: tokio::time::Instant,
-    raw_deadline_ns: u64,
-    expected_process: ProcessIdentity,
-    report: &ServerReport,
+    context: ApprovalContext<'_>,
     observe: F,
     enter: &mut TmuxDestructiveEntry<'_>,
 ) -> Result<(), &'static str>
 where
     F: FnMut(ProcessIdentity) -> bool,
 {
-    tokio::time::timeout_at(expires, async {
+    tokio::time::timeout_at(context.expires, async {
         let (stream, _) = listener
             .accept()
             .await
             .map_err(|_| "close-gate accept failed")?;
-        approve_request_on_stream_and_entry(
-            stream,
-            nonce,
-            pid,
-            expires,
-            raw_deadline_ns,
-            expected_process,
-            report,
-            observe,
-            enter,
-        )
-        .await
+        approve_request_on_stream_and_entry(stream, context, observe, enter).await
     })
     .await
     .map_err(|_| "close-gate deadline elapsed")?
@@ -315,29 +297,13 @@ where
 #[cfg(test)]
 async fn approve_request_on_stream<F>(
     stream: UnixStream,
-    nonce: &str,
-    pid: u32,
-    expires: tokio::time::Instant,
-    raw_deadline_ns: u64,
-    expected_process: ProcessIdentity,
-    report: &ServerReport,
+    context: ApprovalContext<'_>,
     observe: F,
 ) -> Result<(), &'static str>
 where
     F: FnMut(ProcessIdentity) -> bool,
 {
-    approve_request_on_stream_and_entry(
-        stream,
-        nonce,
-        pid,
-        expires,
-        raw_deadline_ns,
-        expected_process,
-        report,
-        observe,
-        &mut |sink| sink(),
-    )
-    .await
+    approve_request_on_stream_and_entry(stream, context, observe, &mut |sink| sink()).await
 }
 
 const APPROVAL_FRAME: &[u8] = b"APPROVE\n";
@@ -358,12 +324,7 @@ fn write_approval_chunk(
 
 async fn approve_request_on_stream_and_entry<F>(
     mut stream: UnixStream,
-    nonce: &str,
-    pid: u32,
-    expires: tokio::time::Instant,
-    raw_deadline_ns: u64,
-    expected_process: ProcessIdentity,
-    report: &ServerReport,
+    context: ApprovalContext<'_>,
     mut observe: F,
     enter: &mut TmuxDestructiveEntry<'_>,
 ) -> Result<(), &'static str>
@@ -391,23 +352,19 @@ where
     let expected_request = format!(
         "{} {} {}\n",
         std::str::from_utf8(PROTOCOL_MARKER).unwrap(),
-        nonce,
-        pid
+        context.nonce,
+        context.pid
     );
     if &request[..used] != expected_request.as_bytes() {
         return Err("close-gate request rejected");
     }
-    if tokio::time::Instant::now() >= expires
-        || monotonic_raw_ns().is_none_or(|now| now >= raw_deadline_ns)
-    {
+    if context.deadline_elapsed() {
         return Err("close-gate deadline elapsed");
     }
-    if report.nonce != nonce || report.pid != pid || !observe(expected_process) {
+    if !context.request_is_current(&mut observe) {
         return Err("close-gate process incarnation changed");
     }
-    if tokio::time::Instant::now() >= expires
-        || monotonic_raw_ns().is_none_or(|now| now >= raw_deadline_ns)
-    {
+    if context.deadline_elapsed() {
         return Err("close-gate deadline elapsed");
     }
     let mut offset = 0;
@@ -418,10 +375,7 @@ where
             .map_err(|_| "close-gate approval write failed")?;
         let mut write_result = None;
         enter(&mut || {
-            if Instant::now() >= expires
-                || monotonic_raw_ns().is_none_or(|now| now >= raw_deadline_ns)
-                || !observe(expected_process)
-            {
+            if context.deadline_elapsed() || !observe(context.expected_process) {
                 return Err("close-gate deadline or process incarnation changed".into());
             }
             write_result = Some(write_approval_chunk(&mut offset, |remaining| {
@@ -460,6 +414,9 @@ pub async fn retire_exact_on_server(
     .await
 }
 
+// Keep the private socket directory, listener, and kill-on-drop client in scope
+// through the joined approval, child wait, and pipe drains.
+#[allow(clippy::too_many_lines)]
 pub async fn retire_exact_on_server_with_entry(
     socket_path: &Path,
     config_path: &Path,
@@ -500,10 +457,7 @@ pub async fn retire_exact_on_server_with_entry(
         Ok(Some(o))
             if o.status.success()
                 && o.stdout == b"PHOENIX_TMUX_CLOSE_GATE_PROBE_V1\n"
-                && o.stderr.is_empty() =>
-        {
-            ()
-        }
+                && o.stderr.is_empty() => {}
         Ok(None) => return TokenBoundKill::DeadlineExceeded,
         _ => {
             return TokenBoundKill::Failed {
@@ -511,7 +465,6 @@ pub async fn retire_exact_on_server_with_entry(
             }
         }
     }
-    use std::os::unix::fs::PermissionsExt;
     let dir = match tempfile::Builder::new()
         .prefix("phx-close-")
         .tempdir_in("/tmp")
@@ -548,13 +501,10 @@ pub async fn retire_exact_on_server_with_entry(
         }
     };
     let nonce = uuid::Uuid::new_v4().simple().to_string();
-    let raw_now = match monotonic_raw_ns() {
-        Some(n) => n,
-        None => {
-            return TokenBoundKill::Failed {
-                reason: "close-gate deadline unavailable".into(),
-            }
-        }
+    let Some(raw_now) = monotonic_raw_ns() else {
+        return TokenBoundKill::Failed {
+            reason: "close-gate deadline unavailable".into(),
+        };
     };
     let remain: u64 = match expires
         .saturating_duration_since(Instant::now())
@@ -564,13 +514,10 @@ pub async fn retire_exact_on_server_with_entry(
         Ok(n) if n > 0 => n,
         _ => return TokenBoundKill::DeadlineExceeded,
     };
-    let deadline_ns = match raw_now.checked_add(remain) {
-        Some(n) => n,
-        None => {
-            return TokenBoundKill::Failed {
-                reason: "close-gate deadline unavailable".into(),
-            }
-        }
+    let Some(deadline_ns) = raw_now.checked_add(remain) else {
+        return TokenBoundKill::Failed {
+            reason: "close-gate deadline unavailable".into(),
+        };
     };
     let pid = expected_process.pid;
     let pid_condition = format!("#{{==:#{{pid}},{pid}}}");
@@ -631,8 +578,7 @@ pub async fn retire_exact_on_server_with_entry(
     let approval = async {
         let bytes = rx
             .await
-            .map_err(|_| "tmux report collector stopped".to_string())?
-            .map_err(|e| e)?;
+            .map_err(|_| "tmux report collector stopped".to_string())??;
         let report = parse_server_report(&bytes)
             .ok_or_else(|| "malformed same-server report".to_string())?;
         if report.nonce != nonce || report.pid != pid || report.token != expected_token {
@@ -640,12 +586,14 @@ pub async fn retire_exact_on_server_with_entry(
         }
         approve_helper(
             &listener,
-            &nonce,
-            pid,
-            expires,
-            deadline_ns,
-            expected_process,
-            &report,
+            ApprovalContext {
+                nonce: &nonce,
+                pid,
+                expires,
+                raw_deadline_ns: deadline_ns,
+                expected_process,
+                report: &report,
+            },
             enter,
         )
         .await
@@ -868,18 +816,16 @@ mod tests {
             stream.read_exact(&mut reply).await.unwrap();
             reply
         });
+        let context = ApprovalContext {
+            nonce: "0123456789abcdef0123456789abcdef",
+            pid: 42,
+            expires,
+            raw_deadline_ns: u64::MAX,
+            expected_process: expected,
+            report: &report,
+        };
         assert_eq!(
-            approve_helper_with_observer(
-                &listener,
-                "0123456789abcdef0123456789abcdef",
-                42,
-                expires,
-                u64::MAX,
-                expected,
-                &report,
-                |_| true
-            )
-            .await,
+            approve_helper_with_observer(&listener, context, |_| true).await,
             Ok(())
         );
         assert_eq!(client.await.unwrap(), *b"APPROVE\n");
@@ -891,17 +837,7 @@ mod tests {
             let stream = UnixStream::connect(client_path).await.unwrap();
             drop(stream);
         });
-        let result = approve_helper_with_observer(
-            &listener,
-            "0123456789abcdef0123456789abcdef",
-            42,
-            expires,
-            u64::MAX,
-            expected,
-            &report,
-            |_| true,
-        )
-        .await;
+        let result = approve_helper_with_observer(&listener, context, |_| true).await;
         assert_eq!(result, Err("close-gate request truncated"));
         client.await.unwrap();
 
@@ -909,13 +845,11 @@ mod tests {
         assert_eq!(
             approve_helper_with_observer(
                 &listener,
-                "0123456789abcdef0123456789abcdef",
-                42,
-                expired,
-                u64::MAX,
-                expected,
-                &report,
-                |_| true
+                ApprovalContext {
+                    expires: expired,
+                    ..context
+                },
+                |_| true,
             )
             .await,
             Err("close-gate deadline elapsed")
@@ -947,12 +881,14 @@ mod tests {
         let expires = tokio::time::Instant::now() + Duration::from_secs(20);
         let mut approval = Box::pin(approve_request_on_stream(
             stream,
-            "0123456789abcdef0123456789abcdef",
-            42,
-            expires,
-            u64::MAX,
-            expected,
-            &report,
+            ApprovalContext {
+                nonce: "0123456789abcdef0123456789abcdef",
+                pid: 42,
+                expires,
+                raw_deadline_ns: u64::MAX,
+                expected_process: expected,
+                report: &report,
+            },
             |_| true,
         ));
         assert!(futures::poll!(&mut approval).is_pending());
@@ -1004,12 +940,14 @@ mod tests {
             });
             let result = approve_helper_with_observer(
                 &listener,
-                nonce,
-                42,
-                expires,
-                u64::MAX,
-                expected,
-                &report,
+                ApprovalContext {
+                    nonce,
+                    pid: 42,
+                    expires,
+                    raw_deadline_ns: u64::MAX,
+                    expected_process: expected,
+                    report: &report,
+                },
                 move |_| observer_accepts,
             )
             .await;

@@ -79,16 +79,56 @@ async fn registered_native_close_loss_classification_rollback_retries_without_re
     run_public_worktree_close(WorktreeJourney::RetryLossClassification).await;
 }
 
+// A global subscriber reaches native/spawn_blocking workers. Buffer a bounded tail
+// so intentional dirty-retry warnings cannot split the hosted `test ... ok` receipt.
+static PHYSICAL_CLOSE_DIAGNOSTICS: std::sync::Mutex<Vec<u8>> = std::sync::Mutex::new(Vec::new());
+
+struct PhysicalCloseDiagnosticWriter;
+
+impl std::io::Write for PhysicalCloseDiagnosticWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        const LIMIT: usize = 65_536;
+        let mut buffer = PHYSICAL_CLOSE_DIAGNOSTICS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if bytes.len() >= LIMIT {
+            buffer.clear();
+            buffer.extend_from_slice(&bytes[bytes.len() - LIMIT..]);
+        } else {
+            let excess = buffer.len().saturating_add(bytes.len()).saturating_sub(LIMIT);
+            buffer.drain(..excess);
+            buffer.extend_from_slice(bytes);
+        }
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn install_physical_close_diagnostics() {
+    static INSTALL: std::sync::Once = std::sync::Once::new();
+    INSTALL.call_once(|| {
+        tracing_subscriber::fmt()
+            .with_env_filter("phoenix_ide::runtime::close_retirement=debug,phoenix_ide::runtime::executor::native_close_retry=warn")
+            .with_writer(|| PhysicalCloseDiagnosticWriter)
+            .with_ansi(false)
+            .try_init()
+            .expect("physical Close journeys require scanner and retry diagnostics");
+    });
+}
+
+fn physical_close_diagnostics() -> String {
+    let buffer = PHYSICAL_CLOSE_DIAGNOSTICS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    String::from_utf8_lossy(&buffer).into_owned()
+}
+
 #[tokio::test]
 async fn registered_native_close_with_production_detector_retires_worktree_and_replays() {
-    // Global dispatch reaches the physical worker's native thread. This exact test
-    // also runs in its own hosted invocation; no production logging/exporters.
-    tracing_subscriber::fmt()
-        .with_env_filter("phoenix_ide::runtime::close_retirement=debug")
-        .with_writer(std::io::stderr)
-        .with_ansi(false)
-        .try_init()
-        .expect("production-detector journey requires scanner diagnostics");
+    install_physical_close_diagnostics();
     run_public_worktree_close(WorktreeJourney::RetireWithProductionDetector).await;
 }
 
@@ -1084,8 +1124,9 @@ async fn run_public_worktree_close(journey: WorktreeJourney) {
         assert_eq!(
             obligation.close_outcome(),
             Some(CloseCompletionOutcome::Archived),
-            "public Worktree Close retained cleanup attention; durable evidence: {}",
+            "public Worktree Close retained cleanup attention; durable evidence: {}\n{}",
             worktree_close_failure_evidence(&fixture, &run).await,
+            physical_close_diagnostics(),
         );
         assert_eq!(
             fixture.db.get_close_run(&run).await.unwrap().status,

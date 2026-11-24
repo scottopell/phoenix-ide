@@ -234,6 +234,10 @@ async fn accept_captured_loss_failure(db: &Database, failure_occurrence_id: &str
     .unwrap();
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "One aggregate must survive refused Delete until failure custody is accepted, then cascade on successful Delete"
+)]
 #[tokio::test]
 async fn captured_loss_admitted_authority_cascades_on_permanent_member_delete() {
     let (db, assessment) = captured_loss_assessment().await;

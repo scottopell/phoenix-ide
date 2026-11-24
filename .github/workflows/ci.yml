@@ -404,7 +404,16 @@ jobs:
         with:
           tool: cargo-deny@0.18.9
       - name: ./dev.py check (clippy, deps)
+        env:
+          PHOENIX_CHECK_DIAGNOSTIC_DIR: ${{ runner.temp }}/close-clippy-diagnostics
         run: ./dev.py check --lanes clippy,deps
+      - name: Retain full Clippy diagnostics
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: clippy-diagnostics-${{ github.sha }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/close-clippy-diagnostics
+          if-no-files-found: warn
 
   check-e2e:
     name: check (e2e)

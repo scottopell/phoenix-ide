@@ -103,6 +103,7 @@ pub(super) async fn retry_after_public_capture(
     initial_run: &CloseRunRef,
     stop_at: Option<Point>,
 ) {
+    install_physical_close_diagnostics();
     let source = SourceToolCall {
         message_id: "captured-loss-retry-message".into(),
         tool_use_id: "captured-loss-retry-call".into(),
@@ -599,7 +600,12 @@ pub(super) async fn retry_after_public_capture(
     )
     .await
     .expect("public captured-loss retry must finish within its terminal fence");
-    assert!(completed.is_success(), "{}", completed.output());
+    assert!(
+        completed.is_success(),
+        "clean captured-loss retry: {}\n{}",
+        completed.output(),
+        physical_close_diagnostics()
+    );
     let admitted: Value = serde_json::from_str(completed.output()).unwrap();
     assert_eq!(admitted["action"], "explicit_retry");
     assert_eq!(admitted["status"], "newly_admitted");

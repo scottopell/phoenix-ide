@@ -341,6 +341,10 @@ fn completed_initial_result_matches(
 /// Consume only canonical rows returned by the round writer in this transaction.
 /// Both finalized and pending self-goal rounds can contain a finalized Close result.
 /// A source transition alone never acknowledges a result or revives a stopped source.
+#[allow(
+    clippy::too_many_lines,
+    reason = "Keep canonical receipt replay, source eligibility, and acknowledgement in order in the round transaction"
+)]
 pub(crate) async fn acknowledge_initial_result_tx(
     tx: &mut Transaction<'_, Sqlite>,
     transcript_id: &str,
@@ -382,7 +386,19 @@ pub(crate) async fn acknowledge_initial_result_tx(
             ContentBlock::ToolUse { id, name, input } if id == &tool_result.tool_use_id => {
                 Some((name, input))
             }
-            _ => None,
+            ContentBlock::Text { .. }
+            | ContentBlock::Image { .. }
+            | ContentBlock::ToolUse { .. }
+            | ContentBlock::ToolResult { .. }
+            | ContentBlock::ServerToolUse { .. }
+            | ContentBlock::ToolSearchToolResult { .. }
+            | ContentBlock::WebSearchToolResult { .. }
+            | ContentBlock::WebFetchToolResult { .. }
+            | ContentBlock::CodeExecutionToolResult { .. }
+            | ContentBlock::BashCodeExecutionToolResult { .. }
+            | ContentBlock::TextEditorCodeExecutionToolResult { .. }
+            | ContentBlock::McpToolUse { .. }
+            | ContentBlock::McpToolResult { .. } => None,
         }) else {
             continue;
         };

@@ -54,8 +54,15 @@ async fn canonical_initial_result_acknowledgement_preserves_loss_retry_origin() 
     let (db, command, run) = retained_loss_origin().await;
     let (assistant, result) = initial_result_round(&command, &run);
     let checkpoint_at = chrono::Utc::now();
-    db.persist_tool_round_and_state(command.source_transcript_id(), &assistant, &[result.clone()],
-        &ConvState::Idle, checkpoint_at).await.unwrap();
+    db.persist_tool_round_and_state(
+        command.source_transcript_id(),
+        &assistant,
+        std::slice::from_ref(&result),
+        &ConvState::Idle,
+        checkpoint_at,
+    )
+    .await
+    .unwrap();
     assert_eq!(initial_ack_counts(&db, &run).await, (1, 0, 1, 0));
     assert_initial_completion_origin_revoked(&db, &run).await;
     db.read_native_close_captured_loss_retry_context(command.intent().target(), &run)

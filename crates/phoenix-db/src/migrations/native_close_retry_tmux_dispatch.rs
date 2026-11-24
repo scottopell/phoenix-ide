@@ -74,7 +74,9 @@ pub(super) async fn run(pool: &SqlitePool, migration: &Migration) -> DbResult<()
         "obligation.phase = 'completed'",
         "obligation.native_managed = 0 AND obligation.phase = 'completed'",
     )?;
-    let suffix = &ORIGINAL[original.len()..];
+    let suffix = ORIGINAL
+        .get(original.len()..)
+        .ok_or_else(|| unexpected(INSERT_AUTHORITY))?;
     let insert_187 = replace_exact(
         &legacy,
         INSERT_AUTHORITY,

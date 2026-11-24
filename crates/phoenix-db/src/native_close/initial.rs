@@ -115,6 +115,7 @@ pub enum NativeCloseInitialFirstEffectError {
 
 impl NativeCloseInitialProcessAuthorization {
     /// Consume the authorization at the manager sink; it cannot be cloned or replayed.
+    #[must_use]
     pub fn into_parts(
         self,
     ) -> (
@@ -150,6 +151,8 @@ enum InitialProcessSelection<'a> {
     ExactResource(&'a RetiredResourceIdentity),
 }
 
+// Bind the sealed inventory, dispatches, and absence of prior success to one writer snapshot.
+#[allow(clippy::too_many_lines)]
 async fn validate_initial_process_step_tx(
     tx: &mut Transaction<'_, Sqlite>,
     command: &NativeCloseCommand,
@@ -490,6 +493,12 @@ impl Database {
     /// effect succeeded. This seam does not prevent replay; an external affine
     /// owner is mandatory to ensure at-most-once entry across repeated calls or
     /// lost responses. Receipt replay is not an ownership mechanism.
+    ///
+    /// # Errors
+    /// Returns `NotStarted` if the writer reservation cannot be acquired, or
+    /// `Rejected` with the rollback classification if validation fails before entry.
+    // The initial receipt, live source, and exact worktree identity are separate from the callback.
+    #[allow(clippy::too_many_arguments)]
     pub async fn with_native_close_initial_worktree_first_effect<F, T>(
         &self,
         command: &NativeCloseCommand,
@@ -533,7 +542,7 @@ impl Database {
     }
 
     /// Validates and synchronously hands off one exact initial process resource while
-    /// holding SQLite's writer reservation. The callback must only perform a short,
+    /// holding `SQLite`'s writer reservation. The callback must only perform a short,
     /// nonblocking in-memory handoff of an already selected exact owner: no I/O, locks,
     /// SQL, or waits. Any entered ownership must be stored externally before returning;
     /// later cleanup must not wait while this database transaction is held. This leaf
@@ -541,6 +550,8 @@ impl Database {
     /// Cancellation during release can prevent any result after the handoff ran:
     /// absence of an `Invoked` return is not proof of non-entry and cannot justify
     /// retry. The externally retained entered owner must remain supervised.
+    // Pass the initial receipt, live source, and exact process identity to the affine handoff gate.
+    #[allow(clippy::too_many_arguments)]
     pub async fn enter_native_close_initial_process_resource<F>(
         &self,
         command: &NativeCloseCommand,
@@ -599,6 +610,12 @@ impl Database {
     /// the caller must retain current source ownership across the real first effect.
     /// External retained outcomes remain caller-owned. This API does not integrate
     /// runtime or terminal effects.
+    ///
+    /// # Errors
+    /// Returns `NotStarted` if the writer reservation cannot be acquired, or
+    /// `Rejected` with the rollback classification if validation fails before entry.
+    // The initial receipt, live source, and exact process identity are separate from the callback.
+    #[allow(clippy::too_many_arguments)]
     pub async fn with_native_close_initial_process_first_effect<F, T>(
         &self,
         command: &NativeCloseCommand,
@@ -642,7 +659,7 @@ impl Database {
     }
 
     /// Fence one exact initial worktree effect with the source and original dispatch
-    /// while holding SQLite's writer reservation. `handoff` is a one-shot affine
+    /// while holding `SQLite`'s writer reservation. `handoff` is a one-shot affine
     /// ownership transfer, not a retryable check: it must synchronously install
     /// its owner under external supervision before returning `Entered`, without
     /// I/O, locks, SQL, waits, or a future. The caller must supervise that owner
@@ -655,6 +672,8 @@ impl Database {
     /// call is invalid. The writer fence is not a replacement for owner custody.
     /// Receipt replay grants no new physical authority or permission to reenter
     /// an already proven effect. This database boundary performs no physical work.
+    // Pass the initial receipt, live source, and exact worktree identity to the affine handoff gate.
+    #[allow(clippy::too_many_arguments)]
     pub async fn enter_native_close_initial_worktree_resource<F>(
         &self,
         command: &NativeCloseCommand,
@@ -856,6 +875,8 @@ impl Database {
         .await
     }
 
+    // Validate the dispatch key before taking the entry lease and consuming the metadata request.
+    #[allow(clippy::too_many_arguments)]
     async fn write_native_close_initial_worktree_metadata<F, L>(
         &self,
         command: &NativeCloseCommand,
@@ -931,7 +952,9 @@ impl Database {
         (classification, lease)
     }
 
-    /// Retires one exact original WorkScope in the same transaction as its success proof.
+    /// Retires one exact original `WorkScope` in the same transaction as its success proof.
+    // Validate the exact scoped dispatch and child proofs before writing retirement and its proof atomically.
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     pub async fn retire_work_scope_for_native_close_initial(
         &self,
         command: &NativeCloseCommand,
@@ -1278,6 +1301,8 @@ impl Database {
     }
 
     /// Records process teardown success only under the exact source-owned initial authority.
+    // Check the source, receipt timing, and scoped dispatch in the transaction that records success.
+    #[allow(clippy::too_many_lines)]
     pub async fn record_native_close_initial_process_step_success(
         &self,
         command: &NativeCloseCommand,
@@ -1422,6 +1447,8 @@ impl Database {
     /// Records successful native initial retirement evidence after exact dispatch intent.
     /// Revalidates source authority before replay and performs no physical retirement.
     /// Residual failures require a separate source-bound terminalization boundary.
+    // Validate the original inventory, proof kind, and dispatch in the transaction that writes the proof.
+    #[allow(clippy::too_many_lines)]
     pub async fn record_native_close_initial_retirement_evidence(
         &self,
         command: &NativeCloseCommand,
@@ -1521,7 +1548,7 @@ impl Database {
                 ));
             }
             Database::record_close_retirement_evidence_sql_tx(
-                &mut *tx, &request, request.snapshot.generation(),
+                &mut tx, &request, request.snapshot.generation(),
             ).await
         }.await;
         match result {
@@ -1745,6 +1772,8 @@ impl Database {
     /// Finalizes only the exact live source-owned initial run after its anchored inventory
     /// has concrete successful retirement proof, or reads its exact completed result.
     /// Live and durable source authority are required before fresh completion and replay.
+    // Classify exact replay or finalize against the original inventory and dispatches under one writer.
+    #[allow(clippy::too_many_lines)]
     pub async fn complete_native_close_initial(
         &self,
         command: &NativeCloseCommand,
@@ -1864,6 +1893,8 @@ impl Database {
     }
 
     /// Records a typed inspection failure against the exact live initial source and captured scope.
+    // Derive the unresolved resources from captured scopes in the transaction that stops the run.
+    #[allow(clippy::too_many_lines)]
     pub async fn terminalize_native_close_initial_inspection_failure(
         &self,
         command: &NativeCloseCommand,
@@ -2449,8 +2480,17 @@ mod tests {
     include!("initial/tests.rs");
 
     #[tokio::test]
+    // One captured run checks callback refusal, metadata writes, and lease lifetime through release.
+    #[allow(clippy::too_many_lines)]
     async fn worktree_metadata_entry_runs_after_validation_and_refusal_writes_nothing() {
         use std::cell::Cell;
+
+        struct Lease<'a>(&'a Cell<bool>);
+        impl Drop for Lease<'_> {
+            fn drop(&mut self) {
+                self.0.set(true);
+            }
+        }
 
         let f = Fixture::new().await;
         let (command, receipt, live_source, expected) = captured_initial_retirement(&f).await;
@@ -2539,12 +2579,6 @@ mod tests {
 
         // A successful entry writes and releases the same transaction. Existing
         // no-callback wrappers remain covered by the adjacent legacy API tests.
-        struct Lease<'a>(&'a Cell<bool>);
-        impl Drop for Lease<'_> {
-            fn drop(&mut self) {
-                self.0.set(true);
-            }
-        }
         let dropped = Cell::new(false);
         let (classification, lease) =
             f.db.record_native_close_initial_worktree_cleanup_plan_with_entry(

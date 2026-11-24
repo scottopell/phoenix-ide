@@ -1,7 +1,7 @@
 //! Physical primitives, not Close authority. Each signal needs its own caller fence.
 //!
 //! Retain this owner in process-epoch custody before requesting SIGSTOP. Cancellation
-//! or unknown SQLite writer release must not drop that custody or start observation,
+//! or unknown `SQLite` writer release must not drop that custody or start observation,
 //! further signaling, or cleanup. Drop closes the fd only; it NEVER resumes a process.
 //! No ordinary signaling wrapper is routed through this API.
 
@@ -80,6 +80,9 @@ impl Handle {
     /// Inert preparation: await the state lock under the original deadline, open
     /// the exact pidfd and probe birth identity before any caller writer is held.
     /// `None` means no matching live leader, NOT verified process-group absence.
+    ///
+    /// # Errors
+    /// Returns [`NativeBashSignalError::Expired`] when the deadline expires, [`NativeBashSignalError::Unsupported`] when exact pidfd signaling is unavailable, and [`NativeBashSignalError::Io`] for operating-system failures.
     pub async fn prepare_native_leaf(
         self: &Arc<Self>,
         deadline: Instant,
@@ -103,29 +106,29 @@ impl Handle {
             let HandleState::Live(live) = guard.as_ref() else {
                 return Ok(None);
             };
-            let pid = live.pid;
-            let pgid = live.pgid;
-            let numeric_pid = i32::try_from(pid).map_err(|_| {
+            let leader_pid = live.pid;
+            let process_group_id = live.pgid;
+            let numeric_pid = i32::try_from(leader_pid).map_err(|_| {
                 NativeBashSignalError::Io(io::Error::from_raw_os_error(libc::EINVAL))
             })?;
             // PIDFD_SIGNAL_PROCESS_GROUP addresses the group whose leader has
             // this pidfd's identity. A nonleader cannot authorize another group.
-            if pgid <= 0 || pgid != numeric_pid {
+            if process_group_id <= 0 || process_group_id != numeric_pid {
                 return Err(NativeBashSignalError::Unsupported);
             }
-            let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, numeric_pid, 0) };
-            if raw < 0 {
+            let pidfd_raw = unsafe { libc::syscall(libc::SYS_pidfd_open, numeric_pid, 0) };
+            if pidfd_raw < 0 {
                 return Err(NativeBashSignalError::Io(io::Error::last_os_error()));
             }
-            let raw = libc::c_int::try_from(raw).map_err(|_| {
+            let raw_fd = libc::c_int::try_from(pidfd_raw).map_err(|_| {
                 NativeBashSignalError::Io(io::Error::from_raw_os_error(libc::EINVAL))
             })?;
             // pidfd_open returns a newly owned descriptor. OwnedFd's Drop only closes it.
-            let pidfd = unsafe { OwnedFd::from_raw_fd(raw) };
-            let wait_id = libc::id_t::try_from(raw).map_err(|_| {
+            let pidfd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
+            let wait_id = libc::id_t::try_from(raw_fd).map_err(|_| {
                 NativeBashSignalError::Io(io::Error::from_raw_os_error(libc::EINVAL))
             })?;
-            if phoenix_core::process_identity::current_process_identity(pid)
+            if phoenix_core::process_identity::current_process_identity(leader_pid)
                 != Some(self.launch_identity.process)
             {
                 return Ok(None);
@@ -145,7 +148,7 @@ impl Handle {
                 let error = io::Error::last_os_error();
                 if matches!(
                     error.raw_os_error(),
-                    Some(libc::EINVAL) | Some(libc::ENOSYS)
+                    Some(libc::EINVAL | libc::ENOSYS)
                 ) {
                     return Err(NativeBashSignalError::Unsupported);
                 }
@@ -158,8 +161,8 @@ impl Handle {
                 state_pin: Some(guard),
                 pidfd,
                 wait_id,
-                pid,
-                pgid,
+                pid: leader_pid,
+                pgid: process_group_id,
                 deadline,
                 phase: Phase::Prepared,
                 resume_required: false,
@@ -188,18 +191,27 @@ fn attempt_once<T>(
 }
 
 impl NativeBashSignal {
+    #[must_use]
     pub fn pid(&self) -> u32 {
         self.pid
     }
+    #[must_use]
     pub fn pgid(&self) -> i32 {
         self.pgid
     }
+    #[must_use]
     pub fn deadline(&self) -> Instant {
         self.deadline
     }
 
     /// Synchronous first physical effect. Invoke INSIDE the exact DB/live-source
     /// callback, after retaining this owner externally. No waits, probes or cleanup.
+    ///
+    /// # Errors
+    /// Returns [`NativeBashSignalError::WrongPhase`] or [`NativeBashSignalError::Expired`]
+    /// if the original phase or deadline does not permit signaling, returns
+    /// [`NativeBashSignalError::Unsupported`] on unsupported hosts, and returns
+    /// [`NativeBashSignalError::Io`] if the kernel rejects the signal.
     pub fn try_request_stop(&mut self) -> Result<(), NativeBashSignalError> {
         #[cfg(not(target_os = "linux"))]
         {
@@ -238,6 +250,11 @@ impl NativeBashSignal {
 
     /// Only after confirmed writer release. Borrowing preserves the externally
     /// retained owner if this observation future is cancelled. No signal is sent.
+    ///
+    /// # Errors
+    /// Returns [`NativeBashSignalError::WrongPhase`], [`NativeBashSignalError::Expired`],
+    /// [`NativeBashSignalError::NotStopped`], or [`NativeBashSignalError::Io`] if exact stop
+    /// observation fails. Unsupported hosts return [`NativeBashSignalError::Unsupported`].
     pub async fn observe_stopped(&mut self) -> Result<(), NativeBashSignalError> {
         #[cfg(not(target_os = "linux"))]
         {
@@ -298,6 +315,11 @@ impl NativeBashSignal {
     /// Reobserves the exact leader with one nonblocking waitid AFTER any caller
     /// authorization wait, then checks the original deadline at actual signal entry.
     /// No wait loop or asynchronous work is done here. Failed signals are not retried.
+    ///
+    /// # Errors
+    /// Returns [`NativeBashSignalError::WrongPhase`], [`NativeBashSignalError::Expired`],
+    /// [`NativeBashSignalError::NotStopped`], or [`NativeBashSignalError::Io`] if the exact
+    /// group signal fails. Unsupported hosts return [`NativeBashSignalError::Unsupported`].
     pub fn try_signal_group(&mut self) -> Result<(), NativeBashSignalError> {
         #[cfg(not(target_os = "linux"))]
         {
@@ -345,6 +367,9 @@ impl NativeBashSignal {
     /// verification. Those operations may wait for a state writer blocked by this
     /// pin. The registry generation fence and fd custody remain the caller's.
     /// This permanently prevents new destructive entry through this owner.
+    ///
+    /// # Errors
+    /// Returns [`NativeBashSignalError::WrongPhase`] while a stop still requires resumption.
     pub fn release_state_pin_after_writer_release(&mut self) -> Result<(), NativeBashSignalError> {
         if self.resume_required {
             return Err(NativeBashSignalError::WrongPhase);
@@ -358,6 +383,10 @@ impl NativeBashSignal {
     /// Explicit exact-leader cleanup only after confirmed release of every writer
     /// involved. May resume after deadline to undo this owner's earlier stop, but
     /// never authorizes another group signal. Errors retain the same owner in place.
+    ///
+    /// # Errors
+    /// Returns [`NativeBashSignalError::Unsupported`] on unsupported hosts and
+    /// [`NativeBashSignalError::Io`] if resumption fails.
     pub fn resume_after_writer_release(&mut self) -> Result<(), NativeBashSignalError> {
         #[cfg(not(target_os = "linux"))]
         {

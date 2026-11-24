@@ -575,7 +575,7 @@ impl LeaseRegistries {
                     .rehydrate_retirement(key, &identity, tmux_expires)
                     .await
                 {
-                    Ok(TmuxRetirementRehydration::Permit(permit)) => permit,
+                    Ok(TmuxRetirementRehydration::Permit(permit)) => *permit,
                     Ok(TmuxRetirementRehydration::AbsenceVerified) => match self
                         .tmux
                         .begin_retirement(key, None, None, tmux_expires)

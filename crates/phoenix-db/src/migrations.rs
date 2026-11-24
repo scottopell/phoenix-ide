@@ -16703,6 +16703,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Compares predecessor rows and guards with fresh successor authority and rejection cases in the same migrated database"
+    )]
     async fn migration_184_adds_unbackfilled_initial_completion_successor_authority() {
         let pool = test_pool().await;
         setup_real_pre_175_schema(&pool).await;
@@ -16991,6 +16995,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Verifies retained loss rows and unchanged triggers before exercising the new ignored category on the same migrated attempt"
+    )]
     async fn migration_185_preserves_existing_losses_and_adds_ignored_category() {
         let pool = test_pool().await;
         setup_real_pre_175_schema(&pool).await;

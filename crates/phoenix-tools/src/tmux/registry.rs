@@ -359,7 +359,7 @@ pub enum TmuxRetirementOutcome {
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum TmuxRetirementRehydration {
-    Permit(TmuxRetirementPermit),
+    Permit(Box<TmuxRetirementPermit>),
     AbsenceVerified,
     Residual { reason: String },
 }
@@ -1739,7 +1739,7 @@ impl TmuxRegistry {
                         drop(current);
                         drop(map);
                         self.emit_lifecycle(work_scope);
-                        Ok(TmuxRetirementRehydration::Permit(permit))
+                        Ok(TmuxRetirementRehydration::Permit(Box::new(permit)))
                     }
                 };
             }
@@ -1917,7 +1917,7 @@ impl TmuxRegistry {
                             exact_process,
                             expires,
                         );
-                        Ok(TmuxRetirementRehydration::Permit(permit))
+                        Ok(TmuxRetirementRehydration::Permit(Box::new(permit)))
                     }
                 }
             }
@@ -2412,8 +2412,8 @@ impl TmuxRegistry {
                 reason: "tmux exact teardown write lock exceeded the Close deadline".to_string(),
             });
         };
-        let exact_owned = Self::matches_exact_instance(&server, permit);
-        if !exact_owned || (exact_owner && server.work_scope != permit.work_scope) {
+        let exact_instance_matches = Self::matches_exact_instance(&server, permit);
+        if !exact_instance_matches || (exact_owner && server.work_scope != permit.work_scope) {
             if exact_owner {
                 return Ok(TmuxRetirementOutcome::IdentityNotProven {
                     reason: "exact tmux retirement fence or identity changed before teardown"
@@ -2949,7 +2949,7 @@ impl TmuxRegistry {
                 .await
             {
                 Ok(TmuxRetirementRehydration::Permit(permit)) => {
-                    match self.complete_retirement(&permit).await {
+                    match self.complete_retirement(permit.as_ref()).await {
                         Ok(outcome) => outcome,
                         Err(error) => TmuxRetirementOutcome::RemovalFailed {
                             reason: error.to_string(),
@@ -4963,7 +4963,10 @@ mod tests {
         assert_eq!(permit.exact_process, Some(server_process));
 
         assert_eq!(
-            restarted.complete_retirement(&permit).await.unwrap(),
+            restarted
+                .complete_retirement(permit.as_ref())
+                .await
+                .unwrap(),
             TmuxRetirementOutcome::Retired
         );
         assert_eq!(fake.kill_server_count(&persisted.socket_path), 1);

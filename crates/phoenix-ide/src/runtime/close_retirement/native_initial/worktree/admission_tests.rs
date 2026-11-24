@@ -318,7 +318,7 @@ async fn second_status_reuses_original_authority_and_rechecks_after_wait() {
     let scope = continuation.original_effect.scope.clone();
     let snapshot = continuation.original_effect.snapshot.clone();
     let deadline = continuation.original_effect.deadline;
-    let mut second = continuation.spawn_status(tokio::runtime::Handle::current());
+    let second = continuation.spawn_status(tokio::runtime::Handle::current());
     second
         .observe()
         .await
@@ -429,7 +429,7 @@ async fn refuses_second_callback(reason: ReentryRefusal) {
     );
     // Also exercise the production supervisor with that same refused context;
     // the direct callback check above proves the spawn boundary stays closed.
-    let mut second = continuation.spawn_status(tokio::runtime::Handle::current());
+    let second = continuation.spawn_status(tokio::runtime::Handle::current());
     assert!(second.observe().await.is_err());
     assert!(second.take_for_continuation().is_none());
 }
@@ -463,7 +463,7 @@ async fn second_status_rechecks_registration_after_status_wait() {
     let replacement = marker.with_file_name(".git.replacement");
     std::fs::write(&replacement, bytes).unwrap();
     std::fs::rename(&replacement, &marker).unwrap();
-    let mut second = continuation.spawn_status(tokio::runtime::Handle::current());
+    let second = continuation.spawn_status(tokio::runtime::Handle::current());
     let error = second
         .observe()
         .await

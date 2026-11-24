@@ -306,7 +306,7 @@ impl super::RuntimeManager {
             TmuxRetirementRehydration::Permit(permit) => {
                 let outcome = self
                     .tmux_registry()
-                    .complete_retirement(&permit)
+                    .complete_retirement(permit.as_ref())
                     .await
                     .map_err(|_| NativeRetryExecutionError::Unclassified)?;
                 if !matches!(
@@ -387,7 +387,7 @@ impl super::RuntimeManager {
                 .map_err(|_| NativeRetryExecutionError::Unclassified)?
             {
                 TmuxRetirementRehydration::Permit(permit) => Some(backend.tmux_registry()
-                    .prepare_retirement(&permit).await
+                    .prepare_retirement(permit.as_ref()).await
                     .map_err(|outcome| NativeRetryExecutionError::ResourceFailure(format!("tmux preparation remained residual: {outcome:?}")))?),
                 TmuxRetirementRehydration::AbsenceVerified => None,
                 TmuxRetirementRehydration::Residual { reason } => return Err(NativeRetryExecutionError::ResourceFailure(reason)),

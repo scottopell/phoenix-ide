@@ -46,6 +46,10 @@ fn assert_only_native_union_added(before: &str, after: &str, native: &str) {
 }
 
 #[tokio::test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "Compares pre-187 trigger sources and the post-187 schema across a second migration run on the same database"
+)]
 async fn real186_to187_preserves_original_branches_and_is_idempotent() {
     let db = predecessor().await;
     let native_queries = [
@@ -271,12 +275,12 @@ async fn original_active_inventory(db: &Database) -> (String, String, String, St
             scope: scope.clone(),
             inventory: CloseOwnedResourceInventory {
                 worktree: None,
-                work_scopes: Default::default(),
-                bash_process_groups: Default::default(),
-                tmux_servers: Default::default(),
-                pty_sessions: Default::default(),
-                browser_sessions: Default::default(),
-                equivalent_live_resources: Default::default(),
+                work_scopes: std::collections::BTreeSet::default(),
+                bash_process_groups: std::collections::BTreeSet::default(),
+                tmux_servers: std::collections::BTreeSet::default(),
+                pty_sessions: std::collections::BTreeSet::default(),
+                browser_sessions: std::collections::BTreeSet::default(),
+                equivalent_live_resources: std::collections::BTreeSet::default(),
             },
         }],
     })
@@ -490,11 +494,15 @@ async fn original_dispatch_update_and_expected_resource_retention_survive187() {
         .await,
         retained_before
     );
+    assert_dispatch_reference_retention(&db).await;
+}
+
+async fn assert_dispatch_reference_retention(db: &Database) {
     // Reference retention, unlike standalone retention, must not disappear when
     // the product has been removed by a cascading aggregate cleanup.
     for suffix in ["update", "delete"] {
         let definition = trigger(
-            &db,
+            db,
             &format!("close_expected_retirement_resources_preserve_dispatched_{suffix}"),
         )
         .await;
@@ -584,6 +592,46 @@ async fn delete_api_clears_dispatches_before_expected_resource_teardown() {
         .is_empty());
 }
 
+async fn install_and_check_captured_authority_schema(
+    db: &Database,
+    pool: &sqlx::SqlitePool,
+    tables: &[&str],
+) {
+    for &table in tables {
+        let ddl: String =
+            sqlx::query_scalar("SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = ?1")
+                .bind(table)
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        sqlx::raw_sql(sqlx::AssertSqlSafe(ddl))
+            .execute(pool)
+            .await
+            .unwrap();
+        let delete_actions: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "SELECT on_delete FROM pragma_foreign_key_list('{table}')"
+        )))
+        .fetch_all(pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            delete_actions.len(),
+            if table.ends_with("_plans") { 2 } else { 4 }
+        );
+        assert!(
+            delete_actions.iter().all(|action| action == "CASCADE"),
+            "{table}"
+        );
+        for suffix in ["immutable", "retained"] {
+            let guard = trigger(db, &format!("{table}_{suffix}")).await;
+            sqlx::raw_sql(sqlx::AssertSqlSafe(guard))
+                .execute(pool)
+                .await
+                .unwrap();
+        }
+    }
+}
+
 // Focused schema regression, not admission coverage: the actual installed capture
 // DDL and mutation guards run against a minimal obligation-owned parent graph.
 // The private native admission fixture is outside this migration test module.
@@ -614,39 +662,7 @@ async fn captured_authority_schema_is_immutable_but_cascades_with_its_obligation
         "native_close_captured_loss_retry_inspections",
         "native_close_captured_loss_retry_resources",
     ];
-    for table in tables {
-        let ddl: String =
-            sqlx::query_scalar("SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = ?1")
-                .bind(table)
-                .fetch_one(&db.pool)
-                .await
-                .unwrap();
-        sqlx::raw_sql(sqlx::AssertSqlSafe(ddl))
-            .execute(&pool)
-            .await
-            .unwrap();
-        let delete_actions: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
-            "SELECT on_delete FROM pragma_foreign_key_list('{table}')"
-        )))
-        .fetch_all(&pool)
-        .await
-        .unwrap();
-        assert_eq!(
-            delete_actions.len(),
-            if table.ends_with("_plans") { 2 } else { 4 }
-        );
-        assert!(
-            delete_actions.iter().all(|action| action == "CASCADE"),
-            "{table}"
-        );
-        for suffix in ["immutable", "retained"] {
-            let guard = trigger(&db, &format!("{table}_{suffix}")).await;
-            sqlx::raw_sql(sqlx::AssertSqlSafe(guard))
-                .execute(&pool)
-                .await
-                .unwrap();
-        }
-    }
+    install_and_check_captured_authority_schema(&db, &pool, &tables).await;
     sqlx::raw_sql(
         "INSERT INTO close_obligations VALUES ('captured-attempt');
         INSERT INTO native_close_retry_plans VALUES ('captured-attempt', 2);

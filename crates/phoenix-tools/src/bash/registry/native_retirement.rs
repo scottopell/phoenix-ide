@@ -53,10 +53,10 @@ pub enum NativeBashRetirementOutcome {
 /// and verification. It deliberately has no Drop cleanup or signal behavior.
 #[must_use = "retain through confirmed external writer release and explicit cleanup"]
 pub struct NativeBashRetirement {
-    _registry_writer: OwnedRwLockWriteGuard<ResourceScopeKeyHandles>,
+    registry_writer: OwnedRwLockWriteGuard<ResourceScopeKeyHandles>,
     global_index: Arc<RwLock<HashMap<HandleId, RegisteredHandle>>>,
     work_scope: ResourceScopeKey,
-    _handle: Arc<Handle>,
+    handle: Arc<Handle>,
     generation: BashTeardownGeneration,
     target: BashRetirementTarget,
     deadline: Instant,
@@ -70,6 +70,10 @@ pub struct NativeBashRetirement {
 impl super::PreparedBashRetirement {
     /// Convert inert registry custody to native leaf custody under the original deadline.
     /// No signal is sent; the returned owner keeps the original registry writer held.
+    ///
+    /// # Errors
+    /// Returns an error when the original deadline or generation is invalid, the exact live
+    /// leader cannot be prepared, or native signaling is unsupported.
     pub async fn prepare_native(self) -> Result<NativeBashRetirement, NativeBashRetirementError> {
         let Self {
             entry,
@@ -103,7 +107,11 @@ impl super::PreparedBashRetirement {
             .map_err(|error| match error {
                 NativeBashSignalError::Unsupported => NativeBashRetirementError::Unsupported,
                 NativeBashSignalError::Expired => NativeBashRetirementError::DeadlineExpired,
-                other => NativeBashRetirementError::Native(other),
+                error @ NativeBashSignalError::WrongPhase
+                | error @ NativeBashSignalError::NotStopped
+                | error @ NativeBashSignalError::Io(_) => {
+                    NativeBashRetirementError::Native(error)
+                }
             })?
             .ok_or(NativeBashRetirementError::NoLiveLeader)?;
         if Instant::now() >= deadline {
@@ -124,10 +132,10 @@ impl super::PreparedBashRetirement {
             target.kill_pending_kernel,
         );
         Ok(NativeBashRetirement {
-            _registry_writer: writer,
+            registry_writer: writer,
             global_index,
             work_scope,
-            _handle: handle,
+            handle,
             generation,
             target,
             deadline,
@@ -141,14 +149,29 @@ impl super::PreparedBashRetirement {
 }
 
 impl NativeBashRetirement {
+    /// Request the first native stop signal for the exact retained leader.
+    ///
+    /// # Errors
+    /// Returns the native signal error if the original deadline or signal phase refuses the
+    /// stop request, or if the kernel call fails.
     pub fn try_request_stop(&mut self) -> Result<(), NativeBashSignalError> {
         self.signal.try_request_stop()
     }
 
+    /// Observe the exact retained leader's stop state without sending a signal.
+    ///
+    /// # Errors
+    /// Returns the native signal error if exact stop observation fails, the original deadline
+    /// expires, or this owner is in the wrong phase.
     pub async fn observe_stopped(&mut self) -> Result<(), NativeBashSignalError> {
         self.signal.observe_stopped().await
     }
 
+    /// Send the native group signal after exact stop observation.
+    ///
+    /// # Errors
+    /// Returns the native signal error if the original deadline, exact stop observation, or
+    /// phase refuses the group signal, or if the kernel call fails.
     pub fn try_signal_group(&mut self) -> Result<(), NativeBashSignalError> {
         self.group_signal_attempted = true;
         let result = self.signal.try_signal_group();
@@ -160,6 +183,10 @@ impl NativeBashRetirement {
 
     /// Invoke only after confirmed release of every external writer. Resumption
     /// must succeed before releasing the handle-state pin.
+    ///
+    /// # Errors
+    /// Returns the native signal error if resume or state-pin release fails. On failure this
+    /// owner retains its cleanup state and registry custody.
     pub fn cleanup_after_writer_release(&mut self) -> Result<(), NativeBashSignalError> {
         self.signal.resume_after_writer_release()?;
         self.signal.release_state_pin_after_writer_release()?;
@@ -171,6 +198,10 @@ impl NativeBashRetirement {
     /// confirmed before any group-signal attempt and explicit native cleanup succeeded.
     /// The borrowed owner remains intact on every error; this operation never cancels or
     /// refreshes the original teardown fence and does not signal or renew its deadline.
+    ///
+    /// # Errors
+    /// Returns an error unless cleanup is complete, no group signal was attempted, the original
+    /// generation and membership remain valid, and the global index has no collision.
     pub async fn handback_compensated_refusal(&mut self) -> Result<(), NativeBashRetirementError> {
         if !self.cleanup_complete {
             return Err(NativeBashRetirementError::CleanupIncomplete);
@@ -178,16 +209,16 @@ impl NativeBashRetirement {
         if self.group_signal_attempted {
             return Err(NativeBashRetirementError::GroupSignalAttempted);
         }
-        if !self._registry_writer.teardown_started
-            || self._registry_writer.teardown_generation != self.generation.0
+        if !self.registry_writer.teardown_started
+            || self.registry_writer.teardown_generation != self.generation.0
         {
             return Err(NativeBashRetirementError::StaleHandbackGeneration);
         }
-        let handle = Arc::clone(&self._handle);
+        let handle = Arc::clone(&self.handle);
         if handle.handle_id != self.target.handle_id
             || handle.launch_identity != self.target.launch_identity
             || self
-                ._registry_writer
+                .registry_writer
                 .handles
                 .contains_key(&handle.handle_id)
         {
@@ -201,7 +232,7 @@ impl NativeBashRetirement {
         if global_index.contains_key(&handle.handle_id) {
             return Err(NativeBashRetirementError::HandbackCollision);
         }
-        self._registry_writer.insert(Arc::clone(&handle));
+        self.registry_writer.insert(Arc::clone(&handle));
         global_index.insert(
             handle.handle_id.clone(),
             RegisteredHandle {
@@ -223,8 +254,8 @@ impl NativeBashRetirement {
             ));
             return NativeBashRetirementOutcome::Unverified(self.report.clone());
         }
-        if !self._registry_writer.teardown_started
-            || self._registry_writer.teardown_generation != self.generation.0
+        if !self.registry_writer.teardown_started
+            || self.registry_writer.teardown_generation != self.generation.0
         {
             self.report.kill_failures.push((
                 self.target.pgid,
@@ -240,7 +271,7 @@ impl NativeBashRetirement {
             return NativeBashRetirementOutcome::Unverified(self.report.clone());
         }
         if let Err(reason) =
-            await_waiter_settlement(self._handle.subscribe_waiter_settlement(), self.deadline).await
+            await_waiter_settlement(self.handle.subscribe_waiter_settlement(), self.deadline).await
         {
             self.report.kill_failures.push((self.target.pgid, reason));
             return NativeBashRetirementOutcome::Unverified(self.report.clone());

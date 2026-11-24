@@ -124,7 +124,7 @@ impl Database {
             ));
         }
         let kind = if anchored {
-            Self::read_stopped_close_original_retirement_proof_tx(&mut *tx, failed_run).await?;
+            Self::read_stopped_close_original_retirement_proof_tx(&mut tx, failed_run).await?;
             NativeCloseRetryOriginKind::Anchored
         } else {
             Self::read_native_close_captured_loss_retry_context_tx(&mut tx, target, failed_run)
@@ -230,7 +230,7 @@ impl Database {
         {
             return Err(refused("captured loss initial receipt provenance differs"));
         }
-        let projection = Self::get_active_close_projection_for_product_on(&mut **tx, target)
+        let projection = Self::get_active_close_projection_for_product_on(tx, target)
             .await?
             .ok_or_else(|| refused("captured loss projection is absent"))?;
         if projection.obligation.attempt_id() != &failed_run.attempt_id
@@ -404,6 +404,7 @@ pub(super) async fn read_captured_scopes_tx(
 mod tests {
     use super::*;
 
+    use crate::native_close::NativeCloseReceipt;
     use crate::workflow::LocalAuthorityResult;
     use phoenix_core::domain::close::CloseLossItem;
     use phoenix_core::domain::llm_types::ContentBlock;
@@ -413,7 +414,17 @@ mod tests {
     fn established<T: std::fmt::Debug>(result: LocalAuthorityResult<DbResult<T>>) -> T {
         match result {
             LocalAuthorityResult::DurableFactEstablished(Ok(value)) => value,
-            other => panic!("expected established success: {other:?}"),
+            other @ (LocalAuthorityResult::DurableFactEstablished(Err(_))
+            | LocalAuthorityResult::DurableFactUnclassified) => {
+                panic!("expected established success: {other:?}");
+            }
+        }
+    }
+
+    fn retained_loss_run(receipt: &NativeCloseReceipt) -> CloseRunRef {
+        CloseRunRef {
+            attempt_id: receipt.admitted.attempt_id.clone(),
+            ordinal: CloseRunOrdinal::INITIAL,
         }
     }
 
@@ -489,10 +500,7 @@ mod tests {
                 .settle_native_close_initial(&command, &receipt, &live)
                 .await,
         );
-        let run = CloseRunRef {
-            attempt_id: receipt.admitted.attempt_id.clone(),
-            ordinal: CloseRunOrdinal::INITIAL,
-        };
+        let run = retained_loss_run(&receipt);
         let inspection = crate::ReplaceCloseInspectionRequest {
             attempt_id: run.attempt_id.clone(),
             scopes: vec![crate::ReplaceCloseInspectionScopeRequest {

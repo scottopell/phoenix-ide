@@ -147,6 +147,80 @@ jobs:
           cargo test -p phoenix-core --lib domain::task_approval::tests::reviewed_body_sha256_preserves_fixed_width_lowercase_encoding -- --exact --nocapture --test-threads=1 2>&1 | tee evidence/task-approval-body-hash.log
           grep -Fx 'test domain::task_approval::tests::reviewed_body_sha256_preserves_fixed_width_lowercase_encoding ... ok' evidence/task-approval-body-hash.log
           grep -F 'test result: ok. 1 passed; 0 failed; 0 ignored;' evidence/task-approval-body-hash.log
+      # Fail at the public retry boundary before paying for full DB regressions.
+      # The same binary/inventory is reused by all later runtime gates.
+      - name: Compile exact runtime fixtures for focused public journeys
+        if: success() || failure()
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build -p phoenix_ide --bin phoenix_ide --message-format=json > evidence/runtime-launcher-build.jsonl
+          launch_exe="$(jq -r 'select(.reason == "compiler-artifact" and .target.name == "phoenix_ide" and (.target.kind | index("bin")) != null and .executable != null) | .executable' evidence/runtime-launcher-build.jsonl)"
+          test -n "$launch_exe"
+          test -x "$launch_exe"
+          export PHOENIX_BASH_LAUNCH_TEST_EXE="$(realpath "$launch_exe")"
+          export PHOENIX_BASH_LAUNCH_TEST_REQUIRED=1
+          printf 'PHOENIX_BASH_LAUNCH_TEST_REQUIRED=1\n' >> "$GITHUB_ENV"
+          printf 'PHOENIX_BASH_LAUNCH_TEST_EXE=%s\n' "$PHOENIX_BASH_LAUNCH_TEST_EXE" >> "$GITHUB_ENV"
+          cargo test -p phoenix_ide --lib --no-run --message-format=json > evidence/runtime-build.jsonl
+          runtime_test_binary="$(jq -r 'select(.reason == "compiler-artifact" and .target.name == "phoenix_ide" and .profile.test == true and .executable != null) | .executable' evidence/runtime-build.jsonl)"
+          test -n "$runtime_test_binary"
+          test -x "$runtime_test_binary"
+          export PHOENIX_RUNTIME_TEST_BINARY="$runtime_test_binary"
+          printf 'PHOENIX_RUNTIME_TEST_BINARY=%s\n' "$runtime_test_binary" >> "$GITHUB_ENV"
+          (cd crates/phoenix-ide && "$runtime_test_binary" --list) 2>&1 | tee evidence/runtime-inventory.log
+          grep -E 'native_close_application::tests::.*: test$|native_close_admission_tests::.*: test$' evidence/runtime-inventory.log > evidence/runtime-selected-tests.txt
+      - name: Required public Worktree retirement with production writer detector
+        if: success() || failure()
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          test -n "${PHOENIX_RUNTIME_TEST_BINARY:-}"
+          test_name='runtime::executor::creation_completion_lifecycle_tests::native_close_admission_tests::worktree_physical::registered_native_close_with_production_detector_retires_worktree_and_replays'
+          grep -Fx "$test_name: test" evidence/runtime-selected-tests.txt
+          timeout --kill-after=10s 6m bash scripts/ci/close-unprivileged-qualification.sh "$GITHUB_WORKSPACE" "$PHOENIX_RUNTIME_TEST_BINARY" "$PHOENIX_BASH_LAUNCH_TEST_EXE" "$(id -u)" "$test_name" --exact --nocapture --test-threads=1 2>&1 | tee evidence/public-worktree-production-detector.log
+          grep -F "$test_name ... ok" evidence/public-worktree-production-detector.log
+          grep -F 'test result: ok. 1 passed; 0 failed; 0 ignored;' evidence/public-worktree-production-detector.log
+
+      - name: Retain bounded failing writer-process attribution
+        if: success() || failure()
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          timeout 10s node scripts/ci/close-writer-process-diagnostic.mjs evidence/public-worktree-production-detector.log > evidence/public-worktree-process-attribution.jsonl
+
+      - name: Required captured-loss public cleanup and explicit retry reclaim
+        if: success() || failure()
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          test -n "${PHOENIX_RUNTIME_TEST_BINARY:-}"
+          failed=0
+          for test in \
+            registered_native_close_captured_loss_public_retry_with_production_detector_reclaims_and_replays \
+            registered_native_close_captured_loss_retry_stop_during_assessment_preserves_worktree_and_history \
+            registered_native_close_captured_loss_retry_stop_while_prepared_preserves_worktree \
+            registered_native_close_captured_loss_retry_stop_before_writer_refuses_dispatch \
+            registered_native_close_captured_loss_retry_stop_before_physical_observation_retains_stopped_result; do
+            test_name="runtime::executor::creation_completion_lifecycle_tests::native_close_admission_tests::worktree_physical::$test"
+            if ! grep -Fx "$test_name: test" evidence/runtime-inventory.log; then
+              failed=1
+              continue
+            fi
+            if ! timeout --kill-after=10s 6m bash scripts/ci/close-unprivileged-qualification.sh "$GITHUB_WORKSPACE" "$PHOENIX_RUNTIME_TEST_BINARY" "$PHOENIX_BASH_LAUNCH_TEST_EXE" "$(id -u)" "$test_name" --exact --nocapture --test-threads=1 2>&1 | tee "evidence/$test.log"; then
+              failed=1
+              continue
+            fi
+            grep -F "$test_name ... ok" "evidence/$test.log" || failed=1
+            grep -F 'test result: ok. 1 passed; 0 failed; 0 ignored;' "evidence/$test.log" || failed=1
+          done
+          test "$failed" -eq 0
+
+      # Intentionally fail fast here if focused public journeys fail. Later DB
+      # receipts are not claimed without this inventory or their own execution.
       - name: Compile database tests and inventory exact selectors
         shell: bash
         run: |
@@ -546,22 +620,6 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cargo build -p phoenix_ide --bin phoenix_ide --message-format=json > evidence/runtime-launcher-build.jsonl
-          launch_exe="$(jq -r 'select(.reason == "compiler-artifact" and .target.name == "phoenix_ide" and (.target.kind | index("bin")) != null and .executable != null) | .executable' evidence/runtime-launcher-build.jsonl)"
-          test -n "$launch_exe"
-          test -x "$launch_exe"
-          export PHOENIX_BASH_LAUNCH_TEST_EXE="$(realpath "$launch_exe")"
-          export PHOENIX_BASH_LAUNCH_TEST_REQUIRED=1
-          printf 'PHOENIX_BASH_LAUNCH_TEST_REQUIRED=1\n' >> "$GITHUB_ENV"
-          printf 'PHOENIX_BASH_LAUNCH_TEST_EXE=%s\n' "$PHOENIX_BASH_LAUNCH_TEST_EXE" >> "$GITHUB_ENV"
-          cargo test -p phoenix_ide --lib --no-run --message-format=json > evidence/runtime-build.jsonl
-          runtime_test_binary="$(jq -r 'select(.reason == "compiler-artifact" and .target.name == "phoenix_ide" and .profile.test == true and .executable != null) | .executable' evidence/runtime-build.jsonl)"
-          test -n "$runtime_test_binary"
-          test -x "$runtime_test_binary"
-          export PHOENIX_RUNTIME_TEST_BINARY="$runtime_test_binary"
-          printf 'PHOENIX_RUNTIME_TEST_BINARY=%s\n' "$runtime_test_binary" >> "$GITHUB_ENV"
-          (cd crates/phoenix-ide && "$runtime_test_binary" --list) 2>&1 | tee evidence/runtime-inventory.log
-          grep -E 'native_close_application::tests::.*: test$|native_close_admission_tests::.*: test$' evidence/runtime-inventory.log > evidence/runtime-selected-tests.txt
           grep -F 'native_close_admission_tests::native_close_backend_requires_actor_database_authority_not_matching_path: test' evidence/runtime-selected-tests.txt
           grep -F 'native_close_admission_tests::bash_stage2_stop_ack::bash_stage_two_stop_ack_reaches_real_second_writer_and_cleans_once: test' evidence/runtime-selected-tests.txt
           grep -F 'native_close_admission_tests::bash_stage2_unknown_release::bash_second_writer_injected_unknown_release_quarantines_original_owner: test' evidence/runtime-selected-tests.txt
@@ -729,55 +787,6 @@ jobs:
               fi
             done
           done
-      - name: Required public Worktree retirement with production writer detector
-        if: success() || failure()
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p evidence
-          test -n "${PHOENIX_RUNTIME_TEST_BINARY:-}"
-          test_name='runtime::executor::creation_completion_lifecycle_tests::native_close_admission_tests::worktree_physical::registered_native_close_with_production_detector_retires_worktree_and_replays'
-          grep -Fx "$test_name: test" evidence/runtime-selected-tests.txt
-          timeout --kill-after=10s 6m bash scripts/ci/close-unprivileged-qualification.sh "$GITHUB_WORKSPACE" "$PHOENIX_RUNTIME_TEST_BINARY" "$PHOENIX_BASH_LAUNCH_TEST_EXE" "$(id -u)" "$test_name" --exact --nocapture --test-threads=1 2>&1 | tee evidence/public-worktree-production-detector.log
-          grep -F "$test_name ... ok" evidence/public-worktree-production-detector.log
-          grep -F 'test result: ok. 1 passed; 0 failed; 0 ignored;' evidence/public-worktree-production-detector.log
-
-      - name: Required captured-loss public cleanup and explicit retry reclaim
-        if: success() || failure()
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p evidence
-          test -n "${PHOENIX_RUNTIME_TEST_BINARY:-}"
-          failed=0
-          for test in \
-            registered_native_close_captured_loss_public_retry_with_production_detector_reclaims_and_replays \
-            registered_native_close_captured_loss_retry_stop_during_assessment_preserves_worktree_and_history \
-            registered_native_close_captured_loss_retry_stop_while_prepared_preserves_worktree \
-            registered_native_close_captured_loss_retry_stop_before_writer_refuses_dispatch \
-            registered_native_close_captured_loss_retry_stop_before_physical_observation_retains_stopped_result; do
-            test_name="runtime::executor::creation_completion_lifecycle_tests::native_close_admission_tests::worktree_physical::$test"
-            if ! grep -Fx "$test_name: test" evidence/runtime-inventory.log; then
-              failed=1
-              continue
-            fi
-            if ! timeout --kill-after=10s 6m bash scripts/ci/close-unprivileged-qualification.sh "$GITHUB_WORKSPACE" "$PHOENIX_RUNTIME_TEST_BINARY" "$PHOENIX_BASH_LAUNCH_TEST_EXE" "$(id -u)" "$test_name" --exact --nocapture --test-threads=1 2>&1 | tee "evidence/$test.log"; then
-              failed=1
-              continue
-            fi
-            grep -F "$test_name ... ok" "evidence/$test.log" || failed=1
-            grep -F 'test result: ok. 1 passed; 0 failed; 0 ignored;' "evidence/$test.log" || failed=1
-          done
-          test "$failed" -eq 0
-
-      - name: Retain bounded failing writer-process attribution
-        if: success() || failure()
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p evidence
-          timeout 10s node scripts/ci/close-writer-process-diagnostic.mjs evidence/public-worktree-production-detector.log > evidence/public-worktree-process-attribution.jsonl
-
       - name: Qualify original-deadline worktree inspection prerequisites
         if: success() || failure()
         shell: bash

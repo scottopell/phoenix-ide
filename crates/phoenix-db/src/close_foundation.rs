@@ -3290,7 +3290,7 @@ impl Database {
     ///
     /// # Errors
     /// Always returns [`DbError`]; retained loss evidence is not deletion authority.
-    pub async fn confirm_close_loss_retirement(
+    pub fn confirm_close_loss_retirement(
         &self,
         _attempt_id: &CloseAttemptId,
         _snapshot: &CloseRetirementSnapshot,
@@ -5199,7 +5199,7 @@ impl Database {
             validate_adopted_absence_evidence(&mut tx, &request, *absence_basis).await?;
         }
 
-        Self::record_close_retirement_evidence_sql_tx(&mut *tx, &request, &inspection_generation)
+        Self::record_close_retirement_evidence_sql_tx(&mut tx, &request, &inspection_generation)
             .await?;
 
         if matches!(request.outcome, RetirementOutcome::Residual { .. })
@@ -7419,7 +7419,12 @@ impl Database {
                         detail: match authority {
                             CloseCleanupFailureAuthority::AttemptInterrupted =>
                                 "process_interrupted: initial native Close source interrupted after proved retirement".into(),
-                            _ => detail.into(),
+                            CloseCleanupFailureAuthority::ExplicitlySuppressed
+                            | CloseCleanupFailureAuthority::ExpectedResource { .. }
+                            | CloseCleanupFailureAuthority::CapturedScope { .. }
+                            | CloseCleanupFailureAuthority::ObservedProcessResource { .. } => {
+                                detail.into()
+                            }
                         },
                         stop_certainty: CloseStopCertainty::ConversationAndProcessesStopped {
                             confirmed_at_us: occurred_at_us,
@@ -7671,6 +7676,10 @@ impl Database {
         Ok(result)
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Keeps the exact run authority checks, failure writes, and allowance suppression in one ordered transaction path"
+    )]
     pub(crate) async fn terminalize_native_retry_source_fence_tx(
         tx: &mut Transaction<'_, Sqlite>,
         fence: crate::native_close::NativeRetrySourceFence,
@@ -11705,14 +11714,12 @@ mod tests {
         let attempt_id = CloseAttemptId::parse("attempt-changed-confirmation").unwrap();
         let stale = db
             .confirm_close_loss_retirement(&attempt_id, &first_token)
-            .await
             .unwrap_err();
         assert!(stale
             .to_string()
             .contains("cannot be confirmed for destructive retirement"));
         let confirmation = db
             .confirm_close_loss_retirement(&attempt_id, &second_token)
-            .await
             .unwrap_err();
         assert!(confirmation
             .to_string()
@@ -12081,7 +12088,11 @@ mod tests {
             inspection.snapshot.fingerprint(),
         )]);
         let aggregate = CloseRetirementSnapshot::parse(&generation, &fingerprint).unwrap();
-        validate_close_retirement_inspection_aggregate(&aggregate, &[inspection.clone()]).unwrap();
+        validate_close_retirement_inspection_aggregate(
+            &aggregate,
+            std::slice::from_ref(&inspection),
+        )
+        .unwrap();
         for changed in [
             CloseRetirementSnapshot::parse("changed-generation", "fingerprint").unwrap(),
             CloseRetirementSnapshot::parse("generation", "changed-fingerprint").unwrap(),
@@ -18961,8 +18972,7 @@ mod tests {
             db.confirm_close_loss_retirement(
                 &CloseAttemptId::parse("attempt-confirm-loss").unwrap(),
                 &stale,
-            )
-            .await,
+            ),
             Err(DbError::CloseFoundationPrecondition(message))
                 if message.contains("cannot be confirmed for destructive retirement")
         ));
@@ -18971,7 +18981,6 @@ mod tests {
                 &CloseAttemptId::parse("attempt-confirm-loss").unwrap(),
                 obligation.snapshot().unwrap(),
             )
-            .await
             .unwrap_err();
         assert!(exact_confirmation
             .to_string()

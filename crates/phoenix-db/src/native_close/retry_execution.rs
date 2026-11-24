@@ -141,7 +141,11 @@ impl NativeCloseRetryDispatchKind {
         match resource.kind() {
             RetiredResourceKind::Worktree => Ok(Self::Worktree),
             RetiredResourceKind::TmuxServer => Ok(Self::Tmux),
-            _ => Err(refused(
+            RetiredResourceKind::WorkScope
+            | RetiredResourceKind::BashProcessGroup
+            | RetiredResourceKind::PtySession
+            | RetiredResourceKind::BrowserSession
+            | RetiredResourceKind::EquivalentLiveResource => Err(refused(
                 "native retry dispatch requires a worktree or tmux effect",
             )),
         }
@@ -340,9 +344,15 @@ impl Database {
     }
 
     /// Runs a short synchronous handoff only after validating the exact live retry
-    /// under the SQLite writer. The caller must supervise cancellation and panic,
+    /// under the `SQLite` writer. The caller must supervise cancellation and panic,
     /// retain the callback outcome independently, and prevent repeated entry.
     /// An unconfirmed rollback is not proof that the writer was released.
+    ///
+    /// # Errors
+    /// Returns `NotStarted` if the writer reservation cannot be acquired, or
+    /// `Rejected` with the rollback classification if validation fails before entry.
+    // The retry run, live source, and exact worktree dispatch key are separate from the callback.
+    #[allow(clippy::too_many_arguments)]
     pub async fn with_native_close_retry_worktree_first_effect<F, T>(
         &self,
         command: &NativeCloseCommand,
@@ -371,6 +381,12 @@ impl Database {
 
     /// Runs the synchronous tmux handoff only for an exact pending, dispatched retry
     /// identity. The caller has the same supervision duties as for worktree entry.
+    ///
+    /// # Errors
+    /// Returns `NotStarted` if the writer reservation cannot be acquired, or
+    /// `Rejected` with the rollback classification if validation fails before entry.
+    // The retry run, live source, and exact tmux dispatch key are separate from the callback.
+    #[allow(clippy::too_many_arguments)]
     pub async fn with_native_close_retry_tmux_first_effect<F, T>(
         &self,
         command: &NativeCloseCommand,
@@ -397,6 +413,8 @@ impl Database {
         .await
     }
 
+    // Check run, source, resource identity, and required dispatch kind before invoking the callback.
+    #[allow(clippy::too_many_arguments)]
     async fn with_native_close_retry_resource_first_effect<F, T>(
         &self,
         command: &NativeCloseCommand,
@@ -941,6 +959,8 @@ impl Database {
         (classification, lease)
     }
 
+    // Validate the retry effect before entry; the caller holds the resulting lease through release.
+    #[allow(clippy::too_many_arguments)]
     async fn retire_work_scope_for_native_close_retry_tx<F, L>(
         tx: &mut Transaction<'_, Sqlite>,
         command: &NativeCloseCommand,

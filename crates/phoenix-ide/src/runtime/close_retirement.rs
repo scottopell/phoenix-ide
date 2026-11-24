@@ -1743,7 +1743,7 @@ impl RuntimeManager {
                         Ok(TmuxRetirementRehydration::Permit(permit)) => {
                             let outcome = self
                                 .tmux_registry()
-                                .complete_retirement(&permit)
+                                .complete_retirement(permit.as_ref())
                                 .await
                                 .map_err(|error| error.to_string())?;
                             match tmux_retirement_outcome(outcome) {

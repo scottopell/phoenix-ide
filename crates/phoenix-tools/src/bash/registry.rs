@@ -189,6 +189,12 @@ impl BashRetirementPermit {
     /// Retain this permit in custody; rollback is valid only before any owned work is entered.
     /// Preparation is not entry or permission to repeat an effect. The caller must supervise
     /// the transferred work even if its source-admission future is subsequently canceled.
+    ///
+    /// # Errors
+    /// Returns [`BashRetirementPreparationError::TargetMismatch`] unless the selected target
+    /// uniquely matches the captured inventory and handle identity. Returns
+    /// [`BashRetirementPreparationError::DeadlineExpired`] when the original deadline expires
+    /// before verification completes.
     pub async fn prepare_target(
         &self,
         selected: &BashRetirementTarget,
@@ -199,9 +205,10 @@ impl BashRetirementPermit {
             .iter()
             .filter(|target| target.handle_id == selected.handle_id)
             .collect::<Vec<_>>();
-        if matching_targets.len() != 1
-            || **matching_targets.first().expect("length checked") != *selected
-        {
+        let [matching_target] = matching_targets.as_slice() else {
+            return Err(BashRetirementPreparationError::TargetMismatch);
+        };
+        if **matching_target != *selected {
             return Err(BashRetirementPreparationError::TargetMismatch);
         }
         let matching_handles = self

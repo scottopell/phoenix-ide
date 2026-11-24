@@ -46,8 +46,7 @@ impl Database {
             Self::count_close_settlement_active_participants_tx(tx, attempt.as_str()).await?;
         if active != 0 {
             return Err(refused(&format!(
-                "attempt {} still has {active} active durable captured member obligation(s)",
-                attempt
+                "attempt {attempt} still has {active} active durable captured member obligation(s)"
             )));
         }
         Ok(())

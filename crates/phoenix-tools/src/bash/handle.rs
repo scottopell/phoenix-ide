@@ -685,11 +685,11 @@ impl Handle {
     /// failures are terminal and can never be overwritten by success.
     pub(super) fn unverify_waiter(&self, reason: impl Into<String>) {
         self.waiter_settlement.send_if_modified(|state| {
-            if !matches!(*state, WaiterSettlement::Unverified(_)) {
+            if matches!(*state, WaiterSettlement::Unverified(_)) {
+                false
+            } else {
                 *state = WaiterSettlement::Unverified(reason.into());
                 true
-            } else {
-                false
             }
         });
     }

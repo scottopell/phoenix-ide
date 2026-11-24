@@ -317,69 +317,6 @@ impl super::RuntimeManager {
 }
 
 #[cfg(test)]
-impl super::RuntimeManager {
-    /// Execute exactly one requested kind using its original still-retained lease.
-    /// The lease-store mutex remains held through native completion. The kind is
-    /// consumed before the first physical await, including for empty inventories;
-    /// cancellation, failure, or evidence retry never clears that process-epoch bit.
-    pub(crate) async fn execute_native_initial_process_step(
-        &self,
-        authorization: phoenix_db::native_close::NativeCloseInitialProcessAuthorization,
-        browser_custody: phoenix_tools::browser::session::BrowserRetirementCustody,
-    ) -> Result<NativeInitialObservation, NativeInitialStepError> {
-        let (run, scope, snapshot, kind, inventory) = authorization.into_parts();
-        let step = match kind {
-            RetiredResourceKind::BashProcessGroup => NativeInitialProcessStep::Bash,
-            RetiredResourceKind::TmuxServer => NativeInitialProcessStep::Tmux,
-            RetiredResourceKind::PtySession => NativeInitialProcessStep::Terminal,
-            RetiredResourceKind::BrowserSession => NativeInitialProcessStep::Browser,
-            _ => return Err(NativeInitialStepError::SealedInventoryMismatch),
-        };
-        if inventory.iter().any(|item| {
-            item.attempt_id != run.attempt_id
-                || item.scope != scope
-                || item.snapshot != snapshot
-                || item.resource.kind() != kind
-        }) {
-            return Err(NativeInitialStepError::SealedInventoryMismatch);
-        }
-        let sealed_inventory = inventory
-            .into_iter()
-            .map(|item| item.resource)
-            .collect::<Vec<_>>();
-        let mut leases = self.close_retirement_leases.lock().await;
-        // Lock contention must not carry a launch past fatal authority loss.
-        if self
-            .fatal_local_authority_fence
-            .fatal_authority_loss_is_latched()
-        {
-            return Err(NativeInitialStepError::FatalAuthority);
-        }
-        let key = (run.attempt_id.as_str().to_string(), scope);
-        let Some(lease) = leases.complete.get_mut(&key) else {
-            return Err(NativeInitialStepError::MissingLease);
-        };
-        enter_native_initial_kind(
-            &lease.resources,
-            lease
-                .capture_evidence
-                .as_ref()
-                .map(|binding| binding.snapshot()),
-            &mut lease.native_initial_entered,
-            &snapshot,
-            step,
-            &sealed_inventory,
-        )?;
-        let mut executor = super::LiveCloseProcessStepExecutor {
-            manager: self,
-            lease,
-            browser_custody,
-        };
-        execute_one_kind(&mut executor, step, &sealed_inventory).await
-    }
-}
-
-#[cfg(test)]
 mod tests {
     use super::*;
 

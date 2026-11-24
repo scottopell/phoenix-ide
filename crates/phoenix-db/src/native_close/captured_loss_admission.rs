@@ -2,8 +2,8 @@
 //! Nothing here establishes or repairs an original retirement anchor.
 
 use phoenix_core::domain::close::{
-    CapturedWorktreeIdentity, CloseAttemptScope, CloseRetirementSnapshot, CloseRunRef,
-    LossItemIdentity, OpaqueIdentity, RetiredResourceIdentity, RetiredResourceKind,
+    CapturedWorktreeIdentity, CloseAttemptId, CloseAttemptScope, CloseRetirementSnapshot,
+    CloseRunRef, LossItemIdentity, OpaqueIdentity, RetiredResourceIdentity, RetiredResourceKind,
 };
 use sha2::{Digest, Sha256};
 use sqlx::{Sqlite, Transaction};
@@ -47,7 +47,7 @@ pub(super) fn captured_effects(
                         LossItemIdentity::Worktree(identity.clone()),
                     )
                     .map_err(|error| refused(&error.to_string()))?,
-                })
+                });
             }
             Some(CapturedWorktreeIdentity::Unresolved { .. }) => {
                 return Err(refused(
@@ -118,6 +118,87 @@ fn fresh_snapshot(
     .map_err(|error| refused(&error.to_string()))
 }
 
+async fn captured_scope_identities_current_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    attempt_id: &CloseAttemptId,
+) -> DbResult<bool> {
+    sqlx::query_scalar(
+        "SELECT NOT EXISTS (
+                SELECT 1 FROM close_attempt_scopes captured
+                LEFT JOIN work_scopes live ON live.id = captured.scope
+                WHERE captured.attempt_id = ?1 AND (live.id IS NULL OR live.lifecycle <> 'active'
+                    OR captured.captured_worktree_identity IS NOT live.worktree_id
+                    OR captured.captured_worktree_fingerprint IS NOT live.worktree_fingerprint
+                    OR captured.captured_worktree_locator IS NOT CASE
+                        WHEN live.environment_kind = 'allocated_worktree' THEN
+                            'git_path_bytes_hex_v1:' || lower(hex(CAST(live.worktree_path AS BLOB)))
+                    END))",
+    )
+    .bind(attempt_id.as_str())
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(DbError::from)
+}
+
+async fn persist_captured_retry_origin_rows_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    context: &NativeCloseCapturedLossRetryContext,
+    assessment: &impl NativeCloseCapturedLossRetryAssessment,
+    snapshot: &CloseRetirementSnapshot,
+    effects: &[CloseSafeRetryEffect],
+    run: &CloseRunRef,
+) -> DbResult<()> {
+    let attempt_id = run.attempt_id.as_str();
+    sqlx::query(
+        "INSERT INTO native_close_captured_loss_retry_plans
+            (attempt_id, run_ordinal, origin_generation, origin_fingerprint, observed_at_us,
+                inspection_generation, inspection_fingerprint)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+    )
+    .bind(attempt_id)
+    .bind(run.ordinal.get())
+    .bind(context.snapshot().generation())
+    .bind(context.snapshot().fingerprint())
+    .bind(assessment.observed_at_us())
+    .bind(snapshot.generation())
+    .bind(snapshot.fingerprint())
+    .execute(&mut **tx)
+    .await?;
+    for scope in &assessment.inspection().scopes {
+        sqlx::query(
+            "INSERT INTO native_close_captured_loss_retry_inspections
+                (attempt_id, run_ordinal, scope, generation, fingerprint) VALUES (?1, ?2, ?3, ?4, ?5)",
+        )
+        .bind(attempt_id)
+        .bind(run.ordinal.get())
+        .bind(scope.scope.as_str())
+        .bind(scope.snapshot.generation())
+        .bind(scope.snapshot.fingerprint())
+        .execute(&mut **tx)
+        .await?;
+    }
+    for (ordinal, effect) in effects.iter().enumerate() {
+        let identity = effect.resource.identity();
+        let (kind, codec, value) = (identity.identity_kind(), identity.codec(), identity.value());
+        sqlx::query(
+            "INSERT INTO native_close_captured_loss_retry_resources
+                (attempt_id, run_ordinal, ordinal, scope, resource_kind, identity_kind,
+                    identity_codec, identity_value) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        )
+        .bind(attempt_id)
+        .bind(run.ordinal.get())
+        .bind(i64::try_from(ordinal).map_err(|_| refused("captured retry plan is too large"))?)
+        .bind(effect.scope.as_str())
+        .bind(effect.resource.kind().as_str())
+        .bind(kind)
+        .bind(codec)
+        .bind(value)
+        .execute(&mut **tx)
+        .await?;
+    }
+    Ok(())
+}
+
 impl Database {
     /// Adopts one explicit source and the next run atomically. The stopped run's
     /// inspection, loss, failure, captured topology and absent anchor stay untouched.
@@ -142,6 +223,10 @@ impl Database {
         }
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Keep source and receipt checks, captured evidence validation, and successor admission together"
+    )]
     async fn apply_native_close_captured_loss_retry_tx(
         tx: &mut Transaction<'_, Sqlite>,
         assessment: &impl NativeCloseCapturedLossRetryAssessment,
@@ -192,21 +277,7 @@ impl Database {
         let effects = captured_effects(context.scopes())?;
         // Compare complete current scope identities, not merely a locator or worktree id.
         // No current topology is enumerated or substituted for the captured finite set.
-        let identities_current: bool = sqlx::query_scalar(
-            "SELECT NOT EXISTS (
-                SELECT 1 FROM close_attempt_scopes captured
-                LEFT JOIN work_scopes live ON live.id = captured.scope
-                WHERE captured.attempt_id = ?1 AND (live.id IS NULL OR live.lifecycle <> 'active'
-                    OR captured.captured_worktree_identity IS NOT live.worktree_id
-                    OR captured.captured_worktree_fingerprint IS NOT live.worktree_fingerprint
-                    OR captured.captured_worktree_locator IS NOT CASE
-                        WHEN live.environment_kind = 'allocated_worktree' THEN
-                            'git_path_bytes_hex_v1:' || lower(hex(CAST(live.worktree_path AS BLOB)))
-                    END))",
-        )
-        .bind(attempt_id.as_str())
-        .fetch_one(&mut **tx)
-        .await?;
+        let identities_current = captured_scope_identities_current_tx(tx, attempt_id).await?;
         if !identities_current {
             return Err(refused(
                 "captured retry current scopes differ from full captured identities",
@@ -240,48 +311,8 @@ impl Database {
                 encoded
             },
         );
-        sqlx::query(
-            "INSERT INTO native_close_captured_loss_retry_plans
-            (attempt_id, run_ordinal, origin_generation, origin_fingerprint, observed_at_us,
-                inspection_generation, inspection_fingerprint)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-        )
-        .bind(attempt_id.as_str())
-        .bind(run.ordinal.get())
-        .bind(context.snapshot().generation())
-        .bind(context.snapshot().fingerprint())
-        .bind(assessment.observed_at_us())
-        .bind(snapshot.generation())
-        .bind(snapshot.fingerprint())
-        .execute(&mut **tx)
-        .await?;
-        for scope in &assessment.inspection().scopes {
-            sqlx::query("INSERT INTO native_close_captured_loss_retry_inspections
-                (attempt_id, run_ordinal, scope, generation, fingerprint) VALUES (?1, ?2, ?3, ?4, ?5)")
-                .bind(attempt_id.as_str()).bind(run.ordinal.get()).bind(scope.scope.as_str())
-                .bind(scope.snapshot.generation()).bind(scope.snapshot.fingerprint())
-                .execute(&mut **tx).await?;
-        }
-        for (ordinal, effect) in effects.iter().enumerate() {
-            let identity = effect.resource.identity();
-            let (kind, codec, value) =
-                (identity.identity_kind(), identity.codec(), identity.value());
-            sqlx::query(
-                "INSERT INTO native_close_captured_loss_retry_resources
-                (attempt_id, run_ordinal, ordinal, scope, resource_kind, identity_kind,
-                    identity_codec, identity_value) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            )
-            .bind(attempt_id.as_str())
-            .bind(run.ordinal.get())
-            .bind(ordinal as i64)
-            .bind(effect.scope.as_str())
-            .bind(effect.resource.kind().as_str())
-            .bind(kind)
-            .bind(codec)
-            .bind(value)
-            .execute(&mut **tx)
+        persist_captured_retry_origin_rows_tx(tx, &context, assessment, &snapshot, &effects, &run)
             .await?;
-        }
         sqlx::query(
             "INSERT INTO native_close_retry_plans (attempt_id, run_ordinal, failed_run_ordinal,
             inspection_generation, inspection_fingerprint, plan_fingerprint, request_id,
