@@ -35,6 +35,8 @@ jobs:
         run: cargo install allium-cli --version 3.5.0 --locked
       - name: Validate exact-source Allium and specification shape
         shell: bash
+        env:
+          PHOENIX_CHECK_DIAGNOSTIC_DIR: ${{ github.workspace }}/evidence/specifications-diagnostics
         run: |
           set -euo pipefail
           mkdir -p evidence
