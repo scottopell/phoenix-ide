@@ -1,5 +1,6 @@
 use libsqlite3_sys as ffi;
 use phoenix_core::domain::instance_identity::InstanceId;
+use phoenix_core::runtime_env::PhoenixRuntimeEnvironment;
 use sha2::{Digest, Sha256};
 use sqlx::sqlite::{
     SqliteConnectOptions, SqliteConnection, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous,
@@ -88,7 +89,9 @@ fn private_template_dir() -> Option<PathBuf> {
     use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 
     let uid = unsafe { libc::geteuid() };
-    let dir = std::env::temp_dir().join(format!("phoenix-db-mem-tpl-{uid}"));
+    let dir = PhoenixRuntimeEnvironment::detect()
+        .tmp_root()
+        .join(format!("phoenix-db-mem-tpl-{uid}"));
     if !dir.exists() {
         let _ = fs::DirBuilder::new()
             .recursive(true)
@@ -105,7 +108,9 @@ fn private_template_dir() -> Option<PathBuf> {
 
 #[cfg(not(unix))]
 fn private_template_dir() -> Option<PathBuf> {
-    let dir = std::env::temp_dir().join("phoenix-db-mem-tpl");
+    let dir = PhoenixRuntimeEnvironment::detect()
+        .tmp_root()
+        .join("phoenix-db-mem-tpl");
     fs::create_dir_all(&dir).ok()?;
     Some(dir)
 }
