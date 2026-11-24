@@ -3157,7 +3157,7 @@ dependencies = [
 
 [[package]]
 name = "phoenix_ide"
-version = "0.13.2-rc.15"
+version = "0.13.2-rc.16"
 dependencies = [
  "async-trait",
  "axum",
