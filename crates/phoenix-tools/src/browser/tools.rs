@@ -278,9 +278,7 @@ impl SavedEvaluationArtifact {
 impl BrowserEvaluation {
     fn into_tool_output(self) -> ToolOutput {
         let text = match self {
-            Self::Json(value) => {
-                serde_json::to_string_pretty(&value).expect("JSON values serialize")
-            }
+            Self::Json(value) => serde_json::to_string(&value).expect("JSON values serialize"),
             Self::Undefined => "undefined".into(),
             Self::Unserializable(value) => value,
             Self::JsonArtifact(artifact) | Self::UnserializableArtifact(artifact) => {
@@ -490,7 +488,7 @@ impl BrowserEvalTool {
             };
         }
         if let Some(value) = result.value() {
-            let text = serde_json::to_string_pretty(value)
+            let text = serde_json::to_string(value)
                 .map_err(|error| format!("Failed to serialize JavaScript result: {error}"))?;
             if text.len() > 4096 {
                 return Ok(BrowserEvaluation::JsonArtifact(
@@ -797,8 +795,7 @@ impl BrowserRecentConsoleLogsTool {
             })
             .collect();
 
-        let json_str =
-            serde_json::to_string_pretty(&display_logs).unwrap_or_else(|_| "[]".to_string());
+        let json_str = serde_json::to_string(&display_logs).unwrap_or_else(|_| "[]".to_string());
 
         if json_str.len() > 4096 {
             // File escape hatch: write FULL untruncated entries so the agent
@@ -807,8 +804,7 @@ impl BrowserRecentConsoleLogsTool {
                 .iter()
                 .map(|(level, text)| json!({"level": level, "text": text}))
                 .collect();
-            let full_json =
-                serde_json::to_string_pretty(&full_logs).unwrap_or_else(|_| "[]".to_string());
+            let full_json = serde_json::to_string(&full_logs).unwrap_or_else(|_| "[]".to_string());
             let path = format!("/tmp/phoenix-console-logs-{}.json", uuid::Uuid::new_v4());
             if let Err(e) = tokio::fs::write(&path, &full_json).await {
                 return ToolOutput::error(format!("Failed to write logs: {e}"));

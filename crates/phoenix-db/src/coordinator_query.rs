@@ -100,6 +100,49 @@ pub enum CoordinatorReal {
     Nan,
 }
 
+impl CoordinatorCell {
+    /// Model-facing value: native JSON for null, integer, finite real and
+    /// text; a one-key object for a non-finite real or a blob summary. A text
+    /// cell is always a JSON string, so the objects cannot be confused with it.
+    fn model_value(&self) -> serde_json::Value {
+        match self {
+            Self::Null => serde_json::Value::Null,
+            Self::Integer(value) => serde_json::Value::from(*value),
+            Self::Real(CoordinatorReal::Finite(value)) => serde_json::Value::from(*value),
+            Self::Real(CoordinatorReal::PositiveInfinity) => {
+                serde_json::json!({"real": "+Infinity"})
+            }
+            Self::Real(CoordinatorReal::NegativeInfinity) => {
+                serde_json::json!({"real": "-Infinity"})
+            }
+            Self::Real(CoordinatorReal::Nan) => serde_json::json!({"real": "NaN"}),
+            Self::Text(value) => serde_json::Value::String(value.clone()),
+            Self::Blob { bytes } => serde_json::json!({"blob_bytes": bytes}),
+        }
+    }
+}
+
+impl CoordinatorQueryResult {
+    /// Compact model-facing view: every field of the result, with each cell
+    /// as [`CoordinatorCell::model_value`] instead of the tagged wire form.
+    #[must_use]
+    pub fn model_view(&self) -> serde_json::Value {
+        let rows: Vec<serde_json::Value> = self
+            .rows
+            .iter()
+            .map(|row| row.iter().map(CoordinatorCell::model_value).collect())
+            .collect();
+        serde_json::json!({
+            "columns": self.columns,
+            "rows": rows,
+            "truncated": self.truncated,
+            "row_limit": self.row_limit,
+            "byte_limit": self.byte_limit,
+            "elapsed_ms": self.elapsed_ms,
+        })
+    }
+}
+
 impl From<f64> for CoordinatorReal {
     fn from(value: f64) -> Self {
         if value.is_nan() {
@@ -1020,5 +1063,93 @@ mod tests {
         assert_eq!(bytes.rows.len(), 1);
         assert!(bytes.truncated);
         assert!(serde_json::to_vec(&bytes).unwrap().len() <= MAX_BYTES);
+    }
+}
+
+#[cfg(test)]
+mod model_view_tests {
+    use super::*;
+
+    fn result(rows: Vec<Vec<CoordinatorCell>>) -> CoordinatorQueryResult {
+        CoordinatorQueryResult {
+            columns: vec!["a".into(), "b".into()],
+            rows,
+            truncated: false,
+            row_limit: 200,
+            byte_limit: 65_536,
+            elapsed_ms: 3,
+        }
+    }
+
+    #[test]
+    fn cells_render_as_native_json_and_tag_only_ambiguous_values() {
+        let view = result(vec![
+            vec![
+                CoordinatorCell::Integer(7),
+                CoordinatorCell::Text("NaN".into()),
+            ],
+            vec![
+                CoordinatorCell::Null,
+                CoordinatorCell::Real(CoordinatorReal::Finite(1.5)),
+            ],
+            vec![
+                CoordinatorCell::Real(CoordinatorReal::Nan),
+                CoordinatorCell::Blob { bytes: 12 },
+            ],
+            vec![
+                CoordinatorCell::Real(CoordinatorReal::PositiveInfinity),
+                CoordinatorCell::Real(CoordinatorReal::NegativeInfinity),
+            ],
+        ])
+        .model_view();
+        assert_eq!(
+            view["rows"],
+            serde_json::json!([
+                [7, "NaN"],
+                [null, 1.5],
+                [{"real": "NaN"}, {"blob_bytes": 12}],
+                [{"real": "+Infinity"}, {"real": "-Infinity"}],
+            ])
+        );
+        for key in [
+            "columns",
+            "truncated",
+            "row_limit",
+            "byte_limit",
+            "elapsed_ms",
+        ] {
+            assert!(view.get(key).is_some(), "{key}");
+        }
+    }
+
+    #[test]
+    fn integral_real_stays_distinct_from_integer() {
+        let view = result(vec![vec![
+            CoordinatorCell::Real(CoordinatorReal::Finite(3.0)),
+            CoordinatorCell::Integer(3),
+        ]])
+        .model_view();
+        assert_eq!(view["rows"][0].to_string(), "[3.0,3]");
+    }
+
+    #[test]
+    fn view_is_much_smaller_than_the_tagged_wire() {
+        let rows = (0..50)
+            .map(|i| {
+                vec![
+                    CoordinatorCell::Integer(i),
+                    CoordinatorCell::Text(format!("row {i}")),
+                ]
+            })
+            .collect();
+        let result = result(rows);
+        let wire = serde_json::to_string_pretty(&result).unwrap();
+        let view = result.model_view().to_string();
+        assert!(
+            view.len() * 3 < wire.len(),
+            "view {} vs wire {}",
+            view.len(),
+            wire.len()
+        );
     }
 }
