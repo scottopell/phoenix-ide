@@ -160,17 +160,23 @@ function formatToolDuration(ms: number): string {
 
 // =====================================================================// Helper functions
 // =====================================================================
+const messageTimeFormatter = new Intl.DateTimeFormat(undefined, { hour: 'numeric', minute: '2-digit' });
+const messageDateFormatter = new Intl.DateTimeFormat(undefined, { month: 'short', day: 'numeric' });
+
 // eslint-disable-next-line react-refresh/only-export-components
 export function formatMessageTime(isoStr: string): string {
   if (!isoStr) return '';
   const date = new Date(isoStr);
+  if (Number.isNaN(date.getTime())) return 'Invalid Date';
   const now = new Date();
-  const isToday = date.toDateString() === now.toDateString();
-  
-  if (isToday) {
-    return date.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+  if (
+    date.getFullYear() === now.getFullYear()
+    && date.getMonth() === now.getMonth()
+    && date.getDate() === now.getDate()
+  ) {
+    return messageTimeFormatter.format(date);
   }
-  return date.toLocaleDateString([], { month: 'short', day: 'numeric' });
+  return messageDateFormatter.format(date);
 }
 
 // Thresholds for auto-expanding output
