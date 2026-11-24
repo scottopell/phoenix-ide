@@ -4,7 +4,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use phoenix_core::domain::close::{
     CloseAttemptScope, CloseExpectedRetirementResource, CloseObligation, CloseRetirementSnapshot,
-    CloseRetirementTarget, CloseRunRef, CloseStopCertainty, LossItemIdentity, RetiredResourceKind,
+    CloseRetirementTarget, CloseRunRef, CloseStopCertainty, LossItemIdentity, RetiredResourceIdentity,
+    RetiredResourceKind,
 };
 use phoenix_core::work_scope::{
     WorkScopeId, WorkScopeRetirementBlocker, WorkScopeRetirementOutcome,
@@ -12,6 +13,7 @@ use phoenix_core::work_scope::{
 };
 use sqlx::{Row, Sqlite, Transaction};
 
+use super::initial::{NativeCloseInitialEntryRelease, NativeCloseInitialFirstEffectError};
 use super::{NativeCloseCommand, NativeCloseIntent, NativeCloseRunRef};
 use crate::close_foundation::{
     close_obligation_for_update, parse_cleanup_resource_identity, retained_close_retry_progress_tx,
@@ -320,6 +322,86 @@ impl Database {
         })
     }
 
+    /// Runs a short synchronous handoff only after validating the exact live retry
+    /// under the SQLite writer. The caller must supervise cancellation and panic,
+    /// retain the callback outcome independently, and prevent repeated entry.
+    /// An unconfirmed rollback is not proof that the writer was released.
+    pub async fn with_native_close_retry_worktree_first_effect<F, T>(
+        &self,
+        command: &NativeCloseCommand,
+        admitted: &NativeCloseRunRef,
+        live_source: &phoenix_core::domain::sm_state::ConvState,
+        scope: WorkScopeId,
+        snapshot: CloseRetirementSnapshot,
+        resource: &RetiredResourceIdentity,
+        first_effect: F,
+    ) -> Result<(T, NativeCloseInitialEntryRelease), NativeCloseInitialFirstEffectError>
+    where
+        F: FnOnce() -> T,
+    {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await
+            .map_err(|error| NativeCloseInitialFirstEffectError::NotStarted(error.into()))?;
+        let validation = async {
+            crate::task_approval_inspection::require_executing_source(
+                live_source, command.source(), "close_conversation", &command.intent().source_input(),
+            ).map_err(|_| refused("Close requires its current executing source"))?;
+            let effect = CloseSafeRetryEffect { scope, resource: resource.clone() };
+            let original = Self::require_native_close_retry_pending_worktree_tx(
+                &mut tx, command, admitted, &effect,
+            ).await?;
+            if snapshot != original {
+                return Err(refused("native retry entry requires its exact original snapshot"));
+            }
+            let identity = resource.identity();
+            let dispatched: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM close_retirement_resource_dispatches
+                 WHERE attempt_id = ?1 AND scope = ?2 AND inspection_generation = ?3
+                   AND inspection_fingerprint = ?4 AND resource_kind = ?5
+                   AND identity_kind = ?6 AND identity_codec = ?7 AND identity_value = ?8)",
+            )
+            .bind(admitted.attempt_id.as_str())
+            .bind(effect.scope.as_str())
+            .bind(snapshot.generation())
+            .bind(snapshot.fingerprint())
+            .bind(resource.kind().as_str())
+            .bind(identity.identity_kind())
+            .bind(identity.codec())
+            .bind(identity.value())
+            .fetch_one(&mut *tx)
+            .await?;
+            if !dispatched {
+                return Err(refused("native retry entry requires exact persisted dispatch membership"));
+            }
+            Ok(())
+        }.await;
+        if let Err(error) = validation {
+            let release = match tx.rollback().await {
+                Ok(()) => NativeCloseInitialEntryRelease::Confirmed,
+                Err(error) => NativeCloseInitialEntryRelease::Unconfirmed(error.into()),
+            };
+            return Err(NativeCloseInitialFirstEffectError::Rejected { error, release });
+        }
+        let outcome = first_effect();
+        let release = match tx.rollback().await {
+            Ok(()) => NativeCloseInitialEntryRelease::Confirmed,
+            Err(error) => NativeCloseInitialEntryRelease::Unconfirmed(error.into()),
+        };
+        Ok((outcome, release))
+    }
+
+    async fn require_native_close_retry_plan_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        command: &NativeCloseCommand,
+        admitted: &NativeCloseRunRef,
+    ) -> DbResult<i64> {
+        let plan = Self::require_native_close_retry_plan_identity_tx(tx, command, admitted).await?;
+        if !plan.running {
+            return Err(refused("native retry mutation requires its exact latest running plan"));
+        }
+        Self::require_native_close_retry_members_quiescent_tx(tx, &admitted.attempt_id).await?;
+        Ok(plan.effect_count)
+    }
+
     pub async fn record_native_close_retry_worktree_cleanup_plan(
         &self,
         command: &NativeCloseCommand,
@@ -330,8 +412,9 @@ impl Database {
             command,
             admitted,
             NativeCloseRetryWorktreeMetadata::Plan(request),
+            || Ok(()),
         )
-        .await
+        .await.0
     }
 
     pub async fn bind_native_close_retry_worktree_final_tombstone(
@@ -344,8 +427,9 @@ impl Database {
             command,
             admitted,
             NativeCloseRetryWorktreeMetadata::Tombstone(request),
+            || Ok(()),
         )
-        .await
+        .await.0
     }
 
     pub async fn bind_native_close_retry_worktree_final_tombstone_object(
@@ -358,21 +442,78 @@ impl Database {
             command,
             admitted,
             NativeCloseRetryWorktreeMetadata::TombstoneObject(request),
+            || Ok(()),
         )
-        .await
+        .await.0
     }
 
-    async fn write_native_close_retry_worktree_metadata(
+    /// Entry callbacks must be short nonblocking in-memory source gates, with no
+    /// I/O, SQL, waits, or nested writers. Do not hold source custody while waiting
+    /// for this method. A successful lease is returned even on unknown release;
+    /// the caller must retain it then and supervise cancellation/panic separately.
+    pub async fn record_native_close_retry_worktree_cleanup_plan_with_entry<F, L>(
+        &self,
+        command: &NativeCloseCommand,
+        admitted: &NativeCloseRunRef,
+        request: RecordCloseWorktreeCleanupPlanRequest,
+        entry: F,
+    ) -> (LocalAuthorityResult<DbResult<()>>, Option<L>)
+    where
+        F: FnOnce() -> DbResult<L>,
+    {
+        self.write_native_close_retry_worktree_metadata(
+            command, admitted, NativeCloseRetryWorktreeMetadata::Plan(request), entry,
+        ).await
+    }
+
+    /// Uses the same custody and supervision contract as the cleanup-plan entry API.
+    pub async fn bind_native_close_retry_worktree_final_tombstone_with_entry<F, L>(
+        &self,
+        command: &NativeCloseCommand,
+        admitted: &NativeCloseRunRef,
+        request: BindCloseWorktreeFinalTombstoneRequest,
+        entry: F,
+    ) -> (LocalAuthorityResult<DbResult<()>>, Option<L>)
+    where
+        F: FnOnce() -> DbResult<L>,
+    {
+        self.write_native_close_retry_worktree_metadata(
+            command, admitted, NativeCloseRetryWorktreeMetadata::Tombstone(request), entry,
+        ).await
+    }
+
+    /// Uses the same custody and supervision contract as the cleanup-plan entry API.
+    pub async fn bind_native_close_retry_worktree_final_tombstone_object_with_entry<F, L>(
+        &self,
+        command: &NativeCloseCommand,
+        admitted: &NativeCloseRunRef,
+        request: BindCloseWorktreeFinalTombstoneObjectRequest,
+        entry: F,
+    ) -> (LocalAuthorityResult<DbResult<()>>, Option<L>)
+    where
+        F: FnOnce() -> DbResult<L>,
+    {
+        self.write_native_close_retry_worktree_metadata(
+            command, admitted, NativeCloseRetryWorktreeMetadata::TombstoneObject(request), entry,
+        ).await
+    }
+
+    async fn write_native_close_retry_worktree_metadata<F, L>(
         &self,
         command: &NativeCloseCommand,
         admitted: &NativeCloseRunRef,
         metadata: NativeCloseRetryWorktreeMetadata,
-    ) -> LocalAuthorityResult<DbResult<()>> {
+        entry: F,
+    ) -> (LocalAuthorityResult<DbResult<()>>, Option<L>)
+    where
+        F: FnOnce() -> DbResult<L>,
+    {
         let (attempt_id, scope, snapshot, resource) = metadata.identity();
         let mut tx = match self.pool.begin_with("BEGIN IMMEDIATE").await {
             Ok(tx) => tx,
-            Err(error) => return LocalAuthorityResult::DurableFactEstablished(Err(error.into())),
+            Err(error) => return (LocalAuthorityResult::DurableFactEstablished(Err(error.into())), None),
         };
+        let mut lease = None;
         let result = async {
             let plan =
                 Self::require_native_close_retry_plan_identity_tx(&mut tx, command, admitted)
@@ -405,6 +546,7 @@ impl Database {
                     "native retry metadata requires an exact pending full-identity worktree effect",
                 ));
             }
+            lease = Some(entry()?);
             match metadata {
                 NativeCloseRetryWorktreeMetadata::Plan(request) => {
                     Self::record_close_worktree_cleanup_plan_tx(&mut tx, request).await
@@ -418,7 +560,7 @@ impl Database {
             }
         }
         .await;
-        match result {
+        let classification = match result {
             Ok(()) => match tx.commit().await {
                 Ok(()) => LocalAuthorityResult::DurableFactEstablished(Ok(())),
                 Err(_) => LocalAuthorityResult::DurableFactUnclassified,
@@ -427,10 +569,10 @@ impl Database {
                 Ok(()) => LocalAuthorityResult::DurableFactEstablished(Err(error)),
                 Err(_) => LocalAuthorityResult::DurableFactUnclassified,
             },
-        }
+        };
+        (classification, lease)
     }
 
-    /// Records dispatch of one pending original-generation worktree effect under the
     /// Records dispatch of one pending original-generation worktree effect under the
     /// exact live native command and latest running retry plan. No current inspection
     /// snapshot is accepted from the caller.
@@ -464,12 +606,12 @@ impl Database {
         }
     }
 
-    async fn record_native_close_retry_retirement_dispatch_tx(
+    async fn require_native_close_retry_pending_worktree_tx(
         tx: &mut Transaction<'_, Sqlite>,
         command: &NativeCloseCommand,
         admitted: &NativeCloseRunRef,
         effect: &CloseSafeRetryEffect,
-    ) -> DbResult<()> {
+    ) -> DbResult<CloseRetirementSnapshot> {
         let plan = Self::require_native_close_retry_plan_identity_tx(tx, command, admitted).await?;
         if !plan.running {
             return Err(refused(
@@ -491,12 +633,22 @@ impl Database {
                 "native retry dispatch requires a pending full-identity worktree effect",
             ));
         }
+        Ok(plan.snapshot)
+    }
+
+    async fn record_native_close_retry_retirement_dispatch_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        command: &NativeCloseCommand,
+        admitted: &NativeCloseRunRef,
+        effect: &CloseSafeRetryEffect,
+    ) -> DbResult<()> {
+        let snapshot = Self::require_native_close_retry_pending_worktree_tx(tx, command, admitted, effect).await?;
         Self::insert_close_retirement_dispatch_tx(
             tx,
             &RecordCloseRetirementDispatchRequest {
-                attempt_id: run.attempt_id,
+                attempt_id: admitted.attempt_id.clone(),
                 scope: effect.scope.clone(),
-                snapshot: plan.snapshot,
+                snapshot,
                 resource: effect.resource.clone(),
             },
         )
@@ -518,10 +670,31 @@ impl Database {
         precondition: WorkScopeRetirementPrecondition,
         reason: &str,
     ) -> LocalAuthorityResult<DbResult<WorkScopeRetirementOutcome>> {
+        self.retire_work_scope_for_native_close_retry_with_entry(
+            command, admitted, effect, precondition, reason, || Ok(()),
+        ).await.0
+    }
+
+    /// Holds a successful entry lease through commit or rollback and returns it
+    /// even if release is unclassified. The callback has the same nonblocking
+    /// and external-supervision contract as the metadata entry APIs.
+    pub async fn retire_work_scope_for_native_close_retry_with_entry<F, L>(
+        &self,
+        command: &NativeCloseCommand,
+        admitted: &NativeCloseRunRef,
+        effect: &CloseSafeRetryEffect,
+        precondition: WorkScopeRetirementPrecondition,
+        reason: &str,
+        entry: F,
+    ) -> (LocalAuthorityResult<DbResult<WorkScopeRetirementOutcome>>, Option<L>)
+    where
+        F: FnOnce() -> DbResult<L>,
+    {
         let mut tx = match self.pool.begin_with("BEGIN IMMEDIATE").await {
             Ok(tx) => tx,
-            Err(error) => return LocalAuthorityResult::DurableFactEstablished(Err(error.into())),
+            Err(error) => return (LocalAuthorityResult::DurableFactEstablished(Err(error.into())), None),
         };
+        let mut lease = None;
         let result = Self::retire_work_scope_for_native_close_retry_tx(
             &mut tx,
             command,
@@ -529,6 +702,8 @@ impl Database {
             effect,
             precondition,
             reason,
+            entry,
+            &mut lease,
         )
         .await;
         let committed = matches!(&result, Ok(WorkScopeRetirementOutcome::Retired));
@@ -537,20 +712,26 @@ impl Database {
         } else {
             tx.rollback().await
         };
-        match finalized {
+        let classification = match finalized {
             Ok(()) => LocalAuthorityResult::DurableFactEstablished(result),
             Err(_) => LocalAuthorityResult::DurableFactUnclassified,
-        }
+        };
+        (classification, lease)
     }
 
-    async fn retire_work_scope_for_native_close_retry_tx(
+    async fn retire_work_scope_for_native_close_retry_tx<F, L>(
         tx: &mut Transaction<'_, Sqlite>,
         command: &NativeCloseCommand,
         admitted: &NativeCloseRunRef,
         effect: &CloseSafeRetryEffect,
         precondition: WorkScopeRetirementPrecondition,
         reason: &str,
-    ) -> DbResult<WorkScopeRetirementOutcome> {
+        entry: F,
+        lease: &mut Option<L>,
+    ) -> DbResult<WorkScopeRetirementOutcome>
+    where
+        F: FnOnce() -> DbResult<L>,
+    {
         let plan = Self::require_native_close_retry_plan_identity_tx(tx, command, admitted).await?;
         if !plan.running {
             return Err(refused(
@@ -627,6 +808,7 @@ impl Database {
                 WorkScopeRetirementBlocker::CoordinatorOwned,
             ));
         }
+        *lease = Some(entry()?);
         Self::retire_work_scope_lifecycle_tx(tx, precondition, reason, Some(&admitted.attempt_id))
             .await
     }

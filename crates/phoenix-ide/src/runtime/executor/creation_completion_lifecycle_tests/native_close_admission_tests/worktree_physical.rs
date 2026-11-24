@@ -31,6 +31,21 @@ async fn registered_native_close_captured_loss_public_retry_with_production_dete
 }
 
 #[tokio::test]
+async fn registered_native_close_captured_loss_retry_stop_during_assessment_preserves_worktree_and_history() {
+    run_public_worktree_close(WorktreeJourney::CapturedLossPublicRetryStoppedDuringAssessment).await;
+}
+
+#[tokio::test]
+async fn registered_native_close_captured_loss_retry_stop_while_prepared_preserves_worktree() {
+    run_public_worktree_close(WorktreeJourney::CapturedLossPublicRetryStoppedDuringPreparation).await;
+}
+
+#[tokio::test]
+async fn registered_native_close_captured_loss_retry_stop_before_physical_observation_retains_stopped_result() {
+    run_public_worktree_close(WorktreeJourney::CapturedLossPublicRetryStoppedBeforePhysicalObservation).await;
+}
+
+#[tokio::test]
 async fn registered_native_close_physically_retires_worktree_only_and_replays_without_effects() {
     run_public_worktree_close(WorktreeJourney::Retire).await;
 }
@@ -78,6 +93,9 @@ enum WorktreeJourney {
     Retire,
     RetireWithProductionDetector,
     CapturedLossPublicRetryWithProductionDetector,
+    CapturedLossPublicRetryStoppedDuringAssessment,
+    CapturedLossPublicRetryStoppedDuringPreparation,
+    CapturedLossPublicRetryStoppedBeforePhysicalObservation,
     RetainContentBlockers,
     ReinspectCapturedLossAfterCleanup,
     RetryLossClassification,
@@ -447,6 +465,9 @@ async fn run_public_worktree_close(journey: WorktreeJourney) {
     let public_captured_retry = matches!(
         journey,
         WorktreeJourney::CapturedLossPublicRetryWithProductionDetector
+            | WorktreeJourney::CapturedLossPublicRetryStoppedDuringAssessment
+            | WorktreeJourney::CapturedLossPublicRetryStoppedDuringPreparation
+            | WorktreeJourney::CapturedLossPublicRetryStoppedBeforePhysicalObservation
     );
     let mut captured_retry_run = None;
     let content_blocked = matches!(
@@ -455,6 +476,9 @@ async fn run_public_worktree_close(journey: WorktreeJourney) {
             | WorktreeJourney::RetryLossClassification
             | WorktreeJourney::ReinspectCapturedLossAfterCleanup
             | WorktreeJourney::CapturedLossPublicRetryWithProductionDetector
+            | WorktreeJourney::CapturedLossPublicRetryStoppedDuringAssessment
+            | WorktreeJourney::CapturedLossPublicRetryStoppedDuringPreparation
+            | WorktreeJourney::CapturedLossPublicRetryStoppedBeforePhysicalObservation
     );
     if content_blocked {
         std::fs::create_dir_all(git.repo.join(".git/info")).unwrap();
@@ -1328,7 +1352,23 @@ async fn run_public_worktree_close(journey: WorktreeJourney) {
             .await
             .expect("acknowledged initial result must remain eligible after source shutdown");
         captured_loss_public_retry::retry_after_public_capture(
-            &fixture, &git, backend, &scope, &run,
+            &fixture,
+            &git,
+            backend,
+            &scope,
+            &run,
+            match journey {
+                WorktreeJourney::CapturedLossPublicRetryStoppedDuringAssessment => Some(
+                    crate::runtime::executor::native_close_retry::test_hooks::Point::CapturedLossAssessmentReady,
+                ),
+                WorktreeJourney::CapturedLossPublicRetryStoppedDuringPreparation => Some(
+                    crate::runtime::executor::native_close_retry::test_hooks::Point::WorktreePreparationReady,
+                ),
+                WorktreeJourney::CapturedLossPublicRetryStoppedBeforePhysicalObservation => Some(
+                    crate::runtime::executor::native_close_retry::test_hooks::Point::PhysicalBeforeObservation,
+                ),
+                _ => None,
+            },
         )
         .await;
     }

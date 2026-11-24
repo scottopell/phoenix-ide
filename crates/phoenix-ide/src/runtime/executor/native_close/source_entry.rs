@@ -121,6 +121,13 @@ impl SourceEntryController {
         ActorEntryResult::Updated
     }
 
+    /// Fatal-exit-only admission closure. Never touches the custody mutex: an
+    /// unknown transaction release may deliberately retain that lock forever.
+    /// This does not authorize a source transition or release an entered lease.
+    pub(crate) fn close_admission_for_fatal_exit(&mut self) {
+        self.shared.revoked.store(true, std::sync::atomic::Ordering::Release);
+    }
+
     /// Closes admission immediately, then performs the actor's state transition
     /// without waiting for a worker's first-effect callback or metadata lease. On Busy,
     /// the caller must retain and defer the source event, then retry this method

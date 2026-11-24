@@ -1,6 +1,7 @@
 use super::*;
 use crate::coordinator_tools;
 use crate::send_chat_service::SendChatApplicationService;
+use crate::runtime::executor::native_close_retry::test_hooks::{Hooks, Point};
 use tokio_util::sync::CancellationToken;
 
 pub(super) async fn acknowledge_public_initial_result(
@@ -100,6 +101,7 @@ pub(super) async fn retry_after_public_capture(
     backend: Arc<crate::runtime::RuntimeManager>,
     scope: &WorkScopeId,
     initial_run: &CloseRunRef,
+    stop_at: Option<Point>,
 ) {
     let source = SourceToolCall {
         message_id: "captured-loss-retry-message".into(),
@@ -193,7 +195,9 @@ pub(super) async fn retry_after_public_capture(
             startup_llm_recovery_ack: Arc::new(Mutex::new(None)),
         },
     );
-    let running = tokio::spawn(actor.run());
+    let hooks = Hooks::default();
+    let actor_hooks = hooks.clone();
+    let running = tokio::spawn(async move { actor_hooks.scope(actor.run()).await });
     tokio::time::timeout(std::time::Duration::from_secs(10), started)
         .await
         .expect("source actor must finish startup")
@@ -292,6 +296,179 @@ pub(super) async fn retry_after_public_capture(
             .unwrap()
             .archived
     );
+
+    if stop_at == Some(Point::CapturedLossAssessmentReady) {
+        let counts_before = close_row_counts(&fixture).await;
+        let target_before = durable_target_rows(&fixture).await;
+        let worktree_before = physical_snapshot(&git.worktree);
+        let admin_before = physical_snapshot(&git.admin);
+        let sibling_before = physical_snapshot(&git.sibling);
+        let sibling_admin_before = physical_snapshot(&git.sibling_admin);
+        let registrations_before = git.run(&git.repo, &["worktree", "list", "--porcelain", "-z"]);
+        let scope_before = fixture
+            .db
+            .get_conversation_work_scope_context(TARGET_ID)
+            .await
+            .unwrap();
+        let messages_before = serde_json::to_value(fixture.db.get_messages(TARGET_ID).await.unwrap())
+            .unwrap();
+
+        let mut pause = hooks.arm(Point::CapturedLossAssessmentReady);
+        let retry_tool = Arc::clone(&tool);
+        let retry_input = input.clone();
+        let retry_context = context.clone();
+        let retry = tokio::spawn(async move { retry_tool.run(retry_input, retry_context).await });
+        pause.reached().await;
+        assert!(!retry.is_finished(), "assessment remains owned by the held worker");
+        assert_eq!(public_retry_rows(&fixture, initial_run.attempt_id.as_str()).await, before);
+
+        // ACK must arrive while assessment cannot finish, not after releasing it.
+        stop_actor(&sender).await;
+        assert!(!retry.is_finished(), "Stop ACK must not depend on joining assessment");
+        assert_ne!(
+            fixture.db.get_conversation(&fixture.source_transcript_id).await.unwrap().state,
+            fixture.state,
+            "Stop ACK must have durably invalidated the exact source"
+        );
+        assert_eq!(public_retry_rows(&fixture, initial_run.attempt_id.as_str()).await, before);
+        assert_eq!(physical_snapshot(&git.worktree), worktree_before);
+        assert_eq!(physical_snapshot(&git.admin), admin_before);
+        pause.release();
+        let refused = tokio::time::timeout(Duration::from_secs(10), retry)
+            .await
+            .expect("held assessment must join after Stop")
+            .unwrap();
+        assert!(!refused.is_success(), "{}", refused.output());
+        let refused: Value = serde_json::from_str(refused.output()).unwrap();
+        assert_eq!(refused["code"], "source_refused");
+        for _ in 0..2 {
+            let refused = tokio::time::timeout(
+                Duration::from_secs(10),
+                tool.run(input.clone(), context.clone()),
+            )
+            .await
+            .expect("stopped public retry must return without admission");
+            assert!(!refused.is_success(), "{}", refused.output());
+            let refused: Value = serde_json::from_str(refused.output()).unwrap();
+            assert_eq!(refused["code"], "source_refused");
+            assert_eq!(public_retry_rows(&fixture, initial_run.attempt_id.as_str()).await, before);
+            assert!(fixture
+                .db
+                .read_native_close_explicit_retry_receipt(&fixture.command)
+                .await
+                .unwrap()
+                .is_none());
+        }
+        assert_eq!(close_row_counts(&fixture).await, counts_before);
+        assert_eq!(durable_target_rows(&fixture).await, target_before);
+        assert_eq!(captured_history(&fixture, initial_run).await, historical);
+        assert_eq!(
+            serde_json::to_value(fixture.db.get_messages(TARGET_ID).await.unwrap()).unwrap(),
+            messages_before
+        );
+        assert_eq!(
+            fixture.db.get_conversation_work_scope_context(TARGET_ID).await.unwrap(),
+            scope_before
+        );
+        assert!(!fixture.db.get_conversation(TARGET_ID).await.unwrap().archived);
+        assert_eq!(physical_snapshot(&git.worktree), worktree_before);
+        assert_eq!(physical_snapshot(&git.admin), admin_before);
+        assert_eq!(physical_snapshot(&git.sibling), sibling_before);
+        assert_eq!(physical_snapshot(&git.sibling_admin), sibling_admin_before);
+        assert_eq!(
+            git.run(&git.repo, &["worktree", "list", "--porcelain", "-z"]),
+            registrations_before
+        );
+        git.assert_untargeted_state_preserved();
+        event_tx.send(Event::Shutdown).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(10), running)
+            .await
+            .expect("stopped retry source actor must shut down")
+            .unwrap();
+        return;
+    }
+
+    if let Some(point) = stop_at {
+        let worktree_before = physical_snapshot(&git.worktree);
+        let admin_before = physical_snapshot(&git.admin);
+        let sibling_before = physical_snapshot(&git.sibling);
+        let sibling_admin_before = physical_snapshot(&git.sibling_admin);
+        let mut pause = hooks.arm(point);
+        let retry_tool = Arc::clone(&tool);
+        let retry_input = input.clone();
+        let retry_context = context.clone();
+        let retry = tokio::spawn(async move { retry_tool.run(retry_input, retry_context).await });
+        pause.reached().await;
+        let receipt = fixture.db.read_native_close_explicit_retry_receipt(&fixture.command)
+            .await.unwrap().expect("barrier must belong to a durably admitted successor");
+        assert_eq!(receipt.attempt_id, initial_run.attempt_id);
+        assert_eq!(receipt.run_ordinal.get(), initial_run.ordinal.get() + 1);
+        let successor = CloseRunRef {
+            attempt_id: receipt.attempt_id.clone(),
+            ordinal: receipt.run_ordinal,
+        };
+        assert_eq!(fixture.db.get_close_run(&successor).await.unwrap().status, CloseRunStatus::Running);
+        assert!(fixture.db.close_safe_retry_progress(&successor).await.unwrap().successful.is_empty());
+        assert!(!retry.is_finished());
+        if point == Point::WorktreePreparationReady {
+            assert_eq!(physical_snapshot(&git.worktree), worktree_before);
+            assert_eq!(physical_snapshot(&git.admin), admin_before);
+        } else {
+            assert_eq!(point, Point::PhysicalBeforeObservation);
+            assert_eq!(std::fs::symlink_metadata(&git.worktree).unwrap_err().kind(), std::io::ErrorKind::NotFound);
+            assert_eq!(std::fs::symlink_metadata(&git.admin).unwrap_err().kind(), std::io::ErrorKind::NotFound);
+        }
+
+        // The worker cannot publish its result until after this ACK is observed.
+        stop_actor(&sender).await;
+        assert!(!retry.is_finished(), "Stop ACK must not wait for the held worker");
+        assert_eq!(fixture.db.get_close_run(&successor).await.unwrap().status, CloseRunStatus::Stopped);
+        assert_eq!(captured_history(&fixture, initial_run).await, historical);
+        assert!(!fixture.db.get_conversation(TARGET_ID).await.unwrap().archived);
+        assert_eq!(fixture.db.get_conversation_work_scope_context(TARGET_ID).await.unwrap().1, WorkScopeLifecycle::Active);
+        let stopped_rows = public_retry_rows(&fixture, initial_run.attempt_id.as_str()).await;
+        let stopped: Value = serde_json::from_str(&stopped_rows).unwrap();
+        assert_eq!(stopped[4], serde_json::json!([]), "no retry effect was acknowledged as successful");
+        let stopped_target = durable_target_rows(&fixture).await;
+        let stopped_physical = physical_snapshot(&git.root);
+        let failures = fixture.db.list_close_cleanup_failures(successor.attempt_id.as_str()).await.unwrap();
+        assert!(failures.iter().any(|failure| {
+            failure.run_ordinal == successor.ordinal
+                && failure.occurrence.failure_occurrence_id == successor.failure_occurrence_id()
+        }), "Stop ACK must establish the exact successor failure");
+
+        pause.release();
+        let refused = tokio::time::timeout(Duration::from_secs(10), retry).await
+            .expect("stopped successor must join its original worker").unwrap();
+        assert!(!refused.is_success(), "{}", refused.output());
+        let refused: Value = serde_json::from_str(refused.output()).unwrap();
+        assert_eq!(refused["code"], "storage_rejected");
+        assert_eq!(public_retry_rows(&fixture, initial_run.attempt_id.as_str()).await, stopped_rows);
+        assert_eq!(durable_target_rows(&fixture).await, stopped_target);
+        assert_eq!(captured_history(&fixture, initial_run).await, historical);
+        assert_eq!(physical_snapshot(&git.root), stopped_physical);
+        assert_eq!(physical_snapshot(&git.sibling), sibling_before);
+        assert_eq!(physical_snapshot(&git.sibling_admin), sibling_admin_before);
+        git.assert_untargeted_state_preserved();
+
+        let replay = tokio::time::timeout(Duration::from_secs(10), tool.run(input, context))
+            .await.expect("stopped successor exact-source receipt replay must be bounded");
+        assert!(!replay.is_success(), "{}", replay.output());
+        let replay: Value = serde_json::from_str(replay.output()).unwrap();
+        assert_eq!(replay["code"], "source_refused");
+        assert_eq!(
+            fixture.db.read_native_close_explicit_retry_receipt(&fixture.command).await.unwrap(),
+            Some(receipt),
+            "source refusal must retain the admitted successor receipt"
+        );
+        assert_eq!(public_retry_rows(&fixture, initial_run.attempt_id.as_str()).await, stopped_rows);
+        assert_eq!(durable_target_rows(&fixture).await, stopped_target);
+        assert_eq!(physical_snapshot(&git.root), stopped_physical);
+        event_tx.send(Event::Shutdown).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(10), running).await
+            .expect("stopped successor actor must shut down").unwrap();
+        return;
+    }
 
     let completed = tokio::time::timeout(
         Duration::from_secs(10),
@@ -498,7 +675,10 @@ async fn captured_history(fixture: &CloseFixture, run: &CloseRunRef) -> Captured
             .db
             .list_close_cleanup_failures(&run.attempt_id)
             .await
-            .unwrap(),
+            .unwrap()
+            .into_iter()
+            .filter(|failure| failure.run_ordinal == run.ordinal)
+            .collect(),
         outcome: serde_json::to_value(outcome).unwrap(),
     }
 }

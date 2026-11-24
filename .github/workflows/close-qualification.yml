@@ -555,7 +555,7 @@ jobs:
           done
           # The detector-enabled acceptance has its own required identity-qualified step.
           # Keep the broader Bash/Tmux actor suite under its existing runner identity.
-          (cd crates/phoenix-ide && "$PHOENIX_RUNTIME_TEST_BINARY" native_close_admission_tests:: --skip registered_native_close_with_production_detector_retires_worktree_and_replays --skip registered_native_close_captured_loss_public_retry_with_production_detector_reclaims_and_replays --nocapture --test-threads=1) 2>&1 | tee evidence/native-close-runtime-actor.log
+          (cd crates/phoenix-ide && "$PHOENIX_RUNTIME_TEST_BINARY" native_close_admission_tests:: --skip registered_native_close_with_production_detector_retires_worktree_and_replays --skip registered_native_close_captured_loss_public_retry_with_production_detector_reclaims_and_replays --skip registered_native_close_captured_loss_retry_stop_ --nocapture --test-threads=1) 2>&1 | tee evidence/native-close-runtime-actor.log
           grep -E 'test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored;' evidence/native-close-runtime-actor.log
           for test in \
             registered_native_close_with_loss_content_stops_incomplete_without_retirement \
@@ -619,11 +619,17 @@ jobs:
           set -euo pipefail
           mkdir -p evidence
           test -n "${PHOENIX_RUNTIME_TEST_BINARY:-}"
-          test_name='runtime::executor::creation_completion_lifecycle_tests::native_close_admission_tests::worktree_physical::registered_native_close_captured_loss_public_retry_with_production_detector_reclaims_and_replays'
-          grep -Fx "$test_name: test" evidence/runtime-inventory.log
-          timeout --kill-after=10s 6m bash scripts/ci/close-unprivileged-qualification.sh "$GITHUB_WORKSPACE" "$PHOENIX_RUNTIME_TEST_BINARY" "$PHOENIX_BASH_LAUNCH_TEST_EXE" "$(id -u)" "$test_name" --exact --nocapture --test-threads=1 2>&1 | tee evidence/public-captured-loss-retry.log
-          grep -F "$test_name ... ok" evidence/public-captured-loss-retry.log
-          grep -F 'test result: ok. 1 passed; 0 failed; 0 ignored;' evidence/public-captured-loss-retry.log
+          for test in \
+            registered_native_close_captured_loss_public_retry_with_production_detector_reclaims_and_replays \
+            registered_native_close_captured_loss_retry_stop_during_assessment_preserves_worktree_and_history \
+            registered_native_close_captured_loss_retry_stop_while_prepared_preserves_worktree \
+            registered_native_close_captured_loss_retry_stop_before_physical_observation_retains_stopped_result; do
+            test_name="runtime::executor::creation_completion_lifecycle_tests::native_close_admission_tests::worktree_physical::$test"
+            grep -Fx "$test_name: test" evidence/runtime-inventory.log
+            timeout --kill-after=10s 6m bash scripts/ci/close-unprivileged-qualification.sh "$GITHUB_WORKSPACE" "$PHOENIX_RUNTIME_TEST_BINARY" "$PHOENIX_BASH_LAUNCH_TEST_EXE" "$(id -u)" "$test_name" --exact --nocapture --test-threads=1 2>&1 | tee "evidence/$test.log"
+            grep -F "$test_name ... ok" "evidence/$test.log"
+            grep -F 'test result: ok. 1 passed; 0 failed; 0 ignored;' "evidence/$test.log"
+          done
 
       - name: Retain bounded failing writer-process attribution
         if: success() || failure()

@@ -12,8 +12,8 @@ use phoenix_db::{
 use tokio::runtime::Handle;
 
 use super::{
-    check_deadline, NativeCloseCommand, OriginalWorktreeEffectContext, SourceEntryWorker,
-    WorkerEntryResult,
+    check_deadline, NativeCloseCommand, NativeCloseIntent, OriginalWorktreeEffectContext,
+    SourceEntryWorker, WorkerEntryResult,
 };
 
 impl OriginalWorktreeEffectContext {
@@ -35,16 +35,27 @@ impl OriginalWorktreeEffectContext {
         // Borrow the local handle, not `self`, so classification can retain its
         // lease while mutating the worker's release marker (or parking forever).
         let source_entry = self.source_entry.clone();
-        let result = runtime.block_on(
-            self.db
-                .record_native_close_initial_worktree_cleanup_plan_with_entry(
+        let entry = || metadata_entry(&source_entry, &self.command, self.deadline);
+        let result = match self.command.intent() {
+            NativeCloseIntent::Initial { .. } => runtime.block_on(
+                self.db.record_native_close_initial_worktree_cleanup_plan_with_entry(
                     &self.command,
                     &self.receipt,
                     &self.live_source,
                     request,
-                    || metadata_entry(&source_entry, &self.command, self.deadline),
+                    entry,
                 ),
-        );
+            ),
+            NativeCloseIntent::ExplicitRetry { .. } => runtime.block_on(
+                self.db.record_native_close_retry_worktree_cleanup_plan_with_entry(
+                    &self.command,
+                    &self.receipt.admitted,
+                    request,
+                    entry,
+                ),
+            ),
+            NativeCloseIntent::Observe { .. } => refused_observation(),
+        };
         self.classify_metadata(result)
     }
 
@@ -72,16 +83,27 @@ impl OriginalWorktreeEffectContext {
         // Borrow the local handle, not `self`, so classification can retain its
         // lease while mutating the worker's release marker (or parking forever).
         let source_entry = self.source_entry.clone();
-        let result = runtime.block_on(
-            self.db
-                .bind_native_close_initial_worktree_final_tombstone_with_entry(
+        let entry = || metadata_entry(&source_entry, &self.command, self.deadline);
+        let result = match self.command.intent() {
+            NativeCloseIntent::Initial { .. } => runtime.block_on(
+                self.db.bind_native_close_initial_worktree_final_tombstone_with_entry(
                     &self.command,
                     &self.receipt,
                     &self.live_source,
                     request,
-                    || metadata_entry(&source_entry, &self.command, self.deadline),
+                    entry,
                 ),
-        );
+            ),
+            NativeCloseIntent::ExplicitRetry { .. } => runtime.block_on(
+                self.db.bind_native_close_retry_worktree_final_tombstone_with_entry(
+                    &self.command,
+                    &self.receipt.admitted,
+                    request,
+                    entry,
+                ),
+            ),
+            NativeCloseIntent::Observe { .. } => refused_observation(),
+        };
         self.classify_metadata(result)
     }
 
@@ -103,16 +125,27 @@ impl OriginalWorktreeEffectContext {
         // Borrow the local handle, not `self`, so classification can retain its
         // lease while mutating the worker's release marker (or parking forever).
         let source_entry = self.source_entry.clone();
-        let result = runtime.block_on(
-            self.db
-                .bind_native_close_initial_worktree_final_tombstone_object_with_entry(
+        let entry = || metadata_entry(&source_entry, &self.command, self.deadline);
+        let result = match self.command.intent() {
+            NativeCloseIntent::Initial { .. } => runtime.block_on(
+                self.db.bind_native_close_initial_worktree_final_tombstone_object_with_entry(
                     &self.command,
                     &self.receipt,
                     &self.live_source,
                     request,
-                    || metadata_entry(&source_entry, &self.command, self.deadline),
+                    entry,
                 ),
-        );
+            ),
+            NativeCloseIntent::ExplicitRetry { .. } => runtime.block_on(
+                self.db.bind_native_close_retry_worktree_final_tombstone_object_with_entry(
+                    &self.command,
+                    &self.receipt.admitted,
+                    request,
+                    entry,
+                ),
+            ),
+            NativeCloseIntent::Observe { .. } => refused_observation(),
+        };
         self.classify_metadata(result)
     }
 
@@ -150,6 +183,15 @@ impl OriginalWorktreeEffectContext {
             }
         }
     }
+}
+
+fn refused_observation<L>() -> (LocalAuthorityResult<DbResult<()>>, Option<L>) {
+    (
+        LocalAuthorityResult::DurableFactEstablished(Err(DbError::CloseFoundationPrecondition(
+            "observational Close cannot authorize a Worktree metadata write".into(),
+        ))),
+        None,
+    )
 }
 
 // Called only after DB validation, while that same writer is held. The

@@ -325,6 +325,50 @@ describe('WorkControlBar — persisted Close recovery', () => {
     expect(screen.queryByRole('button', { name: 'Retry exact Close attempt' })).not.toBeInTheDocument();
   });
 
+  it.each([
+    ['conversation_and_processes_stopped', 'Close incomplete — cleanup not confirmed'],
+    ['shutdown_uncertain', 'Close incomplete — shutdown could not be confirmed'],
+  ] as const)('keeps stopped cleanup blockers visible without inferring disk retention from %s', async (certainty, label) => {
+    const snapshot = closeSnapshot('needs_repair', [{
+      scope: 'repo',
+      resource_kind: 'work_scope',
+      identity: 'scope:unresolved',
+      reason: 'inspection_failed',
+      detail: 'scope retirement not confirmed',
+    }]);
+    vi.mocked(api.getProductConversationSnapshot).mockResolvedValue({
+      ...snapshot,
+      close: {
+        ...snapshot.close,
+        run_status: 'stopped',
+        failure: {
+          occurrence_id: 'close-failure:2:stopped-close',
+          reason: 'identity_not_proven',
+          detail: 'Stop admitted during physical retirement',
+          stop_certainty: certainty === 'conversation_and_processes_stopped'
+            ? { kind: certainty, confirmed_at_us: '1234567890123456' }
+            : { kind: certainty },
+          remaining_resources: [],
+        },
+      },
+    } as never);
+
+    renderWithProviders(
+      <WorkControlBar conversationId="conv-stop-retirement" convModeLabel="Work" phaseType="idle" continuedInConvId={null} prStatusHandle={prStatusHandle()} mutationEnabled={false} />,
+    );
+
+    const status = await screen.findByLabelText('Close repair required');
+    expect(status).toBeVisible();
+    expect(status).toHaveTextContent(`⚠ ${label}`);
+    expect(status).not.toHaveTextContent('disk retained');
+    expect(status).toHaveTextContent('repo: work scope · scope:unresolved · inspection failed — scope retirement not confirmed');
+    expect(status).toHaveTextContent('identity not proven — Stop admitted during physical retirement');
+    expect(screen.getByTestId('clean-up-button')).toBeDisabled();
+    expect(screen.getByTestId('abandon-button')).toBeDisabled();
+    expect(screen.queryByRole('button', { name: 'Retry exact Close attempt' })).not.toBeInTheDocument();
+    expect(api.retryCloseRetirement).not.toHaveBeenCalled();
+  });
+
   it('renders exact residual repair evidence after reload', async () => {
     vi.mocked(api.getProductConversationSnapshot).mockResolvedValue(closeSnapshot('needs_repair', [{
       scope: 'scope-1',

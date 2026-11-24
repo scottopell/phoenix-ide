@@ -228,9 +228,13 @@ impl Database {
             encoded_effects,
         ))
         .map_err(|error| DbError::Serialization(error.to_string()))?;
-        let plan_fingerprint = format!(
-            "native-close-captured-loss-plan-v1:{:x}",
-            Sha256::digest(bytes)
+        let plan_fingerprint = Sha256::digest(bytes).iter().fold(
+            String::from("native-close-captured-loss-plan-v1:"),
+            |mut encoded, byte| {
+                use std::fmt::Write as _;
+                write!(encoded, "{byte:02x}").expect("writing to String cannot fail");
+                encoded
+            },
         );
         sqlx::query(
             "INSERT INTO native_close_captured_loss_retry_plans

@@ -21,7 +21,7 @@ use phoenix_core::{
 use phoenix_db::{
     native_close::{
         NativeCloseCommand, NativeCloseInitialEntryRelease, NativeCloseInitialFirstEffectError,
-        NativeCloseReceipt,
+        NativeCloseIntent, NativeCloseReceipt,
     },
     Database,
 };
@@ -348,20 +348,65 @@ impl OriginalWorktreeEffectContext {
             "previous Worktree leaf release must be classified first"
         );
         self.leaf_release_pending_classification = true;
-        runtime.block_on(self.db.with_native_close_initial_worktree_first_effect(
-            &self.command,
-            &self.receipt,
-            &self.live_source,
-            self.scope.clone(),
-            self.snapshot.clone(),
-            &self.resource,
-            || {
-                self.source_entry.try_first_effect(&self.command, || {
-                    check_deadline(self.deadline)?;
-                    effect()
-                })
-            },
-        ))
+        let source_entry = self.source_entry.clone();
+        let mut source_lease = None;
+        let first_effect = || match source_entry.try_acquire_first_effect(&self.command) {
+            WorkerEntryResult::Ran(lease) => {
+                source_lease = Some(lease);
+                WorkerEntryResult::Ran(check_deadline(self.deadline).and_then(|()| effect()))
+            }
+            WorkerEntryResult::Busy => WorkerEntryResult::Busy,
+            WorkerEntryResult::Refused => WorkerEntryResult::Refused,
+        };
+        let result = match self.command.intent() {
+            NativeCloseIntent::Initial { .. } => runtime.block_on(
+                self.db.with_native_close_initial_worktree_first_effect(
+                    &self.command,
+                    &self.receipt,
+                    &self.live_source,
+                    self.scope.clone(),
+                    self.snapshot.clone(),
+                    &self.resource,
+                    first_effect,
+                ),
+            ),
+            NativeCloseIntent::ExplicitRetry { .. } => runtime.block_on(
+                self.db.with_native_close_retry_worktree_first_effect(
+                    &self.command,
+                    &self.receipt.admitted,
+                    &self.live_source,
+                    self.scope.clone(),
+                    self.snapshot.clone(),
+                    &self.resource,
+                    first_effect,
+                ),
+            ),
+            NativeCloseIntent::Observe { .. } => Err(
+                NativeCloseInitialFirstEffectError::NotStarted(
+                    phoenix_db::DbError::CloseFoundationPrecondition(
+                        "observational Close cannot authorize a Worktree effect".into(),
+                    ),
+                ),
+            ),
+        };
+        match &result {
+            Ok((_, NativeCloseInitialEntryRelease::Unconfirmed(_)))
+            | Err(NativeCloseInitialFirstEffectError::Rejected {
+                release: NativeCloseInitialEntryRelease::Unconfirmed(_),
+                ..
+            }) => {
+                self.fatal
+                    .close("native_close_worktree_unknown_writer_release");
+                let _retained_result = (result, source_lease);
+                loop {
+                    std::thread::park();
+                }
+            }
+            _ => {
+                drop(source_lease);
+                result
+            }
+        }
     }
 
     fn classify_confirmed_release(&mut self) {

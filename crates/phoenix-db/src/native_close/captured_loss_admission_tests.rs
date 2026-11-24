@@ -174,16 +174,12 @@ async fn captured_loss_admits_distinct_successor_without_rewriting_original_evid
 #[tokio::test]
 async fn captured_loss_admitted_authority_cascades_on_permanent_member_delete() {
     let (db, assessment) = captured_loss_assessment().await;
-    db.apply_native_close_captured_loss_retry(&assessment)
-        .await
-        .unwrap()
-        .unwrap();
+    established(db.apply_native_close_captured_loss_retry(&assessment).await);
     let attempt = assessment.context.failed_run().attempt_id.as_str();
     // Stop through the owning source writer before permanent aggregate removal.
     db.update_conversation_state(
         assessment.command.source_transcript_id(),
         &ConvState::Idle,
-        chrono::Utc::now(),
     )
     .await
     .unwrap();
@@ -195,14 +191,14 @@ async fn captured_loss_admitted_authority_cascades_on_permanent_member_delete() 
             .unwrap();
     }
     for table in [
-        "native_close_captured_retry_plans",
-        "native_close_captured_retry_scope_inspections",
-        "native_close_captured_retry_resources",
+        "native_close_captured_loss_retry_plans",
+        "native_close_captured_loss_retry_inspections",
+        "native_close_captured_loss_retry_resources",
         "close_obligations",
     ] {
-        let count: i64 = sqlx::query_scalar(&format!(
+        let count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
             "SELECT COUNT(*) FROM {table} WHERE attempt_id = ?1"
-        ))
+        )))
         .bind(attempt)
         .fetch_one(db.pool())
         .await

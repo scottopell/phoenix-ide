@@ -19,6 +19,18 @@ use phoenix_db::{
 };
 use std::sync::Arc;
 
+#[derive(Debug)]
+pub(crate) enum NativeRetryExecutionError {
+    ResourceFailure(String),
+    TerminalizedFailure(String),
+    Unclassified,
+}
+
+mod admitted;
+#[cfg(test)]
+pub(crate) mod test_hooks;
+pub(super) use admitted::AdmittedRetryCursor;
+
 pub(super) struct NativeCloseRetryAssessment {
     command: NativeCloseCommand,
     original: crate::runtime::close_retirement::NativeCloseRetryAssessment,
@@ -142,8 +154,21 @@ where
         let backend = Arc::clone(&request.backend);
         let exact_command = command.clone();
         let runtime = tokio::runtime::Handle::current();
+        #[cfg(test)]
+        let hooks = test_hooks::Hooks::current();
         let worker = tokio::task::spawn_blocking(move || {
-            runtime.block_on(assess_retry_origin(&backend, &exact_command))
+            runtime.block_on(async {
+                let assessment = assess_retry_origin(&backend, &exact_command).await;
+                #[cfg(test)]
+                if matches!(&assessment, Ok(NativeCloseRetryOriginAssessment::CapturedLoss(_))) {
+                    test_hooks::checkpoint(
+                        hooks.as_ref(),
+                        test_hooks::Point::CapturedLossAssessmentReady,
+                    )
+                    .await;
+                }
+                assessment
+            })
         });
         Some(NativeCloseRetryContinuation {
             command,
@@ -156,25 +181,58 @@ where
         &mut self,
         continuation: NativeCloseRetryContinuation,
         assessment: Result<NativeCloseRetryOriginAssessment, NativeCloseApplicationError>,
-    ) -> bool {
+    ) -> (bool, Option<AdmittedRetryCursor>) {
         if !super::native_close::source_entry::source_matches(&self.state, &continuation.command) {
             let _ = continuation
                 .request
                 .response
                 .send(Err(NativeCloseApplicationError::SourceRefused));
-            return false;
+            return (false, None);
         }
-        match assessment {
-            Ok(assessment) => {
-                self.handle_native_close_retry_prepared(
-                    continuation.request,
-                    Some((continuation.command, assessment)),
-                )
-                .await
-            }
+        let assessment = match assessment {
+            Ok(assessment) => assessment,
             Err(error) => {
                 let _ = continuation.request.response.send(Err(error));
-                false
+                return (false, None);
+            }
+        };
+        let NativeCloseRetryContinuation { command, request, .. } = continuation;
+        let crate::runtime::native_close_application::NativeCloseRetryRequest {
+            backend, admitted, target_gate, attempt_gate, response, ..
+        } = request;
+        // Admission is still source-actor owned and follows queued Stop events.
+        let mut authority = RuntimeSettlementAuthority {
+            owner: Some(admitted),
+            abandoned_reason: "native retry admission lost settlement authority",
+        };
+        let admission = match &assessment {
+            NativeCloseRetryOriginAssessment::Anchored(assessment) => backend.db().apply_native_close_explicit_retry(assessment).await,
+            NativeCloseRetryOriginAssessment::CapturedLoss(assessment) => backend.db().apply_native_close_captured_loss_retry(assessment).await,
+        };
+        match admission {
+            LocalAuthorityResult::DurableFactUnclassified => {
+                let _ = response.send(Err(NativeCloseApplicationError::FatalAuthority));
+                (true, None)
+            }
+            LocalAuthorityResult::DurableFactEstablished(Err(error)) => {
+                tracing::warn!(%error, "native retry admission refused");
+                authority.owner = None;
+                let _ = response.send(Err(NativeCloseApplicationError::Storage));
+                (false, None)
+            }
+            LocalAuthorityResult::DurableFactEstablished(Ok(NativeCloseRetryResult::Replay(receipt))) => {
+                authority.owner = None;
+                let _ = response.send(Ok(NativeCloseRetryResult::Replay(receipt)));
+                (false, None)
+            }
+            LocalAuthorityResult::DurableFactEstablished(Ok(NativeCloseRetryResult::NewlyAdmitted(receipt))) => {
+                let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+                let mut controller = super::native_close::source_entry::SourceEntryController::new(command.clone(), deadline);
+                let _ = controller.revalidate(&self.state, &command);
+                let worker = controller.worker();
+                self.native_close_source_entry = Some(controller);
+                let owner = authority.owner.take().expect("admission retained authority");
+                (false, Some(AdmittedRetryCursor::new(command, receipt, backend, owner, target_gate, attempt_gate, response, worker, deadline.into_std())))
             }
         }
     }

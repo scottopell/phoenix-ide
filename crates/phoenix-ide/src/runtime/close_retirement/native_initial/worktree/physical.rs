@@ -35,7 +35,7 @@ use super::git_leaf::{
     bind_shared_root_command, require_absent, run_git_leaf, GitLeafTarget, RetainedRootLocation,
 };
 use super::mutation::OriginalWorktreeMutationExecutor;
-use super::{NativeWorktreeGitContinuation, WorkerAuthority, WorkerCustody};
+use super::{NativeCloseIntent, NativeWorktreeGitContinuation, WorkerAuthority, WorkerCustody};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum WorktreePhysicalOutcome {
@@ -58,6 +58,8 @@ struct PhysicalState {
     result: Mutex<Option<Result<WorktreePhysicalOutcome, String>>>,
     custody: Mutex<Option<PhysicalCustody>>,
     ready: watch::Sender<bool>,
+    #[cfg(test)]
+    retry_hooks: Option<crate::runtime::executor::native_close_retry::test_hooks::Hooks>,
 }
 
 struct PhysicalCustody {
@@ -100,6 +102,8 @@ impl NativeWorktreeGitContinuation {
                 location: None,
             })),
             ready: ready_tx,
+            #[cfg(test)]
+            retry_hooks: crate::runtime::executor::native_close_retry::test_hooks::Hooks::current(),
         });
         let worker_state = Arc::clone(&state);
         let worker = std::thread::Builder::new()
@@ -202,6 +206,13 @@ fn run_physical_worker(state: &PhysicalState, runtime: &tokio::runtime::Handle) 
     // Every dispatched child, mutation and metadata release is classified.
     drop(slot.take());
     *result_slot = Some(result);
+    drop(result_slot);
+    drop(slot);
+    #[cfg(test)]
+    runtime.block_on(crate::runtime::executor::native_close_retry::test_hooks::checkpoint(
+        state.retry_hooks.as_ref(),
+        crate::runtime::executor::native_close_retry::test_hooks::Point::PhysicalBeforeObservation,
+    ));
     state.ready.send_replace(true);
 }
 
@@ -234,9 +245,6 @@ fn retire_clean_linked_worktree(
                 .into(),
         });
     }
-    // Read the exact original confirmation on this retained worker before any
-    // Git leaf, cleanup metadata, or physical mutation. Read uncertainty refuses
-    // retirement; it cannot substitute a fresh inspection or renew authority.
     custody.confirmed_worktree_snapshot = match read_confirmed_worktree_snapshot(custody, runtime) {
         Ok(snapshot) => Some(snapshot),
         Err(detail) => return Ok(WorktreePhysicalOutcome::Residual { detail }),
@@ -358,6 +366,62 @@ fn read_confirmed_worktree_snapshot(
             "original Worktree resource does not match captured physical owner; target preserved"
                 .into(),
         );
+    }
+    if matches!(
+        original.command.intent(),
+        NativeCloseIntent::ExplicitRetry { .. }
+    ) {
+        let context = runtime
+            .block_on(original.db.read_native_close_retry_execution_context(
+                &original.command,
+                &original.receipt.admitted,
+            ))
+            .map_err(|error| error.to_string())?;
+        if original.snapshot != context.snapshot {
+            return Err("native retry physical inspection snapshot changed; target preserved".into());
+        }
+        let mut scopes = context
+            .scopes
+            .iter()
+            .filter(|scope| scope.scope == original.scope);
+        match (scopes.next(), scopes.next()) {
+            (Some(scope), None)
+                if scope.attempt_id == original.receipt.admitted.attempt_id
+                    && matches!(&scope.captured_worktree,
+                        Some(CapturedWorktreeIdentity::Resolved(identity))
+                        if identity == &owner.prepared.identity) => {}
+            _ => return Err("native retry physical inspection lacks one exact captured Worktree binding; target preserved".into()),
+        }
+        let mut resources = context.resources.iter().filter(|expected| {
+            expected.scope == original.scope && expected.resource == original.resource
+        });
+        match (resources.next(), resources.next()) {
+            (Some(expected), None)
+                if expected.attempt_id == original.receipt.admitted.attempt_id
+                    && expected.snapshot == context.snapshot => {}
+            _ => return Err("native retry physical inspection lacks one exact resource binding; target preserved".into()),
+        }
+        let selected = |effect: &&phoenix_db::CloseSafeRetryEffect| {
+            effect.scope == original.scope && effect.resource == original.resource
+        };
+        if context.effects.iter().filter(selected).count() != 1
+            || context.progress.pending.iter().filter(selected).count() != 1
+            || context.progress.successful.iter().any(|effect| {
+                effect.scope == original.scope && effect.resource == original.resource
+            })
+        {
+            return Err("native retry physical inspection requires its exact pending Worktree effect; target preserved".into());
+        }
+        let mut snapshots = context
+            .worktree_snapshots
+            .iter()
+            .filter(|(target, _)| target.scope == original.scope);
+        let confirmed = match (snapshots.next(), snapshots.next()) {
+            (Some((_, snapshot)), None) => snapshot.clone(),
+            _ => return Err("native retry physical inspection requires one exact Worktree snapshot; target preserved".into()),
+        };
+        super::check_deadline(original.deadline())?;
+        return Ok(confirmed);
     }
     let snapshot = runtime.block_on(async {
         let attempt = original.receipt.admitted.attempt_id.as_str();
@@ -969,6 +1033,7 @@ mod tests {
                 }))),
                 custody: Mutex::new(None),
                 ready: ready_tx,
+                retry_hooks: None,
             }),
             ready,
             _worker: None,

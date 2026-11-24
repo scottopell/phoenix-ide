@@ -1565,7 +1565,7 @@ function ProductConversationPageInner({ productId, globalShell, journey: inherit
         <section className="product-conversation-page__close-status" role="alert" aria-label="Close status">
           <strong>{closeIncomplete
             ? ordinarySnapshot.close.failure?.stop_certainty.kind === 'conversation_and_processes_stopped'
-              ? 'Close incomplete — disk retained'
+              ? 'Close incomplete — cleanup not confirmed'
               : 'Close incomplete — shutdown could not be confirmed'
             : 'Closed — cleanup needs attention'}</strong>
           <div>Run {ordinarySnapshot.close.run_ordinal} · {ordinarySnapshot.close.run_status}. No automatic retry.</div>

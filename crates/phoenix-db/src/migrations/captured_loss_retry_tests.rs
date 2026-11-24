@@ -25,7 +25,7 @@ async fn predecessor() -> Database {
             .unwrap(),
         183
     );
-    Database { pool }
+    Database::from_pool_for_tests(pool, String::new())
 }
 
 async fn trigger(db: &Database, name: &str) -> String {

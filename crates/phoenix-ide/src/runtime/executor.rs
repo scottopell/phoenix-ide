@@ -64,7 +64,7 @@ mod native_close;
 pub(crate) use native_close::source_entry::SourceEntryController;
 pub(crate) use native_close::source_entry::{SourceEntryWorker, WorkerEntryResult};
 mod native_close_observe;
-mod native_close_retry;
+pub(crate) mod native_close_retry;
 mod native_task_approval;
 mod self_goal;
 #[cfg(test)]
@@ -2701,6 +2701,13 @@ where
     async fn revoke_native_close_source_entry(&mut self) {
         if let Some(controller) = &mut self.native_close_source_entry {
             while controller.revoke() == native_close::source_entry::ActorEntryResult::Busy {
+                // Stop waits for entered callbacks, but fatal unknown custody may
+                // intentionally never unlock. The fatal fence forbids publication;
+                // return to fatal cleanup without releasing that retained custody.
+                if self.fatal_local_authority_fence.fatal_authority_loss_is_latched() {
+                    controller.close_admission_for_fatal_exit();
+                    return;
+                }
                 tokio::task::yield_now().await;
             }
         }
@@ -3279,19 +3286,31 @@ where
         let mut pending_native_close_retry: Option<
             native_close_retry::NativeCloseRetryContinuation,
         > = None;
+        let mut admitted_native_close_retry: Option<native_close_retry::AdmittedRetryCursor> = None;
         // Fatal authority exits must not release a continuation's source authority
         // or target gate while its owned preparation worker is still running.
         macro_rules! join_pending_native_close_before_fatal {
             () => {
-                self.revoke_native_close_source_entry().await;
+                // Do not wait on the source mutex: unknown release deliberately
+                // retains it. Join workers, then let process-wide fatal handling
+                // fail-stop without unlocking or publishing a new source state.
+                if let Some(controller) = self.native_close_source_entry.as_mut() {
+                    controller.close_admission_for_fatal_exit();
+                }
                 if let Some(continuation) = pending_native_close_retry.take() {
                     continuation.join_before_exit().await;
+                }
+                if let Some(cursor) = admitted_native_close_retry.take() {
+                    cursor.join_before_exit().await;
                 }
                 if let Some(mut continuation) = pending_native_close_initial.take() {
                     continuation.abort_and_join_inventory_preparation().await;
                 }
             };
         }
+        let mut queued_acknowledged_request: Option<AcknowledgedRuntimeRequest> = None;
+        let mut queued_event: Option<Event> = None;
+        let mut prefer_queued_event = false;
         let mut native_close_step_ready = false;
         // Retain one absolute deadline across select iterations. Recreating a
         // relative sleep lets ordinary request traffic postpone Close forever.
@@ -3303,6 +3322,11 @@ where
                 self.revoke_native_close_source_entry().await;
                 if let Some(continuation) = pending_native_close_retry.take() {
                     continuation.join_before_exit().await;
+                }
+                if admitted_native_close_retry.is_some() {
+                    self.abort_external_effects().await;
+                    deferred_native_close_exit = Some($disposition);
+                    continue;
                 }
                 if let Some(continuation) = pending_native_close_initial.as_mut() {
                     continuation.begin_exit_interruption();
@@ -3327,7 +3351,7 @@ where
             && matches!(self.state, ConvState::ContextExhausted { .. }))
         .then(|| tokio::time::Instant::now() + Duration::from_secs(30));
         loop {
-            if deferred_native_close_exit.is_some() && pending_native_close_initial.is_none() {
+            if deferred_native_close_exit.is_some() && pending_native_close_initial.is_none() && admitted_native_close_retry.is_none() {
                 return deferred_native_close_exit
                     .take()
                     .expect("checked deferred exit");
@@ -3358,6 +3382,10 @@ where
                     if let Some(continuation) = pending_native_close_retry.take() {
                         continuation.join_before_exit().await;
                     }
+                    if admitted_native_close_retry.is_some() {
+                        deferred_native_close_exit = Some(disposition);
+                        continue;
+                    }
                     if let Some(continuation) = pending_native_close_initial.as_mut() {
                         continuation.begin_exit_interruption();
                         deferred_native_close_exit = Some(disposition);
@@ -3370,6 +3398,28 @@ where
                 join_pending_native_close_before_fatal!();
                 return self.fatal_local_authority_exit();
             }
+            // Sample one FIFO head from each existing source-control queue before
+            // due service. Retain non-control heads, without reordering or dropping
+            // their acknowledgements; a head Stop always wins over Close progress.
+            let close_active = pending_native_close_initial.is_some() || pending_native_close_retry.is_some() || admitted_native_close_retry.is_some();
+            if close_active {
+                tokio::task::yield_now().await;
+            }
+            if queued_acknowledged_request.is_none() {
+                queued_acknowledged_request = self.acknowledged_event_rx.try_recv().ok();
+            }
+            if deferred_native_close_exit.is_none() && queued_event.is_none() {
+                queued_event = self.event_rx.try_recv().ok();
+            }
+            let acknowledged_control_ready = queued_acknowledged_request.as_ref().is_some_and(|request| {
+                matches!(request, AcknowledgedRuntimeRequest::Event(request)
+                    if matches!(&request.event, Event::UserCancel { .. } | Event::Shutdown))
+            });
+            let event_control_ready = deferred_native_close_exit.is_none() && queued_event.as_ref().is_some_and(|event| matches!(event, Event::UserCancel { .. } | Event::Shutdown));
+            let source_control_ready = deferred_native_close_exit.is_none() && (acknowledged_control_ready || event_control_ready);
+            // While Close is active, alternate retained non-control heads too:
+            // traffic on one queue cannot hide a Stop behind the other's FIFO head.
+            let serve_queued_event = close_active && deferred_native_close_exit.is_none() && prefer_queued_event && queued_event.is_some() && !acknowledged_control_ready;
             let terminal_retry_at = self
                 .terminal_transition_retry
                 .as_ref()
@@ -3377,6 +3427,9 @@ where
             // Copy deadline before select to avoid borrow conflict
             let deadline = self.deadline;
             let awaiting_recovery = matches!(self.state, ConvState::AwaitingRecovery { .. });
+            let next_native_retry_service_at = admitted_native_close_retry.as_ref()
+                .map(native_close_retry::AdmittedRetryCursor::next_service_at)
+                .unwrap_or_else(tokio::time::Instant::now);
 
             tokio::select! {
                 biased;
@@ -3389,18 +3442,6 @@ where
                     tracing::error!(?boundary, "fatal local SQLite authority loss; aborting external runtime effects");
                     join_pending_native_close_before_fatal!();
                     return self.fatal_local_authority_exit();
-                }
-                assessment = async {
-                    match pending_native_close_retry.as_mut() {
-                        Some(continuation) => continuation.ready().await,
-                        None => std::future::pending().await,
-                    }
-                }, if pending_native_close_retry.is_some() => {
-                    let continuation = pending_native_close_retry.take().expect("guarded retry continuation");
-                    if self.finish_native_close_retry(continuation, assessment).await {
-                        join_pending_native_close_before_fatal!();
-                        return self.fatal_local_authority_exit();
-                    }
                 }
                 // Process shutdown closes admission without publishing fatal authority
                 // loss. Wake dormant Close phases once; a cancelled token must not
@@ -3419,7 +3460,7 @@ where
                 // priority over traffic, then schedules its next deadline after
                 // the awaited work so overdue ticks cannot starve Stop requests.
                 () = tokio::time::sleep_until(next_native_close_service_at),
-                    if pending_native_close_initial.as_ref().is_some_and(|continuation| continuation.needs_service(native_close_step_ready)) => {
+                    if !source_control_ready && pending_native_close_initial.as_ref().is_some_and(|continuation| continuation.needs_service(native_close_step_ready)) => {
                     let mut continuation = pending_native_close_initial.take().expect("guarded continuation");
                     if continuation.observe_terminal_if_required().await {
                         self.revoke_native_close_source_entry().await;
@@ -3499,7 +3540,9 @@ where
                             pending_native_close_initial = Some(continuation);
                         }
                         Err(super::native_close_application::NativeCloseApplicationError::FatalAuthority) => {
-                            self.revoke_native_close_source_entry().await;
+                            if let Some(controller) = self.native_close_source_entry.as_mut() {
+                                controller.close_admission_for_fatal_exit();
+                            }
                             continuation.abort_and_join_inventory_preparation().await;
                             drop(continuation);
                             join_pending_native_close_before_fatal!();
@@ -3519,12 +3562,40 @@ where
                 }, if deferred_native_close_exit.is_none() && matches!(self.state, ConvState::ContextExhausted { .. }) => {
                     defer_exit_until_native_close_observed!(RuntimeExitDisposition::CoordinatedShutdown);
                 }
+                assessment = async {
+                    match pending_native_close_retry.as_mut() {
+                        Some(continuation) => continuation.ready().await,
+                        None => std::future::pending().await,
+                    }
+                }, if !source_control_ready && pending_native_close_retry.is_some() => {
+                    let continuation = pending_native_close_retry.take().expect("guarded retry continuation");
+                    let (fatal, cursor) = self.finish_native_close_retry(continuation, assessment).await;
+                    admitted_native_close_retry = cursor;
+                    if fatal {
+                        join_pending_native_close_before_fatal!();
+                        return self.fatal_local_authority_exit();
+                    }
+                }
+                () = tokio::time::sleep_until(next_native_retry_service_at), if !source_control_ready && admitted_native_close_retry.is_some() => {
+                    let mut cursor = admitted_native_close_retry.take().expect("guarded admitted retry");
+                    match cursor.step(&self.state, &mut self.native_close_source_entry).await {
+                        Ok(true) => { self.revoke_native_close_source_entry().await; }
+                        Ok(false) => {
+                            admitted_native_close_retry = Some(cursor);
+                        }
+                        Err(_) => {
+                            admitted_native_close_retry = Some(cursor);
+                            join_pending_native_close_before_fatal!();
+                            return self.fatal_local_authority_exit();
+                        }
+                    }
+                }
                 Some(review) = async {
                     match self.handoff_review_rx.as_mut() {
                         Some(receiver) => receiver.recv().await,
                         None => std::future::pending().await,
                     }
-                } => {
+                }, if !source_control_ready && !(close_active && (queued_acknowledged_request.is_some() || queued_event.is_some())) => {
                     if deferred_native_close_exit.is_some() {
                         let _ = review.response.send(Err("runtime is exiting".into()));
                         continue;
@@ -3535,7 +3606,13 @@ where
                         defer_exit_until_native_close_observed!(RuntimeExitDisposition::CoordinatedShutdown);
                     }
                 }
-                Some(request) = self.acknowledged_event_rx.recv() => {
+                Some(request) = async {
+                    match queued_acknowledged_request.take() {
+                        Some(request) => Some(request),
+                        None => self.acknowledged_event_rx.recv().await,
+                    }
+                }, if (!event_control_ready || acknowledged_control_ready) && !serve_queued_event => {
+                    prefer_queued_event = true;
                     if deferred_native_close_exit.is_some() {
                         native_close::refuse_during_exit(request);
                         continue;
@@ -3549,7 +3626,7 @@ where
                             // Admission runs under the actual source actor. A newly
                             // admitted receipt transfers both guards into the actor's
                             // bounded continuation; replay/error paths complete here.
-                            if pending_native_close_initial.is_some() || pending_native_close_retry.is_some() {
+                            if pending_native_close_initial.is_some() || pending_native_close_retry.is_some() || admitted_native_close_retry.is_some() {
                                 drop(admitted);
                                 drop(target_gate);
                                 let _ = response.send(Err(super::native_close_application::NativeCloseApplicationError::SourceRefused));
@@ -3586,7 +3663,7 @@ where
                             continue;
                         }
                         AcknowledgedRuntimeRequest::ExecuteNativeCloseRetry(request) => {
-                            if pending_native_close_initial.is_some() || pending_native_close_retry.is_some() {
+                            if pending_native_close_initial.is_some() || pending_native_close_retry.is_some() || admitted_native_close_retry.is_some() {
                                 let _ = request.response.send(Err(super::native_close_application::NativeCloseApplicationError::SourceRefused));
                                 continue;
                             }
@@ -3639,7 +3716,13 @@ where
                         defer_exit_until_native_close_observed!(RuntimeExitDisposition::Terminal);
                     }
                 }
-                Some(event) = self.event_rx.recv(), if deferred_native_close_exit.is_none() => {
+                Some(event) = async {
+                    match queued_event.take() {
+                        Some(event) => Some(event),
+                        None => self.event_rx.recv().await,
+                    }
+                }, if deferred_native_close_exit.is_none() => {
+                    prefer_queued_event = false;
                     // Eviction shutdown signal — exit cleanly so the broadcaster
                     // is dropped and connected SSE clients detect the closed
                     // stream and trigger a reconnect to the new runtime.

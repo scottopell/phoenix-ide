@@ -57,7 +57,7 @@ function CloseStatusPanel({
       <section className="work-actions-close-status" aria-label={close.phase === 'needs_repair' ? 'Close repair required' : 'Close incomplete'}>
         <strong>{stopped
           ? close.failure?.stop_certainty.kind === 'conversation_and_processes_stopped'
-            ? '⚠ Close incomplete — disk retained'
+            ? '⚠ Close incomplete — cleanup not confirmed'
             : '⚠ Close incomplete — shutdown could not be confirmed'
           : close.phase === 'needs_repair' ? '⚠ Close needs repair' : '⚠ Close blocked — content retained'}</strong>
         {close.phase === 'awaiting_loss_confirmation' && (

@@ -32,7 +32,7 @@ enum NativeScopeRuntimeDrain {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-enum NativeRetryNoLiveResourcesError {
+pub(crate) enum NativeRetryNoLiveResourcesError {
     Blocked,
     Unclassified,
 }
@@ -61,11 +61,7 @@ fn classify_native_scope_runtime_drain(
     }
 }
 
-#[derive(Debug)]
-pub(super) enum NativeRetryExecutionError {
-    TerminalizedFailure(String),
-    Unclassified,
-}
+use crate::runtime::executor::native_close_retry::NativeRetryExecutionError;
 
 impl From<String> for NativeRetryExecutionError {
     fn from(detail: String) -> Self {
@@ -91,7 +87,7 @@ fn classify_native_retry_execution(
         Err(NativeRetryExecutionError::TerminalizedFailure(detail)) => {
             LocalAuthorityResult::DurableFactEstablished(Err(detail))
         }
-        Err(NativeRetryExecutionError::Unclassified) => {
+        Err(NativeRetryExecutionError::Unclassified | NativeRetryExecutionError::ResourceFailure(_)) => {
             LocalAuthorityResult::DurableFactUnclassified
         }
     }
@@ -222,7 +218,7 @@ impl super::RuntimeManager {
     }
 
     #[allow(clippy::too_many_lines)]
-    async fn native_retry_tmux(
+    pub(crate) async fn native_retry_tmux(
         &self,
         command: &NativeCloseCommand,
         admitted: &NativeCloseRunRef,
@@ -333,6 +329,77 @@ impl super::RuntimeManager {
             "exact native retry tmux retirement",
         )
         .await
+    }
+
+    pub(crate) fn spawn_native_retry_scope_with_source_entry(
+        self: &Arc<Self>,
+        command: NativeCloseCommand,
+        admitted: NativeCloseRunRef,
+        effect: CloseSafeRetryEffect,
+        source_entry: crate::runtime::executor::SourceEntryWorker,
+        deadline: std::time::Instant,
+    ) -> tokio::task::JoinHandle<Result<(), NativeRetryExecutionError>> {
+        let backend = Arc::clone(self);
+        let runtime = Handle::current();
+        task::spawn_blocking(move || runtime.block_on(async {
+            // Only read-only pre-entry work is cancellable at the original deadline.
+            // The mutation below is outside this timeout and retains its source lease
+            // through confirmed release (including deliberately retained unknown custody).
+            tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), async {
+                if backend.db().work_scope_has_unresolved_product_ownership(&effect.scope).await
+                    .map_err(|_| NativeRetryExecutionError::Unclassified)? {
+                    return Err(NativeRetryExecutionError::ResourceFailure("work scope has unresolved ProductConversation ownership".into()));
+                }
+                match backend.native_retry_no_live_resources(&effect.scope).await {
+                    Ok(()) => Ok(()),
+                    Err(NativeRetryNoLiveResourcesError::Blocked) => Err(NativeRetryExecutionError::ResourceFailure("native retry scope still has a live runtime resource; target preserved".into())),
+                    Err(NativeRetryNoLiveResourcesError::Unclassified) => Err(NativeRetryExecutionError::Unclassified),
+                }
+            }).await.map_err(|_| NativeRetryExecutionError::Unclassified)??;
+            let precondition = WorkScopeRetirementPrecondition::after_runtime_inventory_found_no_live_resource(effect.scope.clone());
+            let (result, lease) = backend.db().retire_work_scope_for_native_close_retry_with_entry(
+                &command, &admitted, &effect, precondition, "native explicit Close retry",
+                || {
+                    use crate::runtime::executor::WorkerEntryResult;
+                    match source_entry.try_acquire_first_effect(&command) {
+                        WorkerEntryResult::Ran(lease) if std::time::Instant::now() < deadline => Ok(lease),
+                        _ => Err(crate::db::DbError::CloseFoundationPrecondition("original native retry source unavailable at WorkScope mutation".into())),
+                    }
+                },
+            ).await;
+            if matches!(result, LocalAuthorityResult::DurableFactUnclassified) {
+                backend.fatal_local_authority_fence.close("native_retry_scope_release_unclassified");
+                // The transaction could still own its writer; keep source custody fenced.
+                std::mem::forget(lease);
+                std::mem::forget(source_entry);
+                return Err(NativeRetryExecutionError::Unclassified);
+            }
+            drop(lease);
+            match result {
+                LocalAuthorityResult::DurableFactEstablished(Ok(phoenix_core::work_scope::WorkScopeRetirementOutcome::Retired)) => {},
+                LocalAuthorityResult::DurableFactEstablished(Ok(_)) => return Err(NativeRetryExecutionError::ResourceFailure("work scope retirement precondition was blocked".into())),
+                LocalAuthorityResult::DurableFactEstablished(Err(error)) => return Err(NativeRetryExecutionError::ResourceFailure(error.to_string())),
+                LocalAuthorityResult::DurableFactUnclassified => unreachable!(),
+            }
+            Ok(())
+        }))
+    }
+
+    pub(crate) fn native_retry_close_writer_probe(
+        &self,
+        receipt: &phoenix_db::native_close::NativeCloseReceipt,
+        effect: &CloseSafeRetryEffect,
+        snapshot: &phoenix_core::domain::close::CloseRetirementSnapshot,
+    ) -> super::CloseWriterProbe {
+        super::CloseWriterProbe {
+            persistence_uncertain: Some(Arc::new(AtomicBool::new(false))),
+            #[cfg(test)]
+            clean_writer_fixture: self.clean_close_writer_fixture,
+            db: self.db().clone(),
+            runtime: Handle::current(),
+            run: CloseRunRef { attempt_id: receipt.admitted.attempt_id.clone(), ordinal: receipt.admitted.run_ordinal },
+            scope: effect.scope.clone(), snapshot: snapshot.clone(), resource: effect.resource.clone(),
+        }
     }
 
     async fn native_retry_scope(
@@ -706,7 +773,7 @@ impl super::RuntimeManager {
         }
     }
 
-    async fn native_retry_no_live_resources(
+    pub(crate) async fn native_retry_no_live_resources(
         &self,
         scope: &phoenix_core::work_scope::WorkScopeId,
     ) -> Result<(), NativeRetryNoLiveResourcesError> {
@@ -736,7 +803,7 @@ impl super::RuntimeManager {
         classify_native_scope_runtime_drain(has_live_other, inventory.tmux.map(|tmux| tmux.status))
     }
 
-    async fn native_retry_record_success(
+    pub(crate) async fn native_retry_record_success(
         &self,
         command: &NativeCloseCommand,
         admitted: &NativeCloseRunRef,
@@ -756,7 +823,7 @@ impl super::RuntimeManager {
         }
     }
 
-    async fn native_retry_failure<T>(
+    pub(crate) async fn native_retry_failure<T>(
         &self,
         command: &NativeCloseCommand,
         admitted: &NativeCloseRunRef,
