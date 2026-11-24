@@ -94,6 +94,16 @@ class CheckPlanTests(unittest.TestCase):
         )
         self.assertEqual("0", env["GIT_CONFIG_COUNT"])
 
+    def test_git_config_override_appends_hookspath_without_duplicating_gpgsign(self):
+        env = {}
+        self.dev._append_git_config_override("commit.gpgsign", "false", env)
+        self.dev._append_git_config_override("core.hooksPath", os.devnull, env)
+
+        self.assertEqual("'commit.gpgsign=false'", env["GIT_CONFIG_PARAMETERS"])
+        self.assertEqual("1", env["GIT_CONFIG_COUNT"])
+        self.assertEqual("core.hooksPath", env["GIT_CONFIG_KEY_0"])
+        self.assertEqual(os.devnull, env["GIT_CONFIG_VALUE_0"])
+
     def test_git_config_override_resets_malformed_inherited_entries(self):
         for malformed in (
             {"GIT_CONFIG_COUNT": "wat", "GIT_CONFIG_KEY_9": "stale"},

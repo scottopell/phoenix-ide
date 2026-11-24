@@ -5023,8 +5023,9 @@ def _is_valid_git_config_key(key):
 def _append_git_config_override(key, value, environ=None):
     """Append a complete process-level Git config entry, resetting malformed input."""
     env = os.environ if environ is None else environ
-    parameters = env.get("GIT_CONFIG_PARAMETERS", "").strip()
-    env["GIT_CONFIG_PARAMETERS"] = f"{parameters} 'commit.gpgsign=false'".strip()
+    if key == "commit.gpgsign" and value == "false":
+        parameters = env.get("GIT_CONFIG_PARAMETERS", "").strip()
+        env["GIT_CONFIG_PARAMETERS"] = f"{parameters} 'commit.gpgsign=false'".strip()
     try:
         count = int(env.get("GIT_CONFIG_COUNT", "0"))
         if count < 0:
@@ -7644,11 +7645,13 @@ def cmd_check(
     if cargo_active:
         _classify_browser_env()
 
-        # Tests create temporary commits and must never consult an interactive
-        # signing agent. Add a process-only override without probing the signer
-        # or modifying any Git config file. Append so caller-provided config
-        # entries remain intact while this final entry takes precedence.
+        # Tests create temporary commits and checkouts and must never consult
+        # an interactive signing agent or host-global git hooks. Add
+        # process-only overrides without modifying any Git config file. Append
+        # so caller-provided config entries remain intact while these final
+        # entries take precedence.
         _append_git_config_override("commit.gpgsign", "false")
+        _append_git_config_override("core.hooksPath", os.devnull)
 
     # nextest probe, thread sizing, and codegen command shapes are rust-only.
     if "rust" in active:
