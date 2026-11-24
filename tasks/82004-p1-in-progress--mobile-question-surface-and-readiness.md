@@ -1,3 +1,28 @@
+## Postmerge qualification and isolated causal experiment
+
+PR #1151 was squash merged as `0f6e3627a24777364406c3f3718efe2431ccf16d`; parent `7dc7372a5231d34a6f1e7f846e03db88744b9e77`, tree `e3bd8d5c82ced901207f895bc5da732791f66754`. Exact-source rendered QA [45311375874](https://github.com/scottopell/phoenix-ide/actions/runs/45311375874) passed: 124 aggregate/96 measured, eight per cell, four pending-history controls, eight preinteraction readiness probes, desktop shortcut receipt and mobile journeys. All records passed; no unknown routes/page exceptions. Full postmerge CI [45310777440](https://github.com/scottopell/phoenix-ide/actions/runs/45310777440) was still running when this diagnostic record was written; final status belongs in the PR evidence comment.
+
+Diagnostic branch `diagnostic/question-module-acquisition`, harness commit `68b347e1479b00254e2d0405cf4a3de971f737e8`, is **not a production optimization or merge candidate**. Its manual-only workflow replaces automatic question QA only on this disposable branch. Both production bundles use the exact merged source above; only the early copy gets an asserted, artifact-retained mount-effect import of the existing ProductConversationPage graph. No app-source change is committed. Hosted run [45311433061](https://github.com/scottopell/phoenix-ide/actions/runs/45311433061) passed, artifact `question-module-diagnostic-45311433061`.
+
+Independent source and artifact audits verified 88 unique/matching aggregate and standalone trials: 64 measured (8 pairs per viewport/mode), 8 warmups, 16 held-history controls. All were successful with no unknown routes or diagnostics. Every measured trial observed question and transcript layout independently before any scripted interaction; held controls observed question layout and accepted input while history remained in flight/unreplied. Control/early order alternated and reversed on odd runs. Conditions were hosted Chromium, 4x CPU, 400ms modeled latency, 1MiB/s, synthetic intercepted HTTP/fake SSE; fresh context per trial, shell/feed setup for warm navigation.
+
+Median **paired early minus control** differences, milliseconds:
+
+| Viewport / route | Question layout | Transcript-tail layout |
+|---|---:|---:|
+| 393 cold-global | +22.4 | -479.0 |
+| 393 warm-notification | +3.5 | -662.8 |
+| 1440 cold-global | +7.1 | -466.9 |
+| 1440 warm-notification | +3.3 | -193.5 |
+
+All eight transcript pairs were earlier in each cell (nominal two-sided exact sign/sign-flip p=0.0078125 per cell; small n, unadjusted, same-host paired trials, not independent machines). Question layout did not demonstrate improvement; lack of significance is not equivalence or proof of no regression. `question_usable_ms` is **not** a causal endpoint here: the scripted interaction deliberately waits for transcript layout. Use only independent navigation-relative rAF layout markers, not postinteraction transcript timers or variable-window CPU metrics. Layout is not paint, unobscured visibility through the mobile modal, or physical input responsiveness.
+
+Manipulation check: ProductConversationPage acquisition started before the navigation-phase Coordinator response in all early measured trials (~407–425ms before), versus after it in every control (~12–130ms after), using the same document clock. History request initiation moved earlier too (median paired changes ~-507/-645/-462/-192ms respectively on its own request clock). Module completion was not necessarily before the Coordinator response. Full resource audit, not the incomplete filename regex, found downstream JS/CSS/font overlap and viewport-specific ordering. Thus this supports the **total early-import intervention effect on synthetic transcript layout**, not a download-only mechanism, question-speed improvement, or production effect size. Import also moves evaluation, CSS and scheduling.
+
+Concrete remaining dependency: history fetch is owned by an effect in the large lazy ProductConversationPage renderer graph; it waits for acquisition/evaluation/mount after identity resolution. A next bounded diagnostic could isolate typed history acquisition in a lightweight resolved-coordinator owner, retaining selection, deduplication, cancellation/freshness and telemetry semantics. That experiment/design has **not** been implemented or approved for shipping here. Question layout instead needs separate upstream shell/QuestionPanel attribution. Production cause remains unresolved; no production snapshots, live questions, local native builds, deployment/restart, or broad performance takeover occurred.
+
+---
+
 # Focus mobile Ember questions and qualify question readiness
 
 Commissioned by Coordinator: long questions at 393x852 share viewport with live transcript chrome and nested scrolling. Provide focused mobile answering, one content scroller, reachable actions/custom input with background inert; non-destructive Return preserves answers and conversation/composer state. Preserve all request-bound submit/dismiss and desktop behavior. Measure pinned-base versus candidate cold/deep-link and warm notification opening with synthetic long transcript under identical CPU/network conditions; separate question usability from history readiness. Existing question feed is independent of transcript: dominant loading cost remains unmeasured. Hosted-only validation, no production snapshots/native builds/deploy; RC11 and broad performance work separately owned.
