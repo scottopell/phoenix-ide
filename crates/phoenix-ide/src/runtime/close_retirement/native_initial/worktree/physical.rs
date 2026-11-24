@@ -378,7 +378,9 @@ fn read_confirmed_worktree_snapshot(
             ))
             .map_err(|error| error.to_string())?;
         if original.snapshot != context.snapshot {
-            return Err("native retry physical inspection snapshot changed; target preserved".into());
+            return Err(
+                "native retry physical inspection snapshot changed; target preserved".into(),
+            );
         }
         let mut scopes = context
             .scopes

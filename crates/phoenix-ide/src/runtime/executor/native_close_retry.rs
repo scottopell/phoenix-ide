@@ -160,7 +160,10 @@ where
             runtime.block_on(async {
                 let assessment = assess_retry_origin(&backend, &exact_command).await;
                 #[cfg(test)]
-                if matches!(&assessment, Ok(NativeCloseRetryOriginAssessment::CapturedLoss(_))) {
+                if matches!(
+                    &assessment,
+                    Ok(NativeCloseRetryOriginAssessment::CapturedLoss(_))
+                ) {
                     test_hooks::checkpoint(
                         hooks.as_ref(),
                         test_hooks::Point::CapturedLossAssessmentReady,
@@ -196,9 +199,16 @@ where
                 return (false, None);
             }
         };
-        let NativeCloseRetryContinuation { command, request, .. } = continuation;
+        let NativeCloseRetryContinuation {
+            command, request, ..
+        } = continuation;
         let crate::runtime::native_close_application::NativeCloseRetryRequest {
-            backend, admitted, target_gate, attempt_gate, response, ..
+            backend,
+            admitted,
+            target_gate,
+            attempt_gate,
+            response,
+            ..
         } = request;
         // Admission is still source-actor owned and follows queued Stop events.
         let mut authority = RuntimeSettlementAuthority {
@@ -206,8 +216,18 @@ where
             abandoned_reason: "native retry admission lost settlement authority",
         };
         let admission = match &assessment {
-            NativeCloseRetryOriginAssessment::Anchored(assessment) => backend.db().apply_native_close_explicit_retry(assessment).await,
-            NativeCloseRetryOriginAssessment::CapturedLoss(assessment) => backend.db().apply_native_close_captured_loss_retry(assessment).await,
+            NativeCloseRetryOriginAssessment::Anchored(assessment) => {
+                backend
+                    .db()
+                    .apply_native_close_explicit_retry(assessment)
+                    .await
+            }
+            NativeCloseRetryOriginAssessment::CapturedLoss(assessment) => {
+                backend
+                    .db()
+                    .apply_native_close_captured_loss_retry(assessment)
+                    .await
+            }
         };
         match admission {
             LocalAuthorityResult::DurableFactUnclassified => {
@@ -220,19 +240,42 @@ where
                 let _ = response.send(Err(NativeCloseApplicationError::Storage));
                 (false, None)
             }
-            LocalAuthorityResult::DurableFactEstablished(Ok(NativeCloseRetryResult::Replay(receipt))) => {
+            LocalAuthorityResult::DurableFactEstablished(Ok(NativeCloseRetryResult::Replay(
+                receipt,
+            ))) => {
                 authority.owner = None;
                 let _ = response.send(Ok(NativeCloseRetryResult::Replay(receipt)));
                 (false, None)
             }
-            LocalAuthorityResult::DurableFactEstablished(Ok(NativeCloseRetryResult::NewlyAdmitted(receipt))) => {
+            LocalAuthorityResult::DurableFactEstablished(Ok(
+                NativeCloseRetryResult::NewlyAdmitted(receipt),
+            )) => {
                 let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
-                let mut controller = super::native_close::source_entry::SourceEntryController::new(command.clone(), deadline);
+                let mut controller = super::native_close::source_entry::SourceEntryController::new(
+                    command.clone(),
+                    deadline,
+                );
                 let _ = controller.revalidate(&self.state, &command);
                 let worker = controller.worker();
                 self.native_close_source_entry = Some(controller);
-                let owner = authority.owner.take().expect("admission retained authority");
-                (false, Some(AdmittedRetryCursor::new(command, receipt, backend, owner, target_gate, attempt_gate, response, worker, deadline.into_std())))
+                let owner = authority
+                    .owner
+                    .take()
+                    .expect("admission retained authority");
+                (
+                    false,
+                    Some(AdmittedRetryCursor::new(
+                        command,
+                        receipt,
+                        backend,
+                        owner,
+                        target_gate,
+                        attempt_gate,
+                        response,
+                        worker,
+                        deadline.into_std(),
+                    )),
+                )
             }
         }
     }

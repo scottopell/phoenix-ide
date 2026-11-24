@@ -4,8 +4,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use phoenix_core::domain::close::{
     CloseAttemptScope, CloseExpectedRetirementResource, CloseObligation, CloseRetirementSnapshot,
-    CloseRetirementTarget, CloseRunRef, CloseStopCertainty, LossItemIdentity, RetiredResourceIdentity,
-    RetiredResourceKind,
+    CloseRetirementTarget, CloseRunRef, CloseStopCertainty, LossItemIdentity,
+    RetiredResourceIdentity, RetiredResourceKind,
 };
 use phoenix_core::work_scope::{
     WorkScopeId, WorkScopeRetirementBlocker, WorkScopeRetirementOutcome,
@@ -406,7 +406,9 @@ impl Database {
                 &mut tx, command, admitted, &effect, kind,
             ).await?;
             if snapshot != original {
-                return Err(refused("native retry entry requires its exact original snapshot"));
+                return Err(refused(
+                    "native retry entry requires its exact original snapshot",
+                ));
             }
             let identity = resource.identity();
             let dispatched: bool = sqlx::query_scalar(
@@ -426,10 +428,13 @@ impl Database {
             .fetch_one(&mut *tx)
             .await?;
             if !dispatched {
-                return Err(refused("native retry entry requires exact persisted dispatch membership"));
+                return Err(refused(
+                    "native retry entry requires exact persisted dispatch membership",
+                ));
             }
             Ok(())
-        }.await;
+        }
+        .await;
         if let Err(error) = validation {
             let release = match tx.rollback().await {
                 Ok(()) => NativeCloseInitialEntryRelease::Confirmed,
@@ -452,7 +457,9 @@ impl Database {
     ) -> DbResult<i64> {
         let plan = Self::require_native_close_retry_plan_identity_tx(tx, command, admitted).await?;
         if !plan.running {
-            return Err(refused("native retry mutation requires its exact latest running plan"));
+            return Err(refused(
+                "native retry mutation requires its exact latest running plan",
+            ));
         }
         Self::require_native_close_retry_members_quiescent_tx(tx, &admitted.attempt_id).await?;
         Ok(plan.effect_count)
@@ -470,7 +477,8 @@ impl Database {
             NativeCloseRetryWorktreeMetadata::Plan(request),
             || Ok(()),
         )
-        .await.0
+        .await
+        .0
     }
 
     pub async fn bind_native_close_retry_worktree_final_tombstone(
@@ -485,7 +493,8 @@ impl Database {
             NativeCloseRetryWorktreeMetadata::Tombstone(request),
             || Ok(()),
         )
-        .await.0
+        .await
+        .0
     }
 
     pub async fn bind_native_close_retry_worktree_final_tombstone_object(
@@ -500,7 +509,8 @@ impl Database {
             NativeCloseRetryWorktreeMetadata::TombstoneObject(request),
             || Ok(()),
         )
-        .await.0
+        .await
+        .0
     }
 
     /// Entry callbacks must be short nonblocking in-memory source gates, with no
@@ -518,8 +528,12 @@ impl Database {
         F: FnOnce() -> DbResult<L>,
     {
         self.write_native_close_retry_worktree_metadata(
-            command, admitted, NativeCloseRetryWorktreeMetadata::Plan(request), entry,
-        ).await
+            command,
+            admitted,
+            NativeCloseRetryWorktreeMetadata::Plan(request),
+            entry,
+        )
+        .await
     }
 
     /// Uses the same custody and supervision contract as the cleanup-plan entry API.
@@ -534,8 +548,12 @@ impl Database {
         F: FnOnce() -> DbResult<L>,
     {
         self.write_native_close_retry_worktree_metadata(
-            command, admitted, NativeCloseRetryWorktreeMetadata::Tombstone(request), entry,
-        ).await
+            command,
+            admitted,
+            NativeCloseRetryWorktreeMetadata::Tombstone(request),
+            entry,
+        )
+        .await
     }
 
     /// Uses the same custody and supervision contract as the cleanup-plan entry API.
@@ -550,8 +568,12 @@ impl Database {
         F: FnOnce() -> DbResult<L>,
     {
         self.write_native_close_retry_worktree_metadata(
-            command, admitted, NativeCloseRetryWorktreeMetadata::TombstoneObject(request), entry,
-        ).await
+            command,
+            admitted,
+            NativeCloseRetryWorktreeMetadata::TombstoneObject(request),
+            entry,
+        )
+        .await
     }
 
     async fn write_native_close_retry_worktree_metadata<F, L>(
@@ -567,7 +589,12 @@ impl Database {
         let (attempt_id, scope, snapshot, resource) = metadata.identity();
         let mut tx = match self.pool.begin_with("BEGIN IMMEDIATE").await {
             Ok(tx) => tx,
-            Err(error) => return (LocalAuthorityResult::DurableFactEstablished(Err(error.into())), None),
+            Err(error) => {
+                return (
+                    LocalAuthorityResult::DurableFactEstablished(Err(error.into())),
+                    None,
+                )
+            }
         };
         let mut lease = None;
         let result = async {
@@ -801,8 +828,15 @@ impl Database {
         reason: &str,
     ) -> LocalAuthorityResult<DbResult<WorkScopeRetirementOutcome>> {
         self.retire_work_scope_for_native_close_retry_with_entry(
-            command, admitted, effect, precondition, reason, || Ok(()),
-        ).await.0
+            command,
+            admitted,
+            effect,
+            precondition,
+            reason,
+            || Ok(()),
+        )
+        .await
+        .0
     }
 
     /// Holds a successful entry lease through commit or rollback and returns it
@@ -816,13 +850,21 @@ impl Database {
         precondition: WorkScopeRetirementPrecondition,
         reason: &str,
         entry: F,
-    ) -> (LocalAuthorityResult<DbResult<WorkScopeRetirementOutcome>>, Option<L>)
+    ) -> (
+        LocalAuthorityResult<DbResult<WorkScopeRetirementOutcome>>,
+        Option<L>,
+    )
     where
         F: FnOnce() -> DbResult<L>,
     {
         let mut tx = match self.pool.begin_with("BEGIN IMMEDIATE").await {
             Ok(tx) => tx,
-            Err(error) => return (LocalAuthorityResult::DurableFactEstablished(Err(error.into())), None),
+            Err(error) => {
+                return (
+                    LocalAuthorityResult::DurableFactEstablished(Err(error.into())),
+                    None,
+                )
+            }
         };
         let mut lease = None;
         let result = Self::retire_work_scope_for_native_close_retry_tx(

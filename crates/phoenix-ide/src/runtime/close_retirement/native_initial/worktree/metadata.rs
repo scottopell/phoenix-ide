@@ -38,21 +38,23 @@ impl OriginalWorktreeEffectContext {
         let entry = || metadata_entry(&source_entry, &self.command, self.deadline);
         let result = match self.command.intent() {
             NativeCloseIntent::Initial { .. } => runtime.block_on(
-                self.db.record_native_close_initial_worktree_cleanup_plan_with_entry(
-                    &self.command,
-                    &self.receipt,
-                    &self.live_source,
-                    request,
-                    entry,
-                ),
+                self.db
+                    .record_native_close_initial_worktree_cleanup_plan_with_entry(
+                        &self.command,
+                        &self.receipt,
+                        &self.live_source,
+                        request,
+                        entry,
+                    ),
             ),
             NativeCloseIntent::ExplicitRetry { .. } => runtime.block_on(
-                self.db.record_native_close_retry_worktree_cleanup_plan_with_entry(
-                    &self.command,
-                    &self.receipt.admitted,
-                    request,
-                    entry,
-                ),
+                self.db
+                    .record_native_close_retry_worktree_cleanup_plan_with_entry(
+                        &self.command,
+                        &self.receipt.admitted,
+                        request,
+                        entry,
+                    ),
             ),
             NativeCloseIntent::Observe { .. } => refused_observation(),
         };
@@ -86,21 +88,23 @@ impl OriginalWorktreeEffectContext {
         let entry = || metadata_entry(&source_entry, &self.command, self.deadline);
         let result = match self.command.intent() {
             NativeCloseIntent::Initial { .. } => runtime.block_on(
-                self.db.bind_native_close_initial_worktree_final_tombstone_with_entry(
-                    &self.command,
-                    &self.receipt,
-                    &self.live_source,
-                    request,
-                    entry,
-                ),
+                self.db
+                    .bind_native_close_initial_worktree_final_tombstone_with_entry(
+                        &self.command,
+                        &self.receipt,
+                        &self.live_source,
+                        request,
+                        entry,
+                    ),
             ),
             NativeCloseIntent::ExplicitRetry { .. } => runtime.block_on(
-                self.db.bind_native_close_retry_worktree_final_tombstone_with_entry(
-                    &self.command,
-                    &self.receipt.admitted,
-                    request,
-                    entry,
-                ),
+                self.db
+                    .bind_native_close_retry_worktree_final_tombstone_with_entry(
+                        &self.command,
+                        &self.receipt.admitted,
+                        request,
+                        entry,
+                    ),
             ),
             NativeCloseIntent::Observe { .. } => refused_observation(),
         };
@@ -128,21 +132,23 @@ impl OriginalWorktreeEffectContext {
         let entry = || metadata_entry(&source_entry, &self.command, self.deadline);
         let result = match self.command.intent() {
             NativeCloseIntent::Initial { .. } => runtime.block_on(
-                self.db.bind_native_close_initial_worktree_final_tombstone_object_with_entry(
-                    &self.command,
-                    &self.receipt,
-                    &self.live_source,
-                    request,
-                    entry,
-                ),
+                self.db
+                    .bind_native_close_initial_worktree_final_tombstone_object_with_entry(
+                        &self.command,
+                        &self.receipt,
+                        &self.live_source,
+                        request,
+                        entry,
+                    ),
             ),
             NativeCloseIntent::ExplicitRetry { .. } => runtime.block_on(
-                self.db.bind_native_close_retry_worktree_final_tombstone_object_with_entry(
-                    &self.command,
-                    &self.receipt.admitted,
-                    request,
-                    entry,
-                ),
+                self.db
+                    .bind_native_close_retry_worktree_final_tombstone_object_with_entry(
+                        &self.command,
+                        &self.receipt.admitted,
+                        request,
+                        entry,
+                    ),
             ),
             NativeCloseIntent::Observe { .. } => refused_observation(),
         };

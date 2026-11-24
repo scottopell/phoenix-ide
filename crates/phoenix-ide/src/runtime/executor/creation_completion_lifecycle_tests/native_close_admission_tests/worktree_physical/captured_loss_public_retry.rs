@@ -1,7 +1,7 @@
 use super::*;
 use crate::coordinator_tools;
-use crate::send_chat_service::SendChatApplicationService;
 use crate::runtime::executor::native_close_retry::test_hooks::{Hooks, Point};
+use crate::send_chat_service::SendChatApplicationService;
 use tokio_util::sync::CancellationToken;
 
 pub(super) async fn acknowledge_public_initial_result(
@@ -310,8 +310,8 @@ pub(super) async fn retry_after_public_capture(
             .get_conversation_work_scope_context(TARGET_ID)
             .await
             .unwrap();
-        let messages_before = serde_json::to_value(fixture.db.get_messages(TARGET_ID).await.unwrap())
-            .unwrap();
+        let messages_before =
+            serde_json::to_value(fixture.db.get_messages(TARGET_ID).await.unwrap()).unwrap();
 
         let mut pause = hooks.arm(Point::CapturedLossAssessmentReady);
         let retry_tool = Arc::clone(&tool);
@@ -319,18 +319,35 @@ pub(super) async fn retry_after_public_capture(
         let retry_context = context.clone();
         let retry = tokio::spawn(async move { retry_tool.run(retry_input, retry_context).await });
         pause.reached().await;
-        assert!(!retry.is_finished(), "assessment remains owned by the held worker");
-        assert_eq!(public_retry_rows(&fixture, initial_run.attempt_id.as_str()).await, before);
+        assert!(
+            !retry.is_finished(),
+            "assessment remains owned by the held worker"
+        );
+        assert_eq!(
+            public_retry_rows(&fixture, initial_run.attempt_id.as_str()).await,
+            before
+        );
 
         // ACK must arrive while assessment cannot finish, not after releasing it.
         stop_actor(&sender).await;
-        assert!(!retry.is_finished(), "Stop ACK must not depend on joining assessment");
+        assert!(
+            !retry.is_finished(),
+            "Stop ACK must not depend on joining assessment"
+        );
         assert_ne!(
-            fixture.db.get_conversation(&fixture.source_transcript_id).await.unwrap().state,
+            fixture
+                .db
+                .get_conversation(&fixture.source_transcript_id)
+                .await
+                .unwrap()
+                .state,
             fixture.state,
             "Stop ACK must have durably invalidated the exact source"
         );
-        assert_eq!(public_retry_rows(&fixture, initial_run.attempt_id.as_str()).await, before);
+        assert_eq!(
+            public_retry_rows(&fixture, initial_run.attempt_id.as_str()).await,
+            before
+        );
         assert_eq!(physical_snapshot(&git.worktree), worktree_before);
         assert_eq!(physical_snapshot(&git.admin), admin_before);
         pause.release();
@@ -351,7 +368,10 @@ pub(super) async fn retry_after_public_capture(
             assert!(!refused.is_success(), "{}", refused.output());
             let refused: Value = serde_json::from_str(refused.output()).unwrap();
             assert_eq!(refused["code"], "source_refused");
-            assert_eq!(public_retry_rows(&fixture, initial_run.attempt_id.as_str()).await, before);
+            assert_eq!(
+                public_retry_rows(&fixture, initial_run.attempt_id.as_str()).await,
+                before
+            );
             assert!(fixture
                 .db
                 .read_native_close_explicit_retry_receipt(&fixture.command)
@@ -367,10 +387,21 @@ pub(super) async fn retry_after_public_capture(
             messages_before
         );
         assert_eq!(
-            fixture.db.get_conversation_work_scope_context(TARGET_ID).await.unwrap(),
+            fixture
+                .db
+                .get_conversation_work_scope_context(TARGET_ID)
+                .await
+                .unwrap(),
             scope_before
         );
-        assert!(!fixture.db.get_conversation(TARGET_ID).await.unwrap().archived);
+        assert!(
+            !fixture
+                .db
+                .get_conversation(TARGET_ID)
+                .await
+                .unwrap()
+                .archived
+        );
         assert_eq!(physical_snapshot(&git.worktree), worktree_before);
         assert_eq!(physical_snapshot(&git.admin), admin_before);
         assert_eq!(physical_snapshot(&git.sibling), sibling_before);
@@ -399,51 +430,107 @@ pub(super) async fn retry_after_public_capture(
         let retry_context = context.clone();
         let retry = tokio::spawn(async move { retry_tool.run(retry_input, retry_context).await });
         pause.reached().await;
-        let receipt = fixture.db.read_native_close_explicit_retry_receipt(&fixture.command)
-            .await.unwrap().expect("barrier must belong to a durably admitted successor");
+        let receipt = fixture
+            .db
+            .read_native_close_explicit_retry_receipt(&fixture.command)
+            .await
+            .unwrap()
+            .expect("barrier must belong to a durably admitted successor");
         assert_eq!(receipt.attempt_id, initial_run.attempt_id);
         assert_eq!(receipt.run_ordinal.get(), initial_run.ordinal.get() + 1);
         let successor = CloseRunRef {
             attempt_id: receipt.attempt_id.clone(),
             ordinal: receipt.run_ordinal,
         };
-        assert_eq!(fixture.db.get_close_run(&successor).await.unwrap().status, CloseRunStatus::Running);
-        assert!(fixture.db.close_safe_retry_progress(&successor).await.unwrap().successful.is_empty());
+        assert_eq!(
+            fixture.db.get_close_run(&successor).await.unwrap().status,
+            CloseRunStatus::Running
+        );
+        assert!(fixture
+            .db
+            .close_safe_retry_progress(&successor)
+            .await
+            .unwrap()
+            .successful
+            .is_empty());
         assert!(!retry.is_finished());
         if point == Point::WorktreePreparationReady {
             assert_eq!(physical_snapshot(&git.worktree), worktree_before);
             assert_eq!(physical_snapshot(&git.admin), admin_before);
         } else {
             assert_eq!(point, Point::PhysicalBeforeObservation);
-            assert_eq!(std::fs::symlink_metadata(&git.worktree).unwrap_err().kind(), std::io::ErrorKind::NotFound);
-            assert_eq!(std::fs::symlink_metadata(&git.admin).unwrap_err().kind(), std::io::ErrorKind::NotFound);
+            assert_eq!(
+                std::fs::symlink_metadata(&git.worktree).unwrap_err().kind(),
+                std::io::ErrorKind::NotFound
+            );
+            assert_eq!(
+                std::fs::symlink_metadata(&git.admin).unwrap_err().kind(),
+                std::io::ErrorKind::NotFound
+            );
         }
 
         // The worker cannot publish its result until after this ACK is observed.
         stop_actor(&sender).await;
-        assert!(!retry.is_finished(), "Stop ACK must not wait for the held worker");
-        assert_eq!(fixture.db.get_close_run(&successor).await.unwrap().status, CloseRunStatus::Stopped);
+        assert!(
+            !retry.is_finished(),
+            "Stop ACK must not wait for the held worker"
+        );
+        assert_eq!(
+            fixture.db.get_close_run(&successor).await.unwrap().status,
+            CloseRunStatus::Stopped
+        );
         assert_eq!(captured_history(&fixture, initial_run).await, historical);
-        assert!(!fixture.db.get_conversation(TARGET_ID).await.unwrap().archived);
-        assert_eq!(fixture.db.get_conversation_work_scope_context(TARGET_ID).await.unwrap().1, WorkScopeLifecycle::Active);
+        assert!(
+            !fixture
+                .db
+                .get_conversation(TARGET_ID)
+                .await
+                .unwrap()
+                .archived
+        );
+        assert_eq!(
+            fixture
+                .db
+                .get_conversation_work_scope_context(TARGET_ID)
+                .await
+                .unwrap()
+                .1,
+            WorkScopeLifecycle::Active
+        );
         let stopped_rows = public_retry_rows(&fixture, initial_run.attempt_id.as_str()).await;
         let stopped: Value = serde_json::from_str(&stopped_rows).unwrap();
-        assert_eq!(stopped[4], serde_json::json!([]), "no retry effect was acknowledged as successful");
+        assert_eq!(
+            stopped[4],
+            serde_json::json!([]),
+            "no retry effect was acknowledged as successful"
+        );
         let stopped_target = durable_target_rows(&fixture).await;
         let stopped_physical = physical_snapshot(&git.root);
-        let failures = fixture.db.list_close_cleanup_failures(successor.attempt_id.as_str()).await.unwrap();
-        assert!(failures.iter().any(|failure| {
-            failure.run_ordinal == successor.ordinal
-                && failure.occurrence.failure_occurrence_id == successor.failure_occurrence_id()
-        }), "Stop ACK must establish the exact successor failure");
+        let failures = fixture
+            .db
+            .list_close_cleanup_failures(successor.attempt_id.as_str())
+            .await
+            .unwrap();
+        assert!(
+            failures.iter().any(|failure| {
+                failure.run_ordinal == successor.ordinal
+                    && failure.occurrence.failure_occurrence_id == successor.failure_occurrence_id()
+            }),
+            "Stop ACK must establish the exact successor failure"
+        );
 
         pause.release();
-        let refused = tokio::time::timeout(Duration::from_secs(10), retry).await
-            .expect("stopped successor must join its original worker").unwrap();
+        let refused = tokio::time::timeout(Duration::from_secs(10), retry)
+            .await
+            .expect("stopped successor must join its original worker")
+            .unwrap();
         assert!(!refused.is_success(), "{}", refused.output());
         let refused: Value = serde_json::from_str(refused.output()).unwrap();
         assert_eq!(refused["code"], "storage_rejected");
-        assert_eq!(public_retry_rows(&fixture, initial_run.attempt_id.as_str()).await, stopped_rows);
+        assert_eq!(
+            public_retry_rows(&fixture, initial_run.attempt_id.as_str()).await,
+            stopped_rows
+        );
         assert_eq!(durable_target_rows(&fixture).await, stopped_target);
         assert_eq!(captured_history(&fixture, initial_run).await, historical);
         assert_eq!(physical_snapshot(&git.root), stopped_physical);
@@ -452,21 +539,31 @@ pub(super) async fn retry_after_public_capture(
         git.assert_untargeted_state_preserved();
 
         let replay = tokio::time::timeout(Duration::from_secs(10), tool.run(input, context))
-            .await.expect("stopped successor exact-source receipt replay must be bounded");
+            .await
+            .expect("stopped successor exact-source receipt replay must be bounded");
         assert!(!replay.is_success(), "{}", replay.output());
         let replay: Value = serde_json::from_str(replay.output()).unwrap();
         assert_eq!(replay["code"], "source_refused");
         assert_eq!(
-            fixture.db.read_native_close_explicit_retry_receipt(&fixture.command).await.unwrap(),
+            fixture
+                .db
+                .read_native_close_explicit_retry_receipt(&fixture.command)
+                .await
+                .unwrap(),
             Some(receipt),
             "source refusal must retain the admitted successor receipt"
         );
-        assert_eq!(public_retry_rows(&fixture, initial_run.attempt_id.as_str()).await, stopped_rows);
+        assert_eq!(
+            public_retry_rows(&fixture, initial_run.attempt_id.as_str()).await,
+            stopped_rows
+        );
         assert_eq!(durable_target_rows(&fixture).await, stopped_target);
         assert_eq!(physical_snapshot(&git.root), stopped_physical);
         event_tx.send(Event::Shutdown).await.unwrap();
-        tokio::time::timeout(Duration::from_secs(10), running).await
-            .expect("stopped successor actor must shut down").unwrap();
+        tokio::time::timeout(Duration::from_secs(10), running)
+            .await
+            .expect("stopped successor actor must shut down")
+            .unwrap();
         return;
     }
 

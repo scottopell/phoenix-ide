@@ -359,8 +359,8 @@ impl OriginalWorktreeEffectContext {
             WorkerEntryResult::Refused => WorkerEntryResult::Refused,
         };
         let result = match self.command.intent() {
-            NativeCloseIntent::Initial { .. } => runtime.block_on(
-                self.db.with_native_close_initial_worktree_first_effect(
+            NativeCloseIntent::Initial { .. } => {
+                runtime.block_on(self.db.with_native_close_initial_worktree_first_effect(
                     &self.command,
                     &self.receipt,
                     &self.live_source,
@@ -368,10 +368,10 @@ impl OriginalWorktreeEffectContext {
                     self.snapshot.clone(),
                     &self.resource,
                     first_effect,
-                ),
-            ),
-            NativeCloseIntent::ExplicitRetry { .. } => runtime.block_on(
-                self.db.with_native_close_retry_worktree_first_effect(
+                ))
+            }
+            NativeCloseIntent::ExplicitRetry { .. } => {
+                runtime.block_on(self.db.with_native_close_retry_worktree_first_effect(
                     &self.command,
                     &self.receipt.admitted,
                     &self.live_source,
@@ -379,15 +379,15 @@ impl OriginalWorktreeEffectContext {
                     self.snapshot.clone(),
                     &self.resource,
                     first_effect,
-                ),
-            ),
-            NativeCloseIntent::Observe { .. } => Err(
-                NativeCloseInitialFirstEffectError::NotStarted(
+                ))
+            }
+            NativeCloseIntent::Observe { .. } => {
+                Err(NativeCloseInitialFirstEffectError::NotStarted(
                     phoenix_db::DbError::CloseFoundationPrecondition(
                         "observational Close cannot authorize a Worktree effect".into(),
                     ),
-                ),
-            ),
+                ))
+            }
         };
         match &result {
             Ok((_, NativeCloseInitialEntryRelease::Unconfirmed(_)))

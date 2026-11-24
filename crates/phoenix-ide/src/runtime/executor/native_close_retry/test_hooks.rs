@@ -39,7 +39,11 @@ impl Hooks {
         let (release, resume) = oneshot::channel();
         let mut slot = self.0.lock().unwrap();
         assert!(slot.is_none(), "only one barrier may be armed per actor");
-        *slot = Some(Checkpoint { point, reached, resume });
+        *slot = Some(Checkpoint {
+            point,
+            reached,
+            resume,
+        });
         Pause { arrival, release }
     }
 
@@ -74,7 +78,9 @@ impl Pause {
     }
 
     pub(crate) fn release(self) {
-        self.release.send(()).expect("held retry worker disappeared");
+        self.release
+            .send(())
+            .expect("held retry worker disappeared");
     }
 }
 

@@ -125,7 +125,9 @@ impl SourceEntryController {
     /// unknown transaction release may deliberately retain that lock forever.
     /// This does not authorize a source transition or release an entered lease.
     pub(crate) fn close_admission_for_fatal_exit(&mut self) {
-        self.shared.revoked.store(true, std::sync::atomic::Ordering::Release);
+        self.shared
+            .revoked
+            .store(true, std::sync::atomic::Ordering::Release);
     }
 
     /// Closes admission immediately, then performs the actor's state transition

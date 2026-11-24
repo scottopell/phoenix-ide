@@ -1,18 +1,23 @@
 //! Joined, actor-serviced execution of the finite admitted successor plan.
 
-use super::super::native_close::source_entry::{ActorEntryResult, SourceEntryController, SourceEntryWorker};
+use super::super::native_close::source_entry::{
+    ActorEntryResult, SourceEntryController, SourceEntryWorker,
+};
+use super::super::RuntimeSettlementAuthority;
 use super::NativeRetryExecutionError;
 use crate::runtime::close_retirement::NativeRetryNoLiveResourcesError;
 use crate::runtime::native_close_application::NativeCloseApplicationError;
 use crate::runtime::{AdmittedOperation, RuntimeManager};
 use crate::state_machine::ConvState;
 use phoenix_core::domain::close::{ClosePhase, CloseRunRef, CloseRunStatus, RetiredResourceKind};
-use phoenix_db::native_close::{NativeCloseCommand, NativeCloseReceipt, NativeCloseRetryExecutionContext, NativeCloseRetryResult};
+use phoenix_db::native_close::{
+    NativeCloseCommand, NativeCloseReceipt, NativeCloseRetryExecutionContext,
+    NativeCloseRetryResult,
+};
 use phoenix_db::workflow::LocalAuthorityResult;
 use phoenix_db::CloseSafeRetryEffect;
 use std::sync::Arc;
 use tokio::sync::{oneshot, OwnedMutexGuard};
-use super::super::RuntimeSettlementAuthority;
 
 #[cfg(unix)]
 use crate::runtime::close_retirement::native_initial::worktree::{
@@ -68,10 +73,15 @@ pub(in crate::runtime::executor) struct AdmittedRetryCursor {
 impl AdmittedRetryCursor {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
-        command: NativeCloseCommand, receipt: NativeCloseReceipt, backend: Arc<RuntimeManager>,
-        admitted: AdmittedOperation, target_gate: OwnedMutexGuard<()>, attempt_gate: OwnedMutexGuard<()>,
+        command: NativeCloseCommand,
+        receipt: NativeCloseReceipt,
+        backend: Arc<RuntimeManager>,
+        admitted: AdmittedOperation,
+        target_gate: OwnedMutexGuard<()>,
+        attempt_gate: OwnedMutexGuard<()>,
         response: oneshot::Sender<Result<NativeCloseRetryResult, NativeCloseApplicationError>>,
-        source_entry: SourceEntryWorker, deadline: std::time::Instant,
+        source_entry: SourceEntryWorker,
+        deadline: std::time::Instant,
     ) -> Self {
         Self { command, receipt, backend, context: None, order: Vec::new(), index: 0,
             stage: Stage::Context, deadline, next_service: tokio::time::Instant::now(), source_entry, scope_worker: None, tmux_worker: None, drain_worker: None,
@@ -87,13 +97,20 @@ impl AdmittedRetryCursor {
     }
 
     fn effect(&self) -> &CloseSafeRetryEffect {
-        &self.context.as_ref().expect("retained retry context").progress.pending[self.order[self.index]]
+        &self
+            .context
+            .as_ref()
+            .expect("retained retry context")
+            .progress
+            .pending[self.order[self.index]]
     }
 
     pub(in crate::runtime::executor) async fn join_before_exit(mut self) {
         self.join_workers().await;
         // An exit is not terminal evidence. Dropping armed authority fences it.
-        if let Some(response) = self.response.take() { let _ = response.send(Err(NativeCloseApplicationError::FatalAuthority)); }
+        if let Some(response) = self.response.take() {
+            let _ = response.send(Err(NativeCloseApplicationError::FatalAuthority));
+        }
     }
 
     async fn join_workers(&mut self) {
@@ -103,30 +120,49 @@ impl AdmittedRetryCursor {
         #[cfg(unix)]
         {
             // spawn_blocking cannot be aborted after entry. Always join it.
-            if let Some(preparation) = self.preparation.take() { let _ = preparation.await; }
-            if let Some(physical) = self.physical.as_ref() { let _ = physical.observe().await; }
+            if let Some(preparation) = self.preparation.take() {
+                let _ = preparation.await;
+            }
+            if let Some(physical) = self.physical.as_ref() {
+                let _ = physical.observe().await;
+            }
         }
     }
 
     fn finish(&mut self, result: Result<NativeCloseRetryResult, NativeCloseApplicationError>) {
         self.authority.owner = None;
-        if let Some(response) = self.response.take() { let _ = response.send(result); }
+        if let Some(response) = self.response.take() {
+            let _ = response.send(result);
+        }
     }
 
     fn accept(&mut self, result: Result<(), NativeRetryExecutionError>) -> bool {
         match result {
-            Ok(()) => { self.index += 1; self.stage = Stage::Select; false }
-            Err(NativeRetryExecutionError::ResourceFailure(detail)) => { self.stage = Stage::Failure(detail); false }
-            Err(NativeRetryExecutionError::TerminalizedFailure(_)) => {
-                self.finish(Err(NativeCloseApplicationError::Storage)); true
+            Ok(()) => {
+                self.index += 1;
+                self.stage = Stage::Select;
+                false
             }
-            Err(NativeRetryExecutionError::Unclassified) => { self.stage = Stage::Fatal; false }
+            Err(NativeRetryExecutionError::ResourceFailure(detail)) => {
+                self.stage = Stage::Failure(detail);
+                false
+            }
+            Err(NativeRetryExecutionError::TerminalizedFailure(_)) => {
+                self.finish(Err(NativeCloseApplicationError::Storage));
+                true
+            }
+            Err(NativeRetryExecutionError::Unclassified) => {
+                self.stage = Stage::Fatal;
+                false
+            }
         }
     }
 
     // Returns true only when terminal custody has been released. Fatal preserves it.
     pub(in crate::runtime::executor) async fn step(
-        &mut self, live: &ConvState, controller: &mut Option<SourceEntryController>,
+        &mut self,
+        live: &ConvState,
+        controller: &mut Option<SourceEntryController>,
     ) -> Result<bool, NativeCloseApplicationError> {
         let result = self.step_inner(live, controller).await;
         self.next_service = tokio::time::Instant::now() + std::time::Duration::from_millis(10);
@@ -134,9 +170,13 @@ impl AdmittedRetryCursor {
     }
 
     async fn step_inner(
-        &mut self, live: &ConvState, controller: &mut Option<SourceEntryController>,
+        &mut self,
+        live: &ConvState,
+        controller: &mut Option<SourceEntryController>,
     ) -> Result<bool, NativeCloseApplicationError> {
-        if matches!(self.stage, Stage::Fatal) { return Err(NativeCloseApplicationError::FatalAuthority); }
+        if matches!(self.stage, Stage::Fatal) {
+            return Err(NativeCloseApplicationError::FatalAuthority);
+        }
         let current = if let Some(controller) = controller.as_mut() {
             match controller.revalidate(live, &self.command) {
                 ActorEntryResult::Updated => true,
@@ -152,18 +192,29 @@ impl AdmittedRetryCursor {
         let stage = std::mem::replace(&mut self.stage, Stage::Fatal);
         match stage {
             Stage::Context => {
-                let context = self.backend.db().read_native_close_retry_execution_context(&self.command, &self.receipt.admitted).await;
+                let context = self
+                    .backend
+                    .db()
+                    .read_native_close_retry_execution_context(
+                        &self.command,
+                        &self.receipt.admitted,
+                    )
+                    .await;
                 let context = match context {
                     Ok(context) => context,
-                    Err(_) => { self.stage = Stage::ObserveTerminal; return Ok(false); }
+                    Err(_) => {
+                        self.stage = Stage::ObserveTerminal;
+                        return Ok(false);
+                    }
                 };
                 self.order = crate::runtime::close_retirement::close_safe_retry_execution_order(&context.progress.pending);
                 self.context = Some(context);
                 self.stage = Stage::Select;
             }
             Stage::Select => {
-                if self.index == self.order.len() { self.stage = Stage::Complete; }
-                else {
+                if self.index == self.order.len() {
+                    self.stage = Stage::Complete;
+                } else {
                     let effect = self.effect().clone();
                     match effect.resource.kind() {
                         RetiredResourceKind::Worktree => self.stage = Stage::WorktreeDispatch,
@@ -175,12 +226,20 @@ impl AdmittedRetryCursor {
                             self.stage = Stage::TmuxRunning;
                         }
                         RetiredResourceKind::WorkScope => {
-                            self.scope_worker = Some(self.backend.spawn_native_retry_scope_with_source_entry(
-                                self.command.clone(), self.receipt.admitted.clone(), effect,
-                                self.source_entry.clone(), self.deadline));
+                            self.scope_worker =
+                                Some(self.backend.spawn_native_retry_scope_with_source_entry(
+                                    self.command.clone(),
+                                    self.receipt.admitted.clone(),
+                                    effect,
+                                    self.source_entry.clone(),
+                                    self.deadline,
+                                ));
                             self.stage = Stage::ScopeRunning;
                         }
-                        _ => self.stage = Stage::Failure("unsupported native retry resource kind".into()),
+                        _ => {
+                            self.stage =
+                                Stage::Failure("unsupported native retry resource kind".into())
+                        }
                     }
                 }
             }
@@ -208,10 +267,23 @@ impl AdmittedRetryCursor {
                 if self.accept(result) { return Ok(true); }
             }
             Stage::ScopeRunning => {
-                let worker = self.scope_worker.as_ref().expect("retained WorkScope worker");
-                if !worker.is_finished() { self.stage = Stage::ScopeRunning; return Ok(false); }
-                let result = self.scope_worker.take().expect("retained WorkScope worker").await;
-                if matches!(&result, Err(_) | Ok(Err(NativeRetryExecutionError::Unclassified))) {
+                let worker = self
+                    .scope_worker
+                    .as_ref()
+                    .expect("retained WorkScope worker");
+                if !worker.is_finished() {
+                    self.stage = Stage::ScopeRunning;
+                    return Ok(false);
+                }
+                let result = self
+                    .scope_worker
+                    .take()
+                    .expect("retained WorkScope worker")
+                    .await;
+                if matches!(
+                    &result,
+                    Err(_) | Ok(Err(NativeRetryExecutionError::Unclassified))
+                ) {
                     self.stage = Stage::Fatal;
                     return Err(NativeCloseApplicationError::FatalAuthority);
                 }
@@ -220,14 +292,28 @@ impl AdmittedRetryCursor {
                 } else {
                     match result {
                         Ok(Ok(())) => self.stage = Stage::ScopeEvidence,
-                        Ok(Err(error)) => if self.accept(Err(error)) { return Ok(true); },
+                        Ok(Err(error)) => {
+                            if self.accept(Err(error)) {
+                                return Ok(true);
+                            }
+                        }
                         Err(_) => self.stage = Stage::Fatal,
                     }
                 }
             }
             Stage::ScopeEvidence => {
-                let result = self.backend.native_retry_record_success(&self.command, &self.receipt.admitted, self.effect(), "independent native retry WorkScope retirement").await;
-                if self.accept(result) { return Ok(true); }
+                let result = self
+                    .backend
+                    .native_retry_record_success(
+                        &self.command,
+                        &self.receipt.admitted,
+                        self.effect(),
+                        "independent native retry WorkScope retirement",
+                    )
+                    .await;
+                if self.accept(result) {
+                    return Ok(true);
+                }
             }
             Stage::WorktreeDispatch => {
                 let backend = Arc::clone(&self.backend);
@@ -236,21 +322,34 @@ impl AdmittedRetryCursor {
                 // This worker owns only read-only inventory: timeout drops no DB
                 // transaction or source lease. The actor remains selectable for Stop.
                 self.drain_worker = Some(tokio::spawn(async move {
-                    tokio::time::timeout_at(deadline, backend.native_retry_no_live_resources(&scope))
-                        .await.unwrap_or(Err(NativeRetryNoLiveResourcesError::Unclassified))
+                    tokio::time::timeout_at(
+                        deadline,
+                        backend.native_retry_no_live_resources(&scope),
+                    )
+                    .await
+                    .unwrap_or(Err(NativeRetryNoLiveResourcesError::Unclassified))
                 }));
                 self.stage = Stage::WorktreeDraining;
             }
             Stage::WorktreeDraining => {
                 let worker = self.drain_worker.as_ref().expect("retained runtime drain");
-                if !worker.is_finished() { self.stage = Stage::WorktreeDraining; return Ok(false); }
-                let result = self.drain_worker.take().expect("retained runtime drain").await;
+                if !worker.is_finished() {
+                    self.stage = Stage::WorktreeDraining;
+                    return Ok(false);
+                }
+                let result = self
+                    .drain_worker
+                    .take()
+                    .expect("retained runtime drain")
+                    .await;
                 self.stage = if !current {
                     Stage::ObserveTerminal
                 } else {
                     match result {
                         Ok(Ok(())) => Stage::WorktreeRecordDispatch,
-                        Ok(Err(NativeRetryNoLiveResourcesError::Blocked)) => Stage::Failure("native retry scope runtime drain not established".into()),
+                        Ok(Err(NativeRetryNoLiveResourcesError::Blocked)) => Stage::Failure(
+                            "native retry scope runtime drain not established".into(),
+                        ),
                         _ => Stage::Fatal,
                     }
                 };
@@ -259,9 +358,22 @@ impl AdmittedRetryCursor {
                 // A separate actor pass revalidates the original source after drain
                 // and before dispatch metadata or any physical worker is entered.
                 let effect = self.effect().clone();
-                match self.backend.db().record_native_close_retry_retirement_dispatch(&self.command, &self.receipt.admitted, &effect).await {
-                    LocalAuthorityResult::DurableFactEstablished(Ok(())) => self.stage = Stage::WorktreePreparing,
-                    LocalAuthorityResult::DurableFactEstablished(Err(error)) => self.stage = Stage::Failure(error.to_string()),
+                match self
+                    .backend
+                    .db()
+                    .record_native_close_retry_retirement_dispatch(
+                        &self.command,
+                        &self.receipt.admitted,
+                        &effect,
+                    )
+                    .await
+                {
+                    LocalAuthorityResult::DurableFactEstablished(Ok(())) => {
+                        self.stage = Stage::WorktreePreparing
+                    }
+                    LocalAuthorityResult::DurableFactEstablished(Err(error)) => {
+                        self.stage = Stage::Failure(error.to_string())
+                    }
                     LocalAuthorityResult::DurableFactUnclassified => {}
                 }
             }
@@ -269,44 +381,77 @@ impl AdmittedRetryCursor {
                 #[cfg(unix)]
                 {
                     if let Some(worker) = self.preparation.as_mut() {
-                        if !worker.is_finished() { self.stage = Stage::WorktreePreparing; return Ok(false); }
+                        if !worker.is_finished() {
+                            self.stage = Stage::WorktreePreparing;
+                            return Ok(false);
+                        }
                         let prepared = worker.await;
                         self.preparation = None;
                         match prepared {
                             Ok(Ok(Some(prepared))) if current => {
                                 let effect = self.effect().clone();
                                 let original = OriginalWorktreeEffectContext::new(
-                                    self.backend.db().clone(), self.command.clone(), self.receipt.clone(), live.clone(),
-                                    effect.scope.clone(), self.context.as_ref().expect("context").snapshot.clone(),
-                                    effect.resource.clone(), self.source_entry.clone(), self.deadline,
-                                    Arc::clone(&self.backend.fatal_local_authority_fence));
+                                    self.backend.db().clone(),
+                                    self.command.clone(),
+                                    self.receipt.clone(),
+                                    live.clone(),
+                                    effect.scope.clone(),
+                                    self.context.as_ref().expect("context").snapshot.clone(),
+                                    effect.resource.clone(),
+                                    self.source_entry.clone(),
+                                    self.deadline,
+                                    Arc::clone(&self.backend.fatal_local_authority_fence),
+                                );
                                 match prepared.into_continuation(original) {
                                     Ok(continuation) => {
-                                        let probe = self.backend.native_retry_close_writer_probe(&self.receipt, &effect, &self.context.as_ref().expect("context").snapshot);
-                                        self.physical = Some(continuation.spawn_physical(tokio::runtime::Handle::current(), probe));
+                                        let probe = self.backend.native_retry_close_writer_probe(
+                                            &self.receipt,
+                                            &effect,
+                                            &self.context.as_ref().expect("context").snapshot,
+                                        );
+                                        self.physical = Some(continuation.spawn_physical(
+                                            tokio::runtime::Handle::current(),
+                                            probe,
+                                        ));
                                         self.stage = Stage::WorktreePhysical;
                                     }
                                     Err(detail) => self.stage = Stage::Failure(detail),
                                 }
                             }
                             Ok(Ok(_)) if !current => self.stage = Stage::ObserveTerminal,
-                            Ok(Ok(None)) => self.stage = Stage::Failure("captured Worktree absent without a physical retirement proof".into()),
+                            Ok(Ok(None)) => {
+                                self.stage = Stage::Failure(
+                                    "captured Worktree absent without a physical retirement proof"
+                                        .into(),
+                                )
+                            }
                             Ok(Err(detail)) => self.stage = Stage::Failure(detail),
-                            Err(_) => {},
+                            Err(_) => {}
                             Ok(Ok(Some(_))) => unreachable!("current source handled above"),
                         }
                     } else if current {
                         let context = self.context.as_ref().expect("context");
                         let effect = self.effect();
-                        let identity = context.scopes.iter().find(|scope| scope.scope == effect.scope).and_then(|scope| scope.captured_worktree.as_ref());
-                        if let Some(phoenix_core::domain::close::CapturedWorktreeIdentity::Resolved(identity)) = identity {
-                            let identity = identity.clone(); let deadline = self.deadline;
+                        let identity = context
+                            .scopes
+                            .iter()
+                            .find(|scope| scope.scope == effect.scope)
+                            .and_then(|scope| scope.captured_worktree.as_ref());
+                        if let Some(
+                            phoenix_core::domain::close::CapturedWorktreeIdentity::Resolved(
+                                identity,
+                            ),
+                        ) = identity
+                        {
+                            let identity = identity.clone();
+                            let deadline = self.deadline;
                             #[cfg(test)]
                             let hooks = super::test_hooks::Hooks::current();
                             #[cfg(test)]
                             let runtime = tokio::runtime::Handle::current();
                             self.preparation = Some(tokio::task::spawn_blocking(move || {
-                                let prepared = prepare_original_worktree_git_until(&identity, deadline);
+                                let prepared =
+                                    prepare_original_worktree_git_until(&identity, deadline);
                                 #[cfg(test)]
                                 if matches!(&prepared, Ok(Some(_))) {
                                     runtime.block_on(super::test_hooks::checkpoint(
@@ -317,64 +462,138 @@ impl AdmittedRetryCursor {
                                 prepared
                             }));
                             self.stage = Stage::WorktreePreparing;
-                        } else { self.stage = Stage::Failure("captured Worktree identity unresolved".into()); }
-                    } else { self.stage = Stage::ObserveTerminal; }
+                        } else {
+                            self.stage =
+                                Stage::Failure("captured Worktree identity unresolved".into());
+                        }
+                    } else {
+                        self.stage = Stage::ObserveTerminal;
+                    }
                 }
                 #[cfg(not(unix))]
-                { self.stage = Stage::Failure("native physical Worktree retry unavailable on this platform".into()); }
+                {
+                    self.stage = Stage::Failure(
+                        "native physical Worktree retry unavailable on this platform".into(),
+                    );
+                }
             }
             Stage::WorktreePhysical => {
                 #[cfg(unix)]
                 {
-                    let physical = self.physical.as_ref().expect("retained physical observation");
-                    if !physical.is_ready() { self.stage = Stage::WorktreePhysical; return Ok(false); }
+                    let physical = self
+                        .physical
+                        .as_ref()
+                        .expect("retained physical observation");
+                    if !physical.is_ready() {
+                        self.stage = Stage::WorktreePhysical;
+                        return Ok(false);
+                    }
                     match physical.observe().await {
                         Ok(outcome) if !current => {
                             tracing::debug!(?outcome, "joined native retry physical outcome after source loss; preserving stopped failure, not recording current-source success");
                             self.stopped_physical_outcome = Some(outcome);
                             self.stage = Stage::ObserveTerminal;
                         }
-                        Ok(WorktreePhysicalOutcome::Retired) => self.stage = Stage::WorktreeEvidence,
-                        Ok(WorktreePhysicalOutcome::StopFailed { detail } | WorktreePhysicalOutcome::ReinspectionRequired { detail } | WorktreePhysicalOutcome::Residual { detail }) => self.stage = Stage::Failure(detail),
-                        Err(_) => {},
+                        Ok(WorktreePhysicalOutcome::Retired) => {
+                            self.stage = Stage::WorktreeEvidence
+                        }
+                        Ok(
+                            WorktreePhysicalOutcome::StopFailed { detail }
+                            | WorktreePhysicalOutcome::ReinspectionRequired { detail }
+                            | WorktreePhysicalOutcome::Residual { detail },
+                        ) => self.stage = Stage::Failure(detail),
+                        Err(_) => {}
                     }
                     self.physical = None;
                 }
             }
             Stage::WorktreeEvidence => {
-                let result = self.backend.native_retry_record_success(&self.command, &self.receipt.admitted, self.effect(), "joined original-context native Worktree retirement").await;
-                if self.accept(result) { return Ok(true); }
+                let result = self
+                    .backend
+                    .native_retry_record_success(
+                        &self.command,
+                        &self.receipt.admitted,
+                        self.effect(),
+                        "joined original-context native Worktree retirement",
+                    )
+                    .await;
+                if self.accept(result) {
+                    return Ok(true);
+                }
             }
             Stage::Failure(detail) => {
                 if !current {
-                    let run = CloseRunRef { attempt_id: self.receipt.admitted.attempt_id.clone(), ordinal: self.receipt.admitted.run_ordinal };
+                    let run = CloseRunRef {
+                        attempt_id: self.receipt.admitted.attempt_id.clone(),
+                        ordinal: self.receipt.admitted.run_ordinal,
+                    };
                     match self.backend.db().get_close_run(&run).await {
-                        Ok(observed) if observed.run == run && observed.status == CloseRunStatus::Stopped => {
+                        Ok(observed)
+                            if observed.run == run
+                                && observed.status == CloseRunStatus::Stopped =>
+                        {
                             self.stage = Stage::ObserveTerminal;
                             return Ok(false);
                         }
-                        Ok(observed) if observed.run == run && observed.status == CloseRunStatus::Running => {},
+                        Ok(observed)
+                            if observed.run == run
+                                && observed.status == CloseRunStatus::Running => {}
                         _ => return Err(NativeCloseApplicationError::FatalAuthority),
                     }
                 }
-                let result = self.backend.native_retry_failure::<()>(&self.command, &self.receipt.admitted, self.context.as_ref().expect("context"), self.effect(), &detail).await;
-                if self.accept(result) { return Ok(true); }
+                let result = self
+                    .backend
+                    .native_retry_failure::<()>(
+                        &self.command,
+                        &self.receipt.admitted,
+                        self.context.as_ref().expect("context"),
+                        self.effect(),
+                        &detail,
+                    )
+                    .await;
+                if self.accept(result) {
+                    return Ok(true);
+                }
             }
             Stage::Complete => {
-                match self.backend.db().complete_native_close_retry(&self.command, &self.receipt.admitted).await {
+                match self
+                    .backend
+                    .db()
+                    .complete_native_close_retry(&self.command, &self.receipt.admitted)
+                    .await
+                {
                     LocalAuthorityResult::DurableFactEstablished(Ok(_)) => {
-                        self.finish(Ok(NativeCloseRetryResult::NewlyAdmitted(self.receipt.clone()))); return Ok(true);
+                        self.finish(Ok(NativeCloseRetryResult::NewlyAdmitted(
+                            self.receipt.clone(),
+                        )));
+                        return Ok(true);
                     }
-                    LocalAuthorityResult::DurableFactEstablished(Err(_)) => self.stage = Stage::ObserveTerminal,
-                    LocalAuthorityResult::DurableFactUnclassified => {},
+                    LocalAuthorityResult::DurableFactEstablished(Err(_)) => {
+                        self.stage = Stage::ObserveTerminal
+                    }
+                    LocalAuthorityResult::DurableFactUnclassified => {}
                 }
             }
             Stage::ObserveTerminal => {
-                let run = CloseRunRef { attempt_id: self.receipt.admitted.attempt_id.clone(), ordinal: self.receipt.admitted.run_ordinal };
-                if let (Ok(observed), Ok(obligation)) = (self.backend.db().get_close_run(&run).await, self.backend.db().get_close_obligation(run.attempt_id.as_str()).await) {
-                    if observed.run == run && observed.status == CloseRunStatus::Running && std::time::Instant::now() >= self.deadline {
+                let run = CloseRunRef {
+                    attempt_id: self.receipt.admitted.attempt_id.clone(),
+                    ordinal: self.receipt.admitted.run_ordinal,
+                };
+                if let (Ok(observed), Ok(obligation)) = (
+                    self.backend.db().get_close_run(&run).await,
+                    self.backend
+                        .db()
+                        .get_close_obligation(run.attempt_id.as_str())
+                        .await,
+                ) {
+                    if observed.run == run
+                        && observed.status == CloseRunStatus::Running
+                        && std::time::Instant::now() >= self.deadline
+                    {
                         if self.index < self.order.len() {
-                            self.stage = Stage::Failure("original native retry source deadline expired".into());
+                            self.stage = Stage::Failure(
+                                "original native retry source deadline expired".into(),
+                            );
                             return Ok(false);
                         }
                         // No pending effect remains for the resource-failure API. Do not
@@ -382,12 +601,25 @@ impl AdmittedRetryCursor {
                         tracing::error!("native retry source deadline expired without a pending effect; fail-stopping with custody armed");
                         return Err(NativeCloseApplicationError::FatalAuthority);
                     }
-                    if observed.run == run && observed.status == CloseRunStatus::Stopped && obligation.phase() == ClosePhase::Completed {
-                        if let Ok(failures) = self.backend.db().list_close_cleanup_failures(run.attempt_id.as_str()).await {
-                            if failures.iter().any(|failure| failure.run_ordinal == run.ordinal && failure.occurrence.failure_occurrence_id == run.failure_occurrence_id()) {
+                    if observed.run == run
+                        && observed.status == CloseRunStatus::Stopped
+                        && obligation.phase() == ClosePhase::Completed
+                    {
+                        if let Ok(failures) = self
+                            .backend
+                            .db()
+                            .list_close_cleanup_failures(run.attempt_id.as_str())
+                            .await
+                        {
+                            if failures.iter().any(|failure| {
+                                failure.run_ordinal == run.ordinal
+                                    && failure.occurrence.failure_occurrence_id
+                                        == run.failure_occurrence_id()
+                            }) {
                                 #[cfg(unix)]
                                 tracing::debug!(outcome = ?self.stopped_physical_outcome, "observed exact stopped native retry failure; joined outcome retained locally, no post-Stop success synthesized");
-                                self.finish(Err(NativeCloseApplicationError::Storage)); return Ok(true);
+                                self.finish(Err(NativeCloseApplicationError::Storage));
+                                return Ok(true);
                             }
                         }
                     }
@@ -400,6 +632,10 @@ impl AdmittedRetryCursor {
             }
             Stage::Fatal => return Err(NativeCloseApplicationError::FatalAuthority),
         }
-        if matches!(self.stage, Stage::Fatal) { Err(NativeCloseApplicationError::FatalAuthority) } else { Ok(false) }
+        if matches!(self.stage, Stage::Fatal) {
+            Err(NativeCloseApplicationError::FatalAuthority)
+        } else {
+            Ok(false)
+        }
     }
 }

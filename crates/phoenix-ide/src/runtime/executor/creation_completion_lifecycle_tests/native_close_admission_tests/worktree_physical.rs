@@ -31,18 +31,25 @@ async fn registered_native_close_captured_loss_public_retry_with_production_dete
 }
 
 #[tokio::test]
-async fn registered_native_close_captured_loss_retry_stop_during_assessment_preserves_worktree_and_history() {
-    run_public_worktree_close(WorktreeJourney::CapturedLossPublicRetryStoppedDuringAssessment).await;
+async fn registered_native_close_captured_loss_retry_stop_during_assessment_preserves_worktree_and_history(
+) {
+    run_public_worktree_close(WorktreeJourney::CapturedLossPublicRetryStoppedDuringAssessment)
+        .await;
 }
 
 #[tokio::test]
 async fn registered_native_close_captured_loss_retry_stop_while_prepared_preserves_worktree() {
-    run_public_worktree_close(WorktreeJourney::CapturedLossPublicRetryStoppedDuringPreparation).await;
+    run_public_worktree_close(WorktreeJourney::CapturedLossPublicRetryStoppedDuringPreparation)
+        .await;
 }
 
 #[tokio::test]
-async fn registered_native_close_captured_loss_retry_stop_before_physical_observation_retains_stopped_result() {
-    run_public_worktree_close(WorktreeJourney::CapturedLossPublicRetryStoppedBeforePhysicalObservation).await;
+async fn registered_native_close_captured_loss_retry_stop_before_physical_observation_retains_stopped_result(
+) {
+    run_public_worktree_close(
+        WorktreeJourney::CapturedLossPublicRetryStoppedBeforePhysicalObservation,
+    )
+    .await;
 }
 
 #[tokio::test]

@@ -2,7 +2,9 @@
 
 pub(crate) mod captured_loss_retry;
 mod native_retry;
-pub(crate) use native_retry::{NativeInitialWorkScopePrecondition, NativeRetryNoLiveResourcesError};
+pub(crate) use native_retry::{
+    NativeInitialWorkScopePrecondition, NativeRetryNoLiveResourcesError,
+};
 pub(crate) mod native_initial;
 
 use std::{

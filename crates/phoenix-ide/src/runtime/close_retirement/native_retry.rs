@@ -87,9 +87,9 @@ fn classify_native_retry_execution(
         Err(NativeRetryExecutionError::TerminalizedFailure(detail)) => {
             LocalAuthorityResult::DurableFactEstablished(Err(detail))
         }
-        Err(NativeRetryExecutionError::Unclassified | NativeRetryExecutionError::ResourceFailure(_)) => {
-            LocalAuthorityResult::DurableFactUnclassified
-        }
+        Err(
+            NativeRetryExecutionError::Unclassified | NativeRetryExecutionError::ResourceFailure(_),
+        ) => LocalAuthorityResult::DurableFactUnclassified,
     }
 }
 
@@ -452,7 +452,8 @@ impl super::RuntimeManager {
     ) -> tokio::task::JoinHandle<Result<(), NativeRetryExecutionError>> {
         let backend = Arc::clone(self);
         let runtime = Handle::current();
-        task::spawn_blocking(move || runtime.block_on(async {
+        task::spawn_blocking(move || {
+            runtime.block_on(async {
             // Only read-only pre-entry work is cancellable at the original deadline.
             // The mutation below is outside this timeout and retains its source lease
             // through confirmed release (including deliberately retained unknown custody).
@@ -493,7 +494,8 @@ impl super::RuntimeManager {
                 LocalAuthorityResult::DurableFactUnclassified => unreachable!(),
             }
             Ok(())
-        }))
+        })
+        })
     }
 
     pub(crate) fn native_retry_close_writer_probe(
@@ -508,8 +510,13 @@ impl super::RuntimeManager {
             clean_writer_fixture: self.clean_close_writer_fixture,
             db: self.db().clone(),
             runtime: Handle::current(),
-            run: CloseRunRef { attempt_id: receipt.admitted.attempt_id.clone(), ordinal: receipt.admitted.run_ordinal },
-            scope: effect.scope.clone(), snapshot: snapshot.clone(), resource: effect.resource.clone(),
+            run: CloseRunRef {
+                attempt_id: receipt.admitted.attempt_id.clone(),
+                ordinal: receipt.admitted.run_ordinal,
+            },
+            scope: effect.scope.clone(),
+            snapshot: snapshot.clone(),
+            resource: effect.resource.clone(),
         }
     }
 

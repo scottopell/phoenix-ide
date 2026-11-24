@@ -2704,7 +2704,10 @@ where
                 // Stop waits for entered callbacks, but fatal unknown custody may
                 // intentionally never unlock. The fatal fence forbids publication;
                 // return to fatal cleanup without releasing that retained custody.
-                if self.fatal_local_authority_fence.fatal_authority_loss_is_latched() {
+                if self
+                    .fatal_local_authority_fence
+                    .fatal_authority_loss_is_latched()
+                {
                     controller.close_admission_for_fatal_exit();
                     return;
                 }
@@ -3351,7 +3354,10 @@ where
             && matches!(self.state, ConvState::ContextExhausted { .. }))
         .then(|| tokio::time::Instant::now() + Duration::from_secs(30));
         loop {
-            if deferred_native_close_exit.is_some() && pending_native_close_initial.is_none() && admitted_native_close_retry.is_none() {
+            if deferred_native_close_exit.is_some()
+                && pending_native_close_initial.is_none()
+                && admitted_native_close_retry.is_none()
+            {
                 return deferred_native_close_exit
                     .take()
                     .expect("checked deferred exit");
@@ -3401,7 +3407,9 @@ where
             // Sample one FIFO head from each existing source-control queue before
             // due service. Retain non-control heads, without reordering or dropping
             // their acknowledgements; a head Stop always wins over Close progress.
-            let close_active = pending_native_close_initial.is_some() || pending_native_close_retry.is_some() || admitted_native_close_retry.is_some();
+            let close_active = pending_native_close_initial.is_some()
+                || pending_native_close_retry.is_some()
+                || admitted_native_close_retry.is_some();
             if close_active {
                 tokio::task::yield_now().await;
             }
@@ -3411,15 +3419,24 @@ where
             if deferred_native_close_exit.is_none() && queued_event.is_none() {
                 queued_event = self.event_rx.try_recv().ok();
             }
-            let acknowledged_control_ready = queued_acknowledged_request.as_ref().is_some_and(|request| {
-                matches!(request, AcknowledgedRuntimeRequest::Event(request)
+            let acknowledged_control_ready =
+                queued_acknowledged_request.as_ref().is_some_and(|request| {
+                    matches!(request, AcknowledgedRuntimeRequest::Event(request)
                     if matches!(&request.event, Event::UserCancel { .. } | Event::Shutdown))
-            });
-            let event_control_ready = deferred_native_close_exit.is_none() && queued_event.as_ref().is_some_and(|event| matches!(event, Event::UserCancel { .. } | Event::Shutdown));
-            let source_control_ready = deferred_native_close_exit.is_none() && (acknowledged_control_ready || event_control_ready);
+                });
+            let event_control_ready = deferred_native_close_exit.is_none()
+                && queued_event.as_ref().is_some_and(|event| {
+                    matches!(event, Event::UserCancel { .. } | Event::Shutdown)
+                });
+            let source_control_ready = deferred_native_close_exit.is_none()
+                && (acknowledged_control_ready || event_control_ready);
             // While Close is active, alternate retained non-control heads too:
             // traffic on one queue cannot hide a Stop behind the other's FIFO head.
-            let serve_queued_event = close_active && deferred_native_close_exit.is_none() && prefer_queued_event && queued_event.is_some() && !acknowledged_control_ready;
+            let serve_queued_event = close_active
+                && deferred_native_close_exit.is_none()
+                && prefer_queued_event
+                && queued_event.is_some()
+                && !acknowledged_control_ready;
             let terminal_retry_at = self
                 .terminal_transition_retry
                 .as_ref()
@@ -3427,7 +3444,8 @@ where
             // Copy deadline before select to avoid borrow conflict
             let deadline = self.deadline;
             let awaiting_recovery = matches!(self.state, ConvState::AwaitingRecovery { .. });
-            let next_native_retry_service_at = admitted_native_close_retry.as_ref()
+            let next_native_retry_service_at = admitted_native_close_retry
+                .as_ref()
                 .map(native_close_retry::AdmittedRetryCursor::next_service_at)
                 .unwrap_or_else(tokio::time::Instant::now);
 
