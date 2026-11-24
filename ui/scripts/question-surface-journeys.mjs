@@ -347,6 +347,11 @@ export async function qualifyDesktopPlacement({ page, out, version }) {
     await first.click();
     await custom.fill('placement preserved answer');
     await composer.fill('placement preserved composer draft');
+    const composerFocused = await geometry();
+    // Filling the offscreen composer scrolls the outer page to that input. Return
+    // that page to the question before testing its own scrollers and controls.
+    await page.locator('.coordinator-page').evaluate(el => { el.scrollTop = 0; });
+    await frames();
     const desktopActions = await actionBounds();
     await top();
 
@@ -451,7 +456,7 @@ export async function qualifyDesktopPlacement({ page, out, version }) {
       await top();
     }
     assert.deepEqual(mutations, [], 'Placement, Return, reopen, and Next/Back must not answer or dismiss');
-    await fs.writeFile(`${out}/${version}-desktop-placement.json`, JSON.stringify({ initial, headerInitiallyClipped: !initial.meta.fullyVisible, desktopOption, desktopActions, reopened, transitions, readingPosition: { viewport: { width: 393, height: 852 }, before: transcriptScroll, reopenedImmediate, reopened: reopenedScroll, returnedImmediate, returned: returnedScroll }, answersAndDraftPreserved: true, launcherFocusRestored: true, mutations, limitations: ['Hosted Chromium, not a real mobile device or OS keyboard.', 'Reading-position assertions apply only to reopen/Return within one unchanged mobile viewport, not cross-viewport pixels.'] }, null, 2));
+    await fs.writeFile(`${out}/${version}-desktop-placement.json`, JSON.stringify({ initial, headerInitiallyClipped: !initial.meta.fullyVisible, desktopOption, desktopActions, composerFocused, reopened, transitions, readingPosition: { viewport: { width: 393, height: 852 }, before: transcriptScroll, reopenedImmediate, reopened: reopenedScroll, returnedImmediate, returned: returnedScroll }, answersAndDraftPreserved: true, launcherFocusRestored: true, mutations, limitations: ['Hosted Chromium, not a real mobile device or OS keyboard.', 'Reading-position assertions apply only to reopen/Return within one unchanged mobile viewport, not cross-viewport pixels.'] }, null, 2));
     await composer.fill('');
     await page.setViewportSize({ width: 1280, height: 900 });
     await frames();
