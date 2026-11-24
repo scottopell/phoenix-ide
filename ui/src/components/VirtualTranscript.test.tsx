@@ -1,4 +1,4 @@
-import { useCallback, useLayoutEffect, useRef, useState, type ReactElement } from 'react';
+import { StrictMode, useCallback, useLayoutEffect, useRef, useState, type ReactElement } from 'react';
 import { initialTranscriptPositioningState, reduceTranscriptPositioning, transcriptPositioningCommandKey, type TranscriptPositioningInput, type TranscriptPositioningEvent } from '../conversation/transcriptPositioning';
 import type { HistoryScrollCommand } from '../conversation/historyExpansion';
 
@@ -2501,5 +2501,28 @@ describe('VirtualTranscript', () => {
     expect(screen.getByTestId('mounted-b')).toBe(originalB);
     expect(screen.getByTestId('mounted-c')).toBe(originalC);
     expect(rowIndexes()).toEqual([0, 1, 2, 3]);
+  });
+
+  it('retains scroller binding and updates range on scroll under React StrictMode', () => {
+    render(
+      <StrictMode>
+        <VirtualTranscript
+          ariaLabel="Transcript"
+          items={makeItems(40, 20)}
+          getKey={(item) => item.id}
+          estimatedExtent={20}
+          overscan={20}
+          initialTail={false}
+          renderItem={renderRow}
+        />
+      </StrictMode>,
+    );
+    const scroller = document.querySelector<HTMLElement>('.virtual-transcript')!;
+    expect(rowIndexes()[0]).toBe(0);
+
+    scroller.scrollTop = 500;
+    fireEvent.scroll(scroller);
+
+    expect(rowIndexes()[0]).toBeGreaterThan(15);
   });
 });

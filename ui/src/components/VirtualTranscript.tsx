@@ -1058,24 +1058,24 @@ function VirtualTranscriptInner<T>(
 
   useLayoutEffect(() => {
     const current = storeRef.current;
+    if (current) {
+      if (current.scroller) observeElement(current, publish, current.scroller);
+      if (current.headerElement) observeElement(current, publish, current.headerElement);
+      for (const row of current.rowElements.values()) observeElement(current, publish, row);
+    }
     return () => {
       if (reconcileTimerRef.current !== 0) {
         clearTimeout(reconcileTimerRef.current);
         reconcileTimerRef.current = 0;
       }
-      detachTouchListenersRef.current?.();
-      detachTouchListenersRef.current = null;
       clearTimeout(witnessTimerRef.current);
-      if (current) current.contentWitness = null;
-      current?.resizeObserver?.disconnect();
-      current?.rowElements.clear();
       if (current) {
-        current.headerElement = null;
-        current.scroller = null;
+        current.contentWitness = null;
+        current.resizeObserver?.disconnect();
         current.resizeObserver = null;
       }
     };
-  }, []);
+  }, [publish]);
 
   useLayoutEffect(() => {
     acquireContentWitness(store);
