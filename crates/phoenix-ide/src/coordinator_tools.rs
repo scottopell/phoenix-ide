@@ -2122,7 +2122,12 @@ mod tests {
             )
             .await;
         assert!(output.is_success(), "{}", output.output());
-        assert!(output.output().contains(home.to_str().unwrap()));
+        assert!(
+            output.output().contains(home.to_str().unwrap()),
+            "home {} missing from {}",
+            home.display(),
+            output.output()
+        );
         assert_eq!(
             std::fs::read_to_string(home.join("evidence.txt")).unwrap(),
             "delegated"
@@ -4406,7 +4411,12 @@ mod tests {
         assert_eq!(ordinary, 0);
         let output = tool.run(json!({"op":"run", "cmd":"pwd; printf kept > evidence.txt", "work_scope_id":scope.work_scope_id.as_str(), "wait_seconds":10}), context).await;
         assert!(output.is_success(), "{}", output.output());
-        assert!(output.output().contains(home.to_str().unwrap()));
+        assert!(
+            output.output().contains(home.to_str().unwrap()),
+            "home {} missing from {}",
+            home.display(),
+            output.output()
+        );
         assert_eq!(
             std::fs::read_to_string(home.join("evidence.txt")).unwrap(),
             "kept"

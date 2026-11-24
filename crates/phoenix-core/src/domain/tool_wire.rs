@@ -96,7 +96,7 @@ impl BashResponse {
     /// [`BashCommandEcho::Omit`], `cmd` is absent.
     #[must_use]
     pub fn model_text(&self, echo: BashCommandEcho) -> String {
-        let mut value = serde_json::to_value(self).expect("bash responses serialize");
+        let mut value = serde_json::to_value(self).unwrap_or(serde_json::Value::Null);
         if let Some(object) = value.as_object_mut() {
             if let Some(window) = self.window() {
                 let texts = window
