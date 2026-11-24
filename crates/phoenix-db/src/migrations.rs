@@ -16687,14 +16687,29 @@ mod tests {
         let pool = test_pool().await;
         setup_real_pre_172_schema(&pool).await;
         run_through_for_test(&pool, 182).await.unwrap();
-        let receipts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM native_close_initial_receipts")
-            .fetch_one(&pool).await.unwrap();
+        let receipts: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM native_close_initial_receipts")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
         assert_eq!(run_through_for_test(&pool, 183).await.unwrap(), 1);
         assert_eq!(run_through_for_test(&pool, 183).await.unwrap(), 0);
-        assert_eq!(sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM native_close_initial_result_acknowledgements")
-            .fetch_one(&pool).await.unwrap(), 0);
-        assert_eq!(sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM native_close_initial_receipts")
-            .fetch_one(&pool).await.unwrap(), receipts);
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM native_close_initial_result_acknowledgements"
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM native_close_initial_receipts")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            receipts
+        );
         assert!(sqlx::query("INSERT INTO native_close_initial_result_acknowledgements
             (request_id, request_fingerprint, attempt_id, run_ordinal, assistant_message_id, result_message_id)
             VALUES ('missing', 'missing', 'missing', 1, 'assistant', 'result')")
@@ -16705,10 +16720,22 @@ mod tests {
             "native_close_initial_result_acknowledgements_no_replacement",
             "native_close_initial_result_acknowledgements_no_direct_delete",
         ] {
-            assert_eq!(sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM sqlite_schema WHERE type = 'trigger' AND name = ?1")
-                .bind(name).fetch_one(&pool).await.unwrap(), 1);
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>(
+                    "SELECT COUNT(*) FROM sqlite_schema WHERE type = 'trigger' AND name = ?1"
+                )
+                .bind(name)
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+                1
+            );
         }
-        assert!(sqlx::query("PRAGMA foreign_key_check").fetch_all(&pool).await.unwrap().is_empty());
+        assert!(sqlx::query("PRAGMA foreign_key_check")
+            .fetch_all(&pool)
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]

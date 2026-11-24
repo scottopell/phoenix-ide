@@ -242,7 +242,11 @@ pub(crate) async fn fence_pre_completion_native_sources_tx(
             let acknowledged_completed_initial = !explicit_retry
                 && row.try_get::<String, _>("status")? == "stopped"
                 && (row.try_get::<bool, _>("acknowledged")?
-                    || completed_initial_result_matches(next_state, &command, run.attempt_id.as_str()));
+                    || completed_initial_result_matches(
+                        next_state,
+                        &command,
+                        run.attempt_id.as_str(),
+                    ));
             if matches!(cause, NativeSourceLossCause::UserSourceLoss)
                 && !acknowledged_completed_initial
             {
@@ -281,27 +285,56 @@ fn completed_initial_result_matches(
     use phoenix_core::domain::conversation_goal::ToolRoundResult;
     use phoenix_core::domain::db_schema::ToolOutcome;
     use phoenix_core::domain::llm_types::ContentBlock;
-    let ConvState::ToolExecuting { assistant_message, completed_results, .. } = state else {
+    let ConvState::ToolExecuting {
+        assistant_message,
+        completed_results,
+        ..
+    } = state
+    else {
         return false;
     };
     if assistant_message.message_id != command.source().message_id
-        || !assistant_message.content.iter().any(|block| matches!(block,
+        || !assistant_message.content.iter().any(|block| {
+            matches!(block,
             ContentBlock::ToolUse { id, name, input } if id == &command.source().tool_use_id
-                && name == "close_conversation" && input == &command.intent().source_input()))
+                && name == "close_conversation" && input == &command.intent().source_input())
+        })
     {
         return false;
     }
+    let request_id = command.request_id().to_string();
     completed_results.iter().any(|result| {
-        let ToolRoundResult::Finalized(result) = result else { return false; };
-        if result.tool_use_id != command.source().tool_use_id { return false; }
-        let ToolOutcome::Success { output, .. } = &result.outcome else { return false; };
-        let Ok(output) = serde_json::from_str::<serde_json::Value>(output) else { return false; };
+        let ToolRoundResult::Finalized(result) = result else {
+            return false;
+        };
+        if result.tool_use_id != command.source().tool_use_id {
+            return false;
+        }
+        let ToolOutcome::Success { output, .. } = &result.outcome else {
+            return false;
+        };
+        let Ok(output) = serde_json::from_str::<serde_json::Value>(output) else {
+            return false;
+        };
         output.get("action").and_then(serde_json::Value::as_str) == Some("initial")
-            && matches!(output.get("status").and_then(serde_json::Value::as_str), Some("newly_admitted" | "replay"))
-            && output.get("request_id").and_then(serde_json::Value::as_str) == Some(command.request_id().as_str())
-            && output.pointer("/admitted/product_conversation_id").and_then(serde_json::Value::as_str) == Some(command.intent().target().as_str())
-            && output.pointer("/admitted/attempt_id").and_then(serde_json::Value::as_str) == Some(attempt_id)
-            && output.pointer("/admitted/run_ordinal").and_then(serde_json::Value::as_i64) == Some(1)
+            && matches!(
+                output.get("status").and_then(serde_json::Value::as_str),
+                Some("newly_admitted" | "replay")
+            )
+            && output.get("request_id").and_then(serde_json::Value::as_str)
+                == Some(request_id.as_str())
+            && output
+                .pointer("/admitted/product_conversation_id")
+                .and_then(serde_json::Value::as_str)
+                == Some(command.intent().target().as_str())
+            && output
+                .pointer("/admitted/attempt_id")
+                .and_then(serde_json::Value::as_str)
+                == Some(attempt_id)
+            && output
+                .pointer("/admitted/run_ordinal")
+                .and_then(serde_json::Value::as_i64)
+                == Some(1)
     })
 }
 
@@ -331,9 +364,11 @@ pub(crate) async fn acknowledge_initial_result_tx(
             continue;
         };
         if row.conversation_id != transcript_id
-            || row.message_id != phoenix_core::domain::tool_result_identity::tool_result_message_id(
-                &assistant.message_id, &tool_result.tool_use_id,
-            )
+            || row.message_id
+                != phoenix_core::domain::tool_result_identity::tool_result_message_id(
+                    &assistant.message_id,
+                    &tool_result.tool_use_id,
+                )
         {
             continue;
         }
@@ -378,7 +413,9 @@ pub(crate) async fn acknowledge_initial_result_tx(
             let command = NativeCloseCommand::new(
                 transcript_id.to_owned(),
                 source.clone(),
-                NativeCloseIntent::Initial { target: target.clone() },
+                NativeCloseIntent::Initial {
+                    target: target.clone(),
+                },
             )
             .map_err(|error| DbError::Serialization(error.to_string()))?;
             let request_id: String = receipt.try_get("request_id")?;
@@ -390,20 +427,43 @@ pub(crate) async fn acknowledge_initial_result_tx(
             )
             .bind(&request_id).bind(&fingerprint).bind(&attempt_id)
             .fetch_optional(&mut **tx).await?;
-            if prior.as_ref().is_some_and(|(prior_assistant, prior_result)| {
-                prior_assistant == &assistant.message_id && prior_result == &row.message_id
-            }) {
+            if prior
+                .as_ref()
+                .is_some_and(|(prior_assistant, prior_result)| {
+                    prior_assistant == &assistant.message_id && prior_result == &row.message_id
+                })
+            {
                 continue;
             }
-            if prior.is_some() || command.fingerprint() != fingerprint
+            if prior.is_some()
+                || command.fingerprint() != fingerprint
                 || input != &command.intent().source_input()
                 || output.get("action").and_then(serde_json::Value::as_str) != Some("initial")
-                || !matches!(output.get("status").and_then(serde_json::Value::as_str), Some("newly_admitted" | "replay"))
-                || output.get("request_id").and_then(serde_json::Value::as_str) != Some(request_id.as_str())
-                || output.pointer("/admitted/product_conversation_id").and_then(serde_json::Value::as_str) != Some(target.as_str())
-                || output.pointer("/admitted/attempt_id").and_then(serde_json::Value::as_str) != Some(attempt_id.as_str())
-                || output.pointer("/admitted/run_ordinal").and_then(serde_json::Value::as_i64) != Some(1)
-                || (require_executing_source(&current_state, &source, "close_conversation", &command.intent().source_input()).is_err()
+                || !matches!(
+                    output.get("status").and_then(serde_json::Value::as_str),
+                    Some("newly_admitted" | "replay")
+                )
+                || output.get("request_id").and_then(serde_json::Value::as_str)
+                    != Some(request_id.as_str())
+                || output
+                    .pointer("/admitted/product_conversation_id")
+                    .and_then(serde_json::Value::as_str)
+                    != Some(target.as_str())
+                || output
+                    .pointer("/admitted/attempt_id")
+                    .and_then(serde_json::Value::as_str)
+                    != Some(attempt_id.as_str())
+                || output
+                    .pointer("/admitted/run_ordinal")
+                    .and_then(serde_json::Value::as_i64)
+                    != Some(1)
+                || (require_executing_source(
+                    &current_state,
+                    &source,
+                    "close_conversation",
+                    &command.intent().source_input(),
+                )
+                .is_err()
                     && !completed_initial_result_matches(&current_state, &command, &attempt_id))
             {
                 continue;
