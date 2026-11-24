@@ -2,6 +2,31 @@
 
 ## Status and authority
 
+**Close architecture reduction disposition:** the dirty reduction based on
+`cb7e80573` is **UNQUALIFIED** and has not been locally executed. Reported Close
+run `45491118337` succeeded; standard CI `45491139148` was red. Preserved run
+`1068` has unknown cause. Shared executing-source identity/provenance, migration
+172 schema compatibility, live Close custody/two-stage handback, existing physical
+deletion, and live resource/`close_retirement` coverage are retained. Unexposed native
+task approval DB/runtime modules, the alternate test adapter, and no-entry initial
+metadata facades are removed from this candidate; exact task work is preserved at
+`preserve/native-task-approval-cb7e80573`. See
+[`CLOSE-ARCHITECTURE-REDUCTION.md`](../../CLOSE-ARCHITECTURE-REDUCTION.md) for
+the bounded keep/share/delete ledger. ADR-284 remains Proposed; no completion or
+qualification claim is made here.
+
+The Close workflow now selects existing neutral executing-source tests and
+requires nonzero passes plus exact named test output; ordinary core task-domain
+compatibility coverage remains broad-CI responsibility.
+
+## Historical checkpoint evidence (preserved work, not current implementation)
+
+The entries and tables below describe the preserved task-feature snapshot. Claims
+about `native_task_approval` DB inspection/admission/receipt APIs and runtime actor
+requests do **not** describe the reduced Close tree; those modules were removed.
+Retained core proposal serialization and replay foundations do not expose native
+approval tools. Requalification belongs to a separate task-feature integration.
+
 **Private Initial execution checkpoint qualified; native approval and Close are NOT complete or enabled.** Exact head `9a0a891e644a87f8417a34cb2db112e509b0fc41`, hosted run `42635841583`, completed successfully in all required lanes. All 50 selected inspection/DB/native-admission tests have raw process evidence (`returncode=0`, `provenance=exact_waited_descendants`) and actual stdout reporting the exact named test passed with no failure/ignored case. This includes manager/provider plain-Markdown and taskmd Initial success/replay, dropped-caller admission custody, persisted source cancellation before Git and after Git/before SQLite, and combined cancellation plus lawful Coordinator rotation. The rotation test is not an isolated identity-only oracle; the old transcript retains its Coordinator role while authoritative head membership changes.
 
 **FollowUp implementation and regressions are authored, not yet hosted-qualified.** The existing FollowUp artifact worker now carries native origin/source checking, a final exact-path reread under the existing approval mutex, and conservative possible-effects progress before promotion/exclude/staging. Settlement reuses the existing atomic objective/authority/context/receipt/obligation transaction. Native HEAD-byte verification also runs when the staged diff is clean. Authored manager regressions cover plain/taskmd objective replacement, same WorkScope/branch/worktree, actual provider completion and historical replay, plus post-promotion failure with compensation retaining `Unavailable` and actor retirement. Worker regressions cover exact-path/source-check refusal, a disk edit during source checking, clean-index HEAD mismatch, and successful compensation without downgrading native progress. These are test claims awaiting execution, not acceptance evidence. DetachedCheckpoint and installed Goal controls remain Unsupported; Fresh native approval remains Unsupported and HTTP behavior is retained.

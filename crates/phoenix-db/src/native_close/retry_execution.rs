@@ -435,7 +435,7 @@ impl Database {
             .await
             .map_err(|error| NativeCloseInitialFirstEffectError::NotStarted(error.into()))?;
         let validation = async {
-            crate::task_approval_inspection::require_executing_source(
+            crate::executing_source::require_executing_source(
                 live_source,
                 command.source(),
                 "close_conversation",

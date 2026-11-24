@@ -762,6 +762,8 @@ async fn native_tmux_retry_fixture() -> (Database, Assessment, NativeCloseReceip
 
 #[tokio::test]
 async fn native_retry_tmux_dispatch_records_exact_pending_identity_and_refuses_mismatches() {
+    use std::cell::Cell;
+
     let (db, assessment, receipt, effect) = native_tmux_retry_fixture().await;
     let attempt = &receipt.admitted.attempt_id;
     let before = retry_dispatch_state(&db, attempt).await;
@@ -769,8 +771,6 @@ async fn native_retry_tmux_dispatch_records_exact_pending_identity_and_refuses_m
         "SELECT COUNT(*) FROM close_retirement_resource_dispatches WHERE attempt_id = ?1",
     ).bind(attempt.as_str()).fetch_one(db.pool()).await.unwrap();
     assert_eq!(dispatch_count, 0);
-
-    use std::cell::Cell;
 
     let entry_calls = Cell::new(0);
     let (entry_result, lease) = db.record_native_close_retry_retirement_dispatch_with_entry(
@@ -827,9 +827,9 @@ async fn native_retry_tmux_dispatch_records_exact_pending_identity_and_refuses_m
 #[tokio::test]
 async fn native_retry_tmux_first_effect_requires_exact_source_dispatch_identity_and_snapshot() {
     use std::cell::Cell;
+    use crate::native_close::{NativeCloseInitialEntryRelease, NativeCloseInitialFirstEffectError};
 
     let (db, assessment, receipt, effect) = native_tmux_retry_fixture().await;
-    use crate::native_close::{NativeCloseInitialEntryRelease, NativeCloseInitialFirstEffectError};
 
     let live_source = db.get_conversation(assessment.command.source_transcript_id())
         .await.unwrap().state;

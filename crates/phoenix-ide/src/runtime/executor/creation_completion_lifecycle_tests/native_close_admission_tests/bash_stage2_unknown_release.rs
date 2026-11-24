@@ -225,7 +225,7 @@ async fn assert_unknown_release_custody(drop_close_before_second_writer: bool) {
         crate::runtime::SseBroadcaster::new(128, 0),
     )
     .with_fatal_local_authority_fence(Arc::clone(&backend.fatal_local_authority_fence))
-    .with_native_task_admission_database(fixture.db.clone());
+    .with_actor_database(fixture.db.clone());
     let (sender, receiver) = mpsc::channel(4);
     let (watch_tx, state_rx) = tokio::sync::watch::channel(fixture.state.clone());
     let (startup, started) = oneshot::channel();

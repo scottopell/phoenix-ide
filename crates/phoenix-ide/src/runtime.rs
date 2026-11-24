@@ -300,34 +300,19 @@ pub(crate) enum AcknowledgedRuntimeRequest {
     ExecuteNativeCloseInitial(Box<native_close_application::NativeCloseInitialRequest>),
     ExecuteNativeCloseObserve(Box<native_close_application::NativeCloseObserveRequest>),
     ExecuteNativeCloseRetry(Box<native_close_application::NativeCloseRetryRequest>),
-    ExecuteNativeTaskApproval {
-        command: Box<phoenix_db::native_task_approval::NativeTaskApprovalCommand>,
-        response: tokio::sync::oneshot::Sender<task_approval_admission::NativeTaskApprovalOutcome>,
-        admission: tokio::sync::OwnedMutexGuard<()>,
-    },
-    #[cfg(test)]
-    InspectNativeTaskApprovalAdmission {
-        expected: Box<task_approval_admission::FrozenPendingTask>,
-        response: tokio::sync::oneshot::Sender<
-            Result<task_approval_admission::NativeTaskAdmissionReadiness, String>,
-        >,
-    },
 }
 
 mod native_close_application;
 pub(crate) use native_close_application::{
     NativeCloseApplicationError, NativeCloseApplicationResult,
 };
-mod task_approval_admission;
 
 #[cfg(test)]
 impl AcknowledgedRuntimeRequest {
     fn into_event(self) -> AcknowledgedEventRequest {
         match self {
             Self::Event(event) => *event,
-            Self::InspectNativeTaskApprovalAdmission { .. }
-            | Self::ExecuteNativeTaskApproval { .. }
-            | Self::ExecuteNativeCloseInitial(_)
+            Self::ExecuteNativeCloseInitial(_)
             | Self::ExecuteNativeCloseObserve(_)
             | Self::ExecuteNativeCloseRetry(_) => panic!("expected event request"),
         }
@@ -806,14 +791,9 @@ pub struct RuntimeManager {
     #[cfg(test)]
     runtime_materialization_panics: AsyncMutex<HashSet<String>>,
     #[cfg(test)]
-    native_pre_git_gates: std::sync::Mutex<HashMap<String, Box<dyn FnOnce() + Send>>>,
     #[cfg(test)]
-    native_projection_gates: std::sync::Mutex<HashMap<String, NativeTaskApprovalProjectionGate>>,
     #[cfg(test)]
-    native_early_target_gates: std::sync::Mutex<HashMap<String, NativeTaskApprovalEarlyTargetGate>>,
     #[cfg(test)]
-    native_failure_observers:
-        std::sync::Mutex<HashMap<String, tokio::sync::oneshot::Sender<(bool, String)>>>,
     #[cfg(test)]
     runtime_materialization_barriers: AsyncMutex<HashMap<String, Arc<tokio::sync::Barrier>>>,
     #[cfg(test)]
@@ -993,20 +973,6 @@ impl ExecutionOccurrenceRecovery {
 
 type StartupLlmRecoveryReceipt = oneshot::Receiver<Result<(), String>>;
 type SharedStartupLlmRecoveryReceipt = Arc<AsyncMutex<Option<StartupLlmRecoveryReceipt>>>;
-
-#[cfg(test)]
-pub(crate) struct NativeTaskApprovalEarlyTargetGate {
-    entered: tokio::sync::oneshot::Sender<()>,
-    release: tokio::sync::oneshot::Receiver<()>,
-}
-
-/// One-shot test scheduling boundary after classified native settlement, before
-/// live projection. It does not replace the actual projection operation/result.
-#[cfg(test)]
-pub(crate) struct NativeTaskApprovalProjectionGate {
-    entered: tokio::sync::oneshot::Sender<()>,
-    release: tokio::sync::oneshot::Receiver<()>,
-}
 
 /// Handle to interact with a running conversation
 #[derive(Clone)]
@@ -2784,13 +2750,9 @@ impl RuntimeManager {
             #[cfg(test)]
             runtime_materialization_panics: AsyncMutex::new(HashSet::new()),
             #[cfg(test)]
-            native_pre_git_gates: std::sync::Mutex::new(HashMap::new()),
             #[cfg(test)]
-            native_projection_gates: std::sync::Mutex::new(HashMap::new()),
             #[cfg(test)]
-            native_early_target_gates: std::sync::Mutex::new(HashMap::new()),
             #[cfg(test)]
-            native_failure_observers: std::sync::Mutex::new(HashMap::new()),
             #[cfg(test)]
             runtime_materialization_barriers: AsyncMutex::new(HashMap::new()),
             #[cfg(test)]
@@ -6831,40 +6793,8 @@ impl RuntimeManager {
         );
         let runtime = runtime
             .with_acknowledged_event_receiver(acknowledged_event_rx)
-            .with_native_task_admission_database(self.db.clone())
+            .with_actor_database(self.db.clone())
             .with_handoff_review_receiver(handoff_review_rx);
-        #[cfg(test)]
-        let runtime = runtime.with_native_pre_git_gate_for_test(
-            self.native_pre_git_gates
-                .lock()
-                .unwrap()
-                .remove(conversation_id),
-        );
-
-        #[cfg(test)]
-        let runtime = runtime.with_native_projection_gate_for_test(
-            self.native_projection_gates
-                .lock()
-                .unwrap()
-                .remove(conversation_id),
-        );
-
-        #[cfg(test)]
-        let runtime = runtime.with_native_early_target_gate_for_test(
-            self.native_early_target_gates
-                .lock()
-                .unwrap()
-                .remove(conversation_id),
-        );
-
-        #[cfg(test)]
-        let runtime = runtime.with_native_failure_observer_for_test(
-            self.native_failure_observers
-                .lock()
-                .unwrap()
-                .remove(conversation_id),
-        );
-
         let runtime = runtime
             .with_model_route_switch(model_upgrade.unwrap_or(false))
             .with_exhausted_maintenance(exhausted_maintenance)
@@ -7332,48 +7262,6 @@ impl RuntimeManager {
 
     /// Internal command only; no tool registration or HTTP route is installed.
     #[allow(dead_code)]
-    pub(crate) async fn execute_native_task_approval(
-        self: &Arc<Self>,
-        command: phoenix_db::native_task_approval::NativeTaskApprovalCommand,
-    ) -> task_approval_admission::NativeTaskApprovalOutcome {
-        use phoenix_db::native_task_approval::NativeTaskApprovalInspection;
-        use task_approval_admission::NativeTaskApprovalOutcome;
-        // Prove current source even for replay; target actor/Stop admission follows replay.
-        match self.db.inspect_native_task_approval_command(&command).await {
-            Ok(NativeTaskApprovalInspection::Replay(receipt)) => {
-                return NativeTaskApprovalOutcome::Committed(receipt)
-            }
-            Ok(NativeTaskApprovalInspection::RequiresOwningActorAdmission) => {}
-            Err(error) => return NativeTaskApprovalOutcome::preflight_error(&error),
-        }
-        let admission = match self
-            .mutation_admission(&command.current_transcript_id)
-            .await
-        {
-            Ok(admission) => admission.lock_owned().await,
-            Err(_) => return NativeTaskApprovalOutcome::Unavailable,
-        };
-        let Ok(handle) = self.get_or_create(&command.current_transcript_id).await else {
-            return NativeTaskApprovalOutcome::Unavailable;
-        };
-        let (response, result) = tokio::sync::oneshot::channel();
-        if handle
-            .acknowledged_event_tx
-            .send(AcknowledgedRuntimeRequest::ExecuteNativeTaskApproval {
-                command: Box::new(command),
-                response,
-                admission,
-            })
-            .await
-            .is_err()
-        {
-            return NativeTaskApprovalOutcome::Unavailable;
-        }
-        result
-            .await
-            .unwrap_or(NativeTaskApprovalOutcome::Unavailable)
-    }
-
     async fn send_acknowledged_event(
         self: &Arc<Self>,
         conversation_id: &str,
@@ -8386,74 +8274,6 @@ impl RuntimeManager {
                     )
                 })
             })
-    }
-
-    #[cfg(test)]
-    pub(crate) fn set_native_pre_git_gate_for_test(
-        &self,
-        conversation_id: &str,
-        gate: impl FnOnce() + Send + 'static,
-    ) {
-        let previous = self
-            .native_pre_git_gates
-            .lock()
-            .unwrap()
-            .insert(conversation_id.to_owned(), Box::new(gate));
-        assert!(
-            previous.is_none(),
-            "native pre-Git test gate already installed"
-        );
-    }
-
-    #[cfg(test)]
-    pub(crate) fn set_native_early_target_gate_for_test(
-        &self,
-        conversation_id: &str,
-        entered: tokio::sync::oneshot::Sender<()>,
-        release: tokio::sync::oneshot::Receiver<()>,
-    ) {
-        let previous = self.native_early_target_gates.lock().unwrap().insert(
-            conversation_id.to_owned(),
-            NativeTaskApprovalEarlyTargetGate { entered, release },
-        );
-        assert!(
-            previous.is_none(),
-            "native early-target test gate already installed"
-        );
-    }
-
-    #[cfg(test)]
-    pub(crate) fn set_native_failure_observer_for_test(
-        &self,
-        conversation_id: &str,
-        observer: tokio::sync::oneshot::Sender<(bool, String)>,
-    ) {
-        let previous = self
-            .native_failure_observers
-            .lock()
-            .unwrap()
-            .insert(conversation_id.to_owned(), observer);
-        assert!(
-            previous.is_none(),
-            "native failure observer already installed"
-        );
-    }
-
-    #[cfg(test)]
-    pub(crate) fn set_native_projection_gate_for_test(
-        &self,
-        conversation_id: &str,
-        entered: tokio::sync::oneshot::Sender<()>,
-        release: tokio::sync::oneshot::Receiver<()>,
-    ) {
-        let previous = self.native_projection_gates.lock().unwrap().insert(
-            conversation_id.to_owned(),
-            NativeTaskApprovalProjectionGate { entered, release },
-        );
-        assert!(
-            previous.is_none(),
-            "native projection test gate already installed"
-        );
     }
 
     pub(crate) async fn mutation_admission(

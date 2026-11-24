@@ -1,6 +1,6 @@
 use super::{NativeCloseCommand, NativeCloseIntent};
 use crate::close_foundation::CloseCleanupFailureAuthority;
-use crate::task_approval_inspection::require_executing_source;
+use crate::executing_source::require_executing_source;
 use crate::{ConvState, Database, DbError, DbResult};
 use phoenix_core::domain::close::{CloseAttemptId, CloseObligation, CloseRunOrdinal, CloseRunRef};
 use phoenix_core::domain::db_schema::SourceToolCall;

@@ -21,7 +21,7 @@ pub(super) async fn require_source_and_target_tx(
         .map_err(|error| DbError::Serialization(error.to_string()))?;
     let target = command.intent().target();
     let input = command.intent().source_input();
-    crate::task_approval_inspection::require_executing_source(
+    crate::executing_source::require_executing_source(
         &state,
         command.source(),
         "close_conversation",

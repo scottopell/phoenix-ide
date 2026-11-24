@@ -50,7 +50,7 @@ where
         // Production already installs the same database used by native admission.
         // An absent test/dormant dependency fails closed; no synthetic manager.
         let db = self
-            .native_task_admission_db
+            .actor_database
             .as_ref()
             .ok_or(NativeCloseApplicationError::Unavailable)?;
         // Once this boundary starts, losing its future before a typed result must

@@ -452,7 +452,7 @@ mod tests {
         let pid = child.id().expect("spawned child has pid");
         let process =
             current_process_identity(pid).expect("real child has a valid process identity");
-        let pgid = i32::try_from(pid).expect("child pid fits pgid");
+        let process_group_id = i32::try_from(pid).expect("child pid fits pgid");
         Handle::new_live_for_actor_with_owner_and_launch_identity(
             ResourceScopeKey::Unattached("native-retirement-test".into()),
             super::super::HandleId::new(format!("native-retirement-{pid}")),
@@ -465,14 +465,14 @@ mod tests {
             "sleep 600".into(),
             None,
             std::path::PathBuf::from("/tmp"),
-            pgid,
+            process_group_id,
             pid,
             1024,
         )
     }
 
     #[cfg(target_os = "linux")]
-    async fn stopped_sleep_child() -> tokio::process::Child {
+    fn stopped_sleep_child() -> tokio::process::Child {
         tokio::process::Command::new("sleep")
             .arg("600")
             .process_group(0)
@@ -486,7 +486,7 @@ mod tests {
     async fn dropping_native_owner_does_not_resume_observed_child() {
         use std::time::Duration;
 
-        let mut child = stopped_sleep_child().await;
+        let mut child = stopped_sleep_child();
         let pid = child.id().unwrap();
         let handle = child_handle(&child);
         let deadline = Instant::now() + Duration::from_secs(10);
@@ -523,7 +523,7 @@ mod tests {
         use super::super::{FinalCause, TOMBSTONE_TAIL_LINES};
         use std::time::{Duration, SystemTime};
 
-        let mut child = stopped_sleep_child().await;
+        let mut child = stopped_sleep_child();
         let handle = child_handle(&child);
         let deadline = Instant::now() + Duration::from_secs(10);
         let mut owner = handle.prepare_native_leaf(deadline).await.unwrap().unwrap();

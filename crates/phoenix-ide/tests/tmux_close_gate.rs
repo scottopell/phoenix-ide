@@ -58,7 +58,6 @@ async fn malformed_recognized_helper_arguments_exit_125_without_falling_through(
 // These tests create only unique disposable servers. Missing tmux is a failure,
 // not a silent skip; the exact-source hosted job installs and records its version.
 mod disposable {
-    use super::*;
     use phoenix_core::process_identity::{current_process_identity, ProcessIdentity};
     use phoenix_tools::tmux::{backend::TokenBoundKill, close_gate::retire_exact_on_server};
     use std::path::{Path, PathBuf};

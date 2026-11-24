@@ -144,9 +144,11 @@ jobs:
           cargo test -p phoenix-core --lib domain::close::tests:: -- --nocapture --test-threads=1 2>&1 | tee evidence/close-domain.log
           grep -E 'test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored;' evidence/close-domain.log
           grep -F 'test domain::close::tests::enums_expose_exact_persisted_strings ... ok' evidence/close-domain.log
-          cargo test -p phoenix-core --lib domain::task_approval::tests::reviewed_body_sha256_preserves_fixed_width_lowercase_encoding -- --exact --nocapture --test-threads=1 2>&1 | tee evidence/task-approval-body-hash.log
-          grep -Fx 'test domain::task_approval::tests::reviewed_body_sha256_preserves_fixed_width_lowercase_encoding ... ok' evidence/task-approval-body-hash.log
-          grep -F 'test result: ok. 1 passed; 0 failed; 0 ignored;' evidence/task-approval-body-hash.log
+          cargo test -p phoenix-core --lib domain::executing_source::tests:: -- --nocapture --test-threads=1 2>&1 | tee evidence/executing-source.log
+          grep -E 'test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored;' evidence/executing-source.log
+          for case in accepts_exact_executing_occurrence rejects_non_executing_state_and_blank_or_wrong_source_identity rejects_wrong_tool_name_and_payload_disagreement rejects_missing_duplicate_remaining_and_completed_occurrences; do
+            grep -Fx "test domain::executing_source::tests::$case ... ok" evidence/executing-source.log
+          done
       # Fail at the public retry boundary before paying for full DB regressions.
       # The same binary/inventory is reused by all later runtime gates.
       - name: Compile exact runtime fixtures for focused public journeys

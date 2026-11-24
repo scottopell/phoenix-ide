@@ -380,7 +380,8 @@ impl Database {
     /// not enforce single launch: repeated pre-effect checks are allowed. The manager
     /// must consume the authorized kind and serialize source revocation at the actual
     /// launch sink. This boundary performs no physical effects.
-    pub async fn authorize_native_close_initial_process_step(
+    #[cfg(test)]
+    pub(crate) async fn authorize_native_close_initial_process_step(
         &self,
         command: &NativeCloseCommand,
         receipt: &NativeCloseReceipt,
@@ -480,7 +481,7 @@ impl Database {
     /// and rollback is attempted. The callback must not perform database work, wait for
     /// another operation that needs this database's writer, or await; any such work can
     /// deadlock behind this reservation. Keep the callback bounded and synchronous.
-    /// This API is only a future integration seam; it performs no physical effect itself.
+    /// This is the live first-effect entry path; it performs no physical effect itself.
     ///
     /// The callback's `T` is retained only in this future until rollback has been
     /// awaited. Callers must therefore run this future under an external,
@@ -674,7 +675,8 @@ impl Database {
     /// an already proven effect. This database boundary performs no physical work.
     // Pass the initial receipt, live source, and exact worktree identity to the affine handoff gate.
     #[allow(clippy::too_many_arguments)]
-    pub async fn enter_native_close_initial_worktree_resource<F>(
+    #[cfg(test)]
+    pub(crate) async fn enter_native_close_initial_worktree_resource<F>(
         &self,
         command: &NativeCloseCommand,
         receipt: &NativeCloseReceipt,
@@ -714,75 +716,6 @@ impl Database {
             Err(error) => NativeCloseInitialEntryRelease::Unconfirmed(error.into()),
         };
         NativeCloseInitialResourceEntryResult::Invoked { decision, release }
-    }
-
-    /// Records exact worktree cleanup metadata under the source-owned initial run.
-    pub async fn record_native_close_initial_worktree_cleanup_plan(
-        &self,
-        command: &NativeCloseCommand,
-        receipt: &NativeCloseReceipt,
-        live_source: &phoenix_core::domain::sm_state::ConvState,
-        request: RecordCloseWorktreeCleanupPlanRequest,
-    ) -> LocalAuthorityResult<DbResult<()>> {
-        self.write_native_close_initial_worktree_metadata(
-            command,
-            receipt,
-            live_source,
-            request.attempt_id.clone(),
-            request.scope.clone(),
-            request.snapshot.clone(),
-            request.resource.clone(),
-            InitialWorktreeMetadata::Plan(request),
-            || Ok(()),
-        )
-        .await
-        .0
-    }
-
-    /// Binds the exact final worktree tombstone under the source-owned initial run.
-    pub async fn bind_native_close_initial_worktree_final_tombstone(
-        &self,
-        command: &NativeCloseCommand,
-        receipt: &NativeCloseReceipt,
-        live_source: &phoenix_core::domain::sm_state::ConvState,
-        request: BindCloseWorktreeFinalTombstoneRequest,
-    ) -> LocalAuthorityResult<DbResult<()>> {
-        self.write_native_close_initial_worktree_metadata(
-            command,
-            receipt,
-            live_source,
-            request.attempt_id.clone(),
-            request.scope.clone(),
-            request.snapshot.clone(),
-            request.resource.clone(),
-            InitialWorktreeMetadata::Tombstone(request),
-            || Ok(()),
-        )
-        .await
-        .0
-    }
-
-    /// Binds the exact worktree tombstone object under the source-owned initial run.
-    pub async fn bind_native_close_initial_worktree_final_tombstone_object(
-        &self,
-        command: &NativeCloseCommand,
-        receipt: &NativeCloseReceipt,
-        live_source: &phoenix_core::domain::sm_state::ConvState,
-        request: BindCloseWorktreeFinalTombstoneObjectRequest,
-    ) -> LocalAuthorityResult<DbResult<()>> {
-        self.write_native_close_initial_worktree_metadata(
-            command,
-            receipt,
-            live_source,
-            request.attempt_id.clone(),
-            request.scope.clone(),
-            request.snapshot.clone(),
-            request.resource.clone(),
-            InitialWorktreeMetadata::TombstoneObject(request),
-            || Ok(()),
-        )
-        .await
-        .0
     }
 
     /// Records a cleanup plan only if the original source still enters inside
@@ -2163,7 +2096,8 @@ impl Database {
     /// No effects, cancellation, blocker, retry, or historical-source fallback is accepted.
     /// Errors are classified only after rollback succeeds; commit/rollback uncertainty
     /// stays unclassified. An arbitrary precondition error is not permission to continue.
-    pub async fn settle_native_close_initial(
+    #[cfg(test)]
+    pub(crate) async fn settle_native_close_initial(
         &self,
         command: &NativeCloseCommand,
         receipt: &NativeCloseReceipt,
@@ -2251,7 +2185,8 @@ async fn prepare_initial_execution_tx(
     })
 }
 
-async fn settle_initial_tx(
+#[cfg(test)]
+pub(crate) async fn settle_initial_tx(
     tx: &mut Transaction<'_, Sqlite>,
     command: &NativeCloseCommand,
     receipt: &NativeCloseReceipt,
@@ -2286,7 +2221,7 @@ pub(super) async fn require_initial_identity_tx(
             "expected initial Close intent".into(),
         ));
     };
-    crate::task_approval_inspection::require_executing_source(
+    crate::executing_source::require_executing_source(
         live_source,
         command.source(),
         "close_conversation",

@@ -2229,10 +2229,10 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn prepared_target_drop_is_inert_and_original_permit_can_rollback() {
         fn assert_owned_send_static<T: Send + 'static>() {}
-        assert_owned_send_static::<PreparedBashRetirement>();
         fn drop_owned_future<F: std::future::Future + Send + 'static>(future: F) {
             drop(future);
         }
+        assert_owned_send_static::<PreparedBashRetirement>();
 
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let registry = BashHandleRegistry::with_lifecycle_sink(Some(tx));
@@ -2301,7 +2301,7 @@ mod tests {
                 "test".into(),
                 None,
                 std::path::PathBuf::from("/tmp"),
-                pid as i32,
+                i32::try_from(pid).expect("test pid fits pgid"),
                 pid,
                 1024,
             );

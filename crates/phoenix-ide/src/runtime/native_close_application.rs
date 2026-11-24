@@ -8,7 +8,6 @@
 
 use phoenix_core::domain::close::{CloseAttemptId, CloseRunOrdinal};
 use phoenix_core::domain::db_schema::SourceToolCall;
-use phoenix_core::domain::llm_types::ContentBlock;
 use phoenix_core::domain::product_conversation::ProductConversationId;
 use phoenix_db::native_close::{NativeCloseCommand, NativeCloseIntent, NativeCloseRunRef};
 use std::sync::Arc;
@@ -108,47 +107,21 @@ fn command_from_executing_source(
     intent: NativeCloseIntent,
 ) -> Result<NativeCloseCommand, NativeCloseSourceRefusal> {
     let invalid = NativeCloseSourceRefusal::NotExactExecutingSource;
-    let ConvState::ToolExecuting {
-        current_tool,
-        remaining_tools,
-        completed_results,
-        assistant_message,
-        ..
-    } = state
-    else {
-        return Err(invalid);
-    };
-    if source.message_id.trim().is_empty()
-        || source.tool_use_id.trim().is_empty()
-        || assistant_message.message_id != source.message_id
-        || current_tool.id != source.tool_use_id
-        || current_tool.name() != "close_conversation"
-        || remaining_tools
-            .iter()
-            .any(|tool| tool.id == source.tool_use_id)
-        || completed_results
-            .iter()
-            .any(|result| result.tool_use_id() == source.tool_use_id)
+    if phoenix_core::domain::executing_source::verify_executing_source(
+        state,
+        source,
+        "close_conversation",
+        &intent.source_input(),
+    )
+    .is_err()
     {
         return Err(invalid);
     }
-    let executing = current_tool.input.to_value();
-    let expected = intent.source_input();
-    let mut occurrences = assistant_message.content.iter().filter_map(|block| {
-        if let ContentBlock::ToolUse { id, name, input } = block {
-            (id == &source.tool_use_id).then_some((name, input))
-        } else {
-            None
-        }
-    });
-    let Some((name, canonical)) = occurrences.next() else {
+    let ConvState::ToolExecuting { current_tool, .. } = state else {
         return Err(invalid);
     };
-    if occurrences.next().is_some()
-        || name != "close_conversation"
-        || canonical != &executing
-        || canonical != &expected
-    {
+    let executing_input = current_tool.input.to_value();
+    if executing_input != intent.source_input() {
         return Err(invalid);
     }
     NativeCloseCommand::new(source_transcript_id.to_owned(), source.clone(), intent)

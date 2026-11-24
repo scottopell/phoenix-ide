@@ -11,6 +11,7 @@ pub mod conversation_goal;
 pub mod coordinator_authority;
 pub mod creation_protocol;
 pub mod db_schema;
+pub mod executing_source;
 pub mod federation_subscription;
 pub mod instance_identity;
 pub mod kill_signal;

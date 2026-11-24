@@ -1,7 +1,7 @@
 use super::{DbError, DbResult, Migration, WritableSchemaGuard};
 use sqlx::{Connection, SqlitePool};
 
-const COMPLETED_INITIAL_INTERRUPTION: &str = r#"
+const COMPLETED_INITIAL_INTERRUPTION: &str = r"
 NEW.authority_kind IN ('attempt_interrupted', 'explicitly_suppressed')
 AND NEW.reason = 'interrupted' AND NEW.cleanup_run_ordinal = 1
 AND NEW.stop_certainty = 'conversation_and_processes_stopped' AND NEW.confirmed_at_us IS NOT NULL
@@ -28,9 +28,9 @@ AND EXISTS (
       AND NOT EXISTS (SELECT 1 FROM close_run_retry_effects resource WHERE resource.attempt_id = proof.attempt_id)
       AND NOT EXISTS (SELECT 1 FROM close_run_retry_successes success WHERE success.attempt_id = proof.attempt_id)
 )
-"#;
+";
 
-const COMPLETED_INITIAL_DISPOSITION: &str = r#"
+const COMPLETED_INITIAL_DISPOSITION: &str = r"
 NEW.native_managed = 1 AND NEW.topology_sealed = 1
 AND OLD.phase IN ('retirement_requested', 'needs_repair')
 AND NEW.close_outcome = 'archived_cleanup_attention'
@@ -66,7 +66,7 @@ AND EXISTS (
       AND NOT EXISTS (SELECT 1 FROM close_runs later
                       WHERE later.attempt_id = proof.attempt_id AND later.run_ordinal > 1)
 )
-"#;
+";
 
 pub(super) async fn run(pool: &SqlitePool, migration: &Migration) -> DbResult<()> {
     let mut guard = WritableSchemaGuard::enable(pool).await?;

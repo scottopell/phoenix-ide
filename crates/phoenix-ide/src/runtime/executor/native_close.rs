@@ -61,15 +61,6 @@ pub(super) fn refuse_during_exit(request: crate::runtime::AcknowledgedRuntimeReq
                 .response
                 .send(Err(NativeCloseApplicationError::Unavailable));
         }
-        Request::ExecuteNativeTaskApproval { response, .. } => {
-            let _ = response.send(
-                crate::runtime::task_approval_admission::NativeTaskApprovalOutcome::Unavailable,
-            );
-        }
-        #[cfg(test)]
-        Request::InspectNativeTaskApprovalAdmission { response, .. } => {
-            let _ = response.send(Err("runtime is exiting".into()));
-        }
     }
 }
 
@@ -1036,7 +1027,7 @@ where
             )
             .map_err(|_| NativeCloseApplicationError::SourceRefused)?;
             let db = self
-                .native_task_admission_db
+                .actor_database
                 .as_ref()
                 .ok_or(NativeCloseApplicationError::Unavailable)?;
             Ok((command, db))
@@ -1116,7 +1107,7 @@ where
         backend_db: &phoenix_db::Database,
     ) -> Result<(), NativeCloseApplicationError> {
         if self
-            .native_task_admission_db
+            .actor_database
             .as_ref()
             .is_some_and(|actor_db| actor_db.shares_authority_with(backend_db))
         {
@@ -1160,7 +1151,7 @@ where
         // Production already installs the same database used by native admission.
         // An absent test/dormant dependency fails closed; no synthetic manager.
         let db = self
-            .native_task_admission_db
+            .actor_database
             .as_ref()
             .ok_or(NativeCloseApplicationError::Unavailable)?;
         // Once this boundary starts, losing its future before a typed result must

@@ -1,5 +1,7 @@
 use std::collections::BTreeSet;
 
+type DispatchFact = (String, String, String, String, String, String, String, i64);
+
 async fn source_fence_fixture() -> (Database, Assessment, CloseRunRef) {
     let db = Database::open_in_memory().await.unwrap();
     let failure = fixture(&db, Vec::new(), true).await;
@@ -942,13 +944,7 @@ async fn initial_source_fence_retains_exact_sealed_inventory_without_physical_ef
     assert_eq!(db.pending_coordinator_watch_events(100).await.unwrap().len(), 1);
 }
 
-#[tokio::test]
-async fn initial_source_fence_retains_no_worktree_scope_inventory_and_dispatch() {
-    use phoenix_core::domain::close::{CloseOwnedResourceInventory, RetiredResourceKind};
-
-    let db = Database::open_in_memory().await.unwrap();
-    create_root(&db, "fenced-no-worktree").await;
-    create_child(&db, "fenced-no-worktree-child", "fenced-no-worktree").await;
+async fn attach_no_worktree_source_fence_scopes(db: &Database) {
     let now = Utc::now().to_rfc3339();
     sqlx::query(
         "INSERT INTO work_scopes (
@@ -973,6 +969,16 @@ async fn initial_source_fence_retains_no_worktree_scope_inventory_and_dispatch()
             .await
             .unwrap();
     }
+}
+
+#[tokio::test]
+async fn initial_source_fence_retains_no_worktree_scope_inventory_and_dispatch() {
+    use phoenix_core::domain::close::{CloseOwnedResourceInventory, RetiredResourceKind};
+
+    let db = Database::open_in_memory().await.unwrap();
+    create_root(&db, "fenced-no-worktree").await;
+    create_child(&db, "fenced-no-worktree-child", "fenced-no-worktree").await;
+    attach_no_worktree_source_fence_scopes(&db).await;
     let command = retry_command(&db, "fenced-no-worktree-child", NativeCloseIntent::Initial {
         target: product_id("fenced-no-worktree"),
     }).await;
@@ -1270,7 +1276,6 @@ async fn initial_source_fence_preserves_proofs_across_mixed_worktree_scopes() {
         resource_kind, identity_kind, identity_codec, identity_value, dispatched_at_us
         FROM close_retirement_resource_dispatches WHERE attempt_id = ?1
         ORDER BY scope, resource_kind, identity_kind, identity_value";
-    type DispatchFact = (String, String, String, String, String, String, String, i64);
     let dispatches_before = sqlx::query_as::<_, DispatchFact>(dispatch_sql)
         .bind(run.attempt_id.as_str())
         .fetch_all(db.pool())
@@ -1344,15 +1349,33 @@ async fn all_complete_initial_source_fence_fixture_with_omissions(
     ConvState,
     CloseRunRef,
 ) {
-    initial_source_fence_inventory_fixture(omit_process_success, empty_generation, omit_bash_dispatch, true, false).await
+    initial_source_fence_inventory_fixture(InitialSourceFenceInventoryConfig {
+        omit_process_success,
+        empty_generation,
+        omit_bash_dispatch,
+        completion: FixtureCompletion::Complete,
+        ..Default::default()
+    }).await
+}
+
+#[derive(Default, PartialEq, Eq)]
+enum FixtureCompletion {
+    #[default]
+    DispatchOnly,
+    Complete,
+}
+
+#[derive(Default)]
+struct InitialSourceFenceInventoryConfig<'a> {
+    omit_process_success: bool,
+    empty_generation: Option<&'a str>,
+    omit_bash_dispatch: bool,
+    completion: FixtureCompletion,
+    include_second_bash: bool,
 }
 
 async fn initial_source_fence_inventory_fixture(
-    omit_process_success: bool,
-    empty_generation: Option<&str>,
-    omit_bash_dispatch: bool,
-    record_completion: bool,
-    include_second_bash: bool,
+    config: InitialSourceFenceInventoryConfig<'_>,
 ) -> (
     Database,
     NativeCloseCommand,
@@ -1363,23 +1386,34 @@ async fn initial_source_fence_inventory_fixture(
     let db = Database::open_in_memory().await.unwrap();
     initial_source_fence_inventory_fixture_with_db(
         db,
-        omit_process_success,
-        empty_generation,
-        omit_bash_dispatch,
-        record_completion,
-        include_second_bash,
+        config,
         BTreeSet::new(),
     )
     .await
 }
 
+async fn assert_inventory_fixture_resources(
+    db: &Database,
+    run: &CloseRunRef,
+    config: &InitialSourceFenceInventoryConfig<'_>,
+    resources: &[phoenix_core::domain::close::CloseExpectedRetirementResource],
+) {
+    assert!(!resources.is_empty());
+    assert!(resources.iter().any(|target| {
+        target.resource.kind() == RetiredResourceKind::BashProcessGroup
+    }));
+    assert!(resources.iter().any(|target| {
+        target.resource.kind() == RetiredResourceKind::WorkScope
+    }));
+    if config.completion == FixtureCompletion::Complete && !config.omit_process_success {
+        assert!(db.unresolved_expected_close_cleanup_resources(run.attempt_id.as_str())
+            .await.unwrap().is_empty());
+    }
+}
+
 async fn initial_source_fence_inventory_fixture_with_db(
     db: Database,
-    omit_process_success: bool,
-    empty_generation: Option<&str>,
-    omit_bash_dispatch: bool,
-    record_completion: bool,
-    include_second_bash: bool,
+    config: InitialSourceFenceInventoryConfig<'_>,
     pty_sessions: BTreeSet<phoenix_core::domain::close::OpaqueIdentity>,
 ) -> (
     Database,
@@ -1392,7 +1426,7 @@ async fn initial_source_fence_inventory_fixture_with_db(
         CloseRetirementSnapshot, OpaqueIdentity};
 
     create_root(&db, "all-complete-source-fence").await;
-    let scope = if empty_generation.is_some() {
+    let scope = if config.empty_generation.is_some() {
         db.get_conversation("all-complete-source-fence").await.unwrap().attached_work_scope_id.unwrap()
     } else {
         allocate_scope_worktree(&db, "all-complete-source-fence").await
@@ -1411,18 +1445,18 @@ async fn initial_source_fence_inventory_fixture_with_db(
     assert!(db.replace_native_close_initial_inspection(&command, &receipt, &source,
         crate::ReplaceCloseInspectionRequest {
             attempt_id: run.attempt_id.clone(),
-            scopes: if empty_generation.is_some() { vec![] } else {
+            scopes: if config.empty_generation.is_some() { vec![] } else {
                 vec![crate::ReplaceCloseInspectionScopeRequest {
                     scope: scope.clone(), snapshot: scope_snapshot.clone(), losses: vec![],
                 }]
             },
-        }, empty_generation).await.established().unwrap().is_ok());
+        }, config.empty_generation).await.established().unwrap().is_ok());
     let snapshot = db.get_close_obligation(run.attempt_id.as_str()).await.unwrap()
         .snapshot().cloned().unwrap();
     let captured = db.list_close_attempt_scopes(run.attempt_id.as_str()).await.unwrap();
     let worktree = match captured[0].captured_worktree.clone() {
         Some(CapturedWorktreeIdentity::Resolved(worktree)) => Some(worktree),
-        None if empty_generation.is_some() => None,
+        None if config.empty_generation.is_some() => None,
         _ => panic!("expected captured worktree or empty inspection"),
     };
     let LocalAuthorityResult::DurableFactEstablished(Ok(resources)) =
@@ -1434,7 +1468,7 @@ async fn initial_source_fence_inventory_fixture_with_db(
                     inventory: CloseOwnedResourceInventory {
                         worktree,
                         work_scopes: BTreeSet::new(),
-                        bash_process_groups: if include_second_bash {
+                        bash_process_groups: if config.include_second_bash {
                             [OpaqueIdentity::parse("complete-bash-session").unwrap(),
                              OpaqueIdentity::parse("complete-bash-session-b").unwrap()].into()
                         } else {
@@ -1447,7 +1481,7 @@ async fn initial_source_fence_inventory_fixture_with_db(
                 }],
             }).await else { panic!("expected sealed inventory"); };
     for target in &resources {
-        if omit_bash_dispatch && target.resource.kind() == RetiredResourceKind::BashProcessGroup {
+        if config.omit_bash_dispatch && target.resource.kind() == RetiredResourceKind::BashProcessGroup {
             continue;
         }
         assert!(matches!(db.record_native_close_initial_retirement_dispatch(
@@ -1456,10 +1490,10 @@ async fn initial_source_fence_inventory_fixture_with_db(
                 scope: target.scope.clone(), resource: target.resource.clone(),
             },
         ).await, LocalAuthorityResult::DurableFactEstablished(Ok(()))));
-        if !record_completion {
+        if config.completion == FixtureCompletion::DispatchOnly {
             continue;
         }
-        if target.resource.kind() == RetiredResourceKind::BashProcessGroup && !omit_process_success {
+        if target.resource.kind() == RetiredResourceKind::BashProcessGroup && !config.omit_process_success {
             let success = crate::CloseProcessStepSuccess {
                 run: run.clone(),
                 scope: target.scope.clone(),
@@ -1483,17 +1517,7 @@ async fn initial_source_fence_inventory_fixture_with_db(
             ).await, LocalAuthorityResult::DurableFactEstablished(Ok(()))));
         }
     }
-    assert!(!resources.is_empty());
-    assert!(resources.iter().any(|target| {
-        target.resource.kind() == RetiredResourceKind::BashProcessGroup
-    }));
-    assert!(resources.iter().any(|target| {
-        target.resource.kind() == RetiredResourceKind::WorkScope
-    }));
-    if record_completion && !omit_process_success {
-        assert!(db.unresolved_expected_close_cleanup_resources(run.attempt_id.as_str())
-            .await.unwrap().is_empty());
-    }
+    assert_inventory_fixture_resources(&db, &run, &config, &resources).await;
     (db, command, receipt, source, run)
 }
 
@@ -1503,7 +1527,7 @@ async fn initial_process_first_effect_preserves_nested_error_and_confirms_releas
     use phoenix_core::domain::close::RetiredResourceKind;
 
     let (db, command, receipt, source, run) =
-        initial_source_fence_inventory_fixture(false, None, false, false, false).await;
+        initial_source_fence_inventory_fixture(InitialSourceFenceInventoryConfig::default()).await;
     let item = db.list_close_expected_retirement_resources(run.attempt_id.as_str()).await.unwrap()
         .into_iter().find(|item| item.resource.kind() == RetiredResourceKind::BashProcessGroup).unwrap();
     let (effect, release) = db.with_native_close_initial_process_first_effect(
@@ -1525,11 +1549,7 @@ async fn initial_pty_process_first_effect_preserves_nested_error_and_confirms_re
     let pty_identity = OpaqueIdentity::parse("exact-pty-session").unwrap();
     let (db, command, receipt, source, run) = initial_source_fence_inventory_fixture_with_db(
         Database::open_in_memory().await.unwrap(),
-        false,
-        None,
-        false,
-        false,
-        false,
+        InitialSourceFenceInventoryConfig::default(),
         [pty_identity.clone()].into(),
     )
     .await;
@@ -1618,13 +1638,16 @@ async fn initial_process_first_effect_rejects_invalid_dispatch_binding_and_sourc
     use phoenix_core::domain::close::{CloseRetirementSnapshot, RetiredResourceKind};
 
     let (db, command, receipt, source, run) =
-        initial_source_fence_inventory_fixture(false, None, true, false, false).await;
+        initial_source_fence_inventory_fixture(InitialSourceFenceInventoryConfig {
+            omit_bash_dispatch: true,
+            ..Default::default()
+        }).await;
     let item = db.list_close_expected_retirement_resources(run.attempt_id.as_str()).await.unwrap()
         .into_iter().find(|item| item.resource.kind() == RetiredResourceKind::BashProcessGroup).unwrap();
     let mut called = false;
     let result = db.with_native_close_initial_process_first_effect(
         &command, &receipt, &source, item.scope.clone(), item.snapshot.clone(), &item.resource,
-        || { called = true; () },
+        || { called = true; },
     ).await;
     assert!(matches!(result, Err(NativeCloseInitialFirstEffectError::Rejected {
         release: NativeCloseInitialEntryRelease::Confirmed, ..
@@ -1632,7 +1655,7 @@ async fn initial_process_first_effect_rejects_invalid_dispatch_binding_and_sourc
     assert!(!called);
 
     let (db, command, receipt, source, run) =
-        initial_source_fence_inventory_fixture(false, None, false, false, false).await;
+        initial_source_fence_inventory_fixture(InitialSourceFenceInventoryConfig::default()).await;
     let resources = db.list_close_expected_retirement_resources(run.attempt_id.as_str()).await.unwrap();
     let process = resources.iter().find(|item| item.resource.kind() == RetiredResourceKind::BashProcessGroup).unwrap();
     let other_kind = resources.iter().find(|item| item.resource.kind() == RetiredResourceKind::WorkScope).unwrap();
@@ -1646,7 +1669,7 @@ async fn initial_process_first_effect_rejects_invalid_dispatch_binding_and_sourc
         let mut called = false;
         let result = db.with_native_close_initial_process_first_effect(
             &command, &receipt, &source, scope, snapshot, &resource,
-            || { called = true; () },
+            || { called = true; },
         ).await;
         assert!(matches!(result, Err(NativeCloseInitialFirstEffectError::Rejected {
             release: NativeCloseInitialEntryRelease::Confirmed, ..
@@ -1662,7 +1685,7 @@ async fn initial_process_first_effect_rejects_invalid_dispatch_binding_and_sourc
         let mut called = false;
         let result = db.with_native_close_initial_process_first_effect(
             &command, &receipt, &source, process.scope.clone(), process.snapshot.clone(), &process.resource,
-            || { called = true; () },
+            || { called = true; },
         ).await;
         assert!(matches!(result, Err(NativeCloseInitialFirstEffectError::Rejected {
             release: NativeCloseInitialEntryRelease::Confirmed, ..
@@ -1683,7 +1706,7 @@ async fn initial_process_first_effect_revalidates_after_independent_writer_revok
     // File-backed open runs only legacy schema setup; mirror numbered startup migrations.
     crate::migrations::run_pending_migrations(db.pool()).await.unwrap();
     let (db, command, receipt, source, run) =
-        initial_source_fence_inventory_fixture_with_db(db, false, None, false, false, false, BTreeSet::new()).await;
+        initial_source_fence_inventory_fixture_with_db(db, InitialSourceFenceInventoryConfig::default(), BTreeSet::new()).await;
     let writer = Database::open(path.to_str().unwrap()).await.unwrap();
     let item = db.list_close_expected_retirement_resources(run.attempt_id.as_str()).await.unwrap()
         .into_iter().find(|item| item.resource.kind() == RetiredResourceKind::BashProcessGroup).unwrap();
@@ -1691,7 +1714,7 @@ async fn initial_process_first_effect_revalidates_after_independent_writer_revok
     let mut called = false;
     let mut entry = Box::pin(db.with_native_close_initial_process_first_effect(
         &command, &receipt, &source, item.scope, item.snapshot, &item.resource,
-        || { called = true; () },
+        || { called = true; },
     ));
     // Pending may be pool acquisition or SQLite contention; neither is an entry.
     // The independent writer commits source loss before the callback can run.
@@ -1717,10 +1740,13 @@ async fn initial_process_first_effect_prior_success_or_retirement_blocks_only_ex
 
     for process_success in [false, true] {
         let (db, command, receipt, source, run) =
-            initial_source_fence_inventory_fixture(false, None, false, false, true).await;
+            initial_source_fence_inventory_fixture(InitialSourceFenceInventoryConfig {
+                include_second_bash: true,
+                ..Default::default()
+            }).await;
         let mut bash: Vec<_> = db.list_close_expected_retirement_resources(run.attempt_id.as_str()).await.unwrap()
             .into_iter().filter(|item| item.resource.kind() == RetiredResourceKind::BashProcessGroup).collect();
-        bash.sort_by_key(|item| item.resource.identity().value().to_owned());
+        bash.sort_by_key(|item| item.resource.identity().value().clone());
         assert_eq!(bash.len(), 2);
         let a = &bash[0];
         let b = &bash[1];
@@ -1742,7 +1768,7 @@ async fn initial_process_first_effect_prior_success_or_retirement_blocks_only_ex
         let mut called = false;
         let blocked = db.with_native_close_initial_process_first_effect(
             &command, &receipt, &source, a.scope.clone(), a.snapshot.clone(), &a.resource,
-            || { called = true; () },
+            || { called = true; },
         ).await;
         assert!(matches!(blocked, Err(NativeCloseInitialFirstEffectError::Rejected {
             release: NativeCloseInitialEntryRelease::Confirmed, ..
@@ -1765,7 +1791,7 @@ async fn initial_process_first_effect_prior_success_or_retirement_blocks_only_ex
 async fn initial_process_authorization_requires_exact_durable_source_scope_snapshot_and_dispatch() {
     use phoenix_core::domain::close::{CloseRetirementSnapshot, RetiredResourceKind};
 
-    let (db, command, receipt, source, run) = initial_source_fence_inventory_fixture(false, None, false, false, false).await;
+    let (db, command, receipt, source, run) = initial_source_fence_inventory_fixture(InitialSourceFenceInventoryConfig::default()).await;
     let inventories = db.list_close_expected_retirement_resources(run.attempt_id.as_str()).await.unwrap();
     let process = inventories.iter().find(|item| {
         item.resource.kind() == RetiredResourceKind::BashProcessGroup
@@ -1813,14 +1839,17 @@ async fn initial_process_authorization_rejects_missing_dispatch_and_stopped_or_c
     use phoenix_core::domain::close::RetiredResourceKind;
 
     let (db, command, receipt, source, run) =
-        initial_source_fence_inventory_fixture(false, None, true, false, false).await;
+        initial_source_fence_inventory_fixture(InitialSourceFenceInventoryConfig {
+            omit_bash_dispatch: true,
+            ..Default::default()
+        }).await;
     let item = db.list_close_expected_retirement_resources(run.attempt_id.as_str()).await.unwrap()
         .into_iter().find(|item| item.resource.kind() == RetiredResourceKind::BashProcessGroup).unwrap();
     assert!(db.authorize_native_close_initial_process_step(
         &command, &receipt, &source, item.scope.clone(), item.snapshot.clone(), RetiredResourceKind::BashProcessGroup,
     ).await.established().unwrap().is_err());
 
-    let (db, command, receipt, source, run) = initial_source_fence_inventory_fixture(false, None, false, false, false).await;
+    let (db, command, receipt, source, run) = initial_source_fence_inventory_fixture(InitialSourceFenceInventoryConfig::default()).await;
     let item = db.list_close_expected_retirement_resources(run.attempt_id.as_str()).await.unwrap()
         .into_iter().find(|item| item.resource.kind() == RetiredResourceKind::BashProcessGroup).unwrap();
     write_source_fence_state(&db, &command, &ConvState::Idle, false).await.unwrap();
@@ -1840,11 +1869,14 @@ async fn exact_initial_process_entry_is_per_resource_not_whole_kind() {
 
     for process_receipt in [false, true] {
     let (db, command, receipt, source, run) =
-        initial_source_fence_inventory_fixture(false, None, false, false, true).await;
+        initial_source_fence_inventory_fixture(InitialSourceFenceInventoryConfig {
+            include_second_bash: true,
+            ..Default::default()
+        }).await;
     let resources = db.list_close_expected_retirement_resources(run.attempt_id.as_str()).await.unwrap();
     let mut bash: Vec<_> = resources.into_iter()
         .filter(|item| item.resource.kind() == RetiredResourceKind::BashProcessGroup).collect();
-    bash.sort_by_key(|item| item.resource.identity().value().to_owned());
+    bash.sort_by_key(|item| item.resource.identity().value().clone());
     assert_eq!(bash.len(), 2);
     let a = &bash[0];
     let b = &bash[1];
@@ -1896,7 +1928,10 @@ async fn exact_initial_process_entry_missing_dispatch_never_invokes_handoff() {
     use phoenix_core::domain::close::RetiredResourceKind;
 
     let (db, command, receipt, source, run) =
-        initial_source_fence_inventory_fixture(false, None, true, false, false).await;
+        initial_source_fence_inventory_fixture(InitialSourceFenceInventoryConfig {
+            omit_bash_dispatch: true,
+            ..Default::default()
+        }).await;
     let item = db.list_close_expected_retirement_resources(run.attempt_id.as_str()).await.unwrap()
         .into_iter().find(|item| item.resource.kind() == RetiredResourceKind::BashProcessGroup).unwrap();
     let mut called = false;
@@ -1916,7 +1951,7 @@ async fn exact_initial_process_entry_rejects_stopped_and_restored_source_without
     use phoenix_core::domain::close::RetiredResourceKind;
 
     let (db, command, receipt, source, run) =
-        initial_source_fence_inventory_fixture(false, None, false, false, false).await;
+        initial_source_fence_inventory_fixture(InitialSourceFenceInventoryConfig::default()).await;
     let item = db.list_close_expected_retirement_resources(run.attempt_id.as_str()).await.unwrap()
         .into_iter().find(|item| item.resource.kind() == RetiredResourceKind::BashProcessGroup).unwrap();
     write_source_fence_state(&db, &command, &ConvState::Idle, false).await.unwrap();
@@ -1948,7 +1983,7 @@ async fn exact_initial_process_entry_revalidates_after_independent_writer_revoke
     // File-backed open runs only legacy schema setup; mirror numbered startup migrations.
     crate::migrations::run_pending_migrations(db.pool()).await.unwrap();
     let (db, command, receipt, source, run) =
-        initial_source_fence_inventory_fixture_with_db(db, false, None, false, false, false, BTreeSet::new()).await;
+        initial_source_fence_inventory_fixture_with_db(db, InitialSourceFenceInventoryConfig::default(), BTreeSet::new()).await;
     let writer = Database::open(path.to_str().unwrap()).await.unwrap();
     let item = db.list_close_expected_retirement_resources(run.attempt_id.as_str()).await.unwrap()
         .into_iter().find(|item| item.resource.kind() == RetiredResourceKind::BashProcessGroup).unwrap();
@@ -1989,7 +2024,10 @@ async fn exact_initial_process_entry_releases_writer_before_retained_cleanup_fin
     // File-backed open runs only legacy schema setup; mirror numbered startup migrations.
     crate::migrations::run_pending_migrations(db.pool()).await.unwrap();
     let (db, command, receipt, source, run) =
-        initial_source_fence_inventory_fixture_with_db(db, false, None, false, false, true, BTreeSet::new()).await;
+        initial_source_fence_inventory_fixture_with_db(db, InitialSourceFenceInventoryConfig {
+            include_second_bash: true,
+            ..Default::default()
+        }, BTreeSet::new()).await;
     let writer = Database::open(path.to_str().unwrap()).await.unwrap();
     let bash: Vec<_> = db.list_close_expected_retirement_resources(run.attempt_id.as_str()).await.unwrap()
         .into_iter().filter(|item| item.resource.kind() == RetiredResourceKind::BashProcessGroup).collect();
@@ -2026,7 +2064,7 @@ async fn exact_initial_process_entry_requires_original_binding_and_preserves_loc
     use phoenix_core::domain::close::{CloseRetirementSnapshot, LossItemIdentity, RetiredResourceIdentity, RetiredResourceKind};
 
     let (db, command, receipt, source, run) =
-        initial_source_fence_inventory_fixture(false, None, false, false, false).await;
+        initial_source_fence_inventory_fixture(InitialSourceFenceInventoryConfig::default()).await;
     let item = db.list_close_expected_retirement_resources(run.attempt_id.as_str()).await.unwrap()
         .into_iter().find(|item| item.resource.kind() == RetiredResourceKind::BashProcessGroup).unwrap();
     let foreign = RetiredResourceIdentity::parse(
@@ -2058,7 +2096,7 @@ async fn exact_initial_process_entry_requires_original_binding_and_preserves_loc
 async fn initial_process_authorization_rejects_source_changed_then_restored() {
     use phoenix_core::domain::close::RetiredResourceKind;
 
-    let (db, command, receipt, source, run) = initial_source_fence_inventory_fixture(false, None, false, false, false).await;
+    let (db, command, receipt, source, run) = initial_source_fence_inventory_fixture(InitialSourceFenceInventoryConfig::default()).await;
     let item = db.list_close_expected_retirement_resources(run.attempt_id.as_str()).await.unwrap()
         .into_iter().find(|item| item.resource.kind() == RetiredResourceKind::BashProcessGroup).unwrap();
     write_source_fence_state(&db, &command, &ConvState::Idle, false).await.unwrap();
@@ -2074,7 +2112,7 @@ async fn initial_process_authorization_rejects_prior_process_success_or_positive
     use phoenix_core::domain::close::RetiredResourceKind;
 
     for record_process_receipt in [false, true] {
-        let (db, command, receipt, source, run) = initial_source_fence_inventory_fixture(false, None, false, false, false).await;
+        let (db, command, receipt, source, run) = initial_source_fence_inventory_fixture(InitialSourceFenceInventoryConfig::default()).await;
         let process = db.list_close_expected_retirement_resources(run.attempt_id.as_str()).await.unwrap()
             .into_iter().find(|item| item.resource.kind() == RetiredResourceKind::BashProcessGroup).unwrap();
         if record_process_receipt {
@@ -2302,7 +2340,7 @@ async fn initial_all_complete_source_fence_records_truthful_unsuccessful_outcome
         assert!(matches!(failure.stop_certainty,
             CloseStopCertainty::ConversationAndProcessesStopped { .. }));
         assert_eq!(source_fence_allowance(&db, &run).await,
-            Some((0, if interruption { 0 } else { 1 })));
+            Some((0, i64::from(!interruption))));
         let obligation = db.get_close_obligation(run.attempt_id.as_str()).await.unwrap();
         assert_eq!(obligation.close_outcome(), Some(CloseCompletionOutcome::ArchivedCleanupAttention));
         assert_eq!(obligation.snapshot(), original_obligation.snapshot());
@@ -2314,10 +2352,10 @@ async fn initial_all_complete_source_fence_records_truthful_unsuccessful_outcome
         let events: Vec<_> = db.pending_coordinator_watch_events(100).await.unwrap()
             .into_iter().map(|event| (event.event_id, event.source_occurrence_id, event.occurred_at_us)).collect();
         let stopped = db.get_close_run(&run).await.unwrap();
-        if !interruption {
-            write_source_fence_state(&db, &command, &ConvState::Idle, false).await.unwrap();
-        } else {
+        if interruption {
             db.reset_all_to_idle().await.unwrap();
+        } else {
+            write_source_fence_state(&db, &command, &ConvState::Idle, false).await.unwrap();
         }
         assert_eq!(db.list_close_cleanup_failures(run.attempt_id.as_str()).await.unwrap(), failures);
         assert_eq!(db.pending_coordinator_watch_events(100).await.unwrap()
@@ -2350,7 +2388,7 @@ async fn all_complete_initial_source_fence_preserves_custom_empty_inspection_gen
         let failures = db.list_close_cleanup_failures(run.attempt_id.as_str()).await.unwrap();
         assert_eq!(failures.len(), 1);
         assert!(failures[0].occurrence.remaining_resources.is_empty());
-        assert!(matches!(failures[0].occurrence.authority, CloseCleanupFailureAuthority::ExplicitlySuppressed { .. }));
+        assert!(matches!(failures[0].occurrence.authority, CloseCleanupFailureAuthority::ExplicitlySuppressed));
     }
 }
 
@@ -2789,6 +2827,8 @@ async fn historical_live_all_success_completion_replay_is_effect_free() {
 
 #[tokio::test]
 async fn concurrent_historical_completion_replays_share_one_successor() {
+    use crate::native_close::NativeCloseCompletionResult::Replay;
+
     let (db, command, receipt, source, run) = all_complete_initial_source_fence_fixture().await;
     assert!(db.interrupt_native_close_initial_after_retirement(&command, &receipt, &source)
         .await.established().unwrap().is_ok());
@@ -2797,7 +2837,6 @@ async fn concurrent_historical_completion_replays_share_one_successor() {
         db.admit_native_close_initial_completion_retry(&command, &receipt, &source),
         db.admit_native_close_initial_completion_retry(&command, &receipt, &source),
     );
-    use crate::native_close::NativeCloseCompletionResult::Replay;
     let left = left.established().unwrap().unwrap();
     let right = right.established().unwrap().unwrap();
     assert!(matches!((&left, &right), (Replay(a), Replay(b)) if a == b));
@@ -2938,4 +2977,62 @@ async fn live_interruption_notification_failure_rolls_back_without_mutation() {
     assert_eq!(sqlx::query_scalar::<_, i64>(
         "SELECT COUNT(*) FROM close_retirement_resources WHERE attempt_id = ?1",
     ).bind(run.attempt_id.as_str()).fetch_one(db.pool()).await.unwrap(), successes);
+}
+
+#[tokio::test]
+async fn approved_task_settlement_atomically_fences_replaced_native_close_source() {
+    let (db, assessment, run) = source_fence_fixture().await;
+    db.initialize_coordinator_work_scope("/approval-fence-coordinator-home")
+        .await
+        .unwrap();
+    let pending = db.close_safe_retry_progress(&run).await.unwrap().pending;
+    assert!(!pending.is_empty());
+    let original_obligation = db.get_close_obligation(run.attempt_id.as_str()).await.unwrap();
+    assert_eq!(source_fence_allowance(&db, &run).await, Some((0, 0)));
+
+    // Native admission requires a current Coordinator. Exercise this general DB
+    // state writer directly on that admitted source: this is storage-fence
+    // coverage, not permission for HTTP approval of the Coordinator. Its home
+    // scope remains unchanged; rebinding it to an ordinary scope is forbidden.
+    let source_id = assessment.command.source_transcript_id();
+
+    let approval = phoenix_core::task_handoff::TaskApprovalHandoffData {
+        task_id: "27099".to_string(),
+        task_title: "Fence native source".to_string(),
+        title: "Fence native source".to_string(),
+        priority: phoenix_core::task_source::Priority::P1,
+        plan: "approved plan".to_string(),
+        task_file: "tasks/27099-p1-ready--fence-native-source.md".to_string(),
+        artifact_body: "# Fence native source\n\napproved plan\n".to_string(),
+    };
+    let now = chrono::Utc::now();
+    let approval_message = phoenix_core::domain::db_schema::Message {
+        message_id: "approval-source-fence-message".to_string(),
+        origin: phoenix_core::domain::db_schema::InputOrigin::SystemGenerated,
+        conversation_id: source_id.to_string(),
+        sequence_id: 99,
+        message_type: phoenix_core::domain::db_schema::MessageType::Agent,
+        content: phoenix_core::domain::db_schema::MessageContent::Agent(vec![]),
+        display_data: None,
+        usage_data: None,
+        created_at: now,
+    };
+    let next_state = ConvState::Idle;
+    let settled = db
+        .persist_approved_task_authority_and_state(
+            source_id,
+            &approval,
+            &approval_message,
+            &next_state,
+            now,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(settled, LocalAuthorityResult::DurableFactEstablished(())));
+
+    assert_eq!(db.get_conversation(source_id).await.unwrap().state, next_state);
+    assert_source_fenced(&db, &assessment, &run, &pending).await;
+    assert_eq!(source_fence_allowance(&db, &run).await, Some((0, 1)));
+    assert_eq!(db.get_close_obligation(run.attempt_id.as_str()).await.unwrap(), original_obligation);
+    assert_eq!(db.close_safe_retry_progress(&run).await.unwrap().pending, pending);
 }

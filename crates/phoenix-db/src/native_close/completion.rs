@@ -11,13 +11,13 @@ use crate::{Database, DbError, DbResult};
 
 /// Automatic successor binding, distinct from an explicit-retry source receipt.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NativeCloseCompletionReceipt {
-    pub origin: NativeCloseReceipt,
-    pub successor: NativeCloseRunRef,
+pub(crate) struct NativeCloseCompletionReceipt {
+    pub(crate) origin: NativeCloseReceipt,
+    pub(crate) successor: NativeCloseRunRef,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum NativeCloseCompletionResult {
+pub(crate) enum NativeCloseCompletionResult {
     NewlyAdmitted(NativeCloseCompletionReceipt),
     Replay(NativeCloseCompletionReceipt),
 }
@@ -25,7 +25,8 @@ pub enum NativeCloseCompletionResult {
 impl Database {
     /// Records an unsuccessful interruption after every initial retirement effect succeeded.
     /// Keeps the executing source current and performs no physical effects or Close finalization.
-    pub async fn interrupt_native_close_initial_after_retirement(
+    #[cfg(test)]
+    pub(crate) async fn interrupt_native_close_initial_after_retirement(
         &self,
         command: &NativeCloseCommand,
         receipt: &NativeCloseReceipt,
@@ -86,7 +87,8 @@ impl Database {
     }
 
     /// Finalizes the exact automatic completion successor without executing cleanup effects.
-    pub async fn complete_native_close_initial_completion_retry(
+    #[cfg(test)]
+    pub(crate) async fn complete_native_close_initial_completion_retry(
         &self,
         command: &NativeCloseCommand,
         receipt: &NativeCloseCompletionReceipt,
@@ -168,7 +170,8 @@ impl Database {
 
     /// Replays an existing historical completion receipt; never creates a new successor.
     /// Revalidates live and durable source identity before consulting retained history.
-    pub async fn admit_native_close_initial_completion_retry(
+    #[cfg(test)]
+    pub(crate) async fn admit_native_close_initial_completion_retry(
         &self,
         command: &NativeCloseCommand,
         receipt: &NativeCloseReceipt,

@@ -1,7 +1,7 @@
 use super::{DbError, DbResult, Migration, WritableSchemaGuard};
 use sqlx::{Connection, SqlitePool};
 
-const AUTO_ADMISSION: &str = r#"
+const AUTO_ADMISSION: &str = r"
 EXISTS (
     SELECT 1 FROM native_close_completion_retry_admissions admission
     JOIN native_close_completion_retry_initial_failures origin
@@ -28,9 +28,9 @@ EXISTS (
       AND NOT EXISTS (SELECT 1 FROM close_runs later
                       WHERE later.attempt_id = admission.attempt_id AND later.run_ordinal > 1)
 )
-"#;
+";
 
-const AUTO_FAILURE: &str = r#"
+const AUTO_FAILURE: &str = r"
 NEW.authority_kind IN ('attempt_interrupted', 'explicitly_suppressed')
 AND NEW.reason = 'interrupted' AND NEW.cleanup_run_ordinal = 2
 AND NEW.failure_occurrence_id = 'close-failure:2:' || NEW.attempt_id
@@ -50,9 +50,9 @@ AND EXISTS (
         OR (NEW.stop_certainty = 'conversation_and_processes_stopped'
           AND NEW.confirmed_at_us >= successor.created_at_us AND NEW.confirmed_at_us <= NEW.occurred_at_us))
 )
-"#;
+";
 
-const AUTO_DISPOSITION: &str = r#"
+const AUTO_DISPOSITION: &str = r"
 OLD.phase = 'completed' AND NEW.phase = 'completed'
 AND OLD.close_outcome IN ('close_incomplete', 'archived_cleanup_attention')
 AND NEW.close_outcome = 'archived_cleanup_attention'
@@ -94,9 +94,9 @@ AND EXISTS (SELECT 1 FROM product_conversations product WHERE product.id = NEW.p
 AND NOT EXISTS (SELECT 1 FROM close_attempt_participants participant JOIN conversations conversation
                 ON conversation.id = participant.conversation_id
                 WHERE participant.attempt_id = NEW.attempt_id AND conversation.archived <> 1)
-"#;
+";
 
-const AUTO_SUCCESS: &str = r#"
+const AUTO_SUCCESS: &str = r"
 OLD.phase = 'completed' AND NEW.phase = 'completed'
 AND OLD.close_outcome IN ('close_incomplete', 'archived_cleanup_attention') AND NEW.close_outcome = 'archived'
 AND NEW.attempt_id IS OLD.attempt_id AND NEW.product_conversation_id IS OLD.product_conversation_id
@@ -114,7 +114,7 @@ AND EXISTS (SELECT 1 FROM product_conversations product WHERE product.id = NEW.p
 AND NOT EXISTS (SELECT 1 FROM close_attempt_participants participant JOIN conversations conversation
                 ON conversation.id = participant.conversation_id
                 WHERE participant.attempt_id = NEW.attempt_id AND conversation.archived <> 1)
-"#;
+";
 
 fn unexpected(object: &str) -> DbError {
     DbError::Serialization(format!(

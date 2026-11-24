@@ -3389,14 +3389,19 @@ async fn initial_worktree_metadata_requires_exact_original_dispatched_authority_
         .await
         .unwrap();
     assert!(before_dispatch.is_none());
-    assert!(matches!(
-        f.db.record_native_close_initial_worktree_cleanup_plan(
+    let (result, lease) = f
+        .db
+        .record_native_close_initial_worktree_cleanup_plan_with_entry(
             &command,
             &receipt,
             &live_source,
             plan(),
+            || Ok(()),
         )
-        .await,
+        .await;
+    assert!(lease.is_none());
+    assert!(matches!(
+        result,
         LocalAuthorityResult::DurableFactEstablished(Err(DbError::CloseFoundationPrecondition(_)))
     ));
     assert!(f
@@ -3429,14 +3434,19 @@ async fn initial_worktree_metadata_requires_exact_original_dispatched_authority_
         .unwrap(),
         ..plan()
     };
-    assert!(matches!(
-        f.db.record_native_close_initial_worktree_cleanup_plan(
+    let (result, lease) = f
+        .db
+        .record_native_close_initial_worktree_cleanup_plan_with_entry(
             &command,
             &receipt,
             &live_source,
             wrong_snapshot,
+            || Ok(()),
         )
-        .await,
+        .await;
+    assert!(lease.is_none());
+    assert!(matches!(
+        result,
         LocalAuthorityResult::DurableFactEstablished(Err(DbError::CloseFoundationPrecondition(_)))
     ));
     assert!(f
@@ -3451,16 +3461,18 @@ async fn initial_worktree_metadata_requires_exact_original_dispatched_authority_
         .unwrap()
         .is_none());
 
-    f.db.record_native_close_initial_worktree_cleanup_plan(
-        &command,
-        &receipt,
-        &live_source,
-        plan(),
-    )
-    .await
-    .established()
-    .unwrap()
-    .unwrap();
+    let (result, lease) = f
+        .db
+        .record_native_close_initial_worktree_cleanup_plan_with_entry(
+            &command,
+            &receipt,
+            &live_source,
+            plan(),
+            || Ok(()),
+        )
+        .await;
+    assert!(lease.is_some());
+    result.established().unwrap().unwrap();
     assert!(f
         .db
         .close_worktree_cleanup_plan(
@@ -3480,14 +3492,19 @@ async fn initial_worktree_metadata_requires_exact_original_dispatched_authority_
         administrative_dir_incarnation: "must-not-write".into(),
         ..plan()
     };
-    assert!(matches!(
-        f.db.record_native_close_initial_worktree_cleanup_plan(
+    let (result, lease) = f
+        .db
+        .record_native_close_initial_worktree_cleanup_plan_with_entry(
             &command,
             &receipt,
             &live_source,
             stopped_plan,
+            || Ok(()),
         )
-        .await,
+        .await;
+    assert!(lease.is_none());
+    assert!(matches!(
+        result,
         LocalAuthorityResult::DurableFactEstablished(Err(DbError::CloseFoundationPrecondition(_)))
     ));
     let retained =

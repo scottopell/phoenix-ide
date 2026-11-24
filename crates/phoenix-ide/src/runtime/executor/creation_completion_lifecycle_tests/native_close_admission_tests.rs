@@ -189,7 +189,7 @@ impl CloseFixture {
         harness.runtime.context.is_coordinator = is_coordinator;
         harness.runtime = harness
             .runtime
-            .with_native_task_admission_database(self.db.clone());
+            .with_actor_database(self.db.clone());
         harness
     }
 }
@@ -421,7 +421,7 @@ async fn native_close_backend_requires_actor_database_authority_not_matching_pat
             .check_native_close_backend(&unrelated_backend),
         Err(NativeCloseApplicationError::SourceRefused)
     );
-    harness.runtime.native_task_admission_db = None;
+    harness.runtime.actor_database = None;
     assert_eq!(
         harness.runtime.check_native_close_backend(&cloned_backend),
         Err(NativeCloseApplicationError::SourceRefused)
@@ -899,7 +899,7 @@ async fn dropped_initial_reply_retains_admission_until_exact_stop_releases_gate(
         crate::runtime::SseBroadcaster::new(128, 0),
     )
     .with_fatal_local_authority_fence(crate::runtime::FatalLocalAuthorityFence::new())
-    .with_native_task_admission_database(fixture.db.clone());
+    .with_actor_database(fixture.db.clone());
     let original_fence = Arc::clone(&actor.fatal_local_authority_fence);
     let admitted = actor.admit_authoritative_effect().unwrap();
     let (sender, receiver) = mpsc::channel(4);
@@ -3132,7 +3132,7 @@ async fn registered_close_waiting_for_target_gate_is_refused_after_source_stop()
         crate::runtime::SseBroadcaster::new(128, 0),
     )
     .with_fatal_local_authority_fence(crate::runtime::FatalLocalAuthorityFence::new())
-    .with_native_task_admission_database(fixture.db.clone());
+    .with_actor_database(fixture.db.clone());
     // Install the real actor's channels, not the fake drain helper. Constructing
     // an actor in its executing state avoids production startup materialization's
     // transient-state recovery and does not launch a second copy of the tool.

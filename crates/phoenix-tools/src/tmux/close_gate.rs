@@ -841,12 +841,12 @@ mod tests {
         assert_eq!(result, Err("close-gate request truncated"));
         client.await.unwrap();
 
-        let expired = tokio::time::Instant::now() - Duration::from_millis(1);
+        let past_deadline = tokio::time::Instant::now() - Duration::from_millis(1);
         assert_eq!(
             approve_helper_with_observer(
                 &listener,
                 ApprovalContext {
-                    expires: expired,
+                    expires: past_deadline,
                     ..context
                 },
                 |_| true,

@@ -179,11 +179,19 @@ impl Fixture {
             .established()
             .unwrap()
             .unwrap();
-        db.settle_native_close_initial(&command, &receipt, &live_source)
-            .await
-            .established()
-            .unwrap()
-            .unwrap();
+        assert_eq!(
+            db.try_settle_native_close_initial(&command, &receipt, &live_source)
+                .await
+                .established()
+                .unwrap()
+                .unwrap(),
+            phoenix_db::native_close::NativeCloseInitialSettlement::Advanced(
+                phoenix_db::native_close::NativeCloseInitialExecution {
+                    run: receipt.admitted.clone(),
+                    phase: phoenix_core::domain::close::ClosePhase::AwaitingRetirementInspection,
+                },
+            ),
+        );
         db.replace_native_close_initial_inspection(
             &command,
             &receipt,

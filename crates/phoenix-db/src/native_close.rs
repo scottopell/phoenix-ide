@@ -196,8 +196,10 @@ pub use captured_loss_retry::{NativeCloseCapturedLossRetryContext, NativeCloseRe
 mod captured_loss_admission;
 pub use captured_loss_admission::NativeCloseCapturedLossRetryAssessment;
 
+#[cfg(test)]
 mod completion;
-pub use completion::{NativeCloseCompletionReceipt, NativeCloseCompletionResult};
+#[cfg(test)]
+pub(crate) use completion::{NativeCloseCompletionReceipt, NativeCloseCompletionResult};
 
 mod initial;
 mod initial_exit;

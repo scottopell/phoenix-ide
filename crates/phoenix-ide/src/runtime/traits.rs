@@ -586,20 +586,6 @@ pub trait StateStore: Send + Sync {
         approval: &phoenix_core::task_handoff::TaskApprovalHandoffData,
     ) -> Result<(), String>;
 
-    async fn persist_native_approved_task_authority_and_state(
-        &self,
-        command: &phoenix_db::native_task_approval::NativeTaskApprovalCommand,
-        approval: &phoenix_core::task_handoff::TaskApprovalHandoffData,
-        approval_message: &Message,
-        state: &ConvState,
-        state_updated_at: DateTime<Utc>,
-    ) -> Result<
-        phoenix_db::workflow::LocalAuthorityResult<
-            phoenix_db::native_task_approval::NativeTaskApprovalReceipt,
-        >,
-        String,
-    >;
-
     async fn persist_approved_task_authority_and_state(
         &self,
         conv_id: &str,
@@ -1454,30 +1440,6 @@ impl<T: StateStore + ?Sized> StateStore for Arc<T> {
     ) -> Result<(), String> {
         (**self)
             .persist_approved_task_authority(conv_id, approval)
-            .await
-    }
-
-    async fn persist_native_approved_task_authority_and_state(
-        &self,
-        command: &phoenix_db::native_task_approval::NativeTaskApprovalCommand,
-        approval: &phoenix_core::task_handoff::TaskApprovalHandoffData,
-        approval_message: &Message,
-        state: &ConvState,
-        state_updated_at: DateTime<Utc>,
-    ) -> Result<
-        phoenix_db::workflow::LocalAuthorityResult<
-            phoenix_db::native_task_approval::NativeTaskApprovalReceipt,
-        >,
-        String,
-    > {
-        (**self)
-            .persist_native_approved_task_authority_and_state(
-                command,
-                approval,
-                approval_message,
-                state,
-                state_updated_at,
-            )
             .await
     }
 
@@ -3020,31 +2982,6 @@ impl StateStore for DatabaseStorage {
             .persist_approved_task_authority(conv_id, approval)
             .await
             .map_err(|e| e.to_string())
-    }
-
-    async fn persist_native_approved_task_authority_and_state(
-        &self,
-        command: &phoenix_db::native_task_approval::NativeTaskApprovalCommand,
-        approval: &phoenix_core::task_handoff::TaskApprovalHandoffData,
-        approval_message: &Message,
-        state: &ConvState,
-        state_updated_at: DateTime<Utc>,
-    ) -> Result<
-        phoenix_db::workflow::LocalAuthorityResult<
-            phoenix_db::native_task_approval::NativeTaskApprovalReceipt,
-        >,
-        String,
-    > {
-        self.db
-            .persist_native_approved_task_authority_and_state(
-                command,
-                approval,
-                approval_message,
-                state,
-                state_updated_at,
-            )
-            .await
-            .map_err(|error| error.to_string())
     }
 
     async fn persist_approved_task_authority_and_state(

@@ -107,9 +107,9 @@ impl super::PreparedBashRetirement {
             .map_err(|error| match error {
                 NativeBashSignalError::Unsupported => NativeBashRetirementError::Unsupported,
                 NativeBashSignalError::Expired => NativeBashRetirementError::DeadlineExpired,
-                error @ NativeBashSignalError::WrongPhase
-                | error @ NativeBashSignalError::NotStopped
-                | error @ NativeBashSignalError::Io(_) => NativeBashRetirementError::Native(error),
+                error @ (NativeBashSignalError::WrongPhase
+                | NativeBashSignalError::NotStopped
+                | NativeBashSignalError::Io(_)) => NativeBashRetirementError::Native(error),
             })?
             .ok_or(NativeBashRetirementError::NoLiveLeader)?;
         if Instant::now() >= deadline {

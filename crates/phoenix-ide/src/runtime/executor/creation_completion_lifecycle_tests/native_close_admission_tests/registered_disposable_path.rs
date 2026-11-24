@@ -50,7 +50,7 @@ async fn registered_close_captures_and_retires_disposable_empty_work_scope() {
         crate::runtime::SseBroadcaster::new(128, 0),
     )
     .with_fatal_local_authority_fence(Arc::clone(&backend.fatal_local_authority_fence))
-    .with_native_task_admission_database(fixture.db.clone());
+    .with_actor_database(fixture.db.clone());
 
     let (sender, receiver) = mpsc::channel(4);
     let (watch_tx, state_rx) = tokio::sync::watch::channel(fixture.state.clone());

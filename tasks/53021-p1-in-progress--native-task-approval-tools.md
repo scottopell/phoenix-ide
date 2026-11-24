@@ -83,3 +83,14 @@ factory, runtime/executor/API, registration, Close or build-hold changes.
 Integration risk: Federation has an unpublished migration 156 reserved in another
 checkout. Renumber one leaf and its ledger assertions before integrating both;
 this leaf does not modify that checkout.
+
+## Current disposition: Close architecture reduction
+
+The working-tree reduction is **UNQUALIFIED**; it has not been locally executed.
+Reported Close run `45491118337` succeeded, while standard CI run `45491139148`
+was red. Preserved run `1068` has unknown cause. This task remains in progress and
+is not marked done. Native task-approval DB/runtime work removed from the Close
+reduction is preserved at `preserve/native-task-approval-cb7e80573`; do not infer
+that the broader feature is complete or qualified. Keep ADR-284 history Proposed.
+The bounded Keep/Share/Delete disposition is recorded in
+[`CLOSE-ARCHITECTURE-REDUCTION.md`](../CLOSE-ARCHITECTURE-REDUCTION.md).

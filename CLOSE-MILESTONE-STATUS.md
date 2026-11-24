@@ -1,3 +1,40 @@
+# Architectural reduction candidate — unqualified
+
+The current source reduces the Close expansion against shipped RC16
+`9885834f049683f5e6fa9c840668bdab92eb8a01`. The keep/share/delete ledger is
+[CLOSE-ARCHITECTURE-REDUCTION.md](CLOSE-ARCHITECTURE-REDUCTION.md).
+
+- Previous head `cb7e805735220fd260537a42e33e15baacaff70f`: Close qualification
+  [45491118337](https://github.com/scottopell/phoenix-ide/actions/runs/45491118337)
+  **passed**. Standard PR CI
+  [45491139148](https://github.com/scottopell/phoenix-ide/actions/runs/45491139148)
+  **failed**. Neither result qualifies this reduction.
+- Shared exact executing-source predicate replaces duplicate core/DB/IDE logic;
+  it remains validation, not mutation authority. Unexposed native task approval
+  DB/runtime modules are removed from this candidate, preserved at local ref
+  `preserve/native-task-approval-cb7e80573`. Migration 172 and later identities,
+  reviewed-proposal state/checkpoint/provider compatibility remain intact.
+- Removed the alternate test-only initial adapter and no-entry initial metadata
+  wrappers; live resource custody, two-stage handback, physical cleanup, source
+  fencing, recovery and retry evidence remain required. Cross-crate fixtures use
+  the retained public settlement API.
+- Independent source reviews found ordinary-approval restoration compile hazards,
+  a lost transaction source fence, a cross-crate test-only API caller and a fixture
+  prerequisite. Repairs are authored, including a direct storage-writer fencing
+  regression with legitimate Coordinator home initialization. That regression is
+  not permission for HTTP approval of the Coordinator.
+- Still-live cb7 lint/import findings are repaired in source. No local executable
+  validation was run. The next evidence is automatic exact-head hosted Close and
+  standard CI after publication; source review and `git diff --check` are not
+  compile, formatting or behavior qualification.
+- The `1068c2da76` captured-loss `storage_rejected` cause remains unknown. Later
+  passing journeys do not establish a causal fix or prove a flake.
+
+No merge, deployment, install or release is claimed or authorized by this record.
+The older progress entries below describe historical candidates only.
+
+---
+
 # Unified Close acceptance milestone
 
 ## Integrated1497 terminal: behavior gates pass; hosted formatting correction requires fresh CI

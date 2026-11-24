@@ -4979,6 +4979,14 @@ mod tests {
     #[tokio::test]
     async fn waiter_reader_join_error_still_awaits_gated_stderr_reader() {
         use std::future::Future as _;
+        struct SignalOnDrop(Option<tokio::sync::oneshot::Sender<()>>);
+        impl Drop for SignalOnDrop {
+            fn drop(&mut self) {
+                if let Some(sender) = self.0.take() {
+                    let _ = sender.send(());
+                }
+            }
+        }
         let handle = live_handle();
         let (release_tx, release_rx) = tokio::sync::oneshot::channel();
         let reader_handle = handle.clone();
@@ -4993,14 +5001,6 @@ mod tests {
             )
             .await;
         });
-        struct SignalOnDrop(Option<tokio::sync::oneshot::Sender<()>>);
-        impl Drop for SignalOnDrop {
-            fn drop(&mut self) {
-                if let Some(sender) = self.0.take() {
-                    let _ = sender.send(());
-                }
-            }
-        }
         let (stdout_ended, stdout_completion) = tokio::sync::oneshot::channel();
         let stdout_join = tokio::spawn(async move {
             let _completion = SignalOnDrop(Some(stdout_ended));

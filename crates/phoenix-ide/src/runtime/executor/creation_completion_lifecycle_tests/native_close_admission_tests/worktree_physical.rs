@@ -610,7 +610,7 @@ async fn run_public_worktree_close(journey: WorktreeJourney) {
         crate::runtime::SseBroadcaster::new(128, 0),
     )
     .with_fatal_local_authority_fence(Arc::clone(&backend.fatal_local_authority_fence))
-    .with_native_task_admission_database(fixture.db.clone());
+    .with_actor_database(fixture.db.clone());
 
     let (phase_tx, mut phases) = mpsc::unbounded_channel();
     if retry_loss_classification {
