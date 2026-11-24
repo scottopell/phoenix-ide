@@ -1,3 +1,33 @@
+## Bounded question attribution and preload cost decision
+
+Further read-only source and artifact reviews used exact merged source `0f6e3627` and the eight measured **control** trials per viewport/mode from diagnostic run45311433061. All times below are document-clock navigation-relative medians, not production observations. No additional experiment or product-source change was made.
+
+| Event | 393 cold | 1440 cold | 393 warm | 1440 warm |
+|---|---:|---:|---:|---:|
+| Shell index JS response end | 1014.7 | 1008.6 | -1796.9 | -1913.6 |
+| Auth response end | 1455.8 | 1443.8 | -1338.1 | -1452.2 |
+| CoordinatorPage JS response end | 1913.5 | 1907.7 | 430.6 | 438.9 |
+| QuestionPanel JS response end | 1912.2 | 1906.4 | 428.9 | 434.6 |
+| Shared lib JS response end | 2333.5 | 2329.8 | 461.8 | 939.3 |
+| Shared arrow-left JS response end | 2306.5 | 2302.4 | 825.0 | 844.0 |
+| Identity request start / end | 2359.4 / 2769.7 | 2362.6 / 2772.2 | 918.6 / 1321.0 | 1031.3 / 1432.9 |
+| Question feed response end | 2770.6 | 2772.5 | -56.6 | -69.7 |
+| Independent question layout | 2875.7 | 2882.7 | 919.8 | 1032.6 |
+
+CoordinatorPage and QuestionPanel acquisition start together: there is no separate sequential QuestionPanel-download waterfall. Shared dependency acquisition continues after their own chunks finish. Cold feed and identity requests overlap (feed starts ~4–6ms later), and paired feed-response-to-layout residual is ~112ms. Warm feed has already completed; question layout occurs ~400ms **before** identity response in all16 warm control trials. Source agrees: DesktopLayout starts the shared question feed, CoordinatorQuestionDock is outside the identity-gated transcript branch, and its store subscription does not require identity. Identity correlation is not identity causality.
+
+Resource response end is not module evaluation/React commit. Last acquisition-wave response to identity-request start is ~25–32ms cold/~92–94ms warm; these and the ~112ms cold feed-to-layout residual mix execution, effects/store publication, React work, dialog/layout and rAF observation. No exact QuestionPanel commit mark exists, so the residual must not be called measured mount cost. Existing `phoenix:view-diagnostic` events expose journey admission/shell/snapshot/hydration/transcript/correlation evidence but not pre-attachment module evaluation, question-ready or exact React commit; journey sampling is not forced here.
+
+**Simplest preload cost review:** no existing application-owned preload/cache helper was found. A scoped best-effort existing-module import is simpler than new history ownership/cache/dedup machinery, but the diagnostic `void import()` is not production-ready failure handling. The import cannot be aborted on departure, executes modules and inserts global CSS, and can waste work if initial ensure/source validation fails. The existing Vite preload-error recovery can display an attachment-safe reload notice even for a speculative failure; catching the promise does not necessarily suppress that event. Do not add automatic reload or a sticky rejected-promise singleton. React.lazy and speculative import rejection/retry behavior are not interchangeable.
+
+One representative early mobile cold trial acquires12 transcript assets (7JS/5CSS),219,701 ResourceTiming transfer bytes (~214.6KiB). Matching successful control eventually acquires the same graph later: advanced work, not extra total successful-navigation traffic. The filename-filter receipt captures only69,926bytes and understates graph cost. Actual failed/unused-route waste, style-order effects and composer input responsiveness were **not measured**. Independent question layout did not improve and does not establish no contention/regression. These costs and the lack of affected-client evidence do not justify shipping a preload yet. No new history owner/cache machinery or optimization PR is proposed.
+
+**Precise missing observation / minimal nonmutating capture proposal:** one actual affected foreground Ember entry, on the affected client's ordinary cache state (do not clear it), identifying deployed version/asset hashes and global versus historical route. Collect one bounded client timeline from before navigation through question/transcript/composer readiness (stop at readiness or45s): document/SPA boundary, sanitized ResourceTiming for shell/route/shared graph, auth/identity/route/question/history request start/end/status and request correlation IDs, timestamped existing `phoenix:view-diagnostic` events without forcing sampling, and independent rAF question/transcript layout. Record manual input/visible readiness separately, with no synthetic answer submission. If module-evaluation-versus-commit attribution remains necessary, one short same-entry main-thread recording can resolve the coarse residual; exact React commit still requires explicit instrumentation, not network inference.
+
+This is a **proposal, not a performed capture**. Never export raw HAR, credentials, auth headers, message/question bodies, attachments, screenshots of private content or production database snapshots; retain only sanitized timing/route templates and correlation identifiers locally. No cache/service-worker override, API interception, live duplicate question, forced sampling, state mutation or performance optimization. Match request IDs to narrow server traces/collector warnings only after that real affected entry exists. Existing synthetic fixtures establish frontend ordering under imposed conditions, not reproduction of the remaining deployed complaint. A production cause/fix needs this missing observation; no broad profiling campaign or deployment/restart was started.
+
+---
+
 ## Postmerge qualification and isolated causal experiment
 
 PR #1151 was squash merged as `0f6e3627a24777364406c3f3718efe2431ccf16d`; parent `7dc7372a5231d34a6f1e7f846e03db88744b9e77`, tree `e3bd8d5c82ced901207f895bc5da732791f66754`. Exact-source rendered QA [45311375874](https://github.com/scottopell/phoenix-ide/actions/runs/45311375874) passed: 124 aggregate/96 measured, eight per cell, four pending-history controls, eight preinteraction readiness probes, desktop shortcut receipt and mobile journeys. All records passed; no unknown routes/page exceptions. Full postmerge CI [45310777440](https://github.com/scottopell/phoenix-ide/actions/runs/45310777440) also passed, including all four Rust test shards, build/musl/clippy, codegen, UI/specs, e2e and repository checks. Exact-commit status rollup was verified SUCCESS.
