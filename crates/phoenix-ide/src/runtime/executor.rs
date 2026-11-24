@@ -23800,10 +23800,9 @@ mod steer_drain_detector_tests {
     async fn ordinary_tool_completion_sqlite_full_fails_stop_and_reopens_without_replay() {
         let temp = tempfile::TempDir::new().unwrap();
         let path = temp.path().join("full-checkpoint.db");
-        let db = crate::db::Database::open(path.to_str().unwrap())
+        let db = crate::db::Database::open_migrated_for_test(path.to_str().unwrap())
             .await
             .unwrap();
-        crate::db::run_pending_migrations(db.pool()).await.unwrap();
         let initial = ordinary_completion_state();
         db.create_conversation(
             "sqlite-full-round",
@@ -23952,10 +23951,9 @@ mod steer_drain_detector_tests {
     async fn ordinary_tool_checkpoint_restart_preserves_committed_result_without_stale_buffer() {
         let temp = tempfile::TempDir::new().unwrap();
         let path = temp.path().join("committed-checkpoint.db");
-        let db = crate::db::Database::open(path.to_str().unwrap())
+        let db = crate::db::Database::open_migrated_for_test(path.to_str().unwrap())
             .await
             .unwrap();
-        crate::db::run_pending_migrations(db.pool()).await.unwrap();
         let initial = ordinary_completion_state();
         db.create_conversation("checkpoint-cut", "checkpoint-cut", "/tmp", true, None, None)
             .await
@@ -24627,10 +24625,9 @@ mod steer_drain_detector_tests {
         for reject_acceptance_once in [false, true] {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("summary-ack.db");
-            let db = crate::db::Database::open(path.to_str().unwrap())
+            let db = crate::db::Database::open_migrated_for_test(path.to_str().unwrap())
                 .await
                 .unwrap();
-            crate::db::run_pending_migrations(db.pool()).await.unwrap();
             let id = "summary-parent";
             db.create_conversation(id, id, "/tmp", true, None, None)
                 .await
@@ -25220,10 +25217,9 @@ mod steer_drain_detector_tests {
         };
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("forced-notice.db");
-        let db = crate::db::Database::open(path.to_str().unwrap())
+        let db = crate::db::Database::open_migrated_for_test(path.to_str().unwrap())
             .await
             .unwrap();
-        crate::db::run_pending_migrations(db.pool()).await.unwrap();
         let id = "sqlite-forced-notice";
         db.create_conversation(id, id, "/tmp", true, None, None)
             .await
@@ -31056,8 +31052,9 @@ mod goal_report_cancellation_checkpoint_tests {
     async fn cancellation_checkpoint(pending_sub_agents: Vec<PendingSubAgent>) {
         let directory = tempfile::TempDir::new().unwrap();
         let path = directory.path().join("cancelled-goal-report.db");
-        let db = Database::open(path.to_str().unwrap()).await.unwrap();
-        phoenix_db::run_pending_migrations(db.pool()).await.unwrap();
+        let db = Database::open_migrated_for_test(path.to_str().unwrap())
+            .await
+            .unwrap();
         let conversation_id = "cancelled-goal-report";
         let conversation = db
             .create_conversation(conversation_id, "cancel report", "/tmp", true, None, None)
@@ -31752,10 +31749,9 @@ mod work_subagent_cwd_guard_tests {
                     None,
                 ),
             };
-            let db = crate::db::Database::open(path.to_str().unwrap())
+            let db = crate::db::Database::open_migrated_for_test(path.to_str().unwrap())
                 .await
                 .unwrap();
-            phoenix_db::run_pending_migrations(db.pool()).await.unwrap();
             db.create_conversation("cwd-guard-conv", "spawn", "/tmp", true, None, None)
                 .await
                 .unwrap();

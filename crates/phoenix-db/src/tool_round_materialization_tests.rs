@@ -309,8 +309,7 @@ async fn malformed_restart_rounds_retain_durable_state_and_write_no_messages() {
             let directory = tempfile::tempdir().unwrap();
             let path = directory.path().join("rejected-round.db");
             let path = path.to_str().unwrap();
-            let db = Database::open(path).await.unwrap();
-            migrations::run_pending_migrations(db.pool()).await.unwrap();
+            let db = Database::open_migrated_for_test(path).await.unwrap();
             let conversation = db
                 .get_or_create_coordinator(
                     Some("test-model"),
@@ -419,8 +418,7 @@ async fn malformed_child_round_is_validated_before_parent_recovery_mutates_it() 
             let directory = tempfile::tempdir().unwrap();
             let path = directory.path().join("rejected-child.db");
             let path = path.to_str().unwrap();
-            let mut db = Database::open(path).await.unwrap();
-            migrations::run_pending_migrations(db.pool()).await.unwrap();
+            let mut db = Database::open_migrated_for_test(path).await.unwrap();
             let parent_id = "parent";
             let child_id = "11111111-1111-4111-8111-111111111111";
             db.create_conversation(parent_id, "parent", "/tmp", true, None, None)
@@ -556,8 +554,7 @@ async fn assert_restart_persists_trusted_receipt(cancelling: bool) {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("trusted-recovery.db");
     let path = path.to_str().unwrap();
-    let db = Database::open(path).await.unwrap();
-    migrations::run_pending_migrations(db.pool()).await.unwrap();
+    let db = Database::open_migrated_for_test(path).await.unwrap();
     let coordinator = db
         .get_or_create_coordinator(
             Some("test-model"),

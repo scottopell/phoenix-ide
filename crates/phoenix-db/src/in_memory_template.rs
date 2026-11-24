@@ -358,6 +358,80 @@ pub(crate) async fn open_in_memory_from_template() -> DbResult<Database> {
     ))
 }
 
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) async fn seed_migrated_file_for_test(path: &Path) -> DbResult<bool> {
+    if template_disabled() || path.exists() {
+        return Ok(false);
+    }
+    let template_bytes = load_or_build_template().await?;
+    let mut open_opts = fs::OpenOptions::new();
+    open_opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        open_opts.mode(0o600);
+    }
+    let mut file = match open_opts.open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => return Ok(false),
+        Err(error) => {
+            return Err(DbError::Serialization(format!(
+                "failed to seed test database template at {}: {error}",
+                path.display()
+            )));
+        }
+    };
+    if let Err(error) = file.write_all(template_bytes) {
+        drop(file);
+        let _ = fs::remove_file(path);
+        return Err(DbError::Serialization(format!(
+            "failed to write test database template at {}: {error}",
+            path.display()
+        )));
+    }
+    Ok(true)
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) async fn open_migrated_for_test(path: &str) -> DbResult<Database> {
+    let seeded = seed_migrated_file_for_test(Path::new(path)).await?;
+    if !seeded {
+        let db = Database::open(path).await?;
+        migrations::run_pending_migrations(db.pool()).await?;
+        return Ok(db);
+    }
+    let opts = SqliteConnectOptions::from_str(&format!("sqlite:{path}?mode=rwc"))?
+        .journal_mode(SqliteJournalMode::Wal)
+        .synchronous(SqliteSynchronous::Normal)
+        .busy_timeout(Duration::from_secs(5))
+        .foreign_keys(true);
+    let sqlite_workload_collector = SqliteWorkloadCollector::new();
+    let pool = SqlitePoolOptions::new()
+        .after_connect({
+            let sqlite_workload_collector = sqlite_workload_collector.clone();
+            move |conn, _meta| {
+                let sqlite_workload_collector = sqlite_workload_collector.clone();
+                Box::pin(async move {
+                    install_native_statement_baseline(conn, sqlite_workload_collector).await
+                })
+            }
+        })
+        .connect_with(opts)
+        .await?;
+    let db = Database::new_with_generated_target_binding(
+        pool,
+        path.to_string(),
+        sqlite_workload_collector,
+    );
+    sqlx::query("UPDATE instance_identity SET instance_id = ?1 WHERE singleton_key = 1")
+        .bind(InstanceId::new().to_string())
+        .persistent(false)
+        .execute(db.pool())
+        .await?;
+    db.restrict_file_permissions();
+    Ok(db)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -437,5 +511,67 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(templated_seqs, fresh_seqs);
+    }
+
+    #[tokio::test]
+    async fn open_migrated_for_test_matches_fresh_file_database_and_supports_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let fresh_path = dir.path().join("fresh.db");
+        let templated_path = dir.path().join("templated.db");
+
+        let fresh = Database::open(fresh_path.to_str().unwrap()).await.unwrap();
+        migrations::run_pending_migrations(fresh.pool())
+            .await
+            .unwrap();
+
+        let templated = Database::open_migrated_for_test(templated_path.to_str().unwrap())
+            .await
+            .unwrap();
+
+        let schema_query =
+            "SELECT type, name, tbl_name, sql FROM sqlite_schema ORDER BY type, name";
+        let fresh_schema: Vec<(String, String, String, Option<String>)> =
+            sqlx::query_as(schema_query)
+                .fetch_all(fresh.pool())
+                .await
+                .unwrap();
+        let templated_schema: Vec<(String, String, String, Option<String>)> =
+            sqlx::query_as(schema_query)
+                .fetch_all(templated.pool())
+                .await
+                .unwrap();
+        assert_eq!(templated_schema, fresh_schema);
+
+        let journal_mode: String = sqlx::query_scalar("PRAGMA journal_mode")
+            .fetch_one(templated.pool())
+            .await
+            .unwrap();
+        assert_eq!(journal_mode.to_lowercase(), "wal");
+        let fk: i64 = sqlx::query_scalar("PRAGMA foreign_keys")
+            .fetch_one(templated.pool())
+            .await
+            .unwrap();
+        assert_eq!(fk, 1);
+        assert_eq!(
+            migrations::run_pending_migrations(templated.pool())
+                .await
+                .unwrap(),
+            0
+        );
+
+        let id_before = templated.instance_id().await.unwrap();
+        assert_ne!(id_before, fresh.instance_id().await.unwrap());
+        templated
+            .create_conversation("reopen-conv", "reopen-conv", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        templated.pool().close().await;
+        drop(templated);
+
+        let reopened = Database::open(templated_path.to_str().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(reopened.instance_id().await.unwrap(), id_before);
+        assert!(reopened.get_conversation("reopen-conv").await.is_ok());
     }
 }

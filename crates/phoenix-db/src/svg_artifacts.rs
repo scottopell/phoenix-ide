@@ -365,8 +365,7 @@ mod tests {
             let path = directory.path().join("restart.db");
             let staging = directory.path().join("chart.svg");
             std::fs::write(&staging, SVG).unwrap();
-            let db = Database::open(path.to_str().unwrap()).await.unwrap();
-            crate::migrations::run_pending_migrations(db.pool())
+            let db = Database::open_migrated_for_test(path.to_str().unwrap())
                 .await
                 .unwrap();
             db.create_conversation("owner", "owner", "/tmp", true, None, None)

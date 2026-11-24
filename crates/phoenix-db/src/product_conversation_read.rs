@@ -2206,10 +2206,9 @@ mod tests {
     #[tokio::test]
     async fn late_hydration_snapshot_survives_committed_reset_and_preserves_hydrated_origin() {
         let dir = tempfile::tempdir().unwrap();
-        let db = Database::open(dir.path().join("race.db").to_str().unwrap())
+        let db = Database::open_migrated_for_test(dir.path().join("race.db").to_str().unwrap())
             .await
             .unwrap();
-        crate::run_pending_migrations(db.pool()).await.unwrap();
         let journal_mode: String = sqlx::query_scalar("PRAGMA journal_mode")
             .fetch_one(db.pool())
             .await

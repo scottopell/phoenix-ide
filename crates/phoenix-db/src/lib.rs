@@ -3689,6 +3689,18 @@ impl Database {
         in_memory_template::open_in_memory_from_template().await
     }
 
+    /// Open a brand-new file-backed database for tests using the cached migrated
+    /// template, falling back to full migration when `path` already exists or
+    /// `PHOENIX_DB_DISABLE_MEM_TEMPLATE=1` is set.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] if seeding or opening the database fails.
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn open_migrated_for_test(path: &str) -> DbResult<Self> {
+        in_memory_template::open_migrated_for_test(path).await
+    }
+
     async fn run_migrations(&self) -> DbResult<()> {
         lineage::preflight(&self.pool, migrations::migration_identities()).await?;
         sqlx::raw_sql(ddl::SCHEMA).execute(&self.pool).await?;

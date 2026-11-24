@@ -2747,6 +2747,9 @@ mod tests {
     async fn open_repo_pair() -> (tempfile::TempDir, WorkflowRepository, WorkflowRepository) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("workflow.db");
+        let _ = crate::in_memory_template::seed_migrated_file_for_test(&path)
+            .await
+            .unwrap();
         let url = format!("sqlite://{}", path.display());
         let open = || async {
             let opts = SqliteConnectOptions::from_str(&url)
