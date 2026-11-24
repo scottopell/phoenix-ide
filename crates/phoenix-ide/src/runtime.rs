@@ -12444,7 +12444,9 @@ mod scope_liveness_tests {
                     } else {
                         assert!(request.messages.iter().flat_map(|message| &message.content).any(|block| matches!(block,
                         ContentBlock::ToolResult { tool_use_id, content, is_error: false, .. }
-                        if tool_use_id == "research-bash" && content.contains("exited") && content.contains("evidence.txt"))), "child request: {request:#?}");
+                        if tool_use_id == "research-bash" && content.contains("\"status\":\"exited\"") && content.contains("\"exit_code\":0")
+                            // A run result does not repeat the command (REQ-BASH-002).
+                            && !content.contains("evidence.txt"))), "child request: {request:#?}");
                         ContentBlock::tool_use(
                             "research-result",
                             "submit_result",
