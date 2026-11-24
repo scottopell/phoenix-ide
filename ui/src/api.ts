@@ -2554,26 +2554,6 @@ export const api = {
     return resp.json();
   },
 
-  /** Lightweight project task availability for the new-conversation workflow. */
-  async getProjectTaskAvailability(cwd: string, signal?: AbortSignal): Promise<TaskAvailabilityResponse> {
-    const resp = await fetch(
-      `/api/tasks/availability?cwd=${encodeURIComponent(cwd)}`,
-      signal ? { signal } : {},
-    );
-    if (!resp.ok) throw new Error('Failed to check task availability');
-    return resp.json();
-  },
-
-  /** List tasks from a project tasks/ directory before a conversation exists */
-  async listProjectTasks(cwd: string, signal?: AbortSignal): Promise<{ tasks: TaskEntry[] }> {
-    const resp = await fetch(
-      `/api/tasks?cwd=${encodeURIComponent(cwd)}`,
-      signal ? { signal } : {},
-    );
-    if (!resp.ok) throw new Error('Failed to list tasks');
-    return resp.json();
-  },
-
   /** List tasks from the conversation's project tasks/ directory */
   async listConversationTasks(
     convId: string,
