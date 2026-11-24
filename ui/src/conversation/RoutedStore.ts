@@ -30,6 +30,8 @@ export class RoutedStore<K, S, A> {
   private atoms = new Map<K, S>();
   private listenersByKey = new Map<K, Set<() => void>>();
   private anyListeners = new Set<() => void>();
+  private anyBatchDepth = 0;
+  private anyDirtyInBatch = false;
   private readonly getInitial: (key: K) => S;
   private readonly reducer: (atom: S, action: A) => S;
 
@@ -156,6 +158,20 @@ export class RoutedStore<K, S, A> {
     return (this.listenersByKey.get(key)?.size ?? 0) > 0;
   }
 
+  /** Coalesce `anyListeners` notifications emitted inside `fn` into one tail notification. */
+  protected batchAny<T>(fn: () => T): T {
+    this.anyBatchDepth += 1;
+    try {
+      return fn();
+    } finally {
+      this.anyBatchDepth -= 1;
+      if (this.anyBatchDepth === 0 && this.anyDirtyInBatch) {
+        this.anyDirtyInBatch = false;
+        this.notifyAny();
+      }
+    }
+  }
+
   private notify(key: K): void {
     const listeners = this.listenersByKey.get(key);
     if (!listeners) return;
@@ -165,6 +181,10 @@ export class RoutedStore<K, S, A> {
   }
 
   private notifyAny(): void {
+    if (this.anyBatchDepth > 0) {
+      this.anyDirtyInBatch = true;
+      return;
+    }
     for (const listener of this.anyListeners) {
       listener();
     }

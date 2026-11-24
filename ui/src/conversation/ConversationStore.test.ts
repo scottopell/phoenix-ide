@@ -1084,4 +1084,50 @@ describe('ConversationStore.upsertSnapshot (task 08684)', () => {
     store.upsertSnapshot('alpha', makeConv('alpha'));
     expect(listener).toHaveBeenCalledTimes(2);
   });
+
+  it('subscribeSnapshots ignores token/liveness dispatches and fires on snapshot changes', () => {
+    const store = new ConversationStore();
+    const conv = makeConv('alpha');
+    store.upsertSnapshot('alpha', conv);
+    store.dispatch('alpha', { type: 'connection_opened', epoch: 1 });
+    store.dispatch('alpha', {
+      type: 'sse_init',
+      epoch: 1,
+      payload: {
+        ...transcriptInit(conv.id),
+        conversation: conv,
+        phase: { type: 'llm_requesting', attempt: 1 },
+      },
+    });
+
+    const anyListener = vi.fn();
+    const snapshotListener = vi.fn();
+    store.subscribeAny(anyListener);
+    store.subscribeSnapshots(snapshotListener);
+
+    for (let i = 1; i <= 20; i++) {
+      store.dispatch('alpha', { type: 'sse_event_observed' });
+      store.dispatch('alpha', { type: 'sse_token', epoch: 1, requestId: 'r1', delta: 'x', sequenceId: i + 1 });
+    }
+    expect(anyListener).toHaveBeenCalledTimes(40);
+    expect(snapshotListener).toHaveBeenCalledTimes(0);
+
+    store.upsertSnapshot('alpha', makeConv('alpha', { updated_at: '2026-06-01T00:00:00Z' }));
+    expect(snapshotListener).toHaveBeenCalledTimes(1);
+
+    store.remove('alpha');
+    expect(snapshotListener).toHaveBeenCalledTimes(2);
+  });
+
+  it('upsertSnapshots coalesces any and snapshot notifications to once per batch', () => {
+    const store = new ConversationStore();
+    const anyListener = vi.fn();
+    const snapshotListener = vi.fn();
+    store.subscribeAny(anyListener);
+    store.subscribeSnapshots(snapshotListener);
+
+    store.upsertSnapshots([makeConv('a'), makeConv('b'), makeConv('c')]);
+    expect(anyListener).toHaveBeenCalledTimes(1);
+    expect(snapshotListener).toHaveBeenCalledTimes(1);
+  });
 });
