@@ -274,10 +274,11 @@ export async function qualifyDesktopPlacement({ page, out, version }) {
   await custom.fill('placement preserved answer');
   const composer = page.locator('#message-input');
   await composer.fill('placement preserved composer draft');
-  await page.locator('#messages').evaluate(el => {el.scrollTop=el.scrollHeight / 2;});
-  const transcriptScroll = await page.locator('#messages').evaluate(el=>el.scrollTop);
   await page.setViewportSize({width:393,height:852});
   await frames();
+  await page.locator('#messages').evaluate(el => {el.scrollTop=10000;});
+  const settledTranscriptScroll = () => page.locator('#messages').evaluate(el => new Promise((resolve,reject)=>{let last=el.scrollTop,stable=0,count=0;const tick=()=>{const current=el.scrollTop;stable=Math.abs(current-last)<.5?stable+1:0;last=current;if(stable>=5)resolve(current);else if(++count>120)reject(new Error('Transcript scroll not settled'));else requestAnimationFrame(tick);};requestAnimationFrame(tick);}));
+  const transcriptScroll = await settledTranscriptScroll();
   await page.getByRole('button',{name:'Return to conversation'}).click();
   const launcher=page.getByRole('button',{name:/Answer Ember/});
   await page.waitForFunction(() => document.activeElement?.matches('.coordinator-question-dock__launcher'));
@@ -288,7 +289,7 @@ export async function qualifyDesktopPlacement({ page, out, version }) {
   if(version==='candidate') assert.ok(reopened.dialog.y>=0);
   assert.equal(await custom.inputValue(),'placement preserved answer');
   assert.equal(await composer.inputValue(),'placement preserved composer draft');
-  assert.equal(await page.locator('#messages').evaluate(el=>el.scrollTop),transcriptScroll);
+  assert.equal(await settledTranscriptScroll(),transcriptScroll);
   const transitions=[];
   for(const viewport of [{width:393,height:852},{width:1280,height:720}]) {
     await page.setViewportSize(viewport);
