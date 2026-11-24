@@ -1408,6 +1408,112 @@ mod tests {
         }
     }
 
+    #[derive(Debug, PartialEq, Eq)]
+    enum ShutdownFixtureRequest {
+        EmptyConnection,
+        Navigation,
+        CleanupGate,
+        Favicon,
+    }
+
+    async fn shutdown_fixture_path(
+        mut reader: impl tokio::io::AsyncRead + Unpin,
+    ) -> Result<ShutdownFixtureRequest, String> {
+        use tokio::io::AsyncReadExt;
+
+        let mut headers = Vec::new();
+        while !headers.ends_with(b"\r\n\r\n") {
+            match reader.read_u8().await {
+                Ok(byte) => headers.push(byte),
+                Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
+                    if headers.is_empty() {
+                        return Ok(ShutdownFixtureRequest::EmptyConnection);
+                    }
+                    return Err(format!("incomplete HTTP headers: {headers:?}"));
+                }
+                Err(error) => return Err(format!("read HTTP headers: {error}")),
+            }
+            if headers.len() > 8192 {
+                return Err("HTTP headers exceed fixture limit".into());
+            }
+        }
+        let headers = std::str::from_utf8(&headers).map_err(|error| error.to_string())?;
+        let request = headers.lines().next().unwrap();
+        match request {
+            "GET /held HTTP/1.1" => Ok(ShutdownFixtureRequest::Navigation),
+            "GET /cleanup-gate HTTP/1.1" => Ok(ShutdownFixtureRequest::CleanupGate),
+            "GET /favicon.ico HTTP/1.1" => Ok(ShutdownFixtureRequest::Favicon),
+            _ => Err(format!("unexpected fixture request: {request:?}")),
+        }
+    }
+
+    async fn serve_shutdown_fixture(
+        listener: tokio::net::TcpListener,
+        gate: tokio::sync::oneshot::Sender<tokio::net::TcpStream>,
+        mut finish: tokio::sync::oneshot::Receiver<()>,
+    ) -> Vec<ShutdownFixtureRequest> {
+        let mut readers = JoinSet::new();
+        let mut gate = Some(gate);
+        let mut accepting = true;
+        let mut accepted = 0;
+        let mut paths = Vec::new();
+        while accepting || !readers.is_empty() {
+            tokio::select! {
+                result = &mut finish, if accepting => {
+                    result.unwrap();
+                    accepting = false;
+                }
+                connection = listener.accept(), if accepting => {
+                    let (mut stream, _) = connection.unwrap();
+                    accepted += 1;
+                    assert!(accepted <= 32, "too many fixture connections");
+                    readers.spawn(async move {
+                        let path = tokio::time::timeout(
+                            Duration::from_secs(30), shutdown_fixture_path(&mut stream),
+                        ).await.expect("fixture headers timed out").unwrap();
+                        (path, stream)
+                    });
+                }
+                result = readers.join_next(), if !readers.is_empty() => {
+                    let (path, mut stream) = result.unwrap().unwrap();
+                    match path {
+                        ShutdownFixtureRequest::CleanupGate => gate.take().expect("duplicate cleanup gate")
+                            .send(stream).expect("cleanup gate receiver dropped"),
+                        ShutdownFixtureRequest::Navigation | ShutdownFixtureRequest::Favicon => {
+                            let (status, body) = if path == ShutdownFixtureRequest::Navigation {
+                                assert!(!paths.contains(&ShutdownFixtureRequest::Navigation), "duplicate navigation");
+                                ("200 OK", "<html><head><link rel='icon' href='data:,'></head><body style='height:600px'></body></html>")
+                            } else {
+                                ("204 No Content", "")
+                            };
+                            stream.write_all(format!("HTTP/1.1 {status}\r\nContent-Length: {}\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+                        }
+                        ShutdownFixtureRequest::EmptyConnection => {}
+                    }
+                    paths.push(path);
+                }
+            }
+        }
+        assert!(gate.is_none(), "fixture never received cleanup gate");
+        paths
+    }
+
+    #[tokio::test]
+    async fn shutdown_fixture_rejects_partial_and_unexpected_requests() {
+        for request in [
+            &b"GET /held HTTP/1.1\r\n"[..],
+            &b"GET /unexpected HTTP/1.1\r\n\r\n"[..],
+            &b"POST /cleanup-gate HTTP/1.1\r\n\r\n"[..],
+            &vec![b'x'; 8193],
+        ] {
+            assert!(shutdown_fixture_path(request).await.is_err());
+        }
+        assert_eq!(
+            shutdown_fixture_path(&b""[..]).await.unwrap(),
+            ShutdownFixtureRequest::EmptyConnection
+        );
+    }
+
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
     async fn worker_scenario_shutdown_reply_has_restored_contact_throttle_and_custody() {
@@ -1419,7 +1525,8 @@ mod tests {
             return;
         }
         let fixture = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}/held", fixture.local_addr().unwrap());
+        let address = fixture.local_addr().unwrap();
+        let url = format!("http://{address}/held");
         let directory = tempfile::tempdir().unwrap();
         let manager = BrowserSessionManager::new();
         manager.set_scope_liveness_hook(Arc::new(|_, _| Box::pin(async { true })));
@@ -1464,7 +1571,26 @@ mod tests {
                 ]
             }),
         };
-        // Serve the initial navigation, then hold the fetch reached with active contact.
+        let (gate, reached_gate) = tokio::sync::oneshot::channel();
+        let (finish_fixture, finished_fixture) = tokio::sync::oneshot::channel();
+        let fixture_task = tokio::spawn(serve_shutdown_fixture(fixture, gate, finished_fixture));
+        drop(tokio::net::TcpStream::connect(address).await.unwrap());
+        // Keep one connection silent while a separate request and Chrome make progress.
+        let preconnect = tokio::net::TcpStream::connect(address).await.unwrap();
+        let mut favicon = tokio::net::TcpStream::connect(address).await.unwrap();
+        favicon
+            .write_all(b"GET /favicon.ico HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .unwrap();
+        let mut favicon_response = Vec::new();
+        tokio::time::timeout(
+            Duration::from_secs(15),
+            favicon.read_to_end(&mut favicon_response),
+        )
+        .await
+        .expect("fixture blocked behind a silent connection")
+        .unwrap();
+        assert!(favicon_response.starts_with(b"HTTP/1.1 204 No Content\r\n"));
         let (server, mut client) = UnixStream::pair().unwrap();
         let scenario = state.reserve_scenario(&request).await.unwrap();
         assert!(scenario.is_some());
@@ -1479,23 +1605,7 @@ mod tests {
         })
         .await
         .unwrap();
-        let fixture_task = tokio::spawn(async move {
-            for held in [false, true] {
-                let (mut stream, _) = fixture.accept().await.unwrap();
-                let mut headers = Vec::new();
-                while !headers.ends_with(b"\r\n\r\n") {
-                    headers.push(stream.read_u8().await.unwrap());
-                }
-                if held {
-                    assert!(headers.starts_with(b"GET /cleanup-gate "));
-                    return stream;
-                }
-                let body = "<html><head><link rel='icon' href='data:,'></head><body style='height:600px'></body></html>";
-                stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
-            }
-            unreachable!()
-        });
-        let held = tokio::time::timeout(Duration::from_secs(15), fixture_task)
+        let held = tokio::time::timeout(Duration::from_secs(15), reached_gate)
             .await
             .expect("scenario never reached active-contact fetch")
             .unwrap();
@@ -1516,10 +1626,24 @@ mod tests {
             .expect("reply left contact active or unknown");
         assert_eq!(guard.throttle_rate().unwrap().to_bits(), 1.5_f64.to_bits());
         drop(guard);
-        drop(held);
         drop(jobs);
         assert!(task.await.unwrap().is_none());
         manager.kill_session(&state.scope).await.unwrap();
+        drop(held);
+        drop(preconnect);
+        finish_fixture.send(()).unwrap();
+        let paths = tokio::time::timeout(Duration::from_secs(15), fixture_task)
+            .await
+            .expect("fixture failed to drain connections")
+            .unwrap();
+        assert!(
+            paths
+                .iter()
+                .filter(|path| **path == ShutdownFixtureRequest::EmptyConnection)
+                .count()
+                >= 2
+        );
+        assert!(paths.contains(&ShutdownFixtureRequest::Favicon));
     }
 
     #[tokio::test]

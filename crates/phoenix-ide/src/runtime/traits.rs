@@ -126,9 +126,26 @@ pub struct AuthoritativeUserMessageAdoptionInput {
 /// Storage for conversation messages
 #[async_trait]
 pub trait MessageStore: Send + Sync {
+    async fn append_coordinator_tracking_observation(
+        &self,
+        source: &str,
+        sequence_id: i64,
+        now_us: i64,
+    ) -> phoenix_db::workflow::LocalAuthorityResult<Result<Option<Message>, String>>;
+
     async fn coordinator_authority(
         &self,
     ) -> Result<phoenix_core::domain::coordinator_authority::CoordinatorAuthority, String>;
+
+    /// Current Authority for an ordinary conversation under an active Coordinator watch.
+    /// `None` means no delegated grants apply to that conversation.
+    async fn delegated_coordinator_authority(
+        &self,
+        _conversation_id: &str,
+    ) -> Result<Option<phoenix_core::domain::coordinator_authority::CoordinatorAuthority>, String>
+    {
+        Ok(None)
+    }
 
     async fn save_continuation_handoff_candidate(
         &self,
@@ -483,11 +500,25 @@ pub trait StateStore: Send + Sync {
         Ok(())
     }
 
-    async fn establish_parent_reconcile_action(
+    async fn establish_unactivated_sub_agent_membership(
         &self,
-        _conversation_id: &str,
-    ) -> Result<(), String> {
-        Ok(())
+        membership: &phoenix_db::UnactivatedSubAgentMembership,
+        state_updated_at: DateTime<Utc>,
+    ) -> phoenix_db::workflow::LocalAuthorityResult<Result<ConvState, String>> {
+        let result = async {
+            let state = membership
+                .reconciled_state()
+                .map_err(|error| error.to_string())?;
+            self.update_state(
+                &membership.invocation.parent_conversation_id,
+                &state,
+                state_updated_at,
+            )
+            .await?;
+            Ok(state)
+        }
+        .await;
+        phoenix_db::workflow::LocalAuthorityResult::DurableFactEstablished(result)
     }
 
     /// Update the conversation state (full state as JSON). `state_updated_at`
@@ -623,15 +654,20 @@ pub trait StateStore: Send + Sync {
         callable_names: &std::collections::BTreeSet<String>,
         visible_messages: &[phoenix_core::domain::tool_availability::ToolPolicyMessage],
         historical_tool_references: &[(String, String)],
+        discovery_mode: phoenix_core::domain::tool_discovery::ToolDiscoveryMode,
     ) -> Result<phoenix_core::domain::tool_availability::ToolAvailability, String>;
+    async fn load_tool_search_catalog(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Vec<phoenix_llm::ToolDefinition>, String>;
     async fn load_tool_admission_policy(
         &self,
         conversation_id: &str,
     ) -> Result<phoenix_core::domain::tool_availability::ToolAvailability, String>;
-    async fn load_responses_replay_state(
+    async fn load_output_replay_state(
         &self,
         conversation_id: &str,
-    ) -> Result<Vec<phoenix_core::domain::responses_replay::ResponsesResponseSet>, String>;
+    ) -> Result<Vec<phoenix_core::domain::responses_replay::ProviderResponseSet>, String>;
     async fn load_provider_replay_state(
         &self,
         conversation_id: &str,
@@ -715,6 +751,11 @@ pub trait StateStore: Send + Sync {
 /// Client for making LLM requests
 #[async_trait]
 pub trait LlmClient: Send + Sync {
+    fn tool_discovery_mode(
+        &self,
+    ) -> Result<phoenix_core::domain::tool_discovery::ToolDiscoveryMode, LlmError> {
+        Ok(phoenix_core::domain::tool_discovery::ToolDiscoveryMode::Eager)
+    }
     async fn count_input(
         &self,
         _request: &LlmRequest,
@@ -856,6 +897,15 @@ impl<T: SvgArtifactRepository + ?Sized> SvgArtifactRepository for Arc<T> {
 
 #[async_trait]
 impl<T: MessageStore + ?Sized> MessageStore for Arc<T> {
+    async fn get_work_scope_legacy_conversation_id(
+        &self,
+        scope_id: &phoenix_core::work_scope::WorkScopeId,
+    ) -> Result<Option<String>, String> {
+        (**self)
+            .get_work_scope_legacy_conversation_id(scope_id)
+            .await
+    }
+
     async fn terminalize_sub_agent_cancellation_backstop(
         &self,
         child_conversation_id: &str,
@@ -901,6 +951,27 @@ impl<T: MessageStore + ?Sized> MessageStore for Arc<T> {
         &self,
     ) -> Result<phoenix_core::domain::coordinator_authority::CoordinatorAuthority, String> {
         (**self).coordinator_authority().await
+    }
+
+    async fn delegated_coordinator_authority(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Option<phoenix_core::domain::coordinator_authority::CoordinatorAuthority>, String>
+    {
+        (**self)
+            .delegated_coordinator_authority(conversation_id)
+            .await
+    }
+
+    async fn append_coordinator_tracking_observation(
+        &self,
+        source: &str,
+        sequence_id: i64,
+        now_us: i64,
+    ) -> phoenix_db::workflow::LocalAuthorityResult<Result<Option<Message>, String>> {
+        (**self)
+            .append_coordinator_tracking_observation(source, sequence_id, now_us)
+            .await
     }
 
     async fn save_continuation_handoff_candidate(
@@ -1261,6 +1332,15 @@ impl<T: MessageStore + ?Sized> MessageStore for Arc<T> {
 
 #[async_trait]
 impl<T: StateStore + ?Sized> StateStore for Arc<T> {
+    async fn establish_unactivated_sub_agent_membership(
+        &self,
+        membership: &phoenix_db::UnactivatedSubAgentMembership,
+        state_updated_at: DateTime<Utc>,
+    ) -> phoenix_db::workflow::LocalAuthorityResult<Result<ConvState, String>> {
+        (**self)
+            .establish_unactivated_sub_agent_membership(membership, state_updated_at)
+            .await
+    }
     async fn record_execution_cancel(&self, conversation_id: &str) -> Result<(), String> {
         (**self).record_execution_cancel(conversation_id).await
     }
@@ -1463,6 +1543,7 @@ impl<T: StateStore + ?Sized> StateStore for Arc<T> {
         callable_names: &std::collections::BTreeSet<String>,
         visible_messages: &[phoenix_core::domain::tool_availability::ToolPolicyMessage],
         historical_tool_references: &[(String, String)],
+        discovery_mode: phoenix_core::domain::tool_discovery::ToolDiscoveryMode,
     ) -> Result<phoenix_core::domain::tool_availability::ToolAvailability, String> {
         (**self)
             .prepare_tool_availability(
@@ -1473,8 +1554,15 @@ impl<T: StateStore + ?Sized> StateStore for Arc<T> {
                 callable_names,
                 visible_messages,
                 historical_tool_references,
+                discovery_mode,
             )
             .await
+    }
+    async fn load_tool_search_catalog(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Vec<phoenix_llm::ToolDefinition>, String> {
+        (**self).load_tool_search_catalog(conversation_id).await
     }
     async fn load_tool_admission_policy(
         &self,
@@ -1482,11 +1570,11 @@ impl<T: StateStore + ?Sized> StateStore for Arc<T> {
     ) -> Result<phoenix_core::domain::tool_availability::ToolAvailability, String> {
         (**self).load_tool_admission_policy(conversation_id).await
     }
-    async fn load_responses_replay_state(
+    async fn load_output_replay_state(
         &self,
         conversation_id: &str,
-    ) -> Result<Vec<phoenix_core::domain::responses_replay::ResponsesResponseSet>, String> {
-        (**self).load_responses_replay_state(conversation_id).await
+    ) -> Result<Vec<phoenix_core::domain::responses_replay::ProviderResponseSet>, String> {
+        (**self).load_output_replay_state(conversation_id).await
     }
     async fn load_provider_replay_state(
         &self,
@@ -1617,6 +1705,11 @@ impl<T: StateStore + ?Sized> StateStore for Arc<T> {
 
 #[async_trait]
 impl<T: LlmClient + ?Sized> LlmClient for Arc<T> {
+    fn tool_discovery_mode(
+        &self,
+    ) -> Result<phoenix_core::domain::tool_discovery::ToolDiscoveryMode, LlmError> {
+        (**self).tool_discovery_mode()
+    }
     async fn count_input(
         &self,
         request: &LlmRequest,
@@ -1793,6 +1886,28 @@ fn direct_turn_terminal_command(
 
 #[async_trait]
 impl MessageStore for DatabaseStorage {
+    async fn append_coordinator_tracking_observation(
+        &self,
+        source: &str,
+        sequence_id: i64,
+        now_us: i64,
+    ) -> phoenix_db::workflow::LocalAuthorityResult<Result<Option<Message>, String>> {
+        match self
+            .db
+            .append_coordinator_tracking_observation(source, sequence_id, now_us)
+            .await
+        {
+            phoenix_db::workflow::LocalAuthorityResult::DurableFactEstablished(result) => {
+                phoenix_db::workflow::LocalAuthorityResult::DurableFactEstablished(
+                    result.map_err(|error| error.to_string()),
+                )
+            }
+            phoenix_db::workflow::LocalAuthorityResult::DurableFactUnclassified => {
+                phoenix_db::workflow::LocalAuthorityResult::DurableFactUnclassified
+            }
+        }
+    }
+
     async fn coordinator_authority(
         &self,
     ) -> Result<phoenix_core::domain::coordinator_authority::CoordinatorAuthority, String> {
@@ -1800,6 +1915,17 @@ impl MessageStore for DatabaseStorage {
             .coordinator_authority()
             .await
             .map_err(|error| format!("Failed to read current Coordinator Authority: {error}"))
+    }
+
+    async fn delegated_coordinator_authority(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Option<phoenix_core::domain::coordinator_authority::CoordinatorAuthority>, String>
+    {
+        self.db
+            .delegated_coordinator_authority(conversation_id)
+            .await
+            .map_err(|error| format!("Failed to read delegated Coordinator Authority: {error}"))
     }
 
     async fn save_continuation_handoff_candidate(
@@ -2698,17 +2824,30 @@ fn direct_turn_local_authority(
 
 #[async_trait]
 impl StateStore for DatabaseStorage {
+    async fn establish_unactivated_sub_agent_membership(
+        &self,
+        membership: &phoenix_db::UnactivatedSubAgentMembership,
+        state_updated_at: DateTime<Utc>,
+    ) -> phoenix_db::workflow::LocalAuthorityResult<Result<ConvState, String>> {
+        match self
+            .db
+            .establish_unactivated_sub_agent_membership(membership, state_updated_at)
+            .await
+        {
+            phoenix_db::workflow::LocalAuthorityResult::DurableFactEstablished(result) => {
+                phoenix_db::workflow::LocalAuthorityResult::DurableFactEstablished(
+                    result.map_err(|error| error.to_string()),
+                )
+            }
+            phoenix_db::workflow::LocalAuthorityResult::DurableFactUnclassified => {
+                phoenix_db::workflow::LocalAuthorityResult::DurableFactUnclassified
+            }
+        }
+    }
     async fn record_execution_cancel(&self, conversation_id: &str) -> Result<(), String> {
         sqlx::query("INSERT INTO execution_cancel_observations(conversation_id) VALUES (?1) ON CONFLICT DO NOTHING")
             .bind(conversation_id).execute(self.db.pool()).await.map_err(|error| error.to_string())?;
         Ok(())
-    }
-
-    async fn establish_parent_reconcile_action(&self, conversation_id: &str) -> Result<(), String> {
-        self.db
-            .establish_parent_reconcile_action(conversation_id)
-            .await
-            .map_err(|error| error.to_string())
     }
 
     async fn update_state(
@@ -2989,6 +3128,7 @@ impl StateStore for DatabaseStorage {
         callable_names: &std::collections::BTreeSet<String>,
         visible_messages: &[phoenix_core::domain::tool_availability::ToolPolicyMessage],
         historical_tool_references: &[(String, String)],
+        discovery_mode: phoenix_core::domain::tool_discovery::ToolDiscoveryMode,
     ) -> Result<phoenix_core::domain::tool_availability::ToolAvailability, String> {
         self.db
             .prepare_tool_availability(
@@ -2999,7 +3139,17 @@ impl StateStore for DatabaseStorage {
                 callable_names,
                 visible_messages,
                 historical_tool_references,
+                discovery_mode,
             )
+            .await
+            .map_err(|error| error.to_string())
+    }
+    async fn load_tool_search_catalog(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Vec<phoenix_llm::ToolDefinition>, String> {
+        self.db
+            .load_tool_search_catalog(conversation_id)
             .await
             .map_err(|error| error.to_string())
     }
@@ -3012,12 +3162,12 @@ impl StateStore for DatabaseStorage {
             .await
             .map_err(|error| error.to_string())
     }
-    async fn load_responses_replay_state(
+    async fn load_output_replay_state(
         &self,
         conversation_id: &str,
-    ) -> Result<Vec<phoenix_core::domain::responses_replay::ResponsesResponseSet>, String> {
+    ) -> Result<Vec<phoenix_core::domain::responses_replay::ProviderResponseSet>, String> {
         self.db
-            .load_responses_replay_state(conversation_id)
+            .load_output_replay_state(conversation_id)
             .await
             .map_err(|error| error.to_string())
     }
@@ -3208,6 +3358,11 @@ impl RegistryLlmClient {
 
 #[async_trait]
 impl LlmClient for RegistryLlmClient {
+    fn tool_discovery_mode(
+        &self,
+    ) -> Result<phoenix_core::domain::tool_discovery::ToolDiscoveryMode, LlmError> {
+        self.service().map(|service| service.tool_discovery_mode())
+    }
     fn freeze_for_request(self: Arc<Self>) -> Result<Arc<dyn LlmClient>, LlmError> {
         Ok(Arc::new(FrozenServiceClient {
             service: self.service()?,
@@ -3256,6 +3411,11 @@ struct FrozenServiceClient {
 
 #[async_trait]
 impl LlmClient for FrozenServiceClient {
+    fn tool_discovery_mode(
+        &self,
+    ) -> Result<phoenix_core::domain::tool_discovery::ToolDiscoveryMode, LlmError> {
+        Ok(self.service.tool_discovery_mode())
+    }
     async fn count_input(
         &self,
         request: &LlmRequest,
@@ -3724,6 +3884,7 @@ mod registry_llm_client_tests {
                 &std::collections::BTreeSet::new(),
                 &[],
                 &[],
+                phoenix_core::domain::tool_discovery::ToolDiscoveryMode::Eager,
             )
             .await
             .unwrap();
@@ -3748,7 +3909,7 @@ mod registry_llm_client_tests {
             system: vec![],
             messages: vec![],
             provider_replay: None,
-            responses_replay: db.load_responses_replay_state("frozen").await.unwrap(),
+            output_replay: db.load_output_replay_state("frozen").await.unwrap(),
             tool_availability: policy.clone(),
             max_tokens: 100,
             effective_effort: EffectiveEffort::native_unknown(),
@@ -3756,7 +3917,7 @@ mod registry_llm_client_tests {
             telemetry: None,
             cache_key: PromptCacheKey::ephemeral(),
         };
-        assert_eq!(request.responses_replay, vec![replay.clone()]);
+        assert_eq!(request.output_replay, vec![replay.clone().into()]);
         first_credential.revoke().await;
         let second_path = write_account("account-b");
         assert!(
@@ -3784,8 +3945,8 @@ mod registry_llm_client_tests {
         assert_eq!(error.kind, phoenix_llm::LlmErrorKind::Auth);
         assert!(error.message.contains("credential signed out"));
         assert_eq!(
-            db.load_responses_replay_state("frozen").await.unwrap(),
-            vec![replay]
+            db.load_output_replay_state("frozen").await.unwrap(),
+            vec![replay.into()]
         );
         let retained = db
             .prepare_tool_availability(
@@ -3796,6 +3957,7 @@ mod registry_llm_client_tests {
                 &std::collections::BTreeSet::new(),
                 &[],
                 &[],
+                phoenix_core::domain::tool_discovery::ToolDiscoveryMode::Eager,
             )
             .await
             .unwrap();
@@ -3860,11 +4022,12 @@ mod registry_llm_client_tests {
                 &std::collections::BTreeSet::new(),
                 &[],
                 &[],
+                phoenix_core::domain::tool_discovery::ToolDiscoveryMode::Eager,
             )
             .await
             .unwrap();
         sqlx::query("INSERT INTO active_provider_replay_state (conversation_id,provider,model,response_id,payload) VALUES ('pinned','anthropic','model','response','{}')").execute(db.pool()).await.unwrap();
-        sqlx::query("INSERT INTO active_responses_replay_sets (conversation_id,response_id,ordinal,model,owner_message_id,public_content) VALUES ('pinned','response',0,'gpt','owner','[]')").execute(db.pool()).await.unwrap();
+        sqlx::query("INSERT INTO active_responses_replay_sets (conversation_id,response_id,ordinal,model,owner_message_id,public_content,api_format) VALUES ('pinned','response',0,'gpt','owner','[]','responses')").execute(db.pool()).await.unwrap();
         registry.reload_codex_credential_with(None);
         let error = client.continuation_route_key().unwrap_err();
         assert_eq!(error.kind, phoenix_llm::LlmErrorKind::InvalidRequest);
@@ -3889,6 +4052,7 @@ mod registry_llm_client_tests {
                 &std::collections::BTreeSet::new(),
                 &[],
                 &[],
+                phoenix_core::domain::tool_discovery::ToolDiscoveryMode::Eager,
             )
             .await
             .unwrap();

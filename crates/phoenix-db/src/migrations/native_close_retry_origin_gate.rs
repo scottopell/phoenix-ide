@@ -3,20 +3,20 @@ use super::{DbError, DbResult, Migration};
 use sqlx::{Connection, SqlitePool};
 
 const TRIGGER: &str = "native_close_captured_loss_retry_origin_requires_exact_stop";
-const SOURCE_184: &str = include_str!("native_close_captured_loss_retry.sql");
+const SOURCE_187: &str = include_str!("native_close_captured_loss_retry.sql");
 const ARCHIVE_GATE: &str = "conversation.archived <> 1 OR ";
 const OLD_STATE_GATE: &str = "conversation.state_kind NOT IN ('Idle', 'Closed', 'Error')";
 const STATE_GATE: &str = "conversation.state_kind NOT IN ('idle', 'terminal', 'error')";
 
 fn unexpected() -> DbError {
     DbError::Serialization(format!(
-        "migration 186 found unexpected {TRIGGER} source shape"
+        "migration 189 found unexpected {TRIGGER} source shape"
     ))
 }
 
 fn corrected_source() -> DbResult<(String, String)> {
     let start = format!("CREATE TRIGGER {TRIGGER}\n");
-    let (_, tail) = SOURCE_184.split_once(&start).ok_or_else(unexpected)?;
+    let (_, tail) = SOURCE_187.split_once(&start).ok_or_else(unexpected)?;
     let (body, _) = tail.split_once("\nEND;").ok_or_else(unexpected)?;
     let old = format!("{start}{body}\nEND");
     if old.matches(ARCHIVE_GATE).count() != 1 || old.matches(OLD_STATE_GATE).count() != 1 {
@@ -67,8 +67,8 @@ mod tests {
             .connect("sqlite::memory:")
             .await
             .unwrap();
-        super::super::setup_real_175_for_test(&pool).await;
-        super::super::run_through_for_test(&pool, 185)
+        super::super::setup_real_178_for_test(&pool).await;
+        super::super::run_through_for_test(&pool, 188)
             .await
             .unwrap();
         pool
@@ -89,7 +89,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn real185_to186_preserves_origin_authority_and_is_idempotent() {
+    async fn real188_to189_preserves_origin_authority_and_is_idempotent() {
         let pool = predecessor().await;
         let (old, corrected) = corrected_source().unwrap();
         let installed: String = sqlx::query_scalar(
@@ -101,7 +101,7 @@ mod tests {
         .unwrap();
         assert_eq!(installed, old);
         assert_eq!(
-            super::super::run_through_for_test(&pool, 186)
+            super::super::run_through_for_test(&pool, 189)
                 .await
                 .unwrap(),
             1
@@ -117,10 +117,10 @@ mod tests {
         let before = snapshot(&pool).await;
         assert_eq!(
             before.1.last(),
-            Some(&(186, "native_close_retry_origin_gate".into()))
+            Some(&(189, "native_close_retry_origin_gate".into()))
         );
         assert_eq!(
-            super::super::run_through_for_test(&pool, 186)
+            super::super::run_through_for_test(&pool, 189)
                 .await
                 .unwrap(),
             0
@@ -129,7 +129,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn missing_or_changed_origin_trigger_rolls_back186() {
+    async fn missing_or_changed_origin_trigger_rolls_back189() {
         for changed in [false, true] {
             let pool = predecessor().await;
             sqlx::raw_sql(
@@ -143,7 +143,7 @@ mod tests {
                     .execute(&pool).await.unwrap();
             }
             let before = snapshot(&pool).await;
-            let error = super::super::run_through_for_test(&pool, 186)
+            let error = super::super::run_through_for_test(&pool, 189)
                 .await
                 .unwrap_err();
             assert!(error.to_string().contains("unexpected native_close_captured_loss_retry_origin_requires_exact_stop source shape"));

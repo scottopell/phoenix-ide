@@ -35,7 +35,6 @@ pub struct PeerAuthenticated {
     pub caller_display_name: String,
 }
 
-#[async_trait::async_trait]
 impl<S> FromRequestParts<S> for PeerAuthenticated
 where
     S: Send + Sync,
@@ -56,7 +55,6 @@ where
 #[derive(Debug, Clone, Copy)]
 pub struct OwnerAuthenticated;
 
-#[async_trait::async_trait]
 impl<S> FromRequestParts<S> for OwnerAuthenticated
 where
     S: Send + Sync,

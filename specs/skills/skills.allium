@@ -304,9 +304,12 @@ rule ExpandSkill {
 -- single rule; the equivalent v3 pattern is to split the rule, gating
 -- each branch with a `requires:` clause. Black-box predicates referenced:
 --   is_empty, contains: String predicates
---   replace_positional: substitutes $ARGUMENTS[N] and $N (1-based) with
---     the Nth whitespace-delimited argument token
+--   replace_positional: substitutes $ARGUMENTS[N] and $N (1-based, N is
+--     every consecutive digit) with the Nth whitespace-delimited argument
+--     token; a placeholder with no Nth token is left as written
 --   replace_full: replaces bare $ARGUMENTS with the full argument string
+-- Both predicates rewrite only placeholders present in the skill body:
+-- text they insert is never rescanned for further placeholders.
 
 -- No arguments provided: body delivered unchanged (common case).
 rule SubstituteArgumentsEmpty {

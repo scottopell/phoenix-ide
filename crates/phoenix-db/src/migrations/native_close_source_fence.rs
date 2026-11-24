@@ -43,7 +43,7 @@ pub(super) async fn run(pool: &SqlitePool, migration: &Migration) -> DbResult<()
                 .await?;
             if schema.matches(old).count() != count {
                 return Err(DbError::Serialization(format!(
-                    "migration 175 found unexpected {object} definition"
+                    "migration 178 found unexpected {object} definition"
                 )));
             }
             sqlx::query("UPDATE sqlite_schema SET sql = ?2 WHERE name = ?1")

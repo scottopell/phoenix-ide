@@ -16,27 +16,37 @@ THE SYSTEM SHALL bind gateway authority to an explicit Slack workspace and owner
 
 Before acknowledgments or replies, actor and workspace evidence SHALL refer to one fixed serving connection. Replacing or reauthorizing that connection SHALL require fresh verification rather than permit the write on another account.
 
-WHEN a message or reaction is considered as a trigger, THE SYSTEM SHALL confirm the source and triggering actor through Slack and accept only the configured owner's action. A message from another user, an app-authored message, or a gateway-authored message SHALL NOT count as the owner's instruction merely because its words name Phoenix or its displayed author resembles the owner. For reactions, the triggering actor is the reacting user, independently of the source message's author; an app-authored source MAY supply briefing context but SHALL NOT become an owner-authored explicit instruction.
+WHEN a message, reaction, or saved item is considered as a trigger, THE SYSTEM SHALL confirm the source and triggering actor through Slack and accept only the configured owner's action. A message from another user, an app-authored message, or a gateway-authored message SHALL NOT count as the owner's instruction merely because its words name Phoenix or its displayed author resembles the owner. For reactions and saved items, the triggering actor is the reacting or saving user, independently of the source message's author; an app-authored source MAY supply briefing context but SHALL NOT become an owner-authored explicit instruction.
 
-An incomplete or ambiguous reactor list SHALL remain unverified rather than establish the owner's absence. A reaction-dependent candidate SHALL retain its discovery page for verified retry. A separately verified owner-authored fire prefix SHALL remain sufficient without reaction evidence, independently of the query that found the source.
+An incomplete or ambiguous reactor list SHALL remain unverified rather than establish the owner's absence. A reaction-dependent candidate SHALL retain its discovery page for verified retry. A separately verified owner-authored configured-emoji prefix SHALL remain sufficient without reaction evidence, independently of the query that found the source.
 
 **Rationale:** An unrelated Slack participant must not gain execution authority over the owner's machine and credentials.
 
 ### REQ-SG-002 — Recognize three explicit gestures
 
-WHEN the owner reacts with `:fire:` to another person's message, THE SYSTEM SHALL prepare a private briefing about that message and its discussion.
+WHEN the owner reacts with the configured trigger emoji to another person's message, THE SYSTEM SHALL prepare a private briefing about that message and its discussion.
 
-WHEN the owner posts a message whose first non-whitespace content is the fire emoji or its Slack `:fire:` representation, THE SYSTEM SHALL treat the remaining message as an explicit request. The word `phoenix` SHALL NOT be required for recognition.
+WHEN the owner posts a message whose first non-whitespace content is the configured trigger emoji's Slack `:name:` representation, THE SYSTEM SHALL treat the remaining message as an explicit request. The Unicode fire emoji SHALL also be recognized when `fire` is configured. The word `phoenix` SHALL NOT be required for recognition.
 
-WHEN the owner reacts with `:fire:` to their own eligible message, THE SYSTEM SHALL treat that message as an explicit request without requiring a prefix.
+WHEN the owner reacts with the configured trigger emoji to their own eligible message, THE SYSTEM SHALL treat that message as an explicit request without requiring a prefix.
 
-THE SYSTEM SHALL NOT treat an untriggered follow-up, an ordinary mention of Phoenix, quoted trigger text, or another person's reaction as an invocation. An empty explicit request SHALL receive an explanation rather than inferred work.
+Outside the configured submission-channel rule in REQ-SG-020, THE SYSTEM SHALL NOT treat an untriggered follow-up, an ordinary mention of Phoenix, quoted trigger text, or another person's reaction as an invocation. An empty emoji-triggered explicit request SHALL receive an explanation rather than inferred work.
 
 **Rationale:** The owner can flag context or submit an instruction using deliberate, recognizable actions without automatic participation in channel chatter.
 
-### REQ-SG-003 — Discover within a four-calendar-day window
+### REQ-SG-018 — Configure one trigger emoji
 
-THE SYSTEM SHALL discover eligible messages in channels, private channels, direct messages, and threads accessible through the configured connection. The source-message date SHALL be today or one of the previous three calendar dates in the configured owner's timezone; a date outside this window SHALL NOT become eligible because its reaction is recent.
+THE SYSTEM SHALL let the owner configure exactly one Slack emoji name, including a custom name such as `phoenix-please-look`. That emoji SHALL invoke the three workflows in REQ-SG-002; other emojis SHALL NOT invoke them. A fresh installation SHALL use `fire`. The owner SHALL be able to replace `fire` entirely. Empty, multiple, malformed, and acknowledgment-only `eyes` names SHALL be rejected without changing settings.
+
+THE SYSTEM SHALL list each workflow with its triggering action and destination beside the editable emoji name, using examples derived from that name. The name MAY be entered with surrounding colons. Creating or uploading the emoji in Slack SHALL remain a separate action; configuring a name SHALL NOT upload an image.
+
+WHEN the configured emoji changes, THE SYSTEM SHALL discard incompatible discovery positions and establish a new baseline before admitting new gestures. It SHALL explain that existing matches and gestures during initialization can be absorbed by that baseline. Saving the same normalized name SHALL NOT reinitialize discovery. Accepted work, handled source identities, reply duties, and provider retry deadlines SHALL be preserved. An already handled emoji source SHALL NOT create another emoji request after changing the emoji.
+
+**Rationale:** A dedicated custom emoji avoids confusing ordinary social reactions with agent requests while keeping discovery to one prefix search and one owner-reaction search.
+
+### REQ-SG-003 — Discover emoji triggers within a four-calendar-day window
+
+THE SYSTEM SHALL discover eligible emoji-triggered messages in channels, private channels, direct messages, and threads accessible through the configured connection. Their source-message date SHALL be today or one of the previous three calendar dates in the configured owner's timezone; a date outside this window SHALL NOT become eligible because its reaction is recent. Saved captures SHALL follow REQ-SG-019 independently of this age window.
 
 WHEN service resumes after downtime, THE SYSTEM SHALL discover still-present, unhandled eligible triggers within that window. A newly added reaction on an eligible older message SHALL remain discoverable independently of the last discovery time. Discovery SHALL follow available result pages without treating an incomplete search as proof that no further triggers exist.
 
@@ -48,7 +58,7 @@ Definitive source unavailability SHALL require structured rejection evidence for
 
 ### REQ-SG-004 — Establish a baseline without swallowing catch-up
 
-WHEN the gateway is first enabled for an owner and workspace, THE SYSTEM SHALL record matching pre-existing triggers as a baseline without executing them. THE SYSTEM SHALL show initialization as inactive and baseline all matches found during that scan, including gestures made during initialization. Admission SHALL begin only after the baseline is complete and the gateway reports ready; a failed or partial baseline SHALL remain visibly incomplete. Gestures made before ready MAY be absorbed by the baseline.
+WHEN emoji discovery is first enabled for an owner and workspace, THE SYSTEM SHALL record matching pre-existing emoji triggers as a baseline without executing them. THE SYSTEM SHALL show initialization as inactive and baseline all matches found during that scan, including emoji gestures made during initialization. Emoji admission SHALL begin only after that baseline is complete and emoji discovery reports ready; a failed or partial baseline SHALL remain visibly incomplete. Emoji gestures made before ready MAY be absorbed by that baseline.
 
 WHEN the gateway restarts with retained discovery state, THE SYSTEM SHALL preserve the baseline and handled identities rather than establish a new baseline that discards missed requests.
 
@@ -60,7 +70,7 @@ WHEN initialization has retained a search boundary but is not complete, THE SYST
 
 WHEN a verified trigger is accepted, THE SYSTEM SHALL durably retain its workspace, owner, source channel, exact message identity, thread root, trigger classification, source instruction snapshot, return destination, stable admission identity, and obligation to report a result or failure before acknowledging it.
 
-WHEN discovery repeats the same source message, including both a prefix and an owner reaction, THE SYSTEM SHALL reuse the accepted request rather than create another conversation, turn, or reply obligation. Removing and re-adding a reaction SHALL NOT constitute a new request for an accepted source. Later source edits SHALL NOT silently change an accepted instruction; a different instruction requires a new source message.
+WHEN emoji discovery repeats the same source message, including both a prefix and an owner reaction, THE SYSTEM SHALL reuse the accepted emoji request rather than create another conversation, turn, or reply obligation. Removing and re-adding a reaction SHALL NOT constitute a new emoji request for an accepted source. Later source edits SHALL NOT silently change an accepted instruction; a different instruction requires a new source message. Saved captures SHALL have their own one-capture-per-message identity under REQ-SG-019, so an emoji baseline or request SHALL NOT suppress a Saved capture.
 
 WHEN an owner or workspace change would leave another account's accepted work or delivery obligations outstanding, THE SYSTEM SHALL refuse that change until those obligations settle. Disabling discovery or repairing the same account's connection SHALL preserve and continue accepted work.
 
@@ -70,7 +80,7 @@ A briefing's needs-input notice SHALL NOT establish terminal lifecycle evidence.
 
 ### REQ-SG-006 — Acknowledge durable acceptance with eyes only
 
-WHEN request acceptance is durable, THE SYSTEM SHALL attempt to add `:eyes:` to the triggering source message. THE SYSTEM SHALL NOT add it before acceptance is durable or use it to claim that work is running, complete, or delivered.
+WHEN an emoji request's acceptance is durable, THE SYSTEM SHALL attempt to add `:eyes:` to the triggering source message. THE SYSTEM SHALL NOT add it before acceptance is durable or use it to claim that work is running, complete, or delivered. Saved captures SHALL receive no source-message acknowledgment under REQ-SG-019.
 
 THE SYSTEM SHALL make at most one bounded acknowledgment attempt per accepted request, recording the attempt before invoking Slack. Success or an operation-qualified already-present response SHALL confirm eyes. Rejection, timeout, interruption, or an ambiguous response SHALL remain visible without automatic retry. A crash after claiming the attempt MAY leave eyes absent. The absence of eyes SHALL NOT imply that work was not accepted.
 
@@ -240,13 +250,13 @@ its source evidence or publishing a return. A changed identity SHALL stop those
 operations and expose the mismatch; recovered connectivity SHALL NOT stand in for
 account verification.
 
-WHEN discovery resumes and its last completed scan predates the current eligible
+WHEN discovery resumes and its last completed emoji scan predates the current eligible
 four-calendar-date window, THE SYSTEM SHALL warn that triggers outside that window
-may have been missed. It SHALL NOT extend the search window or claim complete
-catch-up. Baseline completion and trigger eligibility remain governed by
+may have been missed. It SHALL NOT extend the emoji search window or claim complete
+catch-up. Emoji baseline completion and trigger eligibility remain governed by
 REQ-SG-003/004.
 
-Ready responses SHALL be reconciled independently of waiting for the next discovery interval. Each serialized service opportunity SHALL start at most one thread-delivery attempt, preserving remaining returns for later delivery opportunities so a slow reply backlog cannot monopolize private notification, acknowledgment and discovery work. Their Slack operations SHALL share the gateway's finite call allowance and persisted retry deadline with discovery. Previously recorded source identities, including baseline identities, SHALL be skipped before fetching additional source context. Pagination SHALL preserve progress for both trigger searches without allowing one search to starve the other.
+Ready responses SHALL be reconciled independently of waiting for the next discovery interval. Each serialized service opportunity SHALL start at most one thread-delivery attempt, preserving remaining returns for later delivery opportunities so a slow reply backlog cannot monopolize private notification, acknowledgment and discovery work. Their Slack operations SHALL share the gateway's finite call allowance and persisted retry deadline with discovery. Previously recorded source identities, including baseline identities, SHALL be skipped within their capture workflow before fetching additional source context. Pagination SHALL preserve progress for emoji and Saved discovery without allowing one search to starve another. Saved discovery SHALL share the finite call allowance and accepted-work reserve; it SHALL NOT create an independent polling worker or allowance.
 
 The gateway's owner-facing read-access inspection SHALL share that allowance, serialization and persisted retry deadline, without accepting triggers or advancing discovery. Direct agent or manual MCP tool calls are outside this gateway allowance.
 
@@ -254,9 +264,9 @@ Inspection SHALL report sampled hits and verified sources for each query, and di
 
 Ready return delivery SHALL receive an opportunity before best-effort acknowledgment attempts consume available allowance or introduce a new provider delay. Retry deadlines SHALL apply to the configured owner/workspace, rather than another retained account. Non-throttling discovery failures SHALL be reported as failed rather than provider backoff. A startup recovery failure SHALL remain visible and be retried without requiring a Phoenix restart; no external work SHALL begin before that recovery succeeds.
 
-Candidate first-observation time SHALL be persisted by workspace, owner, channel and message identity before source verification. A transient verification failure SHALL preserve that time across retries and same-version restart; acceptance SHALL transfer it into the immutable request. This metadata SHALL NOT authorize a request or mark the source handled. Acceptance or a handled ineligible observation SHALL retire the candidate metadata. Metadata older than seven days MAY expire because its source is outside the four-calendar-date eligibility window.
+Candidate first-observation time SHALL be persisted by capture workflow, workspace, owner, channel and message identity before source verification. A transient verification failure SHALL preserve that time across retries and same-version restart, subject to metadata expiry; acceptance SHALL transfer the available observation time into the immutable request. This metadata SHALL NOT authorize a request or mark the source handled. Acceptance or a handled ineligible observation SHALL retire metadata only within its workflow. Metadata older than seven days MAY expire. For emoji sources, that age is outside their eligibility window. For Saved sources, expiry SHALL affect timing telemetry only; it SHALL NOT change source eligibility, scan positions, handled identities, or accepted work. Saved timing SHALL NOT be represented as save-to-accept latency.
 
-WHEN initialization is complete and the saved prefix search has advanced, THE SYSTEM SHALL offer a bounded newest-prefix-page check independently of that saved position, subject to the shared allowance, backoff and discovery time bounds. It SHALL preserve capacity for catch-up and accepted work, alternate which class receives the first opportunity, and use the same source-verification and immutable acceptance boundary for both paths. A freshness observation SHALL NOT advance saved positions, establish full-window completion, or bypass initialization. This check SHALL NOT promise that all newly indexed messages are observed on that opportunity; full catch-up remains responsible for the rest of the window.
+WHEN initialization is complete and the saved prefix search has advanced, THE SYSTEM SHALL offer a bounded newest-prefix-page check independently of that saved position, subject to the shared allowance, backoff and discovery time bounds. It SHALL preserve capacity for catch-up and accepted work, rotate first opportunities fairly across enabled trigger streams, and use the same source-verification and immutable acceptance boundary for both paths. A freshness observation SHALL NOT advance saved positions, establish full-window completion, or bypass initialization. This check SHALL NOT promise that all newly indexed messages are observed on that opportunity; full catch-up remains responsible for the rest of the window.
 
 **Rationale:** The owner needs evidence that the gateway is watching without exhausting the same Slack access used for investigations.
 
@@ -267,3 +277,32 @@ WHEN initialization is complete and the saved prefix search has advanced, THE SY
 - [MCP](../mcp/requirements.md): connection ownership and tool execution.
 - [Ask user question](../ask-user-question/requirements.md), REQ-AUQ-009: exact pending-question authority.
 - [Compatibility](../compatibility/requirements.md): feature-scoped recovery promises.
+
+
+### REQ-SG-019 — Capture a discussion privately with Save for later
+
+WHERE Saved capture is enabled and initialized, WHEN the configured connection verifies an accessible, unhandled message or reply as saved by the owner, THE SYSTEM SHALL accept a private briefing capture regardless of the source-message age or author. The source text SHALL supply context only, including when it was written by the owner or contains an emoji invocation. A saved reply SHALL retain its exact identity and parent-thread reference. Files and standalone task notes SHALL NOT count as saved-message captures.
+
+THE SYSTEM SHALL acknowledge Saved captures only through Phoenix or the configured private notification mechanism. It SHALL NOT add reactions, post messages, or send clarification or failure notices to the source conversation as a result of a Saved capture. Each capture SHALL prepare a new private ordinary Phoenix conversation with a briefing and then wait for direction under ordinary permissions.
+
+WHEN Saved capture is first enabled for an account, THE SYSTEM SHALL initialize its own baseline, visibly inactive until a complete scan establishes readiness. Saves present during initialization MAY become baseline without starting work. Enabling or pausing Saved capture SHALL NOT reset emoji discovery. Emoji setting changes SHALL NOT reset Saved progress or readiness. A retained-state restart SHALL preserve both workflows' progress and handled identities. THE SYSTEM SHALL expose Saved readiness, last completed scan, and incomplete-scan warnings independently of emoji readiness.
+
+THE SYSTEM SHALL deduplicate Saved captures within their own workflow. An emoji baseline or request for the same source SHALL NOT suppress a Saved capture. Repeated discovery, removing and re-adding a save, and source edits SHALL NOT repeat a Saved baseline or accepted capture, or alter an accepted snapshot. Removing a save SHALL NOT cancel accepted work; a save removed before observation MAY be missed. Observing a save MAY authorize its briefing even if the item is unsaved before admission completes.
+
+THE SYSTEM SHALL scan the saved-message collection without a source-age cutoff, retain progress across bounded service opportunities, and distinguish a complete scan from provider-limited or failed discovery. Only verified end-of-pagination evidence SHALL establish baseline or scan completion. A provider page limit SHALL remain visibly incomplete rather than establish that older saved messages do not exist. Scan limits SHALL NOT cancel or repeat accepted work. The system SHALL NOT promise an event log, discovery of saves removed before observation, a stable search snapshot, or fixed click-to-accept latency.
+
+**Rationale:** The owner can privately flag an old or new discussion with one Slack action, without notifying its participants or copying its link into a new conversation.
+
+### REQ-SG-020 — Submit work through a personal Slack channel
+
+WHERE the owner configures a submission channel, WHEN a new ordinary top-level message authored by the owner is verified in that channel after its initialization completes, THE SYSTEM SHALL accept one request without requiring an emoji. Channel events, other authors, gateway-generated messages and thread replies SHALL NOT invoke this workflow. The channel SHALL be selected by exact ID and is intended to be private. Visibility and membership remain Slack-managed; Phoenix SHALL NOT infer privacy from the channel's name.
+
+THE SYSTEM SHALL use the owner's accompanying note as the instruction and forwarded discussion as context only. A forward without a note SHALL request a concise briefing with evidence and likely next steps, then await direction. Standalone prompts and pasted source links SHALL also be accepted. The agent MAY read the referenced original discussion using its configured access; forwarded instructions SHALL NOT acquire authority. An inaccessible original SHALL be reported without substituting an unrelated source.
+
+Each submission SHALL create a fresh ordinary Phoenix conversation. Identity SHALL use the submission message, not the forwarded original, so another submission concerning the same original can request different work. Emoji discovery of that same submission SHALL NOT create another request. Saved capture retains its independent identity. Accepted snapshots and work SHALL survive edits, discovery pauses, channel changes and retained-state restart.
+
+THE SYSTEM SHALL return the intentional result, or generic clarification/failure handoff, in the submission's thread with its Phoenix conversation link. It SHALL NOT post to or acknowledge the forwarded original as an automatic consequence. Explicit owner instructions can authorize separately requested publication under ordinary permissions. Further discussion and question answers SHALL occur in Phoenix; plain submission-thread replies SHALL NOT trigger this workflow. Thread replies posted as the owner by Phoenix SHALL be excluded from discovery.
+
+Submission discovery SHALL cover submissions written today and the preceding three calendar dates in the owner's timezone; the forwarded original can be any age. Removed-before-observation and out-of-window submissions MAY be missed. Initialization SHALL baseline matching existing submissions without starting work and SHALL expose readiness independently of emoji and Saved capture. Selecting a channel without retained initialization SHALL establish its baseline; disabling and re-enabling the same channel or restarting SHALL preserve its handled identities. Partial scans SHALL remain incomplete and retain progress. Changing timezone SHALL restart incomplete channel initialization within the new calendar boundary while preserving handled identities and accepted work. Submission discovery SHALL share the gateway's serial worker, finite call allowance, backoff and accepted-work reserve, receiving a fair opportunity alongside other enabled searches.
+
+**Rationale:** The owner can privately forward a discussion with an investigation lens, without a visible source reaction or copying it into a new Phoenix chat.

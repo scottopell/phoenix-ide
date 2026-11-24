@@ -35,6 +35,7 @@ pub mod sm_event;
 pub mod sm_state;
 pub mod task_approval;
 pub mod tool_availability;
+pub mod tool_discovery;
 pub mod tool_result_identity;
 pub mod tool_round;
 pub mod tool_wire;

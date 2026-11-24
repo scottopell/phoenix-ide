@@ -69,7 +69,7 @@ executive summary.
 | **REQ-GR-012:** Commit and Report One Message Outcome | ✅ Complete | HTTP chat and agent cross-conversation actions share typed delivery, steering, rejection, and self-target rejection outcomes |
 | **REQ-GR-013:** Preserve Coordination Context Through Compaction | Implemented; prompt-continuity qualification pending | Existing Coordinator identity selects coordination-specific summary instructions. The shared pipeline protects the accepted handoff (ADR-049). Both summary policies request obligations, exact primary-user authorization provenance, next action and completion checks. Trusted resumption guidance in both languages distinguishes verifying primary evidence from obeying embedded directives: standing directions survive continuation subject to later constraints, current status and established ownership; generated content grants no authority. Compaction-only escaped JSON envelopes expose each retained row's persisted transcript/message locator, typed origin and content kind without treating API origin as human identity or approval. Metadata shares row budgets and retention; full accepted handoff protection is unchanged. New Rust prompt/reference and provider-request regressions await hosted qualification. |
 | **REQ-GR-019:** Continue an Exact Generated Ordinary Handoff | Implemented; bounded qualification passed | Generated-only adapter, current-Coordinator reservation, shared acceptance/capacity flow and closed-authority result suppression have selected DB, application, adapter and prompt passes at `fbdd574d`. The real-registry preclosed native fatal-sink regression observes adapter disposal, fatal exit and unchanged DB messages/state. The initially-open settings uncertainty-to-supervisor fixture passed in the same bounded application run. At `6f80dec3`, the fresh concurrent native requests regression passed through the exact captured durable turn's Completed settlement. Goal997/main is integrated; full-suite/all-target-on-candidate, hosted current-head checks and the real provider journey are not established by these runs. See revision-separated evidence below. |
-| **REQ-GR-020:** Read and Set Automatic-Continuation Preferences Without Scheduling Work | Local behavior qualified; remote candidate qualification pending | Current-Coordinator read/set adapters, closed target/Boolean parsing, shared SQL preference primitives, transactional source/target checks, classified preference-only writes and detached ownership are authored. Source regressions cover default OFF, exact targets, prospective summary-time admission, source rotation, registry denial, trusted context, uncertainty/rollback, requester cancellation and fatal closure. Selected native settings, DB and application regressions passed at `fbdd574d`. Real-registry executor regressions for preclosed read/set fatal sinks passed in that bounded application run; they assert adapter disposal, fatal exit, unchanged DB messages/state and no ordinary message publication. They close authority before native dispatch and do not model DB uncertainty or an in-flight preference write. An additional initially-open, real-registry setter fixture is source-authored: a per-DB test-support pause reuses the lost-commit-acknowledgement seam after the real preference transaction, then returns the unclassified outcome through the application. It observes the adapter pending while the committed DB result is withheld, then asserts closure before any of the four task/application owners release, adapter disposal through the unchanged fatal-cancellation path without an ordinary result, owner drain, fatal runtime disposition, unchanged transcript state/messages and actual HTTPS supervisor fatal exit with runtime-map drain and listening-address rebind. This fixture uses a manually registered handle for the tested runtime, no TLS client or live bash workload, and passed at `fbdd574d`; it is not a live provider/client journey. Format and bounded compilation/execution evidence is attributed below, not promoted to full-suite or all-target qualification on the candidate. Goal997/main is source-integrated while preserving admission-only policy and retained Goal readability. The executed uncertainty-to-supervisor fixture supports its stated boundary, not every in-transaction cancellation/late-closure interleaving or wider integrated check; retained Goal readability is not new Goal admission. Optional-instance remote read/set is source-authored on this candidate with separate closed shapes, a current-Coordinator source gate and authenticated destination transaction; focused regressions exist but no cross-process acceptance or full qualification has been established. Remote set remains prospective and preference-only; it does not create a Goal or dispatch intent. |
+| **REQ-GR-020:** Read and Set Automatic-Continuation Preferences Without Scheduling Work | Local behavior qualified; remote candidate qualification pending | Current-Coordinator read/set adapters, closed target/Boolean parsing, shared SQL preference primitives, transactional source/target checks, classified preference-only writes and detached ownership are authored. Source regressions cover fresh aggregate default ON with preserved historical/explicit OFF preferences (ADR-256), exact targets, prospective summary-time admission, source rotation, registry denial, trusted context, uncertainty/rollback, requester cancellation and fatal closure. Selected native settings, DB and application regressions passed at `fbdd574d`. Real-registry executor regressions for preclosed read/set fatal sinks passed in that bounded application run; they assert adapter disposal, fatal exit, unchanged DB messages/state and no ordinary message publication. They close authority before native dispatch and do not model DB uncertainty or an in-flight preference write. An additional initially-open, real-registry setter fixture is source-authored: a per-DB test-support pause reuses the lost-commit-acknowledgement seam after the real preference transaction, then returns the unclassified outcome through the application. It observes the adapter pending while the committed DB result is withheld, then asserts closure before any of the four task/application owners release, adapter disposal through the unchanged fatal-cancellation path without an ordinary result, owner drain, fatal runtime disposition, unchanged transcript state/messages and actual HTTPS supervisor fatal exit with runtime-map drain and listening-address rebind. This fixture uses a manually registered handle for the tested runtime, no TLS client or live bash workload, and passed at `fbdd574d`; it is not a live provider/client journey. Format and bounded compilation/execution evidence is attributed below, not promoted to full-suite or all-target qualification on the candidate. Goal997/main is source-integrated while preserving admission-only policy and retained Goal readability. The executed uncertainty-to-supervisor fixture supports its stated boundary, not every in-transaction cancellation/late-closure interleaving or wider integrated check; retained Goal readability is not new Goal admission. Optional-instance remote read/set is source-authored on this candidate with separate closed shapes, a current-Coordinator source gate and authenticated destination transaction; focused regressions exist but no cross-process acceptance or full qualification has been established. Remote set remains prospective and preference-only; it does not create a Goal or dispatch intent. |
 | **REQ-GR-021:** Speak as Ember, the User's Chief of Staff | Implemented; static checks only | The Phoenix Coordinator prompt opens with the Ember persona block and four Ember → user contrasts; Caveman is unchanged. Rust and Python checks assert presence, required elements, contrasts and a separate size ceiling. No live model evaluation of voice, lore leakage or challenge behavior (ADR-214). |
 
 The native Continue/settings successor has bounded, revision-separated qualification on an isolated branch. Its separate REQ-GR-007 exceptions and ADR-212/209 do not authorize shipping; source integration and static review are not executable qualification. Settings results report only persisted preference and aggregate identity, not admission/failure status or scheduler action. Shared public HTTP settings extraction preserves its existing projection behavior, including possible post-write projection failure; the native setter uses a separately classified transaction. Bounded independent source reviews found no confirmed blocker in the extraction. The final native settings review found an invalid exhausted-state test fixture; it was corrected and the specific API/state construction was independently source-rechecked without a remaining confirmed blocker. These bounded static reviews are not executable qualification. Two unauthorized Cargo invocations failed on a duplicate reader before any tests ran; the duplicate reader was source-corrected without retrying those unauthorized invocations. Those invocations provide no qualification credit; later separately admitted runs are recorded below. The candidate incorporates landed Goal997/main (`98ef62e566b6350be9976c3f063a21a99516ec24`) after preserving the reviewed regression checkpoint. The cumulative REQ-GR-007 exception and both language policies retain Goal metadata alongside Continue/settings. Goal admission still requires persisted autoContinue ON for create/replacement; OFF-state history, safety exits and receipt replay remain intact. No migration identities, implementations or order were changed by this integration. The real-registry Goal discovery regression now also asserts the three Continue/settings tools are present exactly once. Selected integrated assertions passed at `fbdd574d`; they were not rerun on `6f80dec3`. Answer and review adapters remain separate unfinished work.
@@ -226,3 +226,70 @@ Both Coordinator language variants include an explicit outcome-delegation rule a
 The Phoenix-language Coordinator prompt opens with a 524-word / 3,165-character Ember persona block (ceiling 550 words / 3,300 characters, checked separately from the base and delegation sections). It replaces the former one-clause identity and the superseded "Write for a busy user missing history" sentence; all other reporting, silence, security and delegation guidance is unchanged. Caveman, UI labels and internal Coordinator naming are unchanged. Static checks do not demonstrate live voice quality (ADR-214).
 
 The web list navigation presents one pinned compact Ember entry (Global coordinator), outside ordinary conversation lifecycle/counts, on desktop and mobile; the collapsed desktop rail retains an accessible Ember mark. The existing `/global` singleton route is unchanged. Loading and return-navigation identity use Ember. See REQ-GR-023 and ADR-229. Focused UI tests cover web entry navigation and accessibility naming.
+
+## Reproducing the assembled tool inventory
+
+The opt-in `runtime::tool_surface_inventory::export_coordinator_tool_surface_inventory`
+fixture calls `RuntimeManager::coordinator_tool_registry`, then the same
+`SpawnCatalog::resolve`/`tool_definition` used to specialize configured spawn
+choices. It exports both instruction languages, with/without the authenticated
+built-in skill catalog, and generic versus synthetic configured worker/tier
+choices. Every entry includes the actual descriptions, input schemas, deferred
+flags and byte/word measurements. There is no separately maintained tool roster
+or fixed tool count.
+
+An ordinary test assembles these same variants and checks optional authenticated
+skills, configured worker/tier specialization, unique installed names,
+provider-compatible object roots and the corrected watch guidance. The opt-in
+exporter reuses that assembly; neither path dispatches model or action tools.
+
+```bash
+PHOENIX_TOOL_INVENTORY_OUTPUT=/absolute/path/tool-surface.json \
+  cargo test -p phoenix_ide export_coordinator_tool_surface_inventory -- --ignored
+```
+
+The fixture uses an isolated database and an offline model configuration; it
+performs no provider requests or target mutations. It describes that synthetic
+configuration, not installed production options or a provider's token accounting.
+Final inventory execution must follow integration of newly registered tracking
+tools. Existing create/rename/generated-continuation/Goal capabilities and
+provider-compatible nested schemas remain their owning contracts, not new work
+commissioned by inventory generation.
+
+The watch description distinguishes local question/task-approval wait entries
+from selected-peer v1 terminal facts. A wait is not execution completion. The
+registry composition comment no longer incorrectly claims that host-supplied
+creation tools are absent. These are guidance corrections, not watch timing,
+lifecycle or protocol changes.
+
+The description also names supported local Goal metadata changes. Under
+REQ-GR-015 and REQ-GOAL-AC-002, the installed Goal control path calls
+`coordinator_watches::goal_facts::settled_change_tx`: eligible enrolled open
+ordinary sources receive a `goal_change` occurrence keyed to the saved Goal
+version. Disabled control emits none, and the generic Goal report path excludes
+progress-only `Report` changes. This wording does not promise a notification for
+every progress report or change peer terminal-fact v1.
+
+The final runtime candidate at 2e098a302 compiled and exported eight synthetic
+variants. Its ordinary inventory matrix, opt-in export and real local-read
+recovery fixture pass; earlier registered watch-list (three) and coordinator
+prompt (seven) regressions also passed. The fixture smoke test exercises actual
+list/query/read/search/resolve/think tools against a retained isolated file
+SQLite database and runtime environment, and rejects remote/effectful dispatch.
+
+One separately prepared and independently reviewed real-model trial on
+`gpt-6-astra`, requested high effort, the normal discovered Codex route,
+PhoenixNative instructions and authenticated skills recovered on its first tool
+call: `list_watched_conversations {"request":{"op":"local"}}`. The actual enrolled
+watch was returned and the final answer correctly reported one idle conversation.
+There were no UUID guesses, remote selections, effectful attempts, helper denials
+or errors. Two provider requests used 21,921 observed input tokens including cache
+and 74 output tokens. The frozen budget was not expanded and there was no retry.
+The trace, binary, prompt and definition hashes and exact scope are recorded in
+`scripts/qa/ember-watch-recovery/README.md`.
+
+This qualifies one synthetic retained-history/model read-selection and actual
+registered-dispatch journey. It does not qualify full runtime input admission,
+production activation, every provider or final integrated context. Exact final
+CI and the inventory rerun after tracking/event integration remain required;
+phase 1 stays open for that final composition evidence.

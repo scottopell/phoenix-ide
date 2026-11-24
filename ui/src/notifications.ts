@@ -19,13 +19,13 @@ import {
   registerCoordinatorNotificationTarget,
 } from './notifications/store';
 
-import type { SettingsStatus } from './notifications/policy';
+import type { CoordinatorQuestionNotification, SettingsStatus } from './notifications/policy';
 
 export {
   DEFAULT_NOTIFICATION_SETTINGS,
   AGENT_FINISHED_THRESHOLD_MS,
 } from './notifications/policy';
-export { setActiveNotificationConversationSlug } from './notifications/store';
+export { setActiveNotificationConversationSlug, setMonitoredConversationLookup } from './notifications/store';
 export type { NotificationEventType } from './notifications/policy';
 export { getBrowserNotificationPermission };
 
@@ -72,12 +72,21 @@ export function notifyReminderFeed(items: readonly ReminderNotification[]): void
   store.dispatch({ type: 'reminder_feed', items });
 }
 
+export function notifyCoordinatorQuestionFeed(items: readonly CoordinatorQuestionNotification[]): void {
+  store.dispatch({ type: 'coordinator_question_feed', items });
+}
+
 export function notifyCatchUp(conversations: readonly Conversation[]): void {
   store.dispatch({ type: 'catchup_scan', conversations });
 }
 
 export function closeNotificationsForConversation(conversationId: string): void {
   store.closeForConversation(conversationId);
+}
+
+/** Close notifications about Ember, which the user is now looking at. */
+export function closeCoordinatorNotifications(): void {
+  store.closeForCoordinatorPage();
 }
 
 export function loadNotificationSettings(): Promise<NotificationSettings> {

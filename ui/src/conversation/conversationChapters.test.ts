@@ -328,3 +328,25 @@ describe('continuous history boundaries', () => {
     expect(chapters[1]).toMatchObject({ unitIndex: 1, messageId: 'handoff-exact', transcriptId: 'predecessor' });
   });
 });
+
+describe('Ember tracking chapters', () => {
+  const summary = { id: 'w1', kind: 'requested_work', title: 'Historical review', title_truncated: false,
+    disposition: 'tracking', revision: 1, review_required: true, latest_evidence_ordinal: 1 };
+  const observation = { captured_registry: { registry_revision: 3, active_count: 5, review_required_count: 1,
+    items: [summary], has_more: false, next_cursor: null, omitted_count: 0 },
+    requested_item_due_for_review: summary, captured_at_us: 1791800000123456, admitted_input_sequence_id: 3 };
+  it('labels only trusted saved observations compactly while preserving the persisted chapter target', async () => {
+    const { EMBER_TRACKING_PREFIX } = await import('./emberTrackingObservation');
+    const text = EMBER_TRACKING_PREFIX + JSON.stringify(observation);
+    const trusted = userUnit('ember-obs', text, 42);
+    if (trusted.kind !== 'user') throw new Error('expected persisted user unit');
+    trusted.message.origin = { kind: 'system_generated' };
+    trusted.message.content = { text, is_meta: true } as Message['content'];
+    const ordinary = userUnit('ordinary', text, 43);
+    const chapters = buildConversationChapters([trusted, ordinary]);
+    expect(chapters[0]).toMatchObject({ kind: 'prompt', unitIndex: 0, sequenceId: 42,
+      target: { kind: 'persisted', messageId: 'ember-obs', transcriptId: 'c1' } });
+    expect(chapters[0]?.label).toMatch(/^Ember tracking · captured snapshot/);
+    expect(chapters[1]?.label).toBe(truncateLabel(text));
+  });
+});

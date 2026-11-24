@@ -1,17 +1,42 @@
 import { api } from '../../api';
-import type { CodexLoginPreflight, ModelsResponse } from '../../api';
+import type { CodexLoginPreflight, LlmLanguageSetting, ModelsResponse, NotificationSettings, ProductConversationSnapshotView } from '../../api';
 import type { DeploymentInfo } from '../../generated/DeploymentInfo';
 import type { SidebarFixtureData } from './types';
+
+const fixtureNotificationSettings: NotificationSettings = {
+  enabled: true,
+  notify_task_approval: true,
+  notify_question: true,
+  notify_error: true,
+  notify_idle: true,
+  notify_reminder: true,
+};
+
+const fixtureLlmLanguageSetting: LlmLanguageSetting = {
+  language: 'en',
+  available: ['en'],
+  languages: [],
+};
+
+const fixtureVersion = {
+  version: 'fixture',
+  git_sha: 'fixture000000000000000000000000000000000000',
+  socket_activated: false,
+} as const;
 
 export function installSidebarFixtureApi(data: SidebarFixtureData, scenarioId: keyof NonNullable<SidebarFixtureData['productConversations']>) {
   const original = {
     codexLoginPreflight: api.codexLoginPreflight,
     codexQuota: api.codexQuota,
     deploymentInfo: api.deploymentInfo,
+    getNotificationSettings: api.getNotificationSettings,
+    getLlmLanguageSetting: api.getLlmLanguageSetting,
+    getVersion: api.getVersion,
     getLocalServices: api.getLocalServices,
     getProjects: api.getProjects,
     listModels: api.listModels,
     listProductConversations: api.listProductConversations,
+    getProductConversationSnapshot: api.getProductConversationSnapshot,
     archiveConversation: api.archiveConversation,
     archiveChain: api.archiveChain,
     renameProductConversation: api.renameProductConversation,
@@ -27,6 +52,9 @@ export function installSidebarFixtureApi(data: SidebarFixtureData, scenarioId: k
   });
   api.codexQuota = async () => null;
   api.deploymentInfo = async (): Promise<DeploymentInfo> => ({ local_access: true } as unknown as DeploymentInfo);
+  api.getNotificationSettings = async () => ({ ...fixtureNotificationSettings });
+  api.getLlmLanguageSetting = async () => ({ ...fixtureLlmLanguageSetting });
+  api.getVersion = async () => ({ ...fixtureVersion });
   api.getLocalServices = async () => ({ services: [] });
   api.getProjects = async () => data.projects;
   api.listModels = async (): Promise<ModelsResponse> => ({
@@ -35,7 +63,32 @@ export function installSidebarFixtureApi(data: SidebarFixtureData, scenarioId: k
     llm_configured: false,
     credential_status: 'not_configured',
   });
-  api.listProductConversations = async () => ({ product_conversations: data.productConversations?.[scenarioId] ?? [] });
+  api.listProductConversations = async () => ({ product_conversations: data.productConversations?.[scenarioId] ?? [], coordinator: null });
+  api.getProductConversationSnapshot = async (productConversationId): Promise<ProductConversationSnapshotView> => {
+    const row = data.productConversations?.[scenarioId]?.find((candidate) => candidate.product_conversation_id === productConversationId);
+    if (!row) throw new Error(`Unknown product conversation fixture: ${productConversationId}`);
+
+    const latestTranscriptRowId = row.latest_transcript_row_id;
+    return {
+      segments: [{ segment_ordinal: 0, transcript_row_id: latestTranscriptRowId, slug: row.canonical_root.slug, title: row.canonical_root.title, messages: [], handoff: null }],
+      before: null,
+      has_older: false,
+      product_conversation_id: row.product_conversation_id,
+      close: null,
+      canonical_route: row.canonical_route,
+      requested_transcript_row_id: latestTranscriptRowId,
+      canonical_root: row.canonical_root,
+      ordinary_lifecycle: 'open',
+      latest_transcript_row_id: latestTranscriptRowId,
+      writable_transcript_row_id: latestTranscriptRowId,
+      latest_opening: { status: 'none' },
+      updated_at: row.updated_at,
+      presentation: row.presentation,
+      work_identity: null,
+      source: null,
+      chain_qa_compatibility: null,
+    };
+  };
   api.renameProductConversation = async (reference: string, title: string) => {
     const row = data.productConversations?.[scenarioId]?.find((candidate) => candidate.product_conversation_id === reference);
     if (!row) throw new Error(`Unknown product conversation fixture: ${reference}`);
@@ -52,10 +105,14 @@ export function installSidebarFixtureApi(data: SidebarFixtureData, scenarioId: k
     api.codexLoginPreflight = original.codexLoginPreflight;
     api.codexQuota = original.codexQuota;
     api.deploymentInfo = original.deploymentInfo;
+    api.getNotificationSettings = original.getNotificationSettings;
+    api.getLlmLanguageSetting = original.getLlmLanguageSetting;
+    api.getVersion = original.getVersion;
     api.getLocalServices = original.getLocalServices;
     api.getProjects = original.getProjects;
     api.listModels = original.listModels;
     api.listProductConversations = original.listProductConversations;
+    api.getProductConversationSnapshot = original.getProductConversationSnapshot;
     api.archiveConversation = original.archiveConversation;
     api.archiveChain = original.archiveChain;
     api.renameProductConversation = original.renameProductConversation;

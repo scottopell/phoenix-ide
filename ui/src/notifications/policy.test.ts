@@ -34,6 +34,7 @@ function env(overrides: Partial<NotificationEnv> = {}): NotificationEnv {
     visible: false,
     hasFocus: false,
     activeSlug: null,
+    onCoordinatorPage: false,
     ...overrides,
   };
 }
@@ -131,6 +132,34 @@ describe('notification policy reducer', () => {
       env({ now: AGENT_FINISHED_THRESHOLD_MS }));
     expect(finished.effects).toHaveLength(1);
     expect(finished.effects[0]).toMatchObject({ type: 'show_browser_notification', title: 'Agent finished' });
+  });
+
+  it('stays quiet on completion and questions in a conversation Ember monitors, but not on approvals', () => {
+    const conv = conversation();
+    const monitored = (now: number) => env({ now, isMonitored: () => true });
+    let state = loadedState();
+    state = notificationPolicyReducer(state,
+      { type: 'conversation_state_changed', conversation: conv, previousState: { type: 'idle' }, nextState: { type: 'llm_requesting', attempt: 1 } },
+      monitored(0)).state;
+    const finished = notificationPolicyReducer(state,
+      { type: 'conversation_state_changed', conversation: conv, previousState: { type: 'llm_requesting', attempt: 1 }, nextState: { type: 'idle' } },
+      monitored(AGENT_FINISHED_THRESHOLD_MS));
+    expect(finished.effects).toHaveLength(0);
+
+    const asked = notificationPolicyReducer(loadedState(),
+      { type: 'conversation_state_changed', conversation: conv, previousState: { type: 'idle' }, nextState: { type: 'awaiting_user_response' } as never },
+      monitored(0));
+    expect(asked.effects).toHaveLength(0);
+
+    const approval = notificationPolicyReducer(loadedState(),
+      { type: 'conversation_state_changed', conversation: conv, previousState: { type: 'idle' }, nextState: { type: 'awaiting_task_approval' } as never },
+      monitored(0));
+    expect(approval.effects[0]).toMatchObject({ type: 'show_browser_notification', title: 'Task approval needed' });
+
+    const ownQuestion = notificationPolicyReducer(loadedState(),
+      { type: 'conversation_state_changed', conversation: conv, previousState: { type: 'idle' }, nextState: { type: 'awaiting_user_response' } as never },
+      env({ now: 0, isMonitored: () => false }));
+    expect(ownQuestion.effects[0]).toMatchObject({ type: 'show_browser_notification', title: 'Question asked' });
   });
 
   it('does not fire agent_finished when leaving awaiting_llm', () => {
@@ -404,5 +433,39 @@ describe('connected reminder notifications', () => {
     const sent = notificationPolicyReducer(seed(), { type: 'reminder_feed', items: [item('new')] }, env());
     const failed = notificationPolicyReducer(sent.state, { type: 'notification_delivery_failed', conversationId: 'conv-1', dedupeKey: { kind: 'reminder', id: 'new' } }, env());
     expect(notificationPolicyReducer(failed.state, { type: 'reminder_feed', items: [item('new')] }, env()).effects).toHaveLength(1);
+  });
+});
+
+describe('Ember question notifications (REQ-AUQ-011)', () => {
+  const item = (requestId: string) => ({ requestId, coordinatorProductConversationId: 'ember-1', text: 'Merge the cleanup PR?' });
+  const seed = () => notificationPolicyReducer(loadedState(), { type: 'coordinator_question_feed', items: [] }, env()).state;
+
+  it('baselines questions open at load and announces each new one once', () => {
+    const baseline = notificationPolicyReducer(loadedState(), { type: 'coordinator_question_feed', items: [item('old')] }, env());
+    expect(baseline.effects).toEqual([]);
+    const fresh = notificationPolicyReducer(baseline.state, { type: 'coordinator_question_feed', items: [item('old'), item('new')] }, env());
+    expect(fresh.effects).toEqual([expect.objectContaining({
+      title: 'Ember asked a question',
+      body: 'Merge the cleanup PR?',
+      tag: 'coordinator_question:new',
+      conversation: { id: 'ember-1', slug: null, kind: 'coordinator' },
+      dedupeKey: { kind: 'coordinator_question', id: 'new' },
+    })]);
+    expect(notificationPolicyReducer(fresh.state, { type: 'coordinator_question_feed', items: [item('new')] }, env()).effects).toEqual([]);
+  });
+
+  it('follows the question setting and retries a failed browser notification', () => {
+    const off = { ...seed(), settings: { ...DEFAULT_NOTIFICATION_SETTINGS, notify_question: false } };
+    expect(notificationPolicyReducer(off, { type: 'coordinator_question_feed', items: [item('new')] }, env()).effects).toEqual([]);
+
+    const sent = notificationPolicyReducer(seed(), { type: 'coordinator_question_feed', items: [item('new')] }, env());
+    const failed = notificationPolicyReducer(sent.state, { type: 'notification_delivery_failed', conversationId: 'ember-1', dedupeKey: { kind: 'coordinator_question', id: 'new' } }, env());
+    expect(notificationPolicyReducer(failed.state, { type: 'coordinator_question_feed', items: [item('new')] }, env()).effects).toHaveLength(1);
+  });
+
+  it('stays quiet while Ember\'s page is focused, whichever transcript it shows', () => {
+    const focused = { visible: true, hasFocus: true, activeSlug: 'ember-transcript-2' };
+    expect(notificationPolicyReducer(seed(), { type: 'coordinator_question_feed', items: [item('new')] }, env({ ...focused, onCoordinatorPage: true })).effects).toEqual([]);
+    expect(notificationPolicyReducer(seed(), { type: 'coordinator_question_feed', items: [item('new')] }, env({ ...focused, activeSlug: 'ember-1', onCoordinatorPage: false })).effects).toHaveLength(1);
   });
 });

@@ -5,6 +5,16 @@ permissions:
 
 on:
   workflow_dispatch:
+    inputs:
+      backup_verification_scale:
+        description: "Run disposable 13.4 GB SQLite backup qualification"
+        type: boolean
+        default: false
+      backup_verification_shape:
+        description: "Target one fixture or the full qualification matrix"
+        type: choice
+        options: [all, baseline, wide, dense]
+        default: all
   pull_request:
   push:
     branches:
@@ -18,8 +28,38 @@ concurrency:
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
+  qualify-release-helper:
+    name: release helper qualification (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-15]
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 1
+      - uses: astral-sh/setup-uv@v7
+      - name: Materialize and qualify candidate release helper
+        run: >-
+          uv run --no-project --managed-python --python 3.13.1 python -B -Werror::ResourceWarning
+          tests/integration/qualify_release_helper.py
+          --commit "${{ github.event.pull_request.head.sha || github.sha }}"
+          --output release-helper-qualification.json
+      - name: Upload qualification receipt
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: release-helper-qualification-${{ matrix.os }}
+          path: release-helper-qualification.json
+          if-no-files-found: warn
+
   check-worker-budget:
-    name: check worker budget (exact source)
+    name: check early source (exact source)
     runs-on: ubuntu-latest
     timeout-minutes: 5
     env:
@@ -29,11 +69,19 @@ jobs:
       - uses: actions/checkout@v6
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          components: rustfmt
       - uses: astral-sh/setup-uv@e58605a9b6da7c637471fab8847a5e5a6b8df081 # v5
+      - name: Check Rust formatting (no compilation)
+        run: cargo fmt --all -- --check
+      - name: Check migration ledger structure (no compilation)
+        run: uv run --no-project --managed-python --python 3.13 python scripts/check_migration_ledger.py
       - name: Focused command-construction regressions (no compiler)
         run: |
           uv run --no-project --managed-python --python 3.13 python -m unittest discover -s tests/devpy -p test_check_plan.py
           PHOENIX_CHECK_WORKERS=1 uv run --no-project --managed-python --python 3.13 python -m unittest discover -s tests/devpy -p test_check_plan.py
+          uv run --no-project --managed-python --python 3.13 python -m unittest discover -s tests/devpy -p test_check_migration_ledger.py
 
   plan_check:
     name: plan check lanes
@@ -43,6 +91,7 @@ jobs:
       rust: ${{ steps.plan.outputs.rust }}
       clippy: ${{ steps.plan.outputs.clippy }}
       e2e: ${{ steps.plan.outputs.e2e }}
+      devpy: ${{ steps.plan.outputs.devpy }}
       ui: ${{ steps.plan.outputs.ui }}
       fast: ${{ steps.plan.outputs.fast }}
       active_lanes: ${{ steps.plan.outputs.active_lanes }}
@@ -64,10 +113,10 @@ jobs:
 
   check-rust-build:
     name: check (rust build)
-    needs: plan_check
+    needs: [plan_check, check-worker-budget]
     if: ${{ needs.plan_check.outputs.rust == 'true' }}
     runs-on: ubuntu-latest
-    # 10 setup + 20 native + 20 check (15 archive + fmt) + 5 uploads.
+    # 10 setup + 20 native + 20 check (15 archive) + 5 uploads.
     timeout-minutes: 55
     env:
       PYTHONUNBUFFERED: "1"
@@ -125,6 +174,27 @@ jobs:
       - name: ./dev.py check (rust,cargo-fmt) build phase
         timeout-minutes: 20
         run: ./dev.py check --lanes rust,cargo-fmt --rust-phase build --profile-work --profile-work-dir "$RUST_EVIDENCE_DIR/check"
+      - name: Qualify missing continuation notification witness
+        timeout-minutes: 15
+        shell: bash
+        run: |
+          set -euo pipefail
+          source=crates/phoenix-ide/src/continuation_service/native.rs
+          backup=$(mktemp)
+          cp "$source" "$backup"
+          trap 'cp "$backup" "$source"; rm -f "$backup"' EXIT
+          python3 -c 'from pathlib import Path; p=Path("crates/phoenix-ide/src/continuation_service/native.rs"); s=p.read_text(); call="        self.runtime\n            .publish_continuation_link(&request.predecessor_transcript_id, &successor.id)\n            .await;\n"; assert s.count(call)==1; p.write_text(s.replace(call, ""))'
+          set +e
+          cargo test --locked -p phoenix_ide pending_replay_requires_current_successor_capacity_and_retains_winning_intent -- --nocapture > /tmp/continuation-missing-notification.log 2>&1
+          missing_status=$?
+          set -e
+          cat /tmp/continuation-missing-notification.log
+          test "$missing_status" -eq 101
+          grep -q 'assertion.*left.*right.*failed' /tmp/continuation-missing-notification.log
+          grep -q 'pending_replay_requires_current_successor_capacity_and_retains_winning_intent.*FAILED' /tmp/continuation-missing-notification.log
+          cp "$backup" "$source"
+          cargo test --locked -p phoenix_ide pending_replay_requires_current_successor_capacity_and_retains_winning_intent -- --nocapture
+          git diff --exit-code -- "$source"
       - name: Upload test archive
         timeout-minutes: 5
         uses: actions/upload-artifact@v6
@@ -243,7 +313,7 @@ jobs:
 
   check-rust-musl:
     name: check (rust musl)
-    needs: plan_check
+    needs: [plan_check, check-worker-budget]
     if: ${{ needs.plan_check.outputs.rust == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -272,9 +342,9 @@ jobs:
       - name: Install musl compiler
         timeout-minutes: 5
         run: sudo apt-get update && sudo apt-get install -y musl-tools
-      - name: Check production feature on musl
+      - name: Clippy production feature on musl
         timeout-minutes: 20
-        run: cargo check --target x86_64-unknown-linux-musl --features phoenix_ide/datadog-tracing
+        run: cargo clippy --target x86_64-unknown-linux-musl --features phoenix_ide/datadog-tracing -- -D warnings
 
   check-rust:
     name: check (rust)
@@ -294,7 +364,7 @@ jobs:
 
   check-clippy:
     name: check (clippy)
-    needs: plan_check
+    needs: [plan_check, check-worker-budget]
     if: ${{ needs.plan_check.outputs.clippy == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -329,12 +399,16 @@ jobs:
         run: |
           git config --global user.email "ci@phoenix-ide.invalid"
           git config --global user.name "Phoenix CI"
-      - name: ./dev.py check (clippy)
-        run: ./dev.py check --lanes clippy
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny@0.18.9
+      - name: ./dev.py check (clippy, deps)
+        run: ./dev.py check --lanes clippy,deps
 
   check-e2e:
     name: check (e2e)
-    needs: plan_check
+    needs: [plan_check, check-worker-budget]
     if: ${{ needs.plan_check.outputs.e2e == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -377,6 +451,7 @@ jobs:
         run: ./dev.py check --lanes e2e
 
   qualify-history-realserver:
+    needs: check-worker-budget
     name: typed codegen and isolated instrumented opening witness (not shipping)
     if: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && (github.head_ref == 'qualification/continuation-opening-codegen' || github.head_ref == 'integration/v013-history-current-main') }}
     runs-on: ubuntu-latest
@@ -728,9 +803,67 @@ jobs:
             pinned-app-full-ui-receipt.json
             owned-chrome-linux/
 
+  check-devpy:
+    name: check (dev.py tests)
+    needs: [plan_check, check-worker-budget]
+    if: ${{ needs.plan_check.outputs.devpy == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CARGO_TERM_COLOR: always
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
+      SCCACHE_IDLE_TIMEOUT: "0"
+      PHOENIX_CHECK_ALL: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && '1' || '' }}
+      PHOENIX_CHECK_BASE: ${{ github.event_name == 'pull_request' && 'origin/main' || '' }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Set up Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache: false
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-bin: true
+          shared-key: check-devpy
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          prefix-key: v1-rust
+      - name: Set up sccache
+        uses: mozilla-actions/sccache-action@v0.0.10
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v5
+        with:
+          package_json_file: ui/package.json
+      - name: Set up Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 26
+          cache: pnpm
+          cache-dependency-path: ui/pnpm-lock.yaml
+      - name: Upgrade corepack
+        run: |
+          npm i -g corepack@latest
+          corepack enable
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v7
+      - name: Install ast-grep
+        run: npm i -g @ast-grep/cli
+      - name: Configure git identity
+        run: |
+          git config --global user.email "ci@phoenix-ide.invalid"
+          git config --global user.name "Phoenix CI"
+      - name: Install UI dependencies
+        run: pnpm install --frozen-lockfile
+        working-directory: ui
+      - name: ./dev.py check (dev.py tests)
+        run: ./dev.py check --lanes devpy
+
   check-ui:
     name: check (ui/specs)
-    needs: plan_check
+    needs: [plan_check, check-worker-budget]
     if: ${{ needs.plan_check.outputs.ui == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -796,7 +929,7 @@ jobs:
 
   check-finalization-geometry:
     name: check (assistant finalization geometry)
-    needs: plan_check
+    needs: [plan_check, check-worker-budget]
     if: ${{ needs.plan_check.outputs.ui == 'true' }}
     runs-on: ubuntu-latest
     # 2 bootstrap + 15 install + 15 qualification + 2 artifacts + 1 post-actions.
@@ -826,6 +959,10 @@ jobs:
           npm i -g corepack@latest
           corepack enable
           pnpm install --frozen-lockfile
+          node --check scripts/capture-reminders.mjs
+          node --check scripts/capture-reminders-baseline.mjs
+          node --check scripts/compare-reminders-layout.mjs
+          node --test scripts/capture-reminders.contract.check.mjs
           python3 -m unittest discover -s ../scripts/ci -p 'test_isolate_geometry_apt_source.py'
           sudo python3 ../scripts/ci/isolate_geometry_apt_source.py
           pnpm exec playwright install --with-deps chromium
@@ -834,7 +971,9 @@ jobs:
         env:
           LADLE_URL: http://127.0.0.1:61129
           PHOENIX_LADLE: '1'
+          BASE_SHA: 5f72f617869e001b534542c3c31d7628db6aeecc
         run: |
+          root="$PWD"
           mkdir -p ui/qa-artifacts/assistant-finalization
           git rev-parse HEAD > ui/qa-artifacts/assistant-finalization/source.txt
           server=''
@@ -860,6 +999,31 @@ jobs:
           node scripts/capture-subagent-task-details.mjs
           node scripts/capture-composer-rejection.mjs
           node scripts/capture-review-reading-position.mjs
+          OVERLAY_IDLE_QA=1 REVIEW_READING_QA_OUT=qa-artifacts/review-overlay-idle node scripts/capture-review-reading-position.mjs
+          OVERLAY_PROJECTION_QA=1 REVIEW_READING_QA_OUT=qa-artifacts/review-overlay-projection node scripts/capture-review-reading-position.mjs
+          node scripts/capture-reminders.mjs
+          CAPTURE_STORIES=mobile-continuation-ordinary,mobile-continuation-global CAPTURE_VIEWPORT=mobile-light PLAYWRIGHT_INSTALLED_ONLY=1 node scripts/capture-product-conversation.mjs
+          if [ -n "${BASE_SHA:-}" ]; then
+            cd ..
+            stop_server
+            git fetch --no-tags --depth=1 origin "$BASE_SHA"
+            test "$(git rev-parse FETCH_HEAD)" = "$BASE_SHA"
+            baseline_backup=$(mktemp -d)
+            cp ui/src/reminders/RemindersPanel.tsx "$baseline_backup/RemindersPanel.tsx"
+            cp ui/src/reminders/RemindersPanel.css "$baseline_backup/RemindersPanel.css"
+            restore_reminders() {
+              cp "$baseline_backup/RemindersPanel.tsx" "$root/ui/src/reminders/RemindersPanel.tsx"
+              cp "$baseline_backup/RemindersPanel.css" "$root/ui/src/reminders/RemindersPanel.css"
+            }
+            trap 'stop_server; restore_reminders' EXIT
+            git show "FETCH_HEAD:ui/src/reminders/RemindersPanel.tsx" > ui/src/reminders/RemindersPanel.tsx
+            git show "FETCH_HEAD:ui/src/reminders/RemindersPanel.css" > ui/src/reminders/RemindersPanel.css
+            start_server
+            cd ui
+            node scripts/capture-reminders-baseline.mjs
+            printf 'baseline RemindersPanel source: %s; fixture and capture source: %s\n' "$BASE_SHA" "$(git rev-parse HEAD)" > qa-artifacts/reminders-baseline/source.txt
+            node scripts/compare-reminders-layout.mjs
+          fi
 
       - uses: actions/upload-artifact@v6
         if: always()
@@ -870,7 +1034,7 @@ jobs:
 
   check-fast:
     name: check (task validation)
-    needs: plan_check
+    needs: [plan_check, check-worker-budget]
     if: ${{ needs.plan_check.outputs.fast == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -887,14 +1051,12 @@ jobs:
         uses: actions/setup-node@v6
         with:
           node-version: 26
-      - name: Test roadmap Issue reducer
-        run: node --test scripts/roadmap-issue-reducer.test.mjs
       - name: ./dev.py check (task)
         run: ./dev.py check --lanes task
 
   notify-main-failure:
     name: Open issue on main CI failure
-    needs: [plan_check, check-rust, check-clippy, check-e2e, check-ui, check-finalization-geometry, check-fast]
+    needs: [check-worker-budget, plan_check, check-rust, check-clippy, check-e2e, check-devpy, check-ui, check-finalization-geometry, check-fast]
     if: ${{ always() && github.event_name == 'push' && github.ref == 'refs/heads/main' && contains(join(needs.*.result, ','), 'failure') }}
     runs-on: ubuntu-latest
     permissions:
@@ -920,7 +1082,7 @@ jobs:
 
   close-main-failure:
     name: Close CI-failure issue on green
-    needs: [plan_check, check-rust, check-clippy, check-e2e, check-ui, check-finalization-geometry, check-fast]
+    needs: [check-worker-budget, plan_check, check-rust, check-clippy, check-e2e, check-devpy, check-ui, check-finalization-geometry, check-fast]
     if: ${{ always() && github.event_name == 'push' && github.ref == 'refs/heads/main' && !contains(join(needs.*.result, ','), 'failure') && !contains(join(needs.*.result, ','), 'cancelled') && !contains(join(needs.*.result, ','), 'skipped') }}
     runs-on: ubuntu-latest
     permissions:
@@ -939,3 +1101,67 @@ jobs:
             gh issue comment "$number" --repo "$REPO" --body "Green again at \`$SHA\`. Closing."
             gh issue close "$number" --repo "$REPO"
           fi
+  backup-verification-scale:
+    if: github.event_name == 'workflow_dispatch' && inputs.backup_verification_scale
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ inputs.backup_verification_shape == 'dense' && fromJSON('[{"shape":"dense","payload":128,"columns":0}]') || inputs.backup_verification_shape == 'wide' && fromJSON('[{"shape":"wide","payload":1100,"columns":24}]') || inputs.backup_verification_shape == 'baseline' && fromJSON('[{"shape":"baseline","payload":1100,"columns":0}]') || fromJSON('[{"shape":"baseline","payload":1100,"columns":0},{"shape":"wide","payload":1100,"columns":24},{"shape":"dense","payload":128,"columns":0}]') }}
+    runs-on: macos-latest
+    timeout-minutes: 45
+    env:
+      PYTHONUNBUFFERED: "1"
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v7
+      - name: Assert runtime
+        run: >-
+          uv run --no-project --python 3.13.1 python -c
+          'import sys,sqlite3,platform; print(sys.version,sqlite3.sqlite_version,platform.platform());
+          assert sys.version_info[:3] == (3,13,1); assert sqlite3.sqlite_version == "3.47.1";
+          assert platform.machine() == "arm64"'
+      - name: Focused backup helper regressions
+        run: >-
+          uv run --no-project --managed-python --python 3.13.1 python -m unittest
+          tests.devpy.test_simple_launchd_helper tests.devpy.test_backup_comparator
+      - name: Qualify populated large-database backup verification
+        timeout-minutes: 40
+        run: >-
+          uv run --no-project --managed-python --python 3.13.1 python
+          tests/integration/backup_verification_scale.py
+          --minimum-source-bytes 13437792256
+          --text-bytes ${{ matrix.payload }} --blob-bytes ${{ matrix.payload }}
+          --extra-columns ${{ matrix.columns }}
+          --work-dir "$RUNNER_TEMP/backup-verification-scale"
+          --result "$GITHUB_WORKSPACE/backup-verification-result.json"
+      - name: Record runner identity and commit if qualification failed early
+        if: always()
+        run: |
+          if [ ! -f backup-verification-result.json ]; then
+            uv run --no-project --managed-python --python 3.13.1 python - <<'PY'
+          import json, os, platform, sqlite3, sys
+          from pathlib import Path
+          Path("backup-verification-result.json").write_text(json.dumps({
+              "qualification": "large populated SQLite backup verification",
+              "status": "failed before result was written",
+              "commit": os.environ.get("GITHUB_SHA"),
+              "runner": {"os": platform.platform(), "machine": platform.machine(),
+                         "python": sys.version, "sqlite": sqlite3.sqlite_version},
+          }, indent=2) + "\n")
+          PY
+          fi
+          cat backup-verification-result.json
+      - name: Upload failure-safe qualification result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: backup-verification-${{ matrix.shape }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: backup-verification-result.json
+          if-no-files-found: error
+          retention-days: 30
+      - name: Assert exact checked-out commit
+        if: always()
+        run: test "$(git rev-parse HEAD)" = "$GITHUB_SHA"

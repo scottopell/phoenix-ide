@@ -6,7 +6,7 @@ export interface ConversationIdentityDisplay {
 }
 
 export interface ConversationModeIdentity {
-  key: 'explore' | 'work' | 'branch' | 'direct' | 'unknown';
+  key: 'explore' | 'product' | 'work' | 'work-child' | 'approved-task' | 'branch' | 'direct' | 'coordinator' | 'unknown';
   label: string | null;
   title: string;
   detail: string;
@@ -56,7 +56,10 @@ function pathLeaf(path: string | null | undefined): string | null {
 function normalizeModeKey(mode: string | null | undefined): ConversationModeIdentity['key'] {
   switch (mode?.trim().toLowerCase()) {
     case 'explore': return 'explore';
+    case 'product': return 'product';
+    case 'approved task': return 'approved-task';
     case 'work': return 'work';
+    case 'work child': return 'work-child';
     case 'branch': return 'branch';
     case 'direct': return 'direct';
     default: return 'unknown';
@@ -67,7 +70,10 @@ function normalizeModeLabel(mode: string | null | undefined): string | null {
   const key = normalizeModeKey(mode);
   switch (key) {
     case 'explore': return 'Explore';
+    case 'product': return 'Product';
+    case 'approved-task': return 'Approved Task';
     case 'work': return 'Work';
+    case 'work-child': return 'Work Child';
     case 'branch': return 'Branch';
     case 'direct': return 'Direct';
     default: {
@@ -77,20 +83,37 @@ function normalizeModeLabel(mode: string | null | undefined): string | null {
   }
 }
 
-function modeIdentity(mode: string | null | undefined): ConversationModeIdentity {
+function modeIdentity(mode: string | null | undefined, role: Conversation['runtime_role']): ConversationModeIdentity {
+  if (role === 'coordinator') {
+    return {
+      key: 'coordinator', label: 'Coordinator', detail: 'Coordinator tools', desktopDetail: null,
+      title: 'Coordinator role: scoped write-capable Bash and coordination tools; not the ordinary conversation tool set',
+    };
+  }
   const key = normalizeModeKey(mode);
   const label = normalizeModeLabel(mode);
   switch (key) {
     case 'explore':
-      return { key, label, title: 'Explore mode: read-only git project', detail: 'Read-only git project', desktopDetail: 'read-only' };
+    case 'product':
+      return {
+        key, label, detail: key === 'product' ? 'Design · approval-scoped' : 'Approval-scoped access', desktopDetail: null,
+        title: `${label} mode: design/planning provenance. Unapproved ordinary conversations use restricted tools; Bash is sandboxed when available; approved scope authority or a trusted runtime role may allow writes without changing the mode. Effective access is not reported here.`,
+      };
+    case 'work-child':
+      return { key, label, title: 'Work Child mode: attached work environment; effective access depends on scope authority and runtime role', detail: 'Attached work environment', desktopDetail: null };
+    case 'approved-task':
+      return { key, label, title: 'Approved Task mode: approved task provenance; effective access is not reported here', detail: 'Approved task', desktopDetail: null };
     case 'work':
       return { key, label, title: 'Work mode: task branch', detail: 'Task branch', desktopDetail: 'task branch' };
     case 'branch':
       return { key, label, title: 'Branch mode: existing branch', detail: 'Existing branch', desktopDetail: 'existing branch' };
     case 'direct':
-      return { key, label, title: 'Direct mode: full access', detail: 'Full access', desktopDetail: 'full access' };
+      return {
+        key, label, title: 'Direct mode: local writes; the available tool set depends on runtime role',
+        detail: 'Local writes', desktopDetail: 'local writes',
+      };
     default:
-      return { key, label, title: 'Full access', detail: 'Full access', desktopDetail: null };
+      return { key, label, title: 'Effective access is unavailable for this mode', detail: 'Access unavailable', desktopDetail: null };
   }
 }
 
@@ -195,7 +218,7 @@ export function getConversationIdentityDisplay(
 }
 
 export function getConversationIdentity(
-  conversation: Pick<Conversation, 'slug' | 'task_title' | 'branch_name' | 'base_branch' | 'project_name' | 'worktree_path' | 'cwd' | 'conv_mode_label' | 'model'>,
+  conversation: Pick<Conversation, 'slug' | 'task_title' | 'branch_name' | 'base_branch' | 'project_name' | 'worktree_path' | 'cwd' | 'conv_mode_label' | 'runtime_role' | 'model'>,
   fallback = 'Untitled conversation',
 ): ConversationIdentity {
   return {
@@ -210,7 +233,7 @@ export function getConversationIdentity(
       full: conversationRootPath(conversation),
       summary: summarizeConversationPath(conversationRootPath(conversation)),
     },
-    mode: modeIdentity(conversation.conv_mode_label),
+    mode: modeIdentity(conversation.conv_mode_label, conversation.runtime_role),
     modelLabel: conversation.model,
   };
 }

@@ -910,7 +910,7 @@ LAUNCHD_TRANSITION_TIMEOUT_SECS = 30.0
 LAUNCHD_RESTART_SHUTDOWN_TIMEOUT_SECS = 35.0
 LAUNCHD_HEALTH_TIMEOUT_SECS = 120.0
 LAUNCHD_STALE_HANDOFF_ALLOWANCE_SECS = 30.0
-LAUNCHD_HANDOFF_PROTOCOL_VERSION = 2
+LAUNCHD_HANDOFF_PROTOCOL_VERSION = 4
 LAUNCHD_RESTART_HANDOFF_PROTOCOL_VERSION = 2
 NEWSYSLOG_CONF_PATH = Path("/etc/newsyslog.d") / f"{LAUNCHD_LABEL}.conf"
 
@@ -3369,6 +3369,87 @@ def cmd_qa_coordinator_drive_eval() -> None:
     )
 
 
+
+def cmd_qa_ember_watch_recovery() -> None:
+    """Run isolated watch-list model recovery with the normal resolved LLM env."""
+    env = _resolved_phoenix_env()
+    env.setdefault("CARGO_BUILD_JOBS", "1")
+    test_name = "runtime::tool_surface_recovery::ember_watch_list_recovery"
+    prebuilt = env.get("PHOENIX_TOOL_RECOVERY_TEST_BINARY")
+    if prebuilt:
+        binary = Path(prebuilt)
+        if not binary.is_absolute() or not binary.is_file() or not os.access(binary, os.X_OK):
+            raise SystemExit("watch recovery requires an absolute executable test binary")
+        listing = subprocess.run([str(binary), "--list"], cwd=ROOT, env=env,
+                                 check=True, capture_output=True, text=True)
+        if test_name + ": test" not in listing.stdout.splitlines():
+            raise SystemExit("selected test binary does not contain watch recovery")
+        with binary.open("rb") as stream:
+            env["PHOENIX_TOOL_RECOVERY_BINARY_SHA256"] = hashlib.file_digest(stream, "sha256").hexdigest()
+        command = [str(binary), test_name, "--ignored", "--exact", "--nocapture"]
+    else:
+        command = ["cargo", "test", "-p", "phoenix_ide", "--lib", test_name,
+                   "--", "--ignored", "--exact", "--nocapture"]
+    subprocess.run(command, cwd=ROOT, env=env, check=True)
+
+
+def cmd_qa_ember_event_eval() -> None:
+    """Run the bounded event comparison with real local tools on synthetic data."""
+    env = _resolved_phoenix_env()
+    env.setdefault("CARGO_BUILD_JOBS", "2")
+    test_name = "runtime::event_context_eval::ember_event_eval"
+    prebuilt = env.get("PHOENIX_EVENT_EVAL_TEST_BINARY")
+    if prebuilt:
+        binary = Path(prebuilt)
+        if not binary.is_absolute() or not binary.is_file() or not os.access(binary, os.X_OK):
+            raise SystemExit("event evaluation requires an absolute executable test binary")
+        listing = subprocess.run([str(binary), "--list"], cwd=ROOT, env=env,
+                                 check=True, capture_output=True, text=True)
+        if test_name + ": test" not in listing.stdout.splitlines():
+            raise SystemExit("selected test binary does not contain the event evaluation")
+        with binary.open("rb") as stream:
+            env["PHOENIX_EVENT_EVAL_BINARY_SHA256"] = hashlib.file_digest(stream, "sha256").hexdigest()
+        command = [str(binary), test_name, "--ignored", "--exact", "--nocapture"]
+    else:
+        command = ["cargo", "test", "-p", "phoenix_ide", "--lib", test_name,
+                   "--", "--ignored", "--exact", "--nocapture"]
+    subprocess.run(command, cwd=ROOT, env=env, check=True)
+
+
+def cmd_qa_coordinator_scanner_quality() -> None:
+    """Prepare or run the isolated scanner corpus from an exact retained test binary."""
+    env = _resolved_phoenix_env()
+    test_name = "coordinator_scanner::quality::coordinator_scanner_quality"
+    binary = Path(env.get("PHOENIX_SCANNER_QUALITY_TEST_BINARY", ""))
+    if not binary.is_absolute() or not binary.is_file() or not os.access(binary, os.X_OK):
+        raise SystemExit("scanner quality requires an absolute retained executable test binary")
+    listing = subprocess.run([str(binary), "--list"], cwd=ROOT, env=env,
+                             check=True, capture_output=True, text=True)
+    if test_name + ": test" not in listing.stdout.splitlines():
+        raise SystemExit("selected test binary does not contain scanner quality")
+    with binary.open("rb") as stream:
+        env["PHOENIX_SCANNER_QUALITY_BINARY_SHA256"] = hashlib.file_digest(stream, "sha256").hexdigest()
+    subprocess.run([str(binary), test_name, "--ignored", "--exact", "--nocapture"],
+                   cwd=ROOT, env=env, check=True)
+
+
+def cmd_qa_ember_foreground_memory() -> None:
+    """Run opt-in admitted-runtime memory qualification from a retained test binary."""
+    env = _resolved_phoenix_env()
+    test_name = "runtime::executor::tracking_context_tests::live::foreground::foreground_memory_qualification"
+    binary = Path(env.get("PHOENIX_FOREGROUND_QA_TEST_BINARY", ""))
+    if not binary.is_absolute() or not binary.is_file() or not os.access(binary, os.X_OK):
+        raise SystemExit("foreground qualification requires an absolute retained executable test binary")
+    listing = subprocess.run([str(binary), "--list"], cwd=ROOT, env=env,
+                             check=True, capture_output=True, text=True)
+    if test_name + ": test" not in listing.stdout.splitlines():
+        raise SystemExit("selected test binary does not contain foreground qualification")
+    with binary.open("rb") as stream:
+        env["PHOENIX_FOREGROUND_QA_BINARY_SHA256"] = hashlib.file_digest(stream, "sha256").hexdigest()
+    subprocess.run([str(binary), test_name, "--ignored", "--exact", "--nocapture"],
+                   cwd=ROOT, env=env, check=True)
+
+
 def cmd_qa_grounding_panel() -> None:
     """Capture grounding panel Ladle screenshots into ignored local artifacts."""
     subprocess.run(
@@ -3476,6 +3557,13 @@ def cmd_qa_product_conversation() -> None:
         cwd=ROOT / "ui",
         check=True,
         env=node_env(),
+    )
+
+
+def cmd_qa_annotations() -> None:
+    """Capture annotation design states and a desktop/mobile comparison gallery."""
+    subprocess.run(
+        ["pnpm", "qa:annotations"], cwd=ROOT / "ui", check=True, env=node_env(),
     )
 
 
@@ -4013,6 +4101,7 @@ def collect_doctor_results() -> list[DoctorResult]:
     for name, command, environment in (
         ("cargo-nextest", ["cargo", "nextest", "--version"], rust_environment),
         ("allium", ["allium", "--version"], None),
+        ("cargo-deny", ["cargo", "deny", "--version"], None),
         ("ripgrep", ["rg", "--version"], None),
         ("ast-grep", ["ast-grep", "--version"], None),
     ):
@@ -4202,12 +4291,14 @@ _LANE_DEFS = [
     ("rust", {"RUST"}, "codegen + cargo test"),
     ("cargo-fmt", {"RUST"}, "cargo fmt --check"),
     ("clippy", {"RUST"}, "cargo clippy --all-targets (bounded non-incremental target)"),
+    ("deps", {"RUST"}, "cargo-deny: at most one version of each crate"),
     ("tsc", {"UI"}, "tsc -b --noEmit project typecheck"),
     ("ui-lint", {"UI"}, "eslint + stylelint"),
     ("vitest", {"UI"}, "vitest run"),
     ("ast-grep", {"UI", "RUST", "ASTGREP"}, "structural lint rules over ui/src/ + crates/"),
     ("allium", {"SPECS"}, "allium spec validation"),
     ("spec-shape", {"SPECS"}, "spEARS v2 artifact-shape validation"),
+    ("devpy", {"DEVTOOLS", "RUST"}, "dev.py orchestration and deployment tests"),
     # spec-anchors cross-validates REQ-* anchors in code against specs/, so a
     # change to either side can orphan or satisfy an anchor.
     ("spec-anchors", {"SPECS", "RUST", "UI"}, "REQ-* anchor cross-validation"),
@@ -4222,8 +4313,9 @@ _LANE_DESCS = {name: desc for name, _, desc in _LANE_DEFS}
 
 _CI_LANE_GROUPS = {
     "rust": {"rust", "cargo-fmt"},
-    "clippy": {"clippy"},
+    "clippy": {"clippy", "deps"},
     "e2e": {"e2e"},
+    "devpy": {"devpy"},
     "ui": {"tsc", "ui-lint", "vitest", "ast-grep", "allium", "spec-shape", "spec-anchors", "pkglock"},
     "fast": {"task"},
 }
@@ -4236,6 +4328,33 @@ _LANE_TO_CI_GROUP = {
 
 _LANE_ALIASES = {
     "fast": {"task"},
+    "devpy": {"devpy"},
+}
+
+_DEVPY_DEPENDENCY_PREFIXES = (
+    "scripts/",
+    "tests/devpy/",
+    "tests/integration/",
+    "skills/phoenix-adversarial-review/",
+    "specs/api/",
+    "specs/builtin-skills/",
+    "specs/global-recall/",
+    "crates/phoenix-skills/src/builtin/",
+)
+_DEVPY_DEPENDENCY_PATHS = {
+    ".agents/skills/phoenix-adversarial-review",
+    ".node-version",
+    ".python-version",
+    "Cargo.lock",
+    "Cargo.toml",
+    "pyproject.toml",
+    "rust-toolchain.toml",
+    "specs/adrs/113_coordinator-api-recipes-are-non-exhaustive.md",
+    "specs/compatibility/requirements.md",
+    "ui/package.json",
+    "ui/src/api.ts",
+    "ui/src/components/QuestionPanel.tsx",
+    "uv.lock",
 }
 
 
@@ -4253,7 +4372,7 @@ def _categorize_changed_paths(paths) -> set:
             cats.add("SELF")
         if (
             p.startswith("crates/")
-            or p in ("Cargo.toml", "Cargo.lock")
+            or p in ("Cargo.toml", "Cargo.lock", "deny.toml")
             or p.startswith(".cargo/")
             or p.startswith("rust-toolchain")
         ):
@@ -4268,16 +4387,10 @@ def _categorize_changed_paths(paths) -> set:
             cats.add("TASKS")
         if p.startswith("specs/"):
             cats.add("SPECS")
-        if p.startswith("tests/devpy/"):
-            cats.add("SPECS")
+        if p in _DEVPY_DEPENDENCY_PATHS or p.startswith(_DEVPY_DEPENDENCY_PREFIXES):
+            cats.add("DEVTOOLS")
         if p in {"scripts/check_rust_test_timing.py", "scripts/check_manual_sql_transactions.py"}:
-            cats.update({"ASTGREP", "SPECS"})
-        if p in {
-            "scripts/check_profile_command.py",
-            "scripts/check_profile_report.py",
-            "scripts/python_unittest_profile.py",
-        }:
-            cats.add("SPECS")
+            cats.add("ASTGREP")
         if p.startswith("ast-grep-rules/"):
             cats.add("ASTGREP")
         if p.startswith("tests/e2e/") or p == "phoenix-client.py":
@@ -4314,7 +4427,13 @@ def _resolve_check_merge_base():
         )
 
     base = os.environ.get("PHOENIX_CHECK_BASE")
-    candidates = [base] if base else []
+    if base:
+        merge_base = _git(["merge-base", "HEAD", base])
+        if merge_base.returncode == 0 and merge_base.stdout.strip():
+            return merge_base.stdout.strip()
+        return None
+
+    candidates = []
     head_ref = _git(["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"])
     if head_ref.returncode == 0 and head_ref.stdout.strip():
         candidates.append(head_ref.stdout.strip().removeprefix("refs/remotes/"))
@@ -4339,7 +4458,7 @@ def _compute_changed_paths_vs_base():
     if merge_base is None:
         return None
 
-    tracked = _git(["diff", "--name-only", merge_base])
+    tracked = _git(["diff", "--name-only", "--no-renames", merge_base])
     if tracked.returncode != 0:
         return None
     untracked = _git(["ls-files", "--others", "--exclude-standard"])
@@ -5917,7 +6036,25 @@ def _command_uses_compiler_cache(command: list[str]) -> bool:
         return False
     if Path(command[0]).name == "cargo":
         return True
-    return command == ["uv", "run", "tests/e2e/run.py"]
+    if command == ["uv", "run", "tests/e2e/run.py"]:
+        return True
+
+    allowed_suffixes = ([], ["-v"])
+    direct_devpy = (
+        command[:5] == [sys.executable, "-m", "unittest", "discover", "tests/devpy"]
+        and command[5:] in allowed_suffixes
+    )
+    profiled_devpy = (
+        command[:4]
+        == [
+            sys.executable,
+            str(ROOT / "scripts" / "python_unittest_profile.py"),
+            "discover",
+            "tests/devpy",
+        ]
+        and command[4:] in allowed_suffixes
+    )
+    return direct_devpy or profiled_devpy
 
 
 def _parse_cache_size(value: str) -> int:
@@ -5954,7 +6091,7 @@ def _sccache_limit_warning(
     return None
 
 
-_CARGO_CHECK_LANES = frozenset({"rust", "clippy", "e2e"})
+_CARGO_CHECK_LANES = frozenset({"rust", "clippy", "e2e", "devpy"})
 _CHECK_CPU_BUDGET = 4
 
 
@@ -6002,6 +6139,88 @@ def _rust_check_commands(
         codegen_cmd = ["cargo", "test", *codegen_p, "export_bindings", "--",
                        "--test-threads", str(test_threads)]
     return compile_cmd, test_cmd, codegen_cmd
+
+
+# Lists the current build's artifacts without compiling (runs after a full
+# compile, so everything is fresh).
+_PRUNE_LISTING_CMD = ["cargo", "test", "--no-run", "--message-format=json-render-diagnostics"]
+_CARGO_ARTIFACT_KEY = re.compile(r"^(?:lib)?(?P<stem>[A-Za-z0-9_]+)-(?P<hash>[0-9a-f]{16})(?:\..+)?$")
+
+
+def _artifact_key(name: str) -> tuple[str, str] | None:
+    m = _CARGO_ARTIFACT_KEY.match(name)
+    return (m["stem"], m["hash"]) if m else None
+
+
+def _workspace_artifacts_from_cargo_json(lines, root: Path) -> list[Path]:
+    """Paths of workspace-package artifacts in `cargo --message-format=json` output."""
+    paths: list[Path] = []
+    for line in lines:
+        try:
+            msg = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(msg, dict) or msg.get("reason") != "compiler-artifact":
+            continue
+        manifest = msg.get("manifest_path")
+        if not isinstance(manifest, str) or not Path(manifest).is_relative_to(root):
+            continue
+        for name in [*(msg.get("filenames") or []), msg.get("executable")]:
+            if isinstance(name, str) and name:
+                paths.append(Path(name))
+    return paths
+
+
+def _prune_stale_workspace_artifacts(current: list[Path], older_than: float) -> tuple[int, int]:
+    """Delete workspace executables in a deps dir that `current` (complete
+    builds' outputs) no longer produces: same crate stem, different hash.
+
+    Only executables (test harnesses, bins) are removed; they are the
+    300-500 MB statically linked files that pile up as dependency or feature
+    changes move hashes, and cargo never deletes them. Libraries are left
+    alone because other build configurations (`./dev.py up`, the launcher
+    build) resolve features differently and still use theirs. Kept:
+    hard-linked files (cargo uplifts each name's latest binary into the
+    profile dir), and files touched at or after `older_than`, so a concurrent
+    build sharing the target dir cannot lose what it just wrote. A `.d` file
+    goes once nothing else with its hash remains.
+    Returns (files removed, bytes freed).
+    """
+    keep: dict[Path, set[tuple[str, str]]] = {}
+    for path in current:
+        key = _artifact_key(path.name)
+        if key and path.parent.name == "deps":
+            keep.setdefault(path.parent, set()).add(key)
+    removed = freed = 0
+
+    def delete(path: Path, size: int) -> None:
+        nonlocal removed, freed
+        path.unlink(missing_ok=True)
+        removed += 1
+        freed += size
+
+    for deps_dir, keys in keep.items():
+        stems = {stem for stem, _ in keys}
+        dep_files: list[tuple[Path, tuple[str, str], os.stat_result]] = []
+        for path in deps_dir.iterdir():
+            key = _artifact_key(path.name)
+            if key is None or key[0] not in stems or key in keys:
+                continue
+            try:
+                st = path.lstat()
+            except FileNotFoundError:
+                continue
+            if not stat.S_ISREG(st.st_mode) or st.st_mtime >= older_than:
+                continue
+            if path.suffix == ".d":
+                dep_files.append((path, key, st))
+            elif "." not in path.name and st.st_mode & stat.S_IXUSR and st.st_nlink == 1:
+                delete(path, st.st_size)
+        remaining = {_artifact_key(p.name) for p in deps_dir.iterdir() if p.suffix != ".d"}
+        for path, key, st in dep_files:
+            if key not in remaining:
+                delete(path, st.st_size)
+    return removed, freed
 
 
 class RustPhase(enum.Enum):
@@ -6404,6 +6623,9 @@ def cmd_check(
     CARGO_TEST_TIMEOUT, cargo_test_timeout_source = (
         _cargo_test_timeout_secs() if "rust" in active else (DEFAULT_CARGO_TEST_TIMEOUT_SECS, None)
     )
+    DEVPY_TEST_TIMEOUT, devpy_test_timeout_source = (
+        _devpy_test_timeout_secs() if "devpy" in active else (DEFAULT_DEVPY_TEST_TIMEOUT_SECS, None)
+    )
     if _CHECK_PROFILE is not None:
         _CHECK_PROFILE.metadata["active_lanes"] = sorted(active)
     if lanes is not None and not active:
@@ -6419,6 +6641,11 @@ def cmd_check(
         reporter.info(
             f"cargo test budget: {CARGO_TEST_TIMEOUT}s "
             f"({CARGO_TEST_TIMEOUT_ENV} from {cargo_test_timeout_source})"
+        )
+    if devpy_test_timeout_source is not None:
+        reporter.info(
+            f"dev.py unit-test budget: {DEVPY_TEST_TIMEOUT}s "
+            f"({DEVPY_TEST_TIMEOUT_ENV} from {devpy_test_timeout_source})"
         )
     if skipped:
         ran = ", ".join(sorted(active))
@@ -6777,13 +7004,33 @@ def cmd_check(
                       env_extra={**launcher_env, "TS_RS_EXPORT_DIR": str(codegen_export_base)})
         if rc == 0:
             codegen_stale_step()
-        run_step("cargo test compile", compile_cmd, env_extra=launcher_env)
+        compile_started = time.time()
+        if run_step("cargo test compile", compile_cmd, env_extra=launcher_env) == 0 and not compile_p:
+            prune_stale_test_artifacts(compile_started, launcher_env)
         run_step("cargo test", test_cmd, env_extra=launcher_env, timeout=CARGO_TEST_TIMEOUT)
+
+    def prune_stale_test_artifacts(compile_started, launcher_env):
+        # Full-workspace compiles only: a crate-scoped compile resolves
+        # features differently, so pruning against it would delete artifacts
+        # the next full run needs.
+        lines: list[str] = []
+        rc = run_step("prune stale test artifacts", _PRUNE_LISTING_CMD,
+                      env_extra=launcher_env, output_observer=lines.append)
+        current = _workspace_artifacts_from_cargo_json(lines, ROOT)
+        if rc != 0 or not current:
+            return
+        current += _workspace_artifacts_from_cargo_json(launcher_build_output, ROOT)
+        removed, freed = _prune_stale_workspace_artifacts(current, compile_started)
+        if removed:
+            reporter.info(f"pruned {removed} stale workspace test executables ({freed / 1e9:.1f} GB)")
+
+    launcher_build_output: list[str] = []
 
     def build_native_bash_launcher():
         executables = []
 
         def observe_artifact(line):
+            launcher_build_output.append(line)
             try:
                 artifact = json.loads(line)
             except json.JSONDecodeError:
@@ -6976,6 +7223,27 @@ def cmd_check(
                 "--base-sha", comparison_commit, "crates/",
             ]
         run_step("rust-test-timing", timing_command)
+
+    def check_cargo_deny():
+        """Fail when the dependency graph compiles two versions of one crate.
+
+        Policy and the allowlist of known upstream duplicates live in
+        deny.toml. Locally a missing cargo-deny skips with an install hint;
+        in CI it fails so the gate cannot silently disappear.
+        """
+        import shutil
+        if not shutil.which("cargo-deny"):
+            hint = "install via 'cargo install cargo-deny --locked'"
+            if os.environ.get("CI"):
+                with results_lock:
+                    results.append(("cargo-deny", 1, 0.0, f"cargo-deny not found in CI; {hint}"))
+                return
+            with results_lock:
+                results.append(("cargo-deny", 0, 0.0, ""))
+            skipped_lane_reasons["deps"] = hint
+            reporter.step_skipped("deps", "cargo-deny", hint)
+            return
+        run_step("cargo-deny", ["cargo", "deny", "check", "bans"])
 
     def check_allium():
         """Validate every specs/<name>/<name>.allium parses under v3 grammar.
@@ -7320,17 +7588,19 @@ def cmd_check(
                 results.append(("spec shape", 0, elapsed, detail))
             reporter.step_done("spec-shape", "spec shape", 0, elapsed)
             finish_profile(0)
-            unittest_cmd = [sys.executable, "-m", "unittest", "discover", "tests/devpy"]
-            if profile_work and _CHECK_PROFILE is not None:
-                unittest_cmd = [
-                    sys.executable,
-                    str(ROOT / "scripts" / "python_unittest_profile.py"),
-                    "discover",
-                    "tests/devpy",
-                ]
-            if os.environ.get("PHOENIX_CHECK_DIAGNOSTIC_DIR"):
-                unittest_cmd.append("-v")
-            run_step("dev.py unit tests", unittest_cmd)
+
+    def check_devpy():
+        unittest_cmd = [sys.executable, "-m", "unittest", "discover", "tests/devpy"]
+        if profile_work and _CHECK_PROFILE is not None:
+            unittest_cmd = [
+                sys.executable,
+                str(ROOT / "scripts" / "python_unittest_profile.py"),
+                "discover",
+                "tests/devpy",
+            ]
+        if os.environ.get("PHOENIX_CHECK_DIAGNOSTIC_DIR"):
+            unittest_cmd.append("-v")
+        run_step("dev.py unit tests", unittest_cmd, timeout=DEVPY_TEST_TIMEOUT)
 
     # Bootstrap UI deps so eslint / tsc / vitest can run on a fresh checkout.
     # Skipped when no UI lane runs, so a non-UI change never needs pnpm.
@@ -7621,8 +7891,10 @@ def cmd_check(
         ("cargo-fmt", lane_cargo_fmt),
         ("task", lane_task),
         ("ast-grep", check_ast_grep),
+        ("deps", check_cargo_deny),
         ("allium", check_allium),
         ("spec-shape", check_spec_shape),
+        ("devpy", check_devpy),
         ("spec-anchors", check_spec_anchors),
         ("pkglock", check_package_lock_clean),
         ("e2e", lane_e2e),
@@ -7639,9 +7911,11 @@ def cmd_check(
     # Each lane starts only after its predecessor finishes. A lane wedged in
     # Python therefore cannot leave every later lane parked on a lock or multiply
     # the join timeout. daemon=True lets the interpreter exit after recording the
-    # one stuck lane; subprocess steps have their own CHECK_TIMEOUT kill budget.
+    # one stuck lane; subprocess steps have their own kill budget.
     # Launcher build, codegen, and test compilation each have CHECK_TIMEOUT.
-    LANE_JOIN_TIMEOUT = max(CHECK_TIMEOUT * 6, CHECK_TIMEOUT * 3 + CARGO_TEST_TIMEOUT) + 30
+    LANE_JOIN_TIMEOUT = max(
+        CHECK_TIMEOUT * 6, CHECK_TIMEOUT * 3 + CARGO_TEST_TIMEOUT, DEVPY_TEST_TIMEOUT
+    ) + 30
     with _check_interrupt_handlers(interrupted):
         stuck = _run_check_threads_sequentially(
             threads, LANE_JOIN_TIMEOUT, interrupted=interrupted
@@ -8447,14 +8721,16 @@ def _build_pipeline_model(with_timings: bool = False):
 # in node tooltips. Kept beside _LANE_DEFS conceptually — update both together.
 _GRAPH_LANE_STEPS = {
     "rust": ["native bash launcher", "codegen export", "codegen-stale diff", "cargo test (compile)",
-             "cargo test (run)"],
+             "prune stale test artifacts", "cargo test (run)"],
     "clippy": ["cargo clippy --all-targets -D warnings"],
+    "deps": ["cargo deny check bans"],
     "tsc": ["tsc -b --noEmit"],
     "ui-lint": ["eslint", "stylelint"],
     "vitest": ["vitest run"],
     "ast-grep": ["structural rules over ui/src/ + crates/"],
     "allium": ["allium analyse specs/*/*.allium"],
-    "spec-shape": ["spEARS v2 artifact-shape validation", "python unittest discover tests/devpy"],
+    "spec-shape": ["spEARS v2 artifact-shape validation"],
+    "devpy": ["python unittest discover tests/devpy"],
     "spec-anchors": ["REQ-* anchor cross-validation"],
     "e2e": ["uv run tests/e2e/run.py (real binary)"],
     "cargo-fmt": ["cargo fmt --check"],
@@ -8466,6 +8742,7 @@ _GRAPH_CATEGORY_LABELS = {
     "UI": "UI · ui/",
     "TASKS": "TASKS · tasks/",
     "SPECS": "SPECS · specs/",
+    "DEVTOOLS": "DEVTOOLS · dev.py tests and dependencies",
     "ASTGREP": "ASTGREP · ast-grep-rules/",
     "E2E": "E2E · tests/e2e/",
     "SELF": "SELF · dev.py/.github workflows",
@@ -10026,41 +10303,54 @@ def native_prod_deploy(
 
 CARGO_TEST_TIMEOUT_ENV = "PHOENIX_CHECK_CARGO_TEST_TIMEOUT_SECS"
 DEFAULT_CARGO_TEST_TIMEOUT_SECS = 900
-# Keep the lane join (two 600s steps + this budget + 30s) within Python's
-# platform-supported Thread.join timeout, even for an extreme override.
+# The Rust lane can spend two 600s steps plus this budget before its 30s join grace.
 MAX_CARGO_TEST_TIMEOUT_SECS = int(threading.TIMEOUT_MAX) - 1230
+DEVPY_TEST_TIMEOUT_ENV = "PHOENIX_CHECK_DEVPY_TEST_TIMEOUT_SECS"
+DEFAULT_DEVPY_TEST_TIMEOUT_SECS = 600
+MAX_DEVPY_TEST_TIMEOUT_SECS = int(threading.TIMEOUT_MAX) - 30
 
 
-def _cargo_test_timeout_secs(environ: dict[str, str] | None = None) -> tuple[int, str | None]:
-    """Return the `check` cargo-test step budget and where an override came from.
-
-    The process environment wins over the gitignored, per-host `.phoenix-ide.env`
-    so a single run can be adjusted without editing the file. An override that is
-    not a positive integer is a configuration error, not a reason to fall back.
-    """
+def _check_test_timeout_secs(
+    name: str, default: int, maximum: int, environ: dict[str, str] | None = None
+) -> tuple[int, str | None]:
+    """Read a step budget; process environment takes precedence over the host file."""
     environ = os.environ if environ is None else environ
     source = None
-    raw = environ.get(CARGO_TEST_TIMEOUT_ENV)
+    raw = environ.get(name)
     if raw is not None:
         source = "environment"
     else:
         file_env: dict[str, str] = {}
         loaded = _load_env_file(file_env)
-        raw = file_env.get(CARGO_TEST_TIMEOUT_ENV)
+        raw = file_env.get(name)
         if raw is not None:
             source = loaded
     if raw is None or raw.strip() == "":
-        return DEFAULT_CARGO_TEST_TIMEOUT_SECS, None
+        return default, None
     try:
         value = int(raw.strip())
     except ValueError:
         value = 0
-    if not 0 < value <= MAX_CARGO_TEST_TIMEOUT_SECS:
+    if not 0 < value <= maximum:
         raise SystemExit(
-            f"{CARGO_TEST_TIMEOUT_ENV} must be a positive integer number of seconds "
-            f"at most {MAX_CARGO_TEST_TIMEOUT_SECS}; got {raw!r} from {source}"
+            f"{name} must be a positive integer number of seconds "
+            f"at most {maximum}; got {raw!r} from {source}"
         )
     return value, source
+
+
+def _cargo_test_timeout_secs(environ: dict[str, str] | None = None) -> tuple[int, str | None]:
+    return _check_test_timeout_secs(
+        CARGO_TEST_TIMEOUT_ENV, DEFAULT_CARGO_TEST_TIMEOUT_SECS,
+        MAX_CARGO_TEST_TIMEOUT_SECS, environ,
+    )
+
+
+def _devpy_test_timeout_secs(environ: dict[str, str] | None = None) -> tuple[int, str | None]:
+    return _check_test_timeout_secs(
+        DEVPY_TEST_TIMEOUT_ENV, DEFAULT_DEVPY_TEST_TIMEOUT_SECS,
+        MAX_DEVPY_TEST_TIMEOUT_SECS, environ,
+    )
 
 
 def _load_env_file(env: dict[str, str], filename: str = ".phoenix-ide.env") -> str | None:
@@ -11144,6 +11434,15 @@ class ValidatedLinuxPreparedCandidate:
     release_commit: None = None
 
 
+def _nonnegative_ascii_integer(value: str) -> int:
+    if not isinstance(value, str) or re.fullmatch(r"[0-9]+", value) is None:
+        raise argparse.ArgumentTypeError("must be a nonnegative base-10 integer")
+    try:
+        return int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("integer is out of range") from exc
+
+
 @dataclasses.dataclass(frozen=True)
 class ProdDeployControllerOptions:
     enabled: bool = False
@@ -11159,6 +11458,7 @@ class ProdDeployControllerOptions:
     controller_source_commit: str | None = None
     candidate_source_root: Path | None = None
     candidate_source_commit: str | None = None
+    additional_reserve_bytes: int = 0
 
     def require_local_candidate_source(
         self,
@@ -12080,6 +12380,7 @@ def _report_launchd_handoff(transaction_id: str, identity: RuntimeIdentity) -> N
         print(f"  Transaction: {transaction_id}")
         print(f"  Candidate: {identity.version} ({identity.git_sha})")
         print("  The Phoenix connection may close while the service is replaced.")
+        print("  The independent helper verifies and retains a native SQLite backup before migrations.")
         print("  After reconnecting, run: ./dev.py prod status")
     except BrokenPipeError:
         pass
@@ -12219,6 +12520,7 @@ def launchd_prod_deploy(
             "target_binary": str(target_binary), "target_plist": str(LAUNCHD_PLIST_PATH),
             "label": LAUNCHD_LABEL, "helper_label": label, "uid": os.getuid(),
             "health_url": health_url, "health_insecure_tls": insecure_tls,
+            "additional_reserve_bytes": controller.additional_reserve_bytes,
             "active_path": str(LAUNCHD_DEPLOY_ACTIVE_PATH), "status_path": str(LAUNCHD_DEPLOY_STATUS_PATH),
             "deployed_sha_path": str(PROD_SHA_PATH), "lock_path": str(LAUNCHD_DEPLOY_LOCK_PATH),
             "claim_lock_path": str(LAUNCHD_DEPLOY_CLAIM_LOCK_PATH), "created_at": created_at,
@@ -12579,9 +12881,36 @@ def _print_launchd_deploy_status() -> None:
             print(f"    Failure: {deploy['failure']}")
         if deploy.get("rollback_failure"):
             print(f"    Historical rollback failure: {deploy['rollback_failure']}")
-        if deploy.get("state") == "failed":
-            print("    Manual recovery required. The candidate may have changed the database; "
-                  "do not start an older binary without its matching offline database restore.")
+        proof_path = LAUNCHD_DEPLOY_STATUS_PATH.with_suffix(".proof.json")
+        proof = {}
+        if proof_path.is_file() and not proof_path.is_symlink():
+            try:
+                candidate_proof = json.loads(proof_path.read_text())
+                if (isinstance(candidate_proof, dict)
+                        and candidate_proof.get("transaction_id") == deploy.get("transaction_id")):
+                    proof = candidate_proof
+            except (OSError, ValueError, TypeError):
+                pass
+        if proof:
+            print(f"    Boundary: {proof.get('boundary', 'unknown')} (phase {proof.get('phase', 'unknown')})")
+        elif deploy.get("state") == "failed":
+            print("    Proof: unavailable; migration boundary and backup verification are unknown.")
+        backup = proof.get("backup")
+        if isinstance(backup, dict) and backup.get("backup_path") and backup.get("backup_sha256"):
+            print(f"    Verified backup: {backup['backup_path']} ({backup.get('backup_bytes', 'unknown')} bytes, "
+                  f"SHA-256 {backup['backup_sha256']})")
+        if proof.get("recovery_outcome") == "predecessor_recovered_verified" and proof.get("predecessor_verified") is True:
+            print("    Recovery: captured predecessor privately bootstrapped and health/PID verified; canonical plist published.")
+        elif deploy.get("state") == "failed":
+            if proof.get("boundary") == "not_crossed":
+                print("    Manual recovery required. Migration was not attempted; inspect the quarantined plist and service.")
+            else:
+                print("    Manual recovery required. The candidate may have changed the database; "
+                      "do not start an older binary without its matching offline database restore.")
+            if proof.get("recovery_uncertainty"):
+                print(f"    Recovery uncertainty: {proof['recovery_uncertainty']}")
+            if proof.get("quarantine_path"):
+                print(f"    Quarantined predecessor plist: {proof['quarantine_path']}")
         if owner is not None:
             print("    Inspect activation.log and the retained transaction. Clear the active marker "
                   "only after confirming no helper is running and choosing a manual recovery action.")
@@ -12665,6 +12994,8 @@ def cmd_prod_deploy(
     if controller.prepared_artifact is not None and not controller.systemd_current_schema_upgrade:
         raise SystemExit("prepared artifact deployment is supported only by protected Linux systemd mode")
     env = controller.require_backend()
+    if controller.additional_reserve_bytes and env != "launchd":
+        raise SystemExit("--additional-reserve-bytes is supported only by macOS launchd deployment")
     if controller.enabled and not release and controller.prepared_artifact is None:
         raise SystemExit("controller mode requires --release")
     compiler_cache_setup = None
@@ -12679,7 +13010,7 @@ def cmd_prod_deploy(
         print()
 
     if env == "launchd":
-        if controller.enabled or controller.candidate_source_root is not None:
+        if controller.enabled or controller.candidate_source_root is not None or controller.additional_reserve_bytes:
             launchd_prod_deploy(release, controller=controller)
         else:
             launchd_prod_deploy(
@@ -12996,12 +13327,17 @@ def main():
     qa_sub.add_parser("sidebar", help="Capture sidebar Ladle screenshots")
     qa_sub.add_parser("task-approval", help="Capture task approval Ladle screenshots")
     qa_sub.add_parser("mobile-conversation-list", help="Capture mobile conversation list Ladle screenshots")
+    qa_sub.add_parser("coordinator-scanner-quality", help="Prepare or qualify the actual bounded scanner host corpus")
     qa_sub.add_parser("coordinator-drive-eval", help="Run isolated opt-in Coordinator action evaluation")
+    qa_sub.add_parser("ember-watch-recovery", help="Qualify isolated local-watch tool recovery")
+    qa_sub.add_parser("ember-event-eval", help="Compare bounded completion-event context on synthetic data")
+    qa_sub.add_parser("ember-foreground-memory", help="Qualify isolated admitted-runtime memory behavior")
     qa_sub.add_parser("coordinator", help="Capture Coordinator screenshots across responsive viewports")
     qa_sub.add_parser("mobile-multi-pr-conversation", help="Capture a mobile conversation with two open PRs")
     qa_sub.add_parser("desktop-multi-pr-conversation", help="Capture a desktop conversation with multiple open PRs")
     qa_sub.add_parser("new-conversation", help="Capture the /new page at desktop and mobile sizes")
     qa_sub.add_parser("product-conversation", help="Capture ProductConversation Ladle screenshots at desktop and mobile sizes")
+    qa_sub.add_parser("annotations", help="Capture annotation states and a desktop/mobile design gallery")
     qa_sub.add_parser("message-list", help="Capture message list Ladle screenshots")
     qa_sub.add_parser("svg-artifacts", help="Verify SVG artifact Ladle controls and capture browser evidence")
     qa_sub.add_parser("tool-results", help="Capture tool-result Ladle screenshots at desktop and mobile sizes")
@@ -13048,6 +13384,10 @@ def main():
     deploy_parser.add_argument(
         "--candidate-source-commit", default=None,
         help="Expected full lowercase HEAD SHA of --candidate-source-root",
+    )
+    deploy_parser.add_argument(
+        "--additional-reserve-bytes", type=_nonnegative_ascii_integer, default=0,
+        help="Keep this many extra filesystem bytes available at launchd migration admission (default: 0)",
     )
     deploy_parser.add_argument("legacy_version", nargs="?", help=argparse.SUPPRESS)
     deploy_parser.add_argument(
@@ -13213,8 +13553,16 @@ def main():
             cmd_qa_task_approval()
         elif args.qa_command == "mobile-conversation-list":
             cmd_qa_mobile_conversation_list()
+        elif args.qa_command == "coordinator-scanner-quality":
+            cmd_qa_coordinator_scanner_quality()
         elif args.qa_command == "coordinator-drive-eval":
             cmd_qa_coordinator_drive_eval()
+        elif args.qa_command == "ember-watch-recovery":
+            cmd_qa_ember_watch_recovery()
+        elif args.qa_command == "ember-event-eval":
+            cmd_qa_ember_event_eval()
+        elif args.qa_command == "ember-foreground-memory":
+            cmd_qa_ember_foreground_memory()
         elif args.qa_command == "coordinator":
             cmd_qa_coordinator()
         elif args.qa_command == "mobile-multi-pr-conversation":
@@ -13225,6 +13573,8 @@ def main():
             cmd_qa_new_conversation()
         elif args.qa_command == "product-conversation":
             cmd_qa_product_conversation()
+        elif args.qa_command == "annotations":
+            cmd_qa_annotations()
         elif args.qa_command == "message-list":
             cmd_qa_message_list()
         elif args.qa_command == "svg-artifacts":
@@ -13260,6 +13610,7 @@ def main():
                 pretty=pretty,
                 controller=ProdDeployControllerOptions(
                     enabled=args.controller_mode,
+                    additional_reserve_bytes=args.additional_reserve_bytes,
                     controller_source_commit=args.controller_source_commit,
                     candidate_source_root=getattr(args, "candidate_source_root", None),
                     candidate_source_commit=getattr(args, "candidate_source_commit", None),

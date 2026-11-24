@@ -99,6 +99,11 @@ export type { ProductConversationCloseActionView } from './generated/ProductConv
 export type { ProductConversationCloseUnavailableReasonView } from './generated/ProductConversationCloseUnavailableReasonView';
 export type { ProductConversationListResponse } from './generated/ProductConversationListResponse';
 export type { ProductConversationListRow } from './generated/ProductConversationListRow';
+export type { ProductConversationReadStateView } from './generated/ProductConversationReadStateView';
+export type { CoordinatorListEntryView } from './generated/CoordinatorListEntryView';
+import type { ProductConversationReadStateView as ProductConversationReadStateViewType } from './generated/ProductConversationReadStateView';
+import type { ProductConversationReadAdvanceRequestKind } from './generated/ProductConversationReadAdvanceRequestKind';
+import type { MarkProductConversationReadRequest } from './generated/MarkProductConversationReadRequest';
 export type { ProductConversationSnapshotView } from './generated/ProductConversationSnapshotView';
 export type { ProductConversationHistorySnapshotView } from './generated/ProductConversationHistorySnapshotView';
 import type { ProductConversationHistorySnapshotView } from './generated/ProductConversationHistorySnapshotView';
@@ -258,8 +263,10 @@ export interface Conversation {
 
 export type PrUnavailableReason = 'gh_missing' | 'not_authenticated' | 'not_git_repo' | 'command_failed';
 export type PrCheckState = 'passing' | 'pending' | 'failing' | 'unknown';
-export type PrDisplayState = 'open' | 'draft' | 'merged' | 'closed';
-export type PrFeedbackStatus = 'open' | 'in_progress' | 'approved';
+export type { PrDisplayState } from './generated/PrDisplayState';
+export type { PrFeedbackStatus } from './generated/PrFeedbackStatus';
+import type { PrDisplayState } from './generated/PrDisplayState';
+import type { PrFeedbackStatus } from './generated/PrFeedbackStatus';
 
 export interface CachedPrSummary {
   number: number;
@@ -540,6 +547,19 @@ export interface QuestionOption {
   label: string;
   description?: string;
   preview?: string;
+}
+
+/** An open question Ember posted without stopping its own work (REQ-AUQ-010). */
+/** Per-question notes and chosen preview, keyed by question text. */
+export type QuestionAnnotations = Record<string, { notes?: string; preview?: string }>;
+
+export interface CoordinatorQuestion {
+  request_id: string;
+  /** Ember's stable ProductConversation; survives continuation. */
+  coordinator_product_conversation_id: string;
+  /** RFC 3339. */
+  asked_at: string;
+  questions: UserQuestion[];
 }
 
 export interface ContinuationSummaryRequest {
@@ -972,10 +992,10 @@ export interface TaskAvailabilityResponse {
   available: boolean;
 }
 
-/** Expansion error returned by the server when an @reference or /skill fails (REQ-IR-007) */
+/** Expansion error returned by the server when a /skill fails (REQ-IR-007) */
 export interface ExpansionErrorDetail {
   error: string;
-  error_type: 'file_not_found' | 'file_not_text' | 'skill_invocation_failed';
+  error_type: 'skill_invocation_failed';
   reference: string;
 }
 
@@ -1403,6 +1423,13 @@ export type CodexRedeemResult =
   | { type: 'account_changed' }
   | { type: 'failed' };
 
+export interface ContinueConversationResult {
+  conversation_id: string;
+  slug?: string;
+  status: 'accepted' | 'dispatch_failed' | 'already_exists';
+  error?: string;
+}
+
 export const api = {
   async authStatus(): Promise<AuthStatus> {
     const resp = await fetch('/api/auth/status');
@@ -1594,6 +1621,25 @@ export const api = {
   async ensureGlobalCoordinator(): Promise<GlobalCoordinatorResponse> {
     const resp = await fetch('/api/global/coordinator', { method: 'POST' });
     if (!resp.ok) throw new Error('Failed to load Coordinator conversation');
+    return resp.json();
+  },
+
+  async getCoordinatorLanguage(): Promise<LlmLanguageSetting> {
+    const resp = await fetch('/api/global/coordinator/language');
+    if (!resp.ok) throw new Error('Failed to load Ember language');
+    return resp.json();
+  },
+
+  async updateCoordinatorLanguage(language: string): Promise<LlmLanguageSetting> {
+    const resp = await fetch('/api/global/coordinator/language', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ language }),
+    });
+    if (!resp.ok) {
+      const failure = await resp.json().catch(() => null) as { error?: string } | null;
+      throw new Error(failure?.error ?? 'Failed to save Ember language');
+    }
     return resp.json();
   },
 
@@ -1831,7 +1877,7 @@ export const api = {
           throw new ConflictError(err as ConflictErrorDetail);
         }
         // The first message is expanded at create time even on the attachment
-        // path, so an unresolvable `@file`/`/skill` reference comes back as 422
+        // path, so a failed `/skill` invocation comes back as 422
         // (REQ-IR-007) — surface it as ExpansionError like the JSON path does.
         if (resp.status === 422) {
           throw new ExpansionError(err as ExpansionErrorDetail);
@@ -1851,7 +1897,7 @@ export const api = {
         throw new ConflictError(err as ConflictErrorDetail);
       }
       // The first message is expanded at create time, same as a chat send, so
-      // an unresolvable `@file` reference comes back as 422 (REQ-IR-007).
+      // a failed `/skill` invocation comes back as 422 (REQ-IR-007).
       if (resp.status === 422) {
         throw new ExpansionError(err as ExpansionErrorDetail);
       }
@@ -2401,6 +2447,26 @@ export const api = {
     if (!resp.ok) throw new Error('Failed to close product conversation');
   },
 
+  async markProductConversationRead(
+    productConversationId: string,
+    kind: ProductConversationReadAdvanceRequestKind,
+  ): Promise<ProductConversationReadStateViewType> {
+    const body: MarkProductConversationReadRequest = { kind };
+    const resp = await fetch(`/api/product-conversations/${encodeURIComponent(productConversationId)}/read`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    if (!resp.ok) throw new Error('Failed to mark conversation read');
+    return resp.json();
+  },
+
+  async markProductConversationUnread(productConversationId: string): Promise<ProductConversationReadStateViewType> {
+    const resp = await fetch(`/api/product-conversations/${encodeURIComponent(productConversationId)}/unread`, { method: 'POST' });
+    if (!resp.ok) throw new Error('Failed to mark conversation unread');
+    return resp.json();
+  },
+
   async renameProductConversation(reference: string, title: string): Promise<ProductConversationListRowType> {
     const resp = await fetch(`/api/product-conversations/${encodeURIComponent(reference)}/title`, {
       method: 'PATCH',
@@ -2753,15 +2819,22 @@ export const api = {
     return resp.json();
   },
 
+  async retryContinuationOpening(convId: string): Promise<ContinueConversationResult> {
+    const resp = await fetch(`/api/conversations/${encodeURIComponent(convId)}/retry-continuation-opening`, {
+      method: 'POST',
+    });
+    if (!resp.ok) {
+      const err = await resp.json();
+      if (resp.status === 409) throw new ConflictError(err as ConflictErrorDetail);
+      throw new Error(err.error || 'Failed to retry continuation opening');
+    }
+    return resp.json();
+  },
+
   async continueConversation(
     convId: string,
     request: { handoff: string; source?: ContinueHandoffSource; message_id: string; user_agent?: string; retry_failed_automatic?: boolean },
-  ): Promise<{
-    conversation_id: string;
-    slug?: string;
-    status: 'accepted' | 'dispatch_failed' | 'already_exists';
-    error?: string;
-  }> {
+  ): Promise<ContinueConversationResult> {
     const resp = await fetch(`/api/conversations/${convId}/continue`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -2813,7 +2886,7 @@ export const api = {
     convId: string,
     requestId: string | undefined,
     answers: Record<string, string>,
-    annotations?: Record<string, { notes?: string; preview?: string }>,
+    annotations?: QuestionAnnotations,
   ): Promise<{ success: boolean }> {
     const resp = await fetch(`/api/conversations/${convId}/respond`, {
       method: 'POST',
@@ -2821,6 +2894,34 @@ export const api = {
       body: JSON.stringify({ request_id: requestId, answers, annotations }),
     });
     if (!resp.ok) { const err = await resp.json(); throw new Error(err.error || 'Failed to respond to question'); }
+    return resp.json();
+  },
+
+  async listCoordinatorQuestions(signal?: AbortSignal): Promise<CoordinatorQuestion[]> {
+    const resp = await fetch('/api/coordinator/questions', signal ? { signal } : {});
+    if (!resp.ok) throw new Error('Failed to load Ember questions');
+    return resp.json();
+  },
+
+  async answerCoordinatorQuestion(
+    requestId: string,
+    answers: Record<string, string>,
+    annotations?: QuestionAnnotations,
+  ): Promise<{ success: boolean }> {
+    const resp = await fetch(`/api/coordinator/questions/${encodeURIComponent(requestId)}/answer`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ answers, annotations }),
+    });
+    if (!resp.ok) { const err = await resp.json(); throw new Error(err.error || 'Failed to answer Ember'); }
+    return resp.json();
+  },
+
+  async dismissCoordinatorQuestion(requestId: string): Promise<{ success: boolean }> {
+    const resp = await fetch(`/api/coordinator/questions/${encodeURIComponent(requestId)}/dismiss`, {
+      method: 'POST',
+    });
+    if (!resp.ok) { const err = await resp.json(); throw new Error(err.error || 'Failed to dismiss question'); }
     return resp.json();
   },
 

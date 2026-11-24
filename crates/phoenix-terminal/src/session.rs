@@ -757,6 +757,8 @@ impl ActiveTerminals {
             {
                 handle.close_master_fd();
                 map.handles.remove(&scope);
+                #[cfg(test)]
+                handle.child_lifecycle.publish_cleanup_complete();
             }
         });
     }

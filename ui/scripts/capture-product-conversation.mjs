@@ -1,10 +1,68 @@
+import { captureComposerFocus } from './capture-focus-regressions.mjs';
 import { writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import process from 'node:process';
 import { buildLadleStoryUrl, runSurfaceCapture } from './capture-ladle-surface.mjs';
 
 const measurements = [];
+const trackingMeasurements = [];
 const journeys = [];
+
+async function assertMobileContinuation(page, id, viewport, outDir) {
+  const input = page.locator('.product-conversation-page__composer #message-input');
+  await input.waitFor();
+  await input.fill('Unsent mobile draft');
+  await input.evaluate(element => {
+    window.__continuationComposer = element;
+    element.setSelectionRange(3, 9);
+  });
+  const assertRetainedEditor = async () => {
+    if (!await input.evaluate(element => element === window.__continuationComposer
+      && document.activeElement === element && element.selectionStart === 3 && element.selectionEnd === 9)) {
+      throw new Error('Continuation replaced the editor or lost native focus/selection');
+    }
+  };
+  await page.evaluate(() => {
+    window.dispatchEvent(new Event('product-conversation-fixture-hold-successor'));
+    window.dispatchEvent(new Event('product-conversation-fixture-hold-successor-readback'));
+  });
+  const route = await page.locator('html').getAttribute('data-source-fixture-location');
+  await page.screenshot({ path: `${outDir}/${id}--${viewport.name}--before.png`, fullPage: true });
+  await page.evaluate(() => window.dispatchEvent(new Event('product-conversation-fixture-continue')));
+  await page.waitForFunction(() => {
+    const streamUrl = document.documentElement.dataset.productConversationFixtureEventSourceLastUrl;
+    if (!streamUrl || document.documentElement.dataset.productConversationFixtureActiveTranscriptSubscriptions !== '1') return false;
+    const parsed = new URL(streamUrl, window.location.href);
+    return parsed.pathname === '/api/conversation-reads/stream'
+      && parsed.searchParams.get('reference') === 'fixture-successor';
+  });
+  await assertRetainedEditor();
+  await page.evaluate(() => {
+    window.dispatchEvent(new Event('product-conversation-fixture-release-successor-readback'));
+    window.dispatchEvent(new Event('product-conversation-fixture-release-successor'));
+  });
+  await page.waitForFunction(() => document.documentElement.dataset.productConversationFixtureLastDeliveredInitMember === 'fixture-successor');
+  await assertRetainedEditor();
+  await page.evaluate(() => window.dispatchEvent(new Event('product-conversation-fixture-successor-message')));
+  await page.getByText('Successor is streaming after the handoff.', { exact: true }).waitFor();
+  if (await input.inputValue() !== 'Unsent mobile draft') throw new Error('Continuation lost the unsent draft');
+  if (await page.locator('html').getAttribute('data-source-fixture-location') !== route) throw new Error('Continuation navigated the stable route');
+  if (await page.getByRole('button', { name: 'Open continuation', exact: true }).count()) throw new Error('Redundant continuation action remains');
+  await page.screenshot({ path: `${outDir}/${id}--${viewport.name}--followed.png`, fullPage: true });
+  await page.evaluate(() => window.dispatchEvent(new Event('product-conversation-fixture-stream-failure')));
+  await page.waitForFunction(() => {
+    const data = document.documentElement.dataset;
+    return Number(data.productConversationFixtureLastDeliveredInitInstance) > Number(data.productConversationFixtureFailedTranscriptInstance)
+      && data.productConversationFixtureLastDeliveredInitMember === 'fixture-successor'
+      && data.productConversationFixtureActiveTranscriptSubscriptions === '1';
+  });
+  await page.evaluate(() => window.dispatchEvent(new Event('product-conversation-fixture-successor-message')));
+  await page.getByText('Successor is streaming after reconnect.', { exact: true }).waitFor();
+  if (await page.getByText('Successor is streaming after the handoff.', { exact: true }).count() !== 1) throw new Error('Reconnect duplicated/lost successor message');
+  await assertRetainedEditor();
+  await page.screenshot({ path: `${outDir}/${id}--${viewport.name}--reconnected.png`, fullPage: true });
+  journeys.push(`${id}/${viewport.name}: stable-route real SSE continuation, held cold hydration, retained native editor/focus/selection/draft, one subscription and new post-reconnect message; synthetic mobile browser only`);
+}
 
 async function assertSourceCall(page, id, viewport, outDir) {
   await page.evaluate(() => { window.__sourcePulseSeen = false; const observer = new MutationObserver(() => { if (document.querySelector('[data-tool-id="source-send-call"].jump-highlight')) window.__sourcePulseSeen = true; }); observer.observe(document.body, { subtree: true, attributes: true, attributeFilter: ["class"] }); });
@@ -145,7 +203,7 @@ async function assertTranscriptGeometry(page, id, viewport, theme) {
       display: getComputedStyle(required.transcript).display,
       transcript: box(required.transcript), mainArea: box(required.mainArea), chatView: box(required.chatView),
       virtualTranscript: box(required.virtualTranscript), title: box(required.title), composer: box(required.composer),
-      visibleRealMessageRow: rows.some((row) => row.querySelector('.message.user, .message.agent') && intersects(box(row), viewportBox)),
+      visibleRealMessageRow: rows.some((row) => row.querySelector('.message.user, .message.agent, .message.meta') && intersects(box(row), viewportBox)),
       positiveRows: rows.filter((row) => { const rect = row.getBoundingClientRect(); return rect.width > 0 && rect.height > 0; }).length,
       horizontalOverflow: document.documentElement.scrollWidth > window.innerWidth,
       documentOverflow: document.documentElement.scrollWidth > window.innerWidth || document.documentElement.scrollHeight > window.innerHeight,
@@ -394,6 +452,114 @@ async function assertRecallAndWork(page, viewport, outDir) {
   journeys.push(`Work and Recall ${viewport.name}: typed content visible; Recall in bounds and closes`);
 }
 
+async function assertEmberTracking(page, id, viewport, outDir) {
+  const scroller = page.locator('.virtual-transcript');
+  const nav = page.locator('#conversation-nav');
+  const cardLabel = 'Ember tracking · captured snapshot · 5';
+  const duePills = nav.getByRole('button', { name: new RegExp(cardLabel) });
+  await page.waitForFunction(() => document.querySelectorAll('#conversation-nav .conversation-nav-item').length >= 3);
+  if (await duePills.count() !== (id === 'ember-tracking-fallback' ? 1 : 2)) throw new Error('Historical and current observations need truthful outline anchors');
+  if (await nav.getByRole('button', { name: /Ember tracking · captured snapshot · 4/ }).count() !== (id === 'ember-tracking-fallback' ? 0 : 1)) {
+    throw new Error('Null review cue has an incorrect outline label');
+  }
+  if (id === 'ember-tracking-fallback') {
+    for (const target of ['tracking-spoof', 'tracking-malformed', 'tracking-unknown']) {
+      const prefix = target === 'tracking-unknown' ? 'Unknown system observation:' : '[Saved Ember tracking observation:';
+      const pill = nav.getByRole('button', { name: target === 'tracking-unknown' ? /Unknown system observation:/ : /Saved Ember tracking observation:/ });
+      await pill.nth(target === 'tracking-malformed' ? 1 : 0).click();
+      await page.waitForFunction(message => document.documentElement.dataset.sourceFixtureLocation?.endsWith(`#message-${message}`), target);
+      const row = page.locator(`#message-${target}`);
+      await row.locator('.message-content').waitFor({ state: 'visible' });
+      if (await row.locator('.ember-tracking-card').count() || !await row.locator('.message-content').textContent().then(text => text?.startsWith(prefix))) {
+        throw new Error(`${target} was promoted to a card or lost its exact original prefix`);
+      }
+      await page.screenshot({ path: `${outDir}/${id}--${viewport.name}--${target}.png`, fullPage: true });
+    }
+    await duePills.first().click();
+    await page.locator('#message-tracking-history-due .ember-tracking-card').waitFor({ state: 'visible' });
+    if (await page.evaluate(() => document.documentElement.scrollWidth > innerWidth)) throw new Error('Tracking lookalike caused horizontal overflow');
+    await page.screenshot({ path: `${outDir}/${id}--${viewport.name}--fallback.png`, fullPage: true });
+    journeys.push(`${id}/${viewport.name}: user-origin exact payload spoof, malformed and unknown system-origin payloads remain original text; historical real observation is compact`);
+    return true;
+  }
+  await duePills.last().click();
+  await page.waitForFunction(() => document.documentElement.dataset.sourceFixtureLocation?.endsWith('#message-tracking-current-due'));
+  const due = page.locator('#message-tracking-current-due');
+  await due.locator('.ember-tracking-card').waitFor({ state: 'visible' });
+  if (await due.locator('.ember-tracking-card details').first().getAttribute('open') !== null) throw new Error('Saved observation was not collapsed');
+  const collapsedHeight = await due.locator('.ember-tracking-card').evaluate(element => element.getBoundingClientRect().height);
+  if (collapsedHeight <= 0 || collapsedHeight > 240) throw new Error(`Collapsed observation is not compact: ${collapsedHeight}px`);
+  trackingMeasurements.push({ id, viewport: viewport.name, collapsedTrackingCardHeight: collapsedHeight });
+  const composer = page.locator('.product-conversation-page__composer #message-input');
+  await composer.waitFor({ state: 'visible' });
+  await composer.fill('Unsent tracking QA draft');
+  await composer.focus();
+  if (!await composer.evaluate(element => document.activeElement === element)) throw new Error('Composer focus was lost');
+  if (await page.evaluate(() => document.documentElement.scrollWidth > innerWidth)) throw new Error('Tracking presentation caused horizontal overflow');
+  await page.screenshot({ path: `${outDir}/${id}--${viewport.name}--collapsed.png`, fullPage: true });
+
+  const details = due.locator('.ember-tracking-card > details');
+  const summary = details.locator(':scope > summary');
+  await summary.focus();
+  await summary.press('Enter');
+  await page.waitForFunction(() => document.querySelector('#message-tracking-current-due .ember-tracking-card > details')?.open === true);
+  await details.getByText('3 entries omitted from captured page; more were available at capture.', { exact: true }).waitFor();
+  await details.getByText('Review deployment evidence before release · requested work · tracking at capture · review flagged', { exact: true }).waitFor();
+  const raw = details.locator(':scope > details');
+  await raw.locator('summary').focus();
+  await raw.locator('summary').press('Enter');
+  await raw.locator('pre').waitFor({ state: 'visible' });
+  const original = await raw.locator('pre').textContent();
+  const expectedOriginal = await page.locator('[data-tracking-expected-payload]').getAttribute('data-tracking-expected-payload');
+  if (!expectedOriginal || original !== expectedOriginal) {
+    throw new Error('Raw original was not preserved byte-for-byte as a producer envelope and payload');
+  }
+  await page.context().grantPermissions(['clipboard-read', 'clipboard-write']);
+  await page.screenshot({ path: `${outDir}/${id}--${viewport.name}--raw.png`, fullPage: true });
+  await scroller.evaluate(element => { element.scrollTop = Math.min(100, element.scrollHeight - element.clientHeight); });
+  const mobileCopy = viewport.width <= 768;
+  if (!mobileCopy) {
+    await summary.scrollIntoViewIfNeeded();
+    await summary.click({ button: 'right' });
+  }
+  const copyButton = mobileCopy
+    ? due.getByRole('button', { name: 'Copy system observation' })
+    : page.getByRole('button', { name: 'Copy as Markdown', exact: true });
+  await copyButton.scrollIntoViewIfNeeded();
+  await copyButton.focus();
+  const beforeCopyScroll = await scroller.evaluate(element => element.scrollTop);
+  if (beforeCopyScroll <= 0) throw new Error('Copy stability must start at a nonzero transcript reading position');
+  await copyButton.click();
+  if (mobileCopy) await due.getByRole('button', { name: 'Copied!' }).waitFor();
+  await page.waitForFunction(expected => navigator.clipboard.readText().then(text => text === expected), expectedOriginal);
+  const copied = await page.evaluate(() => navigator.clipboard.readText());
+  if (copied !== original) throw new Error('Copy did not preserve the original producer payload');
+  const afterCopyScroll = await scroller.evaluate(element => element.scrollTop);
+  if (Math.abs(afterCopyScroll - beforeCopyScroll) > 3) throw new Error(`Copy jumped the transcript scroller: ${beforeCopyScroll} -> ${afterCopyScroll}`);
+  trackingMeasurements.push({ id, viewport: viewport.name, beforeCopyScroll, afterCopyScroll });
+  await page.screenshot({ path: `${outDir}/${id}--${viewport.name}--expanded.png`, fullPage: true });
+  await summary.focus();
+  await summary.press('Enter');
+  await page.waitForFunction(() => document.querySelector('#message-tracking-current-due .ember-tracking-card > details')?.open === false);
+
+  await nav.getByRole('button', { name: /Ember tracking · captured snapshot · 4/ }).click();
+  await page.locator('#message-tracking-current-null .ember-tracking-card').waitFor({ state: 'visible' });
+  if (await page.locator('#message-tracking-current-null .ember-tracking-topic').count()) throw new Error('Null cue incorrectly advertises a review topic');
+  await duePills.first().click();
+  await page.waitForFunction(() => document.documentElement.dataset.sourceFixtureLocation?.endsWith('#message-tracking-history-due'));
+  await page.locator('#message-tracking-history-due .ember-tracking-card').waitFor({ state: 'visible' });
+  if (await composer.inputValue() !== 'Unsent tracking QA draft' || !await composer.isEnabled()) throw new Error('Historical selection changed latest composer ownership');
+  const historicalLocation = await page.locator('html').getAttribute('data-source-fixture-location');
+  if (!historicalLocation?.includes('#message-tracking-history-due')) throw new Error('Historical selection did not retain exact message target');
+  await page.reload({ waitUntil: 'networkidle' });
+  await page.waitForSelector(`[data-product-conversation-fixture-ready="${id}"]`);
+  await page.waitForFunction((expected) => document.documentElement.dataset.sourceFixtureLocation === expected, historicalLocation);
+  await page.locator('#message-tracking-history-due .ember-tracking-card').waitFor({ state: 'visible' });
+  await page.screenshot({ path: `${outDir}/${id}--${viewport.name}--history-reload.png`, fullPage: true });
+  journeys.push(`${id}/${viewport.name}: continued historical and current observations, compact outline/anchors, keyboard disclosure/raw original, exact copy, null cue, historical reload and latest composer ownership; virtual transcript scroller stays stable during copy`);
+  return true;
+}
+
 async function writeReport(outDir) {
   const report = [
     '# ProductConversation deterministic browser UAT', '',
@@ -402,6 +568,7 @@ async function writeReport(outDir) {
     '| Scenario | Viewport | Theme | transcript h | main h | chat h | virtual h | positive rows | overflow |',
     '| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | --- |',
     ...measurements.map((item) => `| ${item.id} | ${item.viewport} | ${item.theme} | ${item.transcript.height} | ${item.mainArea.height} | ${item.chatView.height} | ${item.virtualTranscript.height} | ${item.positiveRows} | ${item.horizontalOverflow ? 'yes' : 'no'} |`),
+    '', '## Tracking measurements', ...trackingMeasurements.map(item => `- ${JSON.stringify(item)}`),
     '', '## Deterministic interaction coverage', ...journeys.map((journey) => `- ${journey}`), '',
     'Screenshots and journeys cover only the scenarios selected for this run. Geometry, viewer, and Recall coverage is present only where recorded above. Lazy-history fixtures use HashRouter so browser Back/Forward exercises actual browser history without a Phoenix server; this is not production-path cold-reload or physical-device acceptance. Emulated zero-inset viewports cannot prove physical notch geometry. Shared runner fails on unexpected console, page, request, and >=400 response failures.',
     `Browser engine: ${process.env.PLAYWRIGHT_BROWSER ?? 'chromium'}.`, '',
@@ -415,20 +582,34 @@ runSurfaceCapture({
   outDir: process.env.PRODUCT_CONVERSATION_QA_OUT ?? 'qa-artifacts/product-conversation',
   viewportMatrix: [
     { name: 'desktop-light', width: 1440, height: 900 }, { name: 'desktop-dark', width: 1440, height: 900 },
-    { name: 'mobile-light', width: 390, height: 844 }, { name: 'mobile-dark', width: 390, height: 844 },
+    { name: 'mobile-light', width: 390, height: 844, isMobile: true, hasTouch: true }, { name: 'mobile-dark', width: 390, height: 844, isMobile: true, hasTouch: true },
+    { name: 'tracking-393-dark', width: 393, height: 852, isMobile: true, hasTouch: true },
   ],
   urlForStory: ({ storyKey, id, viewport }) => {
     const theme = viewport.name.endsWith('-light') ? 'light' : 'dark';
     const fixtureHash = id === 'long-history-110-messages' ? '#message-long-older-target' : '';
     const baseUrl = process.env.LADLE_URL ?? `http://127.0.0.1:${process.env.LADLE_PORT ?? 61123}/`;
     return buildLadleStoryUrl(baseUrl, storyKey, { fixtureTheme: theme, fixtureHash,
-      ...(['ordinary-lazy-history', 'global-lazy-history'].includes(id) ? { fixtureBrowserHistory: '1' } : {}),
+      ...(['ordinary-lazy-history', 'global-lazy-history', 'ember-tracking-observations', 'ember-tracking-fallback'].includes(id) ? { fixtureBrowserHistory: '1' } : {}),
     });
   },
   preparePage: async ({ page }) => {
     await page.route('**/api/**', route => route.abort('blockedbyclient'));
   },
   captureStory: async ({ page, id, outDir, viewport }) => {
+    if (id === 'ember-tracking-observations' || id === 'ember-tracking-fallback') {
+      const theme = await fixtureValue(page, 'theme') ?? 'dark';
+      await assertTranscriptGeometry(page, id, viewport, theme);
+      return assertEmberTracking(page, id, viewport, outDir);
+    }
+    if (id === 'composer-focus') {
+      await captureComposerFocus({ page, outDir, viewport });
+      return false;
+    }
+    if (id === 'mobile-continuation-ordinary' || id === 'mobile-continuation-global') {
+      await assertMobileContinuation(page, id, viewport, outDir);
+      return;
+    }
     const theme = await fixtureValue(page, 'theme') ?? 'dark';
     if (id === 'ordinary-lazy-history' || id === 'global-lazy-history') {
       await assertSupersededBoundary(page, id, viewport, outDir);

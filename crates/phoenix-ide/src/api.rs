@@ -9,8 +9,9 @@ pub mod auth;
 mod browser_view;
 mod chains;
 pub mod codex_login;
-mod deployment;
-mod deployment_observations;
+mod coordinator_questions;
+pub(crate) mod deployment;
+pub(crate) mod deployment_observations;
 mod discovery;
 mod event_presentation;
 pub(crate) mod federation;
@@ -45,7 +46,7 @@ pub use deployment::{
 };
 pub(crate) use git_handlers::record_pr_auto_fix_context_baseline;
 pub use handlers::create_router;
-pub(crate) use handlers::validate_submitted_attachments;
+pub(crate) use handlers::validate_continuation_attachments;
 #[allow(unused_imports)] // Public API re-exports
 pub use types::*;
 
@@ -267,6 +268,7 @@ impl AppState {
             .await
             .map_err(std::io::Error::other)?;
         runtime.require_startup_local_authority()?;
+        runtime.start_coordinator_scanner();
         handlers::start_attachment_cleanup_task(db.clone(), Arc::clone(&runtime));
         let terminals = runtime.terminals.clone();
         {

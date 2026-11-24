@@ -47,6 +47,7 @@ mod discovery;
 mod error;
 mod headers;
 mod mock;
+mod model_config;
 mod models;
 mod openai;
 #[cfg(test)]
@@ -202,6 +203,9 @@ impl ProviderInputCount {
 /// Common interface for LLM providers
 #[async_trait]
 pub trait LlmService: Send + Sync {
+    fn tool_discovery_mode(&self) -> phoenix_core::domain::tool_discovery::ToolDiscoveryMode {
+        phoenix_core::domain::tool_discovery::ToolDiscoveryMode::Eager
+    }
     /// Complete provider-rendered input occupancy, without a generation attempt.
     async fn count_input(
         &self,
@@ -228,6 +232,11 @@ pub trait LlmService: Send + Sync {
 
     /// Get the model ID
     fn model_id(&self) -> &str;
+
+    /// Exact model spelling emitted by the provider request, when exposed.
+    fn outbound_model_name(&self) -> Option<&str> {
+        None
+    }
 
     fn diagnostic_route_class(&self) -> phoenix_core::domain::request_capacity::SafeRouteClass {
         phoenix_core::domain::request_capacity::SafeRouteClass::Unknown
@@ -462,6 +471,9 @@ impl LoggingService {
 
 #[async_trait]
 impl LlmService for LoggingService {
+    fn tool_discovery_mode(&self) -> phoenix_core::domain::tool_discovery::ToolDiscoveryMode {
+        self.inner.tool_discovery_mode()
+    }
     async fn count_input(
         &self,
         request: &LlmRequest,
@@ -580,6 +592,10 @@ impl LlmService for LoggingService {
 
     fn model_id(&self) -> &str {
         &self.model_id
+    }
+
+    fn outbound_model_name(&self) -> Option<&str> {
+        self.inner.outbound_model_name()
     }
 
     fn diagnostic_route_class(&self) -> phoenix_core::domain::request_capacity::SafeRouteClass {

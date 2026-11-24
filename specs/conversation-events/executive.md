@@ -1,21 +1,87 @@
 # Conversation events — implementation and qualification
 
-Implemented on the compact-conversation-events branch; not a deployment or merge claim. Durable metadata joins and typed presentation are separate from persisted diagnostic evidence. Available EventPresentation fields are flattened beside `status: available`; unavailable carries event_id/reason. EnrichedMessage.event_presentation is explicitly nullable. Genuine ts-rs exports are checked in, not handwritten.
+Occurrence-bound evidence and compact projection are merged in
+[PR #1092](https://github.com/scottopell/phoenix-ide/pull/1092) as `3a842c5`, after
+independent review and green component CI. Manual migration 164 and event migration
+165 are integrated in order. Qualified scanner migration 166 and combined evidence are recorded in
+[PR #1098](https://github.com/scottopell/phoenix-ide/pull/1098); exact review/CI/merge
+state belongs to GitHub. No production deployment is claimed.
+
+## Occurrence-bound ending evidence
+
+The merged implementation adds normalized immutable ending quotations (1,024 UTF-8 bytes), complete
+typed-response SHA-256 version expectations, and settled-input origin/sender
+snapshots. Direct settlement captures before obligation deletion and shares the
+binding with adopted steering/interaction occurrences. The atomic agent-message /
+selected-state / replay-clear path also supplies its exact response to initial and
+steering outcome capture. State-only, cancellation, failure and other paths without
+an exact carrier report absence instead of searching for the latest response.
+
+Private event details and private prompt hydration consume this evidence. Original
+persisted diagnostic messages remain unchanged, and shared/redacted presentation
+does not acquire the private quotation. Source edits/deletion leave the bounded
+quotation intact, but prevent version-matching recovery of omitted text. Remote
+terminal-fact v1 remains unchanged; its private projection explicitly reports
+`unsupported_remote`.
+
+`read_event_evidence` is a narrowly local-only native tool with a closed UUID/cursor
+request and no peer selector. Existing `read_conversation` remains unchanged. This
+small departure from the original same-tool preference prevents another prose-only
+local/remote distinction; see ADR-261. Every page retains the event identity and
+validates the complete source digest in the same read snapshot.
+
+Component qualification passed. Eight focused DB capture tests and the direct/
+adopted settlement regression pass. IDE event-evidence schema/read composition
+passes two tests; private quotation and the five-test event-presentation module
+pass. Genuine codegen passed all 249 export tests on the event candidate.
+
+Independent answer/metric review and a fresh full-39-trial audit accepted C's
+compact model hydration under ADR-261: 39 final answers, 88 calls, 1,027,411 input
+tokens including cache, zero attribution/authority failures and 60% fewer targeted
+source reads. All three controls met the frozen 10% input / 20% median-latency
+regression bounds. The [complete comparison report](../../scripts/qa/ember-event-eval/results-cfda0b0.md)
+retains per-case metrics and hashes. The [first six-call invocation](../../scripts/qa/ember-event-eval/results-e5ff1b8.md)
+remains partial/unaccepted; the authorized full second run changed only the
+uniform per-trial cap to twelve while retaining all global limits and gates.
+The 1,536-output-token request budget was not an enforced Codex generation/billing
+cap; all output usages were reported and the observed per-call maxima were 223 in
+the complete run and 216 in the partial first run, with no observed exceedance.
+Original evidence/hashes and the semantic/input/latency gates remain unchanged.
+This is synthetic local component qualification with small samples and uncontrolled
+provider cache/load, not billing savings, deployment, remote parity or combined
+Ember acceptance. Event migration 165 passed integrated component CI/review and
+merged after manual migration 164; combined scanner qualification is recorded in
+PR #1098.
+
+Scoped web qualification passes 61 focused event-card/fixture tests and a forced
+application TypeScript check. The actual Ladle Global page rendered a long Unicode
+quotation with escaped literal markup at 1440×900 and 390×844, without horizontal
+overflow or browser page errors. Its source link reached the exact ordinary source,
+and the origin link returned to Global. A redacted-event fixture showed no quotation
+or source link while preserving original diagnostics. The fixture's Global history
+shape and latest-message alignment were corrected so these checks exercise the
+intended receiver rather than an error fallback. Private screenshots are under
+`.phoenix/ember-event-qa/screenshots/` in the event worktree. This is fixture-only web
+qualification, not real-server, SwiftUI or physical-phone acceptance. The focused
+test process emits existing localhost:3000 connection diagnostics; it exits green,
+and the browser's fixture receiver has no page errors.
+
+Durable metadata joins and typed presentation are separate from persisted diagnostic evidence. Available EventPresentation fields are flattened beside `status: available`; unavailable carries event_id/reason. EnrichedMessage.event_presentation is explicitly nullable. Genuine ts-rs exports are checked in, not handwritten.
 
 ## Verification
 
 | Contract | Evidence | Remaining boundary |
 |---|---|---|
-| REQ-CEVT-001 | Four DB tests; API batch completeness including 400/401 identities, fallback and outcome tests | Full workspace checks remain owed |
+| REQ-CEVT-001 | Four DB tests; API batch completeness including 400/401 identities, fallback and outcome tests | Merged component CI passed; combined delivery is tracked in PR #1098 |
 | REQ-CEVT-002/003 | 223 earlier focused UI tests; final c6b app TypeScript and 36 focused tests; actual dark/light browser rendering | Not physical-phone qualification |
-| REQ-CEVT-004 | Ordinary library cargo check; eight event-presentation tests including five genuine export tests; SSE Complete/Tail/Preserve pending-event and redaction parity regression; genuine EnrichedMessage export | Full workspace codegen was interrupted by resource guard and remains owed separately; fixture browser is not actual backend acceptance |
+| REQ-CEVT-004 | Ordinary library cargo check; eight event-presentation tests including five genuine export tests; SSE Complete/Tail/Preserve pending-event and redaction parity regression; genuine EnrichedMessage export | Merged component codegen/freshness checks passed; fixture browser is not actual backend acceptance |
 | REQ-CEVT-005 | Eight rendered cases with 88 passing assertions, including distinct Global-to-ordinary source and return; only human prompt in chapter strip; no duplicate events | Real-server pagination/live/share browser campaign not performed |
 
 Final rendered source: `c6b2292ab0e7e436202d6b0a5b365aff8dc512dc`. Matrix: ordinary/Global, dark/light, widths 1000/390. Recorded title foreground/background contrast: dark 6.848:1, light 4.877:1, with every ancestor opacity verified as 1. The scoped meta-wrapper override prevents generic opacity 0.85 from reducing title contrast. Native details, exact provenance/raw copying, hidden-provenance find, failure/missing fallback and local time passed. All eight cases recorded zero page errors, console errors/warnings, and escaped fixture requests. Existing Global watch/live-command fixture handlers were exercised without status errors; unknown/mutating requests still reject.
 
 Independent whole-contract source review at 520a approved with no blocking counterexample. Follow-up read-only review at 82f approved routing/fixture changes but identified the ancestor-opacity risk; c6b corrected it, with a CSS regression and actual computed-style browser verification.
 
-## Evidence and remaining gates
+## Retained presentation qualification history
 
 Phoenix harness-local evidence is preserved under `.phoenix/qualification/` in the feature worktree: original e301 screenshots/failures and 32 assertions; `theme-correction-c6b/` TypeScript/test logs; `theme-correction-render/` eight-case assertions and 36 screenshots; `theme-render-slot/` resource/cleanup receipts. The final render took 16.133 seconds; its owned process group and port62107 listener were independently absent afterward. These local pointers are not portable CI artifacts.
 
@@ -27,4 +93,4 @@ Hosted run `38733795185` at a1fbb6e completed full codegen and full cargo tests 
 
 Bounded repairs enumerate existing enum variants (future variants require an explicit choice), borrow the wire serializer input, format the affected Rust/CSS, and regenerate SseWireEvent from the verified existing ts-rs test binary. The genuine export ran exactly one named test with 1 pass/1937 filtered; its only generated change is the two-line documentation comment describing explicit projection instead of implicit From. No generated code was hand-edited and no local compiler was launched. Rustfmt checks passed. A focused stylelint run exposed missing inter-rule blank lines after the first formatting edit; those were corrected, with final confirmation left to the next hosted run rather than silently rerunning a consumed admission.
 
-The full-codegen execution gate therefore has hosted evidence, but generated-file freshness and final green Rust/Clippy/UI lanes remain pending the repair head. The 88 rendered assertions remain scoped to the previously qualified presentation behavior; repairs do not constitute a new full browser or physical-phone campaign.
+The full-codegen execution gate had hosted evidence at that stage, while generated-file freshness and green Rust/Clippy/UI lanes still awaited the repair head. Those component CI/review gates subsequently passed before PR #1092 merged. The 88 rendered assertions remain scoped to the qualified presentation behavior; later repairs and merge do not constitute a new full browser or physical-phone campaign.

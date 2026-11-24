@@ -745,10 +745,10 @@ async fn source_fence_refuses_resource_plan_inspection_and_retry_artifact_near_m
 }
 
 #[tokio::test]
-async fn migration_179_populated_upgrade_preserves_retry_and_adds_initial_source_authority() {
-    let (retry_db, assessment, receipt) = migration_176_pending_fixture().await;
+async fn migration_182_populated_upgrade_preserves_retry_and_adds_initial_source_authority() {
+    let (retry_db, assessment, receipt) = migration_179_pending_fixture().await;
     assert_eq!(
-        crate::migrations::run_through_for_test(retry_db.pool(), 178)
+        crate::migrations::run_through_for_test(retry_db.pool(), 181)
             .await
             .unwrap(),
         3
@@ -769,10 +769,10 @@ async fn migration_179_populated_upgrade_preserves_retry_and_adds_initial_source
         .connect("sqlite::memory:")
         .await
         .unwrap();
-    crate::migrations::setup_real_175_for_test(&initial_pool).await;
+    crate::migrations::setup_real_178_for_test(&initial_pool).await;
     let initial_db = Database::from_pool_for_tests(initial_pool, String::new());
     assert_eq!(
-        crate::migrations::run_through_for_test(initial_db.pool(), 178)
+        crate::migrations::run_through_for_test(initial_db.pool(), 181)
             .await
             .unwrap(),
         3
@@ -786,8 +786,7 @@ async fn migration_179_populated_upgrade_preserves_retry_and_adds_initial_source
         },
     )
     .await;
-    // Reproduce the installed165 admission SQL, without asking the current168
-    // API to execute against an intentionally historical schema.
+    // The migration-181 schema accepts this initial receipt without source authority.
     let initial_obligation = initial_db.begin_close_foundation(
         &product_id("migration166-initial"),
         &TranscriptConversationId::parse("migration166-initial").unwrap(),
@@ -806,20 +805,20 @@ async fn migration_179_populated_upgrade_preserves_retry_and_adds_initial_source
     let initial_run = CloseRunRef::initial(initial_obligation.attempt_id().clone());
 
     assert_eq!(
-        crate::migrations::run_through_for_test(retry_db.pool(), 179)
+        crate::migrations::run_through_for_test(retry_db.pool(), 182)
             .await
             .unwrap(),
         1
     );
     assert_eq!(
-        crate::migrations::run_through_for_test(initial_db.pool(), 179)
+        crate::migrations::run_through_for_test(initial_db.pool(), 182)
             .await
             .unwrap(),
         1
     );
     // Current writers require the acknowledgement schema even without ack rows.
-    crate::migrations::run_through_for_test(retry_db.pool(), 183).await.unwrap();
-    crate::migrations::run_through_for_test(initial_db.pool(), 183).await.unwrap();
+    crate::migrations::run_through_for_test(retry_db.pool(), 186).await.unwrap();
+    crate::migrations::run_through_for_test(initial_db.pool(), 186).await.unwrap();
     historical_write_source_fence_state(&retry_db, &assessment.command, &ConvState::Idle)
         .await
         .unwrap();

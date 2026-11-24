@@ -17,7 +17,7 @@ The skills system itself — discovery, invocation, frontmatter parsing, the `/s
 - `specs/skills/` — backend skill discovery, frontmatter parsing, slash-command invocation expansion, catalog rendering for the LLM system prompt
 - `specs/builtin-skills/` — embedded skill assets, startup extraction to disk, override precedence (filesystem skills shadow built-ins of the same name)
 - `specs/conversation-ui/` — the parent layout that hosts the Skills panel; the `InputArea` that consumes the inserted invocation
-- `specs/inline-references/` — `@file` / `/skill` autocomplete inside the input (the "type / and see suggestions" path; the Skills panel is the "browse the catalog" path)
+- `specs/inline-references/` — `./path` / `/skill` autocomplete inside the input (the "type / and see suggestions" path; the Skills panel is the "browse the catalog" path)
 
 ## Why It Exists
 

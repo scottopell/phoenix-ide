@@ -319,6 +319,44 @@ const markdownImageMessages: Message[] = [
   },
 ];
 
+export const narrowWebKitMarkdownTableMessages: Message[] = [
+  {
+    event_presentation: null,
+    message_id: 'user-narrow-webkit-table-1',
+    conversation_id: 'fixture-message-list-narrow-webkit-markdown-table',
+    sequence_id: 1,
+    type: 'user',
+    message_type: 'user',
+    created_at: '2025-01-01T10:00:00.000Z',
+    content: { text: 'Show the merge plan table.' },
+    display_data: {},
+  },
+  {
+    event_presentation: null,
+    message_id: 'agent-narrow-webkit-table-1',
+    conversation_id: 'fixture-message-list-narrow-webkit-markdown-table',
+    sequence_id: 2,
+    type: 'agent',
+    message_type: 'agent',
+    created_at: '2025-01-01T10:01:00.000Z',
+    content: [{
+      type: 'text',
+      text: [
+        'Exact incident table fixture:',
+        '',
+        '| Merge | What it unblocks |',
+        '| --- | --- |',
+        '| **#760 specification** | Preserves the `conversation-ui` transcript requirements while follow-up implementation work proceeds. |',
+        '| **#760 implementation follow-up** | Keeps ordinary conversation polish moving without conflating this table symptom with prior inline-code sizing work. |',
+        '| **#769 performance** | Confirms the WebKit readability fix independently from the compact chronology incident. |',
+        '',
+        'Text after the table confirms the message column recovers after the scroll wrapper.',
+      ].join('\n'),
+    }],
+    display_data: {},
+  },
+];
+
 const wideMarkdownTableMessages: Message[] = [
   {
     event_presentation: null,
@@ -359,6 +397,49 @@ const wideMarkdownTableMessages: Message[] = [
 ];
 
 
+const delayedImageMessages: Message[] = [
+  {
+    event_presentation: null,
+    message_id: 'delayed-image-older',
+    conversation_id: 'fixture-message-list-delayed-image-scroll',
+    sequence_id: 1,
+    type: 'agent',
+    message_type: 'agent',
+    created_at: '2025-01-01T10:00:00.000Z',
+    content: [{ type: 'text', text: `Earlier image row: this conversation history is intentionally ahead of the reading anchor.\n\n![Earlier delayed screenshot](https://message-list-fixture.invalid/delayed-image.svg?id=earlier)\n\n${'Earlier context paragraph. '.repeat(32)}` }],
+    display_data: {},
+  },
+  {
+    event_presentation: null,
+    message_id: 'delayed-image-anchor',
+    conversation_id: 'fixture-message-list-delayed-image-scroll',
+    sequence_id: 2,
+    type: 'agent',
+    message_type: 'agent',
+    created_at: '2025-01-01T10:01:00.000Z',
+    content: [{ type: 'text', text: [
+      'Reading position setup: this is the same full MessageList render path used by conversations. This opening paragraph spans several lines so the reading row crosses the top of the viewport while the exact sentence below remains visible. The earlier screenshot belongs to a fully preceding row; the next screenshot belongs to this reading row and grows above the sentence.',
+      '',
+      '![Delayed screenshot](https://message-list-fixture.invalid/delayed-image.svg?id=anchor)',
+      '',
+      'Keep this exact sentence visible while the image is pending and after its bytes load.',
+      '',
+      ...Array.from({ length: 40 }, (_, index) => `Anchor detail ${String(index + 1).padStart(2, '0')}: delayed image layout changes must not silently discard this reading position.`),
+    ].join('\n') }],
+    display_data: {},
+  },
+  {
+    event_presentation: null,
+    message_id: 'delayed-image-tail',
+    conversation_id: 'fixture-message-list-delayed-image-scroll',
+    sequence_id: 3,
+    type: 'user',
+    message_type: 'user',
+    created_at: '2025-01-01T10:02:00.000Z',
+    content: { text: 'Tail checkpoint: use this to test follow-latest and intentional navigation.' },
+    display_data: {},
+  },
+];
 const continuityParagraphs = Array.from({ length: 28 }, (_, index) => (
   `Continuity marker ${String(index + 1).padStart(2, '0')}: this is deterministic tall-row text used to keep a precise reading position visible while earlier history is inserted.`
 ));
@@ -415,6 +496,12 @@ export const prefixContinuityEarlierMessages: Message[] = Array.from({ length: 1
 
 export const messageListScenarios = [
   {
+    id: 'delayed-image-scroll',
+    title: 'Settled reading through delayed images',
+    description: 'Cold images above and within the reading row; responses controlled by browser QA.',
+    theme: 'dark',
+  },
+  {
     id: 'compact-latest-expanded',
     title: 'Compact latest expanded',
     description: 'Latest finalized assistant summary stays expanded in compact density.',
@@ -443,6 +530,18 @@ export const messageListScenarios = [
     title: 'Prefix continuity offset bug',
     description: 'Interactive real-VirtualTranscript reproduction of identity-only restoration jumping within a tall row.',
     theme: 'dark',
+  },
+  {
+    id: 'narrow-webkit-markdown-table',
+    title: 'Narrow WebKit Markdown table / dark',
+    description: 'Exact two-column Merge / What it unblocks incident table in dark theme.',
+    theme: 'dark',
+  },
+  {
+    id: 'narrow-webkit-markdown-table-light',
+    title: 'Narrow WebKit Markdown table / light',
+    description: 'Exact two-column Merge / What it unblocks incident table in light theme.',
+    theme: 'light',
   },
   {
     id: 'wide-markdown-table',
@@ -479,13 +578,17 @@ export function messageListFixtureData(scenario: MessageListScenario): MessageLi
       ? compactChronologyInitialMessages
       : scenario.id === 'markdown-image-dark'
       ? markdownImageMessages
-      : scenario.id === 'wide-markdown-table' || scenario.id === 'wide-markdown-table-light'
-        ? wideMarkdownTableMessages
+      : scenario.id === 'narrow-webkit-markdown-table' || scenario.id === 'narrow-webkit-markdown-table-light'
+        ? narrowWebKitMarkdownTableMessages
+        : scenario.id === 'wide-markdown-table' || scenario.id === 'wide-markdown-table-light'
+          ? wideMarkdownTableMessages
         : scenario.id === 'scroll-policy-long'
           ? scrollPolicyMessages
           : scenario.id === 'prefix-continuity-offset-bug'
             ? prefixContinuityMessages
-            : baseMessages;
+            : scenario.id === 'delayed-image-scroll'
+              ? delayedImageMessages
+              : baseMessages;
   return {
     conversationId: `fixture-message-list-${scenario.id}`,
     slug: `fixture-message-list-${scenario.id}`,

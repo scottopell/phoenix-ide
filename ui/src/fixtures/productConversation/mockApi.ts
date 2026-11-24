@@ -1,6 +1,10 @@
-import { api, type Conversation, type Message } from '../../api';
+import { api, ApiResponseError, type Conversation, type Message, type ProductConversationHistorySnapshotView } from '../../api';
 import { coordinatorSnapshot } from './scenarios';
 import type { ProductConversationScenario } from './types';
+
+function isOrdinarySnapshot(snapshot: NonNullable<ProductConversationScenario['snapshot']>): snapshot is ProductConversationHistorySnapshotView {
+  return 'close' in snapshot;
+}
 
 function latestConversation(scenario: ProductConversationScenario): Conversation {
   const snapshot = scenario.snapshot;
@@ -47,7 +51,9 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
   const originalGetWorkScopeInventory = api.getWorkScopeInventory;
   const originalListForkProposals = api.listForkProposals;
   const originalReconcileAcceptedMessages = api.reconcileAcceptedMessages;
+  const originalUploadAttachments = api.uploadAttachments;
   const originalContinueConversation = api.continueConversation;
+  const originalRetryContinuationOpening = api.retryContinuationOpening;
   const originalFetch = globalThis.fetch;
   const OriginalWebSocket = globalThis.WebSocket;
   let snapshotRequestCount = 0;
@@ -56,6 +62,15 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
   let eventSourceOpenCount = 0;
   let eventSourceInitCount = 0;
   let latestEventSource: FixtureEventSource | null = null;
+  let lastSubmittedMessage: Message | null = null;
+  let currentSnapshot = scenario.snapshot;
+  let staleSnapshot: typeof currentSnapshot;
+  const holdStaleSnapshot = () => { staleSnapshot = currentSnapshot; };
+  window.addEventListener('product-conversation-fixture-stale-snapshot', holdStaleSnapshot);
+  let currentConversation = latestConversation(scenario);
+  let currentMessages = scenario.alignedLatestMessages
+    ?? (scenario.snapshot?.segments.at(-1)?.messages ?? []) as Message[];
+  let continuationPublished = false;
   let releaseOlderSnapshot: (() => void) | null = null;
 
   const record = (name: string, value: number | string) => {
@@ -74,8 +89,44 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
   };
   window.addEventListener('product-conversation-fixture-hold-older', holdOlderPage);
   window.addEventListener('product-conversation-fixture-release-older', releaseOlderPage);
+  let holdSuccessorInit = false;
+  const heldSuccessorInits: Array<() => void> = [];
+  const holdSuccessor = () => { holdSuccessorInit = true; };
+  const releaseSuccessor = () => {
+    holdSuccessorInit = false;
+    for (const release of heldSuccessorInits.splice(0)) release();
+  };
+  window.addEventListener('product-conversation-fixture-hold-successor', holdSuccessor);
+  window.addEventListener('product-conversation-fixture-release-successor', releaseSuccessor);
+  let holdSuccessorReadback = false;
+  let releaseSuccessorReadback: (() => void) | null = null;
+  const holdSuccessorConversationRead = () => { holdSuccessorReadback = true; };
+  const releaseSuccessorConversationRead = () => { holdSuccessorReadback = false; releaseSuccessorReadback?.(); releaseSuccessorReadback = null; };
+  window.addEventListener('product-conversation-fixture-hold-successor-readback', holdSuccessorConversationRead);
+  window.addEventListener('product-conversation-fixture-release-successor-readback', releaseSuccessorConversationRead);
+  let resolveUpload: ((files: Awaited<ReturnType<typeof api.uploadAttachments>>) => void) | null = null;
+  let holdUpload = false;
+  const holdFixtureUpload = () => { holdUpload = true; };
+  api.uploadAttachments = async (conversationId, files) => holdUpload
+    ? await new Promise(resolve => { resolveUpload = resolve; })
+    : originalUploadAttachments(conversationId, files);
+  window.addEventListener('product-conversation-fixture-hold-upload', holdFixtureUpload);
+  const completeUpload = () => resolveUpload?.([{ original_name: 'notes.txt', media_type: 'text/plain', size_bytes: 4, stored_path: 'notes.txt' }]);
+  window.addEventListener('product-conversation-fixture-complete-upload', completeUpload);
 
+  let snapshotUnavailable = false;
+  const failSnapshot = () => { snapshotUnavailable = true; };
+  const restoreSnapshot = () => { snapshotUnavailable = false; staleSnapshot = undefined; };
+  const checkSnapshotFailure = () => {
+    if (!snapshotUnavailable) return;
+    throw new Error('Fixture continuation snapshot unavailable');
+  };
+  window.addEventListener('product-conversation-fixture-fail-snapshot', failSnapshot);
+  window.addEventListener('product-conversation-fixture-restore-snapshot', restoreSnapshot);
   api.getProductConversationHistorySnapshot = async (_productConversationId, options = {}) => {
+    const requestOptions = options ?? {};
+    if (!requestOptions.before) checkSnapshotFailure();
+    if (scenario.sourceSnapshot && !scenario.sourceIsGlobal && _productConversationId === scenario.sourceSnapshot.product_conversation_id) return scenario.sourceSnapshot;
     if (scenario.kind === 'coordinator') throw new Error('Global must not request ordinary history');
     if (scenario.sourceSnapshot && _productConversationId !== 'fixture-product-conversation') {
       if (scenario.sourceIsGlobal) throw new Error("Global must not request ordinary snapshot");
@@ -93,8 +144,8 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
     if (!scenario.snapshot) {
       throw new Error(`Scenario ${scenario.id} is missing snapshot data`);
     }
-    if (options.before) {
-      const older = scenario.olderPages?.[options.before] ?? (options.before === scenario.snapshot.before ? scenario.olderSnapshot : undefined);
+    if (requestOptions.before) {
+      const older = scenario.olderPages?.[requestOptions.before] ?? (requestOptions.before === scenario.snapshot.before ? scenario.olderSnapshot : undefined);
       if (!older) {
         throw new Error(`Scenario ${scenario.id} received an unexpected older-history cursor`);
       }
@@ -109,10 +160,15 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
       await heldOlderPage;
       return older;
     }
-    return scenario.snapshot;
+    const snapshot = staleSnapshot ?? currentSnapshot;
+    if (!snapshot || !isOrdinarySnapshot(snapshot)) throw new Error(`Scenario ${scenario.id} has no ordinary snapshot`);
+    return snapshot;
   };
 
   api.getProductConversationSnapshot = async (reference, options = {}) => {
+    if (scenario.aliasFallbackNotFound && reference === scenario.snapshot?.latest_transcript_row_id) {
+      throw new ApiResponseError('Conversation aggregate not found', 404);
+    }
     const history = await api.getProductConversationHistorySnapshot(reference, options);
     const { boundaries, segments, ...metadata } = history;
     const pages = scenario.kind === 'coordinator' ? [] : [scenario.snapshot, scenario.olderSnapshot, ...Object.values(scenario.olderPages ?? {})];
@@ -133,6 +189,7 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
   };
 
   api.getCoordinatorHistory = async (reference, options = {}) => {
+    if (!options.before) checkSnapshotFailure();
     if (scenario.kind !== 'coordinator') {
       if (scenario.sourceIsGlobal && scenario.sourceSnapshot) return coordinatorSnapshot(scenario.sourceSnapshot);
       throw new Error(`Unexpected Global history reference: ${reference}`);
@@ -140,7 +197,7 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
     if (![scenario.snapshot.product_conversation_id, ...scenario.snapshot.segments.map(segment => segment.transcript_row_id)].includes(reference)) throw new Error(`Unknown Global member: ${reference}`);
     snapshotRequestCount += 1;
     record('SnapshotRequests', snapshotRequestCount);
-    if (!options.before) return scenario.snapshot;
+    if (!options.before) return (staleSnapshot ?? currentSnapshot) as typeof scenario.snapshot;
     const older = scenario.olderPages?.[options.before];
     if (!older) throw new Error(`Unknown Global cursor: ${options.before}`);
     record('OlderSnapshotRequests', Number(document.documentElement.dataset['productConversationFixtureOlderSnapshotRequests'] ?? '0') + 1);
@@ -168,29 +225,34 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
     work_change: { kind: 'clean' as const },
   });
 
-  const conversation = latestConversation(scenario);
-  const route = { id: conversation.id, slug: conversation.slug };
-  const messages = scenario.alignedLatestMessages
-    ?? (scenario.sourceSnapshot ? [] : scenario.snapshot?.segments.at(-1)?.messages ?? []) as Message[];
+  const conversation = currentConversation;
+  let predecessorConversation: Conversation | null = null;
+  let route = { id: conversation.id, slug: conversation.slug };
 
   const sourceId = scenario.sourceSnapshot?.segments[0]?.transcript_row_id;
   const sourceConversation = { ...conversation, id: sourceId ?? conversation.id, slug: sourceId ?? conversation.slug };
   const sourceMessages = (scenario.sourceSnapshot?.segments[0]?.messages ?? []) as Message[];
   api.getConversationRoute = async (id) => id === sourceId ? { id, slug: id } : route;
   api.getConversationRouteBySlug = async (id) => id === sourceId ? { id, slug: id } : route;
-  api.getConversation = async (id) => ({
-    conversation: id === sourceId ? sourceConversation : scenario.snapshot?.segments.some(segment => segment.transcript_row_id === id)
-      ? { ...conversation, id, slug: id } : conversation,
-    messages: id === sourceId ? sourceMessages : (scenario.snapshot?.segments.find(segment => segment.transcript_row_id === id)?.messages as Message[] | undefined) ?? messages,
-    agent_working: false,
-    presentation_mode: 'idle',
-    context_window_size: 128_000,
-  });
-  api.listProductConversations = async () => ({ product_conversations: [] });
+  api.getConversation = async (id) => {
+    if (holdSuccessorReadback && id === currentConversation.id) {
+      await new Promise<void>(resolve => { releaseSuccessorReadback = resolve; });
+    }
+    return {
+      conversation: id === sourceId ? sourceConversation : id === predecessorConversation?.id ? predecessorConversation
+        : currentSnapshot?.segments.some(segment => segment.transcript_row_id === id)
+          ? { ...currentConversation, id, slug: id } : currentConversation,
+      messages: id === sourceId ? sourceMessages : (currentSnapshot?.segments.find(segment => segment.transcript_row_id === id)?.messages as Message[] | undefined) ?? currentMessages,
+      agent_working: false,
+      presentation_mode: 'idle',
+      context_window_size: 128_000,
+    };
+  };
+  api.listProductConversations = async () => ({ product_conversations: [], coordinator: null });
   api.getProductConversationAutomaticContinuation = async (id) => ({ aggregate: { kind: 'ordinary', product_conversation_id: id }, auto_continue_on_context_exhaustion: false, admission: null });
   api.getCoordinatorAutomaticContinuation = async () => ({ aggregate: { kind: 'coordinator', product_conversation_id: 'source-product' }, auto_continue_on_context_exhaustion: false, admission: null });
   api.ensureGlobalCoordinator = async () => ({ conversation: scenario.kind === 'coordinator' ? conversation : { ...sourceConversation, id: 'current-global', slug: 'current-global' }, created: false });
-  api.resolveCoordinatorRoute = async (id) => ({ coordinator_id: scenario.kind === 'coordinator' && scenario.snapshot.segments.some(segment => segment.transcript_row_id === id) ? scenario.snapshot.product_conversation_id : scenario.sourceIsGlobal && (id === sourceId || id === 'current-global') ? scenario.sourceSnapshot?.product_conversation_id ?? null : scenario.initialEntry === `/global/${id}` ? id : null });
+  api.resolveCoordinatorRoute = async (id) => ({ coordinator_id: scenario.kind === 'coordinator' && currentSnapshot?.segments.some(segment => segment.transcript_row_id === id) ? scenario.snapshot.product_conversation_id : scenario.sourceIsGlobal && (id === sourceId || id === 'current-global') ? scenario.sourceSnapshot?.product_conversation_id ?? null : scenario.initialEntry === `/global/${id}` ? id : null });
   api.listConversations = async () => [];
   api.listArchivedConversations = async () => [];
   api.listModels = async () => ({
@@ -214,6 +276,22 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
       status: 'steering_queued' as const,
     })),
   });
+  let failOpeningRetry = false;
+  let openingRetryCount = 0;
+  const failNextOpeningRetry = () => { failOpeningRetry = true; };
+  window.addEventListener('product-conversation-fixture-fail-opening-retry', failNextOpeningRetry);
+  api.retryContinuationOpening = async predecessorId => {
+    record('OpeningRetryPredecessor', predecessorId);
+    record('OpeningRetryCount', ++openingRetryCount);
+    if (!currentSnapshot || currentSnapshot.latest_opening.status !== 'pending') throw new Error('No pending opening');
+    if (predecessorId !== currentSnapshot.latest_opening.edge.predecessor_transcript_row_id) throw new Error('Wrong predecessor');
+    if (failOpeningRetry) {
+      failOpeningRetry = false;
+      return { conversation_id: currentConversation.id, status: 'dispatch_failed', error: 'Fixture opening dispatch failed' };
+    }
+    acceptSuccessorOpening();
+    return { conversation_id: currentConversation.id, status: 'accepted' };
+  };
   api.continueConversation = async () => ({
     conversation_id: 'fixture-successor',
     slug: 'fixture-successor',
@@ -225,16 +303,86 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
   };
   window.addEventListener('product-conversation-fixture-release-older', releaseOlderSnapshotResponse);
 
+  let reminderFailuresRemaining = scenario.reminderFixture?.initialFailures ?? 0;
+  let reminderFailuresAfterLoad = scenario.reminderFixture?.failuresAfterFirstLoad ?? 0;
+  let hasLoadedReminders = false;
+  let reminderRequestCount = 0;
+  let reminderRevisionBump = 0;
+  let reminderMutationCount = 0;
+  let conflictRows: import('../../generated/Reminder').Reminder[] | undefined;
   globalThis.fetch = async (input, init) => {
     const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+    const requestUrl = new URL(url, location.href);
+    const reminderPath = `/api/conversations/${encodeURIComponent(conversation.id)}/reminders`;
+    if (scenario.reminderFixture && requestUrl.pathname === reminderPath && (init?.method ?? 'GET') === 'GET') {
+      if (scenario.reminderFixture.reminders.some((row) => row.product_conversation_id !== scenario.snapshot?.product_conversation_id)) {
+        throw new Error('Reminders fixture owner differs from product conversation');
+      }
+      reminderRequestCount += 1;
+      record('ReminderRequests', reminderRequestCount);
+      if (reminderFailuresRemaining > 0) {
+        reminderFailuresRemaining -= 1;
+        record('ReminderState', 'failed');
+        return Response.json({ error: 'Fixture reminder service unavailable' }, { status: 503 });
+      }
+      if (hasLoadedReminders && reminderFailuresAfterLoad > 0) {
+        reminderFailuresAfterLoad -= 1;
+        record('ReminderState', 'failed');
+        return Response.json({ error: 'Fixture reminder service unavailable after focus refresh' }, { status: 503 });
+      }
+      hasLoadedReminders = true;
+      record('ReminderState', 'loaded');
+      const rows = conflictRows ?? scenario.reminderFixture.reminders;
+      const servedRows = scenario.reminderFixture.advanceRevisionOnRefresh
+        ? rows.map((row) => ({ ...row, revision: row.revision + reminderRevisionBump }))
+        : rows;
+      if (scenario.reminderFixture.advanceRevisionOnRefresh) reminderRevisionBump += 1;
+      record('ReminderServedRevision', servedRows.find((row) => row.id === 'upcoming-fixture')?.revision ?? 0);
+      return Response.json(servedRows);
+    }
+    if (scenario.reminderFixture?.rejectMutation && requestUrl.pathname.startsWith(`${reminderPath}/`) && init?.method === 'POST') {
+      reminderMutationCount += 1;
+      record('ReminderMutations', reminderMutationCount);
+      const expectedRevision = (JSON.parse(String(init.body)) as { expected_revision: number }).expected_revision;
+      const current = (conflictRows ?? scenario.reminderFixture.reminders).find((row) => row.id === 'upcoming-fixture');
+      if (!current || !requestUrl.pathname.endsWith('/upcoming-fixture/cancel')) throw new Error('Unexpected fixture reminder mutation');
+      record('LastReminderRevision', expectedRevision);
+      if (!conflictRows) {
+        conflictRows = scenario.reminderFixture.reminders.map((row) => row.id === current.id
+          ? { ...row, revision: row.revision + 1, text: 'Check the release candidate — revised on server' }
+          : row);
+      }
+      const latest = conflictRows.find((row) => row.id === current.id)!;
+      if (expectedRevision !== latest.revision) {
+        record('ReminderMutation', 'rejected');
+        return Response.json({ kind: 'revision_conflict', error: 'The reminder changed in this fixture.', current: latest }, { status: 409 });
+      }
+      conflictRows = conflictRows.map((row) => row.id === latest.id
+        ? { ...row, revision: row.revision + 1, state: { kind: 'cancelled', cancelled_at_us: 1783000000000000 } }
+        : row);
+      record('ReminderMutation', 'accepted');
+      record('ReminderAcceptedRevision', conflictRows.find((row) => row.id === latest.id)?.revision ?? 0);
+      return Response.json({ reminder: conflictRows.find((row) => row.id === latest.id) });
+    }
     if (url.endsWith('/api/telemetry/conversation-open') || url.endsWith('/api/telemetry/product-conversation-open')) {
       return new Response(null, { status: 204 });
     }
+    if (url.endsWith(`/api/conversations/${encodeURIComponent(conversation.id)}/reminders`) && (init?.method ?? 'GET') === 'GET') {
+      return Response.json([] satisfies Awaited<ReturnType<typeof api.listReminders>>);
+    }
     if (url.endsWith(`/api/conversations/${conversation.id}/chat`) && init?.method === 'POST') {
-      const body = JSON.parse(String(init.body)) as { text?: string };
+      const body = JSON.parse(String(init.body)) as { text?: string; message_id: string };
       sendCount += 1;
       record('SendCount', sendCount);
       record('LastSentText', body.text ?? '');
+      lastSubmittedMessage = {
+        event_presentation: null, message_id: `${conversation.id}:${body.message_id}`, conversation_id: conversation.id,
+        sequence_id: Math.max(0, ...currentMessages.map(message => message.sequence_id)) + 1,
+        message_type: 'user', content: { text: body.text ?? '' }, created_at: new Date().toISOString(),
+      };
+      if (scenario.sendFailure === 'before-acceptance') return Response.json({ error: 'Fixture expansion rejected', error_type: 'skill_invocation_failed', reference: '/broken-skill' }, { status: 422 });
+      if (scenario.sendFailure === 'after-acceptance') latestEventSource?.emitMessage(lastSubmittedMessage);
+      if (scenario.sendFailure) return Response.json({ error: 'Fixture send failure' }, { status: 503 });
       return Response.json({ queued: false, already_persisted: true });
     }
     if ((init?.method ?? 'GET') === 'GET' && scenario.initialEntry?.startsWith('/global/')) {
@@ -284,6 +432,8 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
   globalThis.WebSocket = FixtureWebSocket as unknown as typeof WebSocket;
 
   const OriginalEventSource = globalThis.EventSource;
+  const eventSources = new Set<FixtureEventSource>();
+  const eventSequenceByMember = new Map<string, number>();
   class FixtureEventSource {
     static readonly CONNECTING = 0;
     static readonly OPEN = 1;
@@ -297,16 +447,38 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
     private readonly listeners = new Map<string, Set<(event: MessageEvent<string>) => void>>();
     private readonly instanceId: number;
     private readonly isSource: boolean;
+    private readonly isTranscript: boolean;
+    private readonly conversationId: string;
+    get id(): number { return this.instanceId; }
+    get memberId(): string { return this.conversationId; }
+    nextSequenceId(): number {
+      const next = (eventSequenceByMember.get(this.conversationId) ?? 1) + 1;
+      eventSequenceByMember.set(this.conversationId, next);
+      return next;
+    }
 
     constructor(url: string) {
       this.isSource = Boolean(sourceId && url.includes(sourceId));
+      const parsed = new URL(url, location.href);
+      this.isTranscript = parsed.pathname === '/api/conversation-reads/stream'
+        || /^\/api\/conversations\/[^/]+\/stream$/.test(parsed.pathname);
+      this.conversationId = parsed.searchParams.get('reference')
+        ?? parsed.pathname.match(/^\/api\/conversations\/([^/]+)\/stream$/)?.[1] ?? '';
       eventSourceOpenCount += 1;
       this.instanceId = eventSourceOpenCount;
+      eventSources.add(this);
       latestEventSource = this; // eslint-disable-line @typescript-eslint/no-this-alias
       record('EventSourceOpens', eventSourceOpenCount);
       record('EventSourceLastInstance', this.instanceId);
       record('EventSourceLastUrl', url);
       queueMicrotask(() => this.onopen?.(new Event('open')));
+    }
+
+    emitMessage(message: Message): void {
+      const sequenceId = Math.max(this.nextSequenceId(), message.sequence_id);
+      eventSequenceByMember.set(this.conversationId, sequenceId);
+      const event = new MessageEvent<string>('message', { data: JSON.stringify({ opening: null, sequence_id: sequenceId, message: { ...message, sequence_id: sequenceId, origin: { kind: 'user_api' } } }) });
+      for (const listener of this.listeners.get('message') ?? []) listener(event);
     }
 
     triggerNativeError(): void {
@@ -321,49 +493,220 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
       const listeners = this.listeners.get(type) ?? new Set();
       listeners.add(callback);
       this.listeners.set(type, listeners);
+      record('ActiveTranscriptSubscriptions', [...eventSources].filter(source => source.isTranscript && source.subscriptionCount > 0).length);
       if (type === 'init') {
         queueMicrotask(() => {
           if (this.readyState === FixtureEventSource.CLOSED) return;
           eventSourceInitCount += 1;
           record('EventSourceInits', eventSourceInitCount);
           record('EventSourceLastInitializedInstance', this.instanceId);
+          const messages = this.isSource ? sourceMessages : this.conversationId === currentConversation.id ? currentMessages : (currentSnapshot?.segments.find(segment => segment.transcript_row_id === this.conversationId)?.messages ?? []);
+          const anchor = Math.max(1, eventSequenceByMember.get(this.conversationId) ?? 0, ...messages.map(message => message.sequence_id));
+          eventSequenceByMember.set(this.conversationId, anchor);
           const init = { opening: null,
-            sequence_id: 1,
-            conversation: this.isSource ? sourceConversation : conversation,
+            sequence_id: anchor,
+            conversation: this.isSource ? sourceConversation : this.conversationId === predecessorConversation?.id ? predecessorConversation : currentConversation,
             transcript_generation: 1,
             transcript_coverage: 'complete',
-            messages: this.isSource ? sourceMessages : messages,
+            messages,
             steering_messages: scenario.steeringMessages ?? [],
             agent_working: false,
-            last_sequence_id: 1,
+            last_sequence_id: anchor,
             stream_incarnation: `fixture-stream-${this.instanceId}`,
             presentation_mode: 'idle',
             context_window_size: 128_000,
             project_name: null,
-            pending_anchor_sequence_id: 1,
+            pending_anchor_sequence_id: anchor,
             pending_events: [],
             pending_truncated: false,
           };
-          callback(new MessageEvent('init', { data: JSON.stringify(init) }));
+          const deliver = () => {
+            callback(new MessageEvent('init', { data: JSON.stringify(init) }));
+            if (this.isTranscript) {
+              record('LastDeliveredInitMember', this.conversationId);
+              record('LastDeliveredInitInstance', this.instanceId);
+            }
+          };
+          if (holdSuccessorInit && this.conversationId === currentConversation.id && continuationPublished) heldSuccessorInits.push(deliver);
+          else deliver();
         });
       }
     }
 
-    removeEventListener(type: string, listener: EventListenerOrEventListenerObject): void {
-      this.listeners.get(type)?.delete(listener as (event: MessageEvent<string>) => void);
+    get subscriptionCount(): number { return [...this.listeners.values()].reduce((count, listeners) => count + listeners.size, 0); }
+
+    emit(type: string, data: unknown): void {
+      const event = new MessageEvent(type, { data: JSON.stringify(data) });
+      for (const listener of this.listeners.get(type) ?? []) listener(event);
     }
 
-    close(): void { this.readyState = FixtureEventSource.CLOSED; }
+    removeEventListener(type: string, listener: EventListenerOrEventListenerObject): void {
+      this.listeners.get(type)?.delete(listener as (event: MessageEvent<string>) => void);
+      record('ActiveTranscriptSubscriptions', [...eventSources].filter(source => source.isTranscript && source.subscriptionCount > 0).length);
+    }
+
+    close(): void {
+      if (this.readyState === FixtureEventSource.CLOSED) return;
+      this.readyState = FixtureEventSource.CLOSED;
+      eventSources.delete(this);
+      record('EventSourceCloses', Number(document.documentElement.dataset['productConversationFixtureEventSourceCloses'] ?? '0') + 1);
+      record('EventSourceLastClosedInstance', this.instanceId);
+      record('ActiveTranscriptSubscriptions', [...eventSources].filter(source => source.isTranscript && source.subscriptionCount > 0).length);
+    }
   }
+  let holdOpening = false;
+  const holdSuccessorOpening = () => { holdOpening = true; };
+  const acceptSuccessorOpening = () => {
+    if (!currentSnapshot || currentSnapshot.latest_opening.status !== 'pending') return;
+    const pending = currentSnapshot.latest_opening;
+    currentSnapshot = { ...currentSnapshot, latest_opening: {
+      status: 'accepted', edge: pending.edge, accepted_message_id: 'fixture-successor-opening',
+      opening_authority: pending.opening_authority, presentation: 'boundary',
+    } };
+    const stream = [...eventSources].find(source => source.memberId === currentConversation.id && source.readyState === FixtureEventSource.OPEN && source.subscriptionCount > 0);
+    if (!stream) throw new Error('Successor SSE has not opened');
+    const openingMessage: Message = {
+      message_id: 'fixture-successor-opening', conversation_id: currentConversation.id,
+      sequence_id: stream.nextSequenceId(), message_type: 'user', origin: { kind: 'unknown_historical' },
+      content: [{ type: 'text', text: 'Saved continuation opening' }],
+      display_data: null, usage_data: null, event_presentation: null, created_at: '2026-07-01T12:00:59Z',
+    };
+    currentMessages = [...currentMessages, openingMessage];
+    stream.emit('message', { opening: currentSnapshot.latest_opening, sequence_id: openingMessage.sequence_id, message: openingMessage });
+  };
+  window.addEventListener('product-conversation-fixture-hold-opening', holdSuccessorOpening);
+  window.addEventListener('product-conversation-fixture-accept-opening', acceptSuccessorOpening);
+  const publishContinuation = () => {
+    if (!scenario.continuationJourney || continuationPublished || !currentSnapshot) return;
+    continuationPublished = true;
+    const previous = currentConversation;
+    const predecessorId = previous.id;
+    const successorId = 'fixture-successor';
+    const last = currentSnapshot.segments.at(-1);
+    if (!last) throw new Error('Continuation fixture requires an existing transcript member');
+    const boundaryId = 'fixture-continuation-boundary';
+    const summary = 'The mobile investigation continues in the next transcript member.';
+    const predecessorSegment = { ...last, messages: [...last.messages, {
+      ...last.messages.at(-1)!, message_id: boundaryId, conversation_id: predecessorId,
+      sequence_id: Math.max(...last.messages.map(message => message.sequence_id), 1) + 1,
+      message_type: 'continuation' as const, content: { summary },
+    }] };
+    const successorSegment = { ...last, segment_ordinal: last.segment_ordinal + 1, transcript_row_id: successorId, slug: successorId,
+      title: 'Continued work', messages: [] };
+    currentSnapshot = { ...currentSnapshot, latest_transcript_row_id: successorId, writable_transcript_row_id: successorId,
+      canonical_route: scenario.kind === 'coordinator' ? `/global/${successorId}` : `/product-conversations/${currentSnapshot.product_conversation_id}`,
+      boundaries: [...currentSnapshot.boundaries, { message_id: boundaryId, represented_successor_opening_message_id: null,
+        predecessor_transcript_row_id: predecessorId, successor_transcript_row_id: successorId, segment_ordinal: last.segment_ordinal }],
+      segments: [...currentSnapshot.segments.slice(0, -1), predecessorSegment, successorSegment],
+      latest_opening: holdOpening ? {
+        status: 'pending', client_turn_key: 'fixture-successor-opening', opening_authority: 'generated_predecessor_context',
+        edge: { product_conversation_id: currentSnapshot.product_conversation_id,
+          predecessor_transcript_row_id: predecessorId, successor_transcript_row_id: successorId, continuation_message_id: boundaryId },
+      } : { status: 'none' } };
+    predecessorConversation = { ...previous, continued_in_conv_id: successorId };
+    currentConversation = { ...previous, id: successorId, slug: successorId, state: { type: 'idle' }, continued_in_conv_id: null, message_count: 0 };
+    route = { id: successorId, slug: successorId };
+    currentMessages = [];
+    record('ContinuationSnapshotPersisted', successorId);
+    record('ContinuationOldSubscription', latestEventSource?.id ?? 0);
+    const predecessorSource = [...eventSources].find(source => source.memberId === predecessorId && source.subscriptionCount > 0);
+    if (!predecessorSource) throw new Error('Predecessor SSE is not subscribed');
+    predecessorSource.emit('conversation_update', { sequence_id: predecessorSource.nextSequenceId(), conversation: { id: predecessorId, continued_in_conv_id: successorId } });
+    record('ContinuationUpdateInstance', predecessorSource.id);
+  };
+  window.addEventListener('product-conversation-fixture-continue', publishContinuation);
+  const publishPhase = (event: Event) => {
+    const phase = (event as CustomEvent<{ type: string; attempt?: number; summary?: string }>).detail;
+    const source = latestEventSource;
+    if (!phase || !source || source.readyState !== FixtureEventSource.OPEN || source.subscriptionCount < 1) return;
+    const sequenceId = source.nextSequenceId();
+    source.emit('state_change', {
+      sequence_id: sequenceId,
+      state: phase,
+      presentation_mode: phase.type,
+      state_updated_at: '2026-07-01T12:00:01Z',
+    });
+    record('EmittedPhaseSequence', sequenceId);
+    record('EmittedPhaseMember', source.memberId);
+  };
+  window.addEventListener('product-conversation-fixture-phase', publishPhase);
+  let successorMessageCount = 0;
+  const publishSuccessorMessage = () => {
+    if (!scenario.continuationJourney || !continuationPublished) return;
+    const successor = [...eventSources].find(source => source.memberId === currentConversation.id && source.readyState === FixtureEventSource.OPEN && source.subscriptionCount > 0);
+    if (!successor) throw new Error('Successor SSE has not opened');
+    successorMessageCount += 1;
+    const message: Message = {
+      message_id: `fixture-successor-message-${successorMessageCount}`, conversation_id: currentConversation.id,
+      sequence_id: successor.nextSequenceId(), message_type: 'agent', origin: { kind: 'unknown_historical' },
+      content: [{ type: 'text', text: successorMessageCount === 1 ? 'Successor is streaming after the handoff.' : 'Successor is streaming after reconnect.' }],
+      display_data: null, usage_data: null, event_presentation: null, created_at: '2026-07-01T12:01:00Z',
+    };
+    currentMessages = [...currentMessages, message];
+    successor.emit('message', { opening: null, sequence_id: message.sequence_id, message });
+    record('SuccessorMessageInstance', successor.id);
+  };
+  window.addEventListener('product-conversation-fixture-successor-message', publishSuccessorMessage);
+
+  const publishReviewProjection = (event: Event) => {
+    if (!scenario.reviewProjectionQa) return;
+    const source = latestEventSource;
+    if (!source || source.readyState !== FixtureEventSource.OPEN || source.subscriptionCount < 1) {
+      throw new Error('Review projection fixture requires an active transcript SSE subscription');
+    }
+    const mode = (event as CustomEvent<{ mode: string }>).detail?.mode;
+    if (mode === 'none') return;
+    const sequenceId = source.nextSequenceId();
+    if (mode === 'changed-message') {
+      const message = currentMessages.find(message => message.message_id === 'history-answer-3');
+      if (!message) throw new Error('Reviewed latest message missing');
+      const blocks = message.content as { type: 'text'; text: string }[];
+      const content = [{ type: 'text' as const, text: `Intentional changed-message control.\n\n${blocks[0]!.text}` }];
+      currentMessages = currentMessages.map(candidate => candidate === message ? { ...message, content } : candidate);
+      source.emit('message_updated', { opening: null, sequence_id: sequenceId, message_id: message.message_id, transcript_generation: 1, display_data: message.display_data, content });
+    } else {
+      const conversation = { title: `Fixture background projection ${sequenceId}`, updated_at: new Date(Date.parse('2026-07-01T12:00:00Z') + sequenceId).toISOString() };
+      currentConversation = { ...currentConversation, ...conversation };
+      source.emit('conversation_update', { sequence_id: sequenceId, conversation });
+    }
+    document.documentElement.dataset['productConversationFixtureReviewProjectionPublishes'] = '1';
+  };
+  window.addEventListener('product-conversation-fixture-review-projection', publishReviewProjection);
+
   globalThis.EventSource = FixtureEventSource as unknown as typeof EventSource;
-  const failLatestEventSource = () => latestEventSource?.triggerNativeError();
+  const failLatestEventSource = () => {
+    const stream = [...eventSources].find(source => source.memberId === currentConversation.id && source.readyState === FixtureEventSource.OPEN && source.subscriptionCount > 0);
+    if (!stream) throw new Error('Current transcript SSE has not opened');
+    record('FailedTranscriptInstance', stream.id);
+    stream.triggerNativeError();
+  };
+  const acknowledgeLastSend = () => { if (lastSubmittedMessage) latestEventSource?.emitMessage(lastSubmittedMessage); };
+  window.addEventListener('product-conversation-fixture-acknowledge-last-send', acknowledgeLastSend);
   window.addEventListener('product-conversation-fixture-stream-failure', failLatestEventSource);
 
   return () => {
     window.removeEventListener('product-conversation-fixture-hold-older', holdOlderPage);
+    window.removeEventListener('product-conversation-fixture-stale-snapshot', holdStaleSnapshot);
+    window.removeEventListener('product-conversation-fixture-fail-snapshot', failSnapshot);
+    window.removeEventListener('product-conversation-fixture-restore-snapshot', restoreSnapshot);
     window.removeEventListener('product-conversation-fixture-release-older', releaseOlderPage);
+    window.removeEventListener('product-conversation-fixture-hold-successor', holdSuccessor);
+    window.removeEventListener('product-conversation-fixture-release-successor', releaseSuccessor);
+    releaseSuccessor();
+    window.removeEventListener('product-conversation-fixture-hold-successor-readback', holdSuccessorConversationRead);
+    window.removeEventListener('product-conversation-fixture-release-successor-readback', releaseSuccessorConversationRead);
+    releaseSuccessorConversationRead();
+    window.removeEventListener('product-conversation-fixture-complete-upload', completeUpload);
+    window.removeEventListener('product-conversation-fixture-hold-upload', holdFixtureUpload);
+    api.uploadAttachments = originalUploadAttachments;
     releaseOlderPage();
     window.removeEventListener('product-conversation-fixture-stream-failure', failLatestEventSource);
+    window.removeEventListener('product-conversation-fixture-acknowledge-last-send', acknowledgeLastSend);
+    window.removeEventListener('product-conversation-fixture-continue', publishContinuation);
+    window.removeEventListener('product-conversation-fixture-hold-opening', holdSuccessorOpening);
+    window.removeEventListener('product-conversation-fixture-accept-opening', acceptSuccessorOpening);
+    window.removeEventListener('product-conversation-fixture-phase', publishPhase);
+    window.removeEventListener('product-conversation-fixture-successor-message', publishSuccessorMessage);
     api.getPrStatus = originalGetPrStatus;
     api.getProductConversationHistorySnapshot = originalGetProductConversationSnapshot;
     api.getProductConversationSnapshot = originalDefaultSnapshot;
@@ -388,6 +731,10 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
     api.listForkProposals = originalListForkProposals;
     api.reconcileAcceptedMessages = originalReconcileAcceptedMessages;
     api.continueConversation = originalContinueConversation;
+    api.retryContinuationOpening = originalRetryContinuationOpening;
+    window.removeEventListener('product-conversation-fixture-review-projection', publishReviewProjection);
+    delete document.documentElement.dataset['productConversationFixtureReviewProjectionPublishes'];
+    window.removeEventListener('product-conversation-fixture-fail-opening-retry', failNextOpeningRetry);
     window.removeEventListener('product-conversation-fixture-release-older', releaseOlderSnapshotResponse);
     globalThis.fetch = originalFetch;
     globalThis.WebSocket = OriginalWebSocket;

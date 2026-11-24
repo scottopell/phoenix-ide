@@ -4,9 +4,11 @@
  * for insecure contexts (non-localhost HTTP) where navigator.clipboard
  * is undefined.
  *
- * Returns true on success, false if both paths fail.
+ * Returns true on success, false if copying fails or is aborted before fallback.
  */
-export async function copyToClipboard(text: string): Promise<boolean> {
+export async function copyToClipboard(text: string, signal?: AbortSignal): Promise<boolean> {
+  if (signal?.aborted) return false;
+
   if (navigator.clipboard?.writeText) {
     try {
       await navigator.clipboard.writeText(text);
@@ -16,6 +18,8 @@ export async function copyToClipboard(text: string): Promise<boolean> {
       // focused, etc.). Fall through to the execCommand path.
     }
   }
+
+  if (signal?.aborted) return false;
 
   const textarea = document.createElement('textarea');
   textarea.value = text;

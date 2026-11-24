@@ -76,7 +76,7 @@ def _reconciliation(rows: list[dict]) -> list[dict]:
     parent_names = {
         "rust": "rust-cargo-test.json",
         "vitest": "vitest-vitest.json",
-        "python": "spec-shape-dev.py-unit-tests.json",
+        "python": "devpy-dev.py-unit-tests.json",
         "e2e": "e2e-e2e.json",
     }
     child_match = {

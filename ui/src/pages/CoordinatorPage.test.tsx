@@ -16,6 +16,7 @@ vi.mock('../hooks/conversationViewTelemetry', async importOriginal => {
 const { apiMock } = vi.hoisted(() => ({
   apiMock: {
     ensureGlobalCoordinator: vi.fn(),
+    getCoordinatorLanguage: vi.fn(),
     getConversation: vi.fn(),
     resolveCoordinatorRoute: vi.fn(),
     getCoordinatorAutomaticContinuation: vi.fn(),
@@ -92,6 +93,7 @@ describe('CoordinatorPage', () => {
     vi.useRealTimers();
     vi.clearAllMocks();
     apiMock.ensureGlobalCoordinator.mockResolvedValue({ conversation: coordinatorConversation() });
+    apiMock.getCoordinatorLanguage.mockResolvedValue({ language: 'phoenix-native', available: ['phoenix-native'], languages: [{ id: 'phoenix-native', label: 'Phoenix', description: 'Default style' }] });
     apiMock.resolveCoordinatorRoute.mockResolvedValue({ coordinator_id: 'conv-coordinator' });
     apiMock.getConversation.mockImplementation(async (id: string) => ({ conversation: { id } }));
     apiMock.listLiveCoordinatorBashHandles.mockResolvedValue([]);

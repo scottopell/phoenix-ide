@@ -1515,6 +1515,7 @@ mod tests {
         let groups = vec![group(a.clone(), "b-1"), group(b.clone(), "b-2")];
         let mut observation = ResourceObservationGeneration {
             sampled_at: Utc::now(),
+            host_swap: [None; 2],
             host: HostResources {
                 logical_cpu_count: None,
                 cpu_busy_percent: None,
@@ -1530,6 +1531,7 @@ mod tests {
             observations: BTreeMap::from([(
                 10,
                 ProcessObservation {
+                    current_rss_bytes: None,
                     pid: 10,
                     name: "test".into(),
                     cpu_percent: None,

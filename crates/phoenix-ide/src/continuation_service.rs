@@ -14,7 +14,11 @@ use crate::send_chat_service::{
 
 mod manual;
 mod native;
-pub(crate) use native::{NativeContinueCompletion, NativeContinueRequest};
+pub(crate) use native::{
+    FederatedNativeContinueCompletion, FederatedNativeContinueRequest,
+    FederatedNativeOpeningEvidence, NativeContinueCompletion, NativeContinueError,
+    NativeContinueRequest,
+};
 
 #[cfg(test)]
 pub(crate) use manual::{automatic_retry_phase_for_turn_state, continuation_message_id};
@@ -84,6 +88,12 @@ impl ContinuationApplicationService {
         req: crate::api::ContinueConversationRequest,
     ) -> Result<crate::api::ContinueConversationResponse, crate::api::handlers::AppError> {
         manual::continue_manual(self, parent_id, req).await
+    }
+    pub(crate) async fn retry_pending_opening(
+        &self,
+        parent_id: &str,
+    ) -> Result<crate::api::ContinueConversationResponse, crate::api::handlers::AppError> {
+        manual::retry_pending_opening(self, parent_id).await
     }
 
     #[must_use]
@@ -192,6 +202,10 @@ impl ContinuationApplicationService {
             .await
             .map_err(|error| error.to_string())?;
 
+        self.runtime
+            .publish_continuation_link(&admission.predecessor_conversation_id, &successor.id)
+            .await;
+
         if plan.transfer_ownership && automatic_intent {
             self.advance_current(
                 &admission.predecessor_conversation_id,
@@ -201,6 +215,7 @@ impl ContinuationApplicationService {
         }
 
         if !automatic_intent {
+            let expansion_policy = continuation_expansion_policy(intent.opening_authority);
             self.runtime
                 .get_or_create(&successor.id)
                 .await
@@ -215,7 +230,7 @@ impl ContinuationApplicationService {
                         images: Vec::new(),
                         files: Vec::new(),
                         user_agent: intent.user_agent,
-                        expansion_policy: MessageExpansionPolicy::LiteralText,
+                        expansion_policy,
                     })
                     .await
                     .map_err(|error| error.to_string())?;

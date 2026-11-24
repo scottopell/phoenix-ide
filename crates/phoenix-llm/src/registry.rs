@@ -3,9 +3,9 @@
 use super::codex_credential::AccountBoundCodexCredential;
 use super::models::RequestModelName;
 use super::{
-    all_models, codex_credential, discover_models, merge_model_specs, parse_external_models,
-    CodexCredential, DiscoveredModels, DiscoveryConfig, LlmService, LlmServiceImpl, LlmTransport,
-    LoggingService, ModelBackend, ModelInfo, ModelSource,
+    all_models, codex_credential, discover_models, merge_model_specs, CodexCredential,
+    DiscoveredModels, DiscoveryConfig, LlmService, LlmServiceImpl, LlmTransport, LoggingService,
+    ModelBackend, ModelInfo, ModelSource,
 };
 use phoenix_core::runtime_env::PhoenixRuntimeEnvironment;
 use serde::de::{Deserialize, Deserializer, MapAccess, Visitor};
@@ -282,7 +282,7 @@ pub struct LlmConfig {
     /// How credential helper output should be sent in HTTP headers.
     /// Parsed from `LLM_AUTH_HEADER` env var at startup.
     pub auth_style: AuthStyle,
-    /// Additional model specs loaded from `PHOENIX_LLM_MODELS` inline JSON.
+    /// Additional model specs loaded from user TOML or `PHOENIX_LLM_MODELS` JSON.
     /// These are additive only; duplicate IDs are ignored when merged with
     /// built-ins.
     pub external_models: Vec<super::ModelSpec>,
@@ -394,7 +394,8 @@ impl Default for LlmConfig {
 impl LlmConfig {
     /// # Panics
     ///
-    /// Panics if `PHOENIX_LLM_REQUEST_MODELS` is set but fails to parse or
+    /// Panics if the user model configuration is invalid or conflicts with
+    /// `PHOENIX_LLM_MODELS`, or if `PHOENIX_LLM_REQUEST_MODELS` fails to parse or
     /// validate (unknown route/model, backend mismatch, blank name, or
     /// duplicate keys). The map is rejected atomically before any
     /// request can use it, so a malformed override must fail startup rather
@@ -440,23 +441,13 @@ impl LlmConfig {
             .map(parse_request_tags)
             .unwrap_or_default();
 
-        let external_models = std::env::var("PHOENIX_LLM_MODELS")
-            .ok()
-            .filter(|raw| !raw.trim().is_empty())
-            .map(|raw| match parse_external_models(&raw) {
-                Ok(models) => {
-                    tracing::info!(count = models.len(), "loaded PHOENIX_LLM_MODELS additions");
-                    models
-                }
-                Err(error) => {
-                    tracing::warn!(
-                        error = %error,
-                        "invalid PHOENIX_LLM_MODELS; ignoring externally configured LLM models"
-                    );
-                    Vec::new()
-                }
-            })
-            .unwrap_or_default();
+        let user_config_path = phoenix_agents::config_path_for(&runtime_env)
+            .unwrap_or_else(|error| panic!("Cannot locate Phoenix config: {error}"));
+        let external_models = super::model_config::load_external_models(
+            &user_config_path,
+            std::env::var("PHOENIX_LLM_MODELS").ok().as_deref(),
+        )
+        .unwrap_or_else(|error| panic!("Cannot load external models: {error}"));
 
         // Resolve Phoenix's native ChatGPT credential at startup.
         let active_auth_path = codex_credential::resolve_active_auth_path(&runtime_env);
@@ -787,6 +778,7 @@ impl ModelRegistry {
         config: &LlmConfig,
     ) -> String {
         const PREFERRED: &[&str] = &[
+            "gpt-6.2-sol",
             "gpt-6.1-sol",
             "claude-sonnet-5",
             "claude-sonnet-4-6",
@@ -1152,6 +1144,17 @@ impl ModelRegistry {
         spec: &super::ModelSpec,
         config: &LlmConfig,
     ) -> Option<Arc<dyn LlmService>> {
+        if spec.backend == ModelBackend::OpenAIChatCompletions
+            && spec.source == ModelSource::BuiltIn
+            && config
+                .openai_chat_completions_base_url
+                .as_deref()
+                .is_none_or(|url| url == "https://api.openai.com/v1/chat/completions")
+        {
+            tracing::debug!(model = %spec.id, "skipping built-in gateway model without a Chat Completions endpoint");
+            return None;
+        }
+
         if spec.backend == ModelBackend::OpenAIResponses && openai_config_is_chat_only(config) {
             tracing::debug!(
                 model = %spec.id,
@@ -2021,8 +2024,67 @@ pub struct CodexReloadOutcome {
 mod tests {
     use super::*;
     use crate::models::{EffortCapabilities, NativeDefault, ServiceTierCapabilities};
+    use crate::parse_external_models;
     use crate::ModelEffort;
     use std::collections::HashSet;
+
+    #[test]
+    fn gemini_builtins_require_a_configured_gateway_and_keep_google_identity() {
+        let mut config = LlmConfig {
+            openai_api_key: Some("test-key".into()),
+            ..Default::default()
+        };
+        let without_endpoint = ModelRegistry::new(&config);
+        config.openai_chat_completions_base_url =
+            Some("https://api.openai.com/v1/chat/completions".into());
+        let openai_endpoint = ModelRegistry::new(&config);
+        config.openai_chat_completions_base_url =
+            Some("https://gateway.example/v1/chat/completions".into());
+        let registry = ModelRegistry::new(&config);
+        for model in [
+            "google/gemini-4-neon",
+            "google/gemini-4-hydrogen",
+            "google/gemini-4-carbon",
+            "google/gemini-4-argon",
+        ] {
+            assert!(without_endpoint.get(model).is_none());
+            assert!(openai_endpoint.get(model).is_none());
+            assert!(registry.get(model).is_some());
+            assert_eq!(registry.context_window(model), 1_048_576);
+            assert_eq!(registry.provider_display_name(model), "Google");
+        }
+    }
+
+    #[test]
+    fn actual_outbound_model_name_survives_registry_logging_and_request_overrides() {
+        let overrides = RequestModelOverrides::parse(
+            r#"{"openai_responses":{"gpt-6-luna":"gpt-6-astra"}}"#,
+            &all_models(),
+        )
+        .unwrap();
+        let direct = ModelRegistry::new(&LlmConfig {
+            openai_api_key: Some("offline-not-dispatched".into()),
+            request_models: overrides.clone(),
+            ..Default::default()
+        });
+        let service = direct.get("gpt-6-luna").unwrap();
+        assert_eq!(service.model_id(), "gpt-6-luna");
+        assert_eq!(service.outbound_model_name(), Some("gpt-6-astra"));
+
+        let directory = tempfile::tempdir().unwrap();
+        let codex = ModelRegistry::new_with_codex_catalog(
+            &LlmConfig {
+                use_codex_auth: true,
+                codex_credential: Some(fake_codex_credential(&directory)),
+                request_models: overrides,
+                ..Default::default()
+            },
+            Some(&HashSet::from(["gpt-6-luna".to_owned()])),
+        );
+        let service = codex.get("gpt-6-luna").unwrap();
+        assert!(service.uses_codex_bridge());
+        assert_eq!(service.outbound_model_name(), Some("gpt-6-luna"));
+    }
 
     #[test]
     fn request_model_map_validates_exact_routes_and_catalog_identity() {
@@ -2142,7 +2204,15 @@ mod tests {
             ModelRegistry::new_with_codex_catalog(&config, None),
             ModelRegistry::new_with_codex_catalog(&config, Some(&unrelated)),
         ] {
-            for id in ["gpt-6-astra", "gpt-6.1-sol", "gpt-6-sol", "gpt-6-luna"] {
+            for id in [
+                "gpt-6.2-astra",
+                "gpt-6.2-sol",
+                "gpt-6.1-terra",
+                "gpt-6-astra",
+                "gpt-6.1-sol",
+                "gpt-6-sol",
+                "gpt-6-luna",
+            ] {
                 assert!(
                     registry.get(id).is_some(),
                     "missing supported built-in {id}"
@@ -2347,11 +2417,11 @@ mod tests {
         let both = HashSet::from(["gpt-6-sol".to_string(), "gpt-6-luna".to_string()]);
         assert_eq!(
             ModelRegistry::new_with_codex_catalog(&config, Some(&only_luna)).default_model_id(),
-            "gpt-6.1-sol"
+            "gpt-6.2-sol"
         );
         assert_eq!(
             ModelRegistry::new_with_codex_catalog(&config, Some(&both)).default_model_id(),
-            "gpt-6.1-sol"
+            "gpt-6.2-sol"
         );
     }
 
@@ -2692,20 +2762,20 @@ mod tests {
     }
 
     #[test]
-    fn product_default_prefers_gpt_61_sol_without_overriding_explicit_defaults() {
+    fn product_default_prefers_gpt_62_sol_without_overriding_explicit_defaults() {
         let mut config = LlmConfig {
             anthropic_api_key: Some("test-key".into()),
             openai_api_key: Some("test-key".into()),
             ..Default::default()
         };
         let registry = ModelRegistry::new(&config);
-        assert_eq!(registry.default_model_id(), "gpt-6.1-sol");
+        assert_eq!(registry.default_model_id(), "gpt-6.2-sol");
         assert_eq!(
-            registry.effective_effort("gpt-6.1-sol", None),
-            phoenix_core::domain::llm_types::EffectiveEffort::native_known(ModelEffort::Medium)
+            registry.effective_effort("gpt-6.2-sol", None),
+            phoenix_core::domain::llm_types::EffectiveEffort::native_unknown()
         );
         assert_eq!(
-            registry.effective_effort("gpt-6.1-sol", Some(ModelEffort::High)),
+            registry.effective_effort("gpt-6.2-sol", Some(ModelEffort::High)),
             phoenix_core::domain::llm_types::EffectiveEffort::explicit(ModelEffort::High)
         );
 
@@ -3264,7 +3334,15 @@ mod tests {
         );
 
         assert!(outcome.credential_loaded);
-        for id in ["gpt-6-astra", "gpt-6.1-sol", "gpt-6-sol", "gpt-6-luna"] {
+        for id in [
+            "gpt-6.2-astra",
+            "gpt-6.2-sol",
+            "gpt-6.1-terra",
+            "gpt-6-astra",
+            "gpt-6.1-sol",
+            "gpt-6-sol",
+            "gpt-6-luna",
+        ] {
             assert!(
                 registry.get(id).is_some(),
                 "missing supported built-in {id}"
@@ -3438,7 +3516,7 @@ mod tests {
             ..Default::default()
         };
         let registry = ModelRegistry::new(&config);
-        assert_eq!(registry.default_model_id(), "gpt-6.1-sol");
+        assert_eq!(registry.default_model_id(), "gpt-6.2-sol");
     }
 
     /// `pick_default_model` must not pin to a configured `DEFAULT_MODEL` that

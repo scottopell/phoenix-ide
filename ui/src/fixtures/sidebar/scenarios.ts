@@ -124,6 +124,38 @@ const conversations: Conversation[] = [
   })),
 ];
 
+const visualProductRows: ProductConversationListRow[] = ([
+  ['normal-title-open', 'Sidebar visual normal working title', 'open', 'working', 'unread'],
+  ['normal-title-draft', 'A deliberately very long conversation title with a draft pull request badge', 'draft', 'idle', 'read'],
+  ['normal-title-merged', 'Sidebar visual merged pull request', 'merged', 'idle', 'unread'],
+  ['normal-title-closed', 'Sidebar visual error and closed pull request', 'closed', 'error', 'read'],
+  ['very-long-title-no-pr', 'A deliberately very long sidebar conversation title to verify safe truncation without pushing its status dot or actions out of bounds', null, 'idle', 'read'],
+] as const).map(([slug, title, prState, presentationMode, readState], index) => ({
+  product_conversation_id: `pc-sidebar-visual-${index}`,
+  canonical_route: `/product-conversations/pc-sidebar-visual-${index}`,
+  canonical_root: {
+    transcript_row_id: `sidebar-visual-root-${index}`,
+    slug: `sidebar-visual-${slug}`,
+    title,
+  },
+  lifecycle: { state: 'open', close_action: { availability: 'available' } },
+  latest_transcript_row_id: `sidebar-visual-latest-${index}`,
+  updated_at: isoAgo(index + 1),
+  presentation: { kind: 'state', display_name: title, presentation_mode: presentationMode },
+  monitored: false,
+  question_with_coordinator_since: null,
+  read_state: readState === 'unread' ? { state: 'unread', reason: 'new_activity' } : { state: 'read' },
+  cached_pr: prState === null ? null : {
+    number: 48100 + index,
+    title: `Sidebar fixture ${prState} PR`,
+    url: `https://github.com/example/phoenix/pull/${48100 + index}`,
+    display_state: prState,
+    base: 'main',
+    head: `sidebar-visual-${prState}`,
+    feedback_status: 'open',
+  },
+}));
+
 const productConversations: Partial<Record<SidebarScenario['id'], ProductConversationListRow[]>> = {
   'product-actions-continued': [
     {
@@ -138,8 +170,14 @@ const productConversations: Partial<Record<SidebarScenario['id'], ProductConvers
       latest_transcript_row_id: 'pc-latest-continuation',
       updated_at: isoAgo(3),
       presentation: { kind: 'state', display_name: 'Fixture Product Root', presentation_mode: 'working' },
+      monitored: false,
+      question_with_coordinator_since: null,
+      read_state: { state: 'read' },
+      cached_pr: null,
     },
   ],
+  'sidebar-visual-normal': visualProductRows,
+  'sidebar-visual-narrow': visualProductRows,
 };
 
 const archivedConversations: Conversation[] = [
@@ -198,6 +236,22 @@ export const sidebarScenarios: SidebarScenario[] = [
     collapsed: false,
     initialProjectId: null,
     activeSlug: 'fixture-product-root',
+  },
+  {
+    id: 'sidebar-visual-normal',
+    theme: 'light',
+    collapsed: false,
+    initialProjectId: null,
+    activeSlug: 'sidebar-visual-normal-title-merged',
+    sidebarWidth: 280,
+  },
+  {
+    id: 'sidebar-visual-narrow',
+    theme: 'light',
+    collapsed: false,
+    initialProjectId: null,
+    activeSlug: 'sidebar-visual-normal-title-merged',
+    sidebarWidth: 160,
   },
   {
     id: 'collapsed-overflow',

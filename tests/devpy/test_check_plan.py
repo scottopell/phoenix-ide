@@ -2,6 +2,7 @@ import io
 import importlib.util
 import json
 import os
+import subprocess
 import tempfile
 import threading
 import unittest
@@ -203,8 +204,13 @@ class CheckPlanTests(unittest.TestCase):
                                  "--message-format=json-render-diagnostics"]]
                     returncodes = [launcher_rc]
                     if launcher_rc == 0:
-                        commands += [codegen_cmd, compile_cmd, test_cmd]
-                        returncodes += [codegen_rc, compile_rc, test_rc]
+                        commands += [codegen_cmd, compile_cmd]
+                        returncodes += [codegen_rc, compile_rc]
+                        if compile_rc == 0:
+                            commands.append(self.dev._PRUNE_LISTING_CMD)
+                            returncodes.append(0)
+                        commands.append(test_cmd)
+                        returncodes.append(test_rc)
                     launched = []
                     target_setting = (None if label == "default target" else
                                       str(root / "absolute-target") if label == "absolute target" else
@@ -292,7 +298,10 @@ class CheckPlanTests(unittest.TestCase):
                         steps.append(("codegen", codegen_rc))
                         if codegen_rc == 0:
                             steps.append(("codegen-stale", int(stale)))
-                        steps += [("cargo test compile", compile_rc), ("cargo test", test_rc)]
+                        steps.append(("cargo test compile", compile_rc))
+                        if compile_rc == 0:
+                            steps.append(("prune stale test artifacts", 0))
+                        steps.append(("cargo test", test_rc))
                     self.assertEqual(
                         [name for name, _rc in steps],
                         [call.args[1] for call in reporter.step_start.call_args_list],
@@ -519,7 +528,7 @@ class CheckPlanTests(unittest.TestCase):
     def test_rust_graph_steps_match_lane_order(self):
         self.assertEqual(
             ["native bash launcher", "codegen export", "codegen-stale diff",
-             "cargo test (compile)", "cargo test (run)"],
+             "cargo test (compile)", "prune stale test artifacts", "cargo test (run)"],
             self.dev._GRAPH_LANE_STEPS["rust"],
         )
 
@@ -657,37 +666,148 @@ class CheckPlanTests(unittest.TestCase):
         resolve.assert_called_once_with()
         self.assertEqual({"crates/example.rs", "tasks/new.md"}, paths)
         self.assertEqual(
-            ["git", "diff", "--name-only", "abc123"],
+            ["git", "diff", "--name-only", "--no-renames", "abc123"],
             run.call_args_list[0].args[0],
         )
 
-    def test_rust_checker_changes_run_structural_and_self_tests(self):
+    def test_explicit_unresolvable_base_does_not_fall_back(self):
+        missing = mock.Mock(returncode=1, stdout="")
+        with mock.patch.dict(
+            os.environ,
+            {"PHOENIX_CHECK_BASE": "missing-explicit-base"},
+            clear=True,
+        ), mock.patch.object(self.dev.subprocess, "run", return_value=missing) as run:
+            self.assertIsNone(self.dev._resolve_check_merge_base())
+
+        run.assert_called_once_with(
+            ["git", "merge-base", "HEAD", "missing-explicit-base"],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+        )
+
+    def test_changed_paths_preserve_both_sides_of_renamed_dependency(self):
+        old_path = "specs/adrs/113_coordinator-api-recipes-are-non-exhaustive.md"
+        new_path = "specs/adrs/renamed.md"
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+            source = repo / old_path
+            source.parent.mkdir(parents=True)
+            source.write_text("# ADR\n")
+            subprocess.run(["git", "add", old_path], cwd=repo, check=True)
+            subprocess.run(
+                [
+                    "git",
+                    "-c",
+                    "user.name=Phoenix Test",
+                    "-c",
+                    "user.email=phoenix@example.invalid",
+                    "commit",
+                    "-qm",
+                    "fixture",
+                ],
+                cwd=repo,
+                check=True,
+            )
+            subprocess.run(["git", "mv", old_path, new_path], cwd=repo, check=True)
+
+            with mock.patch.dict(
+                os.environ,
+                {"PHOENIX_CHECK_BASE": "HEAD"},
+                clear=True,
+            ), mock.patch.object(self.dev, "ROOT", repo):
+                paths = self.dev._compute_changed_paths_vs_base()
+
+        self.assertEqual({old_path, new_path}, paths)
+        self.assertIn("DEVTOOLS", self.dev._categorize_changed_paths(paths))
+
+    def test_rust_checker_changes_run_structural_and_devpy_tests(self):
         for path in ("scripts/check_rust_test_timing.py", "scripts/check_manual_sql_transactions.py"):
             with self.subTest(path=path):
                 cats = self.dev._categorize_changed_paths({path})
                 self.assertIn("ASTGREP", cats)
-                self.assertIn("SPECS", cats)
-                with mock.patch.object(
+                self.assertIn("DEVTOOLS", cats)
+                with mock.patch.dict(
+                    os.environ, GATED_CI_ENV, clear=False,
+                ), mock.patch.object(
                     self.dev, "_changed_paths_vs_base", return_value={path},
                 ):
                     active, _ = self.dev._gate_lanes()
                 self.assertIn("ast-grep", active)
-                self.assertIn("spec-shape", active)
+                self.assertIn("devpy", active)
+                self.assertNotIn("spec-shape", active)
 
-    def test_check_profile_scripts_run_their_devpy_unit_tests(self):
-        for path in (
-            "scripts/check_profile_command.py",
-            "scripts/check_profile_report.py",
-            "scripts/python_unittest_profile.py",
-        ):
-            with self.subTest(path=path):
-                cats = self.dev._categorize_changed_paths({path})
-                self.assertIn("SPECS", cats)
-                with mock.patch.object(
-                    self.dev, "_changed_paths_vs_base", return_value={path},
-                ):
-                    active, _ = self.dev._gate_lanes()
-                self.assertIn("spec-shape", active)
+    def test_devpy_dependency_changes_run_devpy_tests(self):
+        paths = (
+            "tests/devpy/test_check_plan.py",
+            "tests/integration/systemd_vm_harness.py",
+            "scripts/systemd_deploy_helper.py",
+            "skills/phoenix-adversarial-review/SKILL.md",
+            ".agents/skills/phoenix-adversarial-review",
+            ".node-version",
+            "Cargo.toml",
+            "rust-toolchain.toml",
+            "crates/phoenix-core/src/unrelated.rs",
+            "pyproject.toml",
+            "uv.lock",
+            "crates/phoenix-skills/src/builtin/phoenix-api/references/api-reference.md",
+            "ui/src/components/QuestionPanel.tsx",
+            "specs/api/requirements.md",
+            "specs/builtin-skills/builtin-skills.allium",
+            "specs/global-recall/requirements.md",
+            "specs/compatibility/requirements.md",
+        )
+        for path in paths:
+            with self.subTest(path=path), mock.patch.object(
+                self.dev, "_changed_paths_vs_base", return_value={path},
+            ):
+                active, _ = self.dev._gate_lanes()
+                self.assertIn("devpy", active)
+
+    def test_irrelevant_spec_change_skips_devpy_tests(self):
+        path = "specs/bash/executive.md"
+        with mock.patch.dict(
+            os.environ, GATED_CI_ENV, clear=False,
+        ), mock.patch.object(self.dev, "_changed_paths_vs_base", return_value={path}):
+            active, _ = self.dev._gate_lanes()
+
+        self.assertIn("spec-shape", active)
+        self.assertNotIn("devpy", active)
+
+    def test_renamed_or_deleted_devpy_dependency_is_selected_by_path(self):
+        for path in ("scripts/removed_helper.py", "tests/devpy/deleted_test.py"):
+            with self.subTest(path=path), mock.patch.object(
+                self.dev, "_changed_paths_vs_base", return_value={path},
+            ):
+                active, _ = self.dev._gate_lanes()
+                self.assertIn("devpy", active)
+
+    def test_spec_shape_excludes_subprocess_and_compiler_setup(self):
+        shape = mock.Mock(errors=[], legacy_design_docs=[])
+        with mock.patch.dict(os.environ, GATED_CI_ENV, clear=False), mock.patch.object(
+            self.dev, "_changed_paths_vs_base", return_value={"specs/bash/executive.md"}
+        ), mock.patch.object(self.dev, "_make_reporter"), mock.patch.object(
+            self.dev, "_validate_spears_v2_shape", return_value=shape
+        ) as validate_shape, mock.patch.object(
+            self.dev, "_compiler_cache_subprocess_env",
+            side_effect=AssertionError("compiler setup crossed spec-shape boundary"),
+        ) as compiler_setup, mock.patch.object(
+            self.dev.subprocess, "Popen",
+            side_effect=AssertionError("subprocess crossed spec-shape boundary"),
+        ) as popen, mock.patch.object(
+            self.dev.subprocess, "run",
+            side_effect=AssertionError("subprocess crossed spec-shape boundary"),
+        ) as run, mock.patch("builtins.print"):
+            active, skipped = self.dev._resolve_check_lanes(gate=True, lanes="spec-shape")
+            self.assertEqual({"spec-shape"}, active)
+            self.assertEqual({}, skipped)
+            self.dev.cmd_check(gate=True, lanes="spec-shape")
+
+        validate_shape.assert_called_once_with(ROOT / "specs")
+        compiler_setup.assert_not_called()
+        popen.assert_not_called()
+        run.assert_not_called()
 
     def test_pr_433_task_only_rename_activates_only_task_group(self):
         paths = {"tasks/45002-p1-done--deterministic-message-scroll-state-machine.md"}
@@ -701,7 +821,14 @@ class CheckPlanTests(unittest.TestCase):
         self.assertIn("e2e", skipped)
         self.assertIn("ui-lint", skipped)
         self.assertEqual(
-            {"clippy": False, "e2e": False, "fast": True, "rust": False, "ui": False},
+            {
+                "clippy": False,
+                "devpy": False,
+                "e2e": False,
+                "fast": True,
+                "rust": False,
+                "ui": False,
+            },
             self.dev._ci_groups_for_active_lanes(active),
         )
 
@@ -712,6 +839,40 @@ class CheckPlanTests(unittest.TestCase):
 
         self.assertEqual({"task"}, active)
         self.assertEqual({}, skipped)
+
+    def test_explicit_filters_keep_spec_shape_and_devpy_independent(self):
+        paths = {"specs/bash/executive.md", "tests/devpy/test_check_plan.py"}
+        with mock.patch.dict(os.environ, GATED_CI_ENV, clear=False), mock.patch.object(
+            self.dev, "_changed_paths_vs_base", return_value=paths,
+        ):
+            shape, _ = self.dev._resolve_check_lanes(lanes="spec-shape")
+            devpy, _ = self.dev._resolve_check_lanes(lanes="devpy")
+
+        self.assertEqual({"spec-shape"}, shape)
+        self.assertEqual({"devpy"}, devpy)
+
+    def test_full_plan_contains_both_split_lanes(self):
+        active, skipped = self.dev._resolve_check_lanes(gate=False)
+
+        self.assertEqual(set(), set(skipped))
+        self.assertIn("spec-shape", active)
+        self.assertIn("devpy", active)
+
+    def test_unknown_local_base_runs_both_split_lanes(self):
+        with mock.patch.dict(os.environ, {"CI": "", "PHOENIX_CHECK_ALL": ""}, clear=False), \
+             mock.patch.object(self.dev, "_on_integration_base", return_value=False), \
+             mock.patch.object(self.dev, "_changed_paths_vs_base", return_value=None):
+            active, skipped = self.dev._resolve_check_lanes()
+
+        self.assertEqual(set(), set(skipped))
+        self.assertIn("spec-shape", active)
+        self.assertIn("devpy", active)
+
+    def test_unresolvable_ci_base_fails_closed(self):
+        with mock.patch.dict(os.environ, GATED_CI_ENV, clear=False), \
+             mock.patch.object(self.dev, "_changed_paths_vs_base", return_value=None), \
+             self.assertRaises(SystemExit):
+            self.dev._resolve_check_lanes()
 
     def test_ui_change_activates_ui_group_without_task_group(self):
         paths = {"ui/src/App.tsx"}
@@ -757,9 +918,70 @@ class CheckPlanTests(unittest.TestCase):
                 )
             self.assertIn(expected, workflow)
 
+    def test_split_lanes_have_independent_graph_steps(self):
+        self.assertEqual(
+            ["spEARS v2 artifact-shape validation"],
+            self.dev._GRAPH_LANE_STEPS["spec-shape"],
+        )
+        self.assertEqual(
+            ["python unittest discover tests/devpy"],
+            self.dev._GRAPH_LANE_STEPS["devpy"],
+        )
+
+    def test_workflow_failure_jobs_depend_on_devpy_job(self):
+        workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text()
+        self.assertIn("check-devpy:", workflow)
+        self.assertEqual(2, workflow.count("check-e2e, check-devpy, check-ui"))
+
+    def test_expensive_workflow_jobs_wait_for_early_source_checks(self):
+        workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text()
+        early_job = workflow.split("  check-worker-budget:\n", 1)[1].split(
+            "  plan_check:\n", 1
+        )[0]
+        self.assertIn("cargo fmt --all -- --check", early_job)
+        self.assertIn("python scripts/check_migration_ledger.py", early_job)
+        self.assertIn("-p test_check_plan.py", early_job)
+        self.assertIn("-p test_check_migration_ledger.py", early_job)
+
+        for job in (
+            "check-rust-build",
+            "check-rust-musl",
+            "check-clippy",
+            "check-e2e",
+            "check-devpy",
+            "check-ui",
+            "check-finalization-geometry",
+            "check-fast",
+        ):
+            with self.subTest(job=job):
+                job_body = workflow.split(f"  {job}:\n", 1)[1][:500]
+                self.assertIn(
+                    "needs: [plan_check, check-worker-budget]",
+                    job_body,
+                )
+
+        self.assertEqual(
+            2,
+            workflow.count(
+                "needs: [check-worker-budget, plan_check, check-rust, "
+                "check-clippy, check-e2e, check-devpy, check-ui, "
+                "check-finalization-geometry, check-fast]"
+            ),
+        )
+
+    def test_devpy_ci_job_installs_ast_grep_before_running_tests(self):
+        workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text()
+        devpy_job = workflow.split("  check-devpy:\n", 1)[1].split("  check-ui:\n", 1)[0]
+
+        self.assertIn("npm i -g @ast-grep/cli", devpy_job)
+        self.assertLess(
+            devpy_job.index("npm i -g @ast-grep/cli"),
+            devpy_job.index("./dev.py check --lanes devpy"),
+        )
+
     def test_linux_musl_smoke_runs_once_in_rust_ci_group(self):
         workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text()
-        self.assertEqual(1, workflow.count("cargo check --target x86_64-unknown-linux-musl"))
+        self.assertEqual(1, workflow.count("cargo clippy --target x86_64-unknown-linux-musl"))
         self.assertIn("sudo apt-get install -y musl-tools", workflow)
         self.assertIn("target: x86_64-unknown-linux-musl", workflow)
         graph_steps = self.dev._GRAPH_LANE_STEPS["rust"]
@@ -778,8 +1000,9 @@ class CheckPlanTests(unittest.TestCase):
 def workflow_order(group):
     return {
         "rust": ["rust", "cargo-fmt"],
-        "clippy": ["clippy"],
+        "clippy": ["clippy", "deps"],
         "e2e": ["e2e"],
+        "devpy": ["devpy"],
         "ui": ["tsc", "ui-lint", "vitest", "ast-grep", "allium", "spec-shape", "spec-anchors", "pkglock"],
     }[group]
 
@@ -927,6 +1150,141 @@ class CargoTestTimeoutTests(unittest.TestCase):
             with self.subTest(raw=raw), self._with_file(None):
                 with self.assertRaisesRegex(SystemExit, "positive integer"):
                     self.dev._cargo_test_timeout_secs({self.dev.CARGO_TEST_TIMEOUT_ENV: raw})
+
+
+class DevpyTestTimeoutTests(unittest.TestCase):
+    def setUp(self):
+        self.dev = load_devpy()
+
+    def _with_file(self, values):
+        def fake_load(env, filename=".phoenix-ide.env"):
+            if values is None:
+                return None
+            env.update(values)
+            return "/host/.phoenix-ide.env"
+        return mock.patch.object(self.dev, "_load_env_file", side_effect=fake_load)
+
+    def test_default_and_host_file(self):
+        with self._with_file(None):
+            self.assertEqual(self.dev._devpy_test_timeout_secs({}), (600, None))
+        with self._with_file({self.dev.DEVPY_TEST_TIMEOUT_ENV: "2400"}):
+            self.assertEqual(self.dev._devpy_test_timeout_secs({}),
+                             (2400, "/host/.phoenix-ide.env"))
+
+    def test_process_environment_wins_even_when_empty(self):
+        with self._with_file({self.dev.DEVPY_TEST_TIMEOUT_ENV: "2400"}):
+            self.assertEqual(
+                self.dev._devpy_test_timeout_secs({self.dev.DEVPY_TEST_TIMEOUT_ENV: "1500"}),
+                (1500, "environment"),
+            )
+            self.assertEqual(
+                self.dev._devpy_test_timeout_secs({self.dev.DEVPY_TEST_TIMEOUT_ENV: " "}),
+                (600, None),
+            )
+
+    def test_platform_max_budget_is_accepted(self):
+        maximum = self.dev.MAX_DEVPY_TEST_TIMEOUT_SECS
+        with self._with_file(None):
+            self.assertEqual(
+                self.dev._devpy_test_timeout_secs({self.dev.DEVPY_TEST_TIMEOUT_ENV: str(maximum)}),
+                (maximum, "environment"),
+            )
+        self.assertLessEqual(maximum + 30, self.dev.threading.TIMEOUT_MAX)
+
+    def test_invalid_values_fail_loud(self):
+        maximum = self.dev.MAX_DEVPY_TEST_TIMEOUT_SECS
+        for raw in ("abc", "0", "-5", "1.5", str(maximum + 1), "99999999999999999999"):
+            with self.subTest(raw=raw), self._with_file(None):
+                with self.assertRaisesRegex(SystemExit, self.dev.DEVPY_TEST_TIMEOUT_ENV):
+                    self.dev._devpy_test_timeout_secs({self.dev.DEVPY_TEST_TIMEOUT_ENV: raw})
+
+    def test_inactive_lane_ignores_invalid_budget(self):
+        with mock.patch.dict(os.environ, {self.dev.DEVPY_TEST_TIMEOUT_ENV: "invalid"}), \
+             mock.patch.object(self.dev, "_resolve_check_lanes", return_value=({"task"}, {})), \
+             mock.patch.object(self.dev, "_run_check_threads_sequentially", return_value=[]), \
+             mock.patch.object(self.dev, "_make_reporter"):
+            self.dev.cmd_check(gate=False, lanes="task")
+
+    def test_active_invalid_budget_fails_before_reporter_setup(self):
+        with mock.patch.dict(os.environ, {self.dev.DEVPY_TEST_TIMEOUT_ENV: "invalid"}), \
+             mock.patch.object(self.dev, "_resolve_check_lanes", return_value=({"devpy"}, {})), \
+             mock.patch.object(self.dev, "_make_reporter") as reporter:
+            with self.assertRaisesRegex(SystemExit, self.dev.DEVPY_TEST_TIMEOUT_ENV):
+                self.dev.cmd_check(gate=False, lanes="devpy")
+            reporter.assert_not_called()
+
+    def test_active_budget_is_reported_and_extends_lane_join(self):
+        reporter = mock.Mock()
+        with mock.patch.object(self.dev, "_resolve_check_lanes", return_value=({"devpy"}, {})), \
+             mock.patch.object(self.dev, "_devpy_test_timeout_secs",
+                               return_value=(4200, "/host/.phoenix-ide.env")), \
+             mock.patch.object(self.dev, "_make_reporter", return_value=reporter), \
+             mock.patch.object(self.dev, "_run_check_threads_sequentially", return_value=[]) as runner:
+            self.dev.cmd_check(gate=False, lanes="devpy")
+        self.assertIn(mock.call("dev.py unit-test budget: 4200s "
+                                "(PHOENIX_CHECK_DEVPY_TEST_TIMEOUT_SECS from /host/.phoenix-ide.env)"),
+                      reporter.info.call_args_list)
+        self.assertEqual(runner.call_args.args[1], 4230)
+
+
+class PruneStaleWorkspaceArtifactsTests(unittest.TestCase):
+    def setUp(self):
+        self.dev = load_devpy()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.deps = Path(self.tmp.name) / "debug" / "deps"
+        self.deps.mkdir(parents=True)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def touch(self, name, *, age=100.0, size=10, executable=False):
+        path = self.deps / name
+        path.write_bytes(b"x" * size)
+        if executable:
+            path.chmod(0o755)
+        stamp = 1_000_000.0 - age
+        os.utime(path, (stamp, stamp))
+        return path
+
+    def test_removes_superseded_executables_and_keeps_everything_else(self):
+        old_exe = self.touch("phoenix_ide-1111111111111111", size=500, executable=True)
+        old_exe_d = self.touch("phoenix_ide-1111111111111111.d")
+        old_rlib = self.touch("libphoenix_ide-2222222222222222.rlib", size=300)
+        old_rlib_d = self.touch("phoenix_ide-2222222222222222.d")
+        cur_exe = self.touch("phoenix_ide-aaaaaaaaaaaaaaaa", executable=True)
+        cur_d = self.touch("phoenix_ide-aaaaaaaaaaaaaaaa.d")
+        uplifted = self.touch("phoenix_ide-5555555555555555", executable=True)
+        os.link(uplifted, self.deps.parent / "phoenix_ide")
+        other_crate = self.touch("tokio-3333333333333333", executable=True)
+        fresh = self.touch("phoenix_ide-4444444444444444", age=-5, executable=True)
+
+        removed, freed = self.dev._prune_stale_workspace_artifacts(
+            [cur_exe], older_than=1_000_000.0,
+        )
+
+        self.assertEqual((2, 510), (removed, freed))
+        for gone in (old_exe, old_exe_d):
+            self.assertFalse(gone.exists(), gone.name)
+        for kept in (old_rlib, old_rlib_d, cur_exe, cur_d, uplifted, other_crate, fresh):
+            self.assertTrue(kept.exists(), kept.name)
+
+    def test_cargo_json_selects_only_workspace_artifacts(self):
+        root = Path(self.tmp.name)
+        lines = [
+            "   Compiling phoenix_ide v0.1.0",
+            json.dumps({"reason": "compiler-artifact",
+                        "manifest_path": str(root / "crates/a/Cargo.toml"),
+                        "filenames": [str(self.deps / "liba-aaaaaaaaaaaaaaaa.rlib")],
+                        "executable": str(self.deps / "a-bbbbbbbbbbbbbbbb")}),
+            json.dumps({"reason": "compiler-artifact",
+                        "manifest_path": "/registry/tokio/Cargo.toml",
+                        "filenames": [str(self.deps / "libtokio-cccccccccccccccc.rlib")],
+                        "executable": None}),
+        ]
+        self.assertEqual(
+            [self.deps / "liba-aaaaaaaaaaaaaaaa.rlib", self.deps / "a-bbbbbbbbbbbbbbbb"],
+            self.dev._workspace_artifacts_from_cargo_json(lines, root),
+        )
 
 
 if __name__ == "__main__":

@@ -201,10 +201,11 @@ function useMessageReviewNotes(
     setShowPanel(false);
   }, [onSendNotes]);
 
+  const canAnnotate = Boolean(onSendNotes);
   const startAnnotate = useCallback((lineNumber: number, lineContent: string) => {
-    if (!onSendNotes) return;
+    if (!canAnnotate) return;
     setAnnotating({ sequenceId, lineNumber, lineContent });
-  }, [onSendNotes, sequenceId]);
+  }, [canAnnotate, sequenceId]);
   const cancelAnnotate = useCallback(() => {
     setAnnotating(null);
     setAnnotationDraftDirty(false);

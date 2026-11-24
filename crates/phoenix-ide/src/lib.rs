@@ -17,7 +17,10 @@ mod continuation_service;
 mod conversation_action_tools;
 mod conversation_actions;
 mod conversation_cwd;
+mod coordinator_delivery;
 mod coordinator_home;
+mod coordinator_question_delivery;
+mod coordinator_scanner;
 mod coordinator_tools;
 mod coordinator_watch_delivery;
 mod discovery;
@@ -32,6 +35,7 @@ mod reminder_delivery;
 mod reminder_service;
 mod resolution_root;
 mod resource_authority;
+mod resource_flight_recorder;
 mod runtime;
 mod send_chat_service;
 mod slack_gateway;
@@ -693,6 +697,7 @@ pub async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     // and the Phoenix layout under them) once, behind a typed surface. Every
     // subsystem that needs an on-disk location reads it from here.
     let runtime_env = Arc::new(PhoenixRuntimeEnvironment::detect());
+    let resource_recorder = resource_flight_recorder::initialize(&runtime_env);
 
     // REQ-BASH-007: install the child subreaper so descendants whose
     // parent dies (double-forks, setsid daemons) reparent to Phoenix
@@ -1002,6 +1007,10 @@ pub async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     )
     .await?;
 
+    if let Some(recorder) = resource_recorder {
+        resource_flight_recorder::spawn_sampler(state.clone(), recorder);
+    }
+
     let automatic_continuation_runtime = state.runtime.clone();
     let automatic_continuation_authority = state.runtime.clone();
     let automatic_continuation_task = tokio::spawn(async move {
@@ -1054,7 +1063,7 @@ pub async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
             .allow_headers(Any)
     };
 
-    let compression = CompressionLayer::new().gzip(true).br(true);
+    let compression = CompressionLayer::new().gzip(true);
 
     // Clear-to-ready sweep: once a usage-limit window elapses, return the
     // errored conversation to Idle so it is usable again without a manual

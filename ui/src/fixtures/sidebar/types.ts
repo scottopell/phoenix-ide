@@ -5,7 +5,9 @@ export type SidebarScenarioId =
   | 'expanded-project-archived'
   | 'expanded-empty-project'
   | 'collapsed-overflow'
-  | 'product-actions-continued';
+  | 'product-actions-continued'
+  | 'sidebar-visual-normal'
+  | 'sidebar-visual-narrow';
 
 export interface SidebarScenario {
   id: SidebarScenarioId;
@@ -13,6 +15,7 @@ export interface SidebarScenario {
   collapsed: boolean;
   initialProjectId: string | null;
   activeSlug: string | null;
+  sidebarWidth?: number;
 }
 
 export interface SidebarFixtureData {

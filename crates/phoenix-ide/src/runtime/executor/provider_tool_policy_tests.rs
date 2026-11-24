@@ -1,6 +1,6 @@
 use super::*;
 use crate::db::{Database, Message};
-use crate::runtime::testing::MockToolExecutor;
+use crate::runtime::testing::{MockLlmClient, MockToolExecutor};
 use crate::runtime::traits::DatabaseStorage;
 use crate::tools::ToolOutput;
 use async_trait::async_trait;
@@ -12,6 +12,9 @@ use phoenix_core::domain::provider_replay::{
 };
 use phoenix_llm::{LlmError, LlmResponse};
 use std::sync::Mutex;
+
+mod discovery;
+mod live_codex_discovery;
 
 const CONVERSATION: &str = "provider-tool-withdrawal";
 const MCP_TOOL: &str = "mcp__slack__read_thread";
@@ -97,19 +100,19 @@ impl LlmClient for RenderingAnthropicClient {
     }
 }
 
-type TestRuntime =
-    ConversationRuntime<DatabaseStorage, Arc<RenderingAnthropicClient>, Arc<DeferredMcpCatalog>>;
+type TestRuntime<L = RenderingAnthropicClient, T = DeferredMcpCatalog> =
+    ConversationRuntime<DatabaseStorage, Arc<L>, Arc<T>>;
 
-fn runtime(
+fn runtime<L: LlmClient + 'static, T: ToolExecutor + 'static>(
     db: Database,
     directory: &Path,
-    client: Arc<RenderingAnthropicClient>,
-    tools: Arc<DeferredMcpCatalog>,
-) -> TestRuntime {
+    client: Arc<L>,
+    tools: Arc<T>,
+) -> TestRuntime<L, T> {
     let context = ConvContext::new(
         CONVERSATION,
         directory.to_path_buf(),
-        "claude-opus-5-5",
+        client.model_id(),
         200_000,
         16_384,
     );
@@ -131,7 +134,9 @@ fn runtime(
     )
 }
 
-async fn dispatch(runtime: &mut TestRuntime) {
+async fn dispatch<L: LlmClient + 'static, T: ToolExecutor + 'static>(
+    runtime: &mut TestRuntime<L, T>,
+) {
     runtime
         .execute_effect(Effect::RequestLlm)
         .await
@@ -194,6 +199,7 @@ async fn dispatch_cannot_expand_or_reinterpret_the_persisted_request_policy() {
             &callable_names,
             &[],
             &[],
+            phoenix_core::domain::tool_discovery::ToolDiscoveryMode::Eager,
         )
         .await
         .unwrap();
@@ -446,4 +452,222 @@ async fn sqlite_runtime_anthropic_withdrawal_preserves_failed_exchange_after_reo
             .to_json(),
         serde_json::to_value(public).unwrap()
     );
+}
+
+struct ReplayCheckingTools {
+    db: Database,
+    tools: DeferredMcpCatalog,
+}
+
+#[async_trait]
+impl ToolExecutor for ReplayCheckingTools {
+    async fn execute(
+        &self,
+        call: crate::runtime::deny_gate::CheckedToolCall,
+        ctx: ToolContext,
+    ) -> Option<ToolOutput> {
+        use phoenix_core::domain::responses_replay::ProviderResponseSet;
+        let retained = self
+            .db
+            .load_output_replay_state(CONVERSATION)
+            .await
+            .unwrap();
+        let [ProviderResponseSet::ChatCompletions(replay)] = retained.as_slice() else {
+            panic!("signed replay must be durable before tool execution");
+        };
+        let ConvState::ToolExecuting {
+            assistant_message, ..
+        } = self.db.get_conversation(CONVERSATION).await.unwrap().state
+        else {
+            panic!("accepted tool state must already be durable");
+        };
+        assert_eq!(replay.owner_message_id, assistant_message.message_id);
+        assert_eq!(replay.public_content, assistant_message.content);
+        assert_eq!(replay.tool_signatures[0].tool_call_id, "signed-call");
+        assert_eq!(
+            replay.tool_signatures[0].signature,
+            "opaque-google-signature"
+        );
+        self.tools.execute(call, ctx).await
+    }
+
+    async fn definitions(&self) -> Vec<phoenix_llm::ToolDefinition> {
+        self.tools.definitions().await
+    }
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn sqlite_runtime_chat_images_and_signature_survive_reopen() {
+    use phoenix_core::domain::responses_replay::{
+        ChatResponseSet, ChatToolSignature, ProviderResponseSet,
+    };
+    let directory = tempfile::TempDir::new().unwrap();
+    let path = directory.path().join("chat-signature.db");
+    let db = Database::open(path.to_str().unwrap()).await.unwrap();
+    phoenix_db::run_pending_migrations(db.pool()).await.unwrap();
+    db.create_conversation(
+        CONVERSATION,
+        CONVERSATION,
+        directory.path().to_str().unwrap(),
+        true,
+        None,
+        Some("gemini-4-neon"),
+    )
+    .await
+    .unwrap();
+    db.add_message(
+        "user-before-call",
+        CONVERSATION,
+        &MessageContent::user("Read the Slack thread"),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    let public = vec![ContentBlock::tool_use(
+        "signed-call",
+        MCP_TOOL,
+        serde_json::json!({"thread":"fixture"}),
+    )];
+    let replay = ChatResponseSet {
+        response_id: "google-response".into(),
+        model: "google/gemini-4-neon".into(),
+        owner_message_id: String::new(),
+        public_content: public.clone(),
+        tool_signatures: vec![ChatToolSignature {
+            tool_call_id: "signed-call".into(),
+            signature: "opaque-google-signature".into(),
+        }],
+    };
+    let mut response =
+        LlmResponse::non_streaming(public.clone(), false, phoenix_llm::Usage::default());
+    response.provider_replay = Some(ProviderReplayUpdate::ChatCompletions(replay));
+    let client = Arc::new(MockLlmClient::new("gemini-4-neon"));
+    client.queue_response(response);
+    let image = crate::tools::ToolImage {
+        media_type: "image/png".into(),
+        data: "iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAIAAAAlC+aJAAAAdklEQVR4nO3PQQkAMAzAwPo33Yno4xgEIuAyO/t1wwUNaEEDWtCAFjSgBQ1oQQNa0IAWNKAFDWhBA1rQgBY0oAUNaEEDWtCAFjSgBQ1oQQNa0IAWNKAFDWhBA1rQgBY0oAUNaEEDWtCAFjSgBQ1oQQNa0IAWHHtBp+HSthEAJgAAAABJRU5ErkJggg==".into(),
+    };
+    let tools = Arc::new(ReplayCheckingTools {
+        db: db.clone(),
+        tools: DeferredMcpCatalog(MockToolExecutor::new().with_tool(
+            MCP_TOOL,
+            ToolOutput::Error {
+                output: "Session expired".into(),
+                images: vec![image.clone()],
+                display_data: None,
+                llm_usage: None,
+            },
+        )),
+    });
+    let mut first = runtime(db.clone(), directory.path(), client.clone(), tools.clone());
+    dispatch(&mut first).await;
+    assert!(client.recorded_requests()[0].output_replay.is_empty());
+    let (_, outcome) = first.llm_outcome_rx.try_recv().unwrap();
+    Box::pin(first.process_outcome(EffectOutcome::Llm(outcome)))
+        .await
+        .unwrap();
+    assert!(first
+        .observe_tool_preparation_for_test()
+        .await
+        .unwrap()
+        .is_none());
+    let (_, outcome) = tokio::time::timeout(Duration::from_secs(10), first.tool_outcome_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(tools.tools.recorded_executions().len(), 1);
+    Box::pin(first.process_outcome(EffectOutcome::Tool(outcome)))
+        .await
+        .unwrap();
+    first
+        .llm_task_handle
+        .take()
+        .expect("tool follow-up request")
+        .await
+        .unwrap();
+    let expected = db.load_output_replay_state(CONVERSATION).await.unwrap();
+    let [ProviderResponseSet::ChatCompletions(saved)] = expected.as_slice() else {
+        panic!("accepted signed turn must remain retained");
+    };
+    assert!(!saved.owner_message_id.is_empty());
+    assert_eq!(saved.public_content, public);
+    assert_eq!(
+        saved.tool_signatures[0].signature,
+        "opaque-google-signature"
+    );
+    assert_eq!(client.recorded_requests()[1].output_replay, expected);
+    let owner = db
+        .get_messages(CONVERSATION)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|message| message.message_id == saved.owner_message_id)
+        .unwrap();
+    assert_eq!(
+        owner.content.to_json(),
+        serde_json::to_value(&public).unwrap()
+    );
+    drop(first);
+    drop(tools);
+    db.pool().close().await;
+    drop(db);
+
+    let reopened = Database::open(path.to_str().unwrap()).await.unwrap();
+    let mut resumed = runtime(
+        reopened.clone(),
+        directory.path(),
+        client.clone(),
+        Arc::new(DeferredMcpCatalog::new(true)),
+    );
+    dispatch(&mut resumed).await;
+    resumed.state = ConvState::LlmRequesting { attempt: 3 };
+    dispatch(&mut resumed).await;
+    let requests = client.recorded_requests();
+    assert_eq!(requests.len(), 4);
+    for request in &requests[1..] {
+        assert_eq!(request.output_replay, expected);
+        let owner = request
+            .messages
+            .iter()
+            .find(|message| {
+                message.source_message_id.as_deref() == Some(saved.owner_message_id.as_str())
+            })
+            .unwrap();
+        assert_eq!(owner.content, public);
+        let results = request
+            .messages
+            .iter()
+            .flat_map(|message| &message.content)
+            .filter_map(|block| {
+                if let ContentBlock::ToolResult {
+                    tool_use_id,
+                    content,
+                    is_error,
+                    images,
+                } = block
+                {
+                    Some((tool_use_id, content, is_error, images))
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        let [(call_id, content, is_error, images)] = results.as_slice() else {
+            panic!("one authentic image-bearing tool result survives reopen and retry")
+        };
+        assert_eq!(call_id.as_str(), "signed-call");
+        assert_eq!(content.as_str(), "Session expired");
+        assert!(**is_error);
+        assert_eq!(
+            images.as_slice(),
+            &[phoenix_core::domain::llm_types::ImageSource::Base64 {
+                media_type: image.media_type.clone(),
+                data: image.data.clone(),
+            }]
+        );
+    }
+    drop(resumed);
+    reopened.pool().close().await;
 }

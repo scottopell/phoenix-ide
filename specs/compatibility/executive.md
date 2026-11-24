@@ -33,6 +33,7 @@ with the predecessor. The in-app UI states this limitation explicitly.
 | REQ-COMP-012/013/015/017/018/019 | Withdrawn macOS qualifications; IDs reserved |
 | REQ-COMP-014/016 | Existing exact protected Linux systemd qualification remains active |
 | REQ-COMP-020 | Goals lineage validation remains candidate-owned; see below |
+| REQ-COMP-022 | Exact canonical 158-high post-129 tail with only migration 156 absent is admitted for ordinary forward migration; every other post-129 registered-predecessor gap remains rejected |
 
 The retired macOS regression classes and replacement failure/identity coverage
 are accounted for explicitly in the launchd executive and ADR-230. No production
@@ -52,3 +53,9 @@ REQ-COMP-020 and ADR-187 define the extracted migration suffix 132–140 and rea
 The lineage predecessor check follows embedded registry membership, not numeric contiguity: every registered predecessor through the recorded tail is required, and every stored version/name must match its canonical identity. Regression coverage extends through the registered tail, including the 144-to-146 numbering gap, and rejects missing registered predecessors, wrong tail names, and unknown identities without mutation. These corrective regressions are authored; exact-candidate execution is pending. No deployment interval, damaged-ledger repair, or compatibility promise is added.
 
 Tests cover canonical prefixes/idempotence, unsupported and ambiguous lineages with unchanged schema/ledger/data through both entrypoints, migration constraint/history preservation, and the existing repository materialization path. Candidate-specific compilation and execution are pending; combined-tree results are not extraction qualification. Applicable CI, independent review, and local legacy/reference/watch paths remain qualification work. No live database or deployment action is authorized or performed by this extraction.
+
+## Canonical 158-to-156 reconciliation
+
+REQ-COMP-022 and ADR-246 qualify the post-129 registered-predecessor rule for one canonical registry transition. A ledger whose highest recorded migration is canonical 158 may omit canonical migration 156 only when every other embedded predecessor from 129 through 158 is present. The ordinary pending-migration runner then applies 156 by individual membership and preserves 158. Any additional post-129 gap, a higher recorded tail, a wrong identity, an unknown migration, or conflict detected by the existing lineage schema-evidence validators still refuses before mutation.
+
+Regression coverage includes the complete current-main-shaped migration path through 155 plus 158, application of only migration 156 for that fixture, final ledger membership `[156, 158]`, migrated schema checks, and foreign-key validation. A focused post-129 classifier test rejects other single gaps, multiple gaps, and a future-highest tail. Exact-candidate hosted execution remains qualification evidence rather than part of the contract.

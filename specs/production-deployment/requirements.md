@@ -52,7 +52,7 @@ A deployment shall commit only after observing a new backend-owned runtime proce
 
 ### REQ-PD-010 — Linux runtime-artifact rollback
 
-For ordinary Linux activation failure after disruption, the owner shall stop the candidate, atomically restore the previous binary, backend configuration, environment and service state, verify the captured predecessor identity at its previous endpoint, restore its deployed SHA, and distinguish successful runtime-artifact rollback from rollback failure. A captured installed predecessor may report a legacy 12-character lowercase SHA only in this rollback role; candidates require a complete 40-character identity. Runtime-artifact rollback shall not restore a database or establish compatibility with candidate-mutated data. Protected systemd activation follows the stricter pre-marker unchanged-predecessor and post-marker candidate-only boundary in REQ-PD-025. macOS shall instead follow REQ-LDD-030 and shall never automatically start the predecessor after disruption.
+For ordinary Linux activation failure after disruption, the owner shall stop the candidate, atomically restore the previous binary, backend configuration, environment and service state, verify the captured predecessor identity at its previous endpoint, restore its deployed SHA, and distinguish successful runtime-artifact rollback from rollback failure. A captured installed predecessor may report a legacy 12-character lowercase SHA only in this rollback role; candidates require a complete 40-character identity. Runtime-artifact rollback shall not restore a database or establish compatibility with candidate-mutated data. Protected systemd activation follows the stricter pre-marker unchanged-predecessor and post-marker candidate-only boundary in REQ-PD-025. macOS shall instead follow REQ-LDD-030: it may restart only the proven unchanged predecessor before the candidate boundary, never after an attempted or uncertain boundary.
 
 ### REQ-PD-011 — Truthful durable status and recovery
 
@@ -198,4 +198,4 @@ Withdrawn; this ID is reserved and grants no deployment or recovery guarantee. S
 
 ### REQ-PD-031 — macOS manual-recovery contract
 
-Native macOS deployment shall follow REQ-LDD-029–032: invoke candidate-owned migration once, retain failed ownership and diagnostics after disruption, require operator recovery, and provide no automatic database rollback or transaction resumption. This contract shall not alter Linux deployment, recovery or rollback.
+Native macOS deployment shall follow REQ-LDD-029–032: verify and retain a backup for an existing database, or prove a true first install with no database or predecessor artifacts before omitting the backup; invoke candidate-owned migration once, retain failed ownership and diagnostics after disruption, require operator recovery, and provide no automatic database rollback or transaction resumption. This contract shall not alter Linux deployment, recovery or rollback.

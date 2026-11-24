@@ -18,7 +18,7 @@ pub(super) async fn run(pool: &SqlitePool, migration: &Migration) -> DbResult<()
         || !definition.contains("WHEN NOT EXISTS (")
     {
         return Err(DbError::Serialization(
-            "migration 177 found unexpected retirement dispatch authority trigger".to_owned(),
+            "migration 180 found unexpected retirement dispatch authority trigger".to_owned(),
         ));
     }
     let rewritten = definition

@@ -2,9 +2,10 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { useEffect, useRef } from 'react';
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { MemoryRouter, Route, Routes, useLocation } from 'react-router-dom';
-import { ConversationPage } from './ConversationPage';
+import { ConversationPage, EmbeddedConversationPage } from './ConversationPage';
 import { resolveOwnedConversationTarget } from '../conversation/conversationNavigation';
 import { DesktopLayout } from '../components/DesktopLayout';
+import { OPEN_MESSAGE_VIEWER_EVENT } from '../components/MessageContextMenu';
 import { ConversationContext } from '../conversation/ConversationContext';
 import { DraftContext } from '../conversation/DraftContext';
 import { ConversationStore, type InitPayload, type SSEAction } from '../conversation';
@@ -255,6 +256,14 @@ function PersistentFocusScope() {
   return null;
 }
 
+function InterveningFocusScope() {
+  const { pushScope, popScope } = useFocusScopeCommands();
+  return <>
+    <button onClick={(event) => { pushScope('command-palette'); event.currentTarget.focus(); }}>open owner</button>
+    <button onClick={() => popScope('command-palette')}>close owner</button>
+  </>;
+}
+
 function renderPage(
   conversation: Conversation,
   routeSegment: string = conversation.slug,
@@ -262,6 +271,7 @@ function renderPage(
   routePrefix: '/c' | '/global' = '/c',
   activeFocusScope = false,
   messages: Message[] = [historyMessage],
+  mutationEnabled = true,
 ) {
   authoritativeConversations.set(conversation.id, conversation);
   authoritativeMessages.set(conversation.id, messages);
@@ -304,12 +314,13 @@ function renderPage(
     <ConversationContext.Provider value={store}>
       <DraftContext.Provider value={draftStore}>
         <FocusScopeProvider>
+          <InterveningFocusScope />
           <ConversationReadinessProvider>
             <MemoryRouter initialEntries={[`${routePrefix}/${routeSegment}${initialSearch}`]}>
               <Routes>
                 <Route
                   path={`${routePrefix}/:slug`}
-                  element={<>{activeFocusScope && <PersistentFocusScope />}<DesktopLayout><ConversationPage routePrefix={routePrefix} /></DesktopLayout><LocationProbe /></>}
+                  element={<>{activeFocusScope && <PersistentFocusScope />}<DesktopLayout>{mutationEnabled ? <ConversationPage routePrefix={routePrefix} /> : <EmbeddedConversationPage slug={conversation.slug} routePrefix={routePrefix} mutationEnabled={false} suppressCanonicalization />}</DesktopLayout><LocationProbe /></>}
                 />
               </Routes>
             </MemoryRouter>
@@ -498,6 +509,190 @@ describe('ConversationPage message viewer layout', () => {
     await waitFor(() => {
       expect(container.querySelector('.app-split-pane')).toBeInTheDocument();
     });
+  });
+});
+
+describe('ConversationPage explicit composer focus', () => {
+  beforeEach(() => localStorage.clear());
+
+  const resumableError = {
+    type: 'error' as const,
+    message: 'Background failure',
+    error_kind: 'server_error' as const,
+    error: { kind: 'server_error' as const, can_auto_retry: false, can_user_resume: true },
+  };
+
+  function insertDraft(text: string) {
+    act(() => window.dispatchEvent(new CustomEvent('phoenix:insert-draft', { detail: { text } })));
+  }
+
+  function changePhase(store: ConversationStore, phase: NonNullable<Conversation['state']>, sequenceId: number) {
+    act(() => store.dispatch(slug, {
+      type: 'sse_state_change',
+      sequenceId,
+      phase,
+      stateUpdatedAt: Date.now() + sequenceId,
+    }));
+  }
+
+  it.each([false, true])('hands wide fullscreen Send Notes back to the composer, respecting a newer modal (interrupted: %s)', async (interrupted) => {
+    const { container, store } = renderPage(makeConversation(), slug, '?viewer=message&presentation=fullscreen&message=1');
+    await screen.findByRole('textbox');
+    // MessageViewer is lazy-loaded after route readiness mounts the composer.
+    await act(async () => { await vi.dynamicImportSettled(); });
+    expect(await screen.findByRole('dialog', { name: 'Message viewer: User message #1' })).toBeInTheDocument();
+    fireEvent.click(await screen.findByRole('button', { name: 'Add note to line 1' }));
+    fireEvent.change(screen.getByPlaceholderText('Add your note… (Cmd/Ctrl+Enter to save)'), { target: { value: 'Please revise this passage' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Add Note' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Send notes' }));
+    const owner = screen.getByRole('button', { name: 'open owner' });
+    if (interrupted) fireEvent.click(owner);
+    await waitFor(() => expect(container.querySelector('.app-split-pane')).toBeInTheDocument());
+    const composer = screen.getByRole('textbox');
+    expect((composer as HTMLTextAreaElement).value).toContain('Please revise this passage');
+    expect(screen.getByRole('button', { name: 'Close viewer' })).toBeInTheDocument();
+    if (interrupted) {
+      expect(owner).toHaveFocus();
+      fireEvent.click(screen.getByRole('button', { name: 'close owner' }));
+      expect(owner).toHaveFocus();
+      fireEvent.click(screen.getByRole('button', { name: 'Close viewer' }));
+    }
+    await waitFor(() => expect(screen.getByRole('textbox')).toHaveFocus());
+    owner.focus();
+    changePhase(store, resumableError, 1);
+    expect(owner).toHaveFocus();
+  });
+
+  it.each([false, true])('preserves reading focus across an error branch remount (previous insertion: %s)', async (insert) => {
+    const { store } = renderPage(makeConversation());
+    const original = await screen.findByRole('textbox');
+    await waitFor(() => expect(original).toHaveFocus());
+    if (insert) {
+      original.blur();
+      expect(original).not.toHaveFocus();
+      insertDraft('explicit draft');
+      expect(original).toHaveValue('explicit draft');
+      expect(original).toHaveFocus();
+    }
+    const anchor = document.createElement('button');
+    document.body.appendChild(anchor);
+    anchor.focus();
+    try {
+      changePhase(store, resumableError, 1);
+      const replacement = screen.getByRole('textbox');
+      expect(replacement).not.toBe(original);
+      expect(replacement).toHaveValue(insert ? 'explicit draft' : '');
+      expect(anchor).toHaveFocus();
+      changePhase(store, { type: 'idle' }, 2);
+      expect(screen.getByRole('textbox')).not.toBe(replacement);
+      expect(anchor).toHaveFocus();
+    } finally {
+      anchor.remove();
+    }
+  });
+
+  it('does not replay consumed insertion focus on a same-branch update', async () => {
+    const { store } = renderPage(makeConversation());
+    const original = await screen.findByRole('textbox');
+    await waitFor(() => expect(original).toHaveFocus());
+    insertDraft('explicit draft');
+    const anchor = document.createElement('button');
+    document.body.appendChild(anchor);
+    anchor.focus();
+    try {
+      changePhase(store, { type: 'llm_requesting', attempt: 1 }, 1);
+      expect(screen.getByRole('textbox')).toBe(original);
+      expect(anchor).toHaveFocus();
+    } finally {
+      anchor.remove();
+    }
+  });
+
+  it.each([false, true])('preserves an intervening owner until release, then consumes pending intent once (remount: %s)', async (remount) => {
+    const { store } = renderPage(makeConversation());
+    const original = await screen.findByRole('textbox');
+    await waitFor(() => expect(original).toHaveFocus());
+    changePhase(store, { type: 'awaiting_llm' }, 1);
+    insertDraft('pending draft');
+    const owner = screen.getByRole('button', { name: 'open owner' });
+    fireEvent.click(owner);
+    changePhase(store, remount ? resumableError : { type: 'idle' }, 2);
+    expect(screen.getByRole('textbox') === original).toBe(!remount);
+    expect(screen.getByRole('textbox')).toHaveValue('pending draft');
+    expect(owner).toHaveFocus();
+    fireEvent.click(screen.getByRole('button', { name: 'close owner' }));
+    expect(screen.getByRole('textbox')).toHaveFocus();
+    fireEvent.click(owner);
+    fireEvent.click(screen.getByRole('button', { name: 'close owner' }));
+    expect(owner).toHaveFocus();
+    changePhase(store, remount ? { type: 'idle' } : resumableError, 3);
+    expect(owner).toHaveFocus();
+  });
+
+  it('defers pending intent to an intervening route-owned viewer', async () => {
+    const { store } = renderPage(makeConversation());
+    const textbox = await screen.findByRole('textbox');
+    await waitFor(() => expect(textbox).toHaveFocus());
+    changePhase(store, { type: 'awaiting_llm' }, 1);
+    insertDraft('pending draft');
+    act(() => window.dispatchEvent(new CustomEvent(OPEN_MESSAGE_VIEWER_EVENT, {
+      detail: { sequenceId: 1, presentation: 'pane' },
+    })));
+    const close = await screen.findByRole('button', { name: 'Close viewer' });
+    close.focus();
+    changePhase(store, { type: 'idle' }, 2);
+    expect(close).toHaveFocus();
+    fireEvent.click(close);
+    await waitFor(() => expect(screen.getByRole('textbox')).toHaveFocus());
+    const anchor = screen.getByRole('button', { name: 'open owner' });
+    anchor.focus();
+    changePhase(store, resumableError, 3);
+    expect(anchor).toHaveFocus();
+  });
+
+  it('does not let an older acknowledgement clear a newer unavailable request', async () => {
+    const { store } = renderPage(makeConversation());
+    const textbox = await screen.findByRole('textbox');
+    await waitFor(() => expect(textbox).toHaveFocus());
+    textbox.blur();
+    textbox.addEventListener('focus', () => {
+      changePhase(store, { type: 'awaiting_llm' }, 1);
+      insertDraft('newer request');
+    }, { once: true });
+    insertDraft('older request');
+    const anchor = screen.getByRole('button', { name: 'open owner' });
+    anchor.focus();
+    expect(textbox).toHaveValue('older request\n\nnewer request');
+    changePhase(store, { type: 'idle' }, 2);
+    expect(textbox).toHaveFocus();
+    anchor.focus();
+    changePhase(store, resumableError, 3);
+    expect(anchor).toHaveFocus();
+  });
+
+  it('retains a new insertion request made while the composer is absent', async () => {
+    const { store } = renderPage(makeConversation());
+    const original = await screen.findByRole('textbox');
+    await waitFor(() => expect(original).toHaveFocus());
+    insertDraft('first draft');
+    changePhase(store, { type: 'awaiting_continuation', attempt: 1 }, 1);
+    expect(screen.queryByRole('textbox')).not.toBeInTheDocument();
+    const anchor = document.createElement('button');
+    document.body.appendChild(anchor);
+    anchor.focus();
+    try {
+      insertDraft('new pending draft');
+      expect(anchor).toHaveFocus();
+      changePhase(store, { type: 'idle' }, 2);
+      const replacement = screen.getByRole('textbox');
+      expect(replacement).toHaveValue('first draft\n\nnew pending draft');
+      expect(replacement).toHaveFocus();
+      anchor.focus();
+      changePhase(store, resumableError, 3);
+      expect(anchor).toHaveFocus();
+    } finally {
+      anchor.remove();
+    }
   });
 });
 
@@ -759,13 +954,13 @@ describe('ConversationPage message delivery reconciliation', () => {
   it('rolls back an optimistic phase when expansion rejects before a turn starts', async () => {
     vi.spyOn(api, 'sendMessage').mockRejectedValue(new ExpansionError({
       error: 'No matching reference',
-      error_type: 'file_not_found',
-      reference: '@missing',
+      error_type: 'skill_invocation_failed',
+      reference: '/broken-skill',
     }));
     const { store } = renderPage(makeConversation());
 
     const textbox = await screen.findByRole('textbox');
-    fireEvent.change(textbox, { target: { value: '@missing' } });
+    fireEvent.change(textbox, { target: { value: '/broken-skill' } });
     fireEvent.click(screen.getByRole('button', { name: /send/i }));
 
     await waitFor(() => expect(store.getSnapshot(slug).phase.type).toBe('idle'));
@@ -1272,6 +1467,24 @@ describe('ConversationPage context exhausted handoff', () => {
     expect(screen.queryByRole('button', { name: 'Regenerate handoff' })).not.toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Check fit' })).toBeInTheDocument();
     expect(screen.getByText(/conversation model selector/)).toBeInTheDocument();
+  });
+
+  it('keeps continuation recovery read-only while aggregate mutations are disabled', async () => {
+    renderPage(makeConversation({ state: { type: 'recoverable_continuation_failure', message: 'Network interrupted', error_kind: 'network', operation_id: 'op', attempt: 1 } }), slug, '', '/c', false, [historyMessage], false);
+    const retry = await screen.findByRole('button', { name: 'Retry summary' });
+    expect(retry).toBeDisabled();
+    fireEvent.click(retry);
+    expect(api.triggerContinuation).not.toHaveBeenCalled();
+    expect(api.continueConversation).not.toHaveBeenCalled();
+  });
+
+  it('keeps reviewed handoff controls disabled while aggregate mutations are disabled', async () => {
+    renderPage(makeConversation({ state: { type: 'context_exhausted', summary: 'Generated summary' } }), slug, '', '/c', false, [historyMessage], false);
+    const regenerate = await screen.findByRole('button', { name: 'Regenerate handoff' });
+    expect(regenerate).toBeDisabled();
+    fireEvent.click(regenerate);
+    expect(api.triggerContinuation).not.toHaveBeenCalled();
+    expect(api.continueConversation).not.toHaveBeenCalled();
   });
 
   it('keeps explicit retry for a transient continuation failure', async () => {

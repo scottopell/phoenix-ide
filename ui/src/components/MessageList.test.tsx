@@ -934,6 +934,8 @@ describe('MessageList', () => {
     const markdownTableRule = appCss.match(/\.agent-text-block\s+\.markdown-table-scroll\s+table\s*{([^}]*)}/s)?.[1];
     const transcriptRule = appCss.match(/\.message-virtual-transcript\s*{[^}]*}/s)?.[0];
     const tableCodeRule = appCss.match(/\.message-content\s+\.agent-text-block\s+:where\(th,\s*td\)\s+code\s*{([^}]*)}/s)?.[1];
+    const narrowConversationTableRule = appCss.match(/\.agent-text-block\s+\.conversation-markdown-table-scroll\[data-column-count='2'\]\s*>\s*table\s*{([^}]*)}/s)?.[1];
+    const narrowConversationCellRule = appCss.match(/\.agent-text-block\s+\.conversation-markdown-table-scroll\[data-column-count='2'\]\s+:where\(th,\s*td\)\s*{([^}]*)}/s)?.[1];
 
     expect(chatViewRule).toMatch(/container-type:\s*inline-size/);
     expect(tableFallbackRule).toMatch(/max-width:\s*100%/);
@@ -944,6 +946,13 @@ describe('MessageList', () => {
     expect(markdownTableRule).toMatch(/background:\s*var\(--bg-secondary\)/);
     expect(tableFallbackRule).not.toMatch(/background/);
     expect(tableCodeRule).toMatch(/font-size:\s*inherit/);
+    expect(narrowConversationTableRule).toMatch(/width:\s*100%/);
+    expect(narrowConversationTableRule).toMatch(/table-layout:\s*fixed/);
+    expect(narrowConversationCellRule).toMatch(/overflow-wrap:\s*anywhere/);
+    expect(appCss).not.toMatch(/\.conversation-markdown-table-scroll\s*>\s*table/);
+    expect(appCss).not.toMatch(/\.conversation-markdown-table-scroll\s+:where\(th,\s*td\)/);
+    expect(appCss).not.toMatch(/markdown-table-scroll:has/);
+    expect(appCss).not.toMatch(/th:nth-child\(2\):last-child/);
     expect(transcriptRule).not.toMatch(/container-type/);
     expect(transcriptRule).not.toMatch(/overflow-x/);
   });
@@ -4801,4 +4810,96 @@ it('find navigation requests reveal for compact hidden assistant second-line mat
     expect(highlighted).not.toBeNull();
   });
   expect(virtualTranscriptMock.scrollToIndex).toHaveBeenCalled();
+});
+
+describe('find navigation intent across finalization', () => {
+  it.each(['settled', 'pending', 'unrelated', 'superseded', 'closed', 'reset'] as const)('preserves only unfinished current intent across projection refresh: %s', (mode) => {
+    vi.useFakeTimers();
+    const scrolling = vi.spyOn(HTMLElement.prototype, 'scrollIntoView');
+    try {
+      const store = new ConversationStore();
+      const slug = 'find-finalization';
+      const text = 'Intro\n\n## alpha\n\nalpha end';
+      store.dispatch(slug, { type: 'sse_state_change', sequenceId: 1, phase: { type: 'llm_requesting', attempt: 1 }, stateUpdatedAt: Date.now() });
+      store.dispatch(slug, { type: 'sse_token', sequenceId: 2, requestId: 'final-request', delta: text });
+      const historical = { ...makeMessage(1, 'agent'), content: [{ type: 'text', text: 'intro' }, { type: 'text', text: 'alpha historical lower fragment' }] } as Message;
+      const final = { ...makeMessage(2, 'agent'), message_id: 'final-request', content: [{ type: 'text', text }] } as Message;
+      const view = (done: boolean, conversationId = slug) => (
+        <ConversationContext.Provider value={store}>
+          <MemoryRouter><FocusScopeProvider>
+            <MessageList slug={slug} conversationId={conversationId}
+              messages={done ? [historical, final] : [historical]} pendingMessages={[]}
+              streamingRequestId={done ? null : 'final-request'}
+              convState={done ? idleState : { type: 'llm_requesting', attempt: 1 }}
+              onRetry={vi.fn()} onOpenFile={undefined}
+              transcriptPositioning={{ kind: 'idle', view: { conversationId, generation: 1, transcriptGeneration: 1 } }} />
+          </FocusScopeProvider></MemoryRouter>
+        </ConversationContext.Provider>
+      );
+      const { rerender, unmount } = render(view(false));
+      fireEvent.keyDown(window, { key: 'f', metaKey: true });
+      fireEvent.change(screen.getByRole('textbox', { name: 'Find in viewer' }), { target: { value: 'alpha' } });
+      fireEvent.click(screen.getByRole('button', { name: 'Next' }));
+      expect(screen.getByText('2 of 3')).toBeInTheDocument();
+      if (mode === 'unrelated' || mode === 'superseded') {
+        fireEvent.click(screen.getByRole('button', { name: 'Previous' }));
+        expect(screen.getByText('1 of 3')).toBeInTheDocument();
+      }
+      if (mode === 'settled') act(() => vi.advanceTimersByTime(6000));
+      if (mode === 'closed') fireEvent.keyDown(screen.getByRole('textbox', { name: 'Find in viewer' }), { key: 'Escape' });
+      if (mode === 'reset') rerender(view(false, 'other-conversation'));
+      virtualTranscriptMock.scrollToIndex.mockClear();
+      scrolling.mockClear();
+      if (mode === 'unrelated') {
+        act(() => store.dispatch(slug, { type: 'sse_token', sequenceId: 3, requestId: 'final-request', delta: ' unrelated token' }));
+        expect(store.getSnapshot(slug).streamingBuffer?.text).toContain('unrelated token');
+      } else {
+        rerender(view(true, mode === 'reset' ? 'other-conversation' : slug));
+      }
+      // The AgentMessage test double omits its text-fragment DOM; provide the
+      // physical lower-fragment target so row-only scrolling cannot pass.
+      const currentFragment = document.createElement('div');
+      const historicalIntent = mode === 'unrelated' || mode === 'superseded';
+      currentFragment.dataset['fragmentId'] = historicalIntent ? 'agent-text-1' : 'agent-text-0';
+      document.querySelector(`.message.agent[data-sequence-id="${historicalIntent ? 1 : 2}"]`)?.append(currentFragment);
+      act(() => vi.advanceTimersByTime(1000));
+      expect(virtualTranscriptMock.scrollToIndex).not.toHaveBeenCalled();
+      if (mode === 'pending' || historicalIntent) {
+        expect(scrolling.mock.contexts).toContain(currentFragment);
+        expect(agentMessageProps.some((entry) => entry.revealRequest?.fragmentId === currentFragment.dataset['fragmentId'])).toBe(true);
+        if (historicalIntent) {
+          expect(scrolling.mock.contexts.every((element) => element instanceof Element && !element.closest('[data-sequence-id="2"]'))).toBe(true);
+        }
+        scrolling.mockClear();
+        rerender(view(mode !== 'unrelated'));
+        act(() => vi.advanceTimersByTime(1000));
+        expect(scrolling).not.toHaveBeenCalled();
+      } else {
+        expect(scrolling).not.toHaveBeenCalled();
+      }
+      if (mode === 'settled' || mode === 'pending') {
+        expect(screen.getByText('2 of 3')).toBeInTheDocument();
+        fireEvent.click(screen.getByRole('button', { name: 'Next' }));
+        expect(screen.getByText('3 of 3')).toBeInTheDocument();
+        expect(virtualTranscriptMock.scrollToIndex).toHaveBeenLastCalledWith(1, 'start');
+        expect(agentMessageProps.some((entry) => entry.revealRequest?.fragmentId === 'agent-text-0')).toBe(true);
+        act(() => vi.advanceTimersByTime(600));
+        expect(scrolling).toHaveBeenCalledWith({ block: 'center' });
+        const activeOccurrence = document.createElement('mark');
+        activeOccurrence.dataset['viewerFindActiveTarget'] = 'active-occurrence';
+        activeOccurrence.textContent = 'alpha';
+        currentFragment.append(activeOccurrence);
+        scrolling.mockClear();
+        fireEvent.click(screen.getByRole('button', { name: 'Previous' }));
+        expect(screen.getByText('2 of 3')).toBeInTheDocument();
+        act(() => vi.advanceTimersByTime(600));
+        expect(scrolling.mock.contexts).toContain(activeOccurrence);
+        expect(scrolling.mock.contexts).not.toContain(currentFragment);
+      }
+      unmount();
+    } finally {
+      scrolling.mockRestore();
+      vi.useRealTimers();
+    }
+  });
 });

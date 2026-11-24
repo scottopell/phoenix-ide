@@ -77,8 +77,8 @@ impl std::error::Error for ProductConversationIdError {}
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub enum AutoContinueOnContextExhaustion {
-    #[default]
     Disabled,
+    #[default]
     Enabled,
 }
 
@@ -279,12 +279,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn automatic_continuation_preference_defaults_off_and_converts_explicitly() {
+    fn automatic_continuation_preference_defaults_on_and_converts_explicitly() {
         assert_eq!(
             AutoContinueOnContextExhaustion::default(),
-            AutoContinueOnContextExhaustion::Disabled
+            AutoContinueOnContextExhaustion::Enabled
         );
-        assert!(!AutoContinueOnContextExhaustion::default().is_enabled());
+        assert!(AutoContinueOnContextExhaustion::default().is_enabled());
         assert_eq!(
             AutoContinueOnContextExhaustion::from(true),
             AutoContinueOnContextExhaustion::Enabled

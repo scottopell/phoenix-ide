@@ -991,6 +991,7 @@ pub fn transition_core(
         | (CoreState::LlmRequesting { .. }, CoreEvent::UserCancel { .. })
         | (CoreState::ServerOverloadRetrying { .. }, CoreEvent::UserCancel { .. })
         | (CoreState::CancellingTool { .. }, CoreEvent::ToolAborted { .. })
+        | (CoreState::CancellingTool { .. }, CoreEvent::ToolCancellationRetired { .. })
         | (CoreState::CancellingTool { .. }, CoreEvent::ToolComplete { .. })
         | (CoreState::CancellingTool { .. }, CoreEvent::SubAgentResult { .. }) => {
             handle_core_cancellation(state, event)
@@ -1351,6 +1352,7 @@ fn handle_core_tool_complete(
         | CoreEvent::OverloadRetryDeadlineExpired
         | CoreEvent::RetryTimeout { .. }
         | CoreEvent::ToolAborted { .. }
+        | CoreEvent::ToolCancellationRetired { .. }
         | CoreEvent::SubAgentResult { .. }
         | CoreEvent::ContinuationResponse { .. }
         | CoreEvent::ContinuationFailed { .. }
@@ -1370,6 +1372,11 @@ fn handle_core_cancellation(
     state: &CoreState,
     event: CoreEvent,
 ) -> Result<CoreTransitionResult, TransitionError> {
+    let forced_tool_retirement = if matches!(event, CoreEvent::ToolCancellationRetired { .. }) {
+        crate::state::ForcedToolRetirement::Observed
+    } else {
+        crate::state::ForcedToolRetirement::NotObserved
+    };
     match (state, event) {
         // AwaitingSubAgents + UserCancel -> CancellingSubAgents
         (
@@ -1386,6 +1393,7 @@ fn handle_core_cancellation(
                 completed_results: completed_results.clone(),
                 cause,
                 spawn_tool_id: spawn_tool_id.clone(),
+                forced_tool_retirement: crate::state::ForcedToolRetirement::NotObserved,
             })
             .with_effect(Effect::PersistState)
             .with_effect(Effect::CancelSubAgents { ids, cause }))
@@ -1447,6 +1455,9 @@ fn handle_core_cancellation(
             },
             CoreEvent::ToolAborted {
                 tool_use_id: aborted_id,
+            }
+            | CoreEvent::ToolCancellationRetired {
+                tool_use_id: aborted_id,
             },
         ) if *tool_use_id == aborted_id => {
             let cancellation_results =
@@ -1460,16 +1471,23 @@ fn handle_core_cancellation(
             .map(CheckpointData::ToolRound)?;
 
             if pending_sub_agents.is_empty() {
-                Ok(CoreTransitionResult::new(CoreState::Idle)
+                let mut result = CoreTransitionResult::new(CoreState::Idle)
                     .with_effect(Effect::PersistCheckpoint { data: checkpoint })
                     .with_effect(Effect::PersistState)
-                    .with_effect(Effect::notify_agent_done()))
+                    .with_effect(Effect::notify_agent_done());
+                if forced_tool_retirement == crate::state::ForcedToolRetirement::Observed {
+                    result = result.with_effect(Effect::CancellationCompleted {
+                        accepted_child: None,
+                    });
+                }
+                Ok(result)
             } else {
                 Ok(CoreTransitionResult::new(CoreState::CancellingSubAgents {
                     pending: pending_sub_agents.clone(),
                     completed_results: vec![],
                     cause: *cause,
                     spawn_tool_id: None,
+                    forced_tool_retirement,
                 })
                 .with_effect(Effect::PersistCheckpoint { data: checkpoint })
                 .with_effect(Effect::PersistState))
@@ -1512,6 +1530,7 @@ fn handle_core_cancellation(
                     completed_results: vec![],
                     cause: *cause,
                     spawn_tool_id: None,
+                    forced_tool_retirement: crate::state::ForcedToolRetirement::NotObserved,
                 })
                 .with_effect(Effect::PersistCheckpoint { data: checkpoint })
                 .with_effect(Effect::PersistState))
@@ -1674,6 +1693,7 @@ fn handle_core_sub_agents(
                 completed_results,
                 cause,
                 spawn_tool_id,
+                forced_tool_retirement,
             },
             CoreEvent::SubAgentResult { agent_id, outcome },
         ) if pending.iter().any(|p| p.agent_id == agent_id) && pending.len() > 1 => {
@@ -1700,6 +1720,7 @@ fn handle_core_sub_agents(
                 completed_results: new_results,
                 cause: *cause,
                 spawn_tool_id: spawn_tool_id.clone(),
+                forced_tool_retirement: *forced_tool_retirement,
             })
             .with_effect(Effect::PersistState))
         }
@@ -1713,6 +1734,7 @@ fn handle_core_sub_agents(
                 completed_results,
                 cause,
                 spawn_tool_id,
+                forced_tool_retirement,
             },
             CoreEvent::SubAgentResult { agent_id, outcome },
         ) if pending.iter().any(|p| p.agent_id == agent_id) && pending.len() == 1 => {
@@ -1724,7 +1746,7 @@ fn handle_core_sub_agents(
             let recorded = map_teardown_outcome(outcome, *cause);
             let mut new_results = completed_results.clone();
             new_results.push(SubAgentResult {
-                agent_id,
+                agent_id: agent_id.clone(),
                 task,
                 outcome: recorded,
             });
@@ -1735,29 +1757,33 @@ fn handle_core_sub_agents(
             // multi-tool batch where spawn_agents wasn't last) persists a
             // safe non-tool summary. The persist handler — not this gate —
             // guarantees no orphaned tool_result is ever produced.
-            match cause {
+            let mut result = match cause {
                 CancelCause::Timeout => {
-                    Ok(
-                        CoreTransitionResult::new(CoreState::LlmRequesting { attempt: 1 })
-                            .with_effect(Effect::PersistSubAgentResults {
-                                results: new_results,
-                                spawn_tool_id: spawn_tool_id.clone(),
-                                summary_message_id: uuid::Uuid::new_v4().to_string(),
-                            })
-                            .with_effect(Effect::PersistState)
-                            .with_effect(Effect::notify_state_change())
-                            .with_effect(Effect::RequestLlm),
-                    )
+                    CoreTransitionResult::new(CoreState::LlmRequesting { attempt: 1 })
+                        .with_effect(Effect::PersistSubAgentResults {
+                            results: new_results,
+                            spawn_tool_id: spawn_tool_id.clone(),
+                            summary_message_id: uuid::Uuid::new_v4().to_string(),
+                        })
+                        .with_effect(Effect::PersistState)
+                        .with_effect(Effect::notify_state_change())
+                        .with_effect(Effect::RequestLlm)
                 }
-                CancelCause::UserRequested => Ok(CoreTransitionResult::new(CoreState::Idle)
+                CancelCause::UserRequested => CoreTransitionResult::new(CoreState::Idle)
                     .with_effect(Effect::PersistSubAgentResults {
                         results: new_results,
                         spawn_tool_id: spawn_tool_id.clone(),
                         summary_message_id: uuid::Uuid::new_v4().to_string(),
                     })
                     .with_effect(Effect::PersistState)
-                    .with_effect(Effect::notify_agent_done())),
+                    .with_effect(Effect::notify_agent_done()),
+            };
+            if *forced_tool_retirement == crate::state::ForcedToolRetirement::Observed {
+                result = result.with_effect(Effect::CancellationCompleted {
+                    accepted_child: Some(agent_id),
+                });
             }
+            Ok(result)
         }
 
         (state, event) => Err(TransitionError::InvalidTransition {
@@ -2365,6 +2391,7 @@ fn creation_provisioned_transition(
                 *idempotent = true;
             }
             Effect::PersistState
+            | Effect::CancellationCompleted { .. }
             | Effect::RequestLlm
             | Effect::CompleteCreation { .. }
             | Effect::MaterializeCreation { .. }
@@ -2617,36 +2644,23 @@ pub fn transition_parent(
                 annotations,
             }),
         ) if request_authority.matches_submitted(request_id.as_ref()) => {
-            let answers_text = questions
-                .iter()
-                .filter_map(|q| {
-                    let a = answers.get(&q.question)?;
-                    let q_text = &q.question;
-                    let mut parts = vec![format!("\"{}\" = \"{}\"", q_text, a)];
-                    let question_data = questions.iter().find(|qq| qq.question == *q_text);
-                    if let Some(qd) = question_data {
-                        let selected_preview = qd
-                            .options
-                            .iter()
-                            .find(|o| o.label == *a)
-                            .and_then(|o| o.preview.as_deref());
-                        if let Some(preview) = selected_preview {
-                            parts.push(format!("selected preview:\n{preview}"));
-                        }
-                    }
-                    if let Some(ref anns) = annotations {
-                        if let Some(ann) = anns.get(q_text.as_str()) {
-                            if let Some(ref notes) = ann.notes {
-                                parts.push(format!("user notes: {notes}"));
-                            }
-                        }
-                    }
-                    Some(parts.join(" "))
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
+            let answers_text = phoenix_core::domain::sm_state::render_question_answers(
+                questions,
+                &answers,
+                annotations.as_ref(),
+            );
 
-            let user_text = format!("Here are my answers:\n{answers_text}");
+            let answered_by_conversation = source.as_ref().is_some_and(|source| {
+                matches!(
+                    source.origin,
+                    phoenix_core::domain::db_schema::InputOrigin::InternalConversation { .. }
+                )
+            });
+            let user_text = if answered_by_conversation {
+                format!("The Coordinator answered your questions for the user:\n{answers_text}")
+            } else {
+                format!("Here are my answers:\n{answers_text}")
+            };
 
             Ok(
                 ParentTransitionResult::new(ParentState::Core(CoreState::LlmRequesting {
@@ -3776,6 +3790,9 @@ pub fn transition_sub_agent(
             }),
             SubAgentEvent::Core(
                 CoreEvent::ToolAborted {
+                    tool_use_id: settled_id,
+                }
+                | CoreEvent::ToolCancellationRetired {
                     tool_use_id: settled_id,
                 }
                 | CoreEvent::ToolComplete {
@@ -9089,6 +9106,69 @@ mod tests {
     }
 
     #[test]
+    fn coordinator_answers_are_labelled_as_the_coordinators() {
+        use crate::state::UserQuestion;
+
+        let request_authority = phoenix_core::domain::sm_state::QuestionRequestAuthority::new();
+        let request_id = request_authority.request_id().unwrap().clone();
+        let state = ConvState::AwaitingUserResponse {
+            questions: vec![UserQuestion {
+                question: "Which library?".to_string(),
+                header: "Dependencies".to_string(),
+                options: vec![],
+                multi_select: false,
+            }],
+            tool_use_id: "tool-auq-1".to_string(),
+            request_authority,
+        };
+        let mut answers = std::collections::HashMap::new();
+        answers.insert("Which library?".to_string(), "lodash".to_string());
+        let origin = phoenix_core::domain::db_schema::InputOrigin::InternalConversation {
+            product_conversation_id:
+                phoenix_core::domain::product_conversation::ProductConversationId::parse(
+                    "coordinator",
+                )
+                .unwrap(),
+            transcript_id: "coordinator-transcript".to_string(),
+            source_call: None,
+        };
+
+        let result = transition(
+            &state,
+            &test_context(),
+            Event::UserQuestionResponse {
+                source: Some(phoenix_core::domain::sm_event::QuestionAnswerSource {
+                    message_id: "answer".to_string(),
+                    origin: origin.clone(),
+                }),
+                request_id: Some(request_id),
+                answers,
+                annotations: None,
+            },
+        )
+        .unwrap();
+
+        let persisted = result.effects.iter().find_map(|effect| {
+            if let Effect::PersistUserInputMessage {
+                content, origin: o, ..
+            } = effect
+            {
+                Some((content.clone(), o.clone()))
+            } else {
+                None
+            }
+        });
+        let (content, persisted_origin) = persisted.expect("answer is persisted");
+        assert_eq!(persisted_origin, origin);
+        let text = serde_json::to_string(&content).unwrap();
+        assert!(
+            text.contains("The Coordinator answered your questions for the user"),
+            "{text}"
+        );
+        assert!(!text.contains("Here are my answers"), "{text}");
+    }
+
+    #[test]
     fn test_awaiting_user_response_dismisses_without_resuming_llm() {
         use crate::state::UserQuestion;
 
@@ -10441,6 +10521,9 @@ mod teardown_tests {
             completed_results: vec![],
             cause: CancelCause::Timeout,
             spawn_tool_id: Some("spawn-1".to_string()),
+
+            forced_tool_retirement:
+                phoenix_core::domain::sm_state::ForcedToolRetirement::NotObserved,
         };
         let result = transition(
             &state,
@@ -10482,6 +10565,9 @@ mod teardown_tests {
             completed_results: vec![],
             cause: CancelCause::Timeout,
             spawn_tool_id: Some("spawn-1".to_string()),
+
+            forced_tool_retirement:
+                phoenix_core::domain::sm_state::ForcedToolRetirement::NotObserved,
         };
         let result = transition(
             &state,
@@ -10511,6 +10597,9 @@ mod teardown_tests {
             completed_results: vec![],
             cause: CancelCause::Timeout,
             spawn_tool_id: Some("spawn-1".to_string()),
+
+            forced_tool_retirement:
+                phoenix_core::domain::sm_state::ForcedToolRetirement::NotObserved,
         };
         let result = transition(
             &state,
@@ -10553,6 +10642,9 @@ mod teardown_tests {
             completed_results: vec![],
             cause: CancelCause::UserRequested,
             spawn_tool_id: Some("spawn-1".to_string()),
+
+            forced_tool_retirement:
+                phoenix_core::domain::sm_state::ForcedToolRetirement::NotObserved,
         };
         let reported = SubAgentOutcome::Failure {
             error: "cancelled by user".to_string(),
@@ -10740,6 +10832,9 @@ mod teardown_tests {
             completed_results: vec![],
             cause: CancelCause::Timeout,
             spawn_tool_id: Some("spawn-1".to_string()),
+
+            forced_tool_retirement:
+                phoenix_core::domain::sm_state::ForcedToolRetirement::NotObserved,
         };
         let first = transition(
             &state,

@@ -65,11 +65,14 @@ pub(crate) use native_close::source_entry::SourceEntryController;
 pub(crate) use native_close::source_entry::{SourceEntryWorker, WorkerEntryResult};
 mod native_close_observe;
 pub(crate) mod native_close_retry;
+mod native_spawn;
+use native_spawn::{NativeSpawnCutoff, NativeSpawnHandoff, NativeSpawnPhase};
 mod native_task_approval;
 mod self_goal;
 #[cfg(test)]
 mod self_goal_tests;
 mod tool_execution;
+mod tool_preparation;
 use capacity::{CapacityDecision, CountingBudget, RequestCapacity, SuccessorCapacity};
 use tool_execution::ToolExecutionSlot;
 #[cfg(test)]
@@ -182,6 +185,9 @@ enum AuthoritativeEffect {
 }
 
 enum ControlEffect {
+    CancellationCompleted {
+        accepted_child: Option<String>,
+    },
     AbortTool {
         tool_use_id: String,
     },
@@ -208,6 +214,9 @@ impl ClassifiedEffect {
     #[allow(clippy::too_many_lines)]
     fn classify(effect: Effect) -> Self {
         match effect {
+            Effect::CancellationCompleted { accepted_child } => {
+                Self::Control(ControlEffect::CancellationCompleted { accepted_child })
+            }
             Effect::BroadcastAssistantMessage { message } => {
                 Self::Authoritative(Box::new(AuthoritativeEffect::BroadcastAssistantMessage {
                     message,
@@ -507,6 +516,15 @@ struct RequiredSettlementScope {
     admission: crate::runtime::AdmittedOperation,
     boundary: RequiredSettlementBoundary,
     backstop_drain: Option<BackstopDrainReceipts>,
+    cancellation_notice: CancellationNoticeReceipt,
+}
+
+enum CancellationNoticeReceipt {
+    NoCommit,
+    ParentStateCommitted,
+    ChildAccepted(String),
+    Ready,
+    Published,
 }
 
 impl RequiredSettlementScope {
@@ -518,6 +536,7 @@ impl RequiredSettlementScope {
             admission,
             boundary,
             backstop_drain: None,
+            cancellation_notice: CancellationNoticeReceipt::NoCommit,
         }
     }
 
@@ -527,15 +546,26 @@ impl RequiredSettlementScope {
             boundary: RequiredSettlementBoundary::ChildBackstop,
             backstop_drain: (!children.is_empty())
                 .then_some(BackstopDrainReceipts::Pending(children)),
+            cancellation_notice: CancellationNoticeReceipt::NoCommit,
         }
     }
 
     fn record_child_acceptance(&mut self, child_id: &str) {
+        self.cancellation_notice = CancellationNoticeReceipt::ChildAccepted(child_id.to_owned());
         if let Some(BackstopDrainReceipts::Pending(children)) = &mut self.backstop_drain {
             children.retain(|pending| pending != child_id);
             if children.is_empty() {
                 self.backstop_drain = Some(BackstopDrainReceipts::Established);
             }
+        }
+    }
+
+    fn record_parent_state_commit(&mut self) {
+        if matches!(
+            self.cancellation_notice,
+            CancellationNoticeReceipt::NoCommit
+        ) {
+            self.cancellation_notice = CancellationNoticeReceipt::ParentStateCommitted;
         }
     }
 }
@@ -647,6 +677,8 @@ const DIRECT_TURN_TERMINAL_SETTLEMENT_RETRIES: u8 = 3;
 /// on top of (not instead of) the per-tool line caps. 100 KB keeps a generous
 /// amount of legitimate output while making the pathological case impossible.
 const MAX_TOOL_OUTPUT_BYTES: usize = 100 * 1024;
+const _: () =
+    assert!(phoenix_db::coordinator_tracking::TRACKING_DETAIL_BYTES < MAX_TOOL_OUTPUT_BYTES);
 
 /// Maximum number of sub-agent tasks accepted in a single `spawn_agents` call.
 /// Realises the `SpawnLimit` invariant in `specs/bedrock/bedrock.allium`
@@ -975,7 +1007,15 @@ where
     tracing::info!(parent: &span, conv_id = %conv_id, tool = %tool_name, id = %tool_use_id, "Executing tool");
     let tool_start = std::time::Instant::now();
 
-    let callable = tool_surface.callable_tools(tool_executor.definitions().await);
+    let definitions = tokio::select! {
+        biased;
+        () = cancel_token_check.cancelled() => return ToolExecOutcome::Aborted {
+            tool_use_id,
+            reason: crate::state_machine::AbortReason::CancellationRequested,
+        },
+        definitions = tool_executor.definitions() => definitions,
+    };
+    let callable = tool_surface.callable_tools(definitions);
     if !callable
         .iter()
         .any(|definition| definition.name == tool_name && definition.input_schema == request_schema)
@@ -985,6 +1025,15 @@ where
             error: "EUNAVAIL: tool is unavailable under the current conversation policy".into(),
         };
     }
+    let tool_ctx = if tool_name == phoenix_core::domain::tool_discovery::TOOL_SEARCH_NAME {
+        let catalog = match storage.load_tool_search_catalog(&conv_id).await {
+            Ok(catalog) => catalog,
+            Err(error) => return ToolExecOutcome::Failed { tool_use_id, error },
+        };
+        tool_ctx.with_tool_search_catalog(catalog)
+    } else {
+        tool_ctx
+    };
     let output = tool_executor
         .execute(checked.with_input_schema(request_schema), tool_ctx)
         .instrument(span.clone())
@@ -1042,31 +1091,6 @@ where
             error: format!("Unknown tool: {tool_name}"),
         }
     }
-}
-
-/// Forward a permission-gate denial to the conversation loop as a completed
-/// tool outcome, without spawning a tool task (specs/permissions REQ-PERM-005,
-/// deny-and-continue). The denial reaches the model through the same channel a
-/// real tool result uses, so it can attempt an alternative.
-fn forward_denial_outcome(
-    tool_use_id: String,
-    denial: crate::runtime::deny_gate::Denial,
-    generation: u64,
-    tool_outcome_tx: mpsc::Sender<(u64, ToolExecOutcome)>,
-) {
-    let outcome = ToolExecOutcome::Completed(ToolResult {
-        tool_use_id: tool_use_id.clone(),
-        outcome: tool_output_to_outcome(denial.into_tool_output()),
-        duration_ms: Some(0),
-    });
-    let (denied_tx, denied_rx) = oneshot::channel::<ToolExecOutcome>();
-    let _ = denied_tx.send(outcome);
-    tokio::spawn(forward_tool_outcome(
-        denied_rx,
-        tool_use_id,
-        generation,
-        tool_outcome_tx,
-    ));
 }
 
 fn fresh_response_is_text_only(content: &[ContentBlock]) -> bool {
@@ -1726,7 +1750,7 @@ fn render_messages<'a>(
                 {
                     continue;
                 }
-                // Use llm_text when expansion occurred (REQ-IR-001, REQ-IR-006):
+                // Use llm_text when expansion occurred (REQ-IR-006):
                 // the model sees the fully resolved form while the DB stores the shorthand.
                 let mut text_for_llm = match &msg.origin {
                     phoenix_core::domain::db_schema::InputOrigin::InternalConversation {
@@ -1762,7 +1786,8 @@ fn render_messages<'a>(
                     phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical => {
                         format!("[Input of unknown historical origin]\n{}", user_content.llm_text())
                     }
-                    phoenix_core::domain::db_schema::InputOrigin::UserApi => {
+                    phoenix_core::domain::db_schema::InputOrigin::UserApi
+                    | phoenix_core::domain::db_schema::InputOrigin::CoordinatorQuestionReply => {
                         user_content.llm_text().to_string()
                     }
                 };
@@ -1836,6 +1861,7 @@ fn render_messages<'a>(
             MessageContent::Skill(skill_content) => {
                 let source = match &msg.origin {
                     phoenix_core::domain::db_schema::InputOrigin::UserApi => "[User-facing API input]".to_string(),
+                    phoenix_core::domain::db_schema::InputOrigin::CoordinatorQuestionReply => "[User's reply to your question]".to_string(),
                     phoenix_core::domain::db_schema::InputOrigin::RemoteApi { instance_id } => format!("[API-channel input from authenticated instance {instance_id}]"),
                     phoenix_core::domain::db_schema::InputOrigin::RemoteConversation { instance_id, product_conversation_id, transcript_id, .. } => format!("[Message from conversation {product_conversation_id}, transcript {transcript_id}, authenticated instance {instance_id}]"),
                     phoenix_core::domain::db_schema::InputOrigin::RemoteCoordinator { instance_id, product_conversation_id, transcript_id, .. } => format!("[Message from remote Coordinator {product_conversation_id}, transcript {transcript_id}, authenticated instance {instance_id}]"),
@@ -1964,6 +1990,40 @@ impl LlmToolSurface {
                 .collect(),
         }
     }
+}
+
+fn discovery_mode_for_tools(
+    requested: phoenix_core::domain::tool_discovery::ToolDiscoveryMode,
+    callable_tools: &[phoenix_llm::ToolDefinition],
+) -> phoenix_core::domain::tool_discovery::ToolDiscoveryMode {
+    if requested.uses_local_search()
+        && !callable_tools
+            .iter()
+            .any(|tool| tool.name == phoenix_core::domain::tool_discovery::TOOL_SEARCH_NAME)
+    {
+        tracing::debug!(
+            ?requested,
+            "tool surface has no local search; retaining eager declarations"
+        );
+        phoenix_core::domain::tool_discovery::ToolDiscoveryMode::Eager
+    } else {
+        requested
+    }
+}
+
+fn fresh_discovery_availability(
+    mut tools: Vec<phoenix_llm::ToolDefinition>,
+    requested: phoenix_core::domain::tool_discovery::ToolDiscoveryMode,
+) -> phoenix_core::domain::tool_availability::ToolAvailability {
+    let mode = discovery_mode_for_tools(requested, &tools);
+    if mode.uses_local_search() {
+        tools.retain(|tool| !tool.defer_loading);
+    } else {
+        tools.retain(|tool| tool.name != phoenix_core::domain::tool_discovery::TOOL_SEARCH_NAME);
+    }
+    phoenix_core::domain::tool_availability::ToolAvailability::all(tools)
+        .with_discovery(mode, vec![])
+        .expect("empty discovery results are valid")
 }
 
 /// Default cap on consecutive LLM requests within a single parent-conversation
@@ -2166,6 +2226,7 @@ where
     /// Executor-owned hydrated durable prompt rows. Provider tasks receive only
     /// request-local rendered clones; this projection never leaves the runtime.
     active_prompt_projection: Option<ActivePromptProjection>,
+    tracking_observation_pending: bool,
     capacity_prefix_tracker: capacity::PrefixTracker,
     pending_trusted_tool_results: Vec<PendingTrustedToolResult>,
     /// Accepted provider-private replay mutation waiting for the reducer's
@@ -2174,7 +2235,9 @@ where
         Option<phoenix_core::domain::provider_replay::ProviderReplayUpdate>,
     pending_sub_agent_acceptance: Option<String>,
     pending_sub_agent_terminal: Option<phoenix_db::SubAgentTerminalCause>,
-    pending_sub_agent_activation: Option<PendingSubAgentActivation>,
+    native_spawn_handoff: Option<NativeSpawnHandoff>,
+    tool_preparation_runtime: uuid::Uuid,
+    tool_preparation: Option<tool_preparation::ToolPreparation>,
     /// Browser session manager for `ToolContext`
     browser_sessions: Arc<BrowserSessionManager>,
     /// Bash handle registry for `ToolContext` (REQ-BASH-014).
@@ -2518,12 +2581,15 @@ where
             clearable_names,
             clear_watermark_cache: Arc::new(std::sync::Mutex::new(None)),
             active_prompt_projection: None,
+            tracking_observation_pending: true,
             capacity_prefix_tracker: capacity::PrefixTracker::default(),
             pending_trusted_tool_results: Vec::new(),
             pending_provider_replay_update: None,
             pending_sub_agent_acceptance: None,
             pending_sub_agent_terminal: None,
-            pending_sub_agent_activation: None,
+            native_spawn_handoff: None,
+            tool_preparation_runtime: uuid::Uuid::new_v4(),
+            tool_preparation: None,
             browser_sessions,
             bash_handles,
             tmux_registry,
@@ -3828,6 +3894,46 @@ where
                         defer_exit_until_native_close_observed!(RuntimeExitDisposition::Terminal);
                     }
                 }
+                prepared = async {
+                    match self.tool_preparation.as_mut() {
+                        Some(preparation) => preparation.observe().await,
+                        None => std::future::pending().await,
+                    }
+                }, if deferred_native_close_exit.is_none() => {
+                    match self.accept_tool_preparation(prepared) {
+                        Ok(Some(event)) => {
+                            if let Err(error) = self.process_event(event).await {
+                                tracing::error!(%error, "failed to settle prepared tool");
+                            }
+                        }
+                        Ok(None) => {},
+                        Err(error) => tracing::error!(%error, "tool preparation failed"),
+                    }
+                    if self.fatal_local_authority_fence.fatal_authority_loss_is_latched() {
+                        join_pending_native_close_before_fatal!();
+                        return self.fatal_local_authority_exit();
+                    }
+                    if matches!(self.state.step_result(), StepResult::Terminal(_)) {
+                        self.emit_terminal_lifecycle_event().await;
+                        defer_exit_until_native_close_observed!(RuntimeExitDisposition::Terminal);
+                    }
+                }
+                observation = async {
+                    match self.native_spawn_handoff.as_mut() {
+                        Some(handoff) => handoff.observe().await,
+                        None => std::future::pending().await,
+                    }
+                }, if deferred_native_close_exit.is_none() => {
+                    match self.native_spawn_observed(observation).await {
+                        Ok(Some(event)) => {
+                            if let Err(error) = self.process_event(event).await {
+                                tracing::error!(%error, "failed to settle native spawn observation");
+                            }
+                        }
+                        Ok(None) => {},
+                        Err(error) => tracing::error!(%error, "native spawn observation failed"),
+                    }
+                }
                 Some((generation, tool_outcome)) = self.tool_outcome_rx.recv(), if deferred_native_close_exit.is_none() => {
                     // Generation guard for the tool task, mirroring the
                     // `llm_outcome_rx` guard above. A `forward_tool_outcome`
@@ -4150,6 +4256,10 @@ where
             Ok::<(), String>(())
         }
         .await;
+        let settlement = match settlement {
+            Ok(()) if owns_scope => self.publish_required_cancellation_notice().await,
+            other => other,
+        };
         if owns_scope {
             self.required_settlement_authority = None;
         }
@@ -4521,6 +4631,7 @@ where
 
         if matches!(event, Event::UserMessage { .. }) {
             self.parent_tool_cycle_count = 0;
+            self.tracking_observation_pending = true;
         }
 
         // A steer normally waits for the next drain hook. If channel delivery
@@ -4664,6 +4775,7 @@ where
 
             if authoritative_event {
                 self.parent_tool_cycle_count = 0;
+                self.tracking_observation_pending = true;
             }
             if matches!(
                 terminal_event,
@@ -4671,6 +4783,14 @@ where
             ) {
                 self.settle_llm_trusted_context(&result);
             }
+            self.interrupt_read_preparation_before_cancellation_checkpoint(
+                &terminal_event,
+                &result.new_state,
+            );
+            self.interrupt_native_before_cancellation_checkpoint(
+                &terminal_event,
+                &result.new_state,
+            );
             if matches!(
                 terminal_event,
                 Event::UserCancel {
@@ -4686,9 +4806,14 @@ where
                         | ConvState::CancellingSubAgents { .. }
                 )
             {
-                self.storage
+                if let Err(error) = self
+                    .storage
                     .record_execution_cancel(&self.context.conversation_id)
-                    .await?;
+                    .await
+                {
+                    self.observe_native_cancel_persistence_failure(&terminal_event, &error);
+                    return Err(error);
+                }
             }
             self.classify_active_direct_turn_terminal(&terminal_event, &result.new_state);
             self.pending_sub_agent_acceptance
@@ -4707,6 +4832,7 @@ where
                 ) | (
                     ConvState::CancellingTool { .. },
                     Event::ToolAborted { .. }
+                        | Event::ToolCancellationRetired { .. }
                         | Event::ToolComplete { .. }
                         | Event::ToolRoundComplete { .. }
                 )
@@ -4729,6 +4855,7 @@ where
             let generated = match application {
                 Ok(generated) => generated,
                 Err(error) => {
+                    self.observe_native_cancel_persistence_failure(&terminal_event, &error);
                     if accepted_sub_agent.as_ref().is_some_and(|agent_id| {
                         self.pending_sub_agent_acceptance.as_deref() == Some(agent_id.as_str())
                             && self.sub_agent_result_is_pending(agent_id)
@@ -4874,6 +5001,55 @@ where
         {
             self.revoke_native_close_source_entry().await;
         }
+        let notice_boundary = result.effects.iter().find_map(|effect| match effect {
+            Effect::CancellationCompleted { accepted_child } => Some(if accepted_child.is_some() {
+                RequiredSettlementBoundary::Child
+            } else {
+                RequiredSettlementBoundary::Tool
+            }),
+            _ => None,
+        });
+        let Some(boundary) =
+            notice_boundary.filter(|_| self.required_settlement_authority.is_none())
+        else {
+            return Box::pin(self.apply_transition_result_with_deadline(
+                result,
+                ordinary_input_id,
+                authority,
+            ))
+            .await;
+        };
+        let mut owner = self.admit_authoritative_effect()?;
+        self.required_settlement_authority =
+            Some(RequiredSettlementScope::new(owner.reborrow(), boundary));
+        let mut notice_authority = RuntimeSettlementAuthority {
+            owner: Some(owner),
+            abandoned_reason: boundary.owner_disappeared(),
+        };
+        let application = Box::pin(self.apply_transition_result_with_deadline(
+            result,
+            ordinary_input_id,
+            authority,
+        ))
+        .await;
+        let application = match application {
+            Ok(events) => self
+                .publish_required_cancellation_notice()
+                .await
+                .map(|()| events),
+            other => other,
+        };
+        self.required_settlement_authority = None;
+        notice_authority.owner = None;
+        application
+    }
+
+    async fn apply_transition_result_with_deadline(
+        &mut self,
+        result: crate::state_machine::transition::TransitionResult,
+        ordinary_input_id: Option<&str>,
+        authority: TransitionAuthority,
+    ) -> Result<Vec<Event>, String> {
         let remaining = self.bash_wait_transition_remaining(&result.new_state);
         if let Some(remaining) = remaining {
             let dispatch_index = result.effects.iter().position(|effect| {
@@ -4931,6 +5107,25 @@ where
         ordinary_input_id: Option<&str>,
         authority: TransitionAuthority,
     ) -> Result<Vec<Event>, String> {
+        let native_adoption = self.native_spawn_adoption_matches(&result.new_state);
+        if let Some(handoff) = &self.native_spawn_handoff {
+            let terminal_interruption = matches!(
+                result.new_state,
+                ConvState::Error { .. } | ConvState::Failed { .. } | ConvState::Terminal
+            );
+            if !handoff.invocation.owns_state(&result.new_state)
+                && !native_adoption
+                && !terminal_interruption
+            {
+                return Err(
+                    "unresolved native spawn handoff cannot advance its originating selection"
+                        .into(),
+                );
+            }
+        }
+        if native_adoption {
+            self.authorize_native_spawn_adoption(&result.new_state);
+        }
         let mut generated_events = Vec::new();
         self.direct_turn_materialization_aborted = false;
         self.proposed_direct_turn_state = None;
@@ -5530,6 +5725,11 @@ where
                 }
                 let effect_result = match effect_result {
                     Ok(effect_result) => {
+                        if is_state_persist {
+                            if let Some(scope) = &mut self.required_settlement_authority {
+                                scope.record_parent_state_commit();
+                            }
+                        }
                         new_turn_input_persisted |= is_new_turn_input;
                         if is_state_persist && new_turn_input_persisted {
                             self.ordinary_turn_context = None;
@@ -5620,6 +5820,19 @@ where
                 };
                 if let Some(gen_event) = effect_result {
                     generated_events.push(gen_event);
+                }
+                if self.native_spawn_handoff.as_ref().is_some_and(|handoff| {
+                    matches!(handoff.phase, NativeSpawnPhase::ActivationOwnerLost)
+                }) {
+                    let mut handoff = self
+                        .native_spawn_handoff
+                        .take()
+                        .expect("activation failure retains native origin");
+                    handoff.phase = NativeSpawnPhase::Closing;
+                    let failure = Box::pin(self.fail_native_spawn("native spawn activation owner disappeared after exact membership committed".into())).await;
+                    self.native_spawn_handoff = Some(handoff);
+                    failure?;
+                    return Ok(Vec::new());
                 }
                 if checkpoint_commits_state {
                     state_committed = true;
@@ -5769,7 +5982,14 @@ where
                 Box::pin(self.execute_effect(effect)).await
             };
             let effect_result = match effect_result {
-                Ok(effect_result) => effect_result,
+                Ok(effect_result) => {
+                    if is_private_state_persist || is_checkpoint {
+                        if let Some(scope) = &mut self.required_settlement_authority {
+                            scope.record_parent_state_commit();
+                        }
+                    }
+                    effect_result
+                }
                 Err(error) => {
                     let failed_state = self.state.clone();
                     self.install_live_state(
@@ -5868,7 +6088,7 @@ where
     }
 
     fn state_settlement_pending(&self) -> bool {
-        self.pending_sub_agent_activation.is_some()
+        self.native_spawn_activation_pending()
             || self.pending_sub_agent_acceptance.is_some()
             || self.pending_sub_agent_terminal.is_some()
             || self.pending_direct_turn_terminal.is_some()
@@ -5883,7 +6103,7 @@ where
         broadcast: bool,
         admitted: &mut crate::runtime::AdmittedOperation,
     ) -> Result<Option<Event>, String> {
-        let activation = self.pending_sub_agent_activation.take();
+        let activation = self.take_native_spawn_activation();
         if let Some(activation) = &activation {
             let pending = match &self.state {
                 ConvState::ToolExecuting {
@@ -5968,7 +6188,7 @@ where
             }
         }
         if let Some(activation) = activation {
-            let _ = activation.sender.send(());
+            self.release_native_spawn_activation(activation);
         }
 
         if broadcast {
@@ -6807,19 +7027,58 @@ where
                     Some(BackstopDrainReceipts::Established)
                 )
             });
+        let forced_notice_ready =
+            self.required_settlement_authority
+                .as_ref()
+                .is_some_and(|scope| {
+                    matches!(scope.cancellation_notice, CancellationNoticeReceipt::Ready)
+                });
+        if drain_established
+            && (cause == crate::state_machine::event::CancelCause::UserRequested
+                || forced_notice_ready)
+        {
+            self.required_settlement_authority
+                .as_mut()
+                .expect("backstop owns settlement scope")
+                .cancellation_notice = CancellationNoticeReceipt::Ready;
+            if let Err(error) = self.publish_required_cancellation_notice().await {
+                tracing::warn!(%error, "Failed to publish cancellation completion");
+            }
+        }
         self.required_settlement_authority = enclosing_authority;
         authority.owner = None;
+    }
 
-        if cause == crate::state_machine::event::CancelCause::UserRequested && drain_established {
-            self.broadcast_cancellation_backstop_message().await;
+    async fn publish_required_cancellation_notice(&mut self) -> Result<(), String> {
+        if !self
+            .required_settlement_authority
+            .as_ref()
+            .is_some_and(|scope| {
+                matches!(scope.cancellation_notice, CancellationNoticeReceipt::Ready)
+            })
+        {
+            return Ok(());
         }
+        if let Err(error) = self.broadcast_cancellation_backstop_message().await {
+            let boundary = self
+                .required_settlement_authority
+                .as_ref()
+                .expect("notice scope exists")
+                .boundary;
+            self.fatal_local_authority_fence
+                .close(boundary.settlement());
+            return Err(error);
+        }
+        self.required_settlement_authority
+            .as_mut()
+            .expect("notice scope exists")
+            .cancellation_notice = CancellationNoticeReceipt::Published;
+        Ok(())
     }
 
     /// Persist and broadcast the completed-cancellation notice.
-    async fn broadcast_cancellation_backstop_message(&mut self) {
-        let Ok(mut admitted) = self.admit_authoritative_effect() else {
-            return;
-        };
+    async fn broadcast_cancellation_backstop_message(&mut self) -> Result<(), String> {
+        let mut admitted = self.admit_authoritative_effect()?;
         let msg_id = uuid::Uuid::new_v4().to_string();
         let content = crate::db::MessageContent::system(
             "Cancellation completed. Aborted work may still be reclaiming resources in the \
@@ -6847,27 +7106,13 @@ where
             }
             Err(e) => {
                 tracing::warn!(error = %e, "Failed to persist cancellation backstop system message");
+                return Err(e);
             }
         }
+        Ok(())
     }
 
-    /// Handle the cancellation backstop firing (REQ-BED-005a
-    /// `CancellingToolDeadlineFires`): a tool that never observed its
-    /// cancellation token and never returned has held the conversation in
-    /// `CancellingTool` past the bounded deadline. Force the cancellation to
-    /// completion without waiting for the task.
-    ///
-    /// Dispatched by `handle_deadline_expiry` (which has already cleared the
-    /// deadline). Sequence: WARN, abort the retained tool task to stop the
-    /// orphaned tokio task, inject `Event::ToolAborted { tool_use_id }` — the
-    /// same synthetic-result path the cooperative `CancellingTool + ToolAborted
-    /// -> Idle` arm uses — to settle to Idle, then persist+broadcast the
-    /// user-visible system message. The message is persisted AFTER the
-    /// checkpoint commits so its `sequence_id` is strictly after the cancelled
-    /// tool round it describes (history replays by sequence). A late stale
-    /// outcome from the aborted task is rejected by both the tool generation
-    /// guard and the state machine's id/state gate once we have left
-    /// `CancellingTool`.
+    /// Retire the selected tool after its cancellation deadline expires.
     async fn handle_cancelling_tool_timeout(&mut self) {
         let tool_use_id = if let ConvState::CancellingTool { tool_use_id, .. } = &self.state {
             tool_use_id.clone()
@@ -6875,6 +7120,13 @@ where
             // Deadline fired but state already moved on — nothing to do.
             return;
         };
+
+        if self.native_spawn_handoff.is_some() {
+            match self.classify_native_spawn_cutoff(&tool_use_id).await {
+                NativeSpawnCutoff::Reconciled => {}
+                NativeSpawnCutoff::Stop => return,
+            }
+        }
 
         tracing::warn!(
             conv_id = %self.context.conversation_id,
@@ -6892,19 +7144,11 @@ where
         // round that may reuse the same `tool_use_id`.
         self.tool_execution.abort_task_and_invalidate();
 
-        // Drive the cooperative cancellation arm with a synthetic ToolAborted.
-        if let Err(e) = self.process_event(Event::ToolAborted { tool_use_id }).await {
-            tracing::warn!(error = %e, "Failed to process cancellation backstop ToolAborted");
-        }
-
-        // Announce completion only if we actually reached Idle. When the
-        // cancelled round had spawned sub-agents, ToolAborted transitions to
-        // CancellingSubAgents (not Idle) — that path's own backstop announces
-        // completion when it drains to Idle, so broadcasting here would be both
-        // premature (cancellation isn't done) and a duplicate. Persisted AFTER
-        // the checkpoint so its sequence is strictly after the round it describes.
-        if matches!(self.state, ConvState::Idle) {
-            self.broadcast_cancellation_backstop_message().await;
+        if let Err(e) = self
+            .process_event(Event::ToolCancellationRetired { tool_use_id })
+            .await
+        {
+            tracing::warn!(error = %e, "Failed to process cancellation backstop ToolCancellationRetired");
         }
     }
 
@@ -7018,14 +7262,42 @@ where
         })
     }
 
-    /// Handle the `spawn_agents` tool specially:
-    /// 1. Parse tasks and generate agent IDs
-    /// 2. Send spawn requests to `RuntimeManager` for each task
-    /// 3. Return `SpawnAgentsComplete` event
-    #[allow(clippy::too_many_lines)]
-    pub(crate) async fn handle_spawn_agents_tool(
+    fn start_selected_spawn_agents_tool(
         &mut self,
-        tool: ToolCall,
+        current: tool_preparation::CurrentSelection,
+    ) -> Result<Option<Event>, String> {
+        let selection = current.into_selection();
+        self.start_spawn_agents_tool_from_selection(
+            &selection.tool,
+            &selection.context,
+            selection.assistant_message_id(),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn start_spawn_agents_tool(
+        &mut self,
+        tool: &ToolCall,
+    ) -> Result<Option<Event>, String> {
+        let assistant_message_id = match &self.state {
+            ConvState::ToolExecuting {
+                assistant_message, ..
+            } => assistant_message.message_id.clone(),
+            _ => String::new(),
+        };
+        self.start_spawn_agents_tool_from_selection(
+            tool,
+            &self.context.clone(),
+            &assistant_message_id,
+        )
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn start_spawn_agents_tool_from_selection(
+        &mut self,
+        tool: &ToolCall,
+        context: &ConvContext,
+        expected_assistant_message_id: &str,
     ) -> Result<Option<Event>, String> {
         use crate::state_machine::state::{PendingSubAgent, SpawnAgentsInput, SubAgentSpec};
 
@@ -7086,8 +7358,8 @@ where
             .iter()
             .map(|task| task.mode.unwrap_or_default())
             .collect();
-        let parent_allows_work = !self.context.is_coordinator
-            && self.context.resource_authority == crate::work_scope::ResourceAuthority::Work;
+        let parent_allows_work = !context.is_coordinator
+            && context.resource_authority == crate::work_scope::ResourceAuthority::Work;
 
         let mut work_count_in_batch = 0u32;
         for &mode in &resolved_tasks {
@@ -7111,9 +7383,9 @@ where
         let parallel_work_qualified =
             self.spawn_parent_parallel_work_qualified
                 .unwrap_or_else(|| {
-                    self.llm_registry.is_builtin_model(&self.context.model_id)
+                    self.llm_registry.is_builtin_model(&context.model_id)
                         && phoenix_core::subagent_qualification::supports_parallel_work_subagents(
-                            &self.context.model_id,
+                            &context.model_id,
                         )
                 });
 
@@ -7130,8 +7402,7 @@ where
             }));
         }
 
-        let parent_worktree_path = self
-            .context
+        let parent_worktree_path = context
             .work_scope_worktree
             .as_ref()
             .map(|path| path.to_string_lossy());
@@ -7152,7 +7423,7 @@ where
         for (task, &mode) in input.tasks.iter().zip(&resolved_tasks) {
             use phoenix_core::domain::sm_state::ConversationExecutionEnvironment;
             let cwd_override = nonblank(task.cwd.as_deref());
-            let environment = if self.context.is_coordinator {
+            let environment = if context.is_coordinator {
                 if task.cwd.is_some() {
                     return Ok(Some(Event::ToolComplete {
                         tool_use_id: tool_use_id.clone(),
@@ -7165,13 +7436,13 @@ where
                 ConversationExecutionEnvironment::NoFilesystem
             } else {
                 let cwd_path = cwd_override.map_or_else(
-                    || self.context.filesystem_root().to_path_buf(),
+                    || context.filesystem_root().to_path_buf(),
                     |cwd| {
                         let path = std::path::Path::new(cwd);
                         if path.is_absolute() {
                             path.to_path_buf()
                         } else {
-                            self.context.filesystem_root().join(path)
+                            context.filesystem_root().join(path)
                         }
                     },
                 );
@@ -7220,8 +7491,8 @@ where
             let selected = match catalog.select(
                 task.agent_type.as_deref(),
                 task.execution.as_ref(),
-                &self.context.model_id,
-                self.context.effort,
+                &context.model_id,
+                context.effort,
             ) {
                 Ok(selected) => selected,
                 Err(error) => {
@@ -7297,20 +7568,6 @@ where
             }));
         };
 
-        if let Err(error) = self
-            .storage
-            .establish_parent_reconcile_action(&self.context.conversation_id)
-            .await
-        {
-            let result = ToolResult::error(
-                tool_use_id.clone(),
-                format!("failed to persist parent recovery authority: {error}"),
-            );
-            return Ok(Some(Event::ToolComplete {
-                tool_use_id,
-                result,
-            }));
-        }
         let spawned = specs
             .iter()
             .map(|spec| PendingSubAgent {
@@ -7321,67 +7578,97 @@ where
             .collect::<Vec<_>>();
         let (response_tx, response_rx) = oneshot::channel();
         let (activation_tx, activation_rx) = oneshot::channel();
-        let request = SubAgentSpawnRequest {
+        let (closure_tx, closure_rx) = oneshot::channel();
+        let assistant_message_id = match &self.state {
+            ConvState::ToolExecuting {
+                current_tool,
+                assistant_message,
+                ..
+            } if current_tool == tool
+                && assistant_message.message_id == expected_assistant_message_id =>
+            {
+                assistant_message.message_id.clone()
+            }
+            _ => return Err("native spawn preparation lost its originating selection".into()),
+        };
+        if self.native_spawn_handoff.is_some() {
+            return Err("native spawn origin already has an unresolved handoff".into());
+        }
+        let invocation = phoenix_db::SubAgentSpawnInvocation {
+            parent_conversation_id: context.conversation_id.clone(),
+            assistant_message_id,
+            tool_use_id: tool_use_id.clone(),
             batch_id: uuid::Uuid::new_v4().to_string(),
+        };
+        let control = Arc::new(crate::runtime::NativeSpawnControl::new(
+            invocation.clone(),
+            closure_tx,
+        ));
+        let request = SubAgentSpawnRequest {
+            invocation: invocation.clone(),
             specs,
-            parent_conversation_id: self.context.conversation_id.clone(),
-            parent_scope: self.context.resource_scope.work_scope_id().cloned(),
+            parent_scope: context.resource_scope.work_scope_id().cloned(),
             parallel_work_qualified,
             parent_turn_link,
             response_tx,
             activation_rx,
+            control: Arc::clone(&control),
         };
-        if let Err(error) = spawn_tx.send(request).await {
-            return Ok(Some(Event::ToolComplete {
-                tool_use_id: tool_use_id.clone(),
-                result: ToolResult::error(
-                    tool_use_id,
-                    format!("Failed to submit sub-agent batch: {error}"),
-                ),
-            }));
-        }
-        match response_rx.await {
-            Ok(crate::runtime::SubAgentAdmissionResponse::Admitted) => {}
-            Ok(crate::runtime::SubAgentAdmissionResponse::Rejected(error)) => {
-                return Ok(Some(Event::ToolComplete {
-                    tool_use_id: tool_use_id.clone(),
-                    result: ToolResult::error(tool_use_id, error),
-                }));
+        self.native_spawn_handoff = Some(NativeSpawnHandoff {
+            invocation,
+            members: spawned,
+            control,
+            phase: NativeSpawnPhase::Admission {
+                response: response_rx,
+                activation: activation_tx,
+            },
+            closure: closure_rx,
+            cancel_persistence_failure: None,
+        });
+        match spawn_tx.try_send(request) {
+            Ok(()) => {}
+            Err(tokio::sync::mpsc::error::TrySendError::Full(request)) => {
+                let sender = spawn_tx.clone();
+                let handoff = self
+                    .native_spawn_handoff
+                    .as_mut()
+                    .expect("native origin retained before submission");
+                let phase = std::mem::replace(&mut handoff.phase, NativeSpawnPhase::Closing);
+                let NativeSpawnPhase::Admission {
+                    response,
+                    activation,
+                } = phase
+                else {
+                    unreachable!("fresh native origin is awaiting its admission response");
+                };
+                handoff.phase = NativeSpawnPhase::Submission {
+                    send: std::sync::Mutex::new(Box::pin(async move {
+                        sender
+                            .send(request)
+                            .await
+                            .map_err(|error| format!("Failed to submit sub-agent batch: {error}"))
+                    })),
+                    response,
+                    activation,
+                };
             }
-            Ok(crate::runtime::SubAgentAdmissionResponse::Unclassified) => {
-                return Err("FATAL_LOCAL_AUTHORITY_UNCLASSIFIED: sub-agent batch admission commit could not be classified".to_string());
-            }
-            Err(error) => {
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(error)) => {
+                if let Some(handoff) = self.native_spawn_handoff.take() {
+                    handoff.control.request_cancel();
+                }
                 return Ok(Some(Event::ToolComplete {
                     tool_use_id: tool_use_id.clone(),
                     result: ToolResult::error(
                         tool_use_id,
-                        format!("Sub-agent admission stopped: {error}"),
+                        format!(
+                            "Failed to submit sub-agent batch: {}",
+                            tokio::sync::mpsc::error::SendError(error)
+                        ),
                     ),
                 }));
             }
         }
-
-        self.pending_sub_agent_activation = Some(PendingSubAgentActivation {
-            child_ids: spawned.iter().map(|child| child.agent_id.clone()).collect(),
-            sender: activation_tx,
-        });
-
-        // Build success result
-        let agent_ids: Vec<&str> = spawned.iter().map(|p| p.agent_id.as_str()).collect();
-        let output = format!(
-            "Spawning {} sub-agent(s): {}",
-            spawned.len(),
-            agent_ids.join(", ")
-        );
-        let result = ToolResult::success(tool_use_id.clone(), output);
-
-        // Send SpawnAgentsComplete event (synchronously returned, not async)
-        Ok(Some(Event::SpawnAgentsComplete {
-            tool_use_id,
-            result,
-            spawned,
-        }))
+        Ok(None)
     }
 
     /// Execute an effect and optionally return a generated event
@@ -7485,6 +7772,7 @@ where
     }
 
     fn abort_external_effects_in_memory(&mut self) {
+        self.tool_preparation = None;
         self.abort_active_llm_task();
         self.retry_generation = self.retry_generation.wrapping_add(1);
         if let Some(handle) = self.retry_timer_handle.take() {
@@ -7498,6 +7786,7 @@ where
     }
 
     async fn abort_external_effects(&mut self) {
+        self.tool_preparation = None;
         self.abort_active_llm_task();
         self.retry_generation = self.retry_generation.wrapping_add(1);
         if let Some(handle) = self.retry_timer_handle.take() {
@@ -8473,9 +8762,7 @@ where
                 Ok(None)
             }
 
-            AuthoritativeEffect::ExecuteTool { tool } => {
-                self.dispatch_tool_execution(tool, admitted).await
-            }
+            AuthoritativeEffect::ExecuteTool { tool } => self.begin_tool_preparation(tool),
 
             AuthoritativeEffect::ScheduleRetry {
                 delay,
@@ -8798,9 +9085,55 @@ where
         effect: ControlEffect,
     ) -> Result<Option<Event>, String> {
         match effect {
+            ControlEffect::CancellationCompleted { accepted_child } => {
+                let scope = self
+                    .required_settlement_authority
+                    .as_ref()
+                    .ok_or("cancellation completion has no settlement owner")?;
+                let boundary = scope.boundary;
+                let established = match (&scope.cancellation_notice, accepted_child.as_deref()) {
+                    (CancellationNoticeReceipt::ChildAccepted(actual), Some(expected)) => {
+                        actual == expected
+                    }
+                    (CancellationNoticeReceipt::ParentStateCommitted, None) => true,
+                    (CancellationNoticeReceipt::ParentStateCommitted, Some(child)) => {
+                        // A terminal retry can resume after the exact child acceptance committed.
+                        self.storage
+                            .sub_agent_terminal_is_accepted(child)
+                            .await
+                            .inspect_err(|_| {
+                                self.fatal_local_authority_fence
+                                    .close(boundary.settlement());
+                            })?
+                    }
+                    _ => false,
+                };
+                if !established {
+                    self.fatal_local_authority_fence
+                        .close(boundary.settlement());
+                    return Err(
+                        "cancellation notice lacks its exact committed settlement receipt".into(),
+                    );
+                }
+                self.required_settlement_authority
+                    .as_mut()
+                    .expect("completion scope exists")
+                    .cancellation_notice = CancellationNoticeReceipt::Ready;
+                Ok(None)
+            }
             ControlEffect::AbortTool { tool_use_id } => {
                 tracing::info!(tool_id = %tool_use_id, "Aborting tool execution");
+                if self.interrupt_read_only_tool_preparation(&tool_use_id) {
+                    return Ok(None);
+                }
                 self.tool_execution.request_cancel();
+                if let Some(handoff) = self.native_spawn_handoff.as_mut() {
+                    if handoff.invocation.tool_use_id == tool_use_id
+                        && handoff.invocation.owns_state(&self.state)
+                    {
+                        handoff.request_cancel();
+                    }
+                }
                 Ok(None)
             }
             ControlEffect::CancelSubAgents { ids, cause } => {
@@ -9002,6 +9335,7 @@ where
             SteeringDrainPostCommit::StartLlmAndNotifyState => {
                 self.ordinary_turn_context = None;
                 self.parent_tool_cycle_count = 0;
+                self.tracking_observation_pending = true;
                 let _ = self
                     .broadcast_tx
                     .admitted_publication(admitted)
@@ -9455,6 +9789,58 @@ where
                 }));
             }
         }
+        if self.context.is_coordinator && self.tracking_observation_pending {
+            let (reservation, sequences) = self
+                .broadcast_tx
+                .persisted_message_reservation_authority()
+                .await
+                .reserve_next_range(1)
+                .expect("tracking observation reserves one sequence");
+            let sequence_id = sequences[0];
+            let mut tracking_authority = RuntimeSettlementAuthority {
+                owner: Some(admitted.reborrow()),
+                abandoned_reason: "coordinator_tracking_observation_owner_disappeared",
+            };
+            match self
+                .storage
+                .append_coordinator_tracking_observation(
+                    &self.context.conversation_id,
+                    sequence_id,
+                    Utc::now().timestamp_micros(),
+                )
+                .await
+            {
+                phoenix_db::workflow::LocalAuthorityResult::DurableFactEstablished(result) => {
+                    tracking_authority.owner = None;
+                    match result? {
+                        Some(message) => {
+                            let _ = self
+                                .broadcast_tx
+                                .admitted_publication(admitted)
+                                .persisted_message(message);
+                        }
+                        None => {
+                            let _ = self
+                                .broadcast_tx
+                                .admitted_publication(admitted)
+                                .reserved_state_change(
+                                    sequence_id,
+                                    self.state.clone(),
+                                    self.state.presentation_mode().to_string(),
+                                    self.state_updated_at,
+                                );
+                        }
+                    }
+                    self.tracking_observation_pending = false;
+                }
+                phoenix_db::workflow::LocalAuthorityResult::DurableFactUnclassified => {
+                    self.fatal_local_authority_fence
+                        .close("coordinator_tracking_observation_unclassified");
+                    return Err("FATAL_LOCAL_AUTHORITY_UNCLASSIFIED: tracking observation".into());
+                }
+            }
+            drop(reservation);
+        }
         self.refresh_active_prompt_projection().await?;
         let trusted_results = self.pending_trusted_tool_results.clone();
         let trusted_token_reserve = trusted_results
@@ -9558,12 +9944,23 @@ where
         // Freeze the complete provider request before any provider or forwarding
         // task is spawned. Tool definitions, AGENTS-backed system prompt, and the
         // provider context are request authority, not task-local inputs.
-        let (system_prompt, available_tools) = self.prepare_ordinary_overhead().await?;
-        let callable_names = request_tool_surface
-            .callable_tools(available_tools.clone())
+        let (system_prompt, mut available_tools) = self.prepare_ordinary_overhead().await?;
+        let callable_tools = request_tool_surface.callable_tools(available_tools.clone());
+        let discovery_mode = discovery_mode_for_tools(
+            llm_client
+                .tool_discovery_mode()
+                .map_err(|error| error.to_string())?,
+            &callable_tools,
+        );
+        let mut callable_names = callable_tools
             .into_iter()
             .map(|tool| tool.name)
             .collect::<std::collections::BTreeSet<_>>();
+        if !discovery_mode.uses_local_search() {
+            available_tools
+                .retain(|tool| tool.name != phoenix_core::domain::tool_discovery::TOOL_SEARCH_NAME);
+            callable_names.remove(phoenix_core::domain::tool_discovery::TOOL_SEARCH_NAME);
+        }
         let anchor = frozen_messages
             .last()
             .filter(|message| message.role == MessageRole::User)
@@ -9610,10 +10007,11 @@ where
                     )
                     .collect::<Vec<_>>(),
                 &historical_tool_references,
+                discovery_mode,
             )
             .await?;
         let provider_replay = self.storage.load_provider_replay_state(&conv_id).await?;
-        let responses_replay = self.storage.load_responses_replay_state(&conv_id).await?;
+        let responses_replay = self.storage.load_output_replay_state(&conv_id).await?;
         let fixed_tokens = estimate_fixed_request_tokens(&system_prompt, &tool_availability)
             .saturating_add(estimate_private_replay_overhead(
                 &frozen_messages,
@@ -9648,7 +10046,7 @@ where
             system: vec![SystemContent::cached(&system_prompt)],
             messages: frozen_messages.clone(),
             provider_replay: provider_replay.clone(),
-            responses_replay: responses_replay.clone(),
+            output_replay: responses_replay.clone(),
             tool_availability: tool_availability.clone(),
             max_tokens: request_output_tokens,
             effective_effort,
@@ -10072,57 +10470,7 @@ where
         Ok(None)
     }
 
-    /// Dispatch tool execution: resolve the tool, build the execution context,
-    /// spawn the background task, and wire up the outcome channel.
-    #[allow(clippy::too_many_lines)]
-    /// REQ-WPV-002: broadcast `tool_starts[tool_use_id] = now_unix_ms` on
-    /// the parent assistant message via `MessageUpdated` so the client's
-    /// tool widget can render a live elapsed counter sourced from the
-    /// server clock. The state machine is guaranteed to be in
-    /// `ToolExecuting` when `dispatch_tool_execution` fires (only
-    /// `Effect::ExecuteTool { tool }` reaches that method, and that
-    /// effect is only emitted on entry to / between tools of
-    /// `ToolExecuting`), so the destructure below is structurally safe;
-    /// the defensive `else` arm covers a hypothetical future call path.
-    ///
-    /// Why broadcast-only (no DB write): the assistant message that
-    /// owns this `tool_use` is NOT persisted yet during the tool round —
-    /// it lives in the state machine via `BroadcastAssistantMessage`
-    /// (the eager broadcast, ring-replayable per `sse_wire.allium`'s
-    /// `EagerAssistantMessageAppendedToReplayRing`) and the DB write
-    /// happens later via `PersistCheckpoint` at the end of the round.
-    /// `update_message_display_data` against an unpersisted message
-    /// row no-ops with `MessageNotFound`. The client merges the
-    /// broadcast `MessageUpdated.display_data` shallowly onto the
-    /// in-memory message — that's the entire surface the live elapsed
-    /// counter consumes (REQ-WPV-002). Once the tool result lands and
-    /// the round checkpoint persists, the message's permanent
-    /// `display_data` doesn't need `tool_starts` because the
-    /// per-result `duration_ms` (`schema.rs:649`) takes over the
-    /// display.
-    fn broadcast_tool_start_timestamp(&self, tool_use_id: &str) {
-        let assistant_message_id = match &self.state {
-            ConvState::ToolExecuting {
-                assistant_message, ..
-            }
-            | ConvState::CancellingTool {
-                assistant_message, ..
-            } => assistant_message.message_id.clone(),
-            _ => {
-                tracing::warn!(
-                    conv_id = %self.context.conversation_id,
-                    tool_use_id = %tool_use_id,
-                    state = self.state.variant_name(),
-                    "tool_starts broadcast skipped — dispatch_tool_execution called outside ToolExecuting/CancellingTool"
-                );
-                return;
-            }
-        };
-
-        // Build the patch: { "tool_starts": { <id>: <unix_ms> } }.
-        // The client's MessageUpdated reducer merges this shallowly
-        // onto the existing message's display_data, so omitting the
-        // existing bash/etc. keys is safe.
+    fn broadcast_tool_start_timestamp(&self, assistant_message_id: &str, tool_use_id: &str) {
         let now_ms = Utc::now().timestamp_millis();
         let mut tool_starts = serde_json::Map::new();
         tool_starts.insert(
@@ -10139,7 +10487,7 @@ where
         let _ = self.broadcast_tx.send_seq(|seq| SseEvent::MessageUpdated {
             opening: None,
             sequence_id: seq,
-            message_id: assistant_message_id.clone(),
+            message_id: assistant_message_id.to_owned(),
             transcript_generation: None,
             display_data: Some(display_for_broadcast),
             content: None,
@@ -10175,102 +10523,65 @@ where
         self.create_tool_llm_metrics_sink(admitted)
     }
 
-    #[allow(clippy::too_many_lines)]
+    #[cfg(test)]
+    async fn observe_tool_preparation_for_test(&mut self) -> Result<Option<Event>, String> {
+        let observed = self
+            .tool_preparation
+            .as_mut()
+            .expect("preparation installed")
+            .observe()
+            .await;
+        self.accept_tool_preparation(observed)
+    }
+
+    #[cfg(test)]
+    async fn settle_prepared_completions_for_test(&mut self) -> Result<(), String> {
+        while self.tool_preparation.is_some() {
+            let Some(event) = self.observe_tool_preparation_for_test().await? else {
+                break;
+            };
+            self.process_event(event).await?;
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    async fn dispatch_tool_for_test(&mut self, tool: ToolCall) -> Result<Option<Event>, String> {
+        assert!(self
+            .execute_effect(Effect::ExecuteTool { tool })
+            .await?
+            .is_none());
+        self.observe_tool_preparation_for_test().await
+    }
+
+    #[cfg(test)]
     async fn dispatch_tool_execution(
         &mut self,
         tool: ToolCall,
-        admitted: &mut crate::runtime::AdmittedOperation,
+        _admitted: &mut crate::runtime::AdmittedOperation,
     ) -> Result<Option<Event>, String> {
-        let request_policy = self
-            .storage
-            .load_tool_admission_policy(&self.context.conversation_id)
-            .await?;
-        let request_definition = request_policy.declarations().iter().find(|definition| {
-            definition.name == tool.name() && request_policy.is_callable(tool.name())
-        });
-        let Some(request_definition) = request_definition else {
-            return Ok(Some(Event::ToolComplete {
-                tool_use_id: tool.id.clone(),
-                result: ToolResult::error(
-                    tool.id.clone(),
-                    "EUNAVAIL: tool was unavailable in the originating request policy".into(),
-                ),
-            }));
-        };
-        let request_schema = request_definition.input_schema.clone();
-        let surface = if self.context.is_sub_agent && self.grace_turn_granted {
-            LlmToolSurface::SubAgentTerminal
-        } else {
-            LlmToolSurface::Full
-        };
-        if surface == LlmToolSurface::SubAgentTerminal
-            && !matches!(tool.name(), "submit_result" | "submit_error")
-        {
-            return Ok(Some(Event::ToolComplete {
-                tool_use_id: tool.id.clone(),
-                result: ToolResult::error(
-                    tool.id.clone(),
-                    "EUNAVAIL: tool is unavailable under the current conversation policy"
-                        .to_owned(),
-                ),
-            }));
-        }
-        if matches!(tool.name(), "create_goal" | "enable_auto_continuation") {
-            return self.prepare_self_goal(tool).await;
-        }
-        if tool.name() == "spawn_agents" {
-            let advertised = self
-                .tool_executor
-                .definitions()
-                .await
-                .iter()
-                .any(|definition| definition.name == "spawn_agents");
-            let catalog = super::agent_execution::SpawnCatalog::resolve(
-                &self.agent_config,
-                self.llm_registry.available_execution_routes(),
-            );
-            let definition = catalog.tool_definition(
-                &self.context.model_id,
-                self.llm_registry.is_builtin_model(&self.context.model_id),
-                self.context.is_coordinator,
-            );
-            if !advertised || definition.input_schema != request_schema {
-                return Ok(Some(Event::ToolComplete {
-                    tool_use_id: tool.id.clone(),
-                    result: ToolResult::error(
-                        tool.id.clone(),
-                        "EUNAVAIL: spawn_agents no longer matches the originating request policy"
-                            .into(),
-                    ),
-                }));
-            }
-            self.spawn_catalog = Some(catalog);
-            return self.handle_spawn_agents_tool(tool).await;
-        }
+        self.begin_tool_preparation(tool)?;
+        let observed = self
+            .tool_preparation
+            .as_mut()
+            .expect("preparation installed")
+            .observe()
+            .await;
+        self.accept_tool_preparation(observed)
+    }
 
-        let legacy_tmux_conversation_id = match &self.context.resource_scope {
-            phoenix_core::work_scope::ResourceScopeKey::Work(scope_id) => {
-                self.storage
-                    .get_work_scope_legacy_conversation_id(scope_id)
-                    .await?
-            }
-            phoenix_core::work_scope::ResourceScopeKey::Unattached(id) => Some(id.clone()),
-            phoenix_core::work_scope::ResourceScopeKey::Coordinator
-            | phoenix_core::work_scope::ResourceScopeKey::GlobalTerminal => None,
-        };
-
-        // REQ-WPV-002: stamp the per-tool start time into the parent
-        // assistant message's `display_data.tool_starts[tool_use_id]` map
-        // (unix ms, server-authoritative) and broadcast `MessageUpdated`
-        // so the client's tool widget can render a live elapsed counter
-        // that survives reconnect / reload / multi-tab. The runtime
-        // discovers the parent message_id by destructuring the current
-        // ToolExecuting state — the state machine guarantees we're in
-        // ToolExecuting when this method is called (the only path here
-        // is `Effect::ExecuteTool { tool }` which fires on entry to
-        // ToolExecuting). If the destructure fails it's a bug and we
-        // silently skip the stamp rather than panic.
-        self.broadcast_tool_start_timestamp(&tool.id);
+    #[allow(clippy::too_many_lines)]
+    fn launch_cleared_tool(
+        &mut self,
+        current: tool_preparation::CurrentSelection,
+        cleared: tool_preparation::ClearedOrdinaryCall,
+        admitted: &mut crate::runtime::AdmittedOperation,
+    ) {
+        let selection = current.into_selection();
+        let tool = &selection.tool;
+        let context = &selection.context;
+        let (checked, request_schema, surface, legacy_tmux_conversation_id) = cleared.into_parts();
+        self.broadcast_tool_start_timestamp(selection.assistant_message_id(), &tool.id);
 
         // Typed oneshot channel: background task gets Sender<ToolExecOutcome>,
         // physically cannot send an LlmOutcome or other type.
@@ -10295,7 +10606,7 @@ where
         // derivations: a sub-agent Explore resolves to
         // `WorkScope::Conversation(id)` on both sides instead of diverging to
         // `WorkScope::Worktree(cwd)` on the tool side only.
-        let scope_worktree = self.context.work_scope_worktree.clone();
+        let scope_worktree = context.work_scope_worktree.clone();
         let progress_broadcaster = self.broadcast_tx.clone();
         let progress_tool_use_id = tool.id.clone();
         let bash_progress_sink: Arc<dyn BashProgressSink> = Arc::new(move |progress| {
@@ -10307,12 +10618,12 @@ where
                 });
         });
         let llm_metrics_tx = self.create_tool_llm_metrics_sink(admitted);
-        let mut tool_ctx = match &self.context.execution_environment {
+        let mut tool_ctx = match &context.execution_environment {
             phoenix_core::domain::sm_state::ConversationExecutionEnvironment::Filesystem {
                 working_dir,
             } => ToolContext::new_with_resource_scope(
                 cancel_token,
-                self.context.conversation_id.clone(),
+                context.conversation_id.clone(),
                 working_dir.clone(),
                 self.browser_sessions.clone(),
                 self.bash_handles.clone(),
@@ -10320,29 +10631,29 @@ where
                 self.terminals.clone(),
                 self.tmux_registry.clone(),
                 scope_worktree,
-                self.context.resource_scope.clone(),
-                self.context.resource_authority,
+                context.resource_scope.clone(),
+                context.resource_authority,
             ),
             phoenix_core::domain::sm_state::ConversationExecutionEnvironment::NoFilesystem => {
                 ToolContext::new_without_filesystem(
                     cancel_token,
-                    self.context.conversation_id.clone(),
+                    context.conversation_id.clone(),
                     self.browser_sessions.clone(),
                     self.bash_handles.clone(),
                     self.llm_registry.clone(),
                     self.terminals.clone(),
                     self.tmux_registry.clone(),
-                    if self.context.is_coordinator {
+                    if context.is_coordinator {
                         phoenix_core::work_scope::ResourceScopeKey::Coordinator
                     } else {
-                        self.context.resource_scope.clone()
+                        context.resource_scope.clone()
                     },
-                    self.context.resource_authority,
+                    context.resource_authority,
                 )
             }
         }
         .with_bash_progress_sink(bash_progress_sink)
-        .with_root_conversation_id(self.context.root_conversation_id.clone())
+        .with_root_conversation_id(context.root_conversation_id.clone())
         .with_legacy_tmux_conversation_id(legacy_tmux_conversation_id)
         .with_tool_use_id(tool.id.clone())
         .with_svg_artifact_store(Arc::new(
@@ -10354,24 +10665,16 @@ where
         ))
         .with_llm_metrics_tx(llm_metrics_tx);
 
-        if let ConvState::ToolExecuting {
-            assistant_message, ..
-        }
-        | ConvState::CancellingTool {
-            assistant_message, ..
-        } = &self.state
-        {
-            tool_ctx = tool_ctx.with_svg_assistant_message_id(&assistant_message.message_id);
-        }
+        tool_ctx = tool_ctx.with_svg_assistant_message_id(selection.assistant_message_id());
 
-        if let Some(turn) = &self.active_direct_turn {
+        if let Some(turn) = &selection.direct_turn {
             tool_ctx = tool_ctx.with_direct_turn_id(
                 phoenix_core::domain::sm_event::DirectTurnTurnId(turn.turn_id.0),
             );
         }
 
-        let conv_id = self.context.conversation_id.clone();
-        let root_conv_id = self.context.root_conversation_id.clone();
+        let conv_id = context.conversation_id.clone();
+        let root_conv_id = context.root_conversation_id.clone();
         let storage = self.storage.clone();
         let tool_executor = self.tool_executor.clone();
         let tool_use_id = tool.id.clone();
@@ -10379,30 +10682,6 @@ where
         // aborted tool task) still produces a typed outcome for this tool_use.
         let forwarder_tool_use_id = tool.id.clone();
         let tool_name = tool.name().to_string();
-        let tool_input = tool.input.to_value();
-
-        // Permission seam (specs/permissions REQ-PERM-001): every tool call is
-        // gate-cleared before the tool task is spawned, upstream of the
-        // registry-vs-MCP split inside `ToolExecutor::execute` so MCP tools are
-        // covered too. On clear the minted `CheckedToolCall` is the only value
-        // `execute` accepts; on deny no task spawns and the denial returns via
-        // the existing outcome channel (REQ-PERM-005). `spawn_agents` is handled
-        // above and bypasses Layer 0 as intent-relative (REQ-PERM-007).
-        let checked =
-            match crate::runtime::deny_gate::DenyGate::check(tool_name.clone(), tool_input) {
-                Ok(checked) => checked,
-                Err(denial) => {
-                    tracing::info!(conv_id = %conv_id, tool = %tool_name, id = %tool_use_id,
-                    error = %denial.error, "Tool call denied by permission gate");
-                    forward_denial_outcome(
-                        forwarder_tool_use_id,
-                        denial,
-                        dispatch_generation,
-                        tool_outcome_tx,
-                    );
-                    return Ok(None);
-                }
-            };
 
         // Instrumenting the detached task with the turn span parents the
         // `tool.execute` span (execute_tool_to_outcome) into this turn's trace.
@@ -10455,8 +10734,6 @@ where
             dispatch_generation,
             tool_outcome_tx,
         ));
-
-        Ok(None)
     }
 
     async fn persist_checkpoint_with_terminal_obligation(
@@ -11202,6 +11479,18 @@ where
                 &mut system_prompt,
                 self.storage.coordinator_home_scope().await,
             );
+        } else if !is_sub_agent {
+            // REQ-AUTH-007: an owner the Coordinator watches works under the same saved grants.
+            if let Some(authority) = self
+                .storage
+                .delegated_coordinator_authority(&self.context.conversation_id)
+                .await?
+            {
+                system_prompt.push_str("\n\n");
+                system_prompt.push_str(&crate::system_prompt::render_delegated_authority(
+                    &authority,
+                ));
+            }
         }
         if is_sub_agent
             && matches!(
@@ -11287,7 +11576,6 @@ where
                 if intent.successor_conversation_id != self.context.conversation_id
                     || intent.opening_authority
                         != ContinuationOpeningAuthority::GeneratedPredecessorContext
-                    || intent.user_agent.is_some()
                     || !matches!(self.state, ConvState::Idle)
                 {
                     return Err(
@@ -11378,14 +11666,18 @@ where
             .clone()
             .freeze_for_request()
             .map_err(|error| error.to_string())?;
+        let tool_availability = fresh_discovery_availability(
+            tools,
+            client
+                .tool_discovery_mode()
+                .map_err(|error| error.to_string())?,
+        );
         let projection_request = LlmRequest {
             system: vec![SystemContent::cached(&system)],
             messages: vec![],
             provider_replay: None,
-            responses_replay: vec![],
-            tool_availability: phoenix_core::domain::tool_availability::ToolAvailability::all(
-                tools.clone(),
-            ),
+            output_replay: vec![],
+            tool_availability: tool_availability.clone(),
             max_tokens: u32::try_from(self.context.output_budget)
                 .map_err(|error| error.to_string())?,
             effective_effort: self
@@ -11400,11 +11692,8 @@ where
         let mut counting = CountingBudget::new();
         let capacity = SuccessorCapacity {
             context_window: self.context.context_window,
-            ordinary_overhead_tokens: estimate_fixed_request_tokens(
-                &system,
-                &phoenix_core::domain::tool_availability::ToolAvailability::all(tools),
-            )
-            .saturating_add(MESSAGE_OVERHEAD_TOKENS),
+            ordinary_overhead_tokens: estimate_fixed_request_tokens(&system, &tool_availability)
+                .saturating_add(MESSAGE_OVERHEAD_TOKENS),
             output_tokens: self.context.output_budget,
         };
         let describe = |text: &str, authority: phoenix_core::domain::product_conversation::ContinuationOpeningAuthority| {
@@ -11480,7 +11769,7 @@ where
             messages,
             system: vec![SystemContent::new(system)],
             provider_replay: None,
-            responses_replay: vec![],
+            output_replay: vec![],
             tool_availability: phoenix_core::domain::tool_availability::ToolAvailability::all(
                 vec![],
             ),
@@ -11758,14 +12047,18 @@ where
             }
         };
         let (ordinary_system, ordinary_tools) = self.prepare_successor_overhead().await?;
+        let tool_availability = fresh_discovery_availability(
+            ordinary_tools,
+            llm_client
+                .tool_discovery_mode()
+                .map_err(|error| error.to_string())?,
+        );
         let successor_request = LlmRequest {
             system: vec![SystemContent::cached(&ordinary_system)],
             messages: vec![],
             provider_replay: None,
-            responses_replay: vec![],
-            tool_availability: phoenix_core::domain::tool_availability::ToolAvailability::all(
-                ordinary_tools.clone(),
-            ),
+            output_replay: vec![],
+            tool_availability: tool_availability.clone(),
             max_tokens: output_token_limit,
             effective_effort,
             service_tier: effective_service_tier,
@@ -11777,7 +12070,7 @@ where
             context_window,
             ordinary_overhead_tokens: estimate_fixed_request_tokens(
                 &ordinary_system,
-                &phoenix_core::domain::tool_availability::ToolAvailability::all(ordinary_tools),
+                &tool_availability,
             )
             .saturating_add(MESSAGE_OVERHEAD_TOKENS),
             output_tokens: self.context.output_budget,
@@ -11920,7 +12213,7 @@ where
             messages: complete_messages,
             system: vec![SystemContent::new(system_prompt)],
             provider_replay: None,
-            responses_replay: vec![],
+            output_replay: vec![],
             tool_availability: phoenix_core::domain::tool_availability::ToolAvailability::all(
                 vec![],
             ),
@@ -12082,7 +12375,7 @@ where
             messages,
             system: vec![SystemContent::new(system_prompt)],
             provider_replay: None,
-            responses_replay: Vec::new(),
+            output_replay: Vec::new(),
             tool_availability: phoenix_core::domain::tool_availability::ToolAvailability::all(
                 vec![],
             ), // No tools for continuation
@@ -12440,6 +12733,7 @@ where
                     work_scope_key: None,
                     model: None,
                     archived: None,
+                    continued_in_conv_id: None,
                 },
             });
 
@@ -12612,6 +12906,7 @@ where
                     work_scope_key: None,
                     model: None,
                     archived: None,
+                    continued_in_conv_id: None,
                 },
             });
         Ok(())
@@ -12989,6 +13284,7 @@ where
                             work_scope_key: Some(self.context.resource_scope.stable_key()),
                             model: None,
                             archived: None,
+                            continued_in_conv_id: None,
                         },
                     });
 
@@ -13870,26 +14166,29 @@ fn estimate_messages_tokens(messages: &[LlmMessage]) -> usize {
 fn estimate_private_replay_overhead(
     messages: &[LlmMessage],
     anthropic: Option<&phoenix_core::domain::provider_replay::AnthropicReplayPayload>,
-    responses: &[phoenix_core::domain::responses_replay::ResponsesResponseSet],
+    responses: &[phoenix_core::domain::responses_replay::ProviderResponseSet],
 ) -> usize {
     messages
         .iter()
         .filter(|message| message.role == MessageRole::Assistant)
         .map(|message| {
             let public_tokens = estimate_message_tokens(message);
-            let responses_extra = responses
-                .iter()
-                .find(|set| {
-                    message.source_message_id.as_deref() == Some(&set.owner_message_id)
-                        && message.content == set.public_content
-                })
-                .map_or(0, |set| {
-                    estimate_text_tokens(
-                        &serde_json::to_string(&set.output_items).expect("replay items serialize"),
-                    )
-                    .saturating_add(MESSAGE_OVERHEAD_TOKENS)
-                    .saturating_sub(public_tokens)
-                });
+let responses_extra = responses
+    .iter()
+    .find(|set| {
+        message.source_message_id.as_deref() == Some(set.owner_message_id())
+            && message.content == set.public_content()
+    })
+    .map_or(0, |set| match set {
+        phoenix_core::domain::responses_replay::ProviderResponseSet::Responses(set) => {
+            estimate_text_tokens(&serde_json::to_string(&set.output_items).expect("replay items serialize"))
+                .saturating_add(MESSAGE_OVERHEAD_TOKENS)
+                .saturating_sub(public_tokens)
+        }
+        phoenix_core::domain::responses_replay::ProviderResponseSet::ChatCompletions(set) => {
+            estimate_text_tokens(&serde_json::to_string(&set.tool_signatures).expect("tool signatures serialize"))
+        }
+    });
             let anthropic_extra = anthropic
                 .and_then(|payload| {
                     payload.response_sets.iter().find(|set| {
@@ -13916,16 +14215,49 @@ fn estimate_fixed_request_tokens(
     system_prompt: &str,
     availability: &phoenix_core::domain::tool_availability::ToolAvailability,
 ) -> usize {
-    estimate_text_tokens(system_prompt)
-        + phoenix_llm::tool_availability_advisory_chars(availability)
-            .div_ceil(CHARS_PER_TOKEN_ESTIMATE)
-        + availability
-            .declarations()
+    use phoenix_core::domain::tool_discovery::ToolDiscoveryMode;
+    let mode = availability.discovery_mode();
+    let schema_tokens = availability.declarations().iter().filter_map(|tool| {
+        if (mode == ToolDiscoveryMode::OpenAiHosted && (!availability.is_callable(&tool.name) || tool.name == phoenix_core::domain::tool_discovery::TOOL_SEARCH_NAME)) || (mode == ToolDiscoveryMode::OpenAiClient && tool.defer_loading) {
+            None
+        } else if mode == ToolDiscoveryMode::OpenAiHosted && tool.defer_loading {
+            Some(estimate_text_tokens(&serde_json::json!({"name":tool.name,"description":tool.description,"defer_loading":true}).to_string()))
+        } else {
+            Some(estimate_text_tokens(&serde_json::to_string(tool).expect("tool schema serializes")))
+        }
+    }).sum::<usize>();
+    let discovered_tokens = if mode == ToolDiscoveryMode::OpenAiClient {
+        availability
+            .discovery_results()
             .iter()
+            .filter(|result| {
+                result.protocol
+                    == phoenix_core::domain::tool_discovery::ToolDiscoveryProtocol::OpenAiClient
+            })
+            .flat_map(|result| &result.tools)
             .map(|tool| {
                 estimate_text_tokens(&serde_json::to_string(tool).expect("tool schema serializes"))
             })
-            .sum::<usize>()
+            .sum()
+    } else {
+        0
+    };
+    let hosted_search_tokens = if mode == ToolDiscoveryMode::OpenAiHosted
+        && availability
+            .declarations()
+            .iter()
+            .any(|tool| tool.defer_loading && availability.is_callable(&tool.name))
+    {
+        estimate_text_tokens(r#"{"type":"tool_search","execution":"server"}"#)
+    } else {
+        0
+    };
+    estimate_text_tokens(system_prompt)
+        + phoenix_llm::tool_availability_advisory_chars(availability)
+            .div_ceil(CHARS_PER_TOKEN_ESTIMATE)
+        + schema_tokens
+        + discovered_tokens
+        + hosted_search_tokens
 }
 
 #[cfg(test)]
@@ -16962,6 +17294,8 @@ mod dispatch_context_budget_tests {
                 serde_json::json!({"type":"reasoning","encrypted_content":"x".repeat(8_000)}),
             ],
         };
+        let response =
+            phoenix_core::domain::responses_replay::ProviderResponseSet::Responses(response);
         let anthropic =
             AnthropicReplayPayload::new(vec![AnthropicResponseSet::with_public_content(
                 AnthropicResponseIdentity {
@@ -23368,6 +23702,11 @@ mod explore_prompt_cache_shape_tests {
         Box::pin(runtime.process_outcome(EffectOutcome::Llm(outcome)))
             .await
             .unwrap();
+        assert!(runtime
+            .observe_tool_preparation_for_test()
+            .await
+            .unwrap()
+            .is_none());
         let (_, outcome) = tokio::time::timeout(
             std::time::Duration::from_secs(5),
             runtime.tool_outcome_rx.recv(),
@@ -23698,30 +24037,37 @@ mod steer_drain_detector_tests {
         state
     }
 
+    fn unavailable_completion_chain() -> ConvState {
+        let mut initial = ordinary_completion_state();
+        if let ConvState::ToolExecuting {
+            remaining_tools,
+            assistant_message,
+            ..
+        } = &mut initial
+        {
+            for id in ["unavailable-2", "unavailable-3", "unavailable-4"] {
+                remaining_tools.push(ToolCall::new(
+                    id,
+                    ToolInput::from(crate::tools::BashToolInput::run("true")),
+                ));
+                assistant_message.content.push(ContentBlock::tool_use(
+                    id,
+                    "bash",
+                    serde_json::json!({"op": "run", "cmd": "true"}),
+                ));
+            }
+        }
+        initial
+    }
+
     #[tokio::test]
     async fn ordinary_tool_followup_local_dispatches_do_not_depend_on_event_queue() {
         for path in ["freeze", "cycle", "grace", "unavailable_chain"] {
-            let mut initial = ordinary_completion_state();
-            if path == "unavailable_chain" {
-                if let ConvState::ToolExecuting {
-                    remaining_tools,
-                    assistant_message,
-                    ..
-                } = &mut initial
-                {
-                    for id in ["unavailable-2", "unavailable-3", "unavailable-4"] {
-                        remaining_tools.push(ToolCall::new(
-                            id,
-                            ToolInput::from(crate::tools::BashToolInput::run("true")),
-                        ));
-                        assistant_message.content.push(ContentBlock::tool_use(
-                            id,
-                            "bash",
-                            serde_json::json!({"op": "run", "cmd": "true"}),
-                        ));
-                    }
-                }
-            }
+            let initial = if path == "unavailable_chain" {
+                unavailable_completion_chain()
+            } else {
+                ordinary_completion_state()
+            };
             let (mut runtime, storage) =
                 build_runtime_with_state_and_queue("tool-local-dispatch", initial, vec![]);
             runtime.event_rx.close();
@@ -23759,6 +24105,10 @@ mod steer_drain_detector_tests {
                 .process_outcome(EffectOutcome::Tool(ToolExecOutcome::Completed(
                     ToolResult::success("tool-1".into(), "done".into()),
                 )))
+                .await
+                .unwrap();
+            runtime
+                .settle_prepared_completions_for_test()
                 .await
                 .unwrap();
             assert!(!runtime.fatal_local_authority_fence.is_closed(), "{path}");
@@ -24242,12 +24592,10 @@ mod steer_drain_detector_tests {
             unreachable!()
         };
         let event = runtime
-            .execute_effect(Effect::ExecuteTool {
-                tool: current_tool.clone(),
-            })
+            .dispatch_tool_for_test(current_tool.clone())
             .await
             .unwrap()
-            .expect("unavailable declaration yields an inline completion");
+            .expect("unavailable declaration yields a prepared completion");
         assert!(matches!(event, Event::ToolComplete { .. }));
         assert!(runtime.tool_executor.recorded_executions().is_empty());
         storage.set_fail_tool_round_persist(true);
@@ -24526,10 +24874,17 @@ mod steer_drain_detector_tests {
         let (mut runtime, storage) =
             build_runtime_with_state_and_queue("checkpoint-child-activation", initial, vec![]);
         let (sender, mut activated) = oneshot::channel();
-        runtime.pending_sub_agent_activation = Some(PendingSubAgentActivation {
-            child_ids: vec!["admitted-child".into()],
-            sender,
-        });
+        let expected = handle_outcome(
+            &runtime.state,
+            &runtime.context,
+            EffectOutcome::Tool(ToolExecOutcome::Completed(ToolResult::success(
+                "tool-1".into(),
+                "done".into(),
+            ))),
+        )
+        .unwrap()
+        .new_state;
+        runtime.install_native_activation_for_test(sender, expected);
         runtime
             .process_outcome(EffectOutcome::Tool(ToolExecOutcome::Completed(
                 ToolResult::success("tool-1".into(), "done".into()),
@@ -24537,7 +24892,7 @@ mod steer_drain_detector_tests {
             .await
             .unwrap();
         assert_eq!(activated.try_recv(), Ok(()));
-        assert!(runtime.pending_sub_agent_activation.is_none());
+        assert!(!runtime.native_spawn_activation_pending());
         assert!(matches!(
             storage.get_current_state("checkpoint-child-activation"),
             Some(ConvState::AwaitingSubAgents { .. })
@@ -25676,6 +26031,439 @@ mod steer_drain_detector_tests {
         assert_eq!(
             *fence.tx.borrow(),
             Some("sub_agent_result_owner_disappeared")
+        );
+        assert_eq!(fence.owner_count(), 0);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn forced_tool_notice_follows_sqlite_child_acceptance_and_summary() {
+        use phoenix_db::{
+            SubAgentBatchAdmission, SubAgentExecutionAuthority, SubAgentRunAdmission,
+            SubAgentTerminalCause,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("forced-notice.db");
+        let db = crate::db::Database::open(path.to_str().unwrap())
+            .await
+            .unwrap();
+        crate::db::run_pending_migrations(db.pool()).await.unwrap();
+        let id = "sqlite-forced-notice";
+        db.create_conversation(id, id, "/tmp", true, None, None)
+            .await
+            .unwrap();
+        db.create_conversation("child", "child", "/tmp", false, Some(id), None)
+            .await
+            .unwrap();
+        db.admit_sub_agent_batch(&SubAgentBatchAdmission {
+            batch_id: "batch".into(),
+            parent_conversation_id: id.into(),
+            parallel_work_qualified: false,
+            runs: vec![SubAgentRunAdmission {
+                child_conversation_id: "child".into(),
+                execution_authority: SubAgentExecutionAuthority::ReadOnly,
+            }],
+        })
+        .await
+        .unwrap();
+        let mut initial = ordinary_completion_state();
+        if let ConvState::ToolExecuting {
+            pending_sub_agents, ..
+        } = &mut initial
+        {
+            pending_sub_agents.push(PendingSubAgent {
+                agent_id: "child".into(),
+                task: "task".into(),
+                mode: SubAgentMode::Explore,
+            });
+        }
+        db.update_conversation_state(id, &initial).await.unwrap();
+        let (event_tx, event_rx) = mpsc::channel(16);
+        let mut runtime = ConversationRuntime::new(
+            ConvContext::new(id, PathBuf::from("/tmp"), "test-model", 200_000, 16_384),
+            initial,
+            crate::runtime::traits::DatabaseStorage::new(db.clone()),
+            Arc::new(MockLlmClient::new("test-model")),
+            Arc::new(MockToolExecutor::new()),
+            Arc::new(BrowserSessionManager::default()),
+            Arc::new(crate::tools::BashHandleRegistry::new()),
+            Arc::new(crate::tools::TmuxRegistry::new()),
+            Arc::new(ModelRegistry::new_empty()),
+            crate::terminal::ActiveTerminals::new(),
+            event_rx,
+            event_tx,
+            SseBroadcaster::new(128, 0),
+        );
+        let mut broadcasts = runtime.broadcast_tx.subscribe();
+        runtime
+            .process_event(Event::UserCancel {
+                reason: None,
+                cause: crate::state_machine::event::CancelCause::UserRequested,
+            })
+            .await
+            .unwrap();
+        runtime.handle_cancelling_tool_timeout().await;
+        let at = Utc::now();
+        db.update_child_state_and_record_sub_agent_terminal(
+            "child",
+            &ConvState::Completed {
+                result: "authentic result".into(),
+            },
+            at,
+            SubAgentTerminalCause::SubmitResult,
+            at,
+        )
+        .await
+        .established()
+        .unwrap()
+        .unwrap();
+        // A rejected summary/acceptance transaction must keep the phase's notice owed.
+        sqlx::query("CREATE TRIGGER reject_parent_acceptance BEFORE UPDATE OF parent_accepted_at_unix_micros ON sub_agent_runs BEGIN SELECT RAISE(ABORT, 'injected known acceptance failure'); END").execute(db.pool()).await.unwrap();
+        let child = Event::SubAgentResult {
+            agent_id: "child".into(),
+            outcome: SubAgentOutcome::Success {
+                result: "authentic result".into(),
+            },
+        };
+        runtime.process_event(child.clone()).await.unwrap();
+        assert!(!db.sub_agent_terminal_is_accepted("child").await.unwrap());
+        assert!(matches!(
+            runtime.state,
+            ConvState::CancellingSubAgents { .. }
+        ));
+        assert!(!db.get_messages(id).await.unwrap().iter().any(|message| matches!(&message.content, MessageContent::System(content) if content.text.starts_with("Cancellation completed."))));
+        sqlx::query("DROP TRIGGER reject_parent_acceptance")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        runtime.process_event(child.clone()).await.unwrap();
+        assert!(db.sub_agent_terminal_is_accepted("child").await.unwrap());
+        assert!(matches!(
+            db.get_conversation(id).await.unwrap().state,
+            ConvState::Idle
+        ));
+        let messages = db.get_messages(id).await.unwrap();
+        let notices = messages.iter().filter(|message| matches!(&message.content, MessageContent::System(content) if content.text.starts_with("Cancellation completed."))).collect::<Vec<_>>();
+        assert_eq!(notices.len(), 1);
+        let notice = notices[0];
+        let summary = messages.iter().find(|message| matches!(&message.content, MessageContent::User(content) if content.text.contains("authentic result"))).expect("accepted child summary is persisted");
+        assert!(summary.sequence_id < notice.sequence_id);
+        assert_eq!(messages.last().unwrap().message_id, notice.message_id);
+        assert!(messages
+            .iter()
+            .filter(|message| message.message_id != notice.message_id)
+            .all(|message| message.sequence_id < notice.sequence_id));
+        let notice_id = notice.message_id.clone();
+        let mut published = 0;
+        while let Ok(event) = broadcasts.try_recv() {
+            if matches!(event, SseEvent::Message { ref message, .. } if message.message_id == notice_id)
+            {
+                published += 1;
+            }
+        }
+        assert_eq!(published, 1);
+        runtime.process_event(child).await.unwrap();
+        runtime.handle_cancelling_sub_agents_timeout().await;
+        assert_eq!(
+            serde_json::to_value(db.get_messages(id).await.unwrap()).unwrap(),
+            serde_json::to_value(&messages).unwrap()
+        );
+        drop(runtime);
+        db.pool().close().await;
+        let reopened = crate::db::Database::open(path.to_str().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(reopened.get_messages(id).await.unwrap()).unwrap(),
+            serde_json::to_value(&messages).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn forced_tool_notice_survives_delayed_cooperative_child_drain() {
+        let mut initial = ordinary_completion_state();
+        if let ConvState::ToolExecuting {
+            pending_sub_agents, ..
+        } = &mut initial
+        {
+            for child in ["child-a", "child-b"] {
+                pending_sub_agents.push(PendingSubAgent {
+                    agent_id: child.into(),
+                    task: "task".into(),
+                    mode: SubAgentMode::Work,
+                });
+            }
+        }
+        let id = "forced-tool-delayed-children";
+        let (mut runtime, storage) = build_runtime_with_state_and_queue(id, initial, vec![]);
+        let notices = |storage: &InMemoryStorage| {
+            storage.get_all_messages(id).into_iter().filter(|message| {
+            matches!(&message.content, MessageContent::System(content) if content.text.starts_with("Cancellation completed."))
+        }).collect::<Vec<_>>()
+        };
+        runtime
+            .process_event(Event::UserCancel {
+                reason: None,
+                cause: crate::state_machine::event::CancelCause::UserRequested,
+            })
+            .await
+            .unwrap();
+        runtime.handle_cancelling_tool_timeout().await;
+        assert!(matches!(
+            runtime.state,
+            ConvState::CancellingSubAgents { .. }
+        ));
+        assert!(notices(&storage).is_empty());
+        for child in ["child-a", "child-b"] {
+            runtime
+                .process_event(Event::SubAgentResult {
+                    agent_id: child.into(),
+                    outcome: SubAgentOutcome::Success {
+                        result: "done".into(),
+                    },
+                })
+                .await
+                .unwrap();
+            assert_eq!(notices(&storage).len(), usize::from(child == "child-b"));
+        }
+        assert_eq!(storage.sub_agent_acceptance_count(), 2);
+        assert!(matches!(runtime.state, ConvState::Idle));
+        let messages = storage.get_all_messages(id);
+        assert_eq!(
+            messages.last().unwrap().message_id,
+            notices(&storage)[0].message_id
+        );
+        runtime.handle_cancelling_sub_agents_timeout().await;
+        runtime.handle_cancelling_tool_timeout().await;
+        assert_eq!(notices(&storage).len(), 1);
+    }
+
+    fn cancellation_notice_count(storage: &InMemoryStorage, id: &str) -> usize {
+        storage
+            .get_all_messages(id)
+            .iter()
+            .filter(|message| {
+                matches!(&message.content,
+            MessageContent::System(content) if content.text.starts_with("Cancellation completed."))
+            })
+            .count()
+    }
+
+    #[tokio::test]
+    async fn forced_tool_notice_survives_inline_steering_for_immediate_and_delayed_completion() {
+        for delayed_child in [false, true] {
+            let id = "forced-notice-steering";
+            let mut initial = ordinary_completion_state();
+            if delayed_child {
+                if let ConvState::ToolExecuting {
+                    pending_sub_agents, ..
+                } = &mut initial
+                {
+                    pending_sub_agents.push(PendingSubAgent {
+                        agent_id: "child".into(),
+                        task: "task".into(),
+                        mode: SubAgentMode::Explore,
+                    });
+                }
+            }
+            let (mut runtime, storage) = build_runtime_with_state_and_queue(id, initial, vec![]);
+            let entry = mk_entry("forced-steer", "continue after cancellation");
+            runtime.steering_queue = vec![entry.clone()];
+            storage.set_steering_queue(id, vec![entry]);
+            runtime
+                .process_event(Event::UserCancel {
+                    reason: None,
+                    cause: crate::state_machine::event::CancelCause::UserRequested,
+                })
+                .await
+                .unwrap();
+            runtime.handle_cancelling_tool_timeout().await;
+            if delayed_child {
+                assert_eq!(cancellation_notice_count(&storage, id), 0);
+                runtime
+                    .process_event(Event::SubAgentResult {
+                        agent_id: "child".into(),
+                        outcome: SubAgentOutcome::Success {
+                            result: "done".into(),
+                        },
+                    })
+                    .await
+                    .unwrap();
+            }
+            assert!(matches!(runtime.state, ConvState::LlmRequesting { .. }));
+            assert_eq!(cancellation_notice_count(&storage, id), 1);
+            assert!(storage.get_steering_queue(id).is_empty());
+            let messages = storage.get_all_messages(id);
+            assert!(
+                matches!(&messages.last().unwrap().content, MessageContent::System(content) if content.text.starts_with("Cancellation completed."))
+            );
+            runtime.abort_external_effects().await;
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn forced_tool_notice_survives_existing_terminal_checkpoint_retry() {
+        let id = "forced-notice-terminal-retry";
+        let (mut runtime, storage) =
+            build_runtime_with_state_and_queue(id, ordinary_completion_state(), vec![]);
+        let turn = crate::runtime::traits::ActiveDirectTurn {
+            turn_id: phoenix_workflow::TurnAuthorityId(71),
+            generation: 0,
+        };
+        storage.set_active_direct_turn(Some(turn.clone()));
+        runtime.active_direct_turn = Some(Box::new(turn));
+        storage.set_terminal_obligation_establishment_failures(1);
+        runtime
+            .process_event(Event::UserCancel {
+                reason: None,
+                cause: crate::state_machine::event::CancelCause::UserRequested,
+            })
+            .await
+            .unwrap();
+        runtime.handle_cancelling_tool_timeout().await;
+        assert!(runtime.terminal_transition_retry.is_some());
+        assert!(!runtime.fatal_local_authority_fence.is_closed());
+        assert_eq!(cancellation_notice_count(&storage, id), 0);
+        tokio::time::advance(TERMINAL_SETTLEMENT_RETRY_DELAY).await;
+        runtime.retry_terminal_transition().await;
+        assert!(runtime.terminal_transition_retry.is_none());
+        assert!(runtime.active_direct_turn.is_none());
+        assert!(matches!(runtime.state, ConvState::Idle));
+        assert_eq!(cancellation_notice_count(&storage, id), 1);
+        runtime.handle_cancelling_tool_timeout().await;
+        assert_eq!(cancellation_notice_count(&storage, id), 1);
+    }
+
+    #[tokio::test]
+    async fn forced_tool_notice_and_child_deadline_share_one_completion() {
+        let id = "forced-notice-child-deadline";
+        let (mut runtime, storage) = cancelling_runtime(
+            id,
+            &["child-a", "child-b"],
+            crate::state_machine::event::CancelCause::UserRequested,
+        )
+        .await;
+        if let ConvState::CancellingSubAgents {
+            forced_tool_retirement,
+            ..
+        } = &mut runtime.state
+        {
+            *forced_tool_retirement =
+                phoenix_core::domain::sm_state::ForcedToolRetirement::Observed;
+        }
+        runtime
+            .process_event(Event::SubAgentResult {
+                agent_id: "child-a".into(),
+                outcome: SubAgentOutcome::Success {
+                    result: "done".into(),
+                },
+            })
+            .await
+            .unwrap();
+        assert_eq!(cancellation_notice_count(&storage, id), 0);
+        runtime.handle_cancelling_sub_agents_timeout().await;
+        assert_eq!(storage.sub_agent_acceptance_count(), 2);
+        assert_eq!(cancellation_notice_count(&storage, id), 1);
+        runtime
+            .process_event(Event::SubAgentResult {
+                agent_id: "child-b".into(),
+                outcome: SubAgentOutcome::Success {
+                    result: "late".into(),
+                },
+            })
+            .await
+            .unwrap();
+        runtime.handle_cancelling_sub_agents_timeout().await;
+        assert_eq!(cancellation_notice_count(&storage, id), 1);
+    }
+
+    #[tokio::test]
+    async fn cooperative_tool_and_children_do_not_owe_forced_notice() {
+        let id = "cooperative-no-forced-notice";
+        let mut initial = ordinary_completion_state();
+        if let ConvState::ToolExecuting {
+            pending_sub_agents, ..
+        } = &mut initial
+        {
+            pending_sub_agents.push(PendingSubAgent {
+                agent_id: "child".into(),
+                task: "task".into(),
+                mode: SubAgentMode::Explore,
+            });
+        }
+        let (mut runtime, storage) = build_runtime_with_state_and_queue(id, initial, vec![]);
+        runtime
+            .process_event(Event::UserCancel {
+                reason: None,
+                cause: crate::state_machine::event::CancelCause::UserRequested,
+            })
+            .await
+            .unwrap();
+        runtime
+            .process_event(Event::ToolAborted {
+                tool_use_id: "tool-1".into(),
+            })
+            .await
+            .unwrap();
+        runtime
+            .process_event(Event::SubAgentResult {
+                agent_id: "child".into(),
+                outcome: SubAgentOutcome::Success {
+                    result: "done".into(),
+                },
+            })
+            .await
+            .unwrap();
+        assert!(matches!(runtime.state, ConvState::Idle));
+        assert_eq!(storage.sub_agent_acceptance_count(), 1);
+        assert_eq!(cancellation_notice_count(&storage, id), 0);
+    }
+
+    #[tokio::test]
+    async fn forced_tool_notice_write_failure_closes_required_authority() {
+        let id = "forced-notice-write-failure";
+        let (mut runtime, storage) =
+            build_runtime_with_state_and_queue(id, ordinary_completion_state(), vec![]);
+        runtime
+            .process_event(Event::UserCancel {
+                reason: None,
+                cause: crate::state_machine::event::CancelCause::UserRequested,
+            })
+            .await
+            .unwrap();
+        storage.set_fail_message_add(true);
+        runtime.handle_cancelling_tool_timeout().await;
+        assert!(matches!(runtime.state, ConvState::Idle));
+        assert_eq!(cancellation_notice_count(&storage, id), 0);
+        assert_eq!(
+            *runtime.fatal_local_authority_fence.tx.borrow(),
+            Some("ordinary_tool_outcome_settlement")
+        );
+    }
+
+    #[tokio::test]
+    async fn forced_tool_notice_owner_lives_through_notice_write() {
+        let id = "forced-notice-owner-loss";
+        let (mut runtime, storage) =
+            build_runtime_with_state_and_queue(id, ordinary_completion_state(), vec![]);
+        runtime
+            .process_event(Event::UserCancel {
+                reason: None,
+                cause: crate::state_machine::event::CancelCause::UserRequested,
+            })
+            .await
+            .unwrap();
+        let fence = runtime.fatal_local_authority_fence.clone();
+        let (started, _release) = storage.gate_message_add();
+        let task = tokio::spawn(async move { runtime.handle_cancelling_tool_timeout().await });
+        started.await.unwrap();
+        assert!(fence.owner_count() > 0);
+        assert_eq!(cancellation_notice_count(&storage, id), 0);
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert_eq!(
+            *fence.tx.borrow(),
+            Some("ordinary_tool_outcome_owner_disappeared")
         );
         assert_eq!(fence.owner_count(), 0);
     }
@@ -27255,12 +28043,18 @@ mod steer_drain_detector_tests {
             completed_results: vec![],
             cause: crate::state_machine::event::CancelCause::UserRequested,
             spawn_tool_id: None,
+
+            forced_tool_retirement:
+                phoenix_core::domain::sm_state::ForcedToolRetirement::NotObserved,
         };
         let cancelling_second = ConvState::CancellingSubAgents {
             pending: vec![],
             completed_results: vec![],
             cause: crate::state_machine::event::CancelCause::UserRequested,
             spawn_tool_id: None,
+
+            forced_tool_retirement:
+                phoenix_core::domain::sm_state::ForcedToolRetirement::NotObserved,
         };
         rt.deadline = Some(original);
         rt.state = cancelling_second;
@@ -28507,6 +29301,9 @@ mod steer_drain_detector_tests {
                 completed_results: vec![],
                 cause: crate::state_machine::event::CancelCause::UserRequested,
                 spawn_tool_id: None,
+
+                forced_tool_retirement:
+                    phoenix_core::domain::sm_state::ForcedToolRetirement::NotObserved,
             },
         ] {
             let (mut rt, storage) =
@@ -28605,10 +29402,7 @@ mod steer_drain_detector_tests {
             vec![],
         );
         let (activation_tx, mut activation_rx) = oneshot::channel();
-        rt.pending_sub_agent_activation = Some(PendingSubAgentActivation {
-            child_ids: vec!["child".to_string()],
-            sender: activation_tx,
-        });
+        rt.install_native_activation_for_test(activation_tx, rt.state.clone());
         storage.set_fail_state_update(true);
         let mut admitted = rt.admit_authoritative_effect().unwrap();
         assert!(rt.persist_state_effect(false, &mut admitted).await.is_err());
@@ -28629,7 +29423,7 @@ mod steer_drain_detector_tests {
     /// Regression (task 61005): a `SubAgentResult` buffered from an earlier
     /// batch in the same awaiting-round must survive a subsequent
     /// `spawn_agents` dispatch and be delivered when the parent enters
-    /// `AwaitingSubAgents`. The bug: `handle_spawn_agents_tool` reassigned
+    /// `AwaitingSubAgents`. The bug: each spawn dispatch reassigned
     /// `sub_agent_result_buffer = Vec::with_capacity(..)` on every dispatch,
     /// destroying any result buffered while the parent was still running a
     /// prior tool (e.g. tool sequence `[spawn_agents A, bash, spawn_agents B]`,
@@ -28852,6 +29646,9 @@ mod steer_drain_detector_tests {
             completed_results: vec![],
             cause,
             spawn_tool_id: Some("spawn-1".to_string()),
+
+            forced_tool_retirement:
+                phoenix_core::domain::sm_state::ForcedToolRetirement::NotObserved,
         }
     }
 
@@ -31632,7 +32429,22 @@ mod work_subagent_cwd_guard_tests {
 
         ConversationRuntime::new(
             context,
-            ConvState::Idle,
+            ConvState::ToolExecuting {
+                current_tool: spawn_tool(SpawnAgentsInput { tasks: vec![] }),
+                remaining_tools: vec![],
+                completed_results: vec![],
+                pending_sub_agents: vec![],
+                assistant_message: crate::state_machine::state::AssistantMessage::new(
+                    "spawn-assistant".into(),
+                    vec![ContentBlock::tool_use(
+                        "tool-spawn-1",
+                        "spawn_agents",
+                        serde_json::json!({"tasks": []}),
+                    )],
+                    None,
+                    None,
+                ),
+            },
             storage,
             Arc::new(MockLlmClient::new("gpt-5.6-sol")),
             Arc::new(MockToolExecutor::new()),
@@ -31683,7 +32495,10 @@ mod work_subagent_cwd_guard_tests {
         let specs = request.specs;
         request
             .response_tx
-            .send(crate::runtime::SubAgentAdmissionResponse::Admitted)
+            .send(crate::runtime::SubAgentAdmissionReceipt {
+                invocation: request.invocation,
+                outcome: crate::runtime::SubAgentAdmissionResponse::Admitted,
+            })
             .expect("spawn requester receives admission result");
         specs
     }
@@ -31753,6 +32568,7 @@ mod work_subagent_cwd_guard_tests {
                 &["spawn_agents".into()].into_iter().collect(),
                 &[],
                 &[],
+                phoenix_core::domain::tool_discovery::ToolDiscoveryMode::Eager,
             )
             .await
             .unwrap();
@@ -31819,6 +32635,12 @@ mod work_subagent_cwd_guard_tests {
             .await
             .expect("schema validation must finish before spawn admission")
             .unwrap();
+            let event = if rejected {
+                event
+            } else {
+                let observation = resumed.observe_native_spawn().await;
+                resumed.native_spawn_observed(observation).await.unwrap()
+            };
             if rejected {
                 let Some(Event::ToolComplete {
                     tool_use_id,
@@ -31844,7 +32666,7 @@ mod work_subagent_cwd_guard_tests {
         let mut rt = runtime_in_direct_mode(parent.path());
 
         let result = rt
-            .handle_spawn_agents_tool(spawn_tool(SpawnAgentsInput {
+            .prepare_spawn_and_wait(spawn_tool(SpawnAgentsInput {
                 tasks: vec![SubAgentTask {
                     task: "inspect everything".to_string(),
                     cwd: Some("/".to_string()),
@@ -31855,7 +32677,7 @@ mod work_subagent_cwd_guard_tests {
                 }],
             }))
             .await
-            .expect("handle_spawn_agents_tool returned error");
+            .expect("prepare_spawn_and_wait returned error");
 
         match result {
             Some(Event::ToolComplete { result, .. }) => {
@@ -31875,7 +32697,7 @@ mod work_subagent_cwd_guard_tests {
         let mut rt = runtime_in_direct_mode(std::path::Path::new("/"));
 
         let result = rt
-            .handle_spawn_agents_tool(spawn_tool(SpawnAgentsInput {
+            .prepare_spawn_and_wait(spawn_tool(SpawnAgentsInput {
                 tasks: vec![SubAgentTask {
                     task: "inherit root".to_string(),
                     cwd: None,
@@ -31886,7 +32708,7 @@ mod work_subagent_cwd_guard_tests {
                 }],
             }))
             .await
-            .expect("handle_spawn_agents_tool returned error");
+            .expect("prepare_spawn_and_wait returned error");
 
         match result {
             Some(Event::ToolComplete { result, .. }) => {
@@ -31906,7 +32728,7 @@ mod work_subagent_cwd_guard_tests {
         let mut rt = runtime_in_direct_mode(parent.path());
 
         let result = rt
-            .handle_spawn_agents_tool(spawn_tool(SpawnAgentsInput {
+            .prepare_spawn_and_wait(spawn_tool(SpawnAgentsInput {
                 tasks: vec![SubAgentTask {
                     task: "inspect project".to_string(),
                     cwd: Some(deep.to_string_lossy().to_string()),
@@ -31917,7 +32739,7 @@ mod work_subagent_cwd_guard_tests {
                 }],
             }))
             .await
-            .expect("handle_spawn_agents_tool returned error");
+            .expect("prepare_spawn_and_wait returned error");
 
         match result {
             Some(Event::ToolComplete { result, .. }) => {
@@ -31943,7 +32765,7 @@ mod work_subagent_cwd_guard_tests {
         let mut rt = runtime_in_work_mode(worktree.path());
 
         let result = rt
-            .handle_spawn_agents_tool(spawn_tool(SpawnAgentsInput {
+            .prepare_spawn_and_wait(spawn_tool(SpawnAgentsInput {
                 tasks: vec![SubAgentTask {
                     task: "do unsafe writes".to_string(),
                     cwd: Some(outside.path().to_string_lossy().to_string()),
@@ -31954,7 +32776,7 @@ mod work_subagent_cwd_guard_tests {
                 }],
             }))
             .await
-            .expect("handle_spawn_agents_tool returned error");
+            .expect("prepare_spawn_and_wait returned error");
 
         match result {
             Some(Event::ToolComplete { result, .. }) => {
@@ -31986,7 +32808,13 @@ mod work_subagent_cwd_guard_tests {
 
     #[tokio::test]
     async fn qualified_parent_models_admit_multiple_luna_work_children() {
-        for parent_model in ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-6-astra", "gpt-6-sol"] {
+        for parent_model in [
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "gpt-6-astra",
+            "gpt-6-sol",
+            "gpt-6.1-sol",
+        ] {
             let worktree = TempDir::new().expect("worktree tempdir");
             let (spawn_tx, spawn_rx) = mpsc::channel::<SubAgentSpawnRequest>(2);
             let (cancel_tx, _cancel_rx) = mpsc::channel(1);
@@ -31996,7 +32824,7 @@ mod work_subagent_cwd_guard_tests {
 
             let responder = tokio::spawn(accept_spawn_batch(spawn_rx));
             let result = rt
-                .handle_spawn_agents_tool(spawn_tool(SpawnAgentsInput {
+                .prepare_spawn_and_wait(spawn_tool(SpawnAgentsInput {
                     tasks: vec![
                         luna_work_task("first partition"),
                         luna_work_task("second partition"),
@@ -32028,7 +32856,7 @@ mod work_subagent_cwd_guard_tests {
         rt.context.model_id = "gpt-5.6-luna".to_string();
 
         let result = rt
-            .handle_spawn_agents_tool(spawn_tool(SpawnAgentsInput {
+            .prepare_spawn_and_wait(spawn_tool(SpawnAgentsInput {
                 tasks: vec![luna_work_task("first"), luna_work_task("second")],
             }))
             .await
@@ -32040,29 +32868,60 @@ mod work_subagent_cwd_guard_tests {
     }
 
     #[tokio::test]
-    async fn gpt_6_luna_parent_remains_sequential() {
-        let worktree = TempDir::new().expect("worktree tempdir");
-        let (spawn_tx, mut spawn_rx) = mpsc::channel::<SubAgentSpawnRequest>(1);
-        let (cancel_tx, _cancel_rx) = mpsc::channel(1);
-        let mut rt = runtime_in_work_mode(worktree.path()).with_spawn_channels(spawn_tx, cancel_tx);
-        rt.context.model_id = "gpt-6-luna".to_string();
+    async fn unqualified_builtin_parent_models_remain_sequential() {
+        let registry = Arc::new(ModelRegistry::new(&phoenix_llm::LlmConfig {
+            openai_api_key: Some("test-key".into()),
+            anthropic_api_key: Some("test-key".into()),
+            openai_responses_base_url: Some("https://gateway.example/v1/responses".into()),
+            openai_chat_completions_base_url: Some(
+                "https://gateway.example/v1/chat/completions".into(),
+            ),
+            ..Default::default()
+        }));
+        for parent_model in [
+            "gpt-6-luna",
+            "gpt-6.2-astra",
+            "gpt-6.2-sol",
+            "gpt-6.1-terra",
+            "claude-fable-5-2",
+            "claude-haiku-5-5",
+            "google/gemini-4-neon",
+            "google/gemini-4-hydrogen",
+            "google/gemini-4-carbon",
+            "google/gemini-4-argon",
+        ] {
+            let worktree = TempDir::new().expect("worktree tempdir");
+            let (spawn_tx, mut spawn_rx) = mpsc::channel::<SubAgentSpawnRequest>(1);
+            let (cancel_tx, _cancel_rx) = mpsc::channel(1);
+            let mut rt =
+                runtime_in_work_mode(worktree.path()).with_spawn_channels(spawn_tx, cancel_tx);
+            rt.llm_registry = Arc::clone(&registry);
+            rt.context.model_id = parent_model.to_string();
+            assert!(
+                rt.llm_registry.is_builtin_model(parent_model),
+                "{parent_model}"
+            );
 
-        let result = rt
-            .handle_spawn_agents_tool(spawn_tool(SpawnAgentsInput {
-                tasks: vec![
-                    luna_work_task("first partition"),
-                    luna_work_task("second partition"),
-                ],
-            }))
-            .await
-            .expect("Luna rejection is a tool result");
+            let result = rt
+                .prepare_spawn_and_wait(spawn_tool(SpawnAgentsInput {
+                    tasks: vec![
+                        luna_work_task("first partition"),
+                        luna_work_task("second partition"),
+                    ],
+                }))
+                .await
+                .expect("unqualified parent rejection is a tool result");
 
-        let Some(Event::ToolComplete { result, .. }) = result else {
-            panic!("expected ToolComplete rejection");
-        };
-        let text = tool_result_text(&result);
-        assert!(text.contains("Only one Work sub-agent"), "{text}");
-        assert!(spawn_rx.try_recv().is_err());
+            let Some(Event::ToolComplete { result, .. }) = result else {
+                panic!("expected ToolComplete rejection for {parent_model}");
+            };
+            let text = tool_result_text(&result);
+            assert!(
+                text.contains("Only one Work sub-agent"),
+                "{parent_model}: {text}"
+            );
+            assert!(spawn_rx.try_recv().is_err(), "{parent_model}");
+        }
     }
 
     #[tokio::test]
@@ -32077,7 +32936,7 @@ mod work_subagent_cwd_guard_tests {
         rt.context.model_id = "gpt-6-astra".to_string();
 
         let result = rt
-            .handle_spawn_agents_tool(spawn_tool(SpawnAgentsInput {
+            .prepare_spawn_and_wait(spawn_tool(SpawnAgentsInput {
                 tasks: vec![luna_work_task("write")],
             }))
             .await
@@ -32104,7 +32963,7 @@ mod work_subagent_cwd_guard_tests {
 
         let responder = tokio::spawn(accept_spawn_batch(spawn_rx));
         let result = rt
-            .handle_spawn_agents_tool(spawn_tool(SpawnAgentsInput {
+            .prepare_spawn_and_wait(spawn_tool(SpawnAgentsInput {
                 tasks: vec![SubAgentTask {
                     task: "implement the fix".to_string(),
                     cwd: None,
@@ -32115,7 +32974,7 @@ mod work_subagent_cwd_guard_tests {
                 }],
             }))
             .await
-            .expect("handle_spawn_agents_tool returned error");
+            .expect("prepare_spawn_and_wait returned error");
 
         assert!(matches!(result, Some(Event::SpawnAgentsComplete { .. })));
         responder.await.expect("admission responder joins");
@@ -32130,7 +32989,7 @@ mod work_subagent_cwd_guard_tests {
 
         let responder = tokio::spawn(accept_spawn_batch(spawn_rx));
         let result = rt
-            .handle_spawn_agents_tool(spawn_tool(SpawnAgentsInput {
+            .prepare_spawn_and_wait(spawn_tool(SpawnAgentsInput {
                 tasks: vec![SubAgentTask {
                     task: "implement the fix".to_string(),
                     cwd: None,
@@ -32141,7 +33000,7 @@ mod work_subagent_cwd_guard_tests {
                 }],
             }))
             .await
-            .expect("handle_spawn_agents_tool returned error");
+            .expect("prepare_spawn_and_wait returned error");
 
         match result {
             Some(Event::SpawnAgentsComplete {
@@ -32169,7 +33028,7 @@ mod work_subagent_cwd_guard_tests {
         let mut rt = runtime_in_work_mode(worktree.path());
 
         let result = rt
-            .handle_spawn_agents_tool(spawn_tool(SpawnAgentsInput {
+            .prepare_spawn_and_wait(spawn_tool(SpawnAgentsInput {
                 tasks: vec![SubAgentTask {
                     task: "review".to_string(),
                     cwd: None,
@@ -32180,7 +33039,7 @@ mod work_subagent_cwd_guard_tests {
                 }],
             }))
             .await
-            .expect("handle_spawn_agents_tool returned error");
+            .expect("prepare_spawn_and_wait returned error");
 
         match result {
             Some(Event::ToolComplete { result, .. }) => {
@@ -32209,7 +33068,7 @@ mod work_subagent_cwd_guard_tests {
         let mut rt = runtime_in_work_mode(worktree.path());
 
         let result = rt
-            .handle_spawn_agents_tool(spawn_tool(SpawnAgentsInput {
+            .prepare_spawn_and_wait(spawn_tool(SpawnAgentsInput {
                 tasks: vec![
                     SubAgentTask {
                         task: "first".to_string(),
@@ -32236,7 +33095,7 @@ mod work_subagent_cwd_guard_tests {
                 ],
             }))
             .await
-            .expect("handle_spawn_agents_tool returned error");
+            .expect("prepare_spawn_and_wait returned error");
 
         match result {
             Some(Event::ToolComplete { result, .. }) => {
@@ -32266,7 +33125,7 @@ mod work_subagent_cwd_guard_tests {
         );
 
         let result = rt
-            .handle_spawn_agents_tool(spawn_tool(SpawnAgentsInput {
+            .prepare_spawn_and_wait(spawn_tool(SpawnAgentsInput {
                 tasks: vec![SubAgentTask {
                     task: "inspect".to_string(),
                     cwd: None,
@@ -32281,7 +33140,7 @@ mod work_subagent_cwd_guard_tests {
                 }],
             }))
             .await
-            .expect("handle_spawn_agents_tool returned error");
+            .expect("prepare_spawn_and_wait returned error");
 
         match result {
             Some(Event::ToolComplete { result, .. }) => {
@@ -32305,7 +33164,7 @@ mod work_subagent_cwd_guard_tests {
 
         let responder = tokio::spawn(accept_spawn_batch(spawn_rx));
         let result = rt
-            .handle_spawn_agents_tool(spawn_tool(SpawnAgentsInput {
+            .prepare_spawn_and_wait(spawn_tool(SpawnAgentsInput {
                 tasks: vec![SubAgentTask {
                     task: "inspect".to_string(),
                     cwd: Some("  ".to_string()),
@@ -32316,7 +33175,7 @@ mod work_subagent_cwd_guard_tests {
                 }],
             }))
             .await
-            .expect("handle_spawn_agents_tool returned error");
+            .expect("prepare_spawn_and_wait returned error");
 
         assert!(matches!(result, Some(Event::SpawnAgentsComplete { .. })));
         let specs = responder.await.expect("default batch responder");
@@ -32339,7 +33198,7 @@ mod work_subagent_cwd_guard_tests {
         rt.context = ConvContext::coordinator("coordinator", "gpt-5.6-sol", 200_000, 16_384);
         let responder = tokio::spawn(accept_spawn_batch(spawn_rx));
         let result = rt
-            .handle_spawn_agents_tool(spawn_tool(SpawnAgentsInput {
+            .prepare_spawn_and_wait(spawn_tool(SpawnAgentsInput {
                 tasks: (0..2)
                     .map(|i| SubAgentTask {
                         task: format!("Research question {i}"),
@@ -32379,7 +33238,7 @@ mod work_subagent_cwd_guard_tests {
                 runtime_in_direct_mode(parent.path()).with_spawn_channels(spawn_tx, cancel_tx);
             rt.context = ConvContext::coordinator("coordinator", "gpt-5.6-sol", 200_000, 16_384);
             let result = rt
-                .handle_spawn_agents_tool(spawn_tool(SpawnAgentsInput {
+                .prepare_spawn_and_wait(spawn_tool(SpawnAgentsInput {
                     tasks: vec![SubAgentTask {
                         task: "Research".into(),
                         cwd,
@@ -32412,7 +33271,7 @@ mod work_subagent_cwd_guard_tests {
         let mut rt = runtime_in_direct_mode(parent.path());
 
         let result = rt
-            .handle_spawn_agents_tool(spawn_tool(SpawnAgentsInput {
+            .prepare_spawn_and_wait(spawn_tool(SpawnAgentsInput {
                 tasks: vec![SubAgentTask {
                     task: "inspect".to_string(),
                     cwd: Some("nested".to_string()),
@@ -32423,7 +33282,7 @@ mod work_subagent_cwd_guard_tests {
                 }],
             }))
             .await
-            .expect("handle_spawn_agents_tool returned error");
+            .expect("prepare_spawn_and_wait returned error");
 
         match result {
             Some(Event::ToolComplete { result, .. }) => {
@@ -32447,7 +33306,7 @@ mod work_subagent_cwd_guard_tests {
         let mut rt = runtime_in_work_mode(worktree.path()).with_agent_catalog(&catalog);
 
         let result = rt
-            .handle_spawn_agents_tool(spawn_tool(SpawnAgentsInput {
+            .prepare_spawn_and_wait(spawn_tool(SpawnAgentsInput {
                 tasks: vec![SubAgentTask {
                     task: "review".to_string(),
                     cwd: None,
@@ -32458,7 +33317,7 @@ mod work_subagent_cwd_guard_tests {
                 }],
             }))
             .await
-            .expect("handle_spawn_agents_tool returned error");
+            .expect("prepare_spawn_and_wait returned error");
 
         match result {
             Some(Event::ToolComplete { result, .. }) => {
@@ -32489,7 +33348,7 @@ mod work_subagent_cwd_guard_tests {
         let mut rt = runtime_in_work_mode(worktree.path());
 
         let result = rt
-            .handle_spawn_agents_tool(spawn_tool(SpawnAgentsInput {
+            .prepare_spawn_and_wait(spawn_tool(SpawnAgentsInput {
                 tasks: vec![SubAgentTask {
                     task: "do scoped writes".to_string(),
                     cwd: Some(nested.to_string_lossy().to_string()),
@@ -32500,7 +33359,7 @@ mod work_subagent_cwd_guard_tests {
                 }],
             }))
             .await
-            .expect("handle_spawn_agents_tool returned error");
+            .expect("prepare_spawn_and_wait returned error");
 
         match result {
             Some(Event::ToolComplete { result, .. }) => {
@@ -32532,7 +33391,7 @@ mod work_subagent_cwd_guard_tests {
         let mut rt = runtime_in_work_mode(worktree.path());
 
         let result = rt
-            .handle_spawn_agents_tool(spawn_tool(SpawnAgentsInput {
+            .prepare_spawn_and_wait(spawn_tool(SpawnAgentsInput {
                 tasks: vec![SubAgentTask {
                     task: "follow the symlink".to_string(),
                     cwd: Some(symlink.to_string_lossy().to_string()),
@@ -32543,7 +33402,7 @@ mod work_subagent_cwd_guard_tests {
                 }],
             }))
             .await
-            .expect("handle_spawn_agents_tool returned error");
+            .expect("prepare_spawn_and_wait returned error");
 
         match result {
             Some(Event::ToolComplete { result, .. }) => {
@@ -32648,7 +33507,7 @@ mod work_subagent_cwd_guard_tests {
         let mut rt = runtime_in_work_mode(worktree.path());
 
         let result = rt
-            .handle_spawn_agents_tool(spawn_tool(SpawnAgentsInput {
+            .prepare_spawn_and_wait(spawn_tool(SpawnAgentsInput {
                 tasks: vec![SubAgentTask {
                     task: "traverse out".to_string(),
                     cwd: Some(traversing),
@@ -32659,7 +33518,7 @@ mod work_subagent_cwd_guard_tests {
                 }],
             }))
             .await
-            .expect("handle_spawn_agents_tool returned error");
+            .expect("prepare_spawn_and_wait returned error");
 
         match result {
             Some(Event::ToolComplete { result, .. }) => {
@@ -34974,7 +35833,7 @@ mod tool_generation_guard_tests {
 
     /// Build a runtime parked in `ToolExecuting` for `tool_use_id`, modelling a
     /// live tool round whose stale outcome could later collide on id reuse.
-    fn runtime_tool_executing(tool_use_id: &str) -> TestRuntime {
+    pub(super) fn runtime_tool_executing(tool_use_id: &str) -> TestRuntime {
         let storage = Arc::new(InMemoryStorage::new());
         let context = ConvContext::new(
             "conv-tool-gen",
@@ -34992,7 +35851,7 @@ mod tool_generation_guard_tests {
             vec![ContentBlock::ToolUse {
                 id: tool_use_id.to_string(),
                 name: "bash".to_string(),
-                input: serde_json::json!({}),
+                input: ToolInput::from(crate::tools::BashToolInput::run("cmd")).to_value(),
             }],
             None,
             None,
@@ -35149,6 +36008,152 @@ mod tool_generation_guard_tests {
     }
 
     #[tokio::test]
+    async fn denied_selection_reserves_no_ordinary_call_resources() {
+        let mut rt = runtime_tool_executing("denied");
+        let tools = Arc::new(
+            MockToolExecutor::new().with_tool("bash", crate::tools::ToolOutput::success("unused")),
+        );
+        rt.tool_executor = Arc::new(tools.clone());
+        rt.storage.seed_tool_admission_policy(
+            "conv-tool-gen",
+            phoenix_core::domain::tool_availability::ToolAvailability::all(
+                tools.definitions().await,
+            ),
+        );
+        let denied = ToolCall::new(
+            "denied",
+            ToolInput::from(crate::tools::BashToolInput::run("git add -A")),
+        );
+        if let ConvState::ToolExecuting {
+            current_tool,
+            assistant_message,
+            ..
+        } = &mut rt.state
+        {
+            *current_tool = denied.clone();
+            assistant_message.content = vec![ContentBlock::tool_use(
+                "denied",
+                "bash",
+                denied.input.to_value(),
+            )];
+        }
+        let generation = rt.tool_execution.generation();
+        let mut broadcasts = rt.broadcast_tx.subscribe();
+        let event = rt.dispatch_tool_for_test(denied).await.unwrap();
+        assert_eq!(
+            rt.tool_execution.generation(),
+            generation,
+            "Layer 0 denial must precede ordinary generation/channel/token admission"
+        );
+        assert_eq!(
+            rt.fatal_local_authority_fence.owner_count(),
+            0,
+            "denial must not create a metrics writer owning local admission"
+        );
+        while let Ok(event) = broadcasts.try_recv() {
+            assert!(
+                !matches!(event, SseEvent::MessageUpdated { display_data: Some(data), .. }
+                if data.get("tool_starts").is_some()),
+                "denied call must have no start publication"
+            );
+        }
+        assert!(
+            rt.tool_outcome_rx.try_recv().is_err(),
+            "denial owns no ordinary outcome channel"
+        );
+        let Some(Event::ToolComplete {
+            tool_use_id,
+            result,
+        }) = event
+        else {
+            panic!("denial must remain an ordinary paired result")
+        };
+        assert_eq!(tool_use_id, "denied");
+        assert_eq!(result.tool_use_id, "denied");
+        assert!(result.is_error());
+        assert!(result.output().contains("command_safety_rejected"));
+        assert!(tools.recorded_executions().is_empty());
+    }
+
+    #[tokio::test]
+    async fn delayed_policy_read_cannot_queue_run_loop_cancellation() {
+        let mut rt = runtime_tool_executing("before");
+        let tools = Arc::new(
+            MockToolExecutor::new().with_tool("bash", crate::tools::ToolOutput::success("unused")),
+        );
+        rt.tool_executor = Arc::new(tools.clone());
+        rt.storage.seed_tool_admission_policy(
+            "conv-tool-gen",
+            phoenix_core::domain::tool_availability::ToolAvailability::all(
+                tools.definitions().await,
+            ),
+        );
+        let delayed = ToolCall::new(
+            "delayed",
+            ToolInput::from(crate::tools::BashToolInput::run("git status --short")),
+        );
+        if let ConvState::ToolExecuting {
+            current_tool,
+            remaining_tools,
+            assistant_message,
+            ..
+        } = &mut rt.state
+        {
+            *remaining_tools = vec![delayed.clone()];
+            assistant_message.content = [current_tool, &delayed]
+                .into_iter()
+                .map(|call| ContentBlock::tool_use(&call.id, call.name(), call.input.to_value()))
+                .collect();
+        }
+        let (entered, release) = rt.storage.hold_next_tool_policy_read();
+        let (event_tx, event_rx) = mpsc::channel(8);
+        rt.event_tx = event_tx.clone();
+        rt.event_rx = event_rx;
+        let (state_tx, mut states) = watch::channel(rt.state.clone());
+        let task = tokio::spawn(rt.with_state_watcher(state_tx).run());
+        event_tx
+            .send(Event::ToolComplete {
+                tool_use_id: "before".into(),
+                result: ToolResult::success("before".into(), "done".into()),
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(60), entered)
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::pause();
+        event_tx
+            .send(Event::UserCancel {
+                reason: None,
+                cause: crate::state_machine::event::CancelCause::UserRequested,
+            })
+            .await
+            .unwrap();
+        let cancelled_before_release = tokio::time::timeout(
+            Duration::from_millis(100),
+            states.wait_for(|state| matches!(state, ConvState::Idle)),
+        )
+        .await
+        .is_ok();
+        let _ = release.send(Ok(()));
+        tokio::time::resume();
+        event_tx.send(Event::Shutdown).await.unwrap();
+        assert_eq!(
+            task.await.unwrap(),
+            RuntimeExitDisposition::CoordinatedShutdown
+        );
+        assert!(
+            cancelled_before_release,
+            "the owned run loop must settle cancellation within 100ms while its read remains held"
+        );
+        assert!(
+            tools.recorded_executions().is_empty(),
+            "cancelled preparation must never launch after release"
+        );
+    }
+
+    #[tokio::test]
     async fn denied_tool_keeps_current_generation_and_continues_the_round() {
         let mut rt = runtime_tool_executing("denied");
         let tools = Arc::new(
@@ -35195,32 +36200,33 @@ mod tool_generation_guard_tests {
                 phoenix_llm::Usage::default(),
             ));
 
-        rt.execute_effect(Effect::ExecuteTool { tool: denied })
+        let generation_before_denial = rt.tool_execution.generation();
+        let denial = rt
+            .dispatch_tool_for_test(denied)
             .await
-            .unwrap();
-        let (denial_generation, denial) =
-            tokio::time::timeout(Duration::from_secs(30), rt.tool_outcome_rx.recv())
-                .await
-                .expect("permission denial outcome must reach the runtime")
-                .expect("tool outcome channel stays open for the denied call");
-        assert!(!rt.tool_outcome_is_stale(denial_generation));
+            .unwrap()
+            .expect("paired denial event");
+        assert_eq!(rt.tool_execution.generation(), generation_before_denial);
         assert!(tools.recorded_executions().is_empty());
-        let ToolExecOutcome::Completed(result) = &denial else {
+        let Event::ToolComplete { result, .. } = &denial else {
             panic!("denial must produce a completed error result");
         };
         assert_eq!(result.tool_use_id, "denied");
         assert!(result.is_error());
         assert!(result.output().contains("command_safety_rejected"));
 
-        rt.process_outcome(EffectOutcome::Tool(denial))
+        rt.process_event(denial).await.unwrap();
+        assert!(rt
+            .observe_tool_preparation_for_test()
             .await
-            .unwrap();
+            .unwrap()
+            .is_none());
         let (allowed_generation, outcome) =
             tokio::time::timeout(Duration::from_secs(30), rt.tool_outcome_rx.recv())
                 .await
                 .expect("the allowed tool after the denial must complete")
                 .expect("tool outcome channel stays open for the allowed call");
-        assert!(rt.tool_outcome_is_stale(denial_generation));
+        assert_eq!(allowed_generation, generation_before_denial + 1);
         assert!(!rt.tool_outcome_is_stale(allowed_generation));
         assert_eq!(tools.recorded_executions().len(), 1);
         assert_eq!(
@@ -35321,3 +36327,6 @@ mod tool_generation_guard_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod tracking_context_tests;

@@ -134,6 +134,36 @@ surface VirtualTranscriptPhysicalAuthority {
         physical.rendered_end
         physical.visible_range_present
         physical.layout_revision
+
+    @guarantee SettledReaderWitnessAcquisition
+        -- REQ-VT-014: only a passive settled reader without pending positioning,
+        -- command or settled directional ownership, or tail execution is eligible.
+        -- Bounded acquisition searches the physically top visible mounted unit
+        -- for a nonempty positive-height text block whose start is in the viewport.
+        -- The ephemeral witness retains that unit, mounted row, element identity,
+        -- and pre-change viewport-start offset. It is not persisted or a command.
+
+    @guarantee CombinedContentAndUnitCompensation
+        -- REQ-VT-014: for a surviving eligible witness, reconcile measured geometry
+        -- through the ordinary anchor path using effective row offset = captured
+        -- block viewport offset - measured block offset within the row.
+        -- The target is header extent + new unit offset + spacer drift - effective
+        -- row offset. This single target includes both preceding-unit movement
+        -- and intra-row displacement; a second content scroll write is forbidden.
+        -- Native bounds and the web continuity tolerance apply. Natural content
+        -- sizing is retained; fixed media boxes are not a prerequisite.
+
+    @guarantee ContentWitnessRetirementAndFallback
+        -- REQ-VT-014: user gesture/scroll, navigation authority, tail positioning,
+        -- view change, and detach retire the witness. Removed/replaced elements
+        -- or rows and missing unit keys invalidate it. An unavailable or invalid
+        -- witness falls back to ordinary unit-anchor reconciliation, never a
+        -- fabricated pre-change content offset measured after the change.
+        -- Reacquisition requires passive settled eligibility and respects
+        -- REQ-VT-004's stale-touch bound and platform live-touch release evidence.
+        -- A settle timer permits acquisition, not an assertion of physical success.
+        -- No arbitrary glyph-reflow or content-history restoration is promised;
+        -- no additional owner or competing height model is introduced.
 }
 
 rule IdleInputLeavesReducerIdle {

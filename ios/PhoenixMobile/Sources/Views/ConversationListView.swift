@@ -16,6 +16,16 @@ struct ConversationListView: View {
         }
     }
 
+    private var coordinatorUnread: ProductConversationUnreadReason? {
+        model.listStore.coordinatorReadState?.read_state.unreadReason
+    }
+
+    private var emberAccessibilityLabel: String {
+        if openingCoordinator { return "Opening Ember, Global coordinator" }
+        guard let coordinatorUnread else { return "Open Ember, Global coordinator" }
+        return "Open Ember, Global coordinator, " + UnreadDot.label(for: coordinatorUnread)
+    }
+
     var body: some View {
         NavigationStack(path: $navPath) {
             VStack(spacing: 0) {
@@ -36,8 +46,11 @@ struct ConversationListView: View {
                             .frame(width: 32, height: 32)
                             .background(.tint.opacity(0.12), in: RoundedRectangle(cornerRadius: 8))
                         VStack(alignment: .leading, spacing: 2) {
-                            Text("Ember").font(.subheadline.weight(.semibold))
+                            Text("Ember").font(.subheadline.weight(coordinatorUnread == nil ? .semibold : .bold))
                             Text("Global coordinator").font(.caption).foregroundStyle(.secondary)
+                        }
+                        if let coordinatorUnread {
+                            UnreadDot(reason: coordinatorUnread)
                         }
                         Spacer()
                         if openingCoordinator { ProgressView().controlSize(.small) }
@@ -48,10 +61,22 @@ struct ConversationListView: View {
                     .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
-                .accessibilityLabel(openingCoordinator ? "Opening Ember, Global coordinator" : "Open Ember, Global coordinator")
+                .accessibilityLabel(emberAccessibilityLabel)
                 .accessibilityHint(openingCoordinator ? "Opening the Global coordinator" : (model.connectivity.isOnline || model.coordinatorAvailableOffline ? "Open the Global coordinator" : "Connect to open Ember"))
                 .disabled(openingCoordinator || (!model.connectivity.isOnline && !model.coordinatorAvailableOffline))
                 .accessibilityIdentifier("conversationList.ember")
+                .contextMenu {
+                    if let coordinatorId = model.listStore.coordinatorReadState?.product_conversation_id {
+                        Button {
+                            Task { await model.setUnread(coordinatorUnread == nil, productConversationId: coordinatorId) }
+                        } label: {
+                            coordinatorUnread == nil
+                                ? Label("Mark as Unread", systemImage: "circle.fill")
+                                : Label("Mark as Read", systemImage: "circle")
+                        }
+                        .disabled(!model.connectivity.isOnline)
+                    }
+                }
                 list
             }
             .navigationTitle("Conversations")
@@ -231,9 +256,25 @@ struct ConversationListView: View {
                     NavigationLink(value: navigationId) {
                         ConversationRow(
                             conversation: conversation,
-                            isCoordinator: isCoordinator)
+                            isCoordinator: isCoordinator,
+                            readState: model.listStore.readState(forAggregateId: conversation.aggregateIdentity),
+                            cachedPr: model.listStore.cachedPr(forAggregateId: conversation.aggregateIdentity))
                     }
                     .accessibilityIdentifier("conversationList.row.\(conversation.aggregateIdentity)")
+                    .swipeActions(edge: .leading, allowsFullSwipe: true) {
+                        if let productConversationId = conversation.product_conversation_id {
+                            let unread = model.listStore.readState(forAggregateId: productConversationId) != .read
+                            Button {
+                                Task { await model.setUnread(!unread, productConversationId: productConversationId) }
+                            } label: {
+                                unread
+                                    ? Label("Read", systemImage: "circle")
+                                    : Label("Unread", systemImage: "circle.fill")
+                            }
+                            .tint(.blue)
+                            .disabled(!model.connectivity.isOnline)
+                        }
+                    }
                     .swipeActions(edge: .trailing, allowsFullSwipe: false) {
                         if !isCoordinator && conversation.archived == true {
                             Button(role: .destructive) {
@@ -285,45 +326,98 @@ struct ConversationListView: View {
 struct ConversationRow: View {
     let conversation: Conversation
     var isCoordinator = false
+    var readState: ProductConversationReadState = .read
+    var cachedPr: ProductConversationPr?
 
     var displayTitle: String { isCoordinator ? "Ember" : conversation.displayTitle }
 
+    /// One line: state, title, unread, PR. Only when the PR badge cannot fit
+    /// beside the title does it move to a second line.
     var body: some View {
-        VStack(alignment: .leading, spacing: 3) {
+        ViewThatFits(in: .horizontal) {
             HStack(spacing: 6) {
-                StateDot(
-                    presentationMode: conversation.presentation_mode,
-                    requiresAction: conversation.requires_action ?? false,
-                    stateType: conversation.stateType)
-                if isCoordinator {
-                    Image(systemName: "globe")
-                        .font(.caption)
-                        .foregroundStyle(.tint)
-                }
-                Text(displayTitle)
-                    .font(.body)
-                    .lineLimit(1)
-                Spacer()
-                if let date = conversation.updatedAtDate {
-                    Text(date, format: .relative(presentation: .named))
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                }
+                leading
+                if let cachedPr { PrBadge(pr: cachedPr) }
+                Spacer(minLength: 0)
             }
-            HStack(spacing: 6) {
-                Text(conversation.displaySlug)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                if let branch = conversation.branch_name, !branch.isEmpty {
-                    Label(branch, systemImage: "arrow.triangle.branch")
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
+            VStack(alignment: .leading, spacing: 3) {
+                HStack(spacing: 6) {
+                    leading
+                    Spacer(minLength: 0)
                 }
+                if let cachedPr { PrBadge(pr: cachedPr) }
             }
         }
         .padding(.vertical, 2)
+    }
+
+    @ViewBuilder private var leading: some View {
+        StateDot(
+            presentationMode: conversation.presentation_mode,
+            requiresAction: conversation.requires_action ?? false,
+            stateType: conversation.stateType)
+        if isCoordinator {
+            Image(systemName: "globe")
+                .font(.caption)
+                .foregroundStyle(.tint)
+        }
+        Text(displayTitle)
+            .font(readState == .read ? .body : .body.weight(.semibold))
+            .lineLimit(1)
+            .truncationMode(.tail)
+            // Ideal width is what ViewThatFits measures: a title may truncate
+            // down to this before the PR badge is pushed to a second line.
+            .frame(idealWidth: 96, alignment: .leading)
+        if let reason = readState.unreadReason {
+            UnreadDot(reason: reason)
+        }
+    }
+}
+
+/// Compact cached-PR badge: number plus state for non-open PRs.
+struct PrBadge: View {
+    let pr: ProductConversationPr
+
+    static func label(for pr: ProductConversationPr) -> String {
+        switch pr.display_state {
+        case .open: "#\(pr.number)"
+        case .draft: "#\(pr.number) draft"
+        case .merged: "#\(pr.number) merged"
+        case .closed: "#\(pr.number) closed"
+        }
+    }
+
+    static func accessibilityLabel(for pr: ProductConversationPr) -> String {
+        var parts = ["PR \(pr.number)"]
+        if pr.display_state != .open { parts.append(pr.display_state.rawValue) }
+        switch pr.feedback_status {
+        case .open: break
+        case .inProgress: parts.append("feedback in progress")
+        case .approved: parts.append("feedback approved")
+        }
+        return parts.joined(separator: ", ")
+    }
+
+    private var tint: Color {
+        switch pr.display_state {
+        case .open: .secondary
+        case .draft: .orange
+        case .merged: .purple
+        case .closed: .red
+        }
+    }
+
+    var body: some View {
+        Text(Self.label(for: pr))
+            .font(.caption2.monospacedDigit().weight(.semibold))
+            .lineLimit(1)
+            .fixedSize()
+            .padding(.horizontal, 6)
+            .padding(.vertical, 2)
+            .foregroundStyle(tint)
+            .background(tint.opacity(0.15), in: Capsule())
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel(Self.accessibilityLabel(for: pr))
     }
 }
 
@@ -499,5 +593,31 @@ private struct ProductHistoryView: View {
         let formatter = RelativeDateTimeFormatter()
         formatter.unitsStyle = .abbreviated
         return "Cached \(formatter.localizedString(for: fetchedAt, relativeTo: now))"
+    }
+}
+
+/// Unread indicator: solid for new activity, hollow for an explicit
+/// "mark unread to revisit later".
+struct UnreadDot: View {
+    let reason: ProductConversationUnreadReason
+
+    static func label(for reason: ProductConversationUnreadReason) -> String {
+        switch reason {
+        case .marked: "Marked unread"
+        case .newActivity: "New activity"
+        }
+    }
+
+    var body: some View {
+        Group {
+            switch reason {
+            case .newActivity:
+                Circle().fill(Color.accentColor)
+            case .marked:
+                Circle().strokeBorder(Color.accentColor, lineWidth: 1.5)
+            }
+        }
+        .frame(width: 8, height: 8)
+        .accessibilityLabel(Self.label(for: reason))
     }
 }

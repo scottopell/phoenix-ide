@@ -10791,6 +10791,9 @@ mod tests {
                     completed_results: Vec::new(),
                     cause: phoenix_core::domain::sm_event::CancelCause::UserRequested,
                     spawn_tool_id: Some("tool-1".to_string()),
+
+                    forced_tool_retirement:
+                        phoenix_core::domain::sm_state::ForcedToolRetirement::NotObserved,
                 },
             ),
         ];
@@ -13854,20 +13857,18 @@ mod tests {
         command
     }
 
-    // Keep the real pre-160 migration and its retained-row assertions together.
     #[allow(clippy::too_many_lines)]
     #[tokio::test]
-    async fn migration_160_preserves_158_receipt_and_exact_observe_constraints_on_real_schema() {
+    async fn migration_176_preserves_174_receipt_and_exact_observe_constraints_on_real_schema() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("before-observe.db");
         let db = Database::open(path.to_str().unwrap()).await.unwrap();
-        crate::migrations::run_through_for_test(db.pool(), 172)
+        crate::migrations::run_through_for_test(db.pool(), 175)
             .await
             .unwrap();
         let failure =
             initial_cleanup_failure_fixture(&db, CloseStopCertainty::ShutdownUncertain).await;
-        // Seed the historical pre-160 fact through the shared writer: the current
-        // public ingress fence requires the receipt intent introduced by migration 160.
+        // The historical pre-176 receipt has no intent column.
         let mut tx = db.pool().begin_with("BEGIN IMMEDIATE").await.unwrap();
         Database::terminalize_close_run_cleanup_failure_inner_tx(
             &mut tx,

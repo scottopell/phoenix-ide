@@ -16,7 +16,7 @@ use phoenix_db::conversation_goals::{
 use serde::Deserialize;
 
 use super::{auth::OwnerAuthenticated, handlers::AppError, types::ConflictErrorResponse, AppState};
-pub(crate) use service::GoalCommandService;
+pub(crate) use service::{GoalCommandService, RemoteGoalApplyServiceResult};
 
 mod service;
 #[cfg(test)]
@@ -25,15 +25,15 @@ mod tests;
 pub(super) fn routes() -> Router<AppState> {
     Router::new()
         .route(
-            "/api/product-conversations/:reference/goal",
+            "/api/product-conversations/{reference}/goal",
             get(current).post(create),
         )
         .route(
-            "/api/product-conversations/:reference/goal/history",
+            "/api/product-conversations/{reference}/goal/history",
             get(history),
         )
         .route(
-            "/api/product-conversations/:reference/goal/state",
+            "/api/product-conversations/{reference}/goal/state",
             post(state),
         )
 }

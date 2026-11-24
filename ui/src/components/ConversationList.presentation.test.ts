@@ -1,9 +1,12 @@
 import { describe, expect, it } from 'vitest';
 import type { ProductConversationListRow } from '../api';
 import {
+  COORDINATOR_QUESTION_GRACE_MS,
   productConversationDisplayTitle,
+  productConversationPresentationIndicator,
   productConversationOwnsRoute,
   renamedProductConversationLocation,
+  splitMonitoredProductConversations,
 } from './ConversationList.presentation';
 
 function row(overrides: Partial<ProductConversationListRow> = {}): ProductConversationListRow {
@@ -19,6 +22,10 @@ function row(overrides: Partial<ProductConversationListRow> = {}): ProductConver
     latest_transcript_row_id: 'latest-transcript-uuid',
     updated_at: '2026-10-18T00:00:00Z',
     presentation: { kind: 'state', display_name: 'Current name', presentation_mode: 'idle' },
+    read_state: { state: 'read' },
+    cached_pr: null,
+    monitored: false,
+    question_with_coordinator_since: null,
     ...overrides,
   };
 }
@@ -93,5 +100,64 @@ describe('product conversation identity presentation', () => {
     expect(renamedProductConversationLocation(
       '/c/another-conversation', '', '', previous, renamed,
     )).toBeNull();
+  });
+});
+
+describe('splitMonitoredProductConversations', () => {
+  const row = (id: string, monitored: boolean, mode = 'working', kind = 'conversation') => ({
+    product_conversation_id: id,
+    canonical_root: { slug: id, transcript_row_id: `t-${id}`, title: id },
+    presentation: { kind, presentation_mode: mode, display_name: id },
+    monitored,
+  }) as unknown as ProductConversationListRow;
+  const ids = (rows: readonly ProductConversationListRow[]) => rows.map((r) => r.product_conversation_id);
+
+  it('leaves the list untouched when nothing is monitored', () => {
+    const rows = [row('a', false), row('b', false, 'idle')];
+    const split = splitMonitoredProductConversations(rows);
+    expect(split.own).toBe(rows);
+    expect(split.monitored).toEqual([]);
+  });
+
+  it('folds monitored rows and keeps order within each group', () => {
+    const rows = [row('a', true), row('b', false, 'idle'), row('c', true), row('d', true, 'done')];
+    const split = splitMonitoredProductConversations(rows);
+    expect(ids(split.own)).toEqual(['b']);
+    expect(ids(split.monitored)).toEqual(['a', 'c', 'd']);
+  });
+
+  it('never folds a monitored row that needs the user', () => {
+    const rows = [
+      row('ask', true, 'needs_action'),
+      row('err', true, 'error'),
+      row('kind', true, 'working', 'needs_action'),
+      row('quiet', true),
+    ];
+    const split = splitMonitoredProductConversations(rows);
+    expect(ids(split.own)).toEqual(['ask', 'err', 'kind']);
+    expect(ids(split.monitored)).toEqual(['quiet']);
+  });
+
+  it('folds a question Ember holds until its grace period runs out', () => {
+    const handedAt = Date.parse('2026-11-17T10:00:00Z');
+    const asking = {
+      ...row('asking', true, 'needs_action'),
+      question_with_coordinator_since: new Date(handedAt).toISOString(),
+    } as ProductConversationListRow;
+    const held = splitMonitoredProductConversations([asking], () => false, handedAt + 60_000);
+    expect(ids(held.monitored)).toEqual(['asking']);
+    expect(productConversationPresentationIndicator(asking, handedAt + 60_000).label).toBe('With Ember');
+
+    const stale = splitMonitoredProductConversations([asking], () => false, handedAt + COORDINATOR_QUESTION_GRACE_MS);
+    expect(ids(stale.own)).toEqual(['asking']);
+    expect(productConversationPresentationIndicator(asking, handedAt + COORDINATOR_QUESTION_GRACE_MS).label)
+      .toBe('Needs action');
+  });
+
+  it('keeps a pinned monitored row in the main list', () => {
+    const rows = [row('open', true), row('other', true)];
+    const split = splitMonitoredProductConversations(rows, (r) => r.product_conversation_id === 'open');
+    expect(ids(split.own)).toEqual(['open']);
+    expect(ids(split.monitored)).toEqual(['other']);
   });
 });

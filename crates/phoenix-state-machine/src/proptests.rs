@@ -1904,6 +1904,8 @@ proptest! {
         completed_results: vec![],
         cause: CancelCause::UserRequested,
         spawn_tool_id: Some("spawn-1".to_string()),
+
+        forced_tool_retirement: phoenix_core::domain::sm_state::ForcedToolRetirement::NotObserved,
     };
 
     for (i, agent_id) in initial_ids.iter().enumerate() {

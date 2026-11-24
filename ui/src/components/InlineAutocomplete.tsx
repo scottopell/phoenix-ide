@@ -2,8 +2,7 @@
 /**
  * InlineAutocomplete — shared overlay for inline reference triggers.
  *
- * Supports three trigger modes (REQ-IR-004, REQ-IR-005, REQ-IR-008):
- *   - "expand"  (@)  — file reference that will be expanded at send time
+ * Supports two trigger modes (REQ-IR-004, REQ-IR-005, REQ-IR-008):
  *   - "path"    (./) — file path inserted as literal text, no server expansion
  *   - "skill"   (/)  — skill invocation (task 570, not implemented here)
  *
@@ -24,7 +23,7 @@ import { fuzzyMatch } from './CommandPalette/fuzzyMatch';
 // ============================================================================
 
 /** Trigger mode — determines display prefix and send-time behaviour */
-export type AutocompleteMode = 'expand' | 'path' | 'skill';
+export type AutocompleteMode = 'path' | 'skill';
 
 /** A single candidate item shown in the dropdown */
 export interface AutocompleteItem {
@@ -58,13 +57,11 @@ interface InlineAutocompleteProps {
 // ============================================================================
 
 const TRIGGER_PREFIX: Record<AutocompleteMode, string> = {
-  expand: '@',
   path: './',
   skill: '/',
 };
 
 const MODE_HINT: Record<AutocompleteMode, string> = {
-  expand: 'file will be included',
   path: 'path reference',
   skill: 'skill invocation',
 };
@@ -154,7 +151,6 @@ export interface TriggerState {
  *
  * Rules:
  *   - `/<partial>` at start or after whitespace (no whitespace in partial) → skill mode
- *   - `@<partial>` anywhere (no whitespace in partial)                     → expand mode
  *   - `<word_boundary>./<partial>` anywhere                                → path mode
  *
  * Skill trigger is checked first: `/` at start or after whitespace takes precedence.
@@ -173,20 +169,6 @@ export function detectTrigger(value: string, cursorPos: number): TriggerState | 
         mode: 'skill',
         query: slashQuery,
         triggerStart: slashIdx,
-        triggerEnd: cursorPos,
-      };
-    }
-  }
-
-  // ---- @expand trigger -------------------------------------------------------
-  const atIdx = findLastTriggerChar(beforeCursor, '@');
-  if (atIdx !== null) {
-    const query = beforeCursor.slice(atIdx + 1);
-    if (!containsWhitespace(query)) {
-      return {
-        mode: 'expand',
-        query,
-        triggerStart: atIdx,
         triggerEnd: cursorPos,
       };
     }

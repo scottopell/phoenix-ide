@@ -220,10 +220,10 @@ Part A (canonical pending-state capture) and Part B leaf 1 (executing-source pro
 
 ## Review gates and exclusions
 
-1. Owner authorized bounded Part A; proposed ADR-244 reflects the existing canonical receipt as its ownership witness.
+1. Owner authorized bounded Part A; proposed ADR-284 reflects the existing canonical receipt as its ownership witness.
 2. Part A head `05dcca22` passed hosted clippy. Leaf head `5335c1ee` subsequently failed hosted compilation in its dynamic SQL test helper, while musl/UI setup also encountered hosted sccache HTTP 504 failures. The bounded witness fix corrects the two introduced compiler errors; exact-head hosted qualification remains pending. No local compiler, build, tests or codegen was run. Complete source actor/receipt/replay and owning Stop admission before enabling any native mutator. The private receipt foundation does not satisfy the remaining end-to-end native approval gates.
 
-The internal Initial execution leaf above is unqualified; no local build/tests/codegen, registration, RC2, release or production work is included. A draft PR triggers standard hosted CI; runtime behavior remains unverified pending those results. The README index labels ADR-244 Proposed; Stop/pause policy is resolved but its implementation is deferred.
+The internal Initial execution leaf above is unqualified; no local build/tests/codegen, registration, RC2, release or production work is included. A draft PR triggers standard hosted CI; runtime behavior remains unverified pending those results. The README index labels ADR-284 Proposed; Stop/pause policy is resolved but its implementation is deferred.
 
 ### Initial actor review corrections (pending hosted qualification)
 

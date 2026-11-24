@@ -1,3 +1,11 @@
+# Delivery Roadmap — Historical Protocol
+
+**Retired, non-normative archive.** [ADR-262](../adrs/262_retire-delivery-roadmap-with-preserved-history.md) retires the entire protocol below, including REQ-ROADMAP-001 through REQ-ROADMAP-014, all role/posting duties, activation, acknowledgement and scheduled projection rules. Every SHALL, instruction and example below is retained historical text, not an active requirement. No behavior or posting obligation is commissioned by this document.
+
+Current user instructions and the existing domain authorities remain in force: specifications/Allium, ADRs, task filenames, PRs and deployed evidence. Issue #806 retains its final historical projection/comments; no bulk import, dual writing or automatic revival of old obligations is performed.
+
+## Retained historical protocol
+
 # Delivery Roadmap
 
 ## Scope

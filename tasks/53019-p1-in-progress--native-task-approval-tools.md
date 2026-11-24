@@ -1,6 +1,6 @@
 # Native task approval tools — draft review and owner decision
 
-Draft packet: specs/task-approval-tools/requirements.md, executive.md, and Proposed ADR-244. Parent owns review. Implementation slice A is authorized for core/canonical capture foundations and focused tests only; feature enablement and runtime verification remain out of scope.
+Draft packet: specs/task-approval-tools/requirements.md, executive.md, and Proposed ADR-284. Parent owns review. Implementation slice A is authorized for core/canonical capture foundations and focused tests only; feature enablement and runtime verification remain out of scope.
 
 The reviewed body is the exact captured task-file Markdown and the approved plan; there is no separate plan-text value. Its digest covers the exact body bytes. The single typed `AwaitingTaskApproval` snapshot retains that body, repository-relative path, task kind, digest and canonical proposal occurrence reference. The canonical checkpoint transaction captures occurrence/full-message ownership and whole pending state atomically. A repeated identical path/body is a distinct proposal occurrence.
 

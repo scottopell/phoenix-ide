@@ -142,12 +142,14 @@ pub(crate) async fn persist_finalized_round_tx(
         }
     }
     if retained_finalized_round_tx(tx, assistant, &results).await? {
+        crate::tool_discovery::record_round_tx(tx, assistant, &results, true).await?;
         return Ok(true);
     }
     crate::insert_message_tx(tx, assistant).await?;
     for result in &results {
         crate::insert_message_tx(tx, result).await?;
     }
+    crate::tool_discovery::record_round_tx(tx, assistant, &results, false).await?;
     Ok(false)
 }
 
@@ -445,6 +447,9 @@ async fn finalize_round_tx(
     policies: super::execution::GoalWritePolicies,
 ) -> Result<RoundWriteOutcome> {
     if let Some(retained) = retained_round_tx(tx, checkpoint).await? {
+        crate::tool_discovery::record_round_tx(tx, checkpoint.assistant, &retained, true)
+            .await
+            .map_err(GoalDbError::Admission)?;
         return Ok(RoundWriteOutcome {
             results: retained,
             replayed: true,
@@ -506,6 +511,9 @@ async fn finalize_round_tx(
         crate::insert_message_tx(tx, &candidate).await?;
         messages.push(candidate);
     }
+    crate::tool_discovery::record_round_tx(tx, assistant, &messages, false)
+        .await
+        .map_err(GoalDbError::Admission)?;
     Ok(RoundWriteOutcome {
         results: messages,
         replayed: false,

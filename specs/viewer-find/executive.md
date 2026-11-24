@@ -10,7 +10,17 @@ Phoenix's shared viewer-find primitives live in `ui/src/components/viewer-find/`
 
 File, diff, transcript, and task-approval surfaces consume the same typed session. Their canonical semantic projections carry stable source identity separately from mutable reveal coordinates. Pierre adapters reveal file and diff ranges; Virtuoso mounts transcript rows and expands renderer-owned fragments; task approval parses Markdown into stable display blocks shared by matching and rendering. The provider-owned keyboard router selects the topmost eligible modal, viewer, or passive-content registration independently of listener order.
 
+### Conversation Refresh and Reveal
+
+The separate Find fix uses `refresh-results` for conversation projection updates: a retained logical active ID receives fresh physical targets without a new reveal command. Other consumers' `replace-results` behavior remains unchanged. Query changes, Next/Previous, explicit activation, and active-occurrence removal still issue reveals; no results clear decorations. `MessageList` separates selection decoration from reveal intent. Pending reveal retries read the latest target rather than capturing stale streaming coordinates; a later selection, close, or surface reset cancels prior work. Settled navigation is not restarted by a background refresh.
+
+`conversationProjectionSessionMatches` bridges streaming raw offsets to finalized semantic offsets only for the same request/turn with exactly one text block and a uniquely contiguous display-block mapping. The text block may follow non-text content. Covered prose includes plain paragraphs, headings, simple emphasis, and quotes. Multiple text blocks, changed raw offsets, ambiguous/noncontiguous text, cross-display-block matches, and separate code-fragment projections do not receive this correspondence. Blocks containing link/image syntax, HTML, escapes, entities, or backticks are conservatively excluded, including hidden destinations, alt text, and titles that could otherwise impersonate visible text provenance. These exclusions restrict identity transfer, not ordinary search eligibility; unmatched identities use normal fallback reconciliation. This is not a general Markdown source map or a guarantee for arbitrary streaming-to-final transformations.
+
+Explicit conversation navigation prefers the renderer's exact `[data-viewer-find-active-target]` mark inside the selected fragment. Centering a large fragment alone does not establish that its active occurrence is visible. When no exact mark exists, navigation falls back to the fragment/row and its active-location indication. Streaming rows use row-level indication rather than an exact inline active mark.
+
 ## Status Summary
+
+The table describes implementation coverage, not release or production deployment. The separate conversation refresh/reveal fix is local work; hosted verification is pending, and shipping is not claimed.
 
 | Requirement | Status | Notes |
 |-------------|--------|-------|
@@ -25,16 +35,24 @@ File, diff, transcript, and task-approval surfaces consume the same typed sessio
 | **REQ-IVF-008:** Escape Closes Find Before the Enclosing Surface | ✅ Complete | Escape dismisses find without dismissing the enclosing viewer/approval surface |
 | **REQ-IVF-009:** Scope-Local State and Overlay Isolation | ✅ Complete | Each surface owns one structural session and the central keyboard router prevents obscured lower layers from reacting |
 | **REQ-IVF-010:** Editable Controls Keep Their Native Editing Behavior | ✅ Complete | Shortcut interception skips unrelated editable controls; the find input itself preserves text editing semantics |
-| **REQ-IVF-011:** Result Reconciliation as Content Changes | ✅ Complete | All eligible surfaces preserve surviving active IDs and use deterministic nearest-prior fallback when content changes |
+| **REQ-IVF-011:** Result Reconciliation as Content Changes | ✅ Implemented locally; hosted verification pending for the separate Find fix | Conversation refresh retains surviving IDs without new reveal; pending explicit intent uses fresh targets. Bounded streaming/final correspondence and deterministic removal fallback are covered below |
 | **REQ-IVF-012:** Accessibility and Keyboard-Only Operation | ✅ Complete | Labelled search UI, keyboard navigation, status announcement, and focus-visible controls |
 
-**Progress:** 13 complete, 0 partial, 0 missing
+**Implementation coverage:** 13 requirements represented. This is not a claim that the separate Find fix has shipped.
 
 ## Verification Coverage
 
 - Unit coverage beside the shared primitives verifies literal matching, keyboard routing, structural closed/open state, stable-ID reconciliation, wraparound navigation, surface replacement, reset/close commands, and invalid-state type shape.
 - Focus-scope and keyboard-router coverage verifies that hidden lower scopes cannot steal `Cmd/Ctrl+F`, editable controls retain native behavior, and repeated shortcuts return to the owning query.
 - Integration coverage for files, diffs, task approval, and virtualized transcripts verifies off-screen navigation, exact renderer-owned highlighting, focus restoration, disclosure expansion, content-update reconciliation, surface swaps, and streaming isolation.
+
+### Separate Find Fix: Local Verification Scope
+
+- `findSession.test.ts` covers silent retained-ID refresh with updated targets, unchanged explicit replacement behavior, Next/Previous and activation using the refreshed target, query reset, removal fallback, no-results decoration clearing, and closed/reset isolation.
+- `conversationProjectionSession.test.ts` covers supported prose identity transfer, nonzero text-block index, uniqueness, request separation, changed offsets/removal, multiple-text rejection, and hidden Markdown destination/alt/title provenance exclusions.
+- `MessageList.test.tsx` covers settled versus pending finalization, unrelated refresh during pending historical navigation, superseding selection, close/reset cancellation, latest-fragment reveal, and preferring the exact active mark over its larger fragment. These tests use mocked transcript/renderers; they are not browser layout evidence.
+- The local-alias browser scenario `find-identical-finalization` is wired through `capture-message-list.mjs` and `message-list-find-finalization.mjs`. Its four controls are streaming-active with wheel movement, historical-active, closed Find, and streaming-active without wheel movement. After draining reveal work, it samples animation frames across identical-text finalization and checks no scroll/focus commands, stable visible reading coordinates within 2px, retained selection/active owner, and subsequent Next/Previous revealing the active mark within the viewport. The fixture uses identical plain prose; it does not prove arbitrary Markdown finalization or pending-navigation layout behavior.
+- These are local-alias browser and local test coverage, not hosted or production evidence. Hosted verification for this separate fix remains pending. No run result or deployment is inferred from the presence of the tests and capture script.
 
 ## Related Specs
 

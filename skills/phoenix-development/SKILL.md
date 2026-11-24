@@ -9,7 +9,7 @@ Build the smallest correct change from a verified failure model. Repository guid
 
 ## The loop
 
-1. **Orient.** Verify the worktree and `git status`. Read the generated body of GitHub Issue #806 (the delivery roadmap) for current delivery context. Locate the owning crate/UI component, nearby tests, and feature spec. Search before reading large files.
+1. **Orient.** Verify the worktree and `git status`. Use current user instructions, task/PR ownership, relevant specs/ADRs and exact merged/deployed evidence for delivery context. Issue #806 is historical, not a mandatory preflight. Locate the owning crate/UI component, nearby tests, and feature spec. Search before reading large files.
 2. **Model.** State the user-visible failure, violated invariant, and boundary that should own the fix. Do not edit from a symptom alone.
 3. **Trace.** Follow the path end to end where relevant: UI/state → API/SSE → runtime/state machine → persistence/provider/tool. Read existing tests and history around the seam.
 4. **Regress.** Add or identify the narrowest test that can falsify the hypothesis. Reproduce first when practical.
@@ -58,14 +58,9 @@ Treat a failed sub-agent patch as untrusted until inspected. Before continuing:
 
 Prefer delegating bounded leaf slices with explicit file limits and validation commands. Keep ownership-sensitive integration work with one implementation owner.
 
-## Report on the roadmap
+## Report delivery evidence
 
-Use the roadmap only for outcomes substantial enough that another agent or harness needs to know their owner, gate, or delivery state. Do not post routine edits, transient test failures, or leaf tasks.
-
-1. Fetch Issue #806 by its known number; do not discover it with GitHub search. If GitHub is unavailable, state that roadmap context could not be verified.
-2. Follow `specs/roadmap/requirements.md` and the examples in `specs/roadmap/executive.md`: post one `phoenix-roadmap` fenced record per comment, declare `actor.role` and `actor.harness`, and post only the kinds your role allows. Check a record with `node scripts/roadmap-issue-reducer.mjs --validate` before posting.
-3. Report runtime and transcript mechanics in your own harness, not on the roadmap. The roadmap sees their effects: evidence, status, gates, and decisions.
-4. After posting, re-read the Issue body. If your comment ID is at or below `phoenix-roadmap:snapshot-through` and at or above `phoenix-roadmap:ack-window-from`, it is accepted only if listed in the `phoenix-roadmap:accepted` marker and rejected if listed under "Recent rejections"; fix and re-post a rejected record. Below the window the body makes no claim.
+Issue #806 is retired. Do not post roadmap records or maintain its projection. Keep meaningful ownership, blockers, next action and version-bound evidence in the active task/PR or coordination conversation. Historical roadmap links can support investigation but cannot establish current status or revive an old hold. Requirements, decisions, task status, review state and deployed behavior retain their existing authorities.
 
 ## Reasoning about async test completion
 

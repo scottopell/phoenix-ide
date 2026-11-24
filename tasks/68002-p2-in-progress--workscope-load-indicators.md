@@ -22,7 +22,7 @@ Disk measurement/caching, run-queue metrics, host diagnostics, reclamation, auto
 ## Implementation and acceptance
 Resolve exact API/tool shapes, API access rules and inline placement within this baseline. Preserve ownership versus control distinctions. Test shared-scope/coordinator attribution and deduplication, CPU windows with partial coverage and restart reset, demand-driven memory/unavailable semantics, and Global-only tool exposure. Verify inline indicators in the actual UI. Do not broaden to host monitoring or disk cleanup because those motivated the original discussion.
 
-Retain the design conversation as the implementation handoff; coordinate scheduling through the existing project delivery queue and roadmap #806.
+Retain the design conversation as the implementation handoff; coordinate scheduling through current task/PR ownership and the active project delivery conversation. Roadmap #806 is historical and is not maintained.
 
 ## Implementation progress — 2026-10-11
 

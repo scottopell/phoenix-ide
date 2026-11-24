@@ -47,6 +47,22 @@ impl Tool for Reply {
         if executing.product_conversation_id.as_str() != self.product {
             return ToolOutput::error("Reply tool belongs to a different conversation");
         }
+        let channel_submission: bool = match sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM slack_gateway_requests r JOIN slack_gateway_bindings b USING(binding_id) WHERE b.product_id=?1 AND r.trigger_kind='inbox')")
+            .bind(&self.product).fetch_one(self.db.pool()).await {
+                Ok(value) => value,
+                Err(error) => return ToolOutput::error(error.to_string()),
+            };
+        let text = if channel_submission {
+            let Ok(Some(config)) = super::config(&self.db).await else {
+                return ToolOutput::error("Submission reply requires a configured Phoenix URL");
+            };
+            channel_answer(&input.text, &config.phoenix_url, &self.product)
+        } else {
+            input.text
+        };
+        if text.chars().count() > 4500 {
+            return ToolOutput::error("Shorten the answer to leave room for its Phoenix conversation link (4500 characters total).");
+        }
         match self
             .db
             .queue_slack_reply(
@@ -54,7 +70,7 @@ impl Tool for Reply {
                 &input.request_ids,
                 &ctx.conversation_id,
                 &source,
-                &input.text,
+                &text,
             )
             .await
         {
@@ -63,5 +79,32 @@ impl Tool for Reply {
             )),
             Err(e) => ToolOutput::error(e.to_string()),
         }
+    }
+}
+
+fn channel_answer(text: &str, origin: &str, product: &str) -> String {
+    let url = format!("{}/c/{product}", origin.trim_end_matches('/'));
+    if text.contains(&url) {
+        text.to_owned()
+    } else {
+        format!("{}\n\nContinue in Phoenix: {url}", text.trim_end())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn submission_result_has_host_selected_phoenix_handoff() {
+        // REQ-SG-020
+        let answer = channel_answer("Brief findings", "https://phoenix.example/", "product");
+        assert_eq!(
+            answer,
+            "Brief findings\n\nContinue in Phoenix: https://phoenix.example/c/product"
+        );
+        assert_eq!(
+            channel_answer(&answer, "https://phoenix.example", "product"),
+            answer
+        );
     }
 }

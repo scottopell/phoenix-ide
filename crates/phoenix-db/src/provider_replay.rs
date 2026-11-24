@@ -89,6 +89,34 @@ pub(crate) fn validate_task_proposal(
     Ok(())
 }
 
+async fn record_exact_agent_ending_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    conversation_id: &str,
+    message_id: &str,
+    content: &phoenix_core::domain::db_schema::MessageContent,
+    state: &phoenix_core::domain::sm_state::ConvState,
+) -> DbResult<()> {
+    if matches!(
+        content,
+        phoenix_core::domain::db_schema::MessageContent::Agent(_)
+    ) {
+        let response = crate::coordinator_watches::ending_evidence::capture_response_tx(
+            tx,
+            conversation_id,
+            Some(message_id),
+        )
+        .await?;
+        crate::record_initial_execution_outcome_with_response_tx(
+            tx,
+            conversation_id,
+            state,
+            &response,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
 pub(crate) fn validate_goal_round_replay(
     assistant: &Message,
     update: &phoenix_core::domain::provider_replay::ProviderReplayUpdate,
@@ -102,6 +130,9 @@ pub(crate) fn validate_goal_round_replay(
             set.owner_message_id == assistant.message_id && &set.public_content == blocks
         }
         ProviderReplayUpdate::Responses(set) => {
+            set.owner_message_id == assistant.message_id && &set.public_content == blocks
+        }
+        ProviderReplayUpdate::ChatCompletions(set) => {
             set.owner_message_id == assistant.message_id && &set.public_content == blocks
         }
         ProviderReplayUpdate::Clear => true,
@@ -547,12 +578,7 @@ impl Database {
             crate::native_close::fence_native_retry_sources_tx(&mut tx, conversation_id, state)
                 .await?;
         }
-        if matches!(
-            content,
-            phoenix_core::domain::db_schema::MessageContent::Agent(_)
-        ) {
-            crate::record_initial_execution_outcome_tx(&mut tx, conversation_id, state).await?;
-        }
+        record_exact_agent_ending_tx(&mut tx, conversation_id, message_id, content, state).await?;
         sqlx::query("DELETE FROM active_responses_replay_sets WHERE conversation_id = ?1")
             .bind(conversation_id)
             .execute(&mut *tx)
@@ -698,7 +724,24 @@ pub(crate) async fn apply_replay_tx(
                 .await?;
         }
         ProviderReplayUpdate::Responses(response) => {
-            crate::responses_replay::append_tx(tx, conversation_id, response).await?;
+            crate::responses_replay::append_tx(
+                tx,
+                conversation_id,
+                &phoenix_core::domain::responses_replay::ProviderResponseSet::Responses(
+                    response.clone(),
+                ),
+            )
+            .await?;
+        }
+        ProviderReplayUpdate::ChatCompletions(response) => {
+            crate::responses_replay::append_tx(
+                tx,
+                conversation_id,
+                &phoenix_core::domain::responses_replay::ProviderResponseSet::ChatCompletions(
+                    response.clone(),
+                ),
+            )
+            .await?;
         }
         ProviderReplayUpdate::Clear => {
             sqlx::query("DELETE FROM active_responses_replay_sets WHERE conversation_id = ?1")

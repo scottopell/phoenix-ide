@@ -533,7 +533,7 @@ pub enum Event {
     UserMessage {
         /// Display text — stored in DB and shown in history (REQ-IR-006).
         text: String,
-        /// Expanded text delivered to the LLM when `@` references are present (REQ-IR-001).
+        /// Expanded text delivered to the LLM when a `/skill` expands (REQ-IR-006).
         /// `None` means no expansion — `text` is used verbatim.
         llm_text: Option<String>,
         images: Vec<ImageData>,
@@ -636,6 +636,9 @@ pub enum Event {
     },
     /// Tool was aborted due to cancellation
     ToolAborted {
+        tool_use_id: String,
+    },
+    ToolCancellationRetired {
         tool_use_id: String,
     },
 
@@ -816,6 +819,7 @@ impl Event {
             Event::ToolComplete { .. } => "ToolComplete",
             Event::ToolRoundComplete { .. } => "ToolRoundComplete",
             Event::ToolAborted { .. } => "ToolAborted",
+            Event::ToolCancellationRetired { .. } => "ToolCancellationRetired",
             Event::SpawnAgentsComplete { .. } => "SpawnAgentsComplete",
             Event::SubAgentResult { .. } => "SubAgentResult",
             Event::ContinuationResponse { .. } => "ContinuationResponse",
@@ -917,6 +921,9 @@ pub enum CoreEvent {
         result: ToolRoundResult,
     },
     ToolAborted {
+        tool_use_id: String,
+    },
+    ToolCancellationRetired {
         tool_use_id: String,
     },
     SpawnAgentsComplete {
@@ -1173,6 +1180,11 @@ impl TryFrom<Event> for ParentEvent {
             Event::ToolAborted { tool_use_id } => {
                 Ok(ParentEvent::Core(CoreEvent::ToolAborted { tool_use_id }))
             }
+            Event::ToolCancellationRetired { tool_use_id } => {
+                Ok(ParentEvent::Core(CoreEvent::ToolCancellationRetired {
+                    tool_use_id,
+                }))
+            }
             Event::SpawnAgentsComplete {
                 tool_use_id,
                 result,
@@ -1396,6 +1408,11 @@ impl TryFrom<Event> for SubAgentEvent {
             Event::ToolAborted { tool_use_id } => {
                 Ok(SubAgentEvent::Core(CoreEvent::ToolAborted { tool_use_id }))
             }
+            Event::ToolCancellationRetired { tool_use_id } => {
+                Ok(SubAgentEvent::Core(CoreEvent::ToolCancellationRetired {
+                    tool_use_id,
+                }))
+            }
             Event::SpawnAgentsComplete {
                 tool_use_id,
                 result,
@@ -1499,6 +1516,7 @@ impl CoreEvent {
             CoreEvent::OverloadRetryDeadlineExpired => "OverloadRetryDeadlineExpired",
             CoreEvent::ToolComplete { .. } => "ToolComplete",
             CoreEvent::ToolAborted { .. } => "ToolAborted",
+            CoreEvent::ToolCancellationRetired { .. } => "ToolCancellationRetired",
             CoreEvent::SpawnAgentsComplete { .. } => "SpawnAgentsComplete",
             CoreEvent::SubAgentResult { .. } => "SubAgentResult",
             CoreEvent::ContinuationResponse { .. } => "ContinuationResponse",

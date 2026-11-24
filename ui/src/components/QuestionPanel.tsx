@@ -5,12 +5,12 @@
  * Step-by-step wizard showing one question at a time with full keyboard
  * navigation (arrow keys, space, enter, tab, escape).
  *
- * Submit calls api.respondToQuestion; Dismiss calls api.dismissQuestion.
+ * Where answers and dismissals go is the caller's `actions`: a conversation's
+ * blocking wait (`blockingQuestionActions`) or an open Ember question.
  */
 
-import { useState, useCallback, useEffect, useRef } from 'react';
-import { api } from '../api';
-import type { UserQuestion } from '../api';
+import { useState, useCallback, useEffect, useLayoutEffect, useRef } from 'react';
+import type { QuestionAnnotations, UserQuestion } from '../api';
 import {
   ArrowLeft,
   ArrowRight,
@@ -22,12 +22,12 @@ import ReactMarkdown from 'react-markdown';
 import { ConfirmDialog } from './ConfirmDialog';
 import { useRegisterFocusScope } from '../hooks/useFocusScope';
 import { formatShortcut } from '../utils';
+import type { QuestionPanelActions } from './questionPanelActions';
 import './QuestionPanel.css';
 
 export interface QuestionPanelProps {
   questions: UserQuestion[];
-  conversationId: string;
-  requestId?: string;
+  actions: QuestionPanelActions;
   showToast: (message: string, duration?: number) => void;
   /** Called after a successful respond/dismiss POST. The parent uses this to
    *  optimistically advance the local phase out of awaiting_user_response so
@@ -38,6 +38,7 @@ export interface QuestionPanelProps {
   onAnswered: () => void;
   onDismissed: () => void;
   readOnly?: boolean;
+  active?: boolean;
 }
 
 const OTHER_SENTINEL = '__other__';
@@ -53,14 +54,14 @@ function optionCount(q: UserQuestion): number {
 
 export function QuestionPanel({
   questions,
-  conversationId,
+  actions,
   showToast,
-  requestId,
   onAnswered,
   onDismissed,
   readOnly = false,
+  active = true,
 }: QuestionPanelProps) {
-  useRegisterFocusScope('question-panel');
+  useRegisterFocusScope(active ? 'question-panel' : null);
 
   // --- Wizard step state ---
   const [currentStep, setCurrentStep] = useState(0);
@@ -79,7 +80,7 @@ export function QuestionPanel({
   });
   const [otherTexts, setOtherTexts] = useState<Record<string, string>>({});
   const [annotations, setAnnotations] = useState<
-    Record<string, { notes?: string; preview?: string }>
+    QuestionAnnotations
   >({});
   const [submitting, setSubmitting] = useState(false);
   const [focusedPreviews, setFocusedPreviews] = useState<
@@ -93,6 +94,13 @@ export function QuestionPanel({
     isError: boolean;
   } | null>(null);
   const [showConfirmDismiss, setShowConfirmDismiss] = useState(false);
+  useEffect(() => {
+    if (!active) setShowConfirmDismiss(false);
+  }, [active]);
+  const confirmDismissVisibleRef = useRef(showConfirmDismiss);
+  useLayoutEffect(() => {
+    confirmDismissVisibleRef.current = showConfirmDismiss;
+  }, [showConfirmDismiss]);
   const [multiSelections, setMultiSelections] = useState<
     Record<string, Set<string>>
   >({});
@@ -206,9 +214,9 @@ export function QuestionPanel({
   }, [questions, answers, otherTexts, multiSelections]);
 
   const buildAnnotations = useCallback(():
-    | Record<string, { notes?: string; preview?: string }>
+    | QuestionAnnotations
     | undefined => {
-    const result: Record<string, { notes?: string; preview?: string }> = {};
+    const result: QuestionAnnotations = {};
     let hasAny = false;
 
     for (const q of questions) {
@@ -243,12 +251,7 @@ export function QuestionPanel({
     setSubmitting(true);
     setFeedback(null);
     try {
-      await api.respondToQuestion(
-        conversationId,
-        requestId,
-        buildAnswerMap(),
-        buildAnnotations()
-      );
+      await actions.submitAnswers(buildAnswerMap(), buildAnnotations());
       if (mountedRef.current) {
         onAnswered();
         showToast('Response sent', 3000);
@@ -264,8 +267,7 @@ export function QuestionPanel({
     readOnly,
     allAnswered,
     submitting,
-    conversationId,
-    requestId,
+    actions,
     buildAnswerMap,
     buildAnnotations,
     onAnswered,
@@ -283,10 +285,10 @@ export function QuestionPanel({
     setSubmitting(true);
     setFeedback(null);
     try {
-      await api.dismissQuestion(conversationId, requestId);
+      await actions.dismiss();
       if (mountedRef.current) {
         onDismissed();
-        showToast('Question dismissed. Type a message to continue.', 3000);
+        showToast(actions.dismissedMessage, 3000);
       }
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Failed to dismiss';
@@ -294,7 +296,7 @@ export function QuestionPanel({
     } finally {
       setSubmitting(false);
     }
-  }, [readOnly, submitting, conversationId, requestId, onDismissed, showToast]);
+  }, [readOnly, submitting, actions, onDismissed, showToast]);
 
   // --- Navigation ---
   const goToStep = useCallback(
@@ -342,14 +344,17 @@ export function QuestionPanel({
 
   const panelRef = useRef<HTMLDivElement>(null);
 
-  // --- Focus management: auto-focus on mount and step change (REQ-KB-004) ---
+  const hasCurrentQuestion = currentQuestion !== undefined;
+  const focusedStepRef = useRef(currentStep);
   useEffect(() => {
-    if (!currentQuestion) return;
-    // Focus the panel root so it receives keyboard events
-    requestAnimationFrame(() => {
-      panelRef.current?.focus();
+    const stepChanged = focusedStepRef.current !== currentStep;
+    focusedStepRef.current = currentStep;
+    if (!active || !hasCurrentQuestion) return;
+    const frame = requestAnimationFrame(() => {
+      if (!confirmDismissVisibleRef.current) panelRef.current?.focus({ preventScroll: !stepChanged });
     });
-  }, [currentStep, currentQuestion]);
+    return () => cancelAnimationFrame(frame);
+  }, [active, currentStep, hasCurrentQuestion]);
 
   // --- Update focused preview when focusedIndex changes ---
   useEffect(() => {
@@ -422,7 +427,7 @@ export function QuestionPanel({
   // --- Keyboard handler (component-level, not document) ---
   const handleKeyDown = useCallback(
     (e: React.KeyboardEvent<HTMLDivElement>) => {
-      if (readOnly) return;
+      if (!active || readOnly) return;
       if (!currentQuestion) return;
 
       // If confirm dialog is open, don't handle
@@ -534,6 +539,7 @@ export function QuestionPanel({
       }
     },
     [
+      active,
       currentQuestion,
       showConfirmDismiss,
       expandedNotes,
@@ -631,9 +637,9 @@ export function QuestionPanel({
         )}
 
         <ConfirmDialog
-          visible={showConfirmDismiss}
+          visible={active && showConfirmDismiss}
           title="Dismiss structured questions?"
-          message="The question panel will close. No answer will be sent, and the agent will not continue until you type a message."
+          message={actions.dismissConfirmMessage}
           confirmText="Dismiss"
           cancelText="Cancel"
           danger

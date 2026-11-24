@@ -1,5 +1,17 @@
 # Conversation Retrieval
 
+## REQ-RET-012 — Event-bound response recovery
+
+WHEN an authenticated caller reads an occurrence-bound event evidence reference, THE
+SYSTEM SHALL validate the captured version/digest against the complete current source
+content and return a bounded page from the same database snapshot. Every continuation
+page SHALL retain the event/version expectation. Changed, deleted, uncaptured or
+unsupported evidence SHALL produce an explicit nonmatching/unavailable result rather
+than silently reading current content. Ordinary exact-message links SHALL remain
+current-source navigation and SHALL NOT imply occurrence-time version recovery.
+WHEN the bounded response-read domain is exhausted, THE SYSTEM SHALL report any
+remaining prose as explicitly omitted and SHALL NOT return an unsupported next cursor.
+
 ## User Story
 
 As a Phoenix user, I ask recall questions about work that happened
@@ -166,6 +178,15 @@ idempotently
 
 THE SYSTEM SHALL be able to rebuild the entire index from `messages`
 with no loss of source data
+
+WHEN a message's `display_data.hidden` is the JSON boolean `true`
+THE SYSTEM SHALL index empty searchable text for that message
+AND SHALL make ranked search eligibility depend on the indexed text,
+without rechecking the source hidden flag for each match
+
+WHEN a standalone index upsert follows a source-message commit
+THE SYSTEM SHALL read the source message's hidden state under the index
+write's transaction before replacing its indexed text
 
 THE SYSTEM SHALL be able to report the index's **freshness** — at
 minimum, whether startup reconciliation has completed and whether any
@@ -436,6 +457,10 @@ THE predecessor scope SHALL exclude the executing transcript, successors,
 sub-agent transcripts, other ProductConversations, and typed source relations
 such as `approved_task` and `follow_up`, including when resources are shared
 AND SHALL NOT grant this capability to sub-agents or the Coordinator
+
+THE `previous_transcripts` tool SHALL advertise a required `request` whose operation is exactly one of `list` (optional cursor), `search` (required query), or `read` (required exact transcript reference and optional cursor)
+AND SHALL disallow fields from other operations before invoking predecessor retrieval
+AND SHALL give operation-specific corrective guidance without echoing caller-supplied query text or transcript contents when arguments are malformed.
 
 WHEN an eligible agent is oriented for a transcript with predecessors
 THE SYSTEM SHALL supply bounded host-authored orientation identifying the

@@ -1,145 +1,62 @@
-# Delivery Roadmap — Executive Summary
-
-## Scope and Boundary
-
-This spec governs the phoenix-ide delivery roadmap Issue: the v2 record
-protocol posted as Issue comments and the reducer that projects those records
-into the Issue body.
-
-**In scope:**
-- Record kinds, actor roles, and per-kind merge semantics
-- Milestone-first Markdown projection, freshness, and acknowledgement
-- The GitHub Actions workflow that runs the reducer, and the local validator
-
-**Explicitly out of scope:**
-- Harness operations (runtime states, restarts, transcript mechanics)
-- Requirements, product decisions, review state, and task status, which keep
-  their existing authorities
-- A roadmap feature for projects Phoenix works on
-
-## Why It Exists
-
-The v1 roadmap stored one free-text row per workstream, replaced whole by its
-latest comment. Writers copied stale claims forward, holds could not be cleared
-because they had no identity, merged and deployed work stayed listed as
-unfinished, and a single Issue-wide marker made every row look fresh. Several
-harnesses on different machines now contribute, so the roadmap must also avoid
-references that only resolve on one machine.
+# Delivery Roadmap — Retirement Status
 
 ## Current Reality
 
+[ADR-262](../adrs/262_retire-delivery-roadmap-with-preserved-history.md)
+supersedes ADR-069 and retires the entire roadmap protocol. The original
+requirements remain in `requirements.md` as non-normative historical text.
+Issue [#806](https://github.com/scottopell/phoenix-ide/issues/806) retains its final
+projection and comments with an explicit historical-only notice.
+
 | Requirement | Status | Notes |
 |---|---|---|
-| **REQ-ROADMAP-001:** One generated roadmap Issue per project | Implemented | `run` reads the Issue from `PHOENIX_ROADMAP_ISSUE_NUMBER` and writes only when the body carries `ACTIVATION_MARKER` and `PHOENIX_ROADMAP_COORDINATOR_HARNESS` is set. |
-| **REQ-ROADMAP-002:** Records are single immutable fenced comments | Implemented | `parseRecordComment`, `reduceComments`. |
-| **REQ-ROADMAP-003:** Every record declares its actor role and harness | Implemented | `validateRecord` enforces `PERMISSIONS` and the coordinator harness. |
-| **REQ-ROADMAP-004:** Outcomes are the roadmap backbone | Implemented | `APPLY.outcome`, `APPLY["outcome-retire"]`. |
-| **REQ-ROADMAP-005:** Identifiers are unique and references resolve | Implemented | `claimId` and the `live*` lookups. |
-| **REQ-ROADMAP-006:** Milestones separate required from optional outcomes | Implemented | `APPLY.milestone`, `renderMilestone`. |
-| **REQ-ROADMAP-007:** Gates are single-use and clearing is permanent | Implemented | `APPLY.gate`, `APPLY["gate-clear"]`, `APPLY.decision` (scope-bound clearing). |
-| **REQ-ROADMAP-008:** Decisions are immutable and supersede explicitly | Implemented | `APPLY.decision` (scope-overlapping supersession; scope-bound `withdraws`). |
-| **REQ-ROADMAP-009:** Evidence is version-bound and per surface | Implemented | `surfaceDelivery` / `componentDelivery`; PR state from `githubApi().getPull`; URL rules in `githubUrl`. |
-| **REQ-ROADMAP-010:** Status carries next action and execution pointers | Implemented | `APPLY.status`. |
-| **REQ-ROADMAP-011:** Freshness and unknowns are explicit | Implemented | `age`, `deliveryCell`. |
-| **REQ-ROADMAP-012:** Milestone-first projection | Implemented | `renderRoadmap`. |
-| **REQ-ROADMAP-013:** Projection runs without a triggering record | Implemented | `.github/workflows/roadmap-issue-reducer.yml` schedule, dispatch, and concurrency group. |
-| **REQ-ROADMAP-014:** The projection is the authoritative acknowledgement | Implemented | `snapshot-through`, `ack-window-from`, and in-window `accepted` markers with the in-window rejection list; best-effort reactions; `--validate`. |
+| REQ-ROADMAP-001 | Retired | No generated coordination projection or activation contract. |
+| REQ-ROADMAP-002 | Retired | No record posting or validation obligation. |
+| REQ-ROADMAP-003 | Retired | No roadmap actor-role or harness obligation. |
+| REQ-ROADMAP-004 | Retired | No roadmap outcome registry. |
+| REQ-ROADMAP-005 | Retired | Historical identifiers remain evidence only. |
+| REQ-ROADMAP-006 | Retired | No generated milestone aggregation. |
+| REQ-ROADMAP-007 | Retired | Historical gates do not establish current holds. |
+| REQ-ROADMAP-008 | Retired | Current instructions/ADRs retain their own authority. |
+| REQ-ROADMAP-009 | Retired | Review/merge/deploy evidence stays with its owning authority. |
+| REQ-ROADMAP-010 | Retired | Current task/PR and coordination records retain status. |
+| REQ-ROADMAP-011 | Retired | Archive render time is not current delivery freshness. |
+| REQ-ROADMAP-012 | Retired | Final projection preserved, not maintained. |
+| REQ-ROADMAP-013 | Retired | Updater disabled; source workflow/reducer removed. |
+| REQ-ROADMAP-014 | Retired | No new acknowledgement or reaction protocol. |
 
-Code: `scripts/roadmap-issue-reducer.mjs`. Tests:
-`scripts/roadmap-issue-reducer.test.mjs`, with fixtures for a cleared user hold,
-a changed PR head, a PR closed without merge (alone, beside a merged component,
-withdrawn, and replaced), unverified PR state, partial multi-PR delivery, continued ownership, split web/native delivery, an optional
-outcome that must not block its milestone, acknowledgement overflow, deleted and de-fenced records, reaction failures, and
-activation before the Issue switch.
+## Live cutoff evidence — 2026-11-16
 
-### Activation
+Readback of workflow ID `330648486` reports `disabled_manually`. Both repository
+variables `PHOENIX_ROADMAP_ISSUE_NUMBER` and
+`PHOENIX_ROADMAP_COORDINATOR_HARNESS` were deleted. No in-progress or waiting
+executions were present. Issue #806's activation marker was removed after this
+cutoff; its archive notice and preserved projection matched the submitted body
+on readback.
 
-Activation is a hard cutover to Issue #806; v1 records are rejected. #806's body
-carries the activation marker; #651's does not, so the v2 reducer never writes
-#651 even if it reaches `main` before the Issue variable changes. Cutover:
-post the reviewed seed records on #806, merge, set
-`PHOENIX_ROADMAP_COORDINATOR_HARNESS=phoenix@primary` and
-`PHOENIX_ROADMAP_ISSUE_NUMBER=806`, dispatch the workflow once, then close #651.
-Until both variables are set, runs report "not activated" and write nothing.
+GitHub retains two stale run records from November 11 as `queued`, with zero jobs.
+Normal and force-cancel APIs return HTTP 409, “has not been queued yet.” They
+have no executing updater. Disabled workflow, absent variables and absent
+activation marker prevent a later invocation from rewriting the archive. This
+is not a claim that GitHub reports zero queued records.
 
-## Posting a record
+The Issue remains open; closure is not the write-prevention mechanism. No comment
+was deleted or added as a roadmap record. No old rows were bulk imported or
+interpreted as completion, cancellation, permission or a fresh commission.
 
-Validate first, then post a comment consisting only of the fenced record:
+## Source and verification
 
-```bash
-node scripts/roadmap-issue-reducer.mjs --validate record.json   # or pipe on stdin
-```
+The updater workflow, reducer, dedicated reducer tests and their CI invocation
+are removed together. Those tests exercised only the retired reducer/protocol;
+their deletion accompanies feature removal, not suppression of a live
+regression. Unrelated CI and task validation remain.
 
-The validator checks structure and role; references to outcomes, gates, and
-decisions are checked when the Issue is reduced.
+AGENTS.md and the canonical development skill stop mandatory archive reading and
+record posting. Active tasks lose those duties while preserving historical
+commissions, limitations and evidence. Current user instructions,
+specifications/Allium, ADRs, task filenames, PRs and exact deployed evidence
+retain their authority. No replacement coordination dashboard is introduced.
 
-After posting, re-read the Issue body. With `S` = `snapshot-through`, `W` =
-`ack-window-from`, and `A` = the IDs in the `phoenix-roadmap:accepted` marker:
-a comment ID above `S` is not yet processed; between `W` and `S` it is accepted
-if in `A`, rejected if listed under "Recent rejections", and otherwise deleted
-or no longer a record; below `W` the body makes no claim.
-
-### Canonical examples
-
-Worker — status (check-in, next action, pointers that may be machine-local):
-
-```json
-{ "kind": "status", "version": 2, "actor": { "role": "worker", "harness": "phoenix@devmbp" },
-  "outcome": "sidebar-product-actions", "next": "Final exact-head qualification",
-  "pointers": [{ "label": "#777", "url": "https://github.com/scottopell/phoenix-ide/pull/777" },
-               { "label": "owner transcript", "url": "http://devmbp:8031/c/example", "harness": "phoenix@devmbp" }] }
-```
-
-Worker — evidence (`implemented`, `qualified`; `merged` is derived from GitHub):
-
-```json
-{ "kind": "evidence", "version": 2, "actor": { "role": "worker", "harness": "codex" },
-  "outcome": "question-forms", "surface": "web", "stage": "qualified", "result": "pass",
-  "subject": { "pr": 770, "head": "70202823f813ed55178dc5412b7bddce04b63400" },
-  "url": "https://github.com/scottopell/phoenix-ide/pull/770/checks" }
-```
-
-Deployment evidence must link a GitHub receipt:
-
-```json
-{ "kind": "evidence", "version": 2, "actor": { "role": "coordinator", "harness": "phoenix@primary" },
-  "outcome": "auto-continue", "surface": "server", "stage": "deployed", "result": "pass",
-  "subject": { "target": "prod@primary", "commit": "02488dde1b1da76555816c2745d42f1ad4234f9a" },
-  "url": "https://github.com/scottopell/phoenix-ide/pull/807#issuecomment-5859803423" }
-```
-
-Worker — gate and gate-clear (owner/external gates):
-
-```json
-{ "kind": "gate", "version": 2, "actor": { "role": "worker", "harness": "phoenix@devmbp" },
-  "id": "g-797-restart-budget", "blocks": { "outcome": "overload-recovery" },
-  "clearer": "owner", "condition": "Restart/budget review findings resolved on #797" }
-```
-
-```json
-{ "kind": "gate-clear", "version": 2, "actor": { "role": "worker", "harness": "phoenix@devmbp" },
-  "gate": "g-797-restart-budget",
-  "evidence": "https://github.com/scottopell/phoenix-ide/pull/797#pullrequestreview-1" }
-```
-
-Coordinator — decision withdrawing a PR closed without merge from an outcome
-(or replacing it: withdraw, then post evidence for the replacement PR):
-
-```json
-{ "kind": "decision", "version": 2, "actor": { "role": "coordinator", "harness": "phoenix@primary" },
-  "id": "d-794-withdrawn", "statement": "#794 is closed; its scope moved to #796 and #798",
-  "scope": ["kache-adoption"], "withdraws": [{ "outcome": "kache-adoption", "pr": 794 }] }
-```
-
-User — decision (any harness may record it; quote the user's exact words):
-
-```json
-{ "kind": "decision", "version": 2, "actor": { "role": "user", "harness": "phoenix@primary" },
-  "id": "d-tf-no-auto-continue", "statement": "Native auto-continue controls are not a TestFlight prerequisite",
-  "scope": ["testflight-1", "native-auto-continue"],
-  "quote": "TestFlight is next; native auto-continue controls definitely are not a blocker." }
-```
-
-Coordinator only — `outcome`, `outcome-retire`, `milestone`, `milestone-retire`;
-see `specs/roadmap/requirements.md` REQ-ROADMAP-004 and REQ-ROADMAP-006 and the
-seed bundle on the adoption PR for complete examples.
+Scoped task/spec/workflow and reference checks qualify source retirement;
+Rust/UI builds are not relevant to this slice. PR review and CI remain required
+before the source removal is merged.

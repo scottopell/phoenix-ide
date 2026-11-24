@@ -1133,7 +1133,7 @@ pub struct UserContent {
     pub images: Vec<ImageData>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub files: Vec<FileAttachment>,
-    /// Expanded text delivered to the LLM (REQ-IR-001).
+    /// Expanded text delivered to the LLM (REQ-IR-006).
     /// `None` means no expansion occurred and `text` is used verbatim for the LLM.
     /// `Some` holds the fully resolved form (e.g. `<file path="…">…</file>` blocks).
     /// `#[serde(default)]` handles old DB rows that predate this field.
@@ -1175,7 +1175,7 @@ impl UserContent {
     }
 
     /// Create a user message where `display_text` is stored/shown and `llm_text`
-    /// is the expanded form delivered to the LLM (REQ-IR-001, REQ-IR-006).
+    /// is the expanded form delivered to the LLM (REQ-IR-006).
     pub fn with_expansion(
         display_text: impl Into<String>,
         llm_text: impl Into<String>,
@@ -1724,6 +1724,25 @@ pub enum InputOrigin {
         #[ts(type = "string")]
         reminder_id: super::reminder::ReminderId,
     },
+    /// The user's reply to a question the Coordinator posted (REQ-AUQ-011).
+    /// The message id is [`coordinator_question_reply_message_id`] of the
+    /// question's request id.
+    CoordinatorQuestionReply,
+}
+
+const COORDINATOR_QUESTION_REPLY_PREFIX: &str = "coordinator-question-reply:";
+
+/// The message id that delivers the reply to question `request_id`.
+#[must_use]
+pub fn coordinator_question_reply_message_id(request_id: &str) -> String {
+    format!("{COORDINATOR_QUESTION_REPLY_PREFIX}{request_id}")
+}
+
+/// Message ids in this namespace are only accepted with the
+/// [`InputOrigin::CoordinatorQuestionReply`] origin.
+#[must_use]
+pub fn is_coordinator_question_reply_message_id(message_id: &str) -> bool {
+    message_id.starts_with(COORDINATOR_QUESTION_REPLY_PREFIX)
 }
 
 impl InputOrigin {
@@ -1767,7 +1786,8 @@ impl InputOrigin {
             | Self::SystemGenerated
             | Self::SlackGateway { .. }
             | Self::SubscriptionEvent { .. }
-            | Self::ScheduledReminder { .. } => None,
+            | Self::ScheduledReminder { .. }
+            | Self::CoordinatorQuestionReply => None,
         }
     }
 
@@ -1825,6 +1845,9 @@ impl InputOrigin {
             Self::SystemGenerated => ("system_generated", None, None, None, None),
             Self::SlackGateway { .. } => ("slack_gateway", None, None, None, None),
             Self::ScheduledReminder { .. } => ("scheduled_reminder", None, None, None, None),
+            Self::CoordinatorQuestionReply => {
+                ("coordinator_question_reply", None, None, None, None)
+            }
             Self::SubscriptionEvent { event_id } => {
                 ("subscription_event", None, None, Some(event_id), None)
             }
@@ -1874,7 +1897,8 @@ impl InputOrigin {
             | Self::RemoteApi { .. }
             | Self::RemoteConversation { .. }
             | Self::RemoteCoordinator { .. }
-            | Self::ScheduledReminder { .. } => None,
+            | Self::ScheduledReminder { .. }
+            | Self::CoordinatorQuestionReply => None,
         }
     }
 
@@ -1890,7 +1914,8 @@ impl InputOrigin {
             | Self::SubscriptionEvent { .. }
             | Self::RemoteApi { .. }
             | Self::RemoteConversation { .. }
-            | Self::RemoteCoordinator { .. } => None,
+            | Self::RemoteCoordinator { .. }
+            | Self::CoordinatorQuestionReply => None,
         }
     }
 
@@ -1979,6 +2004,9 @@ impl InputOrigin {
             ("unknown_historical", None, None, None, None) => Ok(Self::UnknownHistorical),
             ("user_api", None, None, None, None) => Ok(Self::UserApi),
             ("system_generated", None, None, None, None) => Ok(Self::SystemGenerated),
+            ("coordinator_question_reply", None, None, None, None) => {
+                Ok(Self::CoordinatorQuestionReply)
+            }
             ("subscription_event", None, None, Some(event_id), None)
                 if !event_id.trim().is_empty() =>
             {

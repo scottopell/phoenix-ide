@@ -52,6 +52,7 @@ export function AnnotatableBlock({
       onTouchStart={(e: React.TouchEvent) => lp.start(e, { lineNumber, lineContent })}
       onTouchMove={lp.move}
       onTouchEnd={lp.end}
+      onTouchCancel={lp.end}
       onMouseDown={(e: React.MouseEvent) => lp.start(e, { lineNumber, lineContent })}
       onMouseMove={lp.move}
       onMouseUp={lp.end}

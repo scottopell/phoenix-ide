@@ -25,14 +25,14 @@ import { fuzzyMatch } from '../components/CommandPalette/fuzzyMatch';
  *
  * A conversation has a single immutable `cwd`, and the new-conversation
  * composer picks a directory before any conversation exists — so the
- * candidate set for `@file` / `./path` / `/skill` is a pure function of that
+ * candidate set for `./path` / `/skill` is a pure function of that
  * directory. Keying the engine on `cwd` lets the same composer behaviour run
  * in both places, and resolves candidates against the same root that
  * `message_expander::expand` uses at send time.
  */
 export interface UseInlineReferencesParams {
   /**
-   * Directory to resolve `@file` / `./path` / `/skill` candidates against.
+   * Directory to resolve `./path` / `/skill` candidates against.
    * `undefined`/empty disables fetching (the dropdown simply never populates).
    * The skill/file candidate caches are keyed on this.
    */
@@ -108,7 +108,7 @@ export function useInlineReferences({
    * `acItems` useMemo below), avoiding the derived-state-in-effect anti-pattern.
    */
   const [fileAcItems, setFileAcItems] = useScopedState<AutocompleteItem[]>(scopeKey, []);
-  /** Inline error when an @ref or /skill fails to expand (REQ-IR-007). */
+  /** Inline error when a /skill fails to expand (REQ-IR-007). */
   const [expansionError, setExpansionError] = useScopedState<string | null>(scopeKey, null);
   /** Argument hint ghost text shown after a skill is selected (REQ-IR-005). */
   const [skillArgumentHint, setSkillArgumentHint] = useScopedState<string | null>(scopeKey, null);
@@ -150,7 +150,7 @@ export function useInlineReferences({
         metadata: s,
       }));
     }
-    if (activeTrigger.mode === 'expand' || activeTrigger.mode === 'path') {
+    if (activeTrigger.mode === 'path') {
       return fileAcItems;
     }
     return [];
@@ -171,11 +171,8 @@ export function useInlineReferences({
         const items: AutocompleteItem[] = result.items.map((entry) => ({
           id: entry.path,
           label: entry.path,
-          // @-mention expansion includes file *contents as text*, so the hint
-          // is the includable-as-text axis (only `text`), not viewer-openability
-          // (which also covers images). Images can't be inlined into the prompt,
-          // so they keep the binary hint. Final gate is content-sniffing at
-          // expansion time; this extension-based verdict is the up-front hint.
+          // Extension-based hint: anything the viewer can't show as text is
+          // flagged binary.
           ...(entry.viewer.kind === 'text' ? {} : { subtitle: 'binary' }),
           metadata: entry,
         }));
@@ -232,7 +229,7 @@ export function useInlineReferences({
       return;
     }
 
-    if (activeTrigger.mode !== 'expand' && activeTrigger.mode !== 'path') {
+    if (activeTrigger.mode !== 'path') {
       setFileAcItems([]);
       return;
     }
@@ -279,9 +276,7 @@ export function useInlineReferences({
       if (!activeTrigger) return;
 
       let replacement: string;
-      if (activeTrigger.mode === 'expand') {
-        replacement = `@${item.label} `;
-      } else if (activeTrigger.mode === 'skill') {
+      if (activeTrigger.mode === 'skill') {
         replacement = `/${item.label} `;
         const skill = item.metadata as SkillEntry | undefined;
         setSkillArgumentHint(skill?.argument_hint ?? null);
@@ -374,7 +369,7 @@ export function useInlineReferences({
   }, [setActiveTrigger, setSkillArgumentHint]);
 
   const dropdown = createElement(InlineAutocomplete, {
-    mode: activeTrigger?.mode ?? 'expand',
+    mode: activeTrigger?.mode ?? 'path',
     query: activeTrigger?.query ?? '',
     items: acItems,
     selectedIndex: acSelectedIndex,

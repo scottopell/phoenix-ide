@@ -379,6 +379,81 @@ pub struct ConversationSearchResponse {
 #[ts(export, export_to = "../../../ui/src/generated/")]
 pub struct ProductConversationListResponse {
     pub product_conversations: Vec<ProductConversationListRow>,
+    pub coordinator: Option<CoordinatorListEntryView>,
+}
+
+#[derive(Debug, Clone, Serialize, TS)]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub struct CoordinatorListEntryView {
+    pub product_conversation_id: String,
+    pub read_state: ProductConversationReadStateView,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub enum ProductConversationReadAdvanceRequestKind {
+    /// The user opened the conversation or chose "mark read"; clears an
+    /// explicit unread mark.
+    Acknowledged,
+    /// Output arrived while the conversation was on screen; never clears an
+    /// explicit unread mark.
+    Observed,
+}
+
+#[derive(Debug, Clone, Deserialize, TS)]
+#[serde(deny_unknown_fields)]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub struct MarkProductConversationReadRequest {
+    pub kind: ProductConversationReadAdvanceRequestKind,
+}
+
+impl From<ProductConversationReadAdvanceRequestKind>
+    for phoenix_db::ProductConversationReadAdvance
+{
+    fn from(kind: ProductConversationReadAdvanceRequestKind) -> Self {
+        match kind {
+            ProductConversationReadAdvanceRequestKind::Acknowledged => Self::Acknowledge,
+            ProductConversationReadAdvanceRequestKind::Observed => Self::Observe,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, TS)]
+#[serde(tag = "state", rename_all = "snake_case")]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub enum ProductConversationReadStateView {
+    Read,
+    Unread {
+        reason: ProductConversationUnreadReasonView,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub enum ProductConversationUnreadReasonView {
+    Marked,
+    NewActivity,
+}
+
+impl From<phoenix_db::ProductConversationReadState> for ProductConversationReadStateView {
+    fn from(state: phoenix_db::ProductConversationReadState) -> Self {
+        use phoenix_db::{ProductConversationReadState, ProductConversationUnreadReason};
+        match state {
+            ProductConversationReadState::Read => Self::Read,
+            ProductConversationReadState::Unread(ProductConversationUnreadReason::Marked) => {
+                Self::Unread {
+                    reason: ProductConversationUnreadReasonView::Marked,
+                }
+            }
+            ProductConversationReadState::Unread(ProductConversationUnreadReason::NewActivity) => {
+                Self::Unread {
+                    reason: ProductConversationUnreadReasonView::NewActivity,
+                }
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, TS)]
@@ -391,6 +466,49 @@ pub struct ProductConversationListRow {
     pub latest_transcript_row_id: String,
     pub updated_at: String,
     pub presentation: ProductConversationPresentationView,
+    pub read_state: ProductConversationReadStateView,
+    pub cached_pr: Option<ProductConversationPrView>,
+    /// True while the Coordinator holds an active watch on this conversation.
+    pub monitored: bool,
+    /// When the Coordinator was handed this conversation's current question
+    /// (RFC 3339). Set only while a monitored conversation waits on a question
+    /// the watch reported; the Coordinator answers it or asks the user.
+    pub question_with_coordinator_since: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, TS)]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub struct ProductConversationPrView {
+    pub number: u32,
+    pub title: String,
+    pub url: String,
+    pub display_state: phoenix_core::domain::pr_display_state::PrDisplayState,
+    pub base: String,
+    pub head: String,
+    pub feedback_status: phoenix_core::domain::pr_feedback_status::PrFeedbackStatus,
+}
+
+impl ProductConversationPrView {
+    /// `None` when the PR number cannot be represented on the wire (ts-rs
+    /// maps `u32` to `number`; wider integers become `bigint`).
+    pub(crate) fn from_summary(pr: &crate::runtime::CachedPrSummary) -> Option<Self> {
+        let Ok(number) = u32::try_from(pr.number) else {
+            tracing::debug!(
+                pr_number = pr.number,
+                "dropping cached PR badge: number exceeds u32"
+            );
+            return None;
+        };
+        Some(Self {
+            number,
+            title: pr.title.clone(),
+            url: pr.url.clone(),
+            display_state: pr.display_state.clone(),
+            base: pr.base.clone(),
+            head: pr.head.clone(),
+            feedback_status: pr.feedback_status,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, TS)]
@@ -1087,7 +1205,7 @@ pub struct ContinueConversationRequest {
     pub retry_failed_automatic: bool,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ContinueConversationStatus {
     Accepted,
@@ -1096,7 +1214,7 @@ pub enum ContinueConversationStatus {
 }
 
 /// Response for context-continuation creation and opening-message dispatch.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct ContinueConversationResponse {
     pub conversation_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]

@@ -10,6 +10,11 @@
 //! REQ-BED-009: Sub-Agent Isolation
 
 mod agent_execution;
+mod native_spawn;
+pub use native_spawn::{
+    NativeSpawnClosureReceipt, NativeSpawnControl, NativeSpawnTerminalEvidence,
+    SubAgentAdmissionReceipt,
+};
 pub(crate) mod close_retirement;
 pub(crate) mod creation_worker;
 pub mod deny_gate;
@@ -18,13 +23,22 @@ pub(crate) mod executor;
 pub(crate) mod fork_resolve;
 pub mod pr_status_poll;
 mod recovery;
+#[cfg(test)]
+#[path = "coordinator_scanner/kick_tests.rs"]
+mod scanner_kick_tests;
 mod svg_artifacts;
 pub mod traits;
 pub mod usage_limit_sweep;
 pub mod user_facing_error;
 
 #[cfg(test)]
+mod event_context_eval;
+#[cfg(test)]
 pub mod testing;
+#[cfg(test)]
+mod tool_surface_inventory;
+#[cfg(test)]
+mod tool_surface_recovery;
 
 pub use executor::ConversationRuntime;
 pub use traits::*;
@@ -221,14 +235,14 @@ pub enum SubAgentAdmissionResponse {
 
 #[derive(Debug)]
 pub struct SubAgentSpawnRequest {
-    pub batch_id: String,
+    pub invocation: phoenix_db::SubAgentSpawnInvocation,
     pub specs: Vec<SubAgentSpec>,
-    pub parent_conversation_id: String,
     pub parent_scope: Option<WorkScopeId>,
     pub parallel_work_qualified: bool,
     pub parent_turn_link: opentelemetry::trace::SpanContext,
-    pub response_tx: oneshot::Sender<SubAgentAdmissionResponse>,
+    pub response_tx: oneshot::Sender<SubAgentAdmissionReceipt>,
     pub activation_rx: oneshot::Receiver<()>,
+    pub control: Arc<NativeSpawnControl>,
 }
 
 /// Request to cancel sub-agents
@@ -247,6 +261,8 @@ pub struct SubAgentCancelRequest {
 pub enum EvictionReason {
     /// Recreate the runtime after a model or inference-configuration update.
     ModelUpgrade { model_changed: bool },
+    /// Recreate the idle Coordinator with its newly saved language.
+    LanguageChanged,
     /// Async creation finished provisioning cwd/mode/model metadata; recreate
     /// any shell runtime so it uses the provisioned conversation row.
     CreationProvisioned,
@@ -454,6 +470,20 @@ mod conversation_mutex_gate_tests {
         assert!(second_a.try_lock_owned().is_err());
 
         assert!(conversation_b.try_lock_owned().is_ok());
+    }
+
+    #[tokio::test]
+    async fn remote_goal_apply_gate_serializes_per_reference_only() {
+        let gates = ConversationMutexGates::default();
+        let reference_a = uuid::Uuid::new_v4();
+        let reference_b = uuid::Uuid::new_v4();
+        let first_a = gates.gate_for(&reference_a.to_string()).await;
+        let duplicate_a = gates.gate_for(&reference_a.to_string()).await;
+        let independent_b = gates.gate_for(&reference_b.to_string()).await;
+
+        let _claimed_without_receipt = first_a.lock_owned().await;
+        assert!(duplicate_a.try_lock_owned().is_err());
+        assert!(independent_b.try_lock_owned().is_ok());
     }
 }
 
@@ -795,6 +825,8 @@ pub struct RuntimeManager {
     #[cfg(test)]
     fork_command_barrier: AsyncMutex<Option<Arc<tokio::sync::Barrier>>>,
     #[cfg(test)]
+    native_admission_prewrite_barrier: AsyncMutex<Option<Arc<tokio::sync::Barrier>>>,
+    #[cfg(test)]
     browser_retirement_barrier: AsyncMutex<Option<Arc<tokio::sync::Barrier>>>,
     #[cfg(test)]
     hard_delete_barrier: AsyncMutex<Option<Arc<tokio::sync::Barrier>>>,
@@ -820,6 +852,9 @@ pub struct RuntimeManager {
     /// conversations independent.
     message_acceptance: ConversationMutexGates,
     product_message_admission: ConversationMutexGates,
+    remote_goal_apply: ConversationMutexGates,
+    #[cfg(test)]
+    remote_goal_apply_arrivals: AsyncMutex<HashMap<uuid::Uuid, Arc<Notify>>>,
     /// Serializes the final durable queue snapshot and executor publication
     /// with queue mutations. The database remains authoritative; this gate
     /// only prevents a newly-started executor from observing an older snapshot.
@@ -885,6 +920,7 @@ pub struct RuntimeManager {
     creation_kick_rx: RwLock<Option<tokio::sync::watch::Receiver<u64>>>,
     direct_turn_kick_tx: tokio::sync::watch::Sender<u64>,
     direct_turn_kick_rx: RwLock<Option<tokio::sync::watch::Receiver<u64>>>,
+    coordinator_scanner: crate::coordinator_scanner::ScannerWake,
     fatal_local_authority_fence: Arc<FatalLocalAuthorityFence>,
 }
 
@@ -1557,6 +1593,7 @@ pub struct SseBroadcaster {
     gate: Arc<Mutex<BroadcastGate>>,
     persisted_message_reservation: Arc<Semaphore>,
     fatal_local_authority_fence: Option<Arc<FatalLocalAuthorityFence>>,
+    scanner_kick: Option<Arc<Notify>>,
 }
 
 impl SseBroadcaster {
@@ -1580,6 +1617,7 @@ impl SseBroadcaster {
             gate: Arc::new(Mutex::new(BroadcastGate::default())),
             persisted_message_reservation: Arc::new(Semaphore::new(1)),
             fatal_local_authority_fence: None,
+            scanner_kick: None,
         }
     }
 
@@ -1593,6 +1631,11 @@ impl SseBroadcaster {
 
     fn with_fatal_local_authority_fence(mut self, fence: Arc<FatalLocalAuthorityFence>) -> Self {
         self.fatal_local_authority_fence = Some(fence);
+        self
+    }
+
+    fn with_scanner_kick(mut self, notify: Arc<Notify>) -> Self {
+        self.scanner_kick = Some(notify);
         self
     }
 
@@ -1683,6 +1726,19 @@ impl SseBroadcaster {
                     });
             }
             RingOp::BroadcastOnly => {}
+        }
+        if matches!(op, RingOp::Anchor)
+            || matches!(
+                &event,
+                SseEvent::MessageUpdated {
+                    transcript_generation: Some(_),
+                    ..
+                }
+            )
+        {
+            if let Some(notify) = &self.scanner_kick {
+                notify.notify_one();
+            }
         }
         self.tx.send(event).map_err(|_| ())
     }
@@ -1993,6 +2049,8 @@ pub struct ConversationMetadataUpdate {
     pub model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub archived: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub continued_in_conv_id: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -2608,6 +2666,13 @@ pub(crate) fn cleanup_branch_for_unretained_work_scope<'a>(
 }
 
 impl RuntimeManager {
+    pub(crate) fn live_materialized_handle_count(&self) -> Option<u64> {
+        self.runtimes
+            .try_read()
+            .ok()
+            .and_then(|runtimes| u64::try_from(runtimes.len()).ok())
+    }
+
     pub fn new(
         db: Database,
         llm_registry: Arc<ModelRegistry>,
@@ -2737,6 +2802,8 @@ impl RuntimeManager {
             #[cfg(test)]
             fork_command_barrier: AsyncMutex::new(None),
             #[cfg(test)]
+            native_admission_prewrite_barrier: AsyncMutex::new(None),
+            #[cfg(test)]
             browser_retirement_barrier: AsyncMutex::new(None),
             #[cfg(test)]
             hard_delete_barrier: AsyncMutex::new(None),
@@ -2760,6 +2827,9 @@ impl RuntimeManager {
             fatal_runtime_map_barrier: AsyncMutex::new(None),
             message_acceptance: ConversationMutexGates::default(),
             product_message_admission: ConversationMutexGates::default(),
+            remote_goal_apply: ConversationMutexGates::default(),
+            #[cfg(test)]
+            remote_goal_apply_arrivals: AsyncMutex::new(HashMap::new()),
             steering_projection: ConversationMutexGates::default(),
             evicted_broadcasters: RwLock::new(HashMap::new()),
             aggregate_event_tx,
@@ -2783,6 +2853,7 @@ impl RuntimeManager {
             creation_kick_rx: RwLock::new(Some(creation_kick_rx)),
             direct_turn_kick_tx,
             direct_turn_kick_rx: RwLock::new(Some(direct_turn_kick_rx)),
+            coordinator_scanner: crate::coordinator_scanner::ScannerWake::default(),
             fatal_local_authority_fence,
         }
     }
@@ -3920,6 +3991,11 @@ impl RuntimeManager {
     }
 
     #[cfg(test)]
+    pub(crate) fn fatal_authority_owner_count(&self) -> usize {
+        self.fatal_local_authority_fence.owner_count()
+    }
+
+    #[cfg(test)]
     pub(crate) async fn run_local_authority_pass<T>(
         &self,
         pass: impl std::future::Future<Output = T>,
@@ -4687,6 +4763,10 @@ impl RuntimeManager {
             .await
     }
 
+    pub(crate) fn start_coordinator_scanner(self: &Arc<Self>) {
+        crate::coordinator_scanner::start(self.clone(), &self.coordinator_scanner);
+    }
+
     pub async fn start_direct_turn_worker(
         self: &Arc<Self>,
     ) -> Result<(), crate::FatalLocalAuthorityExit> {
@@ -4860,45 +4940,84 @@ impl RuntimeManager {
 
     async fn handle_spawn_request(self: &Arc<Self>, req: SubAgentSpawnRequest) {
         let SubAgentSpawnRequest {
-            batch_id,
+            invocation,
             specs,
-            parent_conversation_id,
             parent_scope,
             parallel_work_qualified,
             parent_turn_link,
             response_tx,
             activation_rx,
+            control,
         } = req;
+        let mut lifecycle = native_spawn::NativeSpawnLifecycleOwner::new(Arc::clone(&control));
+        let batch = phoenix_db::SubAgentBatchAdmission {
+            batch_id: invocation.batch_id.clone(),
+            parent_conversation_id: invocation.parent_conversation_id.clone(),
+            parallel_work_qualified,
+            runs: specs
+                .iter()
+                .map(|spec| phoenix_db::SubAgentRunAdmission {
+                    child_conversation_id: spec.agent_id.clone(),
+                    execution_authority: match spec.mode {
+                        SubAgentMode::Explore => phoenix_db::SubAgentExecutionAuthority::ReadOnly,
+                        SubAgentMode::Work => phoenix_db::SubAgentExecutionAuthority::WriteCapable,
+                    },
+                })
+                .collect(),
+        };
         match self
             .admit_sub_agent_batch(
-                &batch_id,
+                &invocation.batch_id,
                 &specs,
-                &parent_conversation_id,
+                &invocation.parent_conversation_id,
                 parent_scope,
                 parallel_work_qualified,
+                &mut lifecycle,
             )
             .await
         {
             Ok(()) => {
-                if response_tx
-                    .send(SubAgentAdmissionResponse::Admitted)
-                    .is_err()
-                {
-                    self.abandon_unactivated_sub_agent_batch(&batch_id).await;
-                    return;
+                #[cfg(test)]
+                control.mark_batch_admitted();
+                let response_lost = response_tx
+                    .send(SubAgentAdmissionReceipt {
+                        invocation: invocation.clone(),
+                        outcome: SubAgentAdmissionResponse::Admitted,
+                    })
+                    .is_err();
+                let activate = if response_lost {
+                    false
+                } else {
+                    tokio::select! {
+                        biased;
+                        () = control.cancelled() => false,
+                        activation = activation_rx => activation.is_ok() && !control.is_cancelled(),
+                    }
+                };
+                if activate {
+                    control.activated();
+                    self.kick_admitted_sub_agent_batch(specs, parent_turn_link);
+                } else {
+                    let evidence = self.close_native_spawn_batch(&batch, &mut lifecycle).await;
+                    if !control.publish(evidence) {
+                        tracing::error!(batch_id = %batch.batch_id, "native spawn closure owner disappeared; terminal evidence retained without parent acceptance");
+                    }
                 }
-                if activation_rx.await.is_err() {
-                    self.abandon_unactivated_sub_agent_batch(&batch_id).await;
-                    return;
-                }
-                self.kick_admitted_sub_agent_batch(specs, parent_turn_link);
             }
             Err(error) if error.starts_with("FATAL_LOCAL_AUTHORITY_UNCLASSIFIED:") => {
                 self.signal_fatal_local_authority("sub_agent_batch_admission");
-                let _ = response_tx.send(SubAgentAdmissionResponse::Unclassified);
+                let _ = response_tx.send(SubAgentAdmissionReceipt {
+                    invocation: invocation.clone(),
+                    outcome: SubAgentAdmissionResponse::Unclassified,
+                });
+                control.publish(NativeSpawnTerminalEvidence::Unclassified);
             }
             Err(error) => {
-                let _ = response_tx.send(SubAgentAdmissionResponse::Rejected(error));
+                let _ = response_tx.send(SubAgentAdmissionReceipt {
+                    invocation: invocation.clone(),
+                    outcome: SubAgentAdmissionResponse::Rejected(error),
+                });
+                control.publish(NativeSpawnTerminalEvidence::NotAdmitted);
             }
         }
     }
@@ -4914,15 +5033,16 @@ impl RuntimeManager {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    async fn admit_sub_agent_batch(
-        self: &Arc<Self>,
+    async fn prepare_sub_agent_batch_admission(
+        &self,
         batch_id: &str,
         specs: &[SubAgentSpec],
         parent_conversation_id: &str,
         parent_scope: Option<WorkScopeId>,
         parallel_work_qualified: bool,
-    ) -> Result<(), String> {
+    ) -> Result<phoenix_db::AtomicSubAgentBatchAdmission, String> {
+        use phoenix_db::SubAgentExecutionAuthority::{ReadOnly, WriteCapable};
+
         let parent = self
             .db
             .get_conversation(parent_conversation_id)
@@ -4969,12 +5089,8 @@ impl RuntimeManager {
                     run: phoenix_db::SubAgentRunAdmission {
                         child_conversation_id: spec.agent_id.clone(),
                         execution_authority: match spec.mode {
-                            SubAgentMode::Explore => {
-                                phoenix_db::SubAgentExecutionAuthority::ReadOnly
-                            }
-                            SubAgentMode::Work => {
-                                phoenix_db::SubAgentExecutionAuthority::WriteCapable
-                            }
+                            SubAgentMode::Explore => ReadOnly,
+                            SubAgentMode::Work => WriteCapable,
                         },
                     },
                     slug: format!("sub-{}", spec.agent_id),
@@ -4993,32 +5109,88 @@ impl RuntimeManager {
                 })
             })
             .collect::<Result<Vec<_>, String>>()?;
-        let admission = phoenix_db::AtomicSubAgentBatchAdmission {
+        Ok(phoenix_db::AtomicSubAgentBatchAdmission {
             batch_id: batch_id.to_string(),
             parent_conversation_id: parent_conversation_id.to_string(),
             parent_scope,
             parallel_work_qualified,
             children,
-        };
-        match self.db.admit_sub_agent_batch_atomically(&admission).await {
-            phoenix_db::workflow::LocalAuthorityResult::DurableFactEstablished(result) => {
-                result.map_err(|error| error.to_string())?;
-            }
-            phoenix_db::workflow::LocalAuthorityResult::DurableFactUnclassified => {
-                return Err("FATAL_LOCAL_AUTHORITY_UNCLASSIFIED: sub-agent batch admission commit could not be classified".to_string());
-            }
-        }
-
-        Ok(())
+        })
     }
 
-    async fn abandon_unactivated_sub_agent_batch(&self, batch_id: &str) {
-        if let Err(error) = self
+    #[allow(clippy::too_many_arguments)]
+    async fn admit_sub_agent_batch(
+        self: &Arc<Self>,
+        batch_id: &str,
+        specs: &[SubAgentSpec],
+        parent_conversation_id: &str,
+        parent_scope: Option<WorkScopeId>,
+        parallel_work_qualified: bool,
+        lifecycle: &mut native_spawn::NativeSpawnLifecycleOwner,
+    ) -> Result<(), String> {
+        let admission = self
+            .prepare_sub_agent_batch_admission(
+                batch_id,
+                specs,
+                parent_conversation_id,
+                parent_scope,
+                parallel_work_qualified,
+            )
+            .await?;
+        #[cfg(test)]
+        if let Some(barrier) = self.native_admission_prewrite_barrier.lock().await.take() {
+            barrier.wait().await;
+            barrier.wait().await;
+        }
+        let owner = self.acquire_local_authority_pass().map_err(|()| {
+            "native spawn admission was not issued because local write admission is closed"
+                .to_string()
+        })?;
+        let control = Arc::clone(&lifecycle.control);
+        if !control.try_issue() {
+            return Err("native spawn admission was revoked before its database command".into());
+        }
+        let authority = lifecycle.arm_write(owner);
+        match self
             .db
-            .abandon_unactivated_sub_agent_batch(batch_id, Utc::now())
+            .establish_live_parent_reconcile_action(parent_conversation_id)
             .await
         {
-            tracing::error!(%batch_id, %error, "failed to terminalize unactivated sub-agent batch");
+            phoenix_db::workflow::LocalAuthorityResult::DurableFactEstablished(Ok(())) => {}
+            phoenix_db::workflow::LocalAuthorityResult::DurableFactEstablished(Err(error)) => {
+                authority.classified();
+                return Err(format!(
+                    "failed to persist parent recovery authority: {error}"
+                ));
+            }
+            phoenix_db::workflow::LocalAuthorityResult::DurableFactUnclassified => {
+                self.signal_fatal_local_authority("native_spawn_parent_reconcile_action");
+                authority.classified();
+                return Err(
+                    "FATAL_LOCAL_AUTHORITY_UNCLASSIFIED: native parent reconciliation authority"
+                        .into(),
+                );
+            }
+        }
+        if self.fatal_local_authority_fence.is_closed() || control.is_cancelled() {
+            authority.classified();
+            return Err("native spawn batch was not issued after parent authority settled because admission closed or cancellation was requested".into());
+        }
+        let result = self.db.admit_sub_agent_batch_atomically(&admission).await;
+        if matches!(
+            result,
+            phoenix_db::workflow::LocalAuthorityResult::DurableFactUnclassified
+        ) {
+            self.signal_fatal_local_authority("sub_agent_batch_admission");
+        }
+        authority.classified();
+        match result {
+            phoenix_db::workflow::LocalAuthorityResult::DurableFactEstablished(result) => {
+                result.map(|_| ()).map_err(|error| error.to_string())
+            }
+            phoenix_db::workflow::LocalAuthorityResult::DurableFactUnclassified => {
+                Err("FATAL_LOCAL_AUTHORITY_UNCLASSIFIED: sub-agent batch admission commit could not be classified".to_string())
+            }
         }
     }
 
@@ -5350,6 +5522,7 @@ impl RuntimeManager {
         );
         coordinator_tools.extend(crate::coordinator_tools::goal_tools(self));
         coordinator_tools.extend(crate::coordinator_tools::authority_tools(self));
+        coordinator_tools.push(crate::coordinator_tools::tracking_tool(self));
         coordinator_tools.push(crate::reminder_service::tool(
             self,
             conversation_id.to_owned(),
@@ -7032,6 +7205,7 @@ impl RuntimeManager {
                     .or_insert(model_changed);
             }
             EvictionReason::CreationProvisioned
+            | EvictionReason::LanguageChanged
             | EvictionReason::SteeringReconciliation
             | EvictionReason::RecoveryReconciliation
             | EvictionReason::SubAgentTerminalBeforeDispatch => {}
@@ -7048,6 +7222,63 @@ impl RuntimeManager {
                 "Runtime evicted; shutdown signal sent, broadcaster preserved for new runtime"
             );
         }
+    }
+
+    // REQ-LL-003
+    pub(crate) async fn change_idle_coordinator_language(
+        &self,
+        id: &str,
+        language: crate::llm_language::LlmLanguage,
+    ) -> Result<bool, phoenix_db::DbError> {
+        let _messages = self.lock_message_acceptance(id).await;
+        let creations = self.runtime_creations.lock().await;
+        if creations.contains_key(id)
+            || self
+                .effective_conversation_state(id)
+                .await
+                .is_some_and(|state| !matches!(state, ConvState::Idle))
+        {
+            return Ok(false);
+        }
+        let applied = self.db.set_idle_coordinator_language(id, language).await?;
+        if applied {
+            self.evict_runtime(id, EvictionReason::LanguageChanged)
+                .await;
+        }
+        Ok(applied)
+    }
+
+    pub(crate) async fn lock_remote_goal_apply(
+        &self,
+        action_reference: uuid::Uuid,
+    ) -> tokio::sync::OwnedMutexGuard<()> {
+        let gate = self
+            .remote_goal_apply
+            .gate_for(&action_reference.to_string())
+            .await;
+        #[cfg(test)]
+        if let Some(arrival) = self
+            .remote_goal_apply_arrivals
+            .lock()
+            .await
+            .remove(&action_reference)
+        {
+            arrival.notify_one();
+        }
+        gate.lock_owned().await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn observe_next_remote_goal_apply_gate_arrival(
+        &self,
+        action_reference: uuid::Uuid,
+    ) -> Arc<Notify> {
+        let arrival = Arc::new(Notify::new());
+        self.remote_goal_apply_arrivals
+            .lock()
+            .await
+            .insert(action_reference, arrival.clone());
+        arrival
     }
 
     pub(crate) async fn lock_message_acceptance(
@@ -7785,7 +8016,8 @@ impl RuntimeManager {
             .await
             .unwrap_or(0);
         let candidate = SseBroadcaster::new(SSE_BROADCAST_CAPACITY, initial_last_seq)
-            .with_fatal_local_authority_fence(Arc::clone(&self.fatal_local_authority_fence));
+            .with_fatal_local_authority_fence(Arc::clone(&self.fatal_local_authority_fence))
+            .with_scanner_kick(self.coordinator_scanner.notifier());
         if self.fatal_local_authority_fence.is_closed() {
             candidate.close_publication();
         }
@@ -7812,14 +8044,59 @@ impl RuntimeManager {
         &self,
         conversation_id: &str,
     ) -> Option<SseBroadcaster> {
-        if let Some(handle) = self.try_get_handle(conversation_id).await {
-            return Some(handle.broadcast_tx);
+        let runtimes = self.runtimes.read().await;
+        if let Some(handle) = runtimes.get(conversation_id) {
+            return Some(handle.broadcast_tx.clone());
         }
         self.evicted_broadcasters
             .read()
             .await
             .get(conversation_id)
             .cloned()
+    }
+
+    pub(crate) async fn publish_continuation_link(&self, predecessor_id: &str, successor_id: &str) {
+        let Ok(mut admitted) = self.acquire_local_authority_pass() else {
+            tracing::debug!(
+                predecessor_id,
+                successor_id,
+                "continuation link live publication skipped after authority closed"
+            );
+            return;
+        };
+        let Some(broadcaster) = self.existing_conversation_broadcaster(predecessor_id).await else {
+            return;
+        };
+        if broadcaster
+            .admitted_publication(&mut admitted)
+            .event(|sequence_id| SseEvent::ConversationUpdate {
+                sequence_id,
+                update: ConversationMetadataUpdate {
+                    slug: None,
+                    title: None,
+                    cwd: None,
+                    project_id: None,
+                    project_name: None,
+                    updated_at: None,
+                    branch_name: None,
+                    worktree_path: None,
+                    conv_mode_label: None,
+                    base_branch: None,
+                    task_title: None,
+                    work_scope_key: None,
+                    model: None,
+                    archived: None,
+                    continued_in_conv_id: Some(successor_id.to_string()),
+                },
+            })
+            .is_err()
+        {
+            tracing::debug!(
+                predecessor_id,
+                successor_id,
+                "continuation link live publication was rejected"
+            );
+        }
     }
 
     /// Remove and return the evicted broadcaster for `conversation_id`, if any.
@@ -9551,7 +9828,7 @@ mod scope_liveness_tests {
         )
     }
 
-    async fn test_manager() -> RuntimeManager {
+    pub(super) async fn test_manager() -> RuntimeManager {
         let db = crate::db::Database::open_in_memory().await.expect("db");
         RuntimeManager::new(
             db,
@@ -9562,6 +9839,16 @@ mod scope_liveness_tests {
             Arc::new(McpClientManager::new()),
             None,
         )
+    }
+
+    #[tokio::test]
+    async fn live_materialized_handle_count_is_unavailable_under_contention() {
+        let manager = test_manager().await;
+        assert_eq!(manager.live_materialized_handle_count(), Some(0));
+        let lock = manager.runtimes.write().await;
+        assert_eq!(manager.live_materialized_handle_count(), None);
+        drop(lock);
+        assert_eq!(manager.live_materialized_handle_count(), Some(0));
     }
 
     #[tokio::test]
@@ -10821,14 +11108,20 @@ mod scope_liveness_tests {
             agent_name: None,
             persona: None,
         };
-        let admit = || {
-            manager.admit_sub_agent_batch(
-                "trusted-batch",
-                std::slice::from_ref(&spec),
-                &parent.id,
-                parent.attached_work_scope_id.clone(),
-                true,
-            )
+        let admit = async || {
+            let mut lifecycle = native_spawn::NativeSpawnLifecycleOwner::new(
+                NativeSpawnControl::test_for_batch(&parent.id, "trusted-batch"),
+            );
+            manager
+                .admit_sub_agent_batch(
+                    "trusted-batch",
+                    std::slice::from_ref(&spec),
+                    &parent.id,
+                    parent.attached_work_scope_id.clone(),
+                    true,
+                    &mut lifecycle,
+                )
+                .await
         };
         assert!(admit().await.unwrap_err().contains("Work authority"));
         assert!(manager.db().get_conversation(&spec.agent_id).await.is_err());
@@ -10913,7 +11206,7 @@ mod scope_liveness_tests {
             async move {
                 manager
                     .handle_spawn_request(SubAgentSpawnRequest {
-                        batch_id: "atomic-subagent-batch".to_string(),
+                        invocation: phoenix_db::SubAgentSpawnInvocation { batch_id: "atomic-subagent-batch".into(), parent_conversation_id: parent.id.clone(), assistant_message_id: "assistant".into(), tool_use_id: "spawn".into() },
                         specs: vec![SubAgentSpec {
                             agent_id: agent_id.to_string(),
                             task: "persist all child semantics".to_string(),
@@ -10927,18 +11220,18 @@ mod scope_liveness_tests {
                             agent_name: Some("atomic-test".to_string()),
                             persona: Some("test persona".to_string()),
                         }],
-                        parent_conversation_id: parent.id,
                         parent_scope: None,
                         parallel_work_qualified: false,
                         parent_turn_link: opentelemetry::trace::SpanContext::NONE,
                         response_tx,
                         activation_rx,
+                        control: NativeSpawnControl::test_for_batch(&parent.id, "atomic-subagent-batch"),
                     })
                     .await;
             }
         });
         assert!(matches!(
-            response_rx.await.expect("admission response"),
+            response_rx.await.expect("admission response").outcome,
             SubAgentAdmissionResponse::Admitted
         ));
         assert!(
@@ -11010,13 +11303,21 @@ mod scope_liveness_tests {
         let (response_tx, response_rx) = oneshot::channel();
         manager
             .handle_spawn_request(SubAgentSpawnRequest {
-                batch_id: "cancel-during-materialization-batch".to_string(),
+                invocation: phoenix_db::SubAgentSpawnInvocation {
+                    batch_id: "cancel-during-materialization-batch".into(),
+                    parent_conversation_id: parent.id.clone(),
+                    assistant_message_id: "assistant".into(),
+                    tool_use_id: "spawn".into(),
+                },
                 specs: vec![spec.clone()],
-                parent_conversation_id: parent.id.clone(),
                 parent_scope: None,
                 parallel_work_qualified: false,
                 parent_turn_link: opentelemetry::trace::SpanContext::NONE,
                 response_tx,
+                control: NativeSpawnControl::test_for_batch(
+                    &parent.id,
+                    "cancel-during-materialization-batch",
+                ),
                 activation_rx: {
                     let (tx, rx) = oneshot::channel();
                     let _ = tx.send(());
@@ -11025,7 +11326,7 @@ mod scope_liveness_tests {
             })
             .await;
         assert!(matches!(
-            response_rx.await.expect("admission response"),
+            response_rx.await.expect("admission response").outcome,
             SubAgentAdmissionResponse::Admitted
         ));
 
@@ -11171,6 +11472,9 @@ mod scope_liveness_tests {
                 &parent.id,
                 parent.attached_work_scope_id.clone(),
                 false,
+                &mut native_spawn::NativeSpawnLifecycleOwner::new(
+                    NativeSpawnControl::test_for_batch(&parent.id, "cancellation-boundary-batch"),
+                ),
             )
             .await
             .unwrap();
@@ -11509,6 +11813,9 @@ mod scope_liveness_tests {
                 "ordinary-parent",
                 owner.work_scope_id().cloned(),
                 false,
+                &mut native_spawn::NativeSpawnLifecycleOwner::new(
+                    NativeSpawnControl::test_for_batch("ordinary-parent", "ordinary-cancel-batch"),
+                ),
             )
             .await
             .unwrap();
@@ -11672,6 +11979,9 @@ mod scope_liveness_tests {
                     &parent.id,
                     parent.attached_work_scope_id.clone(),
                     false,
+                    &mut native_spawn::NativeSpawnLifecycleOwner::new(
+                        NativeSpawnControl::test_for_batch(&parent.id, "durable-controller-batch"),
+                    ),
                 )
                 .await
                 .unwrap();
@@ -11694,6 +12004,9 @@ mod scope_liveness_tests {
                 completed_results: vec![],
                 spawn_tool_id: None,
                 cause: phoenix_core::domain::sm_event::CancelCause::UserRequested,
+
+                forced_tool_retirement:
+                    phoenix_core::domain::sm_state::ForcedToolRetirement::NotObserved,
             };
             manager
                 .db()
@@ -14614,6 +14927,14 @@ mod scope_liveness_tests {
         let mut receiver = first.subscribe();
         let second = mgr.conversation_broadcaster("invalid-cwd-shell").await;
 
+        mgr.publish_continuation_link("invalid-cwd-shell", "successor")
+            .await;
+        assert!(matches!(
+            receiver.try_recv().unwrap(),
+            SseEvent::ConversationUpdate { update, .. }
+                if update.continued_in_conv_id.as_deref() == Some("successor")
+        ));
+
         let idle = ConvState::Idle;
         second
             .send_seq(|seq| SseEvent::StateChange {
@@ -14630,6 +14951,23 @@ mod scope_liveness_tests {
                 ..
             }
         ));
+    }
+
+    #[tokio::test]
+    async fn existing_broadcaster_lookup_holds_materialization_fence() {
+        let mgr = test_manager().await;
+        let first = mgr.conversation_broadcaster("lookup-fence").await;
+        let reservations = mgr.evicted_broadcasters.write().await;
+        let lookup = mgr.existing_conversation_broadcaster("lookup-fence");
+        tokio::pin!(lookup);
+        tokio::select! {
+            biased;
+            _ = &mut lookup => panic!("lookup must wait for reservations"),
+            () = std::future::ready(()) => {}
+        }
+        assert!(mgr.runtimes.try_write().is_err());
+        drop(reservations);
+        assert!(first.same_channel(&lookup.await.unwrap()));
     }
 
     #[tokio::test]
@@ -14801,6 +15139,52 @@ mod scope_liveness_tests {
             .expect("materialization joins")
             .expect("materialization succeeds");
         assert!(first.same_channel(&handle.broadcast_tx));
+    }
+
+    #[tokio::test]
+    async fn coordinator_language_refuses_in_flight_materialization() {
+        use phoenix_core::llm_language::LlmLanguage;
+        let mgr = Arc::new(test_manager().await);
+        let home = tempfile::tempdir().unwrap();
+        mgr.db()
+            .initialize_coordinator_work_scope(home.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let coordinator = mgr
+            .db()
+            .get_or_create_coordinator(None, LlmLanguage::Caveman)
+            .await
+            .unwrap();
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        mgr.runtime_materialization_barriers
+            .lock()
+            .await
+            .insert(coordinator.id.clone(), Arc::clone(&barrier));
+        let materialization = {
+            let mgr = Arc::clone(&mgr);
+            let id = coordinator.id.clone();
+            tokio::spawn(async move { mgr.get_or_create(&id).await })
+        };
+        barrier.wait().await;
+        assert!(!mgr
+            .change_idle_coordinator_language(&coordinator.id, LlmLanguage::Adhd)
+            .await
+            .unwrap());
+        assert_eq!(
+            mgr.db()
+                .get_conversation(&coordinator.id)
+                .await
+                .unwrap()
+                .llm_language,
+            LlmLanguage::Caveman
+        );
+        barrier.wait().await;
+        materialization.await.unwrap().unwrap();
+        assert!(mgr
+            .change_idle_coordinator_language(&coordinator.id, LlmLanguage::Adhd)
+            .await
+            .unwrap());
+        assert!(mgr.try_get_handle(&coordinator.id).await.is_none());
     }
 
     #[tokio::test]
@@ -16246,6 +16630,76 @@ mod scope_liveness_tests {
     }
 
     #[tokio::test]
+    async fn coordinator_question_reply_reaches_the_coordinator_once() {
+        let llm = Arc::new(RecordingLlm {
+            requests: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let manager = Arc::new(test_manager_with_recording_llm(llm.clone()).await);
+        let global = manager
+            .db()
+            .get_or_create_coordinator(
+                Some("claude-sonnet-5"),
+                phoenix_core::llm_language::LlmLanguage::default(),
+            )
+            .await
+            .unwrap();
+        let request_id = "6f1f8c2e-2b1d-4a57-9d8e-3f5f2a7c9b10";
+        let questions = vec![phoenix_core::domain::sm_state::UserQuestion {
+            question: "Merge now?".into(),
+            header: "Merge".into(),
+            options: Vec::new(),
+            multi_select: false,
+        }];
+        manager
+            .db()
+            .post_coordinator_question(request_id, &global.id, &questions, 10)
+            .await
+            .unwrap();
+        let reply = crate::coordinator_question_delivery::answer_reply(
+            request_id,
+            &questions,
+            &std::collections::HashMap::from([("Merge now?".to_string(), "Yes".to_string())]),
+            None,
+        );
+        manager
+            .db()
+            .settle_coordinator_question(
+                request_id,
+                phoenix_db::CoordinatorQuestionClose::Answered { reply: &reply },
+                20,
+            )
+            .await
+            .unwrap();
+
+        crate::coordinator_delivery::deliver_pass(&manager).await;
+        crate::coordinator_delivery::deliver_pass(&manager).await;
+
+        // Accepted input is a durable turn keyed by the client message id.
+        let delivered: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM durable_turns WHERE conversation_id = ?1 AND client_turn_key = ?2
+               AND origin_kind = 'coordinator_question_reply'",
+        )
+        .bind(&global.id)
+        .bind(phoenix_core::domain::db_schema::coordinator_question_reply_message_id(request_id))
+        .fetch_one(manager.db().pool())
+        .await
+        .unwrap();
+        assert_eq!(delivered, 1);
+        assert!(manager
+            .db()
+            .undelivered_coordinator_question_replies(16)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(manager
+            .db()
+            .open_coordinator_questions()
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
     async fn watch_wait_input_is_claimed_executed_and_settled_once() {
         let llm = Arc::new(RecordingLlm {
             requests: std::sync::atomic::AtomicUsize::new(0),
@@ -16294,7 +16748,7 @@ mod scope_liveness_tests {
             .await
             .unwrap()
             .remove(0);
-        crate::coordinator_watch_delivery::deliver_pass(&manager).await;
+        crate::coordinator_delivery::deliver_pass(&manager).await;
         let handle = manager.get_or_create(&global.id).await.unwrap();
         let mut states = handle.state_rx.clone();
         manager.dispatch_standalone_turn(&global.id).await.unwrap();
@@ -16319,7 +16773,7 @@ mod scope_liveness_tests {
                 .state,
             waiting
         );
-        crate::coordinator_watch_delivery::deliver_pass(&manager).await;
+        crate::coordinator_delivery::deliver_pass(&manager).await;
         manager.dispatch_standalone_turn(&global.id).await.unwrap();
         assert_eq!(llm.requests.load(std::sync::atomic::Ordering::SeqCst), 1);
         let terminal: String = sqlx::query_scalar(

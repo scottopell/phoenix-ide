@@ -1,0 +1,9 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 2cff0f7f1f8048005ae133670735754a5751cdbc35d4621411d20def088f3d08 # shrinks to script = [(Data(""), false, Lf), (Data(""), false, Lf), (Blank, false, Lf)]
+cc 16eb3239a9c49fe0a4d059b5fd6301e27b6d97369a77b667dc682f49e62a707b # shrinks to script = [(Data(""), false, Lf), (Data(""), false, Lf), (Blank, false, Lf)]
+cc 9c5b8ecd1fdbd4674fb2f757e8bdc0b6a691c7bbe6b10101778850921056b6d3 # shrinks to script = [(Event("_"), false, Lf), (Blank, false, Lf), (Data("}"), false, Lf), (Blank, false, Lf)], cuts = []

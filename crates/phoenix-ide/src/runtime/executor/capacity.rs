@@ -294,7 +294,7 @@ mod tests {
             system: vec![phoenix_llm::SystemContent::cached("instructions")],
             messages: vec![],
             provider_replay: None,
-            responses_replay: vec![],
+            output_replay: vec![],
             tool_availability: phoenix_core::domain::tool_availability::ToolAvailability::all(
                 vec![],
             ),
@@ -695,7 +695,7 @@ impl PrefixTracker {
                 .iter()
                 .all(|m| m.source_message_id.is_some())
                 && request.provider_replay.is_none()
-                && request.responses_replay.is_empty(),
+                && request.output_replay.is_empty(),
             messages: request
                 .messages
                 .iter()

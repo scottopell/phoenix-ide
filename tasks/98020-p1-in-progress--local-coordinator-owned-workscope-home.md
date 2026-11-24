@@ -24,7 +24,7 @@ Global currently borrows ordinary worker scopes to stage evidence and has improv
 
 ## First approved step: recover exact inputs before interface decisions
 
-1. Read roadmap #806 when access permits and relevant normative specs, compatibility requirements, ADRs, cleanup and resource authority contracts.
+1. Read current user instructions, task/PR ownership and relevant normative specs, compatibility requirements, ADRs, cleanup and resource authority contracts. Roadmap #806 is historical, not a required preflight.
 2. Recover original federation requirement/design from task history, retained project transcript/artifacts and source provenance; quote and pin exact source identities in the delivery evidence. Preserve the original remaining scope without guessing tool names or subscriptions.
 3. Send a targeted request to project `7c2d9446-46a1-42b4-bbad-c8ddfbfddf7f` through the supported authenticated coordination channel for original design and retained private home/WorkScope work, including commit/patch paths and interface assumptions. Record acceptance/result or exact failure. Read/reuse only relevant authorized artifacts; do not overwrite the dirty checkout or duplicate existing implementation.
 4. Do not wait on federation pairing or the exhausted remote owner. Use recovered evidence and implement the local commission independently; if exact inputs remain unavailable, keep that specific blocker visible, seek Global's resolution, and do not present guessed interfaces as recovered contract.

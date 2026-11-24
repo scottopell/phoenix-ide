@@ -1,0 +1,136 @@
+# Ember phase 7: cheap transcript-scanning safety net
+
+Parent: [06013](./06013-p1-done--ember-consistency-and-durable-tracking.md). Depends on the relevant terminology/baseline from [phase 1](./06014-p1-done--ember-tool-contract-and-consistency-base.md), [phase 5](./06016-p1-done--ember-durable-tracking-store-and-tools.md) and [phase 6](./06017-p1-done--ember-tracking-continuity-and-inspection.md). This task owns frontier/invalidation/application/model-budget contracts before scanner activation; those decisions do not gate event or direct-tracking delivery. User authorizes automatic capture; Ember bears stale/duplicate retirement.
+
+## Outcome
+
+A bounded auxiliary scanner recovers omitted things from persisted Ember history, automatically adds records/evidence, and exposes honest coverage without scheduling work or reversing Ember decisions.
+
+Activation follows the demonstrated phase 5→6 manual memory journey, not just an available database schema. Offline source-label/corpus and budget preparation may proceed in parallel with that lane; it does not commission a separate checker service. The same memory owner can then implement this safety net against the proven application service. Context/retrieval burden and useful recovery remain acceptance metrics alongside capture/cost.
+
+## Source and model contract
+
+User-selected discovery scope: ONLY the ONE Ember continuation chain. Focus on user-requested work and meaningful unfinished conversational threads, using persisted user/assistant prose with exact typed origin. Assistant responses supply context/stopping points; agent promises are not the primary capture target. Exclude raw tool dumps, worker and inline-child transcripts from scanner discovery. Ember may separately inspect linked workers through existing tools; that does not enroll them in scanning. See Issue #1075: preserve a curiosity as a bookmark without creating a work commitment. User selected the whole Ember history gradually in bounded batches, prioritizing new messages. No initial date cutoff or age-based item expiry. Saved items are reviewed during normal turns and existing watch/reminder wakeups, without new periodic review wakeups. Use a frozen activation high-water boundary with separate bounded live/backfill frontiers so new tail progress never falsely covers an older gap. New continuation members start their live frontier at the beginning. Resolve exact fragment/frontier encoding, generation invalidation and fair lane selection in this slice before activation. Historical suggestions/roadmap quotes never become fresh commissions. Temporary stale historical captures are permitted when a later correction is outside the scanned chunk, but historical provenance and unverified freshness must remain visible. Ember checks later/current evidence before acting and retires stale items. Test an old request and much later cancellation outside the inference window.
+
+Use generation-fenced snapshots and a durable covered position. Append does not change transcript_generation, so generation alone misses new messages; sequence alone misses edits/recovery. Oversized messages need a source-digest/generation-bound fragment cursor or explicit unprocessed status, never silently consume a prefix as the whole message.
+
+Preserve origin, quotation and structured-answer boundaries in scanner inputs. The measured recent window had 7,985 event-origin rows versus 674 user_api rows; the latter also include quotes, review templates, button messages and answers. Neither the user role nor user_api origin alone establishes a new commission. Enriched completion excerpts are worker evidence: they may reconcile an existing record, but cannot establish a fresh human request. Explicit user pauses/corrections remain restrictions until lifted; do not convert errors, event prose or agent suggestions into requested work.
+
+Use tool-free LlmService completion, an explicit eligible cheap route and hard input/output/time/retry/backfill limits. Current get_cheap_model_with_id falls back to default; do not adopt that silent expensive behavior. No eligible route means visible pending/degraded scans, not foreground model substitution or blocked normal Ember work.
+
+## Generation changes after completed coverage
+
+Before activation, specify and implement a durable invalidation transition for committed coverage. Discover enrolled transcript-generation changes even when no message is appended. Startup discovery and bounded revisits by the existing background runner recover missed mutation kicks; no new foreground Ember wakeup or second scheduler is needed.
+
+Use the conservative initial policy: a changed transcript generation makes that transcript's prior coverage stale and resets its scan positions to the beginning in the new generation, with an explicit pending/unprocessed domain and newly captured live boundary. Preserve already committed item/evidence records and retirement decisions; coverage reset is not deletion or reenrollment of all transcripts. Do not copy an old frontier into a new generation or leave the old generation conflicting forever. Process the reset transcript incrementally under existing live/backfill fairness and resource limits.
+
+Distinguish an exact batch retry from a new source-content revision. Durable application identity binds generation and exact source range/fragment; retained evidence identity also binds message/span and canonical quoted-content digest for its identified item. A bounded rescan does not append the same exact evidence to that item again or generate a spurious review-needed transition. Changed content remains a new source observation, preserves prior evidence and triggers reconciliation when attached to an item. This is exact evidence deduplication, not a promise of semantic matching or a global one-item-per-message restriction. Never treat a generation number alone as evidence that text changed or as item identity.
+
+## Processing
+
+- One supervised low-priority in-process runner; durable cursor plus startup discovery; coalesced post-commit kicks reduce latency but are not the authority.
+- Never await inference inside direct_turn_worker::discover_inputs or before durable user/assistant admission completes.
+- Read bounded source and registry revision; include active and relevant retired records.
+- Closed result supports existing match/new candidate/no candidate with exact validated source quotes and explicit completion. Reject fabricated evidence, tool calls, malformed/truncated output and oversized incomplete coverage.
+- Atomically apply capture/evidence plus cursor only if source generation, cursor and registry revision still match. Conflict commits neither writes nor coverage. Respect existing unclassified SQLite commit authority failure.
+- Scanner can auto-add or append evidence. New captures are unreviewed; a new evidence append atomically advances phase 5's evidence watermark and invalidates the prior reviewed next step. Scanner cannot advance the reviewed watermark, overwrite Ember prose, grant authority, resolve/dismiss, or reopen a retired thing. Phase 6's compact index/overflow must expose review-needed before the old note can be used.
+- Bound contention retries within the existing retry/time budgets. Re-read source/cursor/registry state after conflicts and keep pending work discoverable; once contention stops, the existing runner must make progress without another user message. No finer-grained concurrency system is required.
+- Safe repetition of inference is allowed; do not promise exactly-once calls/billing or perfect semantic dedup. Existing cursor prevents exact application replay; changed wording may still produce duplicates Ember dismisses.
+
+## Starting points
+
+Database singleton/topology helpers; prompt_projection.rs generation/sequence types; load_hydrated_prompt_snapshot/tail; get_bounded_read_messages_after_limited; title_generator.rs auxiliary call; ModelRegistry execution-route validation; RuntimeExecutor authoritative persistence hooks; reminder_delivery background lifecycle pattern.
+
+## Acceptance and gates
+
+Deterministic fake-service tests cover new tail arriving during incomplete same-transcript backfill, two continuations, partial/oversized source, edited old message, concurrent manual create/dismissal, replay/interrupted apply, empty complete output, failed/truncated output, restart, model unavailable and retry limits. Two commitments in one message remain representable. Replayed committed ranges cannot repeat application and the scanner cannot reopen an existing retired record. Define host-owned batch/application identity; do not rely on model-generated extraction keys. Different source spans/wording can still yield a new duplicate; semantic duplicate and retired-meaning rediscovery rates are measured rather than asserted zero.
+
+Before enabling auto-add, run a small isolated real-model corpus with pinned route/prompt hashes, source-validity/recall/false-positive/duplicate/retirement metrics, latency and actual usage. Include explicit user requests, an unanswered user question, topic detour and return, an exploratory idea preserved as a bookmark, a worker promise quoted in Ember history, later correction/completion, dismissed duplicates and PR-complete-but-follow-up-owed. Measure requested-work recall separately from bookmark usefulness; an agent promise must not become a fabricated user request. Shadow evaluation is qualification only; product behavior after activation remains automatic capture. Define accepted quality/cost bounds before claiming success.
+
+Use independently reviewed expected captures and restrictions as the reference corpus. The scanner model's own assessment of its recall or usefulness is not sufficient evidence.
+
+Add event-heavy cases with bounded worker excerpts, quoted corrections, structured answers, explicit pauses, intentional abandonment and a completed milestone with a still-owed user outcome. Pauses must remain attached to the saved resumption condition through scanning and continuation.
+
+Required post-coverage edit case: fully cover through sequence 100 at generation G, edit message 5 to create G+1, append nothing, miss the kick and restart. Discovery must durably invalidate/reset that transcript, expose incomplete coverage and finish bounded rescanning. Unchanged source evidence is not appended twice; changed content is not suppressed as an old exact application. Include continued contention followed by quiescence and prove eventual bounded-attempt progress.
+
+Required missed-pause case: an existing actionable note receives previously missed user-pause evidence, then Ember continues. Index/detail/overflow report reconciliation required, trusted source reconciliation retains the pause, and scanning cannot clear it. No new wakeup or permission is manufactured.
+
+Out of scope: worker/remote corpus discovery, scanner retirement/reopening, foreground inference, expensive default-route fallback, scheduling saved work and perfect semantic deduplication.
+
+
+## Current delivery evidence
+
+Scanner candidate PR #1098 includes migration 166 on merged manual/event migrations
+164/165. At `89ff24d7b`, twenty DB tests passed, including no-append old-source
+restart/reset, actual externally changed prose, exact deduplication, retained
+retirement, live gaps and bounded contention recovery. Eighteen runner/kick tests,
+one actual authoritative-input/two-continuation/pause composition and the actual
+37-case host fixture preparation passed. These prove lifecycle/resource boundaries,
+not semantic model quality.
+
+The [first](../scripts/qa/coordinator-scanner-quality/results-ec570d0f3.md) and
+[paired prompt correction](../scripts/qa/coordinator-scanner-quality/results-db6f2b44f.md)
+37-case Luna/Low runs are independently rejected. The paired run recovered all
+eleven requested outcomes, five bookmarks and thirteen restrictions, with 33 valid
+quotes, but recreated two retired requests. No structural reopen occurred; the
+semantic renewals still fail the unchanged gates. Original sources, oracles,
+raw outputs and failed results remain retained.
+
+The typed host chronology projection passed twenty-two DB tests, owning
+all-target Clippy, actual 37-case host fixtures and fresh source reviews before
+the accepted model trial. The later host-only follow-up expanded that suite to
+twenty-five passing tests, as recorded below. The
+[third frozen trial](../scripts/qa/coordinator-scanner-quality/results-e978b7686.md)
+at `e978b7686` was independently accepted after all 37 exact payloads were
+reviewed: 11/11 requested units, 4/5 bookmarks, 13/13 restrictions, 29/29 valid
+quotes, zero false commissions/21, all seventeen negatives correct, zero visible
+duplicates/11 and no authority/reopen violations. Unknown cases passed; H01 stays
+historical and I01's genuine invisible duplicate remains separately measured.
+B04's bookmark miss is within the unchanged threshold; perfect recall is not
+claimed. Both prior reports remain rejected.
+
+Implementation and qualification are complete. Delivery PR #1098 is the authority
+for exact review, CI and main integration. No production deployment or completed
+production backfill is claimed.
+
+
+Final topology qualification passed all twenty-five DB tests at `6c11894f7`,
+then owning DB/IDE all-target Clippy and all 37 host fixtures at the subsequent
+binding-name-only head `74881f401`. Discovery advances from
+the eight-member page before appending the priority head, preventing skipped
+middle members. Scalar head-lineage/member/coverage queries avoid runtime/handoff
+aggregate decoding; recursive traversal/count cost still scales with lineage.
+Regressions use fourteen transcripts/thirteen actual continuations, middle-member
+generation revisit after restart, 1 MiB irrelevant malformed metadata with a real
+typed handoff seeded before corruption, and an explicit test-only edge-guard drop
+to verify detached-source CAS refusal. The [offline follow-up](../scripts/qa/coordinator-scanner-quality/results-e978b7686.md#host-only-topology-follow-up)
+made zero model calls and reproduced all 37 accepted inputs, prepared records,
+prior states and bindings exactly. The accepted paid run remains `e978b7686`.
+
+
+The later resource/fairness repair at `1824f48d3` passed all thirty DB tests,
+owning DB/IDE Clippy, scoped Allium and all 37 host fixtures. A single non-Clone
+32-row allowance limits fetched source rows for the whole preparation across
+members and lanes, charging before errors/backoff and checking known spending
+before prose. Exhausted blocked Wait, including absent route, persists preference
+for the opposite of the last consumed lane; committed non-prose Progress updates
+the ordinary preference without an inference charge or clearing blockers. Ready
+continues through existing reserve behavior. Restart in both directions,
+continuous non-prose backlog and real hourly-cap cases passed. [Offline receipts](../scripts/qa/coordinator-scanner-quality/results-e978b7686.md#later-host-resource-and-fairness-follow-up)
+show zero provider calls, all 111 files byte-identical to the accepted preparation
+and unchanged 37 input hashes/bindings. Earlier e978 model and 7488 topology
+qualification remain separate unchanged evidence.
+
+
+The later SQLite engine-size correction passed all thirty-one DB tests at
+`a5680344a`; its equivalent test-lint-only successor `ba39ee48d` passed owning
+Clippy and all 37 host fixtures. Nested type CASE reads no excluded payload/size,
+and direct-column `octet_length` gates eligible user/agent content before returning
+at most 1 MiB. Formal UTF-8 file-DB controls use stored 32 MiB tool/user values
+and a dedicated 2 MiB per-value connection limit: direct/old-CAST queries fail,
+actual preparation advances only excluded tools or leaves oversized user source
+unprocessed, and small Unicode remains exact. Restoration/closure are checked.
+The [engine follow-up](../scripts/qa/coordinator-scanner-quality/results-e978b7686.md#later-sqlite-engine-size-follow-up)
+records zero-call preparation/all 111 accepted artifacts and 37 hashes/bindings
+unchanged. Earlier evidence stays separate; no process-RSS/constant-CPU bound or
+new UTF-16 conversion contract is claimed.

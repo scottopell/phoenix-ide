@@ -89,6 +89,61 @@ struct Conversation: Codable, Identifiable, Equatable, Hashable, Sendable {
 
 struct ProductConversationListResponse: Codable, Equatable, Sendable {
     var product_conversations: [ProductConversationListRow]
+    var coordinator: CoordinatorListEntry?
+}
+
+struct CoordinatorListEntry: Codable, Equatable, Sendable {
+    var product_conversation_id: String
+    var read_state: ProductConversationReadState
+}
+
+enum ProductConversationUnreadReason: String, Codable, Equatable, Sendable {
+    case marked
+    case newActivity = "new_activity"
+}
+
+/// Server-authoritative read state of a ProductConversation (REQ-CONV-027).
+enum ProductConversationReadState: Codable, Equatable, Sendable {
+    case read
+    case unread(ProductConversationUnreadReason)
+
+    private enum CodingKeys: String, CodingKey { case state, reason }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        switch try container.decode(String.self, forKey: .state) {
+        case "read":
+            self = .read
+        case "unread":
+            self = .unread(try container.decode(ProductConversationUnreadReason.self, forKey: .reason))
+        case let other:
+            throw DecodingError.dataCorruptedError(
+                forKey: .state, in: container, debugDescription: "unknown read state \(other)")
+        }
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        switch self {
+        case .read:
+            try container.encode("read", forKey: .state)
+        case .unread(let reason):
+            try container.encode("unread", forKey: .state)
+            try container.encode(reason, forKey: .reason)
+        }
+    }
+
+    var unreadReason: ProductConversationUnreadReason? {
+        if case .unread(let reason) = self { return reason }
+        return nil
+    }
+}
+
+/// Why the client advances the read cursor. Only `acknowledged` clears an
+/// explicit unread mark; `observed` never undoes a mark set elsewhere.
+enum ProductConversationReadAdvance: String, Sendable {
+    case acknowledged
+    case observed
 }
 
 struct ProductConversationListRow: Codable, Equatable, Sendable {
@@ -99,6 +154,30 @@ struct ProductConversationListRow: Codable, Equatable, Sendable {
     var latest_transcript_row_id: String
     var updated_at: String
     var presentation: ProductConversationPresentation
+    var read_state: ProductConversationReadState
+    var cached_pr: ProductConversationPr?
+}
+
+/// Cached pull request for a ProductConversation's work scope
+/// (wire type ui/src/generated/ProductConversationPrView.ts).
+struct ProductConversationPr: Codable, Equatable, Sendable {
+    enum DisplayState: String, Codable, Equatable, Sendable {
+        case open, draft, merged, closed
+    }
+
+    enum FeedbackStatus: String, Codable, Equatable, Sendable {
+        case open
+        case inProgress = "in_progress"
+        case approved
+    }
+
+    var number: UInt32
+    var title: String
+    var url: String
+    var display_state: DisplayState
+    var base: String
+    var head: String
+    var feedback_status: FeedbackStatus
 }
 
 struct ProductConversationSnapshot: Codable, Equatable, Sendable {
@@ -462,6 +541,7 @@ enum InputOrigin: Codable, Equatable, Sendable {
     case slackGateway(requestId: String)
     case subscriptionEvent(eventId: String)
     case scheduledReminder(reminderId: String)
+    case coordinatorQuestionReply
 
     private enum CodingKeys: String, CodingKey {
         case kind, product_conversation_id, transcript_id, event_id, source_call, request_id, reminder_id
@@ -484,6 +564,7 @@ enum InputOrigin: Codable, Equatable, Sendable {
             self = .subscriptionEvent(eventId: try container.decode(String.self, forKey: .event_id))
         case "scheduled_reminder":
             self = .scheduledReminder(reminderId: try container.decode(String.self, forKey: .reminder_id))
+        case "coordinator_question_reply": self = .coordinatorQuestionReply
         default:
             throw DecodingError.dataCorruptedError(
                 forKey: .kind, in: container, debugDescription: "Unrecognized input origin")
@@ -510,6 +591,7 @@ enum InputOrigin: Codable, Equatable, Sendable {
         case let .scheduledReminder(reminderId):
             try container.encode("scheduled_reminder", forKey: .kind)
             try container.encode(reminderId, forKey: .reminder_id)
+        case .coordinatorQuestionReply: try container.encode("coordinator_question_reply", forKey: .kind)
         }
     }
 
@@ -556,6 +638,7 @@ enum InputOrigin: Codable, Equatable, Sendable {
         case .slackGateway: "Slack request"
         case .subscriptionEvent: "Conversation event"
         case .scheduledReminder: "Scheduled reminder"
+        case .coordinatorQuestionReply: "Question reply"
         }
     }
 }

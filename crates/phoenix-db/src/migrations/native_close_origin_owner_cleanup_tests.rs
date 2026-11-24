@@ -6,8 +6,8 @@ async fn predecessor() -> SqlitePool {
         .connect("sqlite::memory:")
         .await
         .unwrap();
-    setup_real_175_for_test(&pool).await;
-    run_through_for_test(&pool, 186).await.unwrap();
+    setup_real_178_for_test(&pool).await;
+    run_through_for_test(&pool, 189).await.unwrap();
     pool
 }
 
@@ -25,10 +25,10 @@ async fn snapshot(pool: &SqlitePool) -> (Vec<(String, String)>, Vec<(i64, String
 }
 
 #[tokio::test]
-async fn real186_to187_changes_only_owner_cleanup_and_is_idempotent() {
+async fn real189_to190_changes_only_owner_cleanup_and_is_idempotent() {
     let pool = predecessor().await;
     let before = snapshot(&pool).await;
-    assert_eq!(run_through_for_test(&pool, 187).await.unwrap(), 1);
+    assert_eq!(run_through_for_test(&pool, 190).await.unwrap(), 1);
     let after = snapshot(&pool).await;
     let guards = [
         "native_close_completion_retry_admissions_no_delete",
@@ -67,9 +67,9 @@ async fn real186_to187_changes_only_owner_cleanup_and_is_idempotent() {
     assert_eq!(&after.1[..before.1.len()], before.1.as_slice());
     assert_eq!(
         after.1.last(),
-        Some(&(187, "native_close_origin_owner_cleanup".into()))
+        Some(&(190, "native_close_origin_owner_cleanup".into()))
     );
-    assert_eq!(run_through_for_test(&pool, 187).await.unwrap(), 0);
+    assert_eq!(run_through_for_test(&pool, 190).await.unwrap(), 0);
     assert_eq!(snapshot(&pool).await, after);
     assert!(sqlx::query("PRAGMA foreign_key_check")
         .fetch_all(&pool)
@@ -79,13 +79,13 @@ async fn real186_to187_changes_only_owner_cleanup_and_is_idempotent() {
 }
 
 #[tokio::test]
-async fn missing_predecessor_guard_rolls_back187() {
+async fn missing_predecessor_guard_rolls_back190() {
     let pool = predecessor().await;
     sqlx::raw_sql("DROP TRIGGER native_close_completion_retry_origins_no_delete;")
         .execute(&pool)
         .await
         .unwrap();
     let before = snapshot(&pool).await;
-    assert!(run_through_for_test(&pool, 187).await.is_err());
+    assert!(run_through_for_test(&pool, 190).await.is_err());
     assert_eq!(snapshot(&pool).await, before);
 }

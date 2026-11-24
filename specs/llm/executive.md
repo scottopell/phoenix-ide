@@ -1,8 +1,207 @@
 # LLM Provider - Executive Summary
 
+## Model catalog verification (2026-11-20)
+
+Built-ins include GPT-6.2 Astra, GPT-6.2 Sol, GPT-6.1 Terra, Claude Fable 5.2,
+and Claude Haiku 5.5. Opus 5.5, Sonnet 5.5, and GPT-6 Luna were already present.
+The product default is GPT-6.2 Sol. OpenAI additions use Responses on direct
+routes and Responses Lite on Codex, with route-gated Fast and prompt caching.
+Fable and Haiku use adaptive thinking binding on the official Anthropic route;
+Fable also exposes Fast. Other new-model native tool changes are not advertised.
+
+Metadata is sourced from the [OpenAI model catalog](https://developers.openai.com/api/docs/models),
+[GPT-6.2 guide](https://developers.openai.com/api/docs/guides/latest-model),
+and [Claude model catalog](https://platform.claude.com/docs/en/models/overview).
+GPT-6.2 native effort defaults remain unknown in metadata because the checked
+documentation establishes accepted levels but does not establish native defaults.
+Provider defaults are preserved by omitting an unset effort override.
+Model-contract, registry-registration, and provider-wire fixtures cover these
+additions; they do not establish account entitlement or live provider acceptance.
+
+## Added-model parallel Work review (2026-11-23)
+
+All added model IDs deliberately retain the unqualified single-Work-writer
+parent policy. No new parallel Work qualification is granted by model-family
+or version similarity, including for the new default GPT-6.2 Sol.
+
+| Exact resolved parent model ID | Review decision |
+| --- | --- |
+| `gpt-6.2-astra` | Single Work writer; parallel Work unqualified |
+| `gpt-6.2-sol` | Single Work writer; parallel Work unqualified |
+| `gpt-6.1-terra` | Single Work writer; parallel Work unqualified |
+| `claude-fable-5-2` | Single Work writer; parallel Work unqualified |
+| `claude-haiku-5-5` | Single Work writer; parallel Work unqualified |
+| `google/gemini-4-neon` | Single Work writer; parallel Work unqualified |
+| `google/gemini-4-hydrogen` | Single Work writer; parallel Work unqualified |
+| `google/gemini-4-carbon` | Single Work writer; parallel Work unqualified |
+| `google/gemini-4-argon` | Single Work writer; parallel Work unqualified |
+
+The exact-ID qualification, effective `spawn_agents` guidance and input schema,
+and runtime batch-admission regressions cover these entries. Existing SQLite
+admission coverage enforces the single active Work writer across calls. Parallel
+Work support requires a separate disposable parent probe with two overlapping
+Work children writing separate files under the repository's model-addition
+review policy.
+
+## Codex bridge live qualification (2026-11-23)
+
+Phoenix's native Codex login authenticated GPT-6.2 Sol on both HTTP/SSE and
+WebSockets. Live testing exposed the bridge's namespaced
+`tool_search.tool_search_tool` function representation. The qualified adapter
+maps it to native client discovery, retains its complete private envelope, and
+returns native schema-bearing `tool_search_output`. Ordinary function history
+keeps its original protocol. [ADR-279](../adrs/279_qualify-codex-namespaced-native-search-calls.md)
+records this verified representation.
+
+The live adapter probe passed search, deferred function execution, final reply,
+and a new turn after private settlement on both transports. The SQLite runtime
+probe also passed: its real search handler selected from 65 frozen deferred
+schemas, committed native owner/result evidence, admitted and executed the
+selected function, and persisted the final `OK`; all three requests used
+WebSockets. A random proof value present only in the deferred schema had to be
+returned on the first function invocation; the initial request omitted it.
+This proves actual schema retrieval rather than a guessed function call. The
+deferred function is synthetic; no external MCP service was invoked.
+
+Full LLM unit coverage passed (513 tests), including exact namespace, mode,
+argument witness, and ordinary-history negatives. Core coverage (384 tests),
+13 discovery persistence tests, and all five runtime provider-policy tests also
+passed. Isolated adversarial review of the production fix and an anchored review
+of the schema-proof follow-up found no actionable issues. The broad repository
+check passed: 13 executed checks, including Rust tests, clippy, bindings,
+specifications, dev.py tests, and API end-to-end tests. Six checks were skipped:
+four unchanged UI lanes and optional ast-grep/cargo-deny, which were unavailable.
+No production deployment is claimed.
+
+## Gemini / Anthropic model-switch qualification (2026-11-23)
+
+The running development server reporting build
+`13e96eaf91bd545c702ab75fccc9be45ecd69280-dirty` passed a real API conversation through
+Gemini 4 Neon → Claude Opus 5.5 → Gemini 4 Neon, with no compaction. Each leg
+called `read_file` once on a different temporary file containing a random UUID;
+the second and third replies reproduced all earlier values from conversation
+history plus their newly read value. Switches used the normal `upgrade-model`
+endpoint, preserved the transcript, and reached idle before the next leg.
+
+The stronger run used low / high / low effort and a small private-reasoning
+instruction before Opus's tool call. SQLite metadata observation confirmed
+active private replay for both `chat_completions` Gemini signatures and
+Anthropic's Opus response. All six provider generation requests succeeded over
+HTTP/SSE (four Gemini, two Opus). All capacity plans were ordinary with no input
+reduction, no continuation message was created, and both private stores were
+empty after settlement and at the switches. Conversation:
+`3692be2a-d991-45d3-a335-6fbbdd154745`; local metadata-only evidence is
+`/tmp/phoenix-live-provider-switch-thinking-report.json`. No private payloads
+were inspected or saved in the probe report.
+
+An earlier low-effort run also completed all three tool/history assertions.
+Opus emitted no private thinking for that trivial task, motivating the stronger
+run. Its records contain six successful generations plus an initial 0-ms auth
+error followed by automatic recovery; the initial probe's blanket no-auth-error
+assertion rejected that metadata. The stronger run had six successes and no
+error outcomes. Neither run qualifies hidden-reasoning continuity across model
+changes: Phoenix deliberately retires that state under its current contract.
+
+Current upstream Anthropic guidance recommends retaining complete thinking
+across completed turns and model switches so the server can use compatible
+blocks, including when switching back. Phoenix's active-exchange-only retention
+is allowed outside tool use but differs from that recommendation. Task 41024
+tracks a deliberate retention-policy/specification revision. See
+[thinking preservation](https://platform.claude.com/docs/en/build-with-claude/thinking#preserving-thinking-blocks)
+and [preserved thinking](https://platform.claude.com/docs/en/build-with-claude/preserved-thinking#switch-models-and-back).
+
+## Tool discovery integration (2026-11-20)
+
+REQ-LLM-004n and [the discovery contract](tool-discovery.allium) distinguish eager
+loading, native Anthropic search, OpenAI hosted search, OpenAI client-executed
+search on the Codex bridge, and shared function-based search for Chat routes such
+as GLM and gateway Gemini. A surface without an executable local search tool
+keeps eager loading. Anthropic's native mechanism remains separate.
+
+The shared selector uses a frozen permitted request catalog. Canonical result
+admission validates the query and public names-only summary, then commits typed
+schema selections as normalized rows with the owned tool message/state. Full
+permissions and actual advertisement remain separate execution checks. Native
+Codex result placement avoids adding newly loaded schemas to the leading prefix;
+Chat requests add authenticated selected schemas to their function declarations.
+Codex native admission requires native-client loading evidence; ordinary search
+history remains ordinary and can require a new native search after a mode switch.
+[ADR-278](../adrs/278_native-openai-and-shared-local-tool-discovery.md) records the
+choice and its costs.
+
+Integration qualification has focused and live evidence. The actual Phoenix
+adapter passed hosted search, function execution/continuation, and full
+private-envelope replay on the configured Responses gateway in streaming and
+non-streaming modes, including a new tool turn after private-envelope settlement.
+The shared fallback passed 12 live cases: GLM 5.3, GLM 5.3 Flash, and all four
+Gemini 4 models in both modes, with signed private envelopes restored for
+continuation. These probes establish configured gateway behavior, not
+public-platform entitlement.
+
+Real SQLite/runtime tests passed local and native-client search through tool
+execution and reopen/retry, along with schema accounting and all five
+`provider_tool_policy_tests`. Focused core, tool-context, registry, and persistence
+tests also pass. All 509 LLM library tests pass, including actual mock HTTP/SSE
+and WebSocket native-client exchanges. The WebSocket fixture verifies exact
+continuation suffixes and stable leading tools. Independent review found a
+missing withdrawal notice for historical native schemas; the fix and both wire
+regressions passed review. Phoenix-native Codex credentials were unavailable for
+a live bridge probe and no other app's credentials were borrowed.
+
+The broad check reported one failed check (the Rust test stage); other executed
+checks passed, including end-to-end, clippy, bindings, and specifications. UI
+lanes were unchanged and skipped; optional ast-grep/cargo-deny were unavailable.
+The Rust stage passed
+6,339 of 6,342 tests. The replay migration test's outdated pending-count
+assumption was fixed and all five owning replay tests pass. The two browser
+lifecycle failures passed isolated reruns and the whole browser integration
+file (37/37, Chrome enabled); their broad-run cause remains unproven and is
+tracked in task 41021. Task 41022 tracks the lost original failure diagnostics.
+No production activation is claimed.
+
+## Google gateway verification (2026-11-20)
+
+Gemini 4 Neon, Hydrogen, Carbon, and Argon register under Google when a Chat
+Completions endpoint is configured. Their `google/` request spellings and
+1,048,576 context / 65,536 synchronous output limits match the checked gateway
+catalog, maintained gateway route reference, and Google model documentation.
+The common low/medium/high effort controls are exposed with unknown native
+defaults; extended effort names differ between the Google and gateway contracts
+and are not inferred. Sol 6.2 is the product default; explicit choices remain intact.
+
+The original Neon probe completed its first tool call but failed continuation
+with HTTP 400 after dropping `extra_content.google.thought_signature`. Exact
+signature replay made that exchange succeed. Phoenix's real adapter then passed
+complete tool rounds for all four models in both streaming and non-streaming
+modes. The opt-in `gemini_gateway` integration test reproduces that qualification
+with synthetic tool data and configured credentials; it is ignored in ordinary
+checks to avoid accidental provider charges. No private response payload is saved
+as a fixture. These small probes establish tool exchange compatibility, not
+long-session quality, long decode, every thinking level, or production activation.
+
+Typed Chat replay shares the existing normalized output-replay persistence with
+an explicit protocol discriminator. Signature rows retain exact assistant/call
+ownership and public-content witnesses, survive reopen/retry, participate in
+canonical receipts, and retire with the exchange. Migration 169 preserves the
+existing Responses rows and canonical receipt hashes/timestamps. Provider unit
+fixtures cover late streaming signatures, immutable metadata, rewritten-owner
+rejection, and accounting for separately reported Gemini reasoning tokens.
+The built-in Gemini Chat route preserves images returned by screenshot and
+read-image tools in the owning tool-role message. Route-selection and wire
+regressions cover image ordering, error text, remapped model names, and unchanged
+text-only behavior for unqualified Chat routes; the opt-in gateway image test
+exercises the real adapter with synthetic image content and restored private replay.
+The opt-in image exchange covers both image-only and text-plus-image results in
+streaming and non-streaming modes across all four models.
+The SQLite runtime regression also checks that image-bearing error results retain
+their call identity, text, and pixels in follow-up requests after reopen and retry.
+Database regressions cover reopen, immutable replay, migration, receipts, and
+settlement. [ADR-276](../adrs/276_preserve-gemini-tool-signatures-through-chat-completions.md)
+records the integration decision.
+
 ## Requirements Summary
 
-The LLM provider abstracts communication with multiple LLM APIs behind a common interface. Users select their preferred model while the system handles backend-specific translation internally. Phoenix supports built-in Anthropic/OpenAI models plus additive `PHOENIX_LLM_MODELS` entries that declare a backend (`anthropic`, `openai_responses`, or `openai_chat_completions`), optional wire model name, user-facing family, and output cap. Base URL overrides are exact endpoints, not gateway roots; Phoenix does not append hidden provider path suffixes. With credential-helper auth and base URL overrides, Phoenix can opportunistically query derived `/v1/models` endpoints to filter the configured model set; if listing is unavailable, Phoenix falls back to configured models. In direct API mode, only models with configured API keys or a credential helper are registered. Requests use a common format (system prompt, messages, tools) that gets translated per backend. Model specs also classify reasoning-effort capability as known-native, unknown, or unsupported; explicit per-conversation overrides persist independently from provider-native defaults and are translated only when explicitly selected. Responses are normalized to text blocks, tool use requests, end-of-turn indicators, and usage statistics. Errors are classified into exhaustive named categories plus explicit policies for automatic runtime retry and user-triggered resume. Network failures, transient rate-limit throttles, server errors, and timeouts are auto-retryable; auth failures are not auto-retryable but are user-resumable after credentials are refreshed. Quota exhaustion remains non-auto-retryable but user-resumable after its reset window; context exhaustion remains a non-resumable terminal path. Request observability includes provider-centric TTFT measured from request transmission or dispatch to the first generation-bearing provider event, excluding acknowledgements, pings, metadata-only events, usage-only events, and terminal events. TTFT remains content-free and privacy-preserving, and aggregate analysis keeps provider, model, and transport as first-class dimensions. When traffic routes through the codex backend, Phoenix uses only its native Codex login credential. Authoritative account usage supplies current, weekly, additional-family, credit, and spend-control quota state; 429 responses carrying structured quota state are parsed into a plan-aware terminal error rather than an opaque retryable message.
+The LLM provider abstracts communication with multiple LLM APIs behind a common interface. Users select their preferred model while the system handles backend-specific translation internally. Phoenix supports built-in Anthropic/OpenAI models plus additive user TOML `[[models]]` entries or `PHOENIX_LLM_MODELS` entries that declare a backend (`anthropic`, `openai_responses`, or `openai_chat_completions`), optional wire model name, user-facing family, and output cap. Base URL overrides are exact endpoints, not gateway roots; Phoenix does not append hidden provider path suffixes. With credential-helper auth and base URL overrides, Phoenix can opportunistically query derived `/v1/models` endpoints to filter the configured model set; if listing is unavailable, Phoenix falls back to configured models. In direct API mode, only models with configured API keys or a credential helper are registered. Requests use a common format (system prompt, messages, tools) that gets translated per backend. Model specs also classify reasoning-effort capability as known-native, unknown, or unsupported; explicit per-conversation overrides persist independently from provider-native defaults and are translated only when explicitly selected. Responses are normalized to text blocks, tool use requests, end-of-turn indicators, and usage statistics. Errors are classified into exhaustive named categories plus explicit policies for automatic runtime retry and user-triggered resume. Network failures, transient rate-limit throttles, server errors, and timeouts are auto-retryable; auth failures are not auto-retryable but are user-resumable after credentials are refreshed. Quota exhaustion remains non-auto-retryable but user-resumable after its reset window; context exhaustion remains a non-resumable terminal path. Request observability includes provider-centric TTFT measured from request transmission or dispatch to the first generation-bearing provider event, excluding acknowledgements, pings, metadata-only events, usage-only events, and terminal events. TTFT remains content-free and privacy-preserving, and aggregate analysis keeps provider, model, and transport as first-class dimensions. When traffic routes through the codex backend, Phoenix uses only its native Codex login credential. Authoritative account usage supplies current, weekly, additional-family, credit, and spend-control quota state; 429 responses carrying structured quota state are parsed into a plan-aware terminal error rather than an opaque retryable message.
 
 ## Technical Summary
 
@@ -18,10 +217,12 @@ Tool availability is separated from retained declarations and historical calls. 
 |-------------|--------|-------|
 | **REQ-LLM-001:** Provider Abstraction | ✅ Complete | LlmService trait with async complete() |
 | **REQ-LLM-002:** Backend-Compatible Endpoint Support | ✅ Complete | Exact base URL overrides, no hidden suffix append |
-| **REQ-LLM-003:** Model Registry | ✅ Complete | Product default prefers registered GPT-6.1 Sol unless an available explicit DEFAULT_MODEL overrides it. Available-only catalog including direct Claude Sonnet 5.5 and exact GPT-6.1 Sol, GPT-6 Astra/Sol/Luna, and GPT-5.6 Sol/Luna/Terra OpenAI built-ins, discovery bounded by configured specs, exact custom-route precedence, and fail-closed legacy pin mappings |
+| **REQ-LLM-003:** Model Registry | ✅ Complete | Product default prefers registered GPT-6.2 Sol unless an available explicit DEFAULT_MODEL overrides it. Available-only catalog including direct Claude Sonnet 5.5 and exact GPT-6.1 Sol, GPT-6 Astra/Sol/Luna, and GPT-5.6 Sol/Luna/Terra OpenAI built-ins, discovery bounded by configured specs, exact custom-route precedence, and fail-closed legacy pin mappings |
+| **REQ-LLM-003c:** External models in user configuration | ✅ Complete | Startup reads XDG TOML directly; shared model validation, atomic TOML rejection, explicit source-conflict diagnostics, edit/reload and worker coexistence tests in `model_config::tests`, plus process-level startup/restart/conflict coverage in `tests/user_model_config.rs`. Migration and macOS restart workflow documented in `docs/agents-config.md`; ADR-269 records source ownership. |
 | **REQ-LLM-003a:** Model Discovery | ✅ Complete | Opportunistic backend-scoped `/v1/models` discovery, falls back to configured models |
 | **REQ-LLM-003b:** Typed Model Effort Capability Registry | ✅ Complete | Constructor-validated known-native, unknown, unsupported, and supported-level capability states |
 | **REQ-LLM-004:** Request Format | ✅ Complete | LlmRequest with system, messages, tools |
+| **REQ-LLM-004n:** Route-Qualified Tool Discovery | ✅ Complete | Hosted gateway, 12 fallback live cases, and live Codex HTTP/SSE/WebSocket plus SQLite runtime with schema-only proof pass. Native namespaced response qualification, ordinary-history negatives, isolated review, and the follow-up broad check pass. Earlier broad-run exceptions are classified above. |
 | **REQ-LLM-004a–004e:** Reasoning Effort Lifecycle | ✅ Complete | Native omission, explicit overrides, atomic switches, subagent inheritance, and provider translation |
 | **REQ-LLM-004f:** Output Budget Resolution and Reservation | Implemented; qualification in progress | Concrete model output maxima flow through runtime context, ordinary and continuation requests, provider serialization, and reservation. External HTTP definitions require `max_output_tokens`; no effort-based cap or 4k continuation override. Native Codex retains wire omission. |
 | **REQ-LLM-004g:** Fast Request Speed | ✅ Complete | Capability-gated per-conversation Standard/Fast selection maps to each supported route's native control: Responses `priority` or direct Anthropic `speed: fast` with its feature header. Effective speed is persisted per turn for historical pricing, successful Anthropic responses must confirm Fast, continuations preserve it, and subagents default to Standard. |
@@ -48,12 +249,21 @@ Active Responses exchanges retain original output envelopes, including assistant
 
 ## Capacity-policy specification
 
-REQ-LLM-004j–004m have backend implementation and bounded deterministic
-qualification under task 44018. Shared prepared-request accounting reserves the
-selected model's full output allowance; counting has one bounded optional attempt
-and labelled fallback. Capacity diagnostics identify deliberate prefix changes.
-UI delivery, full integration validation, deployment and production recovery
-remain separate gates. ADR-146 records the decisions.
+REQ-LLM-004j–004m have backend and UI delivery, bounded deterministic
+qualification, and dated incident-scoped production acceptance in completed
+task 44018. Shared prepared-request accounting reserves the selected model's
+full output allowance; counting has one bounded optional attempt and labelled
+fallback. Capacity diagnostics identify deliberate prefix changes. PR #977
+merged as `3b602a0b6dd7f92a3304b97c475a66b4eafc2113`. The [PR #979
+acceptance account](https://github.com/scottopell/phoenix-ide/pull/979) reports
+2026-10-25 native deployment on that commit and successful supported recovery
+and ordinary provider/tool rounds for two incident conversations on their
+Codex-auth routes, with the full 128,000-token output reservation. Independent
+read-only verification in [task 67011](../../tasks/67011-p2-done--coordinator-drive-eval.md)
+confirms the committed deployment transaction and running source commit, not
+the conversation-level details or all reported validation gates. This is not
+cross-provider, measured cache, or semantic-continuity qualification. ADR-146
+records the capacity decisions.
 
 Qualification reuses focused fixtures rather than claiming cache performance:
 `capacity_diagnostics_prefix_causes_are_multiple_and_content_free` covers a cold
@@ -85,6 +295,7 @@ the exhausted state contains the mock-generated summary. All seven owning API
 model-guard tests pass. These deterministic fixtures do not establish model
 understanding, cache hits, or full cross-provider interoperability.
 
-Independent specs-only review is recorded in
-`docs/reviews/context-capacity-spec-review.md`; independent implementation review
-and final integration remain delivery gates.
+Independent specs-only and implementation reviews are recorded in
+`docs/reviews/context-capacity-spec-review.md` and
+`docs/reviews/context-capacity-implementation-review.md`; PR #979 records the
+subsequent reported integration and scoped production acceptance.

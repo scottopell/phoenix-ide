@@ -28,6 +28,8 @@ const BROAD_TERM_MATCH_LIMIT: usize = 400;
 /// Always-on ceiling on the combined context output. The scan is killed once
 /// stdout crosses this, even inside a legitimate single repo.
 const MAX_COMBINED_RESULTS: usize = 128 * 1024; // 128KB combined
+/// Cap on raw results returned when the LLM filter is unavailable.
+const RAW_FALLBACK_DISPLAY_BYTES: usize = 8000;
 
 use phoenix_core::llm_language::KEYWORD_SEARCH_FILTER_SYSTEM as FILTER_SYSTEM_PROMPT;
 
@@ -448,7 +450,7 @@ impl KeywordSearchTool {
                 content: vec![ContentBlock::text(user_content)],
             }],
             provider_replay: None,
-            responses_replay: Vec::new(),
+            output_replay: Vec::new(),
             tool_availability: phoenix_core::domain::tool_availability::ToolAvailability::all(
                 vec![],
             ),
@@ -587,17 +589,7 @@ IMPORTANT: Do NOT use this tool if you have precise information like log lines, 
             Err(e) => {
                 // If LLM fails, return raw results (size-truncated).
                 tracing::warn!(error = %e, "LLM filtering failed, returning raw results");
-                if results.len() > 8000 {
-                    // Distinct from the byte-cap note in `incompleteness_notes`:
-                    // this is a display-length cut of the *raw* fallback text,
-                    // not the search-scope truncation.
-                    format!(
-                        "{}\n\n[raw output shortened for display]",
-                        results.get(..8000).unwrap_or(&results)
-                    )
-                } else {
-                    results
-                }
+                raw_fallback_display(&results)
             }
         };
 
@@ -608,9 +600,32 @@ IMPORTANT: Do NOT use this tool if you have precise information like log lines, 
     }
 }
 
+/// Raw results shown when the LLM filter is unavailable, cut to
+/// [`RAW_FALLBACK_DISPLAY_BYTES`]. Distinct from the byte-cap note in
+/// `incompleteness_notes`: this is a display-length cut of the raw fallback
+/// text, not the search-scope truncation.
+fn raw_fallback_display(results: &str) -> String {
+    phoenix_core::text_bounds::truncate_with_marker(
+        results,
+        RAW_FALLBACK_DISPLAY_BYTES,
+        "\n\n[raw output shortened for display]",
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn raw_fallback_is_bounded_when_cap_splits_a_char() {
+        // 1 + 2*n bytes: byte 8000 sits inside a 2-byte char.
+        let results = format!("x{}", "ü".repeat(60_000));
+        let shown = raw_fallback_display(&results);
+        let marker = "\n\n[raw output shortened for display]";
+        assert!(shown.ends_with(marker));
+        assert!(shown.len() <= RAW_FALLBACK_DISPLAY_BYTES + marker.len());
+        assert_eq!(raw_fallback_display("a.rs:1:x"), "a.rs:1:x");
+    }
     use crate::browser::BrowserSessionManager;
     use std::sync::Arc;
     use std::time::Duration;

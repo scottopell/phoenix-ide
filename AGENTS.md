@@ -70,16 +70,9 @@ ios/             # Native iOS client (SwiftUI, offline-first; spec: specs/ios_cl
 
 ### Delivery Roadmap
 
-GitHub Issue [#806](https://github.com/scottopell/phoenix-ide/issues/806) is the phoenix-ide delivery roadmap: a milestone-first view of committed outcomes, their owners, open gates, delivery per surface, and freshness. At the start of development work, read its generated body before relying on local task or PR context alone. If GitHub is unavailable, continue from the domain authorities below and report that roadmap context could not be verified.
+GitHub Issue [#806](https://github.com/scottopell/phoenix-ide/issues/806) is a historical archive, not current coordination authority. Do not read it as a required development preflight or post roadmap records. Its final projection and comments remain historical evidence; old ownership, holds and delivery claims require current verification.
 
-The roadmap is harness-neutral: any harness (each Phoenix instance, Codex, Claude Code) contributes the same way, by posting structured records as Issue comments. Its protocol is [`specs/roadmap/requirements.md`](specs/roadmap/requirements.md); read it before posting. In short:
-
-- the primary Phoenix instance is the coordinator: it alone curates outcomes, milestones, priority, and ownership;
-- workers post `evidence`, `status`, and technical `gate`s for outcomes they work on; record user scope calls as `decision`s quoting the user;
-- evidence must be checkable through GitHub (PR, commit, check run, release, or a deploy record naming a commit); links that only resolve on one machine belong in `status` pointers, labelled with their harness;
-- never edit the generated body or a posted record; post a new record instead.
-
-The roadmap is a coordination authority only. It does not replace the authorities for requirements (specs/Allium), decisions (ADRs), repository task status (taskmd filenames), review state (PRs), or shipped behavior (`main`). When the roadmap conflicts with one of those authorities, the domain authority wins and the owning agent posts a correcting record.
+Use current user instructions and the existing domain authorities: specs/Allium for requirements, ADRs for decisions, taskmd filenames for repository task status, PRs for review/merge state, and exact deployed evidence for production behavior. Keep current ownership, next action and checkable evidence with the task/PR or active coordination conversation. Ember tracking preserves intent and links; it does not replace these authorities. See [ADR-262](specs/adrs/262_retire-delivery-roadmap-with-preserved-history.md).
 
 ### Task Tracking
 
@@ -179,6 +172,11 @@ The cargo-test step budget defaults to 900s; slow hosts can raise it with
 `PHOENIX_CHECK_CARGO_TEST_TIMEOUT_SECS` in the environment or in the gitignored
 `.phoenix-ide.env` (the environment wins).
 
+The dev.py Python unit-test step defaults to 600s; slow hosts can raise it with
+`PHOENIX_CHECK_DEVPY_TEST_TIMEOUT_SECS` in the environment or in the gitignored
+`.phoenix-ide.env` (the process environment wins). For one run, use e.g.
+`PHOENIX_CHECK_DEVPY_TEST_TIMEOUT_SECS=1800 ./dev.py check --lanes devpy`.
+
 For a low-resource check, set `PHOENIX_CHECK_WORKERS=1 ./dev.py check …`.
 The process-environment override must be a nonempty positive ASCII integer;
 invalid values fail before check setup. Unset means four, clamped to available
@@ -251,12 +249,28 @@ Property tests live in `**/proptests.rs` files. Run with `cargo test proptests`.
 ./dev.py prod stop               # Stop service
 ```
 
-Builds static ~9MB binary with embedded UI. Runs on port 8031, database at `~/.phoenix-ide/prod.db`.
+Builds a static `--release` binary with the UI embedded (debug symbols kept unless stripped); the size-optimized `release-min` download is ~50MB. Runs on port 8031, database at `~/.phoenix-ide/prod.db`.
 
 ---
 
 ## Extending the codebase
 *Procedures for adding to Phoenix without breaking its invariants.*
+
+### Model addition review
+
+For every PR that adds, replaces, or renames a built-in model, record whether
+its exact resolved model ID can orchestrate parallel Work sub-agents as a
+parent. Review the model's entry in
+[`subagent_qualification.rs`](crates/phoenix-core/src/subagent_qualification.rs)
+and check that the effective `spawn_agents` tool description, input schema,
+and runtime admission agree. Qualification attaches to the parent model's ID.
+
+Before approving parallel Work support, require a disposable probe with that
+model as the parent. One `spawn_agents` call must admit two `mode: "work"`
+children whose runs overlap and whose writes land in separate files. If the
+model stays single-writer, record that as an explicit review decision and
+verify the advertised and enforced single-writer limit. Link the evidence in
+the PR.
 
 ### Adding a New Tool
 

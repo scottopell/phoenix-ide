@@ -890,96 +890,111 @@ const MIGRATIONS: &[Migration] = &[
     },
     Migration {
         version: 169,
+        name: "chat_completions_signature_replay",
+        sql: include_str!("migrations/chat_completions_signature_replay.sql"),
+    },
+    Migration {
+        version: 170,
+        name: "tool_discovery",
+        sql: include_str!("migrations/tool_discovery.sql"),
+    },
+    Migration {
+        version: 171,
+        name: "adhd_llm_language",
+        sql: "",
+    },
+    Migration {
+        version: 172,
         name: "native_task_approval_receipts",
         sql: include_str!("migrations/native_task_approval_receipts.sql"),
     },
     Migration {
-        version: 170,
+        version: 173,
         name: "close_completion_allowances_and_native_retry_fence",
         sql: MIGRATION_157,
     },
     Migration {
-        version: 171,
+        version: 174,
         name: "native_close_initial_receipts",
         sql: MIGRATION_158,
     },
     Migration {
-        version: 172,
+        version: 175,
         name: "close_original_retirement_anchors",
         sql: include_str!("migrations/close_original_retirement_anchor.sql"),
     },
     Migration {
-        version: 173,
+        version: 176,
         name: "native_close_exact_observation_receipts",
         sql: include_str!("migrations/native_close_exact_observation_receipts.sql"),
     },
     Migration {
-        version: 174,
+        version: 177,
         name: "native_close_explicit_retry_admission",
         sql: include_str!("migrations/native_close_explicit_retry_admission.sql"),
     },
     Migration {
-        version: 175,
+        version: 178,
         name: "native_close_source_fence",
         sql: include_str!("migrations/native_close_source_fence.sql"),
     },
     Migration {
-        version: 176,
+        version: 179,
         name: "native_close_retry_failure",
         sql: include_str!("migrations/native_close_retry_failure.sql"),
     },
     Migration {
-        version: 177,
+        version: 180,
         name: "native_close_retry_dispatch",
         sql: include_str!("migrations/native_close_retry_dispatch.sql"),
     },
     Migration {
-        version: 178,
+        version: 181,
         name: "native_close_retry_worktree_metadata",
         sql: include_str!("migrations/native_close_retry_worktree_metadata.sql"),
     },
     Migration {
-        version: 179,
+        version: 182,
         name: "native_initial_source_fence",
         sql: include_str!("migrations/native_initial_source_fence.sql"),
     },
     Migration {
-        version: 180,
+        version: 183,
         name: "native_initial_completed_interruption",
         sql: include_str!("migrations/native_initial_completed_interruption.sql"),
     },
     Migration {
-        version: 181,
+        version: 184,
         name: "native_initial_completion_retry_admission",
         sql: include_str!("migrations/native_initial_completion_retry_admission.sql"),
     },
     Migration {
-        version: 182,
+        version: 185,
         name: "close_ignored_loss_category",
         sql: include_str!("migrations/close_ignored_loss_category.sql"),
     },
     Migration {
-        version: 183,
+        version: 186,
         name: "native_close_initial_result_acknowledgement",
         sql: include_str!("migrations/native_close_initial_result_acknowledgement.sql"),
     },
     Migration {
-        version: 184,
+        version: 187,
         name: "native_close_captured_loss_retry",
         sql: include_str!("migrations/native_close_captured_loss_retry.sql"),
     },
     Migration {
-        version: 185,
+        version: 188,
         name: "native_close_retry_tmux_dispatch",
         sql: include_str!("migrations/native_close_retry_tmux_dispatch.sql"),
     },
     Migration {
-        version: 186,
+        version: 189,
         name: "native_close_retry_origin_gate",
         sql: "SELECT 1;",
     },
     Migration {
-        version: 187,
+        version: 190,
         name: "native_close_origin_owner_cleanup",
         sql: include_str!("migrations/native_close_origin_owner_cleanup.sql"),
     },
@@ -1124,6 +1139,33 @@ BEGIN
     SELECT RAISE(ABORT, 'native Close management cannot be cleared');
 END;
 ";
+
+async fn run_migration_171(pool: &SqlitePool, migration: &Migration) -> DbResult<()> {
+    let mut guard = WritableSchemaGuard::enable(pool).await?;
+    let result = async {
+        let mut tx = guard.connection().begin().await?;
+        let schema: String = sqlx::query_scalar(
+            "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'product_creation_jobs'",
+        ).fetch_one(&mut *tx).await?;
+        let old = "llm_language IN ('phoenix-native', 'caveman')";
+        if schema.matches(old).count() != 1 {
+            return Err(DbError::Serialization("migration 171 found unexpected language CHECK".into()));
+        }
+        sqlx::query("UPDATE sqlite_schema SET sql = ?1 WHERE type = 'table' AND name = 'product_creation_jobs'")
+            .bind(schema.replacen(old, "llm_language IN ('phoenix-native', 'caveman', 'adhd')", 1))
+            .execute(&mut *tx).await?;
+        let version: i64 = sqlx::query_scalar("PRAGMA schema_version").fetch_one(&mut *tx).await?;
+        sqlx::query(sqlx::AssertSqlSafe(format!("PRAGMA schema_version = {}", version + 1)))
+            .execute(&mut *tx).await?;
+        sqlx::query("INSERT INTO _migrations (version, name) VALUES (?1, ?2)")
+            .bind(migration.version).bind(migration.name).execute(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(())
+    }.await;
+    let restore = guard.disable().await;
+    result?;
+    restore
+}
 
 const MIGRATION_138: &str = concat!(
     include_str!("conversation_goals/execution_candidate.sql"),
@@ -12687,9 +12729,9 @@ pub(crate) async fn run_through_for_test(pool: &SqlitePool, version: u32) -> DbR
 }
 
 #[cfg(test)]
-pub(crate) async fn setup_real_175_for_test(pool: &SqlitePool) {
-    tests::setup_real_pre_172_schema(pool).await;
-    run_through_for_test(pool, 175).await.unwrap();
+pub(crate) async fn setup_real_178_for_test(pool: &SqlitePool) {
+    tests::setup_real_pre_175_schema(pool).await;
+    run_through_for_test(pool, 178).await.unwrap();
 }
 
 /// Run all pending migrations against the database.
@@ -12768,69 +12810,63 @@ async fn run_migration_list(pool: &SqlitePool, migrations: &[Migration]) -> DbRe
             continue;
         }
 
-        if migration.version == 177 {
+        if migration.version == 180 {
             native_close_retry_dispatch::run(pool, migration).await?;
             applied += 1;
             continue;
         }
-        if migration.version == 178 {
+        if migration.version == 181 {
             native_close_retry_worktree_metadata::run(pool, migration).await?;
             applied += 1;
             continue;
         }
 
-        if migration.version == 176 {
+        if migration.version == 179 {
             native_close_retry_failure::run(pool, migration).await?;
             applied += 1;
             continue;
         }
 
-        if migration.version == 180 {
+        if migration.version == 183 {
             native_initial_completed_interruption::run(pool, migration).await?;
             applied += 1;
             tracing::info!(version = migration.version, "Migration complete");
             continue;
         }
 
-        if migration.version == 184 {
+        if migration.version == 187 {
             native_close_captured_loss_retry::run(pool, migration).await?;
             applied += 1;
             continue;
         }
 
-        if migration.version == 185 {
+        if migration.version == 188 {
             native_close_retry_tmux_dispatch::run(pool, migration).await?;
             applied += 1;
             continue;
         }
 
-        if migration.version == 186 {
+        if migration.version == 189 {
             native_close_retry_origin_gate::run(pool, migration).await?;
             applied += 1;
             continue;
         }
 
-        if migration.version == 181 {
+        if migration.version == 184 {
             native_initial_completion_retry_admission::run(pool, migration).await?;
             applied += 1;
             tracing::info!(version = migration.version, "Migration complete");
             continue;
         }
 
-        if migration.version == 179 {
+        if migration.version == 182 {
             native_initial_source_fence::run(pool, migration).await?;
             applied += 1;
             continue;
         }
 
-        if migration.version == 175 {
+        if migration.version == 178 {
             native_close_source_fence::run(pool, migration).await?;
-            applied += 1;
-            continue;
-        }
-
-        if migration.version == 156 {
-            run_migration_156(pool, migration).await?;
             applied += 1;
             continue;
         }
@@ -12841,14 +12877,20 @@ async fn run_migration_list(pool: &SqlitePool, migrations: &[Migration]) -> DbRe
             continue;
         }
 
-        if migration.version == 162 {
-            slack_saved_capture::run(pool, migration).await?;
+        if migration.version == 133 {
+            federated_subscriptions::run(pool, migration).await?;
             applied += 1;
             continue;
         }
 
-        if migration.version == 133 {
-            federated_subscriptions::run(pool, migration).await?;
+        if migration.version == 156 {
+            run_migration_156(pool, migration).await?;
+            applied += 1;
+            continue;
+        }
+
+        if migration.version == 162 {
+            slack_saved_capture::run(pool, migration).await?;
             applied += 1;
             continue;
         }
@@ -12867,6 +12909,12 @@ async fn run_migration_list(pool: &SqlitePool, migrations: &[Migration]) -> DbRe
 
         if migration.version == 132 {
             run_migration_132(pool, migration).await?;
+            applied += 1;
+            continue;
+        }
+
+        if migration.version == 171 {
+            run_migration_171(pool, migration).await?;
             applied += 1;
             continue;
         }
@@ -13725,6 +13773,419 @@ END;
 mod tests {
     use super::*;
     use sqlx::sqlite::SqlitePoolOptions;
+
+    fn registered_after(prefix: u32) -> u32 {
+        u32::try_from(
+            super::MIGRATIONS
+                .iter()
+                .filter(|migration| migration.version > prefix)
+                .count(),
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn migration_163_seeds_existing_product_conversations_as_read() {
+        use phoenix_core::domain::llm_types::ContentBlock;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("read-state.db");
+        let db = crate::Database::open(path.to_str().unwrap()).await.unwrap();
+        run_through_for_test(db.pool(), 162).await.unwrap();
+        let conversation = db
+            .create_conversation("seeded", "seeded", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        db.add_message(
+            "seeded-agent",
+            &conversation.id,
+            &crate::MessageContent::agent(vec![ContentBlock::text("done")]),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(run_through_for_test(db.pool(), 163).await.unwrap(), 1);
+        assert_eq!(run_through_for_test(db.pool(), 163).await.unwrap(), 0);
+        let cursor: Option<String> = sqlx::query_scalar(
+            "SELECT read_through_message_id FROM product_conversation_read_state
+             WHERE product_conversation_id = ?1",
+        )
+        .bind(conversation.product_conversation_id.as_str())
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(cursor.as_deref(), Some("seeded-agent"));
+        let states = db.list_product_conversation_read_states().await.unwrap();
+        assert!(states
+            .iter()
+            .all(|entry| entry.read_state == crate::ProductConversationReadState::Read));
+    }
+
+    #[tokio::test]
+    async fn migration_160_defaults_to_fire_without_reinitializing_existing_discovery() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("slack-emojis.db");
+        let db = crate::Database::open(path.to_str().unwrap()).await.unwrap();
+        run_through_for_test(db.pool(), 159).await.unwrap();
+        let config = r#"{"workspace":"example.slack.com","owner":"UOWNER","enabled":true}"#;
+        db.set_app_setting("slack_gateway", config).await.unwrap();
+        sqlx::raw_sql("INSERT INTO slack_gateway_accounts(workspace,owner,baseline_complete,status,last_scan_at_unix_micros,retry_at_us) VALUES ('example.slack.com','UOWNER',1,'healthy',123,456); INSERT INTO slack_gateway_discovery(workspace,owner,kind,after_date,cursor) VALUES ('example.slack.com','UOWNER','reaction','2026-11-01','retained-cursor');").execute(db.pool()).await.unwrap();
+        assert_eq!(run_through_for_test(db.pool(), 160).await.unwrap(), 1);
+        assert_eq!(run_through_for_test(db.pool(), 160).await.unwrap(), 0);
+        let rows: Vec<String> =
+            sqlx::query_scalar("SELECT name FROM slack_gateway_trigger_emojis ORDER BY ordinal")
+                .fetch_all(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(rows, ["fire"]);
+        let account: (bool, String, i64, i64) = sqlx::query_as("SELECT baseline_complete,status,last_scan_at_unix_micros,retry_at_us FROM slack_gateway_accounts").fetch_one(db.pool()).await.unwrap();
+        assert_eq!(account, (true, "healthy".into(), 123, 456));
+        assert_eq!(
+            sqlx::query_scalar::<_, String>("SELECT cursor FROM slack_gateway_discovery")
+                .fetch_one(db.pool())
+                .await
+                .unwrap(),
+            "retained-cursor"
+        );
+        assert_eq!(
+            db.get_app_setting("slack_gateway")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(config)
+        );
+        db.pool().close().await;
+        let reopened = crate::Database::open(path.to_str().unwrap()).await.unwrap();
+        assert_eq!(run_through_for_test(reopened.pool(), 162).await.unwrap(), 2);
+        assert_eq!(run_through_for_test(reopened.pool(), 162).await.unwrap(), 0);
+        run_pending_migrations(reopened.pool()).await.unwrap();
+        let value: serde_json::Value =
+            serde_json::from_str(&reopened.slack_configuration().await.unwrap().unwrap()).unwrap();
+        assert_eq!(value["trigger_emoji"], serde_json::json!("fire"));
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn migration_161_retains_the_first_emoji_and_durable_work() {
+        // REQ-SG-018
+        for multiple in [false, true] {
+            for ready in [false, true] {
+                let directory = tempfile::tempdir().unwrap();
+                let path = directory.path().join("slack-single.db");
+                let db = crate::Database::open(path.to_str().unwrap()).await.unwrap();
+                run_through_for_test(db.pool(), 160).await.unwrap();
+                db.set_app_setting(
+                    "slack_gateway",
+                    r#"{"workspace":"example.slack.com","owner":"UOWNER","enabled":true}"#,
+                )
+                .await
+                .unwrap();
+                sqlx::query("UPDATE slack_gateway_trigger_emojis SET name='phoenix-please-look'")
+                    .execute(db.pool())
+                    .await
+                    .unwrap();
+                if multiple {
+                    sqlx::query(
+                        "INSERT INTO slack_gateway_trigger_emojis(name,ordinal) VALUES ('fire',1)",
+                    )
+                    .execute(db.pool())
+                    .await
+                    .unwrap();
+                }
+                let source = crate::SlackSource {
+                    workspace: "example.slack.com".into(),
+                    owner: "UOWNER".into(),
+                    channel: "C123".into(),
+                    message_ts: "100.000001".into(),
+                    thread_ts: "100.000001".into(),
+                    source_url: "https://example.slack.com/archives/C123/p100000001".into(),
+                    instruction: "investigate".into(),
+                    context: "quoted".into(),
+                    observed_at_unix_micros: 1,
+                    kind: crate::SlackRequestKind::Explicit,
+                    trigger_kind: crate::SlackTriggerKind::Prefix,
+                };
+                sqlx::raw_sql("INSERT INTO slack_gateway_bindings(binding_id,workspace,owner,channel,thread_ts,kind,creation_id) VALUES ('retained-binding','example.slack.com','UOWNER','C123','100.000001','explicit','retained-creation'); INSERT INTO slack_gateway_requests(request_id,workspace,owner,channel,message_ts,thread_ts,kind,instruction,context,source_url,binding_id,accepted_at_unix_micros,input_id,observed_at_unix_micros,trigger_kind) VALUES ('retained-request','example.slack.com','UOWNER','C123','100.000001','100.000001','explicit','investigate','quoted','https://example.slack.com/archives/C123/p100000001','retained-binding',1,'retained-input',1,'prefix');").execute(db.pool()).await.unwrap();
+                let requests = db
+                    .slack_requests(&source.workspace, &source.owner)
+                    .await
+                    .unwrap();
+                let request = &requests[0];
+                sqlx::query("INSERT INTO slack_gateway_returns(return_id,binding_id,occurrence_key,destination,text,created_at_unix_micros) VALUES ('retained',?1,'done','thread','reply',1)").bind(&request.binding_id).execute(db.pool()).await.unwrap();
+                sqlx::query("INSERT INTO slack_gateway_return_coverage(return_id,request_id) VALUES ('retained',?1)").bind(&request.request_id).execute(db.pool()).await.unwrap();
+                sqlx::query(
+                    "INSERT INTO slack_gateway_accounts(workspace,owner,baseline_complete,retry_at_us) VALUES ('example.slack.com','UOWNER',?1,456)",
+                )
+                .bind(ready)
+                .execute(db.pool())
+                .await
+                .unwrap();
+                sqlx::query("INSERT INTO slack_gateway_discovery(workspace,owner,kind,after_date,cursor) VALUES ('example.slack.com','UOWNER','reaction','2026-11-01','retained-cursor')").execute(db.pool()).await.unwrap();
+                assert_eq!(run_through_for_test(db.pool(), 162).await.unwrap(), 2);
+                assert_eq!(run_through_for_test(db.pool(), 162).await.unwrap(), 0);
+                run_pending_migrations(db.pool()).await.unwrap();
+                let value: serde_json::Value =
+                    serde_json::from_str(&db.slack_configuration().await.unwrap().unwrap())
+                        .unwrap();
+                assert_eq!(value["trigger_emoji"], "phoenix-please-look");
+                assert!(value.get("trigger_emojis").is_none());
+                let account: (bool, i64) = sqlx::query_as(
+                    "SELECT baseline_complete,retry_at_us FROM slack_gateway_accounts",
+                )
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+                assert_eq!(account, (ready, 456));
+                assert_eq!(
+                    sqlx::query_scalar::<_, i64>("SELECT count(*) FROM slack_gateway_discovery")
+                        .fetch_one(db.pool())
+                        .await
+                        .unwrap(),
+                    i64::from(!multiple)
+                );
+                assert_eq!(
+                    db.slack_requests(&source.workspace, &source.owner)
+                        .await
+                        .unwrap()[0]
+                        .request_id,
+                    request.request_id
+                );
+                assert_eq!(
+                    db.slack_returns(&source.workspace, &source.owner)
+                        .await
+                        .unwrap()[0]
+                        .request_ids,
+                    vec![request.request_id.clone()]
+                );
+                assert!(db
+                    .slack_source_recorded(
+                        &source.workspace,
+                        &source.owner,
+                        &source.channel,
+                        &source.message_ts,
+                        source.trigger_kind,
+                    )
+                    .await
+                    .unwrap());
+                assert_eq!(sqlx::query_scalar::<_, i64>("SELECT count(*) FROM sqlite_schema WHERE name='slack_gateway_trigger_emojis'").fetch_one(db.pool()).await.unwrap(), 0);
+                db.pool().close().await;
+                let reopened = crate::Database::open(path.to_str().unwrap()).await.unwrap();
+                assert_eq!(run_through_for_test(reopened.pool(), 161).await.unwrap(), 0);
+                assert_eq!(
+                    reopened.slack_configuration().await.unwrap(),
+                    Some(value.to_string())
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn migration_156_preserves_populated_local_goal_ledger_and_schema() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("migration-156.db");
+        let db = crate::Database::open(path.to_str().unwrap()).await.unwrap();
+        let pool = db.pool().clone();
+        run_through_for_test(&pool, 155).await.unwrap();
+        let coordinator = db
+            .get_or_create_coordinator(None, phoenix_core::llm_language::LlmLanguage::default())
+            .await
+            .unwrap();
+        let source_product_id = coordinator.product_conversation_id.to_string();
+        sqlx::raw_sql(
+            "INSERT INTO product_conversations(id,kind,ordinary_lifecycle) VALUES('owner','ordinary','open');
+             INSERT INTO conversation_goal_ids(goal_id,objective,owner_id) VALUES('goal','objective','owner');
+             INSERT INTO conversation_goal_actors(actor_id,owner_id,kind,host_action_id)
+                 VALUES(1,'owner','generated_host','host-action');
+             INSERT INTO conversation_goal_history(owner_id,version,goal_id,state,action_id,change_kind,requested_actor_id,applied_actor_id,recorded_at_us)
+                 VALUES('owner',1,'goal','underway','goal-action','create',1,1,100);
+             INSERT INTO workflows(workflow_id,profile_kind,profile_version,runtime_acceptance_enabled,external_acceptance_enabled,version,generation,status,snapshot_codec_family,snapshot_codec_version,snapshot_payload,created_at,updated_at)
+                 VALUES(1,'direct_turn',1,0,1,1,0,'Active','direct_turn.snapshot',1,X'01',1,1);",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO durable_turns(turn_id,workflow_id,conversation_id,client_turn_key,prepared_fingerprint,prepared_payload,disposition,generation,owns_conversation,origin_kind,canonical_message_id,materialized) VALUES(1,1,?,'migration-turn','migration-fingerprint',X'01','Runtime',0,1,'user_api',NULL,0)")
+            .bind(&coordinator.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO messages(message_id,conversation_id,sequence_id,message_type,content,created_at) VALUES('message',?,1,'agent','{}','2026-10-31T00:00:00Z')")
+            .bind(&coordinator.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO conversation_goal_preparations(reference,owner_id,caller_conversation_id,source_product_id,workflow_id,turn_id,message_id,tool_use_id,operation,expected_version,objective) VALUES(zeroblob(16),'owner',?,?,1,1,'message','tool','create',0,'prepared objective')")
+            .bind(&coordinator.id)
+            .bind(&source_product_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO conversation_goal_coordinator_receipts(preparation_reference,owner_id,outcome,result_version,recorded_at_us) VALUES(zeroblob(16),'owner','rejected_busy',0,101)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let before: Vec<(String, String)> = sqlx::query_as(
+            "SELECT type,name FROM sqlite_schema
+             WHERE name LIKE 'conversation_goal_%'
+               AND name NOT IN (
+                 'conversation_goal_local_preparations_source_call',
+                 'conversation_goal_remote_preparations_source_call',
+                 'conversation_goal_remote_receipts_require_claimed'
+               )
+             ORDER BY type,name",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        run_through_for_test(&pool, 156).await.unwrap();
+        let after: Vec<(String, String)> = sqlx::query_as(
+            "SELECT type,name FROM sqlite_schema
+             WHERE name LIKE 'conversation_goal_%'
+               AND name NOT IN (
+                 'conversation_goal_local_preparations_source_call',
+                 'conversation_goal_remote_preparations_source_call',
+                 'conversation_goal_remote_receipts_require_claimed'
+               )
+             ORDER BY type,name",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(before, after);
+        let source_call_indexes: Vec<String> = sqlx::query_scalar(
+            "SELECT name FROM sqlite_schema
+             WHERE type='index' AND name IN (
+               'conversation_goal_local_preparations_source_call',
+               'conversation_goal_remote_preparations_source_call'
+             ) ORDER BY name",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            source_call_indexes,
+            vec![
+                "conversation_goal_local_preparations_source_call".to_owned(),
+                "conversation_goal_remote_preparations_source_call".to_owned(),
+            ]
+        );
+        let receipt_claim_trigger: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_schema
+             WHERE type='trigger' AND name='conversation_goal_remote_receipts_require_claimed'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(receipt_claim_trigger, 1);
+        let enrollment_fk: Vec<(String, String, String)> = sqlx::query_as(
+            "SELECT \"table\",\"from\",\"on_delete\" FROM pragma_foreign_key_list('conversation_goal_preparations') WHERE \"from\"='enrollment_id'",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            enrollment_fk,
+            vec![(
+                "federation_enrollments".to_owned(),
+                "enrollment_id".to_owned(),
+                "NO ACTION".to_owned()
+            )]
+        );
+        let preparation_columns: Vec<String> = sqlx::query_scalar(
+            "SELECT name FROM pragma_table_info('conversation_goal_preparations')",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert!(!preparation_columns.contains(&"source_instance_id".to_owned()));
+        assert!(preparation_columns.contains(&"apply_state".to_owned()));
+        for (table, expected) in [
+            ("conversation_goal_ids", 1),
+            ("conversation_goal_actors", 1),
+            ("conversation_goal_history", 1),
+            ("conversation_goal_preparations", 1),
+            ("conversation_goal_coordinator_receipts", 1),
+        ] {
+            let count: i64 =
+                sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT COUNT(*) FROM {table}")))
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(count, expected, "{table}");
+        }
+        let local: (Option<String>, Option<i64>) = sqlx::query_as(
+            "SELECT enrollment_id,expires_at_us FROM conversation_goal_preparations WHERE source_kind='local'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(local, (None, None));
+        let violations: Vec<(String, i64, String, i64)> =
+            sqlx::query_as("PRAGMA foreign_key_check")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert!(violations.is_empty(), "{violations:?}");
+    }
+
+    #[tokio::test]
+    async fn migration_156_applies_when_158_is_already_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("migration-156-after-158.db");
+        let db = crate::Database::open(path.to_str().unwrap()).await.unwrap();
+        let pool = db.pool();
+
+        run_through_for_test(pool, 155).await.unwrap();
+        let migration_158 = MIGRATIONS
+            .iter()
+            .find(|migration| migration.version == 158)
+            .expect("migration 158 must remain registered");
+        federated_conversation_actions::run(pool, migration_158)
+            .await
+            .unwrap();
+
+        let before: Vec<i64> = sqlx::query_scalar(
+            "SELECT version FROM _migrations WHERE version >= 156 ORDER BY version",
+        )
+        .fetch_all(pool)
+        .await
+        .unwrap();
+        assert_eq!(before, vec![158]);
+
+        assert_eq!(
+            run_pending_migrations(pool).await.unwrap(),
+            registered_after(155) - 1
+        );
+
+        let after: Vec<i64> = sqlx::query_scalar(
+            "SELECT version FROM _migrations WHERE version >= 156 ORDER BY version",
+        )
+        .fetch_all(pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            after,
+            MIGRATIONS
+                .iter()
+                .filter(|migration| migration.version >= 156)
+                .map(|migration| i64::from(migration.version))
+                .collect::<Vec<_>>()
+        );
+        sqlx::query("SELECT enrollment_id FROM conversation_goal_actors LIMIT 0")
+            .execute(pool)
+            .await
+            .unwrap();
+        sqlx::query("SELECT objective_source_instance_id FROM product_creation_jobs LIMIT 0")
+            .execute(pool)
+            .await
+            .unwrap();
+        assert!(sqlx::query("PRAGMA foreign_key_check")
+            .fetch_optional(pool)
+            .await
+            .unwrap()
+            .is_none());
+    }
 
     #[tokio::test]
     async fn slack_final_schema_excludes_obsolete_prototype_storage() {
@@ -16199,7 +16660,10 @@ mod tests {
             .unwrap()
             .is_empty());
         assert_eq!(run_through_for_test(db.pool(), 152).await.unwrap(), 1);
-        assert_eq!(run_pending_migrations(db.pool()).await.unwrap(), 33);
+        assert_eq!(
+            run_pending_migrations(db.pool()).await.unwrap(),
+            registered_after(152)
+        );
         assert_eq!(run_pending_migrations(db.pool()).await.unwrap(), 0);
         let ledger: Vec<(i64, String)> = sqlx::query_as(
             "SELECT version, name FROM _migrations WHERE version >= 150 ORDER BY version",
@@ -16208,7 +16672,11 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(
-            ledger,
+            ledger
+                .iter()
+                .filter(|(version, _)| *version <= 163)
+                .cloned()
+                .collect::<Vec<_>>(),
             vec![
                 (150, "federated_subscription_terminal_cancellation".into()),
                 (151, "one_shot_conversation_reminders".into()),
@@ -16222,42 +16690,23 @@ mod tests {
                 (161, "slack_single_trigger_emoji".into()),
                 (162, "slack_saved_capture".into()),
                 (163, "product_conversation_read_state".into()),
-                (164, "coordinator_durable_tracking".into()),
-                (165, "watch_ending_evidence".into()),
-                (166, "coordinator_transcript_scanner".into()),
-                (167, "slack_channel_submissions".into()),
-                (168, "coordinator_user_questions".into()),
-                (169, "native_task_approval_receipts".into()),
-                (
-                    170,
-                    "close_completion_allowances_and_native_retry_fence".into()
-                ),
-                (171, "native_close_initial_receipts".into()),
-                (172, "close_original_retirement_anchors".into()),
-                (173, "native_close_exact_observation_receipts".into()),
-                (174, "native_close_explicit_retry_admission".into()),
-                (175, "native_close_source_fence".into()),
-                (176, "native_close_retry_failure".into()),
-                (177, "native_close_retry_dispatch".into()),
-                (178, "native_close_retry_worktree_metadata".into()),
-                (179, "native_initial_source_fence".into()),
-                (180, "native_initial_completed_interruption".into()),
-                (181, "native_initial_completion_retry_admission".into()),
-                (182, "close_ignored_loss_category".into()),
-                (183, "native_close_initial_result_acknowledgement".into()),
-                (184, "native_close_captured_loss_retry".into()),
-                (185, "native_close_retry_tmux_dispatch".into()),
-                (186, "native_close_retry_origin_gate".into()),
-                (187, "native_close_origin_owner_cleanup".into()),
             ]
+        );
+        assert_eq!(
+            ledger,
+            compiled_migration_ledger()
+                .into_iter()
+                .filter(|(version, _)| *version >= 150)
+                .map(|(version, name)| (version, name.to_string()))
+                .collect::<Vec<_>>()
         );
     }
 
     #[tokio::test]
-    async fn migration_181_adds_unbackfilled_initial_completion_successor_authority() {
+    async fn migration_184_adds_unbackfilled_initial_completion_successor_authority() {
         let pool = test_pool().await;
-        setup_real_pre_172_schema(&pool).await;
-        run_through_for_test(&pool, 180).await.unwrap();
+        setup_real_pre_175_schema(&pool).await;
+        run_through_for_test(&pool, 183).await.unwrap();
         let db = crate::Database::from_pool_for_tests(pool.clone(), String::new());
         let legacy = db
             .create_conversation("completion-legacy", "legacy", "/tmp", true, None, None)
@@ -16311,8 +16760,8 @@ mod tests {
               'close_cleanup_failure_completion_requires_disposition') ORDER BY name",
         ).fetch_all(&pool).await.unwrap();
         assert_eq!(original_guards.len(), 5);
-        assert_eq!(run_through_for_test(&pool, 181).await.unwrap(), 1);
-        assert_eq!(run_through_for_test(&pool, 181).await.unwrap(), 0);
+        assert_eq!(run_through_for_test(&pool, 184).await.unwrap(), 1);
+        assert_eq!(run_through_for_test(&pool, 184).await.unwrap(), 0);
         for name in [
             "native_close_completion_retry_origins",
             "native_close_completion_retry_admissions",
@@ -16542,10 +16991,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn migration_182_preserves_existing_losses_and_adds_ignored_category() {
+    async fn migration_185_preserves_existing_losses_and_adds_ignored_category() {
         let pool = test_pool().await;
-        setup_real_pre_172_schema(&pool).await;
-        run_through_for_test(&pool, 181).await.unwrap();
+        setup_real_pre_175_schema(&pool).await;
+        run_through_for_test(&pool, 184).await.unwrap();
         let db = crate::Database::from_pool_for_tests(pool.clone(), String::new());
         let conversation = db
             .create_conversation("ignored-migration", "ignored", "/tmp", true, None, None)
@@ -16626,8 +17075,8 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(external_triggers_before.len(), external_trigger_names.len());
-        assert_eq!(run_through_for_test(&pool, 182).await.unwrap(), 1);
-        assert_eq!(run_through_for_test(&pool, 182).await.unwrap(), 0);
+        assert_eq!(run_through_for_test(&pool, 185).await.unwrap(), 1);
+        assert_eq!(run_through_for_test(&pool, 185).await.unwrap(), 0);
         let existing: (String, String) = sqlx::query_as(
             "SELECT category, identity_value FROM close_retirement_losses WHERE attempt_id = 'ignored-migration-attempt'",
         )
@@ -16737,17 +17186,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn migration_183_adds_unbackfilled_initial_result_acknowledgements() {
+    async fn migration_186_adds_unbackfilled_initial_result_acknowledgements() {
         let pool = test_pool().await;
-        setup_real_pre_172_schema(&pool).await;
-        run_through_for_test(&pool, 182).await.unwrap();
+        setup_real_pre_175_schema(&pool).await;
+        run_through_for_test(&pool, 185).await.unwrap();
         let receipts: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM native_close_initial_receipts")
                 .fetch_one(&pool)
                 .await
                 .unwrap();
-        assert_eq!(run_through_for_test(&pool, 183).await.unwrap(), 1);
-        assert_eq!(run_through_for_test(&pool, 183).await.unwrap(), 0);
+        assert_eq!(run_through_for_test(&pool, 186).await.unwrap(), 1);
+        assert_eq!(run_through_for_test(&pool, 186).await.unwrap(), 0);
         assert_eq!(
             sqlx::query_scalar::<_, i64>(
                 "SELECT COUNT(*) FROM native_close_initial_result_acknowledgements"
@@ -16793,19 +17242,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn migration_180_upgrades_authentic_179_initial_source_fence_schema() {
+    async fn migration_183_upgrades_authentic_182_initial_source_fence_schema() {
         let pool = test_pool().await;
-        setup_real_pre_172_schema(&pool).await;
-        run_through_for_test(&pool, 179).await.unwrap();
+        setup_real_pre_175_schema(&pool).await;
+        run_through_for_test(&pool, 182).await.unwrap();
         assert_eq!(
             sqlx::query_scalar::<_, i64>("SELECT MAX(version) FROM _migrations")
                 .fetch_one(&pool)
                 .await
                 .unwrap(),
-            179
+            182
         );
-        assert_eq!(run_through_for_test(&pool, 180).await.unwrap(), 1);
-        assert_eq!(run_through_for_test(&pool, 180).await.unwrap(), 0);
+        assert_eq!(run_through_for_test(&pool, 183).await.unwrap(), 1);
+        assert_eq!(run_through_for_test(&pool, 183).await.unwrap(), 0);
         for name in [
             "close_cleanup_failures_require_initial_authority",
             "native_close_source_fence_requires_exact_plan",
@@ -16859,25 +17308,28 @@ mod tests {
         let ledger = compiled_migration_ledger();
         assert!(ledger.windows(2).all(|pair| pair[0].0 < pair[1].0));
         let expected_tail = [
-            (187, "native_close_origin_owner_cleanup"),
-            (186, "native_close_retry_origin_gate"),
-            (185, "native_close_retry_tmux_dispatch"),
-            (184, "native_close_captured_loss_retry"),
-            (183, "native_close_initial_result_acknowledgement"),
-            (182, "close_ignored_loss_category"),
-            (181, "native_initial_completion_retry_admission"),
-            (180, "native_initial_completed_interruption"),
-            (179, "native_initial_source_fence"),
-            (178, "native_close_retry_worktree_metadata"),
-            (177, "native_close_retry_dispatch"),
-            (176, "native_close_retry_failure"),
-            (175, "native_close_source_fence"),
-            (174, "native_close_explicit_retry_admission"),
-            (173, "native_close_exact_observation_receipts"),
-            (172, "close_original_retirement_anchors"),
-            (171, "native_close_initial_receipts"),
-            (170, "close_completion_allowances_and_native_retry_fence"),
-            (169, "native_task_approval_receipts"),
+            (190, "native_close_origin_owner_cleanup"),
+            (189, "native_close_retry_origin_gate"),
+            (188, "native_close_retry_tmux_dispatch"),
+            (187, "native_close_captured_loss_retry"),
+            (186, "native_close_initial_result_acknowledgement"),
+            (185, "close_ignored_loss_category"),
+            (184, "native_initial_completion_retry_admission"),
+            (183, "native_initial_completed_interruption"),
+            (182, "native_initial_source_fence"),
+            (181, "native_close_retry_worktree_metadata"),
+            (180, "native_close_retry_dispatch"),
+            (179, "native_close_retry_failure"),
+            (178, "native_close_source_fence"),
+            (177, "native_close_explicit_retry_admission"),
+            (176, "native_close_exact_observation_receipts"),
+            (175, "close_original_retirement_anchors"),
+            (174, "native_close_initial_receipts"),
+            (173, "close_completion_allowances_and_native_retry_fence"),
+            (172, "native_task_approval_receipts"),
+            (171, "adhd_llm_language"),
+            (170, "tool_discovery"),
+            (169, "chat_completions_signature_replay"),
             (168, "coordinator_user_questions"),
             (167, "slack_channel_submissions"),
             (166, "coordinator_transcript_scanner"),
@@ -16932,7 +17384,6 @@ mod tests {
             (115, "federation_enrollments"),
             (114, "persist_instance_identity"),
             (113, "settle_historical_continuation_openings"),
-            (112, "input_source_tool_call"),
         ];
         assert_eq!(
             ledger
@@ -17810,9 +18261,9 @@ mod tests {
         }
     }
 
-    pub(super) async fn setup_real_pre_172_schema(pool: &SqlitePool) {
+    pub(super) async fn setup_real_pre_175_schema(pool: &SqlitePool) {
         setup_legacy_conversations_table(pool).await;
-        let end = MIGRATIONS.partition_point(|migration| migration.version <= 171);
+        let end = MIGRATIONS.partition_point(|migration| migration.version <= 174);
         run_migration_list(pool, &MIGRATIONS[..end]).await.unwrap();
     }
 
@@ -21148,7 +21599,7 @@ mod tests {
     fn goal_tools_registry_contains_real_145_before_retention_tail() {
         let tail: Vec<_> = MIGRATIONS
             .iter()
-            .filter(|migration| migration.version >= 143)
+            .filter(|migration| (143..=163).contains(&migration.version))
             .map(|migration| (migration.version, migration.name))
             .collect();
         assert_eq!(
@@ -21173,30 +21624,6 @@ mod tests {
                 (161, "slack_single_trigger_emoji"),
                 (162, "slack_saved_capture"),
                 (163, "product_conversation_read_state"),
-                (164, "coordinator_durable_tracking"),
-                (165, "watch_ending_evidence"),
-                (166, "coordinator_transcript_scanner"),
-                (167, "slack_channel_submissions"),
-                (168, "coordinator_user_questions"),
-                (169, "native_task_approval_receipts"),
-                (170, "close_completion_allowances_and_native_retry_fence"),
-                (171, "native_close_initial_receipts"),
-                (172, "close_original_retirement_anchors"),
-                (173, "native_close_exact_observation_receipts"),
-                (174, "native_close_explicit_retry_admission"),
-                (175, "native_close_source_fence"),
-                (176, "native_close_retry_failure"),
-                (177, "native_close_retry_dispatch"),
-                (178, "native_close_retry_worktree_metadata"),
-                (179, "native_initial_source_fence"),
-                (180, "native_initial_completed_interruption"),
-                (181, "native_initial_completion_retry_admission"),
-                (182, "close_ignored_loss_category"),
-                (183, "native_close_initial_result_acknowledgement"),
-                (184, "native_close_captured_loss_retry"),
-                (185, "native_close_retry_tmux_dispatch"),
-                (186, "native_close_retry_origin_gate"),
-                (187, "native_close_origin_owner_cleanup"),
             ]
         );
         let goal = MIGRATIONS
@@ -21210,7 +21637,13 @@ mod tests {
         assert!(goal
             .sql
             .contains("CREATE TABLE conversation_goal_coordinator_receipts"));
-        assert_eq!(MIGRATIONS.len(), 184);
+        assert_eq!(
+            MIGRATIONS
+                .iter()
+                .filter(|migration| migration.version <= 163)
+                .count(),
+            160
+        );
     }
 
     #[tokio::test]
@@ -21226,7 +21659,10 @@ mod tests {
         }
         sqlx::query("UPDATE product_creation_jobs SET status = 'published', published_product_id = 'deleted-product', published_conversation_id = 'deleted-transcript' WHERE request_id = 'orphan-image'")
             .execute(&pool).await.unwrap();
-        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 37);
+        assert_eq!(
+            run_pending_migrations(&pool).await.unwrap(),
+            registered_after(148)
+        );
         let identity: Vec<(String, String)> = sqlx::query_as(
             "SELECT request_id, data_sha256 FROM product_creation_image_replay_identity ORDER BY request_id",
         ).fetch_all(&pool).await.unwrap();
@@ -21280,7 +21716,10 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 37);
+        assert_eq!(
+            run_pending_migrations(&pool).await.unwrap(),
+            registered_after(148)
+        );
         let retained: (String, String, String) = sqlx::query_as(
             "SELECT status, published_product_id, published_conversation_id
              FROM product_creation_jobs WHERE request_id = 'orphan-text'",
@@ -24102,14 +24541,14 @@ mod close_completion_allowance_tests {
     use sqlx::sqlite::SqlitePoolOptions;
 
     use super::{
-        run_pending_migrations, tests::setup_real_pre_172_schema, MIGRATIONS, MIGRATION_157,
+        run_pending_migrations, tests::setup_real_pre_175_schema, MIGRATIONS, MIGRATION_157,
     };
 
     #[tokio::test]
     // Keep the migration's before/after, failed-write, cascade and rollback
     // assertions together so each observes the same retained fixture state.
     #[allow(clippy::too_many_lines)]
-    async fn migration_170_seeds_only_future_operations_and_enforces_monotonicity() {
+    async fn migration_173_seeds_only_future_operations_and_enforces_monotonicity() {
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
             .connect("sqlite::memory:")
@@ -24314,8 +24753,8 @@ mod close_completion_allowance_tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::too_many_lines)] // Exercise the real 171 -> 172 boundary and shared G1 -> G2 path.
-    async fn migration_172_excludes_legacy_sealed_inventory_and_preserves_shared_g2_capture() {
+    #[allow(clippy::too_many_lines)] // Exercise the real 174 -> 175 boundary and shared G1 -> G2 path.
+    async fn migration_175_excludes_legacy_sealed_inventory_and_preserves_shared_g2_capture() {
         use crate::{
             CaptureCloseRetirementInventoryRequest, CaptureCloseRetirementInventoryScopeRequest,
             ReplaceCloseInspectionRequest, ReplaceCloseInspectionScopeRequest,
@@ -24332,7 +24771,7 @@ mod close_completion_allowance_tests {
             .connect("sqlite::memory:")
             .await
             .unwrap();
-        setup_real_pre_172_schema(&pool).await;
+        setup_real_pre_175_schema(&pool).await;
         let missing_tables: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM sqlite_schema WHERE name IN ('close_original_retirement_anchors', 'close_retirement_anchor_exclusions')"
         ).fetch_one(&pool).await.unwrap();
@@ -24388,7 +24827,7 @@ mod close_completion_allowance_tests {
             .unwrap()
             .clone();
 
-        // Author the genuine pre-172 capture using only tables and constraints
+        // Author the genuine pre-175 capture using only tables and constraints
         // available at 158. In particular, no modern capture API can run here.
         sqlx::query(
             "INSERT INTO close_retirement_inventories
@@ -24574,13 +25013,13 @@ mod close_completion_allowance_tests {
     }
 
     #[tokio::test]
-    async fn migration_172_excludes_a_preexisting_zero_inventory_attempt() {
+    async fn migration_175_excludes_a_preexisting_zero_inventory_attempt() {
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
             .connect("sqlite::memory:")
             .await
             .unwrap();
-        setup_real_pre_172_schema(&pool).await;
+        setup_real_pre_175_schema(&pool).await;
         let db = crate::Database::from_pool_for_tests(pool.clone(), String::new());
         let conversation = db
             .create_conversation("legacy-zero", "legacy-zero", "/tmp", true, None, None)
@@ -24596,7 +25035,7 @@ mod close_completion_allowance_tests {
 
         let migration = MIGRATIONS
             .iter()
-            .find(|migration| migration.version == 172)
+            .find(|migration| migration.version == 175)
             .unwrap();
         sqlx::raw_sql(migration.sql).execute(&pool).await.unwrap();
 
@@ -24628,7 +25067,7 @@ mod close_completion_allowance_tests {
 
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
-    async fn migration_172_seals_anchor_and_exclusion_without_hidden_rowid_or_replace_escape() {
+    async fn migration_175_seals_anchor_and_exclusion_without_hidden_rowid_or_replace_escape() {
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
             .connect("sqlite::memory:")
@@ -24665,7 +25104,7 @@ mod close_completion_allowance_tests {
         .unwrap();
         let migration = MIGRATIONS
             .iter()
-            .find(|migration| migration.version == 172)
+            .find(|migration| migration.version == 175)
             .unwrap();
         sqlx::raw_sql(migration.sql).execute(&pool).await.unwrap();
 
@@ -24867,7 +25306,7 @@ mod native_close_initial_receipt_tests {
 
     #[tokio::test]
     #[allow(clippy::too_many_lines)] // One fixture checks the full immutable receipt lifecycle.
-    async fn migration_171_binds_initial_receipts_to_their_exact_obligation_and_run() {
+    async fn migration_174_binds_initial_receipts_to_their_exact_obligation_and_run() {
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
             .connect("sqlite::memory:")

@@ -42,11 +42,30 @@ impl ChildExitPublisher {
     }
 }
 
+#[cfg(test)]
+#[derive(Clone, Copy, Debug)]
+struct ObserverCleanupComplete;
+
+#[cfg(test)]
+pub(crate) struct ObserverCleanupReceipt(watch::Receiver<Option<ObserverCleanupComplete>>);
+
+#[cfg(test)]
+impl ObserverCleanupReceipt {
+    pub(crate) async fn wait(mut self) {
+        self.0
+            .wait_for(Option::is_some)
+            .await
+            .expect("observer cleanup publisher dropped before completion");
+    }
+}
+
 /// The observer is consumed on successful registry publication, never by a relay.
 #[derive(Debug)]
 pub struct TerminalChildLifecycle {
     observer: Mutex<Option<ChildExitObserver>>,
     receipt: ChildExitReceipt,
+    #[cfg(test)]
+    cleanup: watch::Sender<Option<ObserverCleanupComplete>>,
 }
 
 #[derive(Debug)]
@@ -78,6 +97,8 @@ impl TerminalChildLifecycle {
                 publisher: ChildExitPublisher(sender),
             })),
             receipt: ChildExitReceipt(receiver),
+            #[cfg(test)]
+            cleanup: watch::channel(None).0,
         }
     }
 
@@ -107,6 +128,16 @@ impl TerminalChildLifecycle {
             .expect("test publisher already consumed");
         assert!(matches!(observer.source, ChildExitSource::Passive));
         observer.publisher.publish(result);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cleanup_receipt(&self) -> ObserverCleanupReceipt {
+        ObserverCleanupReceipt(self.cleanup.subscribe())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn publish_cleanup_complete(&self) {
+        self.cleanup.send_replace(Some(ObserverCleanupComplete));
     }
 
     pub(crate) fn receipt(&self) -> ChildExitReceipt {

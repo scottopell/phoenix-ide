@@ -4,6 +4,66 @@ import { SlackGatewaySettings } from './SlackGatewaySettings';
 
 afterEach(() => { cleanup(); vi.unstubAllGlobals(); });
 
+it('saves an optional submission channel and explains note authority and Phoenix handoff', async () => {
+  const config = { enabled: true, saved_enabled: false, inbox_channel: null as string | null, mcp_server: 'slack', owner: 'UOWNER', workspace: 'example.slack.com', timezone: 'UTC', phoenix_url: 'https://phoenix.example', trigger_emoji: 'fire', notification_command: null };
+  let submitted: typeof config | undefined;
+  vi.stubGlobal('fetch', vi.fn().mockImplementation(async (_url: string, options?: RequestInit) => {
+    if (options?.method === 'PUT') submitted = JSON.parse(String(options.body));
+    return { ok: true, json: async () => ({ config: submitted ?? config, inbox_scan: { baseline_complete: true, scan_in_progress: false, last_scan_at_unix_micros: null, last_error: null }, requests: [], returns: [] }) };
+  }));
+  render(<SlackGatewaySettings standalone />);
+  const channel = await screen.findByLabelText('Submission channel ID');
+  await waitFor(() => expect((channel as HTMLInputElement).value).toBe(''));
+  fireEvent.change(channel, { target: { value: 'CINBOX' } });
+  fireEvent.click(screen.getByRole('button', { name: 'Save settings' }));
+  await screen.findByText('Settings saved.');
+  expect(submitted?.inbox_channel).toBe('CINBOX');
+  expect(screen.getByText(/Your note is the instruction; forwarded text is context/)).toBeTruthy();
+  expect(screen.getByText(/Wait for Ready before posting/)).toBeTruthy();
+  fireEvent.change(channel, { target: { value: '' } });
+  fireEvent.click(screen.getByRole('button', { name: 'Save settings' }));
+  await screen.findByText('Settings saved.');
+  expect(submitted?.inbox_channel).toBeNull();
+});
+
+it('saves one custom emoji name and explains all three workflows', async () => {
+  const config = { enabled: true, mcp_server: 'slack', owner: 'UOWNER', workspace: 'example.slack.com', timezone: 'UTC', phoenix_url: 'https://phoenix.example', trigger_emoji: 'fire', notification_command: null };
+  let submitted: typeof config | undefined;
+  vi.stubGlobal('fetch', vi.fn().mockImplementation(async (_url: string, options?: RequestInit) => {
+    if (options?.method === 'PUT') submitted = JSON.parse(String(options.body));
+    return { ok: true, json: async () => ({ config: submitted ?? config, scan: { baseline_complete: !submitted, status: submitted ? 'initializing' : 'healthy' }, requests: [], returns: [] }) };
+  }));
+  render(<SlackGatewaySettings standalone />);
+  const first = await screen.findByLabelText('Slack emoji name');
+  await waitFor(() => expect((first as HTMLInputElement).value).toBe('fire'));
+  fireEvent.change(first, { target: { value: ':phoenix-please-look:' } });
+  expect(screen.queryByRole('button', { name: 'Add trigger emoji' })).toBeNull();
+  expect(screen.getByText('1. Message prefix')).toBeTruthy();
+  expect(screen.getByText('2. React to your own message')).toBeTruthy();
+  expect(screen.getByText('3. React to someone else’s message')).toBeTruthy();
+  expect(screen.getByText(':phoenix-please-look: phoenix, investigate this')).toBeTruthy();
+  fireEvent.click(screen.getByRole('button', { name: 'Save settings' }));
+  await screen.findByText('Settings saved.');
+  expect(submitted?.trigger_emoji).toBe('phoenix-please-look');
+  expect(submitted).not.toHaveProperty('trigger_emojis');
+  expect(screen.getByText('Initializing')).toBeTruthy();
+  expect(screen.getByText(/Changing the emoji restarts emoji initialization/)).toBeTruthy();
+  fireEvent.change(first, { target: { value: 'fire' } });
+  expect(screen.queryByText('Settings saved.')).toBeNull();
+});
+
+it.each(['fire, phoenix-please-look', 'fire phoenix-please-look', 'eyes'])('rejects multiple or reserved names without submitting: %s', async name => {
+  const config = { enabled: false, mcp_server: 'slack', owner: 'UOWNER', workspace: 'example.slack.com', timezone: 'UTC', phoenix_url: 'https://phoenix.example', trigger_emoji: 'phoenix-please-look', notification_command: null };
+  const fetch = vi.fn().mockResolvedValue({ ok: true, json: async () => ({ config, requests: [], returns: [] }) });
+  vi.stubGlobal('fetch', fetch);
+  render(<SlackGatewaySettings standalone />);
+  await waitFor(() => expect((screen.getByLabelText('Slack emoji name') as HTMLInputElement).value).toBe('phoenix-please-look'));
+  fireEvent.change(screen.getByLabelText('Slack emoji name'), { target: { value: name } });
+  fireEvent.click(screen.getByRole('button', { name: 'Save settings' }));
+  await screen.findByText(name === 'eyes' ? 'eyes is reserved for Phoenix acknowledgments.' : 'Enter one Slack emoji name, such as phoenix-please-look.');
+  expect(fetch.mock.calls.some(([, options]) => options?.method === 'PUT')).toBe(false);
+});
+
 it('offers a conversation link only while the status API confirms native route availability', async () => {
   let conversationAvailable = false;
   let failure: string | null = null;
@@ -145,4 +205,38 @@ it.each([[], ['slack_read_user_profile'], ['slack_read_user_profile', 'slack_sea
   await screen.findByText(/Slack connection: Cannot verify required tool schemas/);
   expect(screen.queryByText(/Required tools unavailable/)).toBeNull();
   expect(screen.queryByText('healthy')).toBeNull();
+});
+
+it('keeps Saved capture opt-in and submits it independently of the emoji', async () => {
+  let submitted: Record<string, unknown> | undefined;
+  vi.stubGlobal('fetch', vi.fn().mockImplementation(async (_url: string, options?: RequestInit) => {
+    if (options?.method === 'PUT') submitted = JSON.parse(String(options.body));
+    return { ok: true, json: async () => ({ config: submitted ?? null, requests: [], returns: [] }) };
+  }));
+  render(<SlackGatewaySettings standalone />);
+  const toggle = await screen.findByRole('switch', { name: /Capture saved messages privately/ });
+  expect((toggle as HTMLInputElement).checked).toBe(false);
+  fireEvent.click(toggle);
+  fireEvent.click(screen.getByRole('button', { name: 'Save settings' }));
+  await screen.findByText('Settings saved.');
+  expect(submitted?.['saved_enabled']).toBe(true);
+  expect(submitted?.['trigger_emoji']).toBe('fire');
+  expect(screen.getByText(/Messages of any age, from anyone/)).toBeTruthy();
+  expect(screen.getByText(/It adds no reaction and posts nothing/)).toBeTruthy();
+});
+
+it('shows Saved incompleteness independently and never implies eyes are pending', async () => {
+  vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: true, json: async () => ({
+    config: { enabled: true, saved_enabled: true },
+    scan: { baseline_complete: true, status: 'healthy' },
+    saved_scan: { baseline_complete: true, scan_in_progress: true, last_error: 'page_limit_exceeded', last_scan_at_unix_micros: 1000000 },
+    requests: [{ request_id: 'saved', product_id: 'product', conversation_available: true, admitted: true, accepted_at_us: 1000, eyes_confirmed: false, eyes_failure: null, failure: null, source: { kind: 'briefing', trigger_kind: 'saved', source_url: 'https://example.slack.com/source', observed_at_unix_micros: 500, message_ts: '1.000001' } }], returns: [],
+  }) }));
+  render(<SlackGatewaySettings standalone />);
+  await screen.findByRole('link', { name: 'Private Saved capture' });
+  expect(screen.getByText('healthy')).toBeTruthy();
+  expect(screen.getByText('Incomplete')).toBeTruthy();
+  expect(screen.getByRole('alert').textContent).toContain('Saved scan incomplete');
+  expect(screen.getByText(/Private · no Slack acknowledgment/)).toBeTruthy();
+  expect(screen.queryByText(/👀 pending/)).toBeNull();
 });

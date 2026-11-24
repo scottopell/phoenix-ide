@@ -329,12 +329,13 @@ describe('exact-request creation observation', () => {
   it('replays a reloaded uncertain request with images, effort and pinned language instead of current composer settings', async () => {
     const storedRequest: CreateProductConversationRequest = {
       request_id: 'request-1', cwd: '/original', objective: 'Original objective', model: 'original-model',
-      effort: 'high', llm_language: 'Japanese', images: [{ data: 'aW1hZ2U=', media_type: 'image/png' }],
+      effort: 'high', llm_language: 'adhd', images: [{ data: 'aW1hZ2U=', media_type: 'image/png' }],
     };
     seedStoredCreation('request-1', { version: 3, kind: 'uncertain', request: storedRequest });
     apiMock.getProductConversationCreation.mockRejectedValueOnce(new ApiResponseError('Not yet found', 404)).mockResolvedValue(pending);
     const hook = mountCreation();
     await act(async () => {});
+    expect(hook.result.current.selectedLlmLanguage).toBe('adhd');
     expect(apiMock.createProductConversation).toHaveBeenCalledExactlyOnceWith(storedRequest);
     expect(hook.result.current.creationObservation).toEqual(pending);
     expect(generateUUIDMock).not.toHaveBeenCalled();

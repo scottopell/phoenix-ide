@@ -1,4 +1,4 @@
-//! Upgrade the shipped 184 schema; never manufacture the expected trigger body.
+//! Upgrade the shipped 187 schema; never manufacture the expected trigger body.
 use super::*;
 use sqlx::sqlite::SqlitePoolOptions;
 
@@ -8,13 +8,13 @@ async fn predecessor() -> SqlitePool {
         .connect("sqlite::memory:")
         .await
         .unwrap();
-    setup_real_175_for_test(&pool).await;
-    run_through_for_test(&pool, 184).await.unwrap();
+    setup_real_178_for_test(&pool).await;
+    run_through_for_test(&pool, 187).await.unwrap();
     let version: i64 = sqlx::query_scalar("SELECT MAX(version) FROM _migrations")
         .fetch_one(&pool)
         .await
         .unwrap();
-    assert_eq!(version, 184);
+    assert_eq!(version, 187);
     pool
 }
 
@@ -41,7 +41,7 @@ async fn trigger(pool: &SqlitePool, name: &str) -> String {
 }
 
 #[tokio::test]
-async fn real184_to185_preserves_worktree_authority_and_adds_exact_original_tmux() {
+async fn real187_to188_preserves_worktree_authority_and_adds_exact_original_tmux() {
     let pool = predecessor().await;
     let name = "close_retirement_resource_dispatches_require_authority";
     let before = trigger(&pool, name).await;
@@ -49,7 +49,7 @@ async fn real184_to185_preserves_worktree_authority_and_adds_exact_original_tmux
     let membership = trigger(&pool, membership_name).await;
     let original = include_str!("native_close_retry_dispatch.sql").trim_end();
     assert!(before.contains(original));
-    assert_eq!(run_through_for_test(&pool, 185).await.unwrap(), 1);
+    assert_eq!(run_through_for_test(&pool, 188).await.unwrap(), 1);
     let after = trigger(&pool, name).await;
     assert!(after.contains(original), "retain exact worktree authority");
     assert!(after
@@ -60,9 +60,9 @@ async fn real184_to185_preserves_worktree_authority_and_adds_exact_original_tmux
     let applied_ledger = ledger(&pool).await;
     assert_eq!(
         applied_ledger.last(),
-        Some(&(185, "native_close_retry_tmux_dispatch".into()))
+        Some(&(188, "native_close_retry_tmux_dispatch".into()))
     );
-    assert_eq!(run_through_for_test(&pool, 185).await.unwrap(), 0);
+    assert_eq!(run_through_for_test(&pool, 188).await.unwrap(), 0);
     assert_eq!(schema(&pool).await, applied_schema);
     assert_eq!(ledger(&pool).await, applied_ledger);
     let violations: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pragma_foreign_key_check")
@@ -73,7 +73,7 @@ async fn real184_to185_preserves_worktree_authority_and_adds_exact_original_tmux
 }
 
 #[tokio::test]
-async fn missing_or_changed_dispatch_trigger_rolls_back185() {
+async fn missing_or_changed_dispatch_trigger_rolls_back188() {
     for changed in [false, true] {
         let pool = predecessor().await;
         sqlx::raw_sql("DROP TRIGGER close_retirement_resource_dispatches_require_authority;")
@@ -91,7 +91,7 @@ async fn missing_or_changed_dispatch_trigger_rolls_back185() {
         }
         let before = schema(&pool).await;
         let before_ledger = ledger(&pool).await;
-        let error = run_through_for_test(&pool, 185).await.unwrap_err();
+        let error = run_through_for_test(&pool, 188).await.unwrap_err();
         assert!(error.to_string().contains(
             "unexpected close_retirement_resource_dispatches_require_authority source shape"
         ));

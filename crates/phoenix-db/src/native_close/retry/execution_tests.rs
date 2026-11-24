@@ -10,11 +10,11 @@ async fn generic_resource_failure_still_terminalizes_and_replays_non_native_retr
     request.occurred_at_us = Utc::now().timestamp_micros();
     request.detail = "retained non-native retry failure".into();
     let obligation = db.terminalize_close_run_cleanup_failure(&run, &request).await.unwrap();
-    let retained = migration_176_retained_state(&db).await;
+    let retained = migration_179_retained_state(&db).await;
     let counts = native_failure_side_effect_counts(&db).await;
     assert_eq!(db.terminalize_close_run_cleanup_failure(&run, &request).await.unwrap(), obligation);
     assert_eq!(db.get_close_run(&run).await.unwrap().status, CloseRunStatus::Stopped);
-    assert_eq!(migration_176_retained_state(&db).await, retained);
+    assert_eq!(migration_179_retained_state(&db).await, retained);
     assert_eq!(native_failure_side_effect_counts(&db).await, counts);
 }
 
@@ -130,7 +130,7 @@ async fn native_retry_worktree_metadata_is_source_bound_to_pending_original_g1_e
     write_source_fence_state(&db, &assessment.command, &ConvState::Idle, false).await.unwrap();
     // Replacing the live source durably stops its admitted successor. Compare
     // metadata refusal against that established state, not the prior running run.
-    let retained = migration_176_retained_state(&db).await;
+    let retained = migration_179_retained_state(&db).await;
     let stale_results = [
         db.record_native_close_retry_worktree_cleanup_plan(
             &assessment.command, &receipt.admitted, make_request(),
@@ -148,7 +148,7 @@ async fn native_retry_worktree_metadata_is_source_bound_to_pending_original_g1_e
         };
         assert!(message.contains("current executing source"), "{message}");
     }
-    assert_eq!(migration_176_retained_state(&db).await, retained);
+    assert_eq!(migration_179_retained_state(&db).await, retained);
 }
 
 async fn assert_generic_native_metadata_refused(
@@ -170,8 +170,7 @@ async fn assert_generic_native_metadata_refused(
 }
 
 async fn native_resource_failure_fixture() -> (Database, Assessment, NativeCloseReceipt) {
-    // This fixture installs 162 once, then upgrades that same DB to 163.
-    let (db, assessment, receipt) = migration_176_pending_fixture().await;
+    let (db, assessment, receipt) = migration_179_pending_fixture().await;
     crate::migrations::run_pending_migrations(db.pool()).await.unwrap();
     (db, assessment, receipt)
 }
@@ -192,7 +191,7 @@ async fn native_retry_execution_context_reads_original_typed_plan_without_mutati
     success_recorded(db.record_native_close_retry_success(
         &assessment.command, &receipt.admitted, worktree, "original worktree completed",
     ).await);
-    let retained = migration_176_retained_state(&db).await;
+    let retained = migration_179_retained_state(&db).await;
     let metadata = lookup_metadata(&db, &run.attempt_id).await;
     let counts = native_failure_side_effect_counts(&db).await;
     let context = db.read_native_close_retry_execution_context(
@@ -227,7 +226,7 @@ async fn native_retry_execution_context_reads_original_typed_plan_without_mutati
     assert_eq!(generation, context.snapshot.generation());
     assert_eq!(fingerprint, context.snapshot.fingerprint());
     assert_eq!(current_test_snapshot(&db, run.attempt_id.as_str()).await, g2);
-    assert_eq!(migration_176_retained_state(&db).await, retained);
+    assert_eq!(migration_179_retained_state(&db).await, retained);
     assert_eq!(lookup_metadata(&db, &run.attempt_id).await, metadata);
     assert_eq!(native_failure_side_effect_counts(&db).await, counts);
 }
@@ -237,7 +236,7 @@ async fn native_retry_execution_context_checks_live_source_before_retained_recei
     let (db, assessment, receipt) = native_resource_failure_fixture().await;
     assert!(db.read_native_close_explicit_retry_receipt(&assessment.command).await.unwrap().is_some());
     write_source_fence_state(&db, &assessment.command, &ConvState::Idle, false).await.unwrap();
-    let retained = migration_176_retained_state(&db).await;
+    let retained = migration_179_retained_state(&db).await;
     let metadata = lookup_metadata(&db, &receipt.admitted.attempt_id).await;
     let counts = native_failure_side_effect_counts(&db).await;
     let result = db.read_native_close_retry_execution_context(
@@ -247,7 +246,7 @@ async fn native_retry_execution_context_checks_live_source_before_retained_recei
         panic!("stale source must refuse before receipt replay: {result:?}");
     };
     assert!(message.contains("current executing source"), "{message}");
-    assert_eq!(migration_176_retained_state(&db).await, retained);
+    assert_eq!(migration_179_retained_state(&db).await, retained);
     assert_eq!(lookup_metadata(&db, &receipt.admitted.attempt_id).await, metadata);
     assert_eq!(native_failure_side_effect_counts(&db).await, counts);
 }
@@ -255,13 +254,13 @@ async fn native_retry_execution_context_checks_live_source_before_retained_recei
 #[tokio::test]
 async fn native_retry_execution_context_refuses_forged_receipt_wrong_failed_run_and_stopped_latest() {
     let (db, assessment, receipt) = native_resource_failure_fixture().await;
-    let retained = migration_176_retained_state(&db).await;
+    let retained = migration_179_retained_state(&db).await;
     let metadata = lookup_metadata(&db, &receipt.admitted.attempt_id).await;
     let counts = native_failure_side_effect_counts(&db).await;
     let mut forged = receipt.admitted.clone();
     forged.run_ordinal = forged.run_ordinal.checked_next().unwrap();
     assert!(db.read_native_close_retry_execution_context(&assessment.command, &forged).await.is_err());
-    assert_eq!(migration_176_retained_state(&db).await, retained);
+    assert_eq!(migration_179_retained_state(&db).await, retained);
     assert_eq!(lookup_metadata(&db, &receipt.admitted.attempt_id).await, metadata);
     assert_eq!(native_failure_side_effect_counts(&db).await, counts);
     let pending = assessment.request.remaining_effects.clone();
@@ -269,13 +268,13 @@ async fn native_retry_execution_context_refuses_forged_receipt_wrong_failed_run_
     retry_completed(db.terminalize_native_close_retry_resource_failure(
         &assessment.command, &receipt.admitted, request,
     ).await);
-    let retained = migration_176_retained_state(&db).await;
+    let retained = migration_179_retained_state(&db).await;
     let metadata = lookup_metadata(&db, &receipt.admitted.attempt_id).await;
     let counts = native_failure_side_effect_counts(&db).await;
     assert!(db.read_native_close_explicit_retry_receipt(&assessment.command).await.unwrap().is_some());
     assert!(db.read_native_close_retry_execution_context(&assessment.command, &receipt.admitted).await.is_err());
     assert_eq!(native_failure_side_effect_counts(&db).await, counts);
-    assert_eq!(migration_176_retained_state(&db).await, retained);
+    assert_eq!(migration_179_retained_state(&db).await, retained);
     assert_eq!(lookup_metadata(&db, &receipt.admitted.attempt_id).await, metadata);
     let wrong_failed = retry_command(&db, "context-wrong-failed", NativeCloseIntent::ExplicitRetry {
         target: receipt.admitted.target.clone(),
@@ -287,7 +286,7 @@ async fn native_retry_execution_context_refuses_forged_receipt_wrong_failed_run_
     let counts = native_failure_side_effect_counts(&db).await;
     let metadata = lookup_metadata(&db, &receipt.admitted.attempt_id).await;
     assert!(db.read_native_close_retry_execution_context(&wrong_failed, &receipt.admitted).await.is_err());
-    assert_eq!(migration_176_retained_state(&db).await, retained);
+    assert_eq!(migration_179_retained_state(&db).await, retained);
     assert_eq!(lookup_metadata(&db, &receipt.admitted.attempt_id).await, metadata);
     assert_eq!(native_failure_side_effect_counts(&db).await, counts);
 }
@@ -307,7 +306,7 @@ async fn native_retry_pre_admission_context_reads_exact_stopped_g1_without_mutat
         &assessment.command, &receipt.admitted, request,
     ).await);
 
-    let retained = migration_176_retained_state(&db).await;
+    let retained = migration_179_retained_state(&db).await;
     let metadata = lookup_metadata(&db, &run.attempt_id).await;
     let counts = native_failure_side_effect_counts(&db).await;
     let context = db.read_native_close_retry_pre_admission_context(&run).await.unwrap();
@@ -317,7 +316,7 @@ async fn native_retry_pre_admission_context_reads_exact_stopped_g1_without_mutat
     assert!(!context.worktree_snapshots.is_empty());
     assert!(context.worktree_snapshots.iter().all(|(_, snapshot)| snapshot != &g2));
     assert_eq!(current_test_snapshot(&db, run.attempt_id.as_str()).await, g2);
-    assert_eq!(migration_176_retained_state(&db).await, retained);
+    assert_eq!(migration_179_retained_state(&db).await, retained);
     assert_eq!(lookup_metadata(&db, &run.attempt_id).await, metadata);
     assert_eq!(native_failure_side_effect_counts(&db).await, counts);
 }
@@ -350,7 +349,7 @@ async fn native_retry_pre_admission_context_keeps_historical_stopped_readable_an
     // Restoring the predecessor tool state here would legitimately stop the
     // running successor through the native source fence.
 
-    let retained = migration_176_retained_state(&db).await;
+    let retained = migration_179_retained_state(&db).await;
     let counts = native_failure_side_effect_counts(&db).await;
     assert_eq!(db.read_native_close_retry_pre_admission_context(&failed_run).await.unwrap()
         .original.snapshot, assessment.proof.snapshot);
@@ -364,7 +363,7 @@ async fn native_retry_pre_admission_context_keeps_historical_stopped_readable_an
         ordinal: admitted.admitted.run_ordinal,
     };
     assert!(db.read_native_close_retry_pre_admission_context(&wrong_predecessor).await.is_err());
-    assert_eq!(migration_176_retained_state(&db).await, retained);
+    assert_eq!(migration_179_retained_state(&db).await, retained);
     assert_eq!(native_failure_side_effect_counts(&db).await, counts);
 }
 
@@ -418,7 +417,7 @@ async fn native_failure_side_effect_counts(db: &Database) -> (i64, i64, i64, i64
 
 async fn native_failure_immutable_state(db: &Database) -> serde_json::Value {
     let mut state: serde_json::Value =
-        serde_json::from_str(&migration_176_retained_state(db).await).unwrap();
+        serde_json::from_str(&migration_179_retained_state(db).await).unwrap();
     let object = state.as_object_mut().unwrap();
     object.remove("runs");
     object.remove("failures");
@@ -493,7 +492,7 @@ async fn assert_native_resource_failure_pending_tail_replay(failed_index: usize)
     let failures = db.list_close_cleanup_failures(run.attempt_id.as_str()).await.unwrap();
     assert_eq!(failures.last().unwrap().run_ordinal, run.ordinal);
     assert_eq!(failures.last().unwrap().occurrence, request);
-    let retained = migration_176_retained_state(&db).await;
+    let retained = migration_179_retained_state(&db).await;
     for _ in 0..2 {
         assert_eq!(retry_completed(db.terminalize_native_close_retry_resource_failure(
             &assessment.command, &receipt.admitted, request.clone(),
@@ -529,11 +528,11 @@ async fn assert_native_resource_failure_pending_tail_replay(failed_index: usize)
     }
     completion_refused(db.complete_native_close_retry(&assessment.command, &receipt.admitted).await);
     assert!(db.terminalize_close_run_cleanup_failure(&run, &request).await.is_err());
-    assert_eq!(migration_176_retained_state(&db).await, retained);
+    assert_eq!(migration_179_retained_state(&db).await, retained);
     assert_eq!(native_failure_side_effect_counts(&db).await, after);
 
     write_source_fence_state(&db, &assessment.command, &ConvState::Idle, false).await.unwrap();
-    let retained = migration_176_retained_state(&db).await;
+    let retained = migration_179_retained_state(&db).await;
     let result = db.terminalize_native_close_retry_resource_failure(
         &assessment.command, &receipt.admitted, request,
     ).await;
@@ -541,7 +540,7 @@ async fn assert_native_resource_failure_pending_tail_replay(failed_index: usize)
         panic!("stale source must refuse before stopped occurrence replay: {result:?}");
     };
     assert!(message.contains("current executing source"), "{message}");
-    assert_eq!(migration_176_retained_state(&db).await, retained);
+    assert_eq!(migration_179_retained_state(&db).await, retained);
     assert_eq!(native_failure_side_effect_counts(&db).await, after);
 }
 
@@ -558,7 +557,7 @@ async fn native_resource_failure_refuses_full_identity_and_caller_evidence_misma
     let request = native_resource_failure_request(&assessment, &receipt, &pending, index);
     assert_eq!(pending, assessment.request.remaining_effects);
     assert_eq!(pending.len(), 3);
-    let retained = migration_176_retained_state(&db).await;
+    let retained = migration_179_retained_state(&db).await;
     let counts = native_failure_side_effect_counts(&db).await;
     let mut conflicting_requests = Vec::new();
     let LossItemIdentity::Worktree(captured) = pending[index].resource.identity() else { panic!("worktree"); };
@@ -633,7 +632,7 @@ async fn native_resource_failure_refuses_full_identity_and_caller_evidence_misma
         &assessment.command, &wrong_admitted, request.clone(),
     ).await);
     assert!(db.terminalize_close_run_cleanup_failure(&run, &request).await.is_err());
-    assert_eq!(migration_176_retained_state(&db).await, retained);
+    assert_eq!(migration_179_retained_state(&db).await, retained);
     assert_eq!(native_failure_side_effect_counts(&db).await, counts);
 }
 
@@ -666,12 +665,12 @@ async fn native_resource_failure_replay_refuses_a_stopped_predecessor_after_succ
     assert_eq!(admitted_successor.admitted.run_ordinal.get(), run.ordinal.get() + 1);
     db.update_conversation_state(assessment.command.source_transcript_id(), &original_source)
         .await.unwrap();
-    let retained = migration_176_retained_state(&db).await;
+    let retained = migration_179_retained_state(&db).await;
     let counts = native_failure_side_effect_counts(&db).await;
     completion_refused(db.terminalize_native_close_retry_resource_failure(
         &assessment.command, &receipt.admitted, request,
     ).await);
-    assert_eq!(migration_176_retained_state(&db).await, retained);
+    assert_eq!(migration_179_retained_state(&db).await, retained);
     assert_eq!(native_failure_side_effect_counts(&db).await, counts);
 }
 
@@ -689,11 +688,11 @@ async fn native_resource_failure_requires_truthful_original_process_success() {
     request.stop_certainty = CloseStopCertainty::ConversationAndProcessesStopped {
         confirmed_at_us: request.occurred_at_us,
     };
-    let retained = migration_176_retained_state(&db).await;
+    let retained = migration_179_retained_state(&db).await;
     completion_refused(db.terminalize_native_close_retry_resource_failure(
         &assessment.command, &receipt.admitted, request,
     ).await);
-    assert_eq!(migration_176_retained_state(&db).await, retained);
+    assert_eq!(migration_179_retained_state(&db).await, retained);
     let tmux_effect = pending.iter().find(|effect| effect.resource == tmux).unwrap();
     success_recorded(db.record_native_close_retry_success(
         &assessment.command, &receipt.admitted, tmux_effect, "original tmux stopped",
@@ -731,13 +730,13 @@ async fn native_resource_failure_rolls_back_late_outbox_and_outcome_message_erro
          BEGIN SELECT RAISE(ABORT, 'late native failure outcome message error'); END",
     ] {
         sqlx::raw_sql(sqlx::AssertSqlSafe(trigger)).execute(db.pool()).await.unwrap();
-        let retained = migration_176_retained_state(&db).await;
+        let retained = migration_179_retained_state(&db).await;
         let counts = native_failure_side_effect_counts(&db).await;
         let result = db.terminalize_native_close_retry_resource_failure(
             &assessment.command, &receipt.admitted, request.clone(),
         ).await;
         assert!(matches!(result, LocalAuthorityResult::DurableFactEstablished(Err(_))), "{result:?}");
-        assert_eq!(migration_176_retained_state(&db).await, retained);
+        assert_eq!(migration_179_retained_state(&db).await, retained);
         assert_eq!(native_failure_side_effect_counts(&db).await, counts);
         assert_eq!(db.get_close_run(&run).await.unwrap().status, CloseRunStatus::Running);
         sqlx::raw_sql("DROP TRIGGER native_failure_test_late_error").execute(db.pool()).await.unwrap();
@@ -792,7 +791,7 @@ async fn native_retry_tmux_dispatch_records_exact_pending_identity_and_refuses_m
 
     let mut wrong_identity = effect.clone();
     wrong_identity.resource = opaque_resource(RetiredResourceKind::TmuxServer, "forged-tmux");
-    let retained_before_refusal = migration_176_retained_state(&db).await;
+    let retained_before_refusal = migration_179_retained_state(&db).await;
     let (wrong_identity_result, wrong_identity_lease) =
         db.record_native_close_retry_retirement_dispatch_with_entry(
             &assessment.command, &receipt.admitted, &wrong_identity, || {
@@ -803,7 +802,7 @@ async fn native_retry_tmux_dispatch_records_exact_pending_identity_and_refuses_m
     success_refused(wrong_identity_result);
     assert_eq!(wrong_identity_lease, None);
     assert_eq!(entry_calls.get(), 1, "refused identity must not enter");
-    assert_eq!(migration_176_retained_state(&db).await, retained_before_refusal);
+    assert_eq!(migration_179_retained_state(&db).await, retained_before_refusal);
     success_refused(db.record_native_close_retry_retirement_dispatch(
         &assessment.command, &receipt.admitted, &wrong_identity,
     ).await);
@@ -815,13 +814,13 @@ async fn native_retry_tmux_dispatch_records_exact_pending_identity_and_refuses_m
     assert_eq!(retry_dispatch_state(&db, attempt).await, dispatched);
 
     write_source_fence_state(&db, &assessment.command, &ConvState::Idle, false).await.unwrap();
-    let retained = migration_176_retained_state(&db).await;
+    let retained = migration_179_retained_state(&db).await;
     let fenced_dispatch = retry_dispatch_state(&db, attempt).await;
     assert_ne!(fenced_dispatch, dispatched, "source loss terminalizes the running retry");
     success_refused(db.record_native_close_retry_retirement_dispatch(
         &assessment.command, &receipt.admitted, &effect,
     ).await);
-    assert_eq!(migration_176_retained_state(&db).await, retained);
+    assert_eq!(migration_179_retained_state(&db).await, retained);
     assert_eq!(retry_dispatch_state(&db, attempt).await, fenced_dispatch);
 }
 
@@ -849,7 +848,7 @@ async fn native_retry_tmux_first_effect_requires_exact_source_dispatch_identity_
     assert!(matches!(release, NativeCloseInitialEntryRelease::Confirmed));
     assert_eq!(callback_calls.get(), 1);
 
-    let before = migration_176_retained_state(&db).await;
+    let before = migration_179_retained_state(&db).await;
     let wrong_identity = opaque_resource(RetiredResourceKind::TmuxServer, "forged-tmux");
     let wrong_identity_result = db.with_native_close_retry_tmux_first_effect(
         &assessment.command, &receipt.admitted, &live_source, effect.scope.clone(),
@@ -890,10 +889,10 @@ async fn native_retry_tmux_first_effect_requires_exact_source_dispatch_identity_
     assert!(matches!(wrong_snapshot_result,
         Err(NativeCloseInitialFirstEffectError::Rejected { .. })));
     assert_eq!(callback_calls.get(), 1);
-    assert_eq!(migration_176_retained_state(&db).await, before);
+    assert_eq!(migration_179_retained_state(&db).await, before);
 
     write_source_fence_state(&db, &assessment.command, &ConvState::Idle, false).await.unwrap();
-    let retained = migration_176_retained_state(&db).await;
+    let retained = migration_179_retained_state(&db).await;
     let stopped_source_result = db.with_native_close_retry_tmux_first_effect(
         &assessment.command, &receipt.admitted, &ConvState::Idle, effect.scope.clone(),
         assessment.proof.snapshot.clone(), &effect.resource, || {
@@ -903,5 +902,5 @@ async fn native_retry_tmux_first_effect_requires_exact_source_dispatch_identity_
     assert!(matches!(stopped_source_result,
         Err(NativeCloseInitialFirstEffectError::Rejected { .. })));
     assert_eq!(callback_calls.get(), 1, "source Stop must not invoke the callback");
-    assert_eq!(migration_176_retained_state(&db).await, retained);
+    assert_eq!(migration_179_retained_state(&db).await, retained);
 }

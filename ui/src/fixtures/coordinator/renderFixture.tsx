@@ -106,6 +106,7 @@ function FixtureConversation({ scenario }: { scenario: CoordinatorScenario }) {
             <InputArea
               cwd={undefined}
               scopeKey={transcript.conversationId}
+              uploadConversationId={transcript.conversationId}
               convState={convState}
               images={images}
               setImages={setImages}
@@ -114,7 +115,7 @@ function FixtureConversation({ scenario }: { scenario: CoordinatorScenario }) {
               convModeLabel="Explore"
               draft={draft}
               onDraftChange={setDraft}
-              quickAction={COORDINATOR_QUICK_ACTION}
+              quickAction={{ ...COORDINATOR_QUICK_ACTION, send: () => {} }}
               onSend={() => {}}
               onCancel={() => {}}
               onRetry={() => {}}

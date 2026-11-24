@@ -84,6 +84,12 @@ WHEN the active match is outside the mounted viewport
 THE SYSTEM SHALL scroll or mount the owning row, line, or block before revealing the match
 AND SHALL complete navigation without requiring the user to scroll manually first
 
+WHEN explicit conversation-find navigation reaches a mounted fragment with an exact active-occurrence mark
+THE SYSTEM SHALL reveal that mark rather than merely centering its potentially larger owning fragment
+
+IF the renderer cannot supply an exact active-occurrence mark
+THE SYSTEM SHALL reveal the owning fragment or row with the active-location indication defined by REQ-IVF-006 instead of claiming exact substring navigation.
+
 IF the owning surface virtualizes or lazily mounts content
 THE SYSTEM SHALL use a stable typed navigation target rather than DOM-node identity to reach the active match
 
@@ -190,6 +196,26 @@ AND SHALL preserve the current active match when Phoenix can still identify the 
 IF the prior active occurrence no longer exists
 THE SYSTEM SHALL choose the nearest valid active result in document order relative to the prior active ordinal
 OR show no-results if none remain
+
+WHEN a background conversation-content refresh retains the active logical occurrence
+THE SYSTEM SHALL update its reveal target and decorations without initiating a new find reveal or focus movement
+AND SHALL NOT treat changed row, fragment, or projection coordinates alone as a navigation request
+
+IF an explicit conversation-find reveal is still pending when that occurrence's projection refreshes
+THE SYSTEM SHALL preserve that unfinished intent and resolve it against the latest target
+AND SHALL NOT revive an already settled or cancelled reveal
+
+WHEN a new query, Next, Previous, or explicit result activation selects a match
+THE SYSTEM SHALL reveal the selected occurrence using its latest target
+AND a newer selection, find close, or surface reset SHALL supersede or cancel unfinished prior navigation
+
+WHEN removal of the active occurrence selects a fallback result
+THE SYSTEM SHALL reveal that fallback result
+AND WHEN no results remain THE SYSTEM SHALL clear match decorations
+
+For streaming-to-final conversation identity, supported correspondence SHALL require the same request/turn identity, exactly one finalized text block, and an occurrence wholly contained in a display block whose semantic text maps uniquely and contiguously to the same raw-text offsets. The text block need not be the first content block. Plain paragraphs and unambiguous heading, emphasis, and quote text SHALL retain occurrence identity under these conditions.
+
+THE SYSTEM SHALL NOT infer streaming-to-final identity merely from equal result ordinals or equal query text. Multiple finalized text blocks, changed raw offsets, ambiguous or noncontiguous semantic text, and blocks containing link/image syntax, HTML, escapes, entities, or backticks SHALL NOT acquire streaming identity through this correspondence. Separate code-fragment projections and occurrences crossing display-block boundaries are outside this correspondence. Such results remain subject to ordinary source identity and fallback reconciliation; exclusion from correspondence does not itself exclude them from search.
 
 **Rationale:** Streaming transcript text and live viewer updates should not make find jump unpredictably or keep pointing at a vanished occurrence.
 

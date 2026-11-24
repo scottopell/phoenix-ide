@@ -1,0 +1,44 @@
+.message.meta.ember-tracking-message { opacity: 1; }
+
+.ember-tracking-card {
+  min-width: 0;
+  font-size: 0.875rem;
+}
+
+.ember-tracking-heading { font-weight: 600; }
+
+.ember-tracking-topic {
+  color: var(--text-muted);
+  overflow-wrap: anywhere;
+}
+
+.ember-tracking-card summary {
+  cursor: pointer;
+  width: fit-content;
+  padding: 0.25rem 0;
+}
+
+.ember-tracking-card summary:focus-visible {
+  outline: 2px solid currentcolor;
+  outline-offset: 2px;
+}
+
+.ember-tracking-card dl {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  gap: 0.2rem 0.8rem;
+}
+
+.ember-tracking-card dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.ember-tracking-card ul { padding-left: 1.4rem; }
+
+.ember-tracking-card li { overflow-wrap: anywhere; }
+
+.ember-tracking-card pre {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}

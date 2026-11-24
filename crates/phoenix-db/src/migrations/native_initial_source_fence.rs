@@ -47,7 +47,7 @@ pub(super) async fn run(pool: &SqlitePool, migration: &Migration) -> DbResult<()
         let marker = ")\nBEGIN\n    SELECT RAISE(ABORT, 'cleanup failure requires exact active expected-resource, captured-scope, or observed-process authority');";
         if schema.matches(marker).count() != 1 {
             return Err(DbError::Serialization(
-                "migration 179 found unexpected initial-authority trigger definition".into(),
+                "migration 182 found unexpected initial-authority trigger definition".into(),
             ));
         }
         let replacement = format!(") AND {INITIAL_RECEIPT_EXCEPTION}\nBEGIN\n    SELECT RAISE(ABORT, 'cleanup failure requires exact active expected-resource, captured-scope, or observed-process authority');");
@@ -60,7 +60,7 @@ pub(super) async fn run(pool: &SqlitePool, migration: &Migration) -> DbResult<()
             .fetch_one(&mut *tx).await?;
         let disposition_marker = "(failure.authority_kind = 'attempt_interrupted'\n            AND NOT EXISTS";
         if completion.matches(disposition_marker).count() != 1 {
-            return Err(DbError::Serialization("migration 179 found unexpected completion-disposition trigger definition".into()));
+            return Err(DbError::Serialization("migration 182 found unexpected completion-disposition trigger definition".into()));
         }
         sqlx::query("UPDATE sqlite_schema SET sql = ?2 WHERE name = ?1")
             .bind("close_cleanup_failure_completion_requires_disposition")

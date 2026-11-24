@@ -2534,10 +2534,20 @@ impl WorkflowRepository {
                 .await?;
             return Ok(TerminalizeAuthoritativeTurnOutcome::OccurrenceChanged);
         }
+        let (turn_id, generation, _) = terminal_command_parts(&input.command)?;
+        let ending_response =
+            crate::coordinator_watches::ending_evidence::capture_turn_response_tx(
+                &mut tx.tx, turn_id.0, generation,
+            )
+            .await?;
         let step = match telemetry
             .observe_db(
                 SqlitePhase::Statement,
-                self.terminalize_authoritative_turn_in_tx(&mut tx, input),
+                self.terminalize_authoritative_turn_with_response_in_tx(
+                    &mut tx,
+                    input,
+                    &ending_response,
+                ),
             )
             .await
         {
@@ -2550,6 +2560,7 @@ impl WorkflowRepository {
                     &mut tx.tx,
                     occurrence.expect("guarded occurrence"),
                     &terminal,
+                    &ending_response,
                 )
                 .await?;
                 telemetry
@@ -2567,7 +2578,13 @@ impl WorkflowRepository {
                     "terminal command produced nonterminal outcome".to_string(),
                 ));
             };
-            settle_captured_execution_occurrence_tx(&mut tx.tx, occurrence, terminal).await?;
+            settle_captured_execution_occurrence_tx(
+                &mut tx.tx,
+                occurrence,
+                terminal,
+                &ending_response,
+            )
+            .await?;
         }
         if cut == TransactionCut::BeforeCommit {
             telemetry
@@ -2608,6 +2625,21 @@ impl WorkflowRepository {
         &self,
         tx: &mut super::WorkflowTx<'_>,
         input: &TerminalizeAuthoritativeTurnInput,
+    ) -> DbResult<TurnStep> {
+        let (turn_id, generation, _) = terminal_command_parts(&input.command)?;
+        let response = crate::coordinator_watches::ending_evidence::capture_turn_response_tx(
+            &mut tx.tx, turn_id.0, generation,
+        )
+        .await?;
+        self.terminalize_authoritative_turn_with_response_in_tx(tx, input, &response)
+            .await
+    }
+
+    async fn terminalize_authoritative_turn_with_response_in_tx(
+        &self,
+        tx: &mut super::WorkflowTx<'_>,
+        input: &TerminalizeAuthoritativeTurnInput,
+        ending_response: &crate::EndingResponse,
     ) -> DbResult<TurnStep> {
         let command = input.command.clone();
         let (turn_id, expected_generation, terminal) = terminal_command_parts(&command)?;
@@ -2732,7 +2764,7 @@ impl WorkflowRepository {
             .execute(&mut *tx.tx)
             .await?;
         }
-        crate::coordinator_watches::record_terminal_event_tx(
+        crate::coordinator_watches::record_terminal_event_with_response_tx(
             &mut tx.tx,
             turn_id.0,
             expected_generation,
@@ -2746,6 +2778,7 @@ impl WorkflowRepository {
                     .map(|projection| &projection.state),
                 Some(ConvState::ContextExhausted { .. })
             ),
+            ending_response,
         )
         .await?;
         sqlx::query("DELETE FROM direct_turn_terminal_obligations WHERE turn_id = ?1")
@@ -3248,6 +3281,7 @@ async fn settle_captured_execution_occurrence_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     occurrence: CapturedExecutionOccurrence,
     terminal: &TurnTerminal,
+    ending_response: &crate::EndingResponse,
 ) -> DbResult<()> {
     let (terminal_kind, terminal_reason) = match terminal {
         TurnTerminal::Completed => ("Completed", None),
@@ -3268,13 +3302,14 @@ async fn settle_captured_execution_occurrence_tx(
         )
         .await?;
     }
-    crate::coordinator_watches::record_steering_event_tx(
+    crate::coordinator_watches::record_steering_event_with_response_tx(
         tx,
         source_kind,
         &occurrence.message_id,
         &occurrence.conversation_id,
         terminal_kind,
         terminal_reason,
+        ending_response,
     )
     .await?;
     sqlx::query("DELETE FROM steering_execution_occurrences WHERE message_id = ?1")
@@ -4679,6 +4714,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn coordinator_language_refuses_accepted_undispatched_turn() {
+        use phoenix_core::llm_language::LlmLanguage;
+        let db = Database::open_in_memory().await.unwrap();
+        let coordinator = db
+            .get_or_create_coordinator(None, LlmLanguage::Adhd)
+            .await
+            .unwrap();
+        let repo = db.workflow_repository();
+        let accepted = repo
+            .accept_authoritative_turn(&input(&coordinator.id, "pending-language", 1))
+            .await
+            .established()
+            .unwrap()
+            .unwrap();
+        let TurnOutcome::Created { turn_id, .. } = accepted.outcome else {
+            panic!("expected accepted turn")
+        };
+        assert_eq!(
+            db.get_conversation(&coordinator.id).await.unwrap().state,
+            ConvState::Idle
+        );
+        assert!(!db
+            .set_idle_coordinator_language(&coordinator.id, LlmLanguage::Caveman)
+            .await
+            .unwrap());
+        assert_eq!(
+            db.get_conversation(&coordinator.id)
+                .await
+                .unwrap()
+                .llm_language,
+            LlmLanguage::Adhd
+        );
+        repo.terminalize_authoritative_turn(&TerminalizeAuthoritativeTurnInput {
+            command: TurnCommand::Cancel {
+                turn_id,
+                expected_generation: 0,
+            },
+            projection: None,
+            provider_replay_settlement:
+                phoenix_core::domain::provider_replay::ProviderReplaySettlement::Preserve,
+        })
+        .await
+        .unwrap();
+        assert!(db
+            .set_idle_coordinator_language(&coordinator.id, LlmLanguage::Caveman)
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
     async fn close_admission_fence_preserves_admitted_turn_and_refuses_the_next_one() {
         let db = Database::open_in_memory().await.unwrap();
         db.create_conversation("conv-fenced", "Fenced", "/tmp", true, None, None)
@@ -5859,6 +5944,107 @@ mod tests {
             .unwrap()
             .unwrap()
             .owns_conversation());
+    }
+
+    #[tokio::test]
+    async fn ending_response_threads_through_direct_and_adopted_settlement_without_replay_borrowing(
+    ) {
+        let repo = repo().await;
+        let (turn_id, _) = created_turn(&repo, "ending-binding", 28).await;
+        sqlx::query("INSERT INTO coordinator_watches(source_product_conversation_id,enrolled_at_us) SELECT product_conversation_id,1 FROM conversations WHERE id='conv-a'")
+            .execute(&repo.pool).await.unwrap();
+        for (id, sequence, message_type, content) in [
+            (
+                "ending-input",
+                1,
+                "user",
+                r#"{"text":"additional input","is_meta":false}"#,
+            ),
+            (
+                "ending-response",
+                2,
+                "agent",
+                r#"[{"type":"text","text":"exact first ending"}]"#,
+            ),
+        ] {
+            sqlx::query("INSERT INTO messages(message_id,conversation_id,sequence_id,message_type,content,created_at,origin_kind) VALUES (?1,'conv-a',?2,?3,?4,'2026-11-16T00:00:00Z',?5)")
+                .bind(id).bind(sequence).bind(message_type).bind(content)
+                .bind(if message_type=="user" { "user_api" } else { "system_generated" })
+                .execute(&repo.pool).await.unwrap();
+        }
+        sqlx::query("INSERT INTO steering_execution_occurrences(conversation_id,message_id,source_kind) VALUES ('conv-a','ending-input','interaction_response')")
+            .execute(&repo.pool).await.unwrap();
+        let projection = PersistedConversationProjection {
+            state: ConvState::Idle,
+            state_updated_at: Utc::now(),
+        };
+        repo.persist_terminal_obligation(&DirectTurnTerminalObligationInput {
+            turn_id,
+            expected_generation: 0,
+            terminal: TurnTerminal::Completed,
+            projection: projection.clone(),
+            response_message_id: Some("ending-response".into()),
+        })
+        .await
+        .unwrap();
+        let input = TerminalizeAuthoritativeTurnInput {
+            command: TurnCommand::Complete {
+                turn_id,
+                expected_generation: 0,
+            },
+            projection: Some(projection),
+            provider_replay_settlement:
+                phoenix_core::domain::provider_replay::ProviderReplaySettlement::Preserve,
+        };
+        assert!(repo
+            .terminalize_authoritative_turn_with_occurrence_at_cut(
+                &input,
+                Some("ending-input"),
+                None,
+                TransactionCut::BeforeCommit
+            )
+            .await
+            .is_err());
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM coordinator_watch_ending_evidence")
+                .fetch_one(&repo.pool)
+                .await
+                .unwrap();
+        assert_eq!(count, 0);
+        repo.terminalize_authoritative_turn_with_occurrence(&input, Some("ending-input"))
+            .await
+            .unwrap();
+        let evidence: Vec<(String,String,Option<String>,Option<String>)> = sqlx::query_as(
+            "SELECT e.source_occurrence_kind,v.response_state,v.response_message_id,v.excerpt FROM coordinator_watch_events e JOIN coordinator_watch_ending_evidence v ON v.event_id=e.event_id ORDER BY e.source_occurrence_kind",
+        ).fetch_all(&repo.pool).await.unwrap();
+        assert_eq!(evidence.len(), 2);
+        assert!(evidence
+            .iter()
+            .all(|(_, state, id, text)| state == "captured"
+                && id.as_deref() == Some("ending-response")
+                && text.as_deref() == Some("exact first ending")));
+        let remaining: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM direct_turn_terminal_obligations")
+                .fetch_one(&repo.pool)
+                .await
+                .unwrap();
+        assert_eq!(remaining, 0);
+        repo.terminalize_authoritative_turn_with_occurrence(&input, Some("ending-input"))
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO messages(message_id,conversation_id,sequence_id,message_type,content,created_at,origin_kind) VALUES ('later-adopted-input','conv-a',3,'user','{\"text\":\"later\",\"is_meta\":false}','2026-11-16T00:00:01Z','user_api')")
+            .execute(&repo.pool).await.unwrap();
+        sqlx::query("INSERT INTO steering_execution_occurrences(conversation_id,message_id,source_kind) VALUES ('conv-a','later-adopted-input','interaction_response')")
+            .execute(&repo.pool).await.unwrap();
+        repo.terminalize_authoritative_turn_with_occurrence(&input, Some("later-adopted-input"))
+            .await
+            .unwrap();
+        let later_state: String = sqlx::query_scalar("SELECT v.response_state FROM coordinator_watch_events e JOIN coordinator_watch_ending_evidence v ON v.event_id=e.event_id WHERE e.source_occurrence_id='later-adopted-input'")
+            .fetch_one(&repo.pool).await.unwrap();
+        assert_eq!(later_state, "no_carrier");
+        let retained: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM coordinator_watch_ending_evidence WHERE response_message_id='ending-response' AND excerpt='exact first ending'")
+            .fetch_one(&repo.pool).await.unwrap();
+        assert_eq!(retained, 2);
     }
 
     #[tokio::test]
@@ -8699,6 +8885,7 @@ mod tests {
                 | InputOrigin::SystemGenerated
                 | InputOrigin::SlackGateway { .. }
                 | InputOrigin::ScheduledReminder { .. }
+                | InputOrigin::CoordinatorQuestionReply
                 | InputOrigin::SubscriptionEvent { .. } => {}
             }
             if retry.origin != payload.submitted.origin {
@@ -8727,6 +8914,7 @@ mod tests {
                 | InputOrigin::SystemGenerated
                 | InputOrigin::SlackGateway { .. }
                 | InputOrigin::ScheduledReminder { .. }
+                | InputOrigin::CoordinatorQuestionReply
                 | InputOrigin::SubscriptionEvent { .. } => unreachable!(),
             }
             assert!(matches!(

@@ -10,7 +10,10 @@ the complete proposed wording, obtains conversational approval and saves it with
 the document, and the maximum accepted size is 16,384 UTF-8 bytes.
 
 Approval is an instruction to the agent, not a server-verified human action.
-Ordinary conversations and sub-agents do not receive the tools or the document.
+Ordinary conversations and sub-agents do not receive the tools. An ordinary
+conversation under an active Coordinator watch receives the saved text as
+delegated Authority for its commissioned work; sub-agents and unwatched
+conversations do not receive the document.
 Standing grants support confident in-scope work while existing structural
 execution restrictions and later user instructions remain binding.
 
@@ -38,8 +41,11 @@ to keep human approval conversational rather than add an interaction workflow.
 | **REQ-AUTH-004:** Supply Current Authority in Model Context | ✅ Complete | Shared live/inspector renderer, per-request refresh, successor context, stable text and visible read-failure tests pass. |
 | **REQ-AUTH-005:** Establish Replacement Through Normal Persistence Ownership | ✅ Complete | Owned write follows existing local outcome classification; rollback, simulated lost acknowledgement and cancellation boundary tests pass. |
 | **REQ-AUTH-006:** Apply Grants Within Existing Execution Boundaries | ✅ Complete | Prompt applies saved grants subject to later user constraints and structural restrictions; ordinary/sub-agent capability isolation tested. |
+| **REQ-AUTH-007:** Project Authority to Watched Owners | 🔄 In review | Watch-scoped database read, delegated renderer, live dispatch and inspector wiring; database and renderer tests added. No live-dispatch test; not qualified locally; not deployed. |
+| **REQ-AUTH-008:** Present Monitored Conversations Apart | 🔄 In review | Server marks list rows monitored; desktop and mobile lists fold them; palette browsing orders them last; header badge; completion notifications suppressed. UI tests pass locally. Unread state is unchanged. Not checked in a browser; not deployed. |
+| **REQ-AUTH-009:** Route Monitored Questions Through the Coordinator | 🔄 In review | Watch events carry the pending questions; `answer_conversation_question` answers through the question-card path with Coordinator attribution; list rows report `question_with_coordinator_since`; sidebar folds held questions for 30 minutes; question notifications quiet for monitored conversations. Unit tests only; no end-to-end run; not deployed. |
 
-**Progress:** 6 of 6 implemented with bounded local qualification; not deployed.
+**Progress:** 6 of 9 implemented with bounded local qualification; REQ-AUTH-007, REQ-AUTH-008 and REQ-AUTH-009 in review; not deployed.
 
 ## Verification Summary
 

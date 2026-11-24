@@ -23,14 +23,7 @@ pub async fn generate_title(
     effective_effort: phoenix_core::domain::llm_types::EffectiveEffort,
     max_output_tokens: Option<u32>,
 ) -> Option<String> {
-    // Truncate very long messages for the prompt
-    let truncated = if message_text.len() > 500 {
-        format!("{}...", message_text.get(..500).unwrap_or(message_text))
-    } else {
-        message_text.to_string()
-    };
-
-    let prompt = format!("{TITLE_PROMPT}\n{truncated}");
+    let prompt = title_prompt(message_text);
 
     let request = LlmRequest {
         system: vec![],
@@ -40,7 +33,7 @@ pub async fn generate_title(
             content: vec![ContentBlock::text(prompt)],
         }],
         provider_replay: None,
-        responses_replay: Vec::new(),
+        output_replay: Vec::new(),
         tool_availability: phoenix_core::domain::tool_availability::ToolAvailability::all(vec![]),
         max_tokens: max_output_tokens.map_or(50, |limit| limit.min(50)), // Title should be very short
         effective_effort,
@@ -72,6 +65,15 @@ pub async fn generate_title(
     }
 }
 
+/// Longest excerpt of the opening message sent to the title model.
+const TITLE_EXCERPT_BYTES: usize = 500;
+
+fn title_prompt(message_text: &str) -> String {
+    let excerpt =
+        phoenix_core::text_bounds::truncate_with_marker(message_text, TITLE_EXCERPT_BYTES, "...");
+    format!("{TITLE_PROMPT}\n{excerpt}")
+}
+
 fn clean_prose_name(name: &str) -> String {
     name.split_whitespace()
         .map(|word| word.chars().filter(|c| !c.is_control()).collect::<String>())
@@ -95,7 +97,34 @@ fn extract_title_from_response(response: &LlmResponse) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::clean_prose_name;
+    use super::{clean_prose_name, title_prompt, TITLE_EXCERPT_BYTES};
+    use phoenix_core::llm_language::TITLE_PROMPT;
+
+    #[test]
+    fn title_prompt_bounds_multibyte_openings() {
+        // Byte 500 falls inside a 3-byte char; the excerpt must still be cut
+        // rather than the whole message being sent to the title model.
+        let opening = "日本語".repeat(70_000);
+        let prompt = title_prompt(&opening);
+        let excerpt = prompt.strip_prefix(&format!("{TITLE_PROMPT}\n")).unwrap();
+        assert!(
+            excerpt.len() <= TITLE_EXCERPT_BYTES + "...".len(),
+            "{}",
+            excerpt.len()
+        );
+        assert!(excerpt.ends_with("..."));
+        assert!(opening.starts_with(excerpt.strip_suffix("...").unwrap()));
+    }
+
+    #[test]
+    fn title_prompt_keeps_ascii_excerpt_unchanged() {
+        let opening = "a".repeat(600);
+        assert_eq!(
+            title_prompt(&opening),
+            format!("{TITLE_PROMPT}\n{}...", "a".repeat(500))
+        );
+        assert_eq!(title_prompt("short"), format!("{TITLE_PROMPT}\nshort"));
+    }
 
     #[test]
     fn generated_names_preserve_prose_and_unicode() {

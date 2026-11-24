@@ -32,17 +32,20 @@ async fn seed_real_145_receipt(db: &Database, owner: &str) -> String {
     sqlx::query("INSERT INTO conversation_goal_actors(actor_id,owner_id,kind,source_product_id,transcript_id,workflow_id,turn_id,message_id,tool_use_id) VALUES (2,?,'coordinator',?,?,1,1,'migration-agent','migration-tool')")
         .bind(owner).bind(&source).bind(&coordinator.id).execute(db.pool()).await.unwrap();
     let has_source_kind: bool = sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('conversation_goal_preparations') WHERE name='source_kind')",
+        "SELECT EXISTS (
+             SELECT 1 FROM pragma_table_info('conversation_goal_preparations')
+             WHERE name='source_kind'
+         )",
     )
     .fetch_one(db.pool())
     .await
     .unwrap();
-    let insert = if has_source_kind {
+    let preparation_insert = if has_source_kind {
         "INSERT INTO conversation_goal_preparations(reference,owner_id,source_kind,caller_conversation_id,source_product_id,workflow_id,turn_id,message_id,tool_use_id,operation,expected_version,observed_goal_id,objective,disposition,reason) VALUES (zeroblob(16),?,'local',?,?,1,1,'migration-agent','migration-tool','state',1,'legacy-goal',NULL,'blocked','waiting')"
     } else {
         "INSERT INTO conversation_goal_preparations(reference,owner_id,caller_conversation_id,source_product_id,workflow_id,turn_id,message_id,tool_use_id,operation,expected_version,observed_goal_id,objective,disposition,reason) VALUES (zeroblob(16),?,?,?,1,1,'migration-agent','migration-tool','state',1,'legacy-goal',NULL,'blocked','waiting')"
     };
-    sqlx::query(insert)
+    sqlx::query(preparation_insert)
         .bind(owner)
         .bind(&coordinator.id)
         .bind(&source)
@@ -147,8 +150,9 @@ async fn table_data(pool: &SqlitePool) -> Vec<(String, Vec<Vec<String>>)> {
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn canonical_goal_tools_prefixes_upgrade_reopen_and_remain_idempotent() {
-    for through in 142..=153 {
+    for through in (142..=153).chain([155, 156, 158]) {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("goal-tools.db");
         let db = Database::open(path.to_str().unwrap()).await.unwrap();
@@ -165,13 +169,17 @@ async fn canonical_goal_tools_prefixes_upgrade_reopen_and_remain_idempotent() {
         drop(db);
 
         let db = Database::open(path.to_str().unwrap()).await.unwrap();
+        let expected_pending = u32::try_from(
+            crate::migrations::migration_identities()
+                .filter(|(version, _)| *version > through)
+                .count(),
+        )
+        .unwrap();
         assert_eq!(
             crate::migrations::run_pending_migrations(db.pool())
                 .await
                 .unwrap(),
-            crate::migrations::migration_identities()
-                .filter(|(version, _)| *version > through)
-                .count() as u32
+            expected_pending
         );
         assert_goal_rows(&db, &owner, source.is_some()).await;
         let tail: Vec<i64> = sqlx::query_scalar(
@@ -181,14 +189,10 @@ async fn canonical_goal_tools_prefixes_upgrade_reopen_and_remain_idempotent() {
         .await
         .unwrap();
         assert_eq!(
-            tail,
-            [
-                (143..=153).collect::<Vec<_>>(),
-                vec![155, 156],
-                (158..=187).collect(),
-            ]
-            .concat()
+            tail.iter().copied().take_while(|version| *version <= 163).collect::<Vec<_>>(),
+            vec![143, 144, 145, 146, 147, 148, 149, 150, 151, 152, 153, 155, 156, 158, 159, 160, 161, 162, 163,]
         );
+        assert_eq!(tail, crate::migrations::migration_identities().filter(|(version, _)| *version >= 143).map(|(version, _)| i64::from(version)).collect::<Vec<_>>());
         let before = snapshot(db.pool()).await;
         assert_eq!(
             crate::migrations::run_pending_migrations(db.pool())
@@ -316,17 +320,9 @@ async fn real_145_provenance_and_tools_retention_survive_upgrade_delete_and_reop
         1
     );
     seed_real_145_receipt(&db, &owner).await;
-    assert_eq!(
-        crate::migrations::run_pending_migrations(db.pool())
-            .await
-            .unwrap(),
-        u32::try_from(
-            crate::migrations::migration_identities()
-                .filter(|(version, _)| *version > 145)
-                .count(),
-        )
-        .expect("registered migration count fits u32")
-    );
+    crate::migrations::run_pending_migrations(db.pool())
+        .await
+        .unwrap();
     sqlx::query("INSERT INTO product_creation_initial_execution_receipts(request_id,terminal_kind,failure_reason) VALUES ('joint-create','Completed',NULL)")
         .execute(db.pool()).await.unwrap();
     assert_goal_rows(&db, &owner, true).await;

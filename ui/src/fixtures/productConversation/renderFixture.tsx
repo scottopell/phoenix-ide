@@ -8,7 +8,7 @@ import { useDocumentViewportOwnership } from '../../components/viewportRoutes';
 import { FileExplorerProvider } from '../../components/FileExplorer';
 import { ConversationReadinessProvider } from '../../contexts/ConversationReadinessContext';
 import { ViewerSlotProvider } from '../../contexts/ViewerSlotContext';
-import { ConversationProvider } from '../../conversation';
+import { ConversationProvider, useConversationAtom } from '../../conversation';
 import { useDraftActions } from '../../hooks/useDraft';
 import { ProductConversationPage } from '../../pages/ProductConversationPage';
 import '../../index.css';
@@ -30,6 +30,15 @@ function FixtureAlias() { const { slug } = useParams(); return <ProductConversat
 
 interface Props {
   scenario: ProductConversationScenario;
+  children?: ReactNode;
+}
+
+function FixtureAcceptedPhase({ conversationId }: { conversationId: string }) {
+  const [atom] = useConversationAtom(conversationId);
+  return <output hidden data-fixture-accepted-phase={atom.phase.type}
+    data-fixture-phase-sequence={atom.phaseLastAppliedEventSeq}
+    data-fixture-stream-incarnation={atom.streamIncarnation ?? ''}
+    data-fixture-phase-member={atom.conversationId ?? ''} />;
 }
 
 function SeedReactionDraft({ slug, text }: { slug: string; text: string }) {
@@ -46,8 +55,18 @@ function pageHasSettled(root: HTMLElement, scenario: ProductConversationScenario
   if (scenario.state === 'error') {
     return root.textContent?.includes(scenario.snapshotError ?? 'Fixture failed to fetch product conversation snapshot') ?? false;
   }
-  if (scenario.initialEntry?.startsWith('/global/')) {
+  if (scenario.initialEntry?.startsWith('/global/') && !scenario.continuationJourney) {
     return root.querySelector('.coordinator-conversation #chat-view .conversation-event-card') !== null;
+  }
+  if (scenario.reminderFixture) {
+    const settled = document.documentElement.dataset['productConversationFixtureReminderState'];
+    if (settled !== 'loaded' && settled !== 'failed') return false;
+    if (settled === 'failed' && !root.querySelector('.reminders-fetch-status, .reminders-panel')) return false;
+    if (settled === 'loaded' && scenario.reminderFixture.reminders.length > 0 && !root.querySelector('.reminders-panel')) return false;
+  }
+  if (scenario.aliasFallbackNotFound) {
+    return root.querySelector('.conversation-alias-fallback #app .conversation-column #chat-view') !== null
+      && root.querySelector('#input-area') !== null;
   }
   const page = root.querySelector('[data-testid="product-conversation-page"]');
   if (!page) return false;
@@ -60,7 +79,7 @@ function pageHasSettled(root: HTMLElement, scenario: ProductConversationScenario
     && page.querySelector('.product-conversation-page__composer .embedded-conversation-shell') !== null;
 }
 
-function ProductConversationFixtureBody({ scenario }: Props) {
+function ProductConversationFixtureBody({ scenario, children }: Props) {
   useDocumentViewportOwnership(true);
   const rootRef = useRef<HTMLElement>(null);
   const [ready, setReady] = useState(false);
@@ -106,14 +125,19 @@ function ProductConversationFixtureBody({ scenario }: Props) {
       ref={rootRef}
       data-product-conversation-fixture={scenario.id}
       {...(ready ? { 'data-product-conversation-fixture-ready': scenario.id } : {})}
+      {...(ready && scenario.reminderFixture ? { 'data-reminders-fixture-ready': scenario.id.slice('reminders-'.length) } : {})}
     >
       <FixtureRouter initialEntry={new URLSearchParams(window.location.search).get('fixtureEntry') ?? (scenario.initialEntry ?? (scenario.kind === 'coordinator' ? `/global/${scenario.snapshot.latest_transcript_row_id}${fixtureHash}` : `/product-conversations/fixture-product-conversation${fixtureHash}`))}>
         <FixtureLocation />
         <FocusScopeProvider>
           <ConversationProvider>
-            {scenario.initialDraft && scenario.snapshot?.latest_transcript_row_id && (
-              <SeedReactionDraft slug={scenario.snapshot.latest_transcript_row_id} text={scenario.initialDraft} />
+            {scenario.id === 'composer-focus' && scenario.snapshot?.latest_transcript_row_id && (
+              <FixtureAcceptedPhase conversationId={scenario.snapshot.latest_transcript_row_id} />
             )}
+            {scenario.initialDraft && scenario.snapshot?.latest_transcript_row_id && (
+              <SeedReactionDraft slug={`product:${scenario.snapshot.product_conversation_id}`} text={scenario.initialDraft} />
+            )}
+            {children}
             <ConversationReadinessProvider>
               <ChainProvider>
                 <ViewerSlotProvider scopeKey="fixture-product-conversation" browserSessionActive={false}>
@@ -136,7 +160,7 @@ function ProductConversationFixtureBody({ scenario }: Props) {
   );
 }
 
-export function ProductConversationFixture({ scenario }: Props) {
+export function ProductConversationFixture({ scenario, children }: Props) {
   const [installed, setInstalled] = useState(false);
 
   useEffect(() => {
@@ -152,5 +176,5 @@ export function ProductConversationFixture({ scenario }: Props) {
   }, [scenario]);
 
   if (!installed) return null;
-  return <ProductConversationFixtureBody scenario={scenario} />;
+  return <ProductConversationFixtureBody scenario={scenario}>{children}</ProductConversationFixtureBody>;
 }

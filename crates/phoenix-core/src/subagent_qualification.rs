@@ -7,7 +7,7 @@
 pub fn supports_parallel_work_subagents(resolved_parent_model_id: &str) -> bool {
     matches!(
         resolved_parent_model_id,
-        "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-6-astra" | "gpt-6-sol"
+        "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-6-astra" | "gpt-6-sol" | "gpt-6.1-sol"
     )
 }
 
@@ -20,7 +20,13 @@ mod tests {
         use crate::domain::llm_types::ModelEffort;
 
         for effort in ModelEffort::ALL {
-            for model in ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-6-astra"] {
+            for model in [
+                "gpt-5.6-sol",
+                "gpt-5.6-terra",
+                "gpt-6-astra",
+                "gpt-6-sol",
+                "gpt-6.1-sol",
+            ] {
                 assert!(
                     supports_parallel_work_subagents(model),
                     "{model} at {effort}"
@@ -37,13 +43,29 @@ mod tests {
 
     #[test]
     fn exact_allowlist_fails_closed() {
-        for qualified in ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-6-astra"] {
+        for qualified in [
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "gpt-6-astra",
+            "gpt-6-sol",
+            "gpt-6.1-sol",
+        ] {
             assert!(supports_parallel_work_subagents(qualified), "{qualified}");
         }
         for unqualified in [
+            "gpt-6.2-astra",
+            "gpt-6.2-sol",
+            "gpt-6.1-terra",
+            "claude-fable-5-2",
+            "claude-haiku-5-5",
+            "google/gemini-4-neon",
+            "google/gemini-4-hydrogen",
+            "google/gemini-4-carbon",
+            "google/gemini-4-argon",
             "gpt-5.6-luna",
             "gpt-6-luna",
             "gpt-6-astra-preview",
+            "gpt-6.1-sol-preview",
             "GPT-6-ASTRA",
             "claude-opus-5",
             "custom/gpt-6-astra",

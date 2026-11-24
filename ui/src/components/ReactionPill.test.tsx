@@ -12,10 +12,11 @@ const add = vi.fn();
 const close = vi.fn();
 const navigate = vi.fn<(source: ReactionSource, signal: AbortSignal) => boolean | Promise<boolean>>(() => true);
 let offscreen = false;
-function Fixture({ mounted = true, body = 'Keep this guarantee', touchDocked = false, captureSource, available = true, composerAvailable = true, composerKey = 'composer', composerTop, bubbleRef = createRef<HTMLDivElement>(), onChange = () => {} }: { mounted?: boolean; body?: string; touchDocked?: boolean; captureSource?: () => void; available?: boolean; composerAvailable?: boolean; composerKey?: string; composerTop?: number; bubbleRef?: RefObject<HTMLDivElement>; onChange?: (body: string) => void }) {
+function Fixture({ mounted = true, body = 'Keep this guarantee', touchDocked = false, captureSource, available = true, composerAvailable = true, composerKey = 'composer', composerTop, bubbleRef = createRef<HTMLDivElement>(), onChange = () => {}, columnKey = 'column', churn = false }: { mounted?: boolean; body?: string; touchDocked?: boolean; captureSource?: () => void; available?: boolean; composerAvailable?: boolean; composerKey?: string; composerTop?: number; bubbleRef?: RefObject<HTMLDivElement>; onChange?: (body: string) => void; columnKey?: string; churn?: boolean }) {
   return <FocusScopeProvider>
-    <div className="conversation-column">
+    <div key={columnKey} className="conversation-column">
     <div id="messages">
+      {churn && <div data-testid="churn" />}
       {mounted && <div data-inline-reaction-message="answer" data-message-occurrence="earlier:answer"><div className="agent-text-block" data-fragment-id="text-0">first <strong>second</strong> third</div></div>}
     </div>
     {composerAvailable && <footer key={composerKey} id="input-area" {...(composerTop === undefined ? {} : { 'data-composer-top': composerTop })} />}
@@ -119,7 +120,6 @@ describe('reaction pill', () => {
   it('restores the exact passage through DOM remount and returns without focusing the input', async () => {
     const view = render(<Fixture />);
     expect(restoreReactionRange(source)?.toString()).toBe('second');
-    expect(screen.getByRole('textbox')).toHaveAttribute('type', 'text');
     expect(screen.getByRole('textbox')).not.toHaveFocus();
     view.rerender(<Fixture mounted={false} />);
     const dock = await screen.findByRole('button', { name: /Return to passage/ });
@@ -131,6 +131,31 @@ describe('reaction pill', () => {
     await waitFor(() => expect(screen.getByRole('textbox')).toHaveValue('Keep this guarantee'));
     expect(window.getSelection()?.toString()).toBe('second');
     expect(screen.getByRole('textbox')).not.toHaveFocus();
+  });
+
+  it('undocks once the source mounts even while the transcript keeps changing faster than a frame', async () => {
+    vi.stubGlobal('requestAnimationFrame', (callback: FrameRequestCallback) => window.setTimeout(() => callback(performance.now()), 16));
+    vi.stubGlobal('cancelAnimationFrame', (handle: number) => window.clearTimeout(handle));
+    const bubbleRef = createRef<HTMLDivElement>();
+    const view = render(<Fixture mounted={false} churn bubbleRef={bubbleRef} />);
+    await screen.findByRole('button', { name: /Return to passage/ });
+    const churn = screen.getByTestId('churn');
+    const interval = window.setInterval(() => { churn.replaceChildren(document.createElement('span')); }, 1);
+    try {
+      view.rerender(<Fixture churn bubbleRef={bubbleRef} />);
+      await waitFor(() => expect(screen.getByRole('textbox', { name: 'Your reaction' })).toBeInTheDocument());
+    } finally {
+      window.clearInterval(interval);
+    }
+  });
+
+  it('undocks when the source mounts after the conversation column remounts', async () => {
+    const bubbleRef = createRef<HTMLDivElement>();
+    const view = render(<Fixture mounted={false} bubbleRef={bubbleRef} />);
+    await screen.findByRole('button', { name: /Return to passage/ });
+    view.rerender(<Fixture mounted={false} columnKey="remounted" bubbleRef={bubbleRef} />);
+    view.rerender(<Fixture columnKey="remounted" bubbleRef={bubbleRef} />);
+    await waitFor(() => expect(screen.getByRole('textbox', { name: 'Your reaction' })).toBeInTheDocument());
   });
 
   it('keeps an unavailable reaction editable when desktop source return fails', async () => {
@@ -150,7 +175,7 @@ describe('reaction pill', () => {
     fireEvent.click(returnButton);
     await waitFor(() => expect(returnButton).toHaveTextContent('Passage unavailable. Your reaction is saved here.'));
     expect(screen.getByRole('textbox')).toHaveValue('Retained desktop note');
-    expect(screen.getByRole('button', { name: 'Add to draft' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Add to message' })).toBeDisabled();
     expect(add).not.toHaveBeenCalled();
   });
 
@@ -233,7 +258,7 @@ describe('reaction pill', () => {
     expect(scroller.style.getPropertyValue('--reaction-dock-height')).toBe('');
   });
 
-  it('automatically undocks on manual return and preserves the same one-line editor for long text', async () => {
+  it('automatically undocks on manual return and preserves long reaction text', async () => {
     const body = 'A detailed reaction '.repeat(40);
     render(<Fixture body={body} />);
     offscreen = true;
@@ -243,7 +268,6 @@ describe('reaction pill', () => {
     fireEvent.scroll(window);
     const input = await screen.findByRole('textbox');
     expect(input).toHaveValue(body);
-    expect(input.tagName).toBe('INPUT');
     fireEvent.keyDown(input, { key: 'Enter' });
     expect(add).not.toHaveBeenCalled();
     fireEvent.keyDown(input, { key: 'Enter', metaKey: true, isComposing: true });
@@ -321,7 +345,7 @@ describe('reaction pill', () => {
     expect(input).not.toHaveFocus();
     expect(screen.getByRole('status')).toHaveTextContent('Draft unavailable. Your reaction is retained.');
     expect(screen.getByText('“second” · draft unavailable; retained')).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: 'Add to draft' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Add to message' })).toBeDisabled();
 
     viewport.height = 420;
     view.rerender(<Fixture touchDocked body="Retained" composerKey="resumed" composerTop={340} bubbleRef={bubbleRef} />);
@@ -332,7 +356,7 @@ describe('reaction pill', () => {
     expect(restoredInput).toHaveValue('Retained');
     expect(restoredInput).not.toHaveFocus();
     expect(screen.queryByText('Draft unavailable · reaction retained')).not.toBeInTheDocument();
-    expect(screen.getByRole('button', { name: 'Add to draft' })).toBeEnabled();
+    expect(screen.getByRole('button', { name: 'Add to message' })).toBeEnabled();
     expect(add).not.toHaveBeenCalled();
     viewport.height = 700;
   });
@@ -550,6 +574,44 @@ describe('reaction pill', () => {
     document.documentElement.style.removeProperty('--safe-area-right');
     document.documentElement.style.removeProperty('--safe-area-bottom');
     document.documentElement.style.removeProperty('--safe-area-left');
+  });
+
+  it('pins the top edge as discard collapses and Keep restores the editor', async () => {
+    const resizes: Array<() => void> = [];
+    vi.stubGlobal('ResizeObserver', class {
+      constructor(callback: () => void) { resizes.push(callback); }
+      observe() {}
+      unobserve() {}
+      disconnect() {}
+    });
+    Object.defineProperty(window, 'visualViewport', { configurable: true, value: {
+      offsetLeft: 0, offsetTop: 0, width: 390, height: 844,
+      addEventListener: vi.fn(), removeEventListener: vi.fn(),
+    } });
+    vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockImplementation(function (this: HTMLElement) {
+      if (this.id === 'input-area') return new DOMRect(0, 700, 390, 60);
+      if (this.classList.contains('reaction-pill')) return new DOMRect(12, Number.parseFloat(this.style.top) || 0, 366, this.querySelector('.reaction-pill-confirmation') ? 52 : 240);
+      return new DOMRect(0, 0, 390, 700);
+    });
+    render(<Fixture touchDocked />);
+    const pill = screen.getByRole('region', { name: 'Docked reaction' });
+    expect(pill).toHaveStyle({ top: '448px' });
+    const editor = screen.getByRole('textbox');
+    fireEvent.click(screen.getByRole('button', { name: 'Dismiss reaction' }));
+    await act(async () => {
+      resizes.forEach(resize => resize());
+      await new Promise(requestAnimationFrame);
+    });
+    expect(pill).toHaveStyle({ top: '448px' });
+    expect(editor.closest('.reaction-pill-content')).toHaveAttribute('hidden');
+    fireEvent.click(screen.getByRole('button', { name: 'Keep' }));
+    await act(async () => {
+      resizes.forEach(resize => resize());
+      await new Promise(requestAnimationFrame);
+    });
+    expect(pill).toHaveStyle({ top: '448px' });
+    expect(screen.getByRole('textbox')).toBe(editor);
+    expect(editor).toHaveValue('Keep this guarantee');
   });
 
   it('keeps or discards a typed touch-dock reaction without changing its source', () => {

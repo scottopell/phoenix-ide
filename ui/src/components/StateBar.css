@@ -555,6 +555,10 @@
 }
 
 .statebar-mode--direct,
+.statebar-mode--product,
+.statebar-mode--work-child,
+.statebar-mode--approved-task,
+.statebar-mode--coordinator,
 .statebar-mode--unknown {
   background: var(--bg-tertiary);
   color: var(--text-muted);
@@ -974,4 +978,21 @@
     justify-content: center;
     padding: 7px 10px;
   }
+}
+
+/* Marks a conversation Ember is monitoring; links to Ember. */
+.statebar-monitored {
+  flex: none;
+  padding: 1px 8px;
+  border: 1px solid var(--border-subtle);
+  border-radius: 999px;
+  color: var(--text-muted);
+  font-size: 11px;
+  white-space: nowrap;
+  text-decoration: none;
+}
+
+.statebar-monitored:hover,
+.statebar-monitored:focus-visible {
+  color: var(--text-primary);
 }

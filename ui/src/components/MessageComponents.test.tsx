@@ -5,6 +5,7 @@ import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
 import { fireEvent, render, screen, waitFor, act, within } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { SubAgentTranscript, SubAgentStatus, AgentMessage, SendConversationMessageView, ToolOnlyAgentTurnGroup, ToolUseBlock, UnwatchResultView, UserMessage, QueuedUserMessage, TerminalToolResultHighlight, WatchingResultView } from './MessageComponents';
+import { readReactionSelection } from './inlineReactionSelection';
 import { FilePathContextMenu } from './FilePathContextMenu';
 import { MessageContextMenu, OPEN_MESSAGE_VIEWER_EVENT } from './MessageContextMenu';
 import { StreamingMessageView } from './StreamingMessage';
@@ -694,6 +695,27 @@ describe('inline tool timers', () => {
 
     expect(document.querySelectorAll('.compact-tool-owner-copy .message-mobile-copy')).toHaveLength(1);
     expect(document.querySelectorAll('.compact-tool-selected-detail .message-mobile-copy')).toHaveLength(1);
+    expect(document.querySelectorAll('.compact-tool-selected-detail .assistant-message-toolbar')).toHaveLength(0);
+    expect(screen.getByRole('button', { name: 'Copy command' })).toBeInTheDocument();
+  });
+
+  it('keeps continuation chrome controls on ordinary messages, not inside expanded compact detail', () => {
+    mockDensity = 'compact';
+    const owner = agentMessage('agent-copy-continuation', [
+      { type: 'tool_use', id: 'copy-continuation-read', name: 'read_file', input: { path: 'continuation.md' } },
+    ], 2);
+    const { container } = render(<MemoryRouter><>
+      <AgentMessage message={agentMessage('agent-normal-continuation', [{ type: 'text', text: 'Normal continuation.' }])} toolResults={new Map()} isFirstInTurn={false} />
+      <ToolOnlyAgentTurnGroup members={[
+        { kind: 'agent_turn', key: owner.message_id, agent: owner, toolResultsByUseId: new Map(), isFirstInTurn: false },
+      ]} />
+    </></MemoryRouter>);
+
+    expect(container.querySelector('.assistant-message-toolbar--continuation')).toBeInTheDocument();
+    expect(screen.getAllByRole('button', { name: 'Copy Phoenix message' })).toHaveLength(2);
+    fireEvent.click(screen.getByRole('button', { name: /read_file:.*expand tool detail/i }));
+    expect(document.querySelectorAll('.compact-tool-selected-detail .assistant-message-toolbar')).toHaveLength(0);
+    expect(document.querySelector('.compact-tool-selected-detail .message-mobile-copy')).toBeInTheDocument();
   });
 
   it('keeps an expanded older compact tool before newer appended tools in DOM chronology', () => {
@@ -734,6 +756,36 @@ describe('inline tool timers', () => {
     expect(document.querySelector('.compact-tool-selected-detail')).toBeNull();
     expect(document.querySelector('.compact-tool-group')).toBe(group);
     expect(document.activeElement).toBe(screen.getByRole('button', { name: /read_file:.*expand tool detail/i }));
+  });
+
+  it('retains prose annotation anchors while excluding expanded tool arguments after empty chrome removal', () => {
+    const tool = agentMessage('agent-selection-tool', [
+      { type: 'tool_use', id: 'selection-read', name: 'read_file', input: { path: 'selection.md' } },
+    ], 2);
+    const prose = agentMessage('agent-selection-prose', [{ type: 'text', text: 'Readable prose stays commentable.' }], 3);
+    render(<MemoryRouter><div id="messages">
+      <AgentMessage message={tool} toolResults={new Map()} onOpenFile={undefined}
+        forceExpandedTools visibleToolUseId="selection-read" suppressMessageCopy isFirstInTurn={false} />
+      <AgentMessage message={prose} toolResults={new Map()} onOpenFile={undefined} isFirstInTurn={false} />
+    </div></MemoryRouter>);
+    const selection = window.getSelection()!;
+    const selectContents = (element: Element) => {
+      const range = document.createRange();
+      range.selectNodeContents(element);
+      selection.removeAllRanges();
+      selection.addRange(range);
+    };
+    const toolInput = document.querySelector('.tool-block-input')!;
+    expect(toolInput.closest('[data-inline-reaction-message]')).toHaveAttribute('data-inline-reaction-message', tool.message_id);
+    expect(toolInput.closest('.message')?.querySelector('.assistant-message-toolbar')).toBeNull();
+    selectContents(toolInput);
+    expect(readReactionSelection(selection, [tool, prose])).toBeNull();
+    selectContents(document.querySelector('.agent-text-block p')!);
+    const eligible = readReactionSelection(selection, [tool, prose]);
+    expect(eligible?.source.messageId).toBe(prose.message_id);
+    expect(eligible?.source.quote).toBe('Readable prose stays commentable.');
+    expect(eligible?.source.textAnchor?.start.fragmentId).toBeTruthy();
+    selection.removeAllRanges();
   });
 
   it('restores collapse focus inside the owning group when tool use ids recur', () => {
@@ -1247,7 +1299,7 @@ describe('message copy affordances', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Copy input message' }));
 
     await waitFor(() => {
-      expect(copyToClipboard).toHaveBeenCalledWith('Please summarize `src/main.rs`.');
+      expect(copyToClipboard).toHaveBeenCalledWith('Please summarize `src/main.rs`.', expect.any(AbortSignal));
     });
   });
 
@@ -1296,7 +1348,7 @@ describe('message copy affordances', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Copy Phoenix message' }));
 
     await waitFor(() => {
-      expect(copyToClipboard).toHaveBeenCalledWith('First **markdown** block.\n\nSecond block.');
+      expect(copyToClipboard).toHaveBeenCalledWith('First **markdown** block.\n\nSecond block.', expect.any(AbortSignal));
     });
   });
 
@@ -2290,11 +2342,19 @@ describe('markdown table rendering', () => {
     '| Revision | Destination |',
     '| --- | --- |',
     '| `4fd574ee` | `0123456789abcdef0123456789abcdef01234567` |',
+    '',
+    '| Merge | What it unblocks |',
+    '| --- | --- |',
   ].join('\n');
 
   function expectSemanticTableAnnotations(container: HTMLElement) {
+    const wrappers = container.querySelectorAll('.conversation-markdown-table-scroll');
     const tables = container.querySelectorAll('.markdown-table-scroll table');
-    expect(tables).toHaveLength(3);
+    expect(wrappers).toHaveLength(4);
+    expect([...wrappers].map((wrapper) => wrapper.getAttribute('data-column-count')))
+      .toEqual(['6', '2', '2', '2']);
+    expect(tables).toHaveLength(4);
+    expect(tables[3]!.querySelectorAll('tbody td')).toHaveLength(0);
     expect([...tables[0]!.querySelectorAll('th')].map((cell) => cell.dataset['columnKind']))
       .toEqual(['atomic', 'numeric', 'numeric', 'numeric', 'numeric', 'numeric']);
     expect([...tables[1]!.querySelectorAll('th')].map((cell) => cell.dataset['columnKind']))
@@ -2316,6 +2376,8 @@ describe('markdown table rendering', () => {
     const table = screen.getByRole('table');
     const wrapper = table.parentElement;
     expect(wrapper).toHaveClass('markdown-table-scroll');
+    expect(wrapper).toHaveClass('conversation-markdown-table-scroll');
+    expect(wrapper).toHaveAttribute('data-column-count', '6');
     expect(wrapper?.parentElement).toHaveClass('agent-text-block');
 
     const inlineCode = screen.getByText('direct_turn_id');
@@ -2398,7 +2460,7 @@ describe('markdown table rendering', () => {
       </MemoryRouter>,
     );
 
-    await waitFor(() => expect(container.querySelectorAll('table')).toHaveLength(3));
+    await waitFor(() => expect(container.querySelectorAll('table')).toHaveLength(4));
     expectSemanticTableAnnotations(container);
   });
 
@@ -2413,6 +2475,8 @@ describe('markdown table rendering', () => {
       const table = screen.getByRole('table');
       const wrapper = table.parentElement;
       expect(wrapper).toHaveClass('markdown-table-scroll');
+      expect(wrapper).toHaveClass('conversation-markdown-table-scroll');
+      expect(wrapper).toHaveAttribute('data-column-count', '6');
       expect(wrapper?.parentElement).toHaveClass('agent-text-block');
     });
 
@@ -2485,7 +2549,7 @@ describe('finalized code fence highlighting', () => {
     await act(async () => {
       fireEvent.click(screen.getByRole('button', { name: 'Copy Mermaid source' }));
     });
-    expect(copyToClipboard).toHaveBeenCalledWith(mermaidSource);
+    expect(copyToClipboard).toHaveBeenCalledWith(mermaidSource, expect.any(AbortSignal));
   });
 
 
@@ -2681,7 +2745,7 @@ describe('read_file structured result view', () => {
     expect(onOpenFile).toHaveBeenCalledWith('src/lib.rs', new Set(), 40, 64);
 
     fireEvent.click(screen.getByRole('button', { name: /Copy all returned lines/i }));
-    await waitFor(() => expect(copyToClipboard).toHaveBeenCalledWith(lines));
+    await waitFor(() => expect(copyToClipboard).toHaveBeenCalledWith(lines, expect.any(AbortSignal)));
 
     expect(screen.getByText(/5 more returned lines/)).toBeInTheDocument();
     expect(screen.queryByText('fixture line 60')).not.toBeInTheDocument();
@@ -2718,7 +2782,7 @@ describe('read_file structured result view', () => {
     expect(screen.getByRole('button', { name: 'Show preview' })).toHaveAttribute('aria-expanded', 'true');
 
     fireEvent.click(screen.getByRole('button', { name: /Copy all returned lines/i }));
-    await waitFor(() => expect(copyMock).toHaveBeenCalledWith(lines));
+    await waitFor(() => expect(copyMock).toHaveBeenCalledWith(lines, expect.any(AbortSignal)));
   });
 
   it('caps structured previews by characters without truncating copied historical output', async () => {
@@ -2743,7 +2807,7 @@ describe('read_file structured result view', () => {
 
     expect(screen.getByText(/returned line truncated for preview/)).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: /Copy all returned lines/i }));
-    await waitFor(() => expect(copyMock).toHaveBeenCalledWith(`     1\t${longLine}`));
+    await waitFor(() => expect(copyMock).toHaveBeenCalledWith(`     1\t${longLine}`, expect.any(AbortSignal)));
   });
 
   it('preserves literal ellipses and distinguishes an empty range from an empty file', () => {
@@ -3072,7 +3136,7 @@ describe('SubAgentStatus inline activity', () => {
     expect(container.querySelector('.subagent-delegated-task-text')?.textContent).toBe(task);
     expect(container.querySelector('script')).toBeNull();
     fireEvent.click(screen.getByRole('button', { name: 'Copy delegated task' }));
-    await waitFor(() => expect(copyToClipboard).toHaveBeenCalledExactlyOnceWith(task));
+    await waitFor(() => expect(copyToClipboard).toHaveBeenCalledExactlyOnceWith(task, expect.any(AbortSignal)));
     expect(expand).toHaveAttribute('aria-expanded', 'true');
     expect(api.getConversation).toHaveBeenCalledExactlyOnceWith('agent-task');
     await act(async () => resolveSnapshot({ conversation: child, messages: [], agent_working: !completed, presentation_mode: completed ? 'idle' : 'working', context_window_size: 0 }));

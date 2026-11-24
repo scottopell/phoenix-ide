@@ -1,0 +1,84 @@
+name: Global question loading performance
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'ui/**'
+      - '.github/workflows/question-loading-qa.yml'
+permissions:
+  contents: read
+jobs:
+  compare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    env:
+      BASE_SHA: 1c125f0360251d823710762f474d35ff268fa648
+      PLAYWRIGHT_BROWSERS_PATH: /home/runner/.cache/ms-playwright
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          path: candidate
+          fetch-depth: 1
+          persist-credentials: false
+      - uses: actions/checkout@v6
+        with:
+          ref: 1c125f0360251d823710762f474d35ff268fa648
+          path: baseline
+          fetch-depth: 1
+          persist-credentials: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '26'
+      - name: Install pinned UI dependencies and Chromium
+        working-directory: candidate/ui
+        run: |
+          corepack enable
+          pnpm install --frozen-lockfile
+          pnpm exec playwright install --with-deps chromium
+      - name: Focused question regressions
+        working-directory: candidate/ui
+        run: pnpm exec vitest run src/components/CoordinatorQuestionDock.test.tsx src/components/QuestionPanel.test.tsx src/hooks/useKeyboardNav.test.tsx
+      - name: Build and serve baseline
+        working-directory: baseline/ui
+        run: |
+          corepack enable
+          pnpm install --frozen-lockfile
+          pnpm build
+          (pnpm preview --host 127.0.0.1 --port 4173 --strictPort > /tmp/question-baseline.log 2>&1 & echo $! > /tmp/question-baseline.pid)
+      - name: Build and serve candidate
+        working-directory: candidate/ui
+        run: |
+          pnpm build
+          (pnpm preview --host 127.0.0.1 --port 4174 --strictPort > /tmp/question-candidate.log 2>&1 & echo $! > /tmp/question-candidate.pid)
+      - name: Wait for static production previews
+        run: |
+          for port in 4173 4174; do
+            for i in $(seq 1 60); do curl --fail --silent http://127.0.0.1:$port/ >/dev/null && break; sleep 1; done
+            curl --fail --silent http://127.0.0.1:$port/ >/dev/null
+          done
+      - name: Compare alternating baseline and candidate trials
+        working-directory: candidate
+        env:
+          BASELINE_URL: http://127.0.0.1:4173
+          CANDIDATE_URL: http://127.0.0.1:4174
+          QUESTION_QA_OUT: ${{ github.workspace }}/question-loading
+          QUESTION_QA_RUNS: '8'
+          BASELINE_SHA: 1c125f0360251d823710762f474d35ff268fa648
+          CANDIDATE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: node ui/scripts/qualify-question-loading.mjs
+      - name: Provenance and server logs
+        if: always()
+        run: |
+          mkdir -p question-loading
+          git -C baseline rev-parse HEAD > question-loading/base-sha.txt
+          git -C candidate rev-parse HEAD > question-loading/candidate-sha.txt
+          cp /tmp/question-baseline.log question-loading/ 2>/dev/null || true
+          cp /tmp/question-candidate.log question-loading/ 2>/dev/null || true
+      - uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: global-question-loading-${{ github.run_id }}
+          path: question-loading/
+          if-no-files-found: warn
+          retention-days: 14

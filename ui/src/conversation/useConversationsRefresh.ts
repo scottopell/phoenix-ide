@@ -267,6 +267,9 @@ export function useConversationsRefreshDriver(): void {
     const interval = window.setInterval(() => {
       if (document.visibilityState === 'visible' && navigator.onLine) {
         void refreshRef.current();
+        // Read state (including the Global conversation's) lives on the
+        // product list, which ordinary snapshot changes alone don't refresh.
+        notifyProductConversationListMayHaveChanged();
       }
     }, POLL_INTERVAL_MS);
     return () => window.clearInterval(interval);
@@ -297,6 +300,9 @@ export function useConversationsRefreshDriver(): void {
       }
       notifyProductConversationDeleted(detail.conversationId, [...deletedConversationIds]);
       localStorage.removeItem(`phoenix:product-conversation-draft:${detail.conversationId}`);
+      const productDraftScope = `product:${detail.conversationId}`;
+      clearDraftStorage(productDraftScope);
+      draftStore.remove(productDraftScope);
       for (const conversationId of deletedConversationIds) {
         const removedSlugs = store.removeByConversationId(conversationId);
         for (const slug of removedSlugs) {

@@ -52,6 +52,7 @@ final class RenderingReducerTests: XCTestCase {
              .subscriptionEvent(eventId: "event-1"), "Conversation event"),
             (#"{"kind":"scheduled_reminder","reminder_id":"reminder-1"}"#,
              .scheduledReminder(reminderId: "reminder-1"), "Scheduled reminder"),
+            (#"{"kind":"coordinator_question_reply"}"#, .coordinatorQuestionReply, "Question reply"),
             (#"{"kind":"unknown_historical"}"#, .unknownHistorical, "Unknown input"),
         ]
         let base = #"{"message_id":"m1","sequence_id":1,"message_type":"user","content":{"text":"hello"}"#
@@ -85,6 +86,7 @@ final class RenderingReducerTests: XCTestCase {
             (.slackGateway(requestId: "request-1"), false),
             (.subscriptionEvent(eventId: "event-1"), false),
             (.scheduledReminder(reminderId: "reminder-1"), false),
+            (.coordinatorQuestionReply, false),
         ]
         for (origin, isHuman) in origins {
             XCTAssertEqual(origin.isUserApiInput, isHuman)

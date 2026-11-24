@@ -1,6 +1,7 @@
+import { useCoordinatorQuestionFeed } from '../coordinator/coordinatorQuestions';
 import { useReminderDueNotifications } from '../reminders/useReminderDueNotifications';
 import { useDesktopRouteOwner } from './useDesktopRouteOwner';
-import { extractProductRouteReference } from './desktopRouteReference';
+import { extractProductRouteReference, isCoordinatorRoute } from './desktopRouteReference';
 import { conversationGroundingContext } from './FileExplorer/groundingContext';
 import { useLocation } from 'react-router-dom';
 import { lazy, Suspense, useEffect, useLayoutEffect, useCallback, useMemo, useRef, useState } from 'react';
@@ -11,8 +12,9 @@ import {
   useWorkScope,
 } from '../conversation';
 import { useResizablePane, useIsDesktop } from '../hooks';
-import { api, type Conversation, type ProductConversationListRow } from '../api';
+import { api, type Conversation } from '../api';
 import { Sidebar } from './Sidebar';
+import { useProductConversationList } from '../conversation/productConversationList';
 import { FileExplorerPanel, FileExplorerProvider } from './FileExplorer';
 import { ViewerSlotProvider } from '../contexts/ViewerSlotContext';
 import { useConversationReadiness } from '../contexts/useConversationReadiness';
@@ -33,12 +35,12 @@ import {
   useDocumentViewportOwnership,
 } from './viewportRoutes';
 import {
+  closeCoordinatorNotifications,
   closeNotificationsForConversation,
   consumeNotificationPermissionCue,
   loadNotificationSettingsAndCatchUp,
   notifyCatchUp,
   registerCoordinatorForNotifications,
-  subscribeProductConversationListRevision,
   useNotificationClickNavigationBridge,
   setActiveNotificationConversationSlug,
 } from '../notifications';
@@ -87,6 +89,7 @@ function SubAgentViewerDock() {
 
 export function DesktopLayout({ children }: DesktopLayoutProps) {
   useReminderDueNotifications();
+  useCoordinatorQuestionFeed();
   const isDesktop = useIsDesktop();
   const sidebarPane = useResizablePane({
     key: 'sidebar-width',
@@ -144,46 +147,7 @@ export function DesktopLayout({ children }: DesktopLayoutProps) {
   const { refresh: refreshConversations } = useConversationsRefresh();
   const { active: conversations, archived: archivedConversations } = useConversationsList();
   const [coordinatorForNotifications, setCoordinatorForNotifications] = useState<Conversation | null>(null);
-  const [productConversations, setProductConversations] = useState<ProductConversationListRow[]>([]);
-
-  useEffect(() => {
-    let cancelled = false;
-    let inFlight: Promise<void> | null = null;
-    let refreshPending = false;
-    let controller: AbortController | null = null;
-    const refresh = () => {
-      if (inFlight) {
-        refreshPending = true;
-        return inFlight;
-      }
-      controller = new AbortController();
-      const timeout = window.setTimeout(() => controller?.abort(), 15_000);
-      inFlight = api.listProductConversations(controller.signal)
-        .then((response) => {
-          if (!cancelled) setProductConversations(response.product_conversations);
-        })
-        .catch(() => {})
-        .finally(() => {
-          window.clearTimeout(timeout);
-          controller = null;
-          inFlight = null;
-          if (refreshPending && !cancelled) {
-            refreshPending = false;
-            void refresh();
-          }
-        });
-      return inFlight;
-    };
-    void refresh();
-    const interval = window.setInterval(refresh, 5_000);
-    const unsubscribe = subscribeProductConversationListRevision(() => { void refresh(); });
-    return () => {
-      cancelled = true;
-      controller?.abort();
-      window.clearInterval(interval);
-      unsubscribe();
-    };
-  }, []);
+  const productConversations = useProductConversationList().rows;
 
   useEffect(() => {
     let active = true;
@@ -270,11 +234,11 @@ export function DesktopLayout({ children }: DesktopLayoutProps) {
   const liveWorkScope = useWorkScope(activeSlug);
   const { conversationId: readinessConversationId, confirmedLive } = useConversationReadiness();
 
+  const onCoordinatorPage = isCoordinatorRoute(location.pathname);
   useEffect(() => {
-    if (activeConversationId) {
-      closeNotificationsForConversation(activeConversationId);
-    }
-  }, [activeConversationId]);
+    if (onCoordinatorPage) closeCoordinatorNotifications();
+    if (activeConversationId) closeNotificationsForConversation(activeConversationId);
+  }, [onCoordinatorPage, activeConversationId]);
 
   const activeConversationReadOnly = activeConversation !== null
     && (readinessConversationId !== activeConversation.id || !confirmedLive);

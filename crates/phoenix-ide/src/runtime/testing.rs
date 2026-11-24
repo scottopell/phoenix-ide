@@ -209,10 +209,44 @@ impl LlmClient for StreamingMockLlmClient {
 // Mock Tool Executor
 // ============================================================================
 
+type PreparationReadGate = (
+    tokio::sync::oneshot::Sender<()>,
+    tokio::sync::oneshot::Receiver<Result<(), String>>,
+);
+
+#[derive(Default)]
+struct PreparationReadBarrier(Mutex<Option<PreparationReadGate>>);
+
+impl PreparationReadBarrier {
+    fn hold(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<Result<(), String>>,
+    ) {
+        let (started, entered) = tokio::sync::oneshot::channel();
+        let (release, wait) = tokio::sync::oneshot::channel();
+        *self.0.lock().unwrap() = Some((started, wait));
+        (entered, release)
+    }
+
+    async fn wait(&self) -> Result<(), String> {
+        let gate = self.0.lock().unwrap().take();
+        if let Some((started, release)) = gate {
+            let _ = started.send(());
+            release
+                .await
+                .map_err(|_| "preparation read gate disappeared")??;
+        }
+        Ok(())
+    }
+}
+
 /// Mock tool executor with predefined outputs
 #[allow(dead_code)]
 pub struct MockToolExecutor {
     outputs: HashMap<String, ToolOutput>,
+    definitions_gate: PreparationReadBarrier,
     definitions: Vec<ToolDefinition>,
     clearable: std::collections::HashSet<String>,
     /// Record of tool executions
@@ -224,10 +258,20 @@ impl MockToolExecutor {
     pub fn new() -> Self {
         Self {
             outputs: HashMap::new(),
+            definitions_gate: PreparationReadBarrier::default(),
             definitions: Vec::new(),
             clearable: std::collections::HashSet::new(),
             executions: Mutex::new(Vec::new()),
         }
+    }
+
+    pub fn hold_next_definitions(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<Result<(), String>>,
+    ) {
+        self.definitions_gate.hold()
     }
 
     /// Add a tool with a predefined output
@@ -274,6 +318,10 @@ impl ToolExecutor for MockToolExecutor {
     }
 
     async fn definitions(&self) -> Vec<ToolDefinition> {
+        self.definitions_gate
+            .wait()
+            .await
+            .expect("definitions barrier released");
         self.definitions.clone()
     }
 
@@ -637,6 +685,12 @@ pub enum ToolRoundPersistenceFault {
 /// In-memory storage for testing
 #[allow(dead_code)]
 pub struct InMemoryStorage {
+    tracking_observation_gate: Mutex<
+        Option<(
+            tokio::sync::oneshot::Sender<i64>,
+            tokio::sync::oneshot::Receiver<()>,
+        )>,
+    >,
     coordinator_authority:
         Mutex<Result<phoenix_core::domain::coordinator_authority::CoordinatorAuthority, String>>,
     pub handoff_candidates: Mutex<Vec<crate::db::ContinuationHandoffCandidate>>,
@@ -644,6 +698,9 @@ pub struct InMemoryStorage {
     svg_artifacts: Mutex<StoredSvgArtifacts>,
     tool_admission_policies:
         Mutex<HashMap<String, phoenix_core::domain::tool_availability::ToolAvailability>>,
+    tool_policy_read_gate: PreparationReadBarrier,
+    tool_scope_read_gate: PreparationReadBarrier,
+    self_goal_read_gate: PreparationReadBarrier,
     messages: Mutex<HashMap<String, Vec<Message>>>,
     states: Mutex<HashMap<String, ConvState>>,
     state_updated_ats: Mutex<HashMap<String, chrono::DateTime<chrono::Utc>>>,
@@ -762,14 +819,57 @@ impl InMemoryStorage {
             .insert(conversation_id.to_owned(), policy);
     }
 
+    pub fn hold_next_tool_policy_read(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<Result<(), String>>,
+    ) {
+        self.tool_policy_read_gate.hold()
+    }
+
+    pub fn hold_next_tool_scope_read(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<Result<(), String>>,
+    ) {
+        self.tool_scope_read_gate.hold()
+    }
+
+    pub fn hold_next_self_goal_read(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<Result<(), String>>,
+    ) {
+        self.self_goal_read_gate.hold()
+    }
+
+    pub fn gate_tracking_observation(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<i64>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (started, observed) = tokio::sync::oneshot::channel();
+        let (release, wait) = tokio::sync::oneshot::channel();
+        *self.tracking_observation_gate.lock().unwrap() = Some((started, wait));
+        (observed, release)
+    }
+
     pub fn new() -> Self {
         Self {
+            tracking_observation_gate: Mutex::new(None),
             coordinator_authority: Mutex::new(Ok(
                 phoenix_core::domain::coordinator_authority::CoordinatorAuthority::default(),
             )),
             handoff_candidates: Mutex::new(Vec::new()),
             svg_artifacts: Mutex::new(HashMap::new()),
             tool_admission_policies: Mutex::new(HashMap::new()),
+            tool_policy_read_gate: PreparationReadBarrier::default(),
+            tool_scope_read_gate: PreparationReadBarrier::default(),
+            self_goal_read_gate: PreparationReadBarrier::default(),
             messages: Mutex::new(HashMap::new()),
             states: Mutex::new(HashMap::new()),
             state_updated_ats: Mutex::new(HashMap::new()),
@@ -1388,6 +1488,35 @@ impl Default for InMemoryStorage {
 
 #[async_trait]
 impl MessageStore for InMemoryStorage {
+    async fn append_coordinator_tracking_observation(
+        &self,
+        source: &str,
+        sequence_id: i64,
+        _now_us: i64,
+    ) -> phoenix_db::workflow::LocalAuthorityResult<Result<Option<Message>, String>> {
+        let gate = self.tracking_observation_gate.lock().unwrap().take();
+        if let Some((started, release)) = gate {
+            let _ = started.send(sequence_id);
+            let _ = release.await;
+            let result = self
+                .add_message_with_seq(
+                    "gated-tracking-observation",
+                    source,
+                    sequence_id,
+                    &MessageContent::User(crate::db::UserContent::meta(
+                        "Tracking test observation",
+                    )),
+                    None,
+                    None,
+                )
+                .await
+                .map(Some);
+            phoenix_db::workflow::LocalAuthorityResult::DurableFactEstablished(result)
+        } else {
+            phoenix_db::workflow::LocalAuthorityResult::DurableFactEstablished(Ok(None))
+        }
+    }
+
     async fn terminalize_sub_agent_cancellation_backstop(
         &self,
         _child_conversation_id: &str,
@@ -1980,6 +2109,18 @@ impl MessageStore for InMemoryStorage {
         if let Some(release) = release {
             let _ = release.await;
         }
+        {
+            let mut failures = self
+                .terminal_obligation_establishment_failures
+                .lock()
+                .unwrap();
+            if *failures > 0 {
+                *failures -= 1;
+                return crate::runtime::traits::TerminalMutationEstablishment::KnownNotCommitted(
+                    "terminal obligation establishment failed before commit".to_string(),
+                );
+            }
+        }
         self.terminal_obligation_calls
             .lock()
             .unwrap()
@@ -2163,6 +2304,26 @@ impl MessageStore for InMemoryStorage {
             }
         }
         Err(format!("Message not found: {message_id}"))
+    }
+
+    async fn get_work_scope_legacy_conversation_id(
+        &self,
+        _scope: &phoenix_core::work_scope::WorkScopeId,
+    ) -> Result<Option<String>, String> {
+        self.tool_scope_read_gate.wait().await?;
+        Ok(None)
+    }
+
+    async fn prepare_self_goal_tool(
+        &self,
+        _transcript: &str,
+        _turn: &crate::runtime::traits::ActiveDirectTurn,
+        _message_id: &str,
+        _tool_use_id: &str,
+        _operation: phoenix_core::domain::conversation_goal::SelfGoalOperation,
+    ) -> Result<phoenix_core::domain::conversation_goal::PendingSelfGoal, String> {
+        self.self_goal_read_gate.wait().await?;
+        Err("self-goal tools require durable runtime storage".into())
     }
 
     async fn persist_fork_proposal_with_tool_round(
@@ -2654,18 +2815,30 @@ impl StateStore for InMemoryStorage {
         callable_names: &std::collections::BTreeSet<String>,
         _visible_messages: &[phoenix_core::domain::tool_availability::ToolPolicyMessage],
         _historical_tool_references: &[(String, String)],
+        discovery_mode: phoenix_core::domain::tool_discovery::ToolDiscoveryMode,
     ) -> Result<phoenix_core::domain::tool_availability::ToolAvailability, String> {
+        if discovery_mode.uses_local_search() {
+            return Err("local tool discovery requires the durable SQLite test store".into());
+        }
         let policy = phoenix_core::domain::tool_availability::ToolAvailability::new(
             live_definitions.to_vec(),
             callable_names.clone(),
-        )?;
+        )?
+        .with_discovery(discovery_mode, vec![])?;
         self.seed_tool_admission_policy(conversation_id, policy.clone());
         Ok(policy)
+    }
+    async fn load_tool_search_catalog(
+        &self,
+        _conversation_id: &str,
+    ) -> Result<Vec<phoenix_llm::ToolDefinition>, String> {
+        Err("local tool discovery requires the durable SQLite test store".into())
     }
     async fn load_tool_admission_policy(
         &self,
         conversation_id: &str,
     ) -> Result<phoenix_core::domain::tool_availability::ToolAvailability, String> {
+        self.tool_policy_read_gate.wait().await?;
         Ok(self
             .tool_admission_policies
             .lock()
@@ -2676,10 +2849,10 @@ impl StateStore for InMemoryStorage {
                 phoenix_core::domain::tool_availability::ToolAvailability::all(vec![])
             }))
     }
-    async fn load_responses_replay_state(
+    async fn load_output_replay_state(
         &self,
         _conversation_id: &str,
-    ) -> Result<Vec<phoenix_core::domain::responses_replay::ResponsesResponseSet>, String> {
+    ) -> Result<Vec<phoenix_core::domain::responses_replay::ProviderResponseSet>, String> {
         Ok(Vec::new())
     }
     async fn load_provider_replay_state(
@@ -3144,7 +3317,7 @@ mod tests {
 
         let request = LlmRequest {
             provider_replay: None,
-            responses_replay: Vec::new(),
+            output_replay: Vec::new(),
             system: vec![],
             messages: vec![],
             tool_availability: phoenix_core::domain::tool_availability::ToolAvailability::all(
@@ -3961,6 +4134,9 @@ mod tests {
             completed_results: vec![],
             cause: crate::state_machine::event::CancelCause::UserRequested,
             spawn_tool_id: Some("spawn-1".to_string()),
+
+            forced_tool_retirement:
+                phoenix_core::domain::sm_state::ForcedToolRetirement::NotObserved,
         };
 
         let runtime = ConversationRuntime::new(
@@ -4488,8 +4664,7 @@ mod tests {
         );
 
         let event = runtime
-            .handle_spawn_agents_tool(call)
-            .await
+            .start_spawn_agents_tool(&call)
             .expect("handler must not error out");
 
         match event {
@@ -4953,6 +5128,9 @@ mod tests {
             completed_results: vec![],
             cause: crate::state_machine::event::CancelCause::UserRequested,
             spawn_tool_id: Some("spawn-1".to_string()),
+
+            forced_tool_retirement:
+                phoenix_core::domain::sm_state::ForcedToolRetirement::NotObserved,
         };
 
         // Real result for X → Idle.
@@ -5022,6 +5200,9 @@ mod tests {
             completed_results: vec![],
             cause: crate::state_machine::event::CancelCause::UserRequested,
             spawn_tool_id: Some("spawn-1".to_string()),
+
+            forced_tool_retirement:
+                phoenix_core::domain::sm_state::ForcedToolRetirement::NotObserved,
         };
 
         // Duplicate TimedOut for X (not in pending) → InvalidTransition.
@@ -5195,6 +5376,9 @@ mod tests {
             completed_results: vec![],
             cause: crate::state_machine::event::CancelCause::UserRequested,
             spawn_tool_id: Some("spawn-1".to_string()),
+
+            forced_tool_retirement:
+                phoenix_core::domain::sm_state::ForcedToolRetirement::NotObserved,
         };
         assert_ne!(
             std::mem::discriminant(&one),

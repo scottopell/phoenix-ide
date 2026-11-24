@@ -10,6 +10,14 @@ import { ApiResponseError } from '../api';
 const { apiMock, creationStoreMock, creationStoreState } = vi.hoisted(() => ({
   apiMock: {
     listModels: vi.fn().mockResolvedValue({ models: [{ id: 'claude-3-5-sonnet' }], default: 'claude-3-5-sonnet', llm_configured: true }),
+    getLlmLanguageSetting: vi.fn().mockResolvedValue({
+      language: 'caveman',
+      languages: [
+        { id: 'phoenix-native', label: 'Phoenix', description: 'Default Phoenix prose' },
+        { id: 'caveman', label: 'Caveman', description: 'Terse' },
+        { id: 'adhd', label: 'ADHD', description: 'Action first' },
+      ],
+    }),
     getEnv: vi.fn().mockResolvedValue({ home_dir: '/home/user' }),
     listRecentManagementRootSuggestions: vi.fn().mockResolvedValue({ suggestions: [] }),
     getProjects: vi.fn().mockResolvedValue([]),
@@ -18,6 +26,7 @@ const { apiMock, creationStoreMock, creationStoreState } = vi.hoisted(() => ({
     listConversations: vi.fn().mockResolvedValue([]),
     listArchivedConversations: vi.fn().mockResolvedValue([]),
     listProductConversationCreations: vi.fn().mockResolvedValue({ product_creations: [] }),
+    createProductConversation: vi.fn().mockImplementation(async (request: { request_id: string }) => ({ request_id: request.request_id, product_conversation_id: 'created-product' })),
     getProductConversationCreation: vi.fn<(requestId: string, signal?: AbortSignal) => Promise<ProductConversationCreationObservation>>(),
     cancelProductConversationCreation: vi.fn().mockResolvedValue(undefined),
     retryProductConversationDelivery: vi.fn().mockResolvedValue(undefined),
@@ -156,10 +165,67 @@ describe('NewConversationPage', () => {
     });
   }
 
+  it('chooses a language per conversation without inheriting the global default', async () => {
+    renderPage();
+    await settleInitialPageWork();
+    const picker = screen.getAllByRole('combobox', { name: /Language/ })[0]!;
+    expect(picker).toHaveValue('phoenix-native');
+    fireEvent.change(picker, { target: { value: 'adhd' } });
+    expect(screen.getAllByRole('combobox', { name: /Language/ })[1]).toHaveValue('adhd');
+    fireEvent.change(screen.getAllByPlaceholderText('What would you like to work on?')[0]!, {
+      target: { value: 'Explain this code' },
+    });
+    await waitFor(() => expect(screen.getAllByRole('button', { name: 'Send' })[0]).toBeEnabled());
+    fireEvent.click(screen.getAllByRole('button', { name: 'Send' })[0]!);
+    await waitFor(() => expect(apiMock.createProductConversation).toHaveBeenCalledWith(
+      expect.objectContaining({ llm_language: 'adhd' }),
+    ));
+  });
+
+  it('keeps a draft language when leaving and returning through New', async () => {
+    const page = renderPage();
+    await settleInitialPageWork();
+    fireEvent.change(screen.getAllByRole('combobox', { name: /Language/ })[0]!, { target: { value: 'adhd' } });
+    fireEvent.change(screen.getAllByPlaceholderText('What would you like to work on?')[0]!, {
+      target: { value: 'Resume this unsent draft' },
+    });
+    page.unmount();
+
+    renderPage();
+    await settleInitialPageWork();
+    expect(screen.getAllByPlaceholderText('What would you like to work on?')[0]).toHaveValue('Resume this unsent draft');
+    expect(screen.getAllByRole('combobox', { name: /Language/ })[0]).toHaveValue('adhd');
+  });
+
   it('does not show checking status on initial render when cwd is saved', async () => {
     const { container } = renderPage();
     expect(container.querySelectorAll('.status-checking').length).toBe(0);
     await settleInitialPageWork();
+  });
+
+  it('keeps recent locations collapsed, restores the chosen path, and submits it unchanged', async () => {
+    const paths = Array.from({ length: 20 }, (_, i) => `/home/user/repository-${i + 1}`);
+    const selectedPath = paths.at(-1)!;
+    apiMock.listRecentManagementRootSuggestions.mockResolvedValue({ suggestions: paths.map(path => ({ path })) });
+    const page = renderPage();
+    await settleInitialPageWork();
+    const toggle = screen.getAllByRole('button', { name: 'Choose recent location (20)' })[0]!;
+    expect(toggle).toHaveAttribute('aria-expanded', 'false');
+    expect(screen.queryByRole('button', { name: selectedPath })).not.toBeInTheDocument();
+    fireEvent.click(toggle);
+    fireEvent.click(screen.getAllByRole('button', { name: selectedPath })[0]!);
+    expect(screen.getAllByRole('textbox', { name: 'Directory' })[0]).toHaveValue(selectedPath);
+    await waitFor(() => expect(localStorage.getItem('phoenix-last-cwd')).toBe(selectedPath));
+    page.unmount();
+
+    renderPage();
+    await waitFor(() => expect(screen.getAllByRole('textbox', { name: 'Directory' })[0]).toHaveValue(selectedPath));
+    fireEvent.change(screen.getAllByPlaceholderText('What would you like to work on?')[0]!, { target: { value: 'Check the selected directory' } });
+    await waitFor(() => expect(screen.getAllByRole('button', { name: 'Send' })[0]).toBeEnabled());
+    fireEvent.click(screen.getAllByRole('button', { name: 'Send' })[0]!);
+    await waitFor(() => expect(apiMock.createProductConversation).toHaveBeenCalledWith(expect.objectContaining({
+      cwd: selectedPath, objective: 'Check the selected directory',
+    })));
   });
 
   it('renders recovery actions and wires retry/cancel/delete', async () => {

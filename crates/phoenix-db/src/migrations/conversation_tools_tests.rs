@@ -5,6 +5,16 @@ use sqlx::{Row, Sqlite, SqliteConnection, SqlitePool, Transaction};
 use super::{run_pending_migrations, run_through_for_test, MIGRATIONS};
 use crate::{Database, DbError, DbResult};
 
+fn registered_after(prefix: u32) -> u32 {
+    u32::try_from(
+        MIGRATIONS
+            .iter()
+            .filter(|migration| migration.version > prefix)
+            .count(),
+    )
+    .unwrap()
+}
+
 const PROVENANCE: &str = include_str!("agent_creation_provenance.sql");
 const RECEIPTS: &str = include_str!("product_conversation_rename_receipts.sql");
 const RETAIN_RECEIPTS: &str = include_str!("retain_product_conversation_rename_receipts.sql");
@@ -49,16 +59,6 @@ pub(super) async fn body_sql<'a>(
     let mut modified = original.to_owned();
     modified.insert_str(at, "CREATE TEMP TABLE _phase1_injected_failure (n INTEGER CONSTRAINT conversation_tools_fault CHECK(n=1)); INSERT INTO _phase1_injected_failure VALUES(0);\n");
     Ok(Cow::Owned(modified))
-}
-
-fn registered_migration_count_after(version: u32) -> u32 {
-    u32::try_from(
-        MIGRATIONS
-            .iter()
-            .filter(|migration| migration.version > version)
-            .count(),
-    )
-    .expect("registered migration count fits u32")
 }
 
 fn registered_migration_count_between(after: u32, through: u32) -> u32 {
@@ -106,6 +106,65 @@ async fn fixture(prefix: u32, populated: bool) -> SqlitePool {
         seed(&pool, prefix).await;
     }
     pool
+}
+
+#[tokio::test]
+async fn adhd_language_migration_preserves_jobs_and_children() {
+    let pool = fixture(170, true).await;
+    let before: Vec<(String, String)> = sqlx::query_as(
+        "SELECT request_id, llm_language FROM product_creation_jobs ORDER BY request_id",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    let images: i64 = sqlx::query_scalar("SELECT count(*) FROM product_creation_job_images")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(run_through_for_test(&pool, 171).await.unwrap(), 1);
+    let after: Vec<(String, String)> = sqlx::query_as(
+        "SELECT request_id, llm_language FROM product_creation_jobs ORDER BY request_id",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(before, after);
+    assert_eq!(
+        images,
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM product_creation_job_images")
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+    );
+    sqlx::query(
+        "UPDATE product_creation_jobs SET llm_language = 'adhd' WHERE request_id = 'old-user'",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    assert!(sqlx::query(
+        "UPDATE product_creation_jobs SET llm_language = 'unknown' WHERE request_id = 'old-user'"
+    )
+    .execute(&pool)
+    .await
+    .is_err());
+    assert_eq!(
+        run_pending_migrations(&pool).await.unwrap(),
+        registered_after(171)
+    );
+    assert_eq!(run_pending_migrations(&pool).await.unwrap(), 0);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("PRAGMA foreign_keys")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        1
+    );
+    assert!(sqlx::query("PRAGMA foreign_key_check")
+        .fetch_all(&pool)
+        .await
+        .unwrap()
+        .is_empty());
 }
 
 async fn seed(pool: &SqlitePool, prefix: u32) {
@@ -283,10 +342,17 @@ fn registered_identity_order_and_exact_bodies() {
         (151, "one_shot_conversation_reminders"),
         (152, "goal_preparation_inflight_source"),
         (153, "close_writer_observations"),
-        (173, "native_close_exact_observation_receipts"),
-        (174, "native_close_explicit_retry_admission"),
-        (175, "native_close_source_fence"),
-        (176, "native_close_retry_failure"),
+        (159, "federated_continuation_receipts"),
+        (160, "slack_trigger_emojis"),
+        (161, "slack_single_trigger_emoji"),
+        (162, "slack_saved_capture"),
+        (163, "product_conversation_read_state"),
+        (164, "coordinator_durable_tracking"),
+        (165, "watch_ending_evidence"),
+        (176, "native_close_exact_observation_receipts"),
+        (177, "native_close_explicit_retry_admission"),
+        (178, "native_close_source_fence"),
+        (179, "native_close_retry_failure"),
     ];
     for (version, name) in identities {
         let entries = MIGRATIONS
@@ -314,17 +380,24 @@ fn registered_identity_order_and_exact_bodies() {
         (include_str!("reminders.sql"), 151),
         (include_str!("goal_preparation_inflight_source.sql"), 152),
         (include_str!("close_writer_observations.sql"), 153),
-        (include_str!("close_original_retirement_anchor.sql"), 172),
+        (include_str!("federated_continuation_receipts.sql"), 159),
+        (include_str!("slack_trigger_emojis.sql"), 160),
+        (include_str!("slack_single_trigger_emoji.sql"), 161),
+        (include_str!("slack_saved_capture.sql"), 162),
+        (include_str!("product_conversation_read_state.sql"), 163),
+        (include_str!("../coordinator_tracking/schema.sql"), 164),
+        (include_str!("watch_ending_evidence.sql"), 165),
+        (include_str!("close_original_retirement_anchor.sql"), 175),
         (
             include_str!("native_close_exact_observation_receipts.sql"),
-            173,
+            176,
         ),
         (
             include_str!("native_close_explicit_retry_admission.sql"),
-            174,
+            177,
         ),
-        (include_str!("native_close_source_fence.sql"), 175),
-        (include_str!("native_close_retry_failure.sql"), 176),
+        (include_str!("native_close_source_fence.sql"), 178),
+        (include_str!("native_close_retry_failure.sql"), 179),
     ] {
         let entries = MIGRATIONS
             .iter()
@@ -405,7 +478,7 @@ async fn rename_receipt_retention_migration_preserves_rows_and_rolls_back_atomic
         .unwrap();
     assert_eq!(
         run_pending_migrations(&pool).await.unwrap(),
-        registered_migration_count_after(145)
+        registered_after(145)
     );
     let foreign_keys: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM pragma_foreign_key_list('product_conversation_rename_receipts')",
@@ -439,7 +512,7 @@ async fn registered_slack_origin_decodes_and_replays_after_upgrade() {
     let db = Database::from_pool_for_tests(pool.clone(), String::new());
     assert_eq!(
         run_pending_migrations(&pool).await.unwrap(),
-        registered_migration_count_after(142)
+        registered_after(142)
     );
     let retained = db
         .get_product_creation_job("old-slack")
@@ -510,7 +583,7 @@ async fn registered_fresh_upgrade_slack_children_ledger_and_reentry() {
             drop(conn);
             assert_eq!(
                 run_pending_migrations(&pool).await.unwrap(),
-                registered_migration_count_after(149)
+                registered_after(149)
             );
             let mut conn = pool.acquire().await.unwrap();
             let live_images: i64 =
@@ -535,7 +608,7 @@ async fn registered_fresh_upgrade_slack_children_ledger_and_reentry() {
             assert_eq!(
                 ledger
                     .iter()
-                    .filter(|(v, _, _)| *v >= 143)
+                    .filter(|(v, _, _)| (143..=163).contains(v))
                     .map(|(v, n, _)| (*v, n.as_str()))
                     .collect::<Vec<_>>(),
                 [
@@ -558,31 +631,19 @@ async fn registered_fresh_upgrade_slack_children_ledger_and_reentry() {
                     (161, "slack_single_trigger_emoji"),
                     (162, "slack_saved_capture"),
                     (163, "product_conversation_read_state"),
-                    (164, "coordinator_durable_tracking"),
-                    (165, "watch_ending_evidence"),
-                    (166, "coordinator_transcript_scanner"),
-                    (167, "slack_channel_submissions"),
-                    (168, "coordinator_user_questions"),
-                    (169, "native_task_approval_receipts"),
-                    (170, "close_completion_allowances_and_native_retry_fence"),
-                    (171, "native_close_initial_receipts"),
-                    (172, "close_original_retirement_anchors"),
-                    (173, "native_close_exact_observation_receipts"),
-                    (174, "native_close_explicit_retry_admission"),
-                    (175, "native_close_source_fence"),
-                    (176, "native_close_retry_failure"),
-                    (177, "native_close_retry_dispatch"),
-                    (178, "native_close_retry_worktree_metadata"),
-                    (179, "native_initial_source_fence"),
-                    (180, "native_initial_completed_interruption"),
-                    (181, "native_initial_completion_retry_admission"),
-                    (182, "close_ignored_loss_category"),
-                    (183, "native_close_initial_result_acknowledgement"),
-                    (184, "native_close_captured_loss_retry"),
-                    (185, "native_close_retry_tmux_dispatch"),
-                    (186, "native_close_retry_origin_gate"),
-                    (187, "native_close_origin_owner_cleanup"),
                 ]
+            );
+            assert_eq!(
+                ledger
+                    .iter()
+                    .filter(|(version, _, _)| *version >= 143)
+                    .map(|(version, name, _)| (*version, name.as_str()))
+                    .collect::<Vec<_>>(),
+                MIGRATIONS
+                    .iter()
+                    .filter(|migration| migration.version >= 143)
+                    .map(|migration| (i64::from(migration.version), migration.name))
+                    .collect::<Vec<_>>()
             );
             drop(conn);
             assert_eq!(run_pending_migrations(&pool).await.unwrap(), 0);
@@ -630,7 +691,7 @@ async fn registered_body_faults_rollback_and_same_connection_retry() {
         drop(conn);
         assert_eq!(
             run_pending_migrations(&pool).await.unwrap(),
-            registered_migration_count_after(149)
+            registered_after(149)
         );
         let mut conn = pool.acquire().await.unwrap();
         clean(&mut conn).await;
@@ -654,7 +715,7 @@ async fn registered_ledger_failure_rolls_back_body_then_reenters() {
     drop(conn);
     assert_eq!(
         run_pending_migrations(&pool).await.unwrap(),
-        registered_migration_count_after(142)
+        registered_after(142)
     );
 }
 
@@ -716,7 +777,7 @@ async fn image_retirement_ledger_failure_restores_payload_schema_and_retries() {
         .unwrap();
     assert_eq!(
         run_pending_migrations(&pool).await.unwrap(),
-        registered_migration_count_after(148)
+        registered_after(148)
     );
     let restored: Vec<(String, i64, String, String)> = sqlx::query_as(
         "SELECT request_id, ordinal, media_type, data FROM product_creation_job_images ORDER BY request_id, ordinal",
@@ -815,10 +876,7 @@ async fn registered_creation_receipt_retention_preserves_jobs_and_children_atomi
         .execute(&pool)
         .await
         .unwrap();
-    assert_eq!(
-        run_through_for_test(&pool, 147).await.unwrap(),
-        registered_migration_count_between(146, 147)
-    );
+    assert_eq!(run_through_for_test(&pool, 147).await.unwrap(), 1);
     let ledger_entry: (i64, String) =
         sqlx::query_as("SELECT version, name FROM _migrations WHERE version=147")
             .fetch_one(&pool)
@@ -928,6 +986,14 @@ async fn registered_creation_receipt_retention_preserves_jobs_and_children_atomi
     .unwrap();
     assert_eq!(reservation_token.as_deref(), Some("token東京"));
     drop(conn);
+    let pending = u32::try_from(
+        MIGRATIONS
+            .iter()
+            .filter(|migration| migration.version > 147)
+            .count(),
+    )
+    .unwrap();
+    assert_eq!(run_pending_migrations(&pool).await.unwrap(), pending);
 
     db.delete_conversation(&target.id).await.unwrap();
     let retained_ids: (String, String) = sqlx::query_as("SELECT published_product_id, published_conversation_id FROM product_creation_jobs WHERE request_id='old-user'")

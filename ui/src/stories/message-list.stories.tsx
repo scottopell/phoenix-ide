@@ -1,3 +1,4 @@
+import { FindFinalizationFixture } from '../fixtures/messageList/findFinalization';
 import type { Story } from '@ladle/react';
 import { MessageListFixture, getMessageListScenario, messageListScenarios } from '../fixtures/messageList';
 
@@ -23,6 +24,12 @@ ScrollPolicyLong.storyName = 'scroll-policy-long';
 export const PrefixContinuityOffsetBug = storyFor('prefix-continuity-offset-bug');
 PrefixContinuityOffsetBug.storyName = 'prefix-continuity-offset-bug';
 
+export const NarrowWebKitMarkdownTable = storyFor('narrow-webkit-markdown-table');
+NarrowWebKitMarkdownTable.storyName = 'narrow-webkit-markdown-table';
+
+export const NarrowWebKitMarkdownTableLight = storyFor('narrow-webkit-markdown-table-light');
+NarrowWebKitMarkdownTableLight.storyName = 'narrow-webkit-markdown-table-light';
+
 export const WideMarkdownTable = storyFor('wide-markdown-table');
 WideMarkdownTable.storyName = 'wide-markdown-table';
 
@@ -31,3 +38,9 @@ WideMarkdownTableLight.storyName = 'wide-markdown-table-light';
 
 export const MarkdownImageDark = storyFor('markdown-image-dark');
 MarkdownImageDark.storyName = 'markdown-image-dark';
+
+export const DelayedImageScroll = storyFor('delayed-image-scroll');
+DelayedImageScroll.storyName = 'delayed-image-scroll';
+
+export const FindIdenticalFinalization: Story = () => <FindFinalizationFixture />;
+FindIdenticalFinalization.storyName = 'find-identical-finalization';

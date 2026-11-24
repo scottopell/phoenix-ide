@@ -119,18 +119,9 @@ class QualificationOutputTests(unittest.TestCase):
         source = ast.parse((ROOT / "dev.py").read_text())
         check = next(node for node in source.body
                      if isinstance(node, ast.FunctionDef) and node.name == "cmd_check")
-        block = next(node for node in ast.walk(check) if isinstance(node, ast.If)
-                     and any(isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Call)
-                             and isinstance(stmt.value.func, ast.Name)
-                             and stmt.value.func.id == "run_step" and stmt.value.args
-                             and isinstance(stmt.value.args[0], ast.Constant)
-                             and stmt.value.args[0].value == "dev.py unit tests"
-                             for stmt in node.orelse))
-        start = next(index for index, stmt in enumerate(block.orelse)
-                     if isinstance(stmt, ast.Assign)
-                     and any(isinstance(target, ast.Name) and target.id == "unittest_cmd"
-                             for target in stmt.targets))
-        code = compile(ast.Module(body=block.orelse[start:], type_ignores=[]),
+        check_devpy = next(node for node in check.body
+                           if isinstance(node, ast.FunctionDef) and node.name == "check_devpy")
+        code = compile(ast.Module(body=check_devpy.body, type_ignores=[]),
                        str(ROOT / "dev.py"), "exec")
         for diagnostic in (None, "", str(self.directory)):
             for profile in (None, self.directory / "profile"):
@@ -138,13 +129,14 @@ class QualificationOutputTests(unittest.TestCase):
                     env = {} if diagnostic is None else {"PHOENIX_CHECK_DIAGNOSTIC_DIR": diagnostic}
                     run_step = mock.Mock()
                     namespace = dict(os=os, sys=sys, ROOT=ROOT, profile_work=profile is not None,
-                                     _CHECK_PROFILE=profile, run_step=run_step)
+                                     _CHECK_PROFILE=profile, DEVPY_TEST_TIMEOUT=1800,
+                                     run_step=run_step)
                     with mock.patch.dict(os.environ, env, clear=True):
                         exec(code, namespace)
                     prefix = ([sys.executable, "-m", "unittest"] if profile is None else
                               [sys.executable, str(ROOT / "scripts" / "python_unittest_profile.py")])
                     expected = prefix + ["discover", "tests/devpy"] + (["-v"] if diagnostic else [])
-                    run_step.assert_called_once_with("dev.py unit tests", expected)
+                    run_step.assert_called_once_with("dev.py unit tests", expected, timeout=1800)
 
     def test_unittest_capture_retains_verbose_summary_skips_and_completion(self):
         for returncode, ending in ((0, "OK (skipped=1)"),

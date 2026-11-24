@@ -651,7 +651,7 @@ pub struct LlmRequest {
     pub messages: Vec<LlmMessage>,
     /// Durable provider-private replay data for the active exchange, if any.
     pub provider_replay: Option<super::provider_replay::AnthropicReplayPayload>,
-    pub responses_replay: Vec<super::responses_replay::ResponsesResponseSet>,
+    pub output_replay: Vec<super::responses_replay::ProviderResponseSet>,
     pub tool_availability: super::tool_availability::ToolAvailability,
     /// Concrete output limit, also used for input-capacity reservation.
     /// Agent-turn defaults and bounded utility calls follow REQ-LLM-004f.
@@ -1124,7 +1124,7 @@ mod attempt_capture_tests {
             system: vec![],
             messages: vec![],
             provider_replay: None,
-            responses_replay: Vec::new(),
+            output_replay: Vec::new(),
             tool_availability: crate::domain::tool_availability::ToolAvailability::all(vec![]),
             max_tokens: 50,
             effective_effort: EffectiveEffort::native_known(ModelEffort::Max),

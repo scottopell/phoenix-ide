@@ -2707,6 +2707,75 @@ mod tests {
         }
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn observe_fixture_child_terminal(pid: u32) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let child_id = libc::id_t::try_from(pid).expect("child pid fits waitid id_t");
+        let expected_pid = libc::pid_t::try_from(pid).expect("child pid fits pid_t");
+        loop {
+            let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+            // SAFETY: the fixture owns this unreaped child; WNOWAIT leaves its status intact.
+            let rc = unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    child_id,
+                    &raw mut info,
+                    libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+                )
+            };
+            assert_eq!(rc, 0, "waitid failed: {}", std::io::Error::last_os_error());
+            if unsafe { info.si_pid() } == expected_pid {
+                return;
+            }
+            assert!(Instant::now() < deadline, "fixture child did not exit");
+            std::thread::yield_now();
+        }
+    }
+
+    #[cfg(unix)]
+    async fn terminal_unregistered_child(
+        ctx: &ToolContext,
+        working_dir: &std::path::Path,
+        cmd: &str,
+        expected_exit: i32,
+        probe: impl FnOnce(u32) -> Option<phoenix_core::process_identity::ProcessIdentity>,
+    ) -> UnregisteredChild {
+        let child = injected_unregistered_child(ctx, working_dir, cmd, probe);
+        terminal_fixture_phase(child, expected_exit).await
+    }
+
+    #[cfg(unix)]
+    async fn terminal_fixture_phase(
+        mut child: UnregisteredChild,
+        expected_exit: i32,
+    ) -> UnregisteredChild {
+        // wait caches the real status and leaves stdout/stderr unread for settlement.
+        let status = tokio::time::timeout(Duration::from_secs(10), child.child.wait())
+            .await
+            .expect("fixture child did not reach its terminal phase")
+            .expect("wait for fixture child");
+        assert_eq!(status.code(), Some(expected_exit));
+        child
+    }
+
+    #[cfg(unix)]
+    fn fixture_fifo(path: &std::path::Path) {
+        let path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: path is a valid NUL-terminated path in the fixture's temporary directory.
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+    }
+
+    #[cfg(unix)]
+    async fn wait_for_fixture_file(path: &std::path::Path) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !path.exists() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("fixture child did not reach its held-live phase");
+    }
+
     #[cfg(unix)]
     fn response_json(output: &ToolOutput) -> Value {
         serde_json::from_str(output.output()).expect("response JSON")
@@ -3772,7 +3841,7 @@ mod tests {
         let ctx = test_context(&scope("identity-none"));
         let dir = tempfile::tempdir().unwrap();
         let cmd = "printf once >> count; printf 'stdout\\n'; printf 'stderr-tail' >&2; exit 23";
-        let child = injected_unregistered_child(&ctx, dir.path(), cmd, |_| None);
+        let child = terminal_unregistered_child(&ctx, dir.path(), cmd, 23, |_| None).await;
         let registry = ctx.bash_handle_registry();
         let reservation = registry.reserve_spawn(&ctx.work_scope).await.unwrap();
         let response = response_json(
@@ -3792,9 +3861,17 @@ mod tests {
         assert_eq!(response["output_complete"], true);
         assert!(response.get("handle").is_none());
         assert!(response.get("error").is_none());
-        let lines = response["lines"].as_array().unwrap();
-        assert!(lines.iter().any(|line| line["bytes"] == "stdout"));
-        assert!(lines.iter().any(|line| line["bytes"] == "stderr-tail"));
+        let captured: String = response["lines"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|line| line["bytes"].as_str().unwrap())
+            .collect();
+        // Separate pipe readers can append in either order, including the partial tail first.
+        assert!(
+            captured == "stdoutstderr-tail" || captured == "stderr-tailstdout",
+            "unexpected merged output: {captured:?}"
+        );
         assert_eq!(
             std::fs::read_to_string(dir.path().join("count")).unwrap(),
             "once"
@@ -3807,7 +3884,7 @@ mod tests {
         let ctx = test_context(&scope("identity-empty-line-flood"));
         let dir = tempfile::tempdir().unwrap();
         let cmd = "printf '\\n%.0s' {1..128}";
-        let child = injected_unregistered_child(&ctx, dir.path(), cmd, |_| None);
+        let child = terminal_unregistered_child(&ctx, dir.path(), cmd, 0, |_| None).await;
         let reservation = ctx
             .bash_handle_registry()
             .reserve_spawn(&ctx.work_scope)
@@ -3845,10 +3922,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let calls = AtomicUsize::new(0);
         let mut replacement = None;
-        let child = injected_unregistered_child(
+        let child = terminal_unregistered_child(
             &ctx,
             dir.path(),
             "printf once >> count; printf success; exit 0",
+            0,
             |pid| {
                 calls.fetch_add(1, Ordering::SeqCst);
                 // Model a later occupant of this numeric PID with a different birth.
@@ -3858,7 +3936,8 @@ mod tests {
                 });
                 None
             },
-        );
+        )
+        .await;
         let registry = ctx.bash_handle_registry();
         let reservation = registry.reserve_spawn(&ctx.work_scope).await.unwrap();
         let response = response_json(
@@ -3875,6 +3954,9 @@ mod tests {
         );
         assert_eq!(response["status"], "unregistered_exited");
         assert_eq!(response["exit_code"], 0);
+        assert_eq!(response["output_complete"], true);
+        assert_eq!(response["lines"].as_array().unwrap().len(), 1);
+        assert_eq!(response["lines"][0]["bytes"], "success");
         assert!(response.get("handle").is_none());
         assert_eq!(
             calls.load(Ordering::SeqCst),
@@ -3891,14 +3973,13 @@ mod tests {
         assert!(matches!(decoded, BashResponse::UnregisteredExited(_)));
     }
 
-    #[cfg(unix)]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[tokio::test]
     async fn delayed_missing_probe_preserves_owned_child_wait_status() {
         let ctx = test_context(&scope("identity-delayed"));
         let dir = tempfile::tempdir().unwrap();
-        let child = injected_unregistered_child(&ctx, dir.path(), "printf tail; exit 7", |_| {
-            // test-timing-allow: inject launch-thread descheduling before the missing identity observation to exercise owned-child wait status retention
-            std::thread::sleep(Duration::from_millis(100));
+        let child = injected_unregistered_child(&ctx, dir.path(), "printf tail; exit 7", |pid| {
+            observe_fixture_child_terminal(pid);
             None
         });
         let reservation = ctx
@@ -3918,7 +3999,9 @@ mod tests {
             )
             .await,
         );
+        assert_eq!(response["status"], "unregistered_exited");
         assert_eq!(response["exit_code"], 7);
+        assert_eq!(response["output_complete"], true);
         assert_eq!(response["lines"][0]["bytes"], "tail");
     }
 
@@ -3931,8 +4014,11 @@ mod tests {
             1,
         ));
         let dir = tempfile::tempdir().unwrap();
-        let cmd = "printf once >> count; printf 'before\\n'; while [ ! -e release ]; do sleep 0.01; done; printf after";
-        let child = injected_unregistered_child(&ctx, dir.path(), cmd, |_| None);
+        fixture_fifo(&dir.path().join("release"));
+        let cmd = "printf once >> count; printf 'before\\n'; printf ready > ready; read -r release < release; printf after";
+        let mut child = injected_unregistered_child(&ctx, dir.path(), cmd, |_| None);
+        wait_for_fixture_file(&dir.path().join("ready")).await;
+        assert!(child.child.try_wait().unwrap().is_none());
         let registry = ctx.bash_handle_registry();
         let reservation = registry.reserve_spawn(&ctx.work_scope).await.unwrap();
         let response = response_json(
@@ -3951,6 +4037,9 @@ mod tests {
         assert_eq!(response["signal_number"], libc::SIGKILL);
         assert!(response.get("handle").is_none());
         assert!(response.get("pid").is_none());
+        assert_eq!(response["output_complete"], true);
+        assert_eq!(response["lines"].as_array().unwrap().len(), 1);
+        assert_eq!(response["lines"][0]["bytes"], "before");
         assert!(registry.reserve_spawn(&ctx.work_scope).await.is_err());
         assert_eq!(
             std::fs::read_to_string(dir.path().join("count")).unwrap(),
@@ -3976,8 +4065,15 @@ mod tests {
     async fn unverified_descendant_pipe_drain_is_bounded_without_group_signals() {
         let ctx = test_context(&scope("identity-descendant"));
         let dir = tempfile::tempdir().unwrap();
-        let cmd = "(sleep 0.8; printf survived > descendant) & printf 'parent\\n'; exit 19";
-        let child = injected_unregistered_child(&ctx, dir.path(), cmd, |_| None);
+        fixture_fifo(&dir.path().join("descendant-release"));
+        let release = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(dir.path().join("descendant-release"))
+            .unwrap();
+        let cmd = "(exec 3< descendant-release; printf ready > descendant-ready; read -r release <&3; printf survived > descendant) & printf 'parent\\n'; exit 19";
+        let child = terminal_unregistered_child(&ctx, dir.path(), cmd, 19, |_| None).await;
+        wait_for_fixture_file(&dir.path().join("descendant-ready")).await;
         let reservation = ctx
             .bash_handle_registry()
             .reserve_spawn(&ctx.work_scope)
@@ -4002,13 +4098,8 @@ mod tests {
         assert_eq!(response["exit_code"], 19);
         assert_eq!(response["output_complete"], false);
         assert_eq!(response["descendants"], "unverified");
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while !dir.path().join("descendant").exists() {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("unverified group was signalled");
+        drop(release);
+        wait_for_fixture_file(&dir.path().join("descendant")).await;
     }
 
     #[cfg(unix)]
@@ -4038,14 +4129,19 @@ mod tests {
             .is_err());
         let (child, _launch_gate, sandbox_scratch_dir) = spawned.into_waiter_parts();
         std::fs::write(dir.path().join("release"), "").unwrap();
+        let child = terminal_fixture_phase(
+            UnregisteredChild {
+                child,
+                launch_gate: None,
+                sandbox_scratch_dir,
+                started_at: Instant::now(),
+            },
+            6,
+        )
+        .await;
         let response = response_json(
             &settle_unregistered_run(
-                UnregisteredChild {
-                    child,
-                    launch_gate: None,
-                    sandbox_scratch_dir,
-                    started_at: Instant::now(),
-                },
+                child,
                 reservation,
                 "registration test",
                 None,

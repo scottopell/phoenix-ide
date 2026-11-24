@@ -72,8 +72,22 @@ export const productConversationScenarioDefinitions = [
   { id: 'global-lazy-history', title: 'Global three-member lazy history', viewport: 'desktop', state: 'ready' },
   { id: 'compact-events-ordinary', title: 'Compact ordinary events', viewport: 'desktop', state: 'ready' },
   { id: 'compact-events-global', title: 'Compact Global events', viewport: 'desktop', state: 'ready' },
+  { id: 'compact-events-redacted', title: 'Redacted event evidence', viewport: 'desktop', state: 'ready' },
+  { id: 'ember-tracking-observations', title: 'Saved Ember tracking observations across continued history', viewport: 'desktop', state: 'ready' },
+  { id: 'ember-tracking-fallback', title: 'Untrusted and malformed Ember tracking lookalikes', viewport: 'desktop', state: 'ready' },
+  { id: 'composer-focus', title: 'Composer focus ownership', viewport: 'desktop', state: 'ready' },
+  { id: 'reminders-compact-due', title: 'Compact due reminder disclosure', viewport: 'mobile', state: 'ready' },
+  { id: 'reminders-compact-scheduled', title: 'Compact scheduled reminder disclosure', viewport: 'mobile', state: 'ready' },
+  { id: 'reminders-compact-cancelled', title: 'Compact cancelled reminder disclosure', viewport: 'mobile', state: 'ready' },
+  { id: 'reminders-compact-empty', title: 'Compact empty reminder state', viewport: 'mobile', state: 'ready' },
+  { id: 'reminders-initial-failure', title: 'Reminders initial GET failure', viewport: 'mobile', state: 'ready' },
+  { id: 'reminders-alias-fallback-initial-failure', title: 'Conversation alias 404 fallback reminders initial GET failure', viewport: 'mobile', state: 'ready' },
+  { id: 'reminders-loaded-stale-upcoming', title: 'Loaded stale and upcoming reminders', viewport: 'mobile', state: 'ready' },
+  { id: 'reminders-retry-mutation-rejection', title: 'Reminder refresh retry and mutation conflict', viewport: 'mobile', state: 'ready' },
   { id: 'source-call-global', title: 'One-click Global source send', viewport: 'desktop', state: 'ready' },
   { id: 'source-call-ordinary', title: 'One-click historical ordinary source send', viewport: 'desktop', state: 'ready' },
+  { id: 'mobile-continuation-ordinary', title: 'Mobile ordinary continuation liveness', viewport: 'mobile', state: 'ready' },
+  { id: 'mobile-continuation-global', title: 'Mobile Global continuation liveness', viewport: 'mobile', state: 'ready' },
 ] as const satisfies readonly {
   id: string;
   title: string;
@@ -83,11 +97,21 @@ export const productConversationScenarioDefinitions = [
 
 export type ProductConversationScenarioId = (typeof productConversationScenarioDefinitions)[number]['id'];
 
+export interface ReminderFixture {
+  reminders: import('../../generated/Reminder').Reminder[];
+  initialFailures?: number;
+  rejectMutation?: boolean;
+  failuresAfterFirstLoad?: number;
+  advanceRevisionOnRefresh?: boolean;
+}
+
 interface ScenarioCommon {
   initialEntry?: string;
+  aliasFallbackNotFound?: boolean;
   sourceSnapshot?: ProductConversationSnapshotView;
   sourceIsGlobal?: boolean;
   initialDraft?: string;
+  sendFailure?: 'before-acceptance' | 'after-acceptance' | 'unacknowledged';
   id: ProductConversationScenarioId;
   title: string;
   viewport: 'desktop' | 'mobile';
@@ -101,6 +125,9 @@ interface ScenarioCommon {
   initialSnapshotFailures?: number;
   chain?: ChainView;
   snapshotError?: string;
+  reminderFixture?: ReminderFixture;
+  continuationJourney?: boolean;
+  reviewProjectionQa?: boolean;
 }
 
 export type ProductConversationScenario = ScenarioCommon & (

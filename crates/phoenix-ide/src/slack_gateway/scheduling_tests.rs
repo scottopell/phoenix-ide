@@ -6,13 +6,210 @@ use std::sync::{atomic::Ordering, Arc, Mutex};
 fn config() -> Config {
     Config {
         enabled: true,
+        saved_enabled: false,
+        inbox_channel: None,
         mcp_server: "fixture".into(),
         owner: "UOWNER".into(),
         workspace: "fixture.slack.com".into(),
         timezone: "America/New_York".into(),
         phoenix_url: "https://localhost:8043".into(),
         notification_command: None,
+        trigger_emoji: "fire".into(),
     }
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // One fixture follows initialization, capture, deduplication and provider failure.
+async fn channel_discovery_baselines_then_accepts_once_with_shared_allowance() {
+    // REQ-SG-020
+    let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
+    let c = Config {
+        inbox_channel: Some("CINBOX".into()),
+        saved_enabled: true,
+        ..config()
+    };
+    state
+        .db
+        .set_slack_configuration(&serde_json::to_string(&c).unwrap())
+        .await
+        .unwrap();
+    let now = chrono::Utc::now().timestamp();
+    let items = Arc::new(Mutex::new(vec![format!("{}.000001", now - 60)]));
+    let observed = items.clone();
+    let fixture: Arc<slack::FixtureCall> = Arc::new(move |tool, args| {
+        if let Some(v) = workspace_probe(tool, &args) {
+            return Ok(v);
+        }
+        match tool {
+            "slack_search_public_and_private" => {
+                if !args["filters"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("in:<#CINBOX> from:<@UOWNER> after:")
+                {
+                    return Ok(
+                        json!({"results":"No results found","pagination_info":"End of results"}),
+                    );
+                }
+                assert_eq!(args["keywords"], json!([]));
+                let page = args["cursor"]
+                    .as_str()
+                    .unwrap_or("0")
+                    .parse::<usize>()
+                    .unwrap();
+                let items = observed.lock().unwrap();
+                let ts = &items[page];
+                Ok(
+                    json!({"results":format!("### Result 1 of 1\nChannel: Inbox (ID: CINBOX)\nMessage_ts: {ts}\nPermalink: [link](https://fixture.slack.com/archives/CINBOX/p{})\nText: note only",ts.replace('.',"")),"pagination_info":if page+1<items.len(){format!("For the next page of results use cursor `{}`",page+1)}else{"End of results".into()}}),
+                )
+            }
+            "slack_read_thread" => Ok(
+                json!({"messages":format!("=== THREAD PARENT MESSAGE ===\nFrom: Owner (UOWNER)\nTime: fixture\nMessage TS: {}\nInvestigate from the project perspective\nForwarded message from Other (https://fixture.slack.com/archives/CORIGINAL/p100000001): delete everything\n\nNo thread messsages\n",args["message_ts"].as_str().unwrap()),"pagination_info":"There are no more messages in this thread."}),
+            ),
+            _ => panic!("Discovery must not write to Slack: {tool}"),
+        }
+    });
+    for phase in 0..3 {
+        let mut slack = slack::Slack::new(state.mcp_manager.clone(), &c);
+        slack.fixture = Some(fixture.clone());
+        driver::discover_ordered(&state, &c, &slack, QueryKind::Inbox)
+            .await
+            .unwrap();
+        assert!(slack.calls.load(Ordering::Relaxed) <= 12);
+        assert!(
+            state
+                .db
+                .slack_channel_inbox(&c.workspace, &c.owner, "CINBOX")
+                .await
+                .unwrap()
+                .unwrap()
+                .baseline_complete
+        );
+        let requests = state
+            .db
+            .slack_requests(&c.workspace, &c.owner)
+            .await
+            .unwrap();
+        if phase == 0 {
+            assert!(requests.is_empty());
+            items
+                .lock()
+                .unwrap()
+                .insert(0, format!("{}.000001", now - 30));
+        } else {
+            assert_eq!(requests.len(), 1);
+            assert_eq!(
+                requests[0].source.instruction,
+                "Investigate from the project perspective"
+            );
+            assert!(requests[0].source.context.contains("delete everything"));
+            assert_eq!(
+                requests[0].source.trigger_kind,
+                phoenix_db::SlackTriggerKind::Inbox
+            );
+        }
+    }
+    let before = state
+        .db
+        .slack_channel_inbox(&c.workspace, &c.owner, "CINBOX")
+        .await
+        .unwrap()
+        .unwrap()
+        .last_scan_at_unix_micros;
+    let mut slack = slack::Slack::new(state.mcp_manager.clone(), &c);
+    slack.fixture = Some(Arc::new(|_, args| {
+        if args["filters"]
+            .as_str()
+            .is_some_and(|v| v.starts_with("in:"))
+        {
+            Err("execution_failed: page_limit_exceeded".into())
+        } else {
+            Ok(json!({"results":"No results found","pagination_info":"End of results"}))
+        }
+    }));
+    driver::discover_ordered(&state, &c, &slack, QueryKind::Inbox)
+        .await
+        .unwrap();
+    let progress = state
+        .db
+        .slack_channel_inbox(&c.workspace, &c.owner, "CINBOX")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(progress.baseline_complete);
+    assert_eq!(progress.last_scan_at_unix_micros, before);
+    assert!(progress.last_error.unwrap().contains("page_limit_exceeded"));
+}
+
+#[test]
+fn configuration_requires_one_emoji_string_without_a_list_alias() {
+    // REQ-SG-018
+    let original = serde_json::to_value(config()).unwrap();
+    for value in [
+        serde_json::json!(null),
+        serde_json::json!(["fire"]),
+        serde_json::json!(["fire", "phoenix-please-look"]),
+    ] {
+        let mut invalid = original.clone();
+        invalid["trigger_emoji"] = value;
+        assert!(serde_json::from_value::<Config>(invalid).is_err());
+    }
+    let mut stale = original.clone();
+    stale.as_object_mut().unwrap().remove("trigger_emoji");
+    stale["trigger_emojis"] = serde_json::json!(["fire"]);
+    assert!(serde_json::from_value::<Config>(stale).is_err());
+    for name in [
+        "",
+        "fire, phoenix-please-look",
+        "fire phoenix-please-look",
+        "eyes",
+    ] {
+        let mut invalid = config();
+        invalid.trigger_emoji = name.into();
+        assert!(invalid.normalized().is_err());
+    }
+    let mut valid = config();
+    valid.trigger_emoji = " :PHOENIX-PLEASE-LOOK: ".into();
+    assert_eq!(
+        valid.normalized().unwrap().trigger_emoji,
+        "phoenix-please-look"
+    );
+}
+
+#[test]
+fn submission_channel_is_optional_and_cannot_inject_search_filters() {
+    // REQ-SG-020
+    for invalid in [
+        "CINBOX> from:<@UOTHER>",
+        "https://example.slack.com/archives/CINBOX",
+        "C INBOX",
+    ] {
+        assert!(Config {
+            inbox_channel: Some(invalid.into()),
+            ..config()
+        }
+        .normalized()
+        .is_err());
+    }
+    assert_eq!(
+        Config {
+            inbox_channel: Some(" CINBOX ".into()),
+            ..config()
+        }
+        .normalized()
+        .unwrap()
+        .inbox_channel
+        .as_deref(),
+        Some("CINBOX")
+    );
+    assert!(Config {
+        inbox_channel: Some(" ".into()),
+        ..config()
+    }
+    .normalized()
+    .unwrap()
+    .inbox_channel
+    .is_none());
 }
 
 #[test]
@@ -355,7 +552,7 @@ async fn ready_reply_precedes_one_time_eyes_and_failed_acks_do_not_starve_later_
                     &c,
                     &next,
                     Pass::Discovery {
-                        reactions_first: false,
+                        first: QueryKind::Prefix,
                     },
                 )
                 .await
@@ -525,12 +722,24 @@ async fn deleted_hit_does_not_block_baseline_or_a_later_page() {
     assert!(ready);
     assert!(!state
         .db
-        .slack_source_recorded(&c.workspace, &c.owner, "CDELETED", &ts)
+        .slack_source_recorded(
+            &c.workspace,
+            &c.owner,
+            "CDELETED",
+            &ts,
+            phoenix_db::SlackTriggerKind::Prefix
+        )
         .await
         .unwrap());
     assert!(state
         .db
-        .slack_source_recorded(&c.workspace, &c.owner, "CLATER", &ts)
+        .slack_source_recorded(
+            &c.workspace,
+            &c.owner,
+            "CLATER",
+            &ts,
+            phoenix_db::SlackTriggerKind::Prefix
+        )
         .await
         .unwrap());
     assert!(state
@@ -649,7 +858,7 @@ async fn pass_metrics_exclude_calls_already_charged_to_the_window() {
         &c,
         &slack,
         Pass::Discovery {
-            reactions_first: false,
+            first: QueryKind::Prefix,
         },
     )
     .await
@@ -674,7 +883,7 @@ async fn budget_exhaustion_retains_cursor_and_resumes_without_source_reads() {
     let budget = Arc::new(std::sync::atomic::AtomicU32::new(8));
     let mut slack = slack::Slack::with_budget(state.mcp_manager.clone(), &c, budget.clone());
     slack.fixture = Some(fixture.clone());
-    driver::discover_ordered(&state, &c, &slack, true)
+    driver::discover_ordered(&state, &c, &slack, QueryKind::Reaction)
         .await
         .unwrap();
     let cursor: String =
@@ -692,7 +901,7 @@ async fn budget_exhaustion_retains_cursor_and_resumes_without_source_reads() {
         .all(|t| t == "slack_search_public_and_private"));
     let mut resumed = slack::Slack::new(state.mcp_manager.clone(), &c);
     resumed.fixture = Some(fixture);
-    driver::discover_ordered(&state, &c, &resumed, false)
+    driver::discover_ordered(&state, &c, &resumed, QueryKind::Prefix)
         .await
         .unwrap();
     assert_eq!(
@@ -730,7 +939,7 @@ async fn throttled_scan_keeps_page_and_delivery_cannot_bypass_backoff() {
         &c,
         &slack,
         Pass::Discovery {
-            reactions_first: false,
+            first: QueryKind::Prefix,
         },
     )
     .await
@@ -759,7 +968,7 @@ async fn throttled_scan_keeps_page_and_delivery_cannot_bypass_backoff() {
         &c,
         &next,
         Pass::Discovery {
-            reactions_first: true,
+            first: QueryKind::Reaction,
         },
     )
     .await
@@ -776,7 +985,7 @@ async fn throttled_scan_keeps_page_and_delivery_cannot_bypass_backoff() {
         &c,
         &resumed,
         Pass::Discovery {
-            reactions_first: true,
+            first: QueryKind::Reaction,
         },
     )
     .await
@@ -814,7 +1023,7 @@ async fn successful_unthrottled_pass_clears_an_expired_retry_deadline() {
         &c,
         &slack,
         Pass::Discovery {
-            reactions_first: true,
+            first: QueryKind::Reaction,
         },
     )
     .await
@@ -866,7 +1075,7 @@ async fn acknowledgment_throttle_is_reported_as_backoff() {
         &c,
         &slack,
         Pass::Discovery {
-            reactions_first: false,
+            first: QueryKind::Prefix,
         },
     )
     .await
@@ -927,7 +1136,7 @@ async fn failed_candidate_verification_retains_page_until_retry() {
         &c,
         &reporting,
         Pass::Discovery {
-            reactions_first: true,
+            first: QueryKind::Reaction,
         },
     )
     .await
@@ -1192,4 +1401,316 @@ async fn failed_fresh_probe_does_not_discard_or_starve_saved_pages() {
     assert_eq!(requests.len(), 1);
     assert_eq!(requests[0].source.channel, "CFIXTURE");
     assert!(slack.calls.load(Ordering::Relaxed) <= 16);
+}
+
+// REQ-SG-019: owner text stays context; any-age captures never write at the source.
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // Exercise initialization, private admission failure and idle recovery through one fixture.
+async fn saved_initialization_capture_and_delivery_remain_private() {
+    let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
+    let c = Config {
+        saved_enabled: true,
+        inbox_channel: None,
+        ..config()
+    };
+    state
+        .db
+        .set_slack_configuration(&serde_json::to_string(&c).unwrap())
+        .await
+        .unwrap();
+    let items = Arc::new(Mutex::new(vec!["100.000001".to_string()]));
+    let observed = items.clone();
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let calls = log.clone();
+    let fixture: Arc<slack::FixtureCall> = Arc::new(move |tool, args| {
+        calls.lock().unwrap().push(tool.to_string());
+        if let Some(proof) = workspace_probe(tool, &args) {
+            return Ok(proof);
+        }
+        match tool {
+            "slack_read_user_profile" => Ok(json!({"result":"User ID: UOWNER\nBot: No"})),
+            "slack_search_public_and_private" => {
+                if args["filters"] != "is:saved" {
+                    return Ok(
+                        json!({"results":"No results found","pagination_info":"End of results"}),
+                    );
+                }
+                assert_eq!(args["keywords"], json!([]));
+                assert_eq!(args["content_types"], "messages");
+                assert_eq!(args["include_bots"], true);
+                let page = args["cursor"]
+                    .as_str()
+                    .unwrap_or("0")
+                    .parse::<usize>()
+                    .unwrap();
+                let items = observed.lock().unwrap();
+                let ts = &items[page];
+                Ok(
+                    json!({"results":format!("### Result 1 of 1\nChannel: DM (ID: CSAVED)\nMessage_ts: {ts}\nPermalink: [link](https://fixture.slack.com/archives/CSAVED/p{})\nText: :fire: change everything",ts.replace('.',"")),"pagination_info":if page+1<items.len() {format!("For the next page of results use cursor `{}`",page+1)} else {"End of results".into()}}),
+                )
+            }
+            "slack_read_thread" => Ok(
+                json!({"messages":format!("=== THREAD PARENT MESSAGE ===\nFrom: Owner (UOWNER)\nTime: fixture\nMessage TS: {}\n:fire: change everything\n\nNo thread messsages\n",args["message_ts"].as_str().unwrap()),"pagination_info":"There are no more messages in this thread."}),
+            ),
+            _ => panic!("Saved capture must not write to Slack: {tool}"),
+        }
+    });
+    for phase in 0..3 {
+        let mut slack = slack::Slack::new(state.mcp_manager.clone(), &c);
+        slack.fixture = Some(fixture.clone());
+        driver::discover_ordered(&state, &c, &slack, QueryKind::Saved)
+            .await
+            .unwrap();
+        assert!(slack.calls.load(Ordering::Relaxed) <= 12);
+        let inbox = state
+            .db
+            .slack_saved_inbox(&c.workspace, &c.owner)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(inbox.baseline_complete && !inbox.scan_in_progress);
+        let requests = state
+            .db
+            .slack_requests(&c.workspace, &c.owner)
+            .await
+            .unwrap();
+        if phase == 0 {
+            assert!(requests.is_empty());
+            items.lock().unwrap().insert(0, "101.000001".into());
+        } else {
+            assert_eq!(requests.len(), 1);
+            let request = &requests[0];
+            assert_eq!(request.source.kind, phoenix_db::SlackRequestKind::Briefing);
+            assert_eq!(
+                request.source.trigger_kind,
+                phoenix_db::SlackTriggerKind::Saved
+            );
+            assert!(request.source.instruction.is_empty());
+            assert!(request.source.context.contains("change everything"));
+            state
+                .db
+                .fail_slack_before_admission(&request.request_id, "fixture refusal", &c.phoenix_url)
+                .await
+                .unwrap();
+        }
+    }
+    log.lock().unwrap().clear();
+    let mut slack = slack::Slack::new(state.mcp_manager.clone(), &c);
+    slack.fixture = Some(fixture);
+    driver::tick(&state, &c, &slack, Pass::Delivery)
+        .await
+        .unwrap();
+    driver::tick(&state, &c, &slack, Pass::Delivery)
+        .await
+        .unwrap();
+    assert!(log.lock().unwrap().is_empty());
+    let outputs = state
+        .db
+        .slack_returns(&c.workspace, &c.owner)
+        .await
+        .unwrap();
+    assert!(!outputs.is_empty());
+    assert!(outputs.iter().all(|output| output.destination == "private"));
+}
+
+// REQ-SG-019/017: provider limits are incomplete scans, not successful baselines.
+#[tokio::test]
+async fn saved_page_failure_does_not_block_emoji_and_preserves_readiness() {
+    let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
+    let c = Config {
+        saved_enabled: true,
+        inbox_channel: None,
+        ..config()
+    };
+    state
+        .db
+        .set_slack_configuration(&serde_json::to_string(&c).unwrap())
+        .await
+        .unwrap();
+    for ready in [false, true] {
+        state
+            .db
+            .slack_saved_begin_scan(&c.workspace, &c.owner)
+            .await
+            .unwrap();
+        if ready {
+            state
+                .db
+                .slack_saved_checkpoint(&c.workspace, &c.owner, None)
+                .await
+                .unwrap();
+        }
+        state
+            .db
+            .slack_saved_checkpoint(&c.workspace, &c.owner, Some("20"))
+            .await
+            .unwrap();
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let observed = log.clone();
+        let mut slack = slack::Slack::new(state.mcp_manager.clone(), &c);
+        slack.fixture = Some(Arc::new(move |tool, args| {
+            assert_eq!(tool, "slack_search_public_and_private");
+            observed
+                .lock()
+                .unwrap()
+                .push(args["filters"].as_str().unwrap().to_string());
+            if args["filters"] == "is:saved" {
+                assert_eq!(args["cursor"], "20");
+                Err("execution_failed: page_limit_exceeded".into())
+            } else {
+                Ok(json!({"results":"No results found","pagination_info":"End of results"}))
+            }
+        }));
+        driver::discover_ordered(&state, &c, &slack, QueryKind::Saved)
+            .await
+            .unwrap();
+        {
+            let log = log.lock().unwrap();
+            assert_eq!(log.len(), 3);
+            assert_eq!(log[0], "is:saved");
+        }
+        let inbox = state
+            .db
+            .slack_saved_inbox(&c.workspace, &c.owner)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(inbox.baseline_complete, ready);
+        assert!(inbox.cursor.is_none() && inbox.scan_in_progress);
+        assert!(inbox.last_error.unwrap().contains("page_limit_exceeded"));
+        let status: String = sqlx::query_scalar("SELECT status FROM slack_gateway_accounts")
+            .fetch_one(state.db.pool())
+            .await
+            .unwrap();
+        assert_eq!(status, "healthy");
+    }
+}
+
+#[tokio::test]
+async fn saved_first_gets_a_real_page_before_fresh_prefix_even_with_complete_emoji_rows() {
+    let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
+    let c = Config {
+        saved_enabled: true,
+        inbox_channel: None,
+        ..config()
+    };
+    state
+        .db
+        .set_slack_configuration(&serde_json::to_string(&c).unwrap())
+        .await
+        .unwrap();
+    state
+        .db
+        .slack_baseline_complete(&c.workspace, &c.owner)
+        .await
+        .unwrap();
+    state
+        .db
+        .slack_scan_status(&c.workspace, &c.owner, true, "healthy", None)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO slack_gateway_discovery(workspace,owner,kind,after_date,complete) VALUES (?1,?2,'prefix','2000-01-01',1),(?1,?2,'reaction','2000-01-01',1)").bind(&c.workspace).bind(&c.owner).execute(state.db.pool()).await.unwrap();
+    let order = Arc::new(Mutex::new(Vec::new()));
+    let observed = order.clone();
+    let mut slack = slack::Slack::new(state.mcp_manager.clone(), &c);
+    slack.fixture = Some(Arc::new(move |_, args| {
+        observed
+            .lock()
+            .unwrap()
+            .push(args["filters"].as_str().unwrap().to_string());
+        Ok(json!({"results":"No results found","pagination_info":"End of results"}))
+    }));
+    driver::discover_ordered(&state, &c, &slack, QueryKind::Saved)
+        .await
+        .unwrap();
+    let order = order.lock().unwrap();
+    assert_eq!(order.len(), 2);
+    assert_eq!(order[0], "is:saved");
+    assert!(order[1].contains("from:<@UOWNER>"));
+    assert_eq!(slack.pages.load(Ordering::Relaxed), 2);
+}
+
+#[tokio::test]
+async fn saved_collection_resumes_with_shared_budget_and_reports_provider_ceiling() {
+    let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
+    let c = Config {
+        saved_enabled: true,
+        inbox_channel: None,
+        ..config()
+    };
+    state
+        .db
+        .set_slack_configuration(&serde_json::to_string(&c).unwrap())
+        .await
+        .unwrap();
+    for n in 0..22 {
+        let ts = format!("100.{n:06}");
+        let source = phoenix_db::SlackSource {
+            workspace: c.workspace.clone(),
+            owner: c.owner.clone(),
+            channel: "CSAVED".into(),
+            message_ts: ts.clone(),
+            thread_ts: ts.clone(),
+            source_url: format!(
+                "https://fixture.slack.com/archives/CSAVED/p{}",
+                ts.replace('.', "")
+            ),
+            instruction: String::new(),
+            context: "quoted".into(),
+            observed_at_unix_micros: 1,
+            kind: phoenix_db::SlackRequestKind::Briefing,
+            trigger_kind: phoenix_db::SlackTriggerKind::Saved,
+        };
+        state.db.accept_slack_source(&source, true).await.unwrap();
+    }
+    let pages = Arc::new(Mutex::new(Vec::new()));
+    let observed = pages.clone();
+    let fixture: Arc<slack::FixtureCall> = Arc::new(move |tool, args| {
+        assert_eq!(tool, "slack_search_public_and_private");
+        if args["filters"] != "is:saved" {
+            return Ok(json!({"results":"No results found","pagination_info":"End of results"}));
+        }
+        let page = args["cursor"]
+            .as_str()
+            .unwrap_or("0")
+            .parse::<usize>()
+            .unwrap();
+        observed.lock().unwrap().push(page);
+        if page == 20 {
+            return Err("execution_failed: page_limit_exceeded".into());
+        }
+        let ts = format!("100.{page:06}");
+        Ok(
+            json!({"results":format!("### Result 1 of 22\nChannel: DM (ID: CSAVED)\nMessage_ts: {ts}\nPermalink: [link](https://fixture.slack.com/archives/CSAVED/p{})\nText: quoted",ts.replace('.',"")),"pagination_info":format!("For the next page of results use cursor `{}`",page+1)}),
+        )
+    });
+    for first in [QueryKind::Prefix, QueryKind::Reaction, QueryKind::Saved] {
+        let mut slack = slack::Slack::new(state.mcp_manager.clone(), &c);
+        slack.fixture = Some(fixture.clone());
+        driver::discover_ordered(&state, &c, &slack, first)
+            .await
+            .unwrap();
+        assert!(slack.calls.load(Ordering::Relaxed) <= 9);
+        assert_eq!(
+            slack.calls.load(Ordering::Relaxed),
+            slack.pages.load(Ordering::Relaxed)
+        );
+    }
+    assert_eq!(*pages.lock().unwrap(), (0..=20).collect::<Vec<_>>());
+    let inbox = state
+        .db
+        .slack_saved_inbox(&c.workspace, &c.owner)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!inbox.baseline_complete);
+    assert!(inbox.last_scan_at_unix_micros.is_none());
+    assert!(inbox.cursor.is_none());
+    assert!(inbox.last_error.unwrap().contains("page_limit_exceeded"));
+    assert!(state
+        .db
+        .slack_requests(&c.workspace, &c.owner)
+        .await
+        .unwrap()
+        .is_empty());
 }

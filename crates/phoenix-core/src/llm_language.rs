@@ -5,18 +5,45 @@
 //! user can swap the "voice" Phoenix uses with the model without altering
 //! any user-facing UI text.
 //!
-//! Currently two languages:
+//! Built-in languages:
 //! - `PhoenixNative` — the default prose Phoenix has used historically.
 //! - `Caveman` — radically terse, instructional-shorthand variants for
 //!   experimentation.
+//! - `Adhd` — standard operational instructions with action-first response guidance.
 //!
 //! The language is stored per-conversation (column `conversations.llm_language`)
-//! and is fixed at conversation creation from the global app default
-//! (`app_settings.default_llm_language`). Chain continuations and sub-agent
+//! and is fixed at creation from the explicit selection or the API default.
+//! Chain continuations and sub-agent
 //! conversations inherit their parent's language.
 
 use crate::domain::sm_state::ExploreBashCapability;
 use serde::{Deserialize, Serialize};
+
+static ADHD_BASE_PROMPT: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    format!(
+        "{}\n\n{}",
+        base_prompt(LlmLanguage::PhoenixNative),
+        ADHD_RESPONSE_GUIDANCE
+    )
+});
+
+static ADHD_COORDINATOR_PROMPT: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    format!(
+        "{}\n\n{}",
+        coordinator_prompt(LlmLanguage::PhoenixNative),
+        ADHD_RESPONSE_GUIDANCE
+    )
+});
+
+const ADHD_RESPONSE_GUIDANCE: &str = include_str!("adhd_response_guidance.txt");
+
+#[must_use]
+pub const fn response_style_guidance(language: LlmLanguage) -> &'static str {
+    match language {
+        LlmLanguage::Adhd => ADHD_RESPONSE_GUIDANCE,
+        LlmLanguage::PhoenixNative | LlmLanguage::Caveman => "",
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExploreBashPromptCapability {
@@ -40,6 +67,7 @@ pub enum LlmLanguage {
     #[default]
     PhoenixNative,
     Caveman,
+    Adhd,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -71,13 +99,14 @@ impl LlmLanguage {
     /// makes it visible to clients, but you still have to supply
     /// translations (base prompt, mode blocks, chain prompts, tool
     /// overrides as needed) elsewhere in this file for it to be useful.
-    pub const ALL: &'static [Self] = &[Self::PhoenixNative, Self::Caveman];
+    pub const ALL: &'static [Self] = &[Self::PhoenixNative, Self::Caveman, Self::Adhd];
 
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::PhoenixNative => "phoenix-native",
             Self::Caveman => "caveman",
+            Self::Adhd => "adhd",
         }
     }
 
@@ -86,6 +115,7 @@ impl LlmLanguage {
         match self {
             Self::PhoenixNative => "Phoenix",
             Self::Caveman => "Caveman",
+            Self::Adhd => "ADHD",
         }
     }
 
@@ -94,6 +124,7 @@ impl LlmLanguage {
         match self {
             Self::PhoenixNative => "Default Phoenix prose",
             Self::Caveman => "Ugg. Why use many word.",
+            Self::Adhd => "Action first. Small steps. Less distraction. (Experimental)",
         }
     }
 
@@ -162,6 +193,7 @@ pub fn language_catalog() -> Vec<LlmLanguageCatalogEntry> {
 #[must_use]
 pub fn base_prompt(lang: LlmLanguage) -> &'static str {
     match lang {
+        LlmLanguage::Adhd => &ADHD_BASE_PROMPT,
         LlmLanguage::PhoenixNative => {
             "You are a helpful AI assistant with access to tools for executing code, editing \
                 files, and searching codebases. Use tools when appropriate to accomplish \
@@ -179,6 +211,7 @@ pub fn base_prompt(lang: LlmLanguage) -> &'static str {
 #[allow(clippy::too_many_lines)] // Prompt literals are source-wrapped for 100-column review.
 pub fn coordinator_prompt(lang: LlmLanguage) -> &'static str {
     match lang {
+        LlmLanguage::Adhd => &ADHD_COORDINATOR_PROMPT,
         LlmLanguage::PhoenixNative => {
             "You are Ember, the small phoenix on the user's shoulder; your role is Phoenix \
                 Coordinator. The user directs many workers toward something they care about and \
@@ -271,8 +304,10 @@ pub fn coordinator_prompt(lang: LlmLanguage) -> &'static str {
                 healthy progress alone; do not nudge/replan/reassign for activity. Idle alone is \
                 not stalled. Check-ins add no authority or reset decisions, pauses or gates. \
                 Verify unanswered user decisions remain unresolved and material; do independent \
-                authorized work first, then ask_user_question for real choices with context and \
-                recommendation. Brief with missing user input first, then material change: \
+                authorized work first, then post_user_question for real choices with context and \
+                recommendation; it does not pause you, so keep doing independent work until the \
+                reply arrives. Check list_user_questions before asking and after continuation, \
+                so nothing open is asked twice. Brief with missing user input first, then material change: \
                 problem, actual work, outcome/why and next step, in plain English with useful \
                 links and grounded status—not a fixed template. Mention material \
                 delivery/evidence limits. Check-ins are bounded, not polling. Only mutate \
@@ -281,7 +316,10 @@ pub fn coordinator_prompt(lang: LlmLanguage) -> &'static str {
                 installed create_conversation/rename_conversation/continue_conversation/read_automatic_continuation/set_automatic_continuation and prepare_goal/apply_goal metadata. Act on user \
                 turns and factual \
                 events from explicit watches; ordinary watches follow \
-                continuations until removed/closed.\n\n\
+                continuations until removed/closed. A watched conversation's question comes to \
+                you first: answer it with answer_conversation_question when its assignment or \
+                your standing Authority settles it; otherwise ask the user with \
+                post_user_question and pass the user's answer on verbatim.\n\n\
                 Delegate outcomes, not attempts. \
                 State the result, required evidence, and established boundaries; let the owner \
                 choose and revise methods. In-scope command fixes, fixture repairs, and reruns \
@@ -341,14 +379,18 @@ pub fn coordinator_prompt(lang: LlmLanguage) -> &'static str {
                 completion.\n\nCheck all work; leave healthy progress alone. Idle is not stalled. \
                 Check-ins add no authority/reset decisions, pauses or gates. Verify unanswered \
                 choices remain open and matter; do authorized independent work first, then \
-                ask_user_question for real input with context/recommendation. Brief missing input \
+                post_user_question for real input with context/recommendation; not pause you, keep \
+                doing independent work until reply. list_user_questions before asking and after \
+                continuation; no repeat ask. Brief missing input \
                 first; problem, actual work, outcome/why and next step. Plain English, links, \
                 grounded status; not a fixed template. Note delivery/evidence limits. \
                 Bounded check-in, no polling. Change selected WorkScope only with unsandboxed \
                 Bash and explicit active work_scope_id. No dedicated \
                 project/task/workspace/approval/lifecycle mutation tools except installed \
                 create_conversation/rename_conversation/continue_conversation/read_automatic_continuation/set_automatic_continuation and prepare_goal/apply_goal metadata. Act on user turns and \
-                factual watch events; ordinary watches follow continuations until removed/closed.\n\n\
+                factual watch events; ordinary watches follow continuations until removed/closed. \
+                Watched conversation question come to you first: answer_conversation_question when \
+                task or Authority settle it; else post_user_question, pass user answer verbatim.\n\n\
                 Delegate outcomes, not attempts. \
                 State the result, required evidence, and established boundaries; let the owner \
                 choose and revise methods. In-scope command fixes, fixture repairs, and reruns \
@@ -377,7 +419,7 @@ pub fn coordinator_prompt(lang: LlmLanguage) -> &'static str {
 #[must_use]
 pub fn mermaid_rendering_hint(lang: LlmLanguage) -> &'static str {
     match lang {
-        LlmLanguage::PhoenixNative => {
+        LlmLanguage::PhoenixNative | LlmLanguage::Adhd => {
             "Phoenix renders Markdown mermaid code fences as diagrams; prefer them for diagrams \
                 when useful. When a node label contains parentheses, quotes, or other \
                 punctuation, wrap the label text in double quotes (e.g. \
@@ -395,7 +437,7 @@ pub fn mermaid_rendering_hint(lang: LlmLanguage) -> &'static str {
 #[must_use]
 pub fn sub_agent_suffix(lang: LlmLanguage) -> &'static str {
     match lang {
-        LlmLanguage::PhoenixNative => {
+        LlmLanguage::PhoenixNative | LlmLanguage::Adhd => {
             "\n\nYou are a sub-agent working on a specific task. When you complete your task, \
                 call submit_result with your findings. If you encounter an unrecoverable error, \
                 call submit_error. Your conversation will end after calling either tool."
@@ -417,18 +459,27 @@ pub fn mode_explore(
     bash: impl Into<ExploreBashPromptCapability>,
 ) -> String {
     let bash_guidance = match (lang, bash.into()) {
-        (LlmLanguage::PhoenixNative, ExploreBashPromptCapability::Sandboxed) => {
+        (
+            LlmLanguage::PhoenixNative | LlmLanguage::Adhd,
+            ExploreBashPromptCapability::Sandboxed,
+        ) => {
             "`bash` is available for read-only local investigation under an OS sandbox: it can \
                 read local files broadly like other Explore read tools, but source/Git \
                 metadata/task writes and network access are blocked. Use `patch` for task \
                 proposal drafts; bash may write only to scratch, synthetic home, and platform \
                 temp."
         }
-        (LlmLanguage::PhoenixNative, ExploreBashPromptCapability::Unsandboxed) => {
+        (
+            LlmLanguage::PhoenixNative | LlmLanguage::Adhd,
+            ExploreBashPromptCapability::Unsandboxed,
+        ) => {
             "`bash` is available with the approved WorkScope's full write authority and is not \
                 restricted by the Explore sandbox."
         }
-        (LlmLanguage::PhoenixNative, ExploreBashPromptCapability::Unavailable) => {
+        (
+            LlmLanguage::PhoenixNative | LlmLanguage::Adhd,
+            ExploreBashPromptCapability::Unavailable,
+        ) => {
             "`bash` is unavailable because this host cannot enforce the Explore sandbox; use \
                 read-only tools instead."
         }
@@ -441,7 +492,7 @@ pub fn mode_explore(
         (LlmLanguage::Caveman, ExploreBashPromptCapability::Unavailable) => "No bash here.",
     };
     match lang {
-        LlmLanguage::PhoenixNative => format!(
+        LlmLanguage::PhoenixNative | LlmLanguage::Adhd => format!(
             "\n\nYou are in Explore mode. This conversation is read-only for source files -- you \
                 can read files, search, analyze, and discuss the codebase, but you cannot modify \
                 code.\n\nWorkflow for proposing work:\n1. Draft (or reuse) a task file. The body \
@@ -476,7 +527,7 @@ pub fn mode_explore(
 #[must_use]
 pub fn mode_approved_explore_work(lang: LlmLanguage, worktree_path: &str) -> String {
     match lang {
-        LlmLanguage::PhoenixNative => format!(
+        LlmLanguage::PhoenixNative | LlmLanguage::Adhd => format!(
             "\n\nThe conversation retains Explore provenance, but its approved WorkScope grants \
                 full write authority in `{worktree_path}`. `bash` is available with the approved \
                 WorkScope's full write authority and is not restricted by the Explore sandbox. \
@@ -501,14 +552,15 @@ pub fn mode_work(
     worktree_path: &str,
 ) -> String {
     match lang {
-        LlmLanguage::PhoenixNative => format!(
+        LlmLanguage::PhoenixNative | LlmLanguage::Adhd => format!(
             "\n\nYou are in Work mode on branch {branch_name}, targeting {base_branch}.\nYour \
                 working directory is {worktree_path}. All file edits and bash commands MUST stay \
                 inside this worktree. Do NOT modify files in the main checkout or repo root.\nUse \
-                bash and the patch tool to make changes.\n\nWhen the task is complete, let the \
-                user know it's ready; they review and merge the branch into {base_branch} via a \
-                pull request -- Phoenix does not perform the merge. If your task file follows the \
-                taskmd convention (`NNNNN-pX-status--slug.md`), also mark it done yourself before \
+                bash and the patch tool to make changes.\n\nWhen the task is complete, report \
+                that it is ready. Phoenix does not merge automatically: merge the branch into \
+                {base_branch} via a pull request only when your assignment or delegated standing \
+                Authority grants it; otherwise the user reviews and merges. If your task file \
+                follows the taskmd convention (`NNNNN-pX-status--slug.md`), also mark it done yourself before \
                 handing off: rename the file from `...-{{status}}--{{slug}}.md` to \
                 `...-done--{{slug}}.md` (the filename is the sole source of truth for task status \
                 -- nothing renames it for you) and commit that rename on this branch alongside \
@@ -517,7 +569,8 @@ pub fn mode_work(
         LlmLanguage::Caveman => format!(
             "\n\nYou in work cave. Branch: {branch_name}. Aim at: {base_branch}. Cave path: \
                 {worktree_path}. Stay in cave. No touch outside cave. Use bash and patch. Done? \
-                Tell big caveman. Big caveman do merge. If task file like \
+                Tell big caveman. Merge only if task or delegated Authority say so; else big \
+                caveman do merge. If task file like \
                 `NNNNN-pX-status--slug.md`, you rename `status` to `done` and commit."
         ),
     }
@@ -532,7 +585,7 @@ pub fn mode_detached_approved_task(
     task_title: &str,
 ) -> String {
     match lang {
-        LlmLanguage::PhoenixNative => format!(
+        LlmLanguage::PhoenixNative | LlmLanguage::Adhd => format!(
             "\n\nYou are in detached Approved Task mode for task {task_id} ({task_title}), \
                 carrying approved work forward from {base_branch}.\nYour working directory is \
                 {worktree_path}. All file edits and bash commands MUST stay inside this worktree. \
@@ -559,7 +612,7 @@ pub fn mode_detached_approved_task(
 #[must_use]
 pub fn next_taskmd_id_hint(lang: LlmLanguage, tasks_dir_name: &str, next_id: &str) -> String {
     match lang {
-        LlmLanguage::PhoenixNative => format!(
+        LlmLanguage::PhoenixNative | LlmLanguage::Adhd => format!(
             "\n\nThe next available taskmd ID for this worktree is `{next_id}` -- use it when \
                 drafting a new task file (e.g. `{tasks_dir_name}/{next_id}-p2-ready--my-slug.md`)."
         ),
@@ -579,7 +632,7 @@ pub const fn pr_auto_fix_instruction_prefix() -> &'static str {
 pub fn pr_auto_fix_instruction(lang: LlmLanguage, artifact_path: &str) -> String {
     let prefix = pr_auto_fix_instruction_prefix();
     match lang {
-        LlmLanguage::PhoenixNative => format!(
+        LlmLanguage::PhoenixNative | LlmLanguage::Adhd => format!(
             "{prefix}{artifact_path}`. That file is a point-in-time actionable snapshot of the \
                 failing CI checks (with failure logs inline where Phoenix could extract them) and \
                 unresolved/actionable review feedback. Use it as your starting point; if a \
@@ -603,7 +656,7 @@ pub fn pr_auto_fix_instruction(lang: LlmLanguage, artifact_path: &str) -> String
 #[must_use]
 pub fn mode_direct(lang: LlmLanguage) -> &'static str {
     match lang {
-        LlmLanguage::PhoenixNative => {
+        LlmLanguage::PhoenixNative | LlmLanguage::Adhd => {
             "\n\nYou have full tool access. You are working directly in this directory with no \
                 plan/approve workflow or branch isolation. Changes happen on the current branch."
         }
@@ -621,7 +674,7 @@ pub fn mode_branch(
     worktree_path: &str,
 ) -> String {
     match lang {
-        LlmLanguage::PhoenixNative => format!(
+        LlmLanguage::PhoenixNative | LlmLanguage::Adhd => format!(
             "\n\nYou are in Branch mode on existing branch {branch_name}, targeting \
                 {base_branch}.\nYour working directory is {worktree_path}. All file edits and \
                 bash commands MUST stay inside this worktree. Do NOT modify files in the main \
@@ -729,7 +782,7 @@ pub const KEYWORD_SEARCH_FILTER_SYSTEM: &str = "You are a code search relevance 
 #[must_use]
 pub fn chain_qa_agent_system_prompt(lang: LlmLanguage) -> &'static str {
     match lang {
-        LlmLanguage::PhoenixNative => {
+        LlmLanguage::PhoenixNative | LlmLanguage::Adhd => {
             "You are answering a recall question about one Phoenix ProductConversation — a \
                 sequence of transcript members created at continuation boundaries as each \
                 exhausted its context. You have two read-only tools:\n\n- \
@@ -770,7 +823,7 @@ pub fn chain_qa_agent_system_prompt(lang: LlmLanguage) -> &'static str {
 #[must_use]
 pub fn tool_description_override(tool_name: &str, lang: LlmLanguage) -> Option<&'static str> {
     let table: &[(&str, &str)] = match lang {
-        LlmLanguage::PhoenixNative => return None,
+        LlmLanguage::PhoenixNative | LlmLanguage::Adhd => return None,
         LlmLanguage::Caveman => CAVEMAN_TOOL_DESCRIPTIONS,
     };
     table
@@ -810,7 +863,7 @@ const CAVEMAN_TOOL_DESCRIPTIONS: &[(&str, &str)] = &[
 #[must_use]
 pub fn mode_attached_work_child(lang: LlmLanguage) -> &'static str {
     match lang {
-        LlmLanguage::PhoenixNative => {
+        LlmLanguage::PhoenixNative | LlmLanguage::Adhd => {
             "\n\nYou are a trusted Work sub-agent sharing the parent's \
             worktree. Bash and patch have normal write access without filesystem sandboxing. The \
             parent owns task approval, worktree lifecycle, and integration. Complete your \
@@ -828,6 +881,38 @@ pub fn mode_attached_work_child(lang: LlmLanguage) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn adhd_keeps_operational_prompts_and_adds_response_guidance() {
+        let language = LlmLanguage::Adhd;
+        assert_eq!(LlmLanguage::parse("adhd"), Some(language));
+        assert_eq!(serde_json::to_string(&language).unwrap(), "\"adhd\"");
+        assert_eq!(
+            serde_json::from_str::<LlmLanguage>("\"adhd\"").unwrap(),
+            language
+        );
+        assert!(base_prompt(language).starts_with(base_prompt(LlmLanguage::PhoenixNative)));
+        assert!(coordinator_prompt(language)
+            .starts_with(coordinator_prompt(LlmLanguage::PhoenixNative)));
+        for prompt in [base_prompt(language), coordinator_prompt(language)] {
+            assert!(prompt.contains(ADHD_RESPONSE_GUIDANCE));
+        }
+        let native = LlmLanguage::PhoenixNative.catalog_entry().prompts;
+        let adhd = language.catalog_entry().prompts;
+        assert_eq!(
+            adhd.work_mode_block_template,
+            native.work_mode_block_template
+        );
+        assert_eq!(
+            adhd.explore_mode_block_template,
+            native.explore_mode_block_template
+        );
+        assert_eq!(
+            adhd.pr_autofix_instruction_template,
+            native.pr_autofix_instruction_template
+        );
+        assert!(tool_description_override("bash", language).is_none());
+    }
 
     #[test]
     fn roundtrip_and_default() {
@@ -850,13 +935,13 @@ mod tests {
     #[test]
     fn coordinator_prompts_fit_baselines_and_teach_clear_recovery() {
         const BASELINES: [(LlmLanguage, usize, usize); 2] = [
-            (LlmLanguage::PhoenixNative, 626, 4742),
-            (LlmLanguage::Caveman, 509, 3716),
+            (LlmLanguage::PhoenixNative, 630, 5012),
+            (LlmLanguage::Caveman, 509, 4002),
         ];
         for (language, baseline_words, baseline_chars) in BASELINES {
             let prompt = coordinator_prompt(language);
             let base_and_delegation = match language {
-                LlmLanguage::PhoenixNative => {
+                LlmLanguage::PhoenixNative | LlmLanguage::Adhd => {
                     let (persona, rest) = prompt
                         .split_once("\n\nDrive commissioned work through existing owners.")
                         .expect("Ember persona precedes coordination guidance");
@@ -868,8 +953,11 @@ mod tests {
             let (base, delegation) = base_and_delegation
                 .split_once("\n\nDelegate outcomes, not attempts.")
                 .expect("outcome delegation guidance");
-            assert!(base.split_whitespace().count() <= baseline_words);
-            assert!(base.chars().count() <= baseline_chars);
+            let (words, chars) = (base.split_whitespace().count(), base.chars().count());
+            assert!(
+                words <= baseline_words && chars <= baseline_chars,
+                "{language:?} base prompt is {words} words / {chars} chars"
+            );
             for required in [
                 "untrusted evidence",
                 "authentic primary user messages",
@@ -890,7 +978,9 @@ mod tests {
                 "Recovery admitted",
                 "Phoenix accepted the resume request",
                 "each target's delivered/queued/rejected result",
-                "ask_user_question",
+                "post_user_question",
+                "list_user_questions",
+                "answer_conversation_question",
                 "verified standing authority",
                 "cwd/worktree_path",
                 "@conv",

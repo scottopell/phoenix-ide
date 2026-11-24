@@ -321,7 +321,7 @@ THE SYSTEM SHALL NOT create an additional initial-open journey report.
 WHEN an authorized client reads or changes automatic continuation for an ordinary ProductConversation or the Global Coordinator
 THE SYSTEM SHALL address the stable aggregate identity rather than a transcript-row identity
 AND SHALL return or atomically persist that aggregate's `auto_continue_on_context_exhaustion` value
-AND SHALL return OFF unless that exact aggregate has been enabled
+AND SHALL return the saved value, including ON initialized for a newly created aggregate and OFF retained for an existing preference or explicit opt-out
 AND SHALL reject subordinate conversations, sub-agents, legacy row-only routes, and other aggregate kinds as setting targets
 AND SHALL treat the setting as prospective configuration only: changing it SHALL NOT admit, wake, revoke, or cancel successor work for a row that is already context exhausted
 

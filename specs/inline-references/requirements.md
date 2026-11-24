@@ -2,24 +2,9 @@
 
 ## User Story
 
-As a user, I need to embed file and skill references directly in my message so that I can give the AI precise context — either by explicitly loading content myself (`@file`, `/skill`) or by pointing the AI at a path and letting it decide how much to read (`./path`).
+As a user, I need to embed skill and path references directly in my message so that I can give the AI precise context — either by explicitly loading a skill's instructions (`/skill`) or by pointing the AI at a path and letting it decide how much to read (`./path`).
 
 ## Requirements
-
-### REQ-IR-001: Include File Contents by Reference
-
-WHEN a user includes `@path/to/file` anywhere in their message
-THE SYSTEM SHALL include the referenced file's contents in the context delivered to the AI
-
-WHEN the referenced file does not exist or cannot be read
-THE SYSTEM SHALL notify the user before sending and SHALL NOT deliver a broken reference to the AI
-
-WHEN a message contains multiple `@` references
-THE SYSTEM SHALL resolve all of them before delivery
-
-**Rationale:** Users frequently need the AI to reason about specific files. Typing `@src/main.rs` is faster and less error-prone than copying file contents manually or asking the AI to find the file itself.
-
----
 
 ### REQ-IR-002: Load Skill Context by Name
 
@@ -50,31 +35,25 @@ THE SYSTEM SHALL load the skill's instructions unmodified with no substitution p
 
 ### REQ-IR-004: Discover Files via Inline Autocomplete
 
-WHEN a user types `@` in the message input
+WHEN a user types `./` anywhere in the message input
 THE SYSTEM SHALL show an inline autocomplete dropdown of files in the composer's working directory
 
-WHEN a user types `./` anywhere in the message input
-THE SYSTEM SHALL show the same inline autocomplete dropdown of files in the composer's working directory
-
-WHEN the user continues typing after either trigger
+WHEN the user continues typing after the trigger
 THE SYSTEM SHALL filter suggestions by fuzzy match on file path
 
 WHEN the composer is the new-conversation composer, with a directory and workflow chosen but no conversation created yet
-THE SYSTEM SHALL resolve suggestions against the same root the first message will expand against — the chosen directory for a Direct workflow, or the chosen branch's committed tree for a branch/managed workflow — so every suggestion is one that create-time expansion can resolve
+THE SYSTEM SHALL resolve suggestions against the root the conversation will work in — the chosen directory for a Direct workflow, or the chosen branch's committed tree for a branch/managed workflow
 
-WHEN a branch/managed workflow's first message will be expanded against a fresh worktree of the chosen branch
+WHEN a branch/managed workflow's conversation will work in a fresh worktree of the chosen branch
 THE SYSTEM SHALL discover candidates from that branch's committed tree (not the current checkout), so a working-directory file that is uncommitted or untracked — and therefore absent from the worktree — is not offered
 
-WHEN the user selects a suggestion from the `@` trigger
-THE SYSTEM SHALL insert the completed `@path/to/file` reference at the cursor and dismiss the dropdown
-
-WHEN the user selects a suggestion from the `./` trigger
+WHEN the user selects a suggestion
 THE SYSTEM SHALL insert the completed `./path/to/file` path at the cursor and dismiss the dropdown
 
 WHEN the user presses Escape
 THE SYSTEM SHALL dismiss the dropdown without inserting
 
-**Rationale:** Users don't memorize exact paths. Both `@` and `./` trigger the same file picker, but carry different intent: `@` promises to expand the file's contents at send time, while `./` simply completes the path and leaves it as literal text. Sharing the autocomplete surface keeps the interaction consistent while preserving the semantic distinction.
+**Rationale:** Users don't memorize exact paths. `./` completes the path and leaves it as literal text, so the agent decides how much of the file to read.
 
 ---
 
@@ -106,40 +85,24 @@ THE SYSTEM SHALL dismiss the dropdown without inserting
 ### REQ-IR-006: Preserve Original Shorthand in Conversation History
 
 WHEN a message containing expansion references is sent
-THE SYSTEM SHALL store and display the original shorthand the user typed (e.g. `@src/main.rs`, `/writing-style`)
+THE SYSTEM SHALL store and display the original shorthand the user typed (e.g. `/writing-style`)
 AND SHALL deliver the fully expanded content to the AI
 
-**Rationale:** Conversation history should reflect what the user actually did, not a wall of injected file contents or skill instructions. The shorthand is human-readable; the expanded form is for the AI.
+**Rationale:** Conversation history should reflect what the user actually did, not a wall of injected skill instructions. The shorthand is human-readable; the expanded form is for the AI.
 
 ---
 
 ### REQ-IR-007: Graceful Handling of Unresolvable Expansion References
 
-WHEN a message contains `@` followed by a token with a valid path-token shape
-(Unicode path characters, including punctuation inside filenames, balanced
-framework route groups, and no call/prose delimiters or trailing punctuation)
-and that token contains `/` or `.` with a recognized file extension
-AND the referenced file does not exist
-THE SYSTEM SHALL present the user with a clear error identifying the missing file
+WHEN a message begins with `/skill-name` that matches an available skill
+AND the skill's instructions cannot be loaded
+THE SYSTEM SHALL present the user with a clear error identifying the skill
 AND SHALL NOT send the message until the reference is removed or corrected
-
-WHEN a message contains `@` followed by a token that does NOT satisfy the full
-file-reference predicate (for example: bare word, email address,
-`@mention`-style text, code annotation, decorator, malformed route grouping,
-function-call-shaped token, or otherwise non-path-like token)
-THE SYSTEM SHALL treat the `@` as literal text
-AND SHALL send the message without expansion or error
 
 WHEN a message begins with `/skill-name` that matches no available skill
 THE SYSTEM SHALL treat the `/` as literal text (no error, no block)
 
-**Rationale:** `@` appears in email addresses, `@mention` conventions, code
-annotations (`@param`, `@override`), and casual text. Blocking send for
-these false positives is more disruptive than the original risk of silently
-broken references. The heuristic expands only valid path-token shapes, catching
-real file references while letting casual `@` usage and pasted code pass through.
-`/skill` already falls through silently when no skill matches (the token is ignored).
-`./path` references are not validated at send time (see REQ-IR-008).
+**Rationale:** `/` appears in ordinary prose (`use /tmp`), so an unmatched token is literal text rather than an error. A matched skill that cannot load would otherwise reach the AI as a broken reference. `./path` references are not validated at send time (see REQ-IR-008).
 
 ---
 
@@ -179,3 +142,13 @@ THE SYSTEM SHALL require an empty, non-recording composer with no attachments or
 AND SHALL recheck scope, lifetime, and revision before applying the rejected payload.
 
 This contract concerns expansion rejection only; it does not change transport-failure retry queues or conversation Close behavior. Recovery is in-memory within the originating draft lifetime, not a reload or restart persistence guarantee. Voice text recovery follows [REQ-VOICE-008](../voice-input/requirements.md#req-voice-008-voice-ownership-during-late-expansion-recovery).
+
+---
+
+### REQ-IR-010: Deliver `@` Text Literally
+
+WHEN a message contains `@` followed by any token (a path, a name, an email address, a decorator)
+THE SYSTEM SHALL deliver that text to the AI exactly as typed
+AND SHALL NOT read any file, inject any content, or block the message because of it
+
+**Rationale:** Inlining whole files on every turn spends tokens the agent rarely needs; `./path` lets the agent read only what it needs. Keeping `@` free of meaning also reserves it for a future expansion without colliding with file paths, `@mentions`, or code annotations.

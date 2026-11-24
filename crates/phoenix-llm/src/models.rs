@@ -104,6 +104,13 @@ pub enum NativeDefault {
     Unknown,
 }
 
+fn effort_levels_are_unique(levels: &[ModelEffort]) -> bool {
+    levels
+        .iter()
+        .enumerate()
+        .all(|(index, level)| !levels[..index].contains(level))
+}
+
 impl EffortCapabilities {
     #[must_use]
     pub const fn unsupported() -> Self {
@@ -117,13 +124,17 @@ impl EffortCapabilities {
 
     /// # Panics
     ///
-    /// Panics when `levels` is empty or a known native default is not one of the
-    /// supported levels.
+    /// Panics when `levels` is empty or contains duplicates, or when a known
+    /// native default is not one of the supported levels.
     #[must_use]
     pub fn supported(levels: &[ModelEffort], native_default: NativeDefault) -> Self {
         assert!(
             !levels.is_empty(),
             "supported effort levels must be non-empty"
+        );
+        assert!(
+            effort_levels_are_unique(levels),
+            "supported effort levels must be unique"
         );
         if let NativeDefault::Known(level) = native_default {
             assert!(
@@ -312,7 +323,8 @@ pub(crate) enum ApiFormat {
 }
 
 #[derive(Debug, serde::Deserialize)]
-struct ExternalModelSpec {
+#[serde(deny_unknown_fields)]
+pub(super) struct ExternalModelSpec {
     id: String,
     api_name: Option<String>,
     backend: ExternalBackend,
@@ -329,10 +341,10 @@ struct ExternalModelSpec {
 }
 
 #[derive(Debug, serde::Deserialize)]
-#[serde(rename_all = "snake_case", tag = "support")]
+#[serde(rename_all = "snake_case", tag = "support", deny_unknown_fields)]
 enum ExternalEffortCapabilities {
-    Unsupported,
-    Unknown,
+    Unsupported {},
+    Unknown {},
     Supported {
         levels: Vec<ModelEffort>,
         native_default: Option<ModelEffort>,
@@ -430,13 +442,18 @@ impl ModelSpec {
         let openai_fast = service.uses_codex_bridge()
             || (matches!(
                 self.id.as_str(),
-                "gpt-6-astra" | "gpt-6.1-sol" | "gpt-6-sol" | "gpt-6-luna"
+                "gpt-6.2-astra"
+                    | "gpt-6.2-sol"
+                    | "gpt-6.1-terra"
+                    | "gpt-6-astra"
+                    | "gpt-6.1-sol"
+                    | "gpt-6-sol"
+                    | "gpt-6-luna"
             ) && service.uses_official_openai_responses());
-        // Anthropic Fast mode is a research-preview capability of the official
-        // direct Claude API only. A compatible/proxy base URL or a cloud route
+        // Anthropic Fast mode is exposed on the official direct Claude API only. A compatible/proxy base URL or a cloud route
         // must not advertise it, so gate on the official-Anthropic route.
         let anthropic_fast = self.backend == ModelBackend::Anthropic
-            && self.id == "claude-opus-5-5"
+            && matches!(self.id.as_str(), "claude-opus-5-5" | "claude-fable-5-2")
             && service.uses_official_anthropic();
         if openai_fast || anthropic_fast {
             self.service_tier_capabilities
@@ -489,8 +506,8 @@ fn validate_external_effort_capabilities(
         return Ok(EffortCapabilities::unknown());
     };
     match caps {
-        ExternalEffortCapabilities::Unsupported => Ok(EffortCapabilities::unsupported()),
-        ExternalEffortCapabilities::Unknown => Ok(EffortCapabilities::unknown()),
+        ExternalEffortCapabilities::Unsupported {} => Ok(EffortCapabilities::unsupported()),
+        ExternalEffortCapabilities::Unknown {} => Ok(EffortCapabilities::unknown()),
         ExternalEffortCapabilities::Supported {
             levels,
             native_default,
@@ -498,6 +515,12 @@ fn validate_external_effort_capabilities(
             if levels.is_empty() {
                 return Err(format!(
                     "model '{}' must declare at least one supported effort level",
+                    spec.id
+                ));
+            }
+            if !effort_levels_are_unique(levels) {
+                return Err(format!(
+                    "model '{}' must not declare duplicate supported effort levels",
                     spec.id
                 ));
             }
@@ -528,7 +551,7 @@ fn validate_external_effort_capabilities(
     }
 }
 
-fn external_model_spec_from_config(
+pub(super) fn external_model_spec_from_config(
     index: usize,
     spec: ExternalModelSpec,
 ) -> Result<ModelSpec, String> {
@@ -598,7 +621,7 @@ pub fn merge_model_specs(mut builtins: Vec<ModelSpec>, external: &[ModelSpec]) -
         if !ids.insert(spec.id.clone()) {
             tracing::warn!(
                 model_id = %spec.id,
-                "PHOENIX_LLM_MODELS duplicate model id ignored; built-in or earlier configured model kept"
+                "external model duplicate id ignored; built-in or earlier configured model kept"
             );
             continue;
         }
@@ -618,6 +641,20 @@ pub fn all_models() -> Vec<ModelSpec> {
         // their 2026-03-13 GA. The `context-1m-2025-08-07` beta header was
         // retired April 30, 2026 and is no longer required (or accepted on
         // older models). See migration 009 for legacy `-1m` id rewrite.
+        ModelSpec {
+            id: "claude-fable-5-2".into(),
+            default_request_name: "claude-fable-5-2".into(),
+            backend: ModelBackend::Anthropic,
+            family: "Anthropic".into(),
+            description: "Claude Fable 5.2 (frontier reasoning, adaptive thinking)".into(),
+            context_window: 1_000_000,
+            max_output_tokens: 128_000,
+            recommended: true,
+            supports_tool_search: true,
+            source: ModelSource::BuiltIn,
+            effort_capabilities: effort_anthropic_xhigh(),
+            service_tier_capabilities: ServiceTierCapabilities::Supported,
+        },
         ModelSpec {
             id: "claude-opus-5-5".into(),
             default_request_name: "claude-opus-5-5".into(),
@@ -725,6 +762,23 @@ pub fn all_models() -> Vec<ModelSpec> {
             service_tier_capabilities: ServiceTierCapabilities::Unsupported,
         },
         ModelSpec {
+            id: "claude-haiku-5-5".into(),
+            default_request_name: "claude-haiku-5-5".into(),
+            backend: ModelBackend::Anthropic,
+            family: "Anthropic".into(),
+            description: "Claude Haiku 5.5 (fast, efficient, adaptive thinking)".into(),
+            context_window: 1_000_000,
+            max_output_tokens: 128_000,
+            recommended: true,
+            supports_tool_search: true,
+            source: ModelSource::BuiltIn,
+            effort_capabilities: EffortCapabilities::supported_known(
+                EFFORT_LEVELS_ANTHROPIC_XHIGH,
+                ModelEffort::Medium,
+            ),
+            service_tier_capabilities: ServiceTierCapabilities::Unsupported,
+        },
+        ModelSpec {
             id: "claude-haiku-4-5".into(),
             default_request_name: "claude-haiku-4-5-20251001".into(),
             backend: ModelBackend::Anthropic,
@@ -739,12 +793,126 @@ pub fn all_models() -> Vec<ModelSpec> {
             effort_capabilities: EffortCapabilities::unsupported(),
             service_tier_capabilities: ServiceTierCapabilities::Unsupported,
         },
+        ModelSpec {
+            id: "google/gemini-4-neon".into(),
+            default_request_name: "google/gemini-4-neon".into(),
+            backend: ModelBackend::OpenAIChatCompletions,
+            family: "Google".into(),
+            description: "Gemini 4 Neon (frontier coding and reasoning)".into(),
+            context_window: 1_048_576,
+            max_output_tokens: 65_536,
+            recommended: true,
+            supports_tool_search: false,
+            source: ModelSource::BuiltIn,
+            effort_capabilities: EffortCapabilities::supported_unknown(&[
+                ModelEffort::Low,
+                ModelEffort::Medium,
+                ModelEffort::High,
+            ]),
+            service_tier_capabilities: ServiceTierCapabilities::Unsupported,
+        },
+        ModelSpec {
+            id: "google/gemini-4-hydrogen".into(),
+            default_request_name: "google/gemini-4-hydrogen".into(),
+            backend: ModelBackend::OpenAIChatCompletions,
+            family: "Google".into(),
+            description: "Gemini 4 Hydrogen (fast, efficient agentic work)".into(),
+            context_window: 1_048_576,
+            max_output_tokens: 65_536,
+            recommended: true,
+            supports_tool_search: false,
+            source: ModelSource::BuiltIn,
+            effort_capabilities: EffortCapabilities::supported_unknown(&[
+                ModelEffort::Low,
+                ModelEffort::Medium,
+                ModelEffort::High,
+            ]),
+            service_tier_capabilities: ServiceTierCapabilities::Unsupported,
+        },
+        ModelSpec {
+            id: "google/gemini-4-carbon".into(),
+            default_request_name: "google/gemini-4-carbon".into(),
+            backend: ModelBackend::OpenAIChatCompletions,
+            family: "Google".into(),
+            description: "Gemini 4 Carbon (most capable Gemini reasoning)".into(),
+            context_window: 1_048_576,
+            max_output_tokens: 65_536,
+            recommended: true,
+            supports_tool_search: false,
+            source: ModelSource::BuiltIn,
+            effort_capabilities: EffortCapabilities::supported_unknown(&[
+                ModelEffort::Low,
+                ModelEffort::Medium,
+                ModelEffort::High,
+            ]),
+            service_tier_capabilities: ServiceTierCapabilities::Unsupported,
+        },
+        ModelSpec {
+            id: "google/gemini-4-argon".into(),
+            default_request_name: "google/gemini-4-argon".into(),
+            backend: ModelBackend::OpenAIChatCompletions,
+            family: "Google".into(),
+            description: "Gemini 4 Argon (efficient frontier reasoning)".into(),
+            context_window: 1_048_576,
+            max_output_tokens: 65_536,
+            recommended: true,
+            supports_tool_search: false,
+            source: ModelSource::BuiltIn,
+            effort_capabilities: EffortCapabilities::supported_unknown(&[
+                ModelEffort::Low,
+                ModelEffort::Medium,
+                ModelEffort::High,
+            ]),
+            service_tier_capabilities: ServiceTierCapabilities::Unsupported,
+        },
         // OpenAI models
         // Context windows here are the platform-API ceilings. The codex bridge
         // caps every built-in OpenAI Responses model at 272K regardless — that
         // override is applied at registration time in `registry.rs` when the
         // bridge path is selected, so this spec's value reaches the runtime
         // only for direct/provider-compatible routes.
+        ModelSpec {
+            id: "gpt-6.2-astra".into(),
+            default_request_name: "gpt-6.2-astra".into(),
+            backend: ModelBackend::OpenAIResponses,
+            family: "OpenAI".into(),
+            description: "GPT-6.2 Astra (most capable)".into(),
+            context_window: 1_050_000,
+            max_output_tokens: 128_000,
+            recommended: true,
+            supports_tool_search: false,
+            source: ModelSource::BuiltIn,
+            effort_capabilities: EffortCapabilities::supported_unknown(EFFORT_LEVELS_GPT_6_ASTRA),
+            service_tier_capabilities: ServiceTierCapabilities::Supported,
+        },
+        ModelSpec {
+            id: "gpt-6.2-sol".into(),
+            default_request_name: "gpt-6.2-sol".into(),
+            backend: ModelBackend::OpenAIResponses,
+            family: "OpenAI".into(),
+            description: "GPT-6.2 Sol (balanced speed and intelligence)".into(),
+            context_window: 1_050_000,
+            max_output_tokens: 128_000,
+            recommended: true,
+            supports_tool_search: false,
+            source: ModelSource::BuiltIn,
+            effort_capabilities: EffortCapabilities::supported_unknown(EFFORT_LEVELS_GPT_6_ASTRA),
+            service_tier_capabilities: ServiceTierCapabilities::Supported,
+        },
+        ModelSpec {
+            id: "gpt-6.1-terra".into(),
+            default_request_name: "gpt-6.1-terra".into(),
+            backend: ModelBackend::OpenAIResponses,
+            family: "OpenAI".into(),
+            description: "GPT-6.1 Terra (visual reasoning, fast and efficient)".into(),
+            context_window: 1_050_000,
+            max_output_tokens: 128_000,
+            recommended: true,
+            supports_tool_search: false,
+            source: ModelSource::BuiltIn,
+            effort_capabilities: effort_gpt_6_sol_luna_direct(),
+            service_tier_capabilities: ServiceTierCapabilities::Supported,
+        },
         ModelSpec {
             id: "gpt-6-astra".into(),
             default_request_name: "gpt-6-astra".into(),
@@ -873,10 +1041,18 @@ mod tests {
     use super::*;
 
     #[test]
+    #[should_panic(expected = "supported effort levels must be unique")]
+    fn supported_effort_capabilities_reject_duplicate_levels() {
+        let _ = EffortCapabilities::supported_unknown(&[ModelEffort::Low, ModelEffort::Low]);
+    }
+
+    #[test]
     fn catalog_output_maxima_are_explicit_and_fit_context() {
         for model in all_models() {
             let expected = if model.id == "claude-haiku-4-5" {
                 64_000
+            } else if model.backend == ModelBackend::OpenAIChatCompletions {
+                65_536
             } else {
                 128_000
             };
@@ -1009,11 +1185,67 @@ mod tests {
                 "gpt-5.6-sol",
                 "gpt-5.6-terra",
                 "gpt-6.1-sol",
+                "gpt-6.1-terra",
+                "gpt-6.2-astra",
+                "gpt-6.2-sol",
                 "gpt-6-astra",
                 "gpt-6-luna",
                 "gpt-6-sol",
             ])
         );
+    }
+
+    #[test]
+    fn flagship_additions_have_verified_capabilities() {
+        let models = all_models();
+        for (id, context, effort, fast) in [
+            (
+                "gpt-6.2-astra",
+                1_050_000,
+                EffortCapabilities::supported_unknown(EFFORT_LEVELS_GPT_6_ASTRA),
+                ServiceTierCapabilities::Supported,
+            ),
+            (
+                "gpt-6.2-sol",
+                1_050_000,
+                EffortCapabilities::supported_unknown(EFFORT_LEVELS_GPT_6_ASTRA),
+                ServiceTierCapabilities::Supported,
+            ),
+            (
+                "gpt-6.1-terra",
+                1_050_000,
+                effort_gpt_6_sol_luna_direct(),
+                ServiceTierCapabilities::Supported,
+            ),
+            (
+                "claude-fable-5-2",
+                1_000_000,
+                effort_anthropic_xhigh(),
+                ServiceTierCapabilities::Supported,
+            ),
+            (
+                "claude-haiku-5-5",
+                1_000_000,
+                EffortCapabilities::supported_known(
+                    EFFORT_LEVELS_ANTHROPIC_XHIGH,
+                    ModelEffort::Medium,
+                ),
+                ServiceTierCapabilities::Unsupported,
+            ),
+        ] {
+            let model = models.iter().find(|model| model.id == id).unwrap();
+            assert_eq!(model.default_request_name.as_str(), id);
+            assert_eq!(model.context_window, context, "{id}");
+            assert_eq!(model.output_token_limit(), 128_000, "{id}");
+            assert_eq!(model.effort_capabilities, effort, "{id}");
+            assert_eq!(model.service_tier_capabilities, fast, "{id}");
+            assert!(model.recommended);
+            assert!(model.effort_capabilities.supports(ModelEffort::Max));
+            assert_eq!(
+                model.effort_capabilities.supports(ModelEffort::None),
+                id == "gpt-6.1-terra"
+            );
+        }
     }
 
     #[test]
@@ -1121,6 +1353,27 @@ mod tests {
         .expect("top-level external model array parses");
 
         assert!(models.is_empty());
+    }
+
+    #[test]
+    fn duplicate_external_effort_levels_reject_only_the_invalid_model() {
+        let models = parse_external_models(
+            r#"[
+                {"id":"duplicate","backend":"openai_responses","description":"Duplicate metadata","context_window":128000,"max_output_tokens":32768,"recommended":false,"supports_tool_search":false,"effort_capabilities":{"support":"supported","levels":["low","low"]}},
+                {"id":"valid","backend":"openai_responses","description":"Valid metadata","context_window":128000,"max_output_tokens":32768,"recommended":false,"supports_tool_search":false,"effort_capabilities":{"support":"supported","levels":["low","high"],"native_default":"high"}}
+            ]"#,
+        )
+        .expect("top-level external model array parses");
+
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, "valid");
+        assert_eq!(
+            models[0].effort_capabilities,
+            EffortCapabilities::supported_known(
+                &[ModelEffort::Low, ModelEffort::High],
+                ModelEffort::High,
+            )
+        );
     }
 
     #[test]

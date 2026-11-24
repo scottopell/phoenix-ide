@@ -5,7 +5,7 @@ import { ConversationSettings } from '../components/ConversationSettings';
 import { VoiceRecorder } from '../components/VoiceInput/VoiceRecorder';
 import { PaneDivider } from '../components/PaneDivider';
 import { SUPPORTED_IMAGE_TYPES } from '../utils/images';
-import { ExpansionError, api, type ProductConversationCreationAllowedActionView, type ProductConversationCreationRecoveryRow } from '../api';
+import { ExpansionError, api, type LlmLanguageCatalogEntry, type ProductConversationCreationAllowedActionView, type ProductConversationCreationRecoveryRow } from '../api';
 import { useCreateConversation } from '../hooks/useCreateConversation';
 import './NewConversationPage.css';
 import { recoveryDiscoveryDelay } from './recoveryPolling';
@@ -165,10 +165,20 @@ interface NewConversationPageProps {
 export function NewConversationPage({ desktopMode }: NewConversationPageProps = {}) {
   const navigate = useNavigate();
   const conv = useCreateConversation(navigate);
+  const [languages, setLanguages] = useState<LlmLanguageCatalogEntry[]>([]);
+  const [languageError, setLanguageError] = useState<string | null>(null);
+  useEffect(() => {
+    let active = true;
+    api.getLlmLanguageSetting()
+      .then((catalog) => { if (active) setLanguages(catalog.languages); })
+      .catch(() => { if (active) setLanguageError('Language choices could not load. Phoenix is available; reload to choose another.'); });
+    return () => { active = false; };
+  }, []);
+
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  // Inline reference autocomplete (@file, ./path, /skill). The composer renders
+  // Inline reference autocomplete (./path, /skill). The composer renders
   // both a desktop and a mobile textarea (one hidden by CSS);
   // `inlineRefTextarea` tracks whichever is focused so trigger detection reads
   // the right caret.
@@ -191,15 +201,15 @@ export function NewConversationPage({ desktopMode }: NewConversationPageProps = 
   };
   const handleSend = async () => {
     // The Send buttons are disabled while an expansion error is shown; gate the
-    // keyboard (Enter) path too so a stale broken @reference can't be resubmitted
+    // keyboard (Enter) path too so a stale broken /skill reference can't be resubmitted
     // before it's corrected.
     if (ir.expansionError) return;
     ir.reset();
     try {
       await conv.handleSend();
     } catch (err) {
-      // The create endpoint expands the first message and rejects unresolvable
-      // `@file` references with the same 422 as a chat send. Surface it inline
+      // The create endpoint expands the first message and rejects a failed
+      // `/skill` invocation with the same 422 as a chat send. Surface it inline
       // next to the composer (REQ-IR-007) instead of the page-level error,
       // which on mobile renders up in the settings area away from the input.
       if (err instanceof ExpansionError) {
@@ -534,6 +544,11 @@ export function NewConversationPage({ desktopMode }: NewConversationPageProps = 
             error={conv.error}
             recentPaths={conv.recentManagementRootSuggestions.map((suggestion) => suggestion.path)}
             rootFreshness={null}
+            languages={languages}
+            selectedLanguage={conv.selectedLlmLanguage}
+            setSelectedLanguage={conv.setSelectedLlmLanguage}
+            languageError={languageError}
+            languageDisabled={conv.creating}
           />
 
           {/* Main input — hidden until an LLM is configured */}
@@ -615,6 +630,11 @@ export function NewConversationPage({ desktopMode }: NewConversationPageProps = 
             error={conv.error}
             recentPaths={conv.recentManagementRootSuggestions.map((suggestion) => suggestion.path)}
             rootFreshness={null}
+            languages={languages}
+            selectedLanguage={conv.selectedLlmLanguage}
+            setSelectedLanguage={conv.setSelectedLlmLanguage}
+            languageError={languageError}
+            languageDisabled={conv.creating}
           />
         </div>
       </main>

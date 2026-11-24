@@ -470,7 +470,9 @@ async fn expand_product_creation_objective(
         | crate::db::ProductCreationOrigin::SlackGateway { .. } => {
             crate::send_chat_service::MessageExpansionPolicy::ExpandReferences
         }
-        crate::db::ProductCreationOrigin::InternalConversation { .. } => {
+        crate::db::ProductCreationOrigin::HistoricalInternal(_)
+        | crate::db::ProductCreationOrigin::InternalConversation { .. }
+        | crate::db::ProductCreationOrigin::FederatedConversation { .. } => {
             crate::send_chat_service::MessageExpansionPolicy::LiteralText
         }
     };
@@ -514,7 +516,7 @@ async fn persist_retryable_delivery_failure(
             &claimed.job.request_id,
             &claimed.claim,
             delivery_error,
-            chrono::Utc::now(),
+            product_creation_now(manager),
         )
         .await
         .map_err(|db_error| {
@@ -971,8 +973,7 @@ async fn process_product_creation_until_closed(
 #[cfg(test)]
 #[derive(Clone)]
 pub(super) struct ClaimGuardPolicy {
-    lease: chrono::Duration,
-    heartbeat_interval: Duration,
+    heartbeats: Arc<tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<()>>>,
     renewed: tokio::sync::mpsc::UnboundedSender<chrono::DateTime<chrono::Utc>>,
 }
 
@@ -981,6 +982,15 @@ impl ClaimGuardPolicy {
     fn observe_renewal(&self, renewed_at: chrono::DateTime<chrono::Utc>) {
         let _ = self.renewed.send(renewed_at);
     }
+}
+
+fn product_creation_now(manager: &RuntimeManager) -> chrono::DateTime<chrono::Utc> {
+    #[cfg(test)]
+    if let Some(now) = manager.db().test_product_creation_now() {
+        return now;
+    }
+    let _ = manager;
+    chrono::Utc::now()
 }
 
 async fn run_product_creation_until_closed(
@@ -1000,13 +1010,7 @@ async fn run_product_creation_until_closed(
         .lock()
         .unwrap()
         .clone();
-    #[cfg(test)]
-    let (lease, heartbeat_interval) = policy
-        .as_ref()
-        .map_or((lease, heartbeat_interval), |policy| {
-            (policy.lease, policy.heartbeat_interval)
-        });
-    let renewed_at = chrono::Utc::now();
+    let renewed_at = product_creation_now(manager);
     let mut fatal = manager.fatal_local_authority_receiver();
     if !manager
         .db()
@@ -1030,11 +1034,21 @@ async fn run_product_creation_until_closed(
                 return Err("product creation stopped after fatal local authority closure".to_string());
             }
             result = &mut processing => return result,
-            _ = heartbeat.tick() => {
+            renewed_at = async {
+                #[cfg(test)]
+                if let Some(policy) = &policy {
+                    policy.heartbeats.lock().await.recv().await
+                        .expect("test must retain the heartbeat controller until work ends");
+                    return Some(manager.db().test_product_creation_now()
+                        .expect("controlled heartbeat requires the shared creation clock"));
+                }
+                heartbeat.tick().await;
+                None::<chrono::DateTime<chrono::Utc>>
+            } => {
                 let _admitted = manager.acquire_local_authority_pass().map_err(|()| {
                     "product creation claim renewal rejected after fatal local authority closure".to_string()
                 })?;
-                let renewed_at = chrono::Utc::now();
+                let renewed_at = renewed_at.unwrap_or_else(chrono::Utc::now);
                 let renewed = manager.db().renew_product_creation_claim(
                     request_id,
                     claim,
@@ -1900,11 +1914,7 @@ async fn provision_conversation(
                     .map_err(|error| (error, ErrorKind::ServerError))?
                 };
                 (
-                    format!(
-                        "task-{}-{}",
-                        snapshot.task_id,
-                        slugify_label(&snapshot.task_title)
-                    ),
+                    approved_task_branch_name(&snapshot.task_id, &snapshot.task_title),
                     Some(oid),
                     Some(base_branch),
                 )
@@ -2415,6 +2425,7 @@ async fn provision_conversation(
                     ),
                     model: Some(resolved_model.clone()),
                     archived: Some(persisted_conversation.archived),
+                    continued_in_conv_id: None,
                 },
             });
     }
@@ -3785,74 +3796,120 @@ mod product_creation_delivery_replay_tests {
             .unwrap());
     }
 
-    const SHORT_CLAIM_LEASE: chrono::Duration = chrono::Duration::milliseconds(300);
+    struct ControlledClaimGuard {
+        db: Database,
+        now: chrono::DateTime<chrono::Utc>,
+        heartbeats: tokio::sync::mpsc::UnboundedSender<()>,
+        renewals: tokio::sync::mpsc::UnboundedReceiver<chrono::DateTime<chrono::Utc>>,
+    }
 
-    fn install_short_claim_guard_policy(
-        manager: &RuntimeManager,
-    ) -> tokio::sync::mpsc::UnboundedReceiver<chrono::DateTime<chrono::Utc>> {
-        let (renewed, observations) = tokio::sync::mpsc::unbounded_channel();
-        *manager.product_creation_claim_guard_policy.lock().unwrap() = Some(ClaimGuardPolicy {
-            lease: SHORT_CLAIM_LEASE,
-            heartbeat_interval: Duration::from_millis(100),
-            renewed,
-        });
-        observations
+    impl ControlledClaimGuard {
+        fn install(
+            manager: &RuntimeManager,
+            delivery: &crate::db::ClaimedProductCreationJob,
+        ) -> Self {
+            let (heartbeats, ticks) = tokio::sync::mpsc::unbounded_channel();
+            let (renewed, renewals) = tokio::sync::mpsc::unbounded_channel();
+            let db = manager.db().clone();
+            let now = delivery.job.updated_at;
+            db.test_set_product_creation_now(now);
+            *manager.product_creation_claim_guard_policy.lock().unwrap() = Some(ClaimGuardPolicy {
+                heartbeats: Arc::new(tokio::sync::Mutex::new(ticks)),
+                renewed,
+            });
+            Self {
+                db,
+                now,
+                heartbeats,
+                renewals,
+            }
+        }
+
+        fn heartbeat_after(&mut self, elapsed: chrono::Duration) {
+            self.now += elapsed;
+            self.db.test_set_product_creation_now(self.now);
+            self.heartbeats.send(()).unwrap();
+        }
+
+        async fn observe_renewal(&mut self) {
+            let renewed_at = tokio::time::timeout(Duration::from_secs(5), self.renewals.recv())
+                .await
+                .expect("claim guard did not acknowledge the controlled heartbeat")
+                .expect("claim guard renewal channel closed");
+            assert_eq!(renewed_at, self.now);
+        }
+
+        async fn renew_after(&mut self, elapsed: chrono::Duration) {
+            self.heartbeat_after(elapsed);
+            self.observe_renewal().await;
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum EnqueueLease {
+        Renewed,
+        MissingExtension,
+        ExactExpiry,
     }
 
     #[tokio::test]
-    async fn slow_delivery_keeps_short_test_lease_live_through_enqueue() {
+    async fn slow_delivery_keeps_claim_live_through_enqueue() {
+        slow_delivery_enqueue_fence(EnqueueLease::Renewed).await;
+    }
+
+    #[tokio::test]
+    async fn slow_delivery_enqueue_rejects_missing_lease_extension() {
+        slow_delivery_enqueue_fence(EnqueueLease::MissingExtension).await;
+    }
+
+    #[tokio::test]
+    async fn slow_delivery_enqueue_rejects_exact_expiry() {
+        slow_delivery_enqueue_fence(EnqueueLease::ExactExpiry).await;
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn slow_delivery_enqueue_fence(lease: EnqueueLease) {
         let db = Database::open_in_memory().await.unwrap();
         let manager = test_runtime_manager(db.clone());
         let directory = tempfile::tempdir().unwrap();
         let delivery =
             seed_live_delivery(&db, directory.path(), "slow-delivery", "slow-root").await;
-        let mut renewals = install_short_claim_guard_policy(&manager);
-        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
-        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let mut clock = ControlledClaimGuard::install(&manager, &delivery);
+        let first_lease = clock.now + chrono::Duration::seconds(30);
+        let enqueue = Arc::new(tokio::sync::Barrier::new(2));
+        manager
+            .steering_enqueue_handle_barriers
+            .lock()
+            .await
+            .insert("slow-root".to_string(), Arc::clone(&enqueue));
         let worker = tokio::spawn({
             let manager = Arc::clone(&manager);
-            async move {
-                run_product_creation_until_closed(
-                    &manager,
-                    &delivery,
-                    Box::pin(async {
-                        started_tx.send(()).unwrap();
-                        release_rx.await.unwrap();
-                        Box::pin(deliver_product_creation_objective_inner(
-                            &manager, &delivery,
-                        ))
-                        .await
-                    }),
-                )
-                .await
-            }
+            async move { deliver_product_creation_objective(&manager, &delivery).await }
         });
-        tokio::time::timeout(Duration::from_secs(1), started_rx)
+        tokio::time::timeout(Duration::from_secs(5), enqueue.wait())
             .await
-            .unwrap()
-            .unwrap();
-        let first_renewal = tokio::time::timeout(Duration::from_secs(1), renewals.recv())
-            .await
-            .expect("claim guard must renew within the bounded wait")
-            .expect("claim guard renewal channel must remain open");
-        let first_lease = first_renewal + SHORT_CLAIM_LEASE;
-        tokio::time::timeout(Duration::from_secs(1), async {
-            loop {
-                let renewed_at = renewals.recv().await.expect("guard must keep renewing");
-                if renewed_at > first_lease {
-                    break;
-                }
-            }
-        })
-        .await
-        .expect("a heartbeat must successfully renew after the initial lease expired");
+            .expect("delivery must reach the real enqueue barrier");
+        clock.observe_renewal().await;
+        assert_eq!(
+            global_objective_artifact_counts(&db, "slow-delivery").await,
+            (0, 0)
+        );
+        for _ in 0..4 {
+            clock.renew_after(chrono::Duration::seconds(10)).await;
+            let current = product_creation_job(&db, "slow-delivery").await;
+            assert_eq!(
+                current.claim_lease_until.unwrap(),
+                clock.now + chrono::Duration::seconds(30),
+                "a renewal acknowledgement must correspond to a persisted lease extension"
+            );
+        }
         let current = db
             .get_product_creation_job("slow-delivery")
             .await
             .unwrap()
             .unwrap();
-        assert!(chrono::Utc::now() > first_lease);
-        assert!(current.claim_lease_until.unwrap() > chrono::Utc::now());
+        assert!(clock.now > first_lease);
+        assert!(current.claim_lease_until.unwrap() > clock.now);
         assert!(current.claim_lease_until.unwrap() > first_lease);
         assert_eq!(current.status, "delivery_pending");
         assert!(!worker.is_finished());
@@ -3860,30 +3917,103 @@ mod product_creation_delivery_replay_tests {
             .claim_next_product_creation_delivery(
                 "competitor",
                 "competitor-token",
-                chrono::Utc::now(),
+                clock.now,
                 chrono::Duration::seconds(30),
             )
             .await
             .unwrap()
             .is_none());
-        release_tx.send(()).unwrap();
-        tokio::time::timeout(Duration::from_secs(5), worker)
+        let refused_expiry = match lease {
+            EnqueueLease::Renewed => None,
+            EnqueueLease::MissingExtension => Some(first_lease),
+            EnqueueLease::ExactExpiry => Some(clock.now),
+        };
+        if let Some(expiry) = refused_expiry {
+            sqlx::query(
+                "UPDATE product_creation_jobs SET claim_lease_until_unix_micros = ?1
+                 WHERE request_id = 'slow-delivery'",
+            )
+            .bind(expiry.timestamp_micros())
+            .execute(db.pool())
+            .await
+            .unwrap();
+        }
+        enqueue.wait().await;
+        let result = tokio::time::timeout(Duration::from_secs(5), worker)
             .await
             .unwrap()
-            .unwrap()
             .unwrap();
+        if refused_expiry.is_some() {
+            assert!(result.unwrap_err().contains("claim"));
+            assert_eq!(
+                global_objective_artifact_counts(&db, "slow-delivery").await,
+                (0, 0)
+            );
+            let refused = product_creation_job(&db, "slow-delivery").await;
+            assert_eq!(refused.status, "delivery_pending");
+            assert_eq!(refused.claim_lease_until, refused_expiry);
+            assert!(db
+                .get_steering_acceptance_fingerprint("slow-root", "slow-delivery")
+                .await
+                .unwrap()
+                .is_none());
+            assert!(db.get_conversation("slow-root").await.unwrap().archived);
+            return;
+        }
+        result.unwrap();
         let completed = db
             .get_product_creation_job("slow-delivery")
             .await
             .unwrap()
             .unwrap();
         assert_eq!(completed.status, "published");
+        assert_eq!(completed.updated_at, clock.now);
+        assert_eq!(completed.stage_updated_at, clock.now);
         assert_eq!(
             completed.provisioning_stage,
             phoenix_db::ProductCreationProvisioningStage::FinalizePublication
         );
         let (committed, queued) = global_objective_artifact_counts(&db, "slow-delivery").await;
         assert_eq!(committed + queued, 1);
+    }
+
+    #[tokio::test]
+    async fn delivery_heartbeat_at_exact_expiry_drops_work_without_reviving_claim() {
+        let db = Database::open_in_memory().await.unwrap();
+        let manager = test_runtime_manager(db.clone());
+        let directory = tempfile::tempdir().unwrap();
+        let delivery =
+            seed_live_delivery(&db, directory.path(), "expired-heartbeat", "expired-root").await;
+        let mut clock = ControlledClaimGuard::install(&manager, &delivery);
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let worker = tokio::spawn({
+            let manager = Arc::clone(&manager);
+            async move {
+                run_product_creation_until_closed(&manager, &delivery, async {
+                    release_rx.await.unwrap();
+                    panic!("expired delivery must be dropped rather than resumed");
+                })
+                .await
+            }
+        });
+        clock.observe_renewal().await;
+        let before = product_creation_job(&db, "expired-heartbeat").await;
+        clock.heartbeat_after(chrono::Duration::seconds(30));
+        let error = tokio::time::timeout(Duration::from_secs(5), worker)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(
+            error,
+            "product creation claim was lost during heartbeat renewal"
+        );
+        assert!(release_tx.send(()).is_err());
+        assert_eq!(product_creation_job(&db, "expired-heartbeat").await, before);
+        assert_eq!(
+            global_objective_artifact_counts(&db, "expired-heartbeat").await,
+            (0, 0)
+        );
     }
 
     #[tokio::test]
@@ -3898,7 +4028,7 @@ mod product_creation_delivery_replay_tests {
             "cancel-heartbeat-root",
         )
         .await;
-        let _renewals = install_short_claim_guard_policy(&manager);
+        let mut clock = ControlledClaimGuard::install(&manager, &delivery);
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = tokio::sync::oneshot::channel();
         let worker = tokio::spawn({
@@ -3924,9 +4054,10 @@ mod product_creation_delivery_replay_tests {
             .unwrap()
             .unwrap();
         assert!(db
-            .cancel_product_creation("cancel-heartbeat", chrono::Utc::now())
+            .cancel_product_creation("cancel-heartbeat", clock.now)
             .await
             .unwrap());
+        clock.heartbeat_after(chrono::Duration::seconds(10));
         let error = tokio::time::timeout(Duration::from_secs(1), worker)
             .await
             .unwrap()
@@ -3958,7 +4089,7 @@ mod product_creation_delivery_replay_tests {
         let directory = tempfile::tempdir().unwrap();
         let delivery =
             seed_live_delivery(&db, directory.path(), "replace-delivery", "replace-root").await;
-        let _renewals = install_short_claim_guard_policy(&manager);
+        let mut clock = ControlledClaimGuard::install(&manager, &delivery);
         let old_claim = delivery.claim.clone();
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = tokio::sync::oneshot::channel();
@@ -3991,12 +4122,13 @@ mod product_creation_delivery_replay_tests {
                  claim_lease_until_unix_micros = ?1
              WHERE request_id = 'replace-delivery'",
         )
-        .bind((chrono::Utc::now() + chrono::Duration::seconds(30)).timestamp_micros())
+        .bind((clock.now + chrono::Duration::seconds(30)).timestamp_micros())
         .execute(db.pool())
         .await
         .unwrap();
         let replacement = product_creation_job(&db, "replace-delivery").await;
         assert!(replacement.claim_generation > old_claim.generation);
+        clock.heartbeat_after(chrono::Duration::seconds(10));
         let error = tokio::time::timeout(Duration::from_secs(1), worker)
             .await
             .unwrap()
@@ -4357,52 +4489,6 @@ mod product_creation_delivery_replay_tests {
     }
 
     #[tokio::test]
-    async fn objective_expansion_failure_exhausts_bounded_delivery_retries() {
-        let root = tempfile::tempdir().unwrap();
-        let db = Database::open_in_memory().await.unwrap();
-        let request_id = "req-expansion-failure";
-        let conversation_id = "conv-expansion-failure";
-        let manager = test_runtime_manager(db.clone());
-        let (_, _, publish_lease_until) = seed_retry_identity_delivery(
-            &db,
-            root.path().to_str().unwrap(),
-            request_id,
-            conversation_id,
-            "Read @missing.md",
-        )
-        .await;
-        let mut claim_time = publish_lease_until + chrono::Duration::seconds(1);
-
-        for attempt in 1..=4 {
-            let delivery =
-                claim_delivery_attempt(&db, request_id, &attempt.to_string(), claim_time).await;
-            let error = Box::pin(deliver_product_creation_objective(&manager, &delivery))
-                .await
-                .unwrap_err();
-            assert!(error.contains("missing.md"));
-            let job = product_creation_job(&db, request_id).await;
-            assert_eq!(
-                job.status,
-                if attempt < 4 {
-                    "delivery_pending"
-                } else {
-                    "delivery_failed"
-                }
-            );
-            assert_eq!(job.last_error.as_deref(), Some(error.as_str()));
-            if attempt < 4 {
-                claim_time = job.delivery_retry_at.unwrap() + chrono::Duration::seconds(1);
-            } else {
-                assert!(job.delivery_retry_at.is_none());
-            }
-        }
-        assert_eq!(
-            global_objective_artifact_counts(&db, request_id).await,
-            (0, 0)
-        );
-    }
-
-    #[tokio::test]
     async fn internal_creation_objective_is_literal_agent_content() {
         let root = tempfile::tempdir().unwrap();
         let db = Database::open_in_memory().await.unwrap();
@@ -4416,8 +4502,10 @@ mod product_creation_delivery_replay_tests {
         )
         .await
         .unwrap();
+        let source_instance_id = db.instance_id().await.unwrap();
         let manager = test_runtime_manager(db);
         let origin = crate::db::ProductCreationOrigin::InternalConversation {
+            source_instance_id,
             product_conversation_id: "coordinator-product".parse().unwrap(),
             transcript_id: "coordinator-source".into(),
             source_call: phoenix_core::domain::db_schema::SourceToolCall {
@@ -4425,7 +4513,7 @@ mod product_creation_delivery_replay_tests {
                 tool_use_id: "create-call".into(),
             },
         };
-        // Neither a missing @file nor an unknown /skill may be expanded for agent input.
+        // Neither an @token nor an unknown /skill may be expanded for agent input.
         for objective in ["Read @missing.md", "/missing-skill @missing.md"] {
             let expanded = expand_product_creation_objective(
                 &manager,
@@ -4442,9 +4530,74 @@ mod product_creation_delivery_replay_tests {
     }
 
     #[tokio::test]
+    async fn historical_internal_creation_objective_remains_literal() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("notes.md"), "should not be expanded").unwrap();
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation(
+            "historical-objective",
+            "historical-objective",
+            root.path().to_str().unwrap(),
+            false,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        db.accept_product_creation(
+            "historical-origin-job",
+            &ProductCreationIntent {
+                origin: crate::db::ProductCreationOrigin::UserApi,
+                cwd: root.path().to_string_lossy().into_owned(),
+                objective: "Read @notes.md".into(),
+                model: None,
+                effort: None,
+                images: Vec::new(),
+                llm_language: LlmLanguage::Caveman,
+            },
+        )
+        .await
+        .unwrap();
+        sqlx::query("UPDATE product_creation_jobs SET objective_origin = 'historical_internal', objective_source_product_conversation_id = 'pc_source', objective_source_transcript_id = char(9), objective_source_message_id = 'message', objective_source_tool_use_id = 'tool' WHERE request_id = 'historical-origin-job'")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let origin = db
+            .get_product_creation_job("historical-origin-job")
+            .await
+            .unwrap()
+            .unwrap()
+            .intent
+            .origin;
+        assert!(matches!(
+            &origin,
+            crate::db::ProductCreationOrigin::HistoricalInternal(_)
+        ));
+        let manager = test_runtime_manager(db);
+
+        let expanded = expand_product_creation_objective(
+            &manager,
+            "historical-objective",
+            "Read @notes.md",
+            &origin,
+        )
+        .await
+        .unwrap();
+        assert_eq!(expanded.display_text, "Read @notes.md");
+        assert!(expanded.llm_text.is_none());
+        assert!(expanded.skill_invocation.is_none());
+    }
+
+    #[tokio::test]
     async fn initial_objective_expands_against_published_conversation_root() {
         let root = tempfile::tempdir().unwrap();
-        std::fs::write(root.path().join("notes.md"), "published root contents").unwrap();
+        let skill_dir = root.path().join(".claude/skills/probe-skill");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: probe-skill\ndescription: Probe\n---\npublished root contents $ARGUMENTS",
+        )
+        .unwrap();
         let db = Database::open_in_memory().await.unwrap();
         db.create_conversation(
             "expanded-product-objective",
@@ -4476,16 +4629,16 @@ mod product_creation_delivery_replay_tests {
             let expanded = expand_product_creation_objective(
                 &manager,
                 "expanded-product-objective",
-                "Read @notes.md",
+                "/probe-skill read @notes.md",
                 &origin,
             )
             .await
             .unwrap();
-            assert_eq!(expanded.display_text, "Read @notes.md");
+            assert_eq!(expanded.display_text, "/probe-skill read @notes.md");
             assert!(expanded
                 .llm_text
                 .as_deref()
-                .is_some_and(|text| text.contains("published root contents")));
+                .is_some_and(|text| text.contains("published root contents read @notes.md")));
         }
     }
 
@@ -5835,11 +5988,11 @@ mod model_resolution_tests {
         });
         assert_eq!(
             resolve_creation_model(&registry, None).unwrap(),
-            "gpt-6.1-sol"
+            "gpt-6.2-sol"
         );
         assert_ne!(
-            registry.cheap_model_id_for_provider("gpt-6.1-sol"),
-            "gpt-6.1-sol"
+            registry.cheap_model_id_for_provider("gpt-6.2-sol"),
+            "gpt-6.2-sol"
         );
     }
 
@@ -5871,5 +6024,30 @@ mod model_resolution_tests {
             resolve_creation_model(&registry, Some("mock")).unwrap(),
             "mock"
         );
+    }
+}
+
+/// `task-{id}-{slug}`, or `task-{id}` when the title has no ASCII alphanumerics.
+fn approved_task_branch_name(task_id: &str, task_title: &str) -> String {
+    let slug = slugify_label(task_title);
+    if slug.is_empty() {
+        format!("task-{task_id}")
+    } else {
+        format!("task-{task_id}-{slug}")
+    }
+}
+
+#[cfg(test)]
+mod approved_task_branch_tests {
+    use super::approved_task_branch_name;
+
+    #[test]
+    fn branch_name_has_no_dangling_separator() {
+        assert_eq!(
+            approved_task_branch_name("123", "Fix login"),
+            "task-123-fix-login"
+        );
+        assert_eq!(approved_task_branch_name("123", "日本語"), "task-123");
+        assert!(approved_task_branch_name("123", &"x".repeat(500)).len() < 120);
     }
 }

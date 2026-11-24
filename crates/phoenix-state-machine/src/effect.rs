@@ -98,6 +98,8 @@ pub enum Effect {
 
     /// Persist the new state
     PersistState,
+    /// Complete the owned cancellation notice after its settlement commits.
+    CancellationCompleted { accepted_child: Option<String> },
 
     /// Make an LLM request
     RequestLlm,

@@ -553,11 +553,36 @@ WHEN concurrent consumers request metrics within the observation freshness lease
 THE SYSTEM SHALL coalesce them onto the same generation rather than repeat native process discovery and CPU measurement.
 
 WHILE no resource consumer requests demand observations
-THE SYSTEM SHALL perform no recurring memory or host sampling. Owned bash CPU history SHALL follow the resource-aware cadence defined in `../work-scope-load/requirements.md` REQ-WSLOAD-002.
+THE SYSTEM SHALL perform no recurring memory or host sampling except for the bounded resource flight recorder defined in REQ-DEPLOY-007b. Owned bash CPU history SHALL follow the resource-aware cadence defined in `../work-scope-load/requirements.md` REQ-WSLOAD-002.
 
 THE SYSTEM SHALL preserve unavailable metrics as unavailable rather than zero, and SHALL protect process attribution against PID reuse by validating native process identity across the sampling interval.
 
 **Rationale:** Demand CPU measurement requires an interval and proportional-memory reads are operating-system work. One shared generation amortizes those reads and gives overlapping surfaces consistent values. Owned bash CPU history uses lightweight cumulative CPU counters independently of demand memory and host collection.
+
+### REQ-DEPLOY-007b: Bounded autonomous resource evidence
+
+THE SYSTEM SHALL attempt nonfatal resource-recorder initialization from the typed runtime data directory before database open, independently of structured-log configuration. Startup SHALL prepare the typed runtime data parent using ordinary directory creation if absent, without changing permissions on existing entries; failure SHALL remain nonfatal for the recorder. The storage leaf SHALL require that parent to exist, belong to the effective user, and prohibit group/other writes. The storage leaf SHALL create only its fixed private child and fixed private segments, rejecting unsafe entries without repair. Initialization or writer failure SHALL NOT change required database startup, authority fencing, fatal exit, or restart ordering.
+
+After application state exists, THE SYSTEM SHALL observe resources through the shared resource-monitor generation no more often than once every 60 seconds, waiting a full cadence after each attempt completes without catch-up bursts. About and the recorder SHALL use the same privacy-safe aggregate projection. The recorder SHALL NOT introduce another native process-tree walk, SQL scan, tracking registry, HTTP request, UI, daemon, or general monitoring framework.
+
+THE SYSTEM SHALL bound recorder storage to two 2 MiB segments, each frame including its header to 1 KiB, and the producer queue to one pending observation in addition to the writer's in-flight observation. Producer admission SHALL NOT wait for disk or queue capacity. Storage I/O failure SHALL stop this process's writer and subsequent sampling without automatic retry.
+
+### REQ-DEPLOY-007c: Fixed privacy-safe observations and honest gaps
+
+THE SYSTEM SHALL persist only typed primitives and fixed enums: process PID and Phoenix startup timestamp, startup/running phase, sample time and process/host uptime, resource-generation and disk-observation times, current API RSS, proportional API and deduplicated managed memory, observed managed PID count, host memory/swap/pressure, available disk bytes by fixed database/data/temporary role, live materialized runtime-handle count, and fixed persistence/logging failure observations.
+
+The recorder SHALL NOT persist database or executable paths, filesystem identities, disk locations, process names, source or conversation identifiers, raw error text, payload strings, secrets, or unbounded collections. Disk-role bytes SHALL reuse the deployment-observations space provider. Host swap SHALL use the shared host sampler's memory refresh. Runtime-handle count SHALL use only a short nonblocking runtime-map read; it SHALL NOT represent queued work, active conversations, or the fatal-authority test owner's count.
+
+THE SYSTEM SHALL distinguish current RSS, Linux proportional set size, macOS physical footprint, and lifetime maximum RSS. Missing metrics SHALL be null, not zero, stale substitutes, or invented peaks. Host pressure, lifetime maximum RSS, and SQLite extended error code SHALL be null without a supported observation at their true boundary. SQLite codes SHALL NOT be inferred from error strings. Resource generation and disk times SHALL identify freshness separately from the final sample time.
+
+Startup records SHALL NOT assert that application state or resources were sampled. Unavailable Phoenix startup, sample, resource-generation, and disk-observation timestamps SHALL serialize as null, not an invented zero. Process identities, wall times, and host/process uptime SHALL provide limited evidence across restarts; absent intervals SHALL remain unknown, with no invented samples, boot identity, gap duration, or lifetime peak. A surviving valid frame SHALL NOT itself prove successful sync before a crash.
+
+### REQ-DEPLOY-007d: Failure deltas and persistence truth
+
+THE SYSTEM SHALL snapshot the existing operational boundary counters and logging failure/queue-drop counters without reading the database. The fixed failure slots SHALL be ordinary settlement, required startup authority, vanished settlement owner, other local authority, structured write/flush, stdout write/flush, fatal diagnostic write, trace export, and structured queue drops. Only positive deltas SHALL be reported; null SHALL mean no reported delta, not proof of zero failures or supported coverage. Final snapshot time and the latest known boundary failure time SHALL remain distinct; queue drops have only snapshot time.
+
+Recorder queue-full, disconnected, encoding, and oversized drops SHALL use four fixed positive-delta slots. Failure and drop baselines SHALL advance only after a successful append and sync; a failed observation SHALL NOT consume its delta. Process-local boundary baselines SHALL restart with the process identity. Sampled, queued, appended, and committed recorder counters SHALL remain distinct in the in-memory diagnostic snapshot; neither queue admission nor observation time SHALL claim persistence. Storage failure diagnostics SHALL use fixed failure codes without paths or raw errors.
+
 
 ---
 

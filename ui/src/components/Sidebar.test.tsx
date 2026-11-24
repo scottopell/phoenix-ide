@@ -1,12 +1,12 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import {
   notifyProductConversationListMayHaveChanged,
-  subscribeCloseSnapshotChanged,
   subscribeProductConversationListRevision,
   subscribeProductConversationSnapshotChanged,
 } from '../notifications';
 import { act, render, fireEvent, waitFor } from '@testing-library/react';
 import { Link, MemoryRouter, useLocation } from 'react-router-dom';
+import { refreshProductConversationList } from '../conversation/productConversationList';
 import { ApiResponseError, ConflictError } from '../api';
 import type { Conversation, ProductConversationListRow } from '../api';
 
@@ -72,6 +72,10 @@ const makeProductConversation = (id: string, overrides: Partial<ProductConversat
   latest_transcript_row_id: `latest-${id}`,
   updated_at: '2024-01-01T00:00:00Z',
   presentation: { kind: 'state', display_name: overrides.canonical_root?.title ?? `Root ${id}`, presentation_mode: 'idle' },
+  read_state: { state: 'read' },
+  cached_pr: null,
+  monitored: false,
+  question_with_coordinator_since: null,
   ...overrides,
 });
 
@@ -93,6 +97,7 @@ describe('Sidebar — ProductConversation navigation', () => {
     apiMock.deploymentInfo.mockResolvedValue({ local_access: true });
     apiMock.getLocalServices.mockResolvedValue({ services: [] });
     apiMock.getProductConversationSnapshot.mockRejectedValue(new Error('not a product route'));
+    apiMock.listProductConversations.mockReset();
     apiMock.listProductConversations.mockResolvedValue({
       product_conversations: [
         makeProductConversation('pc-open', { canonical_root: { transcript_row_id: 'root-open', slug: 'root-open', title: 'Open Root' } }),
@@ -112,6 +117,29 @@ describe('Sidebar — ProductConversation navigation', () => {
   });
 
 
+
+  it('opens New without discarding the saved draft language or recovery identity', async () => {
+    localStorage.setItem('phoenix-new-conversation-draft', 'Resume this draft');
+    localStorage.setItem('phoenix-create-llm-language', 'adhd');
+    sessionStorage.setItem('phoenix-active-product-create-request', 'request-pending');
+    function NavigationProbe() {
+      return <output data-testid="new-location">{useLocation().pathname}</output>;
+    }
+    const { getByRole, getByTestId } = render(
+      <MemoryRouter initialEntries={['/c/existing']}>
+        <Sidebar collapsed={false} onToggle={vi.fn()} conversations={[]} archivedConversations={[]}
+          activeSlug="existing" onConversationCreated={vi.fn()} />
+        <NavigationProbe />
+      </MemoryRouter>,
+    );
+    await waitFor(() => expect(apiMock.listProductConversations).toHaveBeenCalled());
+    fireEvent.click(getByRole('button', { name: '+ New' }));
+    expect(getByTestId('new-location')).toHaveTextContent('/new');
+    expect(localStorage.getItem('phoenix-new-conversation-draft')).toBe('Resume this draft');
+    expect(localStorage.getItem('phoenix-create-llm-language')).toBe('adhd');
+    expect(sessionStorage.getItem('phoenix-active-product-create-request')).toBe('request-pending');
+    sessionStorage.removeItem('phoenix-active-product-create-request');
+  });
 
   it('shows a History aggregate with no Archived terminology or legacy Archive action', async () => {
     const { container, getByRole, getAllByText, queryByText, queryByTitle } = render(
@@ -163,29 +191,110 @@ describe('Sidebar — ProductConversation navigation', () => {
     expect(onToggle).toHaveBeenCalledTimes(1);
   });
 
-  it('falls back to cached member rows and retries a failed aggregate refresh', async () => {
+  it('keeps an uncached empty list in loading state across route changes until the first snapshot succeeds', async () => {
+    let resolveList!: (value: { product_conversations: ProductConversationListRow[]; coordinator: null }) => void;
+    apiMock.listProductConversations.mockReturnValueOnce(new Promise((resolve) => { resolveList = resolve; }));
+    function RouteHarness() {
+      const { pathname } = useLocation();
+      return <>
+        <output aria-label="Current route">{pathname}</output>
+        <Link to="/global">Global</Link>
+        <Sidebar collapsed={false} onToggle={vi.fn()} conversations={[]} archivedConversations={[]} activeSlug={pathname.startsWith('/c/') ? pathname.slice(3) : null} onConversationCreated={vi.fn()} />
+      </>;
+    }
+    const { getByRole, queryByText } = render(
+      <MemoryRouter initialEntries={['/c/some-conversation']}>
+        <RouteHarness />
+      </MemoryRouter>,
+    );
+    const signal = apiMock.listProductConversations.mock.calls[0]![0] as AbortSignal;
+
+    expect(getByRole('button', { name: /Open …/ })).toBeInTheDocument();
+    expect(getByRole('button', { name: /History …/ })).toBeInTheDocument();
+    expect(getByRole('list', { name: '' })).toHaveTextContent('Loading conversations');
+    expect(queryByText('No Open conversations')).toBeNull();
+    fireEvent.click(getByRole('link', { name: 'Global' }));
+    expect(getByRole('status', { name: 'Current route' })).toHaveTextContent('/global');
+    expect(getByRole('button', { name: /Open …/ })).toBeInTheDocument();
+    expect(getByRole('button', { name: /History …/ })).toBeInTheDocument();
+    expect(getByRole('list', { name: '' })).toHaveTextContent('Loading conversations');
+    expect(queryByText('No Open conversations')).toBeNull();
+    expect(apiMock.listProductConversations).toHaveBeenCalledTimes(1);
+    expect(signal.aborted).toBe(false);
+
+    await act(async () => {
+      resolveList({ product_conversations: [], coordinator: null });
+    });
+    expect(getByRole('button', { name: 'Open 0' })).toBeInTheDocument();
+    expect(getByRole('list', { name: '' })).toHaveTextContent('No Open conversations');
+  });
+
+  it.each([
+    { label: 'empty', rows: [] },
+    { label: 'nonempty', rows: [makeProductConversation('pc-recovered')] },
+  ])('shows an initial failure and retries to a successful $label snapshot', async ({ rows }) => {
+    let resolveList!: (value: { product_conversations: ProductConversationListRow[]; coordinator: null }) => void;
+    apiMock.listProductConversations.mockReset();
     apiMock.listProductConversations
       .mockRejectedValueOnce(new Error('offline'))
-      .mockResolvedValueOnce({ product_conversations: [makeProductConversation('pc-recovered')] });
-    const cached = makeConv('cached-id', 'cached-slug');
+      .mockReturnValueOnce(new Promise((resolve) => { resolveList = resolve; }));
+    const { container, getByRole, queryByText } = render(
+      <MemoryRouter initialEntries={['/']}>
+        <Sidebar collapsed={false} onToggle={vi.fn()} conversations={[]} archivedConversations={[]} activeSlug={null} onConversationCreated={vi.fn()} />
+      </MemoryRouter>,
+    );
+
+    expect(await waitFor(() => getByRole('status'))).toHaveTextContent('Unable to load conversations');
+    expect(queryByText('No Open conversations')).toBeNull();
+    fireEvent.click(getByRole('button', { name: 'Retry' }));
+    expect(getByRole('list', { name: '' })).toHaveTextContent('Loading conversations');
+    expect(queryByText('No Open conversations')).toBeNull();
+    await act(async () => {
+      resolveList({ product_conversations: rows, coordinator: null });
+    });
+    if (rows.length > 0) {
+      expect(container.querySelector('[data-product-conversation-id="pc-recovered"]')).not.toBeNull();
+    } else {
+      expect(getByRole('list', { name: '' })).toHaveTextContent('No Open conversations');
+    }
+  });
+
+  it('preserves cached-empty provenance and count when refresh fails', async () => {
+    localStorage.setItem('phoenix:product-conversation-list:v1', JSON.stringify({ product_conversations: [], coordinator: null }));
+    (globalThis as { __phoenixResetProductConversationListSnapshot?: () => void })
+      .__phoenixResetProductConversationListSnapshot?.();
+    apiMock.listProductConversations.mockRejectedValueOnce(new Error('offline'));
+    const { getByRole } = render(
+      <MemoryRouter initialEntries={['/']}>
+        <Sidebar collapsed={false} onToggle={vi.fn()} conversations={[]} archivedConversations={[]} activeSlug={null} onConversationCreated={vi.fn()} />
+      </MemoryRouter>,
+    );
+
+    expect(await waitFor(() => getByRole('status'))).toHaveTextContent('Showing cached conversations');
+    expect(getByRole('button', { name: 'Open 0' })).toBeInTheDocument();
+    expect(getByRole('list', { name: '' })).toHaveTextContent('No Open conversations');
+  });
+
+  it('renders cached product rows when the refresh fails and recovers on retry', async () => {
+    localStorage.setItem('phoenix:product-conversation-list:v1', JSON.stringify({
+      product_conversations: [makeProductConversation('pc-cached')],
+      coordinator: null,
+    }));
+    (globalThis as { __phoenixResetProductConversationListSnapshot?: () => void })
+      .__phoenixResetProductConversationListSnapshot?.();
+    apiMock.listProductConversations.mockReset();
+    apiMock.listProductConversations
+      .mockRejectedValueOnce(new Error('offline'))
+      .mockResolvedValueOnce({ product_conversations: [makeProductConversation('pc-recovered')], coordinator: null });
 
     const { container, getByRole } = render(
-      <MemoryRouter initialEntries={['/c/cached-slug']}>
-        <Sidebar
-          collapsed={false}
-          onToggle={vi.fn()}
-          conversations={[cached]}
-          archivedConversations={[]}
-          activeSlug="cached-slug"
-          onConversationCreated={vi.fn()}
-        />
+      <MemoryRouter initialEntries={['/c/root-pc-cached']}>
+        <Sidebar collapsed={false} onToggle={vi.fn()} conversations={[]} archivedConversations={[]} activeSlug="root-pc-cached" onConversationCreated={vi.fn()} />
       </MemoryRouter>,
     );
 
     await waitFor(() => expect(getByRole('status')).toHaveTextContent('Showing cached conversations'));
-    expect(container.querySelector('[data-id="cached-id"]')).not.toBeNull();
-    fireEvent.click(getByRole('button', { name: 'Conversation actions' }));
-    expect(container.querySelector('.conv-item-actions')?.textContent).not.toContain('Rename');
+    expect(container.querySelector('[data-product-conversation-id="pc-cached"]')).not.toBeNull();
     fireEvent.click(getByRole('button', { name: 'Retry' }));
     await waitFor(() => expect(container.querySelector('[data-product-conversation-id="pc-recovered"]')).not.toBeNull());
     expect(apiMock.listProductConversations).toHaveBeenCalledTimes(2);
@@ -201,11 +310,19 @@ describe('Sidebar — ProductConversation navigation', () => {
       ...row, canonical_route: '/c/generated-name',
       canonical_root: { ...row.canonical_root, title: 'Generated Name', slug: 'generated-name' },
       presentation: { kind: 'state', display_name: 'Generated Name', presentation_mode: 'idle' },
+      read_state: { state: 'read' },
+      cached_pr: null,
+      monitored: false,
+      question_with_coordinator_since: null,
     });
     apiMock.renameProductConversation.mockResolvedValue({
       ...row,
       canonical_root: { ...row.canonical_root, title: 'Renamed Product Title' },
       presentation: { kind: 'state', display_name: 'Renamed Product Title', presentation_mode: 'idle' },
+      read_state: { state: 'read' },
+      cached_pr: null,
+      monitored: false,
+      question_with_coordinator_since: null,
     });
     const listRevisionListener = vi.fn();
     const unsubscribe = subscribeProductConversationListRevision(listRevisionListener);
@@ -597,7 +714,7 @@ describe('Sidebar — ProductConversation navigation', () => {
       </MemoryRouter>,
     );
 
-    notifyProductConversationListMayHaveChanged();
+    await act(async () => { await refreshProductConversationList(); });
     await waitFor(() => expect(container.querySelector('[data-product-conversation-id="pc-newer"]')).not.toBeNull());
     resolveFirst({ product_conversations: [makeProductConversation('pc-older')] });
 
@@ -659,63 +776,6 @@ describe('Sidebar — ProductConversation navigation', () => {
 
     await waitFor(() => expect(container.querySelector('[data-product-conversation-id="pc-updated"]')).not.toBeNull());
     expect(apiMock.listProductConversations).toHaveBeenCalledTimes(2);
-  });
-
-  it('notifies the active Close surface when Close starts a server-authoritative attempt', async () => {
-    apiMock.listProductConversations.mockRejectedValueOnce(new Error('offline'));
-    apiMock.archiveConversation.mockRejectedValueOnce(new ConflictError({
-      error: 'close loss confirmation required',
-      error_type: 'close_loss_confirmation_required',
-    }));
-    const listener = vi.fn();
-    const unsubscribe = subscribeCloseSnapshotChanged('cached-id', listener);
-
-    const { getByTitle } = render(
-      <MemoryRouter initialEntries={['/c/cached-slug']}>
-        <Sidebar
-          collapsed={false}
-          onToggle={vi.fn()}
-          conversations={[makeConv('cached-id', 'cached-slug')]}
-          archivedConversations={[]}
-          activeSlug="cached-slug"
-          onConversationCreated={vi.fn()}
-        />
-      </MemoryRouter>,
-    );
-
-    fireEvent.click(await waitFor(() => getByTitle('Actions')));
-    fireEvent.click(await waitFor(() => getByTitle('Close conversation "cached-slug"')));
-    await waitFor(() => expect(listener).toHaveBeenCalledTimes(1));
-    unsubscribe();
-  });
-
-  it('does not notify the Close surface for non-close compatibility failures', async () => {
-    apiMock.listProductConversations.mockRejectedValueOnce(new Error('offline'));
-    apiMock.archiveConversation.mockRejectedValueOnce(new ConflictError({
-      error: 'other conflict',
-      error_type: 'proposal_resolved',
-    }));
-    const listener = vi.fn();
-    const unsubscribe = subscribeCloseSnapshotChanged('cached-id', listener);
-
-    const { getByTitle } = render(
-      <MemoryRouter initialEntries={['/c/cached-slug']}>
-        <Sidebar
-          collapsed={false}
-          onToggle={vi.fn()}
-          conversations={[makeConv('cached-id', 'cached-slug')]}
-          archivedConversations={[]}
-          activeSlug="cached-slug"
-          onConversationCreated={vi.fn()}
-        />
-      </MemoryRouter>,
-    );
-
-    fireEvent.click(await waitFor(() => getByTitle('Actions')));
-    fireEvent.click(await waitFor(() => getByTitle('Close conversation "cached-slug"')));
-    await waitFor(() => expect(apiMock.archiveConversation).toHaveBeenCalledTimes(1));
-    expect(listener).toHaveBeenCalledTimes(0);
-    unsubscribe();
   });
 
   it('labels the global nav entry as Ember', async () => {

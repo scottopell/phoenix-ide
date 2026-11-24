@@ -218,6 +218,58 @@ pub struct QuestionAnnotation {
     pub notes: Option<String>,
 }
 
+/// Render answers to structured questions as the agent reads them, in question
+/// order: `"question" = "answer"`, then any selected preview and user notes.
+/// Questions without an answer are left out.
+#[must_use]
+pub fn render_question_answers<S: std::hash::BuildHasher>(
+    questions: &[UserQuestion],
+    answers: &std::collections::HashMap<String, String, S>,
+    annotations: Option<&std::collections::HashMap<String, QuestionAnnotation, S>>,
+) -> String {
+    questions
+        .iter()
+        .filter_map(|question| {
+            let answer = answers.get(&question.question)?;
+            let mut parts = vec![format!("\"{}\" = \"{}\"", question.question, answer)];
+            let selected_preview = question
+                .options
+                .iter()
+                .find(|option| option.label == *answer)
+                .and_then(|option| option.preview.as_deref());
+            if let Some(preview) = selected_preview {
+                parts.push(format!("selected preview:\n{preview}"));
+            }
+            if let Some(notes) = annotations
+                .and_then(|annotations| annotations.get(question.question.as_str()))
+                .and_then(|annotation| annotation.notes.as_ref())
+            {
+                parts.push(format!("user notes: {notes}"));
+            }
+            Some(parts.join(" "))
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// True when every question has exactly one non-blank answer keyed by its
+/// full text, and every note belongs to an answered question. Answers given on
+/// someone else's behalf (the Coordinator's tool, Ember's question card) must
+/// meet this before they are accepted.
+pub fn answers_cover_questions<V, S: std::hash::BuildHasher>(
+    questions: &[UserQuestion],
+    answers: &std::collections::HashMap<String, String, S>,
+    notes: Option<&std::collections::HashMap<String, V, S>>,
+) -> bool {
+    answers.len() == questions.len()
+        && questions.iter().all(|question| {
+            answers
+                .get(&question.question)
+                .is_some_and(|answer| !answer.trim().is_empty())
+        })
+        && notes.is_none_or(|notes| notes.keys().all(|key| answers.contains_key(key)))
+}
+
 /// Input for the `ask_user_question` tool (REQ-AUQ-001)
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AskUserQuestionInput {
@@ -1113,6 +1165,7 @@ mod tests {
                 completed_results: vec![],
                 cause: crate::domain::sm_event::CancelCause::UserRequested,
                 spawn_tool_id: None,
+                forced_tool_retirement: ForcedToolRetirement::NotObserved,
             },
             ConvState::Completed {
                 result: "ok".into(),
@@ -1448,6 +1501,14 @@ pub struct ServerOverloadRetry {
     pub model_id: String,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ForcedToolRetirement {
+    #[default]
+    NotObserved,
+    Observed,
+}
+
 /// Conversation state
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -1553,9 +1614,14 @@ pub enum ConvState {
         cause: crate::domain::sm_event::CancelCause,
         /// `tool_use_id` of the originating `spawn_agents` call, when teardown
         /// began from `AwaitingSubAgents`. `None` for the `CancellingTool`-origin
-        /// path (no spawn id exists), which suppresses result persistence to
-        /// avoid an orphaned `tool_result`. Transient/owned like `cause`.
+        /// path; its results use a standalone summary instead of a tool result.
+        /// Transient/owned like `cause`.
         spawn_tool_id: Option<String>,
+        // owned: pre-feature rows recorded no forced-retirement fact. Startup
+        // reconciliation decodes them before phase reset; NotObserved is correct,
+        // no migration owed.
+        #[serde(default)]
+        forced_tool_retirement: ForcedToolRetirement,
     },
 
     /// Sub-agent completed successfully (terminal state, sub-agent only)
@@ -1716,6 +1782,9 @@ pub enum CoreState {
         cause: crate::domain::sm_event::CancelCause,
         /// See `ConvState::CancellingSubAgents::spawn_tool_id`.
         spawn_tool_id: Option<String>,
+        // owned: same pre-feature absence as ConvState::CancellingSubAgents.
+        #[serde(default)]
+        forced_tool_retirement: ForcedToolRetirement,
     },
     Error {
         message: String,
@@ -1892,11 +1961,13 @@ impl From<CoreState> for ConvState {
                 completed_results,
                 cause,
                 spawn_tool_id,
+                forced_tool_retirement,
             } => ConvState::CancellingSubAgents {
                 pending,
                 completed_results,
                 cause,
                 spawn_tool_id,
+                forced_tool_retirement,
             },
             CoreState::Error {
                 message,
@@ -1995,11 +2066,13 @@ impl TryFrom<ConvState> for ParentState {
                 completed_results,
                 cause,
                 spawn_tool_id,
+                forced_tool_retirement,
             } => Ok(ParentState::Core(CoreState::CancellingSubAgents {
                 pending,
                 completed_results,
                 cause,
                 spawn_tool_id,
+                forced_tool_retirement,
             })),
             ConvState::Error {
                 message,
@@ -2130,11 +2203,13 @@ impl TryFrom<ConvState> for SubAgentState {
                 completed_results,
                 cause,
                 spawn_tool_id,
+                forced_tool_retirement,
             } => Ok(SubAgentState::Core(CoreState::CancellingSubAgents {
                 pending,
                 completed_results,
                 cause,
                 spawn_tool_id,
+                forced_tool_retirement,
             })),
             ConvState::Error {
                 message,

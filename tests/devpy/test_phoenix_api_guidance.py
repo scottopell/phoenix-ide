@@ -27,7 +27,7 @@ class PhoenixApiGuidanceTests(unittest.TestCase):
         )[0]
 
     def test_question_json_matches_registered_route_and_payload(self):
-        self.assertIn('"/api/conversations/:id/respond", post(respond_to_question)', self.handlers)
+        self.assertIn('"/api/conversations/{id}/respond", post(respond_to_question)', self.handlers)
         self.assertIn("POST /api/conversations/{id}/respond", self.recipe)
         match = re.search(r"```json\s+(.*?)\s+```", self.recipe, re.S)
         self.assertIsNotNone(match)
@@ -75,15 +75,17 @@ class PhoenixApiGuidanceTests(unittest.TestCase):
 
     def test_answers_and_notes_match_transition_and_ui_not_extra_guarantees(self):
         transition = (ROOT / "crates/phoenix-state-machine/src/transition.rs").read_text()
-        response = transition.split("let answers_text = questions", 1)[1].split(
-            "let user_text =", 1
+        self.assertIn("let answers_text = phoenix_core::domain::sm_state::render_question_answers(", transition)
+        sm_state = (ROOT / "crates/phoenix-core/src/domain/sm_state.rs").read_text()
+        response = sm_state.split("pub fn render_question_answers", 1)[1].split(
+            "\n}\n", 1
         )[0]
-        self.assertIn(".filter_map(|q|", response)
-        self.assertIn("answers.get(&q.question)?", response)
-        self.assertIn("ann.notes", response)
-        self.assertNotIn("ann.preview", response)
-        self.assertIn(".find(|o| o.label == *a)", response)
-        self.assertIn("o.preview.as_deref()", response)
+        self.assertIn(".filter_map(|question|", response)
+        self.assertIn("answers.get(&question.question)?", response)
+        self.assertIn("annotation.notes", response)
+        self.assertNotIn("annotation.preview", response)
+        self.assertIn(".find(|option| option.label == *answer)", response)
+        self.assertIn("option.preview.as_deref()", response)
         panel = (ROOT / "ui/src/components/QuestionPanel.tsx").read_text()
         self.assertIn("result[q.question] = labels.join(', ')", panel)
         for text in ("every exact full question text", "backend does not enforce answer completeness",
@@ -141,7 +143,7 @@ class PhoenixApiGuidanceTests(unittest.TestCase):
             "## Respond to a pending structured question", 1
         )[0]
         self.assertEqual(re.findall(r"^(\d)\. ", recipe, re.M), ["1", "2", "3", "4", "5"])
-        self.assertIn('"/api/conversations/:id/chat",', self.handlers)
+        self.assertIn('"/api/conversations/{id}/chat",', self.handlers)
         self.assertIn("post(send_chat).layer(DefaultBodyLimit::max(MAX_MULTIPART_BODY_BYTES))", self.handlers)
         self.assertIn("POST /api/conversations/{original_transcript_id}/chat", recipe)
         body = json.loads(re.search(r"```json\s+(.*?)\s+```", recipe, re.S).group(1))

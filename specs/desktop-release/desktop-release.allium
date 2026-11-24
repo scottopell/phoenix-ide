@@ -3,7 +3,7 @@
 --
 -- Scope: exact-tag gating, paired architecture-specific helper/app builds,
 -- Developer ID signing, notarization, and private publication preparation.
--- Requirement traceability: REQ-DESKTOP-REL-001/002/003/005/007/008/009/010/011/012/013.
+-- Requirement traceability: REQ-DESKTOP-REL-001/002/003/005/007/008/009/010/011/012/013/014/015.
 
 enum TagGateState { unresolved | exact_tag_match | new_tag_created | refused }
 enum ArtifactState { pending | built | verified | failed }
@@ -157,6 +157,9 @@ surface DesktopReleaseWorkflow {
         ReleaseTagCreated(gate)
         ExactReleaseTagFound(gate)
         ReleaseGateRejected(gate)
+        FrozenRc8ReleaseTagRequested(gate, tag_input)
+        FrozenRc8PreparationRequested(preparation, tag_input)
+        FrozenRc9PreparationRequested(preparation, tag_input)
         StandaloneHelperVerified(pair)
         DesktopAppVerified(pair)
         NotarizationSubmitted(pair)
@@ -180,6 +183,38 @@ surface DesktopReleaseWorkflow {
 
 -- Helpers
 --
+-- frozen_rc8_source_and_ci_are_exact(identity, tag_input) -> Boolean
+--   REQ-DESKTOP-REL-002/014 fixed candidate, tree, version, deployment-helper
+--   digest and candidate ref match; RC7 is an ancestor of the candidate and
+--   RC7's exact application parent is an ancestor of main. The workflow runs
+--   from exact current main. Nonempty tag_input is rejected before candidate
+--   qualification. The latest exact-candidate ci.yml workflow_dispatch run must
+--   be completed successful; no older-success fallback or source selectors exist.
+-- frozen_rc9_source_and_ci_are_exact(identity, tag_input) -> Boolean
+--   REQ-DESKTOP-REL-014 fixed RC9 commit/tree/version/helper/ref match, with RC7
+--   as sole direct parent, the exact nine-path scope and version-only bytes.
+--   Exact current-main controller and application-base ancestry match; tag input
+--   is empty. Latest exact-candidate ci.yml workflow_dispatch is completed
+--   successful, including ordinary success of both proof-publication witnesses.
+--   No source/version/run selectors, older-success fallback or RC8 evidence apply.
+-- frozen_rc8_preparation_run_qualifies(gate) -> Boolean
+--   REQ-DESKTOP-REL-002: repository scottopell/phoenix-ide run 44975553897,
+--   attempt 1, release.yml workflow_dispatch at controller
+--   b2af8a67d592a415cdf16e13eaf72c1b648ff072 is completed successful and exposes
+--   both nonexpired macOS payload artifacts and both exact-candidate/run/attempt
+--   success headless artifacts named by the requirement. Missing, unreadable,
+--   incomplete, failed or mismatched evidence is false, including in-progress runs.
+-- frozen_rc8_release_is_eligible(gate, tag_input) -> Boolean
+--   Both fixed source/CI and preparation-run predicates hold, gate identity is
+--   the fixed RC8 identity, its tag is absent, and its version follows every
+--   existing supported release tag. Existing RC8 tags are refused, never replaced.
+-- frozen_rc8_rebuild_uses_existing_publication_path(gate) -> Boolean
+--   Tagging selects only the fixed candidate. Release matrices rebuild its bytes;
+--   the existing signing, notarization, native acceptance and exact private-draft
+--   publisher checks apply to those newly built bytes. Preparation artifacts are
+--   eligibility evidence, not bytes promoted to release or acceptance of rebuilt
+--   bytes, and grant no deployment or installation authority.
+--
 -- valid_release_identity(identity) -> Boolean
 --   identity.version is exactly X.Y.Z or X.Y.Z-rc.N, where N is within the
 --   supported positive bound; its tag and channel are derived from that version.
@@ -188,6 +223,17 @@ surface DesktopReleaseWorkflow {
 -- bundle_versions_match_release_identity(pair) -> Boolean
 --   pair's app uses numeric Apple marketing/build versions derived from its
 --   complete authoritative stable or RC release identity.
+-- ordinary_release_operation(gate) -> Boolean
+--   gate is an ordinary version-push release or exact-tag retry, rather than a fixed frozen
+--   publication exception or a preparation operation.
+-- latest_exact_source_ci_succeeded(gate) -> Boolean
+--   the latest GitHub Actions run of ci.yml for push on main whose head commit is
+--   gate.identity.full_commit completed successfully. Selection and completion
+--   wait are bounded to 3600 seconds; API errors, timeout, or any other conclusion
+--   fail closed. No pull-request, parent-commit, or other-workflow run qualifies.
+--   Historical exact-tag retries require the same evidence; absent qualification
+--   refuses admission. Successful admission is a snapshot for the Release run;
+--   partial job reruns may reuse it, while a rerun of the gate requalifies.
 -- tag_absent(gate) -> Boolean
 --   no tag derived from gate.identity.version exists.
 -- no_other_release_workflow_is_mutating(gate) -> Boolean
@@ -343,11 +389,53 @@ surface DesktopReleaseWorkflow {
 --   one inaccessible publication exists for publication.identity and can resume
 --   without replacing its release object.
 
+rule FrozenRc8ReleaseRequiresFixedCompletedQualification {
+    when: FrozenRc8ReleaseTagRequested(gate, tag_input)
+    requires: gate.state = unresolved
+    requires: frozen_rc8_release_is_eligible(gate, tag_input)
+    requires: no_other_release_workflow_is_mutating(gate)
+    requires: pending_replacement_has_explicit_disposition(gate)
+    ensures: gate.state = new_tag_created
+    ensures: tag_points_at_exact_commit(gate)
+    ensures: frozen_rc8_rebuild_uses_existing_publication_path(gate)
+}
+
+rule FrozenRc8ReleaseRefusesUnqualifiedRequests {
+    when: FrozenRc8ReleaseTagRequested(gate, tag_input)
+    requires: gate.state = unresolved
+    requires: not frozen_rc8_release_is_eligible(gate, tag_input)
+    ensures: gate.state = refused
+}
+
+rule FrozenRc8PreparationRetainsNoPublicationAuthority {
+    when: FrozenRc8PreparationRequested(preparation, tag_input)
+    requires: frozen_rc8_source_and_ci_are_exact(preparation.identity, tag_input)
+    ensures: preparation_has_no_release_authority(preparation)
+    ensures: preparation_uses_release_security_path(preparation) implies sanitized_preparation_receipts_exist(preparation)
+    ensures: preparation.verified = (preparation_uses_release_security_path(preparation) and required_native_pairs_passed(preparation))
+}
+
+rule FrozenRc9PreparationRetainsNoPublicationAuthority {
+    when: FrozenRc9PreparationRequested(preparation, tag_input)
+    requires: frozen_rc9_source_and_ci_are_exact(preparation.identity, tag_input)
+    ensures: preparation_has_no_release_authority(preparation)
+    ensures: preparation_uses_release_security_path(preparation) implies sanitized_preparation_receipts_exist(preparation)
+    ensures: preparation.verified = (preparation_uses_release_security_path(preparation) and required_native_pairs_passed(preparation))
+}
+
+rule FrozenRc9PreparationRefusesUnqualifiedRequests {
+    when: FrozenRc9PreparationRequested(preparation, tag_input)
+    requires: not frozen_rc9_source_and_ci_are_exact(preparation.identity, tag_input)
+    ensures: preparation.verified = false
+    ensures: preparation_has_no_release_authority(preparation)
+}
+
 rule GateCreatesOnlyRepresentableReleaseTag {
     when: ReleaseTagCreated(gate)
     requires: gate.state = unresolved
     requires: valid_release_identity(gate.identity)
     requires: bundle_version_representable(gate.identity)
+    requires: not ordinary_release_operation(gate) or latest_exact_source_ci_succeeded(gate)
     requires: tag_absent(gate)
     requires: no_other_release_workflow_is_mutating(gate)
     requires: pending_replacement_has_explicit_disposition(gate)
@@ -362,6 +450,7 @@ rule GateAcceptsOnlyExistingExactTag {
     requires: valid_release_identity(gate.identity)
     requires: bundle_version_representable(gate.identity)
     requires: tag_points_at_exact_commit(gate)
+    requires: not ordinary_release_operation(gate) or latest_exact_source_ci_succeeded(gate)
     ensures: gate.state = exact_tag_match
 }
 

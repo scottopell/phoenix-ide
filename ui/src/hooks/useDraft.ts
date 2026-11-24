@@ -19,6 +19,38 @@ function readDraft(conversationId: string): string {
   }
 }
 
+function readProductDraft(scopeKey: string, legacyTranscriptId: string): string {
+  try {
+    const current = localStorage.getItem(storageKey(scopeKey));
+    // An empty stored value is a cleared-draft tombstone: it must take
+    // precedence over a legacy transcript key that could not be removed.
+    if (current !== null) return current;
+    const legacyKey = storageKey(legacyTranscriptId);
+    const legacy = localStorage.getItem(legacyKey);
+    if (legacy === null) return '';
+    try {
+      localStorage.setItem(storageKey(scopeKey), legacy);
+      localStorage.removeItem(legacyKey);
+    } catch (error) {
+      console.warn('Error persisting transcript draft migration:', error);
+    }
+    return legacy;
+  } catch (error) {
+    console.warn('Error moving transcript draft to product scope:', error);
+    return '';
+  }
+}
+
+function writeProductDraft(scopeKey: string, value: string): void {
+  try {
+    // Keep an empty value rather than removing the key so a failed legacy-key
+    // cleanup cannot make an explicitly cleared draft reappear on revisit.
+    localStorage.setItem(storageKey(scopeKey), value);
+  } catch (error) {
+    console.warn('Error saving product draft to localStorage:', error);
+  }
+}
+
 function writeDraft(conversationId: string, value: string): void {
   try {
     if (value === '') {
@@ -50,6 +82,11 @@ function useDraftStore() {
     throw new Error('useDraft* hooks must be used within ConversationProvider');
   }
   return store;
+}
+
+export function useAnnotationDraft(slug: string) {
+  const store = useDraftStore();
+  return useMemo(() => store.annotations.forScope(slug), [store, slug]);
 }
 
 /**
@@ -118,25 +155,31 @@ export function useDraftActions(slug: string): DraftActions {
  * Re-renders are confined to the `<DraftLifecycle>` wrapper component,
  * which returns null — zero DOM work.
  */
-export function useDraftLifecycle(slug: string): void {
+export function useDraftLifecycle(slug: string, productScope?: { legacyTranscriptSlug: string } | undefined): void {
   const draft = useDraftValue(slug);
-  const conversationId = useConversationSnapshot(slug)?.id ?? null;
+  const transcriptSlug = productScope?.legacyTranscriptSlug ?? slug;
+  const transcriptId = useConversationSnapshot(transcriptSlug)?.id ?? null;
+  const conversationId = productScope ? slug : transcriptId;
+  const isProductScope = productScope !== undefined;
   const store = useDraftStore();
+  const lifetime = useMemo(() => store.recovery(slug), [store, slug]);
 
   // Hydrate once per conversationId. `useLayoutEffect` runs after render
   // but before browser paint, so the first frame already reflects the
   // stored draft.
   const hydratedForRef = useRef<string | null>(null);
   useLayoutEffect(() => {
-    if (!conversationId) return;
+    if (!lifetime.isCurrent() || !conversationId || (productScope && !transcriptId)) return;
     if (hydratedForRef.current === conversationId) return;
     hydratedForRef.current = conversationId;
     if (draft) return;
-    const stored = readDraft(conversationId);
+    const stored = productScope
+      ? readProductDraft(conversationId, transcriptId!)
+      : readDraft(conversationId);
     if (stored) {
       store.dispatch(slug, { type: 'set_draft', text: stored });
     }
-  }, [conversationId, draft, slug, store]);
+  }, [conversationId, draft, lifetime, productScope, slug, store, transcriptId]);
 
   // Debounced write-through. On a conversationId change with a pending
   // write for the prior conversation, flush it synchronously before
@@ -145,30 +188,35 @@ export function useDraftLifecycle(slug: string): void {
   const pendingRef = useRef<{
     timer: number | null;
     conversationId: string | null;
-    value: string | null;
-  }>({ timer: null, conversationId: null, value: null });
+    flush: (() => void) | null;
+  }>({ timer: null, conversationId: null, flush: null });
 
   useEffect(() => {
-    if (!conversationId) return;
+    if (!lifetime.isCurrent() || !conversationId) return;
     if (hydratedForRef.current !== conversationId) return;
     const pending = pendingRef.current;
     if (pending.timer !== null) {
       window.clearTimeout(pending.timer);
       if (
         pending.conversationId !== null &&
-        pending.conversationId !== conversationId &&
-        pending.value !== null
+        pending.conversationId !== conversationId
       ) {
-        writeDraft(pending.conversationId, pending.value);
+        pending.flush?.();
       }
     }
+    const currentDraft = store.getSnapshot(slug).draft;
     pending.conversationId = conversationId;
-    pending.value = draft;
+    const flush = () => {
+      if (!lifetime.isCurrent()) return;
+      if (isProductScope) writeProductDraft(conversationId, currentDraft);
+      else writeDraft(conversationId, currentDraft);
+    };
+    pending.flush = flush;
     pending.timer = window.setTimeout(() => {
-      writeDraft(conversationId, draft);
+      flush();
       pending.timer = null;
     }, DEBOUNCE_MS);
-  }, [conversationId, draft]);
+  }, [conversationId, draft, isProductScope, lifetime, slug, store]);
 
   // Flush any pending write on unmount (page close, navigation away).
   useEffect(() => {
@@ -177,9 +225,7 @@ export function useDraftLifecycle(slug: string): void {
       if (pending.timer !== null) {
         window.clearTimeout(pending.timer);
         pending.timer = null;
-        if (pending.conversationId !== null && pending.value !== null) {
-          writeDraft(pending.conversationId, pending.value);
-        }
+        pending.flush?.();
       }
     };
   }, []);
@@ -187,8 +233,8 @@ export function useDraftLifecycle(slug: string): void {
 
 /** Hosts {@link useDraftLifecycle} in isolation so the keystroke-frequency
  *  draft-value subscription doesn't re-render any sibling subtree. */
-export function DraftLifecycle({ slug }: { slug: string }): null {
-  useDraftLifecycle(slug);
+export function DraftLifecycle({ slug, productScope }: { slug: string; productScope?: { legacyTranscriptSlug: string } | undefined }): null {
+  useDraftLifecycle(slug, productScope);
   return null;
 }
 

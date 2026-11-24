@@ -1,9 +1,16 @@
-import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { ProductConversationListRow } from '../api';
 import { ApiResponseError, api } from '../api';
+import { __testing } from '../conversation/productConversationList';
 import { ConversationListPage } from './ConversationListPage';
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((res) => { resolve = res; });
+  return { promise, resolve };
+}
 
 const pageMocks = vi.hoisted(() => ({
   refresh: vi.fn().mockResolvedValue(undefined),
@@ -78,6 +85,10 @@ const productConversation = (title = 'Mobile Product'): ProductConversationListR
   latest_transcript_row_id: 'latest-mobile',
   updated_at: '2026-01-01T00:00:00Z',
   presentation: { kind: 'state', display_name: title, presentation_mode: 'idle' },
+  read_state: { state: 'read' },
+  cached_pr: null,
+  monitored: false,
+  question_with_coordinator_since: null,
 });
 
 function touchActivate(element: HTMLElement): void {
@@ -88,6 +99,7 @@ function touchActivate(element: HTMLElement): void {
 
 describe('ConversationListPage mobile ProductConversation actions', () => {
   beforeEach(() => {
+    __testing.reset();
     vi.clearAllMocks();
     pageMocks.refresh.mockResolvedValue(undefined);
     pageMocks.isOnline = true;
@@ -96,7 +108,47 @@ describe('ConversationListPage mobile ProductConversation actions', () => {
     vi.mocked(api.codexLoginPreflight).mockResolvedValue({} as never);
     vi.mocked(api.listProductConversations).mockResolvedValue({
       product_conversations: [productConversation()],
+      coordinator: null,
     });
+  });
+
+  it('keeps a ready mobile page loading until an uncached product-list request succeeds', async () => {
+    const request = deferred<{ product_conversations: ProductConversationListRow[]; coordinator: null }>();
+    vi.mocked(api.listProductConversations).mockReturnValue(request.promise);
+    pageMocks.isReady = true;
+    pageMocks.refresh.mockResolvedValue(undefined);
+
+    render(<MemoryRouter initialEntries={['/']}><ConversationListPage /></MemoryRouter>);
+    expect(screen.getByTitle('Loading conversations')).toBeInTheDocument();
+    expect(screen.queryByText('No Open conversations')).toBeNull();
+    expect(pageMocks.refresh).toHaveBeenCalled();
+
+    await act(async () => request.resolve({ product_conversations: [], coordinator: null }));
+    expect(screen.queryByTitle('Loading conversations')).toBeNull();
+    expect(screen.getByText('No Open conversations')).toBeInTheDocument();
+    expect(screen.queryByRole('status')).toBeNull();
+  });
+
+  it('shows an initial load failure without claiming cached or empty data, then retries to real empty success', async () => {
+    const retry = deferred<{ product_conversations: ProductConversationListRow[]; coordinator: null }>();
+    vi.mocked(api.listProductConversations)
+      .mockRejectedValueOnce(new Error('offline'))
+      .mockReturnValueOnce(retry.promise);
+    pageMocks.isReady = true;
+    pageMocks.refresh.mockResolvedValue(undefined);
+
+    render(<MemoryRouter initialEntries={['/']}><ConversationListPage /></MemoryRouter>);
+    expect(await screen.findByRole('status')).toHaveTextContent('Unable to load conversations — offline');
+    expect(screen.queryByText(/Showing cached conversations/)).toBeNull();
+    expect(screen.queryByText('No Open conversations')).toBeNull();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Retry' }));
+    expect(screen.queryByRole('status')).toBeNull();
+    expect(screen.getByTitle('Loading conversations')).toBeInTheDocument();
+    await act(async () => retry.resolve({ product_conversations: [], coordinator: null }));
+    expect(screen.queryByTitle('Loading conversations')).toBeNull();
+    expect(screen.getByText('No Open conversations')).toBeInTheDocument();
+    expect(screen.queryByRole('status')).toBeNull();
   });
 
   it('orders the pinned mobile header as toolbar, Ember, then Open and History', async () => {
@@ -151,6 +203,7 @@ describe('ConversationListPage mobile ProductConversation actions', () => {
     touchActivate(await screen.findByRole('button', { name: 'Rename conversation Mobile Product' }));
     const input = screen.getByRole('textbox');
     fireEvent.change(input, { target: { value: 'Renamed on Mobile' } });
+    vi.mocked(api.listProductConversations).mockResolvedValue({ product_conversations: [renamed], coordinator: null });
     touchActivate(screen.getByRole('button', { name: 'Rename' }));
 
     await waitFor(() => expect(api.renameProductConversation).toHaveBeenCalledWith(
@@ -169,7 +222,7 @@ describe('ConversationListPage mobile ProductConversation actions', () => {
   });
 
   it.each(['open', 'history'] as const)('restores Actions focus after %s confirmation cancellation', async (state) => {
-    if (state === 'history') vi.mocked(api.listProductConversations).mockResolvedValue({ product_conversations: [{ ...productConversation(), lifecycle: { state: 'history' } }] });
+    if (state === 'history') vi.mocked(api.listProductConversations).mockResolvedValue({ product_conversations: [{ ...productConversation(), lifecycle: { state: 'history' } }], coordinator: null });
     render(<MemoryRouter><ConversationListPage /></MemoryRouter>);
     if (state === 'history') fireEvent.click(await screen.findByRole('button', { name: 'History 1' }));
     const trigger = await screen.findByRole('button', { name: 'Actions for conversation Mobile Product' });
@@ -193,7 +246,7 @@ describe('ConversationListPage mobile ProductConversation actions', () => {
       lifecycle: { state: 'history' as const },
       latest_transcript_row_id: 'root-mobile',
     };
-    vi.mocked(api.listProductConversations).mockResolvedValue({ product_conversations: [history] });
+    vi.mocked(api.listProductConversations).mockResolvedValue({ product_conversations: [history], coordinator: null });
     vi.mocked(api.deleteChain).mockResolvedValue({
       success: true,
       outcome: {
@@ -218,7 +271,7 @@ describe('ConversationListPage mobile ProductConversation actions', () => {
       lifecycle: { state: 'history' as const },
       latest_transcript_row_id: 'successor-mobile',
     };
-    vi.mocked(api.listProductConversations).mockResolvedValue({ product_conversations: [history] });
+    vi.mocked(api.listProductConversations).mockResolvedValue({ product_conversations: [history], coordinator: null });
     vi.mocked(api.deleteChain).mockRejectedValue(new ApiResponseError('gone', 404));
     render(<MemoryRouter><ConversationListPage /></MemoryRouter>);
 
@@ -239,7 +292,7 @@ describe('ConversationListPage mobile ProductConversation actions', () => {
       latest_transcript_row_id: 'successor-mobile',
     };
     vi.mocked(api.listProductConversations)
-      .mockResolvedValueOnce({ product_conversations: [history] })
+      .mockResolvedValueOnce({ product_conversations: [history], coordinator: null })
       .mockRejectedValueOnce(new Error('refresh failed'));
     vi.mocked(api.deleteChain).mockResolvedValue({
       success: true,
@@ -271,6 +324,7 @@ describe('ConversationListPage mobile ProductConversation actions', () => {
     vi.mocked(api.closeProductConversation).mockResolvedValue(undefined);
     vi.mocked(api.listProductConversations).mockResolvedValue({
       product_conversations: [{ ...productConversation(), latest_transcript_row_id: 'root-mobile' }],
+      coordinator: null,
     });
     render(<MemoryRouter><ConversationListPage /></MemoryRouter>);
 

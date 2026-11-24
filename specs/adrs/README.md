@@ -17,6 +17,12 @@ Controlled-functional build isolation is governed by [ADR-119](119_separate-cont
 
 Creation terminal evidence and image delivery lifetime are governed by [ADR-207](207_creation-receipt-evidence-and-image-payload-lifetime.md), affecting REQ-CCR-013–015.
 
+Federated native create and rename extend the shared-action decision in [ADR-191](191_native-create-and-rename-use-shared-application-actions.md): [ADR-243](243_federated-native-create-and-rename-use-destination-actions.md), affecting REQ-FED-021–024, REQ-GR-024, REQ-CCR-013, and REQ-CID-007.
+
+Historical native locator qualification is governed by [ADR-245](245_historical-native-locators-preserve-bytes-without-fabricating-trust.md), qualifying only ADR-243's historical backfill and retained-provenance assumptions; ADR-243 remains accepted for live actions. Affects REQ-FED-021 and REQ-FED-023.
+
+Canonical migration 158-to-156 reconciliation is governed by [ADR-246](246_admit-exact-canonical-158-before-156-ledger.md), qualifying only ADR-187's post-129 registered-predecessor continuity rule for the exact supported registry transition. Affects REQ-COMP-002, REQ-COMP-020, and REQ-COMP-022.
+
 Codex reset-credit visibility and manual redemption, including resuming the stopped conversation after a redemption from its quota error, are governed by [ADR-208](208_codex-reset-credits-are-manual-and-resume-the-stopped-conversation.md), affecting REQ-CRR-001–010.
 
 Strict local-only selection of Kache v1.2.2 on macOS arm64 is governed by [ADR-225](225_kache-v1-2-2-strict-local-only-selection.md), superseding only ADR-224's selection conclusion; ADR-223 and ADR-224 retain their historical v1.0.0 evidence. Remote caching remains deferred.
@@ -38,9 +44,46 @@ Allowing gaps does not approve an ID allocation, decision, or publication.
 
 | ADR | Title | Status | Affects |
 | --- | --- | --- | --- |
-| [244](244_native-task-approval-source-snapshot-and-receipt.md) | Bind native task approval to canonical source, snapshot and receipt | Proposed | REQ-TAT-001–008; REQ-PROJ-003; REQ-BED-028/046; REQ-COMP-001/002; REQ-DWF-043 |
-| [246](246_close-uses-exact-blockers-and-explicit-retry-only.md) | Close uses exact blockers and explicit retry only | Accepted; supersedes 245's automatic completion policy and 088's in-Close discard/disposable alternative | REQ-WL-002/002a/002b/002c/002d/002e/002f/004; REQ-BED-029 |
-| [245](245_unified-close-idempotence-and-bounded-completion-retry.md) | Unified Close is idempotent with one bounded completion-only retry | Proposed | REQ-WL-002f; REQ-BED-029; `close_conversation`, retained Close operation and run identity |
+| [284](284_native-task-approval-source-snapshot-and-receipt.md) | Bind native task approval to canonical source, snapshot and receipt | Proposed | REQ-TAT-001–008; REQ-PROJ-003; REQ-BED-028/046; REQ-COMP-001/002; REQ-DWF-043 |
+| [283](283_close-uses-exact-blockers-and-explicit-retry-only.md) | Close uses exact blockers and explicit retry only | Accepted; supersedes 282's automatic completion policy and 088's in-Close discard/disposable alternative | REQ-WL-002/002a/002b/002c/002d/002e/002f/004; REQ-BED-029 |
+| [282](282_unified-close-idempotence-and-bounded-completion-retry.md) | Unified Close is idempotent with one bounded completion-only retry | Proposed | REQ-WL-002f; REQ-BED-029; `close_conversation`, retained Close operation and run identity |
+| [274](274_remove-at-file-inclusion.md) | Remove `@file` content inclusion and leave `@` literal | Accepted | REQ-IR-001, REQ-IR-004, REQ-IR-006, REQ-IR-007, REQ-IR-010, REQ-FE-011 |
+| [273](273_fixed-rc9-preparation-without-publication-authority.md) | Fixed RC9 preparation without publication authority | Accepted | REQ-DESKTOP-REL-014 |
+| [272](272_bound-exhaustive-backup-verification-to-fifteen-minutes.md) | Bound exhaustive backup verification to fifteen minutes | Accepted; qualifies ADR-263 | REQ-LDD-029, REQ-LDD-031 |
+| [271](271_gate-ordinary-publication-on-exact-source-ci.md) | Gate ordinary publication on exact merged-source CI | Accepted | REQ-DESKTOP-REL-015 |
+| [270](270_publish-fixed-rc8-through-rebuilt-release-path.md) | Publish fixed RC8 through the rebuilt release path | Accepted | REQ-DESKTOP-REL-002/010/014 |
+| [280](280_enforce-requested-reserve-at-launchd-candidate-boundary.md) | Enforce requested reserve at the launchd candidate boundary | Accepted | REQ-LDD-002, REQ-LDD-004, REQ-LDD-029, REQ-LDD-033, REQ-COMP-021 |
+| [279](279_qualify-codex-namespaced-native-search-calls.md) | Qualify Codex's namespaced native search calls | Accepted | REQ-LLM-004n, REQ-LLM-005 |
+| [278](278_native-openai-and-shared-local-tool-discovery.md) | Use native OpenAI discovery with a shared local selector | Accepted | REQ-LLM-004i/004j/004m/004n, REQ-LLM-005 |
+| [277](277_preserve-gemini-tool-result-images.md) | Preserve Gemini tool-result images | Accepted | REQ-LLM-004, REQ-BT-003, REQ-BT-006 |
+| [276](276_preserve-gemini-tool-signatures-through-chat-completions.md) | Preserve Gemini tool signatures through Chat Completions | Accepted | REQ-LLM-002–005, REQ-LLM-007 |
+| [275](275_prefer-sol-6-2-for-new-conversations.md) | Prefer Sol 6.2 for new conversations | Accepted | REQ-LLM-003 |
+| [269](269_external-models-in-user-toml.md) | Load external model definitions from user TOML at startup | Accepted | REQ-LLM-003c, REQ-AG-010 |
+| [264](264_scan-only-coordinator-history-with-host-owned-batches.md) | Scan only Coordinator history through bounded host-owned batches | Accepted | REQ-SCAN-001–008, REQ-TRACK-004–007 |
+| [263](263_verify-native-backup-and-bound-predecessor-recovery-for-macos-deploy.md) | Verify a native backup and bound predecessor recovery for macOS deploy | Accepted; qualifies ADR-230 | REQ-LDD-002/004/009/029–031, REQ-PD-010, REQ-COMP-021 |
+| [265](265_publish-recovered-launchd-plist-before-canonical-bootstrap.md) | Preserve SQLite path and recovered launchd plist identity | Accepted; qualifies ADR-263 | REQ-LDD-029–030 |
+| [267](267_publish-exact-frozen-rc7-candidate.md) | Publish the exact frozen RC7 candidate | Accepted | REQ-DESKTOP-REL-002 |
+| [268](268_personal-slack-channel-submissions.md) | Accept personal Slack channel submissions | Accepted | REQ-SG-002/005/007/009/011/016/017/020 |
+| [266](266_preserve-settled-text-blocks-with-content-witness.md) | Preserve settled text-block starts with an ephemeral content witness | Accepted | REQ-VT-001, REQ-VT-004, REQ-VT-010, REQ-VT-014 |
+| [262](262_retire-delivery-roadmap-with-preserved-history.md) | Retire the delivery roadmap while preserving historical evidence | Accepted | REQ-ROADMAP-001–014 |
+| [261](261_completion-events-capture-occurrence-bound-ending-evidence.md) | Completion events capture occurrence-bound ending evidence | Accepted | REQ-CEVT-006–009, REQ-RET-012 |
+| [260](260_coordinator-tracking-retains-intent-at-the-transcript-tail.md) | Retain Coordinator intent independently of continuations | Accepted | REQ-TRACK-001–007, REQ-GR-011 |
+| [259](259_bounded-resource-recorder-reuses-shared-observations.md) | A bounded resource recorder reuses shared observations | Accepted | REQ-DEPLOY-007a–007d |
+| [258](258_search-hidden-visibility-trusts-fts-index.md) | Ranked search trusts indexed text for hidden-message eligibility | Accepted | REQ-RET-003, REQ-RET-007 |
+| [257](257_watch-list-requests-separate-local-and-remote-shapes.md) | Watch listing separates local and remote request shapes | Accepted | REQ-FED-009 |
+| [256](256_new-conversations-default-to-automatic-context-continuation.md) | New conversations default to automatic context continuation | Accepted; partially supersedes 054 | REQ-BED-021, REQ-API-029, REQ-CONV-024 |
+| [255](255_compact-annotation-stack-with-modal-editing.md) | Compact annotation stack with modal editing | Accepted | REQ-PF-019–020 |
+| [254](254_editable-annotation-cards-own-pending-source-highlights.md) | Editable annotation cards own pending source highlights | Superseded by ADR-255 | REQ-PF-018–020 |
+| [253](253_reaction-pill-grows-with-wrapped-text.md) | Reaction pills grow with wrapped text | Accepted | REQ-PF-018–020, REQ-KB-004 |
+| [252](252_server-side-read-cursor-per-product-conversation.md) | Server-side read cursor per ProductConversation | Accepted | REQ-CONV-027 |
+| [251](251_explicit-loopback-oauth-callback-urls.md) | Explicit loopback OAuth callback URLs reuse the fixed-port listener | Accepted | REQ-MCP-020 |
+| [250](250_saved-messages-create-private-any-age-captures.md) | Saved messages create private captures of any age | Accepted | REQ-SG-001/003–007/017/019 |
+| [249](249_slack-uses-one-configurable-trigger-emoji.md) | Slack uses one configurable trigger emoji | Accepted | REQ-SG-002/004/005/018 |
+| [248](248_slack-emoji-aliases-share-discovery-and-reinitialize-baselines.md) | Slack emoji aliases share discovery and reinitialize baselines | Superseded by ADR-249 | REQ-SG-002/004/005/018 |
+| [247](247_trusted-inline-research-inherits-saved-peer-query-selection.md) | Trusted Coordinator inline research can select saved peers for read-only SQL | Accepted | REQ-RQD-001/010, REQ-FED-001, REQ-GR-007 |
+| [246](246_admit-exact-canonical-158-before-156-ledger.md) | Admit the exact canonical 158-before-156 ledger | Accepted; qualifies ADR-187 post-129 registered-predecessor continuity only | REQ-COMP-002; REQ-COMP-020; REQ-COMP-022 |
+| [245](245_historical-native-locators-preserve-bytes-without-fabricating-trust.md) | Historical native locators preserve bytes without fabricating trust | Accepted; qualifies ADR-243 historical assumptions only | REQ-FED-021; REQ-FED-023 |
+| [243](243_federated-native-create-and-rename-use-destination-actions.md) | Federated native create and rename use destination actions | Accepted | REQ-FED-021–024; REQ-GR-024; REQ-CCR-013; REQ-CID-007 |
 | [242](242_execution-bound-own-goal-creation-and-enable.md) | Execution-bound own Goal creation and explicit continuation enable | Accepted | REQ-SGT-001–008; REQ-GOAL-AC-001–004 |
 | [230](230_simplify-macos-deployment-to-candidate-migration-and-manual-recovery.md) | Simplify macOS deployment to candidate migration and manual recovery | Accepted | REQ-LDD-001–032, REQ-PD-031, REQ-COMP-021, REQ-SDC-001–023, REQ-RU-008 |
 | [208](208_codex-reset-credits-are-manual-and-resume-the-stopped-conversation.md) | Codex reset credits are redeemed manually through a Phoenix proxy, and a redemption from the quota error resumes that conversation | Accepted | REQ-CRR-001–010 |
@@ -114,7 +157,7 @@ Allowing gaps does not approve an ID allocation, decision, or publication.
 | [066](066_coordinator-activity-is-queried-on-demand.md) | Coordinator activity is queried on demand | Accepted | REQ-GR-010/011/013 |
 | [067](067_workscope-authority-projects-one-runtime-capability.md) | WorkScope authority projects one runtime capability | Accepted | REQ-BED-028, REQ-BED-046, REQ-BASH-013a, REQ-PROJ-008; runtime tool and sub-agent authority |
 | [068](068_work-children-share-parent-development-trust.md) | Work children share parent development trust | Accepted | REQ-PROJ-008, REQ-BED-018; unsandboxed Work children and parent lifecycle ownership |
-| [069](069_roadmap-records-are-typed-facts-projected-milestone-first.md) | Roadmap records are typed facts projected milestone-first | Accepted | REQ-ROADMAP-001, REQ-ROADMAP-002, REQ-ROADMAP-003, REQ-ROADMAP-004, REQ-ROADMAP-005, REQ-ROADMAP-006, REQ-ROADMAP-007, REQ-ROADMAP-008, REQ-ROADMAP-009, REQ-ROADMAP-010, REQ-ROADMAP-011, REQ-ROADMAP-012, REQ-ROADMAP-013, REQ-ROADMAP-014 |
+| [069](069_roadmap-records-are-typed-facts-projected-milestone-first.md) | Roadmap records are typed facts projected milestone-first | Superseded by ADR-262 | REQ-ROADMAP-001, REQ-ROADMAP-002, REQ-ROADMAP-003, REQ-ROADMAP-004, REQ-ROADMAP-005, REQ-ROADMAP-006, REQ-ROADMAP-007, REQ-ROADMAP-008, REQ-ROADMAP-009, REQ-ROADMAP-010, REQ-ROADMAP-011, REQ-ROADMAP-012, REQ-ROADMAP-013, REQ-ROADMAP-014 |
 | [070](070_trusted-input-provenance-and-global-watches.md) | Trusted input provenance and explicit Global conversation watches | Accepted | REQ-GR-007, REQ-GR-014, REQ-GR-015 |
 | [071](071_historical-input-retries-retain-unknown-provenance.md) | Historical input retries retain unknown provenance | Accepted | REQ-GR-014, REQ-DWF-039, REQ-COMP-001 |
 
@@ -255,7 +298,7 @@ Consult the relevant ADRs before starting work of each kind.
 | Changing Codex route admission or private continuation account identity | 085, preserving 062's advisory discovery policy |
 | Changing MCP credential removal or restart recovery | 086, within 034's compatibility scope |
 | Changing automatic HTTP connection recovery or Slack connection-health reporting | 240, within 034 and 086's recovery scope |
-| Specifying native Close, exact blockers, failure, startup observation, History cleanup attention, mandatory Global failure delivery, or explicit safe retry | 246 supersedes 245's automatic completion-only policy and 088's in-Close discard/disposable alternative; retain 088's bounded execution/lifecycle policy, 241's writer evidence, and the identity/ownership safeguards of 026/040/041/042/080 |
+| Specifying native Close, exact blockers, failure, startup observation, History cleanup attention, mandatory Global failure delivery, or explicit safe retry | 283 supersedes 282's automatic completion-only policy and 088's in-Close discard/disposable alternative; retain 088's bounded execution/lifecycle policy, 241's writer evidence, and the identity/ownership safeguards of 026/040/041/042/080 |
 | Creating or restructuring Phoenix spec artifacts | 000 |
 | Deciding whether to create a new `design.md` | 000 |
 | Migrating legacy `specs/*/design.md` content | 000, 001, 002, 003, 004, 005, 006 |
@@ -310,7 +353,7 @@ Consult the relevant ADRs before starting work of each kind.
 | Specifying projects task-file shapes, proposal classification, or managed approval behavior across taskmd and plain markdown briefs | 023 |
 | Specifying continuation summary retry, restart recovery, or exactly-once commit | 025 |
 | Specifying provider prompt persistence authority, bounded transcript projection, or continuation prompt freezing | 045, then 025 and 031 |
-| Specifying opt-in automatic continuation consent, admission, or generated-context authority | 054, then 025, 031, 045, and 046 |
+| Specifying automatic continuation defaults, consent, admission, or generated-context authority | 256 for new-aggregate defaults; 054, then 025, 031, 045, and 046 for admission and authority |
 | Specifying iOS grounding, server-backed file browsing, prose reading, or anchored comments | 030, then 029, 028, and 026 for draft authority, reader sessions, the companion boundary, ProductConversation, and WorkScope ownership |
 | Specifying ordinary-parent predecessor recall, planning-parent recall eligibility, or continuation recall orientation | 051, then 027, 031, and 045 |
 
@@ -414,6 +457,8 @@ Capacity planning across ordinary requests, handoffs and model switches is gover
 
 Generated handoff readability and explicit source authority are governed by [ADR-147](147_readable-generated-handoffs-retain-source-authority.md); automatic initiation remains governed by ADR-054.
 
-Goals schema extraction and refusal of unsupported migration lineages are governed by [187](187_goal-main-migration-identity-reconciliation.md), implementing REQ-COMP-020 without extending deployment compatibility.
+Goals schema extraction and refusal of unsupported migration lineages are governed by [187](187_goal-main-migration-identity-reconciliation.md), implementing REQ-COMP-020 without extending deployment compatibility. [ADR-246](246_admit-exact-canonical-158-before-156-ledger.md) qualifies only its predecessor-continuity rule for the exact canonical 158-high ledger whose sole missing embedded predecessor in the post-129 registered tail is migration 156.
 
 Goal admission requires explicit automatic continuation without locking existing Goal management or the OFF gesture: [192](192_goal-admission-requires-explicit-auto-continue.md), implementing REQ-GOAL-AC-001–004.
+
+Exact installed predecessor retention with same-transaction verified database recovery evidence is governed by [281](281_retain-exact-installed-predecessor-for-manual-recovery.md), implementing REQ-LDD-034 and REQ-COMP-023.

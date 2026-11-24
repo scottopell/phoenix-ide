@@ -440,29 +440,37 @@ impl PeerCaCertificatePem {
 }
 
 fn validate_peer_ca_certificate(der: &[u8]) -> Result<(), PeerCaCertificatePemError> {
-    use x509_parser::prelude::FromDer as _;
+    use x509_cert::der::oid::AssociatedOid as _;
+    use x509_cert::der::{Decode as _, Reader as _, SliceReader};
+    use x509_cert::ext::pkix::KeyUsage;
 
-    let (remainder, certificate) = x509_parser::certificate::X509Certificate::from_der(der)
+    let mut reader = SliceReader::new(der).map_err(|_| PeerCaCertificatePemError::Invalid)?;
+    let certificate = x509_cert::Certificate::decode(&mut reader)
         .map_err(|_| PeerCaCertificatePemError::Invalid)?;
-    let basic_constraints = certificate
-        .get_extension_unique(&x509_parser::oid_registry::OID_X509_EXT_BASIC_CONSTRAINTS)
-        .map_err(|_| PeerCaCertificatePemError::Invalid)?
+    let extensions = certificate
+        .tbs_certificate
+        .extensions
+        .as_deref()
+        .unwrap_or_default();
+    let unique_extension = |oid| {
+        let mut matches = extensions
+            .iter()
+            .filter(|extension| extension.extn_id == oid);
+        match (matches.next(), matches.next()) {
+            (_, Some(_)) => Err(PeerCaCertificatePemError::Invalid),
+            (found, None) => Ok(found.map(|extension| extension.extn_value.as_bytes())),
+        }
+    };
+    let basic_constraints = unique_extension(x509_cert::ext::pkix::BasicConstraints::OID)?
         .ok_or(PeerCaCertificatePemError::NotCertificateAuthority)?;
-    if !remainder.is_empty() {
+    if !reader.is_finished() {
         return Err(PeerCaCertificatePemError::Invalid);
     }
-    validate_basic_constraints_der(basic_constraints.value)?;
-    if let Some(key_usage) = certificate
-        .get_extension_unique(&x509_parser::oid_registry::OID_X509_EXT_KEY_USAGE)
-        .map_err(|_| PeerCaCertificatePemError::Invalid)?
-    {
-        validate_key_usage_der(key_usage.value)?;
-        let (key_usage_remainder, key_usage) =
-            x509_parser::extensions::KeyUsage::from_der(key_usage.value)
-                .map_err(|_| PeerCaCertificatePemError::Invalid)?;
-        if !key_usage_remainder.is_empty() {
-            return Err(PeerCaCertificatePemError::Invalid);
-        }
+    validate_basic_constraints_der(basic_constraints)?;
+    if let Some(key_usage) = unique_extension(KeyUsage::OID)? {
+        validate_key_usage_der(key_usage)?;
+        let key_usage =
+            KeyUsage::from_der(key_usage).map_err(|_| PeerCaCertificatePemError::Invalid)?;
         if !key_usage.key_cert_sign() {
             return Err(PeerCaCertificatePemError::NotCertificateAuthority);
         }

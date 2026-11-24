@@ -2,7 +2,7 @@
 
 ## Scope
 
-One owner's three Slack gestures create or reuse ordinary local Phoenix
+One owner's emoji gestures, optional Saved-message captures, and personal-channel submissions create or reuse ordinary local Phoenix
 conversations through shared native services and the existing Slack MCP connection.
 Explicit requests receive intentional source-thread answers. Other-author reactions
 prepare separate private briefings. Thread reuse and exact reply coverage remain.
@@ -13,6 +13,9 @@ prepare separate private briefings. Thread reuse and exact reply coverage remain
 |---|---|---|
 | REQ-SG-001 | Partial | Implemented; current candidate validation and production limits below. |
 | REQ-SG-002 | Partial | Implemented; current candidate validation and production limits below. |
+| REQ-SG-018: Configure one trigger emoji | Implemented | Single-string configuration, narrow queries, list removal, and preserving upgrade pass focused checks and local adversarial review. Hosted qualification and deployment remain separate. |
+| REQ-SG-019: Capture a discussion privately with Save for later | Implemented; locally verified | Durable Saved scope/baseline, private outcomes, retained progress and shared polling pass focused tests and local review. Phoenix-owned live qualification and activation remain separate. |
+| REQ-SG-020: Submit work through a personal Slack channel | Implemented; locally verified | Channel initialization, owner-note authority, source deduplication, restart preservation, fresh native conversations and linked thread returns pass local checks. No channel activation is included. |
 | REQ-SG-003 | Partial | Implemented; current candidate validation and production limits below. |
 | REQ-SG-004 | Partial | Implemented; current candidate validation and production limits below. |
 | REQ-SG-005 | Partial | Implemented; current candidate validation and production limits below. |
@@ -29,64 +32,103 @@ prepare separate private briefings. Thread reuse and exact reply coverage remain
 | REQ-SG-016 | Partial | Implemented; current candidate validation and production limits below. |
 | REQ-SG-017 | Partial | Implemented; current candidate validation and production limits below. |
 
-## Simplification
+## Current behavior
 
-REQ-SG-017 projects shared MCP connection health separately from stored scan
-status, checks required tools and warns when the last completed scan predates
-the four-calendar-date window. These changes are implemented; local verification
-is recorded in the [MCP implementation matrix](../mcp/executive.md#automatic-http-recovery-implementation).
-Live fault-injection acceptance and production deployment remain open. Slack adds
-no reconnect worker, signal retries, schema conversion or wider discovery window.
+The personal-channel addition follows [ADR-268](../adrs/268_personal-slack-channel-submissions.md):
+owner-authored top-level submissions supply notes as instructions and forwards as
+context. Results return in the submission thread with a Phoenix link; subsequent
+interaction is in Phoenix. Existing channel messages are baseline-only. Tests use
+generalized connector fixtures; private channel identities and content are not
+committed. Implementation and current qualification do not authorize live activation.
 
-ADR-155 replaces independent signal recovery with single-attempt behavior.
-Private commands record submission, rejection or uncertainty without receipt
-inspection or automatic retry. Eyes is claimed once before calling Slack; failure
-or interruption cannot retry it. These signals never block an otherwise settled
-account change. Clarifications contain only a generic Phoenix handoff and link;
-question bodies and options remain native. Thread replies retain durable delivery
-and exact request coverage. They have at most three durably claimed attempts,
-including pre-dispatch failures; definitely-unsent exhaustion records failure and
-queues one private notice. Negative acknowledgment envelopes remain unconfirmed
-when their error detail is missing or malformed.
+[ADR-249](../adrs/249_slack-uses-one-configurable-trigger-emoji.md) replaces
+multi-emoji aliases with one configurable Slack name. Prefix and owner-reaction
+queries each use that name directly. Changing the name establishes a new baseline;
+saving the same normalized name preserves progress. Accepted work, source identity,
+thread reuse, and delivery duties remain unchanged.
 
-Deleted runtime code includes receipt inspection, inspection scheduling, private
-retry handling, question-text rendering and question-retirement synchronization.
-Obsolete retry tests are replaced by single-attempt failure/restart regressions.
-ADR-188 removes prototype compatibility. One final `142/slack_gateway_v1`
-schema replaces the unmerged migration chain. Obsolete question associations,
-question snapshots, notification inspection metadata and historical trigger
-provenance are absent. Existing lineage preflight refuses prototype identities
-before mutation. Upstream migration history through 141 is unchanged.
+The settings retain the three workflow explanations: an owner prefix or reaction
+to the owner's message requests a Slack reply; an owner reaction to another
+person's message prepares a private briefing. Plain replies do not trigger work.
+Eyes and private notifications remain single-attempt, best-effort signals.
+Clarifications direct the owner into Phoenix. Accepted work and intentional
+thread replies retain their existing durable recovery.
 
 ## Validation
 
-Creation-receipt retention migration147 changes the deletion expectation in `request_status_links_require_native_publication`: deleting the predecessor retains its published creation receipt and original identities. The test still requires ordinary native routing and Slack product links to resolve a remaining live successor, then requires both request/return links to become unavailable after last-transcript deletion while the same receipt remains. Coordinator creation history remains tied to the original transcript and does not inherit that successor route. Hosted qualification at head `4e0857e662203` (synthetic merge `d7e4e2dd282a6`) exposed the obsolete cascade-deletion assertion; the corrected test and whole owning Slack DB module await new exact-source qualification. Earlier validation below is historical, not PASS for the retention successor.
+Focused checks cover scalar configuration and invalid/list input, all three
+custom-emoji workflows, narrow search terms, baseline changes, and upgrade/reopen
+from the published list schema. Upgrade keeps the first saved name, preserves
+single-emoji progress, and discards unsupported multi-emoji query positions.
+Baseline readiness, accepted requests, return coverage, and backoff survive.
+The gateway, Slack database and settings/compatibility suites pass. These include
+Saved initialization, any-age/any-author source verification, private failure and
+question outcomes, scope separation, restart continuity, shared allowance and
+provider-ceiling incompleteness. Clippy and the selected static/spec/UI checks
+pass; ast-grep is unavailable locally. Local review findings are fixed
+and the final focused recheck is clean. Hosted qualification and production
+deployment remain separate.
 
-All 292 Rust migration, lineage, gateway, Goal and replay tests pass on the
-reconciled schema.
-Coverage includes fresh installation, prototype refusal before mutation, native
-attribution, restart admission and delivery, exact request coverage, generic
-clarification handoffs, bounded reply attempts and one-attempt signals.
-
-Eleven UI/static checks pass; seven final static checks also pass after test
-fixture consolidation. The full developer-tool suite and spec-shape checks pass
-with native Bash/OpenSSL and without a shared Cargo target override. Upstream
-migration definitions through 141 are byte-for-byte unchanged.
-
-Integration with main preserves canonical checkpoint transactions and their
-receipt schema. Briefing completion remains atomic and checkpoint replay cannot
-duplicate its private notice. Ten UI/static checks and three final static checks
-pass. Hosted CI and normal automatic review run on the reconciled candidate
-before merge.
+Channel-specific checks cover the generalized forwarded-message envelope, optional
+channel validation, independent baseline and retained page state, provider ceilings,
+shared allowance, a preserving canonical-schema upgrade, and two fresh native
+conversations with host-added Phoenix links. Read-access inspection stops before
+starting a workflow sample without enough remaining allowance. Clarifications and
+plain follow-ups stay in Phoenix. The original Slack discussion is never the
+automatic return destination.
 
 ## Production boundary
 
-The enabled production pilot is an earlier accepted build. Source IDs, recipient
-routing, credentials, provider adapters and private operational records stay outside
-the public repository. The redesigned settings and later hardening are not claimed
-deployed by pilot evidence.
+Saved capture is an opt-in addition under [ADR-250](../adrs/250_saved-messages-create-private-any-age-captures.md).
+It accepts any source age, initializes independently, and has no source-message
+acknowledgment or thread response. It has been deployed and an owner-run capture
+has produced a native briefing. The personal-channel addition is not deployed or activated.
 
-The public feature supports only the final schema on canonical Phoenix data.
-The pilot and other unmerged development ledgers require separate offline
-reconciliation and paired rollback qualification. No prototype conversion or new
-production deployment is implied. The protected deployment gate stays intact.
+Production runs the canonical public schema with the single-emoji and Saved
+features installed. The channel addition requires a preserving schema upgrade.
+Private configuration, recipients, and operational records stay outside
+the public repository.
+
+Discovery remains bounded by the connector's pagination and existing call allowance.
+Emoji discovery retains its four-calendar-date window; Saved discovery has no
+source-message age cutoff. Removing multi-emoji support fixes the
+unsupported OR query; it does not remove the connector's page limit.
+
+## Saved capture verification and open qualification
+
+Controlled read-only checks observe zero, one, two, then one saved message as the
+owner saves and unsaves test sources. The removed reply remains readable without
+the Saved predicate, excluding access loss as the explanation for its disappearance.
+Two one-result pages produce distinct messages followed by a terminal empty page.
+Own-author and other-author sources are covered; the saved reply retains the right
+parent and supports an exact bounded source-plus-parent read. The connected owner
+matches production, whose current MCP catalog exposes the same search inputs.
+
+No Saved timestamp is returned. No new source messages, reactions, notifications,
+native conversations, production setting changes or application changes were made
+for this verification. Test source IDs and content are not public evidence.
+
+The Saved candidate adds normalized scan progress and a distinct source scope,
+with a preserving migration for accepted identities, return coverage and native
+provenance. It shares the serial worker, 16-call allowance, backoff and accepted-work
+reserve with emoji discovery. First initialization baselines existing saves;
+re-enabling and retained-state restart preserve progress and handled identities.
+Emoji-setting changes do not reset Saved state. No source acknowledgment or thread
+return is created by Saved work, including questions, refusal or failure.
+
+Spec-only adversarial reviews found and resolved observation-authority,
+metadata-scope and fresh-prefix ordering inconsistencies. The project-level spec
+review is clean. Implementation review found a mismatched test assertion and a
+missing compatibility probe argument; both are corrected with regression coverage.
+A follow-up check also retains the workspace-identity argument form, which omits
+that optional argument. Its regression test and final review recheck pass.
+
+Production-owned read inspection has demonstrated Saved access. Channel forwarding
+has been checked read-only through the chat connector; that check does not establish
+Phoenix-owned channel transport qualification or authorize activation. Before channel
+activation, qualify the installed transport and approve a controlled live test. Local tests
+exercise any-age and any-author sources, independent scopes, restart continuity,
+private outcomes and shared scheduling. A simulated collection beyond the
+connector's page ceiling must remain visibly incomplete, preserve readiness and
+accepted work, and leave the last-complete marker unchanged. No range-based paging
+continuation or fixed discovery latency is promised.

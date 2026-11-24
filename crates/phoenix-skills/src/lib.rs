@@ -145,18 +145,11 @@ struct SkillFrontmatter {
 
 /// Parse skill metadata from SKILL.md YAML frontmatter.
 ///
-/// Expects the file to start with `---\n`, followed by `key: value` lines,
-/// closed by `\n---\n`. Returns `None` if either required field is missing or the
+/// Expects the file to start with a `---` line, followed by `key: value` lines,
+/// closed by another `---` line (LF or CRLF endings). Returns `None` if either required field is missing or the
 /// frontmatter is malformed.
 fn parse_skill_frontmatter(content: &str) -> Option<SkillFrontmatter> {
-    let body = content.strip_prefix("---\n")?;
-    let end = body.find("\n---\n").or_else(|| {
-        // Handle frontmatter at end of file with no trailing newline after ---
-        body.find("\n---").filter(|&i| i + 4 == body.len())
-    })?;
-    // Safety: `end` is from `find()` on `body`
-    #[allow(clippy::string_slice)]
-    let frontmatter = &body[..end];
+    let (frontmatter, _body) = split_frontmatter(content)?;
 
     let mut name: Option<String> = None;
     let mut description: Option<String> = None;
@@ -681,57 +674,145 @@ pub fn invoke_trusted_coordinator_builtin(
     Ok(content)
 }
 
-/// Strip YAML frontmatter (--- delimited block at the top of the file).
-/// Returns the body content after the closing ---.
-fn strip_frontmatter(content: &str) -> String {
-    let trimmed = content.trim_start();
-    if !trimmed.starts_with("---") {
-        return content.to_string();
+/// Split `content` into `(frontmatter, body)` at strict `---` delimiter lines.
+///
+/// The first line must be exactly `---` (trailing whitespace allowed) and the
+/// closing delimiter is the next line that is exactly `---`. Lines such as
+/// `----`, `--- title` or `---more` are never delimiters. Both LF and CRLF line
+/// endings are accepted. Returns `None` when there is no closed block.
+fn split_frontmatter(content: &str) -> Option<(&str, &str)> {
+    let mut lines = content.split_inclusive('\n');
+    let open = lines.next()?;
+    if open.trim_end() != "---" {
+        return None;
     }
-    // Safety: we checked that `trimmed` starts with "---" (3 bytes), so
-    // slicing at byte offset 3 is a valid UTF-8 boundary.
-    #[allow(clippy::string_slice)]
-    let after_open = &trimmed[3..];
-    if let Some(end_pos) = after_open.find("\n---") {
-        // Skip past the closing "---" and any trailing newline
-        // Safety: `end_pos` is from `find()` on `after_open`; adding 4
-        // accounts for "\n---" (4 bytes). The result is a valid UTF-8 boundary.
-        #[allow(clippy::string_slice)]
-        let body_start_str = &after_open[end_pos + 4..];
-        body_start_str.trim_start_matches('\n').to_string()
-    } else {
-        content.to_string()
+    let fm_start = open.len();
+    let mut offset = fm_start;
+    for line in lines {
+        if line.trim_end() == "---" {
+            // Safety: offsets are sums of `split_inclusive` segment lengths,
+            // so they fall on UTF-8 boundaries.
+            #[allow(clippy::string_slice)]
+            let parts = (&content[fm_start..offset], &content[offset + line.len()..]);
+            return Some(parts);
+        }
+        offset += line.len();
+    }
+    None
+}
+
+/// True when `line` is a top-level `key:` line (bare or quoted key).
+fn is_frontmatter_key_line(line: &str) -> bool {
+    let Some((key, _)) = line.split_once(':') else {
+        return false;
+    };
+    let quoted = key.len() >= 2
+        && ((key.starts_with('"') && key.ends_with('"'))
+            || (key.starts_with('\'') && key.ends_with('\'')));
+    quoted
+        || (key.starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_')
+            && key
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.')))
+}
+
+/// True when the block is a YAML mapping: it opens with a `key:` line and every
+/// other top-level line is blank, a comment, an indented continuation, a `key:`
+/// line, or an indentless sequence item (`- x`) belonging to a preceding key.
+/// Prose or a bare list between two horizontal rules is not a mapping.
+fn looks_like_frontmatter_mapping(block: &str) -> bool {
+    let mut seen_key = false;
+    block.lines().all(|line| {
+        let t = line.trim_end();
+        if t.is_empty() || t.starts_with('#') || t.starts_with([' ', '\t']) {
+            return true;
+        }
+        if is_frontmatter_key_line(t) {
+            seen_key = true;
+            return true;
+        }
+        seen_key && (t == "-" || t.starts_with("- "))
+    })
+}
+
+/// Strip YAML frontmatter (--- delimited block at the top of the file).
+/// Returns the body content after the closing ---. Content that only
+/// resembles frontmatter (a leading horizontal rule) is returned unchanged.
+fn strip_frontmatter(content: &str) -> String {
+    match split_frontmatter(content.trim_start()) {
+        Some((block, body)) if looks_like_frontmatter_mapping(block) => {
+            body.trim_start_matches(['\r', '\n']).to_string()
+        }
+        _ => content.to_string(),
     }
 }
 
 /// Substitute argument placeholders in the skill body.
-/// Order: `$ARGUMENTS[N]` and `$N` first (to prevent `$ARGUMENTS` from
-/// corrupting them), then `$ARGUMENTS`. If no placeholder exists, append
-/// arguments.
+///
+/// When the body contains `$ARGUMENTS`, one left-to-right pass replaces each
+/// `$ARGUMENTS[N]` and `$N` (all consecutive digits) with the Nth
+/// whitespace-delimited argument and each bare `$ARGUMENTS` with the full
+/// argument string. Inserted text is never rescanned, so placeholder-shaped
+/// text inside the arguments reaches the model verbatim. A positional
+/// placeholder with no matching argument is left as written. If no
+/// `$ARGUMENTS` placeholder exists, the arguments are appended.
 fn substitute_arguments(body: &str, arguments: &str) -> String {
     if arguments.is_empty() {
         return body.to_string();
     }
-
-    if body.contains("$ARGUMENTS") {
-        let tokens: Vec<&str> = arguments.split_whitespace().collect();
-        let mut result = body.to_string();
-
-        // Positional first (prevents $ARGUMENTS from corrupting $ARGUMENTS[N])
-        for (i, token) in tokens.iter().enumerate() {
-            let n = i + 1;
-            result = result
-                .replace(&format!("$ARGUMENTS[{n}]"), token)
-                .replace(&format!("${n}"), token);
-        }
-
-        // Then the full $ARGUMENTS
-        result = result.replace("$ARGUMENTS", arguments);
-
-        result
-    } else {
-        format!("{body}\nARGUMENTS: {arguments}")
+    if !body.contains("$ARGUMENTS") {
+        return format!("{body}\nARGUMENTS: {arguments}");
     }
+
+    let tokens: Vec<&str> = arguments.split_whitespace().collect();
+    let positional = |digits: &str| -> Option<&str> {
+        let n: usize = digits.parse().ok()?;
+        n.checked_sub(1).and_then(|i| tokens.get(i).copied())
+    };
+
+    let mut out = String::with_capacity(body.len() + arguments.len());
+    let mut rest = body;
+    while let Some(dollar) = rest.find('$') {
+        let (literal, from_dollar) = rest.split_at(dollar);
+        out.push_str(literal);
+        let after = from_dollar.get(1..).unwrap_or_default();
+        if let Some(after_name) = after.strip_prefix("ARGUMENTS") {
+            let indexed = after_name
+                .strip_prefix('[')
+                .and_then(|index_and_rest| index_and_rest.split_once(']'))
+                .and_then(|(digits, tail)| Some((positional_digits(digits)?, tail)));
+            if let Some((digits, tail)) = indexed {
+                if let Some(token) = positional(digits) {
+                    out.push_str(token);
+                } else {
+                    out.push_str("$ARGUMENTS[");
+                    out.push_str(digits);
+                    out.push(']');
+                }
+                rest = tail;
+                continue;
+            }
+            out.push_str(arguments);
+            rest = after_name;
+            continue;
+        }
+        let digit_len = after.bytes().take_while(u8::is_ascii_digit).count();
+        let (digits, tail) = after.split_at(digit_len);
+        if let Some(token) = positional_digits(digits).and_then(positional) {
+            out.push_str(token);
+            rest = tail;
+        } else {
+            out.push('$');
+            rest = after;
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// `digits` when it is a non-empty run of ASCII digits.
+fn positional_digits(digits: &str) -> Option<&str> {
+    (!digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())).then_some(digits)
 }
 
 #[cfg(test)]
@@ -779,6 +860,95 @@ mod tests {
         let content = "  ---\nname: build\ndescription: Build it\n---\n\nBody here.";
         let result = strip_frontmatter(content);
         assert_eq!(result, "Body here.");
+    }
+
+    #[test]
+    fn test_strip_frontmatter_keeps_document_opening_with_horizontal_rule() {
+        let content = "---\n\nIntro text\n\n---\n\nMore";
+        assert_eq!(strip_frontmatter(content), content);
+    }
+
+    #[test]
+    fn test_strip_frontmatter_requires_exact_delimiter_lines() {
+        for content in [
+            "--- not fm\nname: a\n---\nbody",
+            "----\nname: a\n----\nbody",
+            "---\nname: a\n----\nbody",
+            "---\nname: a\n---more\nbody",
+        ] {
+            assert_eq!(strip_frontmatter(content), content, "{content:?}");
+        }
+    }
+
+    #[test]
+    fn test_strip_frontmatter_crlf_and_trailing_space_delimiters() {
+        assert_eq!(
+            strip_frontmatter("---\r\nname: a\r\n---\r\nbody\r\n"),
+            "body\r\n"
+        );
+        assert_eq!(strip_frontmatter("---\nname: a\n---   \nbody"), "body");
+    }
+
+    #[test]
+    fn test_strip_frontmatter_accepts_indentless_sequences() {
+        let content = "---\nname: build\nallowed-tools:\n- Read\n- Bash\ndescription: d\n---\nBody";
+        assert_eq!(strip_frontmatter(content), "Body");
+        let quoted = "---\n\"name\": build\n---\nBody";
+        assert_eq!(strip_frontmatter(quoted), "Body");
+    }
+
+    #[test]
+    fn test_strip_frontmatter_keeps_leading_list_between_rules() {
+        let content = "---\n- first\n- second\n---\nafter";
+        assert_eq!(strip_frontmatter(content), content);
+    }
+
+    #[test]
+    fn test_strip_frontmatter_empty_block() {
+        assert_eq!(strip_frontmatter("---\n---\nbody"), "body");
+    }
+
+    #[test]
+    fn test_parse_frontmatter_crlf() {
+        let content = "---\r\nname: build\r\ndescription: Build it\r\n---\r\nBody";
+        let fm = parse_skill_frontmatter(content).unwrap();
+        assert_eq!(fm.name, "build");
+        assert_eq!(fm.description, "Build it");
+    }
+
+    mod proptests {
+        use super::*;
+        use proptest::prelude::*;
+
+        proptest! {
+            // Prose (no `key:` shape) between two rules is never frontmatter.
+            #[test]
+            fn rule_delimited_prose_is_preserved(
+                prose in "[A-Za-z][A-Za-z ,.!?]{0,40}",
+                tail in "[ -~\n]{0,60}",
+            ) {
+                let content = format!("---\n\n{prose}\n\n---\n{tail}");
+                prop_assert_eq!(strip_frontmatter(&content), content);
+            }
+
+            // Valid LF frontmatter: body is returned verbatim, minus leading newlines.
+            #[test]
+            fn valid_frontmatter_yields_body(
+                name in "[a-z][a-z0-9-]{0,12}",
+                desc in "[A-Za-z0-9 ]{0,20}",
+                body in "[A-Za-z0-9#][ -~\n]{0,60}",
+            ) {
+                let content = format!("---\nname: {name}\ndescription: {desc}\n---\n\n{body}");
+                prop_assert_eq!(strip_frontmatter(&content), body);
+            }
+
+            // Whatever the input, the result is the input or a suffix of it.
+            #[test]
+            fn result_is_input_or_suffix(content in "[-a-z: \r\n]{0,80}") {
+                let out = strip_frontmatter(&content);
+                prop_assert!(content == out || content.ends_with(&out));
+            }
+        }
     }
 
     // -------------------------------------------------------------------------
@@ -1667,5 +1837,84 @@ mod tests {
         let result =
             invoke_skill("simple", "extra args", SkillAudience::Conversation, &skills).unwrap();
         assert!(result.body.contains("ARGUMENTS: extra args"));
+    }
+}
+
+#[cfg(test)]
+mod substitute_arguments_tests {
+    use super::substitute_arguments;
+    use proptest::prelude::*;
+
+    #[test]
+    fn multi_digit_positional_selects_its_own_token() {
+        let args = "a b c d e f g h i j";
+        assert_eq!(
+            substitute_arguments("tenth=$10 first=$1 $ARGUMENTS[10] $ARGUMENTS", args),
+            format!("tenth=j first=a j {args}")
+        );
+    }
+
+    #[test]
+    fn placeholder_text_inside_arguments_is_not_rescanned() {
+        assert_eq!(
+            substitute_arguments("target=$1 env=$2 all=$ARGUMENTS", "price=$2 prod"),
+            "target=price=$2 env=prod all=price=$2 prod"
+        );
+        assert_eq!(
+            substitute_arguments("q=$1 (full: $ARGUMENTS)", "explain-$ARGUMENTS-usage x"),
+            "q=explain-$ARGUMENTS-usage (full: explain-$ARGUMENTS-usage x)"
+        );
+    }
+
+    #[test]
+    fn unmatched_positionals_and_bare_dollars_stay_literal() {
+        assert_eq!(
+            substitute_arguments(
+                "Budget is $100, $ alone, $ARGUMENTS[9]. Do: $ARGUMENTS",
+                "ship it"
+            ),
+            "Budget is $100, $ alone, $ARGUMENTS[9]. Do: ship it"
+        );
+        assert_eq!(substitute_arguments("$0 $ARGUMENTS$", "x"), "$0 x$");
+    }
+
+    proptest! {
+        // Arguments drawn from placeholder-heavy text are delivered verbatim
+        // wherever the body asks for them.
+        #[test]
+        fn arguments_survive_verbatim(
+            args in "[a-z$0-9\\[\\] ]{0,8}(\\$ARGUMENTS|\\$1|\\$2)?[a-z ]{0,8}",
+            prefix in "[a-z .]{0,12}",
+        ) {
+            prop_assume!(!args.is_empty());
+            let body = format!("{prefix}<<$ARGUMENTS>>");
+            let out = substitute_arguments(&body, &args);
+            let expected = format!("{prefix}<<{args}>>");
+            prop_assert_eq!(out, expected);
+        }
+
+        #[test]
+        fn positional_tokens_survive_verbatim(
+            tokens in proptest::collection::vec("[a-z$0-9]{1,6}", 1..12),
+        ) {
+            let args = tokens.join(" ");
+            let body: String = (1..=tokens.len())
+                .map(|n| format!("[${n}]"))
+                .chain(std::iter::once("$ARGUMENTS".to_string()))
+                .collect();
+            let expected: String = tokens
+                .iter()
+                .map(|t| format!("[{t}]"))
+                .chain(std::iter::once(args.clone()))
+                .collect();
+            prop_assert_eq!(substitute_arguments(&body, &args), expected);
+        }
+
+        // Bodies without `$ARGUMENTS` are never rewritten, only appended to.
+        #[test]
+        fn bodies_without_marker_are_preserved(body in "[a-z$0-9 \\n]{0,40}", args in "[a-z]{1,8}") {
+            prop_assume!(!body.contains("$ARGUMENTS"));
+            prop_assert_eq!(substitute_arguments(&body, &args), format!("{body}\nARGUMENTS: {args}"));
+        }
     }
 }

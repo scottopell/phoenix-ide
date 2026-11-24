@@ -1,10 +1,11 @@
 import { useRef } from 'react';
+import { FocusScopeProvider, useFocusScopeCommands } from '../hooks/useFocusScope';
 import { InputArea, ConnectedInputArea } from './InputArea';
 import { DraftStore } from '../conversation/DraftStore';
 import { DraftContext } from '../conversation/DraftContext';
 import { AgentMessage } from './MessageComponents';
 import { VoicePermission } from './VoiceInput/VoicePermission';
-import type { ComposerQuickAction, InputAreaHandle } from './InputArea';
+import type { ComposerFocusRequest, ComposerQuickAction, InputAreaHandle } from './InputArea';
 import type { ConversationState, Message, SkillEntry } from '../api';
 import { api } from '../api';
 import { describe, expect, it, vi } from 'vitest';
@@ -37,7 +38,7 @@ const rejectedFile: FileAttachment = {
   original_name: 'notes.txt', stored_path: '/uploads/a/notes.txt', media_type: 'text/plain', size_bytes: 42,
 };
 
-function RecoveryHarness({ send, scope = 'a', initialDraft = '  @missing.ts\n', initialImages = [] }: {
+function RecoveryHarness({ send, scope = 'a', initialDraft = '  /broken-skill\n', initialImages = [] }: {
   send: (text: string, images: ImageData[], files: FileAttachment[]) => Promise<void>;
   scope?: string;
   initialDraft?: string;
@@ -46,30 +47,110 @@ function RecoveryHarness({ send, scope = 'a', initialDraft = '  @missing.ts\n', 
   const [draft, setDraft] = useState(initialDraft);
   const [images, setImages] = useState<ImageData[]>(initialImages);
   const [files, setFiles] = useState<FileAttachment[]>([rejectedFile]);
-  return <InputArea cwd={undefined} scopeKey={scope} convState={idleState}
+  return <InputArea cwd={undefined} scopeKey={scope} uploadConversationId={scope} convState={idleState}
     draft={draft} onDraftChange={setDraft} images={images} setImages={setImages}
     files={files} setFiles={setFiles} isOffline={false} failedMessages={[]}
     onSend={send} onCancel={() => {}} onRetry={() => {}} />;
 }
 
-function ConnectedRecoveryHarness({ store, send, scope = 'a' }: {
+function ConnectedRecoveryHarness({ store, send, scope = 'a', initialFiles = [rejectedFile], quickAction }: {
   store: DraftStore;
+  quickAction?: ComposerQuickAction;
   send: (text: string, images: ImageData[], files: FileAttachment[]) => Promise<void>;
   scope?: string;
+  initialFiles?: FileAttachment[];
 }) {
   const [images, setImages] = useState<ImageData[]>([]);
-  const [files, setFiles] = useState<FileAttachment[]>([rejectedFile]);
+  const [files, setFiles] = useState<FileAttachment[]>(initialFiles);
   return <DraftContext.Provider value={store}>
     <button onClick={() => setFiles([{ ...rejectedFile, original_name: 'new.txt', stored_path: '/uploads/a/new.txt' }])}>Attach newer file</button>
-    <ConnectedInputArea slug={scope} cwd={undefined} scopeKey={scope} convState={idleState}
+    <ConnectedInputArea quickAction={quickAction} slug={scope} cwd={undefined} scopeKey={scope} uploadConversationId={scope} convState={idleState}
       images={images} setImages={setImages} files={files} setFiles={setFiles}
       isOffline={false} failedMessages={[]} onSend={send} onCancel={() => {}} onRetry={() => {}} />
   </DraftContext.Provider>;
 }
 
 async function rejectExpansion(pending: ReturnType<typeof deferredSend>) {
-  await act(async () => pending.reject(new ExpansionError({ error: 'Missing file', error_type: 'file_not_found', reference: '@missing.ts' })));
+  await act(async () => pending.reject(new ExpansionError({ error: 'Skill failed', error_type: 'skill_invocation_failed', reference: '/broken-skill' })));
 }
+
+describe('editable annotation cards', () => {
+  const source = { messageId: 'answer', sequenceId: 2, occurrenceToken: 'earlier:answer', quote: 'Selected passage' };
+
+  it('submits edited comments and preserves new draft work while that submission completes', async () => {
+    const store = new DraftStore();
+    store.dispatch('a', { type: 'set_draft', text: 'General feedback' });
+    const annotations = store.annotations.forScope('a');
+    annotations.add({ source, body: 'Original comment' });
+    let complete!: () => void;
+    const send = vi.fn(() => new Promise<void>(resolve => { complete = resolve; }));
+    render(<ConnectedRecoveryHarness store={store} send={send} />);
+    fireEvent.click(screen.getByRole('button', { name: 'Edit annotation 1' }));
+    fireEvent.change(screen.getByRole('textbox', { name: 'Annotation 1 comment' }), { target: { value: 'Edited in composer' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Done' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Send message' }));
+    expect(send).toHaveBeenCalledWith('General feedback\n\nRegarding message #2 (earlier:answer):\n\n```text\nSelected passage\n```\n\nEdited in composer', [], [rejectedFile]);
+    fireEvent.click(screen.getByRole('button', { name: 'Edit annotation 1' }));
+    expect(screen.getByRole('textbox', { name: 'Annotation 1 comment' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Delete annotation' })).toBeDisabled();
+    fireEvent.click(screen.getByRole('button', { name: 'Done' }));
+    act(() => {
+      annotations.add({ source, body: 'Next annotation' });
+      store.dispatch('a', { type: 'set_draft', text: 'Next message' });
+    });
+    await act(async () => complete());
+    expect(annotations.getSnapshot().map(item => item.body)).toEqual(['Next annotation']);
+    expect(store.getSnapshot('a').draft).toBe('Next message');
+  });
+
+  it('retains editable cards and restores text when delivery admission rejects', async () => {
+    const store = new DraftStore();
+    store.dispatch('a', { type: 'set_draft', text: 'General feedback' });
+    const annotations = store.annotations.forScope('a');
+    annotations.add({ source, body: 'Retain me' });
+    const pending = deferredSend();
+    render(<ConnectedRecoveryHarness store={store} send={pending.send} />);
+    fireEvent.click(screen.getByRole('button', { name: 'Send message' }));
+    await act(async () => pending.reject(new Error('Destination unavailable')));
+    expect(store.getSnapshot('a').draft).toBe('General feedback');
+    fireEvent.click(screen.getByRole('button', { name: 'Edit annotation 1' }));
+    expect(screen.getByRole('textbox', { name: 'Annotation 1 comment' })).toBeEnabled();
+    expect(screen.getByRole('textbox', { name: 'Annotation 1 comment' })).toHaveValue('Retain me');
+    expect(annotations.getSnapshot()[0]!.submission).toBeNull();
+  });
+
+  it('sends a quick action without submitting any of the ordinary draft or annotations', async () => {
+    const store = new DraftStore();
+    store.dispatch('a', { type: 'set_draft', text: 'Separate ordinary draft' });
+    const annotations = store.annotations.forScope('a');
+    annotations.add({ source, body: 'Unsent annotation for my separate draft.' });
+    const original = annotations.getSnapshot();
+    const send = vi.fn().mockResolvedValue(undefined);
+    render(<ConnectedRecoveryHarness store={store} send={send} quickAction={{ label: 'Check in & drive', compactLabel: 'Check in', prompt: 'Brief me' }} />);
+    fireEvent.click(screen.getByRole('button', { name: 'Check in & drive' }));
+    await waitFor(() => expect(send).toHaveBeenCalledOnce());
+    expect(send).toHaveBeenCalledWith('Brief me', [], []);
+    expect(store.getSnapshot('a').draft).toBe('Separate ordinary draft');
+    expect(annotations.getSnapshot()).toBe(original);
+    expect(screen.getByRole('button', { name: 'Edit annotation 1' })).toHaveTextContent('Unsent annotation for my separate draft.');
+  });
+
+  it('supports annotation-only messages and removal without changing ordinary draft text', async () => {
+    const store = new DraftStore();
+    const annotations = store.annotations.forScope('a');
+    annotations.add({ source, body: 'Only annotation' });
+    const send = vi.fn().mockResolvedValue(undefined);
+    render(<ConnectedRecoveryHarness store={store} send={send} initialFiles={[]} />);
+    fireEvent.click(screen.getByRole('button', { name: 'Edit annotation 1' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Delete annotation' }));
+    expect(annotations.getSnapshot()).toEqual([]);
+    act(() => annotations.add({ source, body: 'Only annotation' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Send message' }));
+    await waitFor(() => expect(annotations.getSnapshot()).toEqual([]));
+    expect(send.mock.calls[0]![0]).toContain('Only annotation');
+    expect(store.getSnapshot('a').draft).toBe('');
+  });
+});
 
 describe('InputArea rejected submission ownership', () => {
   it('restores raw text and attachments to an untouched cleared composer', async () => {
@@ -78,7 +159,7 @@ describe('InputArea rejected submission ownership', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Send message' }));
     expect(screen.getByRole('textbox')).toHaveValue('');
     await rejectExpansion(pending);
-    expect(screen.getByRole('textbox')).toHaveValue('  @missing.ts\n');
+    expect(screen.getByRole('textbox')).toHaveValue('  /broken-skill\n');
     expect(screen.getByText('notes.txt')).toBeInTheDocument();
   });
 
@@ -107,7 +188,7 @@ describe('InputArea rejected submission ownership', () => {
     expect(screen.queryByLabelText('Attached files')).not.toBeInTheDocument();
     fireEvent.change(screen.getByRole('textbox'), { target: { value: '' } });
     fireEvent.click(screen.getByRole('button', { name: 'Restore unsent message' }));
-    expect(screen.getByRole('textbox')).toHaveValue('  @missing.ts\n');
+    expect(screen.getByRole('textbox')).toHaveValue('  /broken-skill\n');
     expect(screen.getByLabelText('Attached files')).toHaveTextContent('notes.txt');
   });
 
@@ -132,7 +213,7 @@ describe('InputArea rejected submission ownership', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Send message' }));
     act(() => { retired?.onSpeech?.('late'); retired?.onInterim?.('late'); retired?.onEnd?.(); });
     await rejectExpansion(pending);
-    expect(screen.getByRole('textbox')).toHaveValue('  @missing.ts final partial');
+    expect(screen.getByRole('textbox')).toHaveValue('  /broken-skill final partial');
   });
 
   it('uses the atomic store revision even when external insertion and deletion have not rendered', async () => {
@@ -144,7 +225,7 @@ describe('InputArea rejected submission ownership', () => {
     await act(async () => {
       store.dispatch('a', { type: 'append_draft', text: 'external' });
       store.dispatch('a', { type: 'clear_draft' });
-      pending.reject(new ExpansionError({ error: 'Missing file', error_type: 'file_not_found', reference: '@missing.ts' }));
+      pending.reject(new ExpansionError({ error: 'Skill failed', error_type: 'skill_invocation_failed', reference: '/broken-skill' }));
     });
     expect(screen.getByRole('textbox')).toHaveValue('');
     expect(store.getRejected('a')).toHaveLength(1);
@@ -177,10 +258,10 @@ describe('InputArea rejected submission ownership', () => {
   it.each(['', 'new conversation draft'])('does not resurrect a pending send after hard-delete (fresh draft: %j)', async freshDraft => {
     const pending = deferredSend();
     const store = new DraftStore();
-    store.dispatch('a', { type: 'set_draft', text: '  deleted @missing.ts\n' });
+    store.dispatch('a', { type: 'set_draft', text: '  deleted /broken-skill\n' });
     render(<ConnectedRecoveryHarness store={store} send={pending.send} />);
     fireEvent.click(screen.getByRole('button', { name: 'Send message' }));
-    expect(pending.send).toHaveBeenCalledWith('deleted @missing.ts', [], [rejectedFile]);
+    expect(pending.send).toHaveBeenCalledWith('deleted /broken-skill', [], [rejectedFile]);
 
     act(() => {
       // The hard-delete cascade removes the draft lifetime, not just its text.
@@ -296,8 +377,8 @@ interface InputAreaTestProps {
   draft?: string;
   onDraftChange?: (text: string) => void;
   onCancel?: () => void;
-  onSend?: (text: string) => void;
-  focusToken?: number;
+  onSend?: (text: string, images: ImageData[], files: FileAttachment[]) => void;
+  focusRequest?: ComposerFocusRequest | null;
   quickAction?: ComposerQuickAction;
 }
 
@@ -309,14 +390,15 @@ function renderInput({
   onDraftChange = () => {},
   onCancel = () => {},
   onSend = () => {},
-  focusToken,
+  focusRequest,
   quickAction,
 }: InputAreaTestProps) {
-  const focusProps = focusToken === undefined ? {} : { focusToken };
+  const focusProps = focusRequest === undefined ? {} : { focusRequest };
   return render(
     <InputArea
       cwd={cwd}
       scopeKey={scopeKey ?? cwd}
+      uploadConversationId={scopeKey ?? cwd}
       convState={convState}
       images={[]}
       setImages={() => {}}
@@ -325,7 +407,7 @@ function renderInput({
       draft={draft}
       onDraftChange={onDraftChange}
       {...focusProps}
-      quickAction={quickAction}
+      quickAction={quickAction ? { ...quickAction, send: () => onSend(quickAction.prompt, [], []) } : undefined}
       onSend={onSend}
       onCancel={onCancel}
       onRetry={() => {}}
@@ -361,6 +443,7 @@ describe('InputArea controlled-draft contract', () => {
       <InputArea
         cwd="conv-b"
         scopeKey="conv-b"
+        uploadConversationId="conv-b"
         convState={idleState}
         images={[]}
         setImages={() => {}}
@@ -410,6 +493,7 @@ describe('InputArea controlled-draft contract', () => {
       <InputArea
         cwd="/repo"
         scopeKey="conv-a"
+        uploadConversationId="conv-a"
         convState={idleState}
         images={[]}
         setImages={() => {}}
@@ -435,6 +519,7 @@ describe('InputArea controlled-draft contract', () => {
       <InputArea
         cwd="/repo"
         scopeKey="conv-b"
+        uploadConversationId="conv-b"
         convState={idleState}
         images={[]}
         setImages={() => {}}
@@ -546,8 +631,8 @@ describe('InputArea compact composer layout', () => {
   });
 });
 
-describe('InputArea focusToken contract', () => {
-  it('does not steal focus on mount when focusToken is the initial 0', () => {
+describe('InputArea focusRequest contract', () => {
+  it('does not steal focus on mount when focusRequest is null', () => {
     // External anchor to verify focus didn't move into the textarea.
     const anchor = document.createElement('button');
     anchor.textContent = 'anchor';
@@ -555,13 +640,13 @@ describe('InputArea focusToken contract', () => {
     anchor.focus();
     expect(document.activeElement).toBe(anchor);
 
-    renderInput({ cwd: 'conv-a', focusToken: 0 });
+    renderInput({ cwd: 'conv-a', focusRequest: null });
 
     expect(document.activeElement).toBe(anchor);
     document.body.removeChild(anchor);
   });
 
-  it('does not steal focus on mount when focusToken is undefined', () => {
+  it('does not steal focus on mount when focusRequest is undefined', () => {
     const anchor = document.createElement('button');
     document.body.appendChild(anchor);
     anchor.focus();
@@ -572,18 +657,20 @@ describe('InputArea focusToken contract', () => {
     document.body.removeChild(anchor);
   });
 
-  it('focuses the textarea when focusToken is bumped', () => {
+  it('focuses the textarea when a focus request arrives', () => {
+    const acknowledge = vi.fn();
     const anchor = document.createElement('button');
     document.body.appendChild(anchor);
     anchor.focus();
 
-    const { rerender } = renderInput({ cwd: 'conv-a', focusToken: 0 });
+    const { rerender } = renderInput({ cwd: 'conv-a', focusRequest: null });
     expect(document.activeElement).toBe(anchor);
 
     rerender(
       <InputArea
         cwd="conv-a"
         scopeKey="conv-a"
+        uploadConversationId="conv-a"
         convState={idleState}
         images={[]}
         setImages={() => {}}
@@ -591,7 +678,7 @@ describe('InputArea focusToken contract', () => {
         failedMessages={[]}
         draft=""
         onDraftChange={() => {}}
-        focusToken={1}
+        focusRequest={{ acknowledge }}
         onSend={() => {}}
         onCancel={() => {}}
         onRetry={() => {}}
@@ -599,7 +686,99 @@ describe('InputArea focusToken contract', () => {
     );
 
     expect(document.activeElement).toBe(screen.getByRole('textbox'));
+    expect(acknowledge).toHaveBeenCalledOnce();
     document.body.removeChild(anchor);
+  });
+
+  it('does not acknowledge a request when focus fails', () => {
+    const acknowledge = vi.fn();
+    const focus = vi.spyOn(HTMLTextAreaElement.prototype, 'focus').mockImplementation(() => {});
+    try {
+      renderInput({ cwd: 'conv-a', focusRequest: { acknowledge } });
+      expect(focus).toHaveBeenCalledOnce();
+      expect(acknowledge).not.toHaveBeenCalled();
+    } finally {
+      focus.mockRestore();
+    }
+  });
+
+  it('retains the request until the mounted composer becomes writable', () => {
+    const acknowledge = vi.fn();
+    const request = { acknowledge };
+    function Harness() {
+      const [convState, setConvState] = useState<ConversationState>({ type: 'awaiting_llm' });
+      return <>
+        <button onClick={() => setConvState(idleState)}>ready</button>
+        <InputArea cwd="conv-a" scopeKey="conv-a" uploadConversationId="conv-a"
+          convState={convState} images={[]} setImages={() => {}} isOffline={false}
+          failedMessages={[]} draft="" onDraftChange={() => {}} focusRequest={request}
+          onSend={() => {}} onCancel={() => {}} onRetry={() => {}} />
+      </>;
+    }
+    render(<Harness />);
+    expect(acknowledge).not.toHaveBeenCalled();
+    expect(screen.getByRole('textbox')).not.toHaveFocus();
+    fireEvent.click(screen.getByRole('button', { name: 'ready' }));
+    expect(screen.getByRole('textbox')).toHaveFocus();
+    expect(acknowledge).toHaveBeenCalledOnce();
+  });
+
+  it.each([false, true])('defers to an intervening scope on writable transition (remount: %s)', (remount) => {
+    const acknowledge = vi.fn();
+    const request = { acknowledge };
+    function Harness() {
+      const { pushScope, popScope } = useFocusScopeCommands();
+      const [ready, setReady] = useState(false);
+      return <>
+        <button onClick={(event) => { pushScope('command-palette'); event.currentTarget.focus(); }}>open owner</button>
+        <button onClick={() => popScope('command-palette')}>close owner</button>
+        <button onClick={() => setReady(true)}>ready</button>
+        <InputArea key={remount && ready ? 'replacement' : 'original'}
+          cwd="conv-a" scopeKey="conv-a" uploadConversationId="conv-a"
+          convState={ready ? idleState : { type: 'awaiting_llm' }} images={[]} setImages={() => {}} isOffline={false}
+          failedMessages={[]} draft="" onDraftChange={() => {}} focusRequest={request}
+          onSend={() => {}} onCancel={() => {}} onRetry={() => {}} />
+      </>;
+    }
+    render(<FocusScopeProvider><Harness /></FocusScopeProvider>);
+    expect(acknowledge).not.toHaveBeenCalled();
+    const owner = screen.getByRole('button', { name: 'open owner' });
+    fireEvent.click(owner);
+    fireEvent.click(screen.getByRole('button', { name: 'ready' }));
+    expect(owner).toHaveFocus();
+    expect(acknowledge).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole('button', { name: 'close owner' }));
+    expect(screen.getByRole('textbox')).toHaveFocus();
+    expect(acknowledge).toHaveBeenCalledOnce();
+  });
+
+  it('accepts only the named yielding viewer scope and waits for a newer owner to release', () => {
+    const acknowledge = vi.fn();
+    function Harness() {
+      const { pushScope, popScope } = useFocusScopeCommands();
+      const [request, setRequest] = useState<ComposerFocusRequest | null>(null);
+      return <>
+        <button onClick={(event) => {
+          pushScope('message-viewer');
+          pushScope('command-palette');
+          event.currentTarget.focus();
+          setRequest({ yieldingScope: 'message-viewer', acknowledge });
+        }}>send with newer owner</button>
+        <button onClick={() => popScope('command-palette')}>release modal</button>
+        <InputArea cwd="conv-a" scopeKey="conv-a" uploadConversationId="conv-a"
+          convState={idleState} images={[]} setImages={() => {}} isOffline={false}
+          failedMessages={[]} draft="" onDraftChange={() => {}} focusRequest={request}
+          onSend={() => {}} onCancel={() => {}} onRetry={() => {}} />
+      </>;
+    }
+    render(<FocusScopeProvider><Harness /></FocusScopeProvider>);
+    const owner = screen.getByRole('button', { name: 'send with newer owner' });
+    fireEvent.click(owner);
+    expect(owner).toHaveFocus();
+    expect(acknowledge).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole('button', { name: 'release modal' }));
+    expect(screen.getByRole('textbox')).toHaveFocus();
+    expect(acknowledge).toHaveBeenCalledOnce();
   });
 
   it('exposes an imperative focus() handle that focuses the textarea', () => {
@@ -612,6 +791,7 @@ describe('InputArea focusToken contract', () => {
             ref={ref}
             cwd="conv-a"
             scopeKey="conv-a"
+            uploadConversationId="conv-a"
             convState={idleState}
             images={[]}
             setImages={() => {}}
@@ -698,11 +878,52 @@ describe('InputArea cancellation affordance', () => {
     expect(screen.queryByRole('button', { name: /stop|send|queue/i })).not.toBeInTheDocument();
   });
 
+  it('keeps the embedded composer identity while continuation progress and handoff gate actions', () => {
+    const onSend = vi.fn();
+    const commonProps = {
+      cwd: 'conv-continuation',
+      scopeKey: 'conv-continuation',
+      uploadConversationId: 'conv-continuation',
+      images: [],
+      setImages: () => {},
+      files: [],
+      setFiles: () => {},
+      isOffline: false,
+      failedMessages: [],
+      draft: 'retained follow-up',
+      onDraftChange: () => {},
+      onSend,
+      onCancel: () => {},
+      onRetry: () => {},
+      retainComposerDuringContinuation: true,
+    };
+    const { rerender } = render(<InputArea {...commonProps} convState={idleState} />);
+    const textarea = screen.getByRole('textbox');
+    textarea.focus();
+    for (const convState of [
+      { type: 'awaiting_continuation' as const, attempt: 1 },
+      { type: 'context_exhausted' as const, summary: 'manual handoff' },
+      { type: 'idle' as const },
+    ]) {
+      rerender(<InputArea {...commonProps} convState={convState} />);
+      expect(screen.getByRole('textbox')).toBe(textarea);
+      expect(textarea).toHaveValue('retained follow-up');
+      expect(textarea).toHaveFocus();
+      if (convState.type !== 'idle') {
+        expect(screen.queryByRole('button', { name: 'Send message' })).toBeNull();
+        fireEvent.submit(textarea.closest('form')!);
+        expect(onSend).not.toHaveBeenCalled();
+      }
+    }
+    expect(screen.queryByRole('status')).not.toBeInTheDocument();
+  });
+
   it('restores the retained draft after continuation completes', () => {
     const onSend = vi.fn();
     const commonProps = {
       cwd: 'conv-continuation',
       scopeKey: 'conv-continuation',
+      uploadConversationId: 'conv-continuation',
       images: [],
       setImages: () => {},
       isOffline: false,
@@ -736,6 +957,7 @@ describe('InputArea cancellation affordance', () => {
       <InputArea
         cwd="conv-recovery"
         scopeKey="conv-recovery"
+        uploadConversationId="conv-recovery"
         convState={{ type: 'awaiting_recovery', message: 'refreshing credentials', recovery_kind: 'credential', resume: { type: 'conversation_turn' } }}
         images={[]}
         setImages={() => {}}
@@ -759,6 +981,7 @@ describe('InputArea cancellation affordance', () => {
     const props = {
       cwd: 'conv-overload',
       scopeKey: 'conv-overload',
+      uploadConversationId: 'conv-overload',
       images: [],
       setImages: () => {},
       isOffline: false,
@@ -805,6 +1028,7 @@ describe('InputArea cancellation affordance', () => {
       <InputArea
         cwd="conv-cancelling"
         scopeKey="conv-cancelling"
+        uploadConversationId="conv-cancelling"
         convState={{ type: 'cancelling_tool', current_tool: { id: 't', name: 'bash', input: {} } }}
         images={[]}
         setImages={() => {}}
@@ -830,6 +1054,7 @@ describe('InputArea cancellation affordance', () => {
       <InputArea
         cwd="conv-awaiting-llm"
         scopeKey="conv-awaiting-llm"
+        uploadConversationId="conv-awaiting-llm"
         convState={{ type: 'awaiting_llm' }}
         images={[]}
         setImages={() => {}}
@@ -973,6 +1198,78 @@ describe('bash tool rendering', () => {
     expect(screen.queryByRole('button', { name: /peek/i })).not.toBeInTheDocument();
   });
 });
+describe('InputArea continuation upload ownership', () => {
+  function UploadComposer({ scope, transcript }: { scope: string; transcript: string | undefined }) {
+    const [files, setFiles] = useState<FileAttachment[]>([]);
+    const [draft, setDraft] = useState('');
+    return <InputArea cwd={undefined} scopeKey={scope} uploadConversationId={transcript}
+      convState={idleState} images={[]} setImages={() => {}} files={files} setFiles={setFiles}
+      isOffline={false} failedMessages={[]} draft={draft} onDraftChange={setDraft}
+      onSend={() => {}} onCancel={() => {}} onRetry={() => {}} />;
+  }
+
+  it('never uploads with the product draft key while the transcript target is unhydrated', async () => {
+    const upload = vi.spyOn(api, 'uploadAttachments').mockResolvedValue([rejectedFile]);
+    const view = render(<UploadComposer scope="product:p" transcript={undefined} />);
+    fireEvent.drop(document.getElementById('input-area')!, {
+      dataTransfer: { types: ['Files'], files: [new File(['x'], 'notes.txt')] },
+    });
+    expect(upload).not.toHaveBeenCalled();
+    expect(screen.getByText('Open a conversation before attaching files.')).toBeInTheDocument();
+    view.rerender(<UploadComposer scope="product:p" transcript="b" />);
+    fireEvent.drop(document.getElementById('input-area')!, {
+      dataTransfer: { types: ['Files'], files: [new File(['x'], 'notes.txt')] },
+    });
+    await screen.findByText('notes.txt');
+    expect(upload).toHaveBeenCalledExactlyOnceWith('b', expect.any(Array));
+    upload.mockRestore();
+  });
+
+  it('retains a pending upload across continuation and routes the next upload to the successor', async () => {
+    let resolve!: (files: FileAttachment[]) => void;
+    const upload = vi.spyOn(api, 'uploadAttachments')
+      .mockImplementationOnce(() => new Promise<FileAttachment[]>(done => { resolve = done; }))
+      .mockResolvedValueOnce([{ ...rejectedFile, original_name: 'next.txt' }]);
+    const view = render(<UploadComposer scope="product:p" transcript="a" />);
+    fireEvent.drop(document.getElementById('input-area')!, {
+      dataTransfer: { types: ['Files'], files: [new File(['x'], 'notes.txt')] },
+    });
+    expect(upload).toHaveBeenLastCalledWith('a', expect.any(Array));
+    const textarea = screen.getByRole('textbox');
+    fireEvent.change(textarea, { target: { value: 'keep this draft' } });
+    textarea.focus();
+    expect(screen.getByRole('button', { name: 'Send message' })).toBeDisabled();
+    view.rerender(<UploadComposer scope="product:p" transcript="b" />);
+    expect(screen.getByRole('textbox')).toBe(textarea);
+    expect(document.activeElement).toBe(textarea);
+    expect(textarea).toHaveValue('keep this draft');
+    expect(screen.getByRole('button', { name: 'Send message' })).toBeDisabled();
+    await act(async () => { resolve([rejectedFile]); });
+    expect(screen.getByText('notes.txt')).toBeInTheDocument();
+    fireEvent.drop(document.getElementById('input-area')!, {
+      dataTransfer: { types: ['Files'], files: [new File(['x'], 'next.txt')] },
+    });
+    await screen.findByText('next.txt');
+    expect(upload).toHaveBeenLastCalledWith('b', expect.any(Array));
+    upload.mockRestore();
+  });
+
+  it('discards a pending upload after navigation to a different product', async () => {
+    let resolve!: (files: FileAttachment[]) => void;
+    const upload = vi.spyOn(api, 'uploadAttachments').mockImplementationOnce(
+      () => new Promise<FileAttachment[]>(done => { resolve = done; }));
+    const view = render(<UploadComposer scope="product:p" transcript="a" />);
+    fireEvent.drop(document.getElementById('input-area')!, {
+      dataTransfer: { types: ['Files'], files: [new File(['x'], 'notes.txt')] },
+    });
+    view.rerender(<UploadComposer scope="product:q" transcript="c" />);
+    await act(async () => { resolve([rejectedFile]); });
+    expect(screen.queryByText('notes.txt')).not.toBeInTheDocument();
+    expect(screen.queryByText('Uploading attachments...')).not.toBeInTheDocument();
+    upload.mockRestore();
+  });
+});
+
 describe('InputArea file-tree drag-and-drop', () => {
   const FILE_TREE_DRAG_TYPE = 'application/x-phoenix-file-path';
 
@@ -991,7 +1288,7 @@ describe('InputArea file-tree drag-and-drop', () => {
     };
   }
 
-  it('inserts @file reference for text files on custom-type drop', () => {
+  it('inserts ./path for text files on custom-type drop', () => {
     const handler = vi.fn();
     window.addEventListener('phoenix:insert-draft', handler);
     renderForDnd();
@@ -999,12 +1296,12 @@ describe('InputArea file-tree drag-and-drop', () => {
     const footer = document.getElementById('input-area')!;
     const dropEvent = makeDropEvent(
       [FILE_TREE_DRAG_TYPE],
-      { [FILE_TREE_DRAG_TYPE]: JSON.stringify({ relativePath: 'src/main.rs', isDirectory: false, isText: true }) },
+      { [FILE_TREE_DRAG_TYPE]: JSON.stringify({ relativePath: 'src/main.rs', isDirectory: false }) },
     );
     fireEvent.drop(footer, dropEvent as unknown as React.DragEvent);
 
     expect(handler).toHaveBeenCalledWith(
-      expect.objectContaining({ detail: { text: '@src/main.rs ' } }),
+      expect.objectContaining({ detail: { text: './src/main.rs ' } }),
     );
     window.removeEventListener('phoenix:insert-draft', handler);
   });
@@ -1017,7 +1314,7 @@ describe('InputArea file-tree drag-and-drop', () => {
     const footer = document.getElementById('input-area')!;
     const dropEvent = makeDropEvent(
       [FILE_TREE_DRAG_TYPE],
-      { [FILE_TREE_DRAG_TYPE]: JSON.stringify({ relativePath: 'src', isDirectory: true, isText: false }) },
+      { [FILE_TREE_DRAG_TYPE]: JSON.stringify({ relativePath: 'src', isDirectory: true }) },
     );
     fireEvent.drop(footer, dropEvent as unknown as React.DragEvent);
 
@@ -1035,7 +1332,7 @@ describe('InputArea file-tree drag-and-drop', () => {
     const footer = document.getElementById('input-area')!;
     const dropEvent = makeDropEvent(
       [FILE_TREE_DRAG_TYPE],
-      { [FILE_TREE_DRAG_TYPE]: JSON.stringify({ relativePath: 'assets/logo.png', isDirectory: false, isText: false }) },
+      { [FILE_TREE_DRAG_TYPE]: JSON.stringify({ relativePath: 'assets/logo.png', isDirectory: false }) },
     );
     fireEvent.drop(footer, dropEvent as unknown as React.DragEvent);
 
@@ -1053,7 +1350,7 @@ describe('InputArea file-tree drag-and-drop', () => {
     const footer = document.getElementById('input-area')!;
     const dropEvent = makeDropEvent(
       [FILE_TREE_DRAG_TYPE],
-      { [FILE_TREE_DRAG_TYPE]: JSON.stringify({ relativePath: 'src/test data/input.ts', isDirectory: false, isText: true }) },
+      { [FILE_TREE_DRAG_TYPE]: JSON.stringify({ relativePath: 'src/test data/input.ts', isDirectory: false }) },
     );
     fireEvent.drop(footer, dropEvent as unknown as React.DragEvent);
 

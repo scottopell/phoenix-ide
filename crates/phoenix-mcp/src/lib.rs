@@ -1752,23 +1752,29 @@ fn callback_request_query(request: &str) -> String {
         .unwrap_or_default()
 }
 
-/// Bind loopback listeners on `port` for both IPv4 (`127.0.0.1`) and IPv6
-/// (`::1`), so a browser resolving `localhost` to either family reaches the
-/// callback (REQ-MCP-020). Returns every address that bound; errs only if
-/// *neither* did (the port is genuinely unavailable). A few short retries
+/// Bind the callback's literal IP, or both loopback families for `localhost`
+/// (REQ-MCP-020). Returns every requested address that bound; errs if none did.
+/// A few short retries
 /// absorb the brief window where a just-aborted prior listener is still
 /// releasing the port.
-async fn bind_loopback_listeners(port: u16) -> std::io::Result<Vec<tokio::net::TcpListener>> {
+async fn bind_loopback_listeners(
+    callback: &LoopbackCallback,
+) -> std::io::Result<Vec<tokio::net::TcpListener>> {
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
+    let port = callback.port();
+    let ipv4 = IpAddr::V4(Ipv4Addr::LOCALHOST);
+    let ipv6 = IpAddr::V6(Ipv6Addr::LOCALHOST);
+    let addresses = match callback.url().host_str() {
+        Some("127.0.0.1") => vec![ipv4],
+        Some("[::1]") => vec![ipv6],
+        _ => vec![ipv4, ipv6],
+    };
     let mut last_err = None;
     for attempt in 0..5 {
         let mut bound = Vec::new();
-        for ip in [
-            IpAddr::V4(Ipv4Addr::LOCALHOST),
-            IpAddr::V6(Ipv6Addr::LOCALHOST),
-        ] {
-            match tokio::net::TcpListener::bind((ip, port)).await {
+        for ip in &addresses {
+            match tokio::net::TcpListener::bind((*ip, port)).await {
                 Ok(listener) => bound.push(listener),
                 // An IPv6-less host (or vice versa) is fine as long as the
                 // other family bound; only a total failure is fatal.
@@ -1905,9 +1911,9 @@ async fn begin_oauth_flow(
     // A pre-registered app whose allowlist pins a fixed loopback port redirects
     // there; Phoenix bounces that callback to its own route (REQ-MCP-020).
     // Otherwise the redirect is Phoenix's own server-route callback.
-    let loopback_port = preconfigured.and_then(|pre| pre.callback_port);
-    let redirect_uri = match loopback_port {
-        Some(port) => format!("http://localhost:{port}/callback"),
+    let loopback_callback = preconfigured.and_then(|pre| pre.callback.as_ref());
+    let redirect_uri = match loopback_callback {
+        Some(callback) => callback.0.clone(),
         None => oauth_rt.redirect_uri().ok_or_else(|| {
             oauth::OAuthRequestError::Permanent(
                 "OAuth redirect base not configured (server address unknown)".into(),
@@ -1985,7 +1991,8 @@ async fn begin_oauth_flow(
     // surfacing a sign-in URL whose callback can never be received. The
     // listener bounces the fixed-port callback to Phoenix's real route; the
     // server-route case needs no listener.
-    if let Some(port) = loopback_port {
+    if let Some(callback) = loopback_callback {
+        let port = callback.port();
         let Some(base) = oauth_rt.redirect_base() else {
             return Err(oauth::OAuthRequestError::Permanent(format!(
                 "MCP server '{name}': loopback OAuth callback needs Phoenix's own address to \
@@ -1999,7 +2006,7 @@ async fn begin_oauth_flow(
             prior.abort();
             let _ = prior.await;
         }
-        let listeners = bind_loopback_listeners(port).await.map_err(|e| {
+        let listeners = bind_loopback_listeners(callback).await.map_err(|e| {
             oauth::OAuthRequestError::Permanent(format!(
                 "MCP server '{name}': cannot bind OAuth callback port {port} on loopback \
                  (already in use?): {e}"
@@ -5110,26 +5117,27 @@ impl McpClientManager {
                     }
                 };
 
+                if fields.contains_key("callbackUrl")
+                    && fields
+                        .get("clientId")
+                        .and_then(Value::as_str)
+                        .is_none_or(str::is_empty)
+                {
+                    tracing::debug!(server = %name, "'oauth.callbackUrl' requires a nonempty 'clientId'; skipping server");
+                    return None;
+                }
                 let client = match fields.get("clientId") {
                     Some(Value::String(client_id)) if !client_id.is_empty() => {
-                        let callback_port = match fields.get("callbackPort") {
-                            None => None,
-                            Some(value) => {
-                                match value.as_u64().and_then(|p| u16::try_from(p).ok()) {
-                                    Some(port) if port != 0 => Some(port),
-                                    _ => {
-                                        tracing::debug!(
-                                            server = %name,
-                                            "'oauth.callbackPort' must be an integer 1-65535; skipping server"
-                                        );
-                                        return None;
-                                    }
-                                }
+                        let callback = match LoopbackCallback::from_config(fields) {
+                            Ok(callback) => callback,
+                            Err(reason) => {
+                                tracing::debug!(server = %name, reason, "Invalid OAuth callback; skipping server");
+                                return None;
                             }
                         };
                         Some(PreconfiguredClient {
                             client_id: client_id.clone(),
-                            callback_port,
+                            callback,
                         })
                     }
                     Some(_) => {
@@ -5290,16 +5298,66 @@ pub struct OAuthConfig {
 /// point. A server that mandates confidential client authentication is out of
 /// scope here.
 ///
-/// `callback_port` (Claude Code's `oauth.callbackPort`) is set when the
-/// pre-registered app's redirect allowlist only contains a fixed
-/// `http://localhost:<port>/callback` loopback URI — it cannot register
-/// Phoenix's own server-route callback. Phoenix then uses that loopback
-/// redirect and bounces the browser to its real callback via an ephemeral
-/// listener on that port (REQ-MCP-020). Absent, Phoenix uses its server route.
+/// `callback` selects a validated local redirect from `oauth.callbackUrl` or
+/// Claude Code's `oauth.callbackPort`. Absent, Phoenix uses its server route.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PreconfiguredClient {
     pub client_id: String,
-    pub callback_port: Option<u16>,
+    pub callback: Option<LoopbackCallback>,
+}
+
+/// An HTTP callback served by the loopback listener (REQ-MCP-020).
+/// The private string retains the exact configured URI for OAuth matching.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoopbackCallback(String);
+
+impl LoopbackCallback {
+    fn parse(uri: &str) -> Option<Self> {
+        let url = reqwest::Url::parse(uri).ok()?;
+        let local = matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"));
+        (uri.get(..7)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("http://"))
+            && url.scheme() == "http"
+            && local
+            && url.port_or_known_default().is_some_and(|port| port != 0)
+            && url.username().is_empty()
+            && url.password().is_none()
+            && url.query().is_none()
+            && url.fragment().is_none()
+            && !uri.contains('\\')
+            && !uri.chars().any(|c| c.is_whitespace() || c.is_control()))
+        .then(|| Self(uri.to_owned()))
+    }
+
+    fn from_port(port: u16) -> Option<Self> {
+        (port != 0).then(|| Self(format!("http://localhost:{port}/callback")))
+    }
+
+    fn port(&self) -> u16 {
+        self.url()
+            .port_or_known_default()
+            .expect("HTTP callback has a resolved port")
+    }
+
+    fn url(&self) -> reqwest::Url {
+        reqwest::Url::parse(&self.0).expect("validated loopback callback")
+    }
+
+    fn from_config(fields: &serde_json::Map<String, Value>) -> Result<Option<Self>, &'static str> {
+        match (fields.get("callbackUrl"), fields.get("callbackPort")) {
+            (Some(_), Some(_)) => Err("callbackUrl and callbackPort are mutually exclusive"),
+            (Some(value), None) => value.as_str().and_then(Self::parse).map(Some).ok_or(
+                "callbackUrl must be an HTTP loopback URL without credentials, query or fragment",
+            ),
+            (None, Some(value)) => value
+                .as_u64()
+                .and_then(|port| u16::try_from(port).ok())
+                .and_then(Self::from_port)
+                .map(Some)
+                .ok_or("callbackPort must be an integer 1-65535"),
+            (None, None) => Ok(None),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -5462,7 +5520,7 @@ mod tests {
                 auth: HttpAuth::OAuth(OAuthConfig {
                     client: Some(PreconfiguredClient {
                         client_id: "cid-1".to_string(),
-                        callback_port: Some(3118),
+                        callback: LoopbackCallback::from_port(3118),
                     }),
                     scopes: Vec::new(),
                 }),
@@ -5487,7 +5545,7 @@ mod tests {
                 auth: HttpAuth::OAuth(OAuthConfig {
                     client: Some(PreconfiguredClient {
                         client_id: "1601185624273.8899143856786".to_string(),
-                        callback_port: Some(3118),
+                        callback: LoopbackCallback::from_port(3118),
                     }),
                     scopes: vec![
                         "channels:history".to_string(),
@@ -5575,6 +5633,87 @@ mod tests {
                 McpClientManager::classify_config_entry("s", &cfg),
                 None,
                 "callbackPort {bad} must skip the server"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_oauth_callback_url_preserves_exact_loopback_address() {
+        for uri in [
+            "http://127.0.0.1:53682",
+            "http://127.0.0.1:53682/",
+            "http://localhost:3118/custom/callback",
+            "http://[::1]:53682/encoded%20path",
+            "http://localhost:80/callback",
+        ] {
+            let cfg = serde_json::json!({
+                "type": "http", "url": "https://example.com/mcp",
+                "oauth": {"clientId": "LOCAL_APPLICATION", "callbackUrl": uri},
+            });
+            let Some(McpServerConfig::Http {
+                auth: HttpAuth::OAuth(oauth),
+                ..
+            }) = McpClientManager::classify_config_entry("snowflake", &cfg)
+            else {
+                panic!("valid callback {uri}");
+            };
+            let callback = oauth.client.unwrap().callback.unwrap();
+            assert_eq!(callback.0, uri);
+            assert_eq!(
+                callback.port(),
+                reqwest::Url::parse(uri)
+                    .unwrap()
+                    .port_or_known_default()
+                    .unwrap()
+            );
+        }
+        assert_eq!(
+            LoopbackCallback::from_port(3118).unwrap().0,
+            "http://localhost:3118/callback"
+        );
+        assert_eq!(
+            LoopbackCallback::from_port(80).unwrap().0,
+            "http://localhost:80/callback"
+        );
+    }
+
+    #[test]
+    fn classify_oauth_rejects_unsafe_or_ambiguous_callback_url() {
+        for bad in [
+            serde_json::json!(null),
+            serde_json::json!(53682),
+            serde_json::json!("https://127.0.0.1:53682/"),
+            serde_json::json!("http://example.com:53682/"),
+            serde_json::json!("http://0.0.0.0:53682/"),
+            serde_json::json!("http://127.0.0.2:53682/"),
+            serde_json::json!("http://localhost.example.com:53682/"),
+            serde_json::json!("http://user:password@localhost:53682/"),
+            serde_json::json!("http://localhost:53682/?state=fixed"),
+            serde_json::json!("http://localhost:53682/#fragment"),
+            serde_json::json!("http://localhost:0/"),
+            serde_json::json!("http://localhost:65536/"),
+            serde_json::json!("http:/127.0.0.1:53682/"),
+            serde_json::json!(" http://localhost:53682/"),
+            serde_json::json!("http://local\nhost:53682/"),
+        ] {
+            let cfg = serde_json::json!({
+                "type": "http", "url": "https://example.com/mcp",
+                "oauth": {"clientId": "cid", "callbackUrl": bad},
+            });
+            assert!(
+                McpClientManager::classify_config_entry("s", &cfg).is_none(),
+                "{bad}"
+            );
+        }
+        for oauth in [
+            serde_json::json!({"callbackUrl": "http://127.0.0.1:53682/"}),
+            serde_json::json!({"clientId": "", "callbackUrl": "http://127.0.0.1:53682/"}),
+            serde_json::json!({"clientId": "cid", "callbackUrl": "http://127.0.0.1:53682/", "callbackPort": 53682}),
+        ] {
+            let cfg = serde_json::json!({"type": "http", "url": "https://example.com/mcp", "oauth": oauth});
+            assert!(
+                McpClientManager::classify_config_entry("s", &cfg).is_none(),
+                "{oauth}"
             );
         }
     }

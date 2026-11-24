@@ -1,8 +1,8 @@
-async fn migration_176_pending_fixture() -> (Database, Assessment, NativeCloseReceipt) {
-    migration_176_pending_fixture_with_options(true, false).await
+async fn migration_179_pending_fixture() -> (Database, Assessment, NativeCloseReceipt) {
+    migration_179_pending_fixture_with_options(true, false).await
 }
 
-async fn migration_176_pending_fixture_with_options(
+async fn migration_179_pending_fixture_with_options(
     fresh_snapshot: bool,
     prior_dispatch: bool,
 ) -> (Database, Assessment, NativeCloseReceipt) {
@@ -11,7 +11,7 @@ async fn migration_176_pending_fixture_with_options(
         .connect("sqlite::memory:")
         .await
         .unwrap();
-    crate::migrations::setup_real_175_for_test(&pool).await;
+    crate::migrations::setup_real_178_for_test(&pool).await;
     let db = Database::from_pool_for_tests(pool, String::new());
     let mut failure = initial_cleanup_failure_fixture_with_resources(
         &db,
@@ -104,7 +104,7 @@ async fn migration_176_pending_fixture_with_options(
     (db, assessment, receipt)
 }
 
-async fn migration_176_retained_state(db: &Database) -> String {
+async fn migration_179_retained_state(db: &Database) -> String {
     sqlx::query_scalar(
         "SELECT json_object(
           'obligation', (SELECT json_group_array(json_array(attempt_id, product_conversation_id,
@@ -135,7 +135,7 @@ async fn migration_176_retained_state(db: &Database) -> String {
     .unwrap()
 }
 
-async fn migration_176_insert_parent(
+async fn migration_179_insert_parent(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     run: &CloseRunRef,
     effect: i64,
@@ -170,7 +170,7 @@ async fn migration_176_insert_parent(
     .await
 }
 
-async fn migration_176_insert_child(
+async fn migration_179_insert_child(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     run: &CloseRunRef,
     effect: i64,
@@ -194,14 +194,14 @@ async fn migration_176_insert_child(
 }
 
 #[tokio::test]
-async fn migration_176_upgrades_populated_162_without_rebinding_g1_or_g2() {
-    let (db, _, receipt) = migration_176_pending_fixture().await;
-    let before = migration_176_retained_state(&db).await;
+async fn migration_179_upgrades_populated_178_without_rebinding_g1_or_g2() {
+    let (db, _, receipt) = migration_179_pending_fixture().await;
+    let before = migration_179_retained_state(&db).await;
     let definitions: Vec<(String, String)> = sqlx::query_as(
         "SELECT name, sql FROM sqlite_schema WHERE type = 'trigger' ORDER BY name",
     ).fetch_all(db.pool()).await.unwrap();
-    assert_eq!(crate::migrations::run_through_for_test(db.pool(), 176).await.unwrap(), 1);
-    assert_eq!(migration_176_retained_state(&db).await, before);
+    assert_eq!(crate::migrations::run_through_for_test(db.pool(), 179).await.unwrap(), 1);
+    assert_eq!(migration_179_retained_state(&db).await, before);
     for (name, installed) in definitions {
         let rewritten: String = sqlx::query_scalar("SELECT sql FROM sqlite_schema WHERE name = ?1")
             .bind(&name).fetch_one(db.pool()).await.unwrap();
@@ -214,17 +214,17 @@ async fn migration_176_upgrades_populated_162_without_rebinding_g1_or_g2() {
     }
     let latest: i64 = sqlx::query_scalar("SELECT MAX(version) FROM _migrations")
         .fetch_one(db.pool()).await.unwrap();
-    assert_eq!(latest, 176);
+    assert_eq!(latest, 179);
     let run = CloseRunRef { attempt_id: receipt.admitted.attempt_id, ordinal: receipt.admitted.run_ordinal };
     assert_eq!(db.close_safe_retry_progress(&run).await.unwrap().pending.len(), 3);
-    assert_eq!(crate::migrations::run_through_for_test(db.pool(), 176).await.unwrap(), 0);
+    assert_eq!(crate::migrations::run_through_for_test(db.pool(), 179).await.unwrap(), 0);
 }
 
 #[tokio::test]
-async fn migration_176_g1_failure_guards_preserve_g2_and_exact_pending_children() {
-    let (db, _, receipt) = migration_176_pending_fixture().await;
-    crate::migrations::run_through_for_test(db.pool(), 176).await.unwrap();
-    let before = migration_176_retained_state(&db).await;
+async fn migration_179_g1_failure_guards_preserve_g2_and_exact_pending_children() {
+    let (db, _, receipt) = migration_179_pending_fixture().await;
+    crate::migrations::run_through_for_test(db.pool(), 179).await.unwrap();
+    let before = migration_179_retained_state(&db).await;
     let run = CloseRunRef { attempt_id: receipt.admitted.attempt_id, ordinal: receipt.admitted.run_ordinal };
     let pending = db.close_safe_retry_progress(&run).await.unwrap().pending;
     assert_eq!(pending.len(), 3);
@@ -246,19 +246,19 @@ async fn migration_176_g1_failure_guards_preserve_g2_and_exact_pending_children(
             (&g1, created - 1, None),
             (&g1, created + 10, Some(created + 11)),
         ] {
-            assert!(migration_176_insert_parent(&mut tx, &run, 0, snapshot, occurred, confirmation).await.is_err());
+            assert!(migration_179_insert_parent(&mut tx, &run, 0, snapshot, occurred, confirmation).await.is_err());
         }
         let occurred = created + 10;
-        let result = migration_176_insert_parent(&mut tx, &run, 0, &g1, occurred, confirmed.then_some(occurred)).await.unwrap();
+        let result = migration_179_insert_parent(&mut tx, &run, 0, &g1, occurred, confirmed.then_some(occurred)).await.unwrap();
         assert_eq!(result.rows_affected(), 1);
-        assert!(migration_176_insert_child(&mut tx, &run, 1, 0, "unattempted").await.is_err(), "cannot skip the pending head");
-        assert!(migration_176_insert_child(&mut tx, &run, 0, 0, "unattempted").await.is_err(), "designated effect must be failed");
-        assert_eq!(migration_176_insert_child(&mut tx, &run, 0, 0, "failed").await.unwrap().rows_affected(), 1);
-        assert!(migration_176_insert_child(&mut tx, &run, 1, 1, "residual").await.is_err(), "G1 residual evidence is not a new attempt");
-        assert_eq!(migration_176_insert_child(&mut tx, &run, 1, 1, "unattempted").await.unwrap().rows_affected(), 1);
-        assert!(migration_176_insert_child(&mut tx, &run, 2, 2, "failed").await.is_err(), "independent scope was not the failed effect");
-        assert!(migration_176_insert_child(&mut tx, &run, 2, 2, "residual").await.is_err(), "independent scope is still unattempted");
-        assert_eq!(migration_176_insert_child(&mut tx, &run, 2, 2, "unattempted").await.unwrap().rows_affected(), 1);
+        assert!(migration_179_insert_child(&mut tx, &run, 1, 0, "unattempted").await.is_err(), "cannot skip the pending head");
+        assert!(migration_179_insert_child(&mut tx, &run, 0, 0, "unattempted").await.is_err(), "designated effect must be failed");
+        assert_eq!(migration_179_insert_child(&mut tx, &run, 0, 0, "failed").await.unwrap().rows_affected(), 1);
+        assert!(migration_179_insert_child(&mut tx, &run, 1, 1, "residual").await.is_err(), "G1 residual evidence is not a new attempt");
+        assert_eq!(migration_179_insert_child(&mut tx, &run, 1, 1, "unattempted").await.unwrap().rows_affected(), 1);
+        assert!(migration_179_insert_child(&mut tx, &run, 2, 2, "failed").await.is_err(), "independent scope was not the failed effect");
+        assert!(migration_179_insert_child(&mut tx, &run, 2, 2, "residual").await.is_err(), "independent scope is still unattempted");
+        assert_eq!(migration_179_insert_child(&mut tx, &run, 2, 2, "unattempted").await.unwrap().rows_affected(), 1);
         let children: Vec<(i64, String, String)> = sqlx::query_as(
             "SELECT ordinal, scope, disposition FROM close_cleanup_failure_resources
              WHERE failure_occurrence_id = ?1 ORDER BY ordinal",
@@ -273,13 +273,13 @@ async fn migration_176_g1_failure_guards_preserve_g2_and_exact_pending_children(
     let mut tx = db.pool().begin().await.unwrap();
     sqlx::query("INSERT INTO close_run_retry_successes (attempt_id, run_ordinal, ordinal, detail, observed_at_us) VALUES (?1, ?2, 0, 'retired', ?3)")
         .bind(run.attempt_id.as_str()).bind(run.ordinal.get()).bind(created + 1).execute(&mut *tx).await.unwrap();
-    assert!(migration_176_insert_parent(&mut tx, &run, 0, &g1, created + 10, None).await.is_err(), "successful effect cannot fail");
-    migration_176_insert_parent(&mut tx, &run, 1, &g1, created + 10, None).await.unwrap();
-    assert!(migration_176_insert_child(&mut tx, &run, 0, 0, "unattempted").await.is_err(), "successful child is not pending");
-    assert_eq!(migration_176_insert_child(&mut tx, &run, 1, 0, "failed").await.unwrap().rows_affected(), 1);
-    assert!(migration_176_insert_child(&mut tx, &run, 2, 1, "failed").await.is_err(), "only the designated scope failed");
-    assert!(migration_176_insert_child(&mut tx, &run, 2, 1, "residual").await.is_err(), "other scope remains unattempted");
-    assert_eq!(migration_176_insert_child(&mut tx, &run, 2, 1, "unattempted").await.unwrap().rows_affected(), 1);
+    assert!(migration_179_insert_parent(&mut tx, &run, 0, &g1, created + 10, None).await.is_err(), "successful effect cannot fail");
+    migration_179_insert_parent(&mut tx, &run, 1, &g1, created + 10, None).await.unwrap();
+    assert!(migration_179_insert_child(&mut tx, &run, 0, 0, "unattempted").await.is_err(), "successful child is not pending");
+    assert_eq!(migration_179_insert_child(&mut tx, &run, 1, 0, "failed").await.unwrap().rows_affected(), 1);
+    assert!(migration_179_insert_child(&mut tx, &run, 2, 1, "failed").await.is_err(), "only the designated scope failed");
+    assert!(migration_179_insert_child(&mut tx, &run, 2, 1, "residual").await.is_err(), "other scope remains unattempted");
+    assert_eq!(migration_179_insert_child(&mut tx, &run, 2, 1, "unattempted").await.unwrap().rows_affected(), 1);
     let children: Vec<(i64, String, String)> = sqlx::query_as(
         "SELECT ordinal, scope, disposition FROM close_cleanup_failure_resources
          WHERE failure_occurrence_id = ?1 ORDER BY ordinal",
@@ -289,29 +289,29 @@ async fn migration_176_g1_failure_guards_preserve_g2_and_exact_pending_children(
         (1, pending[2].scope.as_str().to_owned(), "unattempted".to_owned()),
     ]);
     tx.rollback().await.unwrap();
-    assert_eq!(migration_176_retained_state(&db).await, before);
+    assert_eq!(migration_179_retained_state(&db).await, before);
 }
 
 #[tokio::test]
-async fn migration_176_upgrade_preserves_installed_source_fence_behavior() {
-    let (db, assessment, receipt) = migration_176_pending_fixture().await;
-    crate::migrations::run_through_for_test(db.pool(), 176).await.unwrap();
+async fn migration_179_upgrade_preserves_installed_source_fence_behavior() {
+    let (db, assessment, receipt) = migration_179_pending_fixture().await;
+    crate::migrations::run_through_for_test(db.pool(), 179).await.unwrap();
     let run = CloseRunRef {
         attempt_id: receipt.admitted.attempt_id,
         ordinal: receipt.admitted.run_ordinal,
     };
     let pending = db.close_safe_retry_progress(&run).await.unwrap().pending;
     let obligation = db.get_close_obligation(run.attempt_id.as_str()).await.unwrap();
-    // The current source-fence writer reads acknowledgement evidence added in 183.
-    crate::migrations::run_through_for_test(db.pool(), 183).await.unwrap();
+    // The current source-fence writer reads acknowledgement evidence added in 186.
+    crate::migrations::run_through_for_test(db.pool(), 186).await.unwrap();
     historical_write_source_fence_state(&db, &assessment.command, &ConvState::Idle).await.unwrap();
     assert_source_fenced(&db, &assessment, &run, &pending).await;
     assert_eq!(db.get_close_obligation(run.attempt_id.as_str()).await.unwrap(), obligation);
 }
 
 #[tokio::test]
-async fn migration_176_unknown_installed_prefix_rolls_back_both_trigger_rewrites() {
-    let (db, _, _) = migration_176_pending_fixture().await;
+async fn migration_179_unknown_installed_prefix_rolls_back_both_trigger_rewrites() {
+    let (db, _, _) = migration_179_pending_fixture().await;
     let original: String = sqlx::query_scalar("SELECT sql FROM sqlite_schema WHERE name = 'close_cleanup_failure_resources_require_authority'")
         .fetch_one(db.pool()).await.unwrap();
     let unknown = original.replacen("WHEN NOT EXISTS", "WHEN  NOT EXISTS", 1);
@@ -320,13 +320,13 @@ async fn migration_176_unknown_installed_prefix_rolls_back_both_trigger_rewrites
     sqlx::raw_sql(sqlx::AssertSqlSafe(unknown)).execute(db.pool()).await.unwrap();
     let before: Vec<(String, String)> = sqlx::query_as("SELECT name, sql FROM sqlite_schema WHERE type = 'trigger' ORDER BY name")
         .fetch_all(db.pool()).await.unwrap();
-    let state = migration_176_retained_state(&db).await;
-    assert!(crate::migrations::run_through_for_test(db.pool(), 176).await.is_err());
+    let state = migration_179_retained_state(&db).await;
+    assert!(crate::migrations::run_through_for_test(db.pool(), 179).await.is_err());
     let after: Vec<(String, String)> = sqlx::query_as("SELECT name, sql FROM sqlite_schema WHERE type = 'trigger' ORDER BY name")
         .fetch_all(db.pool()).await.unwrap();
     assert_eq!(after, before);
-    assert_eq!(migration_176_retained_state(&db).await, state);
+    assert_eq!(migration_179_retained_state(&db).await, state);
     let version: i64 = sqlx::query_scalar("SELECT MAX(version) FROM _migrations")
         .fetch_one(db.pool()).await.unwrap();
-    assert_eq!(version, 175);
+    assert_eq!(version, 178);
 }

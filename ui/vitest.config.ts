@@ -12,7 +12,8 @@ export default defineConfig({
   plugins: [react()],
   test: {
     environment: 'happy-dom',
-    execArgv: ['--no-experimental-webstorage'],
+    // --expose-gc lets testEnvironment.test.ts prove MutationObserver survives collection.
+    execArgv: ['--no-experimental-webstorage', '--expose-gc'],
     // Sandboxed-preview components (MetaViewer/HtmlViewerBody) render an
     // <iframe src="/preview/…">. happy-dom resolves the relative src against
     // the default base URL and would otherwise issue a real network load for

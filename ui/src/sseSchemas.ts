@@ -117,6 +117,7 @@ export const MESSAGE_TYPE_OPTIONS = [
 export const InputOriginSchema: v.GenericSchema<unknown, InputOrigin> = v.variant('kind', [
   v.looseObject({ kind: v.literal('unknown_historical') }),
   v.looseObject({ kind: v.literal('user_api') }),
+  v.looseObject({ kind: v.literal('coordinator_question_reply') }),
   v.looseObject({ kind: v.literal('system_generated') }),
   v.looseObject({ kind: v.literal('slack_gateway'), request_id: v.string() }),
   v.looseObject({ kind: v.literal('subscription_event'), event_id: v.string() }),
@@ -169,6 +170,7 @@ export const EventPresentationSchema: v.GenericSchema<unknown, EventPresentation
     source_generation: v.number(),
     occurred_at_us: v.number(),
     provenance: v.picklist(['subscription', 'mandatory_close_failure']),
+    ending_evidence: v.string(),
     outcome: v.variant('kind', [
       v.looseObject({ kind: v.literal('turn_finished') }),
       v.looseObject({ kind: v.literal('failed'), reason: v.string() }),
@@ -181,6 +183,7 @@ export const EventPresentationSchema: v.GenericSchema<unknown, EventPresentation
   }),
   v.looseObject({
     status: v.literal('federated_fact'),
+    ending_evidence: v.literal('unsupported_remote'),
     event_id: v.string(),
     source_instance_id: v.string(),
     source_product_conversation_id: v.string(),

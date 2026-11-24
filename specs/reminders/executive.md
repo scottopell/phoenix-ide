@@ -70,8 +70,16 @@ uses 100-row due-time/ID pages within the last day of actual observation, with a
 ten-page refresh cap, current continuation/Coordinator targets and History
 exclusion.
 
-The web panel displays saved-zone times, immutable due cards and scheduled-only
-management. Editing retains the opening revision; conflicts reload saved truth.
+The web panel reuses the shared collapsible grounding section, collapsed by default with reminder count and server-state summary. Due status stays visible without displaying reminder bodies or identifiers. Empty loaded lists reserve no panel row. Deliberate expansion reveals saved-zone times, immutable due cards and scheduled-only management; background refresh retains expansion. Component and hosted mobile/desktop fixture regressions cover the disclosure and its controls. Editing retains the opening revision; conflicts attempt to reload
+saved truth. A failed list fetch uses a compact retry/details status rather than
+an empty claim or a full card; previously loaded reminders remain available with a
+stale indication, respecting the disclosure state. Confirmed mutations hide obsolete state and actions until a
+fresh list arrives. Definite HTTP refusals retain actionable errors. An
+uncertain transport or server response is reported as unconfirmed, never
+replayed; a fresh owner-scoped read clears uncertainty only when it reflects
+the requested state. An offset-less ambiguous local time does not confirm a
+reschedule through wall-time readback alone. Omitted or unchanged rows retain
+the uncertainty.
 Abortable, non-overlapping polling runs at five seconds and on visibility, focus
 and network return. Browser alerts use existing permission/settings/focus policy,
 persisted `notify_reminder` defaulting enabled, a quiet initial baseline and

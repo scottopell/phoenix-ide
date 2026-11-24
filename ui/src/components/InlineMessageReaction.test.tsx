@@ -1,8 +1,10 @@
 import { act, cleanup, fireEvent, render, screen } from '@testing-library/react';
+import { useMemo } from 'react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Message } from '../api';
 import { InlineReactionContext, InlineReactionStore, formatInlineReaction } from '../conversation/InlineReactionStore';
 import { DraftStore } from '../conversation/DraftStore';
+import { AnnotationDraftStore, type AnnotationDraft } from '../conversation/AnnotationDraftStore';
 import { FocusScopeProvider, useRegisterFocusScope } from '../hooks/useFocusScope';
 import { InlineMessageReaction } from './InlineMessageReaction';
 import { readReactionSelection } from './inlineReactionSelection';
@@ -41,7 +43,10 @@ function OtherScope() {
   return <button type="button">Other scope control</button>;
 }
 
-function Harness({ store, scope = 'conversation-a', append, sourceMounted = true, otherScope = false, returnToSource, tokenless = false }: { store: InlineReactionStore; scope?: string; append?: ((text: string) => void) | undefined; sourceMounted?: boolean; otherScope?: boolean; returnToSource?: () => boolean | Promise<boolean>; tokenless?: boolean }) {
+function Harness({ store, scope = 'conversation-a', append, sourceMounted = true, otherScope = false, returnToSource, tokenless = false }: { store: InlineReactionStore; scope?: string; append?: ((annotation: Parameters<AnnotationDraft['add']>[0]) => void) | undefined; sourceMounted?: boolean; otherScope?: boolean; returnToSource?: () => boolean | Promise<boolean>; tokenless?: boolean }) {
+  const drafts = useMemo(() => new AnnotationDraftStore(), []);
+  const draft = drafts.forScope(scope);
+  const destination = useMemo(() => append ? { writable: true, draft: { ...draft, add: (annotation: Parameters<AnnotationDraft['add']>[0]) => { append(annotation); draft.add(annotation); } } } : undefined, [append, draft]);
   const renderedMessages = tokenless ? messages.map((message) => ({ ...message, display_data: {} })) : messages;
   return (
     <FocusScopeProvider>
@@ -54,7 +59,7 @@ function Harness({ store, scope = 'conversation-a', append, sourceMounted = true
           ))}
         </div>
         <button type="button" data-testid="unrelated">Unrelated surface</button>
-        <InlineMessageReaction scopeKey={scope} messages={renderedMessages} destination={append ? { append } : undefined} returnToSource={returnToSource} />
+        <InlineMessageReaction scopeKey={scope} messages={renderedMessages} destination={destination} returnToSource={returnToSource} />
         {otherScope && <OtherScope />}
         <MessageContextMenu messages={messages} />
         <FilePathContextMenu />
@@ -91,20 +96,19 @@ describe('inline message reactions', () => {
     const store = new InlineReactionStore();
     const drafts = new DraftStore();
     drafts.dispatch('latest', { type: 'set_draft', text: 'Original draft' });
-    const append = vi.fn((text: string) => drafts.dispatch('latest', { type: 'append_draft', text }));
+    const append = vi.fn();
     render(<Harness store={store} append={append} />);
     select(screen.getByTestId('old').firstChild!);
     const input = await screen.findByRole('textbox', { name: 'Your reaction' });
     expect(input).not.toHaveFocus();
     fireEvent.change(input, { target: { value: 'Strong idea. Please test cancellation too.' } });
     drafts.dispatch('latest', { type: 'set_draft', text: 'Draft edited while reacting  ' });
-    const add = screen.getByRole('button', { name: 'Add to draft' });
+    const add = screen.getByRole('button', { name: 'Add to message' });
     fireEvent.click(add);
     fireEvent.click(add);
     expect(append).toHaveBeenCalledTimes(1);
-    expect(drafts.getSnapshot('latest').draft).toContain('Draft edited while reacting  \n\nRegarding message #2 (row-old:old):');
-    expect(drafts.getSnapshot('latest').draft).toContain('Deterministic state patterns ');
-    expect(drafts.getSnapshot('latest').draft).toContain('Strong idea. Please test cancellation too.');
+    expect(drafts.getSnapshot('latest').draft).toBe('Draft edited while reacting  ');
+    expect(append).toHaveBeenCalledWith(expect.objectContaining({ source: expect.objectContaining({ occurrenceToken: 'row-old:old', quote: 'Deterministic state patterns ' }), body: 'Strong idea. Please test cancellation too.' }));
     expect(screen.queryByRole('textbox', { name: 'Your reaction' })).not.toBeInTheDocument();
     expect(screen.getByRole('status')).toHaveTextContent('Added to draft');
   });
@@ -132,7 +136,7 @@ describe('inline message reactions', () => {
     const store = new InlineReactionStore();
     const drafts = new DraftStore();
     drafts.dispatch('latest', { type: 'set_draft', text: 'Existing mobile draft' });
-    const append = vi.fn((text: string) => drafts.dispatch('latest', { type: 'append_draft', text }));
+    const append = vi.fn();
     render(<Harness store={store} append={append} />);
     const text = screen.getByTestId('old').firstChild!;
     fireEvent.pointerDown(text, { pointerType: 'touch' });
@@ -161,9 +165,10 @@ describe('inline message reactions', () => {
     input.focus();
     expect(store.getSnapshot('conversation-a')?.source).toEqual(captured);
     fireEvent.change(input, { target: { value: 'Keep this mobile observation' } });
-    fireEvent.click(screen.getByRole('button', { name: 'Add to draft' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Add to message' }));
     expect(append).toHaveBeenCalledOnce();
-    expect(drafts.getSnapshot('latest').draft).toBe(`Existing mobile draft\n\n${formatInlineReaction({ source: captured!, body: 'Keep this mobile observation' })}`);
+    expect(drafts.getSnapshot('latest').draft).toBe('Existing mobile draft');
+    expect(append).toHaveBeenCalledWith(expect.objectContaining({ source: captured, body: 'Keep this mobile observation' }));
   });
 
   it.each([false, true])('keeps mouse selection in the floating pill when coarse-pointer capability is %s', async (coarse) => {
@@ -606,16 +611,16 @@ describe('inline message reactions', () => {
     await act(async () => { await new Promise(requestAnimationFrame); });
     expect(store.getSnapshot('conversation-a')?.source.messageId).toBe('old');
     view.rerender(<Harness store={store} />);
-    expect(screen.getByRole('button', { name: 'Add to draft' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Add to message' })).toBeDisabled();
     expect(screen.getByRole('textbox')).toHaveValue('Keep this thought');
     view.rerender(<Harness store={store} scope="conversation-b" append={append} />);
     expect(screen.queryByRole('textbox')).not.toBeInTheDocument();
     view.unmount();
     render(<Harness store={store} append={append} />);
     expect(screen.getByRole('textbox')).toHaveValue('Keep this thought');
-    fireEvent.click(screen.getByRole('button', { name: 'Add to draft' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Add to message' }));
     expect(append).toHaveBeenCalledTimes(1);
-    expect(append.mock.calls[0]?.[0]).toContain('row-old:old');
+    expect(append.mock.calls[0]?.[0].source.occurrenceToken).toBe('row-old:old');
   });
 
   it('does not hijack native context menus or copy keyboard shortcuts while reacting', async () => {
