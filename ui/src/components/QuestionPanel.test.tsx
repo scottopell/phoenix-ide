@@ -136,7 +136,7 @@ describe('QuestionPanel focus lifecycle', () => {
     expect(view.container.querySelector('.question-panel')).toHaveFocus();
   });
 
-  it('uses preventScroll when automatic focus runs on mount, step, and activation', () => {
+  it('preserves scroll on mount and activation but reveals changed steps', () => {
     const view = render(content());
     const panel = view.container.querySelector<HTMLDivElement>('.question-panel')!;
     const focus = vi.spyOn(panel, 'focus');
@@ -148,7 +148,7 @@ describe('QuestionPanel focus lifecycle', () => {
     focus.mockClear();
     fireEvent.click(screen.getByRole('button', { name: 'Next' }));
     flushFrame();
-    expect(focus).toHaveBeenLastCalledWith({ preventScroll: true });
+    expect(focus).toHaveBeenLastCalledWith({ preventScroll: false });
     expect(panel).toHaveFocus();
 
     focus.mockClear();
