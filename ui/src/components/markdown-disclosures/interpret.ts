@@ -4,7 +4,7 @@ import type { Extension } from 'mdast-util-from-markdown';
 import type { Construct, Event, State, Token, TokenizeContext } from 'micromark-util-types';
 import type { Code, Definition, Root, RootContent } from 'mdast';
 import { recognizeDisclosures } from './recognize';
-import { append, basicOptions, constructList, membership, walk } from './support';
+import { append, basicOptions, constructList, createStats, membership, walk } from './support';
 import type {
   DisclosureDetails, MarkdownConfiguration, MarkdownInterpretation, SourceRange,
 } from './types';
@@ -50,11 +50,41 @@ function sourcePositions(source: string) {
   return (start: number, end: number) => ({ start: positions[start]!, end: positions[end]! });
 }
 
+const DISCLOSURE_CANDIDATE_RE = /<\/?(?:details|summary)(?=[\s/>])/i;
+
 /** Interpret once; rendering, chunk boundaries and Find share this result. */
 export function interpretMarkdown(
   source: string,
   options: MarkdownConfiguration = basicOptions,
 ): MarkdownInterpretation {
+  if (!DISCLOSURE_CANDIDATE_RE.test(source) && source.charCodeAt(0) !== 65279) {
+    const stats = createStats(source.length);
+    const defined = membership(stats, 'definition');
+    const footnotes = membership(stats, 'footnote');
+    const parser = parse(options);
+    parser.defined = defined;
+    parser.gfmFootnotes = footnotes;
+    const pre = preprocess();
+    stats.submittedUnits = source.length;
+    stats.submissions = 1;
+    const events = postprocess(parser.document().write(pre(source, undefined, true)));
+    stats.committedEvents = events.length;
+    const tree = compiler({
+      ...options,
+      mdastExtensions: [...(options.mdastExtensions ?? []), codeCompletion],
+    })(events);
+    const definitions: Definition[] = [];
+    if (defined.length > 0) {
+      const seen = new Set<string>();
+      walk(tree, (node) => {
+        if (node.type === 'definition' && !seen.has(node.identifier)) {
+          seen.add(node.identifier);
+          definitions.push(node);
+        }
+      });
+    }
+    return { tree, ranges: [], definitions, stats };
+  }
   const recognition = recognizeDisclosures(source, options);
   const stats = recognition.stats;
   const position = sourcePositions(source);
