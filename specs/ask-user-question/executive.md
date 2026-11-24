@@ -53,6 +53,12 @@ The hosted comparison uses production bundles, intercepted synthetic HTTP payloa
 4× CPU slowdown, 400 ms modeled API latency and throttled asset requests. A client
 EventSource fixture excludes real SSE transport and server/database latency.
 
+### Desktop placement qualification
+
+RC13 (`1c125f0360251d823710762f474d35ff268fa648`) reproduced desktop clipping in disposable hosted Chromium at 1280×900: metadata and dialog top -17px, dock scrollTop 17, document scrollY 0. The first panel-only `preventScroll` candidate also failed the same full-metadata visibility oracle (run 45342310595); native `dialog.show()` focus remained a separate scrolling path.
+
+PR1156 opens desktop presentation through the dialog's `open` property without native show-time focus, and preserves scroll for automatic panel mount/reactivation focus. Explicit step navigation retains reveal-on-focus. Mobile remains native `showModal()`. Expanded regressions check actual overflow clipping ancestors and control hit-testing, untouched opening geometry, 768/769 transitions, Next/Back and retained answer/composer state, plus interior transcript position independently after mobile reopen and Return. Final exact-head hosted qualification is required before acceptance; the PR carries run receipts. REQ-AUQ-013 remains in-review: physical-device/OS keyboard behavior and cross-viewport reading-anchor preservation are not established by these fixtures. No loading improvement is claimed.
+
 ### Integration correction and independent readiness evidence
 
 Integration review found that a desktop nonmodal `dialog.show()` still matched the

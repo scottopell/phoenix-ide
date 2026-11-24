@@ -345,10 +345,13 @@ export function QuestionPanel({
   const panelRef = useRef<HTMLDivElement>(null);
 
   const hasCurrentQuestion = currentQuestion !== undefined;
+  const focusedStepRef = useRef(currentStep);
   useEffect(() => {
+    const stepChanged = focusedStepRef.current !== currentStep;
+    focusedStepRef.current = currentStep;
     if (!active || !hasCurrentQuestion) return;
     const frame = requestAnimationFrame(() => {
-      if (!confirmDismissVisibleRef.current) panelRef.current?.focus();
+      if (!confirmDismissVisibleRef.current) panelRef.current?.focus({ preventScroll: !stepChanged });
     });
     return () => cancelAnimationFrame(frame);
   }, [active, currentStep, hasCurrentQuestion]);

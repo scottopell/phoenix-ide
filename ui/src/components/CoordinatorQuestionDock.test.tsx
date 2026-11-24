@@ -125,7 +125,8 @@ describe('Ember questions (REQ-AUQ-011)', () => {
     expect(screen.getByText('Merge now?')).toBeInTheDocument();
     expect(screen.getByText('1 more waiting')).toBeInTheDocument();
     expect(screen.getByText(/Ember keeps working while you decide/)).toBeInTheDocument();
-    expect(showDialog).toHaveBeenCalledOnce();
+    expect(showDialog).not.toHaveBeenCalled();
+    expect(screen.getByRole('dialog')).toHaveAttribute('open');
 
     fireEvent.click(screen.getByTitle('Select First'));
     fireEvent.click(screen.getByRole('button', { name: 'Submit' }));
@@ -407,7 +408,8 @@ describe('Ember questions (REQ-AUQ-011)', () => {
     expect(screen.getByTitle('Select First')).toHaveClass('selected');
 
     setMobile(false);
-    await waitFor(() => expect(showDialog).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(screen.getByRole('dialog')).toHaveAttribute('open'));
+    expect(showDialog).not.toHaveBeenCalled();
     expect(document.querySelector('.question-panel')).toBe(panel);
     expect(screen.getByTitle('Select First')).toHaveClass('selected');
   });

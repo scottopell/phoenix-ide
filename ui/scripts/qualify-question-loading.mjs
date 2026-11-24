@@ -2,7 +2,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { performance } from 'node:perf_hooks';
 import { chromium } from 'playwright';
-import { qualifyQuestionSurface, qualifyDesktopShortcuts } from './question-surface-journeys.mjs';
+import { qualifyQuestionSurface, qualifyDesktopShortcuts, qualifyDesktopPlacement } from './question-surface-journeys.mjs';
 
 // Synthetic HTTP isolation of the production UI, not server or iPhone latency.
 const out = path.resolve(process.env.QUESTION_QA_OUT ?? 'qa-artifacts/question-loading');
@@ -199,6 +199,10 @@ async function trial(version, base, viewport, mode, run, isolation = false, read
       record.history_pending_before_interaction_trial_ms = performance.now() - trialEpoch;
       if (!record.history_pending_before_interaction) throw new Error('History must be in flight before controlled question interaction');
     }
+    if (viewport.width === 1280) {
+      await page.getByText(marker, {exact:true}).waitFor({state:'visible',timeout:45000});
+      await qualifyDesktopPlacement({ page, out, version });
+    } else {
     const automatic = panel.locator('.question-option').filter({ hasText: 'Automatic' }).first();
     await automatic.click();
     if (!await automatic.evaluate(el => el.classList.contains('selected'))) throw new Error('Option click did not update selection');
@@ -245,6 +249,7 @@ async function trial(version, base, viewport, mode, run, isolation = false, read
         setAnswerError: value => { answerError = value; },
       });
     }
+    }
     for (const request of requests.values()) {
       if (request.response_ms < request.started_ms || request.completed_ms < request.started_ms || request.completed_ms < request.response_ms) {
         throw new Error(`Request clock moved backwards: ${request.url}`);
@@ -272,6 +277,7 @@ try {
     for (const [version, url] of versions) if (!await trial(version, url, viewport, 'cold-global', 0, true)) throw new Error('History isolation or surface journey failed');
     for (const [version, url] of versions) if (!await trial(version, url, viewport, 'warm-notification', -1)) throw new Error('Warm route fixture preflight failed');
   }
+  for (const [version,url] of versions) if (!await trial(version,url,{width:1280,height:900},'cold-global',-3)) throw new Error('Desktop placement failed');
   // Observe both layout signals before any interaction in separate cold/warm controls.
   for (const viewport of viewports) {
     for (const mode of ['cold-global', 'warm-notification']) {

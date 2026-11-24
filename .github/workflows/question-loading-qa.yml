@@ -12,7 +12,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 35
     env:
-      BASE_SHA: 8a685486413fc6517f61c548e3229a2864ce6703
+      BASE_SHA: 1c125f0360251d823710762f474d35ff268fa648
       PLAYWRIGHT_BROWSERS_PATH: /home/runner/.cache/ms-playwright
     steps:
       - uses: actions/checkout@v6
@@ -23,7 +23,7 @@ jobs:
           persist-credentials: false
       - uses: actions/checkout@v6
         with:
-          ref: 8a685486413fc6517f61c548e3229a2864ce6703
+          ref: 1c125f0360251d823710762f474d35ff268fa648
           path: baseline
           fetch-depth: 1
           persist-credentials: false
@@ -64,7 +64,7 @@ jobs:
           CANDIDATE_URL: http://127.0.0.1:4174
           QUESTION_QA_OUT: ${{ github.workspace }}/question-loading
           QUESTION_QA_RUNS: '8'
-          BASELINE_SHA: 8a685486413fc6517f61c548e3229a2864ce6703
+          BASELINE_SHA: 1c125f0360251d823710762f474d35ff268fa648
           CANDIDATE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: node ui/scripts/qualify-question-loading.mjs
       - name: Provenance and server logs

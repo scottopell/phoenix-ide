@@ -87,7 +87,7 @@ function CoordinatorQuestionCard({
 
     const clearViewportBounds = mobile ? setVisualViewportBounds(dialog) : undefined;
     if (mobile) dialog.showModal();
-    else dialog.show();
+    else dialog.open = true;
 
     dialog.querySelector<HTMLElement>('.confirm-dialog .btn-secondary')?.focus({ preventScroll: true });
 
