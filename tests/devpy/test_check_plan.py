@@ -40,6 +40,7 @@ class CheckPlanTests(unittest.TestCase):
         self.addCleanup(env_patch.stop)
         os.environ.pop("PHOENIX_CHECK_WORKERS", None)
         os.environ.pop("CARGO_TARGET_DIR", None)
+        os.environ.pop("PHOENIX_CHECK_DIAGNOSTIC_DIR", None)
         self.dev = load_devpy()
 
     def test_git_config_key_validation_preserves_url_subsections(self):
