@@ -380,7 +380,7 @@ if os.environ.get("FAIL_MIGRATION"):
             target_binary=str(self.root / "installed"), target_plist=str(self.root / "installed.plist"),
             label="test.phoenix", helper_label="com.phoenix-ide.deploy.unit-test", uid=os.getuid(),
             health_url="http://127.0.0.1:18111/api/version", health_insecure_tls=False,
-            active_path=str(self.root / "active"), status_path=str(self.root / "status.json"),
+            additional_reserve_bytes=0, active_path=str(self.root / "active"), status_path=str(self.root / "status.json"),
             deployed_sha_path=str(self.root / "deployed.sha"), lock_path=str(self.root / "activate.lock"),
             claim_lock_path=str(self.root / "claim.lock"), created_at=helper.utc_now(),
         )
@@ -450,6 +450,46 @@ if sys.argv[1:] == ["--build-identity"]:
         Path(self.manifest.target_plist).unlink()
         self.launch.pid = None
 
+    def test_boundary_capacity_accepts_exact_threshold_and_records_observation(self):
+        required = 16 * 1024 * 1024 + min(helper._database_size_bytes(str(self.database)), 64 * 1024 * 1024) + 123
+        with mock.patch.object(helper.shutil, "disk_usage", return_value=mock.Mock(free=required)):
+            admission = helper._reserve_before_boundary(str(self.database), self.root, 123)
+        self.assertEqual(required, admission["required_bytes"])
+        self.assertEqual(required, admission["available_bytes"])
+        self.assertEqual(123, admission["additional_reserve_bytes"])
+
+    def test_boundary_capacity_checks_both_database_and_backup_filesystems(self):
+        backup_directory = self.root / "separate-backup-volume"
+        required = 16 * 1024 * 1024 + min(helper._database_size_bytes(str(self.database)), 64 * 1024 * 1024) + 123
+        for scarce_path in (self.database.parent, backup_directory):
+            with self.subTest(scarce_path=scarce_path):
+                def capacity(path):
+                    return mock.Mock(free=required - 1 if Path(path) == scarce_path else required)
+                with mock.patch.object(helper.shutil, "disk_usage", side_effect=capacity) as usage:
+                    with self.assertRaisesRegex(helper.ActivationError, "insufficient residual deploy space"):
+                        helper._reserve_before_boundary(str(self.database), backup_directory, 123)
+                self.assertEqual({Path(call.args[0]) for call in usage.call_args_list},
+                                 {backup_directory, self.database.parent})
+
+    def test_boundary_capacity_rejects_shortfall(self):
+        required = 16 * 1024 * 1024 + min(helper._database_size_bytes(str(self.database)), 64 * 1024 * 1024) + 123
+        with mock.patch.object(helper.shutil, "disk_usage", return_value=mock.Mock(free=required - 1)):
+            with self.assertRaisesRegex(helper.ActivationError, f"need {required} bytes, have {required - 1}"):
+                helper._reserve_before_boundary(str(self.database), self.root, 123)
+
+    def test_shrink_after_preflight_fails_before_migration_or_database_mutation(self):
+        initial = self.database.read_bytes()
+        required = self.database.stat().st_size + 16 * 1024 * 1024 + self.manifest.additional_reserve_bytes
+        with mock.patch.object(helper.shutil, "disk_usage", side_effect=[
+            mock.Mock(free=required), mock.Mock(free=required), mock.Mock(free=0), mock.Mock(free=0),
+        ]):
+            result = self.activate()
+        self.assertEqual("failed", result)
+        self.assertNotIn(b"migration_started", self.database.read_bytes())
+        self.assertEqual(initial, self.database.read_bytes())
+        self.assertNotIn("migrate\\n", Path(self.root / "events").read_text() if (self.root / "events").exists() else "")
+        self.assertEqual("not_crossed", json.loads(Path(self.manifest.status_path).with_suffix(".proof.json").read_text())["boundary"])
+
     def test_first_install_missing_database_runs_candidate_without_backup(self):
         self.first_install()
         self.assertEqual(self.activate(), "committed")
@@ -488,17 +528,17 @@ if sys.argv[1:] == ["--build-identity"]:
 
     def test_first_install_database_appearing_before_boundary_fails_without_candidate(self):
         self.first_install()
-        check = helper._first_install_capacity
+        check = helper._first_install_admission
         calls = 0
 
-        def appear_before_boundary(database_path):
+        def appear_before_boundary(database_path, additional_reserve_bytes=0):
             nonlocal calls
             calls += 1
             if calls == 3:
                 self.database.write_bytes(b"unexpected database")
-            return check(database_path)
+            return check(database_path, additional_reserve_bytes)
 
-        with mock.patch.object(helper, "_first_install_capacity", side_effect=appear_before_boundary):
+        with mock.patch.object(helper, "_first_install_admission", side_effect=appear_before_boundary):
             self.assertEqual(self.activate(), "failed")
         self.assertEqual(calls, 3)
         self.assertIn("must still be absent", self.status()["failure"])
@@ -516,6 +556,41 @@ if sys.argv[1:] == ["--build-identity"]:
         with mock.patch.object(helper.shutil, "disk_usage", return_value=usage) as disk_usage:
             self.assertEqual(helper._first_install_capacity(str(self.database)), 16 * 1024 * 1024)
         disk_usage.assert_called_once_with(self.database.parent)
+
+    def test_first_install_additional_reserve_boundary_accepts_exact_and_rejects_shortfall(self):
+        self.first_install()
+        additional = 123
+        required = 16 * 1024 * 1024 + additional
+        for available in (required, required - 1):
+            with self.subTest(available=available), mock.patch.object(
+                helper.shutil, "disk_usage", return_value=mock.Mock(free=available)
+            ) as disk_usage:
+                if available == required:
+                    self.assertEqual(
+                        helper._first_install_admission(str(self.database), additional),
+                        {"required_bytes": required, "available_bytes": required},
+                    )
+                else:
+                    with self.assertRaisesRegex(helper.ActivationError, f"need {required} bytes, have {available}"):
+                        helper._first_install_admission(str(self.database), additional)
+            disk_usage.assert_called_once_with(self.database.parent)
+        self.assertFalse(self.database.exists())
+
+    def test_first_install_space_shrink_at_boundary_prevents_candidate_migration(self):
+        self.first_install()
+        self.manifest = dataclasses.replace(self.manifest, additional_reserve_bytes=123)
+        required = 16 * 1024 * 1024 + self.manifest.additional_reserve_bytes
+        with mock.patch.object(helper.shutil, "disk_usage", side_effect=[
+            mock.Mock(free=required), mock.Mock(free=required), mock.Mock(free=required - 1),
+        ]):
+            self.assertEqual(self.activate(), "failed")
+        self.assertIn(f"need {required} bytes, have {required - 1}", self.status()["failure"])
+        self.assertFalse(self.database.exists())
+        self.assertFalse((self.root / "events").exists())
+        self.assertFalse(Path(self.manifest.target_binary).exists())
+        proof = json.loads((self.root / "status.proof.json").read_text())
+        self.assertEqual("not_crossed", proof["boundary"])
+        self.assertIsNone(proof["backup"])
 
     def test_first_install_insufficient_space_refuses_before_disruption(self):
         self.first_install()
@@ -856,14 +931,14 @@ if sys.argv[1:] == ["--build-identity"]:
             self.assertEqual(self.activate(), "failed")
         self.assertEqual(self.changes(), [("after guard release",)])
 
-    def test_deploy_manifest_protocol_three_accepts_and_two_rejects(self):
+    def test_deploy_manifest_protocol_four_accepts_and_three_rejects(self):
         raw = dataclasses.asdict(self.manifest)
         raw["expected"] = dataclasses.asdict(self.manifest.expected)
         path = self.root / "manifest.json"
-        raw["manifest_version"] = 3
+        raw["manifest_version"] = 4
         path.write_text(json.dumps(raw))
-        self.assertEqual(helper.Manifest.load(path).manifest_version, 3)
-        raw["manifest_version"] = 2
+        self.assertEqual(helper.Manifest.load(path).manifest_version, 4)
+        raw["manifest_version"] = 3
         path.write_text(json.dumps(raw))
         with self.assertRaisesRegex(helper.ActivationError, "unsupported deployment manifest"):
             helper.Manifest.load(path)
@@ -951,12 +1026,12 @@ if sys.argv[1:] == ["--build-identity"]:
     def test_post_stop_capacity_failure_restores_only_verified_absent_predecessor(self):
         capacity = helper._preflight_backup_capacity
         calls = 0
-        def fail_after_stop(database_path, directory):
+        def fail_after_stop(database_path, directory, additional_reserve_bytes=0):
             nonlocal calls
             calls += 1
             if calls == 2:
                 raise helper.ActivationError("capacity changed after stop")
-            return capacity(database_path, directory)
+            return capacity(database_path, directory, additional_reserve_bytes)
         with mock.patch.object(helper, "_preflight_backup_capacity", side_effect=fail_after_stop):
             self.assertEqual(self.activate(), "failed")
         self.assertEqual(self.launch.starts, [self.manifest.target_plist])
@@ -985,12 +1060,12 @@ if sys.argv[1:] == ["--build-identity"]:
         self.launch.manifest = self.manifest
         capacity = helper._preflight_backup_capacity
         calls = 0
-        def fail_after_stop(database_path, directory):
+        def fail_after_stop(database_path, directory, additional_reserve_bytes=0):
             nonlocal calls
             calls += 1
             if calls == 2:
                 raise helper.ActivationError("capacity changed after stop")
-            return capacity(database_path, directory)
+            return capacity(database_path, directory, additional_reserve_bytes)
         def start(old_pid, *, plist_path=None):
             self.assertEqual(plist_path, self.manifest.target_plist)
             self.assertTrue(Path(plist_path).is_file())
@@ -1083,12 +1158,12 @@ if sys.argv[1:] == ["--build-identity"]:
         original_write = helper.atomic_write
         calls = 0
 
-        def fail_after_stop(database_path, directory):
+        def fail_after_stop(database_path, directory, additional_reserve_bytes=0):
             nonlocal calls
             calls += 1
             if calls == 2:
                 raise helper.ActivationError("capacity changed after stop")
-            return capacity(database_path, directory)
+            return capacity(database_path, directory, additional_reserve_bytes)
 
         def fail_canonical(path, data, mode=0o600):
             if path == Path(self.manifest.target_plist):

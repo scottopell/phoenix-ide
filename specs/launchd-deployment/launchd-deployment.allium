@@ -27,6 +27,7 @@ entity DeployTransaction {
     source_commit: String
     expected: RuntimeIdentity
     state: TransactionState
+    additional_reserve_bytes: Integer
     failure: String?
 
     transitions state {
@@ -85,7 +86,7 @@ value TargetService {
 -- activation_claim_available() -> Boolean
 --   No deploy/restart marker exists. A terminal status never reclaims a marker.
 -- preparation_complete(transaction) -> Boolean
---   Deploy protocol 3, exact local/published source, SHA-256 and --build-identity,
+--   Deploy protocol 4, exact local/published source, SHA-256 and --build-identity,
 --   full candidate SHA, complete plist/environment/path binding and atomic
 --   installation preparations verify. Restart retains protocol 2.
 -- helper_is_launchd_owned(transaction) -> Boolean
@@ -116,6 +117,11 @@ value TargetService {
 -- writer_reservation_held(transaction) -> Boolean
 --   A bounded SQLite BEGIN IMMEDIATE reservation spans backup verification and
 --   durable candidate boundary recording for an existing database.
+-- requested_reserve_available(transaction) -> Boolean
+--   Protocol-4 manifest requires a nonnegative integer additional_reserve_bytes.
+--   Fresh boundary observations cover baseline plus that request on both backup
+--   and database filesystems (only database filesystem for first install).
+--   Equality admits; shortfall or observation failure prevents candidate writes.
 -- boundary_not_crossed(transaction) -> Boolean
 --   Durable proof establishes that neither candidate binary replacement nor
 --   candidate migration was attempted; missing or ambiguous proof is insufficient.
@@ -230,6 +236,8 @@ rule VerifyFirstInstallAbsence {
 
 rule BeginCandidateMigration {
     when: DatabaseSourceValidated(transaction)
+    -- REQ-LDD-033
+    requires: requested_reserve_available(transaction)
     requires: transaction.state = stopping
     requires: verified_backup_retained(transaction) or first_install_absence_proven(transaction)
     requires: maintenance_exclusivity(transaction)
@@ -243,6 +251,12 @@ rule BeginCandidateMigration {
     @guidance
         -- Record boundary attempted before binary replacement; migration_started
         -- precedes exact candidate --migrate-only. Use staged environment and log.
+        -- Freshly check baseline plus additional_reserve_bytes after backup,
+        -- under the existing DB writer reservation. Durably record request,
+        -- required bytes and minimum observed filesystem availability before
+        -- boundary attempt. First install checks its database filesystem.
+        -- Shortfall follows PreboundaryActivationFailed without candidate writes.
+        -- Admission is not protection against external disk consumers.
         -- For an existing DB, release the writer reservation only after durable
         -- boundary recording, before candidate migration or predecessor recovery.
         -- For first install, recheck path absence before boundary recording; do
