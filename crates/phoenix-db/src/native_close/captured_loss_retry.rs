@@ -19,6 +19,13 @@ use crate::close_foundation::{
 };
 use crate::{Database, DbError, DbResult};
 
+/// Read-only routing evidence, never retry admission or dispatch authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NativeCloseRetryOriginKind {
+    Anchored,
+    CapturedLoss,
+}
+
 /// An exact retained initial-loss origin observed in one database snapshot.
 /// This is deliberately not `StoppedCloseOriginalRetirementProof`: no original
 /// retirement anchor, sealed resource plan, admission, or dispatch authority exists.
@@ -88,6 +95,44 @@ fn scope_resource(scope: &WorkScopeId) -> DbResult<RetiredResourceIdentity> {
 }
 
 impl Database {
+    /// Classifies an exact retained origin without requiring captured losses to
+    /// possess a sealed inventory. Each branch validates its own provenance in
+    /// the same snapshot; assessment and admission must still revalidate it.
+    ///
+    /// # Errors
+    /// Refuses a mismatched target, invalid anchored proof, or invalid captured-loss
+    /// context. Database errors are never interpreted as an alternate origin.
+    pub async fn read_native_close_retry_origin_kind(
+        &self,
+        target: &ProductConversationId,
+        failed_run: &CloseRunRef,
+    ) -> DbResult<NativeCloseRetryOriginKind> {
+        let mut tx = self.pool.begin().await?;
+        let (target_matches, anchored): (bool, bool) = sqlx::query_as(
+            "SELECT EXISTS(SELECT 1 FROM close_obligations
+                           WHERE attempt_id = ?1 AND product_conversation_id = ?2),
+                    EXISTS(SELECT 1 FROM close_original_retirement_anchors
+                           WHERE attempt_id = ?1)",
+        )
+        .bind(failed_run.attempt_id.as_str())
+        .bind(target.as_str())
+        .fetch_one(&mut *tx)
+        .await?;
+        if !target_matches {
+            return Err(refused("retry origin target differs from the retained obligation"));
+        }
+        let kind = if anchored {
+            Self::read_stopped_close_original_retirement_proof_tx(&mut *tx, failed_run).await?;
+            NativeCloseRetryOriginKind::Anchored
+        } else {
+            Self::read_native_close_captured_loss_retry_context_tx(&mut tx, target, failed_run)
+                .await?;
+            NativeCloseRetryOriginKind::CapturedLoss
+        };
+        tx.commit().await?;
+        Ok(kind)
+    }
+
     /// Reads only the exact latest native initial run stopped by retained loss inspection.
     /// No current scope is recaptured, no allowance is consumed, and no authority is granted.
     /// The historical initial source need not still be executing. This does not validate

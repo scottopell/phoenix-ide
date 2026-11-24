@@ -33,6 +33,9 @@ mod settle_historical_continuation;
 mod captured_loss_retry_tests;
 
 #[cfg(test)]
+mod native_close_origin_owner_cleanup_tests;
+
+#[cfg(test)]
 mod conversation_tools_tests;
 
 #[cfg(test)]
@@ -974,6 +977,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 186,
         name: "native_close_retry_origin_gate",
         sql: "SELECT 1;",
+    },
+    Migration {
+        version: 187,
+        name: "native_close_origin_owner_cleanup",
+        sql: include_str!("migrations/native_close_origin_owner_cleanup.sql"),
     },
 ];
 
@@ -16240,6 +16248,7 @@ mod tests {
                 (184, "native_close_captured_loss_retry".into()),
                 (185, "native_close_retry_tmux_dispatch".into()),
                 (186, "native_close_retry_origin_gate".into()),
+                (187, "native_close_origin_owner_cleanup".into()),
             ]
         );
     }
@@ -16850,6 +16859,7 @@ mod tests {
         let ledger = compiled_migration_ledger();
         assert!(ledger.windows(2).all(|pair| pair[0].0 < pair[1].0));
         let expected_tail = [
+            (187, "native_close_origin_owner_cleanup"),
             (186, "native_close_retry_origin_gate"),
             (185, "native_close_retry_tmux_dispatch"),
             (184, "native_close_captured_loss_retry"),
@@ -21186,6 +21196,7 @@ mod tests {
                 (184, "native_close_captured_loss_retry"),
                 (185, "native_close_retry_tmux_dispatch"),
                 (186, "native_close_retry_origin_gate"),
+                (187, "native_close_origin_owner_cleanup"),
             ]
         );
         let goal = MIGRATIONS
@@ -21199,7 +21210,7 @@ mod tests {
         assert!(goal
             .sql
             .contains("CREATE TABLE conversation_goal_coordinator_receipts"));
-        assert_eq!(MIGRATIONS.len(), 183);
+        assert_eq!(MIGRATIONS.len(), 184);
     }
 
     #[tokio::test]

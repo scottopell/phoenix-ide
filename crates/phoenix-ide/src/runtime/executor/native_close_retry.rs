@@ -11,7 +11,8 @@ use phoenix_core::domain::close::{CloseAttemptId, CloseRunOrdinal, CloseRunRef};
 use phoenix_core::domain::db_schema::SourceToolCall;
 use phoenix_core::domain::product_conversation::ProductConversationId;
 use phoenix_db::native_close::{
-    NativeCloseCommand, NativeCloseIntent, NativeCloseRetryResult, NativeCloseRetrySourceAssessment,
+    NativeCloseCommand, NativeCloseIntent, NativeCloseRetryOriginKind, NativeCloseRetryResult,
+    NativeCloseRetrySourceAssessment,
 };
 use phoenix_db::workflow::LocalAuthorityResult;
 use phoenix_db::{
@@ -463,7 +464,7 @@ async fn assess_retry_origin(
     let NativeCloseIntent::ExplicitRetry {
         attempt_id,
         failed_run_ordinal,
-        ..
+        target,
     } = command.intent()
     else {
         return Err(NativeCloseApplicationError::SourceRefused);
@@ -472,16 +473,16 @@ async fn assess_retry_origin(
         attempt_id: attempt_id.clone(),
         ordinal: *failed_run_ordinal,
     };
-    let resources = backend
+    let origin = backend
         .db()
-        .list_close_expected_retirement_resources(failed_run.attempt_id.as_str())
+        .read_native_close_retry_origin_kind(target, &failed_run)
         .await
         .map_err(|error| {
             tracing::warn!(%error, "native Close retry origin lookup failed");
             NativeCloseApplicationError::Storage
         })?;
-    let assessment = if resources.is_empty() {
-        NativeCloseRetryOriginAssessment::CapturedLoss(
+    let assessment = match origin {
+        NativeCloseRetryOriginKind::CapturedLoss => NativeCloseRetryOriginAssessment::CapturedLoss(
             backend
                 .assess_native_close_captured_loss_retry(command)
                 .await
@@ -489,29 +490,30 @@ async fn assess_retry_origin(
                     tracing::warn!(%error, "native Close captured-loss retry assessment failed");
                     NativeCloseApplicationError::Storage
                 })?,
-        )
-    } else {
-        let original = backend
-            .assess_native_close_retry(&failed_run)
-            .await
-            .map_err(|error| {
-                tracing::warn!(%error, "native Close retry assessment failed");
-                NativeCloseApplicationError::Storage
-            })?;
-        let request = AdmitCloseSafeRetryRequest {
-            failed_run,
-            requested_by: CloseRetryRequestedBy::User,
-            observed_at_us: chrono::Utc::now().timestamp_micros(),
-            precondition_resolution:
-                "explicit retry source and current retirement state revalidated".into(),
-            safety_evidence: original.safety_evidence.clone(),
-            remaining_effects: original.remaining_effects.clone(),
-        };
-        NativeCloseRetryOriginAssessment::Anchored(NativeCloseRetryAssessment {
-            command: command.clone(),
-            original,
-            request,
-        })
+        ),
+        NativeCloseRetryOriginKind::Anchored => {
+            let original = backend
+                .assess_native_close_retry(&failed_run)
+                .await
+                .map_err(|error| {
+                    tracing::warn!(%error, "native Close retry assessment failed");
+                    NativeCloseApplicationError::Storage
+                })?;
+            let request = AdmitCloseSafeRetryRequest {
+                failed_run,
+                requested_by: CloseRetryRequestedBy::User,
+                observed_at_us: chrono::Utc::now().timestamp_micros(),
+                precondition_resolution:
+                    "explicit retry source and current retirement state revalidated".into(),
+                safety_evidence: original.safety_evidence.clone(),
+                remaining_effects: original.remaining_effects.clone(),
+            };
+            NativeCloseRetryOriginAssessment::Anchored(NativeCloseRetryAssessment {
+                command: command.clone(),
+                original,
+                request,
+            })
+        }
     };
     Ok(assessment)
 }

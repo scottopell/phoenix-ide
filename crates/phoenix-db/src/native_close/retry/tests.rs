@@ -145,6 +145,41 @@ async fn fixture(
     failure
 }
 
+#[tokio::test]
+async fn retry_origin_reader_validates_anchored_target() {
+    let db = Database::open_in_memory().await.unwrap();
+    let failure = fixture(&db, Vec::new(), true).await;
+    let run = CloseRunRef {
+        attempt_id: failure.attempt_id.clone(),
+        ordinal: CloseRunOrdinal::INITIAL,
+    };
+    for _ in 0..2 {
+        assert_eq!(
+            db.read_native_close_retry_origin_kind(&failure.source_product_conversation_id, &run)
+                .await
+                .unwrap(),
+            crate::native_close::NativeCloseRetryOriginKind::Anchored,
+        );
+    }
+    let wrong_target = ProductConversationId::parse("wrong-target").unwrap();
+    assert!(db
+        .read_native_close_retry_origin_kind(&wrong_target, &run)
+        .await
+        .is_err());
+    let wrong_run = CloseRunRef {
+        attempt_id: run.attempt_id.clone(),
+        ordinal: CloseRunOrdinal::parse(2).unwrap(),
+    };
+    assert!(db
+        .read_native_close_retry_origin_kind(&failure.source_product_conversation_id, &wrong_run)
+        .await
+        .is_err());
+    db.read_stopped_close_original_retirement_proof(&run)
+        .await
+        .unwrap();
+    assert_no_admission(&db, &run.attempt_id).await;
+}
+
 fn admitted(result: LocalAuthorityResult<DbResult<NativeCloseRetryResult>>) -> NativeCloseReceipt {
     match result {
         LocalAuthorityResult::DurableFactEstablished(Ok(NativeCloseRetryResult::NewlyAdmitted(receipt))) => receipt,

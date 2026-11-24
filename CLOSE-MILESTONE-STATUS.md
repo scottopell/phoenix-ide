@@ -1,5 +1,17 @@
 # Unified Close acceptance milestone
 
+## Hosted0123 terminal result and unqualified owner/routing correction
+
+Automatic run **45352177351**, exact `0123c68c988a0d2de1a2b7b13f02a344904ad909`, completed **failure**. Exact artifacts and logs are retained under `/tmp/close-0123c68c9/`; the sole watcher exited. Full migrations172, captured-loss reinspection6 and actor51 passed. Production/runtime compilation, frontend, specifications and format passed. These results qualify0123 only, not the follow-up source below.
+
+The public captured-loss reclaim/replay journey and all four Stop cases now **actually execute**. They fail upstream of their intended assessment/Stop barriers because origin selection calls the sealed-inventory reader for a valid captured-loss origin, which deliberately has no sealed inventory. The initial-Close physical Worktree journey still passes. No captured-loss reclaim/replay or causal Stop safety pass is claimed.
+
+Permanent-member deletion now reaches the canonical mandatory-failure acceptance but fails FK787: historical completion-origin/revocation rows retain references after their owning obligation is deleted. Forward migration187 cleans up exactly that owner's admissions, revocations and origin in dependency order, retaining standalone deletion guards while the owner exists and independent pending mandatory-delivery restrictions. The unexecuted regression is authored to require pending refusal, canonical acceptance, supported aggregate deletion and an empty foreign-key check. Historical migrations remain unchanged.
+
+The routing correction uses a typed, read-only origin discriminator: exact target plus original-anchor presence, followed by strict validation of the selected anchored proof or captured-loss context in one snapshot. Errors never select another origin; no inventory is fabricated, admission granted, or source/dispatch check relaxed. Added captured-loss and anchored target/run regressions have independent exact inventory/execution gates. Independent source review caught and corrected a stale coordinator migration ledger and the anchored test's include-module selector; no other concrete source blockers were found. This is source review, not compile/test evidence.
+
+Next gate: automatic hosted qualification of the corrected immutable head, including both187 tests, both routing regressions, populated permanent deletion, actual public reclaim/replay and all four intended Stop barriers, plus existing DB/runtime/tools/UI/specification/format gates. Task66009 remains separately tracked ordinary-tmux assembly debt, not a new merge gate. No local execution, merge, installation, deployment or readiness claim.
+
 ## Hosted ed710 terminal result and next exact qualification
 
 Automatic run **45344455940**, exact `ed710d35b1216b7ef5809a261b3135f696fae79d`, completed **failure**. Production/runtime test compilation passed; frontend, specification/devpy checks and format gate passed. Full migrations172 and foundation268 tests passed; native DB80 passed/one failed. Evidence is under `/tmp/close-ed710d35b/`.

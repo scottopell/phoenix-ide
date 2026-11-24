@@ -160,6 +160,34 @@ fn captured_admission_refused(
 }
 
 #[tokio::test]
+async fn captured_loss_origin_reader_does_not_require_a_sealed_inventory() {
+    let (db, assessment) = captured_loss_assessment().await;
+    let failed_run = assessment.context.failed_run();
+    let target = assessment.context.target();
+    for _ in 0..2 {
+        assert_eq!(
+            db.read_native_close_retry_origin_kind(target, failed_run)
+                .await
+                .unwrap(),
+            crate::native_close::NativeCloseRetryOriginKind::CapturedLoss,
+        );
+    }
+    assert!(db
+        .read_native_close_retry_origin_kind(&ProductConversationId::parse("wrong-target").unwrap(), failed_run)
+        .await
+        .is_err());
+    let wrong_run = CloseRunRef {
+        attempt_id: failed_run.attempt_id.clone(),
+        ordinal: CloseRunOrdinal::parse(2).unwrap(),
+    };
+    assert!(db
+        .read_native_close_retry_origin_kind(target, &wrong_run)
+        .await
+        .is_err());
+    assert_captured_origin_preserved(&db, &assessment.context).await;
+}
+
+#[tokio::test]
 async fn captured_loss_admits_distinct_successor_without_rewriting_original_evidence() {
     let (db, assessment) = captured_loss_assessment().await;
     let origin = &assessment.context;
@@ -221,6 +249,41 @@ async fn captured_loss_admitted_authority_cascades_on_permanent_member_delete() 
     )
     .await
     .unwrap();
+    for table in [
+        "native_close_completion_retry_origins",
+        "native_close_completion_retry_source_revocations",
+        "native_close_initial_result_acknowledgements",
+    ] {
+        let count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "SELECT COUNT(*) FROM {table} WHERE attempt_id = ?1"
+        )))
+        .bind(attempt)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(count, 1, "fixture must retain {table}");
+    }
+    for table in [
+        "native_close_completion_retry_origins",
+        "native_close_completion_retry_source_revocations",
+    ] {
+        let error = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DELETE FROM {table} WHERE attempt_id = ?1"
+        )))
+        .bind(attempt)
+        .execute(db.pool())
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("retained"), "{error}");
+    }
+    let automatic_admissions: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM native_close_completion_retry_admissions WHERE attempt_id = ?1",
+    )
+    .bind(attempt)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(automatic_admissions, 0);
     // The native tool-result acknowledgement does not accept mandatory failure
     // custody. Permanent Delete must refuse without partially removing the member.
     let target_member = &members[0];
@@ -278,6 +341,17 @@ async fn captured_loss_admitted_authority_cascades_on_permanent_member_delete() 
         .unwrap()
         .is_empty());
 
+    for failure in db.list_close_cleanup_failures(attempt).await.unwrap() {
+        let state: String = sqlx::query_scalar(
+            "SELECT delivery_state FROM coordinator_watch_events WHERE event_id = ?1",
+        )
+        .bind(failure.occurrence.failure_occurrence_id.as_str())
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(state, "accepted");
+    }
+
     for member in members {
         db.delete_conversation(member.conversation_id.as_str())
             .await
@@ -287,6 +361,13 @@ async fn captured_loss_admitted_authority_cascades_on_permanent_member_delete() 
         "native_close_captured_loss_retry_plans",
         "native_close_captured_loss_retry_inspections",
         "native_close_captured_loss_retry_resources",
+        "native_close_completion_retry_origins",
+        "native_close_completion_retry_source_revocations",
+        "native_close_completion_retry_admissions",
+        "native_close_initial_result_acknowledgements",
+        "native_close_initial_receipts",
+        "native_close_retry_plans",
+        "close_runs",
         "close_obligations",
     ] {
         let count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(

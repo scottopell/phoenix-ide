@@ -148,7 +148,7 @@ jobs:
           set -euo pipefail
           cargo test -p phoenix-db --lib --no-run 2>&1 | tee evidence/compile.log
           cargo test -p phoenix-db --lib -- --list 2>&1 | tee evidence/inventory.log
-          grep -E '^close_foundation::tests::.*: test$|^migrations::close_completion_allowance_tests::migration_172_.*: test$|^migrations::retry_tmux_dispatch_tests::.*: test$|^migrations::native_close_retry_origin_gate::tests::.*: test$|^migrations::tests::migration_(180|181|182|183)_.*: test$|^native_close::.*: test$' evidence/inventory.log > evidence/selected-tests.txt
+          grep -E '^close_foundation::tests::.*: test$|^migrations::close_completion_allowance_tests::migration_172_.*: test$|^migrations::retry_tmux_dispatch_tests::.*: test$|^migrations::native_close_retry_origin_gate::tests::.*: test$|^migrations::native_close_origin_owner_cleanup_tests::.*: test$|^migrations::tests::migration_(180|181|182|183)_.*: test$|^native_close::.*: test$' evidence/inventory.log > evidence/selected-tests.txt
           test -s evidence/selected-tests.txt
           grep -F 'close_foundation::tests::inspection_aggregate_validator_preserves_exact_content_and_empty_generation_rules: test' evidence/selected-tests.txt
           for test in \
@@ -301,6 +301,34 @@ jobs:
             grep -Fx "migrations::native_close_retry_origin_gate::tests::$test: test" evidence/selected-tests.txt
             cargo test -p phoenix-db --lib "migrations::native_close_retry_origin_gate::tests::$test" -- --exact --nocapture --test-threads=1 2>&1 | tee "evidence/retry-origin-migration-$test.log"
             grep -E 'test result: ok\. 1 passed; 0 failed; 0 ignored;' "evidence/retry-origin-migration-$test.log"
+          done
+      - name: Require exact native origin owner cleanup migration upgrade
+        if: success() || failure()
+        shell: bash
+        run: |
+          set -euo pipefail
+          for test in \
+            real186_to187_changes_only_owner_cleanup_and_is_idempotent \
+            missing_predecessor_guard_rolls_back187; do
+            selector="migrations::native_close_origin_owner_cleanup_tests::$test"
+            grep -Fx "$selector: test" evidence/selected-tests.txt
+            cargo test -p phoenix-db --lib "$selector" -- --exact --nocapture --test-threads=1 2>&1 | tee "evidence/origin-owner-migration-$test.log"
+            grep -Fx "test $selector ... ok" "evidence/origin-owner-migration-$test.log"
+            grep -E 'test result: ok\. 1 passed; 0 failed; 0 ignored;' "evidence/origin-owner-migration-$test.log"
+          done
+      - name: Require exact typed native retry origin routing
+        if: success() || failure()
+        shell: bash
+        run: |
+          set -euo pipefail
+          for selector in \
+            native_close::captured_loss_retry::tests::captured_loss_origin_reader_does_not_require_a_sealed_inventory \
+            close_foundation::tests::native_retry::retry_origin_reader_validates_anchored_target; do
+            grep -Fx "$selector: test" evidence/selected-tests.txt
+            test_name="${selector##*::}"
+            cargo test -p phoenix-db --lib "$selector" -- --exact --nocapture --test-threads=1 2>&1 | tee "evidence/$test_name.log"
+            grep -Fx "test $selector ... ok" "evidence/$test_name.log"
+            grep -E 'test result: ok\. 1 passed; 0 failed; 0 ignored;' "evidence/$test_name.log"
           done
       - name: Execute migration176 populated upgrade and authority regressions
         if: success()

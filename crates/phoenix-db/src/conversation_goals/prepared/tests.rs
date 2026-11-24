@@ -356,6 +356,7 @@ async fn goal_preparation_migration_follows_conversation_tool_migrations() {
             (184, "native_close_captured_loss_retry".into()),
             (185, "native_close_retry_tmux_dispatch".into()),
             (186, "native_close_retry_origin_gate".into()),
+            (187, "native_close_origin_owner_cleanup".into()),
         ]
     );
 }
