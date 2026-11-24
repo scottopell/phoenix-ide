@@ -1,5 +1,17 @@
 # Unified Close acceptance milestone
 
+## Hosted3c692 terminal: actual public retry and all four Stop cases pass
+
+Automatic run **45369465587**, exact `3c692fd125aeb025dd0bbccc07348c8e99975083`, completed **failure only on five stale migration-tail count assertions**. Evidence is retained under `/tmp/close-3c692fd12/{db,exact,format}/`; its sole watcher completed. Frontend, specifications, formatting (empty exact hosted patch), production/runtime compilation and runtime qualification gates passed.
+
+Actual named execution now passes for the public production-detector captured-loss reclaim/replay journey and **all four intended causal Stop cases**: assessment, prepared, pre-writer acquisition, and pre-physical-observation. Each exact selector reports one passed/zero failed/zero ignored. The initial-Close physical journey remains green. This proves the named barriers, not actual held-writer contention or separately tracked ordinary-tmux assembly scenarios.
+
+Both migration187 upgrade/rollback regressions, both typed origin routing regressions and the supported permanent-member deletion regression passed as individually required exact tests. Native Close DB suite82 passed. Thus pending mandatory delivery still blocks deletion, canonical accepted delivery allows owner graph cleanup, and the regression's foreign-key check is empty. No historical migration or production source-authority relaxation was needed.
+
+The broad foundation/migrations suites exposed five fixture-tail counts missing the new migration: foundation14→15; migrations32→33,36→37 (two fixtures),15→16. These exact hosted actual/expected mismatches are the sole broad-suite failures (foundation268passed/1failed; migrations170passed/4failed). The reviewed follow-up changes only those five expectations plus this status; historical cutoffs and behavior stay unchanged. The registry-length184 expectation already passes and remains unchanged (holes99,154,157).
+
+Next gate is automatic exact-head requalification of those count-only corrections. Named acceptance on3c692 is established, but the required overall green immutable head is still owed. No local build/test/formatter/SQL/syntax execution, manual workflow operation, merge, installation, deployment or readiness claim.
+
 ## Hosted ebe68 terminal: public reclaim/replay passes; test-source follow-up unqualified
 
 Automatic run **45364424705**, exact `ebe68f6c2d1aadae8df7ed00d9716928cae92fa5`, completed **failure**. Full exact-source evidence is retained under `/tmp/close-ebe68f6c2/`; its sole watcher completed. Frontend and specifications passed. The actual named production-detector **public captured-loss cleanup/reclaim/replay journey passed** (one executed test), as did the original initial-Close physical journey.
