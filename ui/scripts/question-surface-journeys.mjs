@@ -246,7 +246,7 @@ export async function qualifyDesktopPlacement({ page, out, version }) {
   const panel = page.locator('.coordinator-question-dock .question-panel');
   const dock = page.locator('.coordinator-question-dock');
   const meta = dock.locator('.coordinator-question-dock__meta');
-  const custom = panel.getByRole('textbox', { name: 'Write a custom answer' });
+  const custom = panel.getByRole('textbox', { name: 'Write a custom answer', includeHidden: true });
   const composer = page.locator('#message-input');
   const transcript = page.locator('#messages');
   const frames = () => page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
