@@ -27,6 +27,7 @@ import {
 import { useTheme } from '../hooks/useTheme';
 import { useRegisterFocusScope } from '../hooks/useFocusScope';
 import { copyToClipboard } from '../utils/clipboard';
+import { safePrefix } from '../utils/textBounds';
 
 const CheckIcon = () => (
   <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
@@ -238,7 +239,7 @@ function formatCommandText(text: string): string {
   const firstLine = text.split('\n', 1)[0] ?? '';
   const trimmed = firstLine.trim();
   if (trimmed.length === 0) return '(no command text)';
-  if (trimmed.length > 50) return trimmed.slice(0, 49) + '…';
+  if (trimmed.length > 50) return safePrefix(trimmed, 49) + '…';
   return trimmed;
 }
 

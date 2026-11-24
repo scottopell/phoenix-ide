@@ -1,5 +1,6 @@
 import { ChevronDown, Send, Trash2 } from 'lucide-react';
 import type { ReviewNote } from '../../contexts/ReviewNotesContext';
+import { safePrefix } from '../../utils/textBounds';
 
 interface NotesPanelProps {
   notes: ReviewNote[];
@@ -58,7 +59,7 @@ export function NotesPanel({
             </div>
             {n.lineContent && (
               <div className="notes-panel-note-preview">
-                {n.lineContent.slice(0, 60)}
+                {safePrefix(n.lineContent, 60)}
                 {n.lineContent.length > 60 && '…'}
               </div>
             )}

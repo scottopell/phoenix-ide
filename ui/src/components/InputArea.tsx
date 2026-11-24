@@ -32,6 +32,7 @@ import { SUPPORTED_IMAGE_TYPES, processImageFiles } from '../utils/images';
 import { FILE_TREE_DRAG_TYPE } from './FileExplorer/FileTree';
 import './InputArea.css';
 import { useFocusScope } from '../hooks/useFocusScope';
+import { safePrefix } from '../utils/textBounds';
 
 export interface InputAreaHandle {
   /** Focus the mounted composer textarea. False when this phase renders no textarea. */
@@ -693,7 +694,7 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
                 {msg.status === 'recoverable_inconsistency'
                   ? 'Accepted message was not found in server history: '
                   : 'Failed to send: '}
-                "{msg.text.length > 50 ? msg.text.slice(0, 50) + '...' : msg.text}"
+                "{msg.text.length > 50 ? safePrefix(msg.text, 50) + '...' : msg.text}"
               </span>
               <button
                 className="failed-message-retry"

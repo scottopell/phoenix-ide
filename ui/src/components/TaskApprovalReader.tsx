@@ -44,6 +44,7 @@ import {
   Check,
   Loader2,
 } from 'lucide-react';
+import { QUOTED_LINE_MAX_UNITS, safePrefix } from '../utils/textBounds';
 
 // Reuse ReviewNote type shape
 interface ReviewNote {
@@ -593,10 +594,10 @@ export function TaskApprovalReader({
         const ln = node?.position?.start?.line ?? 0;
         const startLine = (node?.position?.start?.line ?? 1) - 1;
         const endLine = (node?.position?.end?.line ?? startLine + 1) - 1;
-        const rawLineContent = rawLines
-          .slice(startLine, endLine + 1)
-          .join(' ')
-          .slice(0, 200);
+        const rawLineContent = safePrefix(
+          rawLines.slice(startLine, endLine + 1).join(' '),
+          QUOTED_LINE_MAX_UNITS,
+        );
         const blockId = claimDisplayBlock(ln, node?.position?.start?.offset, kind);
         const blockMatches = matchesByBlockId.get(blockId) ?? [];
         const shouldDecorateChildren = decorateChildren && blockMatches.length > 0;
@@ -896,7 +897,7 @@ export function TaskApprovalReader({
               </button>
             </div>
             <div className="task-approval-annotation-preview">
-              {annotatingLine.lineContent.slice(0, 100)}
+              {safePrefix(annotatingLine.lineContent, 100)}
               {annotatingLine.lineContent.length > 100 && '...'}
             </div>
             <textarea
@@ -948,7 +949,7 @@ export function TaskApprovalReader({
                   </button>
                 </div>
                 <div className="task-approval-note-preview">
-                  {note.lineContent.slice(0, 60)}
+                  {safePrefix(note.lineContent, 60)}
                   {note.lineContent.length > 60 && '...'}
                 </div>
                 <div className="task-approval-note-text">{note.note}</div>
