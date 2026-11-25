@@ -2,6 +2,28 @@
 
 ## Current qualification and reviewed lint follow-up
 
+### 678 hosted result and formatting-only follow-up
+
+Candidate `678c573711d274de9f09baed20f9c239e769b024` is **not qualified**.
+[Close45561465961](https://github.com/scottopell/phoenix-ide/actions/runs/45561465961)
+completed all behavioral gates successfully but failed the final exact-source
+formatting gate: one test-helper signature requires multiline formatting.
+Parent-read logs again establish foundation **270 / 0 / 0**, native DB
+**82 / 0 / 0**, migrations **180 / 0 / 0**, and each of the six exact public
+physical/Stop selectors **1 / 0 / 0**. Frontend and specifications passed.
+[CI45561473214](https://github.com/scottopell/phoenix-ide/actions/runs/45561473214)
+failed early on that same signature; broad Rust build/lint/test jobs were skipped,
+so the new dispatcher, nextest serialization and lint repairs have no executable
+qualification yet. The dev.py tests and task-validation lanes were also skipped;
+there is no hosted dispatcher-fixture or real unprivileged detector execution
+receipt through the new integration.
+
+After both runs became terminal, the unchanged hosted formatting proposal was
+applied to that signature only. Evidence, terminal logs, exact selector counts
+and the proposal are retained in `/tmp/close-678c57371/`. This formatting-only
+follow-up remains **unqualified** pending fresh automatic Close and standard CI;
+no local executable validation, merge, install or release occurred.
+
 ### 184 result and reviewed CI parity follow-up
 
 Exact feature `1847873311f980163ace684e151d1052ca21b662` completed

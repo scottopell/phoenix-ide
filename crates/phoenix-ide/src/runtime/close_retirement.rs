@@ -18786,7 +18786,10 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
-    fn capture_linux_descriptor_test_slot(path: &Path, slot_name: &str) -> super::OwnedDeletionSlot {
+    fn capture_linux_descriptor_test_slot(
+        path: &Path,
+        slot_name: &str,
+    ) -> super::OwnedDeletionSlot {
         let parent = super::open_deletion_parent(path.parent().unwrap()).unwrap();
         let name = std::ffi::CString::new(slot_name).unwrap();
         let identity = super::DeletionEntryIdentity::from_stat(
