@@ -77,10 +77,12 @@ impl WorktreeMutationExecutor for OriginalWorktreeMutationExecutor<'_> {
                 // admission boundary again, under the unchanged deadline.
                 result
             }
-            Ok((
-                WorkerEntryResult::Busy | WorkerEntryResult::Refused,
-                NativeCloseInitialEntryRelease::Confirmed,
-            )) => self.refuse("original Close source unavailable at Worktree mutation".into()),
+            Ok((WorkerEntryResult::Busy, NativeCloseInitialEntryRelease::Confirmed)) => {
+                self.refuse("original Close source unavailable at Worktree mutation: busy".into())
+            }
+            Ok((WorkerEntryResult::Refused, NativeCloseInitialEntryRelease::Confirmed)) => {
+                self.refuse("original Close source unavailable at Worktree mutation: refused".into())
+            }
             Err(
                 NativeCloseInitialFirstEffectError::NotStarted(error)
                 | NativeCloseInitialFirstEffectError::Rejected {

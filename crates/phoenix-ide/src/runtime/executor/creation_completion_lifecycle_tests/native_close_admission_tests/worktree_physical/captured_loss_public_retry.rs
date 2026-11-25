@@ -245,7 +245,7 @@ pub(super) async fn retry_after_public_capture(
     let still_dirty = tool.run(input.clone(), context.clone()).await;
     assert!(!still_dirty.is_success());
     let still_dirty: Value = serde_json::from_str(still_dirty.output()).unwrap();
-    assert_eq!(still_dirty["code"], "storage_rejected");
+    assert_eq!(still_dirty["code"], "storage_rejected", "{still_dirty}");
     assert_eq!(
         public_retry_rows(&fixture, initial_run.attempt_id.as_str()).await,
         before

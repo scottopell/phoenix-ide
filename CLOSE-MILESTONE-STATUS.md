@@ -2,6 +2,71 @@
 
 ## Current qualification and reviewed lint follow-up
 
+### Fresh 9a65 broad failures remain fail-closed inspection gaps
+
+Later [CI45618338984](https://github.com/scottopell/phoenix-ide/actions/runs/45618338984)
+checkpoint: all non-test lanes and Rust archive build passed. Three completed
+shards failed; shard 4 remains active. Retained logs/artifacts:
+`/tmp/close-9a65b8191/{shard1.log,shard2.log,shard3.log,rust-evidence}`.
+
+- Shard 1: 1575/1765 run, 1574 pass/1 fail, 190 selected unrun. Assessment-Stop
+  journey failed in its preliminary still-dirty retry: typed
+  `retry_inspection_blocked`, expected `storage_rejected`, before the intended
+  barrier or Stop. Existing output omits its detector/PID; the assertion now
+  prints the exact JSON on failure without accepting another code or relaxing
+  any safety/Stop assertion.
+- Shard 2: 1611/1761 run, 1610 pass/1 fail, 150 selected unrun. Initial public
+  retirement reached ArchivedCleanupAttention rather than Archived; persisted
+  Worktree Residual/ManualRepairRequired and LinuxMapping PID21136 Unavailable
+  after owner-status ENOENT. Initial run 1 was admitted; no retry/Stop cut here.
+- Shard 3: 1557/1755 run, 1556 pass/1 fail, 198 selected unrun. Pre-observation
+  Stop journey returned `retry_inspection_blocked` before its barrier:
+  LinuxCwd PID18633 Unavailable, no successor admitted, no retry receipt, disk
+  retained. Intended Stop was never sent. Earlier ignored-content warning is
+  accumulated history, not the current clean retry cause.
+
+No source-entry Busy/Refused cause is established by these failures, and no
+vanished PID is inferred harmless. Production fail-closed policy and held
+privilege/isolation decision are unchanged. Exact9a65 is active and is retained;
+its current successful steps cannot replace these failed broad receipts. This
+follow-up adds only mutation refusal classification and failure-output precision,
+not a liveness/behavioral repair or sampling-until-green policy.
+
+### Retained 2b3 terminal evidence: post-admission mutation refusal
+
+[Exact45608183589](https://github.com/scottopell/phoenix-ide/actions/runs/45608183589)
+is terminal failed, source `2b3f34be7321ae48c8dd587f326c61b2ac7ab6f2`, tree
+`1428ba19ee0c833549b907d4b8fbab959d166669` (artifact source receipts verified).
+Primary clean retry failed; all four primary Stop journeys passed. Fixed clean
+samples were 3 pass/1 fail (sample 2); four assessment samples passed. These are
+independent fixed invocations, not an eventual successful retry. Evidence:
+`/tmp/close-2b3f34be7/{close-final-run.json,close-failed.log,artifacts}`.
+
+Both failures durably admitted run 2, then stopped with Worktree Failed and
+WorkScope Unattempted, `IdentityNotProven`/`ShutdownUncertain`, and
+`original Close source unavailable at Worktree mutation`. Primary retained an
+admin-delete target; sample 2 retained a Worktree-delete target. Thus this failure
+reached physical cleanup and must not be described as an untouched pre-admission
+assessment refusal. Earlier ignored-content warnings do not identify its cause.
+Mutation's confirmed-release branch also conflated Busy/Refused; the narrow
+follow-up distinguishes those strings with no admission, retry, scheduling,
+release-classification or custody change. The observed branch remains unknown.
+
+Other 2b3 failures were independently classified: focused DB inventory was
+success-gated and skipped after the physical failures, so later always-run
+wrappers failed on missing `selected-tests.txt`/`inventory.log` before their
+focused tests. Native DB actually passed 82 tests before its inventory check
+failed; full migrations passed 180. These are neither focused execution receipts
+nor evidence those migration algorithms failed. Exact formatting also failed on
+the previously corrected missing-status assertion. Workflow gating is unchanged.
+
+Current `9a65b81917cf2621969e6d710cb4ce2e21a49e44` broad qualification has
+passed early formatting, Clippy, musl, UI/spec/task, dev.py and e2e lanes; Rust
+build/tests remain active. The diagnostic jobs compiled synthetic merge
+`f3a2669c083fb0082554837fc3e8ce3ba3b882f3` (feature 9a65 into main4aba9625),
+not the exact feature source. Exact9a65 has started after retained2b3 ended.
+These positives establish compile/lint repair only, not intermittent behavior.
+
 ### 8b770 hosted compile/lint repair
 
 Published `8b770f1d12cbca284d0cfd18a0be7c2d1d866b55`, the independently
