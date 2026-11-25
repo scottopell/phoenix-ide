@@ -2,6 +2,36 @@
 
 ## Current qualification and reviewed lint follow-up
 
+### Complete broad9a receipts and independent DB diagnostics
+
+Final shard-4 artifact is now retained at
+`/tmp/close-9a65b8191/shard4-final-artifact`. Terminal stderr
+`check/processes/invocation-3434-ba37f3c162194e2c9f0a834484f22715.stderr.log`
+reports 1747/1747 passed (1 slow), 5552 skipped outside the partition. All four
+artifact source receipts identify synthetic merge
+`f3a2669c083fb0082554837fc3e8ce3ba3b882f3`, run45618338984 attempt1.
+
+All six named public journeys actually dispatched as individual tests with zero
+ignored: reclaim/replay, prepared Stop and before-writer Stop passed; initial
+retirement, assessment Stop and before-observation Stop failed. The latter two
+failed before their intended barrier/Stop, not at a successfully exercised cut.
+Actual harness stdout for each shows nobody UID/GID65534 (all four credential
+fields), runner UID1001, own-group-only membership and zero capabilities. Source
+requires source/staged SHA256 equality for runtime/launcher before dispatch;
+the digests themselves are not printed receipts. These six executions are
+3 pass/3 fail, not broad acceptance, complete process-tree closure or proof that
+the failed cuts ran. Wrapper/profiler PIDs are not writer attribution.
+
+The exact-workflow inventory producer was success-only even though downstream
+focused diagnostic consumers run on failure. This caused missing-file failures
+after exact2b3 public failures, not focused test execution. The producer now uses
+`success() || failure()` so independent selected diagnostics can execute after a
+failed public journey, but not after cancellation. Original failures remain
+fatal; full success-only suites, exact selectors/count checks, pipefail and all
+physical custody/privilege rules are unchanged. This intentionally pays bounded
+DB compilation/inventory cost for failure evidence; it is not a runtime fix.
+Failure-path hosted execution of the new condition remains unverified.
+
 ### fdfe hosted formatting follow-up; qualification remains blocked
 
 Published `fdfe106c6846e07c7ef154a387da09f5b784b961` adds mutation Busy/Refused
@@ -17,9 +47,8 @@ is pending behind retained active exact9a65. Watcher logs are retained in
 `/tmp/close-9a65b8191/close-watch.log`.
 
 The 9a65 broad run is now terminal failed. Shard 4 completed successfully
-(job139232534382; `/tmp/close-9a65b8191/shard4.log`), but its exact test count
-is not yet artifact-verified. The retained final artifact collection is incomplete;
-missing count evidence is not itself a test failure.
+(job139232534382; `/tmp/close-9a65b8191/shard4.log`); the later final artifact
+receipt above establishes its exact 1747 passed count.
 The three failed shard classifications below remain unresolved. Exact9a65
 successful interim steps are not terminal acceptance or causal repair.
 
@@ -27,7 +56,7 @@ successful interim steps are not terminal acceptance or causal repair.
 
 Later [CI45618338984](https://github.com/scottopell/phoenix-ide/actions/runs/45618338984)
 terminal result: all non-test lanes and Rust archive build passed. Three
-shards failed; shard 4 passed (exact test count not yet verified). Retained logs/artifacts:
+shards failed; shard 4 passed all 1747 selected tests. Retained logs/artifacts:
 `/tmp/close-9a65b8191/{shard1.log,shard2.log,shard3.log,rust-evidence}`.
 
 - Shard 1: 1575/1765 run, 1574 pass/1 fail, 190 selected unrun. Assessment-Stop

@@ -248,9 +248,10 @@ jobs:
           done
           test "$failed" -eq 0
 
-      # Intentionally fail fast here if focused public journeys fail. Later DB
-      # receipts are not claimed without this inventory or their own execution.
+      # Prepare inventory for failure-path diagnostics; full DB regressions remain success-gated.
+      # DB receipts still require their own selector and execution checks.
       - name: Compile database tests and inventory exact selectors
+        if: success() || failure()
         shell: bash
         run: |
           set -euo pipefail
