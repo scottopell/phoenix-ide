@@ -89,12 +89,29 @@ pub(super) enum PreparedTool {
     Ordinary(Box<ClearedOrdinaryCall>),
 }
 
-type PreparationFuture = Pin<Box<dyn Future<Output = Result<PreparedTool, String>> + Send>>;
+pub(super) enum PreparedOrdinaryTool {
+    Result(ToolResult),
+    Cleared(Box<ClearedOrdinaryCall>),
+}
 
-pub(super) struct ToolPreparation {
+impl From<PreparedOrdinaryTool> for PreparedTool {
+    fn from(prepared: PreparedOrdinaryTool) -> Self {
+        match prepared {
+            PreparedOrdinaryTool::Result(result) => prepared_result(Event::ToolComplete {
+                tool_use_id: result.tool_use_id.clone(),
+                result,
+            }),
+            PreparedOrdinaryTool::Cleared(cleared) => Self::Ordinary(cleared),
+        }
+    }
+}
+
+type PreparationFuture<P> = Pin<Box<dyn Future<Output = Result<P, String>> + Send>>;
+
+pub(super) struct ToolPreparation<P = PreparedTool> {
     selection: Arc<DispatchSelection>,
     failure_boundary: PreparationFailureBoundary,
-    phase: PreparationPhase,
+    phase: PreparationPhase<P>,
 }
 
 #[derive(Clone, Copy)]
@@ -103,24 +120,36 @@ enum PreparationFailureBoundary {
     Required(super::RequiredSettlementBoundary),
 }
 
-enum PreparationPhase {
-    Reading(Mutex<PreparationFuture>),
+enum PreparationPhase<P> {
+    Reading(Mutex<PreparationFuture<P>>),
     Interrupted,
     NoRead,
 }
 
-enum PreparationDisposition {
-    Ready(Result<PreparedTool, String>),
+enum PreparationDisposition<P> {
+    Ready(Result<P, String>),
     Interrupted,
 }
 
-pub(super) struct PreparationObservation {
+pub(super) struct PreparationObservation<P = PreparedTool> {
     selection: Arc<DispatchSelection>,
-    result: PreparationDisposition,
+    result: PreparationDisposition<P>,
 }
 
-impl ToolPreparation {
-    pub(super) async fn observe(&mut self) -> PreparationObservation {
+impl<P> ToolPreparation<P> {
+    fn reading(
+        selection: Arc<DispatchSelection>,
+        failure_boundary: PreparationFailureBoundary,
+        read: impl Future<Output = Result<P, String>> + Send + 'static,
+    ) -> Self {
+        Self {
+            selection,
+            failure_boundary,
+            phase: PreparationPhase::Reading(Mutex::new(Box::pin(read))),
+        }
+    }
+
+    pub(super) async fn observe(&mut self) -> PreparationObservation<P> {
         let result = match &mut self.phase {
             PreparationPhase::Reading(read) => PreparationDisposition::Ready(
                 read.get_mut()
@@ -173,11 +202,7 @@ impl<S: Storage + Clone + 'static, L: LlmClient + 'static, T: ToolExecutor + 'st
     ) -> ToolPreparation {
         let storage = self.storage.clone();
         let executor = self.tool_executor.clone();
-        let surface = if selection.context.is_sub_agent && self.grace_turn_granted {
-            LlmToolSurface::SubAgentTerminal
-        } else {
-            LlmToolSurface::Full
-        };
+        let surface = self.preparation_surface(&selection);
         let catalog = super::super::agent_execution::SpawnCatalog::resolve(
             &self.agent_config,
             self.llm_registry.available_execution_routes(),
@@ -195,10 +220,27 @@ impl<S: Storage + Clone + 'static, L: LlmClient + 'static, T: ToolExecutor + 'st
             (catalog, builtin_model),
             self_goal,
         );
-        ToolPreparation {
-            selection,
-            failure_boundary,
-            phase: PreparationPhase::Reading(Mutex::new(Box::pin(read))),
+        ToolPreparation::reading(selection, failure_boundary, read)
+    }
+
+    fn make_ordinary_tool_preparation(
+        &self,
+        selection: Arc<DispatchSelection>,
+        failure_boundary: PreparationFailureBoundary,
+    ) -> ToolPreparation<PreparedOrdinaryTool> {
+        let read = prepare_ordinary_selected_tool(
+            self.storage.clone(),
+            Arc::clone(&selection),
+            self.preparation_surface(&selection),
+        );
+        ToolPreparation::reading(selection, failure_boundary, read)
+    }
+
+    fn preparation_surface(&self, selection: &DispatchSelection) -> LlmToolSurface {
+        if selection.context.is_sub_agent && self.grace_turn_granted {
+            LlmToolSurface::SubAgentTerminal
+        } else {
+            LlmToolSurface::Full
         }
     }
 
@@ -346,30 +388,14 @@ async fn prepare_selected_tool<S: Storage, T: ToolExecutor>(
     (catalog, builtin_model): (super::super::agent_execution::SpawnCatalog, bool),
     self_goal: impl Future<Output = Result<Option<Event>, String>> + Send,
 ) -> Result<PreparedTool, String> {
+    let schema = match prepare_selected_policy(&storage, &origin, surface).await? {
+        SelectedToolPolicy::Result(result) => {
+            return Ok(PreparedOrdinaryTool::Result(result).into());
+        }
+        SelectedToolPolicy::Allowed(schema) => schema,
+    };
     let tool = &origin.tool;
     let context = &origin.context;
-    let policy = storage
-        .load_tool_admission_policy(&context.conversation_id)
-        .await?;
-    let definition = policy
-        .declarations()
-        .iter()
-        .find(|definition| definition.name == tool.name() && policy.is_callable(tool.name()));
-    let Some(definition) = definition else {
-        return Ok(unavailable(
-            tool,
-            "tool was unavailable in the originating request policy",
-        ));
-    };
-    let schema = definition.input_schema.clone();
-    if surface == LlmToolSurface::SubAgentTerminal
-        && !matches!(tool.name(), "submit_result" | "submit_error")
-    {
-        return Ok(unavailable(
-            tool,
-            "tool is unavailable under the current conversation policy",
-        ));
-    }
     if matches!(tool.name(), "create_goal" | "enable_auto_continuation") {
         return self_goal
             .await?
@@ -387,12 +413,74 @@ async fn prepare_selected_tool<S: Storage, T: ToolExecutor>(
         return Ok(if advertised && definition.input_schema == schema {
             PreparedTool::Native(catalog)
         } else {
-            unavailable(
+            PreparedOrdinaryTool::Result(unavailable(
                 tool,
                 "spawn_agents no longer matches the originating request policy",
-            )
+            ))
+            .into()
         });
     }
+    prepare_ordinary_call(storage, origin, surface, schema)
+        .await
+        .map(Into::into)
+}
+
+enum SelectedToolPolicy {
+    Result(ToolResult),
+    Allowed(serde_json::Value),
+}
+
+async fn prepare_selected_policy<S: Storage>(
+    storage: &S,
+    origin: &DispatchSelection,
+    surface: LlmToolSurface,
+) -> Result<SelectedToolPolicy, String> {
+    let tool = &origin.tool;
+    let policy = storage
+        .load_tool_admission_policy(&origin.context.conversation_id)
+        .await?;
+    let definition = policy
+        .declarations()
+        .iter()
+        .find(|definition| definition.name == tool.name() && policy.is_callable(tool.name()));
+    let Some(definition) = definition else {
+        return Ok(SelectedToolPolicy::Result(unavailable(
+            tool,
+            "tool was unavailable in the originating request policy",
+        )));
+    };
+    if surface == LlmToolSurface::SubAgentTerminal
+        && !matches!(tool.name(), "submit_result" | "submit_error")
+    {
+        return Ok(SelectedToolPolicy::Result(unavailable(
+            tool,
+            "tool is unavailable under the current conversation policy",
+        )));
+    }
+    Ok(SelectedToolPolicy::Allowed(definition.input_schema.clone()))
+}
+
+async fn prepare_ordinary_selected_tool<S: Storage>(
+    storage: S,
+    origin: Arc<DispatchSelection>,
+    surface: LlmToolSurface,
+) -> Result<PreparedOrdinaryTool, String> {
+    match prepare_selected_policy(&storage, &origin, surface).await? {
+        SelectedToolPolicy::Result(result) => Ok(PreparedOrdinaryTool::Result(result)),
+        SelectedToolPolicy::Allowed(schema) => {
+            prepare_ordinary_call(storage, origin, surface, schema).await
+        }
+    }
+}
+
+async fn prepare_ordinary_call<S: Storage>(
+    storage: S,
+    origin: Arc<DispatchSelection>,
+    surface: LlmToolSurface,
+    schema: serde_json::Value,
+) -> Result<PreparedOrdinaryTool, String> {
+    let tool = &origin.tool;
+    let context = &origin.context;
     let legacy_tmux_conversation_id = match &context.resource_scope {
         phoenix_core::work_scope::ResourceScopeKey::Work(scope_id) => {
             storage
@@ -405,19 +493,16 @@ async fn prepare_selected_tool<S: Storage, T: ToolExecutor>(
     };
     Ok(
         match DenyGate::check(tool.name().to_owned(), tool.input.to_value()) {
-            Ok(checked) => PreparedTool::Ordinary(Box::new(ClearedOrdinaryCall {
+            Ok(checked) => PreparedOrdinaryTool::Cleared(Box::new(ClearedOrdinaryCall {
                 checked,
                 schema,
                 surface,
                 legacy_tmux_conversation_id,
             })),
-            Err(denial) => prepared_result(Event::ToolComplete {
+            Err(denial) => PreparedOrdinaryTool::Result(ToolResult {
                 tool_use_id: tool.id.clone(),
-                result: ToolResult {
-                    tool_use_id: tool.id.clone(),
-                    outcome: super::tool_output_to_outcome(denial.into_tool_output()),
-                    duration_ms: Some(0),
-                },
+                outcome: super::tool_output_to_outcome(denial.into_tool_output()),
+                duration_ms: Some(0),
             }),
         },
     )
@@ -427,11 +512,8 @@ fn prepared_result(event: Event) -> PreparedTool {
     PreparedTool::Result(Box::new(event))
 }
 
-fn unavailable(tool: &ToolCall, message: &str) -> PreparedTool {
-    prepared_result(Event::ToolComplete {
-        tool_use_id: tool.id.clone(),
-        result: ToolResult::error(tool.id.clone(), format!("EUNAVAIL: {message}")),
-    })
+fn unavailable(tool: &ToolCall, message: &str) -> ToolResult {
+    ToolResult::error(tool.id.clone(), format!("EUNAVAIL: {message}"))
 }
 
 #[cfg(test)]

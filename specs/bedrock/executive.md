@@ -23,6 +23,13 @@ retained. Lifecycle calls anywhere in the original response keep its whole sourc
 serial. The model chooses independence, including Bash and patch; there is no
 conflict inference or background execution feature.
 
+Batch cancellation uses one explicit open/pre-commit-close/committed-close
+lifecycle. Only committed cancellation enables receipt drain, and repeated close
+signals cannot reopen admission or return to a pre-commit phase. Ordinary batch
+preparation carries a result type limited to a paired tool result or a checked
+ordinary payload; its future and observation cannot carry native admission.
+Serial and batch paths share policy, surface, scope and gate checks.
+
 The normative alignment covers source-ordered complete-round checkpoints,
 independent sibling errors, exact full-source ownership, cancellation snapshots
 before signals, all-owner drain and retirement, child Failed + NotifyParent,

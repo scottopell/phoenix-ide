@@ -1,6 +1,6 @@
 # Run independent foreground ordinary tool calls concurrently
 
-The user authorized a current provider audit, an adversarially reviewed bounded design, implementation, and a separate PR through green CI. The verified implementation base is `9b8b33a3398605db9dbde0cb2de69fbf355d362c` on `codex/concurrent-tool-batches`.
+The user authorized a current provider audit, an adversarially reviewed bounded design, implementation, and a separate PR through green CI. The original implementation base was `9b8b33a3398605db9dbde0cb2de69fbf355d362c` on `codex/concurrent-tool-batches`.
 
 A native provider response containing only independent ordinary calls forms one foreground batch. The model chooses independence. Bash and patch may overlap under existing permissions and Work admission. No conflict detection, locks, dependency graph, external retry/replay, backgrounding, or new crash/exactly-once guarantee is included. Any lifecycle-owned special call keeps the whole response on the existing serial path. The per-conversation bound is eight retained preparation/execution owners, refilled as individual results commit while other calls remain running.
 
@@ -37,7 +37,13 @@ Validation uses deterministic barriers, managed Python 3.13/dev.py helpers, Bash
 
 ## Eight-owner window
 
-The user selected a cap increase from four to eight after the initial candidate was qualified. ADR-271 changes only the numeric bound; ADR-270 remains the historical initial decision. The same sliding window admits the ninth member of a ten-call response after a later sibling commits while the first source call remains held. Eight-active/two-unissued fixtures cover cooperative and forced cancellation, held reads/writes, known cancellation rejection and actual SQLite settlement rejection. Verification worker budget remains four. Earlier receipts below belong to the four-owner candidate; they are not eight-owner validation. Focused cap-eight, whole concurrent-tools module, applicable static checks, repeated full-range reviews and fresh hosted checks qualify this change without repeating the full broad run solely for the numeric bound.
+The user selected a cap increase from four to eight after the initial candidate was qualified. ADR-284 changes only the numeric bound; ADR-283 remains the historical initial decision. These branch-local ADRs were renumbered during integration because main allocated their original numbers. The same sliding window admits the ninth member of a ten-call response after a later sibling commits while the first source call remains held. Eight-active/two-unissued fixtures cover cooperative and forced cancellation, held reads/writes, known cancellation rejection and actual SQLite settlement rejection. Verification worker budget remains four. Earlier receipts below belong to the four-owner candidate; they are not eight-owner validation. Focused cap-eight, whole concurrent-tools module, applicable static checks, repeated full-range reviews and fresh hosted checks qualify this change without repeating the full broad run solely for the numeric bound.
+
+## Type-enforced preparation and cancellation
+
+The user requested both internal refactors and a rebase onto latest main. Batch lifecycle is one `Open | ClosingBeforeCommit | ClosingAfterCommit` enum, eliminating the independently writable closing/commit flags. Resource close is monotonic; only adoption of a committed cancelling state enables receipt drain. The original cancellation cutoff remains with its existing source-bound owner.
+
+Ordinary batch preparation has a separate result type containing only a paired `ToolResult` or a gate-cleared ordinary payload. Its future and observation carry that result type end to end, so native admission cannot reach the batch consumer. Shared policy/surface and ordinary scope/gate helpers preserve serial behavior without running native or self-goal preparation on the batch path. Compile, owning cancellation/preparation/native/provider checks and rebased integration validation are recorded after completion; prior-head receipts below remain historical.
 
 Cap-eight local qualification at `f323ac403`: `/tmp/08500-cap8-focused-owning-01.log` records 13/13 focused passes (3.186s), then the complete concurrent-tools module 28/28 passes (5.798s), combined exit 0 / 300.290s with a freshly built native fixture. The production delta is one numeric limit; current static gates and new exact-head hosted checks remain pending. Existing four-owner receipts stay historical evidence.
 

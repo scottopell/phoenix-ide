@@ -2,7 +2,7 @@ use super::super::{RequiredSettlementBoundary, ToolExecOutcome, ToolExecutionSlo
 use super::{
     Arc, ConvState, ConversationRuntime, CurrentSelection, DispatchSelection, Event, LlmClient,
     PreparationDisposition, PreparationFailureBoundary, PreparationObservation, PreparationPhase,
-    PreparedTool, Storage, ToolCall, ToolExecutor, ToolPreparation, ToolResult,
+    PreparedOrdinaryTool, Storage, ToolCall, ToolExecutor, ToolPreparation, ToolResult,
 };
 use futures::FutureExt as _;
 use phoenix_core::domain::sm_state::AssistantMessage;
@@ -71,7 +71,7 @@ struct BatchCall {
 enum CallPhase {
     Unissued,
     Cleared,
-    Preparing(ToolPreparation),
+    Preparing(ToolPreparation<PreparedOrdinaryTool>),
     Running(RunningCall),
     Ready {
         outcome: ToolExecOutcome,
@@ -157,7 +157,7 @@ impl BatchCall {
 pub(in super::super) enum ForegroundObservation {
     Serial(PreparationObservation),
     Unissued(Arc<DispatchSelection>),
-    Prepared(PreparationObservation),
+    Prepared(PreparationObservation<PreparedOrdinaryTool>),
     Outcome {
         selection: Arc<DispatchSelection>,
         outcome: ToolExecOutcome,
@@ -167,7 +167,9 @@ pub(in super::super) enum ForegroundObservation {
 impl ForegroundDispatch {
     pub(in super::super) fn open_batch_origin(&self) -> Option<Arc<AssistantMessage>> {
         match self {
-            Self::OrdinaryBatch(batch) if batch.lifecycle.is_open() => Some(Arc::clone(&batch.origin)),
+            Self::OrdinaryBatch(batch) if batch.lifecycle.is_open() => {
+                Some(Arc::clone(&batch.origin))
+            }
             Self::OrdinaryBatch(_) | Self::Serial(_) => None,
         }
     }
@@ -609,7 +611,7 @@ impl<S: Storage + Clone + 'static, L: LlmClient + 'static, T: ToolExecutor + 'st
             .map(|call| (Arc::clone(&call.selection), call.boundary))
             .collect();
         for (selection, boundary) in selections {
-            let preparation = self.make_tool_preparation(Arc::clone(&selection), boundary);
+            let preparation = self.make_ordinary_tool_preparation(Arc::clone(&selection), boundary);
             let ForegroundDispatch::OrdinaryBatch(batch) = &mut self.foreground_dispatch else {
                 unreachable!()
             };
@@ -770,11 +772,14 @@ impl<S: Storage + Clone + 'static, L: LlmClient + 'static, T: ToolExecutor + 'st
                             tool_use_id: selection.tool.id.clone(),
                         }))
                     }
-                    PreparationDisposition::Ready(Ok(PreparedTool::Result(event))) => {
+                    PreparationDisposition::Ready(Ok(PreparedOrdinaryTool::Result(result))) => {
                         call.phase = CallPhase::Settling(None);
-                        Ok(Some(*event))
+                        Ok(Some(Event::ToolComplete {
+                            tool_use_id: selection.tool.id.clone(),
+                            result,
+                        }))
                     }
-                    PreparationDisposition::Ready(Ok(PreparedTool::Ordinary(cleared))) => {
+                    PreparationDisposition::Ready(Ok(PreparedOrdinaryTool::Cleared(cleared))) => {
                         call.phase = CallPhase::Cleared;
                         let mut admitted = self.admit_authoritative_effect()?;
                         self.launch_cleared_tool(
@@ -783,9 +788,6 @@ impl<S: Storage + Clone + 'static, L: LlmClient + 'static, T: ToolExecutor + 'st
                             &mut admitted,
                         );
                         Ok(None)
-                    }
-                    PreparationDisposition::Ready(Ok(PreparedTool::Native(_))) => {
-                        Err("native preparation cannot inhabit an ordinary batch".into())
                     }
                 }
             }
