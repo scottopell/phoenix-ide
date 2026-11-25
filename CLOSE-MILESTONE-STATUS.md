@@ -2,6 +2,24 @@
 
 ## Current qualification and reviewed lint follow-up
 
+### 8b770 hosted compile/lint repair
+
+Published `8b770f1d12cbca284d0cfd18a0be7c2d1d866b55`, the independently
+reviewed formatting-only follow-up. [CI45617302819](https://github.com/scottopell/phoenix-ide/actions/runs/45617302819)
+passed early exact-source formatting, task validation and UI/spec checks. It is
+still active, but completed musl and Clippy jobs exposed introduced blockers in
+the earlier inspection-gap mapping: `application_error` needlessly took the now
+non-Copy error by value, two tests imported writer types from `native_close`
+instead of the existing DB facade, and two adapter assertions treated
+`ToolOutput::output()` as a field. Evidence: `/tmp/close-8b770f1d1/{musl,clippy,ui-specs}.log`.
+The narrow repair borrows at all formatter callsites, uses existing DB exports,
+and keeps each ToolOutput alive while reading its output method. No error-code,
+classification, admission or custody semantics change. Hosted executable proof of
+the corrected source is still required; no local executable validation was run.
+The older exact 2b3 remains active with failures; full classification awaits its
+terminal logs. Exact 8b770 is pending. These are distinct feature/exact and broad
+synthetic-merge results, not interchangeable receipts.
+
 ### bf211 hosted result and formatting-only correction
 
 Published `bf211d78f60a2033e68e911bc54f387847322758` after independent

@@ -134,8 +134,8 @@ fn output(result: NativeCloseApplicationResult) -> Value {
     }
 }
 
-fn application_error(error: NativeCloseApplicationError) -> ToolOutput {
-    let code = match &error {
+fn application_error(error: &NativeCloseApplicationError) -> ToolOutput {
+    let code = match error {
         NativeCloseApplicationError::RetryInspectionBlocked(gap) => {
             return ToolOutput::error(
                 json!({
@@ -178,7 +178,7 @@ impl Tool for CloseConversation {
 
     async fn run(&self, input: Value, ctx: ToolContext) -> ToolOutput {
         let Some(source) = ctx.source_tool_call() else {
-            return application_error(NativeCloseApplicationError::SourceRefused);
+            return application_error(&NativeCloseApplicationError::SourceRefused);
         };
         let intent = match parse(&input) {
             Ok(intent) => intent,
@@ -194,7 +194,7 @@ impl Tool for CloseConversation {
             .await
         {
             Ok(result) => ToolOutput::success(output(result).to_string()),
-            Err(error) => application_error(error),
+            Err(error) => application_error(&error),
         }
     }
 }
@@ -208,13 +208,13 @@ mod tests {
         let error = NativeCloseApplicationError::RetryInspectionBlocked(
             crate::runtime::close_retirement::WriterInspectionGap {
                 path: std::path::PathBuf::from("/retained/worktree"),
-                detector: phoenix_db::native_close::CloseWriterDetector::LinuxDescriptor,
-                reason: phoenix_db::native_close::CloseWriterGap::Unavailable,
+                detector: crate::db::CloseWriterDetector::LinuxDescriptor,
+                reason: crate::db::CloseWriterGap::Unavailable,
                 pid: None,
             },
         );
-        let rendered = application_error(error).output;
-        let value: Value = serde_json::from_str(&rendered).unwrap();
+        let rendered = application_error(&error);
+        let value: Value = serde_json::from_str(rendered.output()).unwrap();
         assert_eq!(value["code"], "retry_inspection_blocked");
         assert_eq!(value["facts"]["path"], "/retained/worktree");
         assert_eq!(value["facts"]["detector"], "linux_descriptor");
@@ -236,8 +236,8 @@ mod tests {
                 "fatal_authority",
             ),
         ] {
-            let rendered = application_error(error).output;
-            let value: Value = serde_json::from_str(&rendered).unwrap();
+            let rendered = application_error(&error);
+            let value: Value = serde_json::from_str(rendered.output()).unwrap();
             assert_eq!(value["code"], code);
             assert!(value.get("facts").is_none());
         }

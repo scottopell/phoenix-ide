@@ -542,8 +542,8 @@ fn map_retry_assessment_error(
 #[cfg(test)]
 mod retry_assessment_error_tests {
     use super::*;
+    use crate::db::{CloseWriterDetector, CloseWriterGap};
     use crate::runtime::close_retirement::{RetryAssessmentError, WriterInspectionGap};
-    use phoenix_db::native_close::{CloseWriterDetector, CloseWriterGap};
 
     #[test]
     fn only_typed_inspection_gaps_are_exposed_as_inspection_blocked() {
