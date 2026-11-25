@@ -36238,6 +36238,10 @@ mod close_run_inner_layout_tests {
         std::mem::size_of::<F>()
     }
 
+    fn future_size3<Arg1, Arg2, Arg3, F: Future>(_: impl FnOnce(Arg1, Arg2, Arg3) -> F) -> usize {
+        std::mem::size_of::<F>()
+    }
+
     #[test]
     fn production_run_inner_future_layout() {
         let run_inner_bytes = future_size(crate::runtime::ProductionRuntime::run_inner);
@@ -36247,6 +36251,13 @@ mod close_run_inner_layout_tests {
             std::mem::size_of::<native_close::NativeCloseInitialContinuation>(),
             std::mem::size_of::<native_close_retry::NativeCloseRetryContinuation>(),
             std::mem::size_of::<native_close_retry::AdmittedRetryCursor>(),
+        );
+        let runtime_bytes = std::mem::size_of::<crate::runtime::ProductionRuntime>();
+        let update_conversation_state_bytes =
+            future_size3(crate::db::Database::update_conversation_state);
+        eprintln!(
+            "type-only shared DB source-fence diagnostic: ProductionRuntime={} bytes, raw Database::update_conversation_state future={} bytes",
+            runtime_bytes, update_conversation_state_bytes,
         );
         assert_ne!(
             run_inner_bytes, 0,

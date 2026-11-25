@@ -373,6 +373,16 @@ async fn assert_no_ending_for_input(db: &Database, input_message_id: &str) {
     reason = "one composed owner recovery must retain the same runtime, instruction identity, tracking item, and evidence"
 )]
 async fn native_owner_rejection_continuation_busy_recovery_and_coordinator_retention() {
+    fn phase(name: &str) {
+        use std::io::Write as _;
+
+        // Bypass libtest's per-thread capture so aborts retain the last phase.
+        let mut stderr = std::io::stderr().lock();
+        writeln!(stderr, "[owner-handoff] {name}").expect("write phase marker");
+        stderr.flush().expect("flush phase marker");
+    }
+
+    phase("fixture construction: begin");
     let (sender, mut captured) = mpsc::unbounded_channel();
     let provider = Arc::new(HandoffProvider {
         captures: sender,
@@ -383,6 +393,7 @@ async fn native_owner_rejection_continuation_busy_recovery_and_coordinator_reten
         provider.clone(),
     )))
     .await;
+    phase("fixture construction: complete; coordinator tool setup: begin");
     let coordinator_product =
         f.db.get_conversation(&f.source)
             .await
@@ -396,7 +407,9 @@ async fn native_owner_rejection_continuation_busy_recovery_and_coordinator_reten
     let send = tools.find_tool("send_conversation_message").unwrap();
     let tracking = tools.find_tool("tracking").unwrap();
     let continue_owner = tools.find_tool("continue_conversation").unwrap();
+    phase("coordinator tool setup: complete; tracking seed: begin");
     let tracked = record_paused_concern(&f, tracking.as_ref()).await;
+    phase("tracking seed: complete; predecessor input seed: begin");
     f.db.watch_product_conversation(&f.product).await.unwrap();
     let target = format!("@conv:{}", f.product);
 
@@ -407,11 +420,14 @@ async fn native_owner_rejection_continuation_busy_recovery_and_coordinator_reten
     let old_key = Uuid::new_v4();
     let old_receipt = native_send(send.as_ref(), &f.source, &target, old_key, OLD_INPUT).await;
     assert_eq!(old_receipt["outcome"], "delivered");
+    phase("predecessor input accepted; standalone dispatch: begin");
     f.runtime
         .dispatch_standalone_turn(&f.predecessor)
         .await
         .unwrap();
+    phase("standalone dispatch issued; awaiting predecessor provider observation");
     let old_request = next_capture(&mut captured, 0, &f.predecessor).await;
+    phase("predecessor provider observed; predecessor eviction and successor recovery: begin");
     assert!(old_request.contains(OLD_INPUT));
     assert!(!old_request.contains(RECOVERY));
     let mut predecessor_events = f.runtime.subscribe(&f.predecessor).await.unwrap();
@@ -517,7 +533,9 @@ async fn native_owner_rejection_continuation_busy_recovery_and_coordinator_reten
         .dispatch_standalone_turn(&successor)
         .await
         .unwrap();
+    phase("successor standalone dispatch issued; awaiting opening provider observation");
     let opening_request = next_capture(&mut captured, 1, &successor).await;
+    phase("successor opening observed; recovery dispatch/observation: in progress");
     assert!(opening_request.contains(SUMMARY));
     assert!(!opening_request.contains(RECOVERY));
     assert!(!opening_request.contains(REJECT_ONLY));
@@ -561,8 +579,10 @@ async fn native_owner_rejection_continuation_busy_recovery_and_coordinator_reten
     assert_no_saved_user_input(&f.db, &f.predecessor, REJECT_ONLY).await;
     assert_tracking_unchanged(&f.db, &f.source, &tracked).await;
 
+    phase("successor recovery steering queued; releasing opening provider");
     provider.release.add_permits(1);
     let recovery_request = next_capture(&mut captured, 2, &successor).await;
+    phase("successor recovery provider observed");
     assert!(
         recovery_request.contains(&format!(
             "[Message from conversation {coordinator_product}, transcript {}]",
