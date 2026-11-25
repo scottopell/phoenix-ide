@@ -4489,9 +4489,25 @@ mod lifecycle_hook_tests {
         assert!(!manager.is_active(&scope).await);
     }
 
+    fn real_chrome_lifecycle_tests_configured() -> bool {
+        if std::env::var_os("PHOENIX_CHROME_EXECUTABLE").is_none() {
+            return false;
+        }
+        static INSTALL_SHIM: std::sync::Once = std::sync::Once::new();
+        INSTALL_SHIM.call_once(|| {
+            let executable = std::env::var_os("PHOENIX_TEST_CHROME_SHIM_EXECUTABLE")
+                .expect("real Chrome lifecycle tests require a matched Chrome exec shim");
+            crate::process_group::ChromeExecShim::install_external_qualification_executable(
+                std::path::Path::new(&executable),
+            )
+            .expect("install real Chrome lifecycle test shim");
+        });
+        true
+    }
+
     #[tokio::test]
     async fn shutdown_all_waits_for_process_exit_and_profile_removal() {
-        if std::env::var_os("PHOENIX_CHROME_EXECUTABLE").is_none() {
+        if !real_chrome_lifecycle_tests_configured() {
             return;
         }
 
@@ -4503,6 +4519,8 @@ mod lifecycle_hook_tests {
         let _ = std::fs::remove_dir_all(&profile);
         let manager = BrowserSessionManager::new();
         let session = manager.get_session(&scope).await.expect("launch browser");
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        assert!(session.read().await.owned_group.is_some());
 
         manager.shutdown_all().await.expect("browser shutdown");
 
@@ -4522,13 +4540,15 @@ mod lifecycle_hook_tests {
 
     #[tokio::test]
     async fn get_session_evicts_and_relaunches_after_chrome_process_exits() {
-        if std::env::var_os("PHOENIX_CHROME_EXECUTABLE").is_none() {
+        if !real_chrome_lifecycle_tests_configured() {
             return;
         }
 
         let scope = ResourceScopeKey::Work(WorkScopeId::new());
         let manager = BrowserSessionManager::new();
         let first = manager.get_session(&scope).await.expect("launch first");
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        assert!(first.read().await.owned_group.is_some());
         let first_pid = first
             .read()
             .await
@@ -4536,18 +4556,20 @@ mod lifecycle_hook_tests {
             .expect("chrome process identity")
             .pid;
 
-        // Kill the Chrome process externally so the cached session becomes dead.
-        #[cfg(unix)]
-        unsafe {
-            libc::kill(i32::try_from(first_pid).unwrap(), libc::SIGKILL);
-        }
-        let _ = first
-            .write()
-            .await
-            .browser
-            .wait()
-            .await
-            .expect("await killed Chrome exit");
+        // Kill only the root; retirement must drain the owned group before reaping it.
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        assert_eq!(
+            unsafe { libc::kill(i32::try_from(first_pid).unwrap(), libc::SIGKILL) },
+            0,
+            "kill Chrome root"
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while first.write().await.is_running().expect("observe Chrome root") {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("observe killed Chrome root exit without reaping");
         assert!(
             first.write().await.is_dead(),
             "killed Chrome process must be detected as dead"
@@ -4557,6 +4579,8 @@ mod lifecycle_hook_tests {
             .get_session(&scope)
             .await
             .expect("relaunch after Chrome exit");
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        assert!(second.read().await.owned_group.is_some());
         assert!(
             !Arc::ptr_eq(&first, &second),
             "dead session must be replaced with a fresh session"
@@ -4577,13 +4601,15 @@ mod lifecycle_hook_tests {
 
     #[tokio::test]
     async fn get_session_evicts_and_relaunches_when_cdp_handler_exits() {
-        if std::env::var_os("PHOENIX_CHROME_EXECUTABLE").is_none() {
+        if !real_chrome_lifecycle_tests_configured() {
             return;
         }
 
         let scope = ResourceScopeKey::Work(WorkScopeId::new());
         let manager = BrowserSessionManager::new();
         let first = manager.get_session(&scope).await.expect("launch first");
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        assert!(first.read().await.owned_group.is_some());
 
         first.read().await.handler_task.abort();
         let deadline = Instant::now() + std::time::Duration::from_secs(2);
@@ -4602,6 +4628,8 @@ mod lifecycle_hook_tests {
             .get_session(&scope)
             .await
             .expect("relaunch after CDP handler exit");
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        assert!(second.read().await.owned_group.is_some());
         assert!(
             !Arc::ptr_eq(&first, &second),
             "session with exited CDP handler must be replaced"

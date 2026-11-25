@@ -2,6 +2,54 @@
 
 ## Current qualification and reviewed lint follow-up
 
+### 4fa7 hosted result and reviewed lint / real-Chrome fixture repairs
+
+Exact feature `4fa7be6a38ef2129d86a70f14d2f7ef049ba4b74` completed
+[Close45570531329](https://github.com/scottopell/phoenix-ide/actions/runs/45570531329)
+**successfully**, including final formatting, frontend and specifications.
+Parent-read artifacts establish foundation **270 / 0 / 0**, native DB
+**82 / 0 / 0**, migrations **180 / 0 / 0**, and each of the six exact public
+physical/Stop selectors **1 / 0 / 0** (passed / failed / ignored).
+
+[CI45570540238](https://github.com/scottopell/phoenix-ide/actions/runs/45570540238)
+completed **failed**. Broad Rust checked synthetic merge
+`38537147f5af0bb87bdb893b7003168aa12eaa3c` (main `4aba9625a` + feature 4fa7),
+not exact feature source alone. Rust build/codegen, early source, dev.py tests,
+task validation, UI/specs, E2E and both release-helper platforms passed.
+Test shards 1, 2 and 4 passed **1764**, **1760** and **1746** tests respectively;
+shard 3 stopped after **33 passed / 1 failed** of 1753 selected tests.
+The full Clippy and musl diagnostics identify four lint sites: a missing yield
+statement semicolon, two reads of an underscore-prefixed fixture owner, and a
+large directly awaited drive-turn future (same cause on GNU and musl).
+
+Five of the six dispatcher selectors have actual broad-run identity and execution
+receipts: initial retirement, public captured-loss retry/reclaim/replay, and Stop
+during assessment, while prepared and before writer acquisition each ran as
+`nobody` (UID/GID 65534, runner UID 1001) and passed **1 / 0 / 0**. The Stop before
+physical observation selector was in the fail-fast shard and is **not established
+through broad CI** on this source. Its exact Close receipt above remains distinct.
+
+The failing browser test was
+`get_session_evicts_and_relaunches_after_chrome_process_exits`: profile removal
+returned `Directory not empty`. The fixture had not installed the matched Chrome
+shim, selected root-only ownership, killed the root, then reaped it before
+retirement. Surviving profile-writing descendants are consistent with the failure,
+not individually identified by the log. The reviewed repair installs the existing
+matched shim for all three real-Chrome lifecycle fixtures, asserts owned-group
+launches on Linux/macOS, and observes root exit without reaping its identity anchor
+before retirement drains the group. Configured Chrome without its shim fails;
+the existing absent-Chrome gate is unchanged. Production lifecycle code is not
+changed, and unshimmed production root-only cleanup is not claimed fixed.
+
+After both workflows became terminal, this follow-up batches the four lint-site
+repairs and the browser fixture / CI environment repair. The drive-turn future is
+boxed, not spawned; fixture TempDir custody is retained. Independent source review
+found no concrete blockers. Evidence and frozen repair hashes are retained under
+`/tmp/close-4fa7be6a3/`. This follow-up remains **unqualified** pending fresh automatic
+exact Close and standard CI, including actual execution of the repaired Chrome
+fixtures and all six dispatcher selectors. No local executable validation, main
+merge, installation or release occurred.
+
 ### 678 hosted result and formatting-only follow-up
 
 Candidate `678c573711d274de9f09baed20f9c239e769b024` is **not qualified**.

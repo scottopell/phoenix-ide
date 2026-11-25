@@ -89,7 +89,7 @@ mod disposable {
     }
 
     struct Fixture {
-        _directory: tempfile::TempDir,
+        directory: tempfile::TempDir,
         socket: PathBuf,
         config: PathBuf,
         token: String,
@@ -135,7 +135,7 @@ mod disposable {
                 .unwrap();
             let process = current_process_identity(pid).expect("fresh disposable server identity");
             Self {
-                _directory: directory,
+                directory,
                 socket,
                 config,
                 token,
@@ -314,7 +314,7 @@ mod disposable {
                             break;
                         }
                         Err(error) if error.raw_os_error() == Some(libc::ENXIO) => {
-                            tokio::task::yield_now().await
+                            tokio::task::yield_now().await;
                         }
                         Err(error) => panic!("private fixture release failed: {error}"),
                     }
@@ -330,7 +330,7 @@ mod disposable {
     async fn same_token_socket_rebinding_never_kills_the_replacement_server() {
         let original = Fixture::new().await;
         let replacement = Fixture::with_token(original.token.clone()).await;
-        let alias = original._directory.path().join("alias");
+        let alias = original.directory.path().join("alias");
         std::os::unix::fs::symlink(&original.socket, &alias).unwrap();
         let helper = PausedHelper::new();
         let operation = retire_exact_on_server(
@@ -495,7 +495,7 @@ mod disposable {
             matches!(fixture.retire(fixture.process, &fixture.token, Path::new("/bin/true")).await, TokenBoundKill::Failed { reason } if reason.contains("does not support close-gate helper"))
         );
         fixture.assert_original_running();
-        let injected = fixture._directory.path().join("#(false)");
+        let injected = fixture.directory.path().join("#(false)");
         assert!(
             matches!(fixture.retire(fixture.process, &fixture.token, &injected).await, TokenBoundKill::Failed { reason } if reason == "invalid exact-retirement token or path")
         );
