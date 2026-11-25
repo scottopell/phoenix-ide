@@ -495,4 +495,29 @@ describe('MessageViewer', () => {
     fireEvent.keyDown(window, { key: 'Escape' });
     expect(onClose).toHaveBeenCalledTimes(1);
   });
+
+  it('guards closing a pane-mode message viewer when pending notes exist', () => {
+    const onClose = vi.fn();
+    render(
+      <ReviewNotesProvider>
+        <MessageViewer
+          sequenceId={1}
+          messages={[agentTextMessage(1, 'Pending note line')]}
+          onClose={onClose}
+          onSendNotes={vi.fn()}
+          inline
+        />
+      </ReviewNotesProvider>,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'Add note to line 1' }));
+    fireEvent.change(screen.getByRole('textbox'), { target: { value: 'Keep or discard me' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Add Note' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Close viewer' }));
+
+    expect(onClose).not.toHaveBeenCalled();
+    expect(screen.getByRole('button', { name: 'Discard notes and close' })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Discard notes and close' }));
+    expect(onClose).toHaveBeenCalledTimes(1);
+  });
 });

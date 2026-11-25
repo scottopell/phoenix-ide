@@ -563,7 +563,7 @@ export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
       onToggleNotes={notes.togglePanel}
       onSend={sendAction}
       banner={banner}
-      onClose={focused || notes.annotationDraftDirty ? focusedExit.requestClose : onClose}
+      onClose={focused || source.kind === 'message' || notes.annotationDraftDirty ? focusedExit.requestClose : onClose}
       onEscape={focused ? focusedExit.requestReturn : undefined}
       suppressCloseButtonFocus={findSession !== null}
       bodyScroll={usePierreCode ? 'children' : 'shell'}
