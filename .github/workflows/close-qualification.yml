@@ -1290,6 +1290,15 @@ jobs:
             grep -Eq 'test result: ok\. 1 passed; 0 failed; 0 ignored;' "evidence/$test.log"
           done
           grep -Fx 'test coordinator_tools::tests::native_close_explicit_retry_rejects_untrusted_source_without_legacy_surface ... ok' evidence/native_close_explicit_retry_rejects_untrusted_source_without_legacy_surface.log
+      - name: Record production Close run_inner future layout
+        if: success() || failure()
+        timeout-minutes: 10
+        shell: bash
+        run: |
+          set -euo pipefail
+          (cd crates/phoenix-ide && "$PHOENIX_RUNTIME_TEST_BINARY" runtime::executor::close_run_inner_layout_tests::production_run_inner_future_layout --exact --nocapture --test-threads=1) 2>&1 | tee evidence/production-close-run-inner-layout.log
+          grep -E '^production run_inner future: [1-9][0-9]* bytes$' evidence/production-close-run-inner-layout.log
+          grep -Eq 'test result: ok\. 1 passed; 0 failed; 0 ignored;' evidence/production-close-run-inner-layout.log
       - name: Qualify original-bound native retry assessment
         if: success() || failure()
         shell: bash

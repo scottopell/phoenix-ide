@@ -250,7 +250,7 @@ async fn stop_keeps_batch_commit_and_cutoff_live_while_close_holds_source_custod
         completed_results: vec![],
         pending_sub_agents: vec![],
         assistant_message: crate::state_machine::AssistantMessage::new(
-            "close-source",
+            "close-source".into(),
             vec![ContentBlock::tool_use(
                 "close-call",
                 "close_conversation",

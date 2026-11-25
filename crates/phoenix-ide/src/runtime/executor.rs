@@ -3353,6 +3353,8 @@ where
         let mut admitted_native_close_retry: Option<native_close_retry::AdmittedRetryCursor> = None;
         // Fatal authority exits must not release a continuation's source authority
         // or target gate while its owned preparation worker is still running.
+        // Keep Close-only SQLx/worker observation futures out of this event-loop
+        // future's inline state; boxing changes layout, not polling or custody order.
         macro_rules! join_pending_native_close_before_fatal {
             () => {
                 // Do not wait on the source mutex: unknown release deliberately
@@ -3362,10 +3364,10 @@ where
                     controller.close_admission_for_fatal_exit();
                 }
                 if let Some(continuation) = pending_native_close_retry.take() {
-                    continuation.join_before_exit().await;
+                    Box::pin(continuation.join_before_exit()).await;
                 }
                 if let Some(cursor) = admitted_native_close_retry.take() {
-                    cursor.join_before_exit().await;
+                    Box::pin(cursor.join_before_exit()).await;
                 }
                 if let Some(continuation) = pending_native_close_initial.take() {
                     // Fatal retention is not completion evidence: preserve the
@@ -3393,7 +3395,7 @@ where
                     {
                         continuation.abort_inventory_preparation();
                     }
-                    if continuation.release_if_exactly_terminal().await {
+                    if Box::pin(continuation.release_if_exactly_terminal()).await {
                         pending_native_close_initial = None;
                     }
                 }
@@ -3416,7 +3418,7 @@ where
                     self.abort_external_effects().await;
                 }
                 if let Some(continuation) = pending_native_close_retry.take() {
-                    continuation.join_before_exit().await;
+                    Box::pin(continuation.join_before_exit()).await;
                 }
                 if self.fatal_local_authority_fence.fatal_authority_loss_is_latched() {
                     join_pending_native_close_before_fatal!();
@@ -3586,7 +3588,7 @@ where
                 () = tokio::time::sleep_until(next_native_close_service_at),
                     if !source_control_ready && pending_native_close_initial.as_ref().is_some_and(|continuation| continuation.needs_service(native_close_step_ready)) => {
                     let mut continuation = pending_native_close_initial.take().expect("guarded continuation");
-                    if continuation.observe_terminal_if_required().await {
+                    if Box::pin(continuation.observe_terminal_if_required()).await {
                         self.revoke_native_close_source_entry().await;
                         native_close_step_ready = false;
                         continue;
@@ -3603,7 +3605,12 @@ where
                     {
                         continuation.settlement_entry_observer = self.native_close_settlement_entry_observer.clone();
                     }
-                    let stepped = match continuation.ensure_source_entry(&mut self.native_close_source_entry, &self.state).await {
+                    let stepped = match Box::pin(continuation.ensure_source_entry(
+                        &mut self.native_close_source_entry,
+                        &self.state,
+                    ))
+                    .await
+                    {
                         Ok(()) => Box::pin(continuation.step(&self.state)).await,
                         Err(error) => Err(error),
                     };
@@ -3785,7 +3792,7 @@ where
                             let super::native_close_application::NativeCloseObserveRequest {
                                 source, referenced, admitted, target_gate, response,
                             } = *request;
-                            let result = self.execute_native_close_observe(source, referenced, admitted).await;
+                            let result = Box::pin(self.execute_native_close_observe(source, referenced, admitted)).await;
                             let fatal = matches!(result, Err(super::native_close_application::NativeCloseApplicationError::FatalAuthority));
                             drop(target_gate);
                             let _ = response.send(result);
@@ -3849,7 +3856,7 @@ where
                         );
                         self.abort_external_effects().await;
                         if let Some(continuation) = pending_native_close_initial.as_mut() {
-                            if continuation.release_if_exactly_terminal().await {
+                            if Box::pin(continuation.release_if_exactly_terminal()).await {
                                 pending_native_close_initial = None;
                             }
                         }
@@ -4100,7 +4107,7 @@ where
         }
 
         if let Some(continuation) = pending_native_close_retry.take() {
-            continuation.join_before_exit().await;
+            Box::pin(continuation.join_before_exit()).await;
         }
         self.abort_external_effects().await;
         tracing::info!(conv_id = %self.context.conversation_id, "Conversation runtime stopped");
@@ -36221,3 +36228,29 @@ mod tool_generation_guard_tests {
 
 #[cfg(test)]
 mod tracking_context_tests;
+
+#[cfg(test)]
+mod close_run_inner_layout_tests {
+    use super::*;
+    use std::future::Future;
+
+    fn future_size<Arg, F: Future>(_: impl FnOnce(Arg) -> F) -> usize {
+        std::mem::size_of::<F>()
+    }
+
+    #[test]
+    fn production_run_inner_future_layout() {
+        let run_inner_bytes = future_size(crate::runtime::ProductionRuntime::run_inner);
+        eprintln!("\nproduction run_inner future: {run_inner_bytes} bytes");
+        eprintln!(
+            "native Close continuation/cursor layouts: initial={} bytes, retry={} bytes, admitted_retry_cursor={} bytes",
+            std::mem::size_of::<native_close::NativeCloseInitialContinuation>(),
+            std::mem::size_of::<native_close_retry::NativeCloseRetryContinuation>(),
+            std::mem::size_of::<native_close_retry::AdmittedRetryCursor>(),
+        );
+        assert_ne!(
+            run_inner_bytes, 0,
+            "future layout diagnostic must report a real type"
+        );
+    }
+}
