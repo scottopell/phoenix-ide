@@ -2,6 +2,63 @@
 
 ## Current qualification and reviewed lint follow-up
 
+### Shared-host practicality remains an independent product gate
+
+Privileged PID/mount/private-storage fixture isolation is **on hold pending the
+human decision**. No isolation, credential, production detector or safety-policy
+change is made. Such isolation would qualify a controlled fixture universe, not
+ordinary shared-host liveness.
+
+Latest [CI45600271194](https://github.com/scottopell/phoenix-ide/actions/runs/45600271194)
+compiled synthetic merge `1fa0102d7f6bdc1f96a77c8e4fcacb619909f721` (8b5 into
+main 4aba9625a). Shards 1/3/4 passed **1764 / 1753 / 1746**; shard 2 ran
+**1574 / 1760**, **1573 passed / 1 failed**, leaving 186 selected tests unrun.
+Non-test required lanes passed. The prepared-Stop journey now exposes its original
+pre-barrier `storage_rejected`: fresh Linux descriptor owner-status ENOENT for PID
+21582 became `Vanished`, then an attributed `Unavailable` inspection gap. Durable
+reads show only stopped run 1 and no retry receipt. Stop was not sent. Its preceding
+dirty call also encountered a mapping gap for PID 21577; neither PID had a proven
+owner/incarnation. Evidence is `/tmp/close-8b51143e4/ci-failed.log` and bounded shard
+artifacts. This proves this occurrence, **not** historical a251/c0d causes.
+
+A deterministic Linux-only regression removes the initial synthetic process status
+before scanning and requires an attributed PID-17 `Unavailable` gap for descriptor,
+cwd and mapping detector tags, with no inspect callback. It preserves current
+policy and uses no production change. Local source review and `git diff --check`
+are not hosted executable proof; regression execution remains pending publication.
+
+Recorded installed source is `9885834f049683f5e6fa9c840668bdab92eb8a01`, corroborated
+by `~/.phoenix-ide/deployed.sha` and deployment status source/release/expected SHA.
+This is recorded installation identity, **not** live process attestation. Exact
+source inspection shows macOS already has analogous conservative liveness risk:
+`mac_writer_process` requires complete BSD info before owner filtering, then an
+executable for same-user candidates; `mac_writer_scan` fails on the first gap.
+`stable_writer_observation` returns `ProcessChanged` after absent/changed identity
+even when inspection found no worktree authority. Descriptor enumeration also
+requires vnode evidence before target filtering. Consequently unrelated process/FD
+churn can block clean Close; persistent inaccessible relevant processes can block
+retries indefinitely. No incidence or live-host failure is measured here.
+
+Existing real-production-detector successes (exact 4fa and 6d8, and the bounded
+6064908e3 milestone) prove successful disposable Linux paths on those runs, not
+universal shared-host availability, macOS syscall acceptance or starvation freedom.
+`tasks/41013-p3-ready--close-writer-scan-live-qualification.md` records live-scan
+coverage gaps; its stale executive cross-reference is not fresh acceptance.
+No verified ordinary shared-macOS public Close success is established by the
+bounded source/artifact/history evidence reviewed here.
+
+Analysis-only options, **not implemented or approved policy**: preserve current
+fail-closed behavior while surfacing exact gap stage/detector/PID/native reason and
+explicit fresh retry; this improves honesty but cannot cure persistent starvation.
+A narrower terminal-incapability exclusion would need a retained kernel-backed
+identity proving the *same captured incarnation* cannot retain live authority,
+while keeping transferred/forked holders independently visible. ENOENT, PID reuse,
+process names, ancestry, negative target matches or access denial are not that
+proof. Current REQ-WL-002e treats changing/ambiguous evidence as a gap; a different
+exclusion therefore needs an explicit contract/security decision and platform proof.
+A truthful recoverable blocker remains preferable to a fabricated clean result,
+but controlled-test success alone does not close the product usability gate.
+
 ### 556 early formatting — hosted correction only
 
 [CI45599205760](https://github.com/scottopell/phoenix-ide/actions/runs/45599205760)

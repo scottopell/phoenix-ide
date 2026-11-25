@@ -18474,6 +18474,50 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn linux_writer_scan_missing_pre_owner_status_is_attributed_gap_for_each_detector() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("target");
+        let proc_root = temp.path().join("proc");
+        std::fs::create_dir(&target).unwrap();
+        let process = fake_linux_process(&proc_root, 17, 1, 42);
+        std::fs::remove_file(process.join("status")).unwrap();
+
+        for detector in [
+            super::CloseWriterDetector::LinuxDescriptor,
+            super::CloseWriterDetector::LinuxCwd,
+            super::CloseWriterDetector::LinuxMapping,
+        ] {
+            let inspected = std::cell::Cell::new(false);
+            let result = super::linux_writer_scan_until(
+                &target,
+                &proc_root,
+                1,
+                detector,
+                std::time::Instant::now() + std::time::Duration::from_secs(30),
+                |_, _| {
+                    inspected.set(true);
+                    Ok(None)
+                },
+            )
+            .unwrap();
+
+            assert!(!inspected.get(), "inspected process with missing owner status");
+            assert!(matches!(
+                result,
+                super::ExternalWriterEvidence::Blocked(
+                    super::CloseWriterObservation::InspectionGap {
+                        detector: observed_detector,
+                        pid: Some(17),
+                        reason: super::CloseWriterGap::Unavailable,
+                        ..
+                    }
+                ) if observed_detector == detector
+            ));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn linux_zombie_classification_requires_unambiguous_kernel_state() {
         assert_eq!(
             super::linux_process_is_zombie("State:\tZ (zombie)\n"),
