@@ -3701,6 +3701,16 @@ impl Database {
         in_memory_template::open_migrated_for_test(path).await
     }
 
+    #[cfg(test)]
+    pub(crate) async fn open_prefix_for_test(path: &str, through: u32) -> DbResult<Self> {
+        in_memory_template::open_prefix_for_test(path, through).await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn open_in_memory_prefix_for_test(through: u32) -> DbResult<Self> {
+        in_memory_template::open_in_memory_prefix_for_test(through).await
+    }
+
     async fn run_migrations(&self) -> DbResult<()> {
         lineage::preflight(&self.pool, migrations::migration_identities()).await?;
         sqlx::raw_sql(ddl::SCHEMA).execute(&self.pool).await?;

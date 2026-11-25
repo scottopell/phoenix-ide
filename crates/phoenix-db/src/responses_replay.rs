@@ -480,8 +480,7 @@ mod tests {
     async fn protocol_migration_preserves_existing_responses_items_and_rejects_unknown_protocol() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("upgrade.db");
-        let db = Database::open(path.to_str().unwrap()).await.unwrap();
-        crate::migrations::run_through_for_test(db.pool(), 168)
+        let db = Database::open_prefix_for_test(path.to_str().unwrap(), 168)
             .await
             .unwrap();
         db.create_conversation("replay", "replay", "/tmp", true, None, None)

@@ -64,8 +64,9 @@ mod tests {
     async fn migration_preserves_work_references_and_reopens_idempotently() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("upgrade.db");
-        let db = crate::Database::open(path.to_str().unwrap()).await.unwrap();
-        run_through_for_test(db.pool(), 161).await.unwrap();
+        let db = crate::Database::open_prefix_for_test(path.to_str().unwrap(), 161)
+            .await
+            .unwrap();
         seed(db.pool()).await;
         let conversation = db
             .create_conversation(
@@ -181,8 +182,9 @@ mod tests {
     async fn ledger_failure_rolls_back_rebuild_and_restores_foreign_keys() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("rollback.db");
-        let old = crate::Database::open(path.to_str().unwrap()).await.unwrap();
-        run_through_for_test(old.pool(), 161).await.unwrap();
+        let old = crate::Database::open_prefix_for_test(path.to_str().unwrap(), 161)
+            .await
+            .unwrap();
         seed(old.pool()).await;
         sqlx::query("CREATE TRIGGER refuse_saved_ledger BEFORE INSERT ON _migrations WHEN NEW.version=162 BEGIN SELECT RAISE(ABORT,'fixture refusal'); END").execute(old.pool()).await.unwrap();
         assert!(run_pending_migrations(old.pool()).await.is_err());
