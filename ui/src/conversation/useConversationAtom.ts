@@ -4,8 +4,6 @@ import type { Conversation } from '../api';
 import type { WorkScopeInventory } from '../generated/sse';
 import { ConversationContext } from './ConversationContext';
 import { conversationListsEqual } from '../utils/conversationDiff';
-import { isAgentWorking } from '../utils';
-import { getToolActivity } from './toolActivity';
 
 function useConversationStore() {
   const store = useContext(ConversationContext);
@@ -234,10 +232,6 @@ export function useConversationTranscriptView(slug: string | null): Conversation
 
 const EMPTY_LIVE_BASH_PROGRESS: ConversationAtom['liveBashProgress'] = {};
 
-export function useLiveBashProgress(slug: string | null) {
-  return useLiveBashProgressForToolIds(slug, null);
-}
-
 export function useLiveBashProgressForToolIds(slug: string | null, toolUseIds: readonly string[] | null) {
   const store = useConversationStore();
   const subscribe = useCallback(
@@ -284,22 +278,6 @@ export function useLastSseEventAtRef(slug: string): MutableRefObject<number> {
   return ref;
 }
 
-/** Derived selectors to avoid passing the raw atom to child components. */
-export function useConversationSelectors(slug: string) {
-  const [atom, dispatch] = useConversationAtom(slug);
-
-  const activity = getToolActivity(atom.phase);
-  const currentTool = activity.type === 'none' ? null : activity.activeTool;
-
-  return {
-    atom,
-    dispatch,
-    isAgentWorking: isAgentWorking(atom.phase),
-    currentTool,
-    streamingText: atom.streamingBuffer?.text ?? null,
-  };
-}
-
 /**
  * Returns the conversation snapshot for `slug`, or null if no atom for
  * that slug has been observed yet (or the slug is null).
@@ -325,21 +303,6 @@ export function useConversationSnapshot(slug: string | null): Conversation | nul
   );
   const getSnapshot = useCallback(
     () => (slug ? store.getSnapshot(slug).conversation ?? null : null),
-    [store, slug],
-  );
-
-  return useSyncExternalStore(subscribe, getSnapshot);
-}
-
-export function useConversationPhase(slug: string | null): ConversationAtom['phase'] | null {
-  const store = useConversationStore();
-
-  const subscribe = useCallback(
-    (listener: () => void) => (slug ? store.subscribe(slug, listener) : () => {}),
-    [store, slug],
-  );
-  const getSnapshot = useCallback(
-    () => (slug ? store.getSnapshot(slug).phase : null),
     [store, slug],
   );
 
