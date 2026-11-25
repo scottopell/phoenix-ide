@@ -2,6 +2,23 @@
 
 ## Current qualification and reviewed lint follow-up
 
+### 556 early formatting — hosted correction only
+
+[CI45599205760](https://github.com/scottopell/phoenix-ide/actions/runs/45599205760)
+for diagnostic head `556cbaa86113d623fdba6e3baa664abf0b84017f` failed early
+formatting at the two newly mutable public retry task bindings. Hosted rustfmt
+requests only wrapping each binding before `tokio::spawn`; both unchanged proposals
+are applied together. Rust build/tests/Clippy/musl and dependent lanes were skipped,
+not passed. Remaining release-helper completion is still pending at this checkpoint.
+Exact [Close45599196850](https://github.com/scottopell/phoenix-ide/actions/runs/45599196850)
+is queued behind c0d. This formatting correction changes no behavior and does not
+resolve or qualify either intermittent failure. Evidence: `/tmp/close-556cbaa86/early-source.log`.
+
+Exact 6d8 artifacts additionally confirm foundation **270 / 0 / 0**, native DB
+**82 / 0 / 0**, migrations **180 / 0 / 0** and each of six public physical/retry/Stop
+selectors **1 / 0 / 0** at source `6d8b7a769abcfc9aba70764d5672b1374a46499a`.
+These passing receipts remain historical evidence, not causal resolution.
+
 ### c0d assessment-barrier failure — unresolved, diagnostic follow-up only
 
 [CI45591019848](https://github.com/scottopell/phoenix-ide/actions/runs/45591019848)

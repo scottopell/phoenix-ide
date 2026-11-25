@@ -322,7 +322,8 @@ pub(super) async fn retry_after_public_capture(
         let retry_input = input.clone();
         let retry_context = context.clone();
         let diagnostics_before_retry = physical_close_diagnostics();
-        let mut retry = tokio::spawn(async move { retry_tool.run(retry_input, retry_context).await });
+        let mut retry =
+            tokio::spawn(async move { retry_tool.run(retry_input, retry_context).await });
         require_retry_barrier(
             &fixture,
             initial_run,
@@ -442,7 +443,8 @@ pub(super) async fn retry_after_public_capture(
         let retry_input = input.clone();
         let retry_context = context.clone();
         let diagnostics_before_retry = physical_close_diagnostics();
-        let mut retry = tokio::spawn(async move { retry_tool.run(retry_input, retry_context).await });
+        let mut retry =
+            tokio::spawn(async move { retry_tool.run(retry_input, retry_context).await });
         require_retry_barrier(
             &fixture,
             initial_run,
