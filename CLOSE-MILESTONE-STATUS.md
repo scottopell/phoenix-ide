@@ -2,6 +2,17 @@
 
 ## Current qualification and reviewed lint follow-up
 
+### bf211 hosted result and formatting-only correction
+
+Published `bf211d78f60a2033e68e911bc54f387847322758` after independent
+source review. [CI45616956112](https://github.com/scottopell/phoenix-ide/actions/runs/45616956112)
+is terminal failed: early formatting requests two line-wrap changes in the new
+Git Busy/Refused diagnostic branches. Both proposals are applied unchanged;
+Rust/dependent executable lanes were skipped, not passed. Evidence:
+`/tmp/close-bf211d78f/ci-failed.log`. No local formatter or executable validation.
+The exact bf211 run remains pending behind active 2b3. Exact be1 was automatically
+superseded by GitHub concurrency (terminal cancelled); no manual cancellation.
+
 ### Hosted formatting, source-entry diagnosis, and manual retry guidance
 
 Follow-up to `be1eb187671cfdb04db5cfd00b4bc79c4647d5fd`: all four hosted
