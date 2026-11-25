@@ -44,6 +44,7 @@ Allowing gaps does not approve an ID allocation, decision, or publication.
 
 | ADR | Title | Status | Affects |
 | --- | --- | --- | --- |
+| [283](283_share-coordinator-evidence-origin-labels.md) | Share Coordinator evidence origin labels | Accepted | REQ-SCAN-004, REQ-TRACK-005 |
 | [282](282_cap-quoted-review-lines-at-a-character-boundary.md) | Cap quoted review lines at 200 UTF-16 units on a character boundary | Accepted | REQ-PF-009, REQ-PF-016 |
 | [274](274_remove-at-file-inclusion.md) | Remove `@file` content inclusion and leave `@` literal | Accepted | REQ-IR-001, REQ-IR-004, REQ-IR-006, REQ-IR-007, REQ-IR-010, REQ-FE-011 |
 | [273](273_fixed-rc9-preparation-without-publication-authority.md) | Fixed RC9 preparation without publication authority | Accepted | REQ-DESKTOP-REL-014 |

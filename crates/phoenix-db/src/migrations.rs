@@ -883,6 +883,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "adhd_llm_language",
         sql: "",
     },
+    Migration {
+        version: 172,
+        name: "coordinator_scan_origin_labels",
+        sql: include_str!("migrations/coordinator_scan_origin_labels.sql"),
+    },
 ];
 
 async fn run_migration_171(pool: &SqlitePool, migration: &Migration) -> DbResult<()> {

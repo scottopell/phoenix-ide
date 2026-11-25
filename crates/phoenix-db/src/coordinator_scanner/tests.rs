@@ -223,6 +223,237 @@ fn capture(batch: &PreparedScanBatch) -> ScanResult {
     }
 }
 
+const QUESTION_REPLY: &str = "Use the previous quarter, but ask before starting.";
+
+async fn capture_question_reply(db: &Database, source: &str) -> String {
+    let message_id =
+        phoenix_core::domain::db_schema::coordinator_question_reply_message_id("cobalt-quarter");
+    db.add_message_with_seq_and_origin(
+        &message_id,
+        source,
+        1,
+        &MessageContent::User(UserContent::new(QUESTION_REPLY)),
+        None,
+        None,
+        &InputOrigin::CoordinatorQuestionReply,
+    )
+    .await
+    .unwrap();
+    let batch = prepare(db, 1000).await;
+    assert_eq!(
+        batch.input.fragments[0].origin,
+        InputOrigin::CoordinatorQuestionReply
+    );
+    let output = capture(&batch);
+    let attempt = reserve(db, batch, 1000).await;
+    let ScanApplyOutcome::Applied {
+        created_item_ids, ..
+    } = db
+        .apply_coordinator_scan(&attempt, &output, metrics(), 1001)
+        .await
+        .established()
+        .unwrap()
+        .unwrap()
+    else {
+        panic!("question reply not captured")
+    };
+    assert_eq!(created_item_ids.len(), 1);
+    created_item_ids.into_iter().next().unwrap()
+}
+
+async fn observe_tracking(
+    db: &Database,
+    source: &str,
+    sequence: i64,
+    now: i64,
+) -> crate::coordinator_tracking::TrackingObservation {
+    let msg = db
+        .append_coordinator_tracking_observation(source, sequence, now)
+        .await
+        .established()
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let content = msg.content.to_json();
+    let (_, json) = content["text"].as_str().unwrap().split_once('\n').unwrap();
+    serde_json::from_str(json).unwrap()
+}
+
+#[tokio::test]
+async fn question_reply_and_unknown_provenance_remain_readable_and_reconcilable() {
+    use crate::coordinator_tracking::{TrackingMutation, TRACKING_REVIEW_INTERVAL_US};
+
+    let (db, source) = setup().await;
+    let id = capture_question_reply(&db, &source).await;
+    message(
+        &db,
+        &source,
+        2,
+        "Keep the Cobalt task paused.",
+        &InputOrigin::UserApi,
+    )
+    .await;
+    let batch = prepare(&db, 2000).await;
+    let output = append_output(&batch, &id);
+    let attempt = reserve(&db, batch, 2000).await;
+    db.apply_coordinator_scan(&attempt, &output, metrics(), 2001)
+        .await
+        .established()
+        .unwrap()
+        .unwrap();
+
+    let first_observation_us =
+        chrono::Utc::now().timestamp_micros() - TRACKING_REVIEW_INTERVAL_US - 1;
+    let cue = observe_tracking(&db, &source, 100, first_observation_us)
+        .await
+        .requested_item_due_for_review
+        .unwrap();
+    assert_eq!(cue.id, id);
+    assert!(cue.review_required);
+
+    let known = db.read_coordinator_tracking(&source, &id, 0).await.unwrap();
+    assert_eq!(known.evidence[0].1.quotation, QUESTION_REPLY);
+    assert!(matches!(
+        known.item.resumption,
+        TrackingResumption::ReviewRequired { .. }
+    ));
+    let original = serde_json::to_value(&known).unwrap();
+    assert_eq!(
+        original["page_scanner_evidence_provenance"][0]["origin_kind"],
+        "coordinator_question_reply"
+    );
+    assert_eq!(
+        original["page_scanner_evidence_provenance"][0]["source_role"],
+        "user"
+    );
+    assert_eq!(
+        original["page_scanner_evidence_provenance"][1]["origin_kind"],
+        "user_api"
+    );
+
+    sqlx::query("UPDATE coordinator_scan_evidence_origins SET origin_kind='future_origin' WHERE item_id=? AND evidence_ordinal=1")
+        .bind(&id).execute(&db.pool).await.unwrap();
+    let fallback = db.read_coordinator_tracking(&source, &id, 0).await.unwrap();
+    let mut expected = original;
+    expected["page_scanner_evidence_provenance"][0]["origin_kind"] = "unknown_historical".into();
+    assert_eq!(serde_json::to_value(&fallback).unwrap(), expected);
+    let stored: String = sqlx::query_scalar("SELECT origin_kind FROM coordinator_scan_evidence_origins WHERE item_id=? AND evidence_ordinal=1")
+        .bind(&id).fetch_one(&db.pool).await.unwrap();
+    assert_eq!(stored, "future_origin");
+
+    native(
+        &db,
+        &source,
+        TrackingMutation::Update {
+            id: id.clone(),
+            expected_revision: fallback.item.revision,
+            kind: TrackingKind::RequestedWork,
+            title: "Cobalt".into(),
+            note: "Reviewed the quarter and pause request".into(),
+            resumption: "Keep paused until the user resumes".into(),
+            reviewed_evidence_ordinal: 2,
+            references: vec![],
+        },
+    )
+    .await;
+    let reviewed = db.read_coordinator_tracking(&source, &id, 0).await.unwrap();
+    assert!(matches!(
+        reviewed.item.resumption,
+        TrackingResumption::Reviewed { .. }
+    ));
+    message(
+        &db,
+        &source,
+        101,
+        "Any other updates?",
+        &InputOrigin::UserApi,
+    )
+    .await;
+    assert!(
+        observe_tracking(&db, &source, 102, reviewed.item.reviewed_at_us.unwrap())
+            .await
+            .requested_item_due_for_review
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn origin_label_migration_preserves_preexisting_question_reply_evidence() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::open(dir.path().join("before-172.db").to_str().unwrap())
+        .await
+        .unwrap();
+    crate::migrations::run_through_for_test(&db.pool, 171)
+        .await
+        .unwrap();
+    let source = db
+        .get_or_create_coordinator(None, LlmLanguage::default())
+        .await
+        .unwrap()
+        .id;
+    let id = capture_question_reply(&db, &source).await;
+    let provenance = "SELECT json_array(item_id,evidence_ordinal,origin_kind,source_role,source_generation,fragment_id,utf8_start,utf8_end,attempt_id) FROM coordinator_scan_evidence_origins";
+    let before: String = sqlx::query_scalar(provenance)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert!(before.contains("coordinator_question_reply"));
+    assert_eq!(
+        crate::migrations::run_pending_migrations(&db.pool)
+            .await
+            .unwrap(),
+        1
+    );
+    let after: String = sqlx::query_scalar(provenance)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(after, before);
+    assert!(sqlx::query("PRAGMA foreign_key_check")
+        .fetch_all(&db.pool)
+        .await
+        .unwrap()
+        .is_empty());
+    let detail = db.read_coordinator_tracking(&source, &id, 0).await.unwrap();
+    assert_eq!(
+        detail.page_scanner_evidence_provenance[0].origin_kind,
+        ScanOriginKind::CoordinatorQuestionReply
+    );
+    for invalid in [
+        "UPDATE coordinator_scan_evidence_origins SET origin_kind=' '",
+        "UPDATE coordinator_scan_evidence_origins SET origin_kind=NULL",
+        "UPDATE coordinator_scan_evidence_origins SET origin_kind=X'01'",
+        "UPDATE coordinator_scan_evidence_origins SET source_role='bad'",
+        "UPDATE coordinator_scan_evidence_origins SET attempt_id=-1",
+        "UPDATE coordinator_scan_evidence_origins SET evidence_ordinal=-1",
+    ] {
+        assert!(
+            sqlx::query(invalid).execute(&db.pool).await.is_err(),
+            "unexpectedly accepted {invalid}"
+        );
+    }
+    for &kind in ScanOriginKind::ALL {
+        sqlx::query("UPDATE coordinator_scan_evidence_origins SET origin_kind=? WHERE item_id=?")
+            .bind(kind.as_str())
+            .bind(&id)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        let detail = db.read_coordinator_tracking(&source, &id, 0).await.unwrap();
+        assert_eq!(detail.page_scanner_evidence_provenance[0].origin_kind, kind);
+    }
+
+    sqlx::raw_sql(
+        "PRAGMA ignore_check_constraints=ON;
+        UPDATE coordinator_scan_evidence_origins SET source_role='bad';
+        PRAGMA ignore_check_constraints=OFF;",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    assert!(db.read_coordinator_tracking(&source, &id, 0).await.is_err());
+}
+
 #[tokio::test]
 async fn scanner_exact_source_atomic_capture_replay_and_unknown_provenance() {
     let (db, source) = setup().await;

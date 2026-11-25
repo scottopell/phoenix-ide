@@ -246,6 +246,10 @@ rule CommitValidatedBatch {
         -- Empty complete output still advances only its bounded covered range.
         -- Registry delta is1 exactly when item/evidence changes commit, otherwise0.
         -- New items are unreviewed; evidence appends invalidate reviewed resumption.
+        -- REQ-SCAN-004: Persist the canonical InputOriginKind label from the
+        -- verified source's InputOrigin, including coordinator_question_reply.
+        -- SQLite enforces nonblank TEXT, not an independent origin-kind list.
+        -- The label is evidence metadata, never authority for application.
         -- Same item+source locator+quote digest dedups across unchanged generation
         -- rescans. Never rewrite/review/retire/reopen or grant execution authority.
         -- A later explicit human renewal may create a distinct visible unreviewed

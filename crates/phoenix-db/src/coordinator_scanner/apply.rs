@@ -280,12 +280,7 @@ async fn apply(
         };
         for source in sources {
             let ordinal:i64=sqlx::query_scalar("SELECT ordinal FROM coordinator_tracking_evidence WHERE item_id=?1 AND instance_id=?2 AND transcript_id=?3 AND message_id=?4 AND digest=?5").bind(&id).bind(&source.evidence.instance_id).bind(&source.evidence.transcript_id).bind(&source.evidence.message_id).bind(hash(source.evidence.quotation.as_bytes())).fetch_one(&mut **tx).await?;
-            let origin = serde_json::to_value(&source.fragment.origin)
-                .map_err(|e| invalid(e.to_string()))?;
-            let origin = origin
-                .get("kind")
-                .and_then(serde_json::Value::as_str)
-                .ok_or_else(|| invalid("origin lacks its canonical discriminator"))?;
+            let origin = source.fragment.origin.kind().as_str();
             sqlx::query("INSERT INTO coordinator_scan_evidence_origins(item_id,evidence_ordinal,origin_kind,source_role,source_generation,fragment_id,utf8_start,utf8_end,attempt_id) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9) ON CONFLICT(item_id,evidence_ordinal) DO NOTHING").bind(&id).bind(ordinal).bind(origin).bind(if source.fragment.role==ScanRole::User{"user"}else{"assistant"}).bind(attempt.batch.input.scan_context.source_generation).bind(&source.fragment.fragment_id).bind(i64::try_from(source.start).map_err(|e|invalid(e.to_string()))?).bind(i64::try_from(source.end).map_err(|e|invalid(e.to_string()))?).bind(attempt.id).execute(&mut **tx).await?;
         }
     }
