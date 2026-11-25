@@ -95,6 +95,9 @@ pub(super) async fn acknowledge_public_initial_result(
         .expect("canonical initial result must retain captured-loss retry eligibility");
 }
 
+// Preserve the ordered public capture/retry journey: Stop cuts, physical effects,
+// durable classification, and canonical result provenance must remain causally linked.
+#[allow(clippy::too_many_lines)]
 pub(super) async fn retry_after_public_capture(
     initial_fixture: &CloseFixture,
     git: &DisposableGit,

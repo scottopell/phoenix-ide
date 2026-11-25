@@ -1,7 +1,7 @@
 #![cfg(target_os = "linux")]
 
-//! Public native Close qualification; all Git and SQLite state is disposable.
-//! REQ-WL-002/002f: original Worktree and independent WorkScope retirement.
+//! Public native Close qualification; all Git and `SQLite` state is disposable.
+//! REQ-WL-002/002f: original Worktree and independent `WorkScope` retirement.
 //! The positive lifecycle journey controls writer observations, not host /proc availability.
 //! The production-detector journey is a separate required public acceptance gate.
 
@@ -507,7 +507,16 @@ impl DisposableGit {
     }
 }
 
-async fn run_public_worktree_close(journey: WorktreeJourney) {
+fn run_public_worktree_close(
+    journey: WorktreeJourney,
+) -> std::pin::Pin<Box<impl std::future::Future<Output = ()>>> {
+    // All public journeys share one allocation boundary for the large scenario future.
+    Box::pin(run_public_worktree_close_inner(journey))
+}
+
+// Keep admission, Stop, physical effects, and provenance assertions in causal order.
+#[allow(clippy::too_many_lines)]
+async fn run_public_worktree_close_inner(journey: WorktreeJourney) {
     use crate::coordinator_tools;
     use crate::send_chat_service::SendChatApplicationService;
     use tokio_util::sync::CancellationToken;
@@ -796,7 +805,7 @@ async fn run_public_worktree_close(journey: WorktreeJourney) {
             !output.is_success(),
             "an acknowledged Stop cannot admit Close"
         );
-        let rejection: Value = serde_json::from_str(&output.output()).unwrap();
+        let rejection: Value = serde_json::from_str(output.output()).unwrap();
         assert_eq!(rejection["code"], "source_refused");
         assert_eq!(close_row_counts(&fixture).await, vec![0; 9]);
         assert_eq!(durable_target_rows(&fixture).await, before_admission);
@@ -857,7 +866,7 @@ async fn run_public_worktree_close(journey: WorktreeJourney) {
         use phoenix_core::domain::close::{CloseLossItem, GitPathIdentity};
 
         assert!(output.is_success(), "{}", output.output());
-        let admitted: Value = serde_json::from_str(&output.output()).unwrap();
+        let admitted: Value = serde_json::from_str(output.output()).unwrap();
         assert_eq!(admitted["status"], "newly_admitted");
         let attempt =
             CloseAttemptId::parse(admitted["admitted"]["attempt_id"].as_str().unwrap()).unwrap();
@@ -951,7 +960,7 @@ async fn run_public_worktree_close(journey: WorktreeJourney) {
             .await
             .expect("blocked exact-source replay must be bounded");
         assert!(replay.is_success(), "{}", replay.output());
-        let replay: Value = serde_json::from_str(&replay.output()).unwrap();
+        let replay: Value = serde_json::from_str(replay.output()).unwrap();
         assert_eq!(replay["status"], "replay");
         assert_eq!(replay["admitted"], admitted["admitted"]);
         assert_eq!(
@@ -1077,7 +1086,7 @@ async fn run_public_worktree_close(journey: WorktreeJourney) {
         }
     } else {
         assert!(output.is_success(), "{}", output.output());
-        let admitted: Value = serde_json::from_str(&output.output()).unwrap();
+        let admitted: Value = serde_json::from_str(output.output()).unwrap();
         assert_eq!(admitted["status"], "newly_admitted");
         assert_eq!(
             admitted["admitted"]["product_conversation_id"],
@@ -1342,7 +1351,7 @@ async fn run_public_worktree_close(journey: WorktreeJourney) {
             .await
             .expect("exact-source admission replay must be bounded");
         assert!(replay.is_success(), "{}", replay.output());
-        let replay: Value = serde_json::from_str(&replay.output()).unwrap();
+        let replay: Value = serde_json::from_str(replay.output()).unwrap();
         assert_eq!(replay["status"], "replay");
         assert_eq!(replay["request_id"], admitted["request_id"]);
         assert_eq!(replay["admitted"], admitted["admitted"]);
@@ -1558,7 +1567,7 @@ async fn durable_native_close_rows(fixture: &CloseFixture, run: &CloseRunRef) ->
     .fetch_optional(fixture.db.pool())
     .await
     .unwrap();
-    // quote preserves identity values even if their storage class is BLOB.
+    // `quote` preserves identity values even if their storage class is BLOB.
     let dispatches: Vec<String> = sqlx::query_scalar(
         "SELECT json_array(attempt_id, scope, inspection_generation,
                            inspection_fingerprint, resource_kind, identity_kind,

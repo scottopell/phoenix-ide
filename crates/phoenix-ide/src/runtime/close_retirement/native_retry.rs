@@ -99,7 +99,7 @@ fn classify_native_retry_execution(
     }
 }
 
-/// Outcome of proving that an initial native Close may retire a WorkScope.
+/// Outcome of proving that an initial native Close may retire a `WorkScope`.
 /// DB read failures are kept distinct from an established failed precondition.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum NativeInitialWorkScopePrecondition {

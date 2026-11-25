@@ -1,7 +1,7 @@
 //! Per-resource custody gate for native initial retirement.
 //!
 //! Transfer and release are deliberately separate: the synchronous transfer is
-//! suitable for a SQLite callback, while the work future is not even constructed
+//! suitable for a `SQLite` callback, while the work future is not even constructed
 //! until the owner explicitly confirms that the writer released its transaction.
 //! Keep the external supervisor (including its task handle and result receiver)
 //! for as long as this process epoch must retain custody.
@@ -189,7 +189,7 @@ mod tests {
     async fn cancel_before_entry_is_inert() {
         let calls = Arc::new(AtomicUsize::new(0));
         let work_calls = Arc::clone(&calls);
-        let (mut gate, supervisor) = ResourceSupervisor::<()>::spawn(move |_: ()| async move {
+        let (mut gate, supervisor) = ResourceSupervisor::<()>::spawn(move |()| async move {
             work_calls.fetch_add(1, Ordering::SeqCst);
         });
 
@@ -286,7 +286,7 @@ mod tests {
     async fn unconfirmed_release_does_not_construct_work() {
         let calls = Arc::new(AtomicUsize::new(0));
         let work_calls = Arc::clone(&calls);
-        let (mut gate, mut supervisor) = ResourceSupervisor::<()>::spawn(move |_| {
+        let (mut gate, mut supervisor) = ResourceSupervisor::<()>::spawn(move |()| {
             work_calls.fetch_add(1, Ordering::SeqCst);
             async {}
         });
@@ -311,7 +311,7 @@ mod tests {
         tokio::select! {
             biased;
             result = supervisor.observe() => panic!("result arrived before release: {result:?}"),
-            _ = tokio::time::sleep(std::time::Duration::from_millis(1)) => {}
+            () = tokio::time::sleep(std::time::Duration::from_millis(1)) => {}
         }
         assert!(gate.confirm_release());
         assert_eq!(supervisor.observe().await, Ok(7));

@@ -12,6 +12,8 @@ async fn native_close_retires_two_registered_real_bash_groups_under_one_scope_ca
     run_native_bash_success(2).await;
 }
 
+// Keep real Bash acquisition, retirement, and exact-once custody assertions ordered.
+#[allow(clippy::too_many_lines)]
 async fn run_native_bash_success(group_count: usize) {
     use crate::coordinator_tools;
     use crate::runtime::close_retirement::native_initial::bash::BashStage;
@@ -91,7 +93,7 @@ async fn run_native_bash_success(group_count: usize) {
             "real Bash fixture {ordinal} failed to launch: {}",
             output.output()
         );
-        let launched: serde_json::Value = serde_json::from_str(&output.output())
+        let launched: serde_json::Value = serde_json::from_str(output.output())
             .expect("background Bash run returns its structured handle response");
         let handle_id = launched["handle"]
             .as_str()
@@ -282,10 +284,10 @@ async fn run_native_bash_success(group_count: usize) {
         assert_eq!(stats.group_attempts.load(Ordering::SeqCst), 1);
         assert_eq!(stats.cleanup_attempts.load(Ordering::SeqCst), 1);
         {
-            let state = custody.lock().await;
-            assert_eq!(state.stage, BashStage::Verified);
+            let custody_guard = custody.lock().await;
+            assert_eq!(custody_guard.stage, BashStage::Verified);
             assert!(
-                state.owner.is_none(),
+                custody_guard.owner.is_none(),
                 "successful Verified retirement releases the original scope registry writer"
             );
         }
@@ -303,7 +305,7 @@ async fn run_native_bash_success(group_count: usize) {
         "registered Close admission failed: {}",
         output.output()
     );
-    let admission: serde_json::Value = serde_json::from_str(&output.output())
+    let admission: serde_json::Value = serde_json::from_str(output.output())
         .expect("registered Close returns a structured admission receipt");
     let attempt_id = admission["admitted"]["attempt_id"]
         .as_str()

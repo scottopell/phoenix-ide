@@ -270,7 +270,7 @@ mod tests {
                 .current_dir(directory.path())
                 .output()
                 .unwrap();
-            assert!(output.status.success(), "{:?}", output);
+            assert!(output.status.success(), "{output:?}");
         }
         let identity = WorktreeIdentity::from_parts(
             WorktreeId::parse("captured-retry-tree").unwrap(),

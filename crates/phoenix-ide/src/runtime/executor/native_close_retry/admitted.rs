@@ -202,6 +202,7 @@ impl AdmittedRetryCursor {
         result
     }
 
+    #[allow(clippy::too_many_lines)] // One actor-owned stage machine preserves source checks between every effect.
     async fn step_inner(
         &mut self,
         live: &ConvState,
@@ -217,7 +218,7 @@ impl AdmittedRetryCursor {
                     if self
                         .scope_worker
                         .as_ref()
-                        .is_some_and(|worker| worker.is_finished()) =>
+                        .is_some_and(tokio::task::JoinHandle::is_finished) =>
                 {
                     false
                 }
@@ -225,7 +226,7 @@ impl AdmittedRetryCursor {
                     if self
                         .tmux_worker
                         .as_ref()
-                        .is_some_and(|worker| worker.is_finished()) =>
+                        .is_some_and(tokio::task::JoinHandle::is_finished) =>
                 {
                     false
                 }
@@ -233,7 +234,7 @@ impl AdmittedRetryCursor {
                     if self
                         .dispatch_worker
                         .as_ref()
-                        .is_some_and(|worker| worker.is_finished()) =>
+                        .is_some_and(tokio::task::JoinHandle::is_finished) =>
                 {
                     false
                 }
@@ -268,12 +269,9 @@ impl AdmittedRetryCursor {
                         &self.receipt.admitted,
                     )
                     .await;
-                let context = match context {
-                    Ok(context) => context,
-                    Err(_) => {
-                        self.stage = Stage::ObserveTerminal;
-                        return Ok(false);
-                    }
+                let Ok(context) = context else {
+                    self.stage = Stage::ObserveTerminal;
+                    return Ok(false);
                 };
                 self.order = crate::runtime::close_retirement::close_safe_retry_execution_order(
                     &context.progress.pending,
@@ -314,7 +312,7 @@ impl AdmittedRetryCursor {
                         }
                         _ => {
                             self.stage =
-                                Stage::Failure("unsupported native retry resource kind".into())
+                                Stage::Failure("unsupported native retry resource kind".into());
                         }
                     }
                 }
@@ -333,13 +331,7 @@ impl AdmittedRetryCursor {
                     self.stage = Stage::Fatal;
                     return Err(NativeCloseApplicationError::FatalAuthority);
                 }
-                if !current {
-                    tracing::debug!(
-                        ?result,
-                        "joined tmux retry after source loss; no current-source success recorded"
-                    );
-                    self.stage = Stage::ObserveTerminal;
-                } else {
+                if current {
                     match result {
                         Ok(Ok(())) => self.stage = Stage::TmuxEvidence,
                         Ok(Err(error)) => {
@@ -349,6 +341,12 @@ impl AdmittedRetryCursor {
                         }
                         Err(_) => self.stage = Stage::Fatal,
                     }
+                } else {
+                    tracing::debug!(
+                        ?result,
+                        "joined tmux retry after source loss; no current-source success recorded"
+                    );
+                    self.stage = Stage::ObserveTerminal;
                 }
             }
             Stage::TmuxEvidence => {
@@ -386,9 +384,7 @@ impl AdmittedRetryCursor {
                     self.stage = Stage::Fatal;
                     return Err(NativeCloseApplicationError::FatalAuthority);
                 }
-                if !current {
-                    self.stage = Stage::ObserveTerminal;
-                } else {
+                if current {
                     match result {
                         Ok(Ok(())) => self.stage = Stage::ScopeEvidence,
                         Ok(Err(error)) => {
@@ -398,6 +394,8 @@ impl AdmittedRetryCursor {
                         }
                         Err(_) => self.stage = Stage::Fatal,
                     }
+                } else {
+                    self.stage = Stage::ObserveTerminal;
                 }
             }
             Stage::ScopeEvidence => {
@@ -441,9 +439,7 @@ impl AdmittedRetryCursor {
                     .take()
                     .expect("retained runtime drain")
                     .await;
-                self.stage = if !current {
-                    Stage::ObserveTerminal
-                } else {
+                self.stage = if current {
                     match result {
                         Ok(Ok(())) => Stage::WorktreeRecordDispatch,
                         Ok(Err(NativeRetryNoLiveResourcesError::Blocked)) => Stage::Failure(
@@ -451,6 +447,8 @@ impl AdmittedRetryCursor {
                         ),
                         _ => Stage::Fatal,
                     }
+                } else {
+                    Stage::ObserveTerminal
                 };
             }
             Stage::WorktreeRecordDispatch => {
@@ -526,14 +524,11 @@ impl AdmittedRetryCursor {
                     self.stage = Stage::Fatal;
                     return Err(NativeCloseApplicationError::FatalAuthority);
                 }
-                if !current {
-                    tracing::debug!(?result, "joined Worktree dispatch after source loss; no physical preparation entered");
-                    self.stage = Stage::ObserveTerminal;
-                } else {
+                if current {
                     match result {
                         Ok(Ok(())) => self.stage = Stage::WorktreePreparing,
                         Ok(Err(NativeRetryExecutionError::ResourceFailure(detail))) => {
-                            self.stage = Stage::Failure(detail)
+                            self.stage = Stage::Failure(detail);
                         }
                         Ok(Err(NativeRetryExecutionError::TerminalizedFailure(detail))) => {
                             if self
@@ -546,6 +541,9 @@ impl AdmittedRetryCursor {
                             unreachable!("fatal dispatch result handled above")
                         }
                     }
+                } else {
+                    tracing::debug!(?result, "joined Worktree dispatch after source loss; no physical preparation entered");
+                    self.stage = Stage::ObserveTerminal;
                 }
             }
             Stage::WorktreePreparing => {
@@ -594,7 +592,7 @@ impl AdmittedRetryCursor {
                                 self.stage = Stage::Failure(
                                     "captured Worktree absent without a physical retirement proof"
                                         .into(),
-                                )
+                                );
                             }
                             Ok(Err(detail)) => self.stage = Stage::Failure(detail),
                             Err(_) => {}
@@ -666,7 +664,7 @@ impl AdmittedRetryCursor {
                             self.stage = Stage::ObserveTerminal;
                         }
                         Ok(WorktreePhysicalOutcome::Retired) => {
-                            self.stage = Stage::WorktreeEvidence
+                            self.stage = Stage::WorktreeEvidence;
                         }
                         Ok(
                             WorktreePhysicalOutcome::StopFailed { detail }
@@ -740,7 +738,7 @@ impl AdmittedRetryCursor {
                         return Ok(true);
                     }
                     LocalAuthorityResult::DurableFactEstablished(Err(_)) => {
-                        self.stage = Stage::ObserveTerminal
+                        self.stage = Stage::ObserveTerminal;
                     }
                     LocalAuthorityResult::DurableFactUnclassified => {}
                 }

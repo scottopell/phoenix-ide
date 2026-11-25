@@ -4,8 +4,6 @@ use super::*;
 async fn registered_close_captures_and_retires_disposable_empty_work_scope() {
     use crate::coordinator_tools;
     use crate::send_chat_service::SendChatApplicationService;
-    use std::path::PathBuf;
-    use tokio_util::sync::CancellationToken;
 
     let fixture = CloseFixture::new().await;
     let backend = CloseFixture::backend(fixture.db.clone());
@@ -79,20 +77,7 @@ async fn registered_close_captures_and_retires_disposable_empty_work_scope() {
         .unwrap()
         .unwrap();
 
-    let context = crate::tools::ToolContext::new(
-        CancellationToken::new(),
-        fixture.source_transcript_id.clone(),
-        PathBuf::from("/tmp"),
-        backend.browser_sessions().clone(),
-        backend.bash_handles().clone(),
-        Arc::new(ModelRegistry::new_empty()),
-        backend.terminals.clone(),
-        backend.tmux_registry().clone(),
-        None,
-        phoenix_core::work_scope::WorkScopeId::parse("close-source-test").unwrap(),
-    )
-    .with_tool_use_id(fixture.source.tool_use_id.clone())
-    .with_svg_assistant_message_id(fixture.source.message_id.clone());
+    let context = registered_close_context(&fixture, &backend);
     let input = serde_json::json!({
         "action": "initial",
         "product_conversation_id": fixture.target.as_str()
@@ -108,6 +93,16 @@ async fn registered_close_captures_and_retires_disposable_empty_work_scope() {
     );
     assert_eq!(count(&fixture.db, "native_close_initial_receipts").await, 1);
 
+    assert_empty_scope_retired(&fixture).await;
+
+    event_tx.send(Event::Shutdown).await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(10), running)
+        .await
+        .expect("source actor must shut down after Close completes")
+        .unwrap();
+}
+
+async fn assert_empty_scope_retired(fixture: &CloseFixture) {
     let attempt_id: String = sqlx::query_scalar(
         "SELECT attempt_id FROM native_close_initial_receipts WHERE request_id=?1",
     )
@@ -128,10 +123,27 @@ async fn registered_close_captures_and_retires_disposable_empty_work_scope() {
         .unwrap()
         .iter()
         .all(|scope| scope.captured_worktree.is_none()));
+}
 
-    event_tx.send(Event::Shutdown).await.unwrap();
-    tokio::time::timeout(std::time::Duration::from_secs(10), running)
-        .await
-        .expect("source actor must shut down after Close completes")
-        .unwrap();
+fn registered_close_context(
+    fixture: &CloseFixture,
+    backend: &crate::runtime::RuntimeManager,
+) -> crate::tools::ToolContext {
+    use std::path::PathBuf;
+    use tokio_util::sync::CancellationToken;
+
+    crate::tools::ToolContext::new(
+        CancellationToken::new(),
+        fixture.source_transcript_id.clone(),
+        PathBuf::from("/tmp"),
+        backend.browser_sessions().clone(),
+        backend.bash_handles().clone(),
+        Arc::new(ModelRegistry::new_empty()),
+        backend.terminals.clone(),
+        backend.tmux_registry().clone(),
+        None,
+        phoenix_core::work_scope::WorkScopeId::parse("close-source-test").unwrap(),
+    )
+    .with_tool_use_id(fixture.source.tool_use_id.clone())
+    .with_svg_assistant_message_id(fixture.source.message_id.clone())
 }

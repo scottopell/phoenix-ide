@@ -288,7 +288,7 @@ pub(crate) fn source_matches(live_state: &ConvState, command: &NativeCloseComman
             attempt_id.clone(),
             *failed_run_ordinal,
         ),
-        _ => return false,
+        NativeCloseIntent::Observe { .. } => return false,
     };
     matched.is_ok_and(|matched| matched == *command)
 }
@@ -479,9 +479,8 @@ mod tests {
             controller.revalidate(&state, &command),
             ActorEntryResult::Updated
         );
-        let lease = match worker.try_acquire_first_effect(&command) {
-            WorkerEntryResult::Ran(lease) => lease,
-            _ => panic!("eligible exact metadata entry must acquire its lease"),
+        let WorkerEntryResult::Ran(lease) = worker.try_acquire_first_effect(&command) else {
+            panic!("eligible exact metadata entry must acquire its lease");
         };
         // Deterministic interleaving: the actor cannot apply its source event
         // while metadata owns the lease, including an unclassified DB release.

@@ -126,7 +126,7 @@ impl FailedAcquisition {
 
 enum AcquiringLease {
     Pending(BoxFuture<'static, Acquisition>),
-    Failed(FailedAcquisition),
+    Failed(Box<FailedAcquisition>),
 }
 
 #[derive(Default)]
@@ -176,7 +176,7 @@ impl CloseResourceLeaseStore {
     /// Return only definitely inert, idle reservations to the ordinary lease
     /// store. Arc uniqueness proves no preparation still borrows a permit;
     /// retained resource state separately forbids reopening transferred owners,
-    /// even if SQLite release or the physical outcome remains unknown.
+    /// even if `SQLite` release or the physical outcome remains unknown.
     fn restore_unentered_native_initial_leases(&mut self, attempt: &str) -> Result<(), String> {
         let keys = self
             .native_initial_leases
@@ -341,7 +341,7 @@ impl CloseResourceLeaseStore {
             self.acquiring.insert(
                 key.clone(),
                 AcquiringLease::Pending(Box::pin(async move {
-                    failure
+                    (*failure)
                         .retry_tmux(
                             #[cfg(test)]
                             retry_hook,
@@ -368,7 +368,7 @@ impl CloseResourceLeaseStore {
                     .acquiring
                     .get_mut(key)
                     .expect("pending acquisition remains retained") =
-                    AcquiringLease::Failed(failure);
+                    AcquiringLease::Failed(Box::new(failure));
                 Err(detail)
             }
         }
@@ -605,6 +605,9 @@ impl LeaseRegistries {
         Ok(tmux)
     }
 
+    // Keep the ordered custody transfer and rollback reconstruction together; splitting
+    // this could obscure the invariant that every tmux permit remains paired to its lease.
+    #[allow(clippy::too_many_lines)]
     async fn reopen(
         self,
         leases: Vec<(LeaseKey, CloseResourceLease)>,
@@ -877,7 +880,7 @@ mod tests {
             tokio::pin!(acquisition);
             tokio::time::timeout(std::time::Duration::from_secs(30), async {
                 tokio::select! {
-                    _ = hook.entered.notified() => {},
+                    () = hook.entered.notified() => {},
                     result = &mut acquisition => panic!("acquisition escaped pause: {result:?}"),
                 }
             })
@@ -934,7 +937,7 @@ mod tests {
             tokio::pin!(acquisition);
             tokio::time::timeout(std::time::Duration::from_secs(30), async {
                 tokio::select! {
-                    _ = hook.entered.notified() => {},
+                    () = hook.entered.notified() => {},
                     result = &mut acquisition => panic!("acquisition escaped pause: {result:?}"),
                 }
             })
@@ -1001,7 +1004,7 @@ mod tests {
             tokio::pin!(future);
             tokio::time::timeout(std::time::Duration::from_secs(30), async {
                 tokio::select! {
-                    _ = acquisition.entered.notified() => {},
+                    () = acquisition.entered.notified() => {},
                     result = &mut future => panic!("acquisition escaped pause: {result:?}"),
                 }
             })
@@ -1031,7 +1034,7 @@ mod tests {
             tokio::pin!(future);
             tokio::time::timeout(std::time::Duration::from_secs(30), async {
                 tokio::select! {
-                    _ = retry.entered.notified() => {},
+                    () = retry.entered.notified() => {},
                     result = &mut future => panic!("retry escaped pause: {result:?}"),
                 }
             })
@@ -1068,7 +1071,7 @@ mod tests {
             tokio::pin!(acquisition);
             tokio::time::timeout(std::time::Duration::from_secs(30), async {
                 tokio::select! {
-                    _ = hook.entered.notified() => {},
+                    () = hook.entered.notified() => {},
                     result = &mut acquisition => panic!("acquisition escaped pause: {result:?}"),
                 }
             })
@@ -1444,7 +1447,7 @@ mod tests {
             tokio::pin!(reopening);
             tokio::time::timeout(std::time::Duration::from_secs(30), async {
                 tokio::select! {
-                    _ = hook.entered.notified() => {},
+                    () = hook.entered.notified() => {},
                     result = &mut reopening => panic!("reopening escaped pause: {result:?}"),
                 }
             })
@@ -1485,7 +1488,7 @@ mod tests {
             tokio::pin!(reopening);
             tokio::time::timeout(std::time::Duration::from_secs(30), async {
                 tokio::select! {
-                    _ = hook.entered.notified() => {},
+                    () = hook.entered.notified() => {},
                     result = &mut reopening => panic!("reopening escaped pause: {result:?}"),
                 }
             })

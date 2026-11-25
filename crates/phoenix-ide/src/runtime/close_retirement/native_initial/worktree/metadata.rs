@@ -1,4 +1,4 @@
-//! Original-context metadata writes. SQLite owns the transaction before the
+//! Original-context metadata writes. `SQLite` owns the transaction before the
 //! source-entry lease is acquired and retained through release; no source lock
 //! spans a writer wait, and no admitted physical leaf opens a nested writer.
 
@@ -327,7 +327,9 @@ mod tests {
         assert!(worker.is_eligible_unrevoked_before_deadline_for_test());
         // Eligibility is still open, but the original context deadline expired
         // while waiting for the writer. No refreshed source deadline can save it.
-        let expired = Instant::now() - Duration::from_secs(1);
+        let expired = Instant::now()
+            .checked_sub(Duration::from_secs(1))
+            .expect("a monotonic clock is older than one second");
         assert!(metadata_entry(&worker, &command, expired).is_err());
         assert!(worker.is_eligible_unrevoked_before_deadline_for_test());
     }

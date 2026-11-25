@@ -198,6 +198,7 @@ impl ProcessRetirement {
 }
 
 impl NativeCloseInitialContinuation {
+    #[allow(clippy::too_many_lines)] // Cursor transitions cover each original process resource with custody retained across awaits.
     pub(super) async fn step_process_retirement(
         &mut self,
         live_source: &phoenix_core::domain::sm_state::ConvState,
@@ -258,7 +259,7 @@ impl NativeCloseInitialContinuation {
         };
         // Dispatches above cover the complete original kind inventory; admission
         // below transfers exactly ONE prepared resource under current source/Stop.
-        let resources = vec![resource.clone()];
+        let resources = [resource.clone()];
         if progress.pending.is_none() && progress.observer.is_none() {
             if let Some(entry) = &progress.entry {
                 if !entry.is_finished() {
@@ -270,12 +271,12 @@ impl NativeCloseInitialContinuation {
                         return Err(NativeCloseApplicationError::FatalAuthority)
                     }
                     Ok(Err(error)) => {
-                        progress.blocked = Some(BlockedProcess::Worker { _error: error })
+                        progress.blocked = Some(BlockedProcess::Worker { _error: error });
                     }
                     Err(error) => {
                         progress.blocked = Some(BlockedProcess::Join {
                             _error: error.to_string(),
-                        })
+                        });
                     }
                 }
                 if progress.blocked.is_some() {
@@ -288,7 +289,7 @@ impl NativeCloseInitialContinuation {
                     return Err(NativeCloseApplicationError::SourceRefused);
                 };
                 let source_custody = owner.reborrow();
-                let target_custody = std::sync::Arc::clone(&self._target_gate);
+                let target_custody = std::sync::Arc::clone(&self.target_gate);
                 let backend = std::sync::Arc::clone(&self.backend);
                 let custody = phoenix_tools::browser::session::BrowserRetirementCustody::new(
                     std::sync::Arc::new((source_custody, target_custody)),
@@ -346,8 +347,7 @@ impl NativeCloseInitialContinuation {
             let durable_source = live_source.clone();
             let backend = Arc::clone(&self.backend);
             progress.entry = Some(spawn_retained_entry(backend, async move {
-                prepared
-                    .enter(&db, &command, &receipt, &durable_source, &source_entry)
+                Box::pin(prepared.enter(&db, &command, &receipt, &durable_source, &source_entry))
                     .await
             }));
             return Ok(self.phase);
@@ -371,7 +371,7 @@ impl NativeCloseInitialContinuation {
                 Err(error) => {
                     progress.blocked = Some(BlockedProcess::Join {
                         _error: format!("{error:?}"),
-                    })
+                    });
                 }
             }
             if progress.blocked.is_some() {
@@ -463,7 +463,7 @@ impl NativeCloseInitialContinuation {
                     .await
                 {
                     LocalAuthorityResult::DurableFactEstablished(Ok(())) => {
-                        progress.process_receipt_recorded = true
+                        progress.process_receipt_recorded = true;
                     }
                     LocalAuthorityResult::DurableFactEstablished(Err(error)) => {
                         progress.retry_backoff = true;

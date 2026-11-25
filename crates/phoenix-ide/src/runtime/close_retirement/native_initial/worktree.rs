@@ -231,11 +231,11 @@ fn verify_linked_registration(
     if !registration_metadata.is_dir() || registration_metadata.file_type().is_symlink() {
         return Err("captured Worktree registration is not a real directory".into());
     }
-    let registration_real = registration
+    let registration_resolved = registration
         .canonicalize()
         .map_err(|error| format!("cannot resolve captured Worktree registration: {error}"))?;
-    if !registration_real.starts_with(&registrations_real)
-        || registration_real != git_dir
+    if !registration_resolved.starts_with(&registrations_real)
+        || registration_resolved != git_dir
         || git_dir.parent() != Some(registrations_real.as_path())
     {
         return Err("captured Worktree registration escapes common Git directory".into());
@@ -334,6 +334,9 @@ impl OriginalWorktreeEffectContext {
     /// Admit exactly one bounded first-effect leaf against the original close tuple.
     /// The returned DB release must be classified before this context admits another
     /// leaf; callers that cannot prove confirmed release retain all worker custody.
+    // Keep the typed DB result: boxing its large error would add indirection at
+    // every fail-closed custody classification site without shrinking a stored value.
+    #[allow(clippy::result_large_err)]
     fn admitted_leaf<T>(
         &mut self,
         runtime: &tokio::runtime::Handle,
@@ -497,7 +500,7 @@ impl Drop for WorkerAuthority {
 #[cfg(test)]
 impl NativeWorktreeGit {
     /// Starts the worker before yielding to the caller. Only the synchronous
-    /// SQLite + original-source callback can call `Command::spawn`; neither a
+    /// `SQLite` + original-source callback can call `Command::spawn`; neither a
     /// pre-lock probe nor the post-release wait can authorize another spawn.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn spawn_status(
@@ -559,16 +562,13 @@ impl NativeWorktreeGitContinuation {
                 stdout_reader: None,
                 stderr_reader: None,
             };
-            let result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let Ok(result) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 run_status(&mut custody, &runtime, &mut authority)
-            })) {
-                Ok(result) => result,
-                Err(_) => {
-                    authority
-                        .fatal
-                        .close("native_close_initial_worktree_worker_panic");
-                    retain_unclassified(custody)
-                }
+            })) else {
+                authority
+                    .fatal
+                    .close("native_close_initial_worktree_worker_panic");
+                retain_unclassified(&custody);
             };
             {
                 let mut state = worker_state
@@ -736,9 +736,10 @@ fn wait_confirmed_git(custody: &mut WorkerCustody, deadline: Instant) -> Result<
         .take()
         .expect("stderr reader in custody")
         .join();
-    if stdout.is_err() || stderr.is_err() {
-        panic!("Worktree Git pipe reader panicked");
-    }
+    assert!(
+        stdout.is_ok() && stderr.is_ok(),
+        "Worktree Git pipe reader panicked"
+    );
     let stdout = stdout
         .expect("joined reader")
         .map_err(|error| error.to_string())?;
@@ -760,13 +761,13 @@ fn retain_incomplete_status(custody: &mut WorkerCustody) -> ! {
         .expect("worker retains original effect context")
         .fatal
         .close("native_close_initial_worktree_status_completion_unproven");
-    retain_unclassified(std::mem::replace(custody, WorkerCustody::empty()))
+    retain_unclassified(&std::mem::replace(custody, WorkerCustody::empty()))
 }
 
-fn retain_unclassified(custody: WorkerCustody) -> ! {
+fn retain_unclassified(custody: &WorkerCustody) -> ! {
     loop {
         std::thread::park();
-        std::hint::black_box(&custody);
+        std::hint::black_box(custody);
     }
 }
 
@@ -890,7 +891,12 @@ mod tests {
     }
 
     #[tokio::test]
+    // End-to-end fixture exercises the entire prepared pointer/commondir binding.
+    #[allow(clippy::too_many_lines)]
     async fn preparation_uses_captured_pointer_and_commondir_without_git() {
+        #[cfg(unix)]
+        use std::os::unix::process::ExitStatusExt as _;
+
         use phoenix_core::domain::close::{GitPathIdentity, WorktreeFingerprint, WorktreeId};
 
         let temp = tempfile::tempdir().unwrap();
@@ -978,7 +984,6 @@ mod tests {
             std::fs::rename(&renamed_admin, &admin).unwrap();
             assert!(registrations.is_dir());
 
-            use std::os::unix::process::ExitStatusExt as _;
             let output = Output {
                 status: std::process::ExitStatus::from_raw(0),
                 stdout: vec![1],
@@ -997,7 +1002,7 @@ mod tests {
             tokio::select! {
                 biased;
                 _ = operation.observe() => panic!("unpublished result cannot be observed"),
-                _ = std::future::ready(()) => {}
+                () = std::future::ready(()) => {}
             }
             let db = Database::open_in_memory().await.unwrap();
             let controller;

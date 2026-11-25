@@ -660,6 +660,10 @@ fn begin_retirement_fences_admission_until_reopened() {
 async fn prepared_retirement_is_inert_until_polled_and_projection_is_bound() {
     use crate::session::{PreparedTerminalRetirement, StopReason};
     fn assert_send_static<T: Send + 'static>() {}
+    fn drop_send_static<T: Send + 'static>(value: T) {
+        drop(value);
+    }
+
     assert_send_static::<PreparedTerminalRetirement>();
     let registry = ActiveTerminals::new();
     let scope = scope("prepared-inert");
@@ -676,9 +680,6 @@ async fn prepared_retirement_is_inert_until_polled_and_projection_is_bound() {
     assert_eq!(handle.master_fd_raw(), fd);
 
     let prepared = registry.prepare_retirement(&permit).unwrap();
-    fn drop_send_static<T: Send + 'static>(value: T) {
-        drop(value);
-    }
     drop_send_static(prepared.complete());
     assert_eq!(*handle.stop_tx.borrow(), StopReason::Running);
     assert_eq!(handle.master_fd_raw(), fd);
@@ -742,9 +743,8 @@ async fn try_enter_registry_contention_returns_original_owner_without_effect() {
         (entry, observed)
     });
     entry.join().unwrap();
-    let (prepared, error) = match observed.expect("entry must return before registry unlock") {
-        Ok(_) => panic!("contended registry unexpectedly entered"),
-        Err(failure) => failure,
+    let Err((prepared, error)) = observed.expect("entry must return before registry unlock") else {
+        panic!("contended registry unexpectedly entered");
     };
     assert_eq!(error, TerminalRetirementEntryError::RegistryBusy);
     assert!(!handle.retirement_requested.is_requested());
@@ -775,9 +775,8 @@ async fn try_enter_rejects_superseded_generation_and_replaced_target_without_eff
             original.clone()
         };
         let replacement_permit = registry.begin_retirement(&scope);
-        let (retained, error) = match prepared.try_enter() {
-            Ok(_) => panic!("stale retirement unexpectedly entered"),
-            Err(failure) => failure,
+        let Err((retained, error)) = prepared.try_enter() else {
+            panic!("stale retirement unexpectedly entered");
         };
         assert_eq!(error, TerminalRetirementEntryError::StaleTarget);
         for handle in [&original, &current] {
@@ -804,9 +803,8 @@ async fn try_enter_expiry_has_no_first_effect() {
     );
     let prepared = registry.prepare_retirement(&permit).unwrap();
     tokio::time::advance(std::time::Duration::from_secs(1)).await;
-    let (prepared, error) = match prepared.try_enter() {
-        Ok(_) => panic!("expired retirement unexpectedly entered"),
-        Err(failure) => failure,
+    let Err((prepared, error)) = prepared.try_enter() else {
+        panic!("expired retirement unexpectedly entered");
     };
     assert_eq!(error, TerminalRetirementEntryError::DeadlineExpired);
     assert!(!original.retirement_requested.is_requested());
@@ -848,7 +846,7 @@ async fn prepared_retirement_rejects_projection_spoof_wrong_registry_and_stale_g
         registry.prepare_retirement(&permit).unwrap_err(),
         PrepareTerminalRetirementError::StalePermit
     );
-    assert_eq!(handle.master_fd_raw().is_some(), true);
+    assert!(handle.master_fd_raw().is_some());
     assert_eq!(
         *handle.stop_tx.borrow(),
         crate::session::StopReason::Running

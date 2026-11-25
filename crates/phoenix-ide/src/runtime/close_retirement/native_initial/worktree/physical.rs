@@ -1,7 +1,7 @@
 //! Retained original-context physical retirement for clean linked worktrees.
 //! Git children, metadata writes and individual filesystem mutations enter their
 //! own original source gate; inspection and descriptor traversal do not hold a
-//! SQLite writer. Unsupported states remain preserved, never successful absence.
+//! `SQLite` writer. Unsupported states remain preserved, never successful absence.
 
 use std::{
     fmt::Write as _,
@@ -172,9 +172,8 @@ fn run_physical_worker(state: &PhysicalState, runtime: &tokio::runtime::Handle) 
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         retire_clean_linked_worktree(custody, runtime)
     }));
-    let result = match result {
-        Ok(result) => result,
-        Err(_) => retain_unclassified_physical(custody),
+    let Ok(result) = result else {
+        retain_unclassified_physical(custody);
     };
     // A result is not publishable while any child/pipe custody is unclassified.
     // Git leaves retain on unknown DB release or incomplete cleanup.
@@ -205,7 +204,7 @@ fn run_physical_worker(state: &PhysicalState, runtime: &tokio::runtime::Handle) 
     custody.authority.armed = false;
     // Every dispatched child, mutation and metadata release is classified.
     drop(slot.take());
-    *result_slot = Some(result);
+    *result_slot = Some(Ok(result));
     drop(result_slot);
     drop(slot);
     #[cfg(test)]
@@ -219,35 +218,13 @@ fn run_physical_worker(state: &PhysicalState, runtime: &tokio::runtime::Handle) 
 fn retire_clean_linked_worktree(
     custody: &mut PhysicalCustody,
     runtime: &tokio::runtime::Handle,
-) -> Result<WorktreePhysicalOutcome, String> {
-    if custody
-        .writer_probe
-        .persistence_uncertain
-        .as_ref()
-        .is_some_and(|uncertain| uncertain.load(std::sync::atomic::Ordering::SeqCst))
-    {
-        retain_unclassified_physical(custody);
-    }
-    let original = custody
-        .git
-        .original_effect
-        .as_ref()
-        .expect("original physical context");
-    let probe = &custody.writer_probe;
-    if probe.run.attempt_id != original.receipt.admitted.attempt_id
-        || probe.run.ordinal != original.receipt.admitted.run_ordinal
-        || probe.scope != original.scope
-        || probe.snapshot != original.snapshot
-        || probe.resource != original.resource
-    {
-        return Ok(WorktreePhysicalOutcome::Residual {
-            detail: "writer probe does not match original Worktree run binding; target preserved"
-                .into(),
-        });
+) -> WorktreePhysicalOutcome {
+    if let Err(detail) = validate_physical_binding(custody) {
+        return WorktreePhysicalOutcome::Residual { detail };
     }
     custody.confirmed_worktree_snapshot = match read_confirmed_worktree_snapshot(custody, runtime) {
         Ok(snapshot) => Some(snapshot),
-        Err(detail) => return Ok(WorktreePhysicalOutcome::Residual { detail }),
+        Err(detail) => return WorktreePhysicalOutcome::Residual { detail },
     };
     let owner = custody
         .git
@@ -273,7 +250,7 @@ fn retire_clean_linked_worktree(
     })();
     custody.location = match qualification {
         Ok(location) => Some(location),
-        Err(detail) => return Ok(WorktreePhysicalOutcome::Residual { detail }),
+        Err(detail) => return WorktreePhysicalOutcome::Residual { detail },
     };
     let mut driver = PhysicalDeletionDriver {
         custody,
@@ -284,10 +261,10 @@ fn retire_clean_linked_worktree(
         mutation_refusal: None,
     };
     if let Err(detail) = driver.verify_confirmed_snapshot() {
-        return Ok(driver
+        return driver
             .failure
             .take()
-            .unwrap_or(WorktreePhysicalOutcome::Residual { detail }));
+            .unwrap_or(WorktreePhysicalOutcome::Residual { detail });
     }
     driver.custody.authority.armed = true;
     if let Err(detail) = driver.original().record_cleanup_plan(
@@ -295,7 +272,7 @@ fn retire_clean_linked_worktree(
         administrative_dir.clone(),
         administrative_incarnation.clone(),
     ) {
-        return Ok(WorktreePhysicalOutcome::Residual { detail });
+        return WorktreePhysicalOutcome::Residual { detail };
     }
     let deletion = remove_identity_bound_directory_with_driver(
         &path,
@@ -306,12 +283,12 @@ fn retire_clean_linked_worktree(
         &mut driver,
     );
     if let Err(detail) = deletion {
-        return Ok(driver
+        return driver
             .failure
             .take()
             .unwrap_or_else(|| WorktreePhysicalOutcome::Residual {
-                detail: driver.retained_detail(detail),
-            }));
+                detail: driver.retained_detail(&detail),
+            });
     }
     // No Git is spawned after checkout deletion. Administrative removal uses
     // the immutable registration bytes, captured common-dir identity and same lock.
@@ -333,16 +310,47 @@ fn retire_clean_linked_worktree(
         Some(deadline),
         &mut driver,
     ) {
-        return Ok(WorktreePhysicalOutcome::Residual {
-            detail: driver.retained_detail(detail),
-        });
+        return WorktreePhysicalOutcome::Residual {
+            detail: driver.retained_detail(&detail),
+        };
     }
     if let Err(detail) = driver.verify_retired_paths(&administrative_dir) {
-        return Ok(WorktreePhysicalOutcome::Residual { detail });
+        return WorktreePhysicalOutcome::Residual { detail };
     }
-    Ok(WorktreePhysicalOutcome::Retired)
+    WorktreePhysicalOutcome::Retired
 }
 
+fn validate_physical_binding(custody: &PhysicalCustody) -> Result<(), String> {
+    if custody
+        .writer_probe
+        .persistence_uncertain
+        .as_ref()
+        .is_some_and(|uncertain| uncertain.load(std::sync::atomic::Ordering::SeqCst))
+    {
+        retain_unclassified_physical(custody);
+    }
+    let original = custody
+        .git
+        .original_effect
+        .as_ref()
+        .expect("original physical context");
+    let probe = &custody.writer_probe;
+    if probe.run.attempt_id != original.receipt.admitted.attempt_id
+        || probe.run.ordinal != original.receipt.admitted.run_ordinal
+        || probe.scope != original.scope
+        || probe.snapshot != original.snapshot
+        || probe.resource != original.resource
+    {
+        return Err(
+            "writer probe does not match original Worktree run binding; target preserved".into(),
+        );
+    }
+    Ok(())
+}
+
+// This reads one immutable snapshot from the captured registration and checks
+// its exact worktree identity; splitting the checks would obscure that proof.
+#[allow(clippy::too_many_lines)]
 fn read_confirmed_worktree_snapshot(
     custody: &PhysicalCustody,
     runtime: &tokio::runtime::Handle,
@@ -587,7 +595,7 @@ impl PhysicalDeletionDriver<'_> {
             .expect("captured relocation witness")
     }
 
-    fn retained_detail(&self, detail: String) -> String {
+    fn retained_detail(&self, detail: &str) -> String {
         format!(
             "{detail}; retained native cleanup target at {}",
             self.root
@@ -657,7 +665,7 @@ impl PhysicalDeletionDriver<'_> {
         }
         if fresh.fingerprint() != confirmed.fingerprint() {
             let detail = self.retained_detail(
-                "worktree changed after Close inspection confirmation; fresh confirmation is required".into(),
+                "worktree changed after Close inspection confirmation; fresh confirmation is required",
             );
             self.failure = Some(WorktreePhysicalOutcome::ReinspectionRequired {
                 detail: detail.clone(),
@@ -942,7 +950,7 @@ mod tests {
                 } else {
                     inspection.snapshot.fingerprint()
                 };
-                encoded.push_str(&format!("{}:{scope}{}:{value}", scope.len(), value.len()));
+                let _ = write!(encoded, "{}:{scope}{}:{value}", scope.len(), value.len());
             }
             encoded
         };

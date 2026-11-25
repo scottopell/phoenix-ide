@@ -154,6 +154,9 @@ impl BashEntryContext {
         result
     }
 
+    // The stages below are one custody-locked protocol; extracting phases would
+    // obscure the lock/authority boundary that prevents an unsafe handoff.
+    #[allow(clippy::too_many_lines)]
     async fn complete_inner(
         &self,
         slot: &BashCustodySlot,
@@ -280,11 +283,13 @@ impl BashEntryContext {
                             }
                         };
                     }
-                    Err(NativeCloseInitialFirstEffectError::NotStarted(error))
-                    | Err(NativeCloseInitialFirstEffectError::Rejected {
-                        error,
-                        release: NativeCloseInitialEntryRelease::Confirmed,
-                    }) => {
+                    Err(
+                        NativeCloseInitialFirstEffectError::NotStarted(error)
+                        | NativeCloseInitialFirstEffectError::Rejected {
+                            error,
+                            release: NativeCloseInitialEntryRelease::Confirmed,
+                        },
+                    ) => {
                         confirmed_group_refusal = true;
                         problem = Some(format!("Bash group authorization refused: {error}"));
                     }

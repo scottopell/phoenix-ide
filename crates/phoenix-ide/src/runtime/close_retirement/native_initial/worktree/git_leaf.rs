@@ -15,9 +15,9 @@ use super::{
 /// binding, not just a path derived anew from the command's current environment.
 /// The caller's validator must compare that binding to the command AND filesystem
 /// each time it is called. It must be bounded by the supplied original deadline,
-/// read-only, and must not spawn, wait for children, or enter SQLite itself.
+/// read-only, and must not spawn, wait for children, or enter `SQLite` itself.
 /// Root registration/incarnation validation is unconditional in either mode.
-/// The revalidator runs both before SQLite admission and inside the admitted
+/// The revalidator runs both before `SQLite` admission and inside the admitted
 /// spawn callback, so a preflight-only submodule check is not sufficient.
 pub(super) enum GitLeafTarget<'a> {
     #[cfg(test)]
@@ -28,7 +28,7 @@ pub(super) enum GitLeafTarget<'a> {
     RevalidateTarget(&'a mut dyn FnMut(&Command, Instant) -> Result<(), String>),
 }
 
-/// Admits one prepared command through the original SQLite + source-entry gates.
+/// Admits one prepared command through the original `SQLite` + source-entry gates.
 /// `custody` supplies the exact captured root binding and repository lock. The
 /// deadline must equal BOTH retained deadlines; a shorter/fresh deadline is not
 /// a replacement operation. Only confirmed DB release permits child/pipe waits.
@@ -37,6 +37,8 @@ pub(super) enum GitLeafTarget<'a> {
 /// The caller must stop its graph on error and retain this custody independently
 /// of observer cancellation; unknown authority/completion never returns at all.
 #[allow(clippy::too_many_arguments)]
+// The callback and its post-release outcomes form one indivisible spawn protocol.
+#[allow(clippy::too_many_lines)]
 pub(super) fn run_git_leaf(
     custody: &mut WorkerCustody,
     runtime: &tokio::runtime::Handle,
@@ -108,15 +110,17 @@ pub(super) fn run_git_leaf(
             })
             .map_err(|error| error.to_string())
     });
-    let release_confirmed = match &entry {
+    let release_confirmed = matches!(
+        &entry,
         Ok((_, NativeCloseInitialEntryRelease::Confirmed))
-        | Err(NativeCloseInitialFirstEffectError::NotStarted(_))
-        | Err(NativeCloseInitialFirstEffectError::Rejected {
-            release: NativeCloseInitialEntryRelease::Confirmed,
-            ..
-        }) => true,
-        _ => false,
-    };
+            | Err(
+                NativeCloseInitialFirstEffectError::NotStarted(_)
+                | NativeCloseInitialFirstEffectError::Rejected {
+                    release: NativeCloseInitialEntryRelease::Confirmed,
+                    ..
+                }
+            )
+    );
     if release_confirmed {
         original_effect.classify_confirmed_release();
     }
@@ -132,7 +136,7 @@ pub(super) fn run_git_leaf(
             original_effect
                 .fatal
                 .close("native_close_initial_worktree_unknown_writer_release");
-            retain_unclassified(std::mem::replace(custody, WorkerCustody::empty()));
+            retain_unclassified(&std::mem::replace(custody, WorkerCustody::empty()));
         }
         Ok((_, NativeCloseInitialEntryRelease::Unconfirmed(_)))
         | Err(NativeCloseInitialFirstEffectError::Rejected {
@@ -142,13 +146,15 @@ pub(super) fn run_git_leaf(
             original_effect
                 .fatal
                 .close("native_close_initial_worktree_unknown_writer_release");
-            retain_unclassified(std::mem::replace(custody, WorkerCustody::empty()))
+            retain_unclassified(&std::mem::replace(custody, WorkerCustody::empty()))
         }
-        Err(NativeCloseInitialFirstEffectError::NotStarted(error))
-        | Err(NativeCloseInitialFirstEffectError::Rejected {
-            error,
-            release: NativeCloseInitialEntryRelease::Confirmed,
-        }) => {
+        Err(
+            NativeCloseInitialFirstEffectError::NotStarted(error)
+            | NativeCloseInitialFirstEffectError::Rejected {
+                error,
+                release: NativeCloseInitialEntryRelease::Confirmed,
+            },
+        ) => {
             authority.armed = false;
             Err(format!(
                 "native Worktree Git authorization refused for {operation}: {error}"
@@ -595,13 +601,13 @@ fn validate_root_command(
             {
                 return Err("Git leaf configuration can redirect the captured target".into());
             }
-        } else if ["--literal-pathspecs", "--no-pager", "--no-optional-locks"]
-            .iter()
-            .any(|allowed| arg == *allowed)
-        {
-            continue;
         } else if arg.as_encoded_bytes().starts_with(b"-") {
-            return Err("Git leaf global option requires explicit target validation".into());
+            if !["--literal-pathspecs", "--no-pager", "--no-optional-locks"]
+                .iter()
+                .any(|allowed| arg == *allowed)
+            {
+                return Err("Git leaf global option requires explicit target validation".into());
+            }
         } else {
             return Ok(());
         }
@@ -835,7 +841,7 @@ mod tests {
                     std::fs::write(effect_source.join(".git"), pointer).unwrap();
                 }
                 "pointer" => {
-                    std::fs::write(effect_source.join(".git"), b"gitdir: /replacement\n").unwrap()
+                    std::fs::write(effect_source.join(".git"), b"gitdir: /replacement\n").unwrap();
                 }
                 "backlink" => std::fs::write(admin.join("gitdir"), b"/replacement/.git\n").unwrap(),
                 "commondir" => std::fs::write(admin.join("commondir"), b"../../\n").unwrap(),
@@ -918,7 +924,9 @@ mod tests {
         let original = Instant::now() + Duration::from_secs(60);
         assert!(validate_original_deadline(original, original, original).is_ok());
         for supplied in [
-            original - Duration::from_secs(1),
+            original
+                .checked_sub(Duration::from_secs(1))
+                .expect("a monotonic deadline is older than one second"),
             original + Duration::from_secs(1),
         ] {
             assert!(validate_original_deadline(supplied, original, original).is_err());
@@ -927,7 +935,9 @@ mod tests {
             validate_original_deadline(original, original, original + Duration::from_secs(1))
                 .is_err()
         );
-        let expired = Instant::now() - Duration::from_secs(1);
+        let expired = Instant::now()
+            .checked_sub(Duration::from_secs(1))
+            .expect("a monotonic clock is older than one second");
         assert!(validate_original_deadline(expired, expired, expired).is_err());
     }
 

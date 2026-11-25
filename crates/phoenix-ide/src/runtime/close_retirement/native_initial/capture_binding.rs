@@ -272,6 +272,7 @@ mod tests {
     };
     use phoenix_db::CaptureCloseRetirementInventoryScopeRequest;
     use std::collections::BTreeSet;
+    use std::fmt::Write as _;
 
     fn attempt() -> CloseAttemptId {
         CloseAttemptId::parse("attempt-a").unwrap()
@@ -299,7 +300,7 @@ mod tests {
             for inspection in ordered {
                 let scope = inspection.target.scope.as_str();
                 let value = value(inspection);
-                encoded.push_str(&format!("{}:{scope}{}:{value}", scope.len(), value.len()));
+                let _ = write!(encoded, "{}:{scope}{}:{value}", scope.len(), value.len());
             }
             encoded
         }
@@ -313,7 +314,7 @@ mod tests {
         CloseRetirementSnapshot::parse("custom-empty-generation", "no-worktree").unwrap()
     }
 
-    fn assert_rejected_as(error: String, expected: &str) {
+    fn assert_rejected_as(error: &str, expected: &str) {
         assert!(
             error.contains(expected),
             "expected {expected:?}, got {error:?}"
@@ -474,7 +475,7 @@ mod tests {
             )];
 
             assert_rejected_as(
-                validate_error(&attempt, &aggregate, &scopes, &request, &inspections, &[]),
+                &validate_error(&attempt, &aggregate, &scopes, &request, &inspections, &[]),
                 "full worktree identity differs",
             );
         }
@@ -697,7 +698,7 @@ mod tests {
                 )),
             }];
             assert_rejected_as(
-                validate_error(
+                &validate_error(
                     &attempt,
                     &aggregate,
                     &scopes,

@@ -1790,6 +1790,10 @@ async fn initial_process_first_effect_prior_success_or_retirement_blocks_only_ex
 #[tokio::test]
 #[allow(clippy::too_many_lines)] // One sealed inventory exercises the exact-entry refusal matrix.
 async fn initial_process_authorization_requires_exact_durable_source_scope_snapshot_and_dispatch() {
+    use crate::native_close::{
+        NativeCloseInitialEntryRelease, NativeCloseInitialResourceEntryDecision as Decision,
+        NativeCloseInitialResourceEntryResult as EntryResult,
+    };
     use phoenix_core::domain::close::{CloseRetirementSnapshot, RetiredResourceKind};
 
     let (db, command, receipt, source, run) = initial_source_fence_inventory_fixture(InitialSourceFenceInventoryConfig::default()).await;
@@ -1797,10 +1801,6 @@ async fn initial_process_authorization_requires_exact_durable_source_scope_snaps
     let process = inventories.iter().find(|item| {
         item.resource.kind() == RetiredResourceKind::BashProcessGroup
     }).unwrap();
-    use crate::native_close::{
-        NativeCloseInitialEntryRelease, NativeCloseInitialResourceEntryDecision as Decision,
-        NativeCloseInitialResourceEntryResult as EntryResult,
-    };
 
     let mut called = false;
     assert!(matches!(
@@ -2975,7 +2975,7 @@ async fn historical_live_all_success_completion_replay_is_effect_free() {
     seed_historical_completion_successor(&db, &command, &receipt, &run).await;
     let crate::native_close::NativeCloseCompletionResult::Replay(completion) =
         db.admit_native_close_initial_completion_retry(&command, &receipt, &source)
-            .await.established().unwrap().unwrap() else { panic!("expected historical completion replay"); };
+            .await.established().unwrap().unwrap();
     assert_eq!(completion.origin, receipt);
     assert_eq!(completion.successor.attempt_id, run.attempt_id);
     assert_eq!(completion.successor.target, *command.intent().target());
@@ -3064,7 +3064,7 @@ async fn stale_source_refuses_historical_completion_replay_and_startup_revokes_h
     seed_historical_completion_successor(&db, &command, &receipt, &run).await;
     let crate::native_close::NativeCloseCompletionResult::Replay(completion) =
         db.admit_native_close_initial_completion_retry(&command, &receipt, &source)
-            .await.established().unwrap().unwrap() else { panic!("expected historical replay"); };
+            .await.established().unwrap().unwrap();
     write_source_fence_state(&db, &command, &ConvState::Idle, false).await.unwrap();
     assert!(db.admit_native_close_initial_completion_retry(&command, &receipt, &source)
         .await.established().unwrap().is_err());
@@ -3100,7 +3100,7 @@ async fn idle_source_after_historical_completion_replay_stops_effect_free_succes
     seed_historical_completion_successor(&db, &command, &receipt, &run).await;
     let crate::native_close::NativeCloseCompletionResult::Replay(completion) =
         db.admit_native_close_initial_completion_retry(&command, &receipt, &source)
-            .await.established().unwrap().unwrap() else { panic!("expected historical replay"); };
+            .await.established().unwrap().unwrap();
     write_source_fence_state(&db, &command, &ConvState::Idle, false).await.unwrap();
     let successor = CloseRunRef { attempt_id: run.attempt_id.clone(), ordinal: completion.successor.run_ordinal };
     assert_eq!(db.get_close_run(&successor).await.unwrap().status, CloseRunStatus::Stopped);

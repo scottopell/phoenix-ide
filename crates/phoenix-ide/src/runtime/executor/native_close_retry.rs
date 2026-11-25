@@ -43,9 +43,9 @@ pub(super) struct NativeCloseRetryAssessment {
 }
 
 pub(super) enum NativeCloseRetryOriginAssessment {
-    Anchored(NativeCloseRetryAssessment),
+    Anchored(Box<NativeCloseRetryAssessment>),
     CapturedLoss(
-        crate::runtime::close_retirement::captured_loss_retry::CapturedLossRetryAssessment,
+        Box<crate::runtime::close_retirement::captured_loss_retry::CapturedLossRetryAssessment>,
     ),
 }
 
@@ -224,13 +224,13 @@ where
             NativeCloseRetryOriginAssessment::Anchored(assessment) => {
                 backend
                     .db()
-                    .apply_native_close_explicit_retry(assessment)
+                    .apply_native_close_explicit_retry(assessment.as_ref())
                     .await
             }
             NativeCloseRetryOriginAssessment::CapturedLoss(assessment) => {
                 backend
                     .db()
-                    .apply_native_close_captured_loss_retry(assessment)
+                    .apply_native_close_captured_loss_retry(assessment.as_ref())
                     .await
             }
         };
@@ -412,13 +412,13 @@ where
             NativeCloseRetryOriginAssessment::Anchored(assessment) => {
                 backend
                     .db()
-                    .apply_native_close_explicit_retry(assessment)
+                    .apply_native_close_explicit_retry(assessment.as_ref())
                     .await
             }
             NativeCloseRetryOriginAssessment::CapturedLoss(assessment) => {
                 backend
                     .db()
-                    .apply_native_close_captured_loss_retry(assessment)
+                    .apply_native_close_captured_loss_retry(assessment.as_ref())
                     .await
             }
         };
@@ -489,13 +489,15 @@ async fn assess_retry_origin(
         })?;
     let assessment = match origin {
         NativeCloseRetryOriginKind::CapturedLoss => NativeCloseRetryOriginAssessment::CapturedLoss(
-            backend
-                .assess_native_close_captured_loss_retry(command)
-                .await
-                .map_err(|error| {
-                    tracing::warn!(%error, "native Close captured-loss retry assessment failed");
-                    NativeCloseApplicationError::Storage
-                })?,
+            Box::new(
+                backend
+                    .assess_native_close_captured_loss_retry(command)
+                    .await
+                    .map_err(|error| {
+                        tracing::warn!(%error, "native Close captured-loss retry assessment failed");
+                        NativeCloseApplicationError::Storage
+                    })?,
+            ),
         ),
         NativeCloseRetryOriginKind::Anchored => {
             let original = backend
@@ -514,11 +516,11 @@ async fn assess_retry_origin(
                 safety_evidence: original.safety_evidence.clone(),
                 remaining_effects: original.remaining_effects.clone(),
             };
-            NativeCloseRetryOriginAssessment::Anchored(NativeCloseRetryAssessment {
+            NativeCloseRetryOriginAssessment::Anchored(Box::new(NativeCloseRetryAssessment {
                 command: command.clone(),
                 original,
                 request,
-            })
+            }))
         }
     };
     Ok(assessment)

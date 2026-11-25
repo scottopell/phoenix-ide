@@ -78,6 +78,8 @@ fn fixture_git(home: &Path, args: &[&str]) {
 }
 
 impl Fixture {
+    // The shared test fixture must construct each captured custody input together.
+    #[allow(clippy::too_many_lines)]
     async fn new(budget: Duration) -> Self {
         let files = tempfile::tempdir().unwrap();
         let repository = files.path().join("repository");
@@ -387,15 +389,17 @@ async fn refuses_second_callback(reason: ReentryRefusal) {
             worker_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(())
         });
-        let confirmed = match &entry {
+        let confirmed = matches!(
+            &entry,
             Ok((_, NativeCloseInitialEntryRelease::Confirmed))
-            | Err(NativeCloseInitialFirstEffectError::NotStarted(_))
-            | Err(NativeCloseInitialFirstEffectError::Rejected {
-                release: NativeCloseInitialEntryRelease::Confirmed,
-                ..
-            }) => true,
-            _ => false,
-        };
+                | Err(
+                    NativeCloseInitialFirstEffectError::NotStarted(_)
+                    | NativeCloseInitialFirstEffectError::Rejected {
+                        release: NativeCloseInitialEntryRelease::Confirmed,
+                        ..
+                    },
+                )
+        );
         assert!(
             confirmed,
             "isolated negative fixture must release its database writer"

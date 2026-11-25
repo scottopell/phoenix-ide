@@ -87,8 +87,8 @@ pub(super) struct NativeCloseInitialContinuation {
     loss_terminalization: Option<NativeInitialLossTerminalizationIntent>,
     pub(super) terminal_observation_retry: bool,
     pub(super) authority: RuntimeSettlementAuthority,
-    pub(super) _target_gate: std::sync::Arc<tokio::sync::OwnedMutexGuard<()>>,
-    pub(super) _response: Option<
+    pub(super) target_gate: std::sync::Arc<tokio::sync::OwnedMutexGuard<()>>,
+    pub(super) response: Option<
         tokio::sync::oneshot::Sender<Result<NativeCloseInitialResult, NativeCloseApplicationError>>,
     >,
 }
@@ -174,7 +174,7 @@ pub(super) enum NativeCloseInitialAdmission {
     },
     Continued {
         _result: NativeCloseInitialResult,
-        continuation: NativeCloseInitialContinuation,
+        continuation: Box<NativeCloseInitialContinuation>,
     },
 }
 
@@ -212,7 +212,7 @@ impl NativeCloseInitialContinuation {
             .as_ref()
             .expect("guarded cursor")
             .captured_binding();
-        let deadline = match self
+        let Ok(deadline) = self
             .backend
             .native_initial_original_entry_deadline(
                 self.receipt.admitted.attempt_id.as_str(),
@@ -220,12 +220,9 @@ impl NativeCloseInitialContinuation {
                 snapshot,
             )
             .await
-        {
-            Ok(deadline) => deadline,
-            Err(_) => {
-                self.phase = NativeCloseInitialContinuationPhase::ProcessRetirementBlocked;
-                return Err(NativeCloseApplicationError::FatalAuthority);
-            }
+        else {
+            self.phase = NativeCloseInitialContinuationPhase::ProcessRetirementBlocked;
+            return Err(NativeCloseApplicationError::FatalAuthority);
         };
         // Preserve the exact capture deadline for post-process workers, never
         // refresh it when handing off to physical Worktree retirement.
@@ -284,7 +281,7 @@ impl NativeCloseInitialContinuation {
         self.abort_and_join_inventory_preparation().await;
         self.terminal_observation_retry = false;
         self.authority.owner = None;
-        if let Some(response) = self._response.take() {
+        if let Some(response) = self.response.take() {
             let _ = response.send(Ok(self.admitted_result.clone()));
         }
         true
@@ -442,7 +439,7 @@ impl NativeCloseInitialContinuation {
     /// Settle only the response observer. Revocation does not release the
     /// admitted owner, target gate, or independently supervised physical work.
     fn settle_source_refused(&mut self) {
-        if let Some(response) = self._response.take() {
+        if let Some(response) = self.response.take() {
             let _ = response.send(Err(NativeCloseApplicationError::SourceRefused));
         }
     }
@@ -521,9 +518,10 @@ impl NativeCloseInitialContinuation {
             )
             .await
         {
-            Ok(post_retirement::PostRetirementStep::Retiring) => {
-                Ok(NativeCloseInitialContinuationPhase::RuntimeProcessesDone)
-            }
+            Ok(
+                post_retirement::PostRetirementStep::Retiring
+                | post_retirement::PostRetirementStep::Unclassified,
+            ) => Ok(NativeCloseInitialContinuationPhase::RuntimeProcessesDone),
             Ok(post_retirement::PostRetirementStep::Completed(_)) => {
                 self.phase = NativeCloseInitialContinuationPhase::ObservingTerminal;
                 Ok(self.phase)
@@ -531,9 +529,6 @@ impl NativeCloseInitialContinuation {
             Ok(post_retirement::PostRetirementStep::Blocked) => {
                 self.phase = NativeCloseInitialContinuationPhase::ProcessRetirementBlocked;
                 Ok(self.phase)
-            }
-            Ok(post_retirement::PostRetirementStep::Unclassified) => {
-                Ok(NativeCloseInitialContinuationPhase::RuntimeProcessesDone)
             }
             Ok(post_retirement::PostRetirementStep::FatalAuthority) => {
                 Err(NativeCloseApplicationError::FatalAuthority)
@@ -678,7 +673,7 @@ impl NativeCloseInitialContinuation {
                     .as_mut()
                     .expect("inventory preparation requires retained source authority")
                     .reborrow();
-                let worker_gate = std::sync::Arc::clone(&self._target_gate);
+                let worker_gate = std::sync::Arc::clone(&self.target_gate);
                 self.inventory = InventoryCapture::Preparing(tokio::spawn(async move {
                     let _custody = (worker_owner, worker_gate);
                     #[cfg(test)]
@@ -1065,12 +1060,12 @@ where
                     loss_terminalization: None,
                     terminal_observation_retry: false,
                     authority,
-                    _target_gate: std::sync::Arc::new(target_gate),
-                    _response: Some(response),
+                    target_gate: std::sync::Arc::new(target_gate),
+                    response: Some(response),
                 };
                 Ok(NativeCloseInitialAdmission::Continued {
                     _result: result,
-                    continuation,
+                    continuation: Box::new(continuation),
                 })
             }
             LocalAuthorityResult::DurableFactEstablished(Ok(result)) => {

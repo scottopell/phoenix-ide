@@ -2,7 +2,7 @@
 //!
 //! The source actor alone admits an owner. A separate task retains that owner
 //! across cancellation and cannot construct its effect future before confirmed
-//! SQLite writer release. These records are process-epoch custody, not recovery
+//! `SQLite` writer release. These records are process-epoch custody, not recovery
 //! permission after a restart.
 
 use super::super::{
@@ -270,7 +270,7 @@ fn release_browser_custody_after_verified_result<T, E>(
     }
 }
 
-/// Prepared outside SQLite; dropping before entry has no physical effects.
+/// Prepared outside `SQLite`; dropping before entry has no physical effects.
 /// The observer has already been retained in the backend, independently of this
 /// actor-local value. After transfer, even loss of this future cannot release it.
 pub(crate) struct NativeInitialPreparedEntry {
@@ -301,6 +301,9 @@ impl Drop for EntryAuthorityGuard {
 }
 
 impl NativeInitialPreparedEntry {
+    // Each resource has a different entry/custody protocol. Keeping dispatch and
+    // the matching release classification together makes the fail-closed paths auditable.
+    #[allow(clippy::too_many_lines)]
     pub(crate) async fn enter(
         self,
         db: &Database,
@@ -403,13 +406,13 @@ impl NativeInitialPreparedEntry {
                     NativeCloseInitialResourceEntryDecision::Refused,
                     NativeCloseInitialEntryRelease::Confirmed,
                 ))
-                | Err(phoenix_db::native_close::NativeCloseInitialFirstEffectError::NotStarted(
-                    _,
-                ))
-                | Err(phoenix_db::native_close::NativeCloseInitialFirstEffectError::Rejected {
-                    release: NativeCloseInitialEntryRelease::Confirmed,
-                    ..
-                }) => {
+                | Err(
+                    phoenix_db::native_close::NativeCloseInitialFirstEffectError::NotStarted(_)
+                    | phoenix_db::native_close::NativeCloseInitialFirstEffectError::Rejected {
+                        release: NativeCloseInitialEntryRelease::Confirmed,
+                        ..
+                    },
+                ) => {
                     authority.armed = false;
                     // A failed handoff may follow a real stop. Every writer is
                     // definitely released: compensate explicitly, even revoked.
@@ -632,6 +635,9 @@ impl RuntimeManager {
         assert!(leases.terminal_entry_hook.replace(hook).is_none());
     }
 
+    // Preparation intentionally keeps the exact owner, observer and reservation
+    // construction adjacent so cancellation cannot split their ownership transfer.
+    #[allow(clippy::too_many_lines)]
     pub(crate) async fn prepare_native_initial_resource(
         &self,
         expected: CloseExpectedRetirementResource,
@@ -783,11 +789,11 @@ impl RuntimeManager {
                 )
             }
             RetiredResourceKind::PtySession => {
-                if !lease
+                if lease
                     .terminal
                     .instance
                     .as_ref()
-                    .is_some_and(|instance| instance.stable_identity() == identity.as_str())
+                    .is_none_or(|instance| instance.stable_identity() != identity.as_str())
                 {
                     return Err(NativeInitialStepError::SealedInventoryMismatch);
                 }

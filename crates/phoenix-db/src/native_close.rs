@@ -199,7 +199,7 @@ pub use captured_loss_admission::NativeCloseCapturedLossRetryAssessment;
 #[cfg(test)]
 mod completion;
 #[cfg(test)]
-pub(crate) use completion::{NativeCloseCompletionReceipt, NativeCloseCompletionResult};
+pub(crate) use completion::NativeCloseCompletionResult;
 
 mod initial;
 mod initial_exit;

@@ -60,11 +60,13 @@ impl WorktreeMutationExecutor for OriginalWorktreeMutationExecutor<'_> {
         let confirmed = matches!(
             &entry,
             Ok((_, NativeCloseInitialEntryRelease::Confirmed))
-                | Err(NativeCloseInitialFirstEffectError::NotStarted(_))
-                | Err(NativeCloseInitialFirstEffectError::Rejected {
-                    release: NativeCloseInitialEntryRelease::Confirmed,
-                    ..
-                })
+                | Err(
+                    NativeCloseInitialFirstEffectError::NotStarted(_)
+                    | NativeCloseInitialFirstEffectError::Rejected {
+                        release: NativeCloseInitialEntryRelease::Confirmed,
+                        ..
+                    },
+                )
         );
         if !confirmed {
             self.retain_unknown(entry);
@@ -81,11 +83,13 @@ impl WorktreeMutationExecutor for OriginalWorktreeMutationExecutor<'_> {
                 WorkerEntryResult::Busy | WorkerEntryResult::Refused,
                 NativeCloseInitialEntryRelease::Confirmed,
             )) => self.refuse("original Close source unavailable at Worktree mutation".into()),
-            Err(NativeCloseInitialFirstEffectError::NotStarted(error))
-            | Err(NativeCloseInitialFirstEffectError::Rejected {
-                error,
-                release: NativeCloseInitialEntryRelease::Confirmed,
-            }) => self.refuse(format!(
+            Err(
+                NativeCloseInitialFirstEffectError::NotStarted(error)
+                | NativeCloseInitialFirstEffectError::Rejected {
+                    error,
+                    release: NativeCloseInitialEntryRelease::Confirmed,
+                },
+            ) => self.refuse(format!(
                 "native Worktree mutation authorization refused: {error}"
             )),
             // Classified above. Keep this branch fail-closed if the release

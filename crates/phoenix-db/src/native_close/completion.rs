@@ -18,7 +18,6 @@ pub(crate) struct NativeCloseCompletionReceipt {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum NativeCloseCompletionResult {
-    NewlyAdmitted(NativeCloseCompletionReceipt),
     Replay(NativeCloseCompletionReceipt),
 }
 

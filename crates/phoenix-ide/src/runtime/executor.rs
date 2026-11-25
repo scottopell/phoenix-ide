@@ -2738,7 +2738,7 @@ where
     }
 
     /// Revoke before persistence; a leaf already holding the short source guard
-    /// finishes first. No SQLite writer waits for an actor reply or actor mutex.
+    /// finishes first. No `SQLite` writer waits for an actor reply or actor mutex.
     async fn revoke_native_close_source_entry(&mut self) {
         if let Some(controller) = &mut self.native_close_source_entry {
             while controller.revoke() == native_close::source_entry::ActorEntryResult::Busy {
@@ -2767,16 +2767,14 @@ where
             .native_close_source_entry
             .as_ref()
             .is_some_and(|controller| !controller.matches_state(&state))
-        {
-            if self
+            && self
                 .native_close_source_entry
                 .as_mut()
                 .expect("checked controller")
                 .revoke()
                 == native_close::source_entry::ActorEntryResult::Busy
-            {
-                return Err("Close first effect must finish before source replacement".into());
-            }
+        {
+            return Err("Close first effect must finish before source replacement".into());
         }
         let _owner = self.live_state_owner()?;
         self.state = state;
@@ -3326,7 +3324,7 @@ where
         let mut deferred_native_close_exit: Option<RuntimeExitDisposition> = None;
 
         macro_rules! defer_exit_until_native_close_observed {
-            ($disposition:expr) => {{
+            ($event_loop:lifetime, $disposition:expr) => {{
                 self.revoke_native_close_source_entry().await;
                 if let Some(continuation) = pending_native_close_retry.take() {
                     continuation.join_before_exit().await;
@@ -3334,16 +3332,15 @@ where
                 if admitted_native_close_retry.is_some() {
                     self.abort_external_effects().await;
                     deferred_native_close_exit = Some($disposition);
-                    continue;
+                    continue $event_loop;
                 }
                 if let Some(continuation) = pending_native_close_initial.as_mut() {
                     continuation.begin_exit_interruption();
                     self.abort_external_effects().await;
                     deferred_native_close_exit = Some($disposition);
-                    continue;
-                } else {
-                    return $disposition;
+                    continue $event_loop;
                 }
+                return $disposition;
             }};
         }
 
@@ -3358,7 +3355,7 @@ where
         let exhausted_maintenance_deadline = (self.exhausted_maintenance
             && matches!(self.state, ConvState::ContextExhausted { .. }))
         .then(|| tokio::time::Instant::now() + Duration::from_secs(30));
-        loop {
+        'runtime_events: loop {
             if deferred_native_close_exit.is_some()
                 && pending_native_close_initial.is_none()
                 && admitted_native_close_retry.is_none()
@@ -3379,6 +3376,7 @@ where
                     self.revoke_native_close_source_entry().await;
                     self.abort_external_effects().await;
                     defer_exit_until_native_close_observed!(
+                        'runtime_events,
                         RuntimeExitDisposition::CoordinatedShutdown
                     );
                 }
@@ -3477,7 +3475,10 @@ where
                     }
                     self.revoke_native_close_source_entry().await;
                     self.abort_external_effects().await;
-                    defer_exit_until_native_close_observed!(RuntimeExitDisposition::CoordinatedShutdown);
+                    defer_exit_until_native_close_observed!(
+                        'runtime_events,
+                        RuntimeExitDisposition::CoordinatedShutdown
+                    );
                 }
                 // Fatal authority remains first. A due Close service pass gets
                 // priority over traffic, then schedules its next deadline after
@@ -3518,19 +3519,26 @@ where
                             native_close_step_ready = phase == phoenix_core::domain::close::ClosePhase::AwaitingRetirementInspection;
                             pending_native_close_initial = Some(continuation);
                         }
-                        Ok(native_close::NativeCloseInitialContinuationPhase::CollectingInspection) => {
+                        Ok(
+                            native_close::NativeCloseInitialContinuationPhase::CollectingInspection
+                            | native_close::NativeCloseInitialContinuationPhase::PreparingInventory
+                            | native_close::NativeCloseInitialContinuationPhase::InspectionRequired
+                            | native_close::NativeCloseInitialContinuationPhase::WaitingForQuiescence
+                            | native_close::NativeCloseInitialContinuationPhase::Prepare,
+                        ) => {
                             pending_native_close_initial = Some(continuation);
                         }
-                        Ok(native_close::NativeCloseInitialContinuationPhase::PreparingInventory) => {
-                            pending_native_close_initial = Some(continuation);
-                        }
-                        Ok(native_close::NativeCloseInitialContinuationPhase::Captured) => {
-                            pending_native_close_initial = Some(continuation);
-                            native_close_step_ready = false;
-                        }
-                        Ok(native_close::NativeCloseInitialContinuationPhase::RetiringProcesses
+                        Ok(
+                            native_close::NativeCloseInitialContinuationPhase::Captured
+                            | native_close::NativeCloseInitialContinuationPhase::RetiringProcesses
                             | native_close::NativeCloseInitialContinuationPhase::ProcessRetirementBlocked
-                            | native_close::NativeCloseInitialContinuationPhase::RuntimeProcessesDone) => {
+                            | native_close::NativeCloseInitialContinuationPhase::RuntimeProcessesDone
+                            | native_close::NativeCloseInitialContinuationPhase::ExitObservationOnly
+                            | native_close::NativeCloseInitialContinuationPhase::ClassifyingLosses
+                            | native_close::NativeCloseInitialContinuationPhase::ClassifyingInspectionFailure
+                            | native_close::NativeCloseInitialContinuationPhase::ClassifyingExitInterruption
+                            | native_close::NativeCloseInitialContinuationPhase::ObservingTerminal,
+                        ) => {
                             pending_native_close_initial = Some(continuation);
                             native_close_step_ready = false;
                         }
@@ -3541,26 +3549,6 @@ where
                         Ok(native_close::NativeCloseInitialContinuationPhase::Finished) => {
                             self.revoke_native_close_source_entry().await;
                             pending_native_close_initial = None;
-                        }
-                        Ok(native_close::NativeCloseInitialContinuationPhase::InspectionRequired) => {
-                            pending_native_close_initial = Some(continuation);
-                        }
-                        Ok(native_close::NativeCloseInitialContinuationPhase::ExitObservationOnly) => {
-                            pending_native_close_initial = Some(continuation);
-                            native_close_step_ready = false;
-                        }
-                        Ok(native_close::NativeCloseInitialContinuationPhase::ClassifyingLosses
-                            | native_close::NativeCloseInitialContinuationPhase::ClassifyingInspectionFailure
-                            | native_close::NativeCloseInitialContinuationPhase::ClassifyingExitInterruption
-                            | native_close::NativeCloseInitialContinuationPhase::ObservingTerminal) => {
-                            pending_native_close_initial = Some(continuation);
-                            native_close_step_ready = false;
-                        }
-                        Ok(native_close::NativeCloseInitialContinuationPhase::WaitingForQuiescence) => {
-                            pending_native_close_initial = Some(continuation);
-                        }
-                        Ok(native_close::NativeCloseInitialContinuationPhase::Prepare) => {
-                            pending_native_close_initial = Some(continuation);
                         }
                         Err(super::native_close_application::NativeCloseApplicationError::FatalAuthority) => {
                             if let Some(controller) = self.native_close_source_entry.as_mut() {
@@ -3583,7 +3571,10 @@ where
                         None => std::future::pending().await,
                     }
                 }, if deferred_native_close_exit.is_none() && matches!(self.state, ConvState::ContextExhausted { .. }) => {
-                    defer_exit_until_native_close_observed!(RuntimeExitDisposition::CoordinatedShutdown);
+                    defer_exit_until_native_close_observed!(
+                        'runtime_events,
+                        RuntimeExitDisposition::CoordinatedShutdown
+                    );
                 }
                 assessment = async {
                     match pending_native_close_retry.as_mut() {
@@ -3626,7 +3617,10 @@ where
                     let result = self.review_handoff_input(review.input).await;
                     let _ = review.response.send(result);
                     if self.exhausted_maintenance && matches!(self.state, ConvState::ContextExhausted { .. }) {
-                        defer_exit_until_native_close_observed!(RuntimeExitDisposition::CoordinatedShutdown);
+                        defer_exit_until_native_close_observed!(
+                            'runtime_events,
+                            RuntimeExitDisposition::CoordinatedShutdown
+                        );
                     }
                 }
                 Some(request) = async {
@@ -3658,7 +3652,7 @@ where
                             let result = self.admit_native_close_initial(&backend, source, target, admitted, target_gate, response).await;
                             let (fatal, continuation) = match result {
                                 Ok(native_close::NativeCloseInitialAdmission::Finished { .. }) => (false, None),
-                                Ok(native_close::NativeCloseInitialAdmission::Continued { continuation, .. }) => (false, Some(continuation)),
+                                Ok(native_close::NativeCloseInitialAdmission::Continued { continuation, .. }) => (false, Some(*continuation)),
                                 Err(error) => (matches!(error, super::native_close_application::NativeCloseApplicationError::FatalAuthority), None),
                             };
                             if let Some(continuation) = continuation {
@@ -3716,10 +3710,16 @@ where
                     }
                     if self.creation_settlement_disposition == CreationSettlementDisposition::StaleAuthority {
                         let _ = retirement.await;
-                        defer_exit_until_native_close_observed!(RuntimeExitDisposition::Interrupted);
+                        defer_exit_until_native_close_observed!(
+                            'runtime_events,
+                            RuntimeExitDisposition::Interrupted
+                        );
                     }
                     if terminal {
-                        defer_exit_until_native_close_observed!(RuntimeExitDisposition::Terminal);
+                        defer_exit_until_native_close_observed!(
+                            'runtime_events,
+                            RuntimeExitDisposition::Terminal
+                        );
                     }
                 }
                 Some(event) = async {
@@ -3745,7 +3745,10 @@ where
                                 pending_native_close_initial = None;
                             }
                         }
-                        defer_exit_until_native_close_observed!(RuntimeExitDisposition::CoordinatedShutdown);
+                        defer_exit_until_native_close_observed!(
+                            'runtime_events,
+                            RuntimeExitDisposition::CoordinatedShutdown
+                        );
                     }
                     if let Err(e) = self.process_event(event).await {
                         if e.starts_with("FATAL_LOCAL_AUTHORITY_UNCLASSIFIED:") {
@@ -3772,7 +3775,10 @@ where
                         }
                     }
                     if self.creation_settlement_disposition == CreationSettlementDisposition::StaleAuthority {
-                        defer_exit_until_native_close_observed!(RuntimeExitDisposition::Interrupted);
+                        defer_exit_until_native_close_observed!(
+                            'runtime_events,
+                            RuntimeExitDisposition::Interrupted
+                        );
                     }
                     // FM-5 prevention: terminal states exit the loop explicitly.
                     if let StepResult::Terminal(outcome) = self.state.step_result() {
@@ -3782,7 +3788,10 @@ where
                             "Conversation reached terminal state, exiting executor loop"
                         );
                         self.emit_terminal_lifecycle_event().await;
-                        defer_exit_until_native_close_observed!(RuntimeExitDisposition::Terminal);
+                        defer_exit_until_native_close_observed!(
+                            'runtime_events,
+                            RuntimeExitDisposition::Terminal
+                        );
                     }
                 }
                 Some((generation, llm_outcome)) = self.llm_outcome_rx.recv(), if deferred_native_close_exit.is_none() => {
@@ -3796,7 +3805,10 @@ where
                             "Conversation reached terminal state, exiting executor loop"
                         );
                         self.emit_terminal_lifecycle_event().await;
-                        defer_exit_until_native_close_observed!(RuntimeExitDisposition::Terminal);
+                        defer_exit_until_native_close_observed!(
+                            'runtime_events,
+                            RuntimeExitDisposition::Terminal
+                        );
                     }
                 }
                 () = async {
@@ -3813,7 +3825,10 @@ where
                             "Conversation reached terminal state, exiting executor loop"
                         );
                         self.emit_terminal_lifecycle_event().await;
-                        defer_exit_until_native_close_observed!(RuntimeExitDisposition::Terminal);
+                        defer_exit_until_native_close_observed!(
+                            'runtime_events,
+                            RuntimeExitDisposition::Terminal
+                        );
                     }
                 }
                 prepared = async {
@@ -3837,7 +3852,10 @@ where
                     }
                     if matches!(self.state.step_result(), StepResult::Terminal(_)) {
                         self.emit_terminal_lifecycle_event().await;
-                        defer_exit_until_native_close_observed!(RuntimeExitDisposition::Terminal);
+                        defer_exit_until_native_close_observed!(
+                            'runtime_events,
+                            RuntimeExitDisposition::Terminal
+                        );
                     }
                 }
                 observation = async {
@@ -3885,7 +3903,10 @@ where
                             "Conversation reached terminal state, exiting executor loop"
                         );
                         self.emit_terminal_lifecycle_event().await;
-                        defer_exit_until_native_close_observed!(RuntimeExitDisposition::Terminal);
+                        defer_exit_until_native_close_observed!(
+                            'runtime_events,
+                            RuntimeExitDisposition::Terminal
+                        );
                     }
                 }
                 Some((generation, attempt)) = self.retry_outcome_rx.recv(), if deferred_native_close_exit.is_none() => {
@@ -3917,7 +3938,10 @@ where
                             "Conversation reached terminal state, exiting executor loop"
                         );
                         self.emit_terminal_lifecycle_event().await;
-                        defer_exit_until_native_close_observed!(RuntimeExitDisposition::Terminal);
+                        defer_exit_until_native_close_observed!(
+                            'runtime_events,
+                            RuntimeExitDisposition::Terminal
+                        );
                     }
                 }
                 // Unified liveness backstop (REQ-SA-006, REQ-BED-005a): one arm
@@ -3938,7 +3962,10 @@ where
                             "Conversation reached terminal state, exiting executor loop"
                         );
                         self.emit_terminal_lifecycle_event().await;
-                        defer_exit_until_native_close_observed!(RuntimeExitDisposition::Terminal);
+                        defer_exit_until_native_close_observed!(
+                            'runtime_events,
+                            RuntimeExitDisposition::Terminal
+                        );
                     }
                 }
                 // REQ-BED-030: credential helper settled while awaiting recovery
@@ -3958,7 +3985,10 @@ where
                             "Conversation reached terminal state, exiting executor loop"
                         );
                         self.emit_terminal_lifecycle_event().await;
-                        defer_exit_until_native_close_observed!(RuntimeExitDisposition::Terminal);
+                        defer_exit_until_native_close_observed!(
+                            'runtime_events,
+                            RuntimeExitDisposition::Terminal
+                        );
                     }
                 }
                 else => break,

@@ -208,6 +208,13 @@ pub async fn archive_chain_handler(
     State(state): State<AppState>,
     Path(root_id): Path<String>,
 ) -> Result<Json<SuccessResponse>, AppError> {
+    Box::pin(archive_chain_boxed_body(State(state), Path(root_id))).await
+}
+
+async fn archive_chain_boxed_body(
+    State(state): State<AppState>,
+    Path(root_id): Path<String>,
+) -> Result<Json<SuccessResponse>, AppError> {
     validate_chain_root(&state, &root_id).await?;
 
     let member_ids = state
@@ -304,6 +311,13 @@ fn chain_delete_response(outcome: ChainDeleteOutcome) -> Json<ChainDeleteRespons
 }
 
 pub async fn delete_chain_handler(
+    State(state): State<AppState>,
+    Path(root_id): Path<String>,
+) -> Result<Json<ChainDeleteResponse>, AppError> {
+    Box::pin(delete_chain_boxed_body(State(state), Path(root_id))).await
+}
+
+async fn delete_chain_boxed_body(
     State(state): State<AppState>,
     Path(root_id): Path<String>,
 ) -> Result<Json<ChainDeleteResponse>, AppError> {

@@ -2543,7 +2543,7 @@ impl RepositoryMutationLock {
         deadline: std::time::Instant,
     ) -> Result<Self, (String, ErrorKind)> {
         let (file, lock_path) = Self::open_common_directory_file_until(common_dir, deadline)?;
-        Self::acquire_open_file_until(file, lock_path, deadline)
+        Self::acquire_open_file_until(file, &lock_path, deadline)
     }
 
     fn acquire_with_timeout(
@@ -2552,12 +2552,12 @@ impl RepositoryMutationLock {
     ) -> Result<Self, (String, ErrorKind)> {
         let deadline = std::time::Instant::now() + timeout;
         let (file, lock_path) = Self::open_file(repo_root, timeout)?;
-        Self::acquire_open_file_until(file, lock_path, deadline)
+        Self::acquire_open_file_until(file, &lock_path, deadline)
     }
 
     fn acquire_open_file_until(
         file: std::fs::File,
-        lock_path: PathBuf,
+        lock_path: &Path,
         deadline: std::time::Instant,
     ) -> Result<Self, (String, ErrorKind)> {
         loop {

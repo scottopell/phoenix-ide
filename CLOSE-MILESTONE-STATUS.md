@@ -1,10 +1,44 @@
 # Architectural reduction candidate — unqualified
 
+## Current qualification and reviewed lint follow-up
+
+Published `e169f02a4a6e72b543c79c3a4363b34faed9e2eb` completed
+[Close45532375109](https://github.com/scottopell/phoenix-ide/actions/runs/45532375109)
+**successfully**, including the complete foundation module (**270 passed / 0 failed /
+0 ignored**). Initial public physical Worktree retirement, captured-loss cleanup →
+explicit retry → reclaim → replay, and each of the four causal Stop selectors each
+executed **1 passed / 0 failed / 0 ignored**. These logs are retained under
+`/tmp/close-e169f02a4/artifacts/close-exact-source-e169f02a4a6e72b543c79c3a4363b34faed9e2eb-1/`.
+The before-writer selector is pre-acquisition, not held-writer contention proof.
+
+[CI45532383507](https://github.com/scottopell/phoenix-ide/actions/runs/45532383507)
+completed **failed**. Rust qualification used synthetic merge
+`6ed3d36f458f9e9f4208d580fb45d4a51070d8b2`, with parents main `469647699` and
+feature `e169f02a4`; early source checks used the exact feature source. The complete
+retained Clippy capture reported 268 emissions / 234 distinct source-site+lints
+across three crates. Rust test compilation also rejected the unused completion
+receipt re-export and never-constructed completion admission variant. E2e, dev.py
+tests, UI/specs, task validation and early source checks passed; broad Rust test
+execution was skipped after compilation failed. Close-only green is not merge-ready.
+
+This follow-up removes that dead completion residue while preserving historical
+Replay, consolidates repeated match/exit logic, boxes large live payloads and shared
+future boundaries, and extracts cohesive scanner/physical binding helpers. All Stop,
+identity, deadline, retained-custody and replay assertions remain required. Independent
+source review caught and corrected boxed generic-bound arguments, a cancel-wrapper
+name collision, irrefutable Replay patterns and remaining repeated match arms.
+The finite original diagnostic inventory was reconciled by source inspection; this
+is not a compiler, Clippy or formatter receipt. No local executable validation ran.
+The follow-up remains **unqualified** pending fresh automatic Close and standard CI
+on its published source. No main merge, installation or release is claimed.
+
+## Historical candidate evidence
+
 The current source reduces the Close expansion against shipped RC16
 `9885834f049683f5e6fa9c840668bdab92eb8a01`. The keep/share/delete ledger is
 [CLOSE-ARCHITECTURE-REDUCTION.md](CLOSE-ARCHITECTURE-REDUCTION.md).
 
-- Latest published head `7c659cc3282c89c8df812f9c8b7e1b79e06df53e`:
+- Historical published head `7c659cc3282c89c8df812f9c8b7e1b79e06df53e`:
   [Close45521202899](https://github.com/scottopell/phoenix-ide/actions/runs/45521202899)
   and [CI45521211723](https://github.com/scottopell/phoenix-ide/actions/runs/45521211723)
   are terminal **failed**. Exact Close artifacts under `/tmp/close-7c659cc32/`

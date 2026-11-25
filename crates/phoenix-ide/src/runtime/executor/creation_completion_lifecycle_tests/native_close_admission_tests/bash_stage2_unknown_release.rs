@@ -82,6 +82,8 @@ async fn bash_second_writer_unknown_release_retains_owner_after_public_close_wai
     assert_unknown_release_custody(true).await;
 }
 
+// Keep the real callback, injected unknown release, fail-stop, and custody proofs ordered.
+#[allow(clippy::too_many_lines)]
 async fn assert_unknown_release_custody(drop_close_before_second_writer: bool) {
     use crate::coordinator_tools;
     use crate::runtime::close_retirement::native_initial::bash::BashStage2TestHook;
@@ -361,10 +363,10 @@ async fn assert_unknown_release_custody(drop_close_before_second_writer: bool) {
     // unknown SQLite result. This owner and its original waiter must stay pinned
     // until the assertions above have proved the production fail-stop path.
     {
-        let state = custody.lock().await;
-        assert_eq!(state.stage, BashStage::Quarantined);
+        let custody_guard = custody.lock().await;
+        assert_eq!(custody_guard.stage, BashStage::Quarantined);
         assert!(
-            state.owner.is_some(),
+            custody_guard.owner.is_some(),
             "entire original owner remains in custody"
         );
     }
@@ -423,7 +425,9 @@ async fn assert_unknown_release_custody(drop_close_before_second_writer: bool) {
                         .await
                         .expect("the original waiter remains owned");
                 }
-                other => panic!("original waiter did not settle: {other:?}"),
+                other @ phoenix_tools::bash::handle::WaiterSettlement::Unverified(_) => {
+                    panic!("original waiter did not settle: {other:?}");
+                }
             }
         }
     })

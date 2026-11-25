@@ -1,5 +1,39 @@
 # Close architecture reduction disposition
 
+## Current follow-up: e169 Close green, broad CI red
+
+Exact feature `e169f02a4` passed the complete Close workflow `45532375109`, including
+270 foundation tests and the initial physical / captured-loss retry / four causal
+Stop journeys (each 1 passed, 0 failed, 0 ignored). Standard CI `45532383507` failed
+on synthetic merge `6ed3d36f4` (main `469647699` + feature `e169f02a4`): dead completion
+residue blocked test compilation, and the complete Clippy capture exposed 234 distinct
+source-site+lints. See [CLOSE-MILESTONE-STATUS.md](CLOSE-MILESTONE-STATUS.md) for
+provenance and retained evidence. This follow-up is not yet hosted-qualified.
+
+Disposition of this finite repair inventory:
+- **Delete:** unused completion receipt re-export and never-constructed admission
+  variant; retain historical Replay and its storage/schema compatibility assertions.
+- **Share:** one actor exit-deferral macro with an explicit loop-label parameter;
+  combined identical phase arms; cohesive Linux scanner revalidation and test
+  assertion helpers; physical Worktree binding validation.
+- **Keep with smaller storage/future boundaries:** boxed large assessment, initial
+  continuation and lease-failure payloads preserve live gate/sender/custody ownership;
+  boxing at reused API and public-journey boundaries avoids repeated call-site lint
+  suppressions without spawning or detaching execution.
+- **Simplify:** remove the impossible internal physical-retirement Result error layer;
+  preserve typed Residual, uncertainty retention and the outer publication contract.
+- **Retain proofs:** narrowly documented long-function allowances remain only where
+  the phase/journey is kept together. No blanket module/crate suppression or adversarial
+  assertion removal is used. Mechanical documentation, borrowing, pattern, time and
+  assertion lint repairs do not authorize new behavior.
+
+Source-only independent reviews covered the full dirty source delta and reconciled
+the original diagnostic inventory. Findings were corrected before publication;
+compiler/layout/formatter success remains a hosted obligation. The architectural
+reduction and separate native-task preservation boundary remain unchanged.
+
+## Earlier reduction evidence
+
 This is a scope ledger against shipped baseline `9885834f`, implemented in
 reduction `d180a5e12` and now integrated with main `469647699`. The integrated
 candidate remains **UNQUALIFIED**. Reduction Close run `45509934652` failed:

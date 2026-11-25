@@ -577,9 +577,11 @@ async fn initial_precondition_rollback_does_not_release_running_owner() {
         )
         .await
         .unwrap();
-    let mut continuation = match admission {
-        native_close::NativeCloseInitialAdmission::Continued { continuation, .. } => continuation,
-        _ => panic!("fresh admission must return an owned continuation"),
+    let native_close::NativeCloseInitialAdmission::Continued {
+        mut continuation, ..
+    } = admission
+    else {
+        panic!("fresh admission must return an owned continuation");
     };
 
     assert_eq!(
@@ -619,9 +621,11 @@ async fn exact_stopped_initial_run_releases_owner_and_returns_original_receipt()
         )
         .await
         .unwrap();
-    let mut continuation = match admission {
-        native_close::NativeCloseInitialAdmission::Continued { continuation, .. } => continuation,
-        _ => panic!("fresh admission must return an owned continuation"),
+    let native_close::NativeCloseInitialAdmission::Continued {
+        mut continuation, ..
+    } = admission
+    else {
+        panic!("fresh admission must return an owned continuation");
     };
     let receipt = continuation.receipt.clone();
     let run = phoenix_core::domain::close::CloseRunRef {
@@ -668,9 +672,11 @@ async fn unrelated_initial_receipt_cannot_release_stopped_run_owner() {
         )
         .await
         .unwrap();
-    let mut continuation = match admission {
-        native_close::NativeCloseInitialAdmission::Continued { continuation, .. } => continuation,
-        _ => panic!("fresh admission must return an owned continuation"),
+    let native_close::NativeCloseInitialAdmission::Continued {
+        mut continuation, ..
+    } = admission
+    else {
+        panic!("fresh admission must return an owned continuation");
     };
     let run = phoenix_core::domain::close::CloseRunRef {
         attempt_id: continuation.receipt.admitted.attempt_id.clone(),
@@ -718,8 +724,8 @@ async fn direct_initial_replay_sends_exact_receipt_without_pending_work() {
     assert!(matches!(
         admission,
         Ok(native_close::NativeCloseInitialAdmission::Finished {
-            _result: NativeCloseInitialResult::Replay(ref replay),
-        }) if replay == &receipt
+            _result: NativeCloseInitialResult::Replay(ref replayed_receipt),
+        }) if replayed_receipt == &receipt
     ));
     assert_eq!(
         reply.await.unwrap(),
@@ -758,11 +764,12 @@ async fn direct_dropped_pending_initial_fences_before_releasing_owner() {
             response,
         )
         .await;
-    let pending = match admission {
-        Ok(native_close::NativeCloseInitialAdmission::Continued { continuation, .. }) => {
-            continuation
-        }
-        _ => panic!("fresh admission must own pending work"),
+    let Ok(native_close::NativeCloseInitialAdmission::Continued {
+        continuation: pending,
+        ..
+    }) = admission
+    else {
+        panic!("fresh admission must own pending work");
     };
     assert_eq!(fence.owner_count(), 1);
     assert!(matches!(
@@ -1255,7 +1262,7 @@ async fn admit_initial_continuation(
             continuation,
         } => {
             assert_eq!(continuation.receipt, receipt);
-            (continuation, fence)
+            (*continuation, fence)
         }
         _ => panic!("new initial Close must retain its source owner"),
     }
@@ -1311,8 +1318,10 @@ async fn initial_inspection_continuation(
         .await
         .unwrap()
     {
-        native_close::NativeCloseInitialAdmission::Continued { continuation, .. } => continuation,
-        _ => panic!("new initial Close must retain its source owner"),
+        native_close::NativeCloseInitialAdmission::Continued { continuation, .. } => *continuation,
+        native_close::NativeCloseInitialAdmission::Finished { .. } => {
+            panic!("new initial Close must retain its source owner");
+        }
     }
 }
 
@@ -1515,6 +1524,8 @@ async fn eviction_shutdown_refuses_ordinary_work_while_close_exit_rolls_back() {
     assert_actor_exit_from_dormant_close(false).await;
 }
 
+// Keep dormant admission, actor exit, rollback, and owner-release witnesses in order.
+#[allow(clippy::too_many_lines)]
 async fn assert_actor_exit_from_dormant_close(process_shutdown: bool) {
     use native_close::NativeCloseInitialContinuationPhase as Phase;
     use phoenix_core::domain::close::{CloseRunRef, CloseRunStatus};
@@ -1681,7 +1692,7 @@ async fn assert_actor_exit_from_dormant_close(process_shutdown: bool) {
 }
 
 /// Real capture and Terminal entry, with a passive /dev/null handle (no PTY child).
-/// The held in-memory connection proves pool unavailability, not SQLite BUSY.
+/// The held in-memory connection proves pool unavailability, not `SQLite` BUSY.
 #[tokio::test]
 async fn acknowledged_stop_revokes_captured_terminal_entry_while_db_pool_is_unavailable() {
     run_acknowledged_stop_revokes_captured_terminal_entry(CloseFixture::new().await, None).await;
@@ -1700,6 +1711,8 @@ async fn acknowledged_stop_revokes_captured_terminal_entry_while_independent_sql
     drop(temp);
 }
 
+// Keep capture, writer contention, Stop ACK, and forbidden terminal-entry proofs ordered.
+#[allow(clippy::too_many_lines)]
 async fn run_acknowledged_stop_revokes_captured_terminal_entry(
     fixture: CloseFixture,
     independent_writer_path: Option<&std::path::Path>,
@@ -2723,14 +2736,13 @@ async fn invalid_captured_worktree_collector_does_not_route_generic_repair() {
             phoenix_db::native_close::NativeCloseInitialSettlement::Advanced(_)
         ))
     ));
-    let failure = match crate::runtime::close_retirement::collect_native_initial_inspection(
+    let Err(failure) = crate::runtime::close_retirement::collect_native_initial_inspection(
         &fixture.db,
         receipt.admitted.attempt_id.clone(),
     )
     .await
-    {
-        Err(failure) => failure,
-        Ok(_) => panic!("invalid captured worktree must fail inspection"),
+    else {
+        panic!("invalid captured worktree must fail inspection");
     };
     assert!(
         matches!(failure, crate::runtime::close_retirement::NativeInitialInspectionFailure::Scope {
@@ -2957,6 +2969,8 @@ async fn actor_services_initial_close_while_acknowledged_requests_remain_ready()
 }
 
 #[tokio::test]
+// Keep failed inspection, exact-intent retention, and classification-only retry causal.
+#[allow(clippy::too_many_lines)]
 async fn failed_inspection_classification_retains_exact_intent_for_classification_only_retry() {
     use phoenix_core::domain::close::{CloseRunRef, CloseRunStatus, RetirementFailureReason};
 
@@ -3080,6 +3094,8 @@ fn runtime(state: ConvState) -> RuntimeHarness {
 }
 
 #[tokio::test]
+// Keep the real registered tool, held gate, Stop ACK, and refusal witnesses together.
+#[allow(clippy::too_many_lines)]
 async fn registered_close_waiting_for_target_gate_is_refused_after_source_stop() {
     use crate::coordinator_tools;
     use crate::send_chat_service::SendChatApplicationService;

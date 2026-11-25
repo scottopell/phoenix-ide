@@ -90,10 +90,10 @@ fn select_original_worktrees(
 ) -> Result<Vec<OriginalWorktreeTarget>, String> {
     let mut targets = Vec::new();
     for scope in scopes {
-        let scoped = inventory.iter().filter(|item| {
+        let worktrees_in_scope = inventory.iter().filter(|item| {
             item.scope == *scope && item.resource.kind() == RetiredResourceKind::Worktree
         });
-        for item in scoped {
+        for item in worktrees_in_scope {
             let LossItemIdentity::Worktree(identity) = item.resource.identity() else {
                 return Err("captured Worktree has no typed worktree identity".into());
             };
@@ -206,7 +206,7 @@ impl PostRetirement {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)] // Orchestrates persisted stages while retaining the original inventory cursor.
     pub(super) async fn step(
         &mut self,
         command: &NativeCloseCommand,
@@ -413,6 +413,7 @@ impl PostRetirement {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_lines)] // Exact Worktree proof is intentionally one ordered stage transition.
     async fn step_worktree(
         &mut self,
         command: &NativeCloseCommand,
@@ -755,7 +756,11 @@ mod tests {
         let item = resource(RetiredResourceKind::Worktree, "first");
         let scope = item.scope.clone();
         assert!(
-            select_original_worktrees(&[item.clone(), item.clone()], &[scope.clone()]).is_err()
+            select_original_worktrees(
+                &[item.clone(), item.clone()],
+                std::slice::from_ref(&scope),
+            )
+            .is_err()
         );
         assert!(select_original_worktrees(&[item], &[]).is_err());
     }
@@ -768,7 +773,7 @@ mod tests {
             _ = run_authoritative_command(&mut stage, || {
                 std::future::pending::<LocalAuthorityResult<()>>()
             }) => panic!("unclassified writer cannot return"),
-            _ = std::future::ready(()) => {}
+            () = std::future::ready(()) => {}
         }
         assert!(matches!(stage, Stage::FatalAuthority));
         let later = run_authoritative_command(&mut stage, || {

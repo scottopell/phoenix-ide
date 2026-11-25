@@ -3,6 +3,8 @@
 use super::*;
 
 #[tokio::test]
+// Keep Stop acknowledgement, second-writer refusal, and compensation causally ordered.
+#[allow(clippy::too_many_lines)]
 async fn bash_stage_two_stop_ack_reaches_real_second_writer_and_cleans_once() {
     use crate::coordinator_tools;
     use crate::send_chat_service::SendChatApplicationService;
@@ -66,7 +68,7 @@ async fn bash_stage_two_stop_ack_reaches_real_second_writer_and_cleans_once() {
         "real Bash fixture failed to launch: {}",
         spawned.output()
     );
-    let spawned_json: serde_json::Value = serde_json::from_str(&spawned.output())
+    let spawned_json: serde_json::Value = serde_json::from_str(spawned.output())
         .expect("background Bash run returns its structured handle response");
     let handle_id = spawned_json["handle"]
         .as_str()
@@ -251,9 +253,9 @@ async fn bash_stage_two_stop_ack_reaches_real_second_writer_and_cleans_once() {
     // back the exact handle and release the native table writer without test
     // intervention. Uncertain cleanup paths must still retain their owners.
     {
-        let state = custody.lock().await;
+        let custody_guard = custody.lock().await;
         assert!(
-            state.owner.is_none(),
+            custody_guard.owner.is_none(),
             "confirmed compensated refusal releases native custody after handback"
         );
     }
@@ -328,7 +330,9 @@ async fn bash_stage_two_stop_ack_reaches_real_second_writer_and_cleans_once() {
                         .await
                         .expect("the original waiter remains owned");
                 }
-                other => panic!("disposable Bash waiter did not settle: {other:?}"),
+                other @ phoenix_tools::bash::handle::WaiterSettlement::Unverified(_) => {
+                    panic!("disposable Bash waiter did not settle: {other:?}");
+                }
             }
         }
     })
