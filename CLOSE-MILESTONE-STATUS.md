@@ -4,6 +4,45 @@ The current source reduces the Close expansion against shipped RC16
 `9885834f049683f5e6fa9c840668bdab92eb8a01`. The keep/share/delete ledger is
 [CLOSE-ARCHITECTURE-REDUCTION.md](CLOSE-ARCHITECTURE-REDUCTION.md).
 
+- Latest published head `7c659cc3282c89c8df812f9c8b7e1b79e06df53e`:
+  [Close45521202899](https://github.com/scottopell/phoenix-ide/actions/runs/45521202899)
+  and [CI45521211723](https://github.com/scottopell/phoenix-ide/actions/runs/45521211723)
+  are terminal **failed**. Exact Close artifacts under `/tmp/close-7c659cc32/`
+  prove actual initial public physical Worktree retirement and captured-loss
+  cleanup → explicit retry → reclaim → replay, each **1 passed / 0 failed / 0 ignored**.
+  All four causal Stop selectors (assessment, before writer acquisition, prepared,
+  before physical observation) likewise each executed **1 / 0 / 0**. Frontend,
+  specifications and final exact-source formatting passed. These are real reduced
+  implementation results, not overall qualification or held-writer contention proof.
+- That Close run's sole failed gate was the complete foundation module:
+  **269 passed / 1 failed / 0 ignored**. The approval source-fence regression
+  incorrectly unwrapped `close_safe_retry_progress` after the run was stopped;
+  it correctly refused with `retry progress requires the exact latest running
+  resource plan`. This follow-up asserts that public refusal and compares the
+  retained exact run's pending resources through the storage reader, preserving
+  the source-fence, obligation and no-rewrite assertions. The Coordinator-home
+  prerequisite was already present in the published source; it was not this failure.
+- Standard CI compiles synthetic merge `32a80c9dbb0f1dc247223b95e5cad922696806fb`
+  (parents main `469647699` and feature `7c659cc32`), not the feature SHA alone.
+  Its concrete blockers were dead `InitialProcessSelection::WholeKind`, unused
+  production `NativeInitialSourceFence::process_interrupted`, and core test
+  `manual_string_new`. E2e and seed setup failed while building on the same DB
+  errors. The e2e `run.py: error: unrecognized arguments:
+  product_conversation_context_continuation` diagnostic is explicitly emitted by
+  `test_parse_args_rejects_positional_arguments`, immediately followed by `ok`;
+  all 46 harness self-tests completed OK (one skipped) before the failing build.
+  It is accounted for, not an independent scenario invocation failure.
+- This unqualified follow-up deletes the obsolete whole-kind authorization facade
+  instead of suppressing its lint, migrates its assertions to live exact-resource
+  entry callbacks, retains exact dispatch/prior-success/retirement/source refusals,
+  confines the interruption constructor to its test-only caller, and uses
+  `String::new()` in the empty-source-ID refusal fixture. Source-only independent
+  review found no semantic/compile blocker; the stopped-reader refusal is now
+  explicit. Manual formatting and `git diff --check` are not executable validation.
+  Fresh automatic exact-head Close and standard CI are required after publication.
+- The entries below describe earlier candidates and their then-pending repairs;
+  they do not override the latest terminal results above.
+
 - Integrated head `efee002934983e84606a34e4a2b98a68d98957f5`: automatic
   [Close45517506691](https://github.com/scottopell/phoenix-ide/actions/runs/45517506691)
   and [CI45517517914](https://github.com/scottopell/phoenix-ide/actions/runs/45517517914)

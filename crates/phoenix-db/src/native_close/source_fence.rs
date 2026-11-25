@@ -19,6 +19,7 @@ pub(crate) struct NativeInitialSourceFence {
 }
 
 impl NativeInitialSourceFence {
+    #[cfg(test)]
     pub(crate) fn process_interrupted(run: CloseRunRef) -> Self {
         Self {
             run,

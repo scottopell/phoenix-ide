@@ -145,12 +145,6 @@ fn is_initial_process_kind(kind: RetiredResourceKind) -> bool {
     )
 }
 
-#[derive(Debug, Clone, Copy)]
-enum InitialProcessSelection<'a> {
-    WholeKind(RetiredResourceKind),
-    ExactResource(&'a RetiredResourceIdentity),
-}
-
 // Bind the sealed inventory, dispatches, and absence of prior success to one writer snapshot.
 #[allow(clippy::too_many_lines)]
 async fn validate_initial_process_step_tx(
@@ -160,12 +154,9 @@ async fn validate_initial_process_step_tx(
     live_source: &phoenix_core::domain::sm_state::ConvState,
     scope: WorkScopeId,
     snapshot: phoenix_core::domain::close::CloseRetirementSnapshot,
-    selection: InitialProcessSelection<'_>,
+    resource: &RetiredResourceIdentity,
 ) -> DbResult<NativeCloseInitialProcessAuthorization> {
-    let kind = match selection {
-        InitialProcessSelection::WholeKind(kind) => kind,
-        InitialProcessSelection::ExactResource(resource) => resource.kind(),
-    };
+    let kind = resource.kind();
     let result = async {
         if !is_initial_process_kind(kind) {
             return Err(DbError::CloseFoundationPrecondition(
@@ -222,22 +213,14 @@ async fn validate_initial_process_step_tx(
                 "initial process authorization snapshot differs from original inventory".into(),
             ));
         }
-        let process_inventory: Vec<_> = match selection {
-            InitialProcessSelection::WholeKind(_) => expected.iter()
-                .filter(|item| item.scope == scope && item.snapshot == snapshot
-                    && item.resource.kind() == kind)
-                .cloned().collect(),
-            InitialProcessSelection::ExactResource(resource) => {
-                let exact = expected.iter().find(|item| item.attempt_id == admitted.attempt_id
-                    && item.scope == scope && item.snapshot == snapshot
-                    && item.resource == *resource).cloned().ok_or_else(|| {
-                        DbError::CloseFoundationPrecondition(
-                            "initial process entry requires the exact resource in the original scoped inventory".into(),
-                        )
-                    })?;
-                vec![exact]
-            }
-        };
+        let exact = expected.iter().find(|item| item.attempt_id == admitted.attempt_id
+            && item.scope == scope && item.snapshot == snapshot
+            && item.resource == *resource).cloned().ok_or_else(|| {
+                DbError::CloseFoundationPrecondition(
+                    "initial process entry requires the exact resource in the original scoped inventory".into(),
+                )
+            })?;
+        let process_inventory = vec![exact];
         for item in &process_inventory {
             let dispatched: bool = sqlx::query_scalar(
                 "SELECT EXISTS(SELECT 1 FROM close_retirement_resource_dispatches
@@ -251,7 +234,7 @@ async fn validate_initial_process_step_tx(
                 .fetch_one(&mut **tx).await?;
             if !dispatched {
                 return Err(DbError::CloseFoundationPrecondition(
-                    "initial process launch requires every exact kind dispatch to be durable".into(),
+                    "initial process launch requires the exact resource dispatch to be durable".into(),
                 ));
             }
         }
@@ -372,49 +355,6 @@ async fn require_initial_original_dispatch_tx(
         ));
     }
     Ok(expected)
-}
-
-impl Database {
-    /// Revalidate current source and the complete durable launch inventory against a
-    /// transaction-time snapshot before an initial process-kind launch. This check does
-    /// not enforce single launch: repeated pre-effect checks are allowed. The manager
-    /// must consume the authorized kind and serialize source revocation at the actual
-    /// launch sink. This boundary performs no physical effects.
-    #[cfg(test)]
-    pub(crate) async fn authorize_native_close_initial_process_step(
-        &self,
-        command: &NativeCloseCommand,
-        receipt: &NativeCloseReceipt,
-        live_source: &phoenix_core::domain::sm_state::ConvState,
-        scope: WorkScopeId,
-        snapshot: phoenix_core::domain::close::CloseRetirementSnapshot,
-        kind: RetiredResourceKind,
-    ) -> LocalAuthorityResult<DbResult<NativeCloseInitialProcessAuthorization>> {
-        let mut tx = match self.pool.begin_with("BEGIN IMMEDIATE").await {
-            Ok(tx) => tx,
-            Err(error) => return LocalAuthorityResult::DurableFactEstablished(Err(error.into())),
-        };
-        let result = validate_initial_process_step_tx(
-            &mut tx,
-            command,
-            receipt,
-            live_source,
-            scope,
-            snapshot,
-            InitialProcessSelection::WholeKind(kind),
-        )
-        .await;
-        match result {
-            Ok(authorization) => match tx.commit().await {
-                Ok(()) => LocalAuthorityResult::DurableFactEstablished(Ok(authorization)),
-                Err(_) => LocalAuthorityResult::DurableFactUnclassified,
-            },
-            Err(error) => match tx.rollback().await {
-                Ok(()) => LocalAuthorityResult::DurableFactEstablished(Err(error)),
-                Err(_) => LocalAuthorityResult::DurableFactUnclassified,
-            },
-        }
-    }
 }
 
 async fn validate_initial_worktree_entry_tx(
@@ -577,7 +517,7 @@ impl Database {
             live_source,
             scope,
             snapshot,
-            InitialProcessSelection::ExactResource(resource),
+            resource,
         )
         .await;
         if let Err(error) = validation {
@@ -641,7 +581,7 @@ impl Database {
             live_source,
             scope,
             snapshot,
-            InitialProcessSelection::ExactResource(resource),
+            resource,
         )
         .await
         {

@@ -22,6 +22,39 @@ differences. The next candidate corrects the import to its verified declaration 
 the hosted format patch. It is not yet qualified; reduction does not revert to the
 pre-audit successful candidate.
 
+## Latest qualification and next reduction slice
+
+Published `7c659cc32` completed Close `45521202899` red only at the complete
+foundation module (269 passed, 1 failed). Actual initial public physical retirement,
+captured-loss explicit retry/reclaim/replay and all four causal Stops each executed
+1 passed / 0 failed / 0 ignored. Frontend, specifications and exact formatting passed.
+This does not qualify the overall candidate. Retained evidence is in
+`/tmp/close-7c659cc32/`; see the milestone ledger for exact source and CI provenance.
+
+The foundation failure was the approval source-fence regression reading public retry
+progress after the exact run stopped. The follow-up requires that refusal, then
+checks retained pending identities/order using the exact-run storage reader, keeping
+all source-fence, unchanged-obligation and retained-plan assertions. No admission or
+role trigger is relaxed; the Coordinator-home fixture prerequisite already existed.
+
+Standard CI `45521211723` tested GitHub synthetic merge `32a80c9db` of feature
+`7c659cc32` into main `469647699`, and remains red. This next slice deletes the
+unused whole-kind DB authorization facade and selection enum, migrating assertions
+to the live exact-resource entry boundary instead of preserving dead architecture
+with a lint suppression. Exact inventory membership, dispatch, original source,
+scope/snapshot, prior-success and positive-retirement refusal remain enforced.
+The interruption convenience constructor is test-only, matching its only caller;
+production recovery retains its own `ProcessInterrupted` construction. The core
+empty-ID fixture uses `String::new()` without removing its refusal assertion.
+The e2e argument error is expected output of a passing positional-argument rejection
+self-test (46 harness tests completed OK, one skipped); subsequent e2e and seed
+setup build failures contain the same DB dead-code errors, not a separate CLI defect.
+
+Source-only review found no concrete semantic/compile blocker. Manual formatting
+and whitespace checks do not prove lint/build/test success. Fresh automatic hosted
+Close and broad CI are owed. The prior-candidate paragraphs above are historical;
+no return to the expanded pre-audit implementation or merge/release claim is made.
+
 ## Keep
 
 - One shared executing-source predicate in core, used by DB and IDE callers. This

@@ -135,7 +135,7 @@ mod tests {
         assert_refused(
             &state,
             &SourceToolCall {
-                tool_use_id: "".into(),
+                tool_use_id: String::new(),
                 ..source.clone()
             },
             &input,

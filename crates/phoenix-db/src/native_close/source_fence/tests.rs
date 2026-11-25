@@ -1788,6 +1788,7 @@ async fn initial_process_first_effect_prior_success_or_retirement_blocks_only_ex
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)] // One sealed inventory exercises the exact-entry refusal matrix.
 async fn initial_process_authorization_requires_exact_durable_source_scope_snapshot_and_dispatch() {
     use phoenix_core::domain::close::{CloseRetirementSnapshot, RetiredResourceKind};
 
@@ -1796,46 +1797,138 @@ async fn initial_process_authorization_requires_exact_durable_source_scope_snaps
     let process = inventories.iter().find(|item| {
         item.resource.kind() == RetiredResourceKind::BashProcessGroup
     }).unwrap();
-    let auth = db.authorize_native_close_initial_process_step(
-        &command, &receipt, &source, process.scope.clone(), process.snapshot.clone(),
-        RetiredResourceKind::BashProcessGroup,
-    ).await.established().unwrap().unwrap();
-    let (authorized_run, authorized_scope, authorized_snapshot, kind, process_inventory) = auth.into_parts();
-    assert_eq!(authorized_run.attempt_id, run.attempt_id);
-    assert_eq!(authorized_scope, process.scope);
-    assert_eq!(authorized_snapshot, process.snapshot);
-    assert_eq!(kind, RetiredResourceKind::BashProcessGroup);
-    assert_eq!(process_inventory.len(), 1);
-    assert!(process_inventory.iter().all(|item| {
-        item.resource.kind() == RetiredResourceKind::BashProcessGroup
-    }));
+    use crate::native_close::{
+        NativeCloseInitialEntryRelease, NativeCloseInitialResourceEntryDecision as Decision,
+        NativeCloseInitialResourceEntryResult as EntryResult,
+    };
 
-    // A process-kind absent from this sealed inventory is valid but yields no work.
-    let empty = db.authorize_native_close_initial_process_step(
-        &command, &receipt, &source, process.scope.clone(), process.snapshot.clone(),
+    let mut called = false;
+    assert!(matches!(
+        db.enter_native_close_initial_process_resource(
+            &command,
+            &receipt,
+            &source,
+            process.scope.clone(),
+            process.snapshot.clone(),
+            &process.resource,
+            || {
+                called = true;
+                Decision::Entered
+            },
+        )
+        .await,
+        EntryResult::Invoked {
+            decision: Decision::Entered,
+            release: NativeCloseInitialEntryRelease::Confirmed,
+        }
+    ));
+    assert!(called);
+
+    // A foreign resource must not receive an empty whole-kind allowance.
+    let absent = phoenix_core::domain::close::RetiredResourceIdentity::parse(
         RetiredResourceKind::BrowserSession,
-    ).await.established().unwrap().unwrap();
-    assert!(empty.into_parts().4.is_empty());
-    // A second transaction-time check does not claim a physical launch.
-    assert!(db.authorize_native_close_initial_process_step(
-        &command, &receipt, &source, process.scope.clone(), process.snapshot.clone(),
-        RetiredResourceKind::BashProcessGroup,
-    ).await.established().unwrap().is_ok());
+        phoenix_core::domain::close::LossItemIdentity::Opaque(
+            phoenix_core::domain::close::OpaqueIdentity::parse("absent-browser-session").unwrap(),
+        ),
+    )
+    .unwrap();
+    let mut called = false;
+    assert!(matches!(
+        db.enter_native_close_initial_process_resource(
+            &command,
+            &receipt,
+            &source,
+            process.scope.clone(),
+            process.snapshot.clone(),
+            &absent,
+            || {
+                called = true;
+                Decision::Entered
+            },
+        )
+        .await,
+        EntryResult::Rejected { .. }
+    ));
+    assert!(!called);
+    // An exact-resource check does not itself claim a physical launch.
+    assert!(matches!(
+        db.enter_native_close_initial_process_resource(
+            &command,
+            &receipt,
+            &source,
+            process.scope.clone(),
+            process.snapshot.clone(),
+            &process.resource,
+            || Decision::Entered,
+        )
+        .await,
+        EntryResult::Invoked {
+            decision: Decision::Entered,
+            ..
+        }
+    ));
 
-    for (scope, snapshot, kind) in [
-        (process.scope.clone(), CloseRetirementSnapshot::parse("wrong-generation", "wrong-fingerprint").unwrap(), RetiredResourceKind::BashProcessGroup),
-        (phoenix_core::work_scope::WorkScopeId::new(), process.snapshot.clone(), RetiredResourceKind::BashProcessGroup),
-        (process.scope.clone(), process.snapshot.clone(), RetiredResourceKind::WorkScope),
-        (process.scope.clone(), process.snapshot.clone(), RetiredResourceKind::EquivalentLiveResource),
+    let wrong_kind_resource = |kind| {
+        phoenix_core::domain::close::RetiredResourceIdentity::parse(
+            kind,
+            phoenix_core::domain::close::LossItemIdentity::Opaque(
+                phoenix_core::domain::close::OpaqueIdentity::parse(process.resource.identity().value())
+                    .unwrap(),
+            ),
+        )
+        .unwrap()
+    };
+    let wrong_snapshot =
+        CloseRetirementSnapshot::parse("wrong-generation", "wrong-fingerprint").unwrap();
+    for (scope, snapshot, resource) in [
+        (
+            process.scope.clone(),
+            wrong_snapshot,
+            process.resource.clone(),
+        ),
+        (
+            phoenix_core::work_scope::WorkScopeId::new(),
+            process.snapshot.clone(),
+            process.resource.clone(),
+        ),
+        (
+            process.scope.clone(),
+            process.snapshot.clone(),
+            wrong_kind_resource(RetiredResourceKind::BrowserSession),
+        ),
+        (
+            process.scope.clone(),
+            process.snapshot.clone(),
+            wrong_kind_resource(RetiredResourceKind::EquivalentLiveResource),
+        ),
     ] {
-        assert!(db.authorize_native_close_initial_process_step(
-            &command, &receipt, &source, scope, snapshot, kind,
-        ).await.established().unwrap().is_err());
+        let mut called = false;
+        assert!(matches!(
+            db.enter_native_close_initial_process_resource(
+                &command,
+                &receipt,
+                &source,
+                scope,
+                snapshot,
+                &resource,
+                || {
+                    called = true;
+                    Decision::Entered
+                },
+            )
+            .await,
+            EntryResult::Rejected { .. }
+        ));
+        assert!(!called);
     }
 }
 
 #[tokio::test]
 async fn initial_process_authorization_rejects_missing_dispatch_and_stopped_or_changed_source() {
+    use crate::native_close::{
+        NativeCloseInitialResourceEntryDecision as Decision,
+        NativeCloseInitialResourceEntryResult as EntryResult,
+    };
     use phoenix_core::domain::close::RetiredResourceKind;
 
     let (db, command, receipt, source, run) =
@@ -1845,18 +1938,48 @@ async fn initial_process_authorization_rejects_missing_dispatch_and_stopped_or_c
         }).await;
     let item = db.list_close_expected_retirement_resources(run.attempt_id.as_str()).await.unwrap()
         .into_iter().find(|item| item.resource.kind() == RetiredResourceKind::BashProcessGroup).unwrap();
-    assert!(db.authorize_native_close_initial_process_step(
-        &command, &receipt, &source, item.scope.clone(), item.snapshot.clone(), RetiredResourceKind::BashProcessGroup,
-    ).await.established().unwrap().is_err());
+    let mut called = false;
+    assert!(matches!(
+        db.enter_native_close_initial_process_resource(
+            &command,
+            &receipt,
+            &source,
+            item.scope.clone(),
+            item.snapshot.clone(),
+            &item.resource,
+            || {
+                called = true;
+                Decision::Entered
+            },
+        )
+        .await,
+        EntryResult::Rejected { .. }
+    ));
+    assert!(!called);
 
     let (db, command, receipt, source, run) = initial_source_fence_inventory_fixture(InitialSourceFenceInventoryConfig::default()).await;
     let item = db.list_close_expected_retirement_resources(run.attempt_id.as_str()).await.unwrap()
         .into_iter().find(|item| item.resource.kind() == RetiredResourceKind::BashProcessGroup).unwrap();
     write_source_fence_state(&db, &command, &ConvState::Idle, false).await.unwrap();
     assert_eq!(db.get_close_run(&run).await.unwrap().status, CloseRunStatus::Stopped);
-    assert!(db.authorize_native_close_initial_process_step(
-        &command, &receipt, &source, item.scope, item.snapshot, RetiredResourceKind::BashProcessGroup,
-    ).await.established().unwrap().is_err());
+    let mut called = false;
+    assert!(matches!(
+        db.enter_native_close_initial_process_resource(
+            &command,
+            &receipt,
+            &source,
+            item.scope,
+            item.snapshot,
+            &item.resource,
+            || {
+                called = true;
+                Decision::Entered
+            },
+        )
+        .await,
+        EntryResult::Rejected { .. }
+    ));
+    assert!(!called);
 }
 
 #[tokio::test]
@@ -1903,11 +2026,25 @@ async fn exact_initial_process_entry_is_per_resource_not_whole_kind() {
     ).await, EntryResult::Rejected { release: NativeCloseInitialEntryRelease::Confirmed, .. }));
     assert!(!called);
 
-    // Whole-kind compatibility remains deliberately conservative: A's success blocks the set.
-    assert!(db.authorize_native_close_initial_process_step(
-        &command, &receipt, &source, a.scope.clone(), a.snapshot.clone(),
-        RetiredResourceKind::BashProcessGroup,
-    ).await.established().unwrap().is_err());
+        // Prior evidence blocks this exact identity; it does not block sibling B.
+        let mut called = false;
+        assert!(matches!(
+            db.enter_native_close_initial_process_resource(
+                &command,
+                &receipt,
+                &source,
+                a.scope.clone(),
+                a.snapshot.clone(),
+                &a.resource,
+                || {
+                    called = true;
+                    Decision::Entered
+                },
+            )
+            .await,
+            EntryResult::Rejected { .. }
+        ));
+        assert!(!called);
 
     assert!(matches!(db.enter_native_close_initial_process_resource(
         &command, &receipt, &source, b.scope.clone(), b.snapshot.clone(), &b.resource,
@@ -2094,6 +2231,10 @@ async fn exact_initial_process_entry_requires_original_binding_and_preserves_loc
 
 #[tokio::test]
 async fn initial_process_authorization_rejects_source_changed_then_restored() {
+    use crate::native_close::{
+        NativeCloseInitialResourceEntryDecision as Decision,
+        NativeCloseInitialResourceEntryResult as EntryResult,
+    };
     use phoenix_core::domain::close::RetiredResourceKind;
 
     let (db, command, receipt, source, run) = initial_source_fence_inventory_fixture(InitialSourceFenceInventoryConfig::default()).await;
@@ -2102,13 +2243,32 @@ async fn initial_process_authorization_rejects_source_changed_then_restored() {
     write_source_fence_state(&db, &command, &ConvState::Idle, false).await.unwrap();
     write_source_fence_state(&db, &command, &source, false).await.unwrap();
     assert_eq!(db.get_conversation(command.source_transcript_id()).await.unwrap().state, source);
-    assert!(db.authorize_native_close_initial_process_step(
-        &command, &receipt, &source, item.scope, item.snapshot, RetiredResourceKind::BashProcessGroup,
-    ).await.established().unwrap().is_err());
+    let mut called = false;
+    assert!(matches!(
+        db.enter_native_close_initial_process_resource(
+            &command,
+            &receipt,
+            &source,
+            item.scope,
+            item.snapshot,
+            &item.resource,
+            || {
+                called = true;
+                Decision::Entered
+            },
+        )
+        .await,
+        EntryResult::Rejected { .. }
+    ));
+    assert!(!called);
 }
 
 #[tokio::test]
 async fn initial_process_authorization_rejects_prior_process_success_or_positive_retirement() {
+    use crate::native_close::{
+        NativeCloseInitialResourceEntryDecision as Decision,
+        NativeCloseInitialResourceEntryResult as EntryResult,
+    };
     use phoenix_core::domain::close::RetiredResourceKind;
 
     for record_process_receipt in [false, true] {
@@ -2116,10 +2276,23 @@ async fn initial_process_authorization_rejects_prior_process_success_or_positive
         let process = db.list_close_expected_retirement_resources(run.attempt_id.as_str()).await.unwrap()
             .into_iter().find(|item| item.resource.kind() == RetiredResourceKind::BashProcessGroup).unwrap();
         if record_process_receipt {
-            assert!(db.record_native_close_initial_process_step_success(
-                &command, &receipt, &source, process.snapshot.clone(),
-                initial_bash_process_success(&run, &process.scope),
-            ).await.established().unwrap().is_ok());
+            let mut success = initial_bash_process_success(&run, &process.scope);
+            success.identity = phoenix_core::domain::close::OpaqueIdentity::parse(
+                process.resource.identity().value(),
+            )
+            .unwrap();
+            assert!(db
+                .record_native_close_initial_process_step_success(
+                    &command,
+                    &receipt,
+                    &source,
+                    process.snapshot.clone(),
+                    success,
+                )
+                .await
+                .established()
+                .unwrap()
+                .is_ok());
         } else {
             assert!(db.record_native_close_initial_retirement_evidence(
                 &command, &receipt, &source, RecordCloseRetirementEvidenceRequest {
@@ -2129,10 +2302,24 @@ async fn initial_process_authorization_rejects_prior_process_success_or_positive
                 },
             ).await.established().unwrap().is_ok());
         }
-        assert!(db.authorize_native_close_initial_process_step(
-            &command, &receipt, &source, process.scope, process.snapshot,
-            RetiredResourceKind::BashProcessGroup,
-        ).await.established().unwrap().is_err());
+        let mut called = false;
+        assert!(matches!(
+            db.enter_native_close_initial_process_resource(
+                &command,
+                &receipt,
+                &source,
+                process.scope,
+                process.snapshot,
+                &process.resource,
+                || {
+                    called = true;
+                    Decision::Entered
+                },
+            )
+            .await,
+            EntryResult::Rejected { .. }
+        ));
+        assert!(!called);
     }
 }
 
@@ -3034,5 +3221,14 @@ async fn approved_task_settlement_atomically_fences_replaced_native_close_source
     assert_source_fenced(&db, &assessment, &run, &pending).await;
     assert_eq!(source_fence_allowance(&db, &run).await, Some((0, 1)));
     assert_eq!(db.get_close_obligation(run.attempt_id.as_str()).await.unwrap(), original_obligation);
-    assert_eq!(db.close_safe_retry_progress(&run).await.unwrap().pending, pending);
+    // The source fence intentionally stops this run, so the public progress reader
+    // (which requires a running latest plan) must refuse. Inspect retained storage
+    // directly to prove the atomic fence did not rewrite its resource plan.
+    assert!(db.close_safe_retry_progress(&run).await.is_err());
+    let mut tx = db.pool().begin().await.unwrap();
+    let retained = crate::close_foundation::retained_close_retry_progress_tx(&mut tx, &run)
+        .await
+        .unwrap();
+    tx.rollback().await.unwrap();
+    assert_eq!(retained.pending, pending);
 }
