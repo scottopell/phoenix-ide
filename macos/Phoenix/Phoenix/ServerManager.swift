@@ -176,7 +176,6 @@ enum ConnectionState: Equatable {
     case unavailable(FailureState)
     case tlsFailure(FailureState)
     case wrongService(FailureState)
-    case unsupportedOwnership(VersionInfo, DeploymentInfo, String)
     case failed(FailureState)
 
     var displayName: String {
@@ -193,14 +192,13 @@ enum ConnectionState: Equatable {
         case .unavailable: "Unavailable"
         case .tlsFailure: "TLS trust failure"
         case .wrongService: "Wrong service"
-        case .unsupportedOwnership: "Read-only deployment"
         case .failed: "Failed"
         }
     }
 
     var canDisplayWebView: Bool {
         switch self {
-        case .identityVerified, .authenticationRequired, .ready, .unsupportedOwnership: true
+        case .identityVerified, .authenticationRequired, .ready: true
         default: false
         }
     }
@@ -209,8 +207,6 @@ enum ConnectionState: Equatable {
         switch self {
         case .failed(let failure), .unavailable(let failure), .tlsFailure(let failure), .wrongService(let failure):
             return ConnectionErrorViewModel(message: failure.message, allowsReconnect: true)
-        case .unsupportedOwnership(_, _, let message):
-            return ConnectionErrorViewModel(message: message, allowsReconnect: false)
         default:
             return nil
         }
@@ -220,7 +216,6 @@ enum ConnectionState: Equatable {
         switch self {
         case .identityVerified(let value), .authenticationRequired(let value), .verifyingDeployment(let value): value
         case .ready(let value, _): value
-        case .unsupportedOwnership(let value, _, _): value
         case .failed(let failure), .unavailable(let failure), .tlsFailure(let failure), .wrongService(let failure): failure.version
         default: nil
         }
@@ -228,7 +223,7 @@ enum ConnectionState: Equatable {
 
     var deploymentInfo: DeploymentInfo? {
         switch self {
-        case .ready(_, let deployment), .unsupportedOwnership(_, let deployment, _): deployment
+        case .ready(_, let deployment): deployment
         default: nil
         }
     }
@@ -249,6 +244,8 @@ struct ServerStatusSnapshot {
     let processID: Int32?
     let executablePath: String?
     let databasePath: String?
+    let phoenixLogPath: String?
+    let fatalLogPath: String?
     let logPath: String?
     let recentLogLines: [String]
 }
@@ -262,13 +259,6 @@ func deploymentMatchesBundledInstance(_ deployment: DeploymentInfo?, instanceID:
     guard let instanceID,
           let reported = deployment?.instanceID.flatMap(UUID.init(uuidString:)) else { return false }
     return reported == instanceID
-}
-
-func attachedDeploymentOwnershipViolation(_ ownership: InstallationOwnership) -> String? {
-    guard ownership.grantsManagedAuthority else {
-        return "Attached Phoenix is \(ownership.label). Phoenix.app manages only launchd-owned deployments; this deployment remains viewable but read-only."
-    }
-    return nil
 }
 
 actor SidecarLogRecorder {
@@ -847,12 +837,7 @@ final class ServerManager: ObservableObject {
         }
         let nextState: ConnectionState
         if let violation = deploymentViolation(deployment, for: selected, version: version) {
-            switch selected {
-            case .attached:
-                nextState = .unsupportedOwnership(version, deployment, violation)
-            case .bundled:
-                nextState = .failed(FailureState(version: version, message: violation))
-            }
+            nextState = .failed(FailureState(version: version, message: violation))
         } else {
             nextState = .ready(version, deployment)
         }
@@ -930,6 +915,8 @@ final class ServerManager: ObservableObject {
             processID: process?.processIdentifier,
             executablePath: bundled?.executableURL.path,
             databasePath: bundled?.databaseURL.path,
+            phoenixLogPath: bundled?.phoenixLogURL.path,
+            fatalLogPath: bundled?.fatalLogURL.path,
             logPath: bundled?.launcherLogURL.path,
             recentLogLines: recentLogLines
         )
@@ -966,13 +953,6 @@ final class ServerManager: ObservableObject {
             try acquireOwnerLock(configuration.ownerLockURL)
             launchedBundledInstance = LaunchedBundledInstance(configuration: configuration, instanceID: UUID())
             let sidecarSecrets = try keychain.sidecarEnvironment()
-            let logRecorder = SidecarLogRecorder(
-                writer: currentLogWriter,
-                exactSecretValues: Array(sidecarSecrets.values),
-                snapshotSink: { [logSnapshotSink] lines in
-                    await logSnapshotSink.publish(lines, operation: operation)
-                }
-            )
             let inherited = ProcessInfo.processInfo.environment
             guard let instanceID = launchedBundledInstance?.instanceID else {
                 throw ConfigurationError.bundledBinaryMissing
@@ -983,6 +963,16 @@ final class ServerManager: ObservableObject {
                 instanceID: instanceID,
                 publicEnvironment: configuration.publicEnvironment,
                 sidecarSecrets: sidecarSecrets
+            )
+            let logRecorder = SidecarLogRecorder(
+                writer: currentLogWriter,
+                exactSecretValues: SidecarLaunchEnvironment.sensitiveValuesForRedaction(
+                    environment: environment,
+                    sidecarSecrets: sidecarSecrets
+                ),
+                snapshotSink: { [logSnapshotSink] lines in
+                    await logSnapshotSink.publish(lines, operation: operation)
+                }
             )
 
             let launched = Process()
@@ -1164,13 +1154,13 @@ final class ServerManager: ObservableObject {
         }
     }
 
-    private func deploymentViolation(_ deployment: DeploymentInfo, for selected: ServerMode, version: VersionInfo) -> String? {
+    func deploymentViolation(_ deployment: DeploymentInfo, for selected: ServerMode, version: VersionInfo) -> String? {
         guard deployment.build.version == version.version, deployment.build.gitSHA == version.gitSHA else {
             return "Phoenix reported conflicting build identity between /api/version and /api/deployment."
         }
         switch selected {
         case .attached:
-            return attachedDeploymentOwnershipViolation(deployment.installationOwnership)
+            return nil
         case .bundled:
             guard LoopbackAddressPolicy.bundledBindAddressIsLoopback(deployment.network.bindAddress) else {
                 return "Bundled Phoenix reported a non-loopback listener: \(deployment.network.bindAddress)"

@@ -959,6 +959,10 @@ final class ConfigurationTests: XCTestCase {
         XCTAssertTrue(bad.signingMismatch)
     }
 
+    func testDefaultAttachedOriginUsesHTTPForLoopbackProduction() {
+        XCTAssertEqual(ConfigurationStore.defaultAttachedOrigin, "http://localhost:8031")
+    }
+
     func testBundledEnvironmentIsLoopbackTLSOffAndPrivate() throws {
         let root = URL(fileURLWithPath: "/tmp/Phoenix Tests")
         let configuration = BundledServerConfiguration(
@@ -968,6 +972,7 @@ final class ConfigurationTests: XCTestCase {
             dataDirectoryURL: root.appendingPathComponent(".phoenix-ide"),
             databaseURL: root.appendingPathComponent(".phoenix-ide/phoenix.db"),
             phoenixLogURL: root.appendingPathComponent(".phoenix-ide/phoenix.log"),
+            fatalLogURL: root.appendingPathComponent(".phoenix-ide/phoenix-fatal.log"),
             launcherLogURL: root.appendingPathComponent(".phoenix-ide/launcher.log"),
             ownerLockURL: root.appendingPathComponent("owner.lock"),
             rustLogLevel: "phoenix_ide=debug"
@@ -981,6 +986,9 @@ final class ConfigurationTests: XCTestCase {
         XCTAssertEqual(configuration.publicEnvironment["PHOENIX_TLS"], "off")
         XCTAssertEqual(configuration.publicEnvironment["PHOENIX_PORT"], "8420")
         XCTAssertEqual(configuration.publicEnvironment["PHOENIX_DB_PATH"], "/tmp/Phoenix Tests/.phoenix-ide/phoenix.db")
+        XCTAssertEqual(configuration.publicEnvironment["PHOENIX_LOG_FILE"], "/tmp/Phoenix Tests/.phoenix-ide/phoenix.log")
+        XCTAssertEqual(configuration.publicEnvironment["PHOENIX_FATAL_LOG_FILE"], "/tmp/Phoenix Tests/.phoenix-ide/phoenix-fatal.log")
+        XCTAssertEqual(configuration.publicEnvironment["PHOENIX_LOG_STDOUT"], "false")
         XCTAssertNil(configuration.publicEnvironment["ANTHROPIC_API_KEY"])
         XCTAssertNil(configuration.publicEnvironment["PHOENIX_PASSWORD"])
     }
@@ -1002,6 +1010,7 @@ final class ConfigurationTests: XCTestCase {
         XCTAssertEqual(configuration.dataDirectoryURL.deletingLastPathComponent(), configuration.runtimeRootURL)
         XCTAssertEqual(configuration.launcherLogURL.lastPathComponent, "launcher.log")
         XCTAssertEqual(configuration.phoenixLogURL.lastPathComponent, "phoenix.log")
+        XCTAssertEqual(configuration.fatalLogURL.lastPathComponent, "phoenix-fatal.log")
     }
 
     func testOwnershipDecoderFailsClosedForFutureKind() throws {
@@ -1061,6 +1070,7 @@ final class ConfigurationTests: XCTestCase {
             dataDirectoryURL: root.appendingPathComponent(".phoenix-ide"),
             databaseURL: root.appendingPathComponent(".phoenix-ide/phoenix.db"),
             phoenixLogURL: root.appendingPathComponent(".phoenix-ide/phoenix.log"),
+            fatalLogURL: root.appendingPathComponent(".phoenix-ide/phoenix-fatal.log"),
             launcherLogURL: root.appendingPathComponent(".phoenix-ide/launcher.log"),
             ownerLockURL: root.appendingPathComponent("owner.lock"),
             rustLogLevel: "info"
@@ -1478,7 +1488,6 @@ final class ServerManagerHelpersTests: XCTestCase {
         let matching = DeploymentInfo(
             build: BuildInfo(version: "1.2.3", gitSHA: "abc123"),
             network: NetworkInfo(bindAddress: "127.0.0.1:8420", socketActivated: false, tls: TLSInfo(enabled: false, mode: nil)),
-            currentMode: nil,
             instanceID: instanceID.uuidString,
             localAccess: true,
             installationOwnership: .development
@@ -1486,7 +1495,6 @@ final class ServerManagerHelpersTests: XCTestCase {
         let mismatched = DeploymentInfo(
             build: matching.build,
             network: matching.network,
-            currentMode: nil,
             instanceID: UUID().uuidString,
             localAccess: matching.localAccess,
             installationOwnership: matching.installationOwnership
@@ -1498,27 +1506,12 @@ final class ServerManagerHelpersTests: XCTestCase {
         XCTAssertFalse(deploymentMatchesBundledInstance(matching, instanceID: nil))
     }
 
-    func testDeploymentViolationCanLeaveAttachedDeploymentViewableButReadOnly() throws {
+    func testAttachedModeAcceptsAnyValidDeploymentOwnership() throws {
+        let manager = ServerManager(keychain: ScriptedSecretStore())
         let version = VersionInfo(version: "1.2.3", gitSHA: "abc123")
-        let deployment = DeploymentInfo(
-            build: BuildInfo(version: "1.2.3", gitSHA: "abc123"),
-            network: NetworkInfo(bindAddress: "127.0.0.1:8031", socketActivated: false, tls: TLSInfo(enabled: false, mode: nil)),
-            currentMode: nil,
-            instanceID: nil,
-            localAccess: true,
-            installationOwnership: .systemdManaged
-        )
-        let state = ConnectionState.unsupportedOwnership(version, deployment, "read-only")
-        XCTAssertTrue(state.canDisplayWebView)
-        XCTAssertEqual(state.versionInfo, version)
-        XCTAssertEqual(state.deploymentInfo, deployment)
-        XCTAssertEqual(state.failureViewModel, ConnectionErrorViewModel(message: "read-only", allowsReconnect: false))
-    }
-
-    func testAttachedDeploymentManagementRequiresLaunchdOwnership() {
-        XCTAssertNil(attachedDeploymentOwnershipViolation(.launchdManaged))
-
-        let unsupportedOwnerships: [InstallationOwnership] = [
+        let attached = ServerMode.attached(AttachedServerConfiguration(origin: try PhoenixOrigin("http://localhost:8031")))
+        let ownerships: [InstallationOwnership] = [
+            .launchdManaged,
             .systemdManaged,
             .bareSupervisorManaged,
             .development,
@@ -1527,10 +1520,15 @@ final class ServerManagerHelpersTests: XCTestCase {
             .unsupported("linux"),
             .unknown("future_managed_kind"),
         ]
-        for ownership in unsupportedOwnerships {
-            let violation = attachedDeploymentOwnershipViolation(ownership)
-            XCTAssertNotNil(violation, "\(ownership) must remain viewable but read-only")
-            XCTAssertTrue(violation?.contains("viewable but read-only") == true)
+        for ownership in ownerships {
+            let deployment = DeploymentInfo(
+                build: BuildInfo(version: version.version, gitSHA: version.gitSHA),
+                network: NetworkInfo(bindAddress: "127.0.0.1:8031", socketActivated: false, tls: TLSInfo(enabled: false, mode: nil)),
+                instanceID: nil,
+                localAccess: true,
+                installationOwnership: ownership
+            )
+            XCTAssertNil(manager.deploymentViolation(deployment, for: attached, version: version), "\(ownership) should be accepted in attached mode")
         }
     }
 
@@ -1540,7 +1538,6 @@ final class ServerManagerHelpersTests: XCTestCase {
         let deployment = DeploymentInfo(
             build: BuildInfo(version: version.version, gitSHA: version.gitSHA),
             network: NetworkInfo(bindAddress: "0.0.0.0:8031", socketActivated: false, tls: TLSInfo(enabled: true, mode: nil)),
-            currentMode: CurrentModeInfo(serverMode: "attached", webOrigin: "https://phoenix.example.test:8031"),
             instanceID: nil,
             localAccess: false,
             installationOwnership: .launchdManaged
@@ -1557,6 +1554,7 @@ final class ServerManagerHelpersTests: XCTestCase {
             dataDirectoryURL: URL(fileURLWithPath: "/tmp/runtime/.phoenix-ide", isDirectory: true),
             databaseURL: URL(fileURLWithPath: "/tmp/runtime/.phoenix-ide/phoenix.db"),
             phoenixLogURL: URL(fileURLWithPath: "/tmp/runtime/.phoenix-ide/phoenix.log"),
+            fatalLogURL: URL(fileURLWithPath: "/tmp/runtime/.phoenix-ide/phoenix-fatal.log"),
             launcherLogURL: URL(fileURLWithPath: "/tmp/runtime/.phoenix-ide/launcher.log"),
             ownerLockURL: URL(fileURLWithPath: "/tmp/runtime/owner.lock"),
             rustLogLevel: "phoenix_ide=info"
@@ -1569,7 +1567,6 @@ final class ServerManagerHelpersTests: XCTestCase {
                 DeploymentInfo(
                     build: BuildInfo(version: "1.0.0", gitSHA: "abc123"),
                     network: NetworkInfo(bindAddress: "127.0.0.1:8420", socketActivated: false, tls: TLSInfo(enabled: false, mode: nil)),
-                    currentMode: CurrentModeInfo(serverMode: "bundled", webOrigin: "http://127.0.0.1:8420"),
                     instanceID: UUID().uuidString,
                     localAccess: true,
                     installationOwnership: .development
@@ -1589,7 +1586,6 @@ final class ServerManagerHelpersTests: XCTestCase {
                 DeploymentInfo(
                     build: BuildInfo(version: "1.0.0", gitSHA: "abc123"),
                     network: NetworkInfo(bindAddress: "phoenix.example.test:443", socketActivated: false, tls: TLSInfo(enabled: true, mode: nil)),
-                    currentMode: CurrentModeInfo(serverMode: "attached", webOrigin: "https://phoenix.example.test"),
                     instanceID: nil,
                     localAccess: false,
                     installationOwnership: .launchdManaged
@@ -1608,7 +1604,6 @@ final class ServerManagerHelpersTests: XCTestCase {
                 DeploymentInfo(
                     build: BuildInfo(version: "1.0.0", gitSHA: "abc123"),
                     network: NetworkInfo(bindAddress: "127.0.0.1:8420", socketActivated: false, tls: TLSInfo(enabled: false, mode: nil)),
-                    currentMode: CurrentModeInfo(serverMode: "bundled", webOrigin: "http://127.0.0.1:8420"),
                     instanceID: UUID().uuidString,
                     localAccess: true,
                     installationOwnership: .development
@@ -1814,7 +1809,6 @@ final class ServerManagerHelpersTests: XCTestCase {
         let healthyDeployment = DeploymentInfo(
             build: BuildInfo(version: version.version, gitSHA: version.gitSHA),
             network: NetworkInfo(bindAddress: "phoenix.example.test:8031", socketActivated: false, tls: TLSInfo(enabled: true, mode: nil)),
-            currentMode: nil,
             instanceID: nil,
             localAccess: false,
             installationOwnership: .launchdManaged
@@ -1822,7 +1816,6 @@ final class ServerManagerHelpersTests: XCTestCase {
         let wrongOriginDeployment = DeploymentInfo(
             build: healthyDeployment.build,
             network: NetworkInfo(bindAddress: "other.example.test:8031", socketActivated: false, tls: TLSInfo(enabled: true, mode: nil)),
-            currentMode: nil,
             instanceID: nil,
             localAccess: false,
             installationOwnership: .launchdManaged
@@ -1830,7 +1823,7 @@ final class ServerManagerHelpersTests: XCTestCase {
 
         XCTAssertFalse(ConnectionReapplyDecision.evaluate(currentMode: candidate, currentState: .ready(version, healthyDeployment), candidate: candidate, intent: .applySettings).requiresReconnect)
         XCTAssertFalse(ConnectionReapplyDecision.evaluate(currentMode: candidate, currentState: .ready(version, wrongOriginDeployment), candidate: candidate, intent: .applySettings).requiresReconnect)
-        XCTAssertTrue(ConnectionReapplyDecision.evaluate(currentMode: candidate, currentState: .unsupportedOwnership(version, healthyDeployment, "read-only"), candidate: candidate, intent: .applySettings).requiresReconnect)
+        XCTAssertTrue(ConnectionReapplyDecision.evaluate(currentMode: candidate, currentState: .unavailable(FailureState(version: version, message: "offline")), candidate: candidate, intent: .applySettings).requiresReconnect)
         XCTAssertTrue(ConnectionReapplyDecision.evaluate(currentMode: nil, currentState: .stopped, candidate: candidate, intent: .applySettings).requiresReconnect)
         XCTAssertTrue(ConnectionReapplyDecision.evaluate(currentMode: candidate, currentState: .ready(version, healthyDeployment), candidate: candidate, intent: .statusReconnect).requiresReconnect)
     }
@@ -1857,6 +1850,19 @@ final class ServerManagerHelpersTests: XCTestCase {
                 "USER": "scott",
                 "LOGNAME": "scott",
                 "SSH_AUTH_SOCK": "/tmp/ssh.sock",
+                "XDG_CONFIG_HOME": "/Users/public/.xdg",
+                "LLM_API_KEY_HELPER": "/usr/local/bin/dd-helper",
+                "LLM_API_KEY_HELPER_TTL_MS": "3600000",
+                "ANTHROPIC_BASE_URL": "https://gateway.example.test/anthropic",
+                "OPENAI_BASE_URL": "https://gateway.example.test/openai",
+                "OPENAI_RESPONSES_BASE_URL": "https://gateway.example.test/responses",
+                "OPENAI_CHAT_COMPLETIONS_BASE_URL": "https://gateway.example.test/chat",
+                "LLM_CUSTOM_HEADERS": "X-Gateway-Key: gw-secret-1\\nX-Team: core",
+                "LLM_REQUEST_TAGS": "env=dev,team=ide",
+                "LLM_AUTH_HEADER": "bearer",
+                "PHOENIX_LLM_MODELS": "[{\"id\":\"custom\"}]",
+                "PHOENIX_LLM_REQUEST_MODELS": "{\"claude\":\"custom\"}",
+                "DEFAULT_MODEL": "claude-sonnet-4-6",
                 "SECRET_TOKEN": "nope",
             ],
             userHome: URL(fileURLWithPath: "/Users/public"),
@@ -1870,8 +1876,29 @@ final class ServerManagerHelpersTests: XCTestCase {
         XCTAssertEqual(environment["USER"], "scott")
         XCTAssertEqual(environment["LOGNAME"], "scott")
         XCTAssertEqual(environment["SSH_AUTH_SOCK"], "/tmp/ssh.sock")
+        XCTAssertEqual(environment["XDG_CONFIG_HOME"], "/Users/public/.xdg")
+        XCTAssertEqual(environment["LLM_API_KEY_HELPER"], "/usr/local/bin/dd-helper")
+        XCTAssertEqual(environment["LLM_API_KEY_HELPER_TTL_MS"], "3600000")
+        XCTAssertEqual(environment["ANTHROPIC_BASE_URL"], "https://gateway.example.test/anthropic")
+        XCTAssertEqual(environment["OPENAI_BASE_URL"], "https://gateway.example.test/openai")
+        XCTAssertEqual(environment["OPENAI_RESPONSES_BASE_URL"], "https://gateway.example.test/responses")
+        XCTAssertEqual(environment["OPENAI_CHAT_COMPLETIONS_BASE_URL"], "https://gateway.example.test/chat")
+        XCTAssertEqual(environment["LLM_CUSTOM_HEADERS"], "X-Gateway-Key: gw-secret-1\\nX-Team: core")
+        XCTAssertEqual(environment["LLM_REQUEST_TAGS"], "env=dev,team=ide")
+        XCTAssertEqual(environment["LLM_AUTH_HEADER"], "bearer")
+        XCTAssertEqual(environment["PHOENIX_LLM_MODELS"], "[{\"id\":\"custom\"}]")
+        XCTAssertEqual(environment["PHOENIX_LLM_REQUEST_MODELS"], "{\"claude\":\"custom\"}")
+        XCTAssertEqual(environment["DEFAULT_MODEL"], "claude-sonnet-4-6")
         XCTAssertNil(environment["SECRET_TOKEN"])
         XCTAssertEqual(environment["ANTHROPIC_API_KEY"], "secret")
+
+        let redactedValues = SidecarLaunchEnvironment.sensitiveValuesForRedaction(
+            environment: environment,
+            sidecarSecrets: ["ANTHROPIC_API_KEY": "secret"]
+        )
+        XCTAssertTrue(redactedValues.contains("secret"))
+        XCTAssertTrue(redactedValues.contains("gw-secret-1"))
+        XCTAssertTrue(redactedValues.contains("core"))
     }
 
     func testDeepLinkConversationValidationParsesRouteResponse() throws {

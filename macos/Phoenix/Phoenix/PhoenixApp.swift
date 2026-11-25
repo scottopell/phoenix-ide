@@ -167,7 +167,7 @@ struct SettingsView: View {
     private var attachedSettings: some View {
         VStack(alignment: .leading, spacing: 8) {
             Text("Managed deployment origin").font(.headline)
-            TextField("https://phoenix.example.test:8031", text: $draft.attachedOrigin)
+            TextField("http://localhost:8031", text: $draft.attachedOrigin)
                 .textFieldStyle(.roundedBorder)
             Text("Phoenix.app connects through the API and normal Phoenix login. It never starts, stops, configures, or updates this deployment.")
                 .font(.caption)
@@ -228,7 +228,7 @@ struct SettingsView: View {
     private var stateSymbol: String {
         switch serverManager.state {
         case .ready: "checkmark.circle.fill"
-        case .failed, .unavailable, .wrongService, .tlsFailure, .unsupportedOwnership: "xmark.circle.fill"
+        case .failed, .unavailable, .wrongService, .tlsFailure: "xmark.circle.fill"
         default: "ellipsis.circle"
         }
     }
@@ -236,7 +236,7 @@ struct SettingsView: View {
     private var stateColor: Color {
         switch serverManager.state {
         case .ready: .green
-        case .failed, .unavailable, .wrongService, .tlsFailure, .unsupportedOwnership: .red
+        case .failed, .unavailable, .wrongService, .tlsFailure: .red
         default: .secondary
         }
     }
