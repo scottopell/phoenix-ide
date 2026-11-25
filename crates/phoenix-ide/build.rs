@@ -46,7 +46,18 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=Cargo.toml");
     println!("cargo:rerun-if-changed=src");
-    emit_rerun_if_exists(Path::new("../../crates"));
+    if let Ok(entries) = std::fs::read_dir("../../crates") {
+        let mut crate_dirs: Vec<PathBuf> = entries
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.is_dir())
+            .collect();
+        crate_dirs.sort();
+        for crate_dir in crate_dirs {
+            emit_rerun_if_exists(&crate_dir.join("src"));
+            emit_rerun_if_exists(&crate_dir.join("Cargo.toml"));
+        }
+    }
 
     for git_path in ["HEAD", "index", "packed-refs"] {
         if let Some(path) = resolve_git_path(git_path) {
