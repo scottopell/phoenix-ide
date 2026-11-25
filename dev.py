@@ -5886,11 +5886,15 @@ def _usable_sccache(binary: str | None) -> tuple[str | None, str | None]:
     return version, None
 
 
+_QUALIFIED_KACHE_HOSTS = (("darwin", "arm64"), ("linux", "x86_64"))
+
+
 def _kache_host_error() -> str | None:
     machine = platform.machine().lower()
-    if sys.platform == "darwin" and machine == "arm64":
+    if (sys.platform, machine) in _QUALIFIED_KACHE_HOSTS:
         return None
-    return f"unsupported host {sys.platform}/{machine}; qualified host is darwin/arm64"
+    qualified = ", ".join(f"{os_name}/{arch}" for os_name, arch in _QUALIFIED_KACHE_HOSTS)
+    return f"unsupported host {sys.platform}/{machine}; qualified hosts are {qualified}"
 
 
 def _restore_environment_prefix(prefix: str, original: dict[str, str]) -> None:

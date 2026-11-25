@@ -141,11 +141,12 @@ class CompilerCacheTests(unittest.TestCase):
         )
         self.assertEqual("kache=trace", env["KACHE_LOG_FILE"])
 
-    def test_kache_host_support_is_limited_to_darwin_arm64(self):
-        with mock.patch.object(self.dev.sys, "platform", "darwin"), mock.patch.object(
-            self.dev.platform, "machine", return_value="arm64"
-        ):
-            self.assertIsNone(self.dev._kache_host_error())
+    def test_kache_host_support_is_limited_to_qualified_hosts(self):
+        for system, machine in (("darwin", "arm64"), ("linux", "x86_64")):
+            with self.subTest(qualified=f"{system}/{machine}"), mock.patch.object(
+                self.dev.sys, "platform", system
+            ), mock.patch.object(self.dev.platform, "machine", return_value=machine):
+                self.assertIsNone(self.dev._kache_host_error())
 
         for system, machine in (("linux", "aarch64"), ("win32", "AMD64"), ("darwin", "x86_64")):
             with self.subTest(system=system, machine=machine), mock.patch.object(
@@ -153,15 +154,15 @@ class CompilerCacheTests(unittest.TestCase):
             ), mock.patch.object(self.dev.platform, "machine", return_value=machine):
                 error = self.dev._kache_host_error()
                 self.assertIn(f"unsupported host {system}/{machine.lower()}", error or "")
-                self.assertIn("qualified host is darwin/arm64", error or "")
+                self.assertIn("qualified hosts are darwin/arm64, linux/x86_64", error or "")
 
     def test_explicit_kache_rejects_unsupported_host_before_version_probe(self):
         with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(
-            self.dev, "_kache_host_error", return_value="unsupported host linux/x86_64"
+            self.dev, "_kache_host_error", return_value="unsupported host linux/aarch64"
         ), mock.patch.object(self.dev, "_kache_binary", return_value="/bin/kache"), mock.patch.object(
             self.dev, "_kache_version"
         ) as version:
-            with self.assertRaisesRegex(SystemExit, "unsupported host linux/x86_64"):
+            with self.assertRaisesRegex(SystemExit, "unsupported host linux/aarch64"):
                 self.dev._configure_compiler_cache("kache")
         version.assert_not_called()
 
@@ -252,8 +253,8 @@ class CompilerCacheTests(unittest.TestCase):
         probe.assert_not_called()
 
     @unittest.skipUnless(
-        sys.platform == "darwin" and platform.machine().lower() == "arm64",
-        "Kache v1.2.2 is qualified only on macOS arm64",
+        (sys.platform, platform.machine().lower()) in (("darwin", "arm64"), ("linux", "x86_64")),
+        "Kache v1.2.2 is qualified only on macOS arm64 and Linux x86_64",
     )
     def test_local_kache_binary_is_supported(self):
         with mock.patch.dict(
@@ -1727,7 +1728,7 @@ class CompilerCacheTests(unittest.TestCase):
         ), mock.patch.object(
             self.dev,
             "_kache_host_error",
-            return_value="unsupported host linux/x86_64",
+            return_value="unsupported host linux/aarch64",
         ), mock.patch.object(
             self.dev, "_usable_sccache", return_value=("sccache 0.18.0", None)
         ):

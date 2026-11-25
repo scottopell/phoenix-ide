@@ -4,7 +4,12 @@ Phoenix uses one compiler-cache selection path for Rust checks, ordinary develop
 
 ## Installation
 
-Phoenix selects only released Kache `1.2.2` on macOS arm64, using a strictly local-only Phoenix-generated configuration. Install the official arm64 release or point `PHOENIX_KACHE_BIN` at its executable; other reported versions, including `1.0.0`, do not qualify. The v1.2.2 release tag peels to commit `96052b4842239bb216f6c4812054203c21550788`; the macOS arm64 `kache-aarch64-apple-darwin.tar.gz` release archive has SHA-256 `10d09e146852a8df8796cf642ca58872107a7f391b7647ec8cc253cf289af0a9`. These pins identify the selected release; they do not establish native restored-archive qualification.
+Phoenix selects only released Kache `1.2.2` on macOS arm64 (`darwin/arm64`) or Linux x86_64 (`linux/x86_64`), using a strictly local-only Phoenix-generated configuration. Install the official release for your qualified host or point `PHOENIX_KACHE_BIN` at its executable; other reported versions, including `1.0.0`, do not qualify. The `v1.2.2` release tag peels to commit `96052b4842239bb216f6c4812054203c21550788`:
+
+- macOS arm64 `kache-aarch64-apple-darwin.tar.gz`: SHA-256 `10d09e146852a8df8796cf642ca58872107a7f391b7647ec8cc253cf289af0a9`
+- Linux x86_64 `kache-x86_64-unknown-linux-musl.tar.gz`: SHA-256 `f2f6555dee50945c2a90a7fb793c2084a00cc6459d08ac2306d38d905064321b`
+
+These pins identify the selected release archives; native restored-archive qualification is recorded per host below.
 
 `sccache` remains supported when its executable is on `PATH`. Run `./dev.py doctor` to see each optional cache tool, executable, and version plus the effective compiler-cache request, read-only selected candidate, scope, and automatic fallback reasons. Doctor does not install tools, leave probe-created cache state, or start a daemon; its Kache version probe uses and removes an isolated temporary home. Kache runtime readiness is checked only when a Cargo command starts. A missing optional cache is advisory under `auto`, while an unusable backend explicitly requested through `PHOENIX_COMPILER_CACHE` fails doctor actionably. An explicit `RUSTC_WRAPPER` remains authoritative and is reported without executing an unknown custom wrapper; its scope is the caller-owned inherited environment rather than Phoenix's generated Cargo-only cache environment.
 
@@ -12,8 +17,8 @@ Phoenix selects only released Kache `1.2.2` on macOS arm64, using a strictly loc
 
 `PHOENIX_COMPILER_CACHE` accepts:
 
-- `auto` (default): prefer exact Kache 1.2.2 on macOS arm64 when its local-only daemon is ready, then usable sccache, then no cache;
-- `kache`: require exact Kache 1.2.2 and its owned local-only daemon on macOS arm64; fail actionably rather than substitute another backend;
+- `auto` (default): prefer exact Kache 1.2.2 on macOS arm64 or Linux x86_64 when its local-only daemon is ready, then usable sccache, then no cache;
+- `kache`: require exact Kache 1.2.2 and its owned local-only daemon on macOS arm64 or Linux x86_64; fail actionably rather than substitute another backend;
 - `sccache`: require sccache;
 - `none`: disable Phoenix's automatic wrapper.
 
@@ -34,6 +39,8 @@ Under pressure, retain the capped cache plus only targets for worktrees still in
 The exact macOS arm64 release artifact identified above was qualified on 2026-11-01 with isolated, test-owned home, cache, runtime, config, socket, and target paths. A hostile ambient config named an S3 endpoint, credentials, a different cache root, and a volume shard; Phoenix replaced both config selectors with its generated strict local-only config, started and proved ownership of its private child, and did not create either ambient store path. The child reported version `1.2.2`, the requested private socket, and the generated config path, then stopped cleanly.
 
 Two clean source roots containing an application and a local dependency were built into separate target directories with incremental compilation disabled. The first root produced two misses. The second root added two local hits with no additional misses and zero remote hits, so neither compiler executed for the restored application or dependency. Kache restored the executable's cached dSYM beside the second-root binary. `dwarfdump` reported matching binary/dSYM UUID `49FA89BE-6796-3147-9304-0DE8CA5C0794`; LLDB resolved and stopped at `main.rs:2`, and independently resolved `helper::doubled` at `lib.rs:3`.
+
+The exact Linux x86_64 release artifact (`kache-x86_64-unknown-linux-musl.tar.gz`, SHA-256 `f2f6555dee50945c2a90a7fb793c2084a00cc6459d08ac2306d38d905064321b`) received matching isolated native qualification on 2026-11-25 (recorded in [ADR-283](../../specs/adrs/283_extend-kache-v1-2-2-local-only-qualification-to-linux-x86-64.md)): hostile ambient S3/volume/remote settings were ignored, Phoenix started and verified ownership of its private daemon child (`1.2.2`) via `.state.json` PID and socket-inode receipt without touching ambient paths, the first source root produced two misses and the second source root produced two local hits with zero additional misses and zero remote hits (`copied_bytes: 4352681`, `hit_elapsed_ms: 26` vs. `miss_elapsed_ms: 229`), and after deleting the first source root GDB resolved and stopped on the restored ELF binary (`NT_GNU_BUILD_ID: 9873b3d5a0daa401b6f7a0e04dd44f5a996c1e2f`) at both `app/src/main.rs:2` and `helper/src/lib.rs:3` (`x = 21`).
 
 The source-level configuration and child-lifecycle regressions remain in `tests/devpy/test_compiler_cache.py`. Native qualification used only disposable fixtures and the official release artifact; it did not read active credentials, contact a remote object store, reuse an existing Kache daemon, or inspect or mutate existing cache or upload-queue state.
 
@@ -73,7 +80,7 @@ macOS exposes no unprivileged per-extent unique-allocation total for an arbitrar
 
 Historical validation for official Kache 1.0.0 on macOS arm64 covered version probe, daemon startup over a short explicit socket, Rust compilation, APFS reflink restore, and a two-source run through `./dev.py check --all --lanes e2e --compiler-cache kache`. That evidence establishes debug fidelity for exact 1.0.0 only. Earlier Kache 0.26.0 production-build and benchmark evidence likewise remains historical input.
 
-The exact v1.2.2 release received its own isolated local-only native qualification described above: owned daemon startup, clean-root application and dependency local hits without additional misses, zero remote hits, a UUID-matched restored dSYM, and resolved LLDB application and dependency file/line locations. Source-level tests separately cover selection, environment/configuration shaping, and child ownership. Not validated for v1.2.2: production activation, Windows or Linux restore/signing/debug-symbol behavior, other macOS architectures, cross-device filesystems without reflinks, or remote/S3 caches. Phoenix makes no compatibility or performance guarantee for those paths.
+The exact v1.2.2 release received its own isolated local-only native qualification on macOS arm64 and Linux x86_64 as described above: owned daemon startup, clean-root application and dependency local hits without additional misses, zero remote hits, and source-level debugger verification (UUID-matched restored dSYM + LLDB on macOS arm64; DWARF + GDB on Linux x86_64). Source-level tests separately cover selection, environment/configuration shaping, and child ownership. Not validated for v1.2.2: production activation, Windows, Linux aarch64, macOS x86_64, or remote/S3 caches. Phoenix makes no compatibility or performance guarantee for those paths.
 
 ### Managed-remote qualification blocker in Kache v1.0.0
 
