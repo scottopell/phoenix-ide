@@ -1,6 +1,6 @@
 use super::*;
 use crate::coordinator_tools;
-use crate::runtime::executor::native_close_retry::test_hooks::{Hooks, Point};
+use crate::runtime::executor::native_close_retry::test_hooks::{Hooks, Pause, Point};
 use crate::send_chat_service::SendChatApplicationService;
 use tokio_util::sync::CancellationToken;
 
@@ -321,8 +321,16 @@ pub(super) async fn retry_after_public_capture(
         let retry_tool = Arc::clone(&tool);
         let retry_input = input.clone();
         let retry_context = context.clone();
-        let retry = tokio::spawn(async move { retry_tool.run(retry_input, retry_context).await });
-        pause.reached().await;
+        let diagnostics_before_retry = physical_close_diagnostics();
+        let mut retry = tokio::spawn(async move { retry_tool.run(retry_input, retry_context).await });
+        require_retry_barrier(
+            &fixture,
+            initial_run,
+            &mut pause,
+            &mut retry,
+            &diagnostics_before_retry,
+        )
+        .await;
         assert!(
             !retry.is_finished(),
             "assessment remains owned by the held worker"
@@ -433,8 +441,16 @@ pub(super) async fn retry_after_public_capture(
         let retry_tool = Arc::clone(&tool);
         let retry_input = input.clone();
         let retry_context = context.clone();
-        let retry = tokio::spawn(async move { retry_tool.run(retry_input, retry_context).await });
-        pause.reached().await;
+        let diagnostics_before_retry = physical_close_diagnostics();
+        let mut retry = tokio::spawn(async move { retry_tool.run(retry_input, retry_context).await });
+        require_retry_barrier(
+            &fixture,
+            initial_run,
+            &mut pause,
+            &mut retry,
+            &diagnostics_before_retry,
+        )
+        .await;
         let receipt = fixture
             .db
             .read_native_close_explicit_retry_receipt(&fixture.command)
@@ -780,7 +796,48 @@ pub(super) async fn retry_after_public_capture(
         .unwrap();
 }
 
+async fn require_retry_barrier(
+    fixture: &CloseFixture,
+    run: &CloseRunRef,
+    pause: &mut Pause,
+    retry: &mut tokio::task::JoinHandle<phoenix_tools::ToolOutput>,
+    diagnostics_before_retry: &str,
+) {
+    let (failure, joined) = tokio::select! {
+        arrival = pause.reached() => match arrival {
+            Ok(()) => return,
+            Err(error) => (error.to_owned(), false),
+        },
+        result = &mut *retry => (
+            format!("public retry completed before its required barrier: {result:?}"),
+            true,
+        ),
+    };
+    let diagnostics = physical_close_diagnostics();
+    eprintln!(
+        "{failure}; public task finished: {}\ndiagnostics before held retry:\n{diagnostics_before_retry}\ndiagnostics after held retry (bounded tail):\n{diagnostics}",
+        retry.is_finished()
+    );
+    if !joined {
+        // Failure-only custody: do not detach the public waiter. Dropping the
+        // caller's Pause during unwind releases any held actor-owned worker.
+        retry.abort();
+        let result = tokio::time::timeout(Duration::from_secs(2), &mut *retry).await;
+        eprintln!("public retry join after barrier failure: {result:?}");
+    }
+    let evidence = tokio::time::timeout(
+        Duration::from_secs(2),
+        clean_retry_failure_evidence(fixture, run),
+    )
+    .await;
+    panic!("{failure}; durable evidence: {evidence:?}");
+}
+
 async fn clean_retry_failure_evidence(fixture: &CloseFixture, run: &CloseRunRef) -> String {
+    let source = fixture
+        .db
+        .get_conversation(&fixture.source_transcript_id)
+        .await;
     let target = fixture.db.get_conversation(TARGET_ID).await;
     let retry_rows = sqlx::query_scalar::<_, String>(
         "SELECT json_object('run_ordinal', run_ordinal, 'status', status,
@@ -800,7 +857,7 @@ async fn clean_retry_failure_evidence(fixture: &CloseFixture, run: &CloseRunRef)
         .await;
     let retirement = worktree_close_failure_evidence(fixture, run).await;
     format!(
-        "target: {target:?}; retry rows: {retry_rows:?}; retry receipt: {receipt:?}; cleanup failures: {cleanup_failures:?}; {retirement}"
+        "source: {source:?}; target: {target:?}; retry rows: {retry_rows:?}; retry receipt: {receipt:?}; cleanup failures: {cleanup_failures:?}; {retirement}"
     )
 }
 

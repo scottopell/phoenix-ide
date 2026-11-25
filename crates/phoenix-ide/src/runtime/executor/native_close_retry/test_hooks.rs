@@ -71,11 +71,11 @@ pub(crate) struct Pause {
 }
 
 impl Pause {
-    pub(crate) async fn reached(&mut self) {
+    pub(crate) async fn reached(&mut self) -> Result<(), &'static str> {
         tokio::time::timeout(std::time::Duration::from_secs(10), &mut self.arrival)
             .await
-            .expect("retry worker must reach the causal barrier")
-            .expect("retry worker dropped the causal barrier");
+            .map_err(|_| "retry worker did not reach the causal barrier before its deadline")?
+            .map_err(|_| "retry worker dropped the causal barrier")
     }
 
     pub(crate) fn release(self) {

@@ -2,6 +2,45 @@
 
 ## Current qualification and reviewed lint follow-up
 
+### c0d assessment-barrier failure — unresolved, diagnostic follow-up only
+
+[CI45591019848](https://github.com/scottopell/phoenix-ide/actions/runs/45591019848)
+is terminal failed. Its compiled source is synthetic merge
+`160823795487f0d78f830544775ef45eeb1e77e1` (feature c0d into main 4aba9625a),
+verified from checkout/build logs. Clippy, musl, early formatting, build/codegen,
+dev.py/task/UI/specs/E2E and release helper jobs passed. Rust shards 2/3/4 ran
+**1760 / 1753 / 1746**, all passing. Shard 1 ran **1637 / 1764**: **1636 passed,
+1 failed**, with 127 selected tests not run after fail-fast.
+
+The failing selector is **Stop during captured-loss assessment**, not the clean
+retry/replay selector. It timed out at `Pause::reached` before sending Stop.
+The assessment checkpoint is success-only: an already-completed refusal can
+leave its armed arrival sender retained and produce the same timeout as pending
+work. No original tool result was observed by that failure path. This does not
+establish a Stop defect, a scheduling delay, or a common cause with a251's final
+clean `storage_rejected`. The old dirty-phase warning remains non-causal evidence.
+
+The follow-up preserves the same ten-second barrier guard, racing arrival against
+the public task's actual completion. Failure prints the original result or pending
+state plus before/after bounded trace tails before diagnostic awaits, joins or
+aborts the failed public waiter, then reads bounded durable evidence including
+source state. Barrier success and all existing Stop/physical/durable assertions
+remain unchanged. There is no production behavior change or retry masking.
+
+The fixed diagnostic matrix now includes four independent samples of each observed
+failing selector, with distinct logs and sticky aggregate failure. Each process
+retains its 90-second plus kill-grace fence; the diagnostic step alone is bounded
+at sixteen minutes for eight samples. Existing journey and safety timeouts are
+unchanged. This is evidence collection, not a behavioral fix or merge acceptance.
+
+[Close45583380922](https://github.com/scottopell/phoenix-ide/actions/runs/45583380922)
+for exact 6d8 is now terminal **success**, with its artifacts preserved under
+`/tmp/close-6d8b7a769/artifacts/`; it does not explain either intermittent failure.
+Exact c0d [Close45591009329](https://github.com/scottopell/phoenix-ide/actions/runs/45591009329)
+has started; its results remain pending. Current c0d evidence is preserved under
+`/tmp/close-c0d72cbfb/`. No local executable validation, manual workflow operation,
+merge or deployment. Candidate remains **draft and unqualified**.
+
 ### 6d8 broad results and bounded intermittent retry diagnosis
 
 Candidate `6d8b7a769abcfc9aba70764d5672b1374a46499a` remains **unqualified**.

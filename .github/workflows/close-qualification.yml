@@ -221,26 +221,30 @@ jobs:
           done
           test "$failed" -eq 0
 
-      - name: Capture bounded intermittent clean-retry evidence
+      - name: Capture bounded intermittent retry and assessment evidence
         if: success() || failure()
-        timeout-minutes: 8
+        timeout-minutes: 16
         shell: bash
         run: |
           set -euo pipefail
           test -n "${PHOENIX_RUNTIME_TEST_BINARY:-}"
-          test_name='runtime::executor::creation_completion_lifecycle_tests::native_close_admission_tests::worktree_physical::registered_native_close_captured_loss_public_retry_with_production_detector_reclaims_and_replays'
-          grep -Fx "$test_name: test" evidence/runtime-inventory.log
           failed=0
-          # Fixed independent samples, not retries: every failure remains fatal.
-          # Preserve each process's evidence even when another sample fails.
-          for sample in 1 2 3 4; do
-            log="evidence/captured-loss-clean-retry-sample-$sample.log"
-            if ! timeout --kill-after=10s 90s bash scripts/ci/close-unprivileged-qualification.sh "$GITHUB_WORKSPACE" "$PHOENIX_RUNTIME_TEST_BINARY" "$PHOENIX_BASH_LAUNCH_TEST_EXE" "$(id -u)" "$test_name" --exact --nocapture --test-threads=1 2>&1 | tee "$log"; then
-              failed=1
-              continue
-            fi
-            grep -F "$test_name ... ok" "$log" || failed=1
-            grep -F 'test result: ok. 1 passed; 0 failed; 0 ignored;' "$log" || failed=1
+          for selector in \
+            registered_native_close_captured_loss_public_retry_with_production_detector_reclaims_and_replays \
+            registered_native_close_captured_loss_retry_stop_during_assessment_preserves_worktree_and_history; do
+            test_name="runtime::executor::creation_completion_lifecycle_tests::native_close_admission_tests::worktree_physical::$selector"
+            grep -Fx "$test_name: test" evidence/runtime-inventory.log
+            # Fixed independent samples, not retries: every failure remains fatal.
+            # Preserve each process's evidence even when another sample fails.
+            for sample in 1 2 3 4; do
+              log="evidence/$selector-sample-$sample.log"
+              if ! timeout --kill-after=10s 90s bash scripts/ci/close-unprivileged-qualification.sh "$GITHUB_WORKSPACE" "$PHOENIX_RUNTIME_TEST_BINARY" "$PHOENIX_BASH_LAUNCH_TEST_EXE" "$(id -u)" "$test_name" --exact --nocapture --test-threads=1 2>&1 | tee "$log"; then
+                failed=1
+                continue
+              fi
+              grep -F "$test_name ... ok" "$log" || failed=1
+              grep -F 'test result: ok. 1 passed; 0 failed; 0 ignored;' "$log" || failed=1
+            done
           done
           test "$failed" -eq 0
 
