@@ -374,6 +374,14 @@ async fn refresh_instance_identity_if_present(
     Ok(())
 }
 
+#[cfg(any(test, feature = "test-support"))]
+fn is_in_memory_path(path: &str) -> bool {
+    path == ":memory:"
+        || path == "sqlite::memory:"
+        || path.starts_with("file::memory:")
+        || path.is_empty()
+}
+
 #[cfg(test)]
 pub(crate) async fn open_in_memory_prefix_for_test(through: u32) -> DbResult<Database> {
     if template_disabled() {
@@ -385,6 +393,9 @@ pub(crate) async fn open_in_memory_prefix_for_test(through: u32) -> DbResult<Dat
         let sqlite_workload_collector = SqliteWorkloadCollector::new();
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
+            .min_connections(1)
+            .idle_timeout(None)
+            .max_lifetime(None)
             .after_connect({
                 let sqlite_workload_collector = sqlite_workload_collector.clone();
                 move |conn, _meta| {
@@ -443,7 +454,7 @@ pub(crate) async fn open_in_memory_prefix_for_test(through: u32) -> DbResult<Dat
 
 #[cfg(test)]
 pub(crate) async fn open_prefix_for_test(path: &str, through: u32) -> DbResult<Database> {
-    if path == ":memory:" {
+    if is_in_memory_path(path) {
         return open_in_memory_prefix_for_test(through).await;
     }
     let target = Path::new(path);
@@ -649,7 +660,7 @@ pub(crate) async fn seed_migrated_file_for_test(path: &Path) -> DbResult<bool> {
 
 #[cfg(any(test, feature = "test-support"))]
 pub(crate) async fn open_migrated_for_test(path: &str) -> DbResult<Database> {
-    if path == ":memory:" {
+    if is_in_memory_path(path) {
         return open_in_memory_from_template().await;
     }
     let seeded = seed_migrated_file_for_test(Path::new(path)).await?;
