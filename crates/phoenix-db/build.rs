@@ -35,13 +35,15 @@ fn main() {
     println!("cargo:rerun-if-changed=Cargo.toml");
     println!("cargo:rerun-if-changed=src");
 
-    for git_path in ["HEAD", "index", "packed-refs", "refs/heads"] {
+    for git_path in ["HEAD", "index", "packed-refs"] {
         if let Some(path) = resolve_git_path(git_path) {
             emit_rerun_if_exists(&path);
         }
     }
     if let Some(sym_ref) = git(&["symbolic-ref", "-q", "HEAD"]) {
         if let Some(path) = resolve_git_path(&sym_ref) {
+            emit_rerun_if_exists(&path);
+        } else if let Some(path) = resolve_git_path("refs/heads") {
             emit_rerun_if_exists(&path);
         }
     }
