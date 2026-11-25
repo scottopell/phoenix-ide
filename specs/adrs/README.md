@@ -25,16 +25,18 @@ Canonical migration 158-to-156 reconciliation is governed by [ADR-246](246_admit
 
 Codex reset-credit visibility and manual redemption, including resuming the stopped conversation after a redemption from its quota error, are governed by [ADR-208](208_codex-reset-credits-are-manual-and-resume-the-stopped-conversation.md), affecting REQ-CRR-001–010.
 
-Strict local-only selection of Kache v1.2.2 on macOS arm64 is governed by [ADR-225](225_kache-v1-2-2-strict-local-only-selection.md), superseding only ADR-224's selection conclusion; ADR-223 and ADR-224 retain their historical v1.0.0 evidence. Remote caching remains deferred.
+Strict local-only selection of Kache v1.2.2 on macOS arm64 and Linux x86_64 is governed by [ADR-225](225_kache-v1-2-2-strict-local-only-selection.md) and [ADR-285](285_extend-kache-v1-2-2-local-only-qualification-to-linux-x86-64.md), superseding only ADR-224's selection conclusion; ADR-223 and ADR-224 retain their historical v1.0.0 evidence. Remote caching remains deferred.
 
 ## Numbering and validation
 
 ADRs use unique three-digit numeric IDs in `NNN_<slug>.md` filenames. The
 shared chain includes ADR-000; gaps between IDs are allowed so independent
 decisions do not depend on unrelated publication order. Duplicate numeric IDs
-are invalid even when their slugs differ. Keep existing IDs and accepted
-decision history unchanged; do not add placeholders or renumber records to fill
-gaps.
+are invalid even when their slugs differ. The current main source already has two
+published ADR-285 records (Kache qualification and Coordinator evidence labels);
+this integration preserves both unchanged and leaves that upstream duplicate for
+separate reconciliation. Keep existing IDs and accepted decision history
+unchanged; do not add placeholders or renumber records to fill gaps.
 
 Every ADR must retain its status, date, affected scope, required sections, and
 matching index link. Index links must resolve to the matching numbered record.
@@ -44,9 +46,13 @@ Allowing gaps does not approve an ID allocation, decision, or publication.
 
 | ADR | Title | Status | Affects |
 | --- | --- | --- | --- |
-| [285](285_unified-close-idempotence-and-bounded-completion-retry.md) | Unified Close is idempotent with one bounded completion-only retry | Proposed; identity relocated from branch-local 282 to resolve collision with published ADR-282 | REQ-WL-002f; REQ-BED-029; `close_conversation`, retained Close operation and run identity |
-| [284](284_native-task-approval-source-snapshot-and-receipt.md) | Bind native task approval to canonical source, snapshot and receipt | Proposed | REQ-TAT-001–008; REQ-PROJ-003; REQ-BED-028/046; REQ-COMP-001/002; REQ-DWF-043 |
-| [283](283_close-uses-exact-blockers-and-explicit-retry-only.md) | Close uses exact blockers and explicit retry only | Accepted; supersedes 285's automatic completion policy and 088's in-Close discard/disposable alternative | REQ-WL-002/002a/002b/002c/002d/002e/002f/004; REQ-BED-029 |
+| [288](288_unified-close-idempotence-and-bounded-completion-retry.md) | Unified Close is idempotent with one bounded completion-only retry | Proposed; branch-local proposal; automatic completion policy superseded by ADR-286 | REQ-WL-002f; REQ-BED-029; `close_conversation`, retained Close operation and run identity |
+| [287](287_native-task-approval-source-snapshot-and-receipt.md) | Bind native task approval to canonical source, snapshot and receipt | Proposed | REQ-TAT-001–008; REQ-PROJ-003; REQ-BED-028/046; REQ-COMP-001/002; REQ-DWF-043 |
+| [286](286_close-uses-exact-blockers-and-explicit-retry-only.md) | Close uses exact blockers and explicit retry only | Accepted; supersedes branch-local ADR-288's automatic completion policy and ADR-088's in-Close discard/disposable alternative | REQ-WL-002/002a/002b/002c/002d/002e/002f/004; REQ-BED-029 |
+| [285](285_extend-kache-v1-2-2-local-only-qualification-to-linux-x86-64.md) | Extend Kache v1.2.2 strict local-only qualification to Linux x86_64 | Accepted | development methodology; REQ-COMP-001, REQ-COMP-008 |
+| [285](285_share-coordinator-evidence-origin-labels.md) | Share Coordinator evidence origin labels | Accepted | REQ-SCAN-004; REQ-TRACK-005 |
+| [284](284_raise-ordinary-foreground-window-to-eight.md) | Raise the ordinary foreground window to eight | Accepted | ordinary foreground tool batches; bounded execution window |
+| [283](283_run-ordinary-foreground-tool-batches-with-a-bounded-barrier.md) | Run ordinary foreground tool batches with a bounded barrier | Accepted | ordinary foreground tool batches; bounded execution barrier |
 | [282](282_cap-quoted-review-lines-at-a-character-boundary.md) | Cap quoted review lines at 200 UTF-16 units on a character boundary | Accepted | REQ-PF-009, REQ-PF-016 |
 | [274](274_remove-at-file-inclusion.md) | Remove `@file` content inclusion and leave `@` literal | Accepted | REQ-IR-001, REQ-IR-004, REQ-IR-006, REQ-IR-007, REQ-IR-010, REQ-FE-011 |
 | [273](273_fixed-rc9-preparation-without-publication-authority.md) | Fixed RC9 preparation without publication authority | Accepted | REQ-DESKTOP-REL-014 |
@@ -60,6 +66,10 @@ Allowing gaps does not approve an ID allocation, decision, or publication.
 | [276](276_preserve-gemini-tool-signatures-through-chat-completions.md) | Preserve Gemini tool signatures through Chat Completions | Accepted | REQ-LLM-002–005, REQ-LLM-007 |
 | [275](275_prefer-sol-6-2-for-new-conversations.md) | Prefer Sol 6.2 for new conversations | Accepted | REQ-LLM-003 |
 | [269](269_external-models-in-user-toml.md) | Load external model definitions from user TOML at startup | Accepted | REQ-LLM-003c, REQ-AG-010 |
+| [283](283_run-ordinary-foreground-tool-batches-with-a-bounded-barrier.md) | Run ordinary foreground tool batches with a bounded barrier | Accepted | REQ-BED-003–007, REQ-PERM-004, REQ-SA-005 |
+| [284](284_raise-ordinary-foreground-window-to-eight.md) | Raise the ordinary foreground window to eight | Accepted | REQ-BED-004, REQ-SA-005 |
+| [285](285_share-coordinator-evidence-origin-labels.md) | Share Coordinator evidence origin labels | Accepted | REQ-SCAN-004, REQ-TRACK-005 |
+
 | [264](264_scan-only-coordinator-history-with-host-owned-batches.md) | Scan only Coordinator history through bounded host-owned batches | Accepted | REQ-SCAN-001–008, REQ-TRACK-004–007 |
 | [263](263_verify-native-backup-and-bound-predecessor-recovery-for-macos-deploy.md) | Verify a native backup and bound predecessor recovery for macOS deploy | Accepted; qualifies ADR-230 | REQ-LDD-002/004/009/029–031, REQ-PD-010, REQ-COMP-021 |
 | [265](265_publish-recovered-launchd-plist-before-canonical-bootstrap.md) | Preserve SQLite path and recovered launchd plist identity | Accepted; qualifies ADR-263 | REQ-LDD-029–030 |
@@ -268,7 +278,7 @@ Allowing gaps does not approve an ID allocation, decision, or publication.
 | [222](222_unified-local-and-federated-database-query.md) | One authority-shaped database query surface selects local or federated execution | Accepted | REQ-FED-001–003, REQ-RQD-001/005/009/010 |
 | [223](223_kache-v1-restores-automatic-selection.md) | Qualified Kache v1 restores automatic compiler-cache selection | Superseded by ADR-224 (selection); v1.0.0 debugger evidence remains historical | development methodology; REQ-COMP-001, REQ-COMP-008 |
 | [224](224_kache-default-waits-for-identifiable-isolation-fix.md) | Kache default waits for an identifiable isolation fix | Selection conclusion superseded by ADR-225; historical v1.0.0 evidence retained | development methodology; REQ-COMP-001, REQ-COMP-008 |
-| [225](225_kache-v1-2-2-strict-local-only-selection.md) | Select Kache v1.2.2 only behind a Phoenix-owned local-only boundary | Accepted | development methodology; REQ-COMP-001, REQ-COMP-008 |
+| [225](225_kache-v1-2-2-strict-local-only-selection.md) | Select Kache v1.2.2 only behind a Phoenix-owned local-only boundary | Accepted (extended to Linux x86_64 by ADR-285) | development methodology; REQ-COMP-001, REQ-COMP-008 |
 | [226](226_coordinator-research-uses-explicit-file-targets.md) | Coordinator research agents use explicit file targets | Superseded by 227 | REQ-GR-007, REQ-SA-001, REQ-SA-002, REQ-SA-007 |
 | [227](227_coordinator-inline-agents-reuse-targeted-bash.md) | Coordinator inline agents reuse targeted Bash | Accepted | REQ-GR-007, REQ-SA-002, REQ-SA-007, REQ-BASH-012, REQ-BASH-013 |
 | [229](229_ember-conversation-list-entry.md) | Name and pin Ember in conversation navigation | Accepted | REQ-GR-023, REQ-IOS-022 |
@@ -289,7 +299,7 @@ Consult the relevant ADRs before starting work of each kind.
 | Changing Codex model discovery, availability, or account-bound routing | 062, then 052 and 034 |
 | Changing Codex reset-credit listing, redemption, or post-redemption resume | 208, then 062 and 085 |
 | Configuring named workers, tiers, or sub-agent model routes | 052, within 034's compatibility scope |
-| Selecting or qualifying development compiler-cache defaults | 225, then 224/223/079/078 and 034 |
+| Selecting or qualifying development compiler-cache defaults | 285, 225, then 224/223/079/078 and 034 |
 | Changing pending-question identity compatibility or legacy tokenless settlement | 082, then 034 |
 | Specifying parallel Work-child qualification, admission, shared WorkScope collaboration, cancellation/start, or parent-result delivery | 059, then 052 and 026 |
 | Implementing federation instance identity or bounded known-credential SQL exclusions | 083, within 034's compatibility scope |

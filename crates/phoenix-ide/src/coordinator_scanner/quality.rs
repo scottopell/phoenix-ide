@@ -270,9 +270,9 @@ fn root() -> PathBuf {
         .unwrap()
 }
 async fn open(path: &Path) -> Database {
-    let db = Database::open(path.to_str().unwrap()).await.unwrap();
-    phoenix_db::run_pending_migrations(db.pool()).await.unwrap();
-    db
+    Database::open_migrated_for_test(path.to_str().unwrap())
+        .await
+        .unwrap()
 }
 async fn native(
     db: &Database,

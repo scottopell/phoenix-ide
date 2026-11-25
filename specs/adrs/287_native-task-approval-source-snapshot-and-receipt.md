@@ -1,4 +1,4 @@
-# ADR-284: Bind native task approval to canonical source, snapshot and receipt
+# ADR-287: Bind native task approval to canonical source, snapshot and receipt
 
 - **Status:** Proposed
 - **Date:** 2026-11-08

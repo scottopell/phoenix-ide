@@ -39,6 +39,7 @@ pub use coordinator_watches::{
 pub use federation_peers::FederationPeerConnection;
 mod ddl;
 mod executing_source;
+mod in_memory_template;
 mod reminders;
 mod request_capacity;
 pub use reminders::{
@@ -3719,31 +3720,19 @@ impl Database {
     /// Returns a [`DbError`] if the underlying database operation fails.
     #[allow(dead_code)] // Used in tests
     pub async fn open_in_memory() -> DbResult<Self> {
-        let opts = SqliteConnectOptions::from_str("sqlite::memory:")?
-            .journal_mode(SqliteJournalMode::Wal)
-            .synchronous(SqliteSynchronous::Normal)
-            .busy_timeout(std::time::Duration::from_secs(5))
-            .foreign_keys(true);
-        // In-memory SQLite DBs are per-connection, so limit to 1 connection
-        let sqlite_workload_collector = SqliteWorkloadCollector::new();
-        let pool = SqlitePoolOptions::new()
-            .max_connections(1)
-            .after_connect({
-                let sqlite_workload_collector = sqlite_workload_collector.clone();
-                move |conn, _meta| {
-                    let sqlite_workload_collector = sqlite_workload_collector.clone();
-                    Box::pin(async move {
-                        install_native_statement_baseline(conn, sqlite_workload_collector).await
-                    })
-                }
-            })
-            .connect_with(opts)
-            .await?;
-        let db =
-            Self::new_with_generated_target_binding(pool, String::new(), sqlite_workload_collector);
-        db.run_migrations().await?;
-        migrations::run_pending_migrations(&db.pool).await?;
-        Ok(db)
+        in_memory_template::open_in_memory_from_template().await
+    }
+
+    /// Open a brand-new file-backed database for tests using the cached migrated
+    /// template, falling back to full migration when `path` already exists or
+    /// `PHOENIX_DB_DISABLE_MEM_TEMPLATE=1` is set.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] if seeding or opening the database fails.
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn open_migrated_for_test(path: &str) -> DbResult<Self> {
+        in_memory_template::open_migrated_for_test(path).await
     }
 
     async fn run_migrations(&self) -> DbResult<()> {
@@ -16424,6 +16413,20 @@ fn build_sub_agent_fan_in(
     (llm_content, display_data)
 }
 
+enum MaterializedToolResult<'a> {
+    Recorded(&'a ToolResult),
+    Interrupted(ToolResult),
+}
+
+impl MaterializedToolResult<'_> {
+    fn result(&self) -> &ToolResult {
+        match self {
+            Self::Recorded(result) => result,
+            Self::Interrupted(result) => result,
+        }
+    }
+}
+
 /// Build the materialized message rows for an in-flight tool round recovered
 /// from a `ToolExecuting` or `CancellingTool` state on restart: the assistant
 /// message followed by one tool-result row per `tool_use`, in round order.
@@ -16465,12 +16468,15 @@ fn build_materialized_tool_round(
         phoenix_core::domain::sm_state::SubAgentOutcome,
     >,
 ) -> Result<(Message, Vec<Message>), ToolRoundError> {
-    let mut results = completed_results.to_vec();
+    let mut results: Vec<_> = completed_results
+        .iter()
+        .map(MaterializedToolResult::Recorded)
+        .collect();
     results.extend(interrupted_tool_ids.iter().map(|tool_id| {
-        ToolResult::error(
+        MaterializedToolResult::Interrupted(ToolResult::error(
             tool_id.clone(),
             "[Tool execution interrupted by server restart]".to_string(),
-        )
+        ))
     }));
     validate_tool_round_ids(
         assistant_message
@@ -16493,8 +16499,14 @@ fn build_materialized_tool_round(
                 | phoenix_core::domain::llm_types::ContentBlock::McpToolUse { .. }
                 | phoenix_core::domain::llm_types::ContentBlock::McpToolResult { .. } => None,
             }),
-        results.iter().map(|result| result.tool_use_id.as_str()),
+        results.iter().map(|result| result.result().tool_use_id.as_str()),
     )?;
+    results.sort_by_key(|result| {
+        assistant_message.content.iter().position(|block| {
+            matches!(block, phoenix_core::domain::llm_types::ContentBlock::ToolUse { id, .. }
+                if id == &result.result().tool_use_id)
+        })
+    });
     let mut next_seq = start_seq;
 
     let agent_content = MessageContent::agent(assistant_message.content.clone());
@@ -16522,20 +16534,19 @@ fn build_materialized_tool_round(
     );
 
     let mut tool_msgs = Vec::with_capacity(results.len());
-    for (ordinal, result) in results.iter().enumerate() {
+    for entry in &results {
+        let result = entry.result();
         let mut content = tool_result_transcript_content(result);
-        let display = if ordinal < completed_results.len() {
-            match spawn_fan_ins.get(&result.tool_use_id) {
+        let display = match entry {
+            MaterializedToolResult::Recorded(_) => match spawn_fan_ins.get(&result.tool_use_id) {
                 Some((output, display)) => {
                     content.content.clone_from(output);
                     content.is_error = false;
                     Some(display.clone())
                 }
                 None => merge_duration_into_display(result.display_data(), result.duration_ms),
-            }
-        } else {
-            content.is_error = true;
-            None
+            },
+            MaterializedToolResult::Interrupted(_) => None,
         };
         tool_msgs.push(tool_result_message(
             &assistant_message.message_id,

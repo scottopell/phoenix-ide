@@ -19,6 +19,10 @@ struct ThinkInput {
 
 #[async_trait]
 impl Tool for ThinkTool {
+    fn foreground_execution(&self) -> crate::ForegroundExecution {
+        crate::ForegroundExecution::Concurrent
+    }
+
     fn name(&self) -> &'static str {
         "think"
     }

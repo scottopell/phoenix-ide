@@ -1,5 +1,6 @@
 import type {
   CodeViewerPayload,
+  FileTextSource,
   HtmlViewerPayload,
   ImageViewerPayload,
   MarkdownViewerPayload,
@@ -146,37 +147,43 @@ const IMAGE_URL = `data:image/svg+xml;charset=utf-8,${encodeURIComponent(IMAGE_S
 
 // --- Payload builders ----------------------------------------------------
 
+function fileSource(filePath: string, extra: Partial<FileTextSource> = {}): FileTextSource {
+  return {
+    kind: 'file',
+    absolutePath: absPath(filePath),
+    filePath,
+    rootDir: ROOT,
+    ...extra,
+  };
+}
+
 function textPayload(
   filePath: string,
   content: string,
-  extra: Partial<TextViewerPayload> = {},
+  sourceExtra: Partial<FileTextSource> = {},
 ): TextViewerPayload {
   return {
     kind: 'text',
+    source: fileSource(filePath, sourceExtra),
     title: filePath.split('/').pop() ?? filePath,
-    absolutePath: absPath(filePath),
     onClose: noop,
     onSendNotes: noop,
-    filePath,
-    rootDir: ROOT,
     content,
-    ...extra,
   };
 }
 
 function markdownPayload(
   filePath: string,
   content: string,
-  extra: Partial<MarkdownViewerPayload> = {},
+  extra: Partial<Omit<MarkdownViewerPayload, 'kind' | 'source' | 'content'>> = {},
+  sourceExtra: Partial<FileTextSource> = {},
 ): MarkdownViewerPayload {
   return {
     kind: 'markdown',
+    source: fileSource(filePath, sourceExtra),
     title: filePath.split('/').pop() ?? filePath,
-    absolutePath: absPath(filePath),
     onClose: noop,
     onSendNotes: noop,
-    filePath,
-    rootDir: ROOT,
     content,
     ...extra,
   };
@@ -185,12 +192,10 @@ function markdownPayload(
 function codePayload(filePath: string, content: string, language: string): CodeViewerPayload {
   return {
     kind: 'code',
+    source: fileSource(filePath),
     title: filePath.split('/').pop() ?? filePath,
-    absolutePath: absPath(filePath),
     onClose: noop,
     onSendNotes: noop,
-    filePath,
-    rootDir: ROOT,
     content,
     language,
   };
@@ -199,12 +204,10 @@ function codePayload(filePath: string, content: string, language: string): CodeV
 function htmlPayload(filePath: string, content: string): HtmlViewerPayload {
   return {
     kind: 'html',
+    source: fileSource(filePath),
     title: filePath.split('/').pop() ?? filePath,
-    absolutePath: absPath(filePath),
     onClose: noop,
     onSendNotes: noop,
-    filePath,
-    rootDir: ROOT,
     content,
     language: 'html',
     previewUrl: HTML_PREVIEW_URL,
@@ -215,8 +218,8 @@ function imagePayload(filePath: string): ImageViewerPayload {
   const fileName = filePath.split('/').pop() ?? filePath;
   return {
     kind: 'image',
+    source: { kind: 'file', absolutePath: absPath(filePath) },
     title: fileName,
-    absolutePath: absPath(filePath),
     onClose: noop,
     onSendNotes: noop,
     url: IMAGE_URL,
@@ -232,11 +235,11 @@ function imagePayload(filePath: string): ImageViewerPayload {
 const byId: Record<MetaViewerScenarioId, Omit<MetaViewerScenario, 'id' | 'title' | 'theme' | 'interaction'>> = {
   'large-text-fallback-dark': {
     settleSelector: '[data-testid="viewer-large-text-fallback"]',
-    payload: markdownPayload('logs/worker.md', LARGE_LOG, { renderMode: 'plainLargeText' }),
+    payload: markdownPayload('logs/worker.md', LARGE_LOG, {}, { renderMode: 'plainLargeText' }),
   },
   'large-text-fallback-light': {
     settleSelector: '[data-testid="viewer-large-text-fallback"]',
-    payload: markdownPayload('logs/worker.md', LARGE_LOG, { renderMode: 'plainLargeText' }),
+    payload: markdownPayload('logs/worker.md', LARGE_LOG, {}, { renderMode: 'plainLargeText' }),
   },
   'patch-context-dark': {
     settleSelector: '.phoenix-file-codeview [data-line]',

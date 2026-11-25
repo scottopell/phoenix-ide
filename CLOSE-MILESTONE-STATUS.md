@@ -1,5 +1,37 @@
 # Architectural reduction candidate — unqualified
 
+## Main integration candidate — source reviewed, execution pending
+
+- Integrates main `59021bdad0181fd2d0c700558d42a17997208445` into the
+  owned feature branch, not PR #1161 into main. The PR remains draft/unqualified.
+- Preserves main migration 172 (`coordinator_scan_origin_labels`) and moves only
+  the unshipped feature migration tail to 173–191. Fresh/through-171/main-172
+  upgrade and idempotence coverage is present in source; execution is pending.
+  Published main ADR identities are preserved; the three unmerged feature ADRs
+  move to 286–288 (including upstream's existing duplicate 285, left unchanged).
+- Reconciles Close serial dispatch with main's ordinary concurrent-tool batches
+  and cancellation inbox. Close envelopes preserve acknowledgement/retirement
+  ownership; only acknowledged UserCancel enters the cancellation inbox.
+- Exit now retains original inspection, preparation, process-entry and physical
+  custody until classified, with bounded polling/joins and no refreshed physical
+  deadline. Fatal or unknown durable custody retains the original owner/gates;
+  it is not reported as completed retirement. These repairs do not weaken the
+  production writer/source/Stop guards.
+- Scoped independent source reviews found and drove repairs to cancellation
+  ordering, commit-cutoff responsiveness, worker custody, retry fatal retention,
+  and regression witnesses. Final narrow review found no remaining concrete
+  blocker in those repaired seams. This is not whole-PR or compilation approval.
+- Added causal inspection-collector and process-entry custody tests, direct
+  settlement-entry observation, virtual-time original-cutoff assertions, and
+  sender-envelope regressions. Automatic hosted qualification requires actual
+  execution receipts for these selections; none has executed on this candidate.
+- Exact `e3cf3c7a5` run 45689466800 remains active at this checkpoint (frontend
+  and specifications passed; database pending). Its outcome will be retained
+  separately and cannot qualify this newer integrated source. Broad integrated
+  CI and installed disposable-Mac usability through the designated executor
+  remain outstanding. No local executable validation, PR-to-main merge,
+  installation or deployment has occurred.
+
 ## Exact `80362eb12` terminal receipts — formatting-only failure
 
 - [Exact run 45666550377](https://github.com/scottopell/phoenix-ide/actions/runs/45666550377)
@@ -775,9 +807,13 @@ The current source reduces the Close expansion against shipped RC16
   receiver hazards. Two deterministic synthetic-slot regressions cover detached
   gate waiting and post-wait replacement preservation; existing blocking-profile
   cleanup tests, not those synthetic fixtures, cover physical deletion custody.
-  Main's published ADR-282 is retained; the colliding Proposed Close ADR moves
-  to ADR-285, still superseded by explicit-only ADR-283. All integrated behavior
-  remains unqualified pending automatic exact-head hosted checks.
+  Main's published ADR-283 (ordinary foreground batches), ADR-284 (eight-owner
+  window), and both existing ADR-285 records (Kache qualification and Coordinator
+  evidence labels) remain unchanged. Branch-local Close records move 283→286,
+  native task approval 284→287, and unified Close 285→288. The duplicate main ADR-285
+  records are pre-existing upstream entries and are not resolved here. Proposed
+  Close ADR-288 remains superseded by accepted Close ADR-286. Integrated behavior
+  remains unqualified pending exact-head hosted checks.
 - Previous head `cb7e805735220fd260537a42e33e15baacaff70f`: Close qualification
   [45491118337](https://github.com/scottopell/phoenix-ide/actions/runs/45491118337)
   **passed**. Standard PR CI
@@ -1125,7 +1161,11 @@ Published `d38ab1253df0d4e53e564f23d2418a1144365bc9`, [automatic run45223536108]
 
 New native automatic metadata-only successor admission is rejected before writes; exact pre-existing receipts remain replayable and historical finalization/source/cancellation safety is retained. No runtime loop was removed (the DB API had no runtime caller). Negative no-mutation and six historical/rejection selectors are mandatory in hosted inventory. Historical tests seed legacy data, not new production admission. Independent source review caught and corrected a fixture's double consumption of its allowance; final review found no remaining blocker.
 
-Work Lifecycle and coupled Bedrock requirements/Allium now align with ADR-283: no automatic successors or in-Close discard/repair/classifier; exact ignored/build and operational blockers; separate owner cleanup; mutation rechecks; truthful incomplete placement. Review restored the retained explicit-plan/provenance and atomic cancellation safeguards, and bound blocker decisions to complete immutable scope inspections. Source-only cross-spec review found no remaining blocker. New hosted job uses existing pinned Allium and specification-shape lanes; no local validators executed. This is not implementation completion or a parser/test-pass claim: native ignored/blocker/discard/UI changes and remaining public/platform acceptance are still pending.
+Work Lifecycle and coupled Bedrock requirements/Allium now align with Close ADR-286: no automatic successors or in-Close discard/repair/classifier; exact ignored/build and operational blockers; separate owner cleanup; mutation rechecks; truthful incomplete placement. Review restored the retained explicit-plan/provenance and atomic cancellation safeguards, and bound blocker decisions to complete immutable scope inspections. Source-only cross-spec review found no remaining blocker. New hosted job uses existing pinned Allium and specification-shape lanes; no local validators executed. This is not implementation completion or a parser/test-pass claim: native ignored/blocker/discard/UI changes and remaining public/platform acceptance are still pending.
+
+### Integrated-source candidate note — reconciliation and tests pending
+
+This documentation integration is a candidate only, not a qualification or completion claim. Reconcile current main590 source against the Close candidate and run the required exact-source tests before treating it as integrated. Preserve main migration172; Close's unshipped migration range is 173–191 and remains unqualified. The runtime cancellation-inbox/batch-custody path needs its documented adaptation to the integrated source. Prior e3cf was still running at its recorded checkpoint; do not infer a terminal result from that historical status. No local executable validation was run for this documentation-only reconciliation.
 
 ### Terminal 6064908e3: production-detector Worktree milestone PASSED
 

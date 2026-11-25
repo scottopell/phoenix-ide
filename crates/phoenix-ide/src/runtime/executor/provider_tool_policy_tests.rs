@@ -176,8 +176,9 @@ async fn dispatch_cannot_expand_or_reinterpret_the_persisted_request_policy() {
     ] {
         let directory = tempfile::TempDir::new().unwrap();
         let path = directory.path().join("admission.db");
-        let db = Database::open(path.to_str().unwrap()).await.unwrap();
-        phoenix_db::run_pending_migrations(db.pool()).await.unwrap();
+        let db = Database::open_migrated_for_test(path.to_str().unwrap())
+            .await
+            .unwrap();
         db.create_conversation(CONVERSATION, CONVERSATION, "/tmp", true, None, None)
             .await
             .unwrap();
@@ -281,8 +282,9 @@ async fn dispatch_cannot_expand_or_reinterpret_the_persisted_request_policy() {
 async fn sqlite_runtime_anthropic_withdrawal_preserves_failed_exchange_after_reopen_and_retry() {
     let directory = tempfile::TempDir::new().unwrap();
     let path = directory.path().join("conversation.db");
-    let db = Database::open(path.to_str().unwrap()).await.unwrap();
-    phoenix_db::run_pending_migrations(db.pool()).await.unwrap();
+    let db = Database::open_migrated_for_test(path.to_str().unwrap())
+        .await
+        .unwrap();
     db.create_conversation(
         CONVERSATION,
         CONVERSATION,
@@ -504,8 +506,9 @@ async fn sqlite_runtime_chat_images_and_signature_survive_reopen() {
     };
     let directory = tempfile::TempDir::new().unwrap();
     let path = directory.path().join("chat-signature.db");
-    let db = Database::open(path.to_str().unwrap()).await.unwrap();
-    phoenix_db::run_pending_migrations(db.pool()).await.unwrap();
+    let db = Database::open_migrated_for_test(path.to_str().unwrap())
+        .await
+        .unwrap();
     db.create_conversation(
         CONVERSATION,
         CONVERSATION,

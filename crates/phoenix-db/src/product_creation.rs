@@ -4322,10 +4322,11 @@ mod product_creation_tests {
     #[tokio::test]
     async fn coordinator_creation_snapshot_does_not_mix_acceptance_with_committed_publication() {
         let dir = tempfile::tempdir().unwrap();
-        let db = Database::open(dir.path().join("creation-snapshot.db").to_str().unwrap())
-            .await
-            .unwrap();
-        crate::run_pending_migrations(db.pool()).await.unwrap();
+        let db = Database::open_migrated_for_test(
+            dir.path().join("creation-snapshot.db").to_str().unwrap(),
+        )
+        .await
+        .unwrap();
         let coordinator = db
             .get_or_create_coordinator(None, LlmLanguage::default())
             .await
@@ -4377,10 +4378,11 @@ mod product_creation_tests {
     #[allow(clippy::too_many_lines)]
     async fn coordinator_creation_snapshot_keeps_execution_route_and_authority_coherent() {
         let dir = tempfile::tempdir().unwrap();
-        let db = Database::open(dir.path().join("execution-snapshot.db").to_str().unwrap())
-            .await
-            .unwrap();
-        crate::run_pending_migrations(db.pool()).await.unwrap();
+        let db = Database::open_migrated_for_test(
+            dir.path().join("execution-snapshot.db").to_str().unwrap(),
+        )
+        .await
+        .unwrap();
         let coordinator = db
             .get_or_create_coordinator(None, LlmLanguage::default())
             .await

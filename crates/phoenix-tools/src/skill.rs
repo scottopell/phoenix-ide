@@ -63,6 +63,10 @@ impl SkillTool {
 
 #[async_trait]
 impl Tool for SkillTool {
+    fn foreground_execution(&self) -> crate::ForegroundExecution {
+        crate::ForegroundExecution::Concurrent
+    }
+
     fn name(&self) -> &'static str {
         "skill"
     }

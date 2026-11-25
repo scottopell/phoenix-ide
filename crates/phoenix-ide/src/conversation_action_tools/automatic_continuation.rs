@@ -212,6 +212,10 @@ async fn remote_from_coordinator_inner(
 
 #[async_trait]
 impl Tool for AutomaticContinuationTool {
+    fn foreground_execution(&self) -> phoenix_tools::ForegroundExecution {
+        phoenix_tools::ForegroundExecution::Serial
+    }
+
     fn name(&self) -> &'static str {
         match self.mode {
             Mode::Read => "read_automatic_continuation",

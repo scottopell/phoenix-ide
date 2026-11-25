@@ -10,7 +10,7 @@ const STATE_GATE: &str = "conversation.state_kind NOT IN ('idle', 'terminal', 'e
 
 fn unexpected() -> DbError {
     DbError::Serialization(format!(
-        "migration 189 found unexpected {TRIGGER} source shape"
+        "migration 190 found unexpected {TRIGGER} source shape"
     ))
 }
 
@@ -67,8 +67,8 @@ mod tests {
             .connect("sqlite::memory:")
             .await
             .unwrap();
-        super::super::setup_real_178_for_test(&pool).await;
-        super::super::run_through_for_test(&pool, 188)
+        super::super::setup_real_179_for_test(&pool).await;
+        super::super::run_through_for_test(&pool, 189)
             .await
             .unwrap();
         pool
@@ -89,7 +89,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn real188_to189_preserves_origin_authority_and_is_idempotent() {
+    async fn real189_to190_preserves_origin_authority_and_is_idempotent() {
         let pool = predecessor().await;
         let (old, corrected) = corrected_source().unwrap();
         let installed: String = sqlx::query_scalar(
@@ -101,7 +101,7 @@ mod tests {
         .unwrap();
         assert_eq!(installed, old);
         assert_eq!(
-            super::super::run_through_for_test(&pool, 189)
+            super::super::run_through_for_test(&pool, 190)
                 .await
                 .unwrap(),
             1
@@ -117,10 +117,10 @@ mod tests {
         let before = snapshot(&pool).await;
         assert_eq!(
             before.1.last(),
-            Some(&(189, "native_close_retry_origin_gate".into()))
+            Some(&(190, "native_close_retry_origin_gate".into()))
         );
         assert_eq!(
-            super::super::run_through_for_test(&pool, 189)
+            super::super::run_through_for_test(&pool, 190)
                 .await
                 .unwrap(),
             0
@@ -129,7 +129,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn missing_or_changed_origin_trigger_rolls_back189() {
+    async fn missing_or_changed_origin_trigger_rolls_back190() {
         for changed in [false, true] {
             let pool = predecessor().await;
             sqlx::raw_sql(
@@ -143,7 +143,7 @@ mod tests {
                     .execute(&pool).await.unwrap();
             }
             let before = snapshot(&pool).await;
-            let error = super::super::run_through_for_test(&pool, 189)
+            let error = super::super::run_through_for_test(&pool, 190)
                 .await
                 .unwrap_err();
             assert!(error.to_string().contains("unexpected native_close_captured_loss_retry_origin_requires_exact_stop source shape"));

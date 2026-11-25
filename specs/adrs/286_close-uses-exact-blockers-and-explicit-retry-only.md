@@ -1,4 +1,4 @@
-# ADR-283: Close uses exact blockers and explicit retry only
+# ADR-286: Close uses exact blockers and explicit retry only
 
 - **Status:** Accepted
 - **Date:** 2026-11-23
@@ -6,7 +6,7 @@
 
 ## Context
 
-The accepted scope narrows Close to a bounded retirement operation rather than a recovery or cleanup assistant. ADR-285 proposed a proof-gated automatic metadata-only successor with an original allowance, admission and suppression machinery, and special completion finalization. That adds an automatic authority path even when no resource effect remains. The selected product need is one idempotent native operation with exact retained observation and an explicit Retry or Stop decision after failure.
+The accepted scope narrows Close to a bounded retirement operation rather than a recovery or cleanup assistant. ADR-288 proposed a proof-gated automatic metadata-only successor with an original allowance, admission and suppression machinery, and special completion finalization. That adds an automatic authority path even when no resource effect remains. The selected product need is one idempotent native operation with exact retained observation and an explicit Retry or Stop decision after failure.
 
 The existing inspection also separates ordinary loss warnings from ignored/build content and allows an exact discard confirmation. That distinction obscures the actual blocker decision: repository metadata cannot tell Phoenix that a particular file is safe to delete. A parallel disposable/reconstructibility classifier or in-Close salvage flow would add policy and authority beyond retiring the registered environment.
 
@@ -14,7 +14,7 @@ This decision records the Coordinator-verified accepted simplification. It does 
 
 ## Options considered
 
-1. **Retain ADR-285's one proof-gated automatic completion-only successor.** Preserves automatic completion after an all-success interruption, but needs a separate allowance, admission, fencing and finalization authority that does not serve the explicit Retry/Stop model. Rejected.
+1. **Retain ADR-288's one proof-gated automatic completion-only successor.** Preserves automatic completion after an all-success interruption, but needs a separate allowance, admission, fencing and finalization authority that does not serve the explicit Retry/Stop model. Rejected.
 2. **Retain discard confirmation and a disposable-state classifier, with salvage/repair inside Close.** Can remove more environments without separate owner action, but requires Phoenix to decide which data is expendable and adds new mutation/approval paths. Rejected.
 3. **One idempotent Close, one exact blocker decision, explicit bounded retry only.** Preserves source and retirement safety while leaving unresolved content intact. Owner cleanup is separate and may leave disk usage unresolved until a deliberate action. Selected.
 
@@ -46,7 +46,7 @@ The first failure stops effects across all targeted scopes and durably retains s
 
 ### Supersession boundary
 
-This decision supersedes ADR-285's automatic completion-only successor policy, including its initial-interruption extension and the allowance/admission/suppression machinery specific to that automatic path. ADR-285's source-bound idempotence, exact retained identity, explicit safe-retry authority and independent resource/scope proof are retained.
+This decision supersedes branch-local ADR-288's automatic completion-only successor policy, including its initial-interruption extension and the allowance/admission/suppression machinery specific to that automatic path. ADR-288's source-bound idempotence, exact retained identity, explicit safe-retry authority and independent resource/scope proof are retained.
 
 It partially supersedes ADR-088's disposable-state classification and explicit-discard deletion alternative: neither is an in-Close path. ADR-088's stop-on-first-failure, observation-only startup, separation of shutdown from resource retirement, explicit fresh bounded retry, mandatory failure delivery and original identity/ownership safeguards are retained. Separate owner-authorized work is not a Close phase. ADR-241's immutable exact-run writer evidence remains required. Historical ADR text is left unchanged; this record and the index identify the superseding policy.
 
@@ -63,6 +63,6 @@ It partially supersedes ADR-088's disposable-state classification and explicit-d
 - [Work Lifecycle requirements](../work-lifecycle/requirements.md), especially REQ-WL-002/002a/002b/002c/002f/004.
 - [Work Lifecycle Allium](../work-lifecycle/work-lifecycle.allium) and [executive status](../work-lifecycle/executive.md).
 - [Bedrock requirements](../bedrock/requirements.md), REQ-BED-029, and [Bedrock Allium](../bedrock/bedrock.allium).
-- [ADR-285](285_unified-close-idempotence-and-bounded-completion-retry.md): superseded automatic completion-only policy; retained source and exact-operation safeguards.
+- [ADR-288](288_unified-close-idempotence-and-bounded-completion-retry.md): branch-local proposal; its automatic completion-only policy is superseded, while source and exact-operation safeguards are retained.
 - [ADR-088](088_close-stops-on-failure-and-separates-cleanup-from-lifecycle.md): retained bounded execution/lifecycle policy; superseded in-Close discard/disposable alternative.
 - [ADR-241](241_close-writer-authority-is-immutable-run-evidence.md): retained writer evidence contract.

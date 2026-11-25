@@ -104,7 +104,7 @@ final class ConversationStateTests: XCTestCase {
         """
         XCTAssertEqual(
             parse(raw),
-            .toolExecuting(toolName: "bash", remainingCount: 2, completedCount: 2))
+            .toolExecuting(toolName: "bash", pendingCount: 3, completedCount: 2))
     }
 
     func testAwaitingSubAgentsCarriesCounts() {
@@ -205,9 +205,9 @@ final class ConversationStateTests: XCTestCase {
 
     func testActionLockUsesStableLifecycleFamilies() {
         let origin = ConversationState.toolExecuting(
-            toolName: "first", remainingCount: 2, completedCount: 0)
+            toolName: "first", pendingCount: 2, completedCount: 0)
         let progress = ConversationState.toolExecuting(
-            toolName: "second", remainingCount: 1, completedCount: 1)
+            toolName: "second", pendingCount: 1, completedCount: 1)
         XCTAssertTrue(ConversationSession.actionStillAwaitsOriginalState(
             action: .cancel, origin: origin, current: progress))
         XCTAssertFalse(ConversationSession.actionStillAwaitsOriginalState(
@@ -241,7 +241,7 @@ final class ConversationStateTests: XCTestCase {
         XCTAssertTrue(ConversationState.llmRequesting(attempt: 1).isCancellable)
         XCTAssertTrue(
             ConversationState.toolExecuting(
-                toolName: "bash", remainingCount: 0, completedCount: 0).isCancellable)
+                toolName: "bash", pendingCount: 0, completedCount: 0).isCancellable)
         XCTAssertTrue(
             ConversationState.awaitingSubAgents(pendingCount: 1, completedCount: 0)
                 .isCancellable)
@@ -293,7 +293,7 @@ final class ConversationStateTests: XCTestCase {
             parse("{\"type\":\"llm_requesting\"}"), .llmRequesting(attempt: 1))
         XCTAssertEqual(
             parse("{\"type\":\"tool_executing\"}"),
-            .toolExecuting(toolName: "tool", remainingCount: 0, completedCount: 0))
+            .toolExecuting(toolName: "tool", pendingCount: 0, completedCount: 0))
         XCTAssertEqual(
             parse("{\"type\":\"error\"}"),
             .error(message: "Unknown error", kind: .unknown))

@@ -22,7 +22,7 @@ async fn retry_dispatch_state(db: &Database, attempt: &CloseAttemptId) -> String
     format!(
         "{:?}",
         (
-            migration_179_retained_state(db).await,
+            migration_180_retained_state(db).await,
             lookup_metadata(db, attempt).await,
             native_failure_side_effect_counts(db).await,
             rows,
@@ -70,7 +70,7 @@ async fn native_retry_dispatch_uses_original_g1_under_g2_and_replays_without_mut
     assert_ne!(g2, assessment.proof.snapshot);
     let worktree = assessment.request.remaining_effects.iter()
         .find(|effect| effect.resource.kind() == RetiredResourceKind::Worktree).unwrap();
-    let retained = migration_179_retained_state(&db).await;
+    let retained = migration_180_retained_state(&db).await;
     let counts = native_failure_side_effect_counts(&db).await;
     let metadata = lookup_metadata(&db, attempt).await;
     let before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM close_retirement_resource_dispatches")
@@ -96,7 +96,7 @@ async fn native_retry_dispatch_uses_original_g1_under_g2_and_replays_without_mut
         identity.codec().to_owned(), identity.value().clone(), rows[0].8,
     ));
     assert!(rows[0].8 > 0);
-    assert_eq!(migration_179_retained_state(&db).await, retained);
+    assert_eq!(migration_180_retained_state(&db).await, retained);
     assert_eq!(native_failure_side_effect_counts(&db).await, counts);
     assert_eq!(lookup_metadata(&db, attempt).await, metadata);
     assert_eq!(current_test_snapshot(&db, attempt.as_str()).await, g2);
@@ -176,7 +176,7 @@ async fn native_retry_dispatch_checks_stale_source_before_retained_dispatch_repl
 
 #[tokio::test]
 async fn generic_retry_dispatch_refuses_native_current_g1_with_stale_source() {
-    let (db, assessment, receipt) = migration_179_pending_fixture_with_options(false, false).await;
+    let (db, assessment, receipt) = migration_180_pending_fixture_with_options(false, false).await;
     crate::migrations::run_pending_migrations(db.pool()).await.unwrap();
     let attempt = &receipt.admitted.attempt_id;
     assert_eq!(current_test_snapshot(&db, attempt.as_str()).await, assessment.proof.snapshot);
@@ -201,7 +201,7 @@ async fn generic_retry_dispatch_refuses_native_current_g1_with_stale_source() {
 
 #[tokio::test]
 async fn native_retry_dispatch_replays_historical_g1_without_retimestamping() {
-    let (db, assessment, receipt) = migration_179_pending_fixture_with_options(true, true).await;
+    let (db, assessment, receipt) = migration_180_pending_fixture_with_options(true, true).await;
     crate::migrations::run_pending_migrations(db.pool()).await.unwrap();
     let attempt = &receipt.admitted.attempt_id;
     let worktree = assessment.request.remaining_effects.iter()
@@ -282,9 +282,9 @@ async fn native_retry_raw_dispatch_rejects_g2_and_malformed_plan_without_legacy_
 }
 
 #[tokio::test]
-async fn migration_180_preserves_populated_179_rows_and_rewrites_only_dispatch_authority() {
-    let (db, assessment, receipt) = migration_179_pending_fixture().await;
-    assert_eq!(crate::migrations::run_through_for_test(db.pool(), 179).await.unwrap(), 1);
+async fn migration_181_preserves_populated_180_rows_and_rewrites_only_dispatch_authority() {
+    let (db, assessment, receipt) = migration_180_pending_fixture().await;
+    assert_eq!(crate::migrations::run_through_for_test(db.pool(), 180).await.unwrap(), 1);
     let attempt = &receipt.admitted.attempt_id;
     let worktree = assessment.request.remaining_effects.iter()
         .find(|effect| effect.resource.kind() == RetiredResourceKind::Worktree).unwrap();
@@ -304,8 +304,8 @@ async fn migration_180_preserves_populated_179_rows_and_rewrites_only_dispatch_a
     let ledger: Vec<(i64, String, String)> = sqlx::query_as(
         "SELECT version, name, applied_at FROM _migrations ORDER BY version",
     ).fetch_all(db.pool()).await.unwrap();
-    assert_eq!(ledger.last().unwrap().0, 179);
-    assert_eq!(crate::migrations::run_through_for_test(db.pool(), 180).await.unwrap(), 1);
+    assert_eq!(ledger.last().unwrap().0, 180);
+    assert_eq!(crate::migrations::run_through_for_test(db.pool(), 181).await.unwrap(), 1);
     assert_eq!(retry_dispatch_state(&db, attempt).await, before);
     for (name, installed) in definitions {
         let rewritten: String = sqlx::query_scalar("SELECT sql FROM sqlite_schema WHERE name = ?1")
@@ -326,11 +326,11 @@ async fn migration_180_preserves_populated_179_rows_and_rewrites_only_dispatch_a
     ).fetch_all(db.pool()).await.unwrap();
     assert_eq!(&upgraded[..ledger.len()], ledger.as_slice());
     assert_eq!(upgraded.len(), ledger.len() + 1);
-    assert_eq!(upgraded.last().unwrap().0, 180);
+    assert_eq!(upgraded.last().unwrap().0, 181);
     assert_eq!(upgraded.last().unwrap().1, "native_close_retry_dispatch");
-    assert_eq!(crate::migrations::run_through_for_test(db.pool(), 180).await.unwrap(), 0);
+    assert_eq!(crate::migrations::run_through_for_test(db.pool(), 181).await.unwrap(), 0);
     assert_eq!(retry_dispatch_state(&db, attempt).await, before);
-    // Probe the historical 180 authority directly. Current application writers
+    // Probe the historical 181 authority directly. Current application writers
     // require later schema and are covered by the current-schema tests above.
     let original = RecordCloseRetirementDispatchRequest {
         attempt_id: attempt.clone(), scope: worktree.scope.clone(),
@@ -367,9 +367,9 @@ async fn non_native_retry_dispatch_retains_legacy_current_snapshot_authority() {
 
 
 #[tokio::test]
-async fn migration_181_unknown_second_authority_prefix_rolls_back_first_rewrite_and_ledger() {
-    let (db, _, _) = migration_179_pending_fixture().await;
-    assert_eq!(crate::migrations::run_through_for_test(db.pool(), 180).await.unwrap(), 2);
+async fn migration_182_unknown_second_authority_prefix_rolls_back_first_rewrite_and_ledger() {
+    let (db, _, _) = migration_180_pending_fixture().await;
+    assert_eq!(crate::migrations::run_through_for_test(db.pool(), 181).await.unwrap(), 2);
     let second: String = sqlx::query_scalar(
         "SELECT sql FROM sqlite_schema WHERE name = 'close_worktree_tombstone_require_retry_authority'",
     )
@@ -385,7 +385,7 @@ async fn migration_181_unknown_second_authority_prefix_rolls_back_first_rewrite_
         "SELECT version, name, applied_at FROM _migrations ORDER BY version",
     ).fetch_all(db.pool()).await.unwrap();
 
-    assert!(crate::migrations::run_through_for_test(db.pool(), 181).await.is_err());
+    assert!(crate::migrations::run_through_for_test(db.pool(), 182).await.is_err());
     let after: Vec<(String, String)> = sqlx::query_as(
         "SELECT name, sql FROM sqlite_schema WHERE type = 'trigger' ORDER BY name",
     ).fetch_all(db.pool()).await.unwrap();
@@ -394,14 +394,14 @@ async fn migration_181_unknown_second_authority_prefix_rolls_back_first_rewrite_
     ).fetch_all(db.pool()).await.unwrap();
     assert_eq!(after, before);
     assert_eq!(after_ledger, ledger);
-    assert_eq!(ledger.last().unwrap().0, 180);
+    assert_eq!(ledger.last().unwrap().0, 181);
 }
 
 #[tokio::test]
-async fn migration_181_refuses_native_g2_legacy_metadata_authority() {
-    let (db, assessment, receipt) = migration_179_pending_fixture().await;
-    assert_eq!(crate::migrations::run_through_for_test(db.pool(), 180).await.unwrap(), 2);
-    assert_eq!(crate::migrations::run_through_for_test(db.pool(), 181).await.unwrap(), 1);
+async fn migration_182_refuses_native_g2_legacy_metadata_authority() {
+    let (db, assessment, receipt) = migration_180_pending_fixture().await;
+    assert_eq!(crate::migrations::run_through_for_test(db.pool(), 181).await.unwrap(), 2);
+    assert_eq!(crate::migrations::run_through_for_test(db.pool(), 182).await.unwrap(), 1);
     let worktree = assessment.request.remaining_effects.iter()
         .find(|effect| effect.resource.kind() == RetiredResourceKind::Worktree).unwrap();
     let snapshot = current_test_snapshot(&db, receipt.admitted.attempt_id.as_str()).await;

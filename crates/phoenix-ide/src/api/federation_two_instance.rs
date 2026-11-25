@@ -68,12 +68,11 @@ impl TestInstance {
             .parse()
             .unwrap();
         let mut state = make_test_state().await;
-        state.db = crate::db::Database::open(tempdir.path().join("instance.db").to_str().unwrap())
-            .await
-            .unwrap();
-        crate::db::run_pending_migrations(state.db.pool())
-            .await
-            .unwrap();
+        state.db = crate::db::Database::open_migrated_for_test(
+            tempdir.path().join("instance.db").to_str().unwrap(),
+        )
+        .await
+        .unwrap();
         state.runtime = Arc::new(crate::runtime::RuntimeManager::new(
             state.db.clone(),
             state.llm_registry.clone(),

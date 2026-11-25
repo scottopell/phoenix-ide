@@ -1,16 +1,10 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useMemo } from 'react';
 import type { Message } from '../api';
-import { useMessageReviewNotesData, useReviewNotesCommands } from '../contexts/ReviewNotesContext';
-import type { ReviewNote } from '../contexts/ReviewNotesContext';
 import { getMessageMarkdown } from '../utils/messageCopy';
-import { FocusedReviewExitDialog, ViewerPresentationControl, ViewerShell } from './viewer/ViewerShell';
-import { MarkdownViewerBody } from './viewer/MarkdownViewerBody';
-import { NotesPanel } from './viewer/NotesPanel';
-import { AnnotationDialog } from './viewer/AnnotationDialog';
-import { CopyButton } from './CopyButton';
-import { formatNotesForSend } from './viewer/formatNotes';
 import { useRegisterFocusScope } from '../hooks/useFocusScope';
-import { useFocusedReviewExit } from './viewer/useFocusedReviewExit';
+import { MetaViewer } from './viewer/MetaViewer';
+import { ViewerShell } from './viewer/ViewerShell';
+import type { MarkdownViewerPayload } from './viewer/metaViewerTypes';
 
 interface MessageViewerProps {
   sequenceId: number;
@@ -25,8 +19,26 @@ interface MessageViewerProps {
   inline?: boolean | undefined;
 }
 
-export function MessageViewer({ sequenceId, messageId, occurrenceToken, messages, onClose, onSendNotes, presentation = 'pane', canTogglePresentation = false, onPresentationChange, inline }: MessageViewerProps) {
-  useRegisterFocusScope('message-viewer');
+/**
+ * MessageViewer — thin message-to-payload adapter over `MetaViewer`.
+ *
+ * Resolves canonical message Markdown from loaded conversation messages and
+ * delegates shell chrome, Find, copy, Escape precedence, line navigation, and
+ * review-note lifecycle to `MetaViewer`. Missing/empty states stay outside
+ * `MetaViewer` so partial payloads are never fabricated.
+ */
+export function MessageViewer({
+  sequenceId,
+  messageId,
+  occurrenceToken,
+  messages,
+  onClose,
+  onSendNotes,
+  presentation = 'pane',
+  canTogglePresentation = false,
+  onPresentationChange,
+  inline,
+}: MessageViewerProps) {
   const message = useMemo(() => {
     if (occurrenceToken) {
       return messages.find((m) => (m.display_data as { productOccurrenceToken?: string } | null | undefined)?.productOccurrenceToken === occurrenceToken)
@@ -40,227 +52,76 @@ export function MessageViewer({ sequenceId, messageId, occurrenceToken, messages
 
   const content = message ? getMessageMarkdown(message) : '';
   const title = message ? messageTitle(message) : `Message #${sequenceId}`;
-  const notes = useMessageReviewNotes(sequenceId, message?.message_id ?? messageId, occurrenceToken, onSendNotes);
-  const focused = presentation === 'fullscreen' && canTogglePresentation;
-  const returnToPane = useCallback(() => onPresentationChange?.('pane'), [onPresentationChange]);
-  const focusedExit = useFocusedReviewExit({
-    noteCount: notes.messageNotes.length,
-    unsavedDraft: notes.annotationDraftDirty,
-    send: notes.send,
-    discard: notes.clearAll,
-    returnToPane,
-    closeViewer: onClose,
-  });
-  const lineRefs = useRef<Map<number, HTMLElement>>(new Map());
-  const lineRefsSequenceId = useRef(sequenceId);
-  if (lineRefsSequenceId.current !== sequenceId) {
-    lineRefs.current.clear();
-    lineRefsSequenceId.current = sequenceId;
+
+  if (message && content) {
+    const payload: MarkdownViewerPayload = {
+      kind: 'markdown',
+      source: {
+        kind: 'message',
+        sequenceId,
+        ...(message.message_id || messageId ? { messageId: message.message_id ?? messageId } : {}),
+        ...(occurrenceToken !== undefined ? { occurrenceToken } : {}),
+      },
+      title,
+      content,
+      onClose,
+      ...(onSendNotes !== undefined ? { onSendNotes } : {}),
+      presentation,
+      canTogglePresentation,
+      ...(onPresentationChange !== undefined ? { onPresentationChange } : {}),
+      ...(inline !== undefined ? { inline } : {}),
+    };
+    return <MetaViewer payload={payload} />;
   }
 
-  const registerLineRef = useCallback((lineNumber: number, el: HTMLElement | null) => {
-    if (el) lineRefs.current.set(lineNumber, el);
-    else lineRefs.current.delete(lineNumber);
-  }, []);
-
-  const handleJumpTo = useCallback(
-    (note: ReviewNote) => {
-      if (note.anchor.kind !== 'message' || note.anchor.sequenceId !== sequenceId) return;
-      const el = lineRefs.current.get(note.anchor.lineNumber);
-      if (el) {
-        el.scrollIntoView({ behavior: 'smooth', block: 'center' });
-        notes.highlight(note.anchor.lineNumber);
-      }
-      notes.closePanel();
-    },
-    [notes, sequenceId],
+  return (
+    <EmptyMessageViewerShell
+      title={title}
+      message={message}
+      sequenceId={sequenceId}
+      inline={inline}
+      onClose={onClose}
+    />
   );
+}
 
-  const headerExtras = message && content ? (
-    <>
-      <CopyButton text={content} className="viewer-shell-copy-btn" title="Copy message markdown" />
-      {canTogglePresentation && onPresentationChange && (
-        <ViewerPresentationControl
-          fullscreen={focused}
-          onToggle={focused ? focusedExit.requestReturn : () => onPresentationChange('fullscreen')}
-        />
-      )}
-    </>
-  ) : null;
-
-  const shell = (
+function EmptyMessageViewerShell({
+  title,
+  message,
+  sequenceId,
+  inline,
+  onClose,
+}: {
+  title: string;
+  message: Message | null;
+  sequenceId: number;
+  inline?: boolean | undefined;
+  onClose: () => void;
+}) {
+  useRegisterFocusScope('message-viewer');
+  return (
     <ViewerShell
-      mode={focused ? 'takeover' : inline ? 'inline' : 'overlay'}
+      mode={inline ? 'inline' : 'overlay'}
       ariaLabel={`Message viewer: ${title}`}
       title={title}
       titleTooltip={message ? `Conversation message #${sequenceId}` : undefined}
-      headerExtras={headerExtras}
-      noteCount={notes.messageNotes.length}
-      onToggleNotes={notes.togglePanel}
-      onSend={onSendNotes
-        ? (focused ? focusedExit.sendAndReturn : () => { void notes.send(); })
-        : undefined}
-      onClose={focusedExit.requestClose}
-      onEscape={focused ? focusedExit.requestReturn : undefined}
+      noteCount={0}
+      onToggleNotes={() => undefined}
+      onClose={onClose}
       bodyScroll="shell"
-      panel={
-        notes.showPanel ? (
-          <NotesPanel
-            notes={notes.messageNotes}
-            onJumpTo={handleJumpTo}
-            onRemove={notes.removeNote}
-            onClearAll={notes.clearAll}
-            onSend={onSendNotes
-              ? (focused ? focusedExit.sendAndReturn : () => { void notes.send(); })
-              : undefined}
-            onClose={notes.closePanel}
-          />
-        ) : null
-      }
-      dialog={
-        notes.annotating ? (
-          <AnnotationDialog
-            anchorLabel={`Line ${notes.annotating.lineNumber}`}
-            lineContent={notes.annotating.lineContent}
-            onDirtyChange={notes.setAnnotationDraftDirty}
-            onSubmit={onSendNotes ? notes.submitNote : undefined}
-            onCancel={notes.cancelAnnotate}
-          />
-        ) : null
-      }
-      confirm={focusedExit.exitTarget ? (
-        <FocusedReviewExitDialog
-          target={focusedExit.exitTarget}
-          sending={focusedExit.sending}
-          error={focusedExit.error}
-          canSend={Boolean(onSendNotes)}
-          onSend={() => { void focusedExit.sendAndReturn(); }}
-          onDiscard={focusedExit.discardAndReturn}
-          onKeepReviewing={focusedExit.keepReviewing}
-        />
-      ) : null}
     >
       <div className="viewer-content">
-        {message && content ? (
-          <MarkdownViewerBody
-            content={content}
-            modifiedLines={EMPTY_SET}
-            highlightedLine={notes.highlightedLine}
-            onAnnotate={onSendNotes ? notes.startAnnotate : undefined}
-            registerLineRef={registerLineRef}
-          />
-        ) : (
-          <div className="viewer-error">
-            <span>{message ? 'This message has no markdown content to annotate.' : 'Message not found.'}</span>
-            <button onClick={onClose}>Close</button>
-          </div>
-        )}
+        <div className="viewer-error">
+          <span>{message ? 'This message has no markdown content to annotate.' : 'Message not found.'}</span>
+          <button onClick={onClose}>Close</button>
+        </div>
       </div>
     </ViewerShell>
   );
-  return shell;
 }
-
-const EMPTY_SET: Set<number> = new Set();
 
 function messageTitle(message: Message): string {
   const type = message.message_type || (message as unknown as Record<string, unknown>)['type'];
   const label = type === 'agent' ? 'Agent' : type === 'user' ? 'User' : 'Message';
   return `${label} message #${message.sequence_id}`;
-}
-
-function useMessageReviewNotes(
-  sequenceId: number,
-  messageId: string | undefined,
-  occurrenceToken: string | undefined,
-  onSendNotes: ((notes: string) => void | Promise<void>) | undefined,
-) {
-  const commands = useReviewNotesCommands();
-  const messageNotes = useMessageReviewNotesData(sequenceId, occurrenceToken);
-  const [annotating, setAnnotating] = useState<{ sequenceId: number; lineNumber: number; lineContent: string } | null>(null);
-  const [annotationDraftDirty, setAnnotationDraftDirty] = useState(false);
-  const [showPanel, setShowPanel] = useState(false);
-  const [highlightedLine, setHighlightedLine] = useState<number | null>(null);
-
-  useEffect(() => {
-    if (highlightedLine === null) return undefined;
-    const timer = setTimeout(() => setHighlightedLine(null), 2000);
-    return () => clearTimeout(timer);
-  }, [highlightedLine]);
-
-  useEffect(() => {
-    setAnnotating(null);
-    setAnnotationDraftDirty(false);
-    setHighlightedLine(null);
-    setShowPanel(false);
-  }, [occurrenceToken, sequenceId]);
-
-  useEffect(() => {
-    if (onSendNotes) return;
-    setHighlightedLine(null);
-    setShowPanel(false);
-  }, [onSendNotes]);
-
-  const canAnnotate = Boolean(onSendNotes);
-  const startAnnotate = useCallback((lineNumber: number, lineContent: string) => {
-    if (!canAnnotate) return;
-    setAnnotating({ sequenceId, lineNumber, lineContent });
-  }, [canAnnotate, sequenceId]);
-  const cancelAnnotate = useCallback(() => {
-    setAnnotating(null);
-    setAnnotationDraftDirty(false);
-  }, []);
-  const submitNote = useCallback(
-    (body: string) => {
-      if (!annotating || annotating.sequenceId !== sequenceId) return;
-      commands.addNote(
-        {
-          kind: 'message',
-          sequenceId,
-          ...(messageId !== undefined ? { messageId } : {}),
-          ...(occurrenceToken !== undefined ? { occurrenceToken } : {}),
-          lineNumber: annotating.lineNumber,
-        },
-        annotating.lineContent,
-        body,
-      );
-      setAnnotating(null);
-      setAnnotationDraftDirty(false);
-    },
-    [annotating, commands, messageId, occurrenceToken, sequenceId],
-  );
-
-  const send = useCallback(async () => {
-    const formatted = formatNotesForSend(commands.getSnapshot());
-    if (!formatted || !onSendNotes) return;
-    await onSendNotes(formatted);
-    commands.clear();
-    setShowPanel(false);
-  }, [commands, onSendNotes]);
-
-  const togglePanel = useCallback(() => setShowPanel((v) => !v), []);
-  const closePanel = useCallback(() => setShowPanel(false), []);
-  const highlight = useCallback((lineNumber: number) => setHighlightedLine(lineNumber), []);
-  const clearAll = useCallback(() => {
-    commands.clear();
-    setShowPanel(false);
-  }, [commands]);
-
-  return {
-    messageNotes,
-    annotating,
-    annotationDraftDirty,
-    setAnnotationDraftDirty,
-    startAnnotate,
-    cancelAnnotate,
-    submitNote,
-    showPanel,
-    togglePanel,
-    closePanel,
-    highlightedLine,
-    highlight,
-    send,
-    clearAll,
-    removeNote: commands.removeNote,
-  };
 }

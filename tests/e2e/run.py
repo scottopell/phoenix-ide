@@ -51,6 +51,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import concurrent.futures
 import contextlib
 import io
 import json
@@ -66,6 +67,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import traceback
 import unittest
@@ -2574,6 +2576,101 @@ class ScenarioSelectorTests(unittest.TestCase):
         self.assertEqual(attempts, list(range(1, STARTUP_ATTEMPTS + 1)))
 
 
+_PARALLEL_SCENARIO_PRIORITY = (
+    "public_literal_chat",
+    "coordinator_home",
+    "reminders",
+    "product_conversation_context_continuation",
+    "continuation",
+    "present_svg",
+    "think_tool",
+    "perf_stream",
+    "read_file",
+    "multi_tool",
+    "patch",
+    "image_roundtrip",
+    "text_streaming",
+    "mid_stream_cancel",
+    "list_models",
+)
+
+
+def _e2e_worker_budget() -> int:
+    for env_name in ("PHOENIX_CHECK_WORKERS", "CARGO_BUILD_JOBS"):
+        raw = os.environ.get(env_name, "").strip()
+        if raw.isascii() and raw.isdigit() and int(raw) >= 1:
+            return max(1, min(int(raw), os.cpu_count() or 1))
+    return max(1, min(4, os.cpu_count() or 1))
+
+
+def _ordered_for_parallel_dispatch(
+    scenarios: list[tuple[str, object]],
+) -> list[tuple[str, object]]:
+    rank = {name: index for index, name in enumerate(_PARALLEL_SCENARIO_PRIORITY)}
+    return sorted(scenarios, key=lambda item: (rank.get(item[0], len(rank)), item[0]))
+
+
+def _run_scenarios_parallel(
+    selected_scenarios: list[tuple[str, object]],
+    base_url: str,
+    max_workers: int,
+) -> list[tuple[str, str]]:
+    """Run independent E2E scenarios concurrently within the shared worker budget."""
+    failures: list[tuple[str, str]] = []
+    stop_event = threading.Event()
+    print_lock = threading.Lock()
+    ordered = _ordered_for_parallel_dispatch(selected_scenarios)
+
+    def run_one(name: str, fn) -> tuple[str, str] | None:
+        if stop_event.is_set():
+            return None
+        started = time.monotonic()
+        try:
+            fn(base_url)
+            dt = time.monotonic() - started
+            with print_lock:
+                print(f"  ✓ {name:<22s} {dt:6.2f}s", flush=True)
+            return None
+        except Exception as exc:
+            dt = time.monotonic() - started
+            detail = f"{type(exc).__name__}: {exc}"
+            stop_event.set()
+            with print_lock:
+                print(f"  ✗ {name:<22s} {dt:6.2f}s  {detail}", flush=True)
+            return (name, detail)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = [pool.submit(run_one, name, fn) for name, fn in ordered]
+        for future in concurrent.futures.as_completed(futures):
+            failure = future.result()
+            if failure is not None:
+                failures.append(failure)
+    return failures
+
+
+class ParallelDispatchTests(unittest.TestCase):
+    def test_worker_budget_honors_phoenix_check_workers(self):
+        with mock.patch.dict(os.environ, {"PHOENIX_CHECK_WORKERS": "1", "CARGO_BUILD_JOBS": "4"}, clear=False):
+            self.assertEqual(1, _e2e_worker_budget())
+        with mock.patch.dict(os.environ, {"CARGO_BUILD_JOBS": "2"}, clear=False):
+            os.environ.pop("PHOENIX_CHECK_WORKERS", None)
+            self.assertEqual(2, _e2e_worker_budget())
+
+    def test_parallel_runner_propagates_failure(self):
+        seen: list[str] = []
+
+        def ok(_url: str) -> None:
+            seen.append("ok")
+
+        def boom(_url: str) -> None:
+            raise AssertionError("synthetic e2e failure")
+
+        failures = _run_scenarios_parallel([("ok", ok), ("boom", boom)], "http://unused", 2)
+        self.assertEqual(1, len(failures))
+        self.assertEqual("boom", failures[0][0])
+        self.assertIn("synthetic e2e failure", failures[0][1])
+
+
 def _run_self_tests() -> int:
     suite = unittest.TestSuite(
         unittest.defaultTestLoader.loadTestsFromTestCase(case)
@@ -2585,6 +2682,7 @@ def _run_self_tests() -> int:
             StreamReadinessTests,
             PublicLiteralChatPreflightTests,
             ScenarioSelectorTests,
+            ParallelDispatchTests,
         )
     )
     result = unittest.TextTestRunner(verbosity=2).run(suite)
@@ -2601,59 +2699,65 @@ def main(argv: list[str] | None = None) -> int:
     _build_binary()
     failures: list[tuple[str, str]] = []
     log_text = ""
+    workers = _e2e_worker_budget()
     with _server() as (base_url, log_path, server_pid, profile_dir):
         print(f"[e2e] server up at {base_url}", flush=True)
-        for name, fn in selected_scenarios:
-            started_wall_ns = time.time_ns()
-            started_monotonic_ns = time.monotonic_ns()
-            started_harness_cpu = (
-                _harness_cpu_times() if profile_dir is not None else None
+        if profile_dir is None and workers > 1 and len(selected_scenarios) > 1:
+            failures = _run_scenarios_parallel(
+                selected_scenarios, base_url, min(workers, len(selected_scenarios))
             )
-            started_server_cpu = (
-                _process_cpu_times(server_pid) if profile_dir is not None else None
-            )
-            scenario_status = "failed"
-            try:
-                fn(base_url)
-                scenario_status = "passed"
-                dt = (time.monotonic_ns() - started_monotonic_ns) / 1_000_000_000.0
-                print(f"  ✓ {name:<22s} {dt:6.2f}s", flush=True)
-            except Exception as e:
-                dt = (time.monotonic_ns() - started_monotonic_ns) / 1_000_000_000.0
-                detail = f"{type(e).__name__}: {e}"
-                print(f"  ✗ {name:<22s} {dt:6.2f}s  {detail}", flush=True)
-                failures.append((name, detail))
-                print("[e2e] stopping after first failure to preserve root-cause signal", flush=True)
-                break
-            finally:
-                finished_monotonic_ns = time.monotonic_ns()
-                finished_harness_cpu = (
+        else:
+            for name, fn in selected_scenarios:
+                started_wall_ns = time.time_ns()
+                started_monotonic_ns = time.monotonic_ns()
+                started_harness_cpu = (
                     _harness_cpu_times() if profile_dir is not None else None
                 )
-                finished_server_cpu = (
+                started_server_cpu = (
                     _process_cpu_times(server_pid) if profile_dir is not None else None
                 )
-                _write_cpu_window(
-                    profile_dir,
-                    identity=f"e2e:scenario:{name}:harness",
-                    started_wall_ns=started_wall_ns,
-                    started_monotonic_ns=started_monotonic_ns,
-                    finished_monotonic_ns=finished_monotonic_ns,
-                    start_cpu=started_harness_cpu,
-                    finish_cpu=finished_harness_cpu,
-                    extra={"kind": "e2e_scenario", "process_role": "harness", "scenario": name, "status": scenario_status},
-                )
-                _write_cpu_window(
-                    profile_dir,
-                    identity=f"e2e:scenario:{name}:server",
-                    started_wall_ns=started_wall_ns,
-                    started_monotonic_ns=started_monotonic_ns,
-                    finished_monotonic_ns=finished_monotonic_ns,
-                    start_cpu=started_server_cpu,
-                    finish_cpu=finished_server_cpu,
-                    extra={"kind": "e2e_scenario", "process_role": "server", "scenario": name, "status": scenario_status},
-                )
-            
+                scenario_status = "failed"
+                try:
+                    fn(base_url)
+                    scenario_status = "passed"
+                    dt = (time.monotonic_ns() - started_monotonic_ns) / 1_000_000_000.0
+                    print(f"  ✓ {name:<22s} {dt:6.2f}s", flush=True)
+                except Exception as e:
+                    dt = (time.monotonic_ns() - started_monotonic_ns) / 1_000_000_000.0
+                    detail = f"{type(e).__name__}: {e}"
+                    print(f"  ✗ {name:<22s} {dt:6.2f}s  {detail}", flush=True)
+                    failures.append((name, detail))
+                    print("[e2e] stopping after first failure to preserve root-cause signal", flush=True)
+                    break
+                finally:
+                    finished_monotonic_ns = time.monotonic_ns()
+                    finished_harness_cpu = (
+                        _harness_cpu_times() if profile_dir is not None else None
+                    )
+                    finished_server_cpu = (
+                        _process_cpu_times(server_pid) if profile_dir is not None else None
+                    )
+                    _write_cpu_window(
+                        profile_dir,
+                        identity=f"e2e:scenario:{name}:harness",
+                        started_wall_ns=started_wall_ns,
+                        started_monotonic_ns=started_monotonic_ns,
+                        finished_monotonic_ns=finished_monotonic_ns,
+                        start_cpu=started_harness_cpu,
+                        finish_cpu=finished_harness_cpu,
+                        extra={"kind": "e2e_scenario", "process_role": "harness", "scenario": name, "status": scenario_status},
+                    )
+                    _write_cpu_window(
+                        profile_dir,
+                        identity=f"e2e:scenario:{name}:server",
+                        started_wall_ns=started_wall_ns,
+                        started_monotonic_ns=started_monotonic_ns,
+                        finished_monotonic_ns=finished_monotonic_ns,
+                        start_cpu=started_server_cpu,
+                        finish_cpu=finished_server_cpu,
+                        extra={"kind": "e2e_scenario", "process_role": "server", "scenario": name, "status": scenario_status},
+                    )
+
         # Read log inside the context — the tempdir may be cleaned up after.
         if log_path.exists():
             log_text = log_path.read_text()

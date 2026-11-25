@@ -175,7 +175,6 @@ interface PayloadContext {
 function buildPayload(data: ReadFileResult, ctx: PayloadContext): MetaViewerPayload {
   const common = {
     title: ctx.fileName,
-    absolutePath: ctx.absolutePath,
     onClose: ctx.onClose,
     onSendNotes: ctx.onSendNotes,
     ...(ctx.presentation !== undefined ? { presentation: ctx.presentation } : {}),
@@ -185,7 +184,14 @@ function buildPayload(data: ReadFileResult, ctx: PayloadContext): MetaViewerPayl
   };
 
   if (data.kind === 'image') {
-    return { kind: 'image', ...common, url: data.url, mimeType: data.mime_type, fileName: ctx.fileName };
+    return {
+      kind: 'image',
+      source: { kind: 'file', absolutePath: ctx.absolutePath },
+      ...common,
+      url: data.url,
+      mimeType: data.mime_type,
+      fileName: ctx.fileName,
+    };
   }
 
   const { renderKind, language } = classifyViewerFile(ctx.filePath, data.category);
@@ -193,14 +199,19 @@ function buildPayload(data: ReadFileResult, ctx: PayloadContext): MetaViewerPayl
   // responsive on large files, so they never need the plain-text fallback.
   // Markdown and HTML source still build line-per-node DOM, so they keep the guard.
   const renderMode = renderKind === 'code' || renderKind === 'text' ? 'rich' : textRenderMode(data.content);
-  const textCommon = {
-    ...common,
+  const source = {
+    kind: 'file' as const,
+    absolutePath: ctx.absolutePath,
     filePath: ctx.filePath,
     rootDir: ctx.rootDir,
-    content: data.content,
     ...(ctx.focus !== undefined ? { focus: ctx.focus } : {}),
     ...(renderMode !== 'rich' ? { renderMode } : {}),
     ...(ctx.patchContext !== undefined ? { patchContext: ctx.patchContext } : {}),
+  };
+  const textCommon = {
+    ...common,
+    source,
+    content: data.content,
   };
 
   switch (renderKind) {

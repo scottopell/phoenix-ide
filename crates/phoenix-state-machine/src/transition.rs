@@ -1195,6 +1195,183 @@ fn handle_core_llm_response(
     .with_effect(Effect::execute_tool(first)))
 }
 
+fn source_order_results(assistant: &AssistantMessage, results: &mut [ToolRoundResult]) {
+    results.sort_by_key(|result| {
+        assistant.content.iter().position(|block| {
+            matches!(block, phoenix_core::domain::llm_types::ContentBlock::ToolUse { id, .. }
+                if id == result.tool_use_id())
+        })
+    });
+}
+
+fn source_order_checkpoint(
+    assistant: &AssistantMessage,
+    mut completed: Vec<ToolRoundResult>,
+    tail: impl IntoIterator<Item = impl Into<ToolRoundResult>>,
+) -> Result<CheckpointData, ToolRoundError> {
+    completed.extend(tail.into_iter().map(Into::into));
+    source_order_results(assistant, &mut completed);
+    ToolRoundAssembly::new(
+        assistant.clone(),
+        completed,
+        std::iter::empty::<ToolRoundResult>(),
+    )
+    .map(CheckpointData::ToolRound)
+}
+
+fn complete_ordinary_sibling(
+    state: &CoreState,
+    tool_use_id: &str,
+    result: ToolRoundResult,
+) -> Result<CoreTransitionResult, TransitionError> {
+    let CoreState::ToolExecuting {
+        current_tool,
+        remaining_tools,
+        completed_results,
+        pending_sub_agents,
+        assistant_message,
+    } = state
+    else {
+        unreachable!("completion requires a tool round")
+    };
+    let mut unresolved: Vec<_> = std::iter::once(current_tool)
+        .chain(remaining_tools)
+        .cloned()
+        .collect();
+    let Some(index) = unresolved.iter().position(|call| call.id == tool_use_id) else {
+        return Err(TransitionError::InvalidTransition {
+            state: state.variant_name(),
+            event: "ToolComplete",
+        });
+    };
+    unresolved.remove(index);
+    let mut results = completed_results.clone();
+    results.push(result);
+    source_order_results(assistant_message, &mut results);
+    if !unresolved.is_empty() {
+        let next = unresolved.remove(0);
+        return Ok(CoreTransitionResult::new(CoreState::ToolExecuting {
+            current_tool: next.clone(),
+            remaining_tools: unresolved,
+            completed_results: results,
+            pending_sub_agents: pending_sub_agents.clone(),
+            assistant_message: assistant_message.clone(),
+        })
+        .with_effect(Effect::PersistState)
+        .with_effect(Effect::notify_state_change())
+        .with_effect(Effect::execute_tool(next)));
+    }
+    let checkpoint = ToolRoundAssembly::new(
+        assistant_message.clone(),
+        results,
+        std::iter::empty::<ToolRoundResult>(),
+    )
+    .map(CheckpointData::ToolRound)?;
+    let mut next = if pending_sub_agents.is_empty() {
+        CoreTransitionResult::new(CoreState::LlmRequesting { attempt: 1 })
+    } else {
+        CoreTransitionResult::new(CoreState::AwaitingSubAgents {
+            pending: pending_sub_agents.clone(),
+            completed_results: vec![],
+            spawn_tool_id: None,
+        })
+    }
+    .with_effect(Effect::PersistCheckpoint { data: checkpoint })
+    .with_effect(Effect::PersistState)
+    .with_effect(Effect::notify_state_change());
+    if pending_sub_agents.is_empty() {
+        next = next.with_effect(Effect::RequestLlm);
+    }
+    Ok(next)
+}
+
+fn settle_cancelled_receipt(result: ToolRoundResult, message: &str) -> ToolRoundResult {
+    match result {
+        finalized @ ToolRoundResult::Finalized(_) => finalized,
+        pending @ (ToolRoundResult::PendingSelfGoal { .. }
+        | ToolRoundResult::PendingGoalReport { .. }) => {
+            ToolResult::cancelled(pending.tool_use_id().to_owned(), message).into()
+        }
+    }
+}
+
+fn cancel_ordinary_sibling(
+    state: &CoreState,
+    event: &CoreEvent,
+    cancellation_message: &str,
+) -> Option<Result<CoreTransitionResult, TransitionError>> {
+    let CoreState::CancellingTool {
+        tool_use_id,
+        cause,
+        skipped_tools,
+        completed_results,
+        assistant_message,
+        pending_sub_agents,
+    } = state
+    else {
+        return None;
+    };
+    if skipped_tools.is_empty() {
+        return None;
+    }
+    let (settled_id, result) = match event {
+        CoreEvent::ToolComplete {
+            tool_use_id,
+            result,
+        } => (
+            tool_use_id,
+            settle_cancelled_receipt(result.clone(), cancellation_message),
+        ),
+        CoreEvent::ToolAborted { tool_use_id } => (
+            tool_use_id,
+            ToolResult::cancelled(tool_use_id.clone(), cancellation_message).into(),
+        ),
+        CoreEvent::UserMessage { .. }
+        | CoreEvent::AuthoritativeUserMessage { .. }
+        | CoreEvent::UserCancel { .. }
+        | CoreEvent::LlmResponse { .. }
+        | CoreEvent::LlmError { .. }
+        | CoreEvent::ServerOverloaded { .. }
+        | CoreEvent::ContinuationServerOverloaded { .. }
+        | CoreEvent::OverloadRetryDeadlineExpired
+        | CoreEvent::RetryTimeout { .. }
+        | CoreEvent::SpawnAgentsComplete { .. }
+        | CoreEvent::SubAgentResult { .. }
+        | CoreEvent::ContinuationResponse { .. }
+        | CoreEvent::ContinuationFailed { .. }
+        | CoreEvent::ContinuationError { .. }
+        | CoreEvent::UserTriggerContinuation { .. }
+        | CoreEvent::SteerDrainedUserMessages { .. }
+        | CoreEvent::ToolCancellationRetired { .. } => return None,
+    };
+    if settled_id != tool_use_id && !skipped_tools.iter().any(|call| call.id == *settled_id) {
+        return Some(Err(TransitionError::InvalidTransition {
+            state: state.variant_name(),
+            event: event.variant_name(),
+        }));
+    }
+    let mut remaining = skipped_tools.clone();
+    let representative = if settled_id == tool_use_id {
+        remaining.remove(0).id
+    } else {
+        remaining.retain(|call| call.id != *settled_id);
+        tool_use_id.clone()
+    };
+    let mut results = completed_results.clone();
+    results.push(result);
+    source_order_results(assistant_message, &mut results);
+    Some(Ok(CoreTransitionResult::new(CoreState::CancellingTool {
+        tool_use_id: representative,
+        cause: *cause,
+        skipped_tools: remaining,
+        completed_results: results,
+        assistant_message: assistant_message.clone(),
+        pending_sub_agents: pending_sub_agents.clone(),
+    })
+    .with_effect(Effect::PersistState)
+    .with_effect(Effect::notify_state_change())))
+}
+
 /// Handles `ToolComplete` and `SpawnAgentsComplete` events during `ToolExecuting` state.
 #[allow(clippy::too_many_lines)]
 fn handle_core_tool_complete(
@@ -1212,79 +1389,15 @@ fn handle_core_tool_complete(
         unreachable!("handle_core_tool_complete called in non-ToolExecuting state");
     };
 
+    if let CoreEvent::ToolComplete {
+        tool_use_id,
+        result,
+    } = event
+    {
+        return complete_ordinary_sibling(state, &tool_use_id, result);
+    }
+
     match event {
-        // ToolComplete (more tools remaining) -> next tool
-        CoreEvent::ToolComplete {
-            tool_use_id,
-            result,
-        } if tool_use_id == current_tool.id && !remaining_tools.is_empty() => {
-            let mut new_results = completed_results.clone();
-            new_results.push(result);
-
-            let next_tool = remaining_tools[0].clone();
-            let new_remaining = remaining_tools[1..].to_vec();
-
-            Ok(CoreTransitionResult::new(CoreState::ToolExecuting {
-                current_tool: next_tool.clone(),
-                remaining_tools: new_remaining,
-                completed_results: new_results,
-                pending_sub_agents: pending_sub_agents.clone(),
-                assistant_message: assistant_message.clone(),
-            })
-            .with_effect(Effect::PersistState)
-            .with_effect(Effect::notify_state_change())
-            .with_effect(Effect::execute_tool(next_tool)))
-        }
-
-        // ToolComplete (last tool, no sub-agents) -> LlmRequesting
-        CoreEvent::ToolComplete {
-            tool_use_id,
-            result,
-        } if tool_use_id == current_tool.id
-            && remaining_tools.is_empty()
-            && pending_sub_agents.is_empty() =>
-        {
-            let checkpoint = ToolRoundAssembly::new(
-                assistant_message.clone(),
-                completed_results.clone(),
-                std::iter::once(result),
-            )
-            .map(CheckpointData::ToolRound)?;
-
-            Ok(
-                CoreTransitionResult::new(CoreState::LlmRequesting { attempt: 1 })
-                    .with_effect(Effect::PersistCheckpoint { data: checkpoint })
-                    .with_effect(Effect::PersistState)
-                    .with_effect(Effect::notify_state_change())
-                    .with_effect(Effect::RequestLlm),
-            )
-        }
-
-        // ToolComplete (last tool, has sub-agents) -> AwaitingSubAgents
-        CoreEvent::ToolComplete {
-            tool_use_id,
-            result,
-        } if tool_use_id == current_tool.id
-            && remaining_tools.is_empty()
-            && !pending_sub_agents.is_empty() =>
-        {
-            let checkpoint = ToolRoundAssembly::new(
-                assistant_message.clone(),
-                completed_results.clone(),
-                std::iter::once(result),
-            )
-            .map(CheckpointData::ToolRound)?;
-
-            Ok(CoreTransitionResult::new(CoreState::AwaitingSubAgents {
-                pending: pending_sub_agents.clone(),
-                completed_results: vec![],
-                spawn_tool_id: None,
-            })
-            .with_effect(Effect::PersistCheckpoint { data: checkpoint })
-            .with_effect(Effect::PersistState)
-            .with_effect(Effect::notify_state_change()))
-        }
-
         // SpawnAgentsComplete (more tools) -> accumulate
         CoreEvent::SpawnAgentsComplete {
             tool_use_id,
@@ -1372,6 +1485,9 @@ fn handle_core_cancellation(
     state: &CoreState,
     event: CoreEvent,
 ) -> Result<CoreTransitionResult, TransitionError> {
+    if let Some(partial) = cancel_ordinary_sibling(state, &event, "Cancelled by user") {
+        return partial;
+    }
     let forced_tool_retirement = if matches!(event, CoreEvent::ToolCancellationRetired { .. }) {
         crate::state::ForcedToolRetirement::Observed
     } else {
@@ -1463,12 +1579,11 @@ fn handle_core_cancellation(
             let cancellation_results =
                 build_cancellation_results(tool_use_id, "Cancelled by user", skipped_tools);
 
-            let checkpoint = ToolRoundAssembly::new(
-                assistant_message.clone(),
+            let checkpoint = source_order_checkpoint(
+                assistant_message,
                 completed_results.clone(),
                 cancellation_results,
-            )
-            .map(CheckpointData::ToolRound)?;
+            )?;
 
             if pending_sub_agents.is_empty() {
                 let mut result = CoreTransitionResult::new(CoreState::Idle)
@@ -1499,25 +1614,21 @@ fn handle_core_cancellation(
             CoreState::CancellingTool {
                 tool_use_id,
                 cause,
-                skipped_tools,
+                skipped_tools: _,
                 completed_results,
                 assistant_message,
                 pending_sub_agents,
             },
             CoreEvent::ToolComplete {
                 tool_use_id: completed_id,
-                result: _,
+                result,
             },
         ) if *tool_use_id == completed_id => {
-            let cancellation_results =
-                build_cancellation_results(tool_use_id, "Cancelled by user", skipped_tools);
-
-            let checkpoint = ToolRoundAssembly::new(
-                assistant_message.clone(),
+            let checkpoint = source_order_checkpoint(
+                assistant_message,
                 completed_results.clone(),
-                cancellation_results,
-            )
-            .map(CheckpointData::ToolRound)?;
+                std::iter::once(settle_cancelled_receipt(result, "Cancelled by user")),
+            )?;
 
             if pending_sub_agents.is_empty() {
                 Ok(CoreTransitionResult::new(CoreState::Idle)
@@ -3676,6 +3787,14 @@ pub fn transition_sub_agent(
             event: "ToolRoundComplete",
         });
     }
+    if let (SubAgentState::Core(core), SubAgentEvent::Core(event)) = (state, &event) {
+        if let Some(partial) = cancel_ordinary_sibling(core, event, "Cancelled by parent") {
+            return partial.map(|partial| SubAgentTransitionResult {
+                new_state: SubAgentState::Core(partial.new_state),
+                effects: partial.effects,
+            });
+        }
+    }
     match (state, event) {
         // ============================================================
         // Terminal state absorption (Completed / Failed)
@@ -3777,30 +3896,29 @@ pub fn transition_sub_agent(
         // ============================================================
         // Sub-agent CancellingTool + ToolAborted/ToolComplete -> Failed
         // ============================================================
-        // The in-flight tool the sub-agent aborted has now settled. A cancelled
-        // sub-agent ends terminally Failed (the parent's analogous arm goes to
-        // Idle to resume the user's turn — wrong here, where the sub-agent has
-        // no turn of its own to resume) and notifies the parent so fan-in
-        // accounting stays correct. The tool result is discarded: the round is
-        // being cancelled, not checkpointed. Guarded on id match so a stale
-        // outcome for a different tool_use does not settle the wrong round.
+        // Partial sibling receipts are handled before this terminal arm.
         (
             SubAgentState::Core(CoreState::CancellingTool {
-                tool_use_id, cause, ..
+                tool_use_id,
+                cause,
+                skipped_tools,
+                completed_results,
+                assistant_message,
+                ..
             }),
             SubAgentEvent::Core(
-                CoreEvent::ToolAborted {
-                    tool_use_id: settled_id,
+                ref settled @ (CoreEvent::ToolAborted {
+                    tool_use_id: ref settled_id,
                 }
                 | CoreEvent::ToolCancellationRetired {
-                    tool_use_id: settled_id,
+                    tool_use_id: ref settled_id,
                 }
                 | CoreEvent::ToolComplete {
-                    tool_use_id: settled_id,
+                    tool_use_id: ref settled_id,
                     ..
-                },
+                }),
             ),
-        ) if *tool_use_id == settled_id => {
+        ) if tool_use_id == settled_id => {
             let (error, error_kind, outcome) = match cause {
                 CancelCause::Timeout => (
                     "Sub-agent timed out".to_string(),
@@ -3819,8 +3937,41 @@ pub fn transition_sub_agent(
                     )
                 }
             };
+            let tail: Vec<ToolRoundResult> = match settled {
+                CoreEvent::ToolComplete { result, .. } => vec![settle_cancelled_receipt(
+                    result.clone(),
+                    "Cancelled by parent",
+                )],
+                CoreEvent::ToolAborted { .. } | CoreEvent::ToolCancellationRetired { .. } => {
+                    build_cancellation_results(tool_use_id, "Cancelled by parent", skipped_tools)
+                        .into_iter()
+                        .map(Into::into)
+                        .collect()
+                }
+                CoreEvent::UserMessage { .. }
+                | CoreEvent::AuthoritativeUserMessage { .. }
+                | CoreEvent::UserCancel { .. }
+                | CoreEvent::LlmResponse { .. }
+                | CoreEvent::LlmError { .. }
+                | CoreEvent::ServerOverloaded { .. }
+                | CoreEvent::ContinuationServerOverloaded { .. }
+                | CoreEvent::OverloadRetryDeadlineExpired
+                | CoreEvent::RetryTimeout { .. }
+                | CoreEvent::SpawnAgentsComplete { .. }
+                | CoreEvent::SubAgentResult { .. }
+                | CoreEvent::ContinuationResponse { .. }
+                | CoreEvent::ContinuationFailed { .. }
+                | CoreEvent::ContinuationError { .. }
+                | CoreEvent::UserTriggerContinuation { .. }
+                | CoreEvent::SteerDrainedUserMessages { .. } => {
+                    unreachable!("terminal cancellation receipt matched above")
+                }
+            };
+            let checkpoint =
+                source_order_checkpoint(assistant_message, completed_results.clone(), tail)?;
             Ok(
                 SubAgentTransitionResult::new(SubAgentState::Failed { error, error_kind })
+                    .with_effect(Effect::PersistCheckpoint { data: checkpoint })
                     .with_effect(Effect::PersistState)
                     .with_effect(Effect::NotifyParent { outcome }),
             )
@@ -7443,6 +7594,21 @@ mod tests {
         )
         .unwrap();
 
+        assert!(matches!(
+            result2.new_state,
+            ConvState::CancellingTool { .. }
+        ));
+        let mut result2 = result2;
+        for id in ["tool-2", "tool-3"] {
+            result2 = transition(
+                &result2.new_state,
+                &test_context(),
+                Event::ToolAborted {
+                    tool_use_id: id.into(),
+                },
+            )
+            .unwrap();
+        }
         assert!(matches!(result2.new_state, ConvState::Idle));
         assert!(
             result2

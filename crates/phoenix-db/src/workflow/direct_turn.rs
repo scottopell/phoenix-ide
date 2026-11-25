@@ -4403,43 +4403,23 @@ mod tests {
         sqlx::query("CREATE TABLE projects (id TEXT PRIMARY KEY, canonical_path TEXT UNIQUE NOT NULL, main_ref TEXT NOT NULL DEFAULT 'main', created_at TEXT NOT NULL DEFAULT '2025-01-01')").execute(pool).await.unwrap();
         sqlx::query("CREATE TABLE messages (message_id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL, sequence_id INTEGER NOT NULL DEFAULT 1, message_type TEXT NOT NULL, content TEXT NOT NULL, display_data TEXT, usage_data TEXT, created_at TEXT NOT NULL DEFAULT '2025-01-01')").execute(pool).await.unwrap();
         run_pending_migrations(pool).await.unwrap();
-        for conversation_id in [
-            "conv-a",
-            "conv-b",
-            "conv-c",
-            "conv-d",
-            "conv-replay",
-            "conv-a-scope",
-            "conv-b-scope",
+        seed_repo_conversations(pool).await;
+    }
+
+    async fn seed_repo_conversations(pool: &sqlx::SqlitePool) {
+        let db = crate::Database::from_pool_for_tests(pool.clone(), String::new());
+        for (conversation_id, title) in [
+            ("conv-a", "A"),
+            ("conv-b", "B"),
+            ("conv-c", "C"),
+            ("conv-d", "D"),
+            ("conv-replay", "Replay"),
+            ("conv-a-scope", "A scope"),
+            ("conv-b-scope", "B scope"),
         ] {
-            let work_scope_id = format!("scope-{conversation_id}");
-            sqlx::query(
-                "INSERT OR IGNORE INTO work_scopes
-                 (id, authority_kind, lifecycle, created_at, updated_at, environment_kind, cwd)
-                 VALUES (?1, 'restricted_explore', 'active', '2025-01-01', '2025-01-01', 'unowned_cwd', '/tmp')",
-            )
-            .bind(&work_scope_id)
-            .execute(pool)
-            .await
-            .unwrap();
-            sqlx::query(
-                "INSERT OR IGNORE INTO product_conversations (id, kind, ordinary_lifecycle)
-                 VALUES (?1, 'ordinary', 'open')",
-            )
-            .bind(conversation_id)
-            .execute(pool)
-            .await
-            .unwrap();
-            sqlx::query(
-                "INSERT OR IGNORE INTO conversations
-                 (id, product_conversation_id, runtime_role, work_scope_id)
-                 VALUES (?1, ?1, 'user', ?2)",
-            )
-            .bind(conversation_id)
-            .bind(work_scope_id)
-            .execute(pool)
-            .await
-            .unwrap();
+            db.create_conversation(conversation_id, title, "/tmp", true, None, None)
+                .await
+                .unwrap();
         }
     }
 
@@ -4863,6 +4843,9 @@ mod tests {
     {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("direct-turn.db");
+        let seeded = crate::in_memory_template::seed_migrated_file_for_test(&path)
+            .await
+            .unwrap();
         let url = format!("sqlite://{}", path.display());
         let open = || async {
             let opts = SqliteConnectOptions::from_str(&url)
@@ -4879,7 +4862,18 @@ mod tests {
                 .execute(&pool)
                 .await
                 .unwrap();
-            if sqlx::query_scalar::<_, i64>(
+            if seeded {
+                if sqlx::query_scalar::<_, i64>(
+                    "SELECT COUNT(*) FROM conversations WHERE id = 'conv-a'",
+                )
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+                    == 0
+                {
+                    seed_repo_conversations(&pool).await;
+                }
+            } else if sqlx::query_scalar::<_, i64>(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='conversations'",
             )
             .fetch_one(&pool)

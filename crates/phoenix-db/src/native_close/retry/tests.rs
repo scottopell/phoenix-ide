@@ -834,9 +834,9 @@ async fn native_retry_header_refuses_unmanaged_obligation() {
 }
 
 #[tokio::test]
-async fn migration_177_preserves_existing_receipts_and_is_idempotent() {
+async fn migration_178_preserves_existing_receipts_and_is_idempotent() {
     let db = Database::open_in_memory().await.unwrap();
-    let ledger: String = sqlx::query_scalar("SELECT name FROM _migrations WHERE version = 177")
+    let ledger: String = sqlx::query_scalar("SELECT name FROM _migrations WHERE version = 178")
         .fetch_one(db.pool()).await.unwrap();
     assert_eq!(ledger, "native_close_explicit_retry_admission");
     assert_eq!(crate::migrations::run_pending_migrations(db.pool()).await.unwrap(), 0);

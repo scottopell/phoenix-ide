@@ -1,13 +1,15 @@
-# ADR-285: Unified Close is idempotent with one bounded completion-only retry
+# ADR-288: Unified Close is idempotent with one bounded completion-only retry
 
 - **Status:** Proposed
 - **Date:** 2026-11-14
 - **Affects:** REQ-WL-002f; REQ-BED-029; unified native `close_conversation`, retained Close operation/run identity
 
-Identity note: this branch-local proposal originally used 282. Integration with
-main relocated it to 285 to preserve the already-published, unrelated ADR-282.
-Its original date, Proposed status and decision substance are unchanged; ADR-283
-still supersedes its automatic completion policy.
+Identity note: this branch-local proposal is ADR-288 after integration numbering
+reconciliation. Main's published ADR-283 (ordinary foreground batches), ADR-284
+(eight-owner foreground window), and both existing ADR-285 records (Kache
+qualification and Coordinator evidence labels) remain unchanged. Its original
+date, Proposed status and decision substance are unchanged; branch-local ADR-286
+supersedes its automatic completion policy.
 
 ## Context
 

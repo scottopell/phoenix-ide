@@ -130,36 +130,90 @@ impl AdmittedRetryCursor {
     }
 
     pub(in crate::runtime::executor) async fn join_before_exit(mut self) {
-        self.join_workers().await;
+        let fatal_exit = matches!(self.stage, Stage::Fatal)
+            || self
+                .backend
+                .fatal_local_authority_fence
+                .fatal_authority_loss_is_latched();
+        let retain_custody = fatal_exit || self.join_workers().await;
         // An exit is not terminal evidence. Dropping armed authority fences it.
         if let Some(response) = self.response.take() {
             let _ = response.send(Err(NativeCloseApplicationError::FatalAuthority));
         }
+        if retain_custody {
+            // Keep target/attempt locks and the physical observer alive while an
+            // unknown or deadline-expired worker still owns the native effect.
+            self.backend
+                .fatal_local_authority_fence
+                .close("native_close_retry_exit_retained_custody");
+            std::mem::forget(self);
+        }
     }
 
-    async fn join_workers(&mut self) {
-        if let Some(worker) = self.drain_worker.take() {
-            let _ = worker.await;
+    async fn join_workers(&mut self) -> bool {
+        let deadline = tokio::time::Instant::from_std(self.deadline);
+        // Every worker shares the admitted absolute budget. A timeout must not
+        // take/drop a handle whose mutation or writer custody remains unknown.
+        macro_rules! join_owned_worker {
+            ($field:ident) => {
+                if let Some(worker) = self.$field.as_mut() {
+                    match tokio::time::timeout_at(deadline, &mut *worker).await {
+                        Ok(Ok(result)) => {
+                            // Even a completed worker error can mean that its durable
+                            // authority is unknown. Keep custody rather than releasing
+                            // the gates on actor exit.
+                            let unclassified = result.is_err();
+                            self.$field.take();
+                            if unclassified {
+                                return true;
+                            }
+                        }
+                        Ok(Err(_)) | Err(_) => return true,
+                    }
+                }
+            };
         }
-        if let Some(worker) = self.scope_worker.take() {
-            let _ = worker.await;
-        }
-        if let Some(worker) = self.tmux_worker.take() {
-            let _ = worker.await;
-        }
-        if let Some(worker) = self.dispatch_worker.take() {
-            let _ = worker.await;
-        }
+        join_owned_worker!(drain_worker);
+        join_owned_worker!(scope_worker);
+        join_owned_worker!(tmux_worker);
+        join_owned_worker!(dispatch_worker);
         #[cfg(unix)]
         {
-            // spawn_blocking cannot be aborted after entry. Always join it.
-            if let Some(preparation) = self.preparation.take() {
-                let _ = preparation.await;
+            // spawn_blocking cannot be aborted after entry. Join only within
+            // the admitted attempt's original deadline, retaining the cursor if
+            // the worker still owns preparation when that budget expires.
+            if let Some(preparation) = self.preparation.as_mut() {
+                let deadline = tokio::time::Instant::from_std(self.deadline);
+                match tokio::time::timeout_at(deadline, &mut *preparation).await {
+                    Ok(Ok(_result)) => {
+                        // timeout_at already consumed the completed JoinHandle result.
+                        self.preparation.take();
+                    }
+                    Ok(Err(_)) => {
+                        self.preparation.take();
+                        return true;
+                    }
+                    Err(_) => return true,
+                }
             }
             if let Some(physical) = self.physical.as_ref() {
-                let _ = physical.observe().await;
+                if physical.has_fatal_custody() {
+                    return true;
+                }
+                if !physical.is_ready() {
+                    let deadline = tokio::time::Instant::from_std(self.deadline);
+                    if !matches!(
+                        tokio::time::timeout_at(deadline, physical.observe()).await,
+                        Ok(Ok(_))
+                    ) {
+                        return true;
+                    }
+                } else if physical.observe().await.is_err() {
+                    return true;
+                }
             }
         }
+        false
     }
 
     fn finish(&mut self, result: Result<NativeCloseRetryResult, NativeCloseApplicationError>) {

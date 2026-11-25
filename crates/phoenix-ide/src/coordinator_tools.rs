@@ -230,6 +230,10 @@ struct PreviousTranscriptsTool {
 
 #[async_trait]
 impl Tool for PreviousTranscriptsTool {
+    fn foreground_execution(&self) -> phoenix_tools::ForegroundExecution {
+        phoenix_tools::ForegroundExecution::Concurrent
+    }
+
     fn name(&self) -> &'static str {
         "previous_transcripts"
     }
@@ -341,6 +345,10 @@ struct WorkScopeResearchReadFile(GlobalReadService);
 
 #[async_trait]
 impl Tool for WorkScopeResearchReadFile {
+    fn foreground_execution(&self) -> phoenix_tools::ForegroundExecution {
+        crate::tools::ReadFileTool.foreground_execution()
+    }
+
     fn name(&self) -> &'static str {
         "read_file"
     }
@@ -476,6 +484,10 @@ struct WorkScopeLoadInput {
 
 #[async_trait]
 impl Tool for WorkScopeLoadTool {
+    fn foreground_execution(&self) -> phoenix_tools::ForegroundExecution {
+        phoenix_tools::ForegroundExecution::Serial
+    }
+
     fn name(&self) -> &'static str {
         "work_scope_load"
     }
@@ -640,6 +652,10 @@ fn watch_output(value: impl Serialize) -> ToolOutput {
 
 #[async_trait]
 impl instance::RoutedTool for WatchConversation {
+    fn foreground_execution(&self) -> phoenix_tools::ForegroundExecution {
+        phoenix_tools::ForegroundExecution::Serial
+    }
+
     fn name(&self) -> &'static str {
         "watch_conversation"
     }
@@ -699,6 +715,10 @@ impl instance::RoutedTool for WatchConversation {
 
 #[async_trait]
 impl instance::RoutedTool for UnwatchConversation {
+    fn foreground_execution(&self) -> phoenix_tools::ForegroundExecution {
+        phoenix_tools::ForegroundExecution::Serial
+    }
+
     fn name(&self) -> &'static str {
         "unwatch_conversation"
     }
@@ -759,6 +779,10 @@ impl instance::RoutedTool for UnwatchConversation {
 
 #[async_trait]
 impl Tool for ListWatchedConversations {
+    fn foreground_execution(&self) -> phoenix_tools::ForegroundExecution {
+        phoenix_tools::ForegroundExecution::Concurrent
+    }
+
     fn name(&self) -> &'static str {
         "list_watched_conversations"
     }
@@ -809,6 +833,10 @@ struct WorkScopeCoordinatorBash(GlobalReadService);
 
 #[async_trait]
 impl Tool for WorkScopeCoordinatorBash {
+    fn foreground_execution(&self) -> phoenix_tools::ForegroundExecution {
+        BashTool.foreground_execution()
+    }
+
     fn name(&self) -> &'static str {
         "bash"
     }
@@ -982,6 +1010,10 @@ struct ReadEventEvidenceInput {
 
 #[async_trait]
 impl Tool for ReadEventEvidence {
+    fn foreground_execution(&self) -> phoenix_tools::ForegroundExecution {
+        phoenix_tools::ForegroundExecution::Concurrent
+    }
+
     fn name(&self) -> &'static str {
         "read_event_evidence"
     }
@@ -1101,6 +1133,10 @@ enum SendConversationMessageOutput {
 
 #[async_trait]
 impl Tool for SearchConversations {
+    fn foreground_execution(&self) -> phoenix_tools::ForegroundExecution {
+        phoenix_tools::ForegroundExecution::Concurrent
+    }
+
     fn name(&self) -> &'static str {
         "search_conversations"
     }
@@ -1124,6 +1160,10 @@ impl Tool for SearchConversations {
 
 #[async_trait]
 impl Tool for LocalReadConversation {
+    fn foreground_execution(&self) -> phoenix_tools::ForegroundExecution {
+        phoenix_tools::ForegroundExecution::Concurrent
+    }
+
     fn name(&self) -> &'static str {
         "read_conversation"
     }
@@ -1151,6 +1191,10 @@ impl Tool for LocalReadConversation {
 
 #[async_trait]
 impl instance::RoutedTool for FederatedReadConversation {
+    fn foreground_execution(&self) -> phoenix_tools::ForegroundExecution {
+        phoenix_tools::ForegroundExecution::Concurrent
+    }
+
     fn name(&self) -> &'static str {
         "read_conversation"
     }
@@ -1219,6 +1263,10 @@ impl instance::RoutedTool for FederatedReadConversation {
 
 #[async_trait]
 impl Tool for QueryDatabase {
+    fn foreground_execution(&self) -> phoenix_tools::ForegroundExecution {
+        phoenix_tools::ForegroundExecution::Concurrent
+    }
+
     fn name(&self) -> &'static str {
         "query_database"
     }
@@ -1251,6 +1299,10 @@ impl Tool for QueryDatabase {
 
 #[async_trait]
 impl instance::RoutedTool for FederatedQueryDatabase {
+    fn foreground_execution(&self) -> phoenix_tools::ForegroundExecution {
+        phoenix_tools::ForegroundExecution::Concurrent
+    }
+
     fn name(&self) -> &'static str {
         "query_database"
     }
@@ -1321,6 +1373,10 @@ async fn run_local_query(service: &GlobalReadService, sql: &str) -> ToolOutput {
 
 #[async_trait]
 impl instance::RoutedTool for ResolveReference {
+    fn foreground_execution(&self) -> phoenix_tools::ForegroundExecution {
+        phoenix_tools::ForegroundExecution::Concurrent
+    }
+
     fn name(&self) -> &'static str {
         "resolve_reference"
     }
@@ -1391,6 +1447,10 @@ impl instance::RoutedTool for ResolveReference {
 
 #[async_trait]
 impl Tool for SendConversationMessage {
+    fn foreground_execution(&self) -> phoenix_tools::ForegroundExecution {
+        phoenix_tools::ForegroundExecution::Serial
+    }
+
     fn name(&self) -> &'static str {
         "send_conversation_message"
     }
@@ -1567,6 +1627,10 @@ impl Tool for SendConversationMessage {
 
 #[async_trait]
 impl instance::RoutedTool for FederatedSendConversationMessage {
+    fn foreground_execution(&self) -> phoenix_tools::ForegroundExecution {
+        phoenix_tools::ForegroundExecution::Serial
+    }
+
     fn name(&self) -> &'static str {
         "send_conversation_message"
     }
@@ -3278,6 +3342,10 @@ mod tests {
             .into_iter()
             .find(|tool| tool.name() == "close_conversation")
             .unwrap();
+        assert_eq!(
+            tool.foreground_execution(),
+            phoenix_tools::ForegroundExecution::Serial
+        );
         let output = tool
             .run(
                 json!({"action":"initial", "product_conversation_id":"missing-target"}),

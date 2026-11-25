@@ -148,9 +148,10 @@ async fn adhd_language_migration_preserves_jobs_and_children() {
     .execute(&pool)
     .await
     .is_err());
+    assert_eq!(run_through_for_test(&pool, 172).await.unwrap(), 1);
     assert_eq!(
         run_pending_migrations(&pool).await.unwrap(),
-        registered_after(171)
+        registered_after(172)
     );
     assert_eq!(run_pending_migrations(&pool).await.unwrap(), 0);
     assert_eq!(
@@ -349,10 +350,11 @@ fn registered_identity_order_and_exact_bodies() {
         (163, "product_conversation_read_state"),
         (164, "coordinator_durable_tracking"),
         (165, "watch_ending_evidence"),
-        (176, "native_close_exact_observation_receipts"),
-        (177, "native_close_explicit_retry_admission"),
-        (178, "native_close_source_fence"),
-        (179, "native_close_retry_failure"),
+        (172, "coordinator_scan_origin_labels"),
+        (177, "native_close_exact_observation_receipts"),
+        (178, "native_close_explicit_retry_admission"),
+        (179, "native_close_source_fence"),
+        (180, "native_close_retry_failure"),
     ];
     for (version, name) in identities {
         let entries = MIGRATIONS
@@ -387,17 +389,18 @@ fn registered_identity_order_and_exact_bodies() {
         (include_str!("product_conversation_read_state.sql"), 163),
         (include_str!("../coordinator_tracking/schema.sql"), 164),
         (include_str!("watch_ending_evidence.sql"), 165),
-        (include_str!("close_original_retirement_anchor.sql"), 175),
+        (include_str!("coordinator_scan_origin_labels.sql"), 172),
+        (include_str!("close_original_retirement_anchor.sql"), 176),
         (
             include_str!("native_close_exact_observation_receipts.sql"),
-            176,
+            177,
         ),
         (
             include_str!("native_close_explicit_retry_admission.sql"),
-            177,
+            178,
         ),
-        (include_str!("native_close_source_fence.sql"), 178),
-        (include_str!("native_close_retry_failure.sql"), 179),
+        (include_str!("native_close_source_fence.sql"), 179),
+        (include_str!("native_close_retry_failure.sql"), 180),
     ] {
         let entries = MIGRATIONS
             .iter()

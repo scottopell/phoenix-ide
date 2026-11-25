@@ -249,6 +249,56 @@ export interface ConversationViewerSplitPaneProps extends ConversationViewerHost
   onLiveResize: (size: number, collapsed: boolean) => void;
 }
 
+export const VIEWER_PANE_MIN = 360;
+export const VIEWER_PANE_MAX = 1200;
+
+export function ViewerPaneDivider({
+  viewerPane,
+  minSize = VIEWER_PANE_MIN,
+  maxSize = VIEWER_PANE_MAX,
+  onLiveResize,
+}: {
+  viewerPane: ReturnType<typeof useResizablePane>;
+  minSize?: number;
+  maxSize?: number;
+  onLiveResize: (size: number, collapsed: boolean) => void;
+}) {
+  return (
+    <div
+      className="viewer-pane-divider"
+      title="Drag to resize the viewer pane • Double-click to collapse"
+      role="separator"
+      aria-orientation="vertical"
+      aria-label="Resize viewer pane"
+      aria-valuemin={minSize}
+      aria-valuemax={maxSize}
+      aria-valuenow={viewerPane.collapsed ? 0 : viewerPane.size}
+      tabIndex={0}
+      onPointerDown={(e) => viewerPane.startDrag(e, 'x', true, onLiveResize)}
+      onDoubleClick={() => viewerPane.setCollapsed(!viewerPane.collapsed)}
+      onKeyDown={(e) => {
+        const STEP = 32;
+        if (e.key === 'ArrowLeft') {
+          e.preventDefault();
+          viewerPane.setSize(viewerPane.size + STEP);
+        } else if (e.key === 'ArrowRight') {
+          e.preventDefault();
+          viewerPane.setSize(viewerPane.size - STEP);
+        } else if (e.key === 'Home') {
+          e.preventDefault();
+          viewerPane.setSize(maxSize);
+        } else if (e.key === 'End') {
+          e.preventDefault();
+          viewerPane.setSize(minSize);
+        } else if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault();
+          viewerPane.setCollapsed(!viewerPane.collapsed);
+        }
+      }}
+    />
+  );
+}
+
 /** Wide-desktop split pane + keyboard-accessible resize separator. */
 export function ConversationViewerSplitPane(props: ConversationViewerSplitPaneProps) {
   const {
@@ -285,37 +335,11 @@ export function ConversationViewerSplitPane(props: ConversationViewerSplitPanePr
 
   return (
     <>
-      <div
-        className="viewer-pane-divider"
-        title="Drag to resize the viewer pane • Double-click to collapse"
-        role="separator"
-        aria-orientation="vertical"
-        aria-label="Resize viewer pane"
-        aria-valuemin={minSize}
-        aria-valuemax={maxSize}
-        aria-valuenow={viewerPane.collapsed ? 0 : viewerPane.size}
-        tabIndex={0}
-        onPointerDown={(e) => viewerPane.startDrag(e, 'x', true, onLiveResize)}
-        onDoubleClick={() => viewerPane.setCollapsed(!viewerPane.collapsed)}
-        onKeyDown={(e) => {
-          const STEP = 32;
-          if (e.key === 'ArrowLeft') {
-            e.preventDefault();
-            viewerPane.setSize(viewerPane.size + STEP);
-          } else if (e.key === 'ArrowRight') {
-            e.preventDefault();
-            viewerPane.setSize(viewerPane.size - STEP);
-          } else if (e.key === 'Home') {
-            e.preventDefault();
-            viewerPane.setSize(maxSize);
-          } else if (e.key === 'End') {
-            e.preventDefault();
-            viewerPane.setSize(minSize);
-          } else if (e.key === 'Enter' || e.key === ' ') {
-            e.preventDefault();
-            viewerPane.setCollapsed(!viewerPane.collapsed);
-          }
-        }}
+      <ViewerPaneDivider
+        viewerPane={viewerPane}
+        minSize={minSize}
+        maxSize={maxSize}
+        onLiveResize={onLiveResize}
       />
       <div className="conversation-viewer-pane">
         <Suspense fallback={null}>

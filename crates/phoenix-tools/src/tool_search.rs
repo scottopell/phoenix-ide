@@ -13,6 +13,10 @@ pub struct ToolSearch;
 
 #[async_trait]
 impl Tool for ToolSearch {
+    fn foreground_execution(&self) -> super::ForegroundExecution {
+        super::ForegroundExecution::Concurrent
+    }
+
     fn name(&self) -> &'static str {
         TOOL_SEARCH_NAME
     }

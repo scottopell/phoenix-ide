@@ -13,7 +13,7 @@ const WORKTREE: &str = "      AND effect.resource_kind = 'worktree' AND effect.i
 
 fn unexpected(name: &str) -> DbError {
     DbError::Serialization(format!(
-        "migration 188 found unexpected {name} source shape"
+        "migration 189 found unexpected {name} source shape"
     ))
 }
 
@@ -48,8 +48,8 @@ async fn require_source(
 }
 
 pub(super) async fn run(pool: &SqlitePool, migration: &Migration) -> DbResult<()> {
-    // Reconstruct the full shipped trigger: 119's active/non-native arm, 180's
-    // native original arm, and 187's captured-loss arm. Never derive a new
+    // Reconstruct the full predecessor trigger: 119's active/non-native arm, 181's
+    // native original arm, and 188's captured-loss arm. Never derive a new
     // authority from a fragment of unverified installed SQL.
     let original = ORIGINAL.trim_end();
     let captured = original
@@ -65,7 +65,7 @@ pub(super) async fn run(pool: &SqlitePool, migration: &Migration) -> DbResult<()
             "close_retirement_inventories inventory",
             "native_close_retry_scope_authorities inventory",
         );
-    let native_187 = format!(
+    let native_188 = format!(
         "{original}\nUNION ALL\n{captured}\n      AND EXISTS (SELECT 1 FROM native_close_captured_loss_retry_plans capture_origin\n          WHERE capture_origin.attempt_id = plan.attempt_id AND capture_origin.run_ordinal = plan.run_ordinal)"
     );
     let legacy = replace_exact(
@@ -77,11 +77,11 @@ pub(super) async fn run(pool: &SqlitePool, migration: &Migration) -> DbResult<()
     let suffix = ORIGINAL
         .get(original.len()..)
         .ok_or_else(|| unexpected(INSERT_AUTHORITY))?;
-    let insert_187 = replace_exact(
+    let insert_188 = replace_exact(
         &legacy,
         INSERT_AUTHORITY,
         "\nBEGIN",
-        &format!("\nAND NOT EXISTS (\n{native_187}{suffix}\n)\nBEGIN"),
+        &format!("\nAND NOT EXISTS (\n{native_188}{suffix}\n)\nBEGIN"),
     )?;
 
     // Tmux has only original-inventory authority. Leave both worktree arms
@@ -92,16 +92,16 @@ pub(super) async fn run(pool: &SqlitePool, migration: &Migration) -> DbResult<()
         WORKTREE,
         migration.sql.trim_end(),
     )?;
-    let native_188 = format!("{native_187}\nUNION ALL\n{tmux}");
-    let insert_188 = replace_exact(&insert_187, INSERT_AUTHORITY, &native_187, &native_188)?;
+    let native_189 = format!("{native_188}\nUNION ALL\n{tmux}");
+    let insert_189 = replace_exact(&insert_188, INSERT_AUTHORITY, &native_188, &native_189)?;
 
-    // Keep 187's full membership check. Changing the dispatch key into a
+    // Keep 188's full membership check. Changing the dispatch key into a
     // completed native Close must also meet the INSERT authority; membership
     // alone would allow rewriting a row to an already discharged or unsupported
     // effect. Do not re-authorize timestamp-only updates of historical markers.
-    let update_187 = trigger(CAPTURE, UPDATE_MEMBERSHIP)?;
-    let update_188 = replace_exact(
-        &update_187,
+    let update_188 = trigger(CAPTURE, UPDATE_MEMBERSHIP)?;
+    let update_189 = replace_exact(
+        &update_188,
         UPDATE_MEMBERSHIP,
         "\nBEGIN",
         &format!(
@@ -112,27 +112,27 @@ pub(super) async fn run(pool: &SqlitePool, migration: &Migration) -> DbResult<()
     AND EXISTS (SELECT 1 FROM close_obligations obligation
         WHERE obligation.attempt_id = NEW.attempt_id AND obligation.native_managed = 1
           AND obligation.phase = 'completed')
-    AND NOT EXISTS (\n{native_188}\n))\nBEGIN"
+    AND NOT EXISTS (\n{native_189}\n))\nBEGIN"
         ),
     )?;
 
     let mut connection = pool.acquire().await?;
     let mut tx = connection.begin().await?;
-    require_source(&mut tx, INSERT_AUTHORITY, &insert_187).await?;
+    require_source(&mut tx, INSERT_AUTHORITY, &insert_188).await?;
     require_source(
         &mut tx,
         INSERT_MEMBERSHIP,
         &trigger(CAPTURE, INSERT_MEMBERSHIP)?,
     )
     .await?;
-    require_source(&mut tx, UPDATE_MEMBERSHIP, &update_187).await?;
+    require_source(&mut tx, UPDATE_MEMBERSHIP, &update_188).await?;
     sqlx::raw_sql(
         "DROP TRIGGER close_retirement_resource_dispatches_require_authority;
          DROP TRIGGER close_retirement_resource_dispatches_updates_require_full_membership;",
     )
     .execute(&mut *tx)
     .await?;
-    sqlx::raw_sql(sqlx::AssertSqlSafe(format!("{insert_188};\n{update_188};")))
+    sqlx::raw_sql(sqlx::AssertSqlSafe(format!("{insert_189};\n{update_189};")))
         .execute(&mut *tx)
         .await?;
     sqlx::query("INSERT INTO _migrations (version, name) VALUES (?1, ?2)")

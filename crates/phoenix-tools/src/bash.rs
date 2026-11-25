@@ -72,6 +72,10 @@ impl BashTool {
 
 #[async_trait]
 impl Tool for BashTool {
+    fn foreground_execution(&self) -> crate::ForegroundExecution {
+        crate::ForegroundExecution::Concurrent
+    }
+
     // clearable: re-queryable read (side effects aside) — see specs/stale-tool-results (REQ-STR-002).
     fn clearable(&self) -> bool {
         true
@@ -220,6 +224,10 @@ For complex scripts, write them to a file first and execute the file."#
 
 #[async_trait]
 impl Tool for SandboxedBashTool {
+    fn foreground_execution(&self) -> crate::ForegroundExecution {
+        BashTool.foreground_execution()
+    }
+
     // clearable: sandboxed bash outputs are re-queryable snapshots like ordinary bash.
     fn clearable(&self) -> bool {
         true

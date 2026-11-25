@@ -1515,6 +1515,83 @@ async fn exit_interruption_retries_only_classification_before_releasing_exact_ow
 }
 
 #[tokio::test]
+async fn queued_stop_in_cancellation_inbox_wins_over_due_close_settlement() {
+    use native_close::NativeCloseInitialContinuationPhase as Phase;
+
+    let fixture = CloseFixture::new().await;
+    let mut harness = fixture.runtime(true);
+    let (settlement_tx, mut settlement_entries) = mpsc::unbounded_channel();
+    harness.runtime.native_close_settlement_entry_observer = Some(settlement_tx);
+    let (phase_tx, mut phases) = mpsc::unbounded_channel();
+    harness.runtime.native_close_phase_observer = Some(phase_tx);
+    let (ordinary_ack, _) = mpsc::channel(1);
+    let (_, stop_sender, cancellation_rx) =
+        crate::runtime::cancellation_inbox::channel(harness.event_tx.clone(), ordinary_ack);
+    harness.runtime = harness.runtime.with_cancellation_input_receiver(cancellation_rx);
+    let close_sender = setup_actor_queue(&mut harness);
+    let gate = Arc::new(Mutex::new(()));
+    let (response, _close_reply) = oneshot::channel();
+    close_sender
+        .send(initial_request(
+            harness.runtime.admit_authoritative_effect().unwrap(),
+            &fixture,
+            Arc::clone(&gate).lock_owned().await,
+            response,
+        ))
+        .await
+        .unwrap();
+
+    // Drive the actor in this task so no Close step can run between the phase
+    // witness and queuing Stop. Advance the actual actor clock past its next tick.
+    let actor = harness.runtime.run();
+    tokio::pin!(actor);
+    tokio::select! {
+        biased;
+        phase = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            await_native_close_phase(&mut phases, Phase::Settle),
+        ) => phase.expect("Close must reach its settlement phase"),
+        exit = &mut actor => panic!("actor exited before Close was ready to settle: {exit:?}"),
+    }
+    tokio::time::pause();
+    tokio::time::advance(std::time::Duration::from_secs(1)).await;
+    tokio::time::resume();
+
+    let (acknowledgement, stop_ack) = oneshot::channel();
+    let (_retirement, retirement) = oneshot::channel();
+    stop_sender
+        .send(AcknowledgedEventRequest {
+            event: Event::UserCancel {
+                reason: None,
+                cause: CancelCause::UserRequested,
+            },
+            acknowledgement,
+            retirement,
+        })
+        .await
+        .unwrap();
+    let stopped = tokio::select! {
+        biased;
+        ack = tokio::time::timeout(std::time::Duration::from_secs(10), stop_ack) => ack,
+        exit = &mut actor => panic!("actor exited before Stop was acknowledged: {exit:?}"),
+    };
+    assert_eq!(stopped.unwrap().unwrap().unwrap(), AcknowledgedEventOutcome::Settled);
+    assert!(
+        matches!(settlement_entries.try_recv(), Err(mpsc::error::TryRecvError::Empty)),
+        "due Close must not enter settlement ahead of the queued inbox Stop, even if settlement would fail"
+    );
+
+    harness.event_tx.send(Event::Shutdown).await.unwrap();
+    assert_eq!(
+        tokio::time::timeout(std::time::Duration::from_secs(10), actor)
+            .await
+            .unwrap(),
+        RuntimeExitDisposition::CoordinatedShutdown,
+    );
+    assert!(gate.try_lock().is_ok(), "actor exit must observe Close owner release");
+}
+
+#[tokio::test]
 async fn process_shutdown_wakes_dormant_close_without_an_actor_event() {
     assert_actor_exit_from_dormant_close(true).await;
 }
@@ -2199,6 +2276,65 @@ async fn process_shutdown_after_inventory_capture_retains_resource_admission_fen
 }
 
 #[tokio::test]
+async fn initial_exit_retains_inspection_collector_before_terminal_interruption() {
+    use native_close::NativeCloseInitialContinuationPhase as Phase;
+    use phoenix_core::domain::close::ClosePhase;
+
+    let fixture = CloseFixture::new().await;
+    let gate = Arc::new(Mutex::new(()));
+    let (response, _reply) = oneshot::channel();
+    let (mut continuation, fence) =
+        admit_initial_continuation(&fixture, Arc::clone(&gate), response).await;
+    assert_eq!(continuation.step(&fixture.state).await.unwrap(), Phase::Settle);
+    assert_eq!(
+        continuation.step(&fixture.state).await.unwrap(),
+        Phase::ReachedSettlementPhase(ClosePhase::AwaitingRetirementInspection)
+    );
+    let (entered_tx, entered) = oneshot::channel();
+    let (release, released) = oneshot::channel();
+    let (exited_tx, exited) = oneshot::channel();
+    continuation.set_inspection_collection_test_barrier(entered_tx, released, exited_tx);
+    assert_eq!(
+        continuation.step(&fixture.state).await.unwrap(),
+        Phase::CollectingInspection
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(10), entered)
+        .await
+        .unwrap()
+        .unwrap();
+    continuation.begin_exit_interruption();
+    assert_eq!(
+        continuation.step(&fixture.state).await.unwrap(),
+        Phase::ClassifyingExitInterruption
+    );
+    assert!(gate.try_lock().is_err(), "pending collector must retain target gate");
+    assert_eq!(fence.active_authoritative_effect_count(), 1);
+    assert!(!continuation.release_if_exactly_terminal().await);
+    let obligation = fixture
+        .db
+        .get_close_obligation(continuation.receipt.admitted.attempt_id.as_str())
+        .await
+        .unwrap();
+    assert_eq!(obligation.phase(), ClosePhase::AwaitingRetirementInspection);
+
+    release.send(()).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(10), exited)
+        .await
+        .unwrap()
+        .unwrap();
+    // The exit guard sends after collection returns, with no await afterward.
+    // This current-thread test cannot resume until that task poll completes.
+    assert_eq!(
+        continuation.step(&fixture.state).await.unwrap(),
+        Phase::Finished
+    );
+    assert!(continuation.release_if_exactly_terminal().await);
+    assert_eq!(fence.active_authoritative_effect_count(), 0);
+    drop(continuation);
+    assert!(gate.try_lock().is_ok());
+}
+
+#[tokio::test]
 async fn source_owned_initial_inspection_persists_only_normalized_empty_snapshot() {
     use phoenix_core::domain::close::ClosePhase;
     let fixture = CloseFixture::new().await;
@@ -2422,11 +2558,10 @@ async fn fatal_authority_during_inventory_preparation_joins_worker_before_owner_
     .await
     .expect("fatal authority must abort and join inventory preparation");
     assert_eq!(fatal_step, Err(NativeCloseApplicationError::FatalAuthority));
-    assert_eq!(
-        exited.try_recv(),
-        Ok(()),
-        "the awaited fatal step must already have joined the worker"
-    );
+    tokio::time::timeout(std::time::Duration::from_secs(10), &mut exited)
+        .await
+        .expect("fatal worker cancellation must reach its completion witness")
+        .expect("inventory worker lifecycle sender must remain live until exit");
     assert!(
         release.send(()).is_err(),
         "joined worker must drop its barrier receiver"

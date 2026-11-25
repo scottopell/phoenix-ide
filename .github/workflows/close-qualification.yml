@@ -286,7 +286,7 @@ jobs:
           set -euo pipefail
           cargo test -p phoenix-db --lib --no-run 2>&1 | tee evidence/compile.log
           cargo test -p phoenix-db --lib -- --list 2>&1 | tee evidence/inventory.log
-          grep -E '^close_foundation::tests::.*: test$|^migrations::close_completion_allowance_tests::migration_175_.*: test$|^migrations::retry_tmux_dispatch_tests::.*: test$|^migrations::native_close_retry_origin_gate::tests::.*: test$|^migrations::native_close_origin_owner_cleanup_tests::.*: test$|^migrations::tests::migration_(183|184|185|186)_.*: test$|^native_close::.*: test$' evidence/inventory.log > evidence/selected-tests.txt
+          grep -E '^close_foundation::tests::.*: test$|^migrations::close_completion_allowance_tests::migration_176_.*: test$|^migrations::retry_tmux_dispatch_tests::.*: test$|^migrations::native_close_retry_origin_gate::tests::.*: test$|^migrations::native_close_origin_owner_cleanup_tests::.*: test$|^migrations::tests::(migration_(184|185|186|187)_.*|close_tail_upgrades_base_171_and_main_172_to_cached_schema_idempotently): test$|^native_close::.*: test$' evidence/inventory.log > evidence/selected-tests.txt
           test -s evidence/selected-tests.txt
           grep -F 'close_foundation::tests::inspection_aggregate_validator_preserves_exact_content_and_empty_generation_rules: test' evidence/selected-tests.txt
           for test in \
@@ -316,12 +316,13 @@ jobs:
             grep -Fx "close_foundation::tests::native_retry::$test: test" evidence/selected-tests.txt
           done
           grep -F 'startup_and_observer_interrupt_native_retry_from_original_pending_plan_preserving_allowance: test' evidence/selected-tests.txt
-          grep -F 'migration_175_excludes_legacy_sealed_inventory_and_preserves_shared_g2_capture: test' evidence/selected-tests.txt
-          grep -Fx 'close_foundation::tests::native_retry::migration_182_populated_upgrade_preserves_retry_and_adds_initial_source_authority: test' evidence/selected-tests.txt
-          grep -F 'migration_183_upgrades_authentic_182_initial_source_fence_schema: test' evidence/selected-tests.txt
-          grep -F 'migration_184_adds_unbackfilled_initial_completion_successor_authority: test' evidence/selected-tests.txt
-          grep -Fx 'migrations::tests::migration_185_preserves_existing_losses_and_adds_ignored_category: test' evidence/selected-tests.txt
-          grep -Fx 'migrations::tests::migration_186_adds_unbackfilled_initial_result_acknowledgements: test' evidence/selected-tests.txt
+          grep -F 'migration_176_excludes_legacy_sealed_inventory_and_preserves_shared_g2_capture: test' evidence/selected-tests.txt
+          grep -Fx 'close_foundation::tests::native_retry::migration_183_populated_upgrade_preserves_retry_and_adds_initial_source_authority: test' evidence/selected-tests.txt
+          grep -F 'migration_184_upgrades_authentic_183_initial_source_fence_schema: test' evidence/selected-tests.txt
+          grep -F 'migration_185_adds_unbackfilled_initial_completion_successor_authority: test' evidence/selected-tests.txt
+          grep -Fx 'migrations::tests::migration_186_preserves_existing_losses_and_adds_ignored_category: test' evidence/selected-tests.txt
+          grep -Fx 'migrations::tests::migration_187_adds_unbackfilled_initial_result_acknowledgements: test' evidence/selected-tests.txt
+          grep -Fx 'migrations::tests::close_tail_upgrades_base_171_and_main_172_to_cached_schema_idempotently: test' evidence/selected-tests.txt
           grep -F 'native_retry_success_requires_exact_live_receipt_effect_and_evidence_before_replay: test' evidence/selected-tests.txt
           grep -F 'native_retry_finalizes_exact_g1_successes_without_rebinding_current_g2: test' evidence/selected-tests.txt
           grep -F 'retry_interruption_uses_pending_effect_not_successful_prior_resource: test' evidence/selected-tests.txt
@@ -333,10 +334,10 @@ jobs:
             grep -F "close_foundation::tests::native_retry::$test: test" evidence/selected-tests.txt
           done
           for test in \
-            migration_179_upgrades_populated_178_without_rebinding_g1_or_g2 \
-            migration_179_g1_failure_guards_preserve_g2_and_exact_pending_children \
-            migration_179_upgrade_preserves_installed_source_fence_behavior \
-            migration_179_unknown_installed_prefix_rolls_back_both_trigger_rewrites; do
+            migration_180_upgrades_populated_179_without_rebinding_g1_or_g2 \
+            migration_180_g1_failure_guards_preserve_g2_and_exact_pending_children \
+            migration_180_upgrade_preserves_installed_source_fence_behavior \
+            migration_180_unknown_installed_prefix_rolls_back_both_trigger_rewrites; do
             grep -F "close_foundation::tests::native_retry::$test: test" evidence/selected-tests.txt
           done
           for test in \
@@ -369,14 +370,14 @@ jobs:
             native_retry_dispatch_replays_historical_g1_without_retimestamping \
             native_retry_raw_dispatch_rejects_backdated_new_row \
             native_retry_raw_dispatch_rejects_g2_and_malformed_plan_without_legacy_fallthrough \
-            migration_180_preserves_populated_179_rows_and_rewrites_only_dispatch_authority \
+            migration_181_preserves_populated_180_rows_and_rewrites_only_dispatch_authority \
             non_native_retry_dispatch_retains_legacy_current_snapshot_authority; do
             grep -F "close_foundation::tests::native_retry::$test: test" evidence/selected-tests.txt
           done
           for test in \
             native_retry_worktree_metadata_is_source_bound_to_pending_original_g1_effect \
-            migration_181_unknown_second_authority_prefix_rolls_back_first_rewrite_and_ledger \
-            migration_181_refuses_native_g2_legacy_metadata_authority; do
+            migration_182_unknown_second_authority_prefix_rolls_back_first_rewrite_and_ledger \
+            migration_182_refuses_native_g2_legacy_metadata_authority; do
             grep -F "close_foundation::tests::native_retry::$test: test" evidence/selected-tests.txt
           done
           for test in \
@@ -415,14 +416,23 @@ jobs:
             native_retry_member_work_allows_uncertain_failure_but_not_stopped_placement; do
             grep -F "close_foundation::tests::native_retry::$test: test" evidence/selected-tests.txt
           done
+      - name: Require Close migration lineage and cached schema parity
+        if: success() || failure()
+        shell: bash
+        run: |
+          set -euo pipefail
+          selector=migrations::tests::close_tail_upgrades_base_171_and_main_172_to_cached_schema_idempotently
+          grep -Fx "$selector: test" evidence/selected-tests.txt
+          cargo test -p phoenix-db --lib "$selector" -- --exact --nocapture --test-threads=1 2>&1 | tee evidence/close-migration-lineage.log
+          grep -E 'test result: ok\. 1 passed; 0 failed; 0 ignored;' evidence/close-migration-lineage.log
       - name: Require exact retry tmux dispatch migration upgrade
         if: success() || failure()
         shell: bash
         run: |
           set -euo pipefail
           for test in \
-            real187_to188_preserves_worktree_authority_and_adds_exact_original_tmux \
-            missing_or_changed_dispatch_trigger_rolls_back188; do
+            real188_to189_preserves_worktree_authority_and_adds_exact_original_tmux \
+            missing_or_changed_dispatch_trigger_rolls_back189; do
             grep -Fx "migrations::retry_tmux_dispatch_tests::$test: test" evidence/selected-tests.txt
             cargo test -p phoenix-db --lib "migrations::retry_tmux_dispatch_tests::$test" -- --exact --nocapture --test-threads=1 2>&1 | tee "evidence/retry-tmux-migration-$test.log"
             grep -E 'test result: ok\. 1 passed; 0 failed; 0 ignored;' "evidence/retry-tmux-migration-$test.log"
@@ -433,8 +443,8 @@ jobs:
         run: |
           set -euo pipefail
           for test in \
-            real188_to189_preserves_origin_authority_and_is_idempotent \
-            missing_or_changed_origin_trigger_rolls_back189 \
+            real189_to190_preserves_origin_authority_and_is_idempotent \
+            missing_or_changed_origin_trigger_rolls_back190 \
             source_rewrite_corrects_only_member_quiescence_gate; do
             grep -Fx "migrations::native_close_retry_origin_gate::tests::$test: test" evidence/selected-tests.txt
             cargo test -p phoenix-db --lib "migrations::native_close_retry_origin_gate::tests::$test" -- --exact --nocapture --test-threads=1 2>&1 | tee "evidence/retry-origin-migration-$test.log"
@@ -446,8 +456,8 @@ jobs:
         run: |
           set -euo pipefail
           for test in \
-            real189_to190_changes_only_owner_cleanup_and_is_idempotent \
-            missing_predecessor_guard_rolls_back190; do
+            real190_to191_changes_only_owner_cleanup_and_is_idempotent \
+            missing_predecessor_guard_rolls_back191; do
             selector="migrations::native_close_origin_owner_cleanup_tests::$test"
             grep -Fx "$selector: test" evidence/selected-tests.txt
             cargo test -p phoenix-db --lib "$selector" -- --exact --nocapture --test-threads=1 2>&1 | tee "evidence/origin-owner-migration-$test.log"
@@ -468,41 +478,41 @@ jobs:
             grep -Fx "test $selector ... ok" "evidence/$test_name.log"
             grep -E 'test result: ok\. 1 passed; 0 failed; 0 ignored;' "evidence/$test_name.log"
           done
-      - name: Execute migration179 populated upgrade and authority regressions
+      - name: Execute migration180 populated upgrade and authority regressions
         if: success()
         shell: bash
         run: |
           set -euo pipefail
-          cargo test -p phoenix-db --lib close_foundation::tests::native_retry::migration_179_ -- --nocapture --test-threads=1 2>&1 | tee evidence/migration179.log
-          grep -E 'test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored;' evidence/migration179.log
+          cargo test -p phoenix-db --lib close_foundation::tests::native_retry::migration_180_ -- --nocapture --test-threads=1 2>&1 | tee evidence/migration180.log
+          grep -E 'test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored;' evidence/migration180.log
       - name: Execute native source-fence migration upgrade
         if: success() || failure()
         shell: bash
         run: |
           set -euo pipefail
-          cargo test -p phoenix-db --lib close_foundation::tests::native_retry::migration_182_populated_upgrade_preserves_retry_and_adds_initial_source_authority -- --exact --nocapture --test-threads=1 2>&1 | tee evidence/migration182.log
-          grep -E 'test result: ok\. 1 passed; 0 failed; 0 ignored;' evidence/migration182.log
+          cargo test -p phoenix-db --lib close_foundation::tests::native_retry::migration_183_populated_upgrade_preserves_retry_and_adds_initial_source_authority -- --exact --nocapture --test-threads=1 2>&1 | tee evidence/migration183.log
+          grep -E 'test result: ok\. 1 passed; 0 failed; 0 ignored;' evidence/migration183.log
       - name: Execute initial-interruption migration upgrade
         if: success()
         shell: bash
         run: |
           set -euo pipefail
-          cargo test -p phoenix-db --lib migrations::tests::migration_183_upgrades_authentic_182_initial_source_fence_schema -- --exact --nocapture --test-threads=1 2>&1 | tee evidence/migration183.log
-          grep -E 'test result: ok\. 1 passed; 0 failed; 0 ignored;' evidence/migration183.log
+          cargo test -p phoenix-db --lib migrations::tests::migration_184_upgrades_authentic_183_initial_source_fence_schema -- --exact --nocapture --test-threads=1 2>&1 | tee evidence/migration184.log
+          grep -E 'test result: ok\. 1 passed; 0 failed; 0 ignored;' evidence/migration184.log
       - name: Execute initial completion retry-admission migration upgrade
         if: success()
         shell: bash
         run: |
           set -euo pipefail
-          cargo test -p phoenix-db --lib migrations::tests::migration_184_adds_unbackfilled_initial_completion_successor_authority -- --exact --nocapture --test-threads=1 2>&1 | tee evidence/migration184.log
-          grep -E 'test result: ok\. 1 passed; 0 failed; 0 ignored;' evidence/migration184.log
+          cargo test -p phoenix-db --lib migrations::tests::migration_185_adds_unbackfilled_initial_completion_successor_authority -- --exact --nocapture --test-threads=1 2>&1 | tee evidence/migration185.log
+          grep -E 'test result: ok\. 1 passed; 0 failed; 0 ignored;' evidence/migration185.log
       - name: Execute populated ignored-loss migration upgrade
         if: success()
         shell: bash
         run: |
           set -euo pipefail
-          cargo test -p phoenix-db --lib migrations::tests::migration_185_preserves_existing_losses_and_adds_ignored_category -- --exact --nocapture --test-threads=1 2>&1 | tee evidence/migration185.log
-          grep -E 'test result: ok\. 1 passed; 0 failed; 0 ignored;' evidence/migration185.log
+          cargo test -p phoenix-db --lib migrations::tests::migration_186_preserves_existing_losses_and_adds_ignored_category -- --exact --nocapture --test-threads=1 2>&1 | tee evidence/migration186.log
+          grep -E 'test result: ok\. 1 passed; 0 failed; 0 ignored;' evidence/migration186.log
       - name: Execute complete Close foundation module
         if: success()
         shell: bash
@@ -532,13 +542,13 @@ jobs:
             native_retry_member_work_allows_uncertain_failure_but_not_stopped_placement; do
             grep -F "test close_foundation::tests::native_retry::$test ... ok" evidence/close-foundation.log
           done
-      - name: Execute migration175 regression module selectors
+      - name: Execute migration176 regression module selectors
         if: success() || failure()
         shell: bash
         run: |
           set -euo pipefail
-          cargo test -p phoenix-db --lib migrations::close_completion_allowance_tests::migration_175_ -- --nocapture --test-threads=1 2>&1 | tee evidence/migration175.log
-          grep -E 'test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored;' evidence/migration175.log
+          cargo test -p phoenix-db --lib migrations::close_completion_allowance_tests::migration_176_ -- --nocapture --test-threads=1 2>&1 | tee evidence/migration176.log
+          grep -E 'test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored;' evidence/migration176.log
       - name: Execute native Close DB request and observation tests
         if: success() || failure()
         shell: bash
@@ -577,8 +587,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cargo test -p phoenix-db --lib migrations::tests::migration_186_adds_unbackfilled_initial_result_acknowledgements -- --exact --nocapture --test-threads=1 2>&1 | tee evidence/migration186.log
-          grep -E 'test result: ok\. 1 passed; 0 failed; 0 ignored;' evidence/migration186.log
+          cargo test -p phoenix-db --lib migrations::tests::migration_187_adds_unbackfilled_initial_result_acknowledgements -- --exact --nocapture --test-threads=1 2>&1 | tee evidence/migration187.log
+          grep -E 'test result: ok\. 1 passed; 0 failed; 0 ignored;' evidence/migration187.log
       - name: Execute complete migrations regression module
         if: success() || failure()
         shell: bash
@@ -619,12 +629,12 @@ jobs:
             grep -F 'test result: ok. 1 passed; 0 failed; 0 ignored;' "evidence/$test.log"
           done
           for test in \
-            real186_to187_preserves_original_branches_and_is_idempotent \
-            missing_or_changed_native_source_rolls_back187 \
+            real187_to188_preserves_original_branches_and_is_idempotent \
+            missing_or_changed_native_source_rolls_back188 \
             captured_authority_schema_is_immutable_but_cascades_with_its_obligation \
             delete_api_clears_dispatches_before_expected_resource_teardown \
             original_active_inventory_still_rejects_arbitrary_dispatch_identity_and_codec \
-            original_dispatch_update_and_expected_resource_retention_survive187; do
+            original_dispatch_update_and_expected_resource_retention_survive188; do
             grep -F "migrations::captured_loss_retry_tests::$test: test" evidence/inventory.log
             cargo test -p phoenix-db --lib "migrations::captured_loss_retry_tests::$test" -- --exact --nocapture --test-threads=1 2>&1 | tee "evidence/$test.log"
             grep -F 'test result: ok. 1 passed; 0 failed; 0 ignored;' "evidence/$test.log"
@@ -774,6 +784,8 @@ jobs:
           grep -F 'native_close_admission_tests::bash_stage2_stop_ack::bash_stage_two_stop_ack_reaches_real_second_writer_and_cleans_once ... ok' evidence/native-close-runtime-actor.log
           grep -F 'native_close_admission_tests::bash_stage2_unknown_release::bash_second_writer_injected_unknown_release_quarantines_original_owner ... ok' evidence/native-close-runtime-actor.log
           grep -F 'native_close_admission_tests::bash_stage2_unknown_release::bash_second_writer_unknown_release_retains_owner_after_public_close_waiter_drop ... ok' evidence/native-close-runtime-actor.log
+          grep -F 'native_close_admission_tests::queued_stop_in_cancellation_inbox_wins_over_due_close_settlement ... ok' evidence/native-close-runtime-actor.log
+          grep -F 'native_close_admission_tests::initial_exit_retains_inspection_collector_before_terminal_interruption ... ok' evidence/native-close-runtime-actor.log
           for test in \
             native_close_retires_one_registered_real_bash_group \
             native_close_retires_two_registered_real_bash_groups_under_one_scope_capture; do
@@ -804,6 +816,8 @@ jobs:
             (cd crates/phoenix-ide && "$PHOENIX_RUNTIME_TEST_BINARY" "$module" --nocapture --test-threads=1) 2>&1 | tee "$log"
             grep -E 'test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored;' "$log"
           done
+          grep -F 'process_retirement::tests::exit_custody_poll_waits_for_retained_process_entry_before_classifying ... ok' evidence/runtime-executor-native_close-process_retirement-tests-.log
+          grep -F 'physical::tests::fatal_physical_custody_is_distinguished_from_pending_ordinary_join ... ok' evidence/runtime-close_retirement-native_initial-worktree-physical-tests-.log
       - name: Qualify finite native spawn and tool preparation integration seams
         if: success() || failure()
         timeout-minutes: 15
@@ -846,6 +860,32 @@ jobs:
               fi
             done
           done
+      - name: Execute cancellation inbox and concurrent-tool sender regressions
+        if: success() || failure()
+        timeout-minutes: 10
+        shell: bash
+        run: |
+          set -euo pipefail
+          inbox_tests=(
+            runtime::cancellation_inbox::tests::acknowledged_stop_routes_to_cancellation_with_original_receipt
+            runtime::cancellation_inbox::tests::ordinary_acknowledged_event_keeps_its_envelope
+            runtime::cancellation_inbox::tests::closed_cancellation_inbox_returns_stop_envelope_with_original_receipt
+            runtime::cancellation_inbox::tests::test_receiver_accepts_raw_acknowledged_stop_without_splitting_it
+            runtime::cancellation_inbox::tests::native_close_requests_keep_their_envelopes_and_replies
+          )
+          for test in "${inbox_tests[@]}"; do
+            grep -Fx "$test: test" evidence/runtime-inventory.log
+          done
+          (cd crates/phoenix-ide && "$PHOENIX_RUNTIME_TEST_BINARY" runtime::cancellation_inbox::tests:: --nocapture --test-threads=1) 2>&1 | tee evidence/cancellation-inbox-execution.log
+          grep -E 'test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored;' evidence/cancellation-inbox-execution.log
+          for test in "${inbox_tests[@]}"; do
+            grep -Fx "test $test ... ok" evidence/cancellation-inbox-execution.log
+          done
+          test_name=runtime::executor::concurrent_tools_tests::commit_cancellation::stop_keeps_batch_commit_and_cutoff_live_while_close_holds_source_custody
+          grep -Fx "$test_name: test" evidence/runtime-inventory.log
+          (cd crates/phoenix-ide && "$PHOENIX_RUNTIME_TEST_BINARY" "$test_name" --exact --nocapture --test-threads=1) 2>&1 | tee evidence/concurrent-tools-stop-close-custody.log
+          grep -Fx "test $test_name ... ok" evidence/concurrent-tools-stop-close-custody.log
+          grep -Eq 'test result: ok\. 1 passed; 0 failed; 0 ignored;' evidence/concurrent-tools-stop-close-custody.log
       - name: Qualify original-deadline worktree inspection prerequisites
         if: success() || failure()
         shell: bash

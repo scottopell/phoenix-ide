@@ -905,102 +905,107 @@ const MIGRATIONS: &[Migration] = &[
     },
     Migration {
         version: 172,
+        name: "coordinator_scan_origin_labels",
+        sql: include_str!("migrations/coordinator_scan_origin_labels.sql"),
+    },
+    Migration {
+        version: 173,
         name: "native_task_approval_receipts",
         sql: include_str!("migrations/native_task_approval_receipts.sql"),
     },
     Migration {
-        version: 173,
-        name: "close_completion_allowances_and_native_retry_fence",
-        sql: MIGRATION_173,
-    },
-    Migration {
         version: 174,
-        name: "native_close_initial_receipts",
+        name: "close_completion_allowances_and_native_retry_fence",
         sql: MIGRATION_174,
     },
     Migration {
         version: 175,
+        name: "native_close_initial_receipts",
+        sql: MIGRATION_175,
+    },
+    Migration {
+        version: 176,
         name: "close_original_retirement_anchors",
         sql: include_str!("migrations/close_original_retirement_anchor.sql"),
     },
     Migration {
-        version: 176,
+        version: 177,
         name: "native_close_exact_observation_receipts",
         sql: include_str!("migrations/native_close_exact_observation_receipts.sql"),
     },
     Migration {
-        version: 177,
+        version: 178,
         name: "native_close_explicit_retry_admission",
         sql: include_str!("migrations/native_close_explicit_retry_admission.sql"),
     },
     Migration {
-        version: 178,
+        version: 179,
         name: "native_close_source_fence",
         sql: include_str!("migrations/native_close_source_fence.sql"),
     },
     Migration {
-        version: 179,
+        version: 180,
         name: "native_close_retry_failure",
         sql: include_str!("migrations/native_close_retry_failure.sql"),
     },
     Migration {
-        version: 180,
+        version: 181,
         name: "native_close_retry_dispatch",
         sql: include_str!("migrations/native_close_retry_dispatch.sql"),
     },
     Migration {
-        version: 181,
+        version: 182,
         name: "native_close_retry_worktree_metadata",
         sql: include_str!("migrations/native_close_retry_worktree_metadata.sql"),
     },
     Migration {
-        version: 182,
+        version: 183,
         name: "native_initial_source_fence",
         sql: include_str!("migrations/native_initial_source_fence.sql"),
     },
     Migration {
-        version: 183,
+        version: 184,
         name: "native_initial_completed_interruption",
         sql: include_str!("migrations/native_initial_completed_interruption.sql"),
     },
     Migration {
-        version: 184,
+        version: 185,
         name: "native_initial_completion_retry_admission",
         sql: include_str!("migrations/native_initial_completion_retry_admission.sql"),
     },
     Migration {
-        version: 185,
+        version: 186,
         name: "close_ignored_loss_category",
         sql: include_str!("migrations/close_ignored_loss_category.sql"),
     },
     Migration {
-        version: 186,
+        version: 187,
         name: "native_close_initial_result_acknowledgement",
         sql: include_str!("migrations/native_close_initial_result_acknowledgement.sql"),
     },
     Migration {
-        version: 187,
+        version: 188,
         name: "native_close_captured_loss_retry",
         sql: include_str!("migrations/native_close_captured_loss_retry.sql"),
     },
     Migration {
-        version: 188,
+        version: 189,
         name: "native_close_retry_tmux_dispatch",
         sql: include_str!("migrations/native_close_retry_tmux_dispatch.sql"),
     },
     Migration {
-        version: 189,
+        version: 190,
         name: "native_close_retry_origin_gate",
         sql: "SELECT 1;",
     },
     Migration {
-        version: 190,
+        version: 191,
         name: "native_close_origin_owner_cleanup",
         sql: include_str!("migrations/native_close_origin_owner_cleanup.sql"),
     },
 ];
 
-const MIGRATION_174: &str = r"
+const MIGRATION_175: &str = r"
 CREATE UNIQUE INDEX close_obligations_attempt_product_unique
     ON close_obligations(attempt_id, product_conversation_id);
 
@@ -1064,7 +1069,7 @@ BEGIN
 END;
 ";
 
-const MIGRATION_173: &str = r"
+const MIGRATION_174: &str = r"
 ALTER TABLE close_obligations
 ADD COLUMN native_managed INTEGER NOT NULL DEFAULT 0
     CHECK (typeof(native_managed) = 'integer' AND native_managed IN (0, 1));
@@ -12729,9 +12734,9 @@ pub(crate) async fn run_through_for_test(pool: &SqlitePool, version: u32) -> DbR
 }
 
 #[cfg(test)]
-pub(crate) async fn setup_real_178_for_test(pool: &SqlitePool) {
-    tests::setup_real_pre_175_schema(pool).await;
-    run_through_for_test(pool, 178).await.unwrap();
+pub(crate) async fn setup_real_179_for_test(pool: &SqlitePool) {
+    tests::setup_real_pre_176_schema(pool).await;
+    run_through_for_test(pool, 179).await.unwrap();
 }
 
 /// Run all pending migrations against the database.
@@ -12810,62 +12815,62 @@ async fn run_migration_list(pool: &SqlitePool, migrations: &[Migration]) -> DbRe
             continue;
         }
 
-        if migration.version == 180 {
+        if migration.version == 181 {
             native_close_retry_dispatch::run(pool, migration).await?;
             applied += 1;
             continue;
         }
-        if migration.version == 181 {
+        if migration.version == 182 {
             native_close_retry_worktree_metadata::run(pool, migration).await?;
             applied += 1;
             continue;
         }
 
-        if migration.version == 179 {
+        if migration.version == 180 {
             native_close_retry_failure::run(pool, migration).await?;
             applied += 1;
             continue;
         }
 
-        if migration.version == 183 {
+        if migration.version == 184 {
             native_initial_completed_interruption::run(pool, migration).await?;
             applied += 1;
             tracing::info!(version = migration.version, "Migration complete");
             continue;
         }
 
-        if migration.version == 187 {
+        if migration.version == 188 {
             native_close_captured_loss_retry::run(pool, migration).await?;
             applied += 1;
             continue;
         }
 
-        if migration.version == 188 {
+        if migration.version == 189 {
             native_close_retry_tmux_dispatch::run(pool, migration).await?;
             applied += 1;
             continue;
         }
 
-        if migration.version == 189 {
+        if migration.version == 190 {
             native_close_retry_origin_gate::run(pool, migration).await?;
             applied += 1;
             continue;
         }
 
-        if migration.version == 184 {
+        if migration.version == 185 {
             native_initial_completion_retry_admission::run(pool, migration).await?;
             applied += 1;
             tracing::info!(version = migration.version, "Migration complete");
             continue;
         }
 
-        if migration.version == 182 {
+        if migration.version == 183 {
             native_initial_source_fence::run(pool, migration).await?;
             applied += 1;
             continue;
         }
 
-        if migration.version == 178 {
+        if migration.version == 179 {
             native_close_source_fence::run(pool, migration).await?;
             applied += 1;
             continue;
@@ -16707,10 +16712,10 @@ mod tests {
         clippy::too_many_lines,
         reason = "Compares predecessor rows and guards with fresh successor authority and rejection cases in the same migrated database"
     )]
-    async fn migration_184_adds_unbackfilled_initial_completion_successor_authority() {
+    async fn migration_185_adds_unbackfilled_initial_completion_successor_authority() {
         let pool = test_pool().await;
-        setup_real_pre_175_schema(&pool).await;
-        run_through_for_test(&pool, 183).await.unwrap();
+        setup_real_pre_176_schema(&pool).await;
+        run_through_for_test(&pool, 184).await.unwrap();
         let db = crate::Database::from_pool_for_tests(pool.clone(), String::new());
         let legacy = db
             .create_conversation("completion-legacy", "legacy", "/tmp", true, None, None)
@@ -16764,8 +16769,8 @@ mod tests {
               'close_cleanup_failure_completion_requires_disposition') ORDER BY name",
         ).fetch_all(&pool).await.unwrap();
         assert_eq!(original_guards.len(), 5);
-        assert_eq!(run_through_for_test(&pool, 184).await.unwrap(), 1);
-        assert_eq!(run_through_for_test(&pool, 184).await.unwrap(), 0);
+        assert_eq!(run_through_for_test(&pool, 185).await.unwrap(), 1);
+        assert_eq!(run_through_for_test(&pool, 185).await.unwrap(), 0);
         for name in [
             "native_close_completion_retry_origins",
             "native_close_completion_retry_admissions",
@@ -16999,10 +17004,10 @@ mod tests {
         clippy::too_many_lines,
         reason = "Verifies retained loss rows and unchanged triggers before exercising the new ignored category on the same migrated attempt"
     )]
-    async fn migration_185_preserves_existing_losses_and_adds_ignored_category() {
+    async fn migration_186_preserves_existing_losses_and_adds_ignored_category() {
         let pool = test_pool().await;
-        setup_real_pre_175_schema(&pool).await;
-        run_through_for_test(&pool, 184).await.unwrap();
+        setup_real_pre_176_schema(&pool).await;
+        run_through_for_test(&pool, 185).await.unwrap();
         let db = crate::Database::from_pool_for_tests(pool.clone(), String::new());
         let conversation = db
             .create_conversation("ignored-migration", "ignored", "/tmp", true, None, None)
@@ -17083,8 +17088,8 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(external_triggers_before.len(), external_trigger_names.len());
-        assert_eq!(run_through_for_test(&pool, 185).await.unwrap(), 1);
-        assert_eq!(run_through_for_test(&pool, 185).await.unwrap(), 0);
+        assert_eq!(run_through_for_test(&pool, 186).await.unwrap(), 1);
+        assert_eq!(run_through_for_test(&pool, 186).await.unwrap(), 0);
         let existing: (String, String) = sqlx::query_as(
             "SELECT category, identity_value FROM close_retirement_losses WHERE attempt_id = 'ignored-migration-attempt'",
         )
@@ -17194,17 +17199,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn migration_186_adds_unbackfilled_initial_result_acknowledgements() {
+    async fn migration_187_adds_unbackfilled_initial_result_acknowledgements() {
         let pool = test_pool().await;
-        setup_real_pre_175_schema(&pool).await;
-        run_through_for_test(&pool, 185).await.unwrap();
+        setup_real_pre_176_schema(&pool).await;
+        run_through_for_test(&pool, 186).await.unwrap();
         let receipts: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM native_close_initial_receipts")
                 .fetch_one(&pool)
                 .await
                 .unwrap();
-        assert_eq!(run_through_for_test(&pool, 186).await.unwrap(), 1);
-        assert_eq!(run_through_for_test(&pool, 186).await.unwrap(), 0);
+        assert_eq!(run_through_for_test(&pool, 187).await.unwrap(), 1);
+        assert_eq!(run_through_for_test(&pool, 187).await.unwrap(), 0);
         assert_eq!(
             sqlx::query_scalar::<_, i64>(
                 "SELECT COUNT(*) FROM native_close_initial_result_acknowledgements"
@@ -17250,19 +17255,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn migration_183_upgrades_authentic_182_initial_source_fence_schema() {
+    async fn migration_184_upgrades_authentic_183_initial_source_fence_schema() {
         let pool = test_pool().await;
-        setup_real_pre_175_schema(&pool).await;
-        run_through_for_test(&pool, 182).await.unwrap();
+        setup_real_pre_176_schema(&pool).await;
+        run_through_for_test(&pool, 183).await.unwrap();
         assert_eq!(
             sqlx::query_scalar::<_, i64>("SELECT MAX(version) FROM _migrations")
                 .fetch_one(&pool)
                 .await
                 .unwrap(),
-            182
+            183
         );
-        assert_eq!(run_through_for_test(&pool, 183).await.unwrap(), 1);
-        assert_eq!(run_through_for_test(&pool, 183).await.unwrap(), 0);
+        assert_eq!(run_through_for_test(&pool, 184).await.unwrap(), 1);
+        assert_eq!(run_through_for_test(&pool, 184).await.unwrap(), 0);
         for name in [
             "close_cleanup_failures_require_initial_authority",
             "native_close_source_fence_requires_exact_plan",
@@ -17316,25 +17321,26 @@ mod tests {
         let ledger = compiled_migration_ledger();
         assert!(ledger.windows(2).all(|pair| pair[0].0 < pair[1].0));
         let expected_tail = [
-            (190, "native_close_origin_owner_cleanup"),
-            (189, "native_close_retry_origin_gate"),
-            (188, "native_close_retry_tmux_dispatch"),
-            (187, "native_close_captured_loss_retry"),
-            (186, "native_close_initial_result_acknowledgement"),
-            (185, "close_ignored_loss_category"),
-            (184, "native_initial_completion_retry_admission"),
-            (183, "native_initial_completed_interruption"),
-            (182, "native_initial_source_fence"),
-            (181, "native_close_retry_worktree_metadata"),
-            (180, "native_close_retry_dispatch"),
-            (179, "native_close_retry_failure"),
-            (178, "native_close_source_fence"),
-            (177, "native_close_explicit_retry_admission"),
-            (176, "native_close_exact_observation_receipts"),
-            (175, "close_original_retirement_anchors"),
-            (174, "native_close_initial_receipts"),
-            (173, "close_completion_allowances_and_native_retry_fence"),
-            (172, "native_task_approval_receipts"),
+            (191, "native_close_origin_owner_cleanup"),
+            (190, "native_close_retry_origin_gate"),
+            (189, "native_close_retry_tmux_dispatch"),
+            (188, "native_close_captured_loss_retry"),
+            (187, "native_close_initial_result_acknowledgement"),
+            (186, "close_ignored_loss_category"),
+            (185, "native_initial_completion_retry_admission"),
+            (184, "native_initial_completed_interruption"),
+            (183, "native_initial_source_fence"),
+            (182, "native_close_retry_worktree_metadata"),
+            (181, "native_close_retry_dispatch"),
+            (180, "native_close_retry_failure"),
+            (179, "native_close_source_fence"),
+            (178, "native_close_explicit_retry_admission"),
+            (177, "native_close_exact_observation_receipts"),
+            (176, "close_original_retirement_anchors"),
+            (175, "native_close_initial_receipts"),
+            (174, "close_completion_allowances_and_native_retry_fence"),
+            (173, "native_task_approval_receipts"),
+            (172, "coordinator_scan_origin_labels"),
             (171, "adhd_llm_language"),
             (170, "tool_discovery"),
             (169, "chat_completions_signature_replay"),
@@ -17633,6 +17639,69 @@ mod tests {
             assert_eq!(kind, "unknown_historical");
             assert_eq!((product_id, transcript_id), (None, None));
             assert!(sqlx::query(invalid_update).execute(&pool).await.is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn close_tail_upgrades_base_171_and_main_172_to_cached_schema_idempotently() {
+        let ledger_query = "SELECT version, name, applied_at FROM _migrations ORDER BY version";
+        let schema_query = "SELECT type, name, tbl_name, sql FROM sqlite_schema ORDER BY type, name";
+        let cached = crate::Database::open_in_memory().await.unwrap();
+        let cached_schema: Vec<(String, String, String, Option<String>)> =
+            sqlx::query_as(schema_query)
+                .fetch_all(cached.pool())
+                .await
+                .unwrap();
+        let cached_ledger: Vec<(u32, String)> =
+            sqlx::query_as("SELECT version, name FROM _migrations ORDER BY version")
+                .fetch_all(cached.pool())
+                .await
+                .unwrap();
+        assert!(cached_ledger
+            .iter()
+            .map(|(version, name)| (*version, name.as_str()))
+            .eq(migration_identities()));
+        assert_eq!(run_pending_migrations(cached.pool()).await.unwrap(), 0);
+
+        let dir = tempfile::tempdir().unwrap();
+        for (prefix, pending) in [(171, 20), (172, 19)] {
+            let path = dir.path().join(format!("prefix-{prefix}.db"));
+            let path = path.to_str().unwrap();
+            let db = crate::Database::open(path).await.unwrap();
+            let pool = db.pool();
+            run_through_for_test(pool, prefix).await.unwrap();
+            let before: Vec<(u32, String, String)> = sqlx::query_as(ledger_query)
+                .fetch_all(pool)
+                .await
+                .unwrap();
+            assert_eq!(before.last().unwrap().0, prefix);
+
+            assert_eq!(run_pending_migrations(pool).await.unwrap(), pending);
+            let installed: Vec<(u32, String, String)> = sqlx::query_as(ledger_query)
+                .fetch_all(pool)
+                .await
+                .unwrap();
+            assert!(installed.starts_with(&before));
+            assert!(installed
+                .iter()
+                .map(|(version, name, _)| (version, name))
+                .eq(cached_ledger.iter().map(|(version, name)| (version, name))));
+            let schema: Vec<(String, String, String, Option<String>)> = sqlx::query_as(schema_query)
+                .fetch_all(pool)
+                .await
+                .unwrap();
+            assert_eq!(schema, cached_schema);
+            assert!(sqlx::query("PRAGMA foreign_key_check")
+                .fetch_all(pool)
+                .await
+                .unwrap()
+                .is_empty());
+            assert_eq!(run_pending_migrations(pool).await.unwrap(), 0);
+            let again: Vec<(u32, String, String)> = sqlx::query_as(ledger_query)
+                .fetch_all(pool)
+                .await
+                .unwrap();
+            assert_eq!(again, installed);
         }
     }
 
@@ -18269,9 +18338,9 @@ mod tests {
         }
     }
 
-    pub(super) async fn setup_real_pre_175_schema(pool: &SqlitePool) {
+    pub(super) async fn setup_real_pre_176_schema(pool: &SqlitePool) {
         setup_legacy_conversations_table(pool).await;
-        let end = MIGRATIONS.partition_point(|migration| migration.version <= 174);
+        let end = MIGRATIONS.partition_point(|migration| migration.version <= 175);
         run_migration_list(pool, &MIGRATIONS[..end]).await.unwrap();
     }
 
@@ -24549,14 +24618,14 @@ mod close_completion_allowance_tests {
     use sqlx::sqlite::SqlitePoolOptions;
 
     use super::{
-        run_pending_migrations, tests::setup_real_pre_175_schema, MIGRATIONS, MIGRATION_173,
+        run_pending_migrations, tests::setup_real_pre_176_schema, MIGRATIONS, MIGRATION_174,
     };
 
     #[tokio::test]
     // Keep the migration's before/after, failed-write, cascade and rollback
     // assertions together so each observes the same retained fixture state.
     #[allow(clippy::too_many_lines)]
-    async fn migration_173_seeds_only_future_operations_and_enforces_monotonicity() {
+    async fn migration_174_seeds_only_future_operations_and_enforces_monotonicity() {
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
             .connect("sqlite::memory:")
@@ -24579,7 +24648,7 @@ mod close_completion_allowance_tests {
         .execute(&pool)
         .await
         .unwrap();
-        sqlx::raw_sql(MIGRATION_173).execute(&pool).await.unwrap();
+        sqlx::raw_sql(MIGRATION_174).execute(&pool).await.unwrap();
 
         let old_marker: i64 = sqlx::query_scalar(
             "SELECT native_managed FROM close_obligations WHERE attempt_id = 'preexisting'",
@@ -24761,8 +24830,8 @@ mod close_completion_allowance_tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::too_many_lines)] // Exercise the real 174 -> 175 boundary and shared G1 -> G2 path.
-    async fn migration_175_excludes_legacy_sealed_inventory_and_preserves_shared_g2_capture() {
+    #[allow(clippy::too_many_lines)] // Exercise the real 175 -> 176 boundary and shared G1 -> G2 path.
+    async fn migration_176_excludes_legacy_sealed_inventory_and_preserves_shared_g2_capture() {
         use crate::{
             CaptureCloseRetirementInventoryRequest, CaptureCloseRetirementInventoryScopeRequest,
             ReplaceCloseInspectionRequest, ReplaceCloseInspectionScopeRequest,
@@ -24779,7 +24848,7 @@ mod close_completion_allowance_tests {
             .connect("sqlite::memory:")
             .await
             .unwrap();
-        setup_real_pre_175_schema(&pool).await;
+        setup_real_pre_176_schema(&pool).await;
         let missing_tables: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM sqlite_schema WHERE name IN ('close_original_retirement_anchors', 'close_retirement_anchor_exclusions')"
         ).fetch_one(&pool).await.unwrap();
@@ -24835,7 +24904,7 @@ mod close_completion_allowance_tests {
             .unwrap()
             .clone();
 
-        // Author the genuine pre-175 capture using only tables and constraints
+        // Author the genuine pre-176 capture using only tables and constraints
         // available at 158. In particular, no modern capture API can run here.
         sqlx::query(
             "INSERT INTO close_retirement_inventories
@@ -25021,13 +25090,13 @@ mod close_completion_allowance_tests {
     }
 
     #[tokio::test]
-    async fn migration_175_excludes_a_preexisting_zero_inventory_attempt() {
+    async fn migration_176_excludes_a_preexisting_zero_inventory_attempt() {
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
             .connect("sqlite::memory:")
             .await
             .unwrap();
-        setup_real_pre_175_schema(&pool).await;
+        setup_real_pre_176_schema(&pool).await;
         let db = crate::Database::from_pool_for_tests(pool.clone(), String::new());
         let conversation = db
             .create_conversation("legacy-zero", "legacy-zero", "/tmp", true, None, None)
@@ -25043,7 +25112,7 @@ mod close_completion_allowance_tests {
 
         let migration = MIGRATIONS
             .iter()
-            .find(|migration| migration.version == 175)
+            .find(|migration| migration.version == 176)
             .unwrap();
         sqlx::raw_sql(migration.sql).execute(&pool).await.unwrap();
 
@@ -25075,7 +25144,7 @@ mod close_completion_allowance_tests {
 
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
-    async fn migration_175_seals_anchor_and_exclusion_without_hidden_rowid_or_replace_escape() {
+    async fn migration_176_seals_anchor_and_exclusion_without_hidden_rowid_or_replace_escape() {
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
             .connect("sqlite::memory:")
@@ -25112,7 +25181,7 @@ mod close_completion_allowance_tests {
         .unwrap();
         let migration = MIGRATIONS
             .iter()
-            .find(|migration| migration.version == 175)
+            .find(|migration| migration.version == 176)
             .unwrap();
         sqlx::raw_sql(migration.sql).execute(&pool).await.unwrap();
 
@@ -25310,11 +25379,11 @@ mod close_completion_allowance_tests {
 mod native_close_initial_receipt_tests {
     use sqlx::sqlite::SqlitePoolOptions;
 
-    use super::MIGRATION_174;
+    use super::MIGRATION_175;
 
     #[tokio::test]
     #[allow(clippy::too_many_lines)] // One fixture checks the full immutable receipt lifecycle.
-    async fn migration_174_binds_initial_receipts_to_their_exact_obligation_and_run() {
+    async fn migration_175_binds_initial_receipts_to_their_exact_obligation_and_run() {
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
             .connect("sqlite::memory:")
@@ -25347,7 +25416,7 @@ mod native_close_initial_receipt_tests {
         .execute(&pool)
         .await
         .unwrap();
-        sqlx::raw_sql(MIGRATION_174).execute(&pool).await.unwrap();
+        sqlx::raw_sql(MIGRATION_175).execute(&pool).await.unwrap();
 
         let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM native_close_initial_receipts")
             .fetch_one(&pool)

@@ -153,12 +153,47 @@ impl ProcessRetirement {
             worker.abort();
         }
     }
+    #[cfg(test)]
+    pub(super) fn has_unresolved_exit_custody(&self) -> bool {
+        self.worker.is_some() || self.entry.is_some()
+    }
 
-    pub(super) async fn abort_and_join(&mut self) {
-        self.abort();
-        if let Some(worker) = self.worker.take() {
-            let _ = worker.await;
+    pub(super) async fn poll_exit_custody(
+        &mut self,
+        deadline: Option<std::time::Instant>,
+    ) -> super::post_retirement::ExitCustodyPoll {
+        if self.worker.as_ref().is_some_and(|worker| !worker.is_finished())
+            || self.entry.as_ref().is_some_and(|entry| !entry.is_finished())
+        {
+            return if deadline.is_none_or(|deadline| std::time::Instant::now() >= deadline) {
+                super::post_retirement::ExitCustodyPoll::Fatal
+            } else {
+                super::post_retirement::ExitCustodyPoll::Pending
+            };
         }
+
+        if let Some(worker) = self.worker.take() {
+            // This is inert preparation; cancellation is a classified outcome.
+            if let Err(error) = worker.await {
+                if !error.is_cancelled() {
+                    tracing::error!(%error, "native original process preparation exit observation lost");
+                    return super::post_retirement::ExitCustodyPoll::Fatal;
+                }
+            }
+        }
+        if let Some(entry) = self.entry.take() {
+            match entry.await {
+                Ok(Ok(observer)) => self.observer = Some(observer),
+                Ok(Err(NativeInitialStepError::FatalAuthority)) => {
+                    return super::post_retirement::ExitCustodyPoll::Fatal;
+                }
+                Ok(Err(error)) => self.blocked = Some(BlockedProcess::Worker { _error: error }),
+                Err(error) => {
+                    self.blocked = Some(BlockedProcess::Join { _error: error.to_string() });
+                }
+            }
+        }
+        super::post_retirement::ExitCustodyPoll::Classified
     }
 
     fn current(&self) -> Option<(WorkScopeId, NativeInitialProcessStep)> {
@@ -547,6 +582,50 @@ mod tests {
         let no_physical_resources = ProcessRetirement::new(Vec::new(), vec![scope], snapshot);
         assert!(!no_physical_resources.has_resources());
         assert!(!no_physical_resources.has_original_effects());
+    }
+
+    #[tokio::test]
+    async fn exit_custody_poll_waits_for_retained_process_entry_before_classifying() {
+        use super::super::post_retirement::ExitCustodyPoll;
+
+        let snapshot =
+            phoenix_core::domain::close::CloseRetirementSnapshot::parse("original", "fingerprint")
+                .unwrap();
+        let mut progress = ProcessRetirement::new(Vec::new(), Vec::new(), snapshot);
+        let (release, released) = tokio::sync::oneshot::channel();
+        let (finished, completion) = tokio::sync::oneshot::channel();
+        progress.entry = Some(tokio::spawn(async move {
+            released.await.unwrap();
+            // No await follows this witness: on this current-thread runtime
+            // the JoinHandle is finished before the observing test resumes.
+            finished.send(()).unwrap();
+            Err(NativeInitialStepError::FatalAuthority)
+        }));
+
+        assert!(matches!(
+            progress
+                .poll_exit_custody(Some(
+                    std::time::Instant::now() + std::time::Duration::from_secs(1),
+                ))
+                .await,
+            ExitCustodyPoll::Pending
+        ));
+        assert!(progress.has_unresolved_exit_custody());
+
+        release.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), completion)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            progress
+                .poll_exit_custody(Some(
+                    std::time::Instant::now() + std::time::Duration::from_secs(1),
+                ))
+                .await,
+            ExitCustodyPoll::Fatal
+        ));
+        assert!(!progress.has_unresolved_exit_custody());
     }
 
     #[tokio::test]

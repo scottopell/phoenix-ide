@@ -2401,6 +2401,18 @@ describe('ProductConversationPage', () => {
     expect(screen.getByTestId('aggregate-message-viewer').parentElement).not.toHaveClass('product-conversation-page__viewer-pane');
   });
 
+  it('reserves split-pane layout for embedded file/browser/inspect viewers and exposes resize divider on message split pane', async () => {
+    const prose = renderPage('/product-conversations/pc-1?viewer=prose&presentation=pane&file=README.md&root=%2Ftmp%2Frepo');
+    await waitForPageReady();
+    expect(screen.getByTestId('product-conversation-page')).toHaveClass('product-conversation-page--split-pane');
+    prose.unmount();
+
+    const msg = renderPage('/product-conversations/pc-1?viewer=message&presentation=pane&message=3&message_id=m-3');
+    await waitForPageReady();
+    expect(screen.getByRole('separator', { name: 'Resize viewer pane' })).toBeInTheDocument();
+    msg.unmount();
+  });
+
   it('routes aggregate viewer notes to the embedded latest-row composer capability', async () => {
     const appendReviewNotesToComposer = vi.fn();
     renderPage('/product-conversations/pc-1?viewer=message&presentation=pane&message=3&message_id=m-3');

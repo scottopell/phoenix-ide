@@ -67,6 +67,8 @@ pub(super) fn refuse_during_exit(request: crate::runtime::AcknowledgedRuntimeReq
 /// One source-owned initial Close continuation. Its authority and target gate
 /// remain live while the event loop advances the exact admitted receipt.
 pub(super) struct NativeCloseInitialContinuation {
+    #[cfg(test)]
+    pub(super) settlement_entry_observer: Option<tokio::sync::mpsc::UnboundedSender<()>>,
     pub(super) command: phoenix_db::native_close::NativeCloseCommand,
     pub(super) receipt: phoenix_db::native_close::NativeCloseReceipt,
     pub(super) admitted_result: NativeCloseInitialResult,
@@ -80,9 +82,12 @@ pub(super) struct NativeCloseInitialContinuation {
     post_retirement: Option<post_retirement::PostRetirement>,
     source_entry: Option<source_entry::SourceEntryWorker>,
     original_entry_deadline: Option<std::time::Instant>,
+    exit_custody_deadline: Option<std::time::Instant>,
     backend: std::sync::Arc<crate::runtime::RuntimeManager>,
     #[cfg(test)]
     inventory_preparation_test_barrier: Option<InventoryPreparationTestBarrier>,
+    #[cfg(test)]
+    inspection_collection_test_barrier: Option<InspectionCollectionTestBarrier>,
     inspection_failure: Option<NativeInitialInspectionFailureIntent>,
     loss_terminalization: Option<NativeInitialLossTerminalizationIntent>,
     pub(super) terminal_observation_retry: bool,
@@ -139,6 +144,13 @@ enum InventoryCapture {
         >,
     ),
     Held,
+}
+
+#[cfg(test)]
+struct InspectionCollectionTestBarrier {
+    entered: tokio::sync::oneshot::Sender<()>,
+    release: tokio::sync::oneshot::Receiver<()>,
+    exited: tokio::sync::oneshot::Sender<()>,
 }
 
 #[cfg(test)]
@@ -279,6 +291,16 @@ impl NativeCloseInitialContinuation {
         }
 
         self.abort_and_join_inventory_preparation().await;
+        match self.poll_exit_custody().await {
+            post_retirement::ExitCustodyPoll::Classified => {}
+            post_retirement::ExitCustodyPoll::Pending => return false,
+            post_retirement::ExitCustodyPoll::Fatal => {
+                self.backend
+                    .fatal_local_authority_fence
+                    .close("native_close_initial_terminal_custody_unclassified");
+                return false;
+            }
+        }
         self.terminal_observation_retry = false;
         self.authority.owner = None;
         if let Some(response) = self.response.take() {
@@ -287,23 +309,69 @@ impl NativeCloseInitialContinuation {
         true
     }
 
-    /// Drain every owned phase worker before releasing source/gate custody.
-    /// Resource permits stay manager-owned and fenced after a failed Close.
+    /// Abort inert preparation while retaining every handle for bounded custody
+    /// classification. Resource permits stay manager-owned and fenced after a failed Close.
     pub(super) async fn abort_and_join_inventory_preparation(&mut self) {
-        if let Some(progress) = &mut self.process_retirement {
-            progress.abort_and_join().await;
+        // Abort only inert preparation; retain every handle until bounded custody
+        // polling classifies its result. Aborting a JoinHandle is not a join.
+        if let Some(progress) = &self.process_retirement {
+            progress.abort();
         }
         if let InventoryCapture::Preparing(handle) = &self.inventory {
             handle.abort();
         }
-        if matches!(self.inventory, InventoryCapture::Preparing(_)) {
+    }
+
+    async fn poll_exit_custody(&mut self) -> post_retirement::ExitCustodyPoll {
+        // Original physical entry keeps its captured budget. Read-only work
+        // started before capture gets one bounded exit budget, never rearmed.
+        let deadline = Some(*self.exit_custody_deadline.get_or_insert_with(|| {
+            self.original_entry_deadline.unwrap_or_else(|| {
+                (tokio::time::Instant::now() + super::CANCELLATION_DEADLINE).into_std()
+            })
+        }));
+        if let Some(inspection) = self.inspection.as_ref() {
+            if !inspection.is_finished() {
+                return if deadline.is_none_or(|deadline| std::time::Instant::now() >= deadline) {
+                    post_retirement::ExitCustodyPoll::Fatal
+                } else {
+                    post_retirement::ExitCustodyPoll::Pending
+                };
+            }
+            let inspection = self.inspection.take().expect("checked inspection");
+            if inspection.await.is_err() {
+                return post_retirement::ExitCustodyPoll::Fatal;
+            }
+        }
+        if let InventoryCapture::Preparing(handle) = &self.inventory {
+            if !handle.is_finished() {
+                return if deadline.is_none_or(|deadline| std::time::Instant::now() >= deadline) {
+                    post_retirement::ExitCustodyPoll::Fatal
+                } else {
+                    post_retirement::ExitCustodyPoll::Pending
+                };
+            }
             let InventoryCapture::Preparing(handle) =
                 std::mem::replace(&mut self.inventory, InventoryCapture::NotStarted)
             else {
                 unreachable!();
             };
-            let _ = handle.await;
+            if let Err(error) = handle.await {
+                if !error.is_cancelled() {
+                    return post_retirement::ExitCustodyPoll::Fatal;
+                }
+            }
         }
+        if let Some(processes) = self.process_retirement.as_mut() {
+            match processes.poll_exit_custody(deadline).await {
+                post_retirement::ExitCustodyPoll::Classified => {}
+                other => return other,
+            }
+        }
+        if let Some(post_retirement) = self.post_retirement.as_mut() {
+            return post_retirement.poll_exit_custody(deadline).await;
+        }
+        post_retirement::ExitCustodyPoll::Classified
     }
 
     pub(super) fn collecting_inspection(&self) -> bool {
@@ -314,9 +382,8 @@ impl NativeCloseInitialContinuation {
         if let Some(progress) = &self.process_retirement {
             progress.abort();
         }
-        if let Some(handle) = self.inspection.take() {
-            handle.abort();
-        }
+        // Keep the read-only collector handle owned until exit custody polling
+        // consumes its result or the fatal fence retains this continuation.
         if let InventoryCapture::Preparing(handle) = &self.inventory {
             handle.abort();
         }
@@ -422,6 +489,20 @@ impl NativeCloseInitialContinuation {
         });
     }
 
+    #[cfg(test)]
+    pub(super) fn set_inspection_collection_test_barrier(
+        &mut self,
+        entered: tokio::sync::oneshot::Sender<()>,
+        release: tokio::sync::oneshot::Receiver<()>,
+        exited: tokio::sync::oneshot::Sender<()>,
+    ) {
+        self.inspection_collection_test_barrier = Some(InspectionCollectionTestBarrier {
+            entered,
+            release,
+            exited,
+        });
+    }
+
     fn live_source_matches(&self, live_source: &phoenix_core::domain::sm_state::ConvState) -> bool {
         let phoenix_db::native_close::NativeCloseIntent::Initial { target } = self.command.intent()
         else {
@@ -458,9 +539,8 @@ impl NativeCloseInitialContinuation {
             || matches!(self.inventory, InventoryCapture::Preparing(_))
             || self.process_retirement.is_some()
         {
-            if let Some(handle) = self.inspection.take() {
-                handle.abort();
-            }
+            // Keep the collector handle: it may currently await a nested
+            // spawn_blocking inspection, and source revocation is not custody release.
             if let InventoryCapture::Preparing(handle) = &self.inventory {
                 handle.abort();
             }
@@ -561,9 +641,24 @@ impl NativeCloseInitialContinuation {
         if self.exit_observation_only() {
             return Ok(self.phase);
         }
+        #[cfg(test)]
+        if matches!(self.phase, Phase::Settle | Phase::WaitingForQuiescence) {
+            if let Some(observer) = &self.settlement_entry_observer {
+                let _ = observer.send(());
+            }
+        }
         let result = match self.phase {
             Phase::ClassifyingExitInterruption => {
-                self.abort_and_join_inventory_preparation().await;
+                match self.poll_exit_custody().await {
+                    post_retirement::ExitCustodyPoll::Pending => return Ok(self.phase),
+                    post_retirement::ExitCustodyPoll::Fatal => {
+                        self.backend.fatal_local_authority_fence.close(
+                            "native_close_initial_exit_custody_unclassified",
+                        );
+                        return Err(NativeCloseApplicationError::FatalAuthority);
+                    }
+                    post_retirement::ExitCustodyPoll::Classified => {}
+                }
                 match self
                     .db
                     .interrupt_native_close_initial(&self.command, &self.receipt)
@@ -783,7 +878,19 @@ impl NativeCloseInitialContinuation {
                 }
                 let db = self.db.clone();
                 let attempt_id = self.receipt.admitted.attempt_id.clone();
+                #[cfg(test)]
+                let test_barrier = self.inspection_collection_test_barrier.take();
                 self.inspection = Some(tokio::spawn(async move {
+                    #[cfg(test)]
+                    let _worker_exit = if let Some(barrier) = test_barrier {
+                        let InspectionCollectionTestBarrier { entered, release, exited } = barrier;
+                        let worker_exit = InventoryPreparationWorkerExit(Some(exited));
+                        let _ = entered.send(());
+                        let _ = release.await;
+                        Some(worker_exit)
+                    } else {
+                        None
+                    };
                     collect_native_initial_inspection(&db, attempt_id).await
                 }));
                 self.phase = Phase::CollectingInspection;
@@ -1042,6 +1149,8 @@ where
             )) => {
                 let result = NativeCloseInitialResult::NewlyAdmitted(receipt.clone());
                 let continuation = NativeCloseInitialContinuation {
+                    #[cfg(test)]
+                    settlement_entry_observer: None,
                     command,
                     receipt,
                     admitted_result: result.clone(),
@@ -1053,9 +1162,12 @@ where
                     post_retirement: None,
                     source_entry: None,
                     original_entry_deadline: None,
+                    exit_custody_deadline: None,
                     backend: std::sync::Arc::clone(backend),
                     #[cfg(test)]
                     inventory_preparation_test_barrier: None,
+                    #[cfg(test)]
+                    inspection_collection_test_barrier: None,
                     inspection_failure: None,
                     loss_terminalization: None,
                     terminal_observation_retry: false,

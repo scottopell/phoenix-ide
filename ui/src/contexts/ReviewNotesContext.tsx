@@ -187,6 +187,23 @@ export function ReviewNotesProvider({
   );
 }
 
+/**
+ * Reuse an enclosing `ReviewNotesProvider` when hosted inside a parent shell
+ * (e.g. `EmbeddedConversationPage` inside `ProductConversationPage`), or mount
+ * a scoped provider when rendered standalone.
+ */
+export function EnsureReviewNotesProvider({
+  children,
+  scopeKey,
+}: {
+  children: ReactNode;
+  scopeKey?: string | undefined;
+}) {
+  const existing = useContext(ReviewNotesStoreContext);
+  if (existing) return <>{children}</>;
+  return <ReviewNotesProvider scopeKey={scopeKey}>{children}</ReviewNotesProvider>;
+}
+
 function useReviewNotesStore(): ReviewNotesStore {
   const store = useContext(ReviewNotesStoreContext);
   if (!store) {
@@ -245,6 +262,26 @@ export function useMessageReviewNotesData(sequenceId: number, occurrenceToken?: 
       .filter((n) => n.anchor.kind === 'message'
         && n.anchor.sequenceId === sequenceId
         && (occurrenceToken === undefined || n.anchor.occurrenceToken === occurrenceToken));
+    return sameNotes(cacheRef.current, next) ? cacheRef.current : (cacheRef.current = next);
+  };
+  return useSyncExternalStore(store.subscribe, getSnapshot, getSnapshot);
+}
+
+/** Subscribe to the notes for a single document source (file or message). */
+// eslint-disable-next-line react-refresh/only-export-components
+export function useDocumentReviewNotesData(
+  source:
+    | { kind: 'file'; absolutePath: string }
+    | { kind: 'message'; sequenceId: number; occurrenceToken?: string | undefined },
+): ReviewNote[] {
+  const store = useReviewNotesStore();
+  const cacheRef = useRef<ReviewNote[]>([]);
+  const getSnapshot = () => {
+    const next = source.kind === 'file'
+      ? store.getNotes().filter((n) => n.anchor.kind === 'file' && n.anchor.filePath === source.absolutePath)
+      : store.getNotes().filter((n) => n.anchor.kind === 'message'
+          && n.anchor.sequenceId === source.sequenceId
+          && (source.occurrenceToken === undefined || n.anchor.occurrenceToken === source.occurrenceToken));
     return sameNotes(cacheRef.current, next) ? cacheRef.current : (cacheRef.current = next);
   };
   return useSyncExternalStore(store.subscribe, getSnapshot, getSnapshot);

@@ -47,6 +47,17 @@ import {
 
 const subAgentViewerPaneMax = () => Math.max(360, Math.round(window.innerWidth * 0.6));
 
+function sameCoordinatorNotificationSnapshot(a: Conversation, b: Conversation): boolean {
+  if (a === b) return true;
+  return a.id === b.id
+    && a.slug === b.slug
+    && a.updated_at === b.updated_at
+    && a.archived === b.archived
+    && a.parent_conversation_id === b.parent_conversation_id
+    && a.continued_in_conv_id === b.continued_in_conv_id
+    && JSON.stringify(a.state) === JSON.stringify(b.state);
+}
+
 interface DesktopLayoutProps {
   children: React.ReactNode;
 }
@@ -156,7 +167,9 @@ export function DesktopLayout({ children }: DesktopLayoutProps) {
       if (!active) return;
       generation += 1;
       registerCoordinatorForNotifications(conversation.id);
-      setCoordinatorForNotifications(conversation);
+      setCoordinatorForNotifications((prev) => (
+        prev && sameCoordinatorNotificationSnapshot(prev, conversation) ? prev : conversation
+      ));
     };
     const refreshCoordinator = () => {
       const requestGeneration = generation;

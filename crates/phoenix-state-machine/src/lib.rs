@@ -18,6 +18,8 @@ pub use phoenix_core::domain::sm_event as event;
 pub use phoenix_core::domain::sm_state as state;
 
 #[cfg(test)]
+mod concurrent_tools_tests;
+#[cfg(test)]
 mod creation_protocol_proptests;
 #[cfg(test)]
 mod project_proptests;

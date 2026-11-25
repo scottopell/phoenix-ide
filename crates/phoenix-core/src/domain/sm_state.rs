@@ -1556,9 +1556,9 @@ pub enum ConvState {
     /// conversation — a missing field instead signals corruption and must fail
     /// loudly rather than default silently (task 13014).
     ToolExecuting {
-        /// The current tool being executed
+        /// Representative unresolved call.
         current_tool: ToolCall,
-        /// Remaining tools to execute after current completes
+        /// Other unresolved calls in source order.
         remaining_tools: Vec<ToolCall>,
         /// Completed tool results — single source of truth (FM-4 Prevention).
         /// No parallel `persisted_tool_ids` tracking set.
@@ -1573,12 +1573,12 @@ pub enum ConvState {
     /// Carries the assistant message and completed results so the checkpoint can
     /// be persisted atomically on abort.
     CancellingTool {
-        /// The tool being aborted
+        /// Representative unresolved cancellation receipt.
         tool_use_id: String,
         // owned: pre-cause rows were created only by user cancellation.
         #[serde(default)]
         cause: crate::domain::sm_event::CancelCause,
-        /// Tools that were skipped
+        /// Other unresolved cancellation receipts.
         skipped_tools: Vec<ToolCall>,
         /// Tool results completed before cancellation
         completed_results: Vec<ToolRoundResult>,

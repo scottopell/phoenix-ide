@@ -155,7 +155,7 @@ class DevWorkflowArtifactTests(unittest.TestCase):
             mock.patch.object(
                 self.dev,
                 "_kache_host_error",
-                return_value="unsupported host linux/x86_64; qualified host is darwin/arm64",
+                return_value="unsupported host linux/aarch64; qualified hosts are darwin/arm64, linux/x86_64",
             ),
             mock.patch.object(self.dev, "_kache_version") as version,
             mock.patch.object(self.dev.shutil, "which", return_value=None),
@@ -165,7 +165,7 @@ class DevWorkflowArtifactTests(unittest.TestCase):
         version.assert_not_called()
         kache = next(result for result in results if result.name == "kache")
         self.assertFalse(kache.ok)
-        self.assertIn("unsupported host linux/x86_64", kache.detail)
+        self.assertIn("unsupported host linux/aarch64", kache.detail)
 
     def test_doctor_reports_disabled_kache_unhealthy(self):
         with (

@@ -164,6 +164,10 @@ fn application_error(error: &NativeCloseApplicationError) -> ToolOutput {
 
 #[async_trait]
 impl Tool for CloseConversation {
+    fn foreground_execution(&self) -> phoenix_tools::ForegroundExecution {
+        phoenix_tools::ForegroundExecution::Serial
+    }
+
     fn name(&self) -> &'static str {
         "close_conversation"
     }

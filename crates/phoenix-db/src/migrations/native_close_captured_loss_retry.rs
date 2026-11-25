@@ -84,7 +84,7 @@ const SOURCE_FENCE: &str = include_str!("native_initial_source_fence.sql");
 
 fn unexpected(name: &str) -> DbError {
     DbError::Serialization(format!(
-        "migration 187 found unexpected {name} source shape"
+        "migration 188 found unexpected {name} source shape"
     ))
 }
 
@@ -157,9 +157,9 @@ async fn install(
     Ok(())
 }
 
-// Audited list: dispatch (180), both metadata guards (181), source-fence parent
-// (182 + 184) and children (178), failure parent/child (179), header/effect/run
-// (177 + run's independent 184 exception), success (119), receipt binding (177).
+// Audited list: dispatch (181), both metadata guards (182), source-fence parent
+// (183 + 185) and children (179), failure parent/child (180), header/effect/run
+// (178 + run's independent 185 exception), success (119), receipt binding (178).
 // No discovery by LIKE: a missing or changed native branch aborts the transaction.
 async fn rewrite_native_guards(tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>) -> DbResult<()> {
     for (name, query) in [
@@ -304,7 +304,7 @@ pub(super) async fn run(pool: &SqlitePool, migration: &Migration) -> DbResult<()
             .bind(object).fetch_one(&mut *tx).await?;
         let old = "FOREIGN KEY (\n        attempt_id, scope, inspection_generation, inspection_fingerprint,\n        resource_kind, identity_kind, identity_value\n    ) REFERENCES close_expected_retirement_resources (\n        attempt_id, scope, inspection_generation, inspection_fingerprint,\n        resource_kind, identity_kind, identity_value\n    ) ON DELETE RESTRICT";
         if definition.matches(old).count() != 1 {
-            return Err(DbError::Serialization("migration 187 unexpected dispatch FK".to_owned()));
+            return Err(DbError::Serialization("migration 188 unexpected dispatch FK".to_owned()));
         }
         let rewritten = definition.replace(old,
             "FOREIGN KEY (attempt_id, scope) REFERENCES close_attempt_scopes(attempt_id, scope) ON DELETE RESTRICT");

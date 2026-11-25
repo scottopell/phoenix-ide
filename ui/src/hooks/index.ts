@@ -1,4 +1,4 @@
-export { useLocalStorage, useLocalStorageString } from './useLocalStorage';
+export { useLocalStorage } from './useLocalStorage';
 export { useKeyboardNav, useGlobalKeyboardShortcuts } from './useKeyboardNav';
 export {
   useDraftValue,
@@ -39,7 +39,7 @@ export type { Density } from './useDensity';
 export { useScopedState } from './useScopedState';
 export { useInlineReferences } from './useInlineReferences';
 export type { UseInlineReferencesParams, InlineReferences } from './useInlineReferences';
-export { useMediaQuery, useIsDesktop, useIsCompactLayout, useIsWideDesktop, useIsMobile } from './useMediaQuery';
+export { useMediaQuery, useIsDesktop, useIsCompactLayout, useIsWideDesktop } from './useMediaQuery';
 
 // Export state machine for testing
 export {

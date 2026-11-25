@@ -13870,16 +13870,16 @@ mod tests {
 
     #[allow(clippy::too_many_lines)]
     #[tokio::test]
-    async fn migration_176_preserves_174_receipt_and_exact_observe_constraints_on_real_schema() {
+    async fn migration_177_preserves_175_receipt_and_exact_observe_constraints_on_real_schema() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("before-observe.db");
         let db = Database::open(path.to_str().unwrap()).await.unwrap();
-        crate::migrations::run_through_for_test(db.pool(), 175)
+        crate::migrations::run_through_for_test(db.pool(), 176)
             .await
             .unwrap();
         let failure =
             initial_cleanup_failure_fixture(&db, CloseStopCertainty::ShutdownUncertain).await;
-        // The historical pre-176 receipt has no intent column.
+        // The historical pre-177 receipt has no intent column.
         let mut tx = db.pool().begin_with("BEGIN IMMEDIATE").await.unwrap();
         Database::terminalize_close_run_cleanup_failure_inner_tx(
             &mut tx,

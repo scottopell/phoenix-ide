@@ -1,4 +1,4 @@
-//! Migration 187 schema regressions. These start at the real shipped 186 schema;
+//! Migration 188 schema regressions. These start at the real migration 187 schema;
 //! no production guard is dropped to manufacture accepted capture authority.
 use super::*;
 use crate::close_foundation::{
@@ -16,14 +16,14 @@ async fn predecessor() -> Database {
         .connect("sqlite::memory:")
         .await
         .unwrap();
-    setup_real_178_for_test(&pool).await;
-    run_through_for_test(&pool, 186).await.unwrap();
+    setup_real_179_for_test(&pool).await;
+    run_through_for_test(&pool, 187).await.unwrap();
     assert_eq!(
         sqlx::query_scalar::<_, i64>("SELECT MAX(version) FROM _migrations")
             .fetch_one(&pool)
             .await
             .unwrap(),
-        186
+        187
     );
     Database::from_pool_for_tests(pool, String::new())
 }
@@ -48,9 +48,9 @@ fn assert_only_native_union_added(before: &str, after: &str, native: &str) {
 #[tokio::test]
 #[allow(
     clippy::too_many_lines,
-    reason = "Compares pre-187 trigger sources and the post-187 schema across a second migration run on the same database"
+    reason = "Compares pre-188 trigger sources and the post-188 schema across a second migration run on the same database"
 )]
-async fn real186_to187_preserves_original_branches_and_is_idempotent() {
+async fn real187_to188_preserves_original_branches_and_is_idempotent() {
     let db = predecessor().await;
     let native_queries = [
         (
@@ -83,7 +83,7 @@ async fn real186_to187_preserves_original_branches_and_is_idempotent() {
     let source_before = trigger(&db, "native_close_source_fence_requires_exact_plan").await;
     let header_before = trigger(&db, "native_close_retry_plans_require_original").await;
 
-    assert_eq!(run_through_for_test(&db.pool, 187).await.unwrap(), 1);
+    assert_eq!(run_through_for_test(&db.pool, 188).await.unwrap(), 1);
     for ((name, query), original) in native_queries.into_iter().zip(before) {
         assert_only_native_union_added(&original, &trigger(&db, name).await, query);
     }
@@ -152,7 +152,7 @@ async fn real186_to187_preserves_original_branches_and_is_idempotent() {
     .fetch_all(&db.pool)
     .await
     .unwrap();
-    assert_eq!(run_through_for_test(&db.pool, 187).await.unwrap(), 0);
+    assert_eq!(run_through_for_test(&db.pool, 188).await.unwrap(), 0);
     let again: Vec<(String, String)> = sqlx::query_as(
         "SELECT name, sql FROM sqlite_schema
         WHERE sql IS NOT NULL ORDER BY name",
@@ -176,7 +176,7 @@ async fn real186_to187_preserves_original_branches_and_is_idempotent() {
 }
 
 #[tokio::test]
-async fn missing_or_changed_native_source_rolls_back187() {
+async fn missing_or_changed_native_source_rolls_back188() {
     for missing in [true, false] {
         let db = predecessor().await;
         sqlx::raw_sql("DROP TRIGGER close_retirement_resource_dispatches_require_authority")
@@ -193,7 +193,7 @@ async fn missing_or_changed_native_source_rolls_back187() {
             .await
             .unwrap();
         }
-        let error = run_through_for_test(&db.pool, 187)
+        let error = run_through_for_test(&db.pool, 188)
             .await
             .unwrap_err()
             .to_string();
@@ -206,7 +206,7 @@ async fn missing_or_changed_native_source_rolls_back187() {
                 .fetch_one(&db.pool)
                 .await
                 .unwrap(),
-            186
+            187
         );
         assert_eq!(
             sqlx::query_scalar::<_, i64>(
@@ -228,8 +228,8 @@ async fn missing_or_changed_native_source_rolls_back187() {
     }
 }
 
-// An ordinary, non-native active retirement. In 186 its active-authority branch
-// intentionally relies on the composite FK for identity membership. 187 must
+// An ordinary, non-native active retirement. In 187 its active-authority branch
+// intentionally relies on the composite FK for identity membership. 188 must
 // keep that branch literal AND replace every component of the FK's protection.
 async fn original_active_inventory(db: &Database) -> (String, String, String, String) {
     let conversation = db
@@ -337,9 +337,9 @@ async fn original_active_inventory_still_rejects_arbitrary_dispatch_identity_and
     .to_string();
     assert!(
         before.contains("FOREIGN KEY"),
-        "186 must reach its composite FK: {before}"
+        "187 must reach its composite FK: {before}"
     );
-    run_through_for_test(&db.pool, 187).await.unwrap();
+    run_through_for_test(&db.pool, 188).await.unwrap();
     for (candidate_generation, candidate_fingerprint, codec, identity) in [
         (
             generation.as_str(),
@@ -404,7 +404,7 @@ async fn original_active_inventory_still_rejects_arbitrary_dispatch_identity_and
 }
 
 #[tokio::test]
-async fn original_dispatch_update_and_expected_resource_retention_survive187() {
+async fn original_dispatch_update_and_expected_resource_retention_survive188() {
     let db = predecessor().await;
     let (attempt, scope, generation, fingerprint) = original_active_inventory(&db).await;
     dispatch(
@@ -426,7 +426,7 @@ async fn original_dispatch_update_and_expected_resource_retention_survive187() {
     .await;
     for migrated in [false, true] {
         if migrated {
-            run_through_for_test(&db.pool, 187).await.unwrap();
+            run_through_for_test(&db.pool, 188).await.unwrap();
         }
         for column in [
             "attempt_id",
@@ -521,7 +521,7 @@ async fn assert_dispatch_reference_retention(db: &Database) {
 async fn delete_api_clears_dispatches_before_expected_resource_teardown() {
     let db = predecessor().await;
     let (attempt, scope, generation, fingerprint) = original_active_inventory(&db).await;
-    run_through_for_test(&db.pool, 187).await.unwrap();
+    run_through_for_test(&db.pool, 188).await.unwrap();
     dispatch(
         &db,
         &attempt,
@@ -638,7 +638,7 @@ async fn install_and_check_captured_authority_schema(
 #[tokio::test]
 async fn captured_authority_schema_is_immutable_but_cascades_with_its_obligation() {
     let db = predecessor().await;
-    run_through_for_test(&db.pool, 187).await.unwrap();
+    run_through_for_test(&db.pool, 188).await.unwrap();
     let pool = SqlitePoolOptions::new()
         .max_connections(1)
         .connect("sqlite::memory:")

@@ -797,6 +797,10 @@ use crate::tools::ToolContext;
 /// Executor for tools
 #[async_trait]
 pub trait ToolExecutor: Send + Sync {
+    fn foreground_execution(&self, _name: &str) -> crate::tools::ForegroundExecution {
+        crate::tools::ForegroundExecution::Serial
+    }
+
     /// Execute a gate-cleared tool call. Accepting only a [`CheckedToolCall`]
     /// — whose sole non-test mint is `DenyGate::check` — makes an ungated tool
     /// call unrepresentable (specs/permissions REQ-PERM-001).
@@ -1718,6 +1722,10 @@ impl<T: LlmClient + ?Sized> LlmClient for Arc<T> {
 
 #[async_trait]
 impl<T: ToolExecutor + ?Sized> ToolExecutor for Arc<T> {
+    fn foreground_execution(&self, name: &str) -> crate::tools::ForegroundExecution {
+        (**self).foreground_execution(name)
+    }
+
     async fn execute(&self, call: CheckedToolCall, ctx: ToolContext) -> Option<ToolOutput> {
         (**self).execute(call, ctx).await
     }
@@ -3492,6 +3500,25 @@ impl ToolRegistryExecutor {
 
 #[async_trait]
 impl ToolExecutor for ToolRegistryExecutor {
+    fn foreground_execution(&self, name: &str) -> crate::tools::ForegroundExecution {
+        let registered = self
+            .registry
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .foreground_execution(name);
+        registered.unwrap_or_else(|| {
+            if self.mcp_manager.is_some()
+                && name
+                    .split_once("__")
+                    .is_some_and(|(server, tool)| !server.is_empty() && !tool.is_empty())
+            {
+                crate::tools::ForegroundExecution::Concurrent
+            } else {
+                crate::tools::ForegroundExecution::Serial
+            }
+        })
+    }
+
     async fn execute(&self, call: CheckedToolCall, ctx: ToolContext) -> Option<ToolOutput> {
         let (name, input, expected_schema) = call.into_bound_parts();
         // Look up the tool while holding the read lock, then drop the guard
@@ -3637,6 +3664,10 @@ mod tool_registry_executor_tests {
 
     #[async_trait]
     impl Tool for NamedMarker {
+        fn foreground_execution(&self) -> crate::tools::ForegroundExecution {
+            crate::tools::ForegroundExecution::Serial
+        }
+
         fn name(&self) -> &'static str {
             self.0
         }

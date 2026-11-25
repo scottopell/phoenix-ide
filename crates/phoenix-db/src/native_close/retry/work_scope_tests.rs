@@ -164,7 +164,7 @@ async fn native_scope_retirement_rechecks_source_before_lifecycle_mutation() {
 
 #[tokio::test]
 async fn generic_scope_retirement_refuses_native_completed_retry_even_with_current_g1() {
-    let (db, assessment, receipt) = migration_179_pending_fixture_with_options(false, false).await;
+    let (db, assessment, receipt) = migration_180_pending_fixture_with_options(false, false).await;
     crate::migrations::run_pending_migrations(db.pool()).await.unwrap();
     let (worktree, scope, independent) = native_scope_effects(&assessment);
     assert_eq!(current_test_snapshot(&db, receipt.admitted.attempt_id.as_str()).await,

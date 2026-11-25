@@ -4,10 +4,9 @@
 // This is presentational support for the conversation density feature: it
 // turns the tool_use blocks already present on an `agent_turn` render unit
 // into the lightweight `{ name, toolId, isSubAgent, hasResult, isError }`
-// descriptors the inline pill strip paints. It reads ONLY the turn's own
-// data (content blocks + `toolResultsByUseId`), never phase state — the
-// source of truth for what a turn did is the turn itself.
+// descriptors the inline pill strip paints.
 
+import { toolStartedAt, type ToolActivity } from '../conversation/toolActivity';
 import type { ContentBlock, Message, ToolResultContent } from '../api';
 import { svgArtifactFromResult, type SvgArtifact } from './svgArtifact';
 import type { BashToolProgress } from '../generated/sse';
@@ -338,9 +337,9 @@ export function deriveToolStripItems(
   message: Message,
   toolResultsByUseId: ReadonlyMap<string, Message>,
   liveBashProgress: Readonly<Record<string, { progress: BashToolProgress }>> = {},
+  activity?: ToolActivity,
 ): ToolStripItem[] {
   const blocks = Array.isArray(message.content) ? (message.content as ContentBlock[]) : [];
-  const toolStarts = (message.display_data as Record<string, unknown> | undefined)?.['tool_starts'] as Record<string, unknown> | undefined;
   const items: ToolStripItem[] = [];
   for (const block of blocks) {
     if (block.type !== 'tool_use') continue;
@@ -363,7 +362,7 @@ export function deriveToolStripItems(
       resultSummary: summarizeToolResult(name, result),
       commandIdentity: bashCompact.commandIdentity,
       finalStatus: bashCompact.finalStatus,
-      startedAtMs: typeof toolStarts?.[toolId] === 'number' ? toolStarts[toolId] : null,
+      startedAtMs: toolStartedAt(message, toolId, activity) ?? null,
       outputTail: bashCompact.outputTail,
       isSubAgent: name === 'spawn_agents',
       hasResult: result !== undefined,

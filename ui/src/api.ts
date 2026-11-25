@@ -591,18 +591,32 @@ export type RecoveryResumeTarget =
   | { type: 'continuation_summary'; request: ContinuationSummaryRequest }
   | { type: 'server_overload_retry'; retry: ServerOverloadRetry };
 
+export type FinalizedToolRoundResult = {
+  tool_use_id: string;
+  outcome:
+    | { type: 'success' | 'error'; output: string; display_data?: Record<string, unknown> | null; images?: ImageData[] }
+    | { type: 'trusted_instructions'; output: string }
+    | { type: 'cancelled'; message: string };
+  duration_ms?: number;
+};
+
+export type ToolRoundState = {
+  assistant_message?: { message_id: string } | undefined;
+  completed_results?: (FinalizedToolRoundResult | { pending_self_goal: unknown } | { pending_goal_report: unknown })[] | undefined;
+};
+
 export type ConversationState =
   | { type: 'idle' }
   | { type: 'awaiting_llm' }
   | { type: 'llm_requesting'; attempt: number }
   | { type: 'server_overload_retrying'; attempt: number; maxAttempts: number; retryAt: number | null; target: 'ordinary' | 'continuation' }
   | { type: 'seeded_llm_requesting'; seed_message_id: string; attempt: number }
-  | { type: 'tool_executing'; current_tool: ToolCall; remaining_tools: ToolCall[] }
+  | ({ type: 'tool_executing'; current_tool: ToolCall; remaining_tools: ToolCall[] } & ToolRoundState)
   | { type: 'awaiting_sub_agents'; pending: PendingSubAgent[]; completed_results: SubAgentResult[] }
   | { type: 'awaiting_continuation'; attempt: number }
   | { type: 'recoverable_continuation_failure'; message: string; error_kind: ErrorKind; operation_id: string; attempt: number }
   | { type: 'cancelling' }
-  | { type: 'cancelling_tool'; current_tool: ToolCall }
+  | ({ type: 'cancelling_tool'; tool_use_id: string; skipped_tools: ToolCall[] } & ToolRoundState)
   | { type: 'cancelling_sub_agents'; pending: PendingSubAgent[] }
   | { type: 'awaiting_task_approval'; title: string; priority: string; plan: string }
   | { type: 'awaiting_user_response'; questions: UserQuestion[]; request_id?: string }
@@ -1657,16 +1671,6 @@ export const api = {
     return resp.json();
   },
 
-  async updateLlmLanguageSetting(language: string): Promise<LlmLanguageSetting> {
-    const resp = await fetch('/api/settings/llm-language', {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ language }),
-    });
-    if (!resp.ok) throw new Error('Failed to save LLM language setting');
-    return resp.json();
-  },
-
 
   async login(password: string): Promise<void> {
     const resp = await fetch('/api/auth/login', {
@@ -1929,15 +1933,6 @@ export const api = {
     if (!resp.ok) {
       if (resp.status === 404) throw new Error('Conversation not found');
       throw new Error('Failed to resolve conversation route');
-    }
-    return resp.json();
-  },
-
-  async getProductConversationRoute(productConversationId: string): Promise<ProductConversationRouteResponse> {
-    const resp = await fetch(`/api/product-conversations/${encodeURIComponent(productConversationId)}/route`);
-    if (!resp.ok) {
-      if (resp.status === 404) throw new Error('Conversation not found');
-      throw new Error('Failed to resolve product conversation route');
     }
     return resp.json();
   },
@@ -2373,14 +2368,6 @@ export const api = {
 
   async validateCwd(path: string): Promise<{ valid: boolean; error?: string; is_git: boolean }> {
     const resp = await fetch(`/api/validate-cwd?path=${encodeURIComponent(path)}`);
-    return resp.json();
-  },
-
-  async listGitBranches(cwd: string, search?: string): Promise<GitBranchesResponse> {
-    let url = `/api/git/branches?cwd=${encodeURIComponent(cwd)}`;
-    if (search) url += `&search=${encodeURIComponent(search)}`;
-    const resp = await fetch(url);
-    if (!resp.ok) throw new Error('Failed to list git branches');
     return resp.json();
   },
 
@@ -2960,20 +2947,6 @@ export const api = {
   async enableMcpServer(name: string): Promise<void> {
     const resp = await fetch(`/api/mcp/servers/${encodeURIComponent(name)}/enable`, { method: 'POST' });
     if (!resp.ok) throw new Error('Failed to enable MCP server');
-  },
-
-  /** Fetch conversation data via share token (REQ-AUTH-006) */
-  async getSharedConversation(token: string): Promise<{
-    conversation: Conversation;
-    messages: Message[];
-    agent_working: boolean;
-    presentation_mode: string;
-    context_window_size: number;
-  }> {
-    const resp = await fetch(`/api/share/${encodeURIComponent(token)}/conversation`);
-    if (resp.status === 404) throw new Error('Share link not found or has been revoked');
-    if (!resp.ok) throw new Error('Failed to load shared conversation');
-    return resp.json();
   },
 
   // -----------------------------------------------------------------

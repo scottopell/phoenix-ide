@@ -207,6 +207,10 @@ impl Default for PatchTool {
 
 #[async_trait]
 impl Tool for PatchTool {
+    fn foreground_execution(&self) -> crate::ForegroundExecution {
+        crate::ForegroundExecution::Concurrent
+    }
+
     fn name(&self) -> &'static str {
         "patch"
     }
@@ -247,7 +251,7 @@ Recipes:
 Usage notes:
 - All inputs are interpreted literally (no automatic newline or whitespace handling)
 - For replace, insert_before, and insert_after, oldText must appear EXACTLY ONCE in the file (unless replaceAll is set)
-- All patches in a single call resolve against the original file content simultaneously, not sequentially. Repeating the same oldText across patches cannot disambiguate sites, and two patches whose ranges overlap are rejected. For sequential edits where each step sees the prior result, use separate patch tool calls.
+- All patches in a single call resolve against the original file content simultaneously, not sequentially. Repeating the same oldText across patches cannot disambiguate sites, and two patches whose ranges overlap are rejected. For sequential edits where each step sees the prior result, wait for the first call's result before issuing the next patch call.
 - On success the applied unified diff is returned so you can confirm where each edit landed without re-reading the file.
 
 Size limit: each patch call must be less than 60 KB of input.".to_string()

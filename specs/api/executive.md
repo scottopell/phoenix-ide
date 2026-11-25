@@ -12,6 +12,16 @@ The API still reflects the legacy lifecycle and chain model. Current shipped end
 
 REST/JSON plus SSE. The conversation SSE stream is specified to carry root-keyed `conversation_update`, typed `product_conversation_lifecycle`, continuation-boundary projection, and `work_scope_update` alongside persisted message, state-change, token, LLM lifecycle, and deletion events. Aggregate-bound live carriers are now normatively required to materialize as one closed typed envelope over the authoritative carrier set, sharing one RootStreamLedger ordering space across init, replay, and live delivery while carrying the root ProductConversation identity plus member identity where applicable. `work_scope_update` is aggregate-bound in that contract: it allocates a root-stream sequence, carries the root ProductConversation id plus inventory payload identity, omits any member-row owner, and appends to the same root replay/broadcast path. `init`, terminal `conversation_hard_deleted`, and the live-only steering queue projections remain outside that aggregate-bound replay envelope. The server continues to back both ordinary conversation routes and dedicated chain routes. Conversation creation remains the existing shell-first HTTP flow; the durable creation protocol is only partially cut over.
 
+## Foreground Tool Activity Qualification
+
+The concurrent foreground candidate retains the existing SSE shapes. Its
+`current_tool` is a representative unresolved call, `remaining_count` counts
+other unresolved calls, and `completed_count` counts accepted receipts. Genuine
+starts and assistant-scoped membership determine per-call activity; accepted
+sibling output can precede the complete checkpoint. Source changes and final
+runtime/reconnect qualification are in progress; existing streaming coverage does
+not establish concurrent-round acceptance or production behavior.
+
 ## Requirement Map
 
 | Requirement | Surface | Current status note |
@@ -23,7 +33,8 @@ REST/JSON plus SSE. The conversation SSE stream is specified to carry root-keyed
 | **REQ-API-032:** Reminder visibility and management | Owner reminder list, cancel/reschedule and global recent-due feed | Implemented; three focused API tests pass; integrated browser QA pending |
 | **REQ-API-033:** Reserved reminder input identities | Shared fresh input admission; public chat conflict response | Implemented; exact accepted replay retains its existing contract |
 | **REQ-API-031:** Explicit Public Literal Chat | `/chat` opt-in, closed policy, known receiver, policy-proven replay | Authored; offline qualification only, Rust/E2E execution pending |
-| **REQ-API-005:** Real-time Streaming | SSE with init, token events (`request_id` for correlation), replay-backed reconnection | Implemented |
+| **REQ-API-005:** Real-time Streaming | Existing SSE and assistant-scoped live/reconnect tool projection | Implemented serial paths; concurrent accepted-sibling output qualification pending |
+| **REQ-API-011:** Granular State Change Events | Existing representative/unresolved/accepted fields plus genuine per-call starts | Concurrent activity semantics specified; final integration qualification pending |
 | **REQ-API-006:** Conversation Lifecycle | Archive, delete, rename | Partially implemented against current norms: archive/delete/rename ship, but unified Close/Open/History lifecycle does not |
 | **REQ-API-007:** Slug Resolution | GET /api/conversation-by-slug/{slug} | Implemented |
 | **REQ-API-008:** Directory Browser | validate-cwd and list-directory | Implemented |

@@ -166,8 +166,10 @@ contract NativeCloseApplication {
 contract ToolRoundAdmission {
     @invariant ToolRoundIdentityCorrespondence
         -- REQ-BED-004: A checkpoint has unique Phoenix-managed call identities
-        -- paired one-to-one with result identities. Valid supplied result order
-        -- is preserved; identity matching does not require request-order sorting.
+        -- paired one-to-one with result identities. Foreground execution assembles
+        -- accepted and synthetic results in original assistant call order before
+        -- its complete checkpoint and single continuation. Identity validation
+        -- alone does not reorder another caller's valid supplied result list.
         -- Malformed provider call identities select invalid-response handling
         -- before ordinary execution, approval/question interception, or child completion.
         -- A completion bearing another invocation's identity settles the expected
@@ -180,6 +182,13 @@ contract ToolRoundAdmission {
         -- tools are not replayed and malformed data is not silently repaired.
         -- Every selected held round is decoded and paired before any recovery
         -- mutation, including a parent's settlement of pending child state.
+
+    @invariant InterruptedRoundMaterializationPreservesSourceIdentity
+        -- REQ-BED-007: existing startup interruption materialization pairs accepted
+        -- and synthetic results to the original held assistant calls and restores
+        -- source order, retaining accepted payload/metadata by identity. Missing
+        -- live owners never authorize repeating unknown external effects. This
+        -- does not grant live replacement, replay or exactly-once external effects.
 }
 
 contract ParentTerminalAcceptance {
@@ -540,6 +549,11 @@ entity Conversation {
     -- Core state-dependent fields
     retry_attempt: Integer when core_status = llm_requesting | awaiting_continuation | recoverable_continuation_failure
     overload_retry: ServerOverloadIncident when core_status = server_overload_retrying
+    -- current_tool + tool_queue (Rust remaining_tools) is all unresolved calls;
+    -- tool_results (Rust completed_results) is accepted receipts only. During
+    -- cancellation, cancelling_tool_use_id + skipped_tools is all unresolved
+    -- calls; its tail may include running siblings. The held assistant_message
+    -- scopes every identity to the exact immutable original source.
     current_tool: ToolCall when core_status = executing_tools
     tool_queue: List<ToolCall> when core_status = executing_tools
     cancelling_tool_use_id: String when core_status = cancelling_tool
@@ -831,22 +845,23 @@ rule InterceptedToolNotSole {
 rule BashWaitSettlementDeadlineFires {
     when: BashWaitSettlementDeadlineReached(conversation, tool_call)
     requires: conversation.core_status = executing_tools
-    requires: tool_call = conversation.current_tool
+    requires: tool_call in unresolved_tool_calls(conversation)
     requires: is_bash_wait(tool_call)
     ensures: ToolTaskRetirementRequested(conversation, tool_call)
     ensures: not CommandReexecuted(tool_call)
 
     @guidance
-        -- The serial dispatcher invalidates and aborts the wait task before
-        -- acknowledging ToolTaskRetired. Only that acknowledgement admits the
-        -- synthetic completion, so a successor call cannot open before the
-        -- old receiver's generation has been retired.
+        -- Retire only this exact wait owner before acknowledging ToolTaskRetired.
+        -- Each selected wait has absolute execution and persistence cutoffs;
+        -- sibling progress and representative changes cannot renew either one.
+        -- Batch creation disarms the legacy representative deadline so it cannot
+        -- retire a different sibling.
 }
 
 rule BashWaitRetiredTaskSettles {
     when: ToolTaskRetired(conversation, tool_call)
     requires: conversation.core_status = executing_tools
-    requires: tool_call = conversation.current_tool
+    requires: tool_call in unresolved_tool_calls(conversation)
     requires: is_bash_wait(tool_call)
     ensures: ToolCompletes(
         conversation,
@@ -866,7 +881,7 @@ rule BashWaitRetiredTaskSettles {
 rule BashWaitSettlementPersistenceCutoffFires {
     when: BashWaitSettlementPersistenceCutoffReached(conversation, tool_call)
     requires: conversation.core_status = executing_tools
-    requires: tool_call = conversation.current_tool
+    requires: tool_call in unresolved_tool_calls(conversation)
     requires: is_bash_wait(tool_call)
     ensures: ProcessLocalAuthorityClosed(conversation)
     ensures: not PersistenceReceiptFabricated(tool_call)
@@ -884,11 +899,12 @@ rule ToolCompletesWithMoreRemaining {
     when: ToolCompletes(conversation, result)
     requires: conversation.core_status = executing_tools
     requires: conversation.tool_queue.count > 0
-    requires: result.tool_use_id = conversation.current_tool.tool_use_id
-    let next_tool = conversation.tool_queue.first
-    ensures: conversation.tool_results.add(result)
+    requires: result_identifies_unresolved_call(conversation, result)
+    let remaining = unresolved_without_result(conversation, result)
+    let next_tool = remaining.first
+    ensures: conversation.tool_results = source_ordered_results(conversation, result)
     ensures: conversation.current_tool = next_tool
-    ensures: conversation.tool_queue = remaining_tool_calls(conversation.tool_queue)
+    ensures: conversation.tool_queue = remaining_tool_calls(remaining)
     ensures: ToolExecutionStarted(conversation, next_tool)
 }
 
@@ -898,7 +914,7 @@ rule LastToolCompletesNoSubAgents {
     requires: conversation.tool_queue.count = 0
     requires: conversation.accumulated_sub_agents.count = 0
     requires: result.tool_use_id = conversation.current_tool.tool_use_id
-    ensures: conversation.tool_results.add(result)
+    ensures: conversation.tool_results = source_ordered_results(conversation, result)
     ensures: conversation.core_status = llm_requesting
     ensures: conversation.current_tool = null
     ensures: conversation.tool_queue = null
@@ -914,7 +930,7 @@ rule LastToolCompletesWithSubAgents {
     requires: conversation.accumulated_sub_agents.count > 0
     requires: result.tool_use_id = conversation.current_tool.tool_use_id
     let pending_children = conversation.accumulated_sub_agents
-    ensures: conversation.tool_results.add(result)
+    ensures: conversation.tool_results = source_ordered_results(conversation, result)
     ensures: conversation.core_status = awaiting_sub_agents
     ensures: conversation.current_tool = null
     ensures: conversation.tool_queue = null
@@ -981,9 +997,32 @@ rule CancelDuringToolExecution {
             SubAgentsCancelRequested(conversation)
 }
 
+-- REQ-BED-004 / REQ-BED-005: each receipt removes only its own unresolved
+-- membership; neither the representative nor the tail is a unique running slot.
+rule SiblingSettlesDuringCancellation {
+    when: ToolCompletes(conversation, result)
+    requires: conversation.core_status = cancelling_tool
+    requires: conversation.skipped_tools.count > 0
+    requires: result_identifies_unresolved_call(conversation, result)
+    ensures: conversation.tool_results = source_ordered_results(conversation, result)
+    ensures: CancellationMembershipAdvanced(conversation, result.tool_use_id)
+    ensures: not CancellationCheckpointed(conversation)
+    ensures: not AgentDone(conversation)
+}
+
+rule SiblingAbortsDuringCancellation {
+    when: ToolAbortedSibling(conversation, tool_use_id)
+    requires: conversation.core_status = cancelling_tool
+    requires: conversation.skipped_tools.count > 0
+    requires: unresolved_tool_id(conversation, tool_use_id)
+    ensures: ToolCompletes(conversation, cancelled_result(tool_use_id))
+}
+
 rule ToolAbortConfirmed {
     when: ToolAborted(conversation)
+    requires: conversation.kind = Parent
     requires: conversation.core_status = cancelling_tool
+    requires: conversation.skipped_tools.count = 0
     let pending_children = conversation.sub_agents_pending
     ensures: CancellationCheckpointed(conversation)
     ensures: conversation.cancelling_tool_use_id = null
@@ -1000,9 +1039,12 @@ rule ToolAbortConfirmed {
 
 rule ToolCompletesDuringCancellation {
     when: ToolCompletes(conversation, result)
+    requires: conversation.kind = Parent
     requires: conversation.core_status = cancelling_tool
+    requires: conversation.skipped_tools.count = 0
     requires: result.tool_use_id = conversation.cancelling_tool_use_id
     let pending_children = conversation.sub_agents_pending
+    ensures: conversation.tool_results = source_ordered_results(conversation, result)
     ensures: CancellationCheckpointed(conversation)
     ensures: conversation.cancelling_tool_use_id = null
     ensures:
@@ -1062,9 +1104,10 @@ rule SubAgentResultDuringCancellation {
 --
 -- Cooperative outcomes or an already-queued denial settle through
 -- ToolAbortConfirmed / ToolCompletesDuringCancellation. The deadline requests
--- synchronous runtime-slot retirement even when an intercepted call has no
--- ordinary tool task. Its acknowledgement admits settlement without waiting
--- for task cooperation or resource cleanup.
+-- synchronous retirement of every remaining owner, including an intercepted
+-- call without an ordinary task. One absolute aggregate deadline does not renew
+-- on sibling progress. Only affirmative all-owner retirement admits forced
+-- settlement; task/resource cleanup need not finish first.
 rule CancellingToolDeadlineFires {
     when: CancellationDeadlineExpires(conversation)
     requires: conversation.core_status = cancelling_tool
@@ -1074,7 +1117,9 @@ rule CancellingToolDeadlineFires {
 
 rule RetiredToolCancellationSettles {
     when: ToolCancellationRetired(conversation)
+    requires: conversation.kind = Parent
     requires: conversation.core_status = cancelling_tool
+    requires: all_remaining_foreground_owners_retired(conversation)
     let pending_children = conversation.sub_agents_pending
     ensures: CancellationCheckpointed(conversation)
     ensures: conversation.cancelling_tool_use_id = null
@@ -1095,9 +1140,10 @@ rule RetiredToolCancellationSettles {
             conversation.forced_tool_retirement_observed = true
 
     @guidance
-        -- Sequence on deadline expiry: abort the tool's executing task (do not
-        -- wait for it), reap any subprocesses it spawned (process-group kill),
-        -- synthesize cancelled results for the current and remaining tools,
+        -- On expiry, stop refill, abort all remaining owned tasks without
+        -- waiting for cooperation, and reap their subprocesses. After every
+        -- remaining owner is affirmatively retired, preserve accepted results
+        -- and synthesize cancelled results for unresolved calls in source order,
         -- checkpoint, then settle. Settling reaches idle (not error) — a cancel
         -- the user requested and that succeeded from their view must not be
         -- presented as a failure — except when the round had spawned sub-agents,
@@ -3459,9 +3505,48 @@ rule SubAgentSubmitsError {
 
 rule SubAgentCancelled {
     when: UserCancels(conversation)
+    requires: conversation.kind = SubAgent
     requires: not conversation.is_terminal
+    requires: conversation.core_status not in { executing_tools, cancelling_tool }
     ensures: conversation.sub_agent_status = failed
     ensures: conversation.failure_error = UserCancels.reason or "Cancelled"
+    ensures: SubAgentCompleted(conversation)
+}
+
+-- REQ-SA-005 / REQ-BED-005: a child shares the full foreground drain barrier
+-- while retaining its own failed terminal destination and parent notification.
+rule SubAgentFinalForegroundCompletionDuringCancellation {
+    when: ToolCompletes(conversation, result)
+    requires: conversation.kind = SubAgent
+    requires: conversation.core_status = cancelling_tool
+    requires: conversation.skipped_tools.count = 0
+    requires: result.tool_use_id = conversation.cancelling_tool_use_id
+    ensures: conversation.tool_results = source_ordered_results(conversation, result)
+    ensures: CancellationCheckpointed(conversation)
+    ensures: conversation.sub_agent_status = failed
+    ensures: conversation.failure_error = cancellation_failure(conversation)
+    ensures: SubAgentCompleted(conversation)
+}
+
+rule SubAgentFinalForegroundAbortDuringCancellation {
+    when: ToolAborted(conversation)
+    requires: conversation.kind = SubAgent
+    requires: conversation.core_status = cancelling_tool
+    requires: conversation.skipped_tools.count = 0
+    ensures: CancellationCheckpointed(conversation)
+    ensures: conversation.sub_agent_status = failed
+    ensures: conversation.failure_error = cancellation_failure(conversation)
+    ensures: SubAgentCompleted(conversation)
+}
+
+rule SubAgentForegroundRetirementDuringCancellation {
+    when: ToolCancellationRetired(conversation)
+    requires: conversation.kind = SubAgent
+    requires: conversation.core_status = cancelling_tool
+    requires: all_remaining_foreground_owners_retired(conversation)
+    ensures: CancellationCheckpointed(conversation)
+    ensures: conversation.sub_agent_status = failed
+    ensures: conversation.failure_error = cancellation_failure(conversation)
     ensures: SubAgentCompleted(conversation)
 }
 
@@ -3745,6 +3830,37 @@ rule ModeChangeNotification {
 --   is_bash_wait(call: ToolCall) -> Boolean
 --       True exactly when call.name is bash and its serialized input represents
 --       a supported Bash wait invocation. Input is opaque outside this predicate.
+--   unresolved_tool_calls(conversation: Conversation) -> List<ToolCall>
+--       Executing: current_tool followed by tool_queue. Cancelling: the exact
+--       original call identified by cancelling_tool_use_id followed by skipped_tools.
+--       These canonical core fields preserve source order; no second queue exists.
+--   unresolved_without_result(conversation, result) -> List<ToolCall>
+--       Remove this exact receipt's unresolved identity and preserve source order.
+--   result_identifies_unresolved_call(conversation, result) -> Boolean
+--       One unresolved call in this held round has that result ID. The dispatcher
+--       must also prove exact original source/runtime ownership before submission.
+--   unresolved_tool_id(conversation, tool_use_id) -> Boolean
+--       That identity belongs to this held round's canonical unresolved fields.
+--   source_ordered_results(conversation, result) -> List<ToolResult>
+--       Accepted results plus this exact receipt, with complete payload/metadata,
+--       ordered by call identity in the original held assistant source.
+--   cancelled_result(tool_use_id) -> ToolResult: this identity's synthetic
+--       cancellation result, preserving cancellation rather than ordinary failure.
+--   retained_cancellation_receipt_matches(runtime, conversation, tool_use_id):
+--       the exact retained runtime/full-assistant/call selection owns this existing
+--       abort receipt or affirmative no-call-effects proof; native admission uses
+--       its classified reconciliation rather than inferring effects from absence.
+--   ToolAbortedSibling(conversation, tool_use_id): the partial-round view of the
+--       existing exact ToolAborted event. Its call identity is retained; the final
+--       receipt uses ToolAborted(conversation). No new wire event is introduced.
+--   CancellationMembershipAdvanced(conversation, tool_use_id): remove only that
+--       unresolved identity; the first remaining call becomes representative and
+--       the rest remains skipped_tools. No checkpoint or terminal effect occurs.
+--   all_remaining_foreground_owners_retired(conversation) -> Boolean
+--       Every remaining owner affirmatively relinquished launch and outcome
+--       authority. A missing representative slot or receiver is not this proof.
+--   cancellation_failure(conversation) -> String
+--       Preserve the existing timeout versus parent-cancel cause and diagnostic.
 
 --   valid_tool_identities(content: Content, tool_calls: List<ToolCall>) -> Boolean
 --       True exactly when Phoenix-managed tool-use identities in content and
@@ -4617,19 +4733,47 @@ surface ToolRetirementAcknowledgements {
         ToolTaskRetired(conversation, tool_call)
             when executor_owns_conversation(runtime, conversation)
                  and conversation.core_status = executing_tools
-                 and tool_call = conversation.current_tool
+                 and tool_call in unresolved_tool_calls(conversation)
                  and is_bash_wait(tool_call)
         ToolCancellationRetired(conversation)
             when executor_owns_conversation(runtime, conversation)
                  and conversation.core_status = cancelling_tool
+                 and all_remaining_foreground_owners_retired(conversation)
 
     @guarantee RetirementPrecedesSettlement
         -- Each acknowledgement answers the matching retirement request from
         -- this same owned execution step, after dispatch-generation invalidation
         -- and abort of the retained task handle if present. It is emitted without
         -- waiting for task/resource cleanup and before synthetic settlement can
-        -- advance the conversation. No ordinary task or invocation is required
-        -- to acknowledge cancellation-slot retirement.
+        -- advance the conversation. Batch acknowledgement requires affirmative
+        -- retirement of every remaining owner, never just the representative.
+        -- An intercepted call retains its native admission proof separately.
+}
+
+surface RuntimeToolAbortObservations {
+    facing runtime: RuntimeExecutor
+    context conversation: Conversation
+
+    provides:
+        ToolAbortedSibling(conversation, tool_use_id)
+            when executor_owns_conversation(runtime, conversation)
+                 and conversation.core_status = cancelling_tool
+                 and conversation.skipped_tools.count > 0
+                 and unresolved_tool_id(conversation, tool_use_id)
+                 and retained_cancellation_receipt_matches(runtime, conversation, tool_use_id)
+        ToolAborted(conversation)
+            when executor_owns_conversation(runtime, conversation)
+                 and conversation.core_status = cancelling_tool
+                 and conversation.skipped_tools.count = 0
+                 and retained_cancellation_receipt_matches(runtime, conversation, conversation.cancelling_tool_use_id)
+
+    @guarantee ExistingExactAbortReceipt
+        -- These are partial/final views of the existing ToolAborted event, not
+        -- new wire events or an independent completion authority. The retained
+        -- full-source/call owner supplies its typed Aborted receipt or affirmative
+        -- unissued/read-only interruption proof. Native closure retains its
+        -- separate classified reconciliation before acknowledging an abort.
+        -- Missing memory alone cannot mint a receipt or settle another origin.
 }
 
 surface RuntimeChildResultObservations {
@@ -4745,12 +4889,14 @@ surface UserConversation {
                     awaiting_task_approval,
                     awaiting_recovery
                  }
-        BashWaitSettlementDeadlineReached(conversation, conversation.current_tool)
+        BashWaitSettlementDeadlineReached(conversation, tool_call)
             when conversation.core_status = executing_tools
-             and is_bash_wait(conversation.current_tool)
-        BashWaitSettlementPersistenceCutoffReached(conversation, conversation.current_tool)
+             and tool_call in unresolved_tool_calls(conversation)
+             and is_bash_wait(tool_call)
+        BashWaitSettlementPersistenceCutoffReached(conversation, tool_call)
             when conversation.core_status = executing_tools
-             and is_bash_wait(conversation.current_tool)
+             and tool_call in unresolved_tool_calls(conversation)
+             and is_bash_wait(tool_call)
         TaskApprovalDecided(conversation, decision)
             when conversation.parent_status = awaiting_task_approval
         UserAnswersQuestion(conversation, request_id?, answers, annotations?)

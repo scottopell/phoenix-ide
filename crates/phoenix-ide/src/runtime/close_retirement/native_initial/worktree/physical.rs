@@ -51,6 +51,7 @@ pub(crate) enum WorktreePhysicalOutcome {
 pub(crate) struct WorktreePhysicalObservation {
     state: Arc<PhysicalState>,
     ready: watch::Receiver<bool>,
+    fatal: Arc<crate::runtime::FatalLocalAuthorityFence>,
     _worker: Option<JoinHandle<()>>,
 }
 
@@ -84,6 +85,7 @@ impl NativeWorktreeGitContinuation {
             .get_or_insert_with(|| Arc::new(std::sync::atomic::AtomicBool::new(false)));
         let (ready_tx, ready) = watch::channel(false);
         let fatal = Arc::clone(&self.original_effect.fatal);
+        let observation_fatal = Arc::clone(&fatal);
         // Custody exists before installing the thread, not inside an async body.
         // The shared slot also preserves it if OS thread installation fails.
         let state = Arc::new(PhysicalState {
@@ -133,6 +135,7 @@ impl NativeWorktreeGitContinuation {
         WorktreePhysicalObservation {
             state,
             ready,
+            fatal: observation_fatal,
             _worker: worker,
         }
     }
@@ -143,6 +146,12 @@ impl WorktreePhysicalObservation {
     /// Stop/Shutdown or fatal-fence servicing in the source actor.
     pub(crate) fn is_ready(&self) -> bool {
         *self.ready.borrow()
+    }
+
+    /// A latched fence means the worker retained unknown custody; waiting for a
+    /// classified observation cannot make that authority releasable.
+    pub(crate) fn has_fatal_custody(&self) -> bool {
+        self.fatal.fatal_authority_loss_is_latched()
     }
 
     pub(crate) async fn observe(&self) -> Result<WorktreePhysicalOutcome, String> {
@@ -1046,8 +1055,21 @@ mod tests {
                 retry_hooks: None,
             }),
             ready,
+            fatal: crate::runtime::FatalLocalAuthorityFence::new(),
             _worker: None,
         }
+    }
+
+    #[test]
+    fn fatal_physical_custody_is_distinguished_from_pending_ordinary_join() {
+        let observation = completed_observation();
+        observation.state.ready.send_replace(false);
+        assert!(!observation.is_ready());
+        assert!(!observation.has_fatal_custody());
+        observation
+            .fatal
+            .close("test_unknown_physical_custody");
+        assert!(observation.has_fatal_custody());
     }
 
     #[test]

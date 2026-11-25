@@ -117,6 +117,13 @@ fn select_original_worktrees(
     Ok(targets)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ExitCustodyPoll {
+    Pending,
+    Classified,
+    Fatal,
+}
+
 pub(super) struct PostRetirement {
     original_inventory: Vec<CloseExpectedRetirementResource>,
     worktree_targets: Vec<OriginalWorktreeTarget>,
@@ -135,6 +142,55 @@ pub(super) struct PostRetirement {
 }
 
 impl PostRetirement {
+    pub(super) async fn poll_exit_custody(
+        &mut self,
+        deadline: Option<std::time::Instant>,
+    ) -> ExitCustodyPoll {
+        #[cfg(unix)]
+        {
+            if let Some(preparation) = self.worktree_preparation.as_ref() {
+                if !preparation.is_finished() {
+                    return if deadline.is_none_or(|deadline| std::time::Instant::now() >= deadline) {
+                        ExitCustodyPoll::Fatal
+                    } else {
+                        ExitCustodyPoll::Pending
+                    };
+                }
+                let preparation = self.worktree_preparation.take().expect("checked preparation");
+                match preparation.await {
+                    Ok(_) => {}
+                    Err(error) => {
+                        tracing::error!(%error, "native original Worktree preparation exit observation lost");
+                        return ExitCustodyPoll::Fatal;
+                    }
+                }
+            }
+            if let Some(physical) = self.physical.as_ref() {
+                if physical.has_fatal_custody() {
+                    return ExitCustodyPoll::Fatal;
+                }
+                if !physical.is_ready() {
+                    return if deadline.is_none_or(|deadline| std::time::Instant::now() >= deadline) {
+                        ExitCustodyPoll::Fatal
+                    } else {
+                        ExitCustodyPoll::Pending
+                    };
+                }
+                match physical.observe().await {
+                    Ok(outcome) => {
+                        self.accept_physical_outcome(outcome);
+                        self.physical = None;
+                    }
+                    Err(error) => {
+                        tracing::error!(%error, "native original Worktree exit observation unclassified");
+                        return ExitCustodyPoll::Fatal;
+                    }
+                }
+            }
+        }
+        ExitCustodyPoll::Classified
+    }
+
     pub(super) fn new(
         original_inventory: Vec<CloseExpectedRetirementResource>,
         scope_order: Vec<WorkScopeId>,

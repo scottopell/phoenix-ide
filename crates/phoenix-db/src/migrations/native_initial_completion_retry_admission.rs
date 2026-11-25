@@ -118,7 +118,7 @@ AND NOT EXISTS (SELECT 1 FROM close_attempt_participants participant JOIN conver
 
 fn unexpected(object: &str) -> DbError {
     DbError::Serialization(format!(
-        "migration 184 found unexpected {object} definition"
+        "migration 185 found unexpected {object} definition"
     ))
 }
 
