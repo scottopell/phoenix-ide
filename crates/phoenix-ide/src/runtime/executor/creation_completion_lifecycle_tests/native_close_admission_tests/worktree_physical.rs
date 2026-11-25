@@ -662,9 +662,7 @@ async fn run_public_worktree_close_inner(journey: WorktreeJourney) {
     backend.runtimes.write().await.insert(
         fixture.source_transcript_id.clone(),
         crate::runtime::ConversationHandle {
-            event_tx: crate::runtime::ConversationEventSender::for_test_receiver(
-                event_tx.clone(),
-            ),
+            event_tx: crate::runtime::ConversationEventSender::for_test_receiver(event_tx.clone()),
             acknowledged_event_tx:
                 crate::runtime::cancellation_inbox::AcknowledgedEventSender::for_test_receiver(
                     sender.clone(),

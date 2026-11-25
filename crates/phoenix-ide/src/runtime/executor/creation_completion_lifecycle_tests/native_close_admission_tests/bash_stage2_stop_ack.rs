@@ -172,9 +172,7 @@ async fn bash_stage_two_stop_ack_reaches_real_second_writer_and_cleans_once() {
     backend.runtimes.write().await.insert(
         fixture.source_transcript_id.clone(),
         crate::runtime::ConversationHandle {
-            event_tx: crate::runtime::ConversationEventSender::for_test_receiver(
-                event_tx.clone(),
-            ),
+            event_tx: crate::runtime::ConversationEventSender::for_test_receiver(event_tx.clone()),
             acknowledged_event_tx:
                 crate::runtime::cancellation_inbox::AcknowledgedEventSender::for_test_receiver(
                     sender.clone(),

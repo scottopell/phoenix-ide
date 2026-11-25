@@ -60,9 +60,7 @@ async fn registered_close_captures_and_retires_disposable_empty_work_scope() {
     backend.runtimes.write().await.insert(
         fixture.source_transcript_id.clone(),
         crate::runtime::ConversationHandle {
-            event_tx: crate::runtime::ConversationEventSender::for_test_receiver(
-                event_tx.clone(),
-            ),
+            event_tx: crate::runtime::ConversationEventSender::for_test_receiver(event_tx.clone()),
             acknowledged_event_tx:
                 crate::runtime::cancellation_inbox::AcknowledgedEventSender::for_test_receiver(
                     sender,
