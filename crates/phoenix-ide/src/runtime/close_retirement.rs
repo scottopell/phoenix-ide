@@ -204,7 +204,7 @@ pub(crate) async fn collect_native_initial_inspection(
 
 fn native_initial_inspection_path(
     identity: &WorktreeIdentity,
-    scope: ResourceScopeKey,
+    scope: WorkScopeId,
 ) -> Result<PathBuf, NativeInitialInspectionFailure> {
     use NativeInitialInspectionFailure as Failure;
 
@@ -8261,7 +8261,11 @@ fn linux_writer_scan_until(
             deadline,
             &before,
         )? {
-            return Ok(writer_gap(detector, Some(pid), CloseWriterGap::ProcessChanged));
+            return Ok(writer_gap(
+                detector,
+                Some(pid),
+                CloseWriterGap::ProcessChanged,
+            ));
         }
         if let Some((matched_path, authority)) = observed {
             check_directory_deletion_deadline(Some(deadline))?;
@@ -8534,7 +8538,12 @@ fn quarantine_has_open_descriptors_with_info_reader_until_scoped(
                     descriptor_authority(metadata.is_dir(), metadata.is_file(), access)
                 {
                     let is_exact_self_borrow = self_descriptor.is_some_and(|borrow| {
-                        linux_descriptor_matches_self_borrow(process, &descriptor, &metadata, borrow)
+                        linux_descriptor_matches_self_borrow(
+                            process,
+                            &descriptor,
+                            &metadata,
+                            borrow,
+                        )
                     });
                     if is_exact_self_borrow {
                         continue;
@@ -9813,7 +9822,8 @@ fn observe_hidden_worktree_changes_with_leaf_until(
     std::fs::copy(&index_path, private_index.path())
         .map_err(|error| format!("cannot copy Git index for hidden-change inspection: {error}"))?;
     let private_index = private_index.path();
-    let candidates = inspect_hidden_index_candidates(repository, private_index, deadline, git_leaf)?;
+    let candidates =
+        inspect_hidden_index_candidates(repository, private_index, deadline, git_leaf)?;
     if candidates.is_empty() {
         if std::time::Instant::now() >= deadline {
             return Err("hidden worktree inspection exceeded its deadline".into());
@@ -16179,7 +16189,10 @@ mod tests {
             std::fs::read(repository.join(".git/index")).unwrap(),
             b"synthetic-index"
         );
-        assert_eq!(std::fs::read_dir(repository.join(".git")).unwrap().count(), 2);
+        assert_eq!(
+            std::fs::read_dir(repository.join(".git")).unwrap().count(),
+            2
+        );
     }
 
     #[cfg(unix)]
@@ -18659,7 +18672,12 @@ mod tests {
 
         let exact_proc = temp.path().join("exact-proc");
         make_proc(&exact_proc, pid.cast_unsigned(), borrow.fd, &quarantine);
-        assert_linux_scoped_descriptor_repeatedly_exempt(&quarantine, &exact_proc, deadline, &borrow);
+        assert_linux_scoped_descriptor_repeatedly_exempt(
+            &quarantine,
+            &exact_proc,
+            deadline,
+            &borrow,
+        );
         // An exempt slot must not stop inventory inspection before other authority.
         let mixed_process = exact_proc.join(pid.to_string());
         let extra_fd = borrow.fd + 100;
@@ -18673,11 +18691,21 @@ mod tests {
         assert_linux_scoped_descriptor_authority(&quarantine, &exact_proc, deadline, &borrow);
 
         let duplicate_proc = temp.path().join("duplicate-proc");
-        make_proc(&duplicate_proc, pid.cast_unsigned(), borrow.fd + 1, &quarantine);
+        make_proc(
+            &duplicate_proc,
+            pid.cast_unsigned(),
+            borrow.fd + 1,
+            &quarantine,
+        );
         assert_linux_scoped_descriptor_authority(&quarantine, &duplicate_proc, deadline, &borrow);
 
         let other_pid_proc = temp.path().join("other-pid-proc");
-        make_proc(&other_pid_proc, pid.cast_unsigned() + 1, borrow.fd, &quarantine);
+        make_proc(
+            &other_pid_proc,
+            pid.cast_unsigned() + 1,
+            borrow.fd,
+            &quarantine,
+        );
         assert_linux_scoped_descriptor_authority(&quarantine, &other_pid_proc, deadline, &borrow);
 
         let other_parent = super::open_deletion_parent(other.parent().unwrap()).unwrap();
@@ -18710,7 +18738,12 @@ mod tests {
         std::fs::rename(&quarantine, &retained_path).unwrap();
         std::fs::create_dir(&quarantine).unwrap();
         let replaced_proc = temp.path().join("replaced-proc");
-        make_proc(&replaced_proc, pid.cast_unsigned(), borrow.fd, &retained_path);
+        make_proc(
+            &replaced_proc,
+            pid.cast_unsigned(),
+            borrow.fd,
+            &retained_path,
+        );
         assert_linux_scoped_descriptor_authority(&retained_path, &replaced_proc, deadline, &borrow);
 
         let uncertain_proc = temp.path().join("uncertain-proc");

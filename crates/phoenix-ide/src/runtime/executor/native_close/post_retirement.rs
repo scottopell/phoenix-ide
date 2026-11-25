@@ -755,13 +755,11 @@ mod tests {
     fn rejects_duplicate_or_foreign_original_worktree_targets() {
         let item = resource(RetiredResourceKind::Worktree, "first");
         let scope = item.scope.clone();
-        assert!(
-            select_original_worktrees(
-                &[item.clone(), item.clone()],
-                std::slice::from_ref(&scope),
-            )
-            .is_err()
-        );
+        assert!(select_original_worktrees(
+            &[item.clone(), item.clone()],
+            std::slice::from_ref(&scope),
+        )
+        .is_err());
         assert!(select_original_worktrees(&[item], &[]).is_err());
     }
 

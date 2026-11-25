@@ -60,13 +60,11 @@ impl WorktreeMutationExecutor for OriginalWorktreeMutationExecutor<'_> {
         let confirmed = matches!(
             &entry,
             Ok((_, NativeCloseInitialEntryRelease::Confirmed))
-                | Err(
-                    NativeCloseInitialFirstEffectError::NotStarted(_)
+                | Err(NativeCloseInitialFirstEffectError::NotStarted(_)
                     | NativeCloseInitialFirstEffectError::Rejected {
                         release: NativeCloseInitialEntryRelease::Confirmed,
                         ..
-                    },
-                )
+                    },)
         );
         if !confirmed {
             self.retain_unknown(entry);

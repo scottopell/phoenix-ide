@@ -2,6 +2,25 @@
 
 ## Current qualification and reviewed lint follow-up
 
+### a726 follow-up result and narrow correction
+
+`a72650da461c28abf4b81ceafb5213484a5bd33c` is **not qualified**:
+[Close45546904155](https://github.com/scottopell/phoenix-ide/actions/runs/45546904155)
+and [CI45546910501](https://github.com/scottopell/phoenix-ide/actions/runs/45546910501)
+are both terminal **failed**. CI's exact-source early lane rejected formatting;
+downstream broad compilation/Clippy lanes were skipped, not passed. Close retained
+five E0308 errors from one extracted inspection helper's incorrect `ResourceScopeKey`
+parameter, where its caller and `NativeInitialInspectionFailure::Scope` require
+`WorkScopeId`. This correction changes that parameter back to the exact captured
+WorkScope identity, without wrapping or broadening it to resource scope. It also
+applies the retained hosted formatting patch (five Rust files). Fresh hosted
+qualification is still required; no local executable validation ran.
+
+A726 did execute 82 native DB tests and 180 migration tests successfully; frontend
+and specifications also passed. Runtime/public physical journeys and the complete
+foundation run were not established for a726, so e169's green receipts below remain
+historical only. Retained logs/patches: `/tmp/close-a72650da4/`.
+
 Published `e169f02a4a6e72b543c79c3a4363b34faed9e2eb` completed
 [Close45532375109](https://github.com/scottopell/phoenix-ide/actions/runs/45532375109)
 **successfully**, including the complete foundation module (**270 passed / 0 failed /

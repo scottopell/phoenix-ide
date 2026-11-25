@@ -113,13 +113,11 @@ pub(super) fn run_git_leaf(
     let release_confirmed = matches!(
         &entry,
         Ok((_, NativeCloseInitialEntryRelease::Confirmed))
-            | Err(
-                NativeCloseInitialFirstEffectError::NotStarted(_)
+            | Err(NativeCloseInitialFirstEffectError::NotStarted(_)
                 | NativeCloseInitialFirstEffectError::Rejected {
                     release: NativeCloseInitialEntryRelease::Confirmed,
                     ..
-                }
-            )
+                })
     );
     if release_confirmed {
         original_effect.classify_confirmed_release();
