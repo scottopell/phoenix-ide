@@ -27,6 +27,12 @@ import { OPEN_MESSAGE_VIEWER_EVENT, type OpenMessageViewerEventDetail } from '..
 import { useReaderNavigationKey, useViewerSlot } from '../contexts/ViewerSlotContext';
 import { ReviewNotesProvider } from '../contexts/ReviewNotesContext';
 import { useIsWideDesktop } from '../hooks/useMediaQuery';
+import { useResizablePane } from '../hooks';
+import {
+  VIEWER_PANE_MAX,
+  VIEWER_PANE_MIN,
+  ViewerPaneDivider,
+} from '../components/viewer/ConversationViewerHost';
 import { useConnection } from '../hooks/useConnection';
 import type { SSEAction } from '../conversation/atom';
 import { ConversationContext } from '../conversation/ConversationContext';
@@ -875,7 +881,13 @@ function ProductConversationHeader({
 }
 
 export function ProductConversationPage(props: HistoryPageProps = {}) {
-  return <ProductConversationPageInner {...props} />;
+  const params = useParams<{ productConversationId: string }>();
+  const scopeKey = props.productId ?? params.productConversationId;
+  return (
+    <ReviewNotesProvider scopeKey={scopeKey}>
+      <ProductConversationPageInner {...props} />
+    </ReviewNotesProvider>
+  );
 }
 
 function ProductConversationPageInner({ productId, globalShell, journey: inheritedJourney }: HistoryPageProps) {
@@ -1015,7 +1027,38 @@ function ProductConversationPageInner({ productId, globalShell, journey: inherit
   }, [aggregateMessages, currentLatestProjection?.conversationId, currentLatestProjection?.pendingMessages, snapshot?.latest_opening]);
   const aggregateMessageSlot = viewerSlot.slot.kind === 'message' ? viewerSlot.slot : null;
   const isWideDesktop = useIsWideDesktop();
-  const showSplitPaneViewer = isWideDesktop && aggregateMessageSlot?.presentation === 'pane';
+  const showAggregateMessagePane = isWideDesktop && aggregateMessageSlot?.presentation === 'pane';
+  const showEmbeddedSplitPane = isWideDesktop && (
+    (viewerSlot.slot.kind === 'prose' && viewerSlot.slot.presentation !== 'fullscreen')
+    || (viewerSlot.slot.kind === 'diff' && viewerSlot.slot.presentation === 'pane')
+    || viewerSlot.slot.kind === 'browser'
+    || viewerSlot.slot.kind === 'inspect'
+  );
+  const showSplitPaneViewer = showAggregateMessagePane || showEmbeddedSplitPane;
+  const viewerPane = useResizablePane({
+    key: 'viewer-pane-width',
+    min: VIEWER_PANE_MIN,
+    max: VIEWER_PANE_MAX,
+    defaultSize: 600,
+    collapseThreshold: 280,
+  });
+  const pageElementRef = useRef<HTMLElement | null>(null);
+  const viewerPaneWidthRef = useRef(`${viewerPane.collapsed ? 0 : viewerPane.size}px`);
+  viewerPaneWidthRef.current = `${viewerPane.collapsed ? 0 : viewerPane.size}px`;
+  const attachJourney = coordinator || inheritedJourney ? null : journey.attach;
+  const setPageElement = useCallback((el: HTMLElement | null) => {
+    pageElementRef.current = el;
+    if (el) el.style.setProperty('--viewer-pane-width', viewerPaneWidthRef.current);
+    attachJourney?.(el);
+  }, [attachJourney]);
+  useLayoutEffect(() => {
+    const el = pageElementRef.current;
+    if (el) el.style.setProperty('--viewer-pane-width', `${viewerPane.collapsed ? 0 : viewerPane.size}px`);
+  }, [viewerPane.collapsed, viewerPane.size]);
+  const handleViewerLiveResize = useCallback((size: number, collapsed: boolean) => {
+    const el = pageElementRef.current;
+    if (el) el.style.setProperty('--viewer-pane-width', `${collapsed ? 0 : size}px`);
+  }, []);
   const closeAggregateMessageViewer = viewerSlot.close;
   const appendAggregateReviewNotes = useCallback((formattedNotes: string) => {
     currentLatestProjection?.appendReviewNotesToComposer?.(formattedNotes);
@@ -1417,7 +1460,6 @@ function ProductConversationPageInner({ productId, globalShell, journey: inherit
     [closeInProgress, currentMemberTranscript?.phase, loadingOlder, olderError, ordinarySnapshot?.ordinary_lifecycle, snapshot],
   );
   const latestSlug = snapshot?.latest_transcript_row_id ?? null;
-  const latestConversationId = currentLatestProjection?.conversationId ?? snapshot?.latest_transcript_row_id ?? undefined;
   const latestWorkScopeKey = isOpen
     ? currentLatestProjection?.conversation?.work_scope_key
     : undefined;
@@ -1490,13 +1532,16 @@ function ProductConversationPageInner({ productId, globalShell, journey: inherit
     }
     : null, [positioningTargetMessageId, completedJump, previousJump, hashNavigation.token, transcriptView]);
   useLayoutEffect(() => { desiredJumpRef.current = desiredJump; }, [desiredJump]);
-  const desiredPositioning: TranscriptPositioningInput = (restoreCommand?.navigationToken === hashNavigation.token ? restoreCommand.positioning : null)
-    ?? (desiredJump ? { kind: 'positioning', command: desiredJump } : { kind: 'idle', view: transcriptView });
+  const desiredPositioning = useMemo<TranscriptPositioningInput>(() => (
+    (restoreCommand?.navigationToken === hashNavigation.token ? restoreCommand.positioning : null)
+      ?? (desiredJump ? { kind: 'positioning', command: desiredJump } : { kind: 'idle', view: transcriptView })
+  ), [desiredJump, hashNavigation.token, restoreCommand, transcriptView]);
   const desiredPositioningKey = transcriptPositioningInputCommandKey(desiredPositioning);
-  const transcriptPositioning: TranscriptPositioningInput = desiredPositioningKey !== null
-    && jumpCompletion?.commandKey === desiredPositioningKey
-    ? { kind: 'idle', view: transcriptView }
-    : desiredPositioning;
+  const transcriptPositioning = useMemo<TranscriptPositioningInput>(() => (
+    desiredPositioningKey !== null && jumpCompletion?.commandKey === desiredPositioningKey
+      ? { kind: 'idle', view: transcriptView }
+      : desiredPositioning
+  ), [desiredPositioning, desiredPositioningKey, jumpCompletion?.commandKey, transcriptView]);
   const liveControlsEnabled = isOpen && !closeInProgress && snapshot?.latest_opening.status !== 'pending';
   const initialSnapshotReady = snapshot !== null;
   useLayoutEffect(() => {
@@ -1534,6 +1579,47 @@ function ProductConversationPageInner({ productId, globalShell, journey: inherit
       cancelAnimationFrame(reportFrame);
     };
   }, [initialSnapshotReady, openSnapshotGeneration, productConversationId]);
+
+  const viewAnchorIntent = useMemo(() => ({
+    scope: `${hashNavigation.token}:${observedSegmentId ?? ''}:${historyGeneration}`,
+    ...(desiredJump ? { command: desiredJump } : { command: null, view: transcriptView }),
+  }), [desiredJump, hashNavigation.token, historyGeneration, observedSegmentId, transcriptView]);
+  const reactionDestination = useMemo(() => (
+    currentLatestProjection?.annotationDraft
+      ? { draft: currentLatestProjection.annotationDraft, writable: liveControlsEnabled && currentLatestProjection.canAnnotate }
+      : undefined
+  ), [currentLatestProjection?.annotationDraft, currentLatestProjection?.canAnnotate, liveControlsEnabled]);
+  const noopRetry = useCallback(() => {}, []);
+  const handleRetryPending = liveControlsEnabled
+    ? (currentLatestProjection?.onRetryPending ?? noopRetry)
+    : noopRetry;
+  const handleHistoryScrollCommandHandled = useCallback((completion: TranscriptPositioningCompletion) => {
+    if (completion.commandKey !== desiredPositioningKey) return;
+    journey.anchor(completion.result);
+    if (desiredPositioning.kind === 'positioning' && desiredPositioning.command.kind === 'jump_to_message') {
+      setJumpCompletion(completion);
+    }
+    setRestoreCommand((current) => (
+      current && transcriptPositioningInputCommandKey(current.positioning) === completion.commandKey ? null : current
+    ));
+  }, [desiredPositioning, desiredPositioningKey, journey]);
+  const handleCloseCompleted = useCallback(() => {
+    setSnapshotRetry((retry) => retry + 1);
+  }, []);
+  const productConversationIdForShell = snapshot?.product_conversation_id;
+  const embeddedStateBarExtension = useMemo(() => (
+    globalShell?.stateBarExtension && productConversationIdForShell ? {
+      ...globalShell.stateBarExtension,
+      details: (
+        <>
+          <div className="global-statebar-read-state">
+            <MarkUnreadButton productConversationId={productConversationIdForShell} />
+          </div>
+          {globalShell.stateBarExtension.details}
+        </>
+      ),
+    } : undefined
+  ), [globalShell?.stateBarExtension, productConversationIdForShell]);
 
   useEffect(() => {
     const needsMessage = !!hashTargetMessageId && !hashTargetLoaded && !hashTargetExhausted;
@@ -1575,7 +1661,7 @@ function ProductConversationPageInner({ productId, globalShell, journey: inherit
     <main
       className={`product-conversation-page${showSplitPaneViewer ? ' product-conversation-page--split-pane' : ''}`}
       data-testid="product-conversation-page"
-      ref={coordinator || inheritedJourney ? undefined : journey.attach}
+      ref={setPageElement}
     >
       {snapshot.latest_opening.status === 'pending' && <PendingContinuationOpening
         key={snapshot.latest_opening.edge.continuation_message_id}
@@ -1643,15 +1729,12 @@ function ProductConversationPageInner({ productId, globalShell, journey: inherit
           onViewChaptersReady={journey.chaptersReady}
           onViewTailSettled={journey.tailAnchorSettled}
           onViewAnchorProbe={journey.registerAnchorProbe}
-          viewAnchorIntent={{
-            scope: `${hashNavigation.token}:${observedSegmentId ?? ''}:${historyGeneration}`,
-            ...(desiredJump ? { command: desiredJump } : { command: null, view: transcriptView }),
-          }}
+          viewAnchorIntent={viewAnchorIntent}
           historyBoundaries={snapshot.boundaries}
           streamingRequestId={closeInProgress ? null : currentMemberTranscript?.streamingRequestId ?? null}
           pendingMessages={aggregatePendingMessages}
           convState={convState}
-          onRetry={liveControlsEnabled ? currentLatestProjection?.onRetryPending ?? (() => {}) : () => {}}
+          onRetry={handleRetryPending}
           onCancelSteering={liveControlsEnabled ? currentLatestProjection?.onCancelSteering : undefined}
           onOpenFile={currentLatestProjection?.onOpenFile}
           filePathRootDir={currentLatestProjection?.filePathRootDir}
@@ -1659,9 +1742,7 @@ function ProductConversationPageInner({ productId, globalShell, journey: inherit
           enableMessageSidepanel
           enableMessageFullscreen
           reactionScopeKey={snapshot.product_conversation_id}
-          reactionDestination={currentLatestProjection?.annotationDraft
-            ? { draft: currentLatestProjection.annotationDraft, writable: liveControlsEnabled && currentLatestProjection.canAnnotate }
-            : undefined}
+          reactionDestination={reactionDestination}
           conversationId={snapshot.product_conversation_id}
           slug={latestSlug ?? snapshot.canonical_root.slug ?? snapshot.requested_transcript_row_id}
           hasOlderMessages={snapshot.has_older}
@@ -1670,16 +1751,7 @@ function ProductConversationPageInner({ productId, globalShell, journey: inherit
           loadingOlderMessages={loadingOlder}
           olderHistoryError={olderError}
           transcriptPositioning={transcriptPositioning}
-          onHistoryScrollCommandHandled={(completion) => {
-            if (completion.commandKey !== desiredPositioningKey) return;
-            journey.anchor(completion.result);
-            if (desiredPositioning.kind === 'positioning' && desiredPositioning.command.kind === 'jump_to_message') {
-              setJumpCompletion(completion);
-            }
-            setRestoreCommand((current) => (
-              current && transcriptPositioningInputCommandKey(current.positioning) === completion.commandKey ? null : current
-            ));
-          }}
+          onHistoryScrollCommandHandled={handleHistoryScrollCommandHandled}
           {...(latestWorkScopeKey ? { workScopeKey: latestWorkScopeKey } : {})}
         />
       </section>
@@ -1708,18 +1780,8 @@ function ProductConversationPageInner({ productId, globalShell, journey: inherit
             onStreamAttempt={journey.streamStarted}
             routePrefix={coordinator ? "/global" : "/c"}
             composerQuickAction={globalShell?.composerQuickAction}
-            stateBarExtension={globalShell?.stateBarExtension ? {
-              ...globalShell.stateBarExtension,
-              details: (
-                <>
-                  <div className="global-statebar-read-state">
-                    <MarkUnreadButton productConversationId={snapshot.product_conversation_id} />
-                  </div>
-                  {globalShell.stateBarExtension.details}
-                </>
-              ),
-            } : undefined}
-            onCloseCompleted={() => setSnapshotRetry((retry) => retry + 1)}
+            stateBarExtension={embeddedStateBarExtension}
+            onCloseCompleted={handleCloseCompleted}
           />
         </div>
       )}
@@ -1735,26 +1797,30 @@ function ProductConversationPageInner({ productId, globalShell, journey: inherit
       )}
 
       {aggregateMessageSlot && (
-        <ReviewNotesProvider scopeKey={latestConversationId ?? snapshot.product_conversation_id}>
-          <Suspense fallback={null}>
-            <div className={showSplitPaneViewer ? 'product-conversation-page__viewer-pane' : undefined}>
-              <MessageViewer
-                sequenceId={aggregateMessageSlot.sequenceId}
-                messageId={aggregateMessageSlot.messageId}
-                occurrenceToken={aggregateMessageSlot.occurrenceToken}
-                messages={aggregateMessages}
-                onClose={closeAggregateMessageViewer}
-                onSendNotes={liveControlsEnabled && currentLatestProjection?.appendReviewNotesToComposer
-                  ? appendAggregateReviewNotes
-                  : undefined}
-                presentation={aggregateMessageSlot.presentation}
-                canTogglePresentation={isWideDesktop}
-                onPresentationChange={viewerSlot.setPresentation}
-                inline={showSplitPaneViewer}
-              />
-            </div>
-          </Suspense>
-        </ReviewNotesProvider>
+        <Suspense fallback={null}>
+          {showAggregateMessagePane && (
+            <ViewerPaneDivider
+              viewerPane={viewerPane}
+              onLiveResize={handleViewerLiveResize}
+            />
+          )}
+          <div className={showAggregateMessagePane ? 'product-conversation-page__viewer-pane' : undefined}>
+            <MessageViewer
+              sequenceId={aggregateMessageSlot.sequenceId}
+              messageId={aggregateMessageSlot.messageId}
+              occurrenceToken={aggregateMessageSlot.occurrenceToken}
+              messages={aggregateMessages}
+              onClose={closeAggregateMessageViewer}
+              onSendNotes={liveControlsEnabled && currentLatestProjection?.appendReviewNotesToComposer
+                ? appendAggregateReviewNotes
+                : undefined}
+              presentation={aggregateMessageSlot.presentation}
+              canTogglePresentation={isWideDesktop}
+              onPresentationChange={viewerSlot.setPresentation}
+              inline={showAggregateMessagePane}
+            />
+          </div>
+        </Suspense>
       )}
 
         {taskApprovalOverlay && currentLatestProjection?.conversationId === taskApprovalOverlay.conversationId && (

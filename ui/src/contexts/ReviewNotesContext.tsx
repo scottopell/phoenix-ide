@@ -187,6 +187,23 @@ export function ReviewNotesProvider({
   );
 }
 
+/**
+ * Reuse an enclosing `ReviewNotesProvider` when hosted inside a parent shell
+ * (e.g. `EmbeddedConversationPage` inside `ProductConversationPage`), or mount
+ * a scoped provider when rendered standalone.
+ */
+export function EnsureReviewNotesProvider({
+  children,
+  scopeKey,
+}: {
+  children: ReactNode;
+  scopeKey?: string | undefined;
+}) {
+  const existing = useContext(ReviewNotesStoreContext);
+  if (existing) return <>{children}</>;
+  return <ReviewNotesProvider scopeKey={scopeKey}>{children}</ReviewNotesProvider>;
+}
+
 function useReviewNotesStore(): ReviewNotesStore {
   const store = useContext(ReviewNotesStoreContext);
   if (!store) {

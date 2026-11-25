@@ -6,6 +6,7 @@
 import { describe, it, expect, vi } from 'vitest';
 import { render, act } from '@testing-library/react';
 import {
+  EnsureReviewNotesProvider,
   ReviewNotesProvider,
   useDiffReviewNotesData,
   useFileReviewNotesData,
@@ -110,5 +111,33 @@ describe('ReviewNotesContext render isolation (C6)', () => {
 
     act(() => commands!.clear());
     expect(commands!.getSnapshot()).toHaveLength(0);
+  });
+
+  it('EnsureReviewNotesProvider reuses an enclosing provider store instead of creating a second pile', () => {
+    let outerCommands: ReturnType<typeof useReviewNotesCommands> | null = null;
+    let innerCommands: ReturnType<typeof useReviewNotesCommands> | null = null;
+    function Outer() {
+      outerCommands = useReviewNotesCommands();
+      return null;
+    }
+    function Inner() {
+      innerCommands = useReviewNotesCommands();
+      return null;
+    }
+
+    render(
+      <ReviewNotesProvider scopeKey="pc-1">
+        <Outer />
+        <EnsureReviewNotesProvider scopeKey="row-1">
+          <Inner />
+        </EnsureReviewNotesProvider>
+      </ReviewNotesProvider>,
+    );
+
+    expect(innerCommands).toBe(outerCommands);
+    act(() => {
+      innerCommands!.addNote({ kind: 'file', filePath: '/repo/a.ts', lineNumber: 1 }, 'x', 'shared');
+    });
+    expect(outerCommands!.getSnapshot()).toHaveLength(1);
   });
 });

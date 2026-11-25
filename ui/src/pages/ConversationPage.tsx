@@ -108,8 +108,10 @@ import {
   ConversationViewerOverlays,
   ConversationViewerSplitPane,
   NarrowDesktopViewerHost,
+  VIEWER_PANE_MAX,
+  VIEWER_PANE_MIN,
 } from '../components/viewer/ConversationViewerHost';
-import { ReviewNotesProvider } from '../contexts/ReviewNotesContext';
+import { EnsureReviewNotesProvider } from '../contexts/ReviewNotesContext';
 import { useViewerRestorationSettled, useViewerSlot } from '../contexts/ViewerSlotContext';
 import { useConversationReadiness } from '../contexts/useConversationReadiness';
 import {
@@ -246,7 +248,7 @@ export function EmbeddedConversationPage({
     return () => { cancelled = true; };
   }, [location.hash, navigate, routePrefix, slug, suppressCanonicalization]);
   return (
-    <ReviewNotesProvider scopeKey={slug}>
+    <EnsureReviewNotesProvider scopeKey={slug}>
       {/* The viewer slot (prose / diff / browser) is provided by DesktopLayout,
           which wraps every conversation route. Mounted above
           ConversationPageContent's viewer early-returns so draft persistence
@@ -269,7 +271,7 @@ export function EmbeddedConversationPage({
         {...(onProjectionChange ? { onProjectionChange } : {})}
         {...(onCloseCompleted ? { onCloseCompleted } : {})}
       />
-    </ReviewNotesProvider>
+    </EnsureReviewNotesProvider>
   );
 }
 
@@ -482,8 +484,6 @@ function ConversationPageContent({
   // Below this we keep the existing full-screen overlay UX; above, the
   // reader sits beside the chat as a resizable sibling pane.
   const isWideDesktop = useIsWideDesktop();
-  const VIEWER_PANE_MIN = 360;
-  const VIEWER_PANE_MAX = 1200;
   const viewerPane = useResizablePane({
     key: 'viewer-pane-width',
     min: VIEWER_PANE_MIN,
@@ -494,20 +494,18 @@ function ConversationPageContent({
 
   // The viewer pane (`--viewer-pane-width`) and the terminal pane
   // (`--terminal-pane-height`, read by `TerminalPanel`) are sized from CSS
-  // variables on `#app`. Each variable is owned imperatively (NOT via the React
-  // `style` prop) by exactly two writers that never run concurrently: a layout
-  // effect that syncs it to committed pane state, and the matching divider's
-  // live-drag channel. Driving them from the style prop instead would let an
-  // unrelated re-render mid-drag (streaming, heartbeat) clobber the live size
-  // and snap the pane back; an effect's deps are frozen during a drag, so it
-  // cannot fire until the drag commits on pointer-up. The live channel means a
-  // divider drag resizes its pane without re-rendering this page (and the
-  // conversation subtree below it) on every pointer move — React state catches
-  // up once, on pointer-up. See `useResizablePane`'s `onLiveResize`.
+  // variables on `#app` (and synced to the enclosing `.product-conversation-page`
+  // when embedded so split-pane resizing shifts the transcript and header in
+  // lockstep without React re-renders during drag).
   const appElementRef = useRef<HTMLDivElement | null>(null);
   const setAppCssVariable = useCallback((name: string, value: string) => {
     const appElement = appElementRef.current;
-    if (appElement) appElement.style.setProperty(name, value);
+    if (!appElement) return;
+    appElement.style.setProperty(name, value);
+    if (name === '--viewer-pane-width') {
+      const outerPage = appElement.closest<HTMLElement>('.product-conversation-page');
+      if (outerPage) outerPage.style.setProperty(name, value);
+    }
   }, []);
   useLayoutEffect(() => {
     setAppCssVariable(
