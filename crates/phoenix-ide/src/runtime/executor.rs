@@ -36232,13 +36232,30 @@ mod tracking_context_tests;
 #[cfg(test)]
 mod close_run_inner_layout_tests {
     use super::*;
+    use crate::runtime::ProductionRuntime;
     use std::future::Future;
 
     fn future_size<Arg, F: Future>(_: impl FnOnce(Arg) -> F) -> usize {
         std::mem::size_of::<F>()
     }
 
+    fn future_size2<Arg1, Arg2, F: Future>(_: impl FnOnce(Arg1, Arg2) -> F) -> usize {
+        std::mem::size_of::<F>()
+    }
+
     fn future_size3<Arg1, Arg2, Arg3, F: Future>(_: impl FnOnce(Arg1, Arg2, Arg3) -> F) -> usize {
+        std::mem::size_of::<F>()
+    }
+
+    fn future_size4<Arg1, Arg2, Arg3, Arg4, F: Future>(
+        _: impl FnOnce(Arg1, Arg2, Arg3, Arg4) -> F,
+    ) -> usize {
+        std::mem::size_of::<F>()
+    }
+
+    fn future_size7<Arg1, Arg2, Arg3, Arg4, Arg5, Arg6, Arg7, F: Future>(
+        _: impl FnOnce(Arg1, Arg2, Arg3, Arg4, Arg5, Arg6, Arg7) -> F,
+    ) -> usize {
         std::mem::size_of::<F>()
     }
 
@@ -36256,9 +36273,35 @@ mod close_run_inner_layout_tests {
         let update_conversation_state_bytes =
             future_size3(crate::db::Database::update_conversation_state);
         eprintln!(
-            "type-only shared DB source-fence diagnostic: ProductionRuntime={} bytes, raw Database::update_conversation_state future={} bytes",
-            runtime_bytes, update_conversation_state_bytes,
+            "type-only shared DB source-fence diagnostic: ProductionRuntime={runtime_bytes} bytes, raw Database::update_conversation_state future={update_conversation_state_bytes} bytes",
         );
+        let process_event_bytes = future_size3(ProductionRuntime::process_event_with_authority);
+        let apply_transition_bytes =
+            future_size4(ProductionRuntime::apply_transition_result_with_authority);
+        let apply_deadline_bytes =
+            future_size4(ProductionRuntime::apply_transition_result_with_deadline);
+        let execute_effect_bytes = future_size2(ProductionRuntime::execute_effect);
+        let execute_authoritative_bytes =
+            future_size4(ProductionRuntime::execute_authoritative_effect);
+        let inline_drain_bytes = future_size7(ProductionRuntime::run_effects_with_inline_drain);
+        let apply_inner_bytes = future_size4(ProductionRuntime::apply_transition_result_inner);
+        let persist_state_bytes = future_size3(ProductionRuntime::persist_state_effect);
+        let commit_drain_bytes = future_size4(ProductionRuntime::commit_steering_drain);
+        eprintln!("raw runtime process_event_with_authority future={process_event_bytes} bytes");
+        eprintln!(
+            "raw runtime apply_transition_result_with_authority future={apply_transition_bytes} bytes"
+        );
+        eprintln!(
+            "raw runtime apply_transition_result_with_deadline future={apply_deadline_bytes} bytes"
+        );
+        eprintln!("raw runtime execute_effect future={execute_effect_bytes} bytes");
+        eprintln!(
+            "raw runtime execute_authoritative_effect future={execute_authoritative_bytes} bytes"
+        );
+        eprintln!("raw runtime run_effects_with_inline_drain future={inline_drain_bytes} bytes");
+        eprintln!("raw runtime apply_transition_result_inner future={apply_inner_bytes} bytes");
+        eprintln!("raw runtime persist_state_effect future={persist_state_bytes} bytes");
+        eprintln!("raw runtime commit_steering_drain future={commit_drain_bytes} bytes");
         assert_ne!(
             run_inner_bytes, 0,
             "future layout diagnostic must report a real type"
