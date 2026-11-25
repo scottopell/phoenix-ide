@@ -2,6 +2,25 @@
 
 ## Current qualification and reviewed lint follow-up
 
+### a251 early formatting refusal and unchanged hosted correction
+
+Candidate `a251508aea62e5841d12a4bfa741d904c7cf7921` is **not qualified**.
+[CI45580517021](https://github.com/scottopell/phoenix-ide/actions/runs/45580517021)
+is terminal failed: exact-source formatting requires only a multiline chain in
+the repaired Chrome root-exit observation loop. Broad Rust, Clippy/musl, dev.py,
+task and UI/E2E lanes were skipped, not passed. Both release-helper platforms
+passed. [Close45580506277](https://github.com/scottopell/phoenix-ide/actions/runs/45580506277)
+remains active; its hosted formatting proposal is retained under
+`/tmp/close-a251508ae/format/` and applied unchanged in this correction.
+
+Corrected-head publication does not wait for this known-nonqualifying source's
+entire Close run. Standard CI is already terminal; exact Close uses per-ref
+concurrency with `cancel-in-progress: false`, so its successor queues without
+canceling the active evidence/cache producer. No manual cancellation, rerun or
+dispatch is needed. This follow-up changes only hosted-requested formatting and
+this ledger, remains **unqualified**, and does not claim the skipped code gates
+or repaired browser fixtures have executed. No local executable validation ran.
+
 ### 4fa7 hosted result and reviewed lint / real-Chrome fixture repairs
 
 Exact feature `4fa7be6a38ef2129d86a70f14d2f7ef049ba4b74` completed

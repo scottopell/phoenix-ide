@@ -4564,7 +4564,12 @@ mod lifecycle_hook_tests {
             "kill Chrome root"
         );
         tokio::time::timeout(std::time::Duration::from_secs(10), async {
-            while first.write().await.is_running().expect("observe Chrome root") {
+            while first
+                .write()
+                .await
+                .is_running()
+                .expect("observe Chrome root")
+            {
                 tokio::task::yield_now().await;
             }
         })
