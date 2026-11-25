@@ -419,8 +419,22 @@ async fn origin_label_migration_preserves_preexisting_question_reply_evidence() 
         detail.page_scanner_evidence_provenance[0].origin_kind,
         ScanOriginKind::CoordinatorQuestionReply
     );
+    for label in std::iter::once(String::new()).chain(
+        (0..=0x3000)
+            .filter_map(char::from_u32)
+            .filter(|c| c.is_whitespace())
+            .map(|c| c.to_string()),
+    ) {
+        assert!(
+            sqlx::query("UPDATE coordinator_scan_evidence_origins SET origin_kind=?")
+                .bind(&label)
+                .execute(&db.pool)
+                .await
+                .is_err(),
+            "unexpectedly accepted blank origin {label:?}"
+        );
+    }
     for invalid in [
-        "UPDATE coordinator_scan_evidence_origins SET origin_kind=' '",
         "UPDATE coordinator_scan_evidence_origins SET origin_kind=NULL",
         "UPDATE coordinator_scan_evidence_origins SET origin_kind=X'01'",
         "UPDATE coordinator_scan_evidence_origins SET source_role='bad'",
