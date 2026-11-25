@@ -16966,9 +16966,7 @@ mod tests {
             .unwrap();
         let writer_pid = std::process::id();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-        let mut effects = injected_close_worktree_effects(|_| {
-            Ok(super::FsmonitorStop::NotRunning)
-        });
+        let mut effects = injected_close_worktree_effects(|_| Ok(super::FsmonitorStop::NotRunning));
         effects.observe_open_descriptors = Box::new(move |quarantine, deadline| {
             let evidence = super::quarantine_has_open_descriptors_until(quarantine, deadline)?;
             assert!(

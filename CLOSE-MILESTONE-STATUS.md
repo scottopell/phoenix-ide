@@ -1,5 +1,45 @@
 # Architectural reduction candidate — unqualified
 
+## Exact `80362eb12` terminal receipts — formatting-only failure
+
+- [Exact run 45666550377](https://github.com/scottopell/phoenix-ide/actions/runs/45666550377)
+  finished **failure** at source `80362eb126293af471cfc977053f1e9546106b90`,
+  tree `af21a3934ad4dbde51085ef3f6007da63a5796e2`. Its only failed step was
+  `Require exact source formatting`; this follow-up manually applies its sole
+  whitespace hunk in the live-descriptor test. The patched tree is not qualified
+  by the previous tree's execution. No formatter or executable validation ran locally.
+- All six mandatory public physical journeys actually executed and passed,
+  including clean explicit retry/reclaim/replay and all four intended Stop cuts.
+  The fixed four retry and four assessment samples also each passed. Each focused
+  invocation reports **1 passed, 0 failed, 0 ignored**; no retry-until-green.
+- Both pending-physical Stop/resume regressions, anchored typed writer-gap
+  propagation, and live Linux descriptor attribution each executed and passed
+  **1/0/0**. The descriptor control holds a real writable FD in the test process,
+  calls the production detector after quarantine, and requires that process/path
+  attribution with retained quarantine/admin state. It is not a separate-process
+  writer control or a full public Close journey.
+- Focused wrapper receipts show UID/GID 65534, empty groups, all five capability
+  sets zero, `no_new_privs=1`, distinct caller/private PID namespace inodes and
+  tmpfs fixture storage. Normal supervisor exit status was zero. Configured
+  timeout bounds and wrapper-reported descendant termination are not independent
+  post-run process/storage audits or exercised timeout/failure-teardown proof.
+- Executed module receipts include foundation **270**, native DB **82**,
+  migrations **180**, source-entry **10**, runtime actor **52**, matcher **9**,
+  public parser **4**, and retry assessment **7** passed, with no failed/ignored
+  tests. These selections overlap and do not constitute the full runtime suite.
+  Frontend and specification jobs passed.
+- Exact `ea1e82d58` run 45656308137 is also terminal **failure**: six mandatory
+  journeys and eight fixed samples passed, but three newly selected regressions
+  were refused by the old wrapper allowlist (**zero executed**), plus formatting
+  failed. Exact `50538326c` run 45652361228 is terminal **failure**, including
+  clean retry source-entry busy refusal; later successes do not establish every
+  historical contention cause. Earlier active/pending notes below are historical.
+- PR #1161 remains draft/unqualified/unmerged and currently conflicts with main.
+  No broad PR CI exists for `80362eb12`; exact Linux receipts are not a substitute.
+  Conflict integration, broad qualification and installed disposable-Mac usability
+  through the designated release executor remain outstanding. No merge, install,
+  deployment, production guard relaxation or optional device/system gate added.
+
 ## Approved bounded hosted isolation (source candidate, execution pending)
 
 - Original question reply `coordinator-question-reply:e5fe7b20-5702-439c-b27e-2cb596f9f1da`
