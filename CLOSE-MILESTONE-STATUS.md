@@ -2,11 +2,32 @@
 
 ## Current qualification and reviewed lint follow-up
 
+### fdfe hosted formatting follow-up; qualification remains blocked
+
+Published `fdfe106c6846e07c7ef154a387da09f5b784b961` adds mutation Busy/Refused
+strings and prints exact failed dirty-retry JSON; neither changes behavior.
+[CI45625288436](https://github.com/scottopell/phoenix-ide/actions/runs/45625288436)
+failed early exact-source formatting on one mutation Refused-arm line wrap.
+The complete hosted proposal is applied unchanged; dependent executable lanes
+were skipped, not passed. Evidence: `/tmp/close-fdfe106c6/ci-failed.log`.
+No local executable validation ran. Exact fdfe
+[45625278385](https://github.com/scottopell/phoenix-ide/actions/runs/45625278385)
+is pending behind retained active exact9a65. Watcher logs are retained in
+`/tmp/close-fdfe106c6/close-watch.log` and
+`/tmp/close-9a65b8191/close-watch.log`.
+
+The 9a65 broad run is now terminal failed. Shard 4 completed successfully
+(job139232534382; `/tmp/close-9a65b8191/shard4.log`), but its exact test count
+is not yet artifact-verified. The retained final artifact collection is incomplete;
+missing count evidence is not itself a test failure.
+The three failed shard classifications below remain unresolved. Exact9a65
+successful interim steps are not terminal acceptance or causal repair.
+
 ### Fresh 9a65 broad failures remain fail-closed inspection gaps
 
 Later [CI45618338984](https://github.com/scottopell/phoenix-ide/actions/runs/45618338984)
-checkpoint: all non-test lanes and Rust archive build passed. Three completed
-shards failed; shard 4 remains active. Retained logs/artifacts:
+terminal result: all non-test lanes and Rust archive build passed. Three
+shards failed; shard 4 passed (exact test count not yet verified). Retained logs/artifacts:
 `/tmp/close-9a65b8191/{shard1.log,shard2.log,shard3.log,rust-evidence}`.
 
 - Shard 1: 1575/1765 run, 1574 pass/1 fail, 190 selected unrun. Assessment-Stop
@@ -60,9 +81,9 @@ failed; full migrations passed 180. These are neither focused execution receipts
 nor evidence those migration algorithms failed. Exact formatting also failed on
 the previously corrected missing-status assertion. Workflow gating is unchanged.
 
-Current `9a65b81917cf2621969e6d710cb4ce2e21a49e44` broad qualification has
-passed early formatting, Clippy, musl, UI/spec/task, dev.py and e2e lanes; Rust
-build/tests remain active. The diagnostic jobs compiled synthetic merge
+The `9a65b81917cf2621969e6d710cb4ce2e21a49e44` broad run passed early
+formatting, Clippy, musl, UI/spec/task, dev.py, e2e and Rust archive build;
+its terminal test failures are classified above. The diagnostic jobs compiled synthetic merge
 `f3a2669c083fb0082554837fc3e8ce3ba3b882f3` (feature 9a65 into main4aba9625),
 not the exact feature source. Exact9a65 has started after retained2b3 ended.
 These positives establish compile/lint repair only, not intermittent behavior.

@@ -80,9 +80,8 @@ impl WorktreeMutationExecutor for OriginalWorktreeMutationExecutor<'_> {
             Ok((WorkerEntryResult::Busy, NativeCloseInitialEntryRelease::Confirmed)) => {
                 self.refuse("original Close source unavailable at Worktree mutation: busy".into())
             }
-            Ok((WorkerEntryResult::Refused, NativeCloseInitialEntryRelease::Confirmed)) => {
-                self.refuse("original Close source unavailable at Worktree mutation: refused".into())
-            }
+            Ok((WorkerEntryResult::Refused, NativeCloseInitialEntryRelease::Confirmed)) => self
+                .refuse("original Close source unavailable at Worktree mutation: refused".into()),
             Err(
                 NativeCloseInitialFirstEffectError::NotStarted(error)
                 | NativeCloseInitialFirstEffectError::Rejected {
