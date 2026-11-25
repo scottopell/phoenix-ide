@@ -4227,6 +4227,31 @@ mod tests {
         );
     }
 
+    /// Whether process group `pgid` has a member that is actually still
+    /// running. On Linux this defers to the same `/proc`-walking, zombie-aware
+    /// check production retirement uses (`bash::registry`), because a
+    /// container `PID 1`/subreaper that does not promptly `waitpid` a
+    /// reparented orphan leaves `kill(-pgid, 0)` succeeding indefinitely even
+    /// though every member has exited. Other Unix hosts fall back to the
+    /// plain existence check; they are not exercised on the slow-reaping
+    /// container host this guards against.
+    #[cfg(target_os = "linux")]
+    fn group_has_live_member(pgid: i32) -> std::io::Result<bool> {
+        crate::bash::registry::linux_process_group_has_live_member(pgid)
+    }
+
+    #[cfg(all(unix, not(target_os = "linux")))]
+    fn group_has_live_member(pgid: i32) -> std::io::Result<bool> {
+        let result = unsafe { libc::kill(-pgid, 0) };
+        if result == 0 {
+            return Ok(true);
+        }
+        match std::io::Error::last_os_error().raw_os_error() {
+            Some(libc::ESRCH) => Ok(false),
+            _ => Ok(true),
+        }
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn dropping_unregistered_spawn_kills_the_process_group() {
@@ -4261,10 +4286,7 @@ mod tests {
         drop(spawned);
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
-                let result = unsafe { libc::kill(-pgid, 0) };
-                if result != 0
-                    && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
-                {
+                if !group_has_live_member(pgid).expect("inspect process group") {
                     break;
                 }
                 tokio::task::yield_now().await;

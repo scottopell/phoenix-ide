@@ -1620,7 +1620,25 @@ fn record_handle_in_report(
 fn linux_retirement_target_has_live_member(
     target: &BashRetirementTarget,
 ) -> Result<bool, std::io::Error> {
-    let group_exists = unsafe { libc::kill(-target.pgid, 0) } == 0
+    linux_process_group_has_live_member(target.pgid)
+}
+
+/// Whether process group `pgid` has any member that is actually still
+/// running, i.e. present in `/proc` with a state other than zombie (`Z`) or
+/// dead (`X`).
+///
+/// A container `PID 1` (or subreaper) that does not promptly `waitpid` a
+/// reparented orphan leaves it as a zombie indefinitely; `kill(-pgid, 0)`
+/// alone cannot distinguish that from a genuinely live group, since a zombie
+/// still has a process-table entry. This walks `/proc` and checks each
+/// member's exact kernel state instead of trusting `kill`'s mere existence
+/// signal.
+// `pgid`/`pid` are spec names from `bash.allium`'s `Handle` entity; renaming
+// for the similar-names lint would diverge from the spec.
+#[cfg(target_os = "linux")]
+#[allow(clippy::similar_names)]
+pub(crate) fn linux_process_group_has_live_member(pgid: i32) -> Result<bool, std::io::Error> {
+    let group_exists = unsafe { libc::kill(-pgid, 0) } == 0
         || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
     if !group_exists {
         return Ok(false);
@@ -1650,17 +1668,14 @@ fn linux_retirement_target_has_live_member(
                 format!("malformed /proc/{pid}/stat"),
             ));
         };
-        if member_pgid == target.pgid && state != b'Z' && state != b'X' {
+        if member_pgid == pgid && state != b'Z' && state != b'X' {
             return Ok(true);
         }
     }
     if unreadable_process {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
-            format!(
-                "process group {} still exists but /proc was not fully readable",
-                target.pgid
-            ),
+            format!("process group {pgid} still exists but /proc was not fully readable"),
         ));
     }
     Ok(false)
