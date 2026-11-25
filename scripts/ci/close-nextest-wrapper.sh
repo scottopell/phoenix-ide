@@ -19,7 +19,11 @@ case "$expected_test" in
     runtime::executor::creation_completion_lifecycle_tests::native_close_admission_tests::worktree_physical::registered_native_close_captured_loss_retry_stop_during_assessment_preserves_worktree_and_history | \
     runtime::executor::creation_completion_lifecycle_tests::native_close_admission_tests::worktree_physical::registered_native_close_captured_loss_retry_stop_while_prepared_preserves_worktree | \
     runtime::executor::creation_completion_lifecycle_tests::native_close_admission_tests::worktree_physical::registered_native_close_captured_loss_retry_stop_before_writer_refuses_dispatch | \
-    runtime::executor::creation_completion_lifecycle_tests::native_close_admission_tests::worktree_physical::registered_native_close_captured_loss_retry_stop_before_physical_observation_retains_stopped_result)
+    runtime::executor::creation_completion_lifecycle_tests::native_close_admission_tests::worktree_physical::registered_native_close_captured_loss_retry_stop_before_physical_observation_retains_stopped_result | \
+    runtime::executor::creation_completion_lifecycle_tests::native_close_admission_tests::worktree_physical::registered_native_close_captured_loss_retry_stop_during_physical_mutation_does_not_revalidate_pending_ticks | \
+    runtime::executor::creation_completion_lifecycle_tests::native_close_admission_tests::worktree_physical::registered_native_close_captured_loss_retry_resumes_physical_mutation_after_pending_ticks | \
+    runtime::close_retirement::tests::anchored_native_retry_assessment_preserves_writer_inspection_gap | \
+    runtime::close_retirement::tests::quarantine_rejects_live_linux_descriptor_writer_before_deletion)
         ;;
     *) exec "$@" ;;
 esac

@@ -216,7 +216,10 @@ impl AdmittedRetryCursor {
         // them at every leaf. Idle polling must not contend with those leaves for
         // eligibility. Revalidate again once readiness proves custody was released.
         if matches!(self.stage, Stage::WorktreePhysical)
-            && self.physical.as_ref().is_some_and(|physical| !physical.is_ready())
+            && self
+                .physical
+                .as_ref()
+                .is_some_and(|physical| !physical.is_ready())
         {
             #[cfg(test)]
             if let Some(hooks) = super::test_hooks::Hooks::current() {

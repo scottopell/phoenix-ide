@@ -439,7 +439,8 @@ pub(super) async fn retry_after_public_capture(
         let retry_tool = Arc::clone(&tool);
         let retry_input = input.clone();
         let retry_context = context.clone();
-        let mut retry = tokio::spawn(async move { retry_tool.run(retry_input, retry_context).await });
+        let mut retry =
+            tokio::spawn(async move { retry_tool.run(retry_input, retry_context).await });
         tokio::time::timeout(Duration::from_secs(10), pause.reached())
             .await
             .expect("physical mutation barrier must arrive")

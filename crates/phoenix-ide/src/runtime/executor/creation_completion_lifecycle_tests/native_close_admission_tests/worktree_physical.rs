@@ -52,7 +52,8 @@ async fn registered_native_close_captured_loss_retry_stop_before_physical_observ
 }
 
 #[tokio::test]
-async fn registered_native_close_captured_loss_retry_stop_during_physical_mutation_does_not_revalidate_pending_ticks() {
+async fn registered_native_close_captured_loss_retry_stop_during_physical_mutation_does_not_revalidate_pending_ticks(
+) {
     run_public_worktree_close(
         WorktreeJourney::CapturedLossPublicRetryStoppedDuringPhysicalMutation,
     )
@@ -60,7 +61,8 @@ async fn registered_native_close_captured_loss_retry_stop_during_physical_mutati
 }
 
 #[tokio::test]
-async fn registered_native_close_captured_loss_retry_resumes_physical_mutation_after_pending_ticks() {
+async fn registered_native_close_captured_loss_retry_resumes_physical_mutation_after_pending_ticks()
+{
     run_public_worktree_close(
         WorktreeJourney::CapturedLossPublicRetryResumedDuringPhysicalMutation,
     )

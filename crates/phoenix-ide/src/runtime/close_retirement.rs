@@ -16950,6 +16950,76 @@ mod tests {
         assert!(!worktree_quarantine_path(&identity).unwrap().exists());
     }
 
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn quarantine_rejects_live_linux_descriptor_writer_before_deletion() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = linked_close_worktree(&temp);
+        let identity = inspection_identity(&target);
+        let snapshot = inspect_worktree(&identity).await.unwrap().0;
+        let common = super::exact_worktree_common_git_dir(&target).unwrap();
+        let admin = super::exact_worktree_administrative_dir(&target, &common).unwrap();
+        let incarnation = observe_administrative_dir_incarnation(&admin).unwrap();
+        let writer = std::fs::OpenOptions::new()
+            .write(true)
+            .open(target.join("tracked"))
+            .unwrap();
+        let writer_pid = std::process::id();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let mut effects = injected_close_worktree_effects(|_| {
+            Ok(super::FsmonitorStop::NotRunning)
+        });
+        effects.observe_open_descriptors = Box::new(move |quarantine, deadline| {
+            let evidence = super::quarantine_has_open_descriptors_until(quarantine, deadline)?;
+            assert!(
+                matches!(
+                    &evidence,
+                    super::ExternalWriterEvidence::Blocked(
+                        super::CloseWriterObservation::Authority {
+                            detector: super::CloseWriterDetector::LinuxDescriptor,
+                            process,
+                            matched_path,
+                            authority: super::CloseWriterAuthority::WritableFile(
+                                super::CloseFileWriteAccess::WriteOnly
+                                    | super::CloseFileWriteAccess::ReadWrite
+                            ),
+                        }
+                    ) if process.pid == writer_pid
+                        && matched_path == &quarantine.join("tracked")
+                ),
+                "expected real /proc descriptor attribution to the held writer: {evidence:?}"
+            );
+            Ok(evidence)
+        });
+        effects.observe_external_writer = Box::new(|_, _| {
+            panic!("descriptor evidence must refuse retirement before the next writer scan")
+        });
+
+        let outcome = super::quarantine_and_remove_exact_worktree_with_effects_until(
+            &identity,
+            &snapshot,
+            admin.clone(),
+            incarnation,
+            None,
+            |_, _, _| panic!("must not bind deletion after live writer evidence"),
+            |_| {},
+            effects,
+            deadline,
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(outcome, ExactWorktreeRemoval::Residual { .. }));
+        let retained = worktree_quarantine_path(&identity).unwrap();
+        assert!(!target.exists());
+        assert_eq!(
+            std::fs::read_to_string(retained.join("tracked")).unwrap(),
+            "initial\n"
+        );
+        assert!(admin.exists());
+        drop(writer);
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn quarantine_rejects_positive_or_failed_writer_observations_before_deletion() {

@@ -1,5 +1,39 @@
 # Architectural reduction candidate — unqualified
 
+## Approved bounded hosted isolation (source candidate, execution pending)
+
+- Original question reply `coordinator-question-reply:e5fe7b20-5702-439c-b27e-2cb596f9f1da`
+  confirms **Approve bounded isolation**. This supersedes the isolation hold in
+  historical checkpoints below, not production guards or the installed-Mac gate.
+- The disposable GitHub-hosted Linux wrapper creates private PID/mount namespaces
+  and real namespace-local `/proc`, then drops to nobody with empty supplementary
+  groups, all capability sets empty, and `no_new_privs`. Fixture storage is private
+  tmpfs; preflight verifies credentials, namespace separation, and storage.
+  No production code/privilege or source/writer/Stop policy changes.
+- A privileged supervisor aborts at 75 seconds with a 5-second kill grace and
+  couples namespace-init lifetime to its supervisor. The test has a 70-second
+  inner deadline. Timeout is a failure, not another sample or a renewed deadline.
+  Staging cleanup occurs outside the namespace after supervisor exit; cleanup
+  failure is fatal. These bounds and teardown still require hosted evidence.
+- Exact wrapper allowlists and the broad nextest dispatcher include the two
+  pending-mutation regressions, anchored typed-gap regression, and new live Linux
+  descriptor control. The latter holds a real writable FD, calls the production
+  `/proc` descriptor detector after quarantine, requires attribution to that FD's
+  process/path, and proves retained quarantine/admin state before deletion.
+  It replaces neither the six mandatory public journeys nor shared-host acceptance.
+- Broad [45656326364](https://github.com/scottopell/phoenix-ide/actions/runs/45656326364)
+  at `ea1e82d58` is terminal **failure** at Rust formatting, before Rust test
+  qualification. All five exact hosted formatting hunks are manually applied.
+  Exact [45656308137](https://github.com/scottopell/phoenix-ide/actions/runs/45656308137)
+  is pending at this checkpoint. Older exact `50538326c` run
+  [45652361228](https://github.com/scottopell/phoenix-ide/actions/runs/45652361228)
+  is still progressing through regression steps, with two earlier failed steps;
+  no terminal result or failure-cause claim is made here.
+- Narrow independent source review found no concrete blocker in isolation and
+  live-writer control; this is publication review, not executable qualification.
+  No local formatter, syntax check, build or fixture ran. No merge/install/deploy.
+  Isolated green will not prove shared-host Mac usability or every historical cause.
+
 ## Pending-physical caller repair after `50538326c`
 
 - Broad [45652378449](https://github.com/scottopell/phoenix-ide/actions/runs/45652378449)

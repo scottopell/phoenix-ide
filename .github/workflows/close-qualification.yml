@@ -136,7 +136,8 @@ jobs:
           set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y tmux coreutils
-          { tmux -V; /usr/bin/timeout --version; } | tee evidence/tmux-versions.log
+          { tmux -V; /usr/bin/timeout --version; /usr/bin/unshare --version; /usr/bin/setpriv --version; } | tee evidence/tmux-versions.log
+          bash -n scripts/ci/close-unprivileged-qualification.sh
       - name: Validate Close loss wire and identity contract
         shell: bash
         run: |
@@ -221,7 +222,7 @@ jobs:
           done
           test "$failed" -eq 0
 
-      - name: Execute deterministic pending-mutation and anchored-gap regressions
+      - name: Execute pending-mutation, anchored-gap, and live-writer regressions
         if: success() || failure()
         timeout-minutes: 8
         shell: bash
@@ -233,7 +234,8 @@ jobs:
           for test_name in \
             runtime::executor::creation_completion_lifecycle_tests::native_close_admission_tests::worktree_physical::registered_native_close_captured_loss_retry_stop_during_physical_mutation_does_not_revalidate_pending_ticks \
             runtime::executor::creation_completion_lifecycle_tests::native_close_admission_tests::worktree_physical::registered_native_close_captured_loss_retry_resumes_physical_mutation_after_pending_ticks \
-            runtime::close_retirement::tests::anchored_native_retry_assessment_preserves_writer_inspection_gap; do
+            runtime::close_retirement::tests::anchored_native_retry_assessment_preserves_writer_inspection_gap \
+            runtime::close_retirement::tests::quarantine_rejects_live_linux_descriptor_writer_before_deletion; do
             if ! grep -Fx "$test_name: test" evidence/runtime-inventory.log; then
               failed=1
               continue
