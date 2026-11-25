@@ -343,6 +343,7 @@ async fn question_reply_and_unknown_provenance_remain_readable_and_reconcilable(
         assert_eq!(stored, label);
     }
 
+    let fallback = db.read_coordinator_tracking(&source, &id, 0).await.unwrap();
     native(
         &db,
         &source,
