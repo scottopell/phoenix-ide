@@ -637,19 +637,33 @@ struct OnboardingView: View {
             var draft = persistence.loadConnectionDraft().draft
             draft.mode = .bundled
 
+            let parsedAuthHelper: ParsedPastedConfig?
             switch providerChoice {
             case .authHelper:
-                let parsed = try UserConfigTomlParser.parseSnippet(tomlText)
+                parsedAuthHelper = try UserConfigTomlParser.parseSnippet(tomlText)
+            case .codex:
+                parsedAuthHelper = nil
+            case .apiKeys:
+                parsedAuthHelper = nil
+                draft.anthropicKey = anthropicKey
+                draft.openAIKey = openAIKey
+            }
+
+            // Validate bundled candidate (e.g. sidecar executable present) before writing config.toml.
+            _ = try ConfigurationStore.loadCandidate(
+                kind: .bundled,
+                attachedOrigin: draft.attachedOrigin,
+                bundledPort: draft.bundledPort,
+                developmentBinaryOverride: draft.developmentBinaryOverride,
+                rustLogLevel: draft.rustLogLevel
+            )
+
+            if let parsed = parsedAuthHelper {
                 try UserConfigStore.mergeAndWrite(
                     llm: parsed.llm,
                     rawModelsBlocks: parsed.rawModelsBlocks.isEmpty ? nil : parsed.rawModelsBlocks,
                     to: configURL
                 )
-            case .codex:
-                break
-            case .apiKeys:
-                draft.anthropicKey = anthropicKey
-                draft.openAIKey = openAIKey
             }
 
             let persisted = try persistence.persist(draft: draft)

@@ -1135,16 +1135,19 @@ final class ServerManager: ObservableObject {
             guard operation == operationAuthority.id else { return }
             if allowIntermediateFailureState {
                 let classified = classifyServerIdentityError(error)
-                if case .attached = selected,
-                   let mismatch = await detectLoopbackSchemeMismatch(for: selected.origin, initialError: error) {
+                if case .attached = selected {
+                    let mismatch = await detectLoopbackSchemeMismatch(for: selected.origin, initialError: error)
                     guard operation == operationAuthority.id else { return }
-                    applyIdentityFailure(mismatch.error, version: currentVersion, suggestedOrigin: mismatch.suggestedOrigin)
-                } else {
-                    applyIdentityFailure(
-                        contextualizedIdentityError(classified, origin: selected.origin),
-                        version: currentVersion
-                    )
+                    if let mismatch {
+                        applyIdentityFailure(mismatch.error, version: currentVersion, suggestedOrigin: mismatch.suggestedOrigin)
+                        return
+                    }
                 }
+                guard operation == operationAuthority.id else { return }
+                applyIdentityFailure(
+                    contextualizedIdentityError(classified, origin: selected.origin),
+                    version: currentVersion
+                )
             }
         }
     }

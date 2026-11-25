@@ -119,6 +119,24 @@ struct ConnectionReapplyDecision: Equatable {
 }
 
 
+struct PendingUserConfigRestartState: Equatable {
+    private(set) var pendingRestart = false
+
+    mutating func markConfigWritten() {
+        pendingRestart = true
+    }
+
+    func shouldForceRestart(for mode: PendingServerModeKind?, tomlEdited: Bool) -> Bool {
+        mode == .bundled && (tomlEdited || pendingRestart)
+    }
+
+    mutating func markApplyCompleted(for mode: PendingServerModeKind?) {
+        if mode == .bundled {
+            pendingRestart = false
+        }
+    }
+}
+
 struct ServerReconnectRequest: Equatable {
     let candidate: ServerMode
     let requiresReconnect: Bool

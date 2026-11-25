@@ -626,7 +626,7 @@ enum UserConfigTomlParser {
         return result
     }
 
-    private static func stripComment(_ line: String) -> String {
+    static func stripComment(_ line: String) -> String {
         var inDouble = false
         var inSingle = false
         var escaping = false
@@ -650,7 +650,7 @@ enum UserConfigTomlParser {
         return line
     }
 
-    private static func splitKeyValue(_ line: String) -> (String, String)? {
+    static func splitKeyValue(_ line: String) -> (String, String)? {
         var inDouble = false
         var inSingle = false
         var escaping = false
@@ -723,7 +723,7 @@ enum UserConfigTomlParser {
         return parts
     }
 
-    private static func parseKeyPath(_ raw: String, line: Int) throws -> [String] {
+    static func parseKeyPath(_ raw: String, line: Int) throws -> [String] {
         let parts = splitTopLevel(raw, delimiter: ".")
         var result: [String] = []
         for part in parts {
@@ -823,12 +823,89 @@ enum UserConfigStore {
             case drop
         }
 
+        enum MultilineDelimiter {
+            case basic   // """
+            case literal // '''
+        }
+
+        func updateMultilineState(_ line: String, active: inout MultilineDelimiter?) {
+            var index = line.startIndex
+            var inSingleBasic = false
+            var inSingleLiteral = false
+            while index < line.endIndex {
+                let ch = line[index]
+                if let delimiter = active {
+                    if delimiter == .basic && ch == "\\" {
+                        index = line.index(after: index)
+                        if index < line.endIndex { index = line.index(after: index) }
+                        continue
+                    }
+                    let token = delimiter == .basic ? "\"\"\"" : "'''"
+                    if line[index...].hasPrefix(token) {
+                        active = nil
+                        index = line.index(index, offsetBy: 3)
+                        continue
+                    }
+                    index = line.index(after: index)
+                    continue
+                }
+                if inSingleBasic {
+                    if ch == "\\" {
+                        index = line.index(after: index)
+                        if index < line.endIndex { index = line.index(after: index) }
+                        continue
+                    }
+                    if ch == "\"" { inSingleBasic = false }
+                    index = line.index(after: index)
+                    continue
+                }
+                if inSingleLiteral {
+                    if ch == "'" { inSingleLiteral = false }
+                    index = line.index(after: index)
+                    continue
+                }
+                if ch == "#" {
+                    break
+                }
+                if line[index...].hasPrefix("\"\"\"") {
+                    active = .basic
+                    index = line.index(index, offsetBy: 3)
+                    continue
+                }
+                if line[index...].hasPrefix("'''") {
+                    active = .literal
+                    index = line.index(index, offsetBy: 3)
+                    continue
+                }
+                if ch == "\"" {
+                    inSingleBasic = true
+                } else if ch == "'" {
+                    inSingleLiteral = true
+                }
+                index = line.index(after: index)
+            }
+        }
+
         var mode: KeepMode = .root
-        for line in lines {
-            let trimmed = line.trimmingCharacters(in: .whitespaces)
-            if trimmed.hasPrefix("[[") && trimmed.hasSuffix("]]") {
-                let inner = String(trimmed.dropFirst(2).dropLast(2)).trimmingCharacters(in: .whitespaces)
-                if replaceModels && inner == "models" {
+        var activeMultiline: MultilineDelimiter?
+
+        for (zeroIndex, line) in lines.enumerated() {
+            let lineNumber = zeroIndex + 1
+            if activeMultiline != nil {
+                updateMultilineState(line, active: &activeMultiline)
+                switch mode {
+                case .root: preservedHeaderLines.append(line)
+                case .keep: preservedOtherSections.append(line)
+                case .drop: break
+                }
+                continue
+            }
+
+            let cleaned = UserConfigTomlParser.stripComment(line).trimmingCharacters(in: .whitespaces)
+            if cleaned.hasPrefix("[[") && cleaned.hasSuffix("]]") {
+                let inner = String(cleaned.dropFirst(2).dropLast(2)).trimmingCharacters(in: .whitespaces)
+                let segments = (try? UserConfigTomlParser.parseKeyPath(inner, line: lineNumber)) ?? [inner]
+                if replaceModels && segments == ["models"] {
                     mode = .drop
                 } else {
                     mode = .keep
@@ -836,11 +913,12 @@ enum UserConfigStore {
                 }
                 continue
             }
-            if trimmed.hasPrefix("[") && trimmed.hasSuffix("]") {
-                let inner = String(trimmed.dropFirst().dropLast()).trimmingCharacters(in: .whitespaces)
-                if inner == "llm" || inner.hasPrefix("llm.") {
+            if cleaned.hasPrefix("[") && cleaned.hasSuffix("]") {
+                let inner = String(cleaned.dropFirst().dropLast()).trimmingCharacters(in: .whitespaces)
+                let segments = (try? UserConfigTomlParser.parseKeyPath(inner, line: lineNumber)) ?? [inner]
+                if segments.first == "llm" {
                     mode = .drop
-                } else if replaceModels && inner.hasPrefix("models.") {
+                } else if replaceModels && segments.first == "models" {
                     mode = .drop
                 } else {
                     mode = .keep
@@ -848,9 +926,14 @@ enum UserConfigStore {
                 }
                 continue
             }
+
+            updateMultilineState(line, active: &activeMultiline)
+
             switch mode {
             case .root:
-                if trimmed.hasPrefix("version") && trimmed.contains("=") {
+                if let (rawKey, _) = UserConfigTomlParser.splitKeyValue(cleaned),
+                   let segments = try? UserConfigTomlParser.parseKeyPath(rawKey, line: lineNumber),
+                   segments == ["version"] {
                     hasVersionLine = true
                 }
                 preservedHeaderLines.append(line)

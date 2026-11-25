@@ -37,6 +37,7 @@ struct SettingsView: View {
     @State private var llmTomlText = ""
     @State private var savedLlmTomlText = ""
     @State private var loadedExistingToml = false
+    @State private var userConfigRestartState = PendingUserConfigRestartState()
     @StateObject private var helperTestRunner = AuthHelperTestRunner()
     private let persistence = SettingsPersistence()
 
@@ -56,7 +57,7 @@ struct SettingsView: View {
     }
 
     private var llmTomlChanged: Bool {
-        selectedKind == .bundled && llmTomlText != savedLlmTomlText
+        userConfigRestartState.shouldForceRestart(for: selectedKind, tomlEdited: llmTomlText != savedLlmTomlText)
     }
 
     private var hasUnappliedChanges: Bool {
@@ -168,28 +169,51 @@ struct SettingsView: View {
     private func applySettings() {
         helperTestRunner.cancel()
         do {
-            var changedUserConfig = false
-            if draft.mode == .bundled && llmTomlText != savedLlmTomlText {
+            guard let mode = draft.mode else { throw ConfigurationError.missingModeSelection }
+
+            // Validate both the TOML snippet and the target server candidate before
+            // mutating config.toml, preferences, or Keychain.
+            let pendingTomlEdit: (parsed: ParsedPastedConfig?, canonical: String, hasConfig: Bool)?
+            if mode == .bundled && llmTomlText != savedLlmTomlText {
                 let trimmed = llmTomlText.trimmingCharacters(in: .whitespacesAndNewlines)
                 if trimmed.isEmpty {
-                    try UserConfigStore.mergeAndWrite(llm: nil, to: configURL)
-                    savedLlmTomlText = ""
-                    loadedExistingToml = false
+                    pendingTomlEdit = (nil, "", false)
                 } else {
                     let parsed = try UserConfigTomlParser.parseSnippet(llmTomlText)
+                    pendingTomlEdit = (parsed, UserConfigTomlParser.serializeLLMBlock(parsed.llm), true)
+                }
+            } else {
+                pendingTomlEdit = nil
+            }
+
+            _ = try ConfigurationStore.loadCandidate(
+                kind: mode.persistedKind,
+                attachedOrigin: draft.attachedOrigin,
+                bundledPort: draft.bundledPort,
+                developmentBinaryOverride: draft.developmentBinaryOverride,
+                rustLogLevel: draft.rustLogLevel
+            )
+
+            if let pendingTomlEdit {
+                if let parsed = pendingTomlEdit.parsed {
                     try UserConfigStore.mergeAndWrite(
                         llm: parsed.llm,
                         rawModelsBlocks: parsed.rawModelsBlocks.isEmpty ? nil : parsed.rawModelsBlocks,
                         to: configURL
                     )
-                    let canonical = UserConfigTomlParser.serializeLLMBlock(parsed.llm)
-                    llmTomlText = canonical
-                    savedLlmTomlText = canonical
-                    loadedExistingToml = true
+                } else {
+                    try UserConfigStore.mergeAndWrite(llm: nil, to: configURL)
                 }
-                changedUserConfig = true
+                llmTomlText = pendingTomlEdit.canonical
+                savedLlmTomlText = pendingTomlEdit.canonical
+                loadedExistingToml = pendingTomlEdit.hasConfig
+                userConfigRestartState.markConfigWritten()
             }
 
+            let changedUserConfig = userConfigRestartState.shouldForceRestart(
+                for: draft.mode,
+                tomlEdited: pendingTomlEdit != nil
+            )
             let persisted = try persistence.persist(draft: draft, appliedSnapshot: savedAppliedSnapshot)
             let reconnectDecision = ServerReconnectRequest.evaluate(
                 currentMode: serverManager.mode,
@@ -205,6 +229,7 @@ struct SettingsView: View {
             if reconnectDecision.requiresReconnect {
                 try serverManager.reconnect(reconnectDecision)
             }
+            userConfigRestartState.markApplyCompleted(for: draft.mode)
             feedback = .success(summary: persisted.summary)
             modeMessage = nil
             onApplied?()

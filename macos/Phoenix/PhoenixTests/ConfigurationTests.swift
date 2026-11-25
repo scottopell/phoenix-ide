@@ -2191,4 +2191,89 @@ final class ServerManagerHelpersTests: XCTestCase {
             ["http://localhost:8031", "https://localhost:8031"]
         )
     }
+
+    func testUserConfigStoreMergeHandlesCommentedHeadersAndMultilineStrings() {
+        let existing = """
+        # version = 999
+        version = 1 # schema version
+
+        [llm] # gateway config
+        api_key_helper = "old-helper"
+
+        [llm.custom_headers] # old headers
+        X-Old = "gone"
+
+        [agents.reviewer] # keep this section
+        description = "Review"
+        instructions = \"\"\"
+        Ignore literal bracket lines inside strings:
+        [llm]
+        keep_me = true
+        \"\"\"
+        """
+        let updated = UserLLMConfig(
+            apiKeyHelper: "new-helper",
+            authHeader: .bearer
+        )
+        let merged = UserConfigStore.mergeDocument(existing: existing, llm: updated)
+        XCTAssertEqual(merged.components(separatedBy: "[llm]").count - 1, 2) // new [llm] + literal inside instructions
+        XCTAssertFalse(merged.contains("old-helper"))
+        XCTAssertFalse(merged.contains("X-Old"))
+        XCTAssertTrue(merged.contains("api_key_helper = \"new-helper\""))
+        XCTAssertTrue(merged.contains("[agents.reviewer] # keep this section"))
+        XCTAssertTrue(merged.contains("keep_me = true"))
+        XCTAssertEqual(merged.components(separatedBy: "version = 1").count - 1, 1)
+    }
+
+    func testPendingUserConfigRestartStateSurvivesFailedApplyUntilBundledApplySucceeds() throws {
+        var restartState = PendingUserConfigRestartState()
+        XCTAssertFalse(restartState.shouldForceRestart(for: .bundled, tomlEdited: false))
+        XCTAssertTrue(restartState.shouldForceRestart(for: .bundled, tomlEdited: true))
+
+        // Simulate config.toml written, then persistence.persist fails (e.g. Keychain error)
+        restartState.markConfigWritten()
+        // On retry, tomlEdited is false because savedLlmTomlText already matches disk,
+        // but pendingRestart keeps forceRestart true.
+        XCTAssertTrue(restartState.shouldForceRestart(for: .bundled, tomlEdited: false))
+
+        let bundled = ServerMode.bundled(BundledServerConfiguration(
+            origin: try PhoenixOrigin("http://127.0.0.1:8420"),
+            executableURL: URL(fileURLWithPath: "/bin/sh"),
+            runtimeRootURL: URL(fileURLWithPath: "/tmp/runtime", isDirectory: true),
+            dataDirectoryURL: URL(fileURLWithPath: "/tmp/runtime/.phoenix-ide", isDirectory: true),
+            databaseURL: URL(fileURLWithPath: "/tmp/runtime/.phoenix-ide/phoenix.db"),
+            phoenixLogURL: URL(fileURLWithPath: "/tmp/runtime/.phoenix-ide/phoenix.log"),
+            fatalLogURL: URL(fileURLWithPath: "/tmp/runtime/.phoenix-ide/phoenix-fatal.log"),
+            launcherLogURL: URL(fileURLWithPath: "/tmp/runtime/.phoenix-ide/launcher.log"),
+            ownerLockURL: URL(fileURLWithPath: "/tmp/runtime/owner.lock"),
+            rustLogLevel: "phoenix_ide=info"
+        ))
+        let ready = ConnectionState.ready(
+            VersionInfo(version: "1.0.0", gitSHA: "abc123"),
+            DeploymentInfo(
+                build: BuildInfo(version: "1.0.0", gitSHA: "abc123"),
+                network: NetworkInfo(bindAddress: "127.0.0.1:8420", socketActivated: false, tls: TLSInfo(enabled: false, mode: nil)),
+                instanceID: UUID().uuidString,
+                localAccess: true,
+                installationOwnership: .development
+            )
+        )
+        let retryRequest = ServerReconnectRequest.evaluate(
+            currentMode: bundled,
+            currentState: ready,
+            candidate: bundled,
+            changedBundledSecrets: false,
+            changedUserConfig: restartState.shouldForceRestart(for: .bundled, tomlEdited: false)
+        )
+        XCTAssertTrue(retryRequest.requiresReconnect)
+        XCTAssertTrue(retryRequest.forceRestart)
+
+        // Switching to attached does not clear pending bundled restart.
+        restartState.markApplyCompleted(for: .attached)
+        XCTAssertTrue(restartState.shouldForceRestart(for: .bundled, tomlEdited: false))
+
+        // Completing bundled apply clears it.
+        restartState.markApplyCompleted(for: .bundled)
+        XCTAssertFalse(restartState.shouldForceRestart(for: .bundled, tomlEdited: false))
+    }
 }
