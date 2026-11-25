@@ -2832,7 +2832,7 @@ describe('WorkControlBar — mobile PR rail (REQ-WAB-011)', () => {
     );
 
     expect(screen.getByTestId('mobile-work-fallback')).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: /^Close conversation\./ })).toHaveAttribute('title', expect.stringContaining('Exact tracked, untracked'));
+    expect(screen.getByRole('button', { name: /^Close conversation\./ })).toHaveAttribute('title', expect.stringContaining('Exact work blockers remain visible until resolved separately and Close is explicitly retried'));
     expect(screen.queryByLabelText('Open pull requests')).not.toBeInTheDocument();
   });
 

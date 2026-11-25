@@ -3227,7 +3227,9 @@ impl BrowserSessionManager {
             KillSessionOutcome::AlreadyRequested { attempt } => {
                 self.wait_for_kill_completion(attempt).await
             }
-            KillSessionOutcome::Started { attempt, handle, .. } => {
+            KillSessionOutcome::Started {
+                attempt, handle, ..
+            } => {
                 if let Err(error) = handle.await {
                     tracing::warn!(%error, "browser dead-session teardown task failed");
                 }

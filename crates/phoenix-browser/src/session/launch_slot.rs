@@ -1599,9 +1599,8 @@ pub(super) mod tests {
         let worker_scope = scope.clone();
         let worker_slot = slot.clone();
         let worker = tokio::spawn(async move {
-            let mut retirement = Box::pin(
-                worker_manager.retire_dead_session(key, worker_scope, worker_slot),
-            );
+            let mut retirement =
+                Box::pin(worker_manager.retire_dead_session(key, worker_scope, worker_slot));
             let first_poll = std::future::poll_fn(|cx| {
                 std::task::Poll::Ready(std::future::Future::poll(retirement.as_mut(), cx))
             })
@@ -1658,9 +1657,8 @@ pub(super) mod tests {
         let worker_scope = scope.clone();
         let worker_slot = captured.clone();
         let worker = tokio::spawn(async move {
-            let mut retirement = Box::pin(
-                worker_manager.retire_dead_session(key, worker_scope, worker_slot),
-            );
+            let mut retirement =
+                Box::pin(worker_manager.retire_dead_session(key, worker_scope, worker_slot));
             let first_poll = std::future::poll_fn(|cx| {
                 std::task::Poll::Ready(std::future::Future::poll(retirement.as_mut(), cx))
             })

@@ -11,6 +11,17 @@ at `cb7e80573`; neither qualifies this candidate. No local executable validation
 was run. Preserved run `1068` has an unknown cause; do not attribute it to either
 source or infrastructure without evidence.
 
+Integrated `efee00293` Close run `45517506691` and CI `45517517914` also failed:
+all 82 native Close DB tests and each browser custody test, including the two new
+synthetic gate/cancellation/replacement cases, passed. Runtime compilation rejected
+the attempted import's wrong module path, so public/Stop journeys did not execute;
+the enclosing DB gate also lacked its runtime inventory. Frontend had one stale
+tooltip assertion (114 passed), specs passed, and CI stopped on three Rust format
+differences. The next candidate corrects the import to its verified declaration in
+`domain::llm_types`, updates that assertion to explicit-retry guidance, and applies
+the hosted format patch. It is not yet qualified; reduction does not revert to the
+pre-audit successful candidate.
+
 ## Keep
 
 - One shared executing-source predicate in core, used by DB and IDE callers. This

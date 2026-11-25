@@ -4,6 +4,19 @@ The current source reduces the Close expansion against shipped RC16
 `9885834f049683f5e6fa9c840668bdab92eb8a01`. The keep/share/delete ledger is
 [CLOSE-ARCHITECTURE-REDUCTION.md](CLOSE-ARCHITECTURE-REDUCTION.md).
 
+- Integrated head `efee002934983e84606a34e4a2b98a68d98957f5`: automatic
+  [Close45517506691](https://github.com/scottopell/phoenix-ide/actions/runs/45517506691)
+  and [CI45517517914](https://github.com/scottopell/phoenix-ide/actions/runs/45517517914)
+  **failed**. Browser custody cases, including both new detached/gate/replacement
+  regressions, each executed successfully. The 82 native Close DB tests passed;
+  the enclosing request/observation gate still failed because runtime compilation
+  prevented its required inventory. Runtime compilation rejected the prior repair's
+  wrong `ContentBlock` module path; no public journeys or causal Stops executed.
+  Frontend was 114 passed / 1 failed on a stale mobile tooltip expectation; specs
+  passed. Standard CI stopped on three Rust format differences. This next candidate
+  corrects the import to the declaration's `domain::llm_types` module, aligns the
+  tooltip assertion with separate cleanup/explicit retry semantics, and applies
+  the exact hosted formatting patch. These repairs remain unqualified.
 - Reduction head `d180a5e12d2bd985af94d26f5f89397299548963`: automatic Close
   [45509934652](https://github.com/scottopell/phoenix-ide/actions/runs/45509934652)
   **failed**. All 82 native Close DB tests (including the ordinary-approval
