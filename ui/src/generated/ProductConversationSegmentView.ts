@@ -2,4 +2,4 @@
 import type { EnrichedMessage } from "./EnrichedMessage";
 import type { ProductConversationHandoffView } from "./ProductConversationHandoffView";
 
-export type ProductConversationSegmentView = { segment_ordinal: number, transcript_row_id: string, slug: string | null, title: string | null, messages: Array<EnrichedMessage>, handoff: ProductConversationHandoffView | null, };
+export type ProductConversationSegmentView = { segment_ordinal: number, transcript_row_id: string, transcript_generation: number, slug: string | null, title: string | null, messages: Array<EnrichedMessage>, handoff: ProductConversationHandoffView | null, };

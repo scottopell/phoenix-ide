@@ -110,6 +110,113 @@ final class AppModelProductConversationTests: XCTestCase {
             has_older: hasOlder)
     }
 
+    func testComposedMessagesRetainsSnapshotAndReplacesLiveDuplicates() {
+        var liveReplacement = message("duplicate", sequence: 2)
+        liveReplacement.content = .object(["text": .string("live")])
+
+        let composed = AppModel.composedMessages(
+            snapshot: [
+                message("snapshot", sequence: 1),
+                message("duplicate", sequence: 2),
+                message("same-sequence-z", sequence: 4),
+            ],
+            snapshotGeneration: 7,
+            live: [
+                liveReplacement,
+                message("tail", sequence: 3),
+                message("same-sequence-a", sequence: 4),
+            ],
+            liveGeneration: 7)
+
+        XCTAssertEqual(composed.map(\.message_id), [
+            "snapshot",
+            "duplicate",
+            "tail",
+            "same-sequence-a",
+            "same-sequence-z",
+        ])
+        XCTAssertEqual(composed[1].content, .object(["text": .string("live")]))
+    }
+
+    func testComposedMessagesDropsSnapshotWhenLiveGenerationChanges() {
+        let composed = AppModel.composedMessages(
+            snapshot: [message("stale-prefix", sequence: 1)],
+            snapshotGeneration: 7,
+            live: [message("authoritative-tail", sequence: 2)],
+            liveGeneration: 8)
+
+        XCTAssertEqual(composed.map(\.message_id), ["authoritative-tail"])
+    }
+
+    func testComposedMessagesDropsStaleLiveMessagesWhenSnapshotGenerationIsNewer() {
+        let composed = AppModel.composedMessages(
+            snapshot: [message("authoritative-snapshot", sequence: 2)],
+            snapshotGeneration: 8,
+            live: [message("stale-live", sequence: 1)],
+            liveGeneration: 7)
+
+        XCTAssertEqual(composed.map(\.message_id), ["authoritative-snapshot"])
+    }
+
+    func testComposedMessagesUsesSnapshotUntilLiveGenerationIsKnown() {
+        let composed = AppModel.composedMessages(
+            snapshot: [message("authoritative-snapshot", sequence: 1)],
+            snapshotGeneration: 8,
+            live: [message("unproven-live", sequence: 2)],
+            liveGeneration: nil)
+
+        XCTAssertEqual(composed.map(\.message_id), ["authoritative-snapshot"])
+    }
+
+    func testProductConversationDetailDelegatesOpenAggregateToAuthoritativeTranscript() {
+        var snapshot = historySnapshot(segments: [])
+        snapshot.ordinary_lifecycle = .open
+        snapshot.latest_transcript_row_id = "latest"
+        snapshot.writable_transcript_row_id = "writable"
+
+        XCTAssertEqual(
+            ProductConversationDetailPolicy.delegateTranscriptRowId(
+                snapshot: snapshot,
+                historyOnly: false),
+            "writable")
+
+        snapshot.writable_transcript_row_id = nil
+        XCTAssertEqual(
+            ProductConversationDetailPolicy.delegateTranscriptRowId(
+                snapshot: snapshot,
+                historyOnly: false),
+            "latest")
+
+        snapshot.ordinary_lifecycle = .history
+        XCTAssertNil(ProductConversationDetailPolicy.delegateTranscriptRowId(
+            snapshot: snapshot,
+            historyOnly: false))
+
+        snapshot.ordinary_lifecycle = .open
+        XCTAssertNil(ProductConversationDetailPolicy.delegateTranscriptRowId(
+            snapshot: snapshot,
+            historyOnly: true))
+    }
+
+    func testToolUseIndexBuildsFromComposedMessages() {
+        var toolUse = message("tool-use", sequence: 1)
+        toolUse.message_type = "agent"
+        toolUse.content = .array([
+            .object([
+                "type": .string("tool_use"),
+                "id": .string("call-1"),
+                "name": .string("bash"),
+                "input": .object(["cmd": .string("pwd")]),
+            ]),
+        ])
+
+        XCTAssertEqual(
+            ConversationSession.toolUseIndex(for: [toolUse])["call-1"],
+            ToolUseRef(
+                name: "bash",
+                input: .object(["cmd": .string("pwd")])))
+    }
+
     func testAttentionMergeIncludesCoordinatorWithoutContaminatingOrdinaryList() {
         let ordinary = [conversation(id: "ordinary", aggregateId: "pc-ordinary")]
         let coordinator = conversation(
@@ -403,6 +510,7 @@ final class AppModelProductConversationTests: XCTestCase {
                 ProductConversationSegment(
                     segment_ordinal: 1,
                     transcript_row_id: "successor",
+                    transcript_generation: 11,
                     slug: "successor",
                     title: "Successor",
                     messages: [message("m4", sequence: 2), message("m3", sequence: 1)],
@@ -410,6 +518,7 @@ final class AppModelProductConversationTests: XCTestCase {
                 ProductConversationSegment(
                     segment_ordinal: 0,
                     transcript_row_id: "root",
+                    transcript_generation: 7,
                     slug: "root",
                     title: "Root",
                     messages: [message("m2", sequence: 2)],
@@ -426,6 +535,7 @@ final class AppModelProductConversationTests: XCTestCase {
             ProductConversationSegment(
                 segment_ordinal: 0,
                 transcript_row_id: "root",
+                transcript_generation: 7,
                 slug: "root",
                 title: "Root",
                 messages: [message("m2", sequence: 2), message("m1", sequence: 1)],
@@ -451,6 +561,7 @@ final class AppModelProductConversationTests: XCTestCase {
             ProductConversationSegment(
                 segment_ordinal: 0,
                 transcript_row_id: "root",
+                transcript_generation: 7,
                 slug: "root",
                 title: "Root",
                 messages: [message("cached", sequence: 1)],
@@ -479,6 +590,7 @@ final class AppModelProductConversationTests: XCTestCase {
             ProductConversationSegment(
                 segment_ordinal: 0,
                 transcript_row_id: "root",
+                transcript_generation: 7,
                 slug: "root",
                 title: "Root",
                 messages: [message("cached", sequence: 1)],
@@ -655,11 +767,40 @@ final class AppModelProductConversationTests: XCTestCase {
             now: now))
     }
 
-    func testProductHistoryLoadKeyChangesOnOfflineToOnlineTransition() {
-        let offline = ProductHistoryLoadKey(productConversationId: "product", isOnline: false)
-        let online = ProductHistoryLoadKey(productConversationId: "product", isOnline: true)
+    func testProductHistoryLoadKeyChangesWhenAggregateAuthorityChanges() {
+        let initial = ProductHistoryLoadKey(
+            productConversationId: "product",
+            isOnline: false,
+            fallbackTranscriptRowId: "first",
+            historyOnly: false)
 
-        XCTAssertNotEqual(offline, online)
+        XCTAssertNotEqual(initial, ProductHistoryLoadKey(
+            productConversationId: "product",
+            isOnline: true,
+            fallbackTranscriptRowId: "first",
+            historyOnly: false))
+        XCTAssertNotEqual(initial, ProductHistoryLoadKey(
+            productConversationId: "product",
+            isOnline: false,
+            fallbackTranscriptRowId: "second",
+            historyOnly: false))
+        XCTAssertNotEqual(initial, ProductHistoryLoadKey(
+            productConversationId: "product",
+            isOnline: false,
+            fallbackTranscriptRowId: "first",
+            historyOnly: true))
+        XCTAssertNotEqual(initial, ProductHistoryLoadKey(
+            productConversationId: "product",
+            isOnline: false,
+            fallbackTranscriptRowId: "first",
+            historyOnly: false,
+            delegateTranscriptGeneration: 2))
+        XCTAssertNotEqual(initial, ProductHistoryLoadKey(
+            productConversationId: "product",
+            isOnline: false,
+            fallbackTranscriptRowId: "first",
+            historyOnly: false,
+            fallbackSessionIsLive: true))
     }
 
     func testCloseCompletionGenerationsAreScopedByProduct() {
@@ -681,14 +822,23 @@ final class AppModelProductConversationTests: XCTestCase {
         XCTAssertFalse(tracker.isCurrent(replacementA, productConversationId: "product-a"))
     }
 
-    func testArchivedTranscriptNotificationAliasRoutesToProductHistoryAggregate() {
+    func testTranscriptNotificationAliasRoutesToProductConversationAggregate() {
         let model = AppModel()
-        model.listStore.upsert(conversation(id: "root-row", aggregateId: "pc-history"))
+        model.listStore.upsert(conversation(id: "open-row", aggregateId: "pc-open"))
         model.listStore.upsert(conversation(
-            id: "latest-row", aggregateId: "pc-history", archived: true))
+            id: "history-row", aggregateId: "pc-history", archived: true))
 
-        XCTAssertEqual(model.notificationNavigationId(for: "root-row"), "pc-history")
-        XCTAssertEqual(model.notificationNavigationId(for: "latest-row"), "pc-history")
+        XCTAssertEqual(model.notificationNavigationId(for: "open-row"), "pc-open")
+        XCTAssertEqual(model.notificationNavigationId(for: "history-row"), "pc-history")
+        XCTAssertEqual(model.notificationNavigationId(for: "ordinary-row"), "ordinary-row")
+
+        model.listStore.upsert(conversation(
+            id: "coordinator-row",
+            aggregateId: "pc-coordinator",
+            runtimeRole: "coordinator"))
+        XCTAssertEqual(
+            model.notificationNavigationId(for: "coordinator-row"),
+            "coordinator-row")
     }
 
     func testPendingCloseResolutionTrackerSerializesActionsAndInvalidatesResetCompletion() {

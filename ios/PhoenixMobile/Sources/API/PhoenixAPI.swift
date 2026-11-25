@@ -62,6 +62,10 @@ enum APIError: Error, LocalizedError {
         serverErrorType == "close_already_history"
     }
 
+    var isStaleProductConversationCursor: Bool {
+        serverErrorType == "stale_product_conversation_cursor"
+    }
+
     var serverErrorType: String? {
         guard case .http(_, let body) = self,
               let data = body.data(using: .utf8),

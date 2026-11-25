@@ -1,11 +1,22 @@
 import SwiftUI
 
+enum ProductConversationReadPolicy {
+    static func advance(
+        productConversationId: String,
+        acknowledgedProductId: String?
+    ) -> ProductConversationReadAdvance {
+        acknowledgedProductId == productConversationId ? .observed : .acknowledged
+    }
+}
+
 /// One conversation: cached history + live SSE updates + outbox chips +
 /// composer. Fully readable offline; sends queue while disconnected.
 struct ConversationView: View {
     @Environment(AppModel.self) private var model
     @Environment(\.scenePhase) private var scenePhase
     let session: ConversationSession
+    var showsComposer = true
+    var advancesRead = true
 
     @State private var draft = ""
     /// ProductConversation already acknowledged during this visit; later
@@ -57,7 +68,9 @@ struct ConversationView: View {
                     streamingText: session.streamingText,
                     outboxSession: session)
                 StateDetailView(session: session)
-                ComposerView(session: session, draft: $draft)
+                if showsComposer {
+                    ComposerView(session: session, draft: $draft)
+                }
             }
         }
         .navigationTitle(navigationTitle)
@@ -81,11 +94,13 @@ struct ConversationView: View {
     }
 
     private func advanceRead() {
-        guard scenePhase == .active,
+        guard advancesRead,
+              scenePhase == .active,
               let productId = session.conversation?.product_conversation_id
         else { return }
-        let advance: ProductConversationReadAdvance =
-            acknowledgedProductId == productId ? .observed : .acknowledged
+        let advance = ProductConversationReadPolicy.advance(
+            productConversationId: productId,
+            acknowledgedProductId: acknowledgedProductId)
         Task {
             let advanced = await model.advanceRead(productConversationId: productId, advance: advance)
             if advanced, advance == .acknowledged { acknowledgedProductId = productId }
@@ -238,9 +253,12 @@ struct StreamingBubble: View {
 /// server's copy of the same message_id lands.
 struct OutboxSection: View {
     let session: ConversationSession
+    var authoritativeMessageIds: Set<String> = []
 
     var body: some View {
-        ForEach(session.outbox.visibleEntries) { entry in
+        ForEach(session.outbox.visibleEntries.filter {
+            !$0.isReflected(in: authoritativeMessageIds)
+        }) { entry in
             OutboxEntryView(entry: entry, session: session)
         }
         .accessibilityElement(children: .combine)
