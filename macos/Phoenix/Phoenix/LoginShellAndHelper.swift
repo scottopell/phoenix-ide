@@ -557,3 +557,143 @@ final class AuthHelperTestRunner: ObservableObject {
         }
     }
 }
+
+struct LaunchdPlistHint: Equatable, Sendable {
+    let port: Int
+    let tlsEnabled: Bool
+}
+
+struct DetectedLocalServer: Equatable, Sendable {
+    let origin: PhoenixOrigin
+    let version: VersionInfo?
+    let tlsTrustRequired: Bool
+    let isLaunchdInstalled: Bool
+}
+
+enum LocalDeploymentDetector {
+    static let defaultLaunchdLabel = "com.phoenix-ide.server"
+    static let defaultPort = 8031
+
+    static func launchdPlistURL(userHome: URL = FileManager.default.homeDirectoryForCurrentUser) -> URL {
+        userHome
+            .appendingPathComponent("Library", isDirectory: true)
+            .appendingPathComponent("LaunchAgents", isDirectory: true)
+            .appendingPathComponent("\(defaultLaunchdLabel).plist")
+    }
+
+    static func parseLaunchdPlist(data: Data) -> LaunchdPlistHint? {
+        guard let plist = try? PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any] else {
+            return nil
+        }
+        let env = plist["EnvironmentVariables"] as? [String: Any] ?? [:]
+
+        var port = defaultPort
+        if let sockets = plist["Sockets"] as? [String: Any],
+           let listeners = sockets["Listeners"] as? [String: Any],
+           let rawService = listeners["SockServiceName"],
+           let parsedPort = intValue(rawService),
+           (1...65_535).contains(parsedPort) {
+            port = parsedPort
+        } else if let rawEnvPort = env["PHOENIX_PORT"],
+                  let parsedPort = intValue(rawEnvPort),
+                  (1...65_535).contains(parsedPort) {
+            port = parsedPort
+        }
+
+        let tlsMode = (env["PHOENIX_TLS"] as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased() ?? ""
+        let certPath = (env["PHOENIX_TLS_CERT_PATH"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let keyPath = (env["PHOENIX_TLS_KEY_PATH"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let hasManualPaths = !certPath.isEmpty && !keyPath.isEmpty
+        let tlsEnabled = hasManualPaths || ["1", "true", "on", "auto", "manual"].contains(tlsMode)
+
+        return LaunchdPlistHint(port: port, tlsEnabled: tlsEnabled)
+    }
+
+    static func candidateOrigins(hint: LaunchdPlistHint?) -> [PhoenixOrigin] {
+        let port = hint?.port ?? defaultPort
+        let preferHTTPS = hint?.tlsEnabled ?? true
+        let schemes = preferHTTPS ? ["https", "http"] : ["http", "https"]
+        return schemes.compactMap { try? PhoenixOrigin("\($0)://localhost:\(port)") }
+    }
+
+    static func detect(
+        userHome: URL = FileManager.default.homeDirectoryForCurrentUser,
+        timeoutSeconds: TimeInterval = 1.5
+    ) async -> DetectedLocalServer? {
+        let plistURL = launchdPlistURL(userHome: userHome)
+        let hint: LaunchdPlistHint? = (try? Data(contentsOf: plistURL)).flatMap(parseLaunchdPlist)
+        let isLaunchdInstalled = hint != nil
+        let candidates = candidateOrigins(hint: hint)
+
+        var tlsBlockedOrigin: PhoenixOrigin?
+        for origin in candidates {
+            let outcome = await probeVersion(at: origin, timeoutSeconds: timeoutSeconds)
+            switch outcome {
+            case .found(let version):
+                return DetectedLocalServer(
+                    origin: origin,
+                    version: version,
+                    tlsTrustRequired: false,
+                    isLaunchdInstalled: isLaunchdInstalled
+                )
+            case .tlsTrustFailure:
+                tlsBlockedOrigin = origin
+            case .unavailable:
+                continue
+            }
+        }
+
+        if let tlsBlockedOrigin {
+            return DetectedLocalServer(
+                origin: tlsBlockedOrigin,
+                version: nil,
+                tlsTrustRequired: true,
+                isLaunchdInstalled: isLaunchdInstalled
+            )
+        }
+        return nil
+    }
+
+    enum ProbeOutcome: Equatable, Sendable {
+        case found(VersionInfo)
+        case tlsTrustFailure
+        case unavailable
+    }
+
+    static func probeVersion(at origin: PhoenixOrigin, timeoutSeconds: TimeInterval = 1.5) async -> ProbeOutcome {
+        var request = URLRequest(url: origin.url(path: "/api/version"))
+        request.timeoutInterval = timeoutSeconds
+        let delegate = RedirectRejectingURLSessionDelegate(expectedOrigin: origin)
+        let session = URLSession(configuration: .ephemeral, delegate: delegate, delegateQueue: nil)
+        defer { session.invalidateAndCancel() }
+        do {
+            let (data, response) = try await session.data(for: request)
+            guard let http = response as? HTTPURLResponse,
+                  http.statusCode == 200,
+                  let finalURL = response.url,
+                  origin.exactlyMatches(finalURL),
+                  let version = try? JSONDecoder().decode(VersionInfo.self, from: data) else {
+                return .unavailable
+            }
+            return .found(version)
+        } catch let urlError as URLError {
+            if urlError.code == .serverCertificateUntrusted
+                || urlError.code == .serverCertificateHasUnknownRoot
+                || urlError.code == .serverCertificateHasBadDate
+                || urlError.code == .serverCertificateNotYetValid {
+                return .tlsTrustFailure
+            }
+            return .unavailable
+        } catch {
+            return .unavailable
+        }
+    }
+
+    private static func intValue(_ value: Any) -> Int? {
+        if let intVal = value as? Int { return intVal }
+        if let strVal = value as? String { return Int(strVal.trimmingCharacters(in: .whitespacesAndNewlines)) }
+        return nil
+    }
+}

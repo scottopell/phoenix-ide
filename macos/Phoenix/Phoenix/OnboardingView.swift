@@ -344,6 +344,8 @@ struct OnboardingView: View {
     @State private var anthropicKey = ""
     @State private var openAIKey = ""
     @State private var attachedOrigin = ConfigurationStore.defaultAttachedOrigin
+    @State private var userEditedAttachedOrigin = false
+    @State private var detectedLocalServer: DetectedLocalServer?
     @State private var errorMessage: String?
     @StateObject private var helperTestRunner = AuthHelperTestRunner()
 
@@ -382,6 +384,10 @@ struct OnboardingView: View {
             Spacer(minLength: 16)
             VStack(alignment: .leading, spacing: 20) {
                 header
+
+                if let detected = detectedLocalServer, !showExistingServer {
+                    detectedLocalServerBanner(detected)
+                }
 
                 if showExistingServer {
                     existingServerPanel
@@ -426,9 +432,61 @@ struct OnboardingView: View {
                 loadedExistingToml = true
             }
         }
+        .task {
+            let detected = await LocalDeploymentDetector.detect()
+            guard let detected else { return }
+            detectedLocalServer = detected
+            if !userEditedAttachedOrigin {
+                attachedOrigin = detected.origin.description
+            }
+        }
         .onDisappear {
             helperTestRunner.cancel()
         }
+    }
+
+    @ViewBuilder
+    private func detectedLocalServerBanner(_ detected: DetectedLocalServer) -> some View {
+        HStack(alignment: .center, spacing: 12) {
+            Image(systemName: detected.tlsTrustRequired ? "lock.trianglebadge.exclamationmark.fill" : "bolt.horizontal.circle.fill")
+                .font(.title3)
+                .foregroundStyle(detected.tlsTrustRequired ? .orange : .green)
+
+            VStack(alignment: .leading, spacing: 2) {
+                if let version = detected.version {
+                    Text("Running Phoenix detected (\(version.version))")
+                        .font(.subheadline)
+                        .fontWeight(.medium)
+                    Text("\(detected.origin.description) — connect directly without starting a second copy.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                } else {
+                    Text("HTTPS Phoenix detected at \(detected.origin.description)")
+                        .font(.subheadline)
+                        .fontWeight(.medium)
+                    Text("Trust ~/.phoenix-ide/tls/phoenix-local-ca.pem in Keychain, then connect.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+
+            Spacer()
+
+            Button("Connect") {
+                attachedOrigin = detected.origin.description
+                connectExistingServer()
+            }
+            .buttonStyle(.borderedProminent)
+            .controlSize(.small)
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background((detected.tlsTrustRequired ? Color.orange : Color.green).opacity(0.08))
+        .clipShape(RoundedRectangle(cornerRadius: 8))
+        .overlay(
+            RoundedRectangle(cornerRadius: 8)
+                .stroke((detected.tlsTrustRequired ? Color.orange : Color.green).opacity(0.3), lineWidth: 1)
+        )
     }
 
     private var header: some View {
@@ -506,8 +564,29 @@ struct OnboardingView: View {
             Text("Server URL")
                 .font(.subheadline)
                 .fontWeight(.medium)
-            TextField("http://localhost:8031", text: $attachedOrigin)
-                .textFieldStyle(.roundedBorder)
+            TextField("http://localhost:8031", text: Binding(
+                get: { attachedOrigin },
+                set: {
+                    attachedOrigin = $0
+                    userEditedAttachedOrigin = true
+                }
+            ))
+            .textFieldStyle(.roundedBorder)
+            if let detected = detectedLocalServer {
+                HStack(spacing: 6) {
+                    Image(systemName: detected.tlsTrustRequired ? "exclamationmark.triangle.fill" : "checkmark.circle.fill")
+                        .foregroundStyle(detected.tlsTrustRequired ? .orange : .green)
+                    if let version = detected.version {
+                        Text("Detected local Phoenix v\(version.version) at \(detected.origin.description)")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    } else {
+                        Text("Detected HTTPS Phoenix at \(detected.origin.description) (CA trust required)")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            }
             Text("Connects to an existing local or remote Phoenix server (HTTP allowed on localhost; HTTPS required for remote hosts). Quitting Phoenix.app leaves that server running.")
                 .font(.caption)
                 .foregroundStyle(.secondary)

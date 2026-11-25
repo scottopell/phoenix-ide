@@ -52,6 +52,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         showWindow()
     }
 
+    func switchAttachedOriginAndReconnect(_ origin: PhoenixOrigin) {
+        do {
+            var draft = persistence.loadConnectionDraft().draft
+            draft.mode = .attached
+            draft.attachedOrigin = origin.description
+            let persisted = try persistence.persist(draft: draft)
+            try serverManager.reconnect(to: persisted.candidate)
+        } catch {
+            serverManager.showFailure(message: error.localizedDescription)
+        }
+    }
+
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
         if ReopenDecision.shouldShowMainWindow(mainWindowIsVisible: window?.isVisible == true) {
             showWindow()
@@ -244,7 +256,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         if let failure = state.failureViewModel {
-            window.contentView = NSHostingView(rootView: ErrorView(message: failure.message) { [weak self] in
+            window.contentView = NSHostingView(rootView: ErrorView(
+                origin: serverManager.webOrigin?.description,
+                message: failure.message,
+                suggestedOrigin: failure.suggestedOrigin,
+                onSwitchOrigin: { [weak self] suggested in
+                    self?.switchAttachedOriginAndReconnect(suggested)
+                }
+            ) { [weak self] in
                 guard failure.allowsReconnect else { return }
                 self?.serverManager.reconnect()
             })

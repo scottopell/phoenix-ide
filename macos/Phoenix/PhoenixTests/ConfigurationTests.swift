@@ -2141,4 +2141,54 @@ final class ServerManagerHelpersTests: XCTestCase {
         XCTAssertTrue(request.requiresReconnect)
         XCTAssertTrue(request.forceRestart)
     }
+
+    func testPhoenixOriginAlternateLoopbackSchemeFlipsOnlyLoopbackOrigins() throws {
+        XCTAssertEqual(
+            try PhoenixOrigin("http://localhost:8031").alternateLoopbackSchemeOrigin?.description,
+            "https://localhost:8031"
+        )
+        XCTAssertEqual(
+            try PhoenixOrigin("https://127.0.0.1:8031").alternateLoopbackSchemeOrigin?.description,
+            "http://127.0.0.1:8031"
+        )
+        XCTAssertNil(try PhoenixOrigin("https://phoenix.example.test:8031").alternateLoopbackSchemeOrigin)
+    }
+
+    func testLocalDeploymentDetectorParsesLaunchdPlistPortAndTLS() throws {
+        let httpsPlist = """
+        <?xml version="1.0" encoding="UTF-8"?>
+        <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+        <plist version="1.0">
+        <dict>
+          <key>EnvironmentVariables</key>
+          <dict>
+            <key>PHOENIX_PORT</key>
+            <string>9443</string>
+            <key>PHOENIX_TLS</key>
+            <string>auto</string>
+          </dict>
+          <key>Sockets</key>
+          <dict>
+            <key>Listeners</key>
+            <dict>
+              <key>SockServiceName</key>
+              <string>9443</string>
+            </dict>
+          </dict>
+        </dict>
+        </plist>
+        """
+        let hint = try XCTUnwrap(LocalDeploymentDetector.parseLaunchdPlist(data: Data(httpsPlist.utf8)))
+        XCTAssertEqual(hint, LaunchdPlistHint(port: 9443, tlsEnabled: true))
+        XCTAssertEqual(
+            LocalDeploymentDetector.candidateOrigins(hint: hint).map(\.description),
+            ["https://localhost:9443", "http://localhost:9443"]
+        )
+
+        let httpHint = LaunchdPlistHint(port: 8031, tlsEnabled: false)
+        XCTAssertEqual(
+            LocalDeploymentDetector.candidateOrigins(hint: httpHint).map(\.description),
+            ["http://localhost:8031", "https://localhost:8031"]
+        )
+    }
 }

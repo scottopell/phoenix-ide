@@ -5,6 +5,13 @@ import Darwin
 struct FailureState: Equatable {
     let version: VersionInfo?
     let message: String
+    let suggestedOrigin: PhoenixOrigin?
+
+    init(version: VersionInfo?, message: String, suggestedOrigin: PhoenixOrigin? = nil) {
+        self.version = version
+        self.message = message
+        self.suggestedOrigin = suggestedOrigin
+    }
 }
 
 struct ConnectionLogBuffer: Equatable {
@@ -160,6 +167,13 @@ func isCertificateURLError(_ code: URLError.Code) -> Bool {
 struct ConnectionErrorViewModel: Equatable {
     let message: String
     let allowsReconnect: Bool
+    let suggestedOrigin: PhoenixOrigin?
+
+    init(message: String, allowsReconnect: Bool, suggestedOrigin: PhoenixOrigin? = nil) {
+        self.message = message
+        self.allowsReconnect = allowsReconnect
+        self.suggestedOrigin = suggestedOrigin
+    }
 }
 
 @MainActor
@@ -206,7 +220,11 @@ enum ConnectionState: Equatable {
     var failureViewModel: ConnectionErrorViewModel? {
         switch self {
         case .failed(let failure), .unavailable(let failure), .tlsFailure(let failure), .wrongService(let failure):
-            return ConnectionErrorViewModel(message: failure.message, allowsReconnect: true)
+            return ConnectionErrorViewModel(
+                message: failure.message,
+                allowsReconnect: true,
+                suggestedOrigin: failure.suggestedOrigin
+            )
         default:
             return nil
         }
@@ -1116,17 +1134,85 @@ final class ServerManager: ObservableObject {
         } catch {
             guard operation == operationAuthority.id else { return }
             if allowIntermediateFailureState {
-                applyIdentityFailure(classifyServerIdentityError(error), version: currentVersion)
+                let classified = classifyServerIdentityError(error)
+                if case .attached = selected,
+                   let mismatch = await detectLoopbackSchemeMismatch(for: selected.origin, initialError: error) {
+                    guard operation == operationAuthority.id else { return }
+                    applyIdentityFailure(mismatch.error, version: currentVersion, suggestedOrigin: mismatch.suggestedOrigin)
+                } else {
+                    applyIdentityFailure(
+                        contextualizedIdentityError(classified, origin: selected.origin),
+                        version: currentVersion
+                    )
+                }
             }
         }
     }
 
-    private func applyIdentityFailure(_ error: ServerIdentityError, version: VersionInfo?) {
+    private func detectLoopbackSchemeMismatch(
+        for origin: PhoenixOrigin,
+        initialError: Error
+    ) async -> (error: ServerIdentityError, suggestedOrigin: PhoenixOrigin)? {
+        guard let alternate = origin.alternateLoopbackSchemeOrigin,
+              let urlError = initialError as? URLError else {
+            return nil
+        }
+        let scheme = origin.url.scheme?.lowercased() ?? ""
+        let couldBeSchemeMismatch: Bool
+        if scheme == "http" {
+            couldBeSchemeMismatch = [
+                .networkConnectionLost,
+                .badServerResponse,
+                .cannotParseResponse,
+                .zeroByteResource,
+            ].contains(urlError.code)
+        } else {
+            couldBeSchemeMismatch = [
+                .secureConnectionFailed,
+                .networkConnectionLost,
+                .badServerResponse,
+            ].contains(urlError.code)
+        }
+        guard couldBeSchemeMismatch else { return nil }
+
+        let outcome = await LocalDeploymentDetector.probeVersion(at: alternate, timeoutSeconds: 1.5)
+        switch outcome {
+        case .found(let version):
+            let protocolLabel = alternate.url.scheme?.uppercased() ?? "HTTPS"
+            return (
+                .unavailable("Could not connect to \(origin.description). Phoenix v\(version.version) at this port is serving \(protocolLabel) — switch to \(alternate.description)."),
+                alternate
+            )
+        case .tlsTrustFailure:
+            return (
+                .tls("Could not connect to \(origin.description). This port is serving HTTPS, and macOS does not yet trust its certificate. Trust the Phoenix local CA in Keychain, then switch to \(alternate.description)."),
+                alternate
+            )
+        case .unavailable:
+            return nil
+        }
+    }
+
+    private func contextualizedIdentityError(_ error: ServerIdentityError, origin: PhoenixOrigin) -> ServerIdentityError {
+        let prefix = "Could not connect to \(origin.description): "
+        switch error {
+        case .tls(let message):
+            return .tls(message.hasPrefix("Could not connect") ? message : prefix + message)
+        case .wrongService(let message):
+            return .wrongService(message.hasPrefix("Could not connect") ? message : prefix + message)
+        case .unavailable(let message):
+            return .unavailable(message.hasPrefix("Could not connect") ? message : prefix + message)
+        case .redirected(let message):
+            return .redirected(message.hasPrefix("Could not connect") ? message : prefix + message)
+        }
+    }
+
+    private func applyIdentityFailure(_ error: ServerIdentityError, version: VersionInfo?, suggestedOrigin: PhoenixOrigin? = nil) {
         let failure = FailureState(version: version, message: {
             switch error {
             case .tls(let message), .wrongService(let message), .unavailable(let message), .redirected(let message): return message
             }
-        }())
+        }(), suggestedOrigin: suggestedOrigin)
         switch error {
         case .tls:
             state = .tlsFailure(failure)

@@ -1181,6 +1181,17 @@ struct PhoenixOrigin: Equatable, Codable, CustomStringConvertible {
         return URL(string: relative, relativeTo: url.appendingPathComponent("/"))!.absoluteURL
     }
 
+    var alternateLoopbackSchemeOrigin: PhoenixOrigin? {
+        guard var components = URLComponents(url: url, resolvingAgainstBaseURL: false),
+              let scheme = components.scheme?.lowercased(),
+              LoopbackAddressPolicy.allowsCleartextAttachedOrigin(host: components.host) else {
+            return nil
+        }
+        components.scheme = (scheme == "http") ? "https" : "http"
+        guard let flipped = components.url else { return nil }
+        return try? PhoenixOrigin(flipped.absoluteString)
+    }
+
     func exactlyMatches(_ candidate: URL) -> Bool {
         guard let lhs = URLComponents(url: url, resolvingAgainstBaseURL: false),
               let rhs = URLComponents(url: candidate, resolvingAgainstBaseURL: false) else { return false }
