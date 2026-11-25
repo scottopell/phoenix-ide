@@ -331,15 +331,17 @@ async fn question_reply_and_unknown_provenance_remain_readable_and_reconcilable(
         "user_api"
     );
 
-    sqlx::query("UPDATE coordinator_scan_evidence_origins SET origin_kind='future_origin' WHERE item_id=? AND evidence_ordinal=1")
-        .bind(&id).execute(&db.pool).await.unwrap();
-    let fallback = db.read_coordinator_tracking(&source, &id, 0).await.unwrap();
     let mut expected = original;
     expected["page_scanner_evidence_provenance"][0]["origin_kind"] = "unknown_historical".into();
-    assert_eq!(serde_json::to_value(&fallback).unwrap(), expected);
-    let stored: String = sqlx::query_scalar("SELECT origin_kind FROM coordinator_scan_evidence_origins WHERE item_id=? AND evidence_ordinal=1")
-        .bind(&id).fetch_one(&db.pool).await.unwrap();
-    assert_eq!(stored, "future_origin");
+    for label in ["future_origin", "\0future_origin"] {
+        sqlx::query("UPDATE coordinator_scan_evidence_origins SET origin_kind=? WHERE item_id=? AND evidence_ordinal=1")
+            .bind(label).bind(&id).execute(&db.pool).await.unwrap();
+        let fallback = db.read_coordinator_tracking(&source, &id, 0).await.unwrap();
+        assert_eq!(serde_json::to_value(&fallback).unwrap(), expected);
+        let stored: String = sqlx::query_scalar("SELECT origin_kind FROM coordinator_scan_evidence_origins WHERE item_id=? AND evidence_ordinal=1")
+            .bind(&id).fetch_one(&db.pool).await.unwrap();
+        assert_eq!(stored, label);
+    }
 
     native(
         &db,
@@ -399,7 +401,7 @@ async fn origin_label_migration_preserves_preexisting_question_reply_evidence() 
         .unwrap();
     assert!(before.contains("coordinator_question_reply"));
     assert_eq!(
-        crate::migrations::run_pending_migrations(&db.pool)
+        crate::migrations::run_through_for_test(&db.pool, 172)
             .await
             .unwrap(),
         1
@@ -438,6 +440,13 @@ async fn origin_label_migration_preserves_preexisting_question_reply_evidence() 
         "UPDATE coordinator_scan_evidence_origins SET origin_kind=NULL",
         "UPDATE coordinator_scan_evidence_origins SET origin_kind=X'01'",
         "UPDATE coordinator_scan_evidence_origins SET source_role='bad'",
+        "UPDATE coordinator_scan_evidence_origins SET source_generation=0",
+        "UPDATE coordinator_scan_evidence_origins SET source_generation=1.5",
+        "UPDATE coordinator_scan_evidence_origins SET fragment_id=' '",
+        "UPDATE coordinator_scan_evidence_origins SET utf8_start=-1",
+        "UPDATE coordinator_scan_evidence_origins SET utf8_start=0.5",
+        "UPDATE coordinator_scan_evidence_origins SET utf8_end=utf8_start",
+        "UPDATE coordinator_scan_evidence_origins SET utf8_end=utf8_end+0.5",
         "UPDATE coordinator_scan_evidence_origins SET attempt_id=-1",
         "UPDATE coordinator_scan_evidence_origins SET evidence_ordinal=-1",
     ] {
