@@ -2796,16 +2796,20 @@ where
 
     /// Close admission synchronously, whether or not an entered leaf has drained.
     fn try_revoke_native_close_source_entry(&mut self) -> bool {
-        self.native_close_source_entry.as_mut().is_none_or(|controller| {
-            controller.revoke() != native_close::source_entry::ActorEntryResult::Busy
-        })
+        self.native_close_source_entry
+            .as_mut()
+            .is_none_or(|controller| {
+                controller.revoke() != native_close::source_entry::ActorEntryResult::Busy
+            })
     }
 
     /// Before changing the source, wait for a leaf already holding its short
     /// guard. Fatal unknown custody may never unlock and forbids publication.
     async fn revoke_native_close_source_entry(&mut self) {
         while !self.try_revoke_native_close_source_entry()
-            && !self.fatal_local_authority_fence.fatal_authority_loss_is_latched()
+            && !self
+                .fatal_local_authority_fence
+                .fatal_authority_loss_is_latched()
         {
             tokio::task::yield_now().await;
         }
@@ -3384,7 +3388,9 @@ where
             () => {
                 if let Some(continuation) = pending_native_close_initial.as_mut() {
                     continuation.abort_inspection_if_source_revoked(&self.state);
-                    if continuation.phase == native_close::NativeCloseInitialContinuationPhase::InspectionRequired {
+                    if continuation.phase
+                        == native_close::NativeCloseInitialContinuationPhase::InspectionRequired
+                    {
                         continuation.abort_and_join_inventory_preparation().await;
                     }
                     if continuation.release_if_exactly_terminal().await {
@@ -3440,7 +3446,9 @@ where
         .then(|| tokio::time::Instant::now() + Duration::from_secs(30));
         'runtime_events: loop {
             if self.local_terminal_authority == LocalTerminalAuthority::Fatal
-                || self.fatal_local_authority_fence.fatal_authority_loss_is_latched()
+                || self
+                    .fatal_local_authority_fence
+                    .fatal_authority_loss_is_latched()
             {
                 join_pending_native_close_before_fatal!();
                 return self.fatal_local_authority_exit();
@@ -3453,7 +3461,8 @@ where
                     .take()
                     .expect("checked deferred exit");
             }
-            if self.fatal_local_authority_fence.is_closed() && deferred_native_close_exit.is_none() {
+            if self.fatal_local_authority_fence.is_closed() && deferred_native_close_exit.is_none()
+            {
                 self.revoke_native_close_source_entry().await;
                 self.abort_external_effects().await;
                 defer_exit_until_native_close_observed!(
@@ -3486,7 +3495,11 @@ where
                 queued_event = self.event_rx.try_recv().ok();
             }
             if deferred_native_close_exit.is_none() && !self.has_pending_cancellation() {
-                if let Some(input) = self.cancellation_input_rx.as_mut().and_then(|rx| rx.try_recv().ok()) {
+                if let Some(input) = self
+                    .cancellation_input_rx
+                    .as_mut()
+                    .and_then(|rx| rx.try_recv().ok())
+                {
                     self.retain_cancellation_input(input);
                 }
             }
@@ -3502,7 +3515,9 @@ where
                     matches!(event, Event::UserCancel { .. } | Event::Shutdown)
                 });
             let source_control_ready = deferred_native_close_exit.is_none()
-                && (cancellation_control_ready || acknowledged_control_ready || event_control_ready);
+                && (cancellation_control_ready
+                    || acknowledged_control_ready
+                    || event_control_ready);
             // While Close is active, alternate retained non-control heads too:
             // traffic on one queue cannot hide a Stop behind the other's FIFO head.
             let serve_queued_event = close_active

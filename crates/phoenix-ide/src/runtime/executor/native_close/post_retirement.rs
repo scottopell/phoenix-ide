@@ -150,13 +150,17 @@ impl PostRetirement {
         {
             if let Some(preparation) = self.worktree_preparation.as_ref() {
                 if !preparation.is_finished() {
-                    return if deadline.is_none_or(|deadline| std::time::Instant::now() >= deadline) {
+                    return if deadline.is_none_or(|deadline| std::time::Instant::now() >= deadline)
+                    {
                         ExitCustodyPoll::Fatal
                     } else {
                         ExitCustodyPoll::Pending
                     };
                 }
-                let preparation = self.worktree_preparation.take().expect("checked preparation");
+                let preparation = self
+                    .worktree_preparation
+                    .take()
+                    .expect("checked preparation");
                 match preparation.await {
                     Ok(_) => {}
                     Err(error) => {
@@ -170,7 +174,8 @@ impl PostRetirement {
                     return ExitCustodyPoll::Fatal;
                 }
                 if !physical.is_ready() {
-                    return if deadline.is_none_or(|deadline| std::time::Instant::now() >= deadline) {
+                    return if deadline.is_none_or(|deadline| std::time::Instant::now() >= deadline)
+                    {
                         ExitCustodyPoll::Fatal
                     } else {
                         ExitCustodyPoll::Pending

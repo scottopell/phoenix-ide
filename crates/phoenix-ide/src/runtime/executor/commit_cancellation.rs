@@ -14,7 +14,13 @@ pub(super) struct ObservedCancellation {
 }
 
 pub(super) fn refuse_during_exit(input: CancellationInput) {
-    if let (_, CancellationReceipt::Acknowledged { acknowledgement, .. }) = input.into_parts() {
+    if let (
+        _,
+        CancellationReceipt::Acknowledged {
+            acknowledgement, ..
+        },
+    ) = input.into_parts()
+    {
         let _ = acknowledgement.send(Err("runtime is exiting".into()));
     }
 }
@@ -125,7 +131,8 @@ impl<S: Storage + Clone + 'static, L: LlmClient + 'static, T: ToolExecutor + 'st
                 phase: CutoffPhase::Pending,
             })
         });
-        self.cancellation_custody = CancellationCustody::Pending(ObservedCancellation { input, cutoff });
+        self.cancellation_custody =
+            CancellationCustody::Pending(ObservedCancellation { input, cutoff });
     }
 
     pub(super) fn service_cancellation_resource_cutoff(&mut self) {
@@ -206,14 +213,19 @@ impl<S: Storage + Clone + 'static, L: LlmClient + 'static, T: ToolExecutor + 'st
             {
                 self.service_cancellation_resource_cutoff();
             }
-            if self.fatal_local_authority_fence.fatal_authority_loss_is_latched()
+            if self
+                .fatal_local_authority_fence
+                .fatal_authority_loss_is_latched()
                 || self.try_revoke_native_close_source_entry()
             {
                 break;
             }
             tokio::task::yield_now().await;
         }
-        let mut result = if self.fatal_local_authority_fence.fatal_authority_loss_is_latched() {
+        let mut result = if self
+            .fatal_local_authority_fence
+            .fatal_authority_loss_is_latched()
+        {
             Err("runtime processing closed after fatal local authority loss".into())
         } else if matches!(&receipt, CancellationReceipt::Acknowledged { .. }) {
             self.process_acknowledged_event(event).await
@@ -254,8 +266,8 @@ impl<S: Storage + Clone + 'static, L: LlmClient + 'static, T: ToolExecutor + 'st
         if terminal && !fatal {
             self.emit_terminal_lifecycle_event().await;
         }
-        let interrupted = self.creation_settlement_disposition
-            == CreationSettlementDisposition::StaleAuthority;
+        let interrupted =
+            self.creation_settlement_disposition == CreationSettlementDisposition::StaleAuthority;
         match receipt {
             CancellationReceipt::Addressed => {
                 if let Err(error) = result {

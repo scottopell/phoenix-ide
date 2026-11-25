@@ -17645,7 +17645,8 @@ mod tests {
     #[tokio::test]
     async fn close_tail_upgrades_base_171_and_main_172_to_cached_schema_idempotently() {
         let ledger_query = "SELECT version, name, applied_at FROM _migrations ORDER BY version";
-        let schema_query = "SELECT type, name, tbl_name, sql FROM sqlite_schema ORDER BY type, name";
+        let schema_query =
+            "SELECT type, name, tbl_name, sql FROM sqlite_schema ORDER BY type, name";
         let cached = crate::Database::open_in_memory().await.unwrap();
         let cached_schema: Vec<(String, String, String, Option<String>)> =
             sqlx::query_as(schema_query)
@@ -17670,26 +17671,20 @@ mod tests {
             let db = crate::Database::open(path).await.unwrap();
             let pool = db.pool();
             run_through_for_test(pool, prefix).await.unwrap();
-            let before: Vec<(u32, String, String)> = sqlx::query_as(ledger_query)
-                .fetch_all(pool)
-                .await
-                .unwrap();
+            let before: Vec<(u32, String, String)> =
+                sqlx::query_as(ledger_query).fetch_all(pool).await.unwrap();
             assert_eq!(before.last().unwrap().0, prefix);
 
             assert_eq!(run_pending_migrations(pool).await.unwrap(), pending);
-            let installed: Vec<(u32, String, String)> = sqlx::query_as(ledger_query)
-                .fetch_all(pool)
-                .await
-                .unwrap();
+            let installed: Vec<(u32, String, String)> =
+                sqlx::query_as(ledger_query).fetch_all(pool).await.unwrap();
             assert!(installed.starts_with(&before));
             assert!(installed
                 .iter()
                 .map(|(version, name, _)| (version, name))
                 .eq(cached_ledger.iter().map(|(version, name)| (version, name))));
-            let schema: Vec<(String, String, String, Option<String>)> = sqlx::query_as(schema_query)
-                .fetch_all(pool)
-                .await
-                .unwrap();
+            let schema: Vec<(String, String, String, Option<String>)> =
+                sqlx::query_as(schema_query).fetch_all(pool).await.unwrap();
             assert_eq!(schema, cached_schema);
             assert!(sqlx::query("PRAGMA foreign_key_check")
                 .fetch_all(pool)
@@ -17697,10 +17692,8 @@ mod tests {
                 .unwrap()
                 .is_empty());
             assert_eq!(run_pending_migrations(pool).await.unwrap(), 0);
-            let again: Vec<(u32, String, String)> = sqlx::query_as(ledger_query)
-                .fetch_all(pool)
-                .await
-                .unwrap();
+            let again: Vec<(u32, String, String)> =
+                sqlx::query_as(ledger_query).fetch_all(pool).await.unwrap();
             assert_eq!(again, installed);
         }
     }

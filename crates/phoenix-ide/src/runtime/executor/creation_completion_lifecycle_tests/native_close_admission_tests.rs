@@ -1527,7 +1527,9 @@ async fn queued_stop_in_cancellation_inbox_wins_over_due_close_settlement() {
     let (ordinary_ack, _) = mpsc::channel(1);
     let (_, stop_sender, cancellation_rx) =
         crate::runtime::cancellation_inbox::channel(harness.event_tx.clone(), ordinary_ack);
-    harness.runtime = harness.runtime.with_cancellation_input_receiver(cancellation_rx);
+    harness.runtime = harness
+        .runtime
+        .with_cancellation_input_receiver(cancellation_rx);
     let close_sender = setup_actor_queue(&mut harness);
     let gate = Arc::new(Mutex::new(()));
     let (response, _close_reply) = oneshot::channel();
@@ -1575,7 +1577,10 @@ async fn queued_stop_in_cancellation_inbox_wins_over_due_close_settlement() {
         ack = tokio::time::timeout(std::time::Duration::from_secs(10), stop_ack) => ack,
         exit = &mut actor => panic!("actor exited before Stop was acknowledged: {exit:?}"),
     };
-    assert_eq!(stopped.unwrap().unwrap().unwrap(), AcknowledgedEventOutcome::Settled);
+    assert_eq!(
+        stopped.unwrap().unwrap().unwrap(),
+        AcknowledgedEventOutcome::Settled
+    );
     assert!(
         matches!(settlement_entries.try_recv(), Err(mpsc::error::TryRecvError::Empty)),
         "due Close must not enter settlement ahead of the queued inbox Stop, even if settlement would fail"
@@ -1588,7 +1593,10 @@ async fn queued_stop_in_cancellation_inbox_wins_over_due_close_settlement() {
             .unwrap(),
         RuntimeExitDisposition::CoordinatedShutdown,
     );
-    assert!(gate.try_lock().is_ok(), "actor exit must observe Close owner release");
+    assert!(
+        gate.try_lock().is_ok(),
+        "actor exit must observe Close owner release"
+    );
 }
 
 #[tokio::test]
@@ -2285,7 +2293,10 @@ async fn initial_exit_retains_inspection_collector_before_terminal_interruption(
     let (response, _reply) = oneshot::channel();
     let (mut continuation, fence) =
         admit_initial_continuation(&fixture, Arc::clone(&gate), response).await;
-    assert_eq!(continuation.step(&fixture.state).await.unwrap(), Phase::Settle);
+    assert_eq!(
+        continuation.step(&fixture.state).await.unwrap(),
+        Phase::Settle
+    );
     assert_eq!(
         continuation.step(&fixture.state).await.unwrap(),
         Phase::ReachedSettlementPhase(ClosePhase::AwaitingRetirementInspection)
@@ -2307,7 +2318,10 @@ async fn initial_exit_retains_inspection_collector_before_terminal_interruption(
         continuation.step(&fixture.state).await.unwrap(),
         Phase::ClassifyingExitInterruption
     );
-    assert!(gate.try_lock().is_err(), "pending collector must retain target gate");
+    assert!(
+        gate.try_lock().is_err(),
+        "pending collector must retain target gate"
+    );
     assert_eq!(fence.active_authoritative_effect_count(), 1);
     assert!(!continuation.release_if_exactly_terminal().await);
     let obligation = fixture

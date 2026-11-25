@@ -162,8 +162,14 @@ impl ProcessRetirement {
         &mut self,
         deadline: Option<std::time::Instant>,
     ) -> super::post_retirement::ExitCustodyPoll {
-        if self.worker.as_ref().is_some_and(|worker| !worker.is_finished())
-            || self.entry.as_ref().is_some_and(|entry| !entry.is_finished())
+        if self
+            .worker
+            .as_ref()
+            .is_some_and(|worker| !worker.is_finished())
+            || self
+                .entry
+                .as_ref()
+                .is_some_and(|entry| !entry.is_finished())
         {
             return if deadline.is_none_or(|deadline| std::time::Instant::now() >= deadline) {
                 super::post_retirement::ExitCustodyPoll::Fatal
@@ -189,7 +195,9 @@ impl ProcessRetirement {
                 }
                 Ok(Err(error)) => self.blocked = Some(BlockedProcess::Worker { _error: error }),
                 Err(error) => {
-                    self.blocked = Some(BlockedProcess::Join { _error: error.to_string() });
+                    self.blocked = Some(BlockedProcess::Join {
+                        _error: error.to_string(),
+                    });
                 }
             }
         }

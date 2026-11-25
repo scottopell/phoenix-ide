@@ -1,4 +1,6 @@
-use super::{AcknowledgedEventOutcome, AcknowledgedEventRequest, AcknowledgedRuntimeRequest, Event};
+use super::{
+    AcknowledgedEventOutcome, AcknowledgedEventRequest, AcknowledgedRuntimeRequest, Event,
+};
 use phoenix_core::domain::sm_event::CancelCause;
 use tokio::sync::{mpsc, oneshot};
 
@@ -264,7 +266,9 @@ mod tests {
     use phoenix_core::domain::close::{CloseAttemptId, CloseRunOrdinal};
     use phoenix_core::domain::db_schema::SourceToolCall;
     use phoenix_core::domain::product_conversation::ProductConversationId;
-    use phoenix_db::native_close::{NativeCloseInitialResult, NativeCloseReceipt, NativeCloseRunRef};
+    use phoenix_db::native_close::{
+        NativeCloseInitialResult, NativeCloseReceipt, NativeCloseRunRef,
+    };
     use std::sync::Arc;
     use tokio::sync::Mutex;
 
@@ -439,7 +443,9 @@ mod tests {
         });
         let original = std::ptr::from_ref(initial.as_ref());
         sender
-            .send(AcknowledgedRuntimeRequest::ExecuteNativeCloseInitial(initial))
+            .send(AcknowledgedRuntimeRequest::ExecuteNativeCloseInitial(
+                initial,
+            ))
             .await
             .unwrap();
         let AcknowledgedRuntimeRequest::ExecuteNativeCloseInitial(initial) =
@@ -465,7 +471,9 @@ mod tests {
         });
         let original = std::ptr::from_ref(observe.as_ref());
         sender
-            .send(AcknowledgedRuntimeRequest::ExecuteNativeCloseObserve(observe))
+            .send(AcknowledgedRuntimeRequest::ExecuteNativeCloseObserve(
+                observe,
+            ))
             .await
             .unwrap();
         let AcknowledgedRuntimeRequest::ExecuteNativeCloseObserve(observe) =

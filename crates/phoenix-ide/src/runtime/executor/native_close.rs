@@ -652,9 +652,9 @@ impl NativeCloseInitialContinuation {
                 match self.poll_exit_custody().await {
                     post_retirement::ExitCustodyPoll::Pending => return Ok(self.phase),
                     post_retirement::ExitCustodyPoll::Fatal => {
-                        self.backend.fatal_local_authority_fence.close(
-                            "native_close_initial_exit_custody_unclassified",
-                        );
+                        self.backend
+                            .fatal_local_authority_fence
+                            .close("native_close_initial_exit_custody_unclassified");
                         return Err(NativeCloseApplicationError::FatalAuthority);
                     }
                     post_retirement::ExitCustodyPoll::Classified => {}
@@ -883,7 +883,11 @@ impl NativeCloseInitialContinuation {
                 self.inspection = Some(tokio::spawn(async move {
                     #[cfg(test)]
                     let _worker_exit = if let Some(barrier) = test_barrier {
-                        let InspectionCollectionTestBarrier { entered, release, exited } = barrier;
+                        let InspectionCollectionTestBarrier {
+                            entered,
+                            release,
+                            exited,
+                        } = barrier;
                         let worker_exit = InventoryPreparationWorkerExit(Some(exited));
                         let _ = entered.send(());
                         let _ = release.await;

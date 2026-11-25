@@ -1066,9 +1066,7 @@ mod tests {
         observation.state.ready.send_replace(false);
         assert!(!observation.is_ready());
         assert!(!observation.has_fatal_custody());
-        observation
-            .fatal
-            .close("test_unknown_physical_custody");
+        observation.fatal.close("test_unknown_physical_custody");
         assert!(observation.has_fatal_custody());
     }
 
