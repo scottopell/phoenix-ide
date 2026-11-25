@@ -129,6 +129,7 @@ struct ServerReconnectRequest: Equatable {
         currentState: ConnectionState,
         candidate: ServerMode,
         changedBundledSecrets: Bool,
+        changedUserConfig: Bool = false,
         intent: ReconnectIntent = .applySettings
     ) -> ServerReconnectRequest {
         let reapply = ConnectionReapplyDecision.evaluate(
@@ -137,7 +138,7 @@ struct ServerReconnectRequest: Equatable {
             candidate: candidate,
             intent: intent
         )
-        let requiresForceRestart = candidate.kind == .bundled && changedBundledSecrets
+        let requiresForceRestart = candidate.kind == .bundled && (changedBundledSecrets || changedUserConfig)
         return ServerReconnectRequest(
             candidate: candidate,
             requiresReconnect: reapply.requiresReconnect || requiresForceRestart,
@@ -216,10 +217,21 @@ struct SidecarLaunchEnvironment {
         userHome: URL,
         instanceID: UUID,
         publicEnvironment: [String: String],
-        sidecarSecrets: [String: String]
+        sidecarSecrets: [String: String],
+        loginShellPath: String? = nil
     ) -> [String: String] {
+        let resolvedPath: String
+        if let loginShellPath, !loginShellPath.isEmpty {
+            resolvedPath = LoginShellPathResolver.mergedSearchPath(
+                loginShellPath: loginShellPath,
+                inheritedPath: inherited["PATH"],
+                userHome: userHome
+            )
+        } else {
+            resolvedPath = executableSearchPath(inherited: inherited["PATH"])
+        }
         var environment = [
-            "PATH": executableSearchPath(inherited: inherited["PATH"]),
+            "PATH": resolvedPath,
             "TMPDIR": inherited["TMPDIR"] ?? NSTemporaryDirectory(),
             "LANG": inherited["LANG"] ?? "en_US.UTF-8",
             "HOME": userHome.path,
@@ -436,6 +448,10 @@ struct ReopenDecision {
     }
 }
 enum FirstRunDecision {
+    static func shouldShowOnboarding(hasSavedModeSelection: Bool) -> Bool {
+        !hasSavedModeSelection
+    }
+
     static func shouldOpenSettings(hasSavedModeSelection: Bool) -> Bool {
         !hasSavedModeSelection
     }

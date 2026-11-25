@@ -1923,4 +1923,222 @@ final class ServerManagerHelpersTests: XCTestCase {
         XCTAssertTrue(LoopbackAddressPolicy.bundledBindAddressIsLoopback("[::1]:8420"))
         XCTAssertFalse(LoopbackAddressPolicy.bundledBindAddressIsLoopback("192.168.1.10:8420"))
     }
+
+    func testUserConfigTomlParsesSlackFencedSmartQuotedSnippetAndRoundTrips() throws {
+        let slackPaste = """
+        ```toml
+        [llm]
+        api_key_helper = “ddtool auth token --scope ai”
+        api_key_helper_ttl_ms = 3_600_000
+        auth_header = “bearer”
+        default_model = “google/gemini-4-neon”
+        anthropic_base_url = “https://gateway.example.test/anthropic/v1/messages”
+        openai_chat_completions_base_url = “https://gateway.example.test/openai/v1/chat/completions”
+
+        [llm.custom_headers]
+        X-Org = “eng”
+
+        [llm.request_tags]
+        team = “ide”
+
+        [llm.request_models.openai_chat_completions]
+        “google/gemini-4-neon” = “google/gemini-4-neon”
+        ```
+        """
+
+        let parsed = try UserConfigTomlParser.parseSnippet(slackPaste)
+        XCTAssertEqual(parsed.llm.apiKeyHelper, "ddtool auth token --scope ai")
+        XCTAssertEqual(parsed.llm.apiKeyHelperTTLMs, 3_600_000)
+        XCTAssertEqual(parsed.llm.authHeader, .bearer)
+        XCTAssertEqual(parsed.llm.defaultModel, "google/gemini-4-neon")
+        XCTAssertEqual(parsed.llm.anthropicBaseURL, "https://gateway.example.test/anthropic/v1/messages")
+        XCTAssertEqual(parsed.llm.openaiChatCompletionsBaseURL, "https://gateway.example.test/openai/v1/chat/completions")
+        XCTAssertEqual(parsed.llm.customHeaders, ["X-Org": "eng"])
+        XCTAssertEqual(parsed.llm.requestTags, ["team": "ide"])
+        XCTAssertEqual(parsed.llm.requestModels["openai_chat_completions"]?["google/gemini-4-neon"], "google/gemini-4-neon")
+        XCTAssertTrue(parsed.warnings.isEmpty)
+
+        let serialized = UserConfigTomlParser.serializeLLMBlock(parsed.llm)
+        let reparsed = try UserConfigTomlParser.parseSnippet(serialized)
+        XCTAssertEqual(reparsed.llm, parsed.llm)
+    }
+
+    func testUserConfigTomlAcceptsBareLLMKeysAndInlineTablesAndWarnsOnPathlessURL() throws {
+        let snippet = """
+        api_key_helper = "my-helper"
+        openai_chat_completions_base_url = "https://gateway.example.test"
+        custom_headers = { X-Team = "core", "X-Env" = "dev" }
+        request_tags = { service = "phoenix" }
+        """
+        let parsed = try UserConfigTomlParser.parseSnippet(snippet)
+        XCTAssertEqual(parsed.llm.apiKeyHelper, "my-helper")
+        XCTAssertEqual(parsed.llm.customHeaders, ["X-Team": "core", "X-Env": "dev"])
+        XCTAssertEqual(parsed.llm.requestTags, ["service": "phoenix"])
+        XCTAssertEqual(parsed.warnings.count, 1)
+    }
+
+    func testUserConfigTomlRejectsStaticAPIKeysUnknownFieldsAndInvalidValues() {
+        XCTAssertThrowsError(try UserConfigTomlParser.parseSnippet("[llm]\nanthropic_api_key = \"sk-ant\"")) { error in
+            XCTAssertEqual(error as? UserConfigTomlError, .staticAPIKeyNotAllowed("anthropic_api_key"))
+        }
+        XCTAssertThrowsError(try UserConfigTomlParser.parseSnippet("[llm]\nopenai_api_key = \"sk-123\"")) { error in
+            XCTAssertEqual(error as? UserConfigTomlError, .staticAPIKeyNotAllowed("openai_api_key"))
+        }
+        XCTAssertThrowsError(try UserConfigTomlParser.parseSnippet("[llm]\nbogus = \"x\""))
+        XCTAssertThrowsError(try UserConfigTomlParser.parseSnippet("[llm]\nauth_header = \"basic\""))
+        XCTAssertThrowsError(try UserConfigTomlParser.parseSnippet("[llm]\napi_key_helper_ttl_ms = 0"))
+        XCTAssertThrowsError(try UserConfigTomlParser.parseSnippet("[llm]\nanthropic_base_url = \"not-a-url\""))
+        XCTAssertThrowsError(try UserConfigTomlParser.parseSnippet("version = 2\n[llm]\napi_key_helper = \"x\""))
+    }
+
+    func testUserConfigStoreMergePreservesAgentsTiersAndExistingModels() throws {
+        let existing = """
+        version = 1
+
+        [llm]
+        api_key_helper = "old-helper"
+
+        [[models]]
+        id = "custom-model"
+        backend = "openai_chat_completions"
+        description = "Kept"
+        context_window = 1000
+        max_output_tokens = 100
+        recommended = false
+        supports_tool_search = false
+
+        [agents.reviewer]
+        description = "Review"
+        instructions = "Find bugs"
+        """
+        let updated = UserLLMConfig(
+            apiKeyHelper: "new-helper",
+            authHeader: .bearer,
+            openaiChatCompletionsBaseURL: "https://gw.example.test/v1/chat/completions"
+        )
+        let merged = UserConfigStore.mergeDocument(existing: existing, llm: updated)
+        XCTAssertTrue(merged.contains("version = 1"))
+        XCTAssertTrue(merged.contains("api_key_helper = \"new-helper\""))
+        XCTAssertFalse(merged.contains("old-helper"))
+        XCTAssertTrue(merged.contains("id = \"custom-model\""))
+        XCTAssertTrue(merged.contains("[agents.reviewer]"))
+
+        let tempDir = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+        let fileURL = tempDir.appendingPathComponent("phoenix-ide/config.toml")
+        try UserConfigStore.mergeAndWrite(llm: updated, to: fileURL)
+        let loaded = try UserConfigStore.loadExistingLLMConfig(at: fileURL)
+        XCTAssertEqual(loaded, updated)
+    }
+
+    func testLoginShellPathResolverExtractsSentinelMergesAndResolvesCommands() {
+        let noisy = "Welcome to zsh!\n__PHOENIX_PATH_BEGIN__/opt/datadog/bin:/Users/test/.local/bin:/usr/bin__PHOENIX_PATH_END__\nbye\n"
+        XCTAssertEqual(
+            LoginShellPathResolver.extractSentinelPath(from: noisy),
+            "/opt/datadog/bin:/Users/test/.local/bin:/usr/bin"
+        )
+
+        let merged = LoginShellPathResolver.mergedSearchPath(
+            loginShellPath: "/opt/datadog/bin:/usr/bin",
+            inheritedPath: "/usr/bin:/custom/bin",
+            userHome: URL(fileURLWithPath: "/Users/test")
+        )
+        XCTAssertTrue(merged.hasPrefix("/opt/datadog/bin:/usr/bin:/custom/bin:/Users/test/.local/bin"))
+        XCTAssertEqual(merged.split(separator: ":").filter { $0 == "/usr/bin" }.count, 1)
+
+        let resolution = LoginShellPathResolver.resolveCommandExecutable(
+            "FOO=bar ddtool auth token",
+            searchPath: "/opt/datadog/bin:/usr/bin",
+            userHome: URL(fileURLWithPath: "/Users/test"),
+            fileExistsExecutable: { $0 == "/opt/datadog/bin/ddtool" }
+        )
+        XCTAssertEqual(resolution, .found(executable: "ddtool", resolvedPath: "/opt/datadog/bin/ddtool"))
+
+        let missing = LoginShellPathResolver.resolveCommandExecutable(
+            "missing-tool --flag",
+            searchPath: "/usr/bin:/bin",
+            userHome: URL(fileURLWithPath: "/Users/test"),
+            fileExistsExecutable: { _ in false }
+        )
+        XCTAssertEqual(missing, .notFound(executable: "missing-tool"))
+
+        let builtin = LoginShellPathResolver.resolveCommandExecutable(
+            "echo test-token",
+            searchPath: "/usr/bin:/bin",
+            userHome: URL(fileURLWithPath: "/Users/test"),
+            fileExistsExecutable: { _ in false }
+        )
+        XCTAssertEqual(builtin, .shellBuiltin("echo"))
+    }
+
+    func testAuthHelperTestRunnerVerifiesMultiLineHelperWithoutExposingCredential() async throws {
+        let runner = AuthHelperTestRunner()
+        runner.run(command: "printf 'Visit https://sso.example.test/login\\nsuper-secret-token-value\\n'")
+
+        let deadline = ContinuousClock.now + .seconds(5)
+        while ContinuousClock.now < deadline {
+            if case .succeeded(let length, _, let lines) = runner.status {
+                XCTAssertEqual(length, "super-secret-token-value".count)
+                XCTAssertEqual(lines, ["Visit https://sso.example.test/login"])
+                XCTAssertFalse(lines.joined(separator: "\n").contains("super-secret-token-value"))
+                return
+            }
+            if case .failed(let message, _) = runner.status {
+                XCTFail("Expected helper test to succeed, got failure: \(message)")
+                return
+            }
+            try await Task.sleep(for: .milliseconds(25))
+        }
+        XCTFail("Timed out waiting for AuthHelperTestRunner; final status: \(runner.status)")
+    }
+
+    func testAuthHelperTestRunnerReportsMissingExecutableClearly() async throws {
+        let runner = AuthHelperTestRunner()
+        runner.run(command: "definitely-nonexistent-phoenix-helper-xyz-99999 token")
+
+        let deadline = ContinuousClock.now + .seconds(5)
+        while ContinuousClock.now < deadline {
+            if case .failed(let message, _) = runner.status {
+                XCTAssertTrue(message.contains("definitely-nonexistent-phoenix-helper-xyz-99999"))
+                XCTAssertTrue(message.contains("not found"))
+                return
+            }
+            try await Task.sleep(for: .milliseconds(25))
+        }
+        XCTFail("Timed out waiting for missing-command failure; final status: \(runner.status)")
+    }
+
+    func testServerReconnectRequestForcesRestartWhenUserConfigChangesInBundledMode() throws {
+        let bundled = ServerMode.bundled(BundledServerConfiguration(
+            origin: try PhoenixOrigin("http://127.0.0.1:8420"),
+            executableURL: URL(fileURLWithPath: "/bin/sh"),
+            runtimeRootURL: URL(fileURLWithPath: "/tmp/runtime", isDirectory: true),
+            dataDirectoryURL: URL(fileURLWithPath: "/tmp/runtime/.phoenix-ide", isDirectory: true),
+            databaseURL: URL(fileURLWithPath: "/tmp/runtime/.phoenix-ide/phoenix.db"),
+            phoenixLogURL: URL(fileURLWithPath: "/tmp/runtime/.phoenix-ide/phoenix.log"),
+            fatalLogURL: URL(fileURLWithPath: "/tmp/runtime/.phoenix-ide/phoenix-fatal.log"),
+            launcherLogURL: URL(fileURLWithPath: "/tmp/runtime/.phoenix-ide/launcher.log"),
+            ownerLockURL: URL(fileURLWithPath: "/tmp/runtime/owner.lock"),
+            rustLogLevel: "phoenix_ide=info"
+        ))
+        let ready = ConnectionState.ready(
+            VersionInfo(version: "1.0.0", gitSHA: "abc123"),
+            DeploymentInfo(
+                build: BuildInfo(version: "1.0.0", gitSHA: "abc123"),
+                network: NetworkInfo(bindAddress: "127.0.0.1:8420", socketActivated: false, tls: TLSInfo(enabled: false, mode: nil)),
+                instanceID: UUID().uuidString,
+                localAccess: true,
+                installationOwnership: .development
+            )
+        )
+        let request = ServerReconnectRequest.evaluate(
+            currentMode: bundled,
+            currentState: ready,
+            candidate: bundled,
+            changedBundledSecrets: false,
+            changedUserConfig: true
+        )
+        XCTAssertTrue(request.requiresReconnect)
+        XCTAssertTrue(request.forceRestart)
+    }
 }

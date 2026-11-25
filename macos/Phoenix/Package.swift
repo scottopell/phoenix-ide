@@ -21,8 +21,11 @@ let package = Package(
                 "ErrorView.swift",
                 "GlobalHotkey.swift",
                 "LoadingView.swift",
+                "LoginShellAndHelper.swift",
+                "OnboardingView.swift",
                 "ServerManager.swift",
                 "ServerStatusView.swift",
+                "UserConfigToml.swift",
                 "WebViewWrapper.swift",
             ]
         ),

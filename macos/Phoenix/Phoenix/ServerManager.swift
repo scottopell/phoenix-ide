@@ -244,6 +244,7 @@ struct ServerStatusSnapshot {
     let processID: Int32?
     let executablePath: String?
     let databasePath: String?
+    let userConfigPath: String?
     let phoenixLogPath: String?
     let fatalLogPath: String?
     let logPath: String?
@@ -725,6 +726,7 @@ final class ServerManager: ObservableObject {
     private var outputPipe: Pipe?
     private var exitDrainInProgress = false
     private var readinessTask: Task<Void, Never>?
+    private var launchPreparationTask: Task<Void, Never>?
     private var stopDeadline: DispatchSourceTimer?
     private var stopCompletions: [() -> Void] = []
     private var bundledReconnectQueue = BundledReconnectQueue()
@@ -751,6 +753,8 @@ final class ServerManager: ObservableObject {
         guard !terminationInProgress else { return }
         resetBrowserOwnedStateForOperationTransition()
         bundledReconnectQueue.cancel()
+        launchPreparationTask?.cancel()
+        launchPreparationTask = nil
         readinessTask?.cancel()
         let operation = operationAuthority.replace()
         logPublicationOperation = nil
@@ -765,7 +769,7 @@ final class ServerManager: ObservableObject {
                     await self?.verifyIdentity(for: selected, operation: operation, allowIntermediateFailureState: true)
                 }
             case .bundled(let configuration):
-                try startBundled(configuration, operation: operation)
+                prepareAndStartBundled(configuration, operation: operation)
             }
         } catch {
             state = .failed(FailureState(version: currentVersion, message: error.localizedDescription))
@@ -864,6 +868,8 @@ final class ServerManager: ObservableObject {
     func stop(completion: (() -> Void)? = nil, preservedState: ConnectionState? = nil, isTransitionStop: Bool = false) {
         if let completion { stopCompletions.append(completion) }
         if !isTransitionStop, preservedState == nil { bundledReconnectQueue.cancel() }
+        launchPreparationTask?.cancel()
+        launchPreparationTask = nil
         readinessTask?.cancel()
         readinessTask = nil
         _ = operationAuthority.invalidate(operationAuthority.id)
@@ -915,6 +921,7 @@ final class ServerManager: ObservableObject {
             processID: process?.processIdentifier,
             executablePath: bundled?.executableURL.path,
             databasePath: bundled?.databaseURL.path,
+            userConfigPath: bundled == nil ? nil : UserConfigStore.configURL().path,
             phoenixLogPath: bundled?.phoenixLogURL.path,
             fatalLogPath: bundled?.fatalLogURL.path,
             logPath: bundled?.launcherLogURL.path,
@@ -942,7 +949,33 @@ final class ServerManager: ObservableObject {
         stop(completion: nil, preservedState: .failed(failure))
     }
 
-    private func startBundled(_ configuration: BundledServerConfiguration, operation: UUID) throws {
+    private func prepareAndStartBundled(_ configuration: BundledServerConfiguration, operation: UUID) {
+        state = .startingSidecar
+        recentLogLines = []
+        logPublicationOperation = operation
+
+        let inherited = ProcessInfo.processInfo.environment
+        let userHome = FileManager.default.homeDirectoryForCurrentUser
+
+        launchPreparationTask = Task { [weak self] in
+            let loginShellPath = await Task.detached(priority: .userInitiated) {
+                LoginShellPathResolver.captureLoginShellPath(inherited: inherited, userHome: userHome)
+            }.value
+            guard let self,
+                  !Task.isCancelled,
+                  !self.terminationInProgress,
+                  self.operationAuthority.id == operation else { return }
+            self.launchPreparationTask = nil
+            do {
+                try self.startBundled(configuration, operation: operation, loginShellPath: loginShellPath)
+            } catch {
+                guard self.operationAuthority.id == operation else { return }
+                self.state = .failed(FailureState(version: self.currentVersion, message: error.localizedDescription))
+            }
+        }
+    }
+
+    private func startBundled(_ configuration: BundledServerConfiguration, operation: UUID, loginShellPath: String?) throws {
         state = .startingSidecar
         recentLogLines = []
         logPublicationOperation = operation
@@ -962,7 +995,8 @@ final class ServerManager: ObservableObject {
                 userHome: FileManager.default.homeDirectoryForCurrentUser,
                 instanceID: instanceID,
                 publicEnvironment: configuration.publicEnvironment,
-                sidecarSecrets: sidecarSecrets
+                sidecarSecrets: sidecarSecrets,
+                loginShellPath: loginShellPath
             )
             let logRecorder = SidecarLogRecorder(
                 writer: currentLogWriter,

@@ -46,6 +46,7 @@ struct ServerStatusView: View {
                         StatusSection("App-owned sidecar") {
                             StatusRow("PID", snapshot.processID.map(String.init) ?? "None")
                             StatusRow("Executable", snapshot.executablePath ?? "Unavailable")
+                            StatusRow("User config", snapshot.userConfigPath ?? "Unavailable")
                             StatusRow("Private database", snapshot.databasePath ?? "Unavailable")
                             StatusRow("Structured log", snapshot.phoenixLogPath ?? "Unavailable")
                             StatusRow("Fatal log", snapshot.fatalLogPath ?? "Unavailable")

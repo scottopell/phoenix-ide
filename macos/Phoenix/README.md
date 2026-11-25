@@ -6,7 +6,7 @@ The app icon is derived from the canonical `ui/public/phoenix.svg` bird/flame ma
 
 ## Server modes
 
-On first launch Phoenix.app stays disconnected until the user explicitly chooses either **Managed deployment** or **Bundled Phoenix** in Settings and clicks **Apply and Connect**. Draft edits in Settings remain local to that window until apply; simply closing Settings never changes the next launch target.
+On first launch Phoenix.app presents an inline local-first setup view in the main window with three provider options (**Auth Helper** via `~/.config/phoenix-ide/config.toml` with TOML paste and live helper testing, **Codex / ChatGPT** in-app sign-in, or **API Keys** stored in Keychain), plus a secondary **Connect to an existing server…** link for managed deployments. Draft edits in Settings remain local to that window until **Apply and Connect**; simply closing Settings never changes the next launch target.
 
 ### Managed deployment
 
@@ -24,7 +24,8 @@ Launches only `Phoenix.app/Contents/Helpers/phoenix_ide` (or a clearly marked De
 - a private runtime root under `~/Library/Application Support/Phoenix/sidecar-home` used only for Phoenix/Codex-owned mutable state
 - private `PHOENIX_STATE_DIR`, `PHOENIX_DATA_DIR`, `CODEX_HOME`, `PHOENIX_TMP_DIR`, database, `PHOENIX_LOG_FILE`, and `PHOENIX_FATAL_LOG_FILE` paths beneath that runtime root (with `PHOENIX_LOG_STDOUT=false`)
 - a fixed configured loopback port
-- allowlisted inherited Phoenix LLM/gateway/config environment variables (`LLM_API_KEY_HELPER`, `LLM_API_KEY_HELPER_TTL_MS`, `ANTHROPIC_BASE_URL`, `OPENAI_BASE_URL`, `OPENAI_RESPONSES_BASE_URL`, `OPENAI_CHAT_COMPLETIONS_BASE_URL`, `LLM_CUSTOM_HEADERS`, `LLM_REQUEST_TAGS`, `LLM_AUTH_HEADER`, `PHOENIX_LLM_MODELS`, `PHOENIX_LLM_REQUEST_MODELS`, `DEFAULT_MODEL`, and `XDG_CONFIG_HOME`) when present in the launcher environment
+- a login-shell-captured `PATH` merged ahead of standard macOS/Homebrew directories so credential helpers and developer CLIs work even when launched from Finder
+- allowlisted inherited Phoenix LLM/gateway/config environment variables (`LLM_API_KEY_HELPER`, `LLM_API_KEY_HELPER_TTL_MS`, `ANTHROPIC_BASE_URL`, `OPENAI_BASE_URL`, `OPENAI_RESPONSES_BASE_URL`, `OPENAI_CHAT_COMPLETIONS_BASE_URL`, `LLM_CUSTOM_HEADERS`, `LLM_REQUEST_TAGS`, `LLM_AUTH_HEADER`, `PHOENIX_LLM_MODELS`, `PHOENIX_LLM_REQUEST_MODELS`, `DEFAULT_MODEL`, and `XDG_CONFIG_HOME`) when present in the launcher environment; non-secret provider/gateway configuration also loads directly from `$XDG_CONFIG_HOME/phoenix-ide/config.toml` (default `~/.config/phoenix-ide/config.toml`) `[llm]`
 
 An advisory file lock prevents concurrent Phoenix.app owners from opening that private runtime. This is state isolation, not a filesystem sandbox: the sidecar and its terminals retain ordinary access to the user's files. Phoenix.app creates the private runtime/data directories before taking that lock so the lock itself remains outside the managed data tree and cleanup still works after launch-preparation failures. A busy port is a bind failure; the app never adopts or kills a listener discovered by port. Any transition away from bundled mode first stops the exact child Phoenix.app launched, coalesces overlapping reconnect requests, and only then connects the latest candidate mode. Readiness accepts only a deployment whose echoed `instance_id` matches the exact child Phoenix.app launched. Quit sends SIGTERM to the exact child, allows 35 seconds for Phoenix's 30-second graceful drain, then escalates to SIGKILL.
 

@@ -17,6 +17,9 @@
 		B40783182B6F5D0000C7A123 /* LoadingView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B4078330AB6F5D0000C7A123 /* LoadingView.swift */; };
 		B40783192B6F5D0000C7A123 /* ErrorView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B4078331AB6F5D0000C7A123 /* ErrorView.swift */; };
 		B407831A2B6F5D0000C7A123 /* ServerStatusView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B4078333AB6F5D0000C7A123 /* ServerStatusView.swift */; };
+		B407831B2B6F5D0000C7A123 /* UserConfigToml.swift in Sources */ = {isa = PBXBuildFile; fileRef = B4078335AB6F5D0000C7A123 /* UserConfigToml.swift */; };
+		B407831C2B6F5D0000C7A123 /* LoginShellAndHelper.swift in Sources */ = {isa = PBXBuildFile; fileRef = B4078336AB6F5D0000C7A123 /* LoginShellAndHelper.swift */; };
+		B407831D2B6F5D0000C7A123 /* OnboardingView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B4078337AB6F5D0000C7A123 /* OnboardingView.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -33,6 +36,9 @@
 		B4078331AB6F5D0000C7A123 /* ErrorView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ErrorView.swift; sourceTree = "<group>"; };
 		B4078333AB6F5D0000C7A123 /* ServerStatusView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ServerStatusView.swift; sourceTree = "<group>"; };
 		B4078334AB6F5D0000C7A123 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+		B4078335AB6F5D0000C7A123 /* UserConfigToml.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UserConfigToml.swift; sourceTree = "<group>"; };
+		B4078336AB6F5D0000C7A123 /* LoginShellAndHelper.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LoginShellAndHelper.swift; sourceTree = "<group>"; };
+		B4078337AB6F5D0000C7A123 /* OnboardingView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OnboardingView.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -60,6 +66,9 @@
 				B40783202B6F5D0000C7A123 /* PhoenixApp.swift */,
 				B40783212B6F5D0000C7A123 /* AppDelegate.swift */,
 				B40783272B6F5D0000C7A123 /* Configuration.swift */,
+				B4078335AB6F5D0000C7A123 /* UserConfigToml.swift */,
+				B4078336AB6F5D0000C7A123 /* LoginShellAndHelper.swift */,
+				B4078337AB6F5D0000C7A123 /* OnboardingView.swift */,
 				B40783282B6F5D0000C7A123 /* WebViewWrapper.swift */,
 				B40783292B6F5D0000C7A123 /* ServerManager.swift */,
 				B4078333AB6F5D0000C7A123 /* ServerStatusView.swift */,
@@ -175,6 +184,9 @@
 				B407831A2B6F5D0000C7A123 /* ServerStatusView.swift in Sources */,
 				B40783182B6F5D0000C7A123 /* LoadingView.swift in Sources */,
 				B40783192B6F5D0000C7A123 /* ErrorView.swift in Sources */,
+				B407831B2B6F5D0000C7A123 /* UserConfigToml.swift in Sources */,
+				B407831C2B6F5D0000C7A123 /* LoginShellAndHelper.swift in Sources */,
+				B407831D2B6F5D0000C7A123 /* OnboardingView.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
