@@ -504,8 +504,7 @@ async fn mixed_self_goal_checkpoint_cut_preserves_atomic_refusal_and_retry() {
         CanonicalCommitCut::BeforeCanonicalCommit,
         CanonicalCommitCut::AfterCanonicalCommit,
     ] {
-        let db = Database::open(":memory:").await.unwrap();
-        crate::run_pending_migrations(db.pool()).await.unwrap();
+        let db = Database::open_in_memory().await.unwrap();
         let round = SelfRound::with_preference(
             &db,
             "mixed-cut",
@@ -1009,8 +1008,9 @@ async fn real_lost_acknowledgements_reopen_and_replay_without_duplicate_effects(
     ] {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("self-goal.sqlite");
-        let db = Database::open(path.to_str().unwrap()).await.unwrap();
-        crate::run_pending_migrations(db.pool()).await.unwrap();
+        let db = Database::open_migrated_for_test(path.to_str().unwrap())
+            .await
+            .unwrap();
         let db = db
             .install_goal_controls_for_tests()
             .await

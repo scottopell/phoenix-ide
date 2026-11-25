@@ -591,8 +591,9 @@ mod tests {
         let worktree = temp.path().join("worktree");
         std::fs::create_dir_all(&worktree).unwrap();
         std::fs::write(worktree.join(".git"), "gitdir: /tmp/linked-worktree\n").unwrap();
-        let db = Database::open(db_path.to_str().unwrap()).await.unwrap();
-        phoenix_db::run_pending_migrations(db.pool()).await.unwrap();
+        let db = Database::open_migrated_for_test(db_path.to_str().unwrap())
+            .await
+            .unwrap();
         let now = chrono::Utc::now().to_rfc3339();
         sqlx::query(
             "INSERT INTO work_scopes (

@@ -1363,8 +1363,9 @@ mod tests {
     async fn catchup_inserts_missing_git_repository_on_file_backed_db() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("catchup.db");
-        let db = Database::open(path.to_str().unwrap()).await.unwrap();
-        run_pending_migrations(db.pool()).await.unwrap();
+        let db = Database::open_migrated_for_test(path.to_str().unwrap())
+            .await
+            .unwrap();
         insert_project(&db, "repo-file").await;
 
         let stats = run_catchup(&db).await.unwrap();
@@ -1652,8 +1653,9 @@ mod tests {
     async fn catchup_rejects_independently_reopened_file_database_before_mutation() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("reopened-catchup.db");
-        let db = Database::open(path.to_str().unwrap()).await.unwrap();
-        run_pending_migrations(db.pool()).await.unwrap();
+        let db = Database::open_migrated_for_test(path.to_str().unwrap())
+            .await
+            .unwrap();
         let reopened = Database::open(path.to_str().unwrap()).await.unwrap();
         run_pending_migrations(reopened.pool()).await.unwrap();
         insert_project(&db, "repo-a").await;

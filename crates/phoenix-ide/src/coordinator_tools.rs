@@ -2623,10 +2623,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("explicit-local-reads.db");
 
-        let db = crate::db::Database::open(db_path.to_str().unwrap())
+        let db = crate::db::Database::open_migrated_for_test(db_path.to_str().unwrap())
             .await
             .unwrap();
-        phoenix_db::run_pending_migrations(db.pool()).await.unwrap();
         let conversation = db
             .create_conversation("local-transcript", "local", "/tmp", true, None, None)
             .await
@@ -2761,10 +2760,9 @@ mod tests {
     ) {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("coordinator-bash.db");
-        let db = crate::db::Database::open(db_path.to_str().unwrap())
+        let db = crate::db::Database::open_migrated_for_test(db_path.to_str().unwrap())
             .await
             .unwrap();
-        phoenix_db::run_pending_migrations(db.pool()).await.unwrap();
         let retriever = Arc::new(db.fts_retriever());
         let tool = WorkScopeCoordinatorBash(GlobalReadService::new(db.clone(), retriever));
         let context = context("coordinator");

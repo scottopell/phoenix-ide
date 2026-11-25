@@ -379,8 +379,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("reminder-receipt.db");
         let path = path.to_str().unwrap();
-        let db = Database::open(path).await.unwrap();
-        phoenix_db::run_pending_migrations(db.pool()).await.unwrap();
+        let db = Database::open_migrated_for_test(path).await.unwrap();
         let source = db
             .create_conversation("receipt-source", "source", "/tmp", true, None, None)
             .await

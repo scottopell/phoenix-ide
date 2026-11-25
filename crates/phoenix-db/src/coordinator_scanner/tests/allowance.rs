@@ -229,8 +229,9 @@ async fn scanner_blocked_exhaustion_rotates_lanes_across_restart_without_new_inp
     ] {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("blocked-lane.db");
-        let db = Database::open(path.to_str().unwrap()).await.unwrap();
-        crate::run_pending_migrations(db.pool()).await.unwrap();
+        let db = Database::open_migrated_for_test(path.to_str().unwrap())
+            .await
+            .unwrap();
         let owner = db
             .get_or_create_coordinator(None, LlmLanguage::default())
             .await

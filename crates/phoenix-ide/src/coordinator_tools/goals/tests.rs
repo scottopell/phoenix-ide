@@ -1223,7 +1223,7 @@ async fn native_goal_receipt_replays_after_database_reopen_and_service_reconstru
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("isolated-native-goal.sqlite");
     let f = Fixture::with_db(
-        crate::db::Database::open(path.to_str().unwrap())
+        crate::db::Database::open_migrated_for_test(path.to_str().unwrap())
             .await
             .unwrap(),
     )
@@ -1355,7 +1355,7 @@ async fn native_goal_reopen_preserves_pending_preparation_and_refused_receipt() 
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("pending-refused.sqlite");
     let f = Fixture::with_db(
-        crate::db::Database::open(path.to_str().unwrap())
+        crate::db::Database::open_migrated_for_test(path.to_str().unwrap())
             .await
             .unwrap(),
     )

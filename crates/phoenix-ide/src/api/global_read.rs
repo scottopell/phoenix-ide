@@ -5222,10 +5222,9 @@ mod tests {
     async fn stable_resolution_keeps_current_member_and_scope_from_one_point_in_time() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("stable-resolution.sqlite");
-        let db = crate::db::Database::open(path.to_str().unwrap())
+        let db = crate::db::Database::open_migrated_for_test(path.to_str().unwrap())
             .await
             .unwrap();
-        phoenix_db::run_pending_migrations(db.pool()).await.unwrap();
         db.create_conversation("race-root", "race-root", "/tmp/root", true, None, None)
             .await
             .unwrap();
@@ -5491,10 +5490,9 @@ mod tests {
         let work = dir.path().join("work");
         std::fs::create_dir(&work).unwrap();
         let canonical = work.canonicalize().unwrap();
-        let db = crate::db::Database::open(path.to_str().unwrap())
+        let db = crate::db::Database::open_migrated_for_test(path.to_str().unwrap())
             .await
             .unwrap();
-        phoenix_db::run_pending_migrations(db.pool()).await.unwrap();
         db.create_conversation(
             "scope-owner",
             "scope-owner",

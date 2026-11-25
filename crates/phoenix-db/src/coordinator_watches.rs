@@ -1167,8 +1167,7 @@ mod tests {
     async fn wait_outbox_and_state_rollback_together_before_delivery() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("wait.db");
-        let db = Database::open(path.to_str().unwrap()).await.unwrap();
-        crate::migrations::run_pending_migrations(db.pool())
+        let db = Database::open_migrated_for_test(path.to_str().unwrap())
             .await
             .unwrap();
         let source = db

@@ -2009,8 +2009,7 @@ mod tests {
         // REQ-SG-019: retained state belongs to the workflow, not emoji configuration.
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("saved.db");
-        let db = Database::open(path.to_str().unwrap()).await.unwrap();
-        crate::migrations::run_pending_migrations(db.pool())
+        let db = Database::open_migrated_for_test(path.to_str().unwrap())
             .await
             .unwrap();
         let config = serde_json::json!({"enabled":true,"workspace":"example.slack.com","owner":"UOWNER","saved_enabled":true,"trigger_emoji":"fire"});

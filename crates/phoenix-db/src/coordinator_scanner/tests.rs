@@ -1086,8 +1086,9 @@ async fn scanner_budget_charges_crashes_and_keeps_partially_observed_usage() {
 async fn scanner_file_restart_keeps_reserved_attempt_and_retry_cycle() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("scanner.db");
-    let db = Database::open(path.to_str().unwrap()).await.unwrap();
-    crate::run_pending_migrations(db.pool()).await.unwrap();
+    let db = Database::open_migrated_for_test(path.to_str().unwrap())
+        .await
+        .unwrap();
     let source = db
         .get_or_create_coordinator(None, LlmLanguage::default())
         .await
@@ -1783,8 +1784,9 @@ async fn scanner_restart_finds_old_generation_edit_without_append_across_two_con
     use crate::coordinator_tracking::{TrackingMutation, TrackingRetirement, TrackingState};
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("old-edit.db");
-    let db = Database::open(path.to_str().unwrap()).await.unwrap();
-    crate::run_pending_migrations(db.pool()).await.unwrap();
+    let db = Database::open_migrated_for_test(path.to_str().unwrap())
+        .await
+        .unwrap();
     let source = db
         .get_or_create_coordinator(None, LlmLanguage::default())
         .await

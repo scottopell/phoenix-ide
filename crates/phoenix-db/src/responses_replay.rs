@@ -184,8 +184,9 @@ mod tests {
     async fn complete_tool_round_envelopes_survive_reopen_retry_and_settlement() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("replay.db");
-        let db = Database::open(path.to_str().unwrap()).await.unwrap();
-        crate::run_pending_migrations(db.pool()).await.unwrap();
+        let db = Database::open_migrated_for_test(path.to_str().unwrap())
+            .await
+            .unwrap();
         db.create_conversation("replay", "replay", "/tmp", true, None, None)
             .await
             .unwrap();
@@ -370,8 +371,9 @@ mod tests {
     async fn chat_signatures_survive_reopen_retry_and_settle_atomically() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("gemini-replay.db");
-        let db = Database::open(path.to_str().unwrap()).await.unwrap();
-        crate::run_pending_migrations(db.pool()).await.unwrap();
+        let db = Database::open_migrated_for_test(path.to_str().unwrap())
+            .await
+            .unwrap();
         db.create_conversation("replay", "replay", "/tmp", true, None, None)
             .await
             .unwrap();

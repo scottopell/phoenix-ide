@@ -25,9 +25,12 @@ const SQLITE_HEADER_MAGIC: &[u8] = b"SQLite format 3\0";
 const MIN_SQLITE_BYTES: usize = 4096;
 const TEMPLATE_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 
+#[cfg(test)]
+type PrefixTemplateCache = HashMap<u32, Arc<OnceCell<Vec<u8>>>>;
+
 static IN_MEMORY_TEMPLATE: OnceCell<Vec<u8>> = OnceCell::const_new();
 #[cfg(test)]
-static PREFIX_TEMPLATES: OnceLock<Mutex<HashMap<u32, Arc<OnceCell<Vec<u8>>>>>> = OnceLock::new();
+static PREFIX_TEMPLATES: OnceLock<Mutex<PrefixTemplateCache>> = OnceLock::new();
 
 fn template_disabled() -> bool {
     matches!(
@@ -440,6 +443,9 @@ pub(crate) async fn open_in_memory_prefix_for_test(through: u32) -> DbResult<Dat
 
 #[cfg(test)]
 pub(crate) async fn open_prefix_for_test(path: &str, through: u32) -> DbResult<Database> {
+    if path == ":memory:" {
+        return open_in_memory_prefix_for_test(through).await;
+    }
     let target = Path::new(path);
     let seeded = if template_disabled() || target.exists() {
         false
@@ -643,6 +649,9 @@ pub(crate) async fn seed_migrated_file_for_test(path: &Path) -> DbResult<bool> {
 
 #[cfg(any(test, feature = "test-support"))]
 pub(crate) async fn open_migrated_for_test(path: &str) -> DbResult<Database> {
+    if path == ":memory:" {
+        return open_in_memory_from_template().await;
+    }
     let seeded = seed_migrated_file_for_test(Path::new(path)).await?;
     if !seeded {
         let db = Database::open(path).await?;
@@ -823,6 +832,11 @@ mod tests {
             .unwrap();
         assert_eq!(reopened.instance_id().await.unwrap(), id_before);
         assert!(reopened.get_conversation("reopen-conv").await.is_ok());
+
+        // ":memory:" delegates to the in-memory template without creating a literal file.
+        let mem = Database::open_migrated_for_test(":memory:").await.unwrap();
+        assert!(!Path::new(":memory:").exists());
+        assert_ne!(mem.instance_id().await.unwrap(), id_before);
     }
 
     #[tokio::test]

@@ -4956,8 +4956,9 @@ mod product_creation_tests {
     async fn unwatched_terminal_receipt_survives_occurrence_consumption_and_file_reopen() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("initial-execution.sqlite");
-        let db = Database::open(path.to_str().unwrap()).await.unwrap();
-        crate::run_pending_migrations(db.pool()).await.unwrap();
+        let db = Database::open_migrated_for_test(path.to_str().unwrap())
+            .await
+            .unwrap();
         let (db, request, conversation) = initial_execution_fixture_in(db, false, None).await;
         db.update_conversation_state(
             &conversation,
@@ -6211,10 +6212,7 @@ mod product_creation_tests {
             .join("delivery-race.db")
             .to_string_lossy()
             .to_string();
-        let db = Database::open(&path).await.unwrap();
-        crate::migrations::run_pending_migrations(db.pool())
-            .await
-            .unwrap();
+        let db = Database::open_migrated_for_test(&path).await.unwrap();
         let peer = Database::open(&path).await.unwrap();
         for index in 0..4 {
             let request_id = format!("sink-race-{index}");
@@ -8286,10 +8284,7 @@ mod product_creation_tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("product-delivery-claim.sqlite");
         let path = path.to_string_lossy().to_string();
-        let db1 = Database::open(&path).await.unwrap();
-        crate::migrations::run_pending_migrations(db1.pool())
-            .await
-            .unwrap();
+        let db1 = Database::open_migrated_for_test(&path).await.unwrap();
         let db2 = Database::open(&path).await.unwrap();
         crate::migrations::run_pending_migrations(db2.pool())
             .await
