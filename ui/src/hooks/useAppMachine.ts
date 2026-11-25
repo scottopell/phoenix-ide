@@ -27,20 +27,6 @@ export function useAppMachine() {
   const executeEffects = useCallback(async (effects: AppEffect[]) => {
     for (const effect of effects) {
       switch (effect.type) {
-        case 'INIT_CACHE': {
-          // Machine doesn't emit INIT_CACHE, handled defensively
-          try {
-            await cacheDB.init();
-            const pendingOps = await cacheDB.getPendingOps();
-            pendingOpsCountRef.current = pendingOps.length;
-            setPendingOpsCount(pendingOps.length);
-            dispatch({ type: 'INIT_SUCCESS' });
-          } catch (error) {
-            const message = error instanceof Error ? error.message : 'Failed to initialize local storage';
-            dispatch({ type: 'INIT_ERROR', error: message });
-          }
-          break;
-        }
         case 'START_SYNC': {
           try {
             const pendingOps = await cacheDB.getPendingOps();

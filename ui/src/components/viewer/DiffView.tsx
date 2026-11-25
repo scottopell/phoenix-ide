@@ -15,10 +15,10 @@ import { Columns2, GitBranch, Rows3 } from 'lucide-react';
 import type { BranchRemoteStatus, CheckoutStatus } from '../../api';
 import type { DiffSection, ReviewNote } from '../../contexts/ReviewNotesContext';
 import { useRegisterFocusScope } from '../../hooks/useFocusScope';
+import { buildDiffSearchProjection } from '../viewer-find/diffSearchProjection';
 import {
   FindBar,
   activeSessionMatchIndex,
-  buildDiffSearchProjection,
   createSurfaceKey,
   projectionMatchesToSessionMatches,
   useFindSession,

@@ -11,6 +11,7 @@
 import type { ContentBlock, Message, ToolResultContent } from '../api';
 import { svgArtifactFromResult, type SvgArtifact } from './svgArtifact';
 import type { BashToolProgress } from '../generated/sse';
+import { safePrefix } from '../utils/textBounds';
 
 export interface ToolStripItem {
   svgArtifact?: SvgArtifact | null;
@@ -44,7 +45,7 @@ const SUMMARY_LIMIT = 96;
 
 function truncate(text: string, maxLen = SUMMARY_LIMIT): string {
   const flat = text.replace(/\s+/g, ' ').trim();
-  return flat.length > maxLen ? `${flat.slice(0, maxLen - 1)}…` : flat;
+  return flat.length > maxLen ? `${safePrefix(flat, maxLen - 1)}…` : flat;
 }
 
 function stringInput(input: Record<string, unknown>, key: string): string {

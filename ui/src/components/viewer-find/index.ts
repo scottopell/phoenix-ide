@@ -30,7 +30,6 @@ export {
 export {
   buildBlockSearchProjection,
   buildConversationSearchProjection,
-  buildDiffSearchProjection,
   buildFileSearchProjection,
   buildMarkdownFileSearchProjection,
   buildKeywordSearchOutputProjection,

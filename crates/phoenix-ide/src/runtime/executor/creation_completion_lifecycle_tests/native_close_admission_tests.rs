@@ -187,9 +187,7 @@ impl CloseFixture {
             runtime_with_storage(self.state.clone(), Arc::new(InMemoryStorage::new()));
         harness.runtime.context.conversation_id = self.source_transcript_id.clone();
         harness.runtime.context.is_coordinator = is_coordinator;
-        harness.runtime = harness
-            .runtime
-            .with_actor_database(self.db.clone());
+        harness.runtime = harness.runtime.with_actor_database(self.db.clone());
         harness
     }
 }

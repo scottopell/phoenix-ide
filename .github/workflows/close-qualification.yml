@@ -1143,6 +1143,8 @@ jobs:
             session::launch_slot::tests::aborted_kill_task_before_first_poll_marks_failure
             session::launch_slot::tests::aborted_kill_task_while_slot_held_marks_failure
             session::launch_slot::tests::aborted_waiter_keeps_custody_inside_actual_blocking_profile_cleanup
+            session::launch_slot::tests::dead_retirement_detaches_synthetic_cleanup_and_revalidates_the_captured_slot
+            session::launch_slot::tests::dead_retirement_preserves_replacement_installed_while_waiting_for_gate
           )
           for test in "${tests[@]}"; do
             grep -Fx "$test: test" evidence/browser-custody-inventory.log

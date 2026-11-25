@@ -1049,6 +1049,14 @@ impl BrowserSession {
         }
     }
 
+    /// True when the owned Chrome process has exited or the CDP WebSocket
+    /// handler task has terminated, meaning this session can no longer service
+    /// browser operations and must be torn down before reuse.
+    #[must_use]
+    pub fn is_dead(&mut self) -> bool {
+        self.handler_task.is_finished() || matches!(self.is_running(), Ok(false))
+    }
+
     #[must_use]
     pub fn exact_instance_matches(&self, identity: &BrowserSessionInstanceIdentity) -> bool {
         self.launch_identity.launch_uuid == identity.durable.launch_uuid
@@ -2167,13 +2175,13 @@ impl BrowserSessionManager {
     /// Publish a lifecycle edge if a sink is wired. Best-effort: dropped
     /// receivers / closed channels are logged at `debug` (capability gap)
     /// and do not affect session correctness.
-    fn emit_lifecycle(
-        &self,
+    fn emit_lifecycle_to(
+        sink: Option<&BrowserSessionLifecycleSink>,
         work_scope: &ResourceScopeKey,
         audience: BrowserSessionAudience,
         kind: BrowserSessionLifecycleKind,
     ) {
-        let Some(sink) = self.lifecycle_sink.as_ref() else {
+        let Some(sink) = sink else {
             return;
         };
         let event = BrowserSessionLifecycleEvent {
@@ -2189,6 +2197,15 @@ impl BrowserSessionManager {
                 "dropping browser session lifecycle event — sink closed"
             );
         }
+    }
+
+    fn emit_lifecycle(
+        &self,
+        work_scope: &ResourceScopeKey,
+        audience: BrowserSessionAudience,
+        kind: BrowserSessionLifecycleKind,
+    ) {
+        Self::emit_lifecycle_to(self.lifecycle_sink.as_ref(), work_scope, audience, kind);
     }
 
     fn scope_retirement_fence_key(work_scope: &ResourceScopeKey) -> BrowserRetirementFenceKey {
@@ -2386,7 +2403,7 @@ impl BrowserSessionManager {
     /// Returns [`BrowserError::AccessDenied`] when the actor cannot control an
     /// existing session, or a browser launch/initialization error when creating one.
     pub async fn get_session_for_actor(
-        &self,
+        self: &Arc<Self>,
         work_scope: &ResourceScopeKey,
         actor: &EffectiveResourceAccess,
     ) -> Result<Arc<RwLock<BrowserSession>>, BrowserError> {
@@ -2449,7 +2466,7 @@ impl BrowserSessionManager {
     /// Returns [`BrowserError`] when Chrome cannot be launched for a
     /// not-yet-existing session.
     pub async fn get_session(
-        &self,
+        self: &Arc<Self>,
         work_scope: &ResourceScopeKey,
     ) -> Result<Arc<RwLock<BrowserSession>>, BrowserError> {
         let system = EffectiveResourceAccess::new("browser-manager", ResourceAuthority::Work);
@@ -2492,7 +2509,7 @@ impl BrowserSessionManager {
     }
 
     async fn get_session_with_creator(
-        &self,
+        self: &Arc<Self>,
         work_scope: &ResourceScopeKey,
         actor: &EffectiveResourceAccess,
     ) -> Result<Arc<RwLock<BrowserSession>>, BrowserError> {
@@ -2526,6 +2543,34 @@ impl BrowserSessionManager {
                     drop(state);
                     self.wait_for_kill_completion(attempt).await?;
                     continue;
+                }
+                if let Some(ready_session) = entry.session.ready() {
+                    let dead = ready_session
+                        .try_write()
+                        .is_ok_and(|mut guard| guard.is_dead());
+                    if dead {
+                        let dead_slot = entry.session.clone();
+                        let entry_scope = entry.scope.clone();
+                        tracing::warn!(
+                            work_scope = %entry_scope,
+                            "browser session is dead; tearing down before relaunch"
+                        );
+                        drop(state);
+                        let manager = Arc::clone(self);
+                        let retirement_key = key.clone();
+                        tokio::spawn(async move {
+                            manager
+                                .retire_dead_session(retirement_key, entry_scope, dead_slot)
+                                .await
+                        })
+                        .await
+                        .map_err(|error| {
+                            BrowserError::OperationFailed(format!(
+                                "dead browser session teardown task failed: {error}"
+                            ))
+                        })??;
+                        continue;
+                    }
                 }
                 break entry.session.clone();
             }
@@ -3168,20 +3213,39 @@ impl BrowserSessionManager {
             .flatten()
     }
 
+    async fn retire_dead_session(
+        self: &Arc<Self>,
+        key: String,
+        scope: ResourceScopeKey,
+        slot: Arc<LaunchSlot>,
+    ) -> Result<(), BrowserError> {
+        match self
+            .spawn_kill_session_by_key(key, scope, None, Some(slot), None)
+            .await
+        {
+            KillSessionOutcome::Absent => Ok(()),
+            KillSessionOutcome::AlreadyRequested { attempt } => {
+                self.wait_for_kill_completion(attempt).await
+            }
+            KillSessionOutcome::Started { attempt, handle, .. } => {
+                if let Err(error) = handle.await {
+                    tracing::warn!(%error, "browser dead-session teardown task failed");
+                }
+                self.wait_for_kill_completion(attempt).await
+            }
+        }
+    }
+
     /// Kill the session belonging to `work_scope` (called from the cleanup
     /// cascade on archive/abandon/mark-merged/delete of the chain leaf).
     ///
     /// Force-closes the underlying Chrome process via
-    /// [`BrowserSession::terminate`] BEFORE dropping the map's `Arc`.
+    /// [`BrowserSession::terminate`] before dropping the map's `Arc`.
     /// Other holders of the session `Arc` (notably the `browser-view`
-    /// WebSocket viewer, which keeps an `Arc` for the duration of its
-    /// connection) would otherwise prevent `Drop for BrowserSession`
-    /// from running, leaving the OS chromium process alive after the
-    /// cascade claimed to have killed it.
+    /// WebSocket viewer) would otherwise keep the OS process alive.
     ///
-    /// The sessions write lock is released as soon as the entry is
-    /// removed; `terminate` and the awaited `remove_dir_all` run
-    /// lock-free so concurrent `get_session` / `get_existing` /
+    /// The sessions write lock is released before teardown and profile cleanup
+    /// so concurrent lookups and unrelated scopes remain responsive.
     /// `is_active` calls on unrelated scopes are not blocked for the
     /// duration of fs deletion + Chrome shutdown.
     #[allow(clippy::too_many_lines)]
@@ -3190,7 +3254,8 @@ impl BrowserSessionManager {
         key: String,
         work_scope: ResourceScopeKey,
         expected: Option<BrowserSessionInstanceIdentity>,
-        custody: BrowserRetirementCustody,
+        expected_slot: Option<Arc<LaunchSlot>>,
+        mut custody: Option<BrowserRetirementCustody>,
     ) -> KillSessionOutcome {
         // Existing attempts must remain joinable without waiting for the
         // physical retirement gate: the active task may itself be waiting on
@@ -3203,6 +3268,9 @@ impl BrowserSessionManager {
             if expected
                 .as_ref()
                 .is_some_and(|expected| !Self::current_entry_matches_identity(entry, expected))
+                || expected_slot
+                    .as_ref()
+                    .is_some_and(|expected| !Arc::ptr_eq(&entry.session, expected))
             {
                 return KillSessionOutcome::Absent;
             }
@@ -3217,7 +3285,9 @@ impl BrowserSessionManager {
                 drop(current);
                 drop(state);
                 tracing::debug!(work_scope = %work_scope, "browser kill already requested");
-                group.retain(custody);
+                if let Some(custody) = custody.take() {
+                    group.retain(custody);
+                }
                 return KillSessionOutcome::AlreadyRequested { attempt };
             }
             entry.session.clone()
@@ -3232,6 +3302,9 @@ impl BrowserSessionManager {
                 || expected
                     .as_ref()
                     .is_some_and(|expected| !Self::current_entry_matches_identity(entry, expected))
+                || expected_slot
+                    .as_ref()
+                    .is_some_and(|expected| !Arc::ptr_eq(&entry.session, expected))
             {
                 return KillSessionOutcome::Absent;
             }
@@ -3246,7 +3319,9 @@ impl BrowserSessionManager {
                 drop(current);
                 drop(state);
                 tracing::debug!(work_scope = %work_scope, "browser kill already requested");
-                group.retain(custody);
+                if let Some(custody) = custody.take() {
+                    group.retain(custody);
+                }
                 return KillSessionOutcome::AlreadyRequested { attempt };
             }
             let attempt = KillAttempt::new();
@@ -3271,7 +3346,9 @@ impl BrowserSessionManager {
             )
         };
         let group = attempt.custody_group();
-        group.retain(custody);
+        if let Some(custody) = custody {
+            group.retain(custody);
+        }
         // Blocking profile cleanup can outlive the async task. Physical
         // exclusion must follow that actual cleanup, not just its waiter.
         group.retain(BrowserRetirementCustody::new(Arc::new(retirement_gate)));
@@ -3368,7 +3445,8 @@ impl BrowserSessionManager {
                         expected.session_key.clone(),
                         permit.work_scope.clone(),
                         Some(expected.clone()),
-                        custody.clone(),
+                        None,
+                        Some(custody.clone()),
                     )
                     .await
                 {
@@ -3667,7 +3745,7 @@ impl BrowserSessionManager {
             if let Some(scope) = scope {
                 tracing::info!(scope_key = %key, "Cleaning up idle browser session");
                 match self
-                    .spawn_kill_session_by_key(key, scope, None, BrowserRetirementCustody::no_op())
+                    .spawn_kill_session_by_key(key, scope, None, None, None)
                     .await
                 {
                     KillSessionOutcome::Absent => {}
@@ -4114,7 +4192,7 @@ mod lifecycle_hook_tests {
 
     #[tokio::test]
     async fn begin_retirement_fences_scope_admission_until_reopened() {
-        let manager = BrowserSessionManager::default();
+        let manager = Arc::new(BrowserSessionManager::default());
         let scope = scope("browser-retirement-fence");
 
         let permit = manager.begin_retirement(&scope).await;
@@ -4134,7 +4212,7 @@ mod lifecycle_hook_tests {
 
     #[tokio::test]
     async fn begin_retirement_fences_actor_admission_until_reopened() {
-        let manager = BrowserSessionManager::default();
+        let manager = Arc::new(BrowserSessionManager::default());
         let scope = scope("browser-actor-retirement-fence");
         let actor = EffectiveResourceAccess::new("restricted-child", ResourceAuthority::Restricted);
 
@@ -4438,6 +4516,106 @@ mod lifecycle_hook_tests {
                 .is_some(),
             "shutdown_all returned before Chrome exited"
         );
+    }
+
+    #[tokio::test]
+    async fn get_session_evicts_and_relaunches_after_chrome_process_exits() {
+        if std::env::var_os("PHOENIX_CHROME_EXECUTABLE").is_none() {
+            return;
+        }
+
+        let scope = ResourceScopeKey::Work(WorkScopeId::new());
+        let manager = BrowserSessionManager::new();
+        let first = manager.get_session(&scope).await.expect("launch first");
+        let first_pid = first
+            .read()
+            .await
+            .chrome_process()
+            .expect("chrome process identity")
+            .pid;
+
+        // Kill the Chrome process externally so the cached session becomes dead.
+        #[cfg(unix)]
+        unsafe {
+            libc::kill(i32::try_from(first_pid).unwrap(), libc::SIGKILL);
+        }
+        let _ = first
+            .write()
+            .await
+            .browser
+            .wait()
+            .await
+            .expect("await killed Chrome exit");
+        assert!(
+            first.write().await.is_dead(),
+            "killed Chrome process must be detected as dead"
+        );
+
+        let second = manager
+            .get_session(&scope)
+            .await
+            .expect("relaunch after Chrome exit");
+        assert!(
+            !Arc::ptr_eq(&first, &second),
+            "dead session must be replaced with a fresh session"
+        );
+        let value: i64 = second
+            .read()
+            .await
+            .page
+            .evaluate("1 + 1")
+            .await
+            .expect("evaluate on relaunched session")
+            .into_value()
+            .expect("numeric result");
+        assert_eq!(value, 2);
+
+        manager.shutdown_all().await.expect("cleanup");
+    }
+
+    #[tokio::test]
+    async fn get_session_evicts_and_relaunches_when_cdp_handler_exits() {
+        if std::env::var_os("PHOENIX_CHROME_EXECUTABLE").is_none() {
+            return;
+        }
+
+        let scope = ResourceScopeKey::Work(WorkScopeId::new());
+        let manager = BrowserSessionManager::new();
+        let first = manager.get_session(&scope).await.expect("launch first");
+
+        first.read().await.handler_task.abort();
+        let deadline = Instant::now() + std::time::Duration::from_secs(2);
+        while Instant::now() < deadline {
+            if first.write().await.is_dead() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            first.write().await.is_dead(),
+            "finished CDP handler must mark session dead"
+        );
+
+        let second = manager
+            .get_session(&scope)
+            .await
+            .expect("relaunch after CDP handler exit");
+        assert!(
+            !Arc::ptr_eq(&first, &second),
+            "session with exited CDP handler must be replaced"
+        );
+        let value: i64 = second
+            .read()
+            .await
+            .page
+            .evaluate("2 + 3")
+            .await
+            .expect("evaluate on relaunched session")
+            .into_value()
+            .expect("numeric result");
+        assert_eq!(value, 5);
+
+        manager.shutdown_all().await.expect("cleanup");
     }
 
     /// `rekey_scope` on a manager with no session for `old` is a no-op:

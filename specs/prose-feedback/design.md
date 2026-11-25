@@ -240,16 +240,7 @@ Jump-to-line uses a `Map<number, HTMLElement>` of refs registered during render.
 
 ### REQ-PF-009 Implementation: Notes Formatting and Injection
 
-Format function:
-```typescript
-const formatted = `Review notes for \`${absoluteFilePath}\`:\n\n` +
-  notes.map(n => {
-    // Use the full raw line content for greppability
-    return `> Line ${n.lineNumber}: \`${n.lineContent}\`\n${n.note}`;
-  }).join("\n\n");
-```
-
-Note: The `lineContent` field stores the complete raw line text, not a truncated preview. This ensures the AI can search for exact matches in the codebase.
+`formatNotesForSend` (`ui/src/components/viewer/formatNotes.ts`) groups notes by file and quotes each note's line content in a code span. Quoted content is cut with `safePrefix` to `QUOTED_LINE_MAX_UNITS` (200 UTF-16 code units) and marked with `…`; `safePrefix` never splits a surrogate pair (ADR-282). The capture sites in `MarkdownViewerBody` and `TaskApprovalReader` apply the same cap.
 
 The `onSendNotes` callback passes this string to the parent component, which injects it into the message input state. The parent handles appending to existing draft with appropriate spacing.
 

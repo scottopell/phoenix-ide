@@ -403,7 +403,7 @@ export function useConversationsList(): {
   }>({ active: [], archived: [] });
 
   const subscribe = useCallback(
-    (listener: () => void) => store.subscribeAny(listener),
+    (listener: () => void) => store.subscribeSnapshots(listener),
     [store],
   );
 

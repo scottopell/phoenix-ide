@@ -37,8 +37,8 @@ pub use coordinator_watches::{
     MAX_WATCH_RESPONSE_CURSOR,
 };
 pub use federation_peers::FederationPeerConnection;
-mod executing_source;
 mod ddl;
+mod executing_source;
 mod reminders;
 mod request_capacity;
 pub use reminders::{

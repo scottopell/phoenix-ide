@@ -409,12 +409,11 @@ export function ConversationList({
   );
   const displayProductList = useMemo(
     () => (monitoredExpanded
-      ? [...monitoredSplit.own, ...monitoredSplit.monitored]
+      ? [...monitoredSplit.monitored, ...monitoredSplit.own]
       : monitoredSplit.own),
     [monitoredExpanded, monitoredSplit],
   );
   const monitoredCount = monitoredSplit.monitored.length;
-  const firstMonitoredId = monitoredSplit.monitored[0]?.product_conversation_id;
 
   useLayoutEffect(() => {
     if (expandedId && !menuRef.current) setExpandedId(null);
@@ -551,30 +550,31 @@ export function ConversationList({
             </li>
           ) : null
         ) : (
-          displayProductList.map((row) => [
-            row.product_conversation_id === firstMonitoredId && monitoredExpanded ? monitoredGroupToggle : null,
-            <ProductConversationListRowView
-              key={row.product_conversation_id}
-              row={row}
-              now={questionClock}
-              isMobileList={isMobileList}
-              isMenuOpen={expandedId === row.product_conversation_id}
-              onToggleMenu={toggleActions}
-              onCloseMenu={closeRowMenu}
-              menuRef={expandedId === row.product_conversation_id ? menuRef : undefined}
-              isActive={activeSlug === row.product_conversation_id || activeSlug === row.canonical_root.slug || activeSlug === row.canonical_root.transcript_row_id}
-              isKeyboardSelected={selectedId === row.product_conversation_id}
-              onClick={(productRow) => {
-                if (onProductConversationClick) onProductConversationClick(productRow);
-                else navigate(productRow.canonical_route);
-              }}
-              {...(onProductConversationClose ? { onProductConversationClose } : {})}
-              {...(onProductConversationDelete ? { onProductConversationDelete } : {})}
-              {...(onProductConversationRename ? { onProductConversationRename } : {})}
-            />,
-          ])
+          <>
+            {monitoredGroupToggle}
+            {displayProductList.map((row) => (
+              <ProductConversationListRowView
+                key={row.product_conversation_id}
+                row={row}
+                now={questionClock}
+                isMobileList={isMobileList}
+                isMenuOpen={expandedId === row.product_conversation_id}
+                onToggleMenu={toggleActions}
+                onCloseMenu={closeRowMenu}
+                menuRef={expandedId === row.product_conversation_id ? menuRef : undefined}
+                isActive={activeSlug === row.product_conversation_id || activeSlug === row.canonical_root.slug || activeSlug === row.canonical_root.transcript_row_id}
+                isKeyboardSelected={selectedId === row.product_conversation_id}
+                onClick={(productRow) => {
+                  if (onProductConversationClick) onProductConversationClick(productRow);
+                  else navigate(productRow.canonical_route);
+                }}
+                {...(onProductConversationClose ? { onProductConversationClose } : {})}
+                {...(onProductConversationDelete ? { onProductConversationDelete } : {})}
+                {...(onProductConversationRename ? { onProductConversationRename } : {})}
+              />
+            ))}
+          </>
         )}
-        {!isEmpty && !monitoredExpanded ? monitoredGroupToggle : null}
       </ul>
       {footer && <div className="conversation-list-footer">{footer}</div>}
     </section>

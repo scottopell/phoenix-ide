@@ -1,4 +1,5 @@
 import type { BashToolInput } from '../generated/sse';
+import { safePrefix } from '../utils/textBounds';
 
 export function cleanToolThoughts(raw: string): string {
   let text = raw.replace(/^\s*<thinking>\s*/i, '');
@@ -8,7 +9,7 @@ export function cleanToolThoughts(raw: string): string {
 }
 
 export function truncateToolInputValue(value: string, max = 40): string {
-  return value.length > max ? `${value.slice(0, max)}…` : value;
+  return value.length > max ? `${safePrefix(value, max)}…` : value;
 }
 
 function isFiniteInteger(value: unknown): value is number {

@@ -330,6 +330,13 @@ impl LaunchSlot {
             while let Some(event) = handler.next().await {
                 if let Err(error) = event {
                     tracing::warn!(%error, "CDP handler error");
+                    if matches!(
+                        error,
+                        chromiumoxide::error::CdpError::Ws(_)
+                            | chromiumoxide::error::CdpError::Io(_)
+                    ) {
+                        break;
+                    }
                 }
             }
         });
@@ -850,7 +857,13 @@ pub(super) mod tests {
         let (after_completion, after_completion_dropped, after_completion_changed) =
             witnessed_custody();
         let held = manager
-            .spawn_kill_session_by_key(key.clone(), scope.clone(), None, after_completion)
+            .spawn_kill_session_by_key(
+                key.clone(),
+                scope.clone(),
+                None,
+                None,
+                Some(after_completion),
+            )
             .await;
         let crate::session::KillSessionOutcome::AlreadyRequested { attempt: joined } = held else {
             panic!("physical cleanup still holds group: no second kill task");
@@ -880,7 +893,13 @@ pub(super) mod tests {
             "completed attempt cannot keep group alive"
         );
         let retry = manager
-            .spawn_kill_session_by_key(key, scope, None, BrowserRetirementCustody::no_op())
+            .spawn_kill_session_by_key(
+                key,
+                scope,
+                None,
+                None,
+                Some(BrowserRetirementCustody::no_op()),
+            )
             .await;
         let crate::session::KillSessionOutcome::Started { handle, .. } = retry else {
             panic!("quiescent group permits a new kill attempt");
@@ -1346,7 +1365,7 @@ pub(super) mod tests {
             &EffectiveResourceAccess::new("owner", ResourceAuthority::Work),
         );
         let joined = manager
-            .spawn_kill_session_by_key(key, scope.clone(), Some(expected), late)
+            .spawn_kill_session_by_key(key, scope.clone(), Some(expected), None, Some(late))
             .await;
         let crate::session::KillSessionOutcome::AlreadyRequested {
             attempt: joined_attempt,
@@ -1417,7 +1436,13 @@ pub(super) mod tests {
             &EffectiveResourceAccess::new("owner", ResourceAuthority::Work),
         );
         let started = manager
-            .spawn_kill_session_by_key(key, scope.clone(), None, BrowserRetirementCustody::no_op())
+            .spawn_kill_session_by_key(
+                key,
+                scope.clone(),
+                None,
+                None,
+                Some(BrowserRetirementCustody::no_op()),
+            )
             .await;
         let crate::session::KillSessionOutcome::Started {
             handle, attempt, ..
@@ -1534,6 +1559,132 @@ pub(super) mod tests {
         assert_eq!(permit.instances[0].process_identity(), full.chrome_process);
         assert_eq!(permit.instances[0].durable, full);
         drop(state_guard);
+    }
+
+    #[tokio::test]
+    async fn dead_retirement_detaches_synthetic_cleanup_and_revalidates_the_captured_slot() {
+        let (events_tx, mut events) = tokio::sync::mpsc::unbounded_channel();
+        let manager = BrowserSessionManager::with_lifecycle_sink(Some(events_tx));
+        let scope = scope();
+        let slot = reserve_in_manager(&manager, &scope).await;
+        let key = slot.key.clone();
+        let stop_attempts = Arc::new(AtomicUsize::new(0));
+        let dropped = Arc::new(AtomicBool::new(false));
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let cancelled_task = cancelled.clone();
+        let (cancelled_tx, cancelled_rx) = tokio::sync::oneshot::channel();
+        slot.scenario_owner
+            .start(move |mut cancellation| async move {
+                if !*cancellation.borrow() {
+                    let _ = cancellation.changed().await;
+                }
+                if *cancellation.borrow() {
+                    cancelled_task.store(true, Ordering::SeqCst);
+                    let _ = cancelled_tx.send(());
+                }
+            })
+            .unwrap();
+        *slot.state.write().await = LaunchState::InjectedPending(InjectedPending {
+            identity: slot.identity.clone(),
+            failures_remaining: 0,
+            stop_attempts: stop_attempts.clone(),
+            dropped,
+        });
+        std::fs::create_dir_all(&slot.profile).unwrap();
+
+        let gate = slot.retirement_gate.clone().lock_owned().await;
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let worker_manager = manager.clone();
+        let worker_scope = scope.clone();
+        let worker_slot = slot.clone();
+        let worker = tokio::spawn(async move {
+            let mut retirement = Box::pin(
+                worker_manager.retire_dead_session(key, worker_scope, worker_slot),
+            );
+            let first_poll = std::future::poll_fn(|cx| {
+                std::task::Poll::Ready(std::future::Future::poll(retirement.as_mut(), cx))
+            })
+            .await;
+            assert!(
+                first_poll.is_pending(),
+                "retirement must block on the held gate"
+            );
+            let _ = started_tx.send(());
+            let result = retirement.await;
+            let _ = done_tx.send(result);
+        });
+        started_rx.await.unwrap();
+        let waiter = tokio::spawn(async move { worker.await });
+        waiter.abort();
+        assert!(waiter.await.unwrap_err().is_cancelled());
+
+        assert_eq!(stop_attempts.load(Ordering::SeqCst), 0);
+        assert!(!cancelled.load(Ordering::SeqCst));
+        assert!(slot.profile.exists());
+        assert!(events.try_recv().is_err());
+        let state = manager.state.read().await;
+        assert!(state.sessions[&slot.key]
+            .current_kill
+            .lock()
+            .unwrap()
+            .is_none());
+        drop(state);
+
+        drop(gate);
+        done_rx.await.unwrap().unwrap();
+        assert_eq!(stop_attempts.load(Ordering::SeqCst), 1);
+        tokio::time::timeout(std::time::Duration::from_secs(5), cancelled_rx)
+            .await
+            .expect("scenario cancellation must be observed")
+            .expect("scenario cancellation observer remains connected");
+        assert!(cancelled.load(Ordering::SeqCst));
+        assert!(manager.state.read().await.sessions.get(&slot.key).is_none());
+        assert!(events.try_recv().is_ok());
+        // InjectedPending tests detached retirement coordination, not physical deletion.
+        std::fs::remove_dir_all(&slot.profile).expect("remove synthetic profile directory");
+    }
+
+    #[tokio::test]
+    async fn dead_retirement_preserves_replacement_installed_while_waiting_for_gate() {
+        let manager = Arc::new(BrowserSessionManager::default());
+        let scope = scope();
+        let captured = reserve_in_manager(&manager, &scope).await;
+        let key = captured.key.clone();
+        let gate = captured.retirement_gate.clone().lock_owned().await;
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let worker_manager = manager.clone();
+        let worker_scope = scope.clone();
+        let worker_slot = captured.clone();
+        let worker = tokio::spawn(async move {
+            let mut retirement = Box::pin(
+                worker_manager.retire_dead_session(key, worker_scope, worker_slot),
+            );
+            let first_poll = std::future::poll_fn(|cx| {
+                std::task::Poll::Ready(std::future::Future::poll(retirement.as_mut(), cx))
+            })
+            .await;
+            assert!(
+                first_poll.is_pending(),
+                "retirement must block on the held gate"
+            );
+            let _ = started_tx.send(());
+            let result = retirement.await;
+            let _ = done_tx.send(result);
+        });
+        started_rx.await.unwrap();
+        drop(tokio::spawn(async move { worker.await }));
+
+        let replacement = reserve_in_manager(&manager, &scope).await;
+        assert_eq!(captured.key, replacement.key);
+        assert!(!Arc::ptr_eq(&captured, &replacement));
+        drop(gate);
+        done_rx.await.unwrap().unwrap();
+        let current = manager.state.read().await.sessions[&replacement.key]
+            .session
+            .clone();
+        assert!(Arc::ptr_eq(&current, &replacement));
     }
 
     #[tokio::test]

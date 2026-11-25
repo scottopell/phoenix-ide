@@ -60,8 +60,87 @@ interface SnapshotUpsertOptions {
  */
 export class ConversationStore extends RoutedStore<string, ConversationAtom, SSEAction> {
   private slugByConvId = new Map<string, string>();
+  private slugsByConvId = new Map<string, Set<string>>();
+  private snapshotListeners = new Set<() => void>();
+  private snapshotBatchDepth = 0;
+  private snapshotDirtyInBatch = false;
   private transcriptAuthorityById = new Map<string, TranscriptAuthority>();
   private connectionIdsByKey = new Map<string, symbol>();
+
+  /** Subscribe only to changes that can affect `listSnapshots()` (`atom.conversation`
+   *  membership, snapshot replacement, or canonical slug index updates). High-frequency
+   *  per-token / progress / liveness actions that leave `atom.conversation` untouched do
+   *  not trigger these listeners. */
+  subscribeSnapshots(listener: () => void): () => void {
+    this.snapshotListeners.add(listener);
+    return () => {
+      this.snapshotListeners.delete(listener);
+    };
+  }
+
+  private notifySnapshots(): void {
+    if (this.snapshotBatchDepth > 0) {
+      this.snapshotDirtyInBatch = true;
+      return;
+    }
+    for (const listener of this.snapshotListeners) {
+      listener();
+    }
+  }
+
+  private batchSnapshots<T>(fn: () => T): T {
+    this.snapshotBatchDepth += 1;
+    try {
+      return fn();
+    } finally {
+      this.snapshotBatchDepth -= 1;
+      if (this.snapshotBatchDepth === 0 && this.snapshotDirtyInBatch) {
+        this.snapshotDirtyInBatch = false;
+        this.notifySnapshots();
+      }
+    }
+  }
+
+  private trackSlugForConvId(convId: string, slug: string): void {
+    let set = this.slugsByConvId.get(convId);
+    if (!set) {
+      set = new Set();
+      this.slugsByConvId.set(convId, set);
+    }
+    set.add(slug);
+  }
+
+  private untrackSlugForConvId(convId: string, slug: string): void {
+    const set = this.slugsByConvId.get(convId);
+    if (!set) return;
+    set.delete(slug);
+    if (set.size === 0) this.slugsByConvId.delete(convId);
+  }
+
+  protected override setAtom(slug: string, next: ConversationAtom): boolean {
+    const prev = this.atomByKey(slug);
+    const prevConversation = prev?.conversation ?? null;
+    if (!super.setAtom(slug, next)) return false;
+    const nextConversation = next.conversation;
+    if (prevConversation?.id !== nextConversation?.id) {
+      if (prevConversation) this.untrackSlugForConvId(prevConversation.id, slug);
+      if (nextConversation) this.trackSlugForConvId(nextConversation.id, slug);
+    }
+    if (prevConversation !== nextConversation) {
+      this.notifySnapshots();
+    }
+    return true;
+  }
+
+  protected override removeAtom(slug: string): boolean {
+    const prev = this.atomByKey(slug);
+    if (!super.removeAtom(slug)) return false;
+    if (prev?.conversation) {
+      this.untrackSlugForConvId(prev.conversation.id, slug);
+      this.notifySnapshots();
+    }
+    return true;
+  }
 
   getTranscriptAuthority(conversationId: string): TranscriptAuthority {
     return this.transcriptAuthorityById.get(conversationId) ?? LIVE_TRANSCRIPT;
@@ -125,12 +204,14 @@ export class ConversationStore extends RoutedStore<string, ConversationAtom, SSE
     if (!indexedSlug) {
       this.slugByConvId.set(conversation.id, slug);
       this.notifyChanged(slug);
+      this.notifySnapshots();
       return;
     }
     const indexedConversation = this.atomByKey(indexedSlug)?.conversation;
     if (indexedSlug !== slug && (!indexedConversation || conversation.updated_at > indexedConversation.updated_at)) {
       this.slugByConvId.set(conversation.id, slug);
       this.notifyChanged(slug);
+      this.notifySnapshots();
     }
   }
 
@@ -250,13 +331,15 @@ export class ConversationStore extends RoutedStore<string, ConversationAtom, SSE
    * atoms actually changed (callers can use this to gate cache writes).
    */
   upsertSnapshots(rows: readonly Conversation[], options: SnapshotUpsertOptions = {}): string[] {
-    const changed: string[] = [];
-    for (const row of rows) {
-      if (this.upsertSnapshot(row.slug, row, options)) {
-        changed.push(row.slug);
+    return this.batchAny(() => this.batchSnapshots(() => {
+      const changed: string[] = [];
+      for (const row of rows) {
+        if (this.upsertSnapshot(row.slug, row, options)) {
+          changed.push(row.slug);
+        }
       }
-    }
-    return changed;
+      return changed;
+    }));
   }
 
   replaceSlugSnapshot(oldSlug: string, conversation: Conversation): boolean {
@@ -283,9 +366,11 @@ export class ConversationStore extends RoutedStore<string, ConversationAtom, SSE
   }
 
   private bestConversationForId(convId: string): Conversation | undefined {
+    const slugs = this.slugsByConvId.get(convId);
+    if (!slugs) return undefined;
     let best: Conversation | undefined;
-    for (const [, atom] of this.entries()) {
-      const conversation = atom.conversation;
+    for (const slug of slugs) {
+      const conversation = this.atomByKey(slug)?.conversation;
       if (conversation?.id !== convId) continue;
       if (!best || this.preferForSidebar(conversation, best)) best = conversation;
     }
@@ -293,8 +378,12 @@ export class ConversationStore extends RoutedStore<string, ConversationAtom, SSE
   }
 
   private removeInactiveAliases(convId: string, keepSlug: string): void {
-    for (const [slug, atom] of this.entries()) {
-      if (slug === keepSlug || atom.conversation?.id !== convId) continue;
+    const slugs = this.slugsByConvId.get(convId);
+    if (!slugs || slugs.size === 0) return;
+    for (const slug of [...slugs]) {
+      if (slug === keepSlug) continue;
+      const atom = this.atomByKey(slug);
+      if (!atom || atom.conversation?.id !== convId) continue;
       if (this.isSnapshotOnly(slug, atom)) {
         this.removeAtom(slug);
       }
@@ -367,10 +456,14 @@ export class ConversationStore extends RoutedStore<string, ConversationAtom, SSE
   removeByConversationId(convId: string): string[] {
     this.transcriptAuthorityById.delete(convId);
     this.connectionIdsByKey.delete(convId);
+    const slugs = this.slugsByConvId.get(convId);
     const removed: string[] = [];
-    for (const [slug, atom] of this.entries()) {
-      if (atom.conversation?.id !== convId) continue;
-      if (this.removeAtom(slug)) removed.push(slug);
+    if (slugs) {
+      this.batchAny(() => this.batchSnapshots(() => {
+        for (const slug of [...slugs]) {
+          if (this.removeAtom(slug)) removed.push(slug);
+        }
+      }));
     }
     this.slugByConvId.delete(convId);
     return removed;

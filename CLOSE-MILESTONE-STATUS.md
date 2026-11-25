@@ -4,6 +4,25 @@ The current source reduces the Close expansion against shipped RC16
 `9885834f049683f5e6fa9c840668bdab92eb8a01`. The keep/share/delete ledger is
 [CLOSE-ARCHITECTURE-REDUCTION.md](CLOSE-ARCHITECTURE-REDUCTION.md).
 
+- Reduction head `d180a5e12d2bd985af94d26f5f89397299548963`: automatic Close
+  [45509934652](https://github.com/scottopell/phoenix-ide/actions/runs/45509934652)
+  **failed**. All 82 native Close DB tests (including the ordinary-approval
+  transaction source-fence regression), four shared-source core tests, frontend
+  and specification lanes passed. Runtime test compilation failed on a missing
+  `ContentBlock` import; runtime public journeys and Stop cases did not execute.
+  The hosted format-only patch and import repair are incorporated in this next
+  candidate, not yet qualified. Standard PR CI was absent while main conflicts
+  prevented a synthetic merge.
+- This candidate integrates main `4696476996c66b77de85a23ac9331a4ef04bc8e3`,
+  preserving its extracted UI action components and dead-browser detection while
+  routing dead-session retirement through existing gate/custody/completion
+  ownership. Source review found and repaired moved-key, adapter-arity and Arc
+  receiver hazards. Two deterministic synthetic-slot regressions cover detached
+  gate waiting and post-wait replacement preservation; existing blocking-profile
+  cleanup tests, not those synthetic fixtures, cover physical deletion custody.
+  Main's published ADR-282 is retained; the colliding Proposed Close ADR moves
+  to ADR-285, still superseded by explicit-only ADR-283. All integrated behavior
+  remains unqualified pending automatic exact-head hosted checks.
 - Previous head `cb7e805735220fd260537a42e33e15baacaff70f`: Close qualification
   [45491118337](https://github.com/scottopell/phoenix-ide/actions/runs/45491118337)
   **passed**. Standard PR CI

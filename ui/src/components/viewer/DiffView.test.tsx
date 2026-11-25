@@ -1,7 +1,7 @@
 import { render, screen, fireEvent, within, act, waitFor } from '@testing-library/react';
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { __diffViewFindTestables, DiffView } from './DiffView';
-import * as searchProjectionModule from '../viewer-find/searchProjections';
+import * as diffSearchProjectionModule from '../viewer-find/diffSearchProjection';
 import { ReviewNotesProvider } from '../../contexts/ReviewNotesContext';
 import { codeViewMockState, itemVersion, resetCodeViewMock } from './__testutils__/codeViewMock';
 
@@ -91,7 +91,7 @@ describe('DiffView (Pierre CodeView wiring)', () => {
   });
 
   it('reuses the memoized diff projection when a new query navigates to its first match', async () => {
-    const spy = vi.spyOn(searchProjectionModule, 'buildDiffSearchProjection');
+    const spy = vi.spyOn(diffSearchProjectionModule, 'buildDiffSearchProjection');
     renderDiff(COMMITTED, COMMITTED.replaceAll('foo.txt', 'bar.txt'));
 
     fireEvent.click(screen.getByRole('button', { name: 'Find in diff' }));

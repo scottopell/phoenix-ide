@@ -44,9 +44,10 @@ Allowing gaps does not approve an ID allocation, decision, or publication.
 
 | ADR | Title | Status | Affects |
 | --- | --- | --- | --- |
+| [285](285_unified-close-idempotence-and-bounded-completion-retry.md) | Unified Close is idempotent with one bounded completion-only retry | Proposed; identity relocated from branch-local 282 to resolve collision with published ADR-282 | REQ-WL-002f; REQ-BED-029; `close_conversation`, retained Close operation and run identity |
 | [284](284_native-task-approval-source-snapshot-and-receipt.md) | Bind native task approval to canonical source, snapshot and receipt | Proposed | REQ-TAT-001–008; REQ-PROJ-003; REQ-BED-028/046; REQ-COMP-001/002; REQ-DWF-043 |
-| [283](283_close-uses-exact-blockers-and-explicit-retry-only.md) | Close uses exact blockers and explicit retry only | Accepted; supersedes 282's automatic completion policy and 088's in-Close discard/disposable alternative | REQ-WL-002/002a/002b/002c/002d/002e/002f/004; REQ-BED-029 |
-| [282](282_unified-close-idempotence-and-bounded-completion-retry.md) | Unified Close is idempotent with one bounded completion-only retry | Proposed | REQ-WL-002f; REQ-BED-029; `close_conversation`, retained Close operation and run identity |
+| [283](283_close-uses-exact-blockers-and-explicit-retry-only.md) | Close uses exact blockers and explicit retry only | Accepted; supersedes 285's automatic completion policy and 088's in-Close discard/disposable alternative | REQ-WL-002/002a/002b/002c/002d/002e/002f/004; REQ-BED-029 |
+| [282](282_cap-quoted-review-lines-at-a-character-boundary.md) | Cap quoted review lines at 200 UTF-16 units on a character boundary | Accepted | REQ-PF-009, REQ-PF-016 |
 | [274](274_remove-at-file-inclusion.md) | Remove `@file` content inclusion and leave `@` literal | Accepted | REQ-IR-001, REQ-IR-004, REQ-IR-006, REQ-IR-007, REQ-IR-010, REQ-FE-011 |
 | [273](273_fixed-rc9-preparation-without-publication-authority.md) | Fixed RC9 preparation without publication authority | Accepted | REQ-DESKTOP-REL-014 |
 | [272](272_bound-exhaustive-backup-verification-to-fifteen-minutes.md) | Bound exhaustive backup verification to fifteen minutes | Accepted; qualifies ADR-263 | REQ-LDD-029, REQ-LDD-031 |
@@ -298,7 +299,7 @@ Consult the relevant ADRs before starting work of each kind.
 | Changing Codex route admission or private continuation account identity | 085, preserving 062's advisory discovery policy |
 | Changing MCP credential removal or restart recovery | 086, within 034's compatibility scope |
 | Changing automatic HTTP connection recovery or Slack connection-health reporting | 240, within 034 and 086's recovery scope |
-| Specifying native Close, exact blockers, failure, startup observation, History cleanup attention, mandatory Global failure delivery, or explicit safe retry | 283 supersedes 282's automatic completion-only policy and 088's in-Close discard/disposable alternative; retain 088's bounded execution/lifecycle policy, 241's writer evidence, and the identity/ownership safeguards of 026/040/041/042/080 |
+| Specifying native Close, exact blockers, failure, startup observation, History cleanup attention, mandatory Global failure delivery, or explicit safe retry | 283 supersedes 285's automatic completion-only policy and 088's in-Close discard/disposable alternative; retain 088's bounded execution/lifecycle policy, 241's writer evidence, and the identity/ownership safeguards of 026/040/041/042/080 |
 | Creating or restructuring Phoenix spec artifacts | 000 |
 | Deciding whether to create a new `design.md` | 000 |
 | Migrating legacy `specs/*/design.md` content | 000, 001, 002, 003, 004, 005, 006 |

@@ -1,5 +1,6 @@
 use super::*;
 use crate::state_machine::state::{AssistantMessage, ToolCall, ToolInput};
+use phoenix_core::domain::ContentBlock;
 use serde_json::{json, Value};
 
 fn fixture(input: Value) -> (ConvState, SourceToolCall) {

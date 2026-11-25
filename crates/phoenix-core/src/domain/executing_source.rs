@@ -1,10 +1,6 @@
 use serde_json::Value;
 
-use super::{
-    db_schema::SourceToolCall,
-    llm_types::ContentBlock,
-    sm_state::ConvState,
-};
+use super::{db_schema::SourceToolCall, llm_types::ContentBlock, sm_state::ConvState};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum ExecutingSourceRefusal {
@@ -40,7 +36,9 @@ pub fn verify_executing_source(
         || assistant_message.message_id != source.message_id
         || current_tool.id != source.tool_use_id
         || current_tool.name() != tool_name
-        || remaining_tools.iter().any(|tool| tool.id == source.tool_use_id)
+        || remaining_tools
+            .iter()
+            .any(|tool| tool.id == source.tool_use_id)
         || completed_results
             .iter()
             .any(|result| result.tool_use_id() == source.tool_use_id)
@@ -164,11 +162,18 @@ mod tests {
     fn rejects_wrong_tool_name_and_payload_disagreement() {
         let (state, source, input) = fixture();
         assert_refused(&state, &source, &json!({"target": "other"}));
-        assert_refused(&state, &source, &json!({"target": "conversation-1", "extra": true}));
+        assert_refused(
+            &state,
+            &source,
+            &json!({"target": "conversation-1", "extra": true}),
+        );
         assert_refused(&state, &source, &json!({}));
 
         let mut wrong_name = state.clone();
-        if let ConvState::ToolExecuting { assistant_message, .. } = &mut wrong_name {
+        if let ConvState::ToolExecuting {
+            assistant_message, ..
+        } = &mut wrong_name
+        {
             if let ContentBlock::ToolUse { name, .. } = &mut assistant_message.content[0] {
                 *name = "other_tool".into();
             }
@@ -193,19 +198,30 @@ mod tests {
         let (state, source, input) = fixture();
 
         let mut missing = state.clone();
-        if let ConvState::ToolExecuting { assistant_message, .. } = &mut missing {
+        if let ConvState::ToolExecuting {
+            assistant_message, ..
+        } = &mut missing
+        {
             assistant_message.content.clear();
         }
         assert_refused(&missing, &source, &input);
 
         let mut duplicate = state.clone();
-        if let ConvState::ToolExecuting { assistant_message, .. } = &mut duplicate {
-            assistant_message.content.push(assistant_message.content[0].clone());
+        if let ConvState::ToolExecuting {
+            assistant_message, ..
+        } = &mut duplicate
+        {
+            assistant_message
+                .content
+                .push(assistant_message.content[0].clone());
         }
         assert_refused(&duplicate, &source, &input);
 
         let mut remaining = state.clone();
-        if let ConvState::ToolExecuting { remaining_tools, .. } = &mut remaining {
+        if let ConvState::ToolExecuting {
+            remaining_tools, ..
+        } = &mut remaining
+        {
             remaining_tools.push(ToolCall::new(
                 "tool-1",
                 ToolInput::Unknown {
@@ -217,12 +233,13 @@ mod tests {
         assert_refused(&remaining, &source, &input);
 
         let mut completed = state;
-        if let ConvState::ToolExecuting { completed_results, .. } = &mut completed {
-            completed_results.push(
-                crate::domain::conversation_goal::ToolRoundResult::from(
-                    crate::domain::db_schema::ToolResult::success("tool-1".into(), "done".into()),
-                ),
-            );
+        if let ConvState::ToolExecuting {
+            completed_results, ..
+        } = &mut completed
+        {
+            completed_results.push(crate::domain::conversation_goal::ToolRoundResult::from(
+                crate::domain::db_schema::ToolResult::success("tool-1".into(), "done".into()),
+            ));
         }
         assert_refused(&completed, &source, &input);
     }

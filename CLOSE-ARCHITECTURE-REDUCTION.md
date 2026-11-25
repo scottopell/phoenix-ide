@@ -1,11 +1,15 @@
 # Close architecture reduction disposition
 
-This is a scope ledger against shipped baseline `9885834f` and dirty reduction
-`cb7e80573`, not evidence that the reduction is qualified. Qualification evidence
-is limited to the reported Close run `45491118337` (success) and standard CI run
-`45491139148` (red). The present dirty reduction is **UNQUALIFIED**: it has not
-been locally executed. Preserved run `1068` has an unknown cause; do not attribute
-it to either source or infrastructure without evidence.
+This is a scope ledger against shipped baseline `9885834f`, implemented in
+reduction `d180a5e12` and now integrated with main `469647699`. The integrated
+candidate remains **UNQUALIFIED**. Reduction Close run `45509934652` failed:
+82 native Close DB tests, four shared-source core tests, frontend and specs
+passed, but runtime test compilation failed on a missing `ContentBlock` import.
+The next candidate includes that import repair and the reviewed hosted formatting
+patch. Prior Close run `45491118337` passed and standard CI `45491139148` failed
+at `cb7e80573`; neither qualifies this candidate. No local executable validation
+was run. Preserved run `1068` has an unknown cause; do not attribute it to either
+source or infrastructure without evidence.
 
 ## Keep
 

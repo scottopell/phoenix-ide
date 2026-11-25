@@ -9,6 +9,7 @@ import { AnnotatableBlock } from './AnnotatableBlock';
 import type { ViewerBodyProps } from './AnnotatableBlock';
 import { MermaidDiagram } from '../MermaidDiagram';
 import { buildMarkdownFileSearchProjection } from '../viewer-find';
+import { QUOTED_LINE_MAX_UNITS, safePrefix } from '../../utils/textBounds';
 
 // Stable plugin reference — a fresh array each render defeats ReactMarkdown's
 // internal memoization and forces a full re-parse.
@@ -94,7 +95,7 @@ export function MarkdownViewerBody({
         const ln = node?.position?.start?.line ?? 0;
         const startLine = (node?.position?.start?.line ?? 1) - 1;
         const endLine = (node?.position?.end?.line ?? startLine + 1) - 1;
-        const rawLineContent = rawLines.slice(startLine, endLine + 1).join(' ').slice(0, 200);
+        const rawLineContent = safePrefix(rawLines.slice(startLine, endLine + 1).join(' '), QUOTED_LINE_MAX_UNITS);
         const sourceOffset = node?.position?.start?.offset;
         const blockMatches = sourceOffset === undefined ? [] : matchesBySourceOffset.get(sourceOffset) ?? [];
         return (

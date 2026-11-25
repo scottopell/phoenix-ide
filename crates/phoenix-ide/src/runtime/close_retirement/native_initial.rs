@@ -147,5 +147,4 @@ mod tests {
             RetiredResourceKind::BrowserSession
         );
     }
-
 }

@@ -14,6 +14,7 @@
  */
 
 import { useState, useMemo } from 'react';
+import { safeSuffix } from '../utils/textBounds';
 
 /** Actions that have a dedicated structured renderer. Other browser_profile
  *  actions (e.g. why_render, throttle, gc_heap) should fall through to the
@@ -914,7 +915,7 @@ function clampPercent(n: number): number {
 
 function shortPath(p: string): string {
   if (p.length <= 40) return p;
-  return `…${p.slice(-37)}`;
+  return `…${safeSuffix(p, 37)}`;
 }
 
 function fmtMetricValue(name: string, v: number): string {
