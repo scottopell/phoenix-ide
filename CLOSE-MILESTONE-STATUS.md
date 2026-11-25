@@ -2,6 +2,50 @@
 
 ## Current qualification and reviewed lint follow-up
 
+### 6d8 broad results and bounded intermittent retry diagnosis
+
+Candidate `6d8b7a769abcfc9aba70764d5672b1374a46499a` remains **unqualified**.
+[CI45583392931](https://github.com/scottopell/phoenix-ide/actions/runs/45583392931)
+is terminal failed only at Clippy: `INSTALL_SHIM` appears after a statement.
+Early formatting, musl, Rust build/codegen, dev.py/task/UI/specs/E2E and all four
+Rust shards passed. Shards executed **1764**, **1760**, **1753** and **1746** tests,
+all passing; selected-out tests are not counted. Broad source was synthetic merge
+`99b533a4e3176f4e05d0b8d4d6e1c83d51e174a5`, not exact feature alone.
+All six unprivileged dispatcher selectors have actual **1 / 0 / 0** receipts,
+including Stop before physical observation. The repaired real-Chrome root-exit
+and handler-exit relaunch fixtures passed. Exact
+[Close45583380922](https://github.com/scottopell/phoenix-ide/actions/runs/45583380922)
+is still active; its final qualification is not claimed.
+
+Retained predecessor [Close45580506277](https://github.com/scottopell/phoenix-ide/actions/runs/45580506277)
+finished failed on a251. In addition to formatting, the clean public captured-loss
+retry actually returned `storage_rejected`. Four causal Stop selectors and initial
+physical retirement passed, as did native DB **82 / 0 / 0** and migrations
+**180 / 0 / 0**. Missing downstream DB inventories caused further receipt-gate
+failures; those are not independent selector executions. No Close runtime, journey
+or qualification workflow source changed from the passing 4fa7 to a251. This is an
+**unresolved intermittent behavioral failure**, not excused by the later broad pass.
+The sole ignored-content warning was retained from an earlier intentionally dirty
+retry: the accumulating trace buffer cannot establish the clean refusal's cause.
+
+This diagnostic follow-up moves the unchanged `Once` declaration before statements,
+prints the original clean refusal plus separately labeled before/after bounded
+trace tails before any diagnostic DB await, and reads retry receipt/run/cleanup
+and retirement state without diagnostic unwraps. A two-second outer evidence guard
+cannot suppress the already printed original refusal. Strict journey assertions,
+Stop fences, successful replay and physical/durable checks remain unchanged.
+
+Exact qualification adds four fixed, isolated clean-retry journey samples through
+the existing unprivileged harness. Each preserves a distinct log; every nonzero
+status, missing exact execution receipt or non-passing count fails the step. These
+are not retry-until-green, and a later success cannot erase an earlier failure.
+Per-sample 90-second plus kill-grace limits and an eight-minute step fence bound the
+investigation. Even all samples passing would not explain the observed failure:
+merge remains blocked pending trustworthy failing-stage evidence and resolution,
+not repeated whole pipelines until one green. No production safety policy changes,
+automatic recovery, sleeps, manual reruns/cancellation or local executable validation.
+Evidence is retained under `/tmp/close-a251508ae/` and `/tmp/close-6d8b7a769/`.
+
 ### a251 early formatting refusal and unchanged hosted correction
 
 Candidate `a251508aea62e5841d12a4bfa741d904c7cf7921` is **not qualified**.

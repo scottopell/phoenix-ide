@@ -597,18 +597,26 @@ pub(super) async fn retry_after_public_capture(
         return;
     }
 
+    let diagnostics_before_clean_retry = physical_close_diagnostics();
     let completed = tokio::time::timeout(
         Duration::from_secs(10),
         tool.run(input.clone(), context.clone()),
     )
     .await
     .expect("public captured-loss retry must finish within its terminal fence");
-    assert!(
-        completed.is_success(),
-        "clean captured-loss retry: {}\n{}",
-        completed.output(),
-        physical_close_diagnostics()
-    );
+    if !completed.is_success() {
+        let diagnostics = physical_close_diagnostics();
+        eprintln!(
+            "clean captured-loss retry was refused: {}\ndiagnostics before clean retry:\n{diagnostics_before_clean_retry}\ndiagnostics after clean retry (bounded tail):\n{diagnostics}",
+            completed.output()
+        );
+        let evidence = tokio::time::timeout(
+            Duration::from_secs(2),
+            clean_retry_failure_evidence(&fixture, initial_run),
+        )
+        .await;
+        panic!("clean captured-loss retry failure; durable evidence: {evidence:?}");
+    }
     let admitted: Value = serde_json::from_str(completed.output()).unwrap();
     assert_eq!(admitted["action"], "explicit_retry");
     assert_eq!(admitted["status"], "newly_admitted");
@@ -770,6 +778,30 @@ pub(super) async fn retry_after_public_capture(
         .await
         .expect("retry source actor must shut down")
         .unwrap();
+}
+
+async fn clean_retry_failure_evidence(fixture: &CloseFixture, run: &CloseRunRef) -> String {
+    let target = fixture.db.get_conversation(TARGET_ID).await;
+    let retry_rows = sqlx::query_scalar::<_, String>(
+        "SELECT json_object('run_ordinal', run_ordinal, 'status', status,
+                            'ended_at_us', ended_at_us)
+         FROM close_runs WHERE attempt_id = ?1 ORDER BY run_ordinal",
+    )
+    .bind(run.attempt_id.as_str())
+    .fetch_all(fixture.db.pool())
+    .await;
+    let receipt = fixture
+        .db
+        .read_native_close_explicit_retry_receipt(&fixture.command)
+        .await;
+    let cleanup_failures = fixture
+        .db
+        .list_close_cleanup_failures(run.attempt_id.as_str())
+        .await;
+    let retirement = worktree_close_failure_evidence(fixture, run).await;
+    format!(
+        "target: {target:?}; retry rows: {retry_rows:?}; retry receipt: {receipt:?}; cleanup failures: {cleanup_failures:?}; {retirement}"
+    )
 }
 
 #[derive(Debug, PartialEq)]

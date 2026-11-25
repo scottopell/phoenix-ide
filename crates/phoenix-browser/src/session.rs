@@ -4490,10 +4490,10 @@ mod lifecycle_hook_tests {
     }
 
     fn real_chrome_lifecycle_tests_configured() -> bool {
+        static INSTALL_SHIM: std::sync::Once = std::sync::Once::new();
         if std::env::var_os("PHOENIX_CHROME_EXECUTABLE").is_none() {
             return false;
         }
-        static INSTALL_SHIM: std::sync::Once = std::sync::Once::new();
         INSTALL_SHIM.call_once(|| {
             let executable = std::env::var_os("PHOENIX_TEST_CHROME_SHIM_EXECUTABLE")
                 .expect("real Chrome lifecycle tests require a matched Chrome exec shim");
