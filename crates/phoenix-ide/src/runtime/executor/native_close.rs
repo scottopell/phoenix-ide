@@ -290,7 +290,7 @@ impl NativeCloseInitialContinuation {
             return false;
         }
 
-        self.abort_and_join_inventory_preparation().await;
+        self.abort_inventory_preparation();
         match self.poll_exit_custody().await {
             post_retirement::ExitCustodyPoll::Classified => {}
             post_retirement::ExitCustodyPoll::Pending => return false,
@@ -311,7 +311,7 @@ impl NativeCloseInitialContinuation {
 
     /// Abort inert preparation while retaining every handle for bounded custody
     /// classification. Resource permits stay manager-owned and fenced after a failed Close.
-    pub(super) async fn abort_and_join_inventory_preparation(&mut self) {
+    pub(super) fn abort_inventory_preparation(&mut self) {
         // Abort only inert preparation; retain every handle until bounded custody
         // polling classifies its result. Aborting a JoinHandle is not a join.
         if let Some(progress) = &self.process_retirement {
@@ -635,7 +635,7 @@ impl NativeCloseInitialContinuation {
             .and_then(|owner| owner.fence.as_ref())
             .is_some_and(|fence| fence.fatal_authority_loss_is_latched())
         {
-            self.abort_and_join_inventory_preparation().await;
+            self.abort_inventory_preparation();
             return Err(NativeCloseApplicationError::FatalAuthority);
         }
         if self.exit_observation_only() {
@@ -797,7 +797,7 @@ impl NativeCloseInitialContinuation {
             Phase::PreparingInventory => {
                 if !self.live_source_matches(live_source) {
                     self.abort_inspection_if_source_revoked(live_source);
-                    self.abort_and_join_inventory_preparation().await;
+                    self.abort_inventory_preparation();
                     self.phase = Phase::InspectionRequired;
                     self.settle_source_refused();
                     return Err(NativeCloseApplicationError::SourceRefused);
@@ -1085,7 +1085,7 @@ impl NativeCloseInitialContinuation {
             | Phase::Finished => Ok(self.phase),
         };
         if matches!(&result, Err(NativeCloseApplicationError::FatalAuthority)) {
-            self.abort_and_join_inventory_preparation().await;
+            self.abort_inventory_preparation();
         }
         result
     }

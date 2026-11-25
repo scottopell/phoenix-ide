@@ -247,7 +247,7 @@ impl NativeCloseInitialContinuation {
         live_source: &phoenix_core::domain::sm_state::ConvState,
     ) -> Result<Phase, NativeCloseApplicationError> {
         if !self.live_source_matches(live_source) {
-            self.abort_and_join_inventory_preparation().await;
+            self.abort_inventory_preparation();
             self.phase = Phase::InspectionRequired;
             return Err(NativeCloseApplicationError::SourceRefused);
         }

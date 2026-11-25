@@ -26,6 +26,8 @@ TEST_NAMES = [PREFIX + suffix for suffix in (
     "registered_native_close_captured_loss_retry_stop_while_prepared_preserves_worktree",
     "registered_native_close_captured_loss_retry_stop_before_writer_refuses_dispatch",
     "registered_native_close_captured_loss_retry_stop_before_physical_observation_retains_stopped_result",
+    "registered_native_close_captured_loss_retry_stop_during_physical_mutation_does_not_revalidate_pending_ticks",
+    "registered_native_close_captured_loss_retry_resumes_physical_mutation_after_pending_ticks",
 )]
 
 
@@ -73,10 +75,10 @@ class CloseNextestWrapperTests(unittest.TestCase):
                 self.assertEqual(args, result.stdout.decode().split("\0")[:-1])
                 self.assertEqual(b"original fixture stderr\n", result.stderr)
 
-    def test_allowlist_is_exactly_the_existing_harness_six(self):
+    def test_allowlist_is_exactly_the_existing_harness_eight(self):
         pattern = re.escape(PREFIX) + r"[a-z0-9_]+"
         expected = set(TEST_NAMES)
-        self.assertEqual(6, len(expected))
+        self.assertEqual(8, len(expected))
         for path in (DISPATCHER, QUALIFICATION):
             self.assertEqual(expected, set(re.findall(pattern, path.read_text())))
 

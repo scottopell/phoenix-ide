@@ -60,8 +60,13 @@ async fn registered_close_captures_and_retires_disposable_empty_work_scope() {
     backend.runtimes.write().await.insert(
         fixture.source_transcript_id.clone(),
         crate::runtime::ConversationHandle {
-            event_tx: event_tx.clone(),
-            acknowledged_event_tx: sender,
+            event_tx: crate::runtime::ConversationEventSender::for_test_receiver(
+                event_tx.clone(),
+            ),
+            acknowledged_event_tx:
+                crate::runtime::cancellation_inbox::AcknowledgedEventSender::for_test_receiver(
+                    sender,
+                ),
             handoff_review_tx: None,
             turn_trigger: crate::runtime::TurnTriggerSlot::default(),
             broadcast_tx: crate::runtime::SseBroadcaster::new(128, 0),

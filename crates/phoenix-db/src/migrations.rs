@@ -17660,8 +17660,8 @@ mod tests {
                 .unwrap();
         assert!(cached_ledger
             .iter()
-            .map(|(version, name)| (*version, name.as_str()))
-            .eq(migration_identities()));
+            .cloned()
+            .eq(migration_identities().map(|(version, name)| (version, name.to_owned()))));
         assert_eq!(run_pending_migrations(cached.pool()).await.unwrap(), 0);
 
         let dir = tempfile::tempdir().unwrap();

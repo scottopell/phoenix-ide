@@ -1,8 +1,8 @@
 use super::*;
 use crate::runtime::traits::MessageStore;
 use crate::runtime::{
-    AddressedConversationEventDispatcher, ConversationEventDispatcher, ConversationHandle,
-    RuntimeManager,
+    AcknowledgedEventRequest, AddressedConversationEventDispatcher, ConversationEventDispatcher,
+    ConversationHandle, RuntimeManager,
 };
 
 #[derive(Clone, Copy)]
@@ -249,7 +249,7 @@ async fn stop_keeps_batch_commit_and_cutoff_live_while_close_holds_source_custod
         remaining_tools: vec![],
         completed_results: vec![],
         pending_sub_agents: vec![],
-        assistant_message: AssistantMessage::new(
+        assistant_message: crate::state_machine::AssistantMessage::new(
             "close-source",
             vec![ContentBlock::tool_use(
                 "close-call",

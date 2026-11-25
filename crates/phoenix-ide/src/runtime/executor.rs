@@ -3391,7 +3391,7 @@ where
                     if continuation.phase
                         == native_close::NativeCloseInitialContinuationPhase::InspectionRequired
                     {
-                        continuation.abort_and_join_inventory_preparation().await;
+                        continuation.abort_inventory_preparation();
                     }
                     if continuation.release_if_exactly_terminal().await {
                         pending_native_close_initial = None;
@@ -3604,7 +3604,7 @@ where
                         continuation.settlement_entry_observer = self.native_close_settlement_entry_observer.clone();
                     }
                     let stepped = match continuation.ensure_source_entry(&mut self.native_close_source_entry, &self.state).await {
-                        Ok(()) => continuation.step(&self.state).await,
+                        Ok(()) => Box::pin(continuation.step(&self.state)).await,
                         Err(error) => Err(error),
                     };
                     #[cfg(test)]
@@ -3686,7 +3686,7 @@ where
                     }
                 }, if !source_control_ready && pending_native_close_retry.is_some() => {
                     let continuation = pending_native_close_retry.take().expect("guarded retry continuation");
-                    let (fatal, cursor) = self.finish_native_close_retry(continuation, assessment).await;
+                    let (fatal, cursor) = Box::pin(self.finish_native_close_retry(continuation, assessment)).await;
                     admitted_native_close_retry = cursor;
                     if fatal {
                         join_pending_native_close_before_fatal!();
@@ -3695,7 +3695,7 @@ where
                 }
                 () = tokio::time::sleep_until(next_native_retry_service_at), if !source_control_ready && admitted_native_close_retry.is_some() => {
                     let mut cursor = admitted_native_close_retry.take().expect("guarded admitted retry");
-                    match cursor.step(&self.state, &mut self.native_close_source_entry).await {
+                    match Box::pin(cursor.step(&self.state, &mut self.native_close_source_entry)).await {
                         Ok(true) => { self.revoke_native_close_source_entry().await; }
                         Ok(false) => {
                             admitted_native_close_retry = Some(cursor);
@@ -3765,7 +3765,7 @@ where
                                 let _ = response.send(Err(super::native_close_application::NativeCloseApplicationError::SourceRefused));
                                 continue;
                             }
-                            let result = self.admit_native_close_initial(&backend, source, target, admitted, target_gate, response).await;
+                            let result = Box::pin(self.admit_native_close_initial(&backend, source, target, admitted, target_gate, response)).await;
                             let (fatal, continuation) = match result {
                                 Ok(native_close::NativeCloseInitialAdmission::Finished { .. }) => (false, None),
                                 Ok(native_close::NativeCloseInitialAdmission::Continued { continuation, .. }) => (false, Some(*continuation)),
@@ -3800,7 +3800,7 @@ where
                                 let _ = request.response.send(Err(super::native_close_application::NativeCloseApplicationError::SourceRefused));
                                 continue;
                             }
-                            pending_native_close_retry = self.begin_native_close_retry(*request).await;
+                            pending_native_close_retry = Box::pin(self.begin_native_close_retry(*request)).await;
                             continue;
                         }
                     };

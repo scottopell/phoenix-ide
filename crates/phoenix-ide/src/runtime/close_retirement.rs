@@ -12929,7 +12929,10 @@ mod tests {
             .await
             .get_mut(&source_conversation.id)
             .unwrap()
-            .acknowledged_event_tx = sender;
+            .acknowledged_event_tx =
+                crate::runtime::cancellation_inbox::AcknowledgedEventSender::for_test_receiver(
+                    sender,
+                );
         // Exercise the production manager route: it owns lock acquisition, backend
         // selection, envelope construction and response classification.
         let (result, actor_fatal) = tokio::join!(
@@ -12987,7 +12990,10 @@ mod tests {
             .await
             .get_mut(&source_conversation.id)
             .unwrap()
-            .acknowledged_event_tx = replay_sender;
+            .acknowledged_event_tx =
+                crate::runtime::cancellation_inbox::AcknowledgedEventSender::for_test_receiver(
+                    replay_sender,
+                );
         let (result, actor_fatal) = tokio::join!(
             manager.apply_native_close_explicit_retry(
                 &source_conversation.id,
@@ -13032,7 +13038,10 @@ mod tests {
             .await
             .get_mut(&source_conversation.id)
             .unwrap()
-            .acknowledged_event_tx = stopped_sender;
+            .acknowledged_event_tx =
+                crate::runtime::cancellation_inbox::AcknowledgedEventSender::for_test_receiver(
+                    stopped_sender,
+                );
         let (result, actor_fatal) = tokio::join!(
             manager.apply_native_close_explicit_retry(
                 &source_conversation.id,

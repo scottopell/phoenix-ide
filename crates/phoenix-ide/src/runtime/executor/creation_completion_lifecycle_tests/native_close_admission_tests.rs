@@ -2322,7 +2322,7 @@ async fn initial_exit_retains_inspection_collector_before_terminal_interruption(
         gate.try_lock().is_err(),
         "pending collector must retain target gate"
     );
-    assert_eq!(fence.active_authoritative_effect_count(), 1);
+    assert_eq!(fence.owner_count(), 1);
     assert!(!continuation.release_if_exactly_terminal().await);
     let obligation = fixture
         .db
@@ -2343,7 +2343,7 @@ async fn initial_exit_retains_inspection_collector_before_terminal_interruption(
         Phase::Finished
     );
     assert!(continuation.release_if_exactly_terminal().await);
-    assert_eq!(fence.active_authoritative_effect_count(), 0);
+    assert_eq!(fence.owner_count(), 0);
     drop(continuation);
     assert!(gate.try_lock().is_ok());
 }
@@ -3310,8 +3310,10 @@ async fn registered_close_waiting_for_target_gate_is_refused_after_source_stop()
     backend.runtimes.write().await.insert(
         fixture.source_transcript_id.clone(),
         crate::runtime::ConversationHandle {
-            event_tx: event_tx.clone(),
-            acknowledged_event_tx: sender.clone(),
+            event_tx: crate::runtime::ConversationEventSender::for_test_receiver(event_tx.clone()),
+            acknowledged_event_tx: crate::runtime::AcknowledgedEventSender::for_test_receiver(
+                sender.clone(),
+            ),
             handoff_review_tx: None,
             turn_trigger: crate::runtime::TurnTriggerSlot::default(),
             broadcast_tx: crate::runtime::SseBroadcaster::new(128, 0),
