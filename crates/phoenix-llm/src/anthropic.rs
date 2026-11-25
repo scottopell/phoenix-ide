@@ -3419,38 +3419,130 @@ mod tests {
         );
     }
 
+    fn assert_anthropic_batch_continuation(
+        response: &LlmResponse,
+        ids: &[&str],
+    ) -> serde_json::Value {
+        use phoenix_core::domain::provider_replay::AnthropicReplayPayload;
+
+        assert!(!response.end_turn);
+        let calls: Vec<_> = response
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::ToolUse { id, .. } => Some(id.as_str()),
+                ContentBlock::Text { .. }
+                | ContentBlock::Image { .. }
+                | ContentBlock::ToolResult { .. }
+                | ContentBlock::ServerToolUse { .. }
+                | ContentBlock::ToolSearchToolResult { .. }
+                | ContentBlock::WebSearchToolResult { .. }
+                | ContentBlock::WebFetchToolResult { .. }
+                | ContentBlock::CodeExecutionToolResult { .. }
+                | ContentBlock::BashCodeExecutionToolResult { .. }
+                | ContentBlock::TextEditorCodeExecutionToolResult { .. }
+                | ContentBlock::McpToolUse { .. }
+                | ContentBlock::McpToolResult { .. } => None,
+            })
+            .collect();
+        assert_eq!(calls, ids);
+        let mut request = test_request_with_tools();
+        request.messages = vec![
+            LlmMessage {
+                source_message_id: Some("batch-owner".into()),
+                role: MessageRole::Assistant,
+                content: response.content.clone(),
+            },
+            LlmMessage {
+                source_message_id: None,
+                role: MessageRole::User,
+                content: ids
+                    .iter()
+                    .enumerate()
+                    .map(|(index, id)| ContentBlock::ToolResult {
+                        tool_use_id: (*id).into(),
+                        content: format!("result-{index}"),
+                        is_error: index == 1,
+                        images: vec![],
+                    })
+                    .collect(),
+            },
+        ];
+        if let Some(ProviderReplayUpdate::Anthropic(set)) = &response.provider_replay {
+            request.provider_replay = Some(
+                AnthropicReplayPayload::new(vec![set
+                    .clone()
+                    .with_owner_message_id("batch-owner".into())])
+                .unwrap(),
+            );
+        }
+        let wire = serde_json::to_value(
+            translate_request(&test_spec(false), &request, false, true).unwrap(),
+        )
+        .unwrap();
+        let assistant = wire["messages"][0]["content"].as_array().unwrap();
+        let calls: Vec<_> = assistant
+            .iter()
+            .filter(|block| block["type"] == "tool_use")
+            .collect();
+        let expected_calls: Vec<_> = response
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::ToolUse { id, name, input } => {
+                    Some(serde_json::json!({"type":"tool_use","id":id,"name":name,"input":input}))
+                }
+                ContentBlock::Text { .. }
+                | ContentBlock::Image { .. }
+                | ContentBlock::ToolResult { .. }
+                | ContentBlock::ServerToolUse { .. }
+                | ContentBlock::ToolSearchToolResult { .. }
+                | ContentBlock::WebSearchToolResult { .. }
+                | ContentBlock::WebFetchToolResult { .. }
+                | ContentBlock::CodeExecutionToolResult { .. }
+                | ContentBlock::BashCodeExecutionToolResult { .. }
+                | ContentBlock::TextEditorCodeExecutionToolResult { .. }
+                | ContentBlock::McpToolUse { .. }
+                | ContentBlock::McpToolResult { .. } => None,
+            })
+            .collect();
+        assert_eq!(serde_json::json!(calls), serde_json::json!(expected_calls));
+        let results = wire["messages"][1]["content"].as_array().unwrap();
+        assert_eq!(results.len(), ids.len());
+        for (index, (result, id)) in results.iter().zip(ids).enumerate() {
+            assert_eq!(result["type"], "tool_result");
+            assert_eq!(result["tool_use_id"], *id);
+            assert_eq!(result["content"], format!("result-{index}"));
+            assert_eq!(result["is_error"], index == 1);
+        }
+        wire
+    }
+
     #[tokio::test]
     async fn streaming_assembles_tool_use_from_split_input_json() {
         let mut acc = StreamAccumulator::new(Instant::now(), &test_request(), false);
         acc.response_id = Some("msg_stream".to_string());
         acc.response_model = Some("claude-opus-5-5".to_string());
         let (tx, _rx) = tokio::sync::mpsc::channel(8);
-
-        acc.process_event(
-            "content_block_start",
-            r#"{"index":0,"content_block":{"type":"tool_use","id":"tu1","name":"bash"}}"#,
-            &tx,
-        )
-        .await
-        .unwrap();
-        // The arguments object arrives split across two deltas.
-        acc.process_event(
-            "content_block_delta",
-            r#"{"index":0,"delta":{"type":"input_json_delta","partial_json":"{\"cmd\":"}}"#,
-            &tx,
-        )
-        .await
-        .unwrap();
-        acc.process_event(
-            "content_block_delta",
-            r#"{"index":0,"delta":{"type":"input_json_delta","partial_json":"\"ls\"}"}}"#,
-            &tx,
-        )
-        .await
-        .unwrap();
-        acc.process_event("content_block_stop", r#"{"index":0}"#, &tx)
+        for (index, id, command) in [(0, "tu1", "ls"), (1, "tu2", "pwd")] {
+            let start = serde_json::json!({"index":index,"content_block":{"type":"tool_use","id":id,"name":"bash"}});
+            acc.process_event("content_block_start", &start.to_string(), &tx)
+                .await
+                .unwrap();
+            for fragment in ["{\"cmd\":".to_string(), format!("\"{command}\"}}")] {
+                let delta = serde_json::json!({"index":index,"delta":{"type":"input_json_delta","partial_json":fragment}});
+                acc.process_event("content_block_delta", &delta.to_string(), &tx)
+                    .await
+                    .unwrap();
+            }
+            acc.process_event(
+                "content_block_stop",
+                &serde_json::json!({"index":index}).to_string(),
+                &tx,
+            )
             .await
             .unwrap();
+        }
         acc.process_event(
             "message_delta",
             r#"{"delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":3}}"#,
@@ -3459,14 +3551,13 @@ mod tests {
         .await
         .unwrap();
         acc.process_event("message_stop", "{}", &tx).await.unwrap();
-
-        let resp = acc.into_response_with_diagnostics(None).unwrap();
-        assert_eq!(resp.content.len(), 1);
-        assert!(matches!(
-            &resp.content[0],
-            ContentBlock::ToolUse { id, name, input }
-                if id == "tu1" && name == "bash" && input["cmd"] == "ls"
-        ));
+        let response = acc.into_response_with_diagnostics(None).unwrap();
+        assert_eq!(response.content.len(), 2);
+        for (block, command) in response.content.iter().zip(["ls", "pwd"]) {
+            assert!(matches!(block, ContentBlock::ToolUse { name, input, .. }
+                if name == "bash" && input["cmd"] == command));
+        }
+        assert_anthropic_batch_continuation(&response, &["tu1", "tu2"]);
     }
 
     #[tokio::test]
@@ -3574,6 +3665,10 @@ mod tests {
             id: "msg_test".to_string(),
             model: "claude-opus-5-5".to_string(),
             content: vec![
+                AnthropicContentBlock::Thinking {
+                    thinking: String::new(),
+                    signature: "opaque-batch-signature".into(),
+                },
                 AnthropicContentBlock::Text {
                     text: "Here is my analysis.".to_string(),
                     cache_control: None,
@@ -3588,6 +3683,11 @@ mod tests {
                     name: "bash".to_string(),
                     input: serde_json::json!({"op": "run", "cmd": "ls"}),
                 },
+                AnthropicContentBlock::ToolUse {
+                    id: "toolu_second".to_string(),
+                    name: "bash".to_string(),
+                    input: serde_json::json!({"op": "run", "cmd": "pwd"}),
+                },
             ],
             stop_reason: Some("tool_use".to_string()),
             stop_details: None,
@@ -3600,10 +3700,13 @@ mod tests {
             },
         };
 
+        let original_content = serde_json::to_value(&resp.content).unwrap();
         let result = normalize_response(resp).unwrap();
+        let continuation =
+            assert_anthropic_batch_continuation(&result, &["toolu_xyz789", "toolu_second"]);
+        assert_eq!(continuation["messages"][0]["content"], original_content);
 
-        // ServerToolUse is now PRESERVED -- Text, ServerToolUse, and ToolUse all come through
-        assert_eq!(result.content.len(), 3);
+        assert_eq!(result.content.len(), 4);
         assert!(
             matches!(&result.content[0], ContentBlock::Text { text } if text == "Here is my analysis.")
         );

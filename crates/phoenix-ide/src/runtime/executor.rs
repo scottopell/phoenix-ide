@@ -58,6 +58,9 @@ use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
 mod capacity;
+mod commit_cancellation;
+#[cfg(test)]
+mod concurrent_tools_tests;
 mod continuation;
 mod native_spawn;
 use native_spawn::{NativeSpawnCutoff, NativeSpawnHandoff, NativeSpawnPhase};
@@ -837,6 +840,26 @@ fn finalized_round_results(results: Vec<ToolRoundResult>) -> Result<Vec<ToolResu
             result.into_finalized().map_err(|_| {
                 "unfinished tool result requires an atomic goal checkpoint".to_string()
             })
+        })
+        .collect()
+}
+
+fn finalized_round_messages(
+    assistant: &crate::db::Message,
+    tool_results: Vec<ToolResult>,
+    sequence_ids: impl IntoIterator<Item = i64>,
+) -> Vec<FinalizedToolResult> {
+    tool_results
+        .into_iter()
+        .zip(sequence_ids)
+        .map(|(result, sequence_id)| {
+            FinalizedToolResult::new(
+                &assistant.message_id,
+                &assistant.conversation_id,
+                sequence_id,
+                Utc::now(),
+                &result,
+            )
         })
         .collect()
 }
@@ -2166,6 +2189,34 @@ struct PendingSubAgentActivation {
     sender: oneshot::Sender<()>,
 }
 
+impl PendingSubAgentActivation {
+    fn validate_membership(&self, state: &ConvState) -> Result<(), String> {
+        let pending = match state {
+            ConvState::ToolExecuting {
+                pending_sub_agents, ..
+            } => pending_sub_agents,
+            ConvState::AwaitingSubAgents { pending, .. }
+            | ConvState::CancellingSubAgents { pending, .. } => pending,
+            _ => {
+                return Err(
+                    "sub-agent activation persist omitted admitted parent membership".to_string(),
+                )
+            }
+        };
+        if !self.child_ids.iter().all(|child_id| {
+            pending
+                .iter()
+                .any(|pending_child| pending_child.agent_id == *child_id)
+        }) {
+            return Err(
+                "sub-agent activation persist did not contain its exact admitted membership"
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
+}
+
 #[allow(clippy::struct_excessive_bools)] // independent runtime concerns; conversation lifecycle is ConvState
 pub struct ConversationRuntime<S, L, T>
 where
@@ -2224,7 +2275,7 @@ where
     pending_sub_agent_terminal: Option<phoenix_db::SubAgentTerminalCause>,
     native_spawn_handoff: Option<NativeSpawnHandoff>,
     tool_preparation_runtime: uuid::Uuid,
-    tool_preparation: Option<tool_preparation::ToolPreparation>,
+    foreground_dispatch: tool_preparation::ForegroundDispatch,
     /// Browser session manager for `ToolContext`
     browser_sessions: Arc<BrowserSessionManager>,
     /// Bash handle registry for `ToolContext` (REQ-BASH-014).
@@ -2238,10 +2289,11 @@ where
     event_rx: mpsc::Receiver<Event>,
     event_tx: mpsc::Sender<Event>,
     acknowledged_event_rx: mpsc::Receiver<AcknowledgedEventRequest>,
+    cancellation_input_rx: Option<mpsc::Receiver<super::cancellation_inbox::CancellationInput>>,
+    cancellation_custody: commit_cancellation::CancellationCustody,
     handoff_review_rx: Option<mpsc::Receiver<super::HandoffReviewRequest>>,
     exhausted_maintenance: bool,
     broadcast_tx: SseBroadcaster,
-    tool_execution: ToolExecutionSlot,
     /// Handle to the spawned LLM task — aborted on cancel to drop the HTTP connection.
     llm_task_handle: Option<tokio::task::JoinHandle<()>>,
     /// Active provider attempt retained outside the task for cancellation metrics.
@@ -2555,7 +2607,7 @@ where
             pending_sub_agent_terminal: None,
             native_spawn_handoff: None,
             tool_preparation_runtime: uuid::Uuid::new_v4(),
-            tool_preparation: None,
+            foreground_dispatch: tool_preparation::ForegroundDispatch::default(),
             browser_sessions,
             bash_handles,
             tmux_registry,
@@ -2565,9 +2617,10 @@ where
             event_tx,
             broadcast_tx,
             acknowledged_event_rx,
+            cancellation_input_rx: None,
+            cancellation_custody: commit_cancellation::CancellationCustody::default(),
             handoff_review_rx: None,
             exhausted_maintenance: false,
-            tool_execution: ToolExecutionSlot::default(),
             llm_task_handle: None,
             active_llm_attempt: None,
             retry_timer_handle: None,
@@ -3251,12 +3304,26 @@ where
             if self.local_terminal_authority == LocalTerminalAuthority::Fatal {
                 return self.fatal_local_authority_exit();
             }
+            if self
+                .fatal_local_authority_fence
+                .fatal_authority_loss_is_latched()
+            {
+                return self.fatal_local_authority_exit();
+            }
+            if let Some(observed) = self.cancellation_custody.take_pending() {
+                if let Some(exit) = self.settle_cancellation_input(observed).await {
+                    return exit;
+                }
+                continue;
+            }
             let terminal_retry_at = self
                 .terminal_transition_retry
                 .as_ref()
                 .map(|retry| retry.retry_at);
             // Copy deadline before select to avoid borrow conflict
             let deadline = self.deadline;
+            let batch_deadline = self.foreground_dispatch.batch_deadline();
+            let cancellation_resource_cutoff = self.cancellation_custody.pending_cutoff();
             let awaiting_recovery = matches!(self.state, ConvState::AwaitingRecovery { .. });
 
             tokio::select! {
@@ -3288,6 +3355,22 @@ where
                     let _ = review.response.send(result);
                     if self.exhausted_maintenance && matches!(self.state, ConvState::ContextExhausted { .. }) {
                         return RuntimeExitDisposition::CoordinatedShutdown;
+                    }
+                }
+                () = async {
+                    tokio::time::sleep_until(cancellation_resource_cutoff.expect("retained resource cutoff")).await;
+                }, if cancellation_resource_cutoff.is_some() => {
+                    self.service_cancellation_resource_cutoff();
+                }
+                cancellation = async {
+                    self.cancellation_input_rx.as_mut().expect("open cancellation inbox").recv().await
+                }, if self.cancellation_input_rx.is_some() => {
+                    match cancellation {
+                        Some(input) => {
+                            let observed = self.observe_cancellation_input(input);
+                            if let Some(exit) = self.settle_cancellation_input(observed).await { return exit; }
+                        }
+                        None => self.cancellation_input_rx = None,
                     }
                 }
                 Some(AcknowledgedEventRequest { event, acknowledgement, retirement }) = self.acknowledged_event_rx.recv() => {
@@ -3376,20 +3459,25 @@ where
                         return RuntimeExitDisposition::Terminal;
                     }
                 }
-                prepared = async {
-                    match self.tool_preparation.as_mut() {
-                        Some(preparation) => preparation.observe().await,
+                () = async {
+                    match batch_deadline {
+                        Some(deadline) => tokio::time::sleep_until(deadline).await,
                         None => std::future::pending().await,
                     }
-                } => {
-                    match self.accept_tool_preparation(prepared) {
+                }, if batch_deadline.is_some() => {
+                    if let Err(error) = self.expire_batch_waits().await {
+                        tracing::error!(%error, "batch wait deadline settlement failed");
+                    }
+                }
+                observation = self.foreground_dispatch.observe() => {
+                    match self.accept_foreground_observation(observation) {
                         Ok(Some(event)) => {
                             if let Err(error) = self.process_event(event).await {
                                 tracing::error!(%error, "failed to settle prepared tool");
                             }
                         }
                         Ok(None) => {},
-                        Err(error) => tracing::error!(%error, "tool preparation failed"),
+                        Err(error) => tracing::error!(%error, "foreground tool failed"),
                     }
                     if self.fatal_local_authority_fence.fatal_authority_loss_is_latched() {
                         return self.fatal_local_authority_exit();
@@ -3427,7 +3515,6 @@ where
                     if self.tool_outcome_is_stale(generation) {
                         tracing::debug!(
                             outcome_generation = generation,
-                            current_generation = self.tool_execution.generation(),
                             state = self.state.variant_name(),
                             "Ignoring stale tool outcome — task superseded (abort/new dispatch)"
                         );
@@ -3671,7 +3758,12 @@ where
     }
 
     fn tool_outcome_is_stale(&self, generation: u64) -> bool {
-        self.tool_execution.is_stale(generation)
+        match &self.foreground_dispatch {
+            tool_preparation::ForegroundDispatch::Serial(serial) => {
+                serial.execution.is_stale(generation)
+            }
+            tool_preparation::ForegroundDispatch::OrdinaryBatch(_) => true,
+        }
     }
 
     /// Whether a forwarded `RetryTimeout` stamped with `generation` belongs to a
@@ -3886,6 +3978,7 @@ where
         } else {
             self.apply_transition_result(result).await?
         };
+        self.commit_foreground_membership();
         for event in generated_events.into_iter().rev() {
             self.event_tx
                 .send(event)
@@ -4239,6 +4332,7 @@ where
             ) {
                 self.settle_llm_trusted_context(&result);
             }
+            self.interrupt_batch_before_cancellation_checkpoint(&terminal_event, &result.new_state);
             self.interrupt_read_preparation_before_cancellation_checkpoint(
                 &terminal_event,
                 &result.new_state,
@@ -4262,11 +4356,10 @@ where
                         | ConvState::CancellingSubAgents { .. }
                 )
             {
-                if let Err(error) = self
-                    .storage
-                    .record_execution_cancel(&self.context.conversation_id)
-                    .await
-                {
+                let storage = self.storage.clone();
+                let conversation_id = self.context.conversation_id.clone();
+                let write = async move { storage.record_execution_cancel(&conversation_id).await };
+                if let Err(error) = self.await_ordinary_batch_commit(write).await {
                     self.observe_native_cancel_persistence_failure(&terminal_event, &error);
                     return Err(error);
                 }
@@ -4339,6 +4432,8 @@ where
                 self.handoff_completion_authority = None;
                 self.handoff_completion_timestamp = None;
             }
+            self.commit_foreground_membership();
+            self.fill_ordinary_batch();
             events_to_process.extend(generated);
         }
 
@@ -4529,6 +4624,9 @@ where
                     .to_string());
             };
             for effect in downstream_dispatch {
+                if self.cancellation_defers_dispatch(&effect) {
+                    continue;
+                }
                 if authority.requires_committed_state() {
                     self.publish_live_state()?;
                 }
@@ -4857,6 +4955,9 @@ where
             let mut state_committed = false;
             let mut new_turn_input_persisted = false;
             for (effect_index, effect) in result.effects.into_iter().enumerate() {
+                if self.cancellation_defers_dispatch(&effect) {
+                    continue;
+                }
                 if authority.requires_committed_state()
                     && matches!(effect, Effect::RequestLlm | Effect::ExecuteTool { .. })
                 {
@@ -5475,6 +5576,12 @@ where
             }
         }
 
+        if self.has_pending_cancellation() {
+            self.steering_queue = drained_entries;
+            drop(projection_guard);
+            return Ok(());
+        }
+
         let Event::SteerDrainedUserMessages { entries } = drain_event else {
             unreachable!("maybe_drain_steering_queue returns only SteerDrainedUserMessages")
         };
@@ -5554,29 +5661,7 @@ where
     ) -> Result<Option<Event>, String> {
         let activation = self.take_native_spawn_activation();
         if let Some(activation) = &activation {
-            let pending = match &self.state {
-                ConvState::ToolExecuting {
-                    pending_sub_agents, ..
-                } => pending_sub_agents,
-                ConvState::AwaitingSubAgents { pending, .. }
-                | ConvState::CancellingSubAgents { pending, .. } => pending,
-                _ => {
-                    return Err(
-                        "sub-agent activation persist omitted admitted parent membership"
-                            .to_string(),
-                    )
-                }
-            };
-            if !activation.child_ids.iter().all(|child_id| {
-                pending
-                    .iter()
-                    .any(|pending_child| pending_child.agent_id == *child_id)
-            }) {
-                return Err(
-                    "sub-agent activation persist did not contain its exact admitted membership"
-                        .to_string(),
-                );
-            }
+            activation.validate_membership(&self.state)?;
         }
         let state_persisted = if let Some(cause) = self.pending_sub_agent_terminal.take() {
             self.storage
@@ -5617,24 +5702,31 @@ where
             self.settle_pending_direct_turn(turn, Box::new(terminal))
                 .await?;
         } else if !state_persisted {
-            if let Some(update) = self.pending_provider_replay_update.take() {
-                self.storage
-                    .update_state_and_provider_replay(
-                        &self.context.conversation_id,
-                        &self.state,
-                        self.state_updated_at,
-                        &update,
-                    )
-                    .await?;
-            } else {
-                self.storage
-                    .update_state(
-                        &self.context.conversation_id,
-                        &self.state,
-                        self.state_updated_at,
-                    )
-                    .await?;
-            }
+            let storage = self.storage.clone();
+            let conversation_id = self.context.conversation_id.clone();
+            let state = self.state.clone();
+            let state_updated_at = self.state_updated_at;
+            let update = self.pending_provider_replay_update.take();
+            let write = async {
+                match update {
+                    Some(update) => {
+                        storage
+                            .update_state_and_provider_replay(
+                                &conversation_id,
+                                &state,
+                                state_updated_at,
+                                &update,
+                            )
+                            .await
+                    }
+                    None => {
+                        storage
+                            .update_state(&conversation_id, &state, state_updated_at)
+                            .await
+                    }
+                }
+            };
+            self.await_ordinary_batch_commit(write).await?;
         }
         if let Some(activation) = activation {
             self.release_native_spawn_activation(activation);
@@ -6219,6 +6311,13 @@ where
     }
 
     fn bash_wait_transition_remaining(&self, next_state: &ConvState) -> Option<Duration> {
+        if matches!(
+            self.foreground_dispatch,
+            tool_preparation::ForegroundDispatch::OrdinaryBatch(_)
+        ) {
+            return self.foreground_dispatch.batch_settlement_remaining();
+        }
+
         let current_is_bash_wait = Self::deadline_for(&self.state).is_some()
             && matches!(self.state, ConvState::ToolExecuting { .. });
         let (state, entered_at) = if current_is_bash_wait {
@@ -6257,7 +6356,12 @@ where
         if matches!(old_state, ConvState::CancellingTool { .. })
             && !matches!(self.state, ConvState::CancellingTool { .. })
         {
-            self.tool_execution.release_task();
+            if let tool_preparation::ForegroundDispatch::Serial(serial) =
+                &mut self.foreground_dispatch
+            {
+                serial.execution.release_task();
+                serial.publication = None;
+            }
         }
 
         let entered_waiting_variant = old_state.variant_name() != self.state.variant_name();
@@ -6268,6 +6372,14 @@ where
                     phoenix_core::domain::bash_types::BashInvocation::Wait { .. }
                 )) && old_state != &self.state
         );
+        if matches!(
+            self.foreground_dispatch,
+            tool_preparation::ForegroundDispatch::OrdinaryBatch(_)
+        ) && matches!(self.state, ConvState::ToolExecuting { .. })
+        {
+            self.deadline = None;
+            return;
+        }
         let now = Utc::now();
         let remaining = overload_recovery_deadline_for(&self.state, now).or_else(|| {
             Self::scheduler_deadline_for(&self.state).map(|duration| {
@@ -6342,7 +6454,9 @@ where
             return;
         };
         let tool_use_id = current_tool.id.clone();
-        self.tool_execution.abort_task_and_invalidate();
+        self.serial_dispatch_mut()
+            .execution
+            .abort_task_and_invalidate();
         if let Err(error) = self
             .process_outcome(EffectOutcome::Tool(ToolExecOutcome::Failed {
                 tool_use_id,
@@ -6563,6 +6677,16 @@ where
 
     /// Retire the selected tool after its cancellation deadline expires.
     async fn handle_cancelling_tool_timeout(&mut self) {
+        if !matches!(self.state, ConvState::CancellingTool { .. }) {
+            return;
+        }
+        let batch = match self.drain_ready_before_forced_retirement().await {
+            Ok(batch) => batch,
+            Err(error) => {
+                tracing::error!(%error, "failed to drain ready batch receipts at cancellation cutoff");
+                return;
+            }
+        };
         let tool_use_id = if let ConvState::CancellingTool { tool_use_id, .. } = &self.state {
             tool_use_id.clone()
         } else {
@@ -6591,7 +6715,11 @@ where
         // Bump the tool generation so the aborted task's forwarded outcome is
         // stale and discarded by the select loop rather than applied to a later
         // round that may reuse the same `tool_use_id`.
-        self.tool_execution.abort_task_and_invalidate();
+        if !batch {
+            self.serial_dispatch_mut()
+                .execution
+                .abort_task_and_invalidate();
+        }
 
         if let Err(e) = self
             .process_event(Event::ToolCancellationRetired { tool_use_id })
@@ -7221,7 +7349,6 @@ where
     }
 
     fn abort_external_effects_in_memory(&mut self) {
-        self.tool_preparation = None;
         self.abort_active_llm_task();
         self.retry_generation = self.retry_generation.wrapping_add(1);
         if let Some(handle) = self.retry_timer_handle.take() {
@@ -7231,11 +7358,10 @@ where
         if let Some(attempt_capture) = self.active_llm_attempt.take() {
             let _ = attempt_capture.finalize_cancelled();
         }
-        self.tool_execution.cancel_and_abort();
+        self.foreground_dispatch.abort();
     }
 
     async fn abort_external_effects(&mut self) {
-        self.tool_preparation = None;
         self.abort_active_llm_task();
         self.retry_generation = self.retry_generation.wrapping_add(1);
         if let Some(handle) = self.retry_timer_handle.take() {
@@ -7249,7 +7375,7 @@ where
                 }
             }
         }
-        self.tool_execution.cancel_and_abort();
+        self.foreground_dispatch.abort();
     }
 
     #[allow(clippy::too_many_lines)]
@@ -7304,6 +7430,14 @@ where
         admitted: &mut crate::runtime::AdmittedOperation,
         task_approval_execution: Option<TaskApprovalExecution>,
     ) -> Result<Option<Event>, String> {
+        if self.has_pending_cancellation()
+            && matches!(
+                effect,
+                AuthoritativeEffect::RequestLlm | AuthoritativeEffect::ExecuteTool { .. }
+            )
+        {
+            return Ok(None);
+        }
         #[cfg(test)]
         if matches!(
             effect,
@@ -8211,7 +8345,7 @@ where
                 Ok(None)
             }
 
-            AuthoritativeEffect::ExecuteTool { tool } => self.begin_tool_preparation(tool),
+            AuthoritativeEffect::ExecuteTool { tool } => self.begin_tool_preparation(&tool),
 
             AuthoritativeEffect::ScheduleRetry {
                 delay,
@@ -8560,10 +8694,13 @@ where
             }
             ControlEffect::AbortTool { tool_use_id } => {
                 tracing::info!(tool_id = %tool_use_id, "Aborting tool execution");
+                if self.cancel_ordinary_batch() {
+                    return Ok(None);
+                }
                 if self.interrupt_read_only_tool_preparation(&tool_use_id) {
                     return Ok(None);
                 }
-                self.tool_execution.request_cancel();
+                self.serial_dispatch_mut().execution.request_cancel();
                 if let Some(handoff) = self.native_spawn_handoff.as_mut() {
                     if handoff.invocation.tool_use_id == tool_use_id
                         && handoff.invocation.owns_state(&self.state)
@@ -9963,7 +10100,8 @@ where
     #[cfg(test)]
     async fn observe_tool_preparation_for_test(&mut self) -> Result<Option<Event>, String> {
         let observed = self
-            .tool_preparation
+            .serial_dispatch_mut()
+            .preparation
             .as_mut()
             .expect("preparation installed")
             .observe()
@@ -9973,7 +10111,7 @@ where
 
     #[cfg(test)]
     async fn settle_prepared_completions_for_test(&mut self) -> Result<(), String> {
-        while self.tool_preparation.is_some() {
+        while self.serial_dispatch_mut().preparation.is_some() {
             let Some(event) = self.observe_tool_preparation_for_test().await? else {
                 break;
             };
@@ -9997,14 +10135,9 @@ where
         tool: ToolCall,
         _admitted: &mut crate::runtime::AdmittedOperation,
     ) -> Result<Option<Event>, String> {
-        self.begin_tool_preparation(tool)?;
-        let observed = self
-            .tool_preparation
-            .as_mut()
-            .expect("preparation installed")
-            .observe()
-            .await;
-        self.accept_tool_preparation(observed)
+        self.begin_tool_preparation(&tool)?;
+        let observed = self.foreground_dispatch.observe().await;
+        self.accept_foreground_observation(observed)
     }
 
     #[allow(clippy::too_many_lines)]
@@ -10030,7 +10163,12 @@ where
             .as_ref()
             .map(CancellationToken::child_token)
             .unwrap_or_default();
-        let dispatch_generation = self.tool_execution.begin_dispatch(cancel_token.clone());
+        let dispatch_generation = match &mut self.foreground_dispatch {
+            tool_preparation::ForegroundDispatch::Serial(serial) => {
+                serial.execution.begin_dispatch(cancel_token.clone())
+            }
+            tool_preparation::ForegroundDispatch::OrdinaryBatch(_) => 0,
+        };
         let cancel_token_check = cancel_token.clone();
 
         // Create ToolContext for this invocation. The scope-defining worktree
@@ -10044,9 +10182,14 @@ where
         // `WorkScope::Conversation(id)` on both sides instead of diverging to
         // `WorkScope::Worktree(cwd)` on the tool side only.
         let scope_worktree = context.work_scope_worktree.clone();
+        let publication = Arc::new(());
+        let progress_lifetime = Arc::downgrade(&publication);
         let progress_broadcaster = self.broadcast_tx.clone();
         let progress_tool_use_id = tool.id.clone();
         let bash_progress_sink: Arc<dyn BashProgressSink> = Arc::new(move |progress| {
+            let Some(_live) = progress_lifetime.upgrade() else {
+                return;
+            };
             let _ =
                 progress_broadcaster.send_live_progress(|sequence_id| SseEvent::BashToolProgress {
                     sequence_id,
@@ -10059,7 +10202,7 @@ where
             phoenix_core::domain::sm_state::ConversationExecutionEnvironment::Filesystem {
                 working_dir,
             } => ToolContext::new_with_resource_scope(
-                cancel_token,
+                cancel_token.clone(),
                 context.conversation_id.clone(),
                 working_dir.clone(),
                 self.browser_sessions.clone(),
@@ -10073,7 +10216,7 @@ where
             ),
             phoenix_core::domain::sm_state::ConversationExecutionEnvironment::NoFilesystem => {
                 ToolContext::new_without_filesystem(
-                    cancel_token,
+                    cancel_token.clone(),
                     context.conversation_id.clone(),
                     self.browser_sessions.clone(),
                     self.bash_handles.clone(),
@@ -10151,26 +10294,22 @@ where
                 () = tool_execution => {}
             }
         });
-        self.tool_execution.retain_task(tool_task);
-
-        // Forward the typed outcome — a dropped sender becomes a typed Failed
-        // outcome so a panicked/aborted tool task can never wedge the
-        // conversation. See `forward_tool_outcome`.
-        //
-        // Generation-tagged, mirroring the LLM/retry paths: the forwarder
-        // stamps `dispatch_generation`, and the select loop discards an outcome
-        // whose generation has been superseded (a later dispatch or an
-        // intentional abort/backstop teardown). The state machine's id/state
-        // gate remains as defense in depth, but the generation guard is what
-        // closes the same-id-reuse race — a stale outcome for a `tool_use_id`
-        // that the next turn happens to reuse is dropped before it can reach
-        // the reducer. See specs/bedrock REQ-BED-005a.
-        tokio::spawn(forward_tool_outcome(
-            tool_rx,
-            forwarder_tool_use_id,
-            dispatch_generation,
-            tool_outcome_tx,
-        ));
+        match &mut self.foreground_dispatch {
+            tool_preparation::ForegroundDispatch::Serial(serial) => {
+                serial.publication = Some(publication);
+                serial.running = Some(selection);
+                serial.execution.retain_task(tool_task);
+                tokio::spawn(forward_tool_outcome(
+                    tool_rx,
+                    forwarder_tool_use_id,
+                    dispatch_generation,
+                    tool_outcome_tx,
+                ));
+            }
+            tool_preparation::ForegroundDispatch::OrdinaryBatch(batch) => {
+                batch.retain_execution(&selection, cancel_token, tool_task, tool_rx, publication);
+            }
+        }
     }
 
     async fn persist_checkpoint_with_terminal_obligation(
@@ -10327,46 +10466,48 @@ where
                     created_at: assistant_message.created_at,
                 };
 
-                let tool_msgs: Vec<FinalizedToolResult> = tool_results
-                    .into_iter()
-                    .zip(reserved_seqs.into_iter().skip(1))
-                    .map(|(result, sequence_id)| {
-                        FinalizedToolResult::new(
-                            &agent_msg.message_id,
-                            &conv_id,
-                            sequence_id,
-                            Utc::now(),
-                            &result,
-                        )
-                    })
-                    .collect();
+                let tool_msgs = finalized_round_messages(
+                    &agent_msg,
+                    tool_results,
+                    reserved_seqs.into_iter().skip(1),
+                );
 
                 // Persist the assistant message and every tool result in one
                 // transaction: either the full round is durable or none of it
                 // is. A partial write would leave an unpaired `tool_use` that
                 // 400s every later LLM request (REQ-BED-007, FM-2 Prevention).
-                if let Some(update) = self.pending_provider_replay_update.take() {
-                    self.storage
-                        .persist_tool_round_state_and_provider_replay(
-                            &conv_id,
-                            &agent_msg,
-                            &tool_msgs,
-                            &self.state,
-                            self.state_updated_at,
-                            &update,
-                        )
-                        .await?;
-                } else {
-                    self.storage
-                        .persist_tool_round_and_state(
-                            &conv_id,
-                            &agent_msg,
-                            &tool_msgs,
-                            &self.state,
-                            self.state_updated_at,
-                        )
-                        .await?;
-                }
+                let storage = self.storage.clone();
+                let state = self.state.clone();
+                let state_updated_at = self.state_updated_at;
+                let update = self.pending_provider_replay_update.take();
+                let write = async {
+                    match update {
+                        Some(update) => {
+                            storage
+                                .persist_tool_round_state_and_provider_replay(
+                                    &conv_id,
+                                    &agent_msg,
+                                    &tool_msgs,
+                                    &state,
+                                    state_updated_at,
+                                    &update,
+                                )
+                                .await
+                        }
+                        None => {
+                            storage
+                                .persist_tool_round_and_state(
+                                    &conv_id,
+                                    &agent_msg,
+                                    &tool_msgs,
+                                    &state,
+                                    state_updated_at,
+                                )
+                                .await
+                        }
+                    }
+                };
+                self.await_ordinary_batch_commit(write).await?;
 
                 merge_trusted_tool_results(
                     &mut self.pending_trusted_tool_results,
@@ -20499,7 +20640,9 @@ mod authoritative_user_message_effect_tests {
         let (tool_started_tx, tool_started_rx) = oneshot::channel();
         let (tool_dropped_tx, tool_dropped_rx) = oneshot::channel();
         let tool_cancel_token = CancellationToken::new();
-        rt.tool_execution.begin_dispatch(tool_cancel_token.clone());
+        rt.serial_dispatch_mut()
+            .execution
+            .begin_dispatch(tool_cancel_token.clone());
         rt.llm_task_handle = Some(tokio::spawn(async move {
             struct NotifyDrop(Option<oneshot::Sender<()>>);
             impl Drop for NotifyDrop {
@@ -20513,19 +20656,21 @@ mod authoritative_user_message_effect_tests {
             let _ = llm_started_tx.send(());
             std::future::pending::<()>().await;
         }));
-        rt.tool_execution.retain_task(tokio::spawn(async move {
-            struct NotifyDrop(Option<oneshot::Sender<()>>);
-            impl Drop for NotifyDrop {
-                fn drop(&mut self) {
-                    if let Some(tx) = self.0.take() {
-                        let _ = tx.send(());
+        rt.serial_dispatch_mut()
+            .execution
+            .retain_task(tokio::spawn(async move {
+                struct NotifyDrop(Option<oneshot::Sender<()>>);
+                impl Drop for NotifyDrop {
+                    fn drop(&mut self) {
+                        if let Some(tx) = self.0.take() {
+                            let _ = tx.send(());
+                        }
                     }
                 }
-            }
-            let _notify_drop = NotifyDrop(Some(tool_dropped_tx));
-            let _ = tool_started_tx.send(());
-            std::future::pending::<()>().await;
-        }));
+                let _notify_drop = NotifyDrop(Some(tool_dropped_tx));
+                let _ = tool_started_tx.send(());
+                std::future::pending::<()>().await;
+            }));
         llm_started_rx.await.expect("provider task started");
         tool_started_rx.await.expect("tool task started");
         assert_eq!(
@@ -20549,7 +20694,9 @@ mod authoritative_user_message_effect_tests {
         let (llm_dropped_tx, llm_dropped_rx) = oneshot::channel();
         let (tool_dropped_tx, tool_dropped_rx) = oneshot::channel();
         let tool_cancel_token = CancellationToken::new();
-        rt.tool_execution.begin_dispatch(tool_cancel_token.clone());
+        rt.serial_dispatch_mut()
+            .execution
+            .begin_dispatch(tool_cancel_token.clone());
         rt.llm_task_handle = Some(tokio::spawn(async move {
             struct NotifyDrop(Option<oneshot::Sender<()>>);
             impl Drop for NotifyDrop {
@@ -20563,18 +20710,20 @@ mod authoritative_user_message_effect_tests {
             let _ = llm_started_tx.send(());
             std::future::pending::<()>().await;
         }));
-        rt.tool_execution.retain_task(tokio::spawn(async move {
-            struct NotifyDrop(Option<oneshot::Sender<()>>);
-            impl Drop for NotifyDrop {
-                fn drop(&mut self) {
-                    if let Some(tx) = self.0.take() {
-                        let _ = tx.send(());
+        rt.serial_dispatch_mut()
+            .execution
+            .retain_task(tokio::spawn(async move {
+                struct NotifyDrop(Option<oneshot::Sender<()>>);
+                impl Drop for NotifyDrop {
+                    fn drop(&mut self) {
+                        if let Some(tx) = self.0.take() {
+                            let _ = tx.send(());
+                        }
                     }
                 }
-            }
-            let _notify_drop = NotifyDrop(Some(tool_dropped_tx));
-            std::future::pending::<()>().await;
-        }));
+                let _notify_drop = NotifyDrop(Some(tool_dropped_tx));
+                std::future::pending::<()>().await;
+            }));
         let run = tokio::spawn(rt.run_inner());
         llm_started_rx.await.expect("provider task started");
 
@@ -23337,7 +23486,7 @@ mod steer_drain_detector_tests {
         runtime
             .tool_outcome_tx
             .send((
-                runtime.tool_execution.generation(),
+                runtime.serial_dispatch().execution.generation(),
                 ToolExecOutcome::Completed(ToolResult::success(
                     "tool-1".into(),
                     "committed tool output".into(),
@@ -23410,7 +23559,7 @@ mod steer_drain_detector_tests {
         runtime
             .tool_outcome_tx
             .send((
-                runtime.tool_execution.generation(),
+                runtime.serial_dispatch().execution.generation(),
                 ToolExecOutcome::Completed(ToolResult::success("tool-1".into(), "done".into())),
             ))
             .await
@@ -23452,7 +23601,7 @@ mod steer_drain_detector_tests {
         runtime
             .tool_outcome_tx
             .send((
-                runtime.tool_execution.generation(),
+                runtime.serial_dispatch().execution.generation(),
                 ToolExecOutcome::Completed(ToolResult::success("tool-1".into(), "done".into())),
             ))
             .await
@@ -23544,7 +23693,7 @@ mod steer_drain_detector_tests {
             runtime
                 .tool_outcome_tx
                 .send((
-                    runtime.tool_execution.generation(),
+                    runtime.serial_dispatch().execution.generation(),
                     ToolExecOutcome::Completed(ToolResult::success(
                         "tool-1".into(),
                         "finished exactly once".into(),
@@ -24198,7 +24347,7 @@ mod steer_drain_detector_tests {
             runtime
                 .tool_outcome_tx
                 .send((
-                    runtime.tool_execution.generation(),
+                    runtime.serial_dispatch().execution.generation(),
                     ToolExecOutcome::Completed(ToolResult::success(
                         "tool-1".into(),
                         "finished".into(),
@@ -26562,14 +26711,19 @@ mod steer_drain_detector_tests {
         );
         let independent = tokio::spawn(async { std::future::pending::<()>().await });
         let token = CancellationToken::new();
-        let generation = rt.tool_execution.begin_dispatch(token.clone());
+        let generation = rt
+            .serial_dispatch_mut()
+            .execution
+            .begin_dispatch(token.clone());
         let (started, start) = oneshot::channel();
         let (held, dropped) = oneshot::channel::<()>();
-        rt.tool_execution.retain_task(tokio::spawn(async move {
-            let _held = held;
-            started.send(()).unwrap();
-            std::future::pending::<()>().await;
-        }));
+        rt.serial_dispatch_mut()
+            .execution
+            .retain_task(tokio::spawn(async move {
+                let _held = held;
+                started.send(()).unwrap();
+                std::future::pending::<()>().await;
+            }));
         start.await.unwrap();
 
         assert_eq!(
@@ -27005,7 +27159,7 @@ mod steer_drain_detector_tests {
             bash_wait_executing_state("wait-cutoff-race", "b-cutoff-race", Some(0)),
             vec![],
         );
-        let stale_generation = rt.tool_execution.generation();
+        let stale_generation = rt.serial_dispatch().execution.generation();
         let fence = Arc::clone(&rt.fatal_local_authority_fence);
         let (write_started, write_release) = storage.gate_tool_round_persist();
         rt.deadline = Some(tokio::time::Instant::now());
@@ -27226,8 +27380,11 @@ mod steer_drain_detector_tests {
             vec![],
         );
         rt.deadline = Some(tokio::time::Instant::now() + Duration::from_secs(5));
-        rt.tool_execution.begin_dispatch(CancellationToken::new());
-        rt.tool_execution
+        rt.serial_dispatch_mut()
+            .execution
+            .begin_dispatch(CancellationToken::new());
+        rt.serial_dispatch_mut()
+            .execution
             .retain_task(tokio::spawn(async { std::future::pending::<()>().await }));
         let independent = tokio::spawn(async { std::future::pending::<()>().await });
         let runtime = tokio::spawn(rt.run_inner());
@@ -27340,7 +27497,7 @@ mod steer_drain_detector_tests {
             bash_wait_executing_state("wait-stale", "b-stale", Some(0)),
             vec![],
         );
-        let stale_generation = rt.tool_execution.generation();
+        let stale_generation = rt.serial_dispatch().execution.generation();
         rt.handle_deadline_expiry().await;
         assert!(rt.tool_outcome_is_stale(stale_generation));
         assert_eq!(
@@ -31001,6 +31158,22 @@ mod goal_report_cancellation_checkpoint_tests {
             },
         )
         .unwrap();
+        assert!(matches!(
+            settled.new_state,
+            ConvState::CancellingTool { .. }
+        ));
+        let settled = crate::state_machine::transition::transition(
+            &settled.new_state,
+            &context,
+            Event::ToolComplete {
+                tool_use_id: "skipped-report".into(),
+                result: ToolResult::cancelled(
+                    "skipped-report".into(),
+                    "Skipped due to cancellation",
+                ),
+            },
+        )
+        .unwrap();
         let selected_state = settled.new_state;
         if has_pending_sub_agents {
             assert!(matches!(
@@ -34653,7 +34826,7 @@ mod llm_generation_guard_tests {
         assert!(rt.llm_outcome_is_stale(1));
         assert!(storage.recorded_messages().is_empty());
         assert!(tools.recorded_executions().is_empty());
-        assert_eq!(rt.tool_execution.generation(), 0);
+        assert_eq!(rt.serial_dispatch().execution.generation(), 0);
     }
 
     #[tokio::test]
@@ -34922,7 +35095,10 @@ mod tool_generation_guard_tests {
 
     async fn assert_queued_tool_outcomes_rejected(retain_handoff_owner: bool) {
         let mut rt = runtime_tool_executing("X");
-        let generation = rt.tool_execution.begin_dispatch(CancellationToken::new());
+        let generation = rt
+            .serial_dispatch_mut()
+            .execution
+            .begin_dispatch(CancellationToken::new());
         let fence = Arc::clone(&rt.fatal_local_authority_fence);
         rt.broadcast_tx = rt
             .broadcast_tx
@@ -35013,7 +35189,10 @@ mod tool_generation_guard_tests {
         let mut rt = runtime_tool_executing("X");
 
         // Simulate a dispatch having opened generation 1.
-        let dispatched_gen = rt.tool_execution.begin_dispatch(CancellationToken::new());
+        let dispatched_gen = rt
+            .serial_dispatch_mut()
+            .execution
+            .begin_dispatch(CancellationToken::new());
 
         rt.execute_effect(Effect::AbortTool {
             tool_use_id: "X".to_string(),
@@ -35022,7 +35201,7 @@ mod tool_generation_guard_tests {
         .expect("AbortTool executes");
 
         assert_eq!(
-            rt.tool_execution.generation(),
+            rt.serial_dispatch().execution.generation(),
             dispatched_gen,
             "AbortTool must NOT bump the generation — the cooperative Aborted outcome \
              carries this generation and must remain current"
@@ -35063,11 +35242,11 @@ mod tool_generation_guard_tests {
                 denied.input.to_value(),
             )];
         }
-        let generation = rt.tool_execution.generation();
+        let generation = rt.serial_dispatch().execution.generation();
         let mut broadcasts = rt.broadcast_tx.subscribe();
         let event = rt.dispatch_tool_for_test(denied).await.unwrap();
         assert_eq!(
-            rt.tool_execution.generation(),
+            rt.serial_dispatch().execution.generation(),
             generation,
             "Layer 0 denial must precede ordinary generation/channel/token admission"
         );
@@ -35226,13 +35405,16 @@ mod tool_generation_guard_tests {
                 phoenix_llm::Usage::default(),
             ));
 
-        let generation_before_denial = rt.tool_execution.generation();
+        let generation_before_denial = rt.serial_dispatch().execution.generation();
         let denial = rt
             .dispatch_tool_for_test(denied)
             .await
             .unwrap()
             .expect("paired denial event");
-        assert_eq!(rt.tool_execution.generation(), generation_before_denial);
+        assert_eq!(
+            rt.serial_dispatch().execution.generation(),
+            generation_before_denial
+        );
         assert!(tools.recorded_executions().is_empty());
         let Event::ToolComplete { result, .. } = &denial else {
             panic!("denial must produce a completed error result");
@@ -35295,14 +35477,20 @@ mod tool_generation_guard_tests {
     async fn stale_tool_outcome_with_reused_id_is_rejected_by_generation_guard() {
         // Round 1 dispatches a tool with id "X" → generation 1.
         let mut rt = runtime_tool_executing("X");
-        let round1_gen = rt.tool_execution.begin_dispatch(CancellationToken::new());
+        let round1_gen = rt
+            .serial_dispatch_mut()
+            .execution
+            .begin_dispatch(CancellationToken::new());
 
         // A forced cancellation reaches Idle. Round 1's wedged tool task is still
         // in flight; its forwarder will later enqueue a stale outcome stamped
         // with `round1_gen`. A new tool round then dispatches a tool that REUSES
         // id "X", bumping the generation (mirrors the dispatch site opening a
         // fresh generation on every tool round).
-        let round2_gen = rt.tool_execution.begin_dispatch(CancellationToken::new());
+        let round2_gen = rt
+            .serial_dispatch_mut()
+            .execution
+            .begin_dispatch(CancellationToken::new());
         assert_ne!(
             round1_gen, round2_gen,
             "the reused-id round opens a new generation"
@@ -35346,7 +35534,10 @@ mod tool_generation_guard_tests {
     #[tokio::test]
     async fn current_generation_tool_outcome_is_not_stale() {
         let mut rt = runtime_tool_executing("X");
-        let generation = rt.tool_execution.begin_dispatch(CancellationToken::new());
+        let generation = rt
+            .serial_dispatch_mut()
+            .execution
+            .begin_dispatch(CancellationToken::new());
         assert!(
             !rt.tool_outcome_is_stale(generation),
             "an outcome stamped with the current generation must be processed"

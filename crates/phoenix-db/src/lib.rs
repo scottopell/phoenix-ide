@@ -16307,6 +16307,20 @@ fn build_sub_agent_fan_in(
     (llm_content, display_data)
 }
 
+enum MaterializedToolResult<'a> {
+    Recorded(&'a ToolResult),
+    Interrupted(ToolResult),
+}
+
+impl MaterializedToolResult<'_> {
+    fn result(&self) -> &ToolResult {
+        match self {
+            Self::Recorded(result) => result,
+            Self::Interrupted(result) => result,
+        }
+    }
+}
+
 /// Build the materialized message rows for an in-flight tool round recovered
 /// from a `ToolExecuting` or `CancellingTool` state on restart: the assistant
 /// message followed by one tool-result row per `tool_use`, in round order.
@@ -16348,12 +16362,15 @@ fn build_materialized_tool_round(
         phoenix_core::domain::sm_state::SubAgentOutcome,
     >,
 ) -> Result<(Message, Vec<Message>), ToolRoundError> {
-    let mut results = completed_results.to_vec();
+    let mut results: Vec<_> = completed_results
+        .iter()
+        .map(MaterializedToolResult::Recorded)
+        .collect();
     results.extend(interrupted_tool_ids.iter().map(|tool_id| {
-        ToolResult::error(
+        MaterializedToolResult::Interrupted(ToolResult::error(
             tool_id.clone(),
             "[Tool execution interrupted by server restart]".to_string(),
-        )
+        ))
     }));
     validate_tool_round_ids(
         assistant_message
@@ -16376,8 +16393,14 @@ fn build_materialized_tool_round(
                 | phoenix_core::domain::llm_types::ContentBlock::McpToolUse { .. }
                 | phoenix_core::domain::llm_types::ContentBlock::McpToolResult { .. } => None,
             }),
-        results.iter().map(|result| result.tool_use_id.as_str()),
+        results.iter().map(|result| result.result().tool_use_id.as_str()),
     )?;
+    results.sort_by_key(|result| {
+        assistant_message.content.iter().position(|block| {
+            matches!(block, phoenix_core::domain::llm_types::ContentBlock::ToolUse { id, .. }
+                if id == &result.result().tool_use_id)
+        })
+    });
     let mut next_seq = start_seq;
 
     let agent_content = MessageContent::agent(assistant_message.content.clone());
@@ -16405,20 +16428,19 @@ fn build_materialized_tool_round(
     );
 
     let mut tool_msgs = Vec::with_capacity(results.len());
-    for (ordinal, result) in results.iter().enumerate() {
+    for entry in &results {
+        let result = entry.result();
         let mut content = tool_result_transcript_content(result);
-        let display = if ordinal < completed_results.len() {
-            match spawn_fan_ins.get(&result.tool_use_id) {
+        let display = match entry {
+            MaterializedToolResult::Recorded(_) => match spawn_fan_ins.get(&result.tool_use_id) {
                 Some((output, display)) => {
                     content.content.clone_from(output);
                     content.is_error = false;
                     Some(display.clone())
                 }
                 None => merge_duration_into_display(result.display_data(), result.duration_ms),
-            }
-        } else {
-            content.is_error = true;
-            None
+            },
+            MaterializedToolResult::Interrupted(_) => None,
         };
         tool_msgs.push(tool_result_message(
             &assistant_message.message_id,

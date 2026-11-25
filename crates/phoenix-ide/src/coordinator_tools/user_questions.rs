@@ -19,6 +19,10 @@ pub(super) struct ListUserQuestions(pub(super) crate::db::Database);
 
 #[async_trait]
 impl Tool for PostUserQuestion {
+    fn foreground_execution(&self) -> crate::tools::ForegroundExecution {
+        crate::tools::ForegroundExecution::Serial
+    }
+
     fn name(&self) -> &'static str {
         "post_user_question"
     }
@@ -80,6 +84,10 @@ struct WithdrawInput {
 
 #[async_trait]
 impl Tool for WithdrawUserQuestion {
+    fn foreground_execution(&self) -> crate::tools::ForegroundExecution {
+        crate::tools::ForegroundExecution::Serial
+    }
+
     fn name(&self) -> &'static str {
         "withdraw_user_question"
     }
@@ -133,6 +141,10 @@ impl Tool for WithdrawUserQuestion {
 
 #[async_trait]
 impl Tool for ListUserQuestions {
+    fn foreground_execution(&self) -> crate::tools::ForegroundExecution {
+        crate::tools::ForegroundExecution::Serial
+    }
+
     fn name(&self) -> &'static str {
         "list_user_questions"
     }

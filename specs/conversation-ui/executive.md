@@ -38,6 +38,16 @@ Within the scope above: a responsive interface for conversations with the AI age
 
 React 18 SPA with React Router, Vite build tooling, and CSS variables for theming. Conversation state managed via a single `ConversationAtom` + `useReducer` in a router-level React context — all SSE events flow through one pure reducer, eliminating split-brain between independent `useState` atoms. `ConversationState` is a TypeScript discriminated union with `satisfies never` on every switch — new backend state variants are compile errors. The atom also owns the server-authoritative steering queue: init snapshots restore it after reconnect or restart, live enqueue/cancel events mutate it, and browser-local optimistic entries are deduplicated by message ID. `agentWorking` is a derived selector, not maintained state, and the StateBar is the sole owner of the live "is the agent working right now" answer. `lastSequenceId` lives in the atom and survives navigation, replacing unbounded `seenIdsRef` with O(1) idempotency. Token streaming accumulates in `streamingBuffer` on the atom; the `sse_message` action clears it atomically in one render (REQ-CONV-019 no-flicker). `appMachine.ts` (previously dead code) is wired as the live implementation via `useAppMachine.ts`. A shared `PillStrip` primitive backs the conversation navigation strip and compact-mode tool strip. Conversation view density (`full`/`compact`) is a presentational preference layered over the canonical `buildRenderUnits` output; assistant prose remains fully visible in both densities while compact mode reduces tool chrome. Compact bash cards preserve command or handle identity, lifecycle status, duration, and a bounded structured output tail instead of reducing bash to a generic done badge, and density no longer implies that only finalized turns can render compact tool cards. `buildConversationChapters` uses the same significance threshold to derive the navigation strip's chapters, derives chapter labels from human-meaningful conversation text rather than opaque display IDs, and jumps the virtualized list by render-unit index (`scrollToUnitIndex`) rather than by DOM query.
 
+## Concurrent Foreground Activity Qualification
+
+The normative activity model distinguishes pending, genuinely started and settled
+calls in one owning assistant round. A representative unresolved call does not
+identify the only running tool; accepted sibling output can render before the
+complete round checkpoint. The source candidate keeps existing SSE shapes and
+scopes reused provider IDs by assistant identity. Implementation and final UI,
+reconnect and native-client qualification remain pending; earlier activity and
+cancellation checks do not qualify concurrent siblings.
+
 ## Markdown Disclosure Qualification
 
 **IMPLEMENTED; local qualification complete, hosted review/landing pending.** REQ-CONV-025 and [ADR-099](../adrs/099_bounded-markdown-disclosures.md) define the bounded replacement inside the native Markdown stack. The source candidate at `94a64665d27badcdb1aa78973c74753d7734c80b` passed independent exact-head static review, strict source TypeScript, ESLint/Stylelint, and the full UI suite: **156 files, 3,076 tests passed, 2 skipped**. This is branch qualification, not a claim that disclosures are deployed.
@@ -62,8 +72,8 @@ An inherited downstream limitation remains unresolved: both the native control a
 | **REQ-CONV-004:** Message Delivery States | ✅ Complete | Sending/sent/failed with retry; server-authoritative pending steering entries arrive live across clients and in reconnect snapshots, reconcile by message ID, compact from local storage, and surface a recoverable inconsistency if later authoritative idle evidence still lacks the message |
 | **REQ-CONV-005:** Connection Status | ✅ Complete | Reconnection with backoff |
 | **REQ-CONV-006:** Reconnection Data Integrity | ✅ Complete | Sequence-based deduplication |
-| **REQ-CONV-007:** Agent Activity Indicators | ✅ Complete | StateBar is the sole live-activity owner; discriminated union and exhaustive labels prevent ambiguous duplicate activity surfaces |
-| **REQ-CONV-008:** Cancellation | ✅ Complete | Cancel button during agent work |
+| **REQ-CONV-007:** Agent Activity Indicators | Concurrent qualification pending | StateBar remains the sole live-activity owner; representative membership, genuine per-call starts, accepted output and owning assistant identity distinguish concurrent pending/running/settled calls |
+| **REQ-CONV-008:** Cancellation | Concurrent qualification pending | Existing cancel affordance retained; whole-sibling drain and final settled activity require candidate integration checks |
 | **REQ-CONV-009:** New Conversation | ⚠️ Deprecated | Replaced by REQ-CONV-015, 017, 018 |
 | **REQ-CONV-010:** Responsive Layout | ✅ Complete | Viewport-specific layouts; mobile terminal status/launcher lives in the expanded state drawer; existing-conversation model, effort, and supported request speed are staged atomically in a top-layer selection dialog, with visible lock guidance while work is in flight (`StateBar`, `SelectionDialog`, `StateBar.test.tsx`, `mobileMultiPrConversation`) |
 | **REQ-CONV-011:** Local Storage Schema | ✅ Complete | Namespaced keys |
@@ -92,3 +102,10 @@ The pre-fix actual-source browser diagnostic (`/tmp/input-focus-diag/results.jso
 ## Opening contract integration gate
 
 REQ-CONV-026 backend snapshots replace `latest_opening_pending` with `latest_opening`; SSE init/message/message_updated envelopes carry a nullable typed `opening` observation. Backend regression sources cover authority/content distinctions and live committed acceptance without aggregate GET. Hand-authored UI consumers, generated types, and valibot schemas intentionally remain unchanged in this backend-only unit; genuine hosted codegen and consumer reconciliation are required before integration. UI stale-pending-versus-accepted ordering and refresh-failure acceptance remain unqualified, not passed.
+
+Live accepted tool-result projection preserves the canonical transcript disposition:
+trusted skill instructions render as the opaque authenticated-delivery receipt,
+and cancellation retains `is_error=false`. Synthetic sentinel and live/finalized
+equivalence regressions pass alongside the 738-test owning UI selection; current
+typecheck/eslint/stylelint pass. Final integrated default/hosted qualification is
+pending; these receipts do not establish native-client or browser acceptance.

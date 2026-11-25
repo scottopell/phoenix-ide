@@ -16,6 +16,10 @@ pub struct BrowserSnapshotTool;
 
 #[async_trait]
 impl Tool for BrowserSnapshotTool {
+    fn foreground_execution(&self) -> crate::ForegroundExecution {
+        crate::ForegroundExecution::Concurrent
+    }
+
     fn name(&self) -> &'static str {
         "browser_snapshot"
     }

@@ -266,7 +266,13 @@ async fn same_assistant_and_call_ids_cannot_adopt_changed_source() {
         .execute_effect(Effect::ExecuteTool { tool: call })
         .await
         .unwrap();
-    let observation = runtime.tool_preparation.as_mut().unwrap().observe().await;
+    let observation = runtime
+        .serial_dispatch_mut()
+        .preparation
+        .as_mut()
+        .unwrap()
+        .observe()
+        .await;
     let ConvState::ToolExecuting {
         assistant_message, ..
     } = &mut runtime.state
@@ -282,9 +288,9 @@ async fn same_assistant_and_call_ids_cannot_adopt_changed_source() {
         .accept_tool_preparation(observation)
         .unwrap()
         .is_none());
-    assert_eq!(runtime.tool_execution.generation(), 0);
+    assert_eq!(runtime.serial_dispatch().execution.generation(), 0);
     assert!(runtime.tool_executor.recorded_executions().is_empty());
-    assert!(runtime.tool_preparation.is_none());
+    assert!(runtime.serial_dispatch_mut().preparation.is_none());
     runtime.abort_external_effects_in_memory();
 }
 
@@ -328,7 +334,7 @@ async fn stale_clear_deny_and_read_error_cannot_touch_same_id_successor() {
             .await
             .unwrap();
         runtime.required_settlement_authority = None;
-        let mut pending = runtime.tool_preparation.take().unwrap();
+        let mut pending = runtime.serial_dispatch_mut().preparation.take().unwrap();
         let observation = async {
             let observation = pending.observe();
             let unblock = async {
@@ -351,7 +357,7 @@ async fn stale_clear_deny_and_read_error_cannot_touch_same_id_successor() {
             .await
             .unwrap();
         let state = runtime.state.clone();
-        let generation = runtime.tool_execution.generation();
+        let generation = runtime.serial_dispatch().execution.generation();
         assert!(
             runtime
                 .accept_tool_preparation(observation)
@@ -360,8 +366,8 @@ async fn stale_clear_deny_and_read_error_cannot_touch_same_id_successor() {
             "{disposition}"
         );
         assert_eq!(runtime.state, state);
-        assert!(runtime.tool_preparation.is_some());
-        assert_eq!(runtime.tool_execution.generation(), generation);
+        assert!(runtime.serial_dispatch_mut().preparation.is_some());
+        assert_eq!(runtime.serial_dispatch().execution.generation(), generation);
         assert!(runtime.tool_executor.recorded_executions().is_empty());
         assert!(runtime.storage.recorded_messages().is_empty());
         assert!(!runtime.fatal_local_authority_fence.is_closed());
@@ -379,15 +385,21 @@ async fn changed_origin_cannot_adopt_its_own_ready_clear_or_denial() {
             .execute_effect(Effect::ExecuteTool { tool: call.clone() })
             .await
             .unwrap();
-        let observation = runtime.tool_preparation.as_mut().unwrap().observe().await;
+        let observation = runtime
+            .serial_dispatch_mut()
+            .preparation
+            .as_mut()
+            .unwrap()
+            .observe()
+            .await;
         selected(&mut runtime, "successor", &call);
         assert!(runtime
             .accept_tool_preparation(observation)
             .unwrap()
             .is_none());
-        assert_eq!(runtime.tool_execution.generation(), 0);
+        assert_eq!(runtime.serial_dispatch().execution.generation(), 0);
         assert!(runtime.tool_executor.recorded_executions().is_empty());
-        assert!(runtime.tool_preparation.is_none());
+        assert!(runtime.serial_dispatch_mut().preparation.is_none());
     }
 }
 
@@ -400,7 +412,13 @@ async fn genuine_shared_authority_loss_precedes_stale_read_disposition() {
         .execute_effect(Effect::ExecuteTool { tool: call.clone() })
         .await
         .unwrap();
-    let observation = runtime.tool_preparation.as_mut().unwrap().observe().await;
+    let observation = runtime
+        .serial_dispatch_mut()
+        .preparation
+        .as_mut()
+        .unwrap()
+        .observe()
+        .await;
     selected(&mut runtime, "successor", &call);
     runtime
         .fatal_local_authority_fence
@@ -412,7 +430,7 @@ async fn genuine_shared_authority_loss_precedes_stale_read_disposition() {
     assert!(runtime
         .fatal_local_authority_fence
         .fatal_authority_loss_is_latched());
-    assert_eq!(runtime.tool_execution.generation(), 0);
+    assert_eq!(runtime.serial_dispatch().execution.generation(), 0);
     assert!(runtime.tool_executor.recorded_executions().is_empty());
 }
 
@@ -427,7 +445,12 @@ async fn ordinary_read_error_text_is_not_sqlite_authority_and_keeps_positive_can
         .execute_effect(Effect::ExecuteTool { tool: call })
         .await
         .unwrap();
-    let observation = runtime.tool_preparation.as_mut().unwrap().observe();
+    let observation = runtime
+        .serial_dispatch_mut()
+        .preparation
+        .as_mut()
+        .unwrap()
+        .observe();
     let unblock = async {
         entered.await.unwrap();
         release.send(Err(diagnostic.into())).unwrap();
@@ -439,7 +462,12 @@ async fn ordinary_read_error_text_is_not_sqlite_authority_and_keeps_positive_can
     );
     assert!(!runtime.fatal_local_authority_fence.is_closed());
     assert!(matches!(
-        runtime.tool_preparation.as_ref().unwrap().phase,
+        runtime
+            .serial_dispatch_mut()
+            .preparation
+            .as_ref()
+            .unwrap()
+            .phase,
         PreparationPhase::NoRead
     ));
     runtime
@@ -457,7 +485,7 @@ async fn ordinary_read_error_text_is_not_sqlite_authority_and_keeps_positive_can
     assert!(matches!(interrupted, Event::ToolAborted { .. }));
     runtime.process_event(interrupted).await.unwrap();
     assert!(matches!(runtime.state, ConvState::Idle));
-    assert_eq!(runtime.tool_execution.generation(), 0);
+    assert_eq!(runtime.serial_dispatch().execution.generation(), 0);
     assert!(runtime.tool_executor.recorded_executions().is_empty());
 }
 
@@ -471,12 +499,12 @@ async fn rejected_cancel_checkpoint_revokes_read_without_false_completion_or_lat
         .execute_effect(Effect::ExecuteTool { tool: call })
         .await
         .unwrap();
-    let mut pending = runtime.tool_preparation.take().unwrap();
+    let mut pending = runtime.serial_dispatch_mut().preparation.take().unwrap();
     tokio::select! {
         _ = pending.observe() => panic!("read must remain held"),
         entered = entered => entered.unwrap(),
     }
-    runtime.tool_preparation = Some(pending);
+    runtime.serial_dispatch_mut().preparation = Some(pending);
     runtime.storage.set_fail_state_update(true);
     let error = runtime
         .process_event(Event::UserCancel {
@@ -500,12 +528,17 @@ async fn rejected_cancel_checkpoint_revokes_read_without_false_completion_or_lat
         "failed cancellation checkpoint cannot publish ToolAborted"
     );
     assert!(matches!(
-        runtime.tool_preparation.as_ref().unwrap().phase,
+        runtime
+            .serial_dispatch_mut()
+            .preparation
+            .as_ref()
+            .unwrap()
+            .phase,
         PreparationPhase::NoRead
     ));
     assert!(runtime.storage.recorded_messages().is_empty());
     assert!(!runtime.fatal_local_authority_fence.is_closed());
-    assert_eq!(runtime.tool_execution.generation(), 0);
+    assert_eq!(runtime.serial_dispatch().execution.generation(), 0);
     runtime.storage.set_fail_state_update(false);
     runtime
         .process_event(Event::UserCancel {

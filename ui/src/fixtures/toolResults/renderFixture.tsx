@@ -30,9 +30,6 @@ function ToolResultsFixtureBody({ scenario, ready }: Props & { ready: boolean })
   const data = toolResultsFixtureData(scenario);
   const store = useMemo(() => new ConversationStore(), []);
   const activity = getToolActivity(data.convState);
-  const activeToolUseId = activity.type === 'executing'
-    ? activity.activeTool.id
-    : undefined;
   const renderedMessages = useMemo(() => data.messages.map((message) => {
     if (message.message_id !== 'agent-13') return message;
     return {
@@ -77,7 +74,7 @@ function ToolResultsFixtureBody({ scenario, ready }: Props & { ready: boolean })
                           onOpenFile={() => {}}
                           filePathRootDir={data.filePathRootDir}
                           workScopeKey={data.workScopeKey}
-                          activeToolUseId={activeToolUseId}
+                          toolActivity={activity}
                           isLatestAgentMessage={unit.members.some((member) => member.key === lastAgentKey)}
                         />
                       );
@@ -91,7 +88,7 @@ function ToolResultsFixtureBody({ scenario, ready }: Props & { ready: boolean })
                         onOpenFile={() => {}}
                         filePathRootDir={data.filePathRootDir}
                         workScopeKey={data.workScopeKey}
-                        activeToolUseId={activeToolUseId}
+                        toolActivity={activity}
                         isFirstInTurn={unit.isFirstInTurn}
                         isLatestAgentMessage={unit.key === lastAgentKey}
                         forceExpandedText={unit.key === lastAgentKey}

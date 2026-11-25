@@ -622,6 +622,7 @@ export function toolResultsFixtureData(scenario: ToolResultsScenario): ToolResul
     convState: scenario.family === 'shell'
       ? {
           type: 'tool_executing',
+          assistant_message: { message_id: 'agent-13' },
           current_tool: { id: 'shell-pending', name: 'browser_wait_for_selector', input: { selector: '.fixture-ready' } },
           remaining_tools: [],
         }

@@ -1,3 +1,4 @@
+import { ownsToolActivity, projectToolRound, progressForToolRound, toolStartedAt, type ToolActivity } from '../conversation/toolActivity';
 import { ConversationEventCard } from './ConversationEventCard';
 import { EmberTrackingCard } from './EmberTrackingCard';
 import { emberTrackingObservation } from '../conversation/emberTrackingObservation';
@@ -823,7 +824,7 @@ interface AgentMessageProps {
   onOpenFile?: ((filePath: string, modifiedLines: Set<number>, firstModifiedLine: number, focusEndLine?: number) => void) | undefined;
   filePathRootDir?: string | undefined;
   workScopeKey?: string | undefined;
-  activeToolUseId?: string | undefined;
+  toolActivity?: ToolActivity | undefined;
   liveBashProgress?: import('../conversation/atom').ConversationAtom['liveBashProgress'];
   /**
    * When false, suppresses the "Phoenix HH:MM" header row. Used by the list
@@ -853,7 +854,7 @@ interface ToolOnlyAgentTurnGroupProps {
   onOpenFile?: AgentMessageProps['onOpenFile'];
   filePathRootDir?: string | undefined;
   workScopeKey?: string | undefined;
-  activeToolUseId?: string | undefined;
+  toolActivity?: ToolActivity | undefined;
   isLatestAgentMessage?: boolean;
   unitKey?: string;
   revealRequest?: AgentTextRevealRequest | null;
@@ -893,7 +894,7 @@ export const ToolOnlyAgentTurnGroup = memo(function ToolOnlyAgentTurnGroup({
   onOpenFile,
   filePathRootDir,
   workScopeKey,
-  activeToolUseId,
+  toolActivity,
   isLatestAgentMessage = false,
   unitKey,
   revealRequest = null,
@@ -906,8 +907,8 @@ export const ToolOnlyAgentTurnGroup = memo(function ToolOnlyAgentTurnGroup({
   const pendingScrollToolRef = useRef<CompactToolTarget | null>(null);
   const pendingFocusToolRef = useRef<CompactToolTarget | null>(null);
   const items = useMemo(
-    () => members.flatMap((member) => deriveToolStripItems(member.agent, member.toolResultsByUseId, liveBashProgress)),
-    [liveBashProgress, members],
+    () => members.flatMap((member) => deriveToolStripItems(member.agent, projectToolRound(member.agent, member.toolResultsByUseId, toolActivity), progressForToolRound(member.agent, liveBashProgress, toolActivity), toolActivity)),
+    [liveBashProgress, members, toolActivity],
   );
 
   const expand = useCallback((target: CompactToolTarget) => {
@@ -1031,7 +1032,7 @@ export const ToolOnlyAgentTurnGroup = memo(function ToolOnlyAgentTurnGroup({
                   onOpenFile={onOpenFile}
                   filePathRootDir={filePathRootDir}
                   workScopeKey={workScopeKey}
-                  activeToolUseId={activeToolUseId}
+                  toolActivity={toolActivity}
                   forceExpandedTools
                   visibleToolUseId={expandedToolTarget.toolId}
                   suppressMessageCopy
@@ -1074,7 +1075,7 @@ export const ToolOnlyAgentTurnGroup = memo(function ToolOnlyAgentTurnGroup({
       onOpenFile={onOpenFile}
       filePathRootDir={filePathRootDir}
       workScopeKey={workScopeKey}
-      activeToolUseId={activeToolUseId}
+      toolActivity={toolActivity}
       forceExpandedTools
       isFirstInTurn={member.isFirstInTurn}
       forceExpandedText={isLatestAgentMessage && index === members.length - 1}
@@ -1092,11 +1093,13 @@ export const ToolOnlyAgentTurnGroup = memo(function ToolOnlyAgentTurnGroup({
 
 export const AgentMessage = memo(AgentMessageImpl);
 
-function AgentMessageImpl({ message, toolResults, onOpenFile, filePathRootDir, workScopeKey, activeToolUseId, liveBashProgress = {}, isFirstInTurn = true, forceExpandedText = false, forceExpandedTools = false, visibleToolUseId, suppressMessageCopy = false, isLatestAgentMessage = false, unitKey, revealRequest = null, activeHighlight = null, onRevealHandled }: AgentMessageProps) {
+function AgentMessageImpl({ message, toolResults: persistedToolResults, onOpenFile, filePathRootDir, workScopeKey, toolActivity, liveBashProgress: rawLiveBashProgress = {}, isFirstInTurn = true, forceExpandedText = false, forceExpandedTools = false, visibleToolUseId, suppressMessageCopy = false, unitKey, revealRequest = null, activeHighlight = null, onRevealHandled }: AgentMessageProps) {
   const blocks = useMemo(
     () => (Array.isArray(message.content) ? (message.content as ContentBlock[]) : []),
     [message.content],
   );
+  const toolResults = useMemo(() => projectToolRound(message, persistedToolResults, toolActivity), [message, persistedToolResults, toolActivity]);
+  const liveBashProgress = useMemo(() => progressForToolRound(message, rawLiveBashProgress, toolActivity), [message, rawLiveBashProgress, toolActivity]);
   const timestamp = message.created_at;
   const { theme } = useTheme();
   const { density } = useDensity();
@@ -1113,11 +1116,9 @@ function AgentMessageImpl({ message, toolResults, onOpenFile, filePathRootDir, w
   // mounts. Cleared after the scroll so re-expansion is idempotent.
   const pendingScrollToolIdRef = useRef<string | null>(null);
 
-  // Derived purely from this turn's own content blocks + paired results — the
-  // turn is the single source of truth for what it did (never phase state).
   const toolStripItems = useMemo(
-    () => deriveToolStripItems(message, toolResults, liveBashProgress),
-    [message, toolResults, liveBashProgress],
+    () => deriveToolStripItems(message, toolResults, liveBashProgress, toolActivity),
+    [message, toolResults, liveBashProgress, toolActivity],
   );
   const knownResultIds = useMemo(
     () => (import.meta.env.DEV ? Array.from(toolResults.keys()) : undefined),
@@ -1374,20 +1375,11 @@ function AgentMessageImpl({ message, toolResults, onOpenFile, filePathRootDir, w
               // (typed `{ [tool_use_id]: unix_ms }` on the Rust side).
               // When present, the widget renders a live elapsed counter
               // that survives reconnect / reload / multi-tab.
-              const toolStartsMap = (message.display_data as Record<string, unknown> | undefined)?.[
-                'tool_starts'
-              ] as Record<string, number> | undefined;
               const toolUseId = block.id;
-              const toolStartedAtMs =
-                toolUseId !== undefined &&
-                  toolUseId === activeToolUseId &&
-                  toolStartsMap &&
-                  typeof toolStartsMap[toolUseId] === 'number'
-                  ? (toolStartsMap[toolUseId] as number)
-                  : undefined;
+              const toolStartedAtMs = toolUseId ? toolStartedAt(message, toolUseId, toolActivity) : undefined;
               const result = toolResults.get(block.id || '');
               const showMissingResult =
-                result === undefined && !(isLatestAgentMessage && activeToolUseId !== undefined);
+                result === undefined && !ownsToolActivity(toolActivity, message);
               return (
                   <ToolUseBlock
                     key={block.id || i}
@@ -1478,6 +1470,7 @@ interface ToolUseBlockProps {
 
 type ToolCardState =
   | { kind: 'declared' }
+  | { kind: 'pending' }
   | { kind: 'running'; toolStartedAtMs: number }
   | { kind: 'completed'; result: Message; resultContent: ToolResultContent; durationMs?: number }
   | { kind: 'failed'; result: Message; resultContent: ToolResultContent; durationMs?: number }
@@ -1487,10 +1480,12 @@ function getToolCardState({
   toolId,
   result,
   toolStartedAtMs,
+  pending,
 }: {
   toolId: string;
   result: Message | undefined;
   toolStartedAtMs?: number | undefined;
+  pending: boolean;
 }): ToolCardState {
   if (result) {
     const resultContent = result.content as ToolResultContent;
@@ -1506,6 +1501,7 @@ function getToolCardState({
   if (toolStartedAtMs != null) {
     return { kind: 'running', toolStartedAtMs };
   }
+  if (pending) return { kind: 'pending' };
   if (toolId) {
     return { kind: 'missing_result' };
   }
@@ -1536,6 +1532,8 @@ function logMissingToolResult({
 
 function renderToolCardState(state: ToolCardState, inflightElapsedSeconds: number): React.ReactNode {
   switch (state.kind) {
+    case 'pending':
+      return <span className="tool-block-status pending">Pending</span>;
     case 'declared':
       return <span className="tool-block-status pending">Declared</span>;
     case 'running':
@@ -1583,6 +1581,7 @@ function renderMissingToolResultBody(state: ToolCardState): React.ReactNode {
       return <div className="tool-block-output-content tool-missing-result">result not received</div>;
     case 'completed':
     case 'failed':
+    case 'pending':
       return null;
     default:
       state satisfies never;
@@ -2715,7 +2714,7 @@ function ToolUseBlockImpl({ block, result, onOpenFile, knownResultIds, toolStart
     block.display
   );
 
-  const toolCardState = getToolCardState({ toolId, result, toolStartedAtMs });
+  const toolCardState = getToolCardState({ toolId, result, toolStartedAtMs, pending: showMissingResult === false });
   const resultContent =
     toolCardState.kind === 'completed' || toolCardState.kind === 'failed'
       ? toolCardState.resultContent

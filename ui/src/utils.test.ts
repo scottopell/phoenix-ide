@@ -22,10 +22,10 @@ describe('formatGitShaForDisplay', () => {
 
 describe('tool activity descriptions', () => {
   it.each([
-    ['bash', 0, 'bash'],
-    ['bash', 2, 'bash (+2 queued)'],
-    ['', 0, 'tool'],
-    ['', 1, 'tool (+1 queued)'],
+    ['bash', 0, 'bash (pending)'],
+    ['bash', 2, '3 tools pending'],
+    ['', 0, 'tool (pending)'],
+    ['', 1, '2 tools pending'],
   ])('preserves the tool name %s with %i queued calls', (name, count, expected) => {
     const tool = { id: 'active', name, input: {} };
     expect(getStateDescription({
@@ -34,7 +34,7 @@ describe('tool activity descriptions', () => {
   });
 
   it('keeps cancellation independent of the tool name', () => {
-    expect(getStateDescription({ type: 'cancelling_tool', current_tool: { id: 'active', name: 'bash', input: {} } }))
+    expect(getStateDescription({ type: 'cancelling_tool', tool_use_id: 'active', skipped_tools: [] }))
       .toBe('cancelling...');
   });
 });

@@ -133,13 +133,13 @@ struct StateDetailBody: View {
 
     var body: some View {
         switch state {
-        case .toolExecuting(let toolName, let remaining, let completed):
+        case .toolExecuting(let toolName, let pending, let completed):
             workingRow {
                 HStack(spacing: 4) {
-                    Text(toolName)
+                    Text(pending == 1 ? "\(toolName) (pending)" : "\(pending) tools pending")
                         .font(.caption.monospaced().bold())
                     // Queue depth per REQ-API-011: evidence of progress.
-                    Text(progressSuffix(remaining: remaining, completed: completed))
+                    Text(completed > 0 ? "\(completed) done" : "")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -308,13 +308,6 @@ struct StateDetailBody: View {
                     .foregroundStyle(.secondary)
             }
         }
-    }
-
-    private func progressSuffix(remaining: Int, completed: Int) -> String {
-        var parts: [String] = []
-        if completed > 0 { parts.append("\(completed) done") }
-        if remaining > 0 { parts.append("\(remaining) queued") }
-        return parts.isEmpty ? "running" : parts.joined(separator: " · ")
     }
 
     private func workingRow(@ViewBuilder _ content: @escaping () -> some View) -> some View {

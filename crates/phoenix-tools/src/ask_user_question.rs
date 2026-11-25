@@ -15,6 +15,10 @@ pub struct AskUserQuestionTool;
 
 #[async_trait]
 impl Tool for AskUserQuestionTool {
+    fn foreground_execution(&self) -> crate::ForegroundExecution {
+        crate::ForegroundExecution::Serial
+    }
+
     fn name(&self) -> &'static str {
         "ask_user_question"
     }

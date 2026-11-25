@@ -95,6 +95,10 @@ pub(super) fn check_answer(
 
 #[async_trait]
 impl Tool for AnswerConversationQuestion {
+    fn foreground_execution(&self) -> crate::tools::ForegroundExecution {
+        crate::tools::ForegroundExecution::Serial
+    }
+
     fn name(&self) -> &'static str {
         "answer_conversation_question"
     }

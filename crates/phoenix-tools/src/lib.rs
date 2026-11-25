@@ -710,11 +710,19 @@ impl ToolContext {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForegroundExecution {
+    Concurrent,
+    Serial,
+}
+
 /// Trait for tools that can be executed by the agent
 ///
 /// REQ-BASH-010, REQ-BT-012: Tools are stateless - all context via `ToolContext`
 #[async_trait]
 pub trait Tool: Send + Sync {
+    fn foreground_execution(&self) -> ForegroundExecution;
+
     /// Tool name
     fn name(&self) -> &str;
 
@@ -1216,6 +1224,11 @@ impl ToolRegistry {
         self.definitions_for_language(phoenix_core::llm_language::LlmLanguage::default())
     }
 
+    #[must_use]
+    pub fn foreground_execution(&self, name: &str) -> Option<ForegroundExecution> {
+        self.find_tool(name).map(|tool| tool.foreground_execution())
+    }
+
     /// Get all tool definitions for LLM in the requested language.
     /// Tools without a translated description fall back to phoenix-native.
     #[must_use]
@@ -1389,6 +1402,10 @@ mod tests {
 
     #[async_trait]
     impl Tool for NamedTool {
+        fn foreground_execution(&self) -> crate::ForegroundExecution {
+            crate::ForegroundExecution::Serial
+        }
+
         fn name(&self) -> &'static str {
             self.0
         }

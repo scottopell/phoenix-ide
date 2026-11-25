@@ -20,6 +20,10 @@ struct ReplyInput {
 }
 #[async_trait]
 impl Tool for Reply {
+    fn foreground_execution(&self) -> phoenix_tools::ForegroundExecution {
+        phoenix_tools::ForegroundExecution::Serial
+    }
+
     fn name(&self) -> &'static str {
         "slack_gateway_reply"
     }
