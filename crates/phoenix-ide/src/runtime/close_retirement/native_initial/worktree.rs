@@ -295,6 +295,8 @@ pub(crate) struct OriginalWorktreeEffectContext {
     source_entry: SourceEntryWorker,
     deadline: Instant,
     fatal: Arc<FatalLocalAuthorityFence>,
+    #[cfg(test)]
+    test_hooks: Option<crate::runtime::executor::native_close_retry::test_hooks::Hooks>,
     leaf_release_pending_classification: bool,
 }
 
@@ -323,6 +325,8 @@ impl OriginalWorktreeEffectContext {
             source_entry,
             deadline,
             fatal,
+            #[cfg(test)]
+            test_hooks: crate::runtime::executor::native_close_retry::test_hooks::Hooks::current(),
             leaf_release_pending_classification: false,
         }
     }
@@ -528,6 +532,8 @@ impl NativeWorktreeGit {
             source_entry,
             deadline: original_deadline,
             fatal,
+            #[cfg(test)]
+            test_hooks: crate::runtime::executor::native_close_retry::test_hooks::Hooks::current(),
             leaf_release_pending_classification: false,
         };
         NativeWorktreeGitContinuation {
@@ -1056,6 +1062,8 @@ mod tests {
                             source_entry: controller.worker(),
                             deadline,
                             fatal: FatalLocalAuthorityFence::new(),
+                            #[cfg(test)]
+                            test_hooks: None,
                             leaf_release_pending_classification: false,
                         }
                     },

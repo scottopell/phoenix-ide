@@ -56,6 +56,13 @@ impl WorktreeMutationExecutor for OriginalWorktreeMutationExecutor<'_> {
         if let Some(refusal) = &self.refusal {
             return Err(refusal.clone());
         }
+        #[cfg(test)]
+        self.runtime.block_on(
+            crate::runtime::executor::native_close_retry::test_hooks::checkpoint(
+                self.original.test_hooks.as_ref(),
+                crate::runtime::executor::native_close_retry::test_hooks::Point::PhysicalBeforeMutation,
+            ),
+        );
         let entry = self.original.admitted_leaf(self.runtime, effect);
         let confirmed = matches!(
             &entry,

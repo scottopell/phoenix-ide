@@ -221,6 +221,33 @@ jobs:
           done
           test "$failed" -eq 0
 
+      - name: Execute deterministic pending-mutation and anchored-gap regressions
+        if: success() || failure()
+        timeout-minutes: 8
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${PHOENIX_RUNTIME_TEST_BINARY:-}"
+          failed=0
+          # Scoped clean-writer fixtures isolate source custody; they do not replace production-detector acceptance.
+          for test_name in \
+            runtime::executor::creation_completion_lifecycle_tests::native_close_admission_tests::worktree_physical::registered_native_close_captured_loss_retry_stop_during_physical_mutation_does_not_revalidate_pending_ticks \
+            runtime::executor::creation_completion_lifecycle_tests::native_close_admission_tests::worktree_physical::registered_native_close_captured_loss_retry_resumes_physical_mutation_after_pending_ticks \
+            runtime::close_retirement::tests::anchored_native_retry_assessment_preserves_writer_inspection_gap; do
+            if ! grep -Fx "$test_name: test" evidence/runtime-inventory.log; then
+              failed=1
+              continue
+            fi
+            log="evidence/${test_name##*::}.log"
+            if ! timeout --kill-after=10s 2m bash scripts/ci/close-unprivileged-qualification.sh "$GITHUB_WORKSPACE" "$PHOENIX_RUNTIME_TEST_BINARY" "$PHOENIX_BASH_LAUNCH_TEST_EXE" "$(id -u)" "$test_name" --exact --nocapture --test-threads=1 2>&1 | tee "$log"; then
+              failed=1
+              continue
+            fi
+            grep -F "$test_name ... ok" "$log" || failed=1
+            grep -F 'test result: ok. 1 passed; 0 failed; 0 ignored;' "$log" || failed=1
+          done
+          test "$failed" -eq 0
+
       - name: Capture bounded intermittent retry and assessment evidence
         if: success() || failure()
         timeout-minutes: 16

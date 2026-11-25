@@ -52,6 +52,22 @@ async fn registered_native_close_captured_loss_retry_stop_before_physical_observ
 }
 
 #[tokio::test]
+async fn registered_native_close_captured_loss_retry_stop_during_physical_mutation_does_not_revalidate_pending_ticks() {
+    run_public_worktree_close(
+        WorktreeJourney::CapturedLossPublicRetryStoppedDuringPhysicalMutation,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn registered_native_close_captured_loss_retry_resumes_physical_mutation_after_pending_ticks() {
+    run_public_worktree_close(
+        WorktreeJourney::CapturedLossPublicRetryResumedDuringPhysicalMutation,
+    )
+    .await;
+}
+
+#[tokio::test]
 async fn registered_native_close_captured_loss_retry_stop_before_writer_refuses_dispatch() {
     run_public_worktree_close(
         WorktreeJourney::CapturedLossPublicRetryStoppedBeforeWorktreeDispatch,
@@ -154,6 +170,8 @@ enum WorktreeJourney {
     CapturedLossPublicRetryStoppedDuringPreparation,
     CapturedLossPublicRetryStoppedBeforeWorktreeDispatch,
     CapturedLossPublicRetryStoppedBeforePhysicalObservation,
+    CapturedLossPublicRetryStoppedDuringPhysicalMutation,
+    CapturedLossPublicRetryResumedDuringPhysicalMutation,
     RetainContentBlockers,
     ReinspectCapturedLossAfterCleanup,
     RetryLossClassification,
@@ -536,6 +554,8 @@ async fn run_public_worktree_close_inner(journey: WorktreeJourney) {
             | WorktreeJourney::CapturedLossPublicRetryStoppedDuringPreparation
             | WorktreeJourney::CapturedLossPublicRetryStoppedBeforeWorktreeDispatch
             | WorktreeJourney::CapturedLossPublicRetryStoppedBeforePhysicalObservation
+            | WorktreeJourney::CapturedLossPublicRetryStoppedDuringPhysicalMutation
+            | WorktreeJourney::CapturedLossPublicRetryResumedDuringPhysicalMutation
     );
     let mut captured_retry_run = None;
     let content_blocked = matches!(
@@ -548,6 +568,8 @@ async fn run_public_worktree_close_inner(journey: WorktreeJourney) {
             | WorktreeJourney::CapturedLossPublicRetryStoppedDuringPreparation
             | WorktreeJourney::CapturedLossPublicRetryStoppedBeforeWorktreeDispatch
             | WorktreeJourney::CapturedLossPublicRetryStoppedBeforePhysicalObservation
+            | WorktreeJourney::CapturedLossPublicRetryStoppedDuringPhysicalMutation
+            | WorktreeJourney::CapturedLossPublicRetryResumedDuringPhysicalMutation
     );
     if content_blocked {
         std::fs::create_dir_all(git.repo.join(".git/info")).unwrap();
@@ -571,6 +593,8 @@ async fn run_public_worktree_close_inner(journey: WorktreeJourney) {
             | WorktreeJourney::RetainContentBlockers
             | WorktreeJourney::RetryLossClassification
             | WorktreeJourney::ReinspectCapturedLossAfterCleanup
+            | WorktreeJourney::CapturedLossPublicRetryStoppedDuringPhysicalMutation
+            | WorktreeJourney::CapturedLossPublicRetryResumedDuringPhysicalMutation
     ) {
         // Qualify public admission and real Git/filesystem retirement independently
         // of ambient runner processes. Production inspection gaps remain blocking;
@@ -1439,6 +1463,15 @@ async fn run_public_worktree_close_inner(journey: WorktreeJourney) {
                 ),
                 WorktreeJourney::CapturedLossPublicRetryStoppedBeforePhysicalObservation => Some(
                     crate::runtime::executor::native_close_retry::test_hooks::Point::PhysicalBeforeObservation,
+                ),
+                WorktreeJourney::CapturedLossPublicRetryStoppedDuringPhysicalMutation => Some(
+                    crate::runtime::executor::native_close_retry::test_hooks::Point::PhysicalBeforeMutation,
+                ),
+                _ => None,
+            },
+            match journey {
+                WorktreeJourney::CapturedLossPublicRetryResumedDuringPhysicalMutation => Some(
+                    crate::runtime::executor::native_close_retry::test_hooks::Point::PhysicalBeforeMutation,
                 ),
                 _ => None,
             },

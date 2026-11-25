@@ -105,6 +105,7 @@ pub(super) async fn retry_after_public_capture(
     scope: &WorkScopeId,
     initial_run: &CloseRunRef,
     stop_at: Option<Point>,
+    resume_at: Option<Point>,
 ) {
     install_physical_close_diagnostics();
     let source = SourceToolCall {
@@ -433,6 +434,36 @@ pub(super) async fn retry_after_public_capture(
         return;
     }
 
+    let resumed = if let Some(point) = resume_at {
+        let mut pause = hooks.arm(point);
+        let retry_tool = Arc::clone(&tool);
+        let retry_input = input.clone();
+        let retry_context = context.clone();
+        let mut retry = tokio::spawn(async move { retry_tool.run(retry_input, retry_context).await });
+        tokio::time::timeout(Duration::from_secs(10), pause.reached())
+            .await
+            .expect("physical mutation barrier must arrive")
+            .expect("physical mutation worker must reach barrier");
+        let revalidations = hooks.revalidation_count();
+        let pending_ticks = hooks.pending_tick_count();
+        let serviced = tokio::time::timeout(
+            Duration::from_secs(10),
+            hooks.wait_for_pending_ticks(pending_ticks + 5),
+        )
+        .await;
+        let after_pending = hooks.revalidation_count();
+        pause.release();
+        serviced.expect("actor services pending physical cursor while worker is paused");
+        assert_eq!(after_pending, revalidations);
+        let output = tokio::time::timeout(Duration::from_secs(20), &mut retry)
+            .await
+            .expect("resumed retry must complete")
+            .unwrap();
+        Some(output)
+    } else {
+        None
+    };
+
     if let Some(point) = stop_at {
         let worktree_before = physical_snapshot(&git.worktree);
         let admin_before = physical_snapshot(&git.admin);
@@ -453,6 +484,20 @@ pub(super) async fn retry_after_public_capture(
             &diagnostics_before_retry,
         )
         .await;
+        if point == Point::PhysicalBeforeMutation {
+            let revalidations = hooks.revalidation_count();
+            let pending_ticks = hooks.pending_tick_count();
+            let serviced = tokio::time::timeout(
+                Duration::from_secs(10),
+                hooks.wait_for_pending_ticks(pending_ticks + 5),
+            )
+            .await;
+            if serviced.is_err() {
+                pause.release();
+                panic!("actor did not service pending physical cursor");
+            }
+            assert_eq!(hooks.revalidation_count(), revalidations);
+        }
         let receipt = fixture
             .db
             .read_native_close_explicit_retry_receipt(&fixture.command)
@@ -479,7 +524,9 @@ pub(super) async fn retry_after_public_capture(
         assert!(!retry.is_finished());
         if matches!(
             point,
-            Point::WorktreeDispatchBeforeWriter | Point::WorktreePreparationReady
+            Point::WorktreeDispatchBeforeWriter
+                | Point::WorktreePreparationReady
+                | Point::PhysicalBeforeMutation
         ) {
             assert_eq!(physical_snapshot(&git.worktree), worktree_before);
             assert_eq!(physical_snapshot(&git.admin), admin_before);
@@ -616,12 +663,16 @@ pub(super) async fn retry_after_public_capture(
     }
 
     let diagnostics_before_clean_retry = physical_close_diagnostics();
-    let completed = tokio::time::timeout(
-        Duration::from_secs(10),
-        tool.run(input.clone(), context.clone()),
-    )
-    .await
-    .expect("public captured-loss retry must finish within its terminal fence");
+    let completed = if let Some(output) = resumed {
+        output
+    } else {
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            tool.run(input.clone(), context.clone()),
+        )
+        .await
+        .expect("public captured-loss retry must finish within its terminal fence")
+    };
     if !completed.is_success() {
         let diagnostics = physical_close_diagnostics();
         eprintln!(

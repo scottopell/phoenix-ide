@@ -9,6 +9,7 @@ pub(crate) enum Point {
     CapturedLossAssessmentReady,
     WorktreeDispatchBeforeWriter,
     WorktreePreparationReady,
+    PhysicalBeforeMutation,
     PhysicalBeforeObservation,
 }
 
@@ -19,7 +20,12 @@ struct Checkpoint {
 }
 
 #[derive(Clone, Default)]
-pub(crate) struct Hooks(Arc<Mutex<Option<Checkpoint>>>);
+pub(crate) struct Hooks {
+    checkpoint: Arc<Mutex<Option<Checkpoint>>>,
+    revalidations: Arc<std::sync::atomic::AtomicUsize>,
+    pending_ticks: Arc<std::sync::atomic::AtomicUsize>,
+    pending_tick: Arc<tokio::sync::Notify>,
+}
 
 tokio::task_local! {
     static ACTOR_HOOKS: Hooks;
@@ -38,7 +44,7 @@ impl Hooks {
     pub(crate) fn arm(&self, point: Point) -> Pause {
         let (reached, arrival) = oneshot::channel();
         let (release, resume) = oneshot::channel();
-        let mut slot = self.0.lock().unwrap();
+        let mut slot = self.checkpoint.lock().unwrap();
         assert!(slot.is_none(), "only one barrier may be armed per actor");
         *slot = Some(Checkpoint {
             point,
@@ -48,9 +54,38 @@ impl Hooks {
         Pause { arrival, release }
     }
 
+    pub(crate) fn revalidation_count(&self) -> usize {
+        self.revalidations.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub(crate) fn record_revalidation(&self) {
+        self.revalidations
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub(crate) fn record_pending_tick(&self) {
+        self.pending_ticks
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.pending_tick.notify_one();
+    }
+
+    pub(crate) fn pending_tick_count(&self) -> usize {
+        self.pending_ticks.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub(crate) async fn wait_for_pending_ticks(&self, target: usize) {
+        loop {
+            let notified = self.pending_tick.notified();
+            if self.pending_ticks.load(std::sync::atomic::Ordering::SeqCst) >= target {
+                return;
+            }
+            notified.await;
+        }
+    }
+
     pub(crate) async fn checkpoint(&self, point: Point) {
         let checkpoint = {
-            let mut slot = self.0.lock().unwrap();
+            let mut slot = self.checkpoint.lock().unwrap();
             if slot.as_ref().is_some_and(|hook| hook.point == point) {
                 slot.take()
             } else {

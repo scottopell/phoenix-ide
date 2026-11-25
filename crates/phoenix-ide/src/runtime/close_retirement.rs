@@ -1964,6 +1964,36 @@ impl RuntimeManager {
         &self,
         failed_run: &CloseRunRef,
     ) -> Result<NativeCloseRetryAssessment, RetryAssessmentError> {
+        self.assess_native_close_retry_with_writer_probe(
+            failed_run,
+            |original, quarantine, tombstone, clean_writer_fixture| {
+                #[cfg(not(test))]
+                let _ = clean_writer_fixture;
+                probe_retry_worktree_writers(
+                    original,
+                    quarantine,
+                    tombstone,
+                    #[cfg(test)]
+                    clean_writer_fixture,
+                )
+            },
+        )
+        .await
+    }
+
+    async fn assess_native_close_retry_with_writer_probe<F>(
+        &self,
+        failed_run: &CloseRunRef,
+        mut writer_probe: F,
+    ) -> Result<NativeCloseRetryAssessment, RetryAssessmentError>
+    where
+        F: FnMut(
+            &Path,
+            &Path,
+            Option<&CloseWorktreeFinalTombstone>,
+            bool,
+        ) -> Result<(), RetryAssessmentError>,
+    {
         let context = self
             .db()
             .read_native_close_retry_pre_admission_context(failed_run)
@@ -1984,6 +2014,7 @@ impl RuntimeManager {
                     worktree_snapshots: &worktree_snapshots,
                     retired: &original.outcomes,
                 },
+                &mut writer_probe,
             )
             .await?;
         Ok(NativeCloseRetryAssessment {
@@ -2000,6 +2031,12 @@ impl RuntimeManager {
         snapshot: &CloseRetirementSnapshot,
         plan: &[CloseSafeRetryEffect],
         evidence: CloseRetryLiveEvidence<'_>,
+        writer_probe: &mut impl FnMut(
+            &Path,
+            &Path,
+            Option<&CloseWorktreeFinalTombstone>,
+            bool,
+        ) -> Result<(), RetryAssessmentError>,
     ) -> Result<String, RetryAssessmentError> {
         let CloseRetryLiveEvidence {
             scopes,
@@ -2038,7 +2075,8 @@ impl RuntimeManager {
                 {
                     return Err(format!(
                         "scope {scope} has a retry effect outside sealed original inventory"
-                    ).into());
+                    )
+                    .into());
                 }
             }
             match &captured.captured_worktree {
@@ -2066,12 +2104,14 @@ impl RuntimeManager {
                     } else {
                         None
                     };
-                    probe_retry_worktree_writers(
+                    writer_probe(
                         &path,
                         &quarantine,
                         tombstone.as_ref(),
                         #[cfg(test)]
                         self.clean_close_writer_fixture,
+                        #[cfg(not(test))]
+                        false,
                     )?;
                     if let Some(tombstone) = &tombstone {
                         let object = tombstone.root.join("object");
@@ -2088,7 +2128,9 @@ impl RuntimeManager {
                     let active = path.try_exists().map_err(|error| error.to_string())?;
                     let quarantined = quarantine.try_exists().map_err(|error| error.to_string())?;
                     if active && quarantined {
-                        return Err(format!("scope {scope} has ambiguous worktree locations").into());
+                        return Err(
+                            format!("scope {scope} has ambiguous worktree locations").into()
+                        );
                     }
                     let selected = if active {
                         Some(path)
@@ -2101,12 +2143,10 @@ impl RuntimeManager {
                         if observe_worktree_fingerprint(&path).as_deref()
                             != Some(identity.fingerprint().as_str())
                         {
-                            return Err(
-                                format!(
-                                    "scope {scope} captured worktree fingerprint changed"
-                                )
-                                .into(),
-                            );
+                            return Err(format!(
+                                "scope {scope} captured worktree fingerprint changed"
+                            )
+                            .into());
                         }
                         if planned
                             .iter()
@@ -2123,12 +2163,10 @@ impl RuntimeManager {
                             if fresh.fingerprint() != confirmed.1.fingerprint()
                                 || !losses.is_empty()
                             {
-                                return Err(
-                                    format!(
-                                        "scope {scope} worktree is not unchanged and reconstructible"
-                                    )
-                                    .into(),
-                                );
+                                return Err(format!(
+                                    "scope {scope} worktree is not unchanged and reconstructible"
+                                )
+                                .into());
                             }
                         }
                         observations.push(format!(
@@ -2195,12 +2233,10 @@ impl RuntimeManager {
                         if !matches!(&captured.captured_worktree, Some(CapturedWorktreeIdentity::Resolved(id))
                             if effect.resource.identity() == &LossItemIdentity::Worktree(id.clone()))
                         {
-                            return Err(
-                                format!(
-                                    "scope {scope} worktree retry lacks its exact captured identity"
-                                )
-                                .into(),
-                            );
+                            return Err(format!(
+                                "scope {scope} worktree retry lacks its exact captured identity"
+                            )
+                            .into());
                         }
                     }
                     RetiredResourceKind::TmuxServer => {
@@ -2244,12 +2280,10 @@ impl RuntimeManager {
                                     .await
                                     .map_err(|error| error.to_string())?
                                 {
-                                    return Err(
-                                        format!(
-                                            "scope {scope} tmux absence lacks original dispatch"
-                                        )
-                                        .into(),
-                                    );
+                                    return Err(format!(
+                                        "scope {scope} tmux absence lacks original dispatch"
+                                    )
+                                    .into());
                                 }
                                 observations.push(format!(
                                     "{scope}: dispatched exact tmux {} absent",
@@ -2257,12 +2291,10 @@ impl RuntimeManager {
                                 ));
                             }
                             _ => {
-                                return Err(
-                                    format!(
-                                        "scope {scope} tmux identity differs or is ambiguous"
-                                    )
-                                    .into(),
-                                );
+                                return Err(format!(
+                                    "scope {scope} tmux identity differs or is ambiguous"
+                                )
+                                .into());
                             }
                         }
                     }
@@ -2273,12 +2305,10 @@ impl RuntimeManager {
                                     .map_err(|error| error.to_string())?,
                             )
                         {
-                            return Err(
-                                format!(
-                                    "scope {scope} retry identity differs from captured scope"
-                                )
-                                .into(),
-                            );
+                            return Err(format!(
+                                "scope {scope} retry identity differs from captured scope"
+                            )
+                            .into());
                         }
                         observations
                             .push(format!("{scope}: original work-scope ownership checked"));
@@ -12641,6 +12671,94 @@ mod tests {
             .is_err());
     }
 
+    #[tokio::test]
+    async fn anchored_native_retry_assessment_preserves_writer_inspection_gap() {
+        let temp = tempfile::tempdir().unwrap();
+        let linked = linked_close_worktree(&temp);
+        let (mut fixture, original, _) =
+            stopped_native_retry_fixture_with_worktree_at_g2(Some(&linked), true).await;
+        fixture.manager.clean_close_writer_fixture = true;
+        let before_inspections = fixture
+            .manager
+            .db()
+            .list_close_retirement_inspections(fixture.run.attempt_id.as_str())
+            .await
+            .unwrap();
+        let original_run = fixture
+            .manager
+            .db()
+            .get_close_run(&fixture.run)
+            .await
+            .unwrap();
+        let mut observed_target = None;
+
+        let error = fixture
+            .manager
+            .assess_native_close_retry_with_writer_probe(
+                &fixture.run,
+                |path, quarantine, tombstone, _clean_writer_fixture| {
+                    super::probe_retry_worktree_writers_with(
+                        path,
+                        quarantine,
+                        tombstone,
+                        |target| {
+                            observed_target = Some(target.to_path_buf());
+                            Ok(super::RetryTargetObservation::Present(
+                                super::ExternalWriterEvidence::Blocked(
+                                    super::CloseWriterObservation::InspectionGap {
+                                        detector: super::CloseWriterDetector::LinuxDescriptor,
+                                        pid: None,
+                                        reason: super::CloseWriterGap::Unavailable,
+                                    },
+                                ),
+                            ))
+                        },
+                    )
+                },
+            )
+            .await
+            .expect_err("writer inspection gap must block anchored retry assessment");
+        let super::RetryAssessmentError::WriterInspectionGap(gap) = error else {
+            panic!("anchored assessment lost typed writer inspection gap");
+        };
+        assert_eq!(gap.path, linked);
+        assert_eq!(gap.detector, super::CloseWriterDetector::LinuxDescriptor);
+        assert_eq!(gap.reason, super::CloseWriterGap::Unavailable);
+        assert_eq!(gap.pid, None);
+        assert_eq!(observed_target.as_deref(), Some(linked.as_path()));
+
+        assert_eq!(
+            fixture
+                .manager
+                .db()
+                .get_close_run(&fixture.run)
+                .await
+                .unwrap(),
+            original_run
+        );
+        assert_eq!(original.run.run, fixture.run);
+        let successor = super::CloseRunRef {
+            attempt_id: fixture.run.attempt_id.clone(),
+            ordinal: super::CloseRunOrdinal::parse(2).unwrap(),
+        };
+        assert!(fixture
+            .manager
+            .db()
+            .get_close_run(&successor)
+            .await
+            .is_err());
+        assert_eq!(
+            fixture
+                .manager
+                .db()
+                .list_close_retirement_inspections(fixture.run.attempt_id.as_str())
+                .await
+                .unwrap(),
+            before_inspections
+        );
+        assert!(linked.exists(), "anchored retry target must remain intact");
+    }
+
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread")]
     #[allow(clippy::too_many_lines)]
@@ -13098,7 +13216,9 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            error.to_string().contains("not unchanged and reconstructible"),
+            error
+                .to_string()
+                .contains("not unchanged and reconstructible"),
             "{error}"
         );
         assert_eq!(

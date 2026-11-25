@@ -115,6 +115,10 @@ impl SourceEntryController {
         live_state: &ConvState,
         exact_original: &NativeCloseCommand,
     ) -> ActorEntryResult {
+        #[cfg(test)]
+        if let Some(hooks) = crate::runtime::executor::native_close_retry::test_hooks::Hooks::current() {
+            hooks.record_revalidation();
+        }
         if self
             .shared
             .revoked

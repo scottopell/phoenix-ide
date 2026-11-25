@@ -1,5 +1,44 @@
 # Architectural reduction candidate — unqualified
 
+## Pending-physical caller repair after `50538326c`
+
+- Broad [45652378449](https://github.com/scottopell/phoenix-ide/actions/runs/45652378449)
+  is terminal **failure** at the formatting gate, before Rust test qualification.
+  This follow-up manually applies the complete retained hosted Rust formatting
+  proposal, including the chained error assertion. No formatter ran locally.
+- Exact [45652361228](https://github.com/scottopell/phoenix-ide/actions/runs/45652361228)
+  remains in progress at this source checkpoint; frontend/specifications passed.
+  It tests `50538326c`, not this unexecuted follow-up. Its first watcher exited
+  on GitHub HTTP500; after checking no surviving watcher, one replacement watches
+  the same run. That retrieval failure is not a workflow/test failure.
+- Source review establishes a possible explicit-retry contention schedule:
+  repeated actor revalidation takes the same eligibility mutex as an otherwise
+  eligible worker leaf; a confirmed non-entry Busy becomes terminal mutation
+  refusal. This is not a diagnosis of historical merged Busy/Refused failures.
+- The narrow repair skips idle `WorktreePhysical` polling revalidation only while
+  its retained observation is not ready. Fatal handling remains first. Physical
+  readiness is published after child/DB/source custody release; ready handling
+  still revalidates and routes stale-source outcomes to stopped observation.
+  Leaf checks still enforce exact original command, deadline and revocation.
+  No Busy retry, authority renewal, writer-proof relaxation or new framework.
+- Two deterministic clean-writer journeys pause immediately before the actual
+  mutation admission sink. Each requires five further actor cursor services
+  without revalidation, then either resumes into existing retirement/replay
+  assertions or acknowledges Stop before releasing the worker and checks no new
+  effects and unchanged retained targets. These fixtures do not qualify ambient
+  production writer detection, entered-leaf unknown release, or historical cause.
+- A stopped anchored assessment test injects a typed inspection gap at the writer
+  observation seam and verifies preserved path/detector/reason/PID, unchanged
+  failed run and inspection rows, no successor, and retained worktree path.
+  This is assessment propagation evidence, not public-actor admission evidence
+  or proof of filesystem content equality. All three new exact selectors are
+  required in a separate failure-path hosted step; the six existing mandatory
+  production physical journeys remain unchanged. No new tests ran locally.
+- Source-only independent review found no remaining demonstrated correctness
+  blocker in this repair slice. Hosted compilation/execution and unchanged
+  acceptance remain required; CI isolation decision `e5fe7b20` is still pending.
+  No merge, installation, privileged setup or real-user fixture was performed.
+
 ## Current disposition after exact `818b08b40`
 
 - Exact Close run [45627288649](https://github.com/scottopell/phoenix-ide/actions/runs/45627288649)
