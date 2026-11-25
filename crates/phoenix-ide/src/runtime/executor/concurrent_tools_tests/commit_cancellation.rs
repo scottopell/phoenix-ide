@@ -204,6 +204,7 @@ async fn acknowledged_cancel_interrupts_running_siblings_during_held_commit() {
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)] // Keep the held-write/custody Stop interleaving in one test.
 async fn stop_keeps_batch_commit_and_cutoff_live_while_close_holds_source_custody() {
     use native_close::source_entry::{ActorEntryResult, SourceEntryController, WorkerEntryResult};
     use phoenix_core::domain::{

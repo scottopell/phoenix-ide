@@ -417,6 +417,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)] // Keep all three envelope/reply ownership cases together.
     async fn native_close_requests_keep_their_envelopes_and_replies() {
         let backend = Arc::new(test_manager().await);
         let source = SourceToolCall {

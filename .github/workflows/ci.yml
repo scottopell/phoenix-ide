@@ -174,6 +174,31 @@ jobs:
       - name: ./dev.py check (rust,cargo-fmt) build phase
         timeout-minutes: 20
         run: ./dev.py check --lanes rust,cargo-fmt --rust-phase build --profile-work --profile-work-dir "$RUST_EVIDENCE_DIR/check"
+      - name: Capture production run-inner future layout evidence
+        timeout-minutes: 10
+        shell: bash
+        run: |
+          set -euo pipefail
+          log="$RUST_EVIDENCE_DIR/production-run-inner-future-layout.log"
+          set +e
+          cargo test --locked -p phoenix_ide --lib runtime::executor::close_run_inner_layout_tests::production_run_inner_future_layout -- --exact --nocapture --test-threads=1 2>&1 | tee "$log"
+          pipeline_status=("${PIPESTATUS[@]}")
+          test_status=${pipeline_status[0]}
+          tee_status=${pipeline_status[1]}
+          set -e
+          bytes=$(wc -c < "$log" | tr -d ' ')
+          running=$(grep -Ec '^running 1 test$' "$log" || true)
+          result=$(grep -Ec '^test result: ok\. 1 passed; 0 failed; 0 ignored;' "$log" || true)
+          run_inner=$(grep -Ec '^production run_inner future: [0-9]+ bytes$' "$log" || true)
+          continuation=$(grep -Ec '^native Close continuation/cursor layouts: initial=[0-9]+ bytes, retry=[0-9]+ bytes, admitted_retry_cursor=[0-9]+ bytes$' "$log" || true)
+          printf 'test_status=%s tee_status=%s bytes=%s running_one_test=%s passing_result=%s run_inner_measurement=%s continuation_measurement=%s\n' "$test_status" "$tee_status" "$bytes" "$running" "$result" "$run_inner" "$continuation" | tee "$RUST_EVIDENCE_DIR/production-run-inner-future-layout.receipt"
+          test "$test_status" -eq 0
+          test "$tee_status" -eq 0
+          test "$bytes" -gt 0
+          test "$running" -eq 1
+          test "$result" -eq 1
+          test "$run_inner" -eq 1
+          test "$continuation" -eq 1
       - name: Qualify missing continuation notification witness
         timeout-minutes: 15
         shell: bash
