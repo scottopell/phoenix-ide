@@ -1963,7 +1963,7 @@ impl RuntimeManager {
     pub(crate) async fn assess_native_close_retry(
         &self,
         failed_run: &CloseRunRef,
-    ) -> Result<NativeCloseRetryAssessment, String> {
+    ) -> Result<NativeCloseRetryAssessment, RetryAssessmentError> {
         let context = self
             .db()
             .read_native_close_retry_pre_admission_context(failed_run)
@@ -2000,7 +2000,7 @@ impl RuntimeManager {
         snapshot: &CloseRetirementSnapshot,
         plan: &[CloseSafeRetryEffect],
         evidence: CloseRetryLiveEvidence<'_>,
-    ) -> Result<String, String> {
+    ) -> Result<String, RetryAssessmentError> {
         let CloseRetryLiveEvidence {
             scopes,
             expected,
@@ -2025,7 +2025,7 @@ impl RuntimeManager {
                 .await
                 .map_err(|error| error.to_string())?
             {
-                return Err(format!("scope {scope} has unresolved ownership"));
+                return Err(format!("scope {scope} has unresolved ownership").into());
             }
             let planned = plan
                 .iter()
@@ -2038,12 +2038,12 @@ impl RuntimeManager {
                 {
                     return Err(format!(
                         "scope {scope} has a retry effect outside sealed original inventory"
-                    ));
+                    ).into());
                 }
             }
             match &captured.captured_worktree {
                 Some(CapturedWorktreeIdentity::Unresolved { .. }) => {
-                    return Err(format!("scope {scope} has unresolved worktree identity"));
+                    return Err(format!("scope {scope} has unresolved worktree identity").into());
                 }
                 Some(CapturedWorktreeIdentity::Resolved(identity)) => {
                     let path = worktree_path(identity);
@@ -2072,8 +2072,7 @@ impl RuntimeManager {
                         tombstone.as_ref(),
                         #[cfg(test)]
                         self.clean_close_writer_fixture,
-                    )
-                    .map_err(|error| error.to_string())?;
+                    )?;
                     if let Some(tombstone) = &tombstone {
                         let object = tombstone.root.join("object");
                         if object.try_exists().map_err(|error| error.to_string())? {
@@ -2089,7 +2088,7 @@ impl RuntimeManager {
                     let active = path.try_exists().map_err(|error| error.to_string())?;
                     let quarantined = quarantine.try_exists().map_err(|error| error.to_string())?;
                     if active && quarantined {
-                        return Err(format!("scope {scope} has ambiguous worktree locations"));
+                        return Err(format!("scope {scope} has ambiguous worktree locations").into());
                     }
                     let selected = if active {
                         Some(path)
@@ -2102,9 +2101,12 @@ impl RuntimeManager {
                         if observe_worktree_fingerprint(&path).as_deref()
                             != Some(identity.fingerprint().as_str())
                         {
-                            return Err(format!(
-                                "scope {scope} captured worktree fingerprint changed"
-                            ));
+                            return Err(
+                                format!(
+                                    "scope {scope} captured worktree fingerprint changed"
+                                )
+                                .into(),
+                            );
                         }
                         if planned
                             .iter()
@@ -2121,9 +2123,12 @@ impl RuntimeManager {
                             if fresh.fingerprint() != confirmed.1.fingerprint()
                                 || !losses.is_empty()
                             {
-                                return Err(format!(
-                                    "scope {scope} worktree is not unchanged and reconstructible"
-                                ));
+                                return Err(
+                                    format!(
+                                        "scope {scope} worktree is not unchanged and reconstructible"
+                                    )
+                                    .into(),
+                                );
                             }
                         }
                         observations.push(format!(
@@ -2170,9 +2175,12 @@ impl RuntimeManager {
                             .await
                             .map_err(|error| error.to_string())?;
                         if !prior_success && (!dispatched || cleanup.is_none()) {
-                            return Err(format!(
-                                "scope {scope} absent worktree has no exact prior proof or cleanup authority"
-                            ));
+                            return Err(
+                                format!(
+                                    "scope {scope} absent worktree has no exact prior proof or cleanup authority"
+                                )
+                                .into(),
+                            );
                         }
                         observations.push(format!(
                             "{scope}: absence bound to original captured worktree"
@@ -2187,9 +2195,12 @@ impl RuntimeManager {
                         if !matches!(&captured.captured_worktree, Some(CapturedWorktreeIdentity::Resolved(id))
                             if effect.resource.identity() == &LossItemIdentity::Worktree(id.clone()))
                         {
-                            return Err(format!(
-                                "scope {scope} worktree retry lacks its exact captured identity"
-                            ));
+                            return Err(
+                                format!(
+                                    "scope {scope} worktree retry lacks its exact captured identity"
+                                )
+                                .into(),
+                            );
                         }
                     }
                     RetiredResourceKind::TmuxServer => {
@@ -2233,9 +2244,12 @@ impl RuntimeManager {
                                     .await
                                     .map_err(|error| error.to_string())?
                                 {
-                                    return Err(format!(
-                                        "scope {scope} tmux absence lacks original dispatch"
-                                    ));
+                                    return Err(
+                                        format!(
+                                            "scope {scope} tmux absence lacks original dispatch"
+                                        )
+                                        .into(),
+                                    );
                                 }
                                 observations.push(format!(
                                     "{scope}: dispatched exact tmux {} absent",
@@ -2243,9 +2257,12 @@ impl RuntimeManager {
                                 ));
                             }
                             _ => {
-                                return Err(format!(
-                                    "scope {scope} tmux identity differs or is ambiguous"
-                                ));
+                                return Err(
+                                    format!(
+                                        "scope {scope} tmux identity differs or is ambiguous"
+                                    )
+                                    .into(),
+                                );
                             }
                         }
                     }
@@ -2256,9 +2273,12 @@ impl RuntimeManager {
                                     .map_err(|error| error.to_string())?,
                             )
                         {
-                            return Err(format!(
-                                "scope {scope} retry identity differs from captured scope"
-                            ));
+                            return Err(
+                                format!(
+                                    "scope {scope} retry identity differs from captured scope"
+                                )
+                                .into(),
+                            );
                         }
                         observations
                             .push(format!("{scope}: original work-scope ownership checked"));
@@ -13078,7 +13098,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            error.contains("not unchanged and reconstructible"),
+            error.to_string().contains("not unchanged and reconstructible"),
             "{error}"
         );
         assert_eq!(

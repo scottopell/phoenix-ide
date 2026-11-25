@@ -37,6 +37,11 @@ export function CloseStatusPanel({
       {residual.detail ? ` — ${residual.detail}` : ''}
     </li>
   ));
+  const remainingResourceRows = (close.failure?.remaining_resources ?? []).map((resource, index) => (
+    <li key={`${resource.scope}:${resource.resource_kind}:${resource.identity}:${resource.disposition}:${index}`}>
+      <code>scope: {resource.scope} · resource_kind: {resource.resource_kind} · identity: {resource.identity} · disposition: {resource.disposition}</code>
+    </li>
+  ));
   const failure = close.failure && (
     <p>
       {close.failure.reason.replaceAll('_', ' ')} — {close.failure.detail}
@@ -53,6 +58,12 @@ export function CloseStatusPanel({
           : '⚠ Close incomplete — shutdown could not be confirmed'}</strong>
         {lossRows.length > 0 && <><p>Exact work items:</p><ul>{lossRows}</ul></>}
         {residualRows.length > 0 && <ul>{residualRows}</ul>}
+        {remainingResourceRows.length > 0 && (
+          <>
+            <p>Remaining resources ({remainingResourceRows.length}):</p>
+            <ol>{remainingResourceRows}</ol>
+          </>
+        )}
         {failure}
         <p>
           To retry, navigate to the Coordinator and send one explicit fresh safe retry request.

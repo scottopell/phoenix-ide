@@ -505,7 +505,7 @@ async fn assess_retry_origin(
                 .await
                 .map_err(|error| {
                     tracing::warn!(%error, "native Close retry assessment failed");
-                    NativeCloseApplicationError::Storage
+                    map_retry_assessment_error(error)
                 })?;
             let request = AdmitCloseSafeRetryRequest {
                 failed_run,

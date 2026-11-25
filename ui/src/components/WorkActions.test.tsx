@@ -369,6 +369,52 @@ describe('WorkControlBar — persisted Close recovery', () => {
     expect(api.retryCloseRetirement).not.toHaveBeenCalled();
   });
 
+  it('renders every exact remaining-resource disposition in a stopped Close snapshot', async () => {
+    const snapshot = closeSnapshot('needs_repair');
+    vi.mocked(api.getProductConversationSnapshot).mockResolvedValue({
+      ...snapshot,
+      close: {
+        ...snapshot.close,
+        run_status: 'stopped',
+        residuals: [],
+        failure: {
+          occurrence_id: 'close-failure:remaining-resources',
+          reason: 'identity_not_proven',
+          detail: 'Cleanup could not be confirmed',
+          stop_certainty: { kind: 'conversation_and_processes_stopped', confirmed_at_us: '1234567890123456' },
+          remaining_resources: [
+            { scope: 'scope-alpha', resource_kind: 'worktree', identity: 'worktree:/exact/tree', disposition: 'failed' },
+            { scope: 'scope-beta', resource_kind: 'pty_session', identity: 'pty:exact-session', disposition: 'unattempted' },
+            { scope: 'scope-alpha', resource_kind: 'browser_session', identity: 'browser:unknown-session', disposition: 'unknown' },
+            { scope: 'scope-gamma', resource_kind: 'work_scope', identity: 'scope:residual-only', disposition: 'residual' },
+          ],
+        },
+      },
+    } as never);
+
+    renderWithProviders(
+      <WorkControlBar conversationId="conv-remaining-resources" convModeLabel="Work" phaseType="idle" continuedInConvId={null} prStatusHandle={prStatusHandle()} />,
+    );
+
+    const status = await screen.findByLabelText('Close repair required');
+    expect(status).toHaveTextContent('Close incomplete — cleanup not confirmed');
+    expect(status).toHaveTextContent('conversation and processes stopped');
+    expect(status).toHaveTextContent('Cleanup could not be confirmed');
+    expect(status).not.toHaveTextContent('Residual resources');
+
+    expect(screen.getByText('Remaining resources (4):')).toBeVisible();
+    const resources = status.querySelectorAll('ol li');
+    expect(resources).toHaveLength(4);
+    for (const [index, text] of [
+      'scope: scope-alpha · resource_kind: worktree · identity: worktree:/exact/tree · disposition: failed',
+      'scope: scope-beta · resource_kind: pty_session · identity: pty:exact-session · disposition: unattempted',
+      'scope: scope-alpha · resource_kind: browser_session · identity: browser:unknown-session · disposition: unknown',
+      'scope: scope-gamma · resource_kind: work_scope · identity: scope:residual-only · disposition: residual',
+    ].entries()) {
+      expect(resources[index]).toHaveTextContent(text);
+    }
+  });
+
   it('offers stopped Close retry for the authoritative product ID, not the successor transcript', async () => {
     const snapshot = closeSnapshot('needs_repair', [{
       scope: 'repo',

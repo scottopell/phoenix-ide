@@ -1,5 +1,45 @@
 # Architectural reduction candidate — unqualified
 
+## Current disposition after exact `818b08b40`
+
+- Exact Close run [45627288649](https://github.com/scottopell/phoenix-ide/actions/runs/45627288649)
+  is terminal **success** at source `818b08b40b6f582880575392e54fb9ce4e10bc28`,
+  tree `0e007389d5a8d3fc21f76076116218ec049ab354`. Retained exact-source receipts
+  include production physical retirement **1 passed**, source-entry **9 passed**,
+  foundation **270 passed**, native DB **82 passed**, migrations **180 passed**.
+  These finite successes do not diagnose older source-unavailable failures or
+  establish shared-host liveness. The inventory producer's new failure path
+  was not exercised by this green run.
+- Retained exact `9a65b8191` run
+  [45618326108](https://github.com/scottopell/phoenix-ide/actions/runs/45618326108)
+  is also terminal **success**. Active-run notes below are historical checkpoints.
+- Broad run [45627305546](https://github.com/scottopell/phoenix-ide/actions/runs/45627305546)
+  remains terminal **failure**. Its failed physical journey expected preliminary
+  still-dirty retry `storage_rejected`, but got `retry_inspection_blocked`,
+  detector `linux_mapping`, PID `18927`, reason `unavailable`, with **no new run
+  admitted**. That invocation never reached its intended Stop cut. This is
+  existing fail-closed guard evidence, not proof of an unsafe writer or a
+  harmless vanished process. Exact green does not replace missing acceptance.
+- Human decision `e5fe7b20` still gates privileged CI isolation. Do not loosen
+  writer proof or spend repeated full runs hoping the inspection gap vanishes.
+  Essential acceptance remains clean reclaim, exact dirty/blocker reporting,
+  Stop/source/replay, and installed-Mac validation through the sole release
+  executor; optional assembled-system and physical-device debt adds no new gate.
+- This source-only follow-up renders existing failed/unattempted/unknown/
+  residual remaining-resource rows without conflating them with residual
+  outcomes. Anchored retry preserves typed writer-inspection gaps rather than
+  erasing them to storage strings. Neither change fabricates missing operational
+  blocker classifications or adds persisted permission/syscall detail.
+- New deterministic source-entry characterization pauses real ExplicitRetry
+  actor revalidation while it owns eligibility: worker entry must return Busy
+  without effects, then enter once after release under the same tuple/deadline.
+  This demonstrates a possible schedule, **not** the cause of old merged
+  Busy/Refused failures and **not** a runtime liveness repair. Sink-level
+  resumability/Stop proof and any resulting narrow repair remain unfinished.
+  The new changes have not yet run hosted validation.
+- PR #1161 remains draft, unmerged and uninstalled. No local executable
+  validation, privileged setup, real-user fixture, merge or deployment was run.
+
 ## Current qualification and reviewed lint follow-up
 
 ### Complete broad9a receipts and independent DB diagnostics

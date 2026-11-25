@@ -31,6 +31,15 @@ struct Shared {
 /// worker handle cannot establish or restore eligibility.
 pub(crate) struct SourceEntryController {
     shared: Arc<Shared>,
+    #[cfg(test)]
+    revalidation_checkpoint: Option<RevalidationCheckpoint>,
+}
+
+#[cfg(test)]
+struct RevalidationCheckpoint {
+    entered: std::sync::mpsc::Sender<()>,
+    // Keep the controller's production Send + Sync properties in test builds.
+    release: Mutex<std::sync::mpsc::Receiver<()>>,
 }
 
 /// Worker capability scoped to one exact original command and deadline.
@@ -70,6 +79,8 @@ impl SourceEntryController {
                 original,
                 deadline,
             }),
+            #[cfg(test)]
+            revalidation_checkpoint: None,
         }
     }
 
@@ -83,6 +94,18 @@ impl SourceEntryController {
         SourceEntryWorker {
             shared: Arc::clone(&self.shared),
         }
+    }
+
+    #[cfg(test)]
+    fn arm_revalidation_checkpoint_for_test(
+        &mut self,
+        entered: std::sync::mpsc::Sender<()>,
+        release: std::sync::mpsc::Receiver<()>,
+    ) {
+        self.revalidation_checkpoint = Some(RevalidationCheckpoint {
+            entered,
+            release: Mutex::new(release),
+        });
     }
 
     /// Revalidates eligibility using the actor's actual borrowed state and exact
@@ -116,6 +139,19 @@ impl SourceEntryController {
                 .store(true, std::sync::atomic::Ordering::Release);
             *eligibility = Eligibility::Revoked;
             return ActorEntryResult::Refused;
+        }
+        #[cfg(test)]
+        if let Some(checkpoint) = self.revalidation_checkpoint.take() {
+            checkpoint
+                .entered
+                .send(())
+                .expect("observe revalidation checkpoint");
+            checkpoint
+                .release
+                .into_inner()
+                .expect("unpoisoned checkpoint receiver")
+                .recv_timeout(std::time::Duration::from_secs(60))
+                .expect("release revalidation checkpoint");
         }
         *eligibility = Eligibility::Eligible;
         ActorEntryResult::Updated
@@ -347,6 +383,93 @@ mod tests {
         )
         .unwrap();
         (state, command, mismatched)
+    }
+
+    #[test]
+    fn explicit_retry_worker_contention_during_revalidation_is_busy_then_runs_once() {
+        use phoenix_core::domain::close::{CloseAttemptId, CloseRunOrdinal};
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let source = SourceToolCall {
+            message_id: "retry-source-message".into(),
+            tool_use_id: "retry-source-call".into(),
+        };
+        let target = ProductConversationId::parse("retry-target").unwrap();
+        let attempt_id = CloseAttemptId::parse("retry-attempt").unwrap();
+        let failed_run_ordinal = CloseRunOrdinal::parse(2).unwrap();
+        let command = NativeCloseCommand::new(
+            "retry-transcript".into(),
+            source.clone(),
+            NativeCloseIntent::ExplicitRetry {
+                target,
+                attempt_id,
+                failed_run_ordinal,
+            },
+        )
+        .unwrap();
+        let input = command.intent().source_input();
+        let state = ConvState::ToolExecuting {
+            current_tool: ToolCall::new(
+                &source.tool_use_id,
+                ToolInput::Unknown {
+                    name: "close_conversation".into(),
+                    input: input.clone(),
+                },
+            ),
+            remaining_tools: Vec::new(),
+            completed_results: Vec::new(),
+            pending_sub_agents: Vec::new(),
+            assistant_message: AssistantMessage::new(
+                source.message_id,
+                vec![ContentBlock::ToolUse {
+                    id: source.tool_use_id,
+                    name: "close_conversation".into(),
+                    input,
+                }],
+                None,
+                None,
+            ),
+        };
+        let deadline = Instant::now() + Duration::from_secs(300);
+        let mut controller = SourceEntryController::new(command.clone(), deadline);
+        assert_eq!(
+            controller.revalidate(&state, &command),
+            ActorEntryResult::Updated
+        );
+        let worker = controller.worker();
+        let mut effects = 0;
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        controller.arm_revalidation_checkpoint_for_test(entered_tx, release_rx);
+        std::thread::scope(|scope| {
+            let actor_command = command.clone();
+            let actor = scope.spawn(move || {
+                let result = controller.revalidate(&state, &actor_command);
+                (controller, result)
+            });
+            let reached = entered_rx.recv_timeout(Duration::from_secs(60));
+            let busy = reached
+                .as_ref()
+                .ok()
+                .map(|()| worker.try_first_effect(&command, || effects += 1));
+            let effects_before_release = effects;
+            // Release/join before assertions, including when the actor never reached the checkpoint.
+            let released = release_tx.send(());
+            let actor_result = actor.join();
+            reached.expect("actor reached revalidation checkpoint");
+            released.expect("actor accepted checkpoint release");
+            let (_controller, revalidated) = actor_result.unwrap();
+            assert_eq!(busy, Some(WorkerEntryResult::Busy));
+            assert_eq!(effects_before_release, 0);
+            assert_eq!(revalidated, ActorEntryResult::Updated);
+            assert_eq!(
+                worker.try_first_effect(&command, || effects += 1),
+                WorkerEntryResult::Ran(())
+            );
+        });
+        assert_eq!(effects, 1);
+        assert!(Instant::now() < deadline);
     }
 
     #[test]
