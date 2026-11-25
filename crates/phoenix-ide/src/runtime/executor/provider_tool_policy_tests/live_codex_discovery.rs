@@ -185,8 +185,9 @@ async fn codex_native_discovery_runtime_sqlite_roundtrip() {
     let tools = Arc::new(SyntheticNumbers::default());
     let directory = tempfile::TempDir::new().unwrap();
     let path = directory.path().join("live-codex-discovery.db");
-    let db = Database::open(path.to_str().unwrap()).await.unwrap();
-    phoenix_db::run_pending_migrations(db.pool()).await.unwrap();
+    let db = Database::open_migrated_for_test(path.to_str().unwrap())
+        .await
+        .unwrap();
     db.create_conversation(
         CONVERSATION,
         CONVERSATION,

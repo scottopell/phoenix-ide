@@ -3701,6 +3701,16 @@ impl Database {
         in_memory_template::open_migrated_for_test(path).await
     }
 
+    #[cfg(test)]
+    pub(crate) async fn open_prefix_for_test(path: &str, through: u32) -> DbResult<Self> {
+        in_memory_template::open_prefix_for_test(path, through).await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn open_in_memory_prefix_for_test(through: u32) -> DbResult<Self> {
+        in_memory_template::open_in_memory_prefix_for_test(through).await
+    }
+
     async fn run_migrations(&self) -> DbResult<()> {
         lineage::preflight(&self.pool, migrations::migration_identities()).await?;
         sqlx::raw_sql(ddl::SCHEMA).execute(&self.pool).await?;
@@ -19361,8 +19371,9 @@ mod tests {
     async fn mcp_removal_intent_survives_restart_and_commits_atomically() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("oauth.db");
-        let db = Database::open(path.to_str().unwrap()).await.unwrap();
-        run_pending_migrations(db.pool()).await.unwrap();
+        let db = Database::open_migrated_for_test(path.to_str().unwrap())
+            .await
+            .unwrap();
         let token = McpOAuthTokenRow {
             server_name: "remote".into(),
             resource_uri: "https://mcp.example/mcp".into(),
@@ -19592,8 +19603,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("credential-query-policy.sqlite");
         let db_path = db_path.to_string_lossy().into_owned();
-        let db = Database::open(&db_path).await.unwrap();
-        migrations::run_pending_migrations(db.pool()).await.unwrap();
+        let db = Database::open_migrated_for_test(&db_path).await.unwrap();
         db.create_conversation(
             "credential-policy-conversation",
             "credential-policy-conversation",
@@ -19670,10 +19680,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("active-pr-cas.sqlite");
         let db_path = db_path.to_string_lossy().into_owned();
-        let first = Database::open(&db_path).await.unwrap();
-        migrations::run_pending_migrations(&first.pool)
-            .await
-            .unwrap();
+        let first = Database::open_migrated_for_test(&db_path).await.unwrap();
         let second = Database::open(&db_path).await.unwrap();
         migrations::run_pending_migrations(&second.pool)
             .await
@@ -22727,8 +22734,9 @@ mod tests {
         use phoenix_core::llm_language::LlmLanguage;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("language.db");
-        let db = Database::open(path.to_str().unwrap()).await.unwrap();
-        migrations::run_pending_migrations(db.pool()).await.unwrap();
+        let db = Database::open_migrated_for_test(path.to_str().unwrap())
+            .await
+            .unwrap();
         let coordinator = db
             .get_or_create_coordinator(None, LlmLanguage::Caveman)
             .await
@@ -22859,8 +22867,9 @@ mod tests {
             "phoenix-coordinator-race-{}.db",
             uuid::Uuid::new_v4()
         ));
-        let db = Database::open(path.to_str().unwrap()).await.unwrap();
-        migrations::run_pending_migrations(db.pool()).await.unwrap();
+        let db = Database::open_migrated_for_test(path.to_str().unwrap())
+            .await
+            .unwrap();
         db.create_conversation("ordinary", "coordinator", "/tmp", true, None, None)
             .await
             .unwrap();
@@ -23943,8 +23952,7 @@ mod tests {
     async fn prompt_snapshot_transaction_keeps_generation_parents_and_attachments_consistent() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("prompt-snapshot.db");
-        let writer = Database::open(path.to_str().unwrap()).await.unwrap();
-        migrations::run_pending_migrations(writer.pool())
+        let writer = Database::open_migrated_for_test(path.to_str().unwrap())
             .await
             .unwrap();
         writer
@@ -24455,8 +24463,9 @@ mod tests {
     async fn concurrent_add_message_allocates_distinct_sequences_and_preserves_replay_contract() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("concurrent-add-message.db");
-        let db = Database::open(path.to_str().unwrap()).await.unwrap();
-        migrations::run_pending_migrations(db.pool()).await.unwrap();
+        let db = Database::open_migrated_for_test(path.to_str().unwrap())
+            .await
+            .unwrap();
         db.create_conversation("concurrent-append", "append", "/tmp", true, None, None)
             .await
             .unwrap();
@@ -24819,8 +24828,9 @@ mod tests {
         };
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("remote-origins.db");
-        let db = Database::open(path.to_str().unwrap()).await.unwrap();
-        run_pending_migrations(db.pool()).await.unwrap();
+        let db = Database::open_migrated_for_test(path.to_str().unwrap())
+            .await
+            .unwrap();
         let target = db
             .create_conversation("remote-target", "remote-target", "/tmp", true, None, None)
             .await
@@ -28370,8 +28380,9 @@ mod tests {
     async fn open_file_backed_test_db(name: &str) -> (tempfile::TempDir, Database) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(name);
-        let db = Database::open(path.to_str().unwrap()).await.unwrap();
-        migrations::run_pending_migrations(db.pool()).await.unwrap();
+        let db = Database::open_migrated_for_test(path.to_str().unwrap())
+            .await
+            .unwrap();
         (dir, db)
     }
 

@@ -595,12 +595,10 @@ mod tests {
     }
 
     async fn real_prefix(through: u32) -> SqlitePool {
-        let pool = pool().await;
-        let db = crate::Database::from_pool_for_tests(pool.clone(), String::new());
-        db.run_migrations().await.unwrap();
-        crate::migrations::run_through_for_test(&pool, through)
+        let db = crate::Database::open_in_memory_prefix_for_test(through)
             .await
             .unwrap();
+        let pool = db.pool().clone();
         sqlx::raw_sql("CREATE TABLE retained_payload(value TEXT); INSERT INTO retained_payload VALUES ('unchanged');")
             .execute(&pool).await.unwrap();
         pool

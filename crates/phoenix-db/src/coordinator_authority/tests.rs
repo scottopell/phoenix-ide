@@ -18,8 +18,9 @@ fn instructions(text: &str) -> CoordinatorAuthority {
 async fn coordinator_authority_replaces_clears_and_survives_reopen() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("authority.db");
-    let db = Database::open(path.to_str().unwrap()).await.unwrap();
-    crate::run_pending_migrations(db.pool()).await.unwrap();
+    let db = Database::open_migrated_for_test(path.to_str().unwrap())
+        .await
+        .unwrap();
     let source = coordinator(&db).await;
     assert!(db.coordinator_authority().await.unwrap().is_empty());
     for text in [

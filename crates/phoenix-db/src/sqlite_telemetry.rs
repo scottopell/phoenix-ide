@@ -1193,8 +1193,7 @@ mod tests {
     async fn real_fts_lock_contention_records_exact_phase_and_codes_without_payload() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("contention.db");
-        let db = Database::open(path.to_str().unwrap()).await.unwrap();
-        crate::migrations::run_pending_migrations(db.pool())
+        let db = Database::open_migrated_for_test(path.to_str().unwrap())
             .await
             .unwrap();
 
@@ -1616,8 +1615,7 @@ mod tests {
     async fn caller_owned_fts_transaction_records_acquisition_failure() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("caller-owned.db");
-        let setup = Database::open(path.to_str().unwrap()).await.unwrap();
-        crate::migrations::run_pending_migrations(setup.pool())
+        let _setup = Database::open_migrated_for_test(path.to_str().unwrap())
             .await
             .unwrap();
 
@@ -1668,8 +1666,7 @@ mod tests {
     async fn display_update_records_transaction_admission_failure() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("caller-owned-statement.db");
-        let setup = Database::open(path.to_str().unwrap()).await.unwrap();
-        crate::migrations::run_pending_migrations(setup.pool())
+        let setup = Database::open_migrated_for_test(path.to_str().unwrap())
             .await
             .unwrap();
         setup

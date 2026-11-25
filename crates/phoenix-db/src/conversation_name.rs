@@ -111,8 +111,9 @@ mod tests {
     async fn concurrent_duplicate_names_allocate_atomically_and_release_old_routes() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("names.db");
-        let db = crate::Database::open(path.to_str().unwrap()).await.unwrap();
-        crate::run_pending_migrations(db.pool()).await.unwrap();
+        let db = crate::Database::open_migrated_for_test(path.to_str().unwrap())
+            .await
+            .unwrap();
         let other = crate::Database::open(path.to_str().unwrap()).await.unwrap();
         let first = db
             .create_conversation("first-id", "first-name", "/tmp", true, None, None)

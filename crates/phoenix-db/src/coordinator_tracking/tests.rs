@@ -385,8 +385,9 @@ async fn tracking_bounded_pagination_does_not_drop_distinct_requests_or_claim_fu
 async fn tracking_supported_restart_preserves_items_and_explicit_retirement() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("tracking.db");
-    let db = Database::open(path.to_str().unwrap()).await.unwrap();
-    crate::run_pending_migrations(db.pool()).await.unwrap();
+    let db = Database::open_migrated_for_test(path.to_str().unwrap())
+        .await
+        .unwrap();
     let source = db
         .get_or_create_coordinator(None, LlmLanguage::default())
         .await

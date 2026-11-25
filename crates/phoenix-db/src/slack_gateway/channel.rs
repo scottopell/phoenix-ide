@@ -66,8 +66,7 @@ mod tests {
         // REQ-SG-020/005
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("upgrade.db");
-        let db = Database::open(path.to_str().unwrap()).await.unwrap();
-        crate::migrations::run_through_for_test(db.pool(), 166)
+        let db = Database::open_prefix_for_test(path.to_str().unwrap(), 166)
             .await
             .unwrap();
         sqlx::raw_sql("INSERT INTO slack_gateway_accounts(workspace,owner) VALUES ('example.slack.com','UOWNER');

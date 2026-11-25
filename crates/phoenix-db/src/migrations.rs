@@ -13471,8 +13471,9 @@ mod tests {
         use phoenix_core::domain::llm_types::ContentBlock;
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("read-state.db");
-        let db = crate::Database::open(path.to_str().unwrap()).await.unwrap();
-        run_through_for_test(db.pool(), 162).await.unwrap();
+        let db = crate::Database::open_prefix_for_test(path.to_str().unwrap(), 162)
+            .await
+            .unwrap();
         let conversation = db
             .create_conversation("seeded", "seeded", "/tmp", true, None, None)
             .await
@@ -13507,8 +13508,9 @@ mod tests {
     async fn migration_160_defaults_to_fire_without_reinitializing_existing_discovery() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("slack-emojis.db");
-        let db = crate::Database::open(path.to_str().unwrap()).await.unwrap();
-        run_through_for_test(db.pool(), 159).await.unwrap();
+        let db = crate::Database::open_prefix_for_test(path.to_str().unwrap(), 159)
+            .await
+            .unwrap();
         let config = r#"{"workspace":"example.slack.com","owner":"UOWNER","enabled":true}"#;
         db.set_app_setting("slack_gateway", config).await.unwrap();
         sqlx::raw_sql("INSERT INTO slack_gateway_accounts(workspace,owner,baseline_complete,status,last_scan_at_unix_micros,retry_at_us) VALUES ('example.slack.com','UOWNER',1,'healthy',123,456); INSERT INTO slack_gateway_discovery(workspace,owner,kind,after_date,cursor) VALUES ('example.slack.com','UOWNER','reaction','2026-11-01','retained-cursor');").execute(db.pool()).await.unwrap();
@@ -13554,8 +13556,9 @@ mod tests {
             for ready in [false, true] {
                 let directory = tempfile::tempdir().unwrap();
                 let path = directory.path().join("slack-single.db");
-                let db = crate::Database::open(path.to_str().unwrap()).await.unwrap();
-                run_through_for_test(db.pool(), 160).await.unwrap();
+                let db = crate::Database::open_prefix_for_test(path.to_str().unwrap(), 160)
+                    .await
+                    .unwrap();
                 db.set_app_setting(
                     "slack_gateway",
                     r#"{"workspace":"example.slack.com","owner":"UOWNER","enabled":true}"#,
@@ -13666,9 +13669,10 @@ mod tests {
     async fn migration_156_preserves_populated_local_goal_ledger_and_schema() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("migration-156.db");
-        let db = crate::Database::open(path.to_str().unwrap()).await.unwrap();
+        let db = crate::Database::open_prefix_for_test(path.to_str().unwrap(), 155)
+            .await
+            .unwrap();
         let pool = db.pool().clone();
-        run_through_for_test(&pool, 155).await.unwrap();
         let coordinator = db
             .get_or_create_coordinator(None, phoenix_core::llm_language::LlmLanguage::default())
             .await
@@ -13815,10 +13819,10 @@ mod tests {
     async fn migration_156_applies_when_158_is_already_recorded() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("migration-156-after-158.db");
-        let db = crate::Database::open(path.to_str().unwrap()).await.unwrap();
+        let db = crate::Database::open_prefix_for_test(path.to_str().unwrap(), 155)
+            .await
+            .unwrap();
         let pool = db.pool();
-
-        run_through_for_test(pool, 155).await.unwrap();
         let migration_158 = MIGRATIONS
             .iter()
             .find(|migration| migration.version == 158)

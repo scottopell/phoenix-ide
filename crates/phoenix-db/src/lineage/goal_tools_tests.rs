@@ -149,114 +149,148 @@ async fn table_data(pool: &SqlitePool) -> Vec<(String, Vec<Vec<String>>)> {
     data
 }
 
-#[tokio::test]
 #[allow(clippy::too_many_lines)]
-async fn canonical_goal_tools_prefixes_upgrade_reopen_and_remain_idempotent() {
-    for through in (142..=153).chain([155, 156, 158]) {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("goal-tools.db");
-        let db = Database::open(path.to_str().unwrap()).await.unwrap();
-        crate::migrations::run_through_for_test(db.pool(), through)
-            .await
-            .unwrap();
-        let owner = seed_legacy_goal(&db).await;
-        let source = if through >= 145 {
-            Some(seed_real_145_receipt(&db, &owner).await)
-        } else {
-            None
-        };
-        db.pool().close().await;
-        drop(db);
-
-        let db = Database::open(path.to_str().unwrap()).await.unwrap();
-        let expected_pending = u32::try_from(
-            crate::migrations::migration_identities()
-                .filter(|(version, _)| *version > through)
-                .count(),
-        )
-        .unwrap();
-        assert_eq!(
-            crate::migrations::run_pending_migrations(db.pool())
-                .await
-                .unwrap(),
-            expected_pending
-        );
-        assert_goal_rows(&db, &owner, source.is_some()).await;
-        let tail: Vec<i64> = sqlx::query_scalar(
-            "SELECT version FROM _migrations WHERE version>=143 ORDER BY version",
-        )
-        .fetch_all(db.pool())
+async fn assert_canonical_goal_tools_prefix_upgrades_reopens_and_remains_idempotent(through: u32) {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("goal-tools.db");
+    let db = Database::open_prefix_for_test(path.to_str().unwrap(), through)
         .await
         .unwrap();
-        assert_eq!(
-            tail.iter().copied().take_while(|version| *version <= 163).collect::<Vec<_>>(),
-            vec![143, 144, 145, 146, 147, 148, 149, 150, 151, 152, 153, 155, 156, 158, 159, 160, 161, 162, 163,]
-        );
-        assert_eq!(tail, crate::migrations::migration_identities().filter(|(version, _)| *version >= 143).map(|(version, _)| i64::from(version)).collect::<Vec<_>>());
-        let before = snapshot(db.pool()).await;
-        assert_eq!(
-            crate::migrations::run_pending_migrations(db.pool())
-                .await
-                .unwrap(),
-            0
-        );
-        assert_eq!(snapshot(db.pool()).await, before);
-        db.pool().close().await;
-        drop(db);
+    let owner = seed_legacy_goal(&db).await;
+    let source = if through >= 145 {
+        Some(seed_real_145_receipt(&db, &owner).await)
+    } else {
+        None
+    };
+    db.pool().close().await;
+    drop(db);
 
-        let db = Database::open(path.to_str().unwrap()).await.unwrap();
-        assert_eq!(
-            crate::migrations::run_pending_migrations(db.pool())
-                .await
-                .unwrap(),
-            0
-        );
-        assert_goal_rows(&db, &owner, source.is_some()).await;
-        if let Some(source) = source {
-            let before_delete = snapshot(db.pool()).await;
-            let data_before_delete = table_data(db.pool()).await;
-            let error = sqlx::query("DELETE FROM product_conversations WHERE id=?")
-                .bind(&source)
-                .execute(db.pool())
-                .await
-                .unwrap_err();
-            assert!(
-                error
-                    .to_string()
-                    .contains("Coordinator transcript is outside ordinary Delete"),
-                "{error}"
-            );
-            assert_eq!(snapshot(db.pool()).await, before_delete);
-            assert_eq!(table_data(db.pool()).await, data_before_delete);
-            assert_goal_rows(&db, &owner, true).await;
-        }
-        sqlx::query("DELETE FROM product_conversations WHERE id=?")
-            .bind(&owner)
+    let db = Database::open(path.to_str().unwrap()).await.unwrap();
+    let expected_pending = u32::try_from(
+        crate::migrations::migration_identities()
+            .filter(|(version, _)| *version > through)
+            .count(),
+    )
+    .unwrap();
+    assert_eq!(
+        crate::migrations::run_pending_migrations(db.pool())
+            .await
+            .unwrap(),
+        expected_pending
+    );
+    assert_goal_rows(&db, &owner, source.is_some()).await;
+    let tail: Vec<i64> = sqlx::query_scalar(
+        "SELECT version FROM _migrations WHERE version>=143 ORDER BY version",
+    )
+    .fetch_all(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        tail.iter()
+            .copied()
+            .take_while(|version| *version <= 163)
+            .collect::<Vec<_>>(),
+        vec![
+            143, 144, 145, 146, 147, 148, 149, 150, 151, 152, 153, 155, 156, 158, 159, 160, 161,
+            162, 163,
+        ]
+    );
+    assert_eq!(
+        tail,
+        crate::migrations::migration_identities()
+            .filter(|(version, _)| *version >= 143)
+            .map(|(version, _)| i64::from(version))
+            .collect::<Vec<_>>()
+    );
+    let before = snapshot(db.pool()).await;
+    assert_eq!(
+        crate::migrations::run_pending_migrations(db.pool())
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(snapshot(db.pool()).await, before);
+    db.pool().close().await;
+    drop(db);
+
+    let db = Database::open(path.to_str().unwrap()).await.unwrap();
+    assert_eq!(
+        crate::migrations::run_pending_migrations(db.pool())
+            .await
+            .unwrap(),
+        0
+    );
+    assert_goal_rows(&db, &owner, source.is_some()).await;
+    if let Some(source) = source {
+        let before_delete = snapshot(db.pool()).await;
+        let data_before_delete = table_data(db.pool()).await;
+        let error = sqlx::query("DELETE FROM product_conversations WHERE id=?")
+            .bind(&source)
             .execute(db.pool())
             .await
-            .unwrap();
-        for table in [
-            "conversation_goal_preparations",
-            "conversation_goal_coordinator_receipts",
-            "conversation_goal_history",
-            "conversation_goal_actors",
-            "conversation_goal_ids",
-        ] {
-            let count: i64 =
-                sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT COUNT(*) FROM {table}")))
-                    .fetch_one(db.pool())
-                    .await
-                    .unwrap();
-            assert_eq!(count, 0, "owner deletion left {table} at prefix{through}");
-        }
-        assert!(sqlx::query("PRAGMA foreign_key_check")
-            .fetch_all(db.pool())
-            .await
-            .unwrap()
-            .is_empty());
-        db.pool().close().await;
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("Coordinator transcript is outside ordinary Delete"),
+            "{error}"
+        );
+        assert_eq!(snapshot(db.pool()).await, before_delete);
+        assert_eq!(table_data(db.pool()).await, data_before_delete);
+        assert_goal_rows(&db, &owner, true).await;
     }
+    sqlx::query("DELETE FROM product_conversations WHERE id=?")
+        .bind(&owner)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    for table in [
+        "conversation_goal_preparations",
+        "conversation_goal_coordinator_receipts",
+        "conversation_goal_history",
+        "conversation_goal_actors",
+        "conversation_goal_ids",
+    ] {
+        let count: i64 =
+            sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT COUNT(*) FROM {table}")))
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(count, 0, "owner deletion left {table} at prefix{through}");
+    }
+    assert!(sqlx::query("PRAGMA foreign_key_check")
+        .fetch_all(db.pool())
+        .await
+        .unwrap()
+        .is_empty());
+    db.pool().close().await;
 }
+
+macro_rules! canonical_goal_tools_prefix_test {
+    ($name:ident, $through:expr) => {
+        #[tokio::test]
+        async fn $name() {
+            assert_canonical_goal_tools_prefix_upgrades_reopens_and_remains_idempotent($through)
+                .await;
+        }
+    };
+}
+
+canonical_goal_tools_prefix_test!(canonical_goal_tools_prefix_142_upgrades_reopens_and_remains_idempotent, 142);
+canonical_goal_tools_prefix_test!(canonical_goal_tools_prefix_143_upgrades_reopens_and_remains_idempotent, 143);
+canonical_goal_tools_prefix_test!(canonical_goal_tools_prefix_144_upgrades_reopens_and_remains_idempotent, 144);
+canonical_goal_tools_prefix_test!(canonical_goal_tools_prefix_145_upgrades_reopens_and_remains_idempotent, 145);
+canonical_goal_tools_prefix_test!(canonical_goal_tools_prefix_146_upgrades_reopens_and_remains_idempotent, 146);
+canonical_goal_tools_prefix_test!(canonical_goal_tools_prefix_147_upgrades_reopens_and_remains_idempotent, 147);
+canonical_goal_tools_prefix_test!(canonical_goal_tools_prefix_148_upgrades_reopens_and_remains_idempotent, 148);
+canonical_goal_tools_prefix_test!(canonical_goal_tools_prefix_149_upgrades_reopens_and_remains_idempotent, 149);
+canonical_goal_tools_prefix_test!(canonical_goal_tools_prefix_150_upgrades_reopens_and_remains_idempotent, 150);
+canonical_goal_tools_prefix_test!(canonical_goal_tools_prefix_151_upgrades_reopens_and_remains_idempotent, 151);
+canonical_goal_tools_prefix_test!(canonical_goal_tools_prefix_152_upgrades_reopens_and_remains_idempotent, 152);
+canonical_goal_tools_prefix_test!(canonical_goal_tools_prefix_153_upgrades_reopens_and_remains_idempotent, 153);
+canonical_goal_tools_prefix_test!(canonical_goal_tools_prefix_155_upgrades_reopens_and_remains_idempotent, 155);
+canonical_goal_tools_prefix_test!(canonical_goal_tools_prefix_156_upgrades_reopens_and_remains_idempotent, 156);
+canonical_goal_tools_prefix_test!(canonical_goal_tools_prefix_158_upgrades_reopens_and_remains_idempotent, 158);
 
 #[tokio::test]
 async fn fresh_goal_tools_database_applies_complete_registry() {
@@ -307,8 +341,7 @@ async fn seed_legacy_tools_retention(
 async fn real_145_provenance_and_tools_retention_survive_upgrade_delete_and_reopen() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("retention.db");
-    let db = Database::open(path.to_str().unwrap()).await.unwrap();
-    crate::migrations::run_through_for_test(db.pool(), 144)
+    let db = Database::open_prefix_for_test(path.to_str().unwrap(), 144)
         .await
         .unwrap();
     let owner = seed_legacy_goal(&db).await;

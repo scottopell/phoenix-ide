@@ -16,8 +16,7 @@ impl HistoryReadCut {
 async fn file_backed_pair() -> (tempfile::TempDir, Database, Database) {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("goal-history-snapshot.sqlite");
-    let reader = Database::open(path.to_str().unwrap()).await.unwrap();
-    crate::migrations::run_pending_migrations(reader.pool())
+    let reader = Database::open_migrated_for_test(path.to_str().unwrap())
         .await
         .unwrap();
     let writer = Database::open(path.to_str().unwrap()).await.unwrap();

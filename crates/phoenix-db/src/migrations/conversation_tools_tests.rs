@@ -62,22 +62,10 @@ pub(super) async fn body_sql<'a>(
 }
 
 async fn fixture(prefix: u32, populated: bool) -> SqlitePool {
-    let options = sqlx::sqlite::SqliteConnectOptions::new()
-        .in_memory(true)
-        .foreign_keys(true);
-    let pool = sqlx::sqlite::SqlitePoolOptions::new()
-        .max_connections(1)
-        .min_connections(1)
-        .idle_timeout(None)
-        .max_lifetime(None)
-        .connect_with(options)
+    let db = Database::open_in_memory_prefix_for_test(prefix)
         .await
         .unwrap();
-    Database::from_pool_for_tests(pool.clone(), String::new())
-        .run_migrations()
-        .await
-        .unwrap();
-    run_through_for_test(&pool, prefix).await.unwrap();
+    let pool = db.pool().clone();
     let versions: Vec<i64> = sqlx::query_scalar("SELECT version FROM _migrations ORDER BY version")
         .fetch_all(&pool)
         .await

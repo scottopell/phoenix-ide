@@ -6,10 +6,7 @@ async fn new_aggregates_are_enabled_but_existing_preferences_survive_reopen_and_
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("continuation.sqlite");
     let path = path.to_str().unwrap();
-    let db = Database::open(path).await.unwrap();
-    crate::migrations::run_pending_migrations(db.pool())
-        .await
-        .unwrap();
+    let db = Database::open_migrated_for_test(path).await.unwrap();
     let ordinary = db
         .create_conversation("fresh-ordinary", "fresh-ordinary", "/tmp", true, None, None)
         .await
