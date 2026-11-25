@@ -135,7 +135,22 @@ fn output(result: NativeCloseApplicationResult) -> Value {
 }
 
 fn application_error(error: NativeCloseApplicationError) -> ToolOutput {
-    let code = match error {
+    let code = match &error {
+        NativeCloseApplicationError::RetryInspectionBlocked(gap) => {
+            return ToolOutput::error(json!({
+                "code":"retry_inspection_blocked",
+                "message":error.to_string(),
+                "facts": {
+                    "path":gap.path.display().to_string(),
+                    "detector":gap.detector.as_str(),
+                    "reason":gap.reason.as_str(),
+                    "pid":gap.pid,
+                    "new_run_admitted":false,
+                    "disk_contents_retained":true,
+                    "requires_explicit_fresh_retry":true
+                }
+            }).to_string());
+        }
         NativeCloseApplicationError::SourceRefused => "source_refused",
         NativeCloseApplicationError::Unavailable => "unavailable",
         NativeCloseApplicationError::Storage => "storage_rejected",
@@ -184,6 +199,43 @@ impl Tool for CloseConversation {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retry_inspection_error_exposes_only_typed_gap_facts() {
+        let error = NativeCloseApplicationError::RetryInspectionBlocked(
+            crate::runtime::close_retirement::WriterInspectionGap {
+                path: std::path::PathBuf::from("/retained/worktree"),
+                detector: phoenix_db::native_close::CloseWriterDetector::LinuxDescriptor,
+                reason: phoenix_db::native_close::CloseWriterGap::Unavailable,
+                pid: None,
+            },
+        );
+        let rendered = application_error(error).output;
+        let value: Value = serde_json::from_str(&rendered).unwrap();
+        assert_eq!(value["code"], "retry_inspection_blocked");
+        assert_eq!(value["facts"]["path"], "/retained/worktree");
+        assert_eq!(value["facts"]["detector"], "linux_descriptor");
+        assert_eq!(value["facts"]["reason"], "unavailable");
+        assert!(value["facts"]["pid"].is_null());
+        assert_eq!(value["facts"]["new_run_admitted"], false);
+        assert_eq!(value["facts"]["disk_contents_retained"], true);
+        assert_eq!(value["facts"]["requires_explicit_fresh_retry"], true);
+        assert!(value["facts"].get("permission").is_none());
+        assert!(value["facts"].get("syscall_stage").is_none());
+    }
+
+    #[test]
+    fn storage_and_fatal_errors_keep_existing_codes() {
+        for (error, code) in [
+            (NativeCloseApplicationError::Storage, "storage_rejected"),
+            (NativeCloseApplicationError::FatalAuthority, "fatal_authority"),
+        ] {
+            let rendered = application_error(error).output;
+            let value: Value = serde_json::from_str(&rendered).unwrap();
+            assert_eq!(value["code"], code);
+            assert!(value.get("facts").is_none());
+        }
+    }
 
     #[test]
     fn native_close_parser_accepts_only_exact_action_coordinates() {

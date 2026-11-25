@@ -1,6 +1,45 @@
 //! Exact-instance resource fences and receipts for Close retirement.
 
 pub(crate) mod captured_loss_retry;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WriterInspectionGap {
+    pub(crate) path: std::path::PathBuf,
+    pub(crate) detector: CloseWriterDetector,
+    pub(crate) reason: CloseWriterGap,
+    pub(crate) pid: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RetryAssessmentError {
+    WriterInspectionGap(WriterInspectionGap),
+    Other(String),
+}
+
+impl From<String> for RetryAssessmentError {
+    fn from(error: String) -> Self {
+        Self::Other(error)
+    }
+}
+
+impl From<&str> for RetryAssessmentError {
+    fn from(error: &str) -> Self {
+        Self::Other(error.to_owned())
+    }
+}
+
+impl std::fmt::Display for RetryAssessmentError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::WriterInspectionGap(gap) => write!(
+                formatter,
+                "incomplete external-writer inspection at {}; no new run admitted",
+                gap.path.display()
+            ),
+            Self::Other(error) => formatter.write_str(error),
+        }
+    }
+}
 mod native_retry;
 pub(crate) use native_retry::{
     NativeInitialWorkScopePrecondition, NativeRetryNoLiveResourcesError,
@@ -2033,7 +2072,8 @@ impl RuntimeManager {
                         tombstone.as_ref(),
                         #[cfg(test)]
                         self.clean_close_writer_fixture,
-                    )?;
+                    )
+                    .map_err(|error| error.to_string())?;
                     if let Some(tombstone) = &tombstone {
                         let object = tombstone.root.join("object");
                         if object.try_exists().map_err(|error| error.to_string())? {
@@ -7420,7 +7460,7 @@ fn probe_retry_worktree_writers_with<F>(
     quarantine: &Path,
     tombstone: Option<&CloseWorktreeFinalTombstone>,
     mut observe: F,
-) -> Result<(), String>
+) -> Result<(), RetryAssessmentError>
 where
     F: FnMut(&Path) -> Result<RetryTargetObservation, String>,
 {
@@ -7431,12 +7471,14 @@ where
     {
         match observe(path)? {
             RetryTargetObservation::Present(ExternalWriterEvidence::Blocked(
-                CloseWriterObservation::InspectionGap { .. },
+                CloseWriterObservation::InspectionGap { detector, pid, reason },
             )) => {
-                return Err(format!(
-                    "incomplete external-writer inspection at {}; no new run admitted",
-                    path.display()
-                ))
+                return Err(RetryAssessmentError::WriterInspectionGap(WriterInspectionGap {
+                    path: path.to_path_buf(),
+                    detector,
+                    reason,
+                    pid,
+                }))
             }
             RetryTargetObservation::Present(ExternalWriterEvidence::Blocked(
                 CloseWriterObservation::Authority { .. },
@@ -7444,7 +7486,8 @@ where
                 return Err(format!(
                     "external writer holds exact retry target {}; no new run admitted",
                     path.display()
-                ))
+                )
+                .into())
             }
             RetryTargetObservation::Absent
             | RetryTargetObservation::Present(ExternalWriterEvidence::NoPositiveEvidence) => {}
@@ -7458,7 +7501,7 @@ fn probe_retry_worktree_writers(
     quarantine: &Path,
     tombstone: Option<&CloseWorktreeFinalTombstone>,
     #[cfg(test)] clean_writer_fixture: bool,
-) -> Result<(), String> {
+) -> Result<(), RetryAssessmentError> {
     probe_retry_worktree_writers_with(original, quarantine, tombstone, |path| {
         if !path
             .try_exists()
@@ -16904,14 +16947,43 @@ mod tests {
             })
         })
         .expect_err("a positive external writer must reject the retry");
+        let message = error.to_string();
         assert!(
-            error.contains("external writer") && error.contains("no new run admitted"),
-            "rejection must name the external writer: {error}"
+            message.contains("external writer") && message.contains("no new run admitted"),
+            "rejection must name the external writer: {message}"
         );
         assert!(
-            error.contains(&quarantine.display().to_string()),
-            "rejection must name the holding target: {error}"
+            message.contains(&quarantine.display().to_string()),
+            "rejection must name the holding target: {message}"
         );
+    }
+
+    #[test]
+    fn retry_writer_inspection_gap_keeps_exact_target_and_typed_details() {
+        let original = Path::new("/captured/worktree");
+        let quarantine = Path::new("/captured/quarantine");
+        let mut observed = Vec::new();
+        let error = super::probe_retry_worktree_writers_with(original, quarantine, None, |path| {
+            observed.push(path.to_path_buf());
+            Ok(super::RetryTargetObservation::Present(
+                super::ExternalWriterEvidence::Blocked(
+                    super::CloseWriterObservation::InspectionGap {
+                        detector: super::CloseWriterDetector::LinuxDescriptor,
+                        pid: None,
+                        reason: super::CloseWriterGap::Unavailable,
+                    },
+                ),
+            ))
+        })
+        .expect_err("an inspection gap must block before later retry targets");
+        let super::RetryAssessmentError::WriterInspectionGap(gap) = error else {
+            panic!("inspection gap lost its typed classification");
+        };
+        assert_eq!(gap.path, original);
+        assert_eq!(gap.detector, super::CloseWriterDetector::LinuxDescriptor);
+        assert_eq!(gap.reason, super::CloseWriterGap::Unavailable);
+        assert_eq!(gap.pid, None);
+        assert_eq!(observed, [original.to_path_buf()]);
     }
 
     #[test]
@@ -16927,7 +16999,7 @@ mod tests {
         })
         .expect_err("a probe failure must be fail-closed, not proof of absence");
         assert!(
-            error.contains("cannot probe retry writer target"),
+            error.to_string().contains("cannot probe retry writer target"),
             "probe error must propagate as the rejection: {error}"
         );
     }
@@ -18501,7 +18573,10 @@ mod tests {
             )
             .unwrap();
 
-            assert!(!inspected.get(), "inspected process with missing owner status");
+            assert!(
+                !inspected.get(),
+                "inspected process with missing owner status"
+            );
             assert!(matches!(
                 result,
                 super::ExternalWriterEvidence::Blocked(

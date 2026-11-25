@@ -2,6 +2,39 @@
 
 ## Current qualification and reviewed lint follow-up
 
+### Actionable inspection-gap mapping — narrow correction, parity still open
+
+Source trace confirms captured-loss pre-admission writer gaps were collapsed to
+`storage_rejected` after classification. The correction carries only an existing
+classified gap (target path, detector, optional PID, reason) through an in-memory
+assessment error to the existing native application/tool boundary. The response
+is `retry_inspection_blocked`, states no new run admitted and disk contents retained,
+and requires an explicit fresh retry. Unrelated DB/probe/content errors remain
+Storage; positive writer evidence is not relabeled as an inspection gap. No new
+persistence, detector exclusion, admission change, automatic retry or privileged
+fixture setup is introduced. Anchored retry behavior remains unchanged.
+
+Focused source regressions cover typed target retention/short-circuit, unknown PID,
+known/unknown PID mapping, unrelated text containing gap remaining Storage, and
+existing Storage/Fatal tool codes. The hosted 2b3 broad run is terminal failed
+**early formatting only**, requesting one multiline assertion in the missing-status
+regression; its proposal is applied unchanged. Executable lanes were skipped, not
+passed. Exact 2b3 qualification remains queued behind retained 8b5 evidence; it is
+not discarded or substituted with a later green sample. Current source changes
+still require independent review and hosted qualification.
+
+Remaining precision/parity limitations are explicit: `CloseWriterObservation` has
+no syscall-stage or permission-denied field; those details are debug-only before
+this mapping, so `unavailable` cannot honestly be rendered as permission denied or
+as a specific failed syscall. Initial admitted physical failure persists existing
+exact writer rows and projects its detector/PID/reason error detail, but the UI has
+no structured writer-row projection. Its stopped branch has no Retry action and
+the HTTP retry handler deliberately refuses native-retirement rows rather than
+admitting through that button. Exposing it blindly would widen authority and offer
+a false action. These initial/UI/precision gaps remain **unresolved acceptance**,
+not hidden by this captured-loss tool correction. Explicit native retry still
+requires its exact current Coordinator source; no UI admission widening is claimed.
+
 ### Shared-host practicality remains an independent product gate
 
 Privileged PID/mount/private-storage fixture isolation is **on hold pending the

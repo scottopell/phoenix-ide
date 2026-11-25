@@ -1032,7 +1032,7 @@ where
             Err(error) => {
                 authority.owner = None;
                 drop(target_gate);
-                let _ = response.send(Err(error));
+                let _ = response.send(Err(error.clone()));
                 return Err(error);
             }
         };

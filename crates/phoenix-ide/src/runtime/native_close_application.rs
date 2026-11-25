@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use crate::state_machine::ConvState;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub(crate) enum NativeCloseApplicationError {
     #[error("Close requires its exact live executing Coordinator source")]
     SourceRefused,
@@ -22,6 +22,8 @@ pub(crate) enum NativeCloseApplicationError {
     Unavailable,
     #[error("Close storage rejected the command")]
     Storage,
+    #[error("Close retry inspection is incomplete at {}; no new run admitted and disk contents were retained; use an explicit fresh retry after resolving the inspection gap", .0.path.display())]
+    RetryInspectionBlocked(crate::runtime::close_retirement::WriterInspectionGap),
     #[error("Close durable outcome could not be classified; authority is fenced")]
     FatalAuthority,
 }

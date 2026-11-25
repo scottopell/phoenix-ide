@@ -46,7 +46,7 @@ impl super::RuntimeManager {
     pub(crate) async fn assess_native_close_captured_loss_retry(
         &self,
         command: &NativeCloseCommand,
-    ) -> Result<CapturedLossRetryAssessment, String> {
+    ) -> Result<CapturedLossRetryAssessment, super::RetryAssessmentError> {
         let NativeCloseIntent::ExplicitRetry {
             target,
             attempt_id,

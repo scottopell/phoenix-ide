@@ -830,7 +830,8 @@ impl super::RuntimeManager {
                         .observe(path, super::quarantine_has_external_writer)
                         .map(super::RetryTargetObservation::Present)
                 },
-            )?;
+            )
+            .map_err(|error| error.to_string())?;
             if !root.try_exists().map_err(|error| error.to_string())?
                 && !quarantine.try_exists().map_err(|error| error.to_string())?
             {

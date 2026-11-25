@@ -495,7 +495,7 @@ async fn assess_retry_origin(
                     .await
                     .map_err(|error| {
                         tracing::warn!(%error, "native Close captured-loss retry assessment failed");
-                        NativeCloseApplicationError::Storage
+                        map_retry_assessment_error(error)
                     })?,
             ),
         ),
@@ -524,4 +524,49 @@ async fn assess_retry_origin(
         }
     };
     Ok(assessment)
+}
+
+fn map_retry_assessment_error(
+    error: crate::runtime::close_retirement::RetryAssessmentError,
+) -> NativeCloseApplicationError {
+    match error {
+        crate::runtime::close_retirement::RetryAssessmentError::WriterInspectionGap(gap) => {
+            NativeCloseApplicationError::RetryInspectionBlocked(gap)
+        }
+        crate::runtime::close_retirement::RetryAssessmentError::Other(_) => {
+            NativeCloseApplicationError::Storage
+        }
+    }
+}
+
+#[cfg(test)]
+mod retry_assessment_error_tests {
+    use super::*;
+    use crate::runtime::close_retirement::{RetryAssessmentError, WriterInspectionGap};
+    use phoenix_db::native_close::{CloseWriterDetector, CloseWriterGap};
+
+    #[test]
+    fn only_typed_inspection_gaps_are_exposed_as_inspection_blocked() {
+        let unrelated =
+            RetryAssessmentError::Other("unavailable gap while inspecting writer".to_owned());
+        assert_eq!(
+            map_retry_assessment_error(unrelated),
+            NativeCloseApplicationError::Storage
+        );
+
+        for pid in [None, Some(42)] {
+            let error = RetryAssessmentError::WriterInspectionGap(WriterInspectionGap {
+                path: std::path::PathBuf::from("/captured/worktree"),
+                detector: CloseWriterDetector::LinuxDescriptor,
+                reason: CloseWriterGap::Unavailable,
+                pid,
+            });
+            let NativeCloseApplicationError::RetryInspectionBlocked(gap) =
+                map_retry_assessment_error(error)
+            else {
+                panic!("typed inspection gap was not preserved");
+            };
+            assert_eq!(gap.pid, pid);
+        }
+    }
 }
