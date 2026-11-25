@@ -24,5 +24,5 @@ On this checkout, the scanner already accepts a user-role `InputOrigin::Coordina
 ## Verification
 
 - [PR #1182](https://github.com/scottopell/phoenix-ide/pull/1182), reviewed implementation head `f72f2e7af90893e3e17b07dc76752a7c5925d160`. All 97 focused origin, scanner, and migration tests passed. The tracking tool serializes the tested detail without reshaping it.
-- [Hosted CI attempt 3](https://github.com/scottopell/phoenix-ide/actions/runs/45655169097/attempts/3) passed every required check, including all four Rust test shards, clippy, specs, task validation, and e2e. The optional macOS release-helper job timed out; it is unrelated to this change.
+- [Hosted CI attempt 3](https://github.com/scottopell/phoenix-ide/actions/runs/45655169097/attempts/3) passed every required check, including all four Rust test shards, clippy, specs, task validation, and e2e. The non-required macOS release-helper job was cancelled, so the workflow did not report overall success.
 - Independent adversarial review and [Codex review](https://github.com/scottopell/phoenix-ide/pull/1182#issuecomment-7167817510) had no actionable findings on the implementation head after the SQLite edge cases and migration assertions were fixed. Final task-only head evidence is recorded on the PR.
