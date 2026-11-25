@@ -158,12 +158,19 @@ pub(super) fn run_git_leaf(
                 "native Worktree Git authorization refused for {operation}: {error}"
             ))
         }
-        Ok((
-            WorkerEntryResult::Busy | WorkerEntryResult::Refused,
-            NativeCloseInitialEntryRelease::Confirmed,
-        )) => {
+        Ok((WorkerEntryResult::Busy, NativeCloseInitialEntryRelease::Confirmed)) => {
+            // Busy/Refused are returned before the admitted callback runs, so no child exists.
             authority.armed = false;
-            Err("original Close source unavailable at Worktree Git spawn".into())
+            Err(
+                "original Close source unavailable at Worktree Git spawn: source-entry busy".into(),
+            )
+        }
+        Ok((WorkerEntryResult::Refused, NativeCloseInitialEntryRelease::Confirmed)) => {
+            // Refusal likewise precedes spawn; preserve the source-unavailable diagnosis.
+            authority.armed = false;
+            Err(
+                "original Close source unavailable at Worktree Git spawn: source-entry refused".into(),
+            )
         }
         Ok((WorkerEntryResult::Ran(Err(error)), NativeCloseInitialEntryRelease::Confirmed)) => {
             authority.armed = false;

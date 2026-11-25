@@ -2,6 +2,36 @@
 
 ## Current qualification and reviewed lint follow-up
 
+### Hosted formatting, source-entry diagnosis, and manual retry guidance
+
+Follow-up to `be1eb187671cfdb04db5cfd00b4bc79c4647d5fd`: all four hosted
+formatting proposals from [CI45613284565](https://github.com/scottopell/phoenix-ide/actions/runs/45613284565)
+are applied manually unchanged. That run failed early source formatting; Rust and
+dependent lanes were skipped, not passed. No local executable validation was run.
+
+The confirmed-release Git-spawn refusal now distinguishes `source-entry busy`
+from `source-entry refused`. Both branches still disarm and fail closed before
+any child spawn. The actual branch behind the 8b5 post-admission source-unavailable
+failure is not yet proven; this is diagnostic separation, not a behavioral fix.
+Do not conflate it with the distinct broad pre-admission `/proc` inspection gap.
+
+Stopped Close now offers a manual Coordinator link and exact copyable request,
+not the known-refused legacy HTTP retry callback. The request uses the snapshot's
+authoritative `product_conversation_id`, exact attempt ID, and decimal-string
+`failed_run_ordinal`; it performs no admission, automatic send, or retry loop.
+Independent review caught a transcript/ProductConversation targeting error before
+publication. The corrected regression deliberately separates those IDs and uses
+ordinal `9007199254740993` to guard against JavaScript numeric rounding. Other
+non-stopped controls are unchanged. This does not add structured writer rows,
+syscall-stage/permission precision, or prove initial/API/UI full parity.
+
+Source review and hosted qualification remain distinct. At this checkpoint,
+[exact 2b3](https://github.com/scottopell/phoenix-ide/actions/runs/45608183589)
+is in progress and [exact be1](https://github.com/scottopell/phoenix-ide/actions/runs/45613274182)
+is pending. Their existing single watchers are retained; no manual cancellation,
+rerun, or dispatch. Earlier pending exact runs may be superseded automatically by
+GitHub concurrency. This candidate remains draft/unqualified; no merge or rollout.
+
 ### Actionable inspection-gap mapping — narrow correction, parity still open
 
 Source trace confirms captured-loss pre-admission writer gaps were collapsed to
@@ -28,7 +58,7 @@ no syscall-stage or permission-denied field; those details are debug-only before
 this mapping, so `unavailable` cannot honestly be rendered as permission denied or
 as a specific failed syscall. Initial admitted physical failure persists existing
 exact writer rows and projects its detector/PID/reason error detail, but the UI has
-no structured writer-row projection. Its stopped branch has no Retry action and
+no structured writer-row projection. Before the follow-up above, its stopped branch had no Retry action and
 the HTTP retry handler deliberately refuses native-retirement rows rather than
 admitting through that button. Exposing it blindly would widen authority and offer
 a false action. These initial/UI/precision gaps remain **unresolved acceptance**,

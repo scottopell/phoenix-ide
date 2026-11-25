@@ -137,19 +137,22 @@ fn output(result: NativeCloseApplicationResult) -> Value {
 fn application_error(error: NativeCloseApplicationError) -> ToolOutput {
     let code = match &error {
         NativeCloseApplicationError::RetryInspectionBlocked(gap) => {
-            return ToolOutput::error(json!({
-                "code":"retry_inspection_blocked",
-                "message":error.to_string(),
-                "facts": {
-                    "path":gap.path.display().to_string(),
-                    "detector":gap.detector.as_str(),
-                    "reason":gap.reason.as_str(),
-                    "pid":gap.pid,
-                    "new_run_admitted":false,
-                    "disk_contents_retained":true,
-                    "requires_explicit_fresh_retry":true
-                }
-            }).to_string());
+            return ToolOutput::error(
+                json!({
+                    "code":"retry_inspection_blocked",
+                    "message":error.to_string(),
+                    "facts": {
+                        "path":gap.path.display().to_string(),
+                        "detector":gap.detector.as_str(),
+                        "reason":gap.reason.as_str(),
+                        "pid":gap.pid,
+                        "new_run_admitted":false,
+                        "disk_contents_retained":true,
+                        "requires_explicit_fresh_retry":true
+                    }
+                })
+                .to_string(),
+            );
         }
         NativeCloseApplicationError::SourceRefused => "source_refused",
         NativeCloseApplicationError::Unavailable => "unavailable",
@@ -228,7 +231,10 @@ mod tests {
     fn storage_and_fatal_errors_keep_existing_codes() {
         for (error, code) in [
             (NativeCloseApplicationError::Storage, "storage_rejected"),
-            (NativeCloseApplicationError::FatalAuthority, "fatal_authority"),
+            (
+                NativeCloseApplicationError::FatalAuthority,
+                "fatal_authority",
+            ),
         ] {
             let rendered = application_error(error).output;
             let value: Value = serde_json::from_str(&rendered).unwrap();

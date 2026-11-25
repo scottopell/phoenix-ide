@@ -369,6 +369,48 @@ describe('WorkControlBar — persisted Close recovery', () => {
     expect(api.retryCloseRetirement).not.toHaveBeenCalled();
   });
 
+  it('offers stopped Close retry for the authoritative product ID, not the successor transcript', async () => {
+    const snapshot = closeSnapshot('needs_repair', [{
+      scope: 'repo',
+      resource_kind: 'worktree',
+      identity: '/work/tree',
+      reason: 'inspection_failed',
+      detail: 'cleanup incomplete',
+    }]);
+    vi.mocked(api.getProductConversationSnapshot).mockResolvedValue({
+      ...snapshot,
+      product_conversation_id: 'product-conversation-owned',
+      close: {
+        ...snapshot.close,
+        attempt_id: 'attempt-stopped-exact',
+        run_ordinal: '9007199254740993',
+        run_status: 'stopped',
+        failure: {
+          occurrence_id: 'close-failure:stopped',
+          reason: 'identity_not_proven',
+          detail: 'Cleanup could not be confirmed',
+          stop_certainty: { kind: 'conversation_and_processes_stopped', confirmed_at_us: '1234567890123456' },
+          remaining_resources: [],
+        },
+      },
+    } as never);
+
+    renderWithProviders(
+      <WorkControlBar conversationId="successor-transcript-row" convModeLabel="Work" phaseType="idle" continuedInConvId={null} prStatusHandle={prStatusHandle()} />,
+    );
+
+    const status = await screen.findByLabelText('Close repair required');
+    const request = screen.getByRole('textbox', { name: 'Explicit fresh safe retry request' });
+    expect(request).toHaveValue(
+      'Please make ONE explicit fresh safe retry via close_conversation for ProductConversation product-conversation-owned, attempt_id attempt-stopped-exact, failed_run_ordinal 9007199254740993. Do not run an automatic loop, use a stale fallback, or discard anything.',
+    );
+    expect(screen.getByRole('link', { name: 'Open Coordinator to request retry' })).toHaveAttribute('href', '/global/coordinator');
+    expect(status).toHaveTextContent('Nothing is admitted automatically');
+    expect(status).toHaveTextContent('send it normally in the Coordinator');
+    expect(screen.queryByRole('button', { name: 'Retry exact Close attempt' })).not.toBeInTheDocument();
+    expect(api.retryCloseRetirement).not.toHaveBeenCalled();
+  });
+
   it('renders exact residual repair evidence after reload', async () => {
     vi.mocked(api.getProductConversationSnapshot).mockResolvedValue(closeSnapshot('needs_repair', [{
       scope: 'scope-1',

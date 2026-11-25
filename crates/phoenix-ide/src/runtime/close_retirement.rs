@@ -7471,14 +7471,20 @@ where
     {
         match observe(path)? {
             RetryTargetObservation::Present(ExternalWriterEvidence::Blocked(
-                CloseWriterObservation::InspectionGap { detector, pid, reason },
-            )) => {
-                return Err(RetryAssessmentError::WriterInspectionGap(WriterInspectionGap {
-                    path: path.to_path_buf(),
+                CloseWriterObservation::InspectionGap {
                     detector,
-                    reason,
                     pid,
-                }))
+                    reason,
+                },
+            )) => {
+                return Err(RetryAssessmentError::WriterInspectionGap(
+                    WriterInspectionGap {
+                        path: path.to_path_buf(),
+                        detector,
+                        reason,
+                        pid,
+                    },
+                ))
             }
             RetryTargetObservation::Present(ExternalWriterEvidence::Blocked(
                 CloseWriterObservation::Authority { .. },
@@ -16999,7 +17005,9 @@ mod tests {
         })
         .expect_err("a probe failure must be fail-closed, not proof of absence");
         assert!(
-            error.to_string().contains("cannot probe retry writer target"),
+            error
+                .to_string()
+                .contains("cannot probe retry writer target"),
             "probe error must propagate as the rejection: {error}"
         );
     }

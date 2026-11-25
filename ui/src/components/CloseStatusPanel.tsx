@@ -54,6 +54,19 @@ export function CloseStatusPanel({
         {lossRows.length > 0 && <><p>Exact work items:</p><ul>{lossRows}</ul></>}
         {residualRows.length > 0 && <ul>{residualRows}</ul>}
         {failure}
+        <p>
+          To retry, navigate to the Coordinator and send one explicit fresh safe retry request.
+          Nothing is admitted automatically; this request does not retry, use a stale fallback, or discard anything.
+        </p>
+        <a href="/global/coordinator">Open Coordinator to request retry</a>
+        <label>
+          <span>Copy this request and send it normally in the Coordinator:</span>
+          <textarea
+            aria-label="Explicit fresh safe retry request"
+            readOnly
+            value={`Please make ONE explicit fresh safe retry via close_conversation for ProductConversation ${snapshot.product_conversation_id}, attempt_id ${close.attempt_id}, failed_run_ordinal ${close.run_ordinal}. Do not run an automatic loop, use a stale fallback, or discard anything.`}
+          />
+        </label>
       </section>
     );
   }
