@@ -2,6 +2,50 @@
 
 ## Current qualification and reviewed lint follow-up
 
+### 184 result and reviewed CI parity follow-up
+
+Exact feature `1847873311f980163ace684e151d1052ca21b662` completed
+[Close45549078100](https://github.com/scottopell/phoenix-ide/actions/runs/45549078100)
+**successfully**. The retained logs establish **270 / 0 / 0** foundation tests,
+**82 / 0 / 0** native DB tests and **180 / 0 / 0** migration tests
+(passed / failed / ignored). Initial public physical retirement, captured-loss
+cleanup → explicit retry → reclaim → replay, and each of four causal Stop
+selectors each executed **1 / 0 / 0**. Evidence is retained under
+`/tmp/close-184787331/artifacts/close-exact-source-1847873311f980163ace684e151d1052ca21b662-1/`.
+The before-writer selector does not establish held-writer contention coverage.
+
+[CI45549084694](https://github.com/scottopell/phoenix-ide/actions/runs/45549084694)
+completed **failed**. Its broad Rust source was synthetic merge
+`ff76488e42dcede2e89d25c8d9ce19bece536d43` (parents main
+`4aba9625a1dfc85ab25f07eaa1f4536a51b19a1e` and exact feature 184), not feature
+source alone. Build and test compilation passed. Remaining blockers were nine
+Clippy sites and five captured-loss public retry/Stop tests in each broad shard.
+One retry log proves fail-closed refusal because an ambient same-EUID runner
+process's `/proc/1150/exe` was unreadable; the other four barrier timeouts are
+consistent with pre-admission refusal, but their logs do not prove that same cause.
+Complete diagnostics and terminal receipts are retained in `/tmp/close-184787331/`.
+
+This follow-up repairs the nine lint sites without weakening Stop, scanner,
+identity or custody checks. Broad split tests opt into a six-exact-test dispatcher
+that reuses the existing checksum-verified unprivileged qualification harness and
+its real production detector. Other tests exec their original command unchanged.
+The runner-owned profiler remains outside the identity drop and retains output,
+identity and exit receipts. The original nextest test binary and CI-built
+`target/debug/phoenix_ide` launcher are staged; no test is skipped or replaced by a
+success receipt. Independent review caught and repaired an incorrect launcher
+filename and a shared-UID concurrency race before publication. An opt-in nextest
+group serializes the public physical Worktree module across whole invocations,
+including staging, preflight and cleanup, so these six harnesses cannot race one
+another's process scans. The split job explicitly provisions tmux rather than
+assuming the runner image supplies it. Focused dispatcher/profiler/argument,
+serialization-config and launcher source-contract fixtures are added, not locally
+executed.
+
+The follow-up is **unqualified** until fresh automatic exact Close and standard
+CI complete. Source inspection and `git diff --check` are not executable receipts;
+no local executable validation, main merge, installation or release occurred.
+The sections below preserve older candidate history, not current qualification.
+
 ### a726 follow-up result and narrow correction
 
 `a72650da461c28abf4b81ceafb5213484a5bd33c` is **not qualified**:

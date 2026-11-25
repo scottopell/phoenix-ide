@@ -8222,18 +8222,16 @@ fn linux_writer_scan_until(
                 return Ok(writer_gap(detector, Some(pid), CloseWriterGap::Unavailable));
             }
         }
-        let before_result = linux_writer_process_until(&process.path(), boot_id.trim(), deadline);
-        check_directory_deletion_deadline(Some(deadline))?;
-        let before = match before_result {
+        let before = match linux_writer_identity_before_until(
+            &process.path(),
+            boot_id.trim(),
+            detector,
+            pid,
+            deadline,
+        ) {
             Ok(identity) => identity,
             Err(WriterScanError::Stopped(message)) => return Err(message),
             Err(WriterScanError::Gap(reason)) => {
-                tracing::debug!(
-                    operation = "identity_before",
-                    detector = detector.as_str(),
-                    pid,
-                    ?reason
-                );
                 return Ok(writer_gap(detector, Some(pid), reason));
             }
         };
@@ -8281,6 +8279,27 @@ fn linux_writer_scan_until(
     }
     check_directory_deletion_deadline(Some(deadline))?;
     Ok(ExternalWriterEvidence::NoPositiveEvidence)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_writer_identity_before_until(
+    process: &Path,
+    boot_id: &str,
+    detector: CloseWriterDetector,
+    pid: u32,
+    deadline: std::time::Instant,
+) -> Result<CloseWriterProcess, WriterScanError> {
+    let before_result = linux_writer_process_until(process, boot_id, deadline);
+    writer_scan_check(deadline)?;
+    if let Err(WriterScanError::Gap(reason)) = &before_result {
+        tracing::debug!(
+            operation = "identity_before",
+            detector = detector.as_str(),
+            pid,
+            ?reason
+        );
+    }
+    before_result
 }
 
 #[cfg(target_os = "linux")]
@@ -18644,12 +18663,7 @@ mod tests {
         let other = temp.path().join("other");
         std::fs::create_dir(&quarantine).unwrap();
         std::fs::create_dir(&other).unwrap();
-        let parent = super::open_deletion_parent(quarantine.parent().unwrap()).unwrap();
-        let name = std::ffi::CString::new("quarantine").unwrap();
-        let identity = super::DeletionEntryIdentity::from_stat(
-            &super::deletion_slot_stat(&parent, &name).unwrap(),
-        );
-        let witness = super::OwnedDeletionSlot::capture(&parent, &name, identity).unwrap();
+        let witness = capture_linux_descriptor_test_slot(&quarantine, "quarantine");
         let borrow = witness.self_descriptor_borrow().unwrap();
         // SAFETY: geteuid and getpid have no preconditions.
         let uid = unsafe { libc::geteuid() };
@@ -18657,13 +18671,7 @@ mod tests {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
 
         let make_proc = |root: &Path, process_pid: u32, fd: i32, target: &Path| {
-            let process = fake_linux_process(root, process_pid, uid, 44);
-            std::os::unix::fs::symlink(target, process.join(format!("fd/{fd}"))).unwrap();
-            std::fs::write(
-                process.join(format!("fdinfo/{fd}")),
-                "pos:\t0\nflags:\t0100000\n",
-            )
-            .unwrap();
+            fake_linux_readonly_descriptor(root, process_pid, uid, fd, target);
         };
 
         let ordinary_proc = temp.path().join("ordinary-proc");
@@ -18708,13 +18716,7 @@ mod tests {
         );
         assert_linux_scoped_descriptor_authority(&quarantine, &other_pid_proc, deadline, &borrow);
 
-        let other_parent = super::open_deletion_parent(other.parent().unwrap()).unwrap();
-        let other_name = std::ffi::CString::new("other").unwrap();
-        let other_identity = super::DeletionEntryIdentity::from_stat(
-            &super::deletion_slot_stat(&other_parent, &other_name).unwrap(),
-        );
-        let other_witness =
-            super::OwnedDeletionSlot::capture(&other_parent, &other_name, other_identity).unwrap();
+        let other_witness = capture_linux_descriptor_test_slot(&other, "other");
         let other_borrow = other_witness.self_descriptor_borrow().unwrap();
         let mismatched_borrow = super::SelfDeletionDescriptorBorrow {
             witness: &other_witness,
@@ -18764,6 +18766,33 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[cfg(target_os = "linux")]
+    fn fake_linux_readonly_descriptor(
+        root: &Path,
+        process_pid: u32,
+        uid: libc::uid_t,
+        fd: i32,
+        target: &Path,
+    ) {
+        let process = fake_linux_process(root, process_pid, uid, 44);
+        std::os::unix::fs::symlink(target, process.join(format!("fd/{fd}"))).unwrap();
+        std::fs::write(
+            process.join(format!("fdinfo/{fd}")),
+            "pos:\t0\nflags:\t0100000\n",
+        )
+        .unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    fn capture_linux_descriptor_test_slot(path: &Path, slot_name: &str) -> super::OwnedDeletionSlot {
+        let parent = super::open_deletion_parent(path.parent().unwrap()).unwrap();
+        let name = std::ffi::CString::new(slot_name).unwrap();
+        let identity = super::DeletionEntryIdentity::from_stat(
+            &super::deletion_slot_stat(&parent, &name).unwrap(),
+        );
+        super::OwnedDeletionSlot::capture(&parent, &name, identity).unwrap()
     }
 
     #[cfg(target_os = "linux")]

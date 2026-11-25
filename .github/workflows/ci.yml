@@ -229,8 +229,8 @@ jobs:
           - { part: "test 3-4", phase: test, partition: 3/4 }
           - { part: "test 4-4", phase: test, partition: 4/4 }
           - { part: codegen, phase: codegen, partition: "" }
-    # 10 setup/browser + 5 download + 35 check (1800 s cargo test + extract) + 2 evidence.
-    timeout-minutes: 52
+    # 3 identity tools + 10 setup/browser + 5 download + 35 check + 2 evidence.
+    timeout-minutes: 55
     env:
       PYTHONUNBUFFERED: "1"
       PHOENIX_DEV_TRACE_ENDPOINT: "off"
@@ -239,6 +239,7 @@ jobs:
       PHOENIX_CHECK_ALL: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && '1' || '' }}
       PHOENIX_CHECK_BASE: ${{ github.event_name == 'pull_request' && 'origin/main' || '' }}
       PHOENIX_CHECK_CARGO_TEST_TIMEOUT_SECS: "1800"
+      PHOENIX_CHECK_CLOSE_UNPRIVILEGED: "1"
       PHOENIX_BASH_LAUNCH_TEST_EXE: ${{ github.workspace }}/target/debug/phoenix_ide
       PHOENIX_BASH_LAUNCH_TEST_REQUIRED: '1'
     steps:
@@ -277,6 +278,13 @@ jobs:
           node-version: 26
           cache: pnpm
           cache-dependency-path: ui/pnpm-lock.yaml
+      - name: Prepare Close identity qualification tools
+        if: ${{ matrix.phase == 'test' }}
+        timeout-minutes: 3
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y tmux
+          /usr/bin/tmux -V
       - name: Prepare pinned Chromium for native browser tests
         if: ${{ matrix.phase == 'test' }}
         timeout-minutes: 10

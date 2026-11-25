@@ -4272,11 +4272,11 @@ mod lifecycle_hook_tests {
         let foreign = Arc::new(BrowserSessionManager::default());
         let scope = scope("browser-foreign-retirement-permit");
         let permit = issuer.begin_retirement(&scope).await;
-        let _matching_foreign_fence = foreign.begin_retirement(&scope).await;
+        let matching_foreign_fence = foreign.begin_retirement(&scope).await;
 
         assert_eq!(permit.generation().get(), 1);
-        assert_eq!(permit.generation(), _matching_foreign_fence.generation());
-        assert_ne!(permit, _matching_foreign_fence);
+        assert_eq!(permit.generation(), matching_foreign_fence.generation());
+        assert_ne!(permit, matching_foreign_fence);
         assert_eq!(
             foreign.verify_exact_absence(&permit).await,
             BrowserSessionManager::invalid_permit_outcome()

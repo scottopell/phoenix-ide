@@ -461,9 +461,15 @@ def _write_nextest_profile_config(profile: CheckWorkProfile) -> Path:
     config = profile.artifact_dir / "nextest-profile.toml"
     wrapper = ROOT / "scripts" / "check_profile_command.py"
     output_dir = profile.artifact_dir / "rust-tests"
-    command = json.dumps([
+    command_args = [
         sys.executable, str(wrapper), "--output-dir", str(output_dir), "--",
-    ])
+    ]
+    if os.environ.get("PHOENIX_CHECK_CLOSE_UNPRIVILEGED") == "1":
+        # Keep profiling in the runner identity, outside the harness's env -i.
+        command_args.extend([
+            "bash", str(ROOT / "scripts" / "ci" / "close-nextest-wrapper.sh"), str(ROOT),
+        ])
+    command = json.dumps(command_args)
     config.write_text(
         'nextest-version = "0.9.98"\n'
         'experimental = ["wrapper-scripts"]\n\n'
@@ -473,6 +479,15 @@ def _write_nextest_profile_config(profile: CheckWorkProfile) -> Path:
         'filter = "all()"\n'
         'run-wrapper = "phoenix-cpu"\n'
     )
+    if os.environ.get("PHOENIX_CHECK_CLOSE_UNPRIVILEGED") == "1":
+        with config.open("a") as config_file:
+            config_file.write(
+                '\n[test-groups.close-physical-identity]\n'
+                'max-threads = 1\n\n'
+                '[[profile.phoenix-cpu.overrides]]\n'
+                'filter = "binary(=phoenix_ide) & test(worktree_physical::)"\n'
+                'test-group = "close-physical-identity"\n'
+            )
     return config
 
 

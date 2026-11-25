@@ -791,6 +791,10 @@ pub(super) mod tests {
     }
 
     #[tokio::test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Keep the physical cleanup, cancelled waiter, late custody, and retry assertions in one lifecycle test"
+    )]
     async fn aborted_waiter_keeps_custody_inside_actual_blocking_profile_cleanup() {
         let root = tempfile::tempdir().unwrap();
         let profile = root.path().join("owned-unmarked-profile");
@@ -1374,12 +1378,12 @@ pub(super) mod tests {
             panic!("late caller must join the active kill");
         };
         assert!(Arc::ptr_eq(&attempt, &joined_attempt));
-        let joiner = {
+        let cancelled_wait_handle = {
             let manager = manager.clone();
             tokio::spawn(async move { manager.wait_for_kill_completion(joined_attempt).await })
         };
-        joiner.abort();
-        assert!(joiner.await.unwrap_err().is_cancelled());
+        cancelled_wait_handle.abort();
+        assert!(cancelled_wait_handle.await.unwrap_err().is_cancelled());
         parent.abort();
         assert!(parent.await.unwrap_err().is_cancelled());
         assert!(
@@ -1614,7 +1618,7 @@ pub(super) mod tests {
             let _ = done_tx.send(result);
         });
         started_rx.await.unwrap();
-        let waiter = tokio::spawn(async move { worker.await });
+        let waiter = tokio::spawn(worker);
         waiter.abort();
         assert!(waiter.await.unwrap_err().is_cancelled());
 
@@ -1638,7 +1642,7 @@ pub(super) mod tests {
             .expect("scenario cancellation must be observed")
             .expect("scenario cancellation observer remains connected");
         assert!(cancelled.load(Ordering::SeqCst));
-        assert!(manager.state.read().await.sessions.get(&slot.key).is_none());
+        assert!(!manager.state.read().await.sessions.contains_key(&slot.key));
         assert!(events.try_recv().is_ok());
         // InjectedPending tests detached retirement coordination, not physical deletion.
         std::fs::remove_dir_all(&slot.profile).expect("remove synthetic profile directory");
@@ -1672,7 +1676,7 @@ pub(super) mod tests {
             let _ = done_tx.send(result);
         });
         started_rx.await.unwrap();
-        drop(tokio::spawn(async move { worker.await }));
+        drop(tokio::spawn(worker));
 
         let replacement = reserve_in_manager(&manager, &scope).await;
         assert_eq!(captured.key, replacement.key);
