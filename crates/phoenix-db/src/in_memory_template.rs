@@ -5,11 +5,15 @@ use sha2::{Digest, Sha256};
 use sqlx::sqlite::{
     SqliteConnectOptions, SqliteConnection, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous,
 };
+#[cfg(test)]
+use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+#[cfg(test)]
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::OnceCell;
 
@@ -21,7 +25,12 @@ const SQLITE_HEADER_MAGIC: &[u8] = b"SQLite format 3\0";
 const MIN_SQLITE_BYTES: usize = 4096;
 const TEMPLATE_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 
+#[cfg(test)]
+type PrefixTemplateCache = HashMap<u32, Arc<OnceCell<Vec<u8>>>>;
+
 static IN_MEMORY_TEMPLATE: OnceCell<Vec<u8>> = OnceCell::const_new();
+#[cfg(test)]
+static PREFIX_TEMPLATES: OnceLock<Mutex<PrefixTemplateCache>> = OnceLock::new();
 
 fn template_disabled() -> bool {
     matches!(
@@ -294,6 +303,204 @@ async fn load_or_build_template() -> DbResult<&'static [u8]> {
     Ok(bytes.as_slice())
 }
 
+#[cfg(test)]
+async fn build_fresh_prefix_bytes(through: u32) -> DbResult<Vec<u8>> {
+    let opts = SqliteConnectOptions::from_str("sqlite::memory:")?
+        .journal_mode(SqliteJournalMode::Wal)
+        .synchronous(SqliteSynchronous::Normal)
+        .busy_timeout(Duration::from_secs(5))
+        .foreign_keys(true);
+    let collector = SqliteWorkloadCollector::new();
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(opts)
+        .await?;
+    let db = Database::new_with_generated_target_binding(pool, String::new(), collector);
+    db.run_migrations().await?;
+    migrations::run_through_for_test(&db.pool, through).await?;
+    let mut conn = db.pool.acquire().await?;
+    serialize_connection(&mut conn).await
+}
+
+#[cfg(test)]
+async fn load_or_build_prefix_template(through: u32) -> DbResult<Vec<u8>> {
+    let cell = {
+        let map = PREFIX_TEMPLATES.get_or_init(|| Mutex::new(HashMap::new()));
+        let mut guard = map
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard
+            .entry(through)
+            .or_insert_with(|| Arc::new(OnceCell::new()))
+            .clone()
+    };
+    let bytes = cell
+        .get_or_try_init(|| async {
+            let cache_path = private_template_dir()
+                .map(|dir| dir.join(format!("tpl-{}-v{through}.sqlite", template_fingerprint())));
+            if let Some(path) = cache_path.as_deref() {
+                if let Some(cached) = try_load_cached_template(path) {
+                    return Ok::<Vec<u8>, DbError>(cached);
+                }
+            }
+            let fresh = build_fresh_prefix_bytes(through).await?;
+            if let Some(path) = cache_path.as_deref() {
+                try_store_cached_template(path, &fresh);
+            }
+            Ok(fresh)
+        })
+        .await?;
+    Ok(bytes.clone())
+}
+
+#[cfg(test)]
+async fn refresh_instance_identity_if_present(
+    conn: &mut SqliteConnection,
+    fresh_instance_id: &str,
+) -> Result<(), sqlx::Error> {
+    let exists: Option<i64> = sqlx::query_scalar(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'instance_identity'",
+    )
+    .persistent(false)
+    .fetch_optional(&mut *conn)
+    .await?;
+    if exists.is_some() {
+        sqlx::query("UPDATE instance_identity SET instance_id = ?1 WHERE singleton_key = 1")
+            .bind(fresh_instance_id)
+            .persistent(false)
+            .execute(&mut *conn)
+            .await?;
+    }
+    Ok(())
+}
+
+#[cfg(any(test, feature = "test-support"))]
+fn is_in_memory_path(path: &str) -> bool {
+    path == ":memory:"
+        || path == "sqlite::memory:"
+        || path.starts_with("file::memory:")
+        || path.is_empty()
+}
+
+#[cfg(test)]
+pub(crate) async fn open_in_memory_prefix_for_test(through: u32) -> DbResult<Database> {
+    if template_disabled() {
+        let opts = SqliteConnectOptions::from_str("sqlite::memory:")?
+            .journal_mode(SqliteJournalMode::Wal)
+            .synchronous(SqliteSynchronous::Normal)
+            .busy_timeout(Duration::from_secs(5))
+            .foreign_keys(true);
+        let sqlite_workload_collector = SqliteWorkloadCollector::new();
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .min_connections(1)
+            .idle_timeout(None)
+            .max_lifetime(None)
+            .after_connect({
+                let sqlite_workload_collector = sqlite_workload_collector.clone();
+                move |conn, _meta| {
+                    let sqlite_workload_collector = sqlite_workload_collector.clone();
+                    Box::pin(async move {
+                        install_native_statement_baseline(conn, sqlite_workload_collector).await
+                    })
+                }
+            })
+            .connect_with(opts)
+            .await?;
+        let db = Database::new_with_generated_target_binding(
+            pool,
+            String::new(),
+            sqlite_workload_collector,
+        );
+        db.run_migrations().await?;
+        migrations::run_through_for_test(&db.pool, through).await?;
+        return Ok(db);
+    }
+
+    let template_bytes = Arc::new(load_or_build_prefix_template(through).await?);
+    let fresh_instance_id = InstanceId::new().to_string();
+    let opts = SqliteConnectOptions::from_str("sqlite::memory:")?
+        .journal_mode(SqliteJournalMode::Wal)
+        .synchronous(SqliteSynchronous::Normal)
+        .busy_timeout(Duration::from_secs(5))
+        .foreign_keys(true);
+    let sqlite_workload_collector = SqliteWorkloadCollector::new();
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .min_connections(1)
+        .idle_timeout(None)
+        .max_lifetime(None)
+        .after_connect({
+            let sqlite_workload_collector = sqlite_workload_collector.clone();
+            move |conn, _meta| {
+                let sqlite_workload_collector = sqlite_workload_collector.clone();
+                let template_bytes = template_bytes.clone();
+                let fresh_instance_id = fresh_instance_id.clone();
+                Box::pin(async move {
+                    deserialize_into_connection(conn, &template_bytes).await?;
+                    refresh_instance_identity_if_present(conn, &fresh_instance_id).await?;
+                    install_native_statement_baseline(conn, sqlite_workload_collector).await
+                })
+            }
+        })
+        .connect_with(opts)
+        .await?;
+    Ok(Database::new_with_generated_target_binding(
+        pool,
+        String::new(),
+        sqlite_workload_collector,
+    ))
+}
+
+#[cfg(test)]
+pub(crate) async fn open_prefix_for_test(path: &str, through: u32) -> DbResult<Database> {
+    if is_in_memory_path(path) {
+        return open_in_memory_prefix_for_test(through).await;
+    }
+    let target = Path::new(path);
+    let seeded = if template_disabled() || target.exists() {
+        false
+    } else {
+        let template_bytes = load_or_build_prefix_template(through).await?;
+        seed_bytes_atomically(target, &template_bytes)?
+    };
+    if !seeded {
+        let db = Database::open(path).await?;
+        migrations::run_through_for_test(db.pool(), through).await?;
+        db.restrict_file_permissions();
+        return Ok(db);
+    }
+    let opts = SqliteConnectOptions::from_str(&format!("sqlite:{path}?mode=rwc"))?
+        .journal_mode(SqliteJournalMode::Wal)
+        .synchronous(SqliteSynchronous::Normal)
+        .busy_timeout(Duration::from_secs(5))
+        .foreign_keys(true);
+    let sqlite_workload_collector = SqliteWorkloadCollector::new();
+    let pool = SqlitePoolOptions::new()
+        .after_connect({
+            let sqlite_workload_collector = sqlite_workload_collector.clone();
+            move |conn, _meta| {
+                let sqlite_workload_collector = sqlite_workload_collector.clone();
+                Box::pin(async move {
+                    install_native_statement_baseline(conn, sqlite_workload_collector).await
+                })
+            }
+        })
+        .connect_with(opts)
+        .await?;
+    let db = Database::new_with_generated_target_binding(
+        pool,
+        path.to_string(),
+        sqlite_workload_collector,
+    );
+    {
+        let mut conn = db.pool().acquire().await?;
+        refresh_instance_identity_if_present(&mut conn, &InstanceId::new().to_string()).await?;
+    }
+    db.restrict_file_permissions();
+    Ok(db)
+}
+
 pub(crate) async fn open_in_memory_fresh() -> DbResult<Database> {
     let opts = SqliteConnectOptions::from_str("sqlite::memory:")?
         .journal_mode(SqliteJournalMode::Wal)
@@ -365,11 +572,7 @@ pub(crate) async fn open_in_memory_from_template() -> DbResult<Database> {
 }
 
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) async fn seed_migrated_file_for_test(path: &Path) -> DbResult<bool> {
-    if template_disabled() || path.exists() {
-        return Ok(false);
-    }
-    let template_bytes = load_or_build_template().await?;
+fn seed_bytes_atomically(path: &Path, template_bytes: &[u8]) -> DbResult<bool> {
     let parent = path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -447,7 +650,19 @@ pub(crate) async fn seed_migrated_file_for_test(path: &Path) -> DbResult<bool> {
 }
 
 #[cfg(any(test, feature = "test-support"))]
+pub(crate) async fn seed_migrated_file_for_test(path: &Path) -> DbResult<bool> {
+    if template_disabled() || path.exists() {
+        return Ok(false);
+    }
+    let template_bytes = load_or_build_template().await?;
+    seed_bytes_atomically(path, template_bytes)
+}
+
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) async fn open_migrated_for_test(path: &str) -> DbResult<Database> {
+    if is_in_memory_path(path) {
+        return open_in_memory_from_template().await;
+    }
     let seeded = seed_migrated_file_for_test(Path::new(path)).await?;
     if !seeded {
         let db = Database::open(path).await?;
@@ -628,5 +843,67 @@ mod tests {
             .unwrap();
         assert_eq!(reopened.instance_id().await.unwrap(), id_before);
         assert!(reopened.get_conversation("reopen-conv").await.is_ok());
+
+        // ":memory:" delegates to the in-memory template without creating a literal file.
+        let mem = Database::open_migrated_for_test(":memory:").await.unwrap();
+        assert!(!Path::new(":memory:").exists());
+        assert_ne!(mem.instance_id().await.unwrap(), id_before);
+    }
+
+    #[tokio::test]
+    async fn prefix_templates_match_fresh_run_through_for_test_schema_and_ledger() {
+        let dir = tempfile::tempdir().unwrap();
+        let fresh_path = dir.path().join("fresh-142.db");
+        let cached_path = dir.path().join("cached-142.db");
+
+        let fresh = Database::open(fresh_path.to_str().unwrap()).await.unwrap();
+        migrations::run_through_for_test(fresh.pool(), 142)
+            .await
+            .unwrap();
+
+        let cached_file = open_prefix_for_test(cached_path.to_str().unwrap(), 142)
+            .await
+            .unwrap();
+        let cached_mem = open_in_memory_prefix_for_test(142).await.unwrap();
+
+        let schema_query =
+            "SELECT type, name, tbl_name, sql FROM sqlite_schema ORDER BY type, name";
+        let fresh_schema: Vec<(String, String, String, Option<String>)> =
+            sqlx::query_as(schema_query)
+                .fetch_all(fresh.pool())
+                .await
+                .unwrap();
+        let file_schema: Vec<(String, String, String, Option<String>)> =
+            sqlx::query_as(schema_query)
+                .fetch_all(cached_file.pool())
+                .await
+                .unwrap();
+        let mem_schema: Vec<(String, String, String, Option<String>)> =
+            sqlx::query_as(schema_query)
+                .fetch_all(cached_mem.pool())
+                .await
+                .unwrap();
+        assert_eq!(file_schema, fresh_schema);
+        assert_eq!(mem_schema, fresh_schema);
+
+        let mig_query = "SELECT version, name FROM _migrations ORDER BY version";
+        let fresh_migs: Vec<(i64, String)> = sqlx::query_as(mig_query)
+            .fetch_all(fresh.pool())
+            .await
+            .unwrap();
+        let file_migs: Vec<(i64, String)> = sqlx::query_as(mig_query)
+            .fetch_all(cached_file.pool())
+            .await
+            .unwrap();
+        let mem_migs: Vec<(i64, String)> = sqlx::query_as(mig_query)
+            .fetch_all(cached_mem.pool())
+            .await
+            .unwrap();
+        assert_eq!(file_migs, fresh_migs);
+        assert_eq!(mem_migs, fresh_migs);
+        assert_ne!(
+            cached_file.instance_id().await.unwrap(),
+            cached_mem.instance_id().await.unwrap()
+        );
     }
 }

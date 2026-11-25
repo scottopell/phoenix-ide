@@ -547,10 +547,9 @@ async fn retries_bind_original_target_and_text_without_reattributing_sender() {
 }
 
 async fn state_from_database_path(path: &std::path::Path) -> AppState {
-    let db = crate::db::Database::open(path.to_str().unwrap())
+    let db = crate::db::Database::open_migrated_for_test(path.to_str().unwrap())
         .await
         .unwrap();
-    crate::db::run_pending_migrations(db.pool()).await.unwrap();
     crate::api::handlers::hard_delete_cascade_tests::make_test_state_with_db(db)
 }
 

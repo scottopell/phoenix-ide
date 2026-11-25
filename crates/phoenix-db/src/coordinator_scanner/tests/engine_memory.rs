@@ -32,8 +32,9 @@ async fn scanner_utf8_engine_length_guard_never_materializes_excluded_or_oversiz
     for kind in ["tool", "user", "utf8"] {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("engine-size.db");
-        let db = Database::open(path.to_str().unwrap()).await.unwrap();
-        crate::run_pending_migrations(db.pool()).await.unwrap();
+        let db = Database::open_migrated_for_test(path.to_str().unwrap())
+            .await
+            .unwrap();
         let encoding: String = sqlx::query_scalar("PRAGMA encoding")
             .fetch_one(db.pool())
             .await

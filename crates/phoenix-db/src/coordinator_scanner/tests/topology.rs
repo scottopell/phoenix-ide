@@ -9,8 +9,9 @@ async fn scanner_metadata_pages_visit_every_middle_member_and_revisit_old_genera
     };
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("paged-chain.db");
-    let db = Database::open(path.to_str().unwrap()).await.unwrap();
-    crate::run_pending_migrations(db.pool()).await.unwrap();
+    let db = Database::open_migrated_for_test(path.to_str().unwrap())
+        .await
+        .unwrap();
     let first = db
         .get_or_create_coordinator(None, LlmLanguage::default())
         .await

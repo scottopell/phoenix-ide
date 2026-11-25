@@ -628,8 +628,9 @@ mod tests {
     async fn reopening_retains_prefix_and_change_positions() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("policy.db");
-        let db = Database::open(path.to_str().unwrap()).await.unwrap();
-        crate::run_pending_migrations(db.pool()).await.unwrap();
+        let db = Database::open_migrated_for_test(path.to_str().unwrap())
+            .await
+            .unwrap();
         db.create_conversation("policy", "policy", "/tmp", true, None, None)
             .await
             .unwrap();

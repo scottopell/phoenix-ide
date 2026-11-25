@@ -688,10 +688,10 @@ async fn prepare_case(
     let home = root.join(id);
     std::fs::create_dir(&home).unwrap();
     phoenix_skills::builtin::extract_to(&home.join("skills")).unwrap();
-    let db = crate::db::Database::open(home.join("working.sqlite").to_str().unwrap())
-        .await
-        .unwrap();
-    phoenix_db::run_pending_migrations(db.pool()).await.unwrap();
+    let db =
+        crate::db::Database::open_migrated_for_test(home.join("working.sqlite").to_str().unwrap())
+            .await
+            .unwrap();
     db.initialize_coordinator_work_scope(home.to_str().unwrap())
         .await
         .unwrap();
@@ -1373,10 +1373,11 @@ async fn foreground_memory_qualification() {
 async fn foreground_question_reply_uses_real_protocol_and_file_reads() {
     let home = tempfile::tempdir().unwrap();
     phoenix_skills::builtin::extract_to(&home.path().join("skills")).unwrap();
-    let db = crate::db::Database::open(home.path().join("fixture.sqlite").to_str().unwrap())
-        .await
-        .unwrap();
-    phoenix_db::run_pending_migrations(db.pool()).await.unwrap();
+    let db = crate::db::Database::open_migrated_for_test(
+        home.path().join("fixture.sqlite").to_str().unwrap(),
+    )
+    .await
+    .unwrap();
     db.initialize_coordinator_work_scope(home.path().to_str().unwrap())
         .await
         .unwrap();

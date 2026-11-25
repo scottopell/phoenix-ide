@@ -2360,8 +2360,9 @@ mod tests {
     async fn live_parent_reconcile_unknown_read_retains_committed_sqlite_action() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("parent-action.db");
-        let db = Database::open(path.to_str().unwrap()).await.unwrap();
-        migrations::run_pending_migrations(db.pool()).await.unwrap();
+        let db = Database::open_migrated_for_test(path.to_str().unwrap())
+            .await
+            .unwrap();
         reconcile_parent(&db, "parent", true).await;
         assert!(matches!(
             db.establish_live_parent_reconcile_action_with_cut(
@@ -2615,8 +2616,7 @@ mod tests {
     async fn open_pair(name: &str) -> (tempfile::TempDir, Database, Database) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(name);
-        let first = Database::open(path.to_str().unwrap()).await.unwrap();
-        migrations::run_pending_migrations(first.pool())
+        let first = Database::open_migrated_for_test(path.to_str().unwrap())
             .await
             .unwrap();
         let second = Database::open(path.to_str().unwrap()).await.unwrap();

@@ -39,10 +39,10 @@ impl Fixture {
         let root = tempfile::tempdir().unwrap();
         let runtime_env = PhoenixRuntimeEnvironment::with_root(root.path());
         std::fs::create_dir_all(runtime_env.data_dir()).unwrap();
-        let db = phoenix_db::Database::open(runtime_env.db_path().to_str().unwrap())
-            .await
-            .unwrap();
-        phoenix_db::run_pending_migrations(db.pool()).await.unwrap();
+        let db =
+            phoenix_db::Database::open_migrated_for_test(runtime_env.db_path().to_str().unwrap())
+                .await
+                .unwrap();
         let coordinator = db
             .get_or_create_coordinator(None, LANGUAGE)
             .await

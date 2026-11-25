@@ -2192,8 +2192,7 @@ mod tests {
     async fn prune_orphans_survives_concurrent_wal_write() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("prune-wal.db");
-        let db = Database::open(path.to_str().unwrap()).await.unwrap();
-        crate::migrations::run_pending_migrations(db.pool())
+        let db = Database::open_migrated_for_test(path.to_str().unwrap())
             .await
             .unwrap();
         db.create_conversation("c-a", "a", "/tmp/a", true, None, None)
@@ -2409,8 +2408,7 @@ mod tests {
     async fn stale_reconcile_plan_cannot_overwrite_fresh_source_index() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("retrieval-stale-plan.db");
-        let db = Database::open(path.to_str().unwrap()).await.unwrap();
-        crate::migrations::run_pending_migrations(db.pool())
+        let db = Database::open_migrated_for_test(path.to_str().unwrap())
             .await
             .unwrap();
         db.create_conversation("c-a", "a", "/tmp/a", true, None, None)

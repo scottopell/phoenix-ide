@@ -34,11 +34,7 @@ async fn active_enrollment_id(db: &Database, caller: InstanceId) -> Uuid {
 }
 
 async fn open_migrated(path: &str) -> Database {
-    let db = Database::open(path).await.unwrap();
-    crate::migrations::run_pending_migrations(db.pool())
-        .await
-        .unwrap();
-    db
+    Database::open_migrated_for_test(path).await.unwrap()
 }
 struct Fixture {
     db: Database,

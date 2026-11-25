@@ -9115,8 +9115,7 @@ mod tests {
     async fn concurrent_begin_returns_domain_conflict_after_immediate_lock() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("close-race.db");
-        let db = Database::open(path.to_str().unwrap()).await.unwrap();
-        crate::migrations::run_pending_migrations(db.pool())
+        let db = Database::open_migrated_for_test(path.to_str().unwrap())
             .await
             .unwrap();
         create_root(&db, "race-root").await;
@@ -10508,8 +10507,7 @@ mod tests {
     async fn unresolved_worktree_routes_from_inspection_directly_to_repair() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("repair-projection-reload.db");
-        let db = Database::open(path.to_str().unwrap()).await.unwrap();
-        crate::migrations::run_pending_migrations(db.pool())
+        let db = Database::open_migrated_for_test(path.to_str().unwrap())
             .await
             .unwrap();
         create_root(&db, "root").await;
@@ -12801,8 +12799,7 @@ mod tests {
     async fn concurrent_identical_retirement_inventory_is_idempotent() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("inventory-race.db");
-        let db = Database::open(path.to_str().unwrap()).await.unwrap();
-        crate::migrations::run_pending_migrations(db.pool())
+        let db = Database::open_migrated_for_test(path.to_str().unwrap())
             .await
             .unwrap();
         create_root(&db, "root").await;

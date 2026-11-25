@@ -7966,8 +7966,9 @@ mod tests {
     async fn restarted_worker_discovers_accepted_subordinate_direct_turn() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("subordinate-recovery.db");
-        let db = Database::open(path.to_str().unwrap()).await.unwrap();
-        run_pending_migrations(db.pool()).await.unwrap();
+        let db = Database::open_migrated_for_test(path.to_str().unwrap())
+            .await
+            .unwrap();
         db.create_conversation("conv-a", "A", "/tmp", true, None, None)
             .await
             .unwrap();
@@ -8767,8 +8768,9 @@ mod tests {
         };
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("remote-turns.db");
-        let db = Database::open(path.to_str().unwrap()).await.unwrap();
-        run_pending_migrations(db.pool()).await.unwrap();
+        let db = Database::open_migrated_for_test(path.to_str().unwrap())
+            .await
+            .unwrap();
         let instance_id = InstanceId::new();
         sqlx::query(
             "INSERT INTO federation_peer_connections (peer_instance_id, peer_display_name, domain_or_ipv4_host, port, bearer_credential, created_at_us)

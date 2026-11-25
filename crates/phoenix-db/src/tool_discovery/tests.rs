@@ -422,8 +422,9 @@ async fn discovery_selection_survives_reopen_and_immutable_replay_but_not_schema
 {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("discovery.db");
-    let db = Database::open(path.to_str().unwrap()).await.unwrap();
-    crate::run_pending_migrations(db.pool()).await.unwrap();
+    let db = Database::open_migrated_for_test(path.to_str().unwrap())
+        .await
+        .unwrap();
     create(&db).await;
     prepare(&db, 1, None, &[], ToolDiscoveryMode::Local).await;
     let (assistant, results) = successful_round(&db, "issues").await;

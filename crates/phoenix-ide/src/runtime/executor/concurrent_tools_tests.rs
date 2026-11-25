@@ -1215,10 +1215,11 @@ async fn lost_batch_task_settles_one_exact_error_without_cancelling_its_sibling(
 }
 
 async fn sqlite_batch_database(directory: &std::path::Path) -> crate::db::Database {
-    let db = crate::db::Database::open(directory.join("batch-commit.db").to_str().unwrap())
-        .await
-        .unwrap();
-    crate::db::run_pending_migrations(db.pool()).await.unwrap();
+    let db = crate::db::Database::open_migrated_for_test(
+        directory.join("batch-commit.db").to_str().unwrap(),
+    )
+    .await
+    .unwrap();
     db.create_conversation(
         "ordinary-batch",
         "ordinary-batch",
