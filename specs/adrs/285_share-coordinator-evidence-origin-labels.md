@@ -1,4 +1,4 @@
-# ADR-283: Share Coordinator evidence origin labels
+# ADR-285: Share Coordinator evidence origin labels
 
 - **Status:** Accepted
 - **Date:** 2026-11-24

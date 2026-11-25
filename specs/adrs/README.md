@@ -44,7 +44,6 @@ Allowing gaps does not approve an ID allocation, decision, or publication.
 
 | ADR | Title | Status | Affects |
 | --- | --- | --- | --- |
-| [283](283_share-coordinator-evidence-origin-labels.md) | Share Coordinator evidence origin labels | Accepted | REQ-SCAN-004, REQ-TRACK-005 |
 | [282](282_cap-quoted-review-lines-at-a-character-boundary.md) | Cap quoted review lines at 200 UTF-16 units on a character boundary | Accepted | REQ-PF-009, REQ-PF-016 |
 | [274](274_remove-at-file-inclusion.md) | Remove `@file` content inclusion and leave `@` literal | Accepted | REQ-IR-001, REQ-IR-004, REQ-IR-006, REQ-IR-007, REQ-IR-010, REQ-FE-011 |
 | [273](273_fixed-rc9-preparation-without-publication-authority.md) | Fixed RC9 preparation without publication authority | Accepted | REQ-DESKTOP-REL-014 |
@@ -60,6 +59,8 @@ Allowing gaps does not approve an ID allocation, decision, or publication.
 | [269](269_external-models-in-user-toml.md) | Load external model definitions from user TOML at startup | Accepted | REQ-LLM-003c, REQ-AG-010 |
 | [283](283_run-ordinary-foreground-tool-batches-with-a-bounded-barrier.md) | Run ordinary foreground tool batches with a bounded barrier | Accepted | REQ-BED-003–007, REQ-PERM-004, REQ-SA-005 |
 | [284](284_raise-ordinary-foreground-window-to-eight.md) | Raise the ordinary foreground window to eight | Accepted | REQ-BED-004, REQ-SA-005 |
+| [285](285_share-coordinator-evidence-origin-labels.md) | Share Coordinator evidence origin labels | Accepted | REQ-SCAN-004, REQ-TRACK-005 |
+
 | [264](264_scan-only-coordinator-history-with-host-owned-batches.md) | Scan only Coordinator history through bounded host-owned batches | Accepted | REQ-SCAN-001–008, REQ-TRACK-004–007 |
 | [263](263_verify-native-backup-and-bound-predecessor-recovery-for-macos-deploy.md) | Verify a native backup and bound predecessor recovery for macOS deploy | Accepted; qualifies ADR-230 | REQ-LDD-002/004/009/029–031, REQ-PD-010, REQ-COMP-021 |
 | [265](265_publish-recovered-launchd-plist-before-canonical-bootstrap.md) | Preserve SQLite path and recovered launchd plist identity | Accepted; qualifies ADR-263 | REQ-LDD-029–030 |
