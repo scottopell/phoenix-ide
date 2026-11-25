@@ -116,8 +116,8 @@ export function MetaViewerFixture({ scenario }: Props) {
             />
           ) : (
             <>
-              {scenario.seedNotes && scenario.payload && (
-                <SeedReviewNotes notes={scenario.seedNotes} absolutePath={scenario.payload.absolutePath} />
+              {scenario.seedNotes && scenario.payload && scenario.payload.source.kind === 'file' && (
+                <SeedReviewNotes notes={scenario.seedNotes} absolutePath={scenario.payload.source.absolutePath} />
               )}
               <MetaViewer payload={scenario.payload!} />
             </>
