@@ -103,8 +103,9 @@ async fn local_and_native_client_search_load_then_execute_and_survive_reopen() {
     for mode in [ToolDiscoveryMode::Local, ToolDiscoveryMode::OpenAiClient] {
         let directory = tempfile::TempDir::new().unwrap();
         let path = directory.path().join("discovery.db");
-        let db = Database::open(path.to_str().unwrap()).await.unwrap();
-        phoenix_db::run_pending_migrations(db.pool()).await.unwrap();
+        let db = Database::open_migrated_for_test(path.to_str().unwrap())
+            .await
+            .unwrap();
         let client = Arc::new(DiscoveryClient {
             inner: MockLlmClient::new("gpt-6.2-sol"),
             mode,

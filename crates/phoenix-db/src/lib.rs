@@ -38,6 +38,7 @@ pub use coordinator_watches::{
 };
 pub use federation_peers::FederationPeerConnection;
 mod ddl;
+mod in_memory_template;
 mod reminders;
 mod request_capacity;
 pub use reminders::{
@@ -3685,31 +3686,19 @@ impl Database {
     /// Returns a [`DbError`] if the underlying database operation fails.
     #[allow(dead_code)] // Used in tests
     pub async fn open_in_memory() -> DbResult<Self> {
-        let opts = SqliteConnectOptions::from_str("sqlite::memory:")?
-            .journal_mode(SqliteJournalMode::Wal)
-            .synchronous(SqliteSynchronous::Normal)
-            .busy_timeout(std::time::Duration::from_secs(5))
-            .foreign_keys(true);
-        // In-memory SQLite DBs are per-connection, so limit to 1 connection
-        let sqlite_workload_collector = SqliteWorkloadCollector::new();
-        let pool = SqlitePoolOptions::new()
-            .max_connections(1)
-            .after_connect({
-                let sqlite_workload_collector = sqlite_workload_collector.clone();
-                move |conn, _meta| {
-                    let sqlite_workload_collector = sqlite_workload_collector.clone();
-                    Box::pin(async move {
-                        install_native_statement_baseline(conn, sqlite_workload_collector).await
-                    })
-                }
-            })
-            .connect_with(opts)
-            .await?;
-        let db =
-            Self::new_with_generated_target_binding(pool, String::new(), sqlite_workload_collector);
-        db.run_migrations().await?;
-        migrations::run_pending_migrations(&db.pool).await?;
-        Ok(db)
+        in_memory_template::open_in_memory_from_template().await
+    }
+
+    /// Open a brand-new file-backed database for tests using the cached migrated
+    /// template, falling back to full migration when `path` already exists or
+    /// `PHOENIX_DB_DISABLE_MEM_TEMPLATE=1` is set.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] if seeding or opening the database fails.
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn open_migrated_for_test(path: &str) -> DbResult<Self> {
+        in_memory_template::open_migrated_for_test(path).await
     }
 
     async fn run_migrations(&self) -> DbResult<()> {

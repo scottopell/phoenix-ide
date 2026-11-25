@@ -184,8 +184,7 @@ async fn source(db: &Database, name: &str) -> crate::Conversation {
 }
 
 async fn file_db(path: &str) -> Database {
-    let db = Database::open(path).await.unwrap();
-    crate::run_pending_migrations(db.pool()).await.unwrap();
+    let db = Database::open_migrated_for_test(path).await.unwrap();
     db
 }
 

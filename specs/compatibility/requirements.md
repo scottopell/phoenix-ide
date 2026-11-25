@@ -124,7 +124,7 @@ THE SYSTEM SHALL reject any payload whose fingerprint matches neither its curren
 ### REQ-COMP-008 — Qualified Compiler-Cache Compatibility
 
 WHEN Phoenix automatically selects a compiler cache
-THE SYSTEM SHALL prefer exact Kache `1.2.2` on macOS arm64 when its owned local daemon becomes ready
+THE SYSTEM SHALL prefer exact Kache `1.2.2` on macOS arm64 or Linux x86_64 when its owned local daemon becomes ready
 AND SHALL otherwise select an sccache executable that passes its version probe or no compiler cache
 AND SHALL report the fallback reason and backend actually selected
 
@@ -135,7 +135,7 @@ AND SHALL state that Kache runtime readiness is evaluated only when a Cargo comm
 AND SHALL report an unusable backend explicitly selected through `PHOENIX_COMPILER_CACHE` as an actionable configuration failure while preserving an explicit `RUSTC_WRAPPER`
 
 WHEN Phoenix selects Kache explicitly or automatically
-THE SYSTEM SHALL require a macOS arm64 host and an executable reporting exactly `kache 1.2.2`
+THE SYSTEM SHALL require a macOS arm64 or Linux x86_64 host and an executable reporting exactly `kache 1.2.2`
 AND SHALL generate and explicitly set both `KACHE_CONFIG` and `KACHE_HOST_CONFIG` to Phoenix-owned configuration
 AND SHALL set `[cache] local_only = true` and `ignore_env = true` with explicit Phoenix-owned `local_store` and `runtime_dir`
 AND SHALL NOT configure or activate remote caching, planners, or volumes through Phoenix-managed Kache

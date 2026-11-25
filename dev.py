@@ -5023,8 +5023,9 @@ def _is_valid_git_config_key(key):
 def _append_git_config_override(key, value, environ=None):
     """Append a complete process-level Git config entry, resetting malformed input."""
     env = os.environ if environ is None else environ
-    parameters = env.get("GIT_CONFIG_PARAMETERS", "").strip()
-    env["GIT_CONFIG_PARAMETERS"] = f"{parameters} 'commit.gpgsign=false'".strip()
+    if (key == "commit.gpgsign" and value == "false") or key == "core.hooksPath":
+        parameters = env.get("GIT_CONFIG_PARAMETERS", "").strip()
+        env["GIT_CONFIG_PARAMETERS"] = f"{parameters} '{key}={value}'".strip()
     try:
         count = int(env.get("GIT_CONFIG_COUNT", "0"))
         if count < 0:
@@ -5048,6 +5049,39 @@ def _append_git_config_override(key, value, environ=None):
         env["GIT_CONFIG_COUNT"] = str(count + 1)
     else:
         env["GIT_CONFIG_COUNT"] = str(count)
+
+
+def _snapshot_build_git_identity(repo_root: Path = ROOT) -> tuple[str, str] | None:
+    """Probe exact repo-wide git SHA and dirty status once for non-release check builds."""
+    if not (repo_root / ".git").exists():
+        return None
+    sha = "unknown"
+    dirty = "unknown"
+    try:
+        rev = subprocess.run(
+            ["git", "--no-optional-locks", "rev-parse", "--verify", "HEAD^{commit}"],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        candidate = rev.stdout.strip() if isinstance(rev.stdout, str) else ""
+        if rev.returncode == 0 and len(candidate) == 40 and all(c in "0123456789abcdef" for c in candidate):
+            sha = candidate
+        status = subprocess.run(
+            ["git", "--no-optional-locks", "status", "--porcelain=v1", "--untracked-files=normal"],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        if status.returncode == 0 and isinstance(status.stdout, str):
+            dirty = "dirty" if status.stdout.strip() else "clean"
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return sha, dirty
 
 
 _COMPILER_CACHE_BACKENDS = ("auto", "kache", "sccache", "none")
@@ -5885,11 +5919,15 @@ def _usable_sccache(binary: str | None) -> tuple[str | None, str | None]:
     return version, None
 
 
+_QUALIFIED_KACHE_HOSTS = (("darwin", "arm64"), ("linux", "x86_64"))
+
+
 def _kache_host_error() -> str | None:
     machine = platform.machine().lower()
-    if sys.platform == "darwin" and machine == "arm64":
+    if (sys.platform, machine) in _QUALIFIED_KACHE_HOSTS:
         return None
-    return f"unsupported host {sys.platform}/{machine}; qualified host is darwin/arm64"
+    qualified = ", ".join(f"{os_name}/{arch}" for os_name, arch in _QUALIFIED_KACHE_HOSTS)
+    return f"unsupported host {sys.platform}/{machine}; qualified hosts are {qualified}"
 
 
 def _restore_environment_prefix(prefix: str, original: dict[str, str]) -> None:
@@ -6054,7 +6092,18 @@ def _command_uses_compiler_cache(command: list[str]) -> bool:
         ]
         and command[4:] in allowed_suffixes
     )
-    return direct_devpy or profiled_devpy
+    parallel_devpy = (
+        len(command) >= 4
+        and command[:3]
+        == [
+            sys.executable,
+            str(ROOT / "scripts" / "run_devpy_tests.py"),
+            "--workers",
+        ]
+        and command[3].isdigit()
+        and command[4:] in allowed_suffixes
+    )
+    return direct_devpy or profiled_devpy or parallel_devpy
 
 
 def _parse_cache_size(value: str) -> int:
@@ -7591,7 +7640,7 @@ def cmd_check(
             finish_profile(0)
 
     def check_devpy():
-        unittest_cmd = [sys.executable, "-m", "unittest", "discover", "tests/devpy"]
+        diagnostic_dir = os.environ.get("PHOENIX_CHECK_DIAGNOSTIC_DIR")
         if profile_work and _CHECK_PROFILE is not None:
             unittest_cmd = [
                 sys.executable,
@@ -7599,7 +7648,16 @@ def cmd_check(
                 "discover",
                 "tests/devpy",
             ]
-        if os.environ.get("PHOENIX_CHECK_DIAGNOSTIC_DIR"):
+        elif not diagnostic_dir and worker_budget > 1:
+            unittest_cmd = [
+                sys.executable,
+                str(ROOT / "scripts" / "run_devpy_tests.py"),
+                "--workers",
+                str(worker_budget),
+            ]
+        else:
+            unittest_cmd = [sys.executable, "-m", "unittest", "discover", "tests/devpy"]
+        if diagnostic_dir:
             unittest_cmd.append("-v")
         run_step("dev.py unit tests", unittest_cmd, timeout=DEVPY_TEST_TIMEOUT)
 
@@ -7644,11 +7702,21 @@ def cmd_check(
     if cargo_active:
         _classify_browser_env()
 
-        # Tests create temporary commits and must never consult an interactive
-        # signing agent. Add a process-only override without probing the signer
-        # or modifying any Git config file. Append so caller-provided config
-        # entries remain intact while this final entry takes precedence.
+        # Tests create temporary commits and checkouts and must never consult
+        # an interactive signing agent or host-global git hooks. Add
+        # process-only overrides without modifying any Git config file. Append
+        # so caller-provided config entries remain intact while these final
+        # entries take precedence.
         _append_git_config_override("commit.gpgsign", "false")
+        _append_git_config_override("core.hooksPath", os.devnull)
+
+        # Snapshot exact repo-wide git identity once before running check's
+        # multiple Cargo invocations so build.rs does not force redundant
+        # phoenix-db / phoenix_ide recompiles between steps while remaining
+        # exact across any unstaged or untracked change between check runs.
+        build_git_identity = _snapshot_build_git_identity(ROOT)
+        if build_git_identity is not None:
+            os.environ["PHOENIX_BUILD_GIT_SHA"], os.environ["PHOENIX_BUILD_GIT_DIRTY"] = build_git_identity
 
     # nextest probe, thread sizing, and codegen command shapes are rust-only.
     if "rust" in active:

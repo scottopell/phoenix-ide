@@ -11,8 +11,8 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",
-    "lint": "eslint . --ext ts,tsx --report-unused-disable-directives --max-warnings 0",
-    "lint:css": "stylelint \"src/**/*.css\"",
+    "lint": "eslint . --ext ts,tsx --report-unused-disable-directives --max-warnings 0 --cache --cache-strategy content --cache-location node_modules/.cache/eslint/.eslintcache",
+    "lint:css": "stylelint \"src/**/*.css\" --cache --cache-strategy content --cache-location node_modules/.cache/stylelint/.stylelintcache",
     "lint:css:fix": "stylelint --fix \"src/**/*.css\"",
     "typecheck": "tsc -b --noEmit",
     "preview": "vite preview",

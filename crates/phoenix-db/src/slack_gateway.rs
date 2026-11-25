@@ -1689,8 +1689,7 @@ mod tests {
     async fn unsent_thread_replies_exhaust_their_bound_across_restart() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("reply.db");
-        let mut db = Database::open(path.to_str().unwrap()).await.unwrap();
-        crate::migrations::run_pending_migrations(db.pool())
+        let mut db = Database::open_migrated_for_test(path.to_str().unwrap())
             .await
             .unwrap();
         let source = source("100.000", SlackRequestKind::Explicit);
@@ -1811,8 +1810,7 @@ mod tests {
         ] {
             let directory = tempfile::tempdir().unwrap();
             let path = directory.path().join("once.db");
-            let db = Database::open(path.to_str().unwrap()).await.unwrap();
-            crate::migrations::run_pending_migrations(db.pool())
+            let db = Database::open_migrated_for_test(path.to_str().unwrap())
                 .await
                 .unwrap();
             let source = source("100.000", SlackRequestKind::Briefing);
@@ -3457,8 +3455,7 @@ mod tests {
         // REQ-SG-020: accepted work survives settings changes and restart.
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("channel.db");
-        let mut db = Database::open(path.to_str().unwrap()).await.unwrap();
-        crate::migrations::run_pending_migrations(db.pool())
+        let mut db = Database::open_migrated_for_test(path.to_str().unwrap())
             .await
             .unwrap();
         let config = serde_json::json!({"enabled":true,"owner":"UOWNER","workspace":"example.slack.com","timezone":"UTC","inbox_channel":"CCHANNEL"});

@@ -313,7 +313,7 @@ async fn capture_occurrence(
 impl World {
     async fn new(case: &Case, models: Arc<ModelRegistry>) -> Self {
         let database_dir = tempfile::tempdir().unwrap();
-        let db = Database::open(
+        let db = Database::open_migrated_for_test(
             database_dir
                 .path()
                 .join("event-eval.sqlite")
@@ -322,7 +322,6 @@ impl World {
         )
         .await
         .unwrap();
-        phoenix_db::run_pending_migrations(db.pool()).await.unwrap();
         let coordinator = db
             .get_or_create_coordinator(None, LlmLanguage::default())
             .await

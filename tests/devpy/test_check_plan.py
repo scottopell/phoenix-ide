@@ -94,6 +94,45 @@ class CheckPlanTests(unittest.TestCase):
         )
         self.assertEqual("0", env["GIT_CONFIG_COUNT"])
 
+    def test_git_config_override_appends_hookspath_without_duplicating_gpgsign(self):
+        env = {"GIT_CONFIG_PARAMETERS": "'core.hooksPath=/host/hooks'"}
+        self.dev._append_git_config_override("commit.gpgsign", "false", env)
+        self.dev._append_git_config_override("core.hooksPath", os.devnull, env)
+
+        self.assertEqual(
+            f"'core.hooksPath=/host/hooks' 'commit.gpgsign=false' 'core.hooksPath={os.devnull}'",
+            env["GIT_CONFIG_PARAMETERS"],
+        )
+        self.assertEqual("1", env["GIT_CONFIG_COUNT"])
+        self.assertEqual("core.hooksPath", env["GIT_CONFIG_KEY_0"])
+        self.assertEqual(os.devnull, env["GIT_CONFIG_VALUE_0"])
+
+    def test_snapshot_build_git_identity_detects_clean_and_untracked_dirty(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            env = {
+                "GIT_CONFIG_GLOBAL": os.devnull,
+                "GIT_CONFIG_SYSTEM": os.devnull,
+                "GIT_CONFIG_NOSYSTEM": "1",
+                "GIT_AUTHOR_NAME": "test",
+                "GIT_AUTHOR_EMAIL": "test@example.com",
+                "GIT_COMMITTER_NAME": "test",
+                "GIT_COMMITTER_EMAIL": "test@example.com",
+                "PATH": os.environ.get("PATH", ""),
+            }
+            subprocess.run(["git", "init", "-q"], cwd=repo, env=env, check=True)
+            (repo / "a.txt").write_text("hello\n")
+            subprocess.run(["git", "add", "a.txt"], cwd=repo, env=env, check=True)
+            subprocess.run(["git", "-c", "commit.gpgsign=false", "commit", "-qm", "init"], cwd=repo, env=env, check=True)
+            sha, dirty = self.dev._snapshot_build_git_identity(repo)
+            self.assertEqual(40, len(sha))
+            self.assertEqual("clean", dirty)
+
+            (repo / "untracked.txt").write_text("dirty\n")
+            sha2, dirty2 = self.dev._snapshot_build_git_identity(repo)
+            self.assertEqual(sha, sha2)
+            self.assertEqual("dirty", dirty2)
+
     def test_git_config_override_resets_malformed_inherited_entries(self):
         for malformed in (
             {"GIT_CONFIG_COUNT": "wat", "GIT_CONFIG_KEY_9": "stale"},
