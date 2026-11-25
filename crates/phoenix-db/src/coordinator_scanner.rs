@@ -3,6 +3,8 @@ use crate::coordinator_tracking::{TrackingKind, TrackingRetirement};
 use phoenix_core::domain::db_schema::InputOrigin;
 use serde::{Deserialize, Serialize};
 
+pub use phoenix_core::domain::db_schema::InputOriginKind as ScanOriginKind;
+
 mod apply;
 mod source;
 mod storage;
@@ -298,20 +300,6 @@ pub struct ScanCoveragePage {
 #[cfg(test)]
 mod tests;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ScanOriginKind {
-    UnknownHistorical,
-    UserApi,
-    InternalConversation,
-    SystemGenerated,
-    SlackGateway,
-    RemoteApi,
-    RemoteConversation,
-    RemoteCoordinator,
-    SubscriptionEvent,
-    ScheduledReminder,
-}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScanEvidenceProvenance {
     pub evidence_ordinal: i64,

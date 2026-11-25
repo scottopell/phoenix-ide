@@ -28,6 +28,8 @@ List/detail results SHALL identify captured registry/item revisions, counts, omi
 
 The writer SHALL reject saved data that cannot be fully inspected through supported reads. Complete serialized detail results SHALL remain below the executor's tool-output clipping limit, preserving valid JSON, lossless accepted notes and honest child pagination even with escaped text.
 
+WHEN reading scanner evidence provenance in tracking detail, THE SYSTEM SHALL return recognized origin labels unchanged. For an unrecognized stored label, it SHALL log the mismatch and return `unknown_historical` for that evidence's origin label without failing the page, dropping the evidence or changing the stored row. The fallback SHALL represent untrusted provenance for display only; it SHALL NOT change review state, source classification or execution authority.
+
 The conversation UI SHALL present recognized system-generated saved tracking observations as compact, collapsed-by-default historical snapshot cards with captured counts and optional captured review topics. Structured historical details, original safety language and raw payload SHALL remain available on deliberate expansion, and copy SHALL preserve the original message. Navigation labels SHALL remain compact while retaining exact message targets. Recognition SHALL require authoritative system-generated origin and a supported valid observation payload; copied ordinary user text, malformed observations and unknown system inputs SHALL retain their generic presentation. The presentation SHALL NOT change stored or model-delivered content, imply live worker state or user approval, or change tracking/scanner execution semantics.
 
 ### REQ-TRACK-006: Prefix-preserving continuity

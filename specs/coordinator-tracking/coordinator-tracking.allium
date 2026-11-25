@@ -92,6 +92,13 @@ entity TrackingObservation {
         -- with explicit continuation cursors, and serialize within 96 KiB. The
         -- writer rejects encoded metadata/evidence/reasons that cannot fit the
         -- lossless read contract; executor text clipping never supplies pagination.
+
+    @invariant ScannerOriginDisplayIsNotAuthority
+        -- REQ-TRACK-005: On tracking detail reads, recognize scanner provenance
+        -- labels with the shared InputOriginKind projection. Preserve known labels.
+        -- Log an unrecognized stored label and return unknown_historical as
+        -- untrusted display metadata. Return the rest of the evidence as usual;
+        -- do not rewrite the row, reclassify the source, alter review or grant authority.
 }
 
 config {
@@ -126,7 +133,7 @@ rule AppendNovelEvidence {
     @guidance
         -- New observations append ordered immutable source evidence. Exact duplicate
         -- source+quotation digest is a no-op and cannot manufacture review work.
-        -- Scanner application later shares this evidence path, not trusted native
+        -- Scanner application shares this evidence path, not trusted native
         -- call authority. It cannot overwrite prose or advance the reviewed watermark.
 }
 

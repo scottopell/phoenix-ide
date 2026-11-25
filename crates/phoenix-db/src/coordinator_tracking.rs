@@ -3,7 +3,10 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::{Connection, Row, Sqlite, Transaction};
 
-use crate::{workflow::LocalAuthorityResult, Database, DbError, DbResult};
+use crate::{
+    coordinator_scanner::ScanOriginKind, workflow::LocalAuthorityResult, Database, DbError,
+    DbResult,
+};
 
 pub const TRACKING_PAGE_SIZE: usize = 8;
 pub const TRACKING_REVIEW_INTERVAL_US: i64 = 86_400_000_000;
@@ -956,9 +959,15 @@ impl Database {
         let mut page_scanner_evidence_provenance = Vec::new();
         for (ordinal, _) in &evidence {
             if let Some(row)=sqlx::query("SELECT * FROM coordinator_scan_evidence_origins WHERE item_id=?1 AND evidence_ordinal=?2").bind(id).bind(ordinal).fetch_optional(&mut *tx).await?{
+                let label: String = row.try_get("origin_kind")?;
+                let origin_kind = ScanOriginKind::from_label(&label).unwrap_or_else(|| {
+                    tracing::warn!(item_id = id, evidence_ordinal = ordinal,
+                        "unrecognized scanner evidence origin; presenting as unknown historical");
+                    ScanOriginKind::UnknownHistorical
+                });
                 page_scanner_evidence_provenance.push(crate::coordinator_scanner::ScanEvidenceProvenance {
                     evidence_ordinal:*ordinal,
-                    origin_kind:serde_json::from_value(serde_json::Value::String(row.try_get("origin_kind")?)).map_err(|e|invalid(&e.to_string()))?,
+                    origin_kind,
                     source_role:serde_json::from_value(serde_json::Value::String(row.try_get("source_role")?)).map_err(|e|invalid(&e.to_string()))?,
                     source_generation:row.try_get("source_generation")?,utf8_start:row.try_get("utf8_start")?,utf8_end:row.try_get("utf8_end")?
                 });

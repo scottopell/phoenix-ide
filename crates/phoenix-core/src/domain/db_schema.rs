@@ -1730,6 +1730,51 @@ pub enum InputOrigin {
     CoordinatorQuestionReply,
 }
 
+macro_rules! input_origin_kinds {
+    ($($variant:ident $({ $rest:tt })? => $label:literal),+ $(,)?) => {
+        /// Payload-free classification of an input, not proof of admission or authority.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+        pub enum InputOriginKind {
+            $(#[serde(rename = $label)] $variant,)+
+        }
+
+        impl InputOriginKind {
+            pub const ALL: &'static [Self] = &[$(Self::$variant,)+];
+
+            #[must_use]
+            pub const fn as_str(self) -> &'static str {
+                match self { $(Self::$variant => $label,)+ }
+            }
+
+            #[must_use]
+            pub fn from_label(label: &str) -> Option<Self> {
+                match label { $($label => Some(Self::$variant),)+ _ => None }
+            }
+        }
+
+        impl InputOrigin {
+            #[must_use]
+            pub const fn kind(&self) -> InputOriginKind {
+                match self { $(Self::$variant $({ $rest })? => InputOriginKind::$variant,)+ }
+            }
+        }
+    };
+}
+
+input_origin_kinds! {
+    UnknownHistorical => "unknown_historical",
+    UserApi => "user_api",
+    InternalConversation { .. } => "internal_conversation",
+    SystemGenerated => "system_generated",
+    SlackGateway { .. } => "slack_gateway",
+    RemoteApi { .. } => "remote_api",
+    RemoteConversation { .. } => "remote_conversation",
+    RemoteCoordinator { .. } => "remote_coordinator",
+    SubscriptionEvent { .. } => "subscription_event",
+    ScheduledReminder { .. } => "scheduled_reminder",
+    CoordinatorQuestionReply => "coordinator_question_reply",
+}
+
 const COORDINATOR_QUESTION_REPLY_PREFIX: &str = "coordinator-question-reply:";
 
 /// The message id that delivers the reply to question `request_id`.
@@ -1828,61 +1873,44 @@ impl InputOrigin {
         Option<&str>,
         Option<String>,
     ) {
-        match self {
-            Self::UnknownHistorical => ("unknown_historical", None, None, None, None),
-            Self::UserApi => ("user_api", None, None, None, None),
+        let (product, transcript, event, instance) = match self {
+            Self::UnknownHistorical
+            | Self::UserApi
+            | Self::SystemGenerated
+            | Self::SlackGateway { .. }
+            | Self::ScheduledReminder { .. }
+            | Self::CoordinatorQuestionReply => (None, None, None, None),
             Self::InternalConversation {
                 product_conversation_id,
                 transcript_id,
                 ..
             } => (
-                "internal_conversation",
                 Some(product_conversation_id.as_str()),
-                Some(transcript_id),
+                Some(transcript_id.as_str()),
                 None,
                 None,
             ),
-            Self::SystemGenerated => ("system_generated", None, None, None, None),
-            Self::SlackGateway { .. } => ("slack_gateway", None, None, None, None),
-            Self::ScheduledReminder { .. } => ("scheduled_reminder", None, None, None, None),
-            Self::CoordinatorQuestionReply => {
-                ("coordinator_question_reply", None, None, None, None)
-            }
-            Self::SubscriptionEvent { event_id } => {
-                ("subscription_event", None, None, Some(event_id), None)
-            }
-            Self::RemoteApi { instance_id } => (
-                "remote_api",
-                None,
-                None,
-                None,
-                Some(instance_id.to_string()),
-            ),
+            Self::SubscriptionEvent { event_id } => (None, None, Some(event_id.as_str()), None),
+            Self::RemoteApi { instance_id } => (None, None, None, Some(instance_id.to_string())),
             Self::RemoteConversation {
                 instance_id,
                 product_conversation_id,
                 transcript_id,
                 ..
-            } => (
-                "remote_conversation",
-                Some(product_conversation_id.as_str()),
-                Some(transcript_id),
-                None,
-                Some(instance_id.to_string()),
-            ),
-            Self::RemoteCoordinator {
+            }
+            | Self::RemoteCoordinator {
                 instance_id,
                 product_conversation_id,
                 transcript_id,
                 ..
             } => (
-                "remote_coordinator",
                 Some(product_conversation_id.as_str()),
-                Some(transcript_id),
+                Some(transcript_id.as_str()),
                 None,
                 Some(instance_id.to_string()),
             ),
-        }
+        };
+        (self.kind().as_str(), product, transcript, event, instance)
     }
 
     #[must_use]
@@ -2136,6 +2164,36 @@ mod input_origin_tests {
             .into_iter()
             .map(|json| serde_json::from_str(json).unwrap())
             .collect()
+    }
+
+    #[test]
+    fn input_origin_kind_labels_match_every_input_origin() {
+        use super::InputOriginKind;
+
+        let fixtures = fixtures().into_iter().chain([
+            r#"{"kind":"slack_gateway","request_id":"slack-request"}"#,
+            r#"{"kind":"scheduled_reminder","reminder_id":"reminder-1"}"#,
+            r#"{"kind":"coordinator_question_reply"}"#,
+        ]);
+        let mut covered = Vec::new();
+        for fixture in fixtures {
+            let origin: InputOrigin = serde_json::from_str(fixture).unwrap();
+            let serialized = serde_json::to_value(&origin).unwrap();
+            let kind = origin.kind();
+            let label = kind.as_str();
+            assert_eq!(origin.db_parts().0, label);
+            assert_eq!(serialized["kind"], label);
+            let encoded_kind = serde_json::to_value(kind).unwrap();
+            assert_eq!(encoded_kind, label);
+            assert_eq!(
+                serde_json::from_value::<InputOriginKind>(encoded_kind).unwrap(),
+                kind
+            );
+            assert_eq!(InputOriginKind::from_label(label), Some(kind));
+            assert!(!covered.contains(&kind));
+            covered.push(kind);
+        }
+        assert_eq!(covered.len(), InputOriginKind::ALL.len());
     }
 
     #[test]
