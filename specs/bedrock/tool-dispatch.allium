@@ -128,8 +128,9 @@ variant SerialDispatch : ForegroundDispatch {}
 
 variant OrdinaryBatch : ForegroundDispatch {
     source: AssistantSource
-    closing: Boolean
-    cancellation_deadline: Timestamp when closing = true
+    lifecycle: open | closing_before_commit | closing_after_commit
+    closing: lifecycle != open
+    cancellation_deadline: Timestamp when lifecycle = closing_before_commit | closing_after_commit
     owners: BatchCallOwner with batch = this
     retained: owners where phase in { preparing, running, ready, settling, forced_retired }
 }
@@ -271,6 +272,7 @@ rule SubmitOneExactBatchReceipt {
     requires: process_authority.open
     requires: batch_owner_is_current(owner)
     requires: owner.phase = ready
+    requires: owner.batch.lifecycle != closing_before_commit
     ensures: owner.phase = settling
     ensures: ExactBatchReceiptSubmitted(owner, owner.outcome)
 
@@ -323,7 +325,7 @@ rule CancelEveryOrdinaryOwnerBeforePersistenceWait {
     requires: has_ordinary_batch(conversation)
     let batch = ordinary_batch_for(conversation)
     requires: not batch.closing
-    ensures: batch.closing = true
+    ensures: batch.lifecycle = closing_before_commit
     ensures: batch.cancellation_deadline = absolute_cancellation_cutoff(conversation)
     ensures: AvailableTypedReceiptsSnapshottedBeforeSignals(batch)
     ensures: UnissuedAndNoReadProofsConsumedForCancellation(batch)
@@ -344,10 +346,11 @@ rule ObserveCancellationWhileBatchCommitIsIssued {
     requires: process_authority.open
     requires: has_ordinary_batch(conversation)
     let batch = ordinary_batch_for(conversation)
+    requires: batch.lifecycle = open
     ensures: CancellationDeliveryRetained(conversation)
     ensures: AvailableTypedReceiptsSnapshottedBeforeSignals(batch)
     ensures: EveryRunningSiblingSignalled(batch)
-    ensures: batch.closing = true
+    ensures: batch.lifecycle = closing_before_commit
 
     @guidance
         -- Both acknowledged and addressed cancellation use the same concrete
@@ -370,6 +373,17 @@ rule ObserveCancellationWhileBatchCommitIsIssued {
         -- writes too; release it only when that exact batch retires. Scope the
         -- timer to the retained source owner so it cannot retire a successor.
         -- No diagnostic implies Unknown, and no write is automatically retried.
+}
+
+rule CommittedBatchCancellationEnablesReceiptDrain {
+    when: BatchCancellationStateCommitted(batch)
+    requires: batch.lifecycle = closing_before_commit
+    ensures: batch.lifecycle = closing_after_commit
+
+    @guidance
+        -- Only adoption of the owning committed cancelling state enables receipt
+        -- drain. Repeated cancellation keeps this phase and the original cutoff;
+        -- it cannot return the batch to pre-commit closing or reopen admission.
 }
 
 rule RetireEveryRemainingBatchOwnerAtAggregateDeadline {
@@ -1139,6 +1153,19 @@ surface InvocationBoundaryObservations {
         -- is settled before an ordinary invocation exists and starts no tool task.
 }
 
+surface BatchCancellationCommitObservations {
+    facing runtime: ToolRuntime
+    context batch: OrdinaryBatch
+
+    provides:
+        BatchCancellationStateCommitted(batch)
+            when batch.runtime = runtime and batch.lifecycle = closing_before_commit
+
+    @guarantee OwningCommitPrecedesDrain
+        -- This observes adoption of the exact batch's committed cancelling state;
+        -- a pending or rejected write cannot supply the observation.
+}
+
 surface RuntimeAuthorityObservations {
     facing runtime: ToolRuntime
 
@@ -1279,7 +1306,7 @@ surface RuntimeAuthorityObservations {
 -- no_serial_resources_owned(runtime) -> Boolean: no serial preparation/task owns
 --   resources when replacing Serial with OrdinaryBatch.
 -- OrdinaryBatchSelected(runtime, source): select that exclusive disposition and
---   create one batch with closing=false plus affine unissued proofs for each
+--   create one batch with lifecycle=open plus affine unissued proofs for each
 --   canonical unresolved call. Emit BatchRefillRequested for available capacity.
 -- has_unissued_owner(batch) -> Boolean: a source call retains an unissued proof.
 -- first_unissued_owner(batch) -> BatchCallOwner: its first source-ordered proof.
@@ -1325,6 +1352,8 @@ surface RuntimeAuthorityObservations {
 --   this resource fact does not submit a reducer event or a persistence command.
 -- BatchCommitCancellationObserved(conversation): the exact owned cancellation
 --   delivery is received while an ordinary batch write remains issued.
+-- BatchCancellationStateCommitted(batch): the owning cancelling-state write has
+--   committed and the actor adopts that state for this exact batch source.
 -- CancellationDeliveryRetained(conversation): affine process-local request,
 --   acknowledgement/retirement custody and original cutoff retained through the
 --   issued write's classification, then consumed by normal semantic processing.

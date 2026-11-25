@@ -41,8 +41,25 @@ pub(in super::super) struct OrdinaryBatch {
     origin: Arc<AssistantMessage>,
     serial_generation: u64,
     calls: Vec<BatchCall>,
-    closing: bool,
-    cancellation_committed: bool,
+    lifecycle: BatchLifecycle,
+}
+
+enum BatchLifecycle {
+    Open,
+    ClosingBeforeCommit,
+    ClosingAfterCommit,
+}
+
+impl BatchLifecycle {
+    fn begin_closing(&mut self) {
+        if matches!(self, Self::Open) {
+            *self = Self::ClosingBeforeCommit;
+        }
+    }
+
+    fn is_open(&self) -> bool {
+        matches!(self, Self::Open)
+    }
 }
 
 struct BatchCall {
@@ -150,7 +167,7 @@ pub(in super::super) enum ForegroundObservation {
 impl ForegroundDispatch {
     pub(in super::super) fn open_batch_origin(&self) -> Option<Arc<AssistantMessage>> {
         match self {
-            Self::OrdinaryBatch(batch) if !batch.closing => Some(Arc::clone(&batch.origin)),
+            Self::OrdinaryBatch(batch) if batch.lifecycle.is_open() => Some(Arc::clone(&batch.origin)),
             Self::OrdinaryBatch(_) | Self::Serial(_) => None,
         }
     }
@@ -163,7 +180,7 @@ impl ForegroundDispatch {
         let Self::OrdinaryBatch(batch) = self else {
             return;
         };
-        if batch.closing {
+        if !batch.lifecycle.is_open() {
             return;
         }
         let now = tokio::time::Instant::now();
@@ -223,7 +240,7 @@ impl ForegroundDispatch {
     }
 
     pub(in super::super) fn has_open_batch_controls(&self) -> bool {
-        matches!(self, Self::OrdinaryBatch(batch) if !batch.closing)
+        matches!(self, Self::OrdinaryBatch(batch) if batch.lifecycle.is_open())
     }
 
     pub(in super::super) fn abort(&mut self) {
@@ -236,7 +253,7 @@ impl ForegroundDispatch {
                 serial.running = None;
             }
             Self::OrdinaryBatch(batch) => {
-                batch.closing = true;
+                batch.lifecycle.begin_closing();
                 batch.calls.clear();
             }
         }
@@ -246,7 +263,7 @@ impl ForegroundDispatch {
         let Self::OrdinaryBatch(batch) = self else {
             return None;
         };
-        if batch.closing {
+        if !batch.lifecycle.is_open() {
             return None;
         }
         batch
@@ -295,7 +312,7 @@ impl ForegroundDispatch {
 
 impl OrdinaryBatch {
     fn cancel(&mut self) {
-        self.closing = true;
+        self.lifecycle.begin_closing();
         for call in &mut self.calls {
             call.capture_ready();
         }
@@ -323,7 +340,7 @@ impl OrdinaryBatch {
     }
 
     async fn observe(&mut self) -> ForegroundObservation {
-        if self.closing && !self.cancellation_committed {
+        if matches!(self.lifecycle, BatchLifecycle::ClosingBeforeCommit) {
             return std::future::pending().await;
         }
         std::future::poll_fn(|cx| {
@@ -552,8 +569,7 @@ impl<S: Storage + Clone + 'static, L: LlmClient + 'static, T: ToolExecutor + 'st
             origin,
             serial_generation,
             calls,
-            closing: false,
-            cancellation_committed: false,
+            lifecycle: BatchLifecycle::Open,
         });
         self.fill_ordinary_batch();
         Ok(true)
@@ -563,7 +579,7 @@ impl<S: Storage + Clone + 'static, L: LlmClient + 'static, T: ToolExecutor + 'st
         let ForegroundDispatch::OrdinaryBatch(batch) = &self.foreground_dispatch else {
             return;
         };
-        if batch.closing {
+        if !batch.lifecycle.is_open() {
             return;
         }
         let active = batch
@@ -748,7 +764,7 @@ impl<S: Storage + Clone + 'static, L: LlmClient + 'static, T: ToolExecutor + 'st
                         call.phase = CallPhase::NoRead;
                         Err(error)
                     }
-                    PreparationDisposition::Ready(Ok(_)) if batch.closing => {
+                    PreparationDisposition::Ready(Ok(_)) if !batch.lifecycle.is_open() => {
                         call.phase = CallPhase::Settling(None);
                         Ok(Some(Event::ToolAborted {
                             tool_use_id: selection.tool.id.clone(),
@@ -845,7 +861,7 @@ impl<S: Storage + Clone + 'static, L: LlmClient + 'static, T: ToolExecutor + 'st
         }
         if let ForegroundDispatch::OrdinaryBatch(batch) = &mut self.foreground_dispatch {
             if matches!(self.state, ConvState::CancellingTool { .. }) {
-                batch.cancellation_committed = true;
+                batch.lifecycle = BatchLifecycle::ClosingAfterCommit;
             }
             for call in &mut batch.calls {
                 if !call
