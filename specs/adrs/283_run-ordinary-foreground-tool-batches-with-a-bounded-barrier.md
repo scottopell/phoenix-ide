@@ -1,4 +1,4 @@
-# ADR-270: Run ordinary foreground tool batches with a bounded barrier
+# ADR-283: Run ordinary foreground tool batches with a bounded barrier
 
 - **Status:** Accepted
 - **Date:** 2026-11-17

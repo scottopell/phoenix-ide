@@ -6599,8 +6599,8 @@ mod tests {
         assert_eq!(set.response_id, wire["id"].as_str().unwrap());
         assert_eq!(set.model, wire["model"].as_str().unwrap());
         request
-            .responses_replay
-            .push(set.clone().with_owner_message_id("batch-owner".into()));
+            .output_replay
+            .push(set.clone().with_owner_message_id("batch-owner".into()).into());
         let model = wire["model"].as_str().unwrap();
         validate_responses_replay(&request, model).unwrap();
         let mut expected = wire["output"].as_array().unwrap().clone();

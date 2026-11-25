@@ -1270,6 +1270,7 @@ async fn seed_sqlite_tool_policy(db: &crate::db::Database, definitions: &[ToolDe
             .collect(),
         &[],
         &[],
+        phoenix_core::domain::tool_discovery::ToolDiscoveryMode::Eager,
     )
     .await
     .unwrap();
