@@ -1,4 +1,5 @@
 import { defineConfig } from 'vite'
+import { configDefaults } from 'vitest/config'
 import react from '@vitejs/plugin-react'
 
 const profileDir = process.env.PHOENIX_CHECK_PROFILE_DIR
@@ -50,7 +51,7 @@ export default defineConfig({
               name: 'unit',
               pool: 'threads',
               execArgv: ['--no-experimental-webstorage'],
-              exclude: ['**/node_modules/**', 'src/testEnvironment.test.ts'],
+              exclude: [...configDefaults.exclude, 'src/testEnvironment.test.ts'],
             },
           },
           {

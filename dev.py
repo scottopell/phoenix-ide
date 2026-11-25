@@ -5023,9 +5023,9 @@ def _is_valid_git_config_key(key):
 def _append_git_config_override(key, value, environ=None):
     """Append a complete process-level Git config entry, resetting malformed input."""
     env = os.environ if environ is None else environ
-    if key == "commit.gpgsign" and value == "false":
+    if (key == "commit.gpgsign" and value == "false") or key == "core.hooksPath":
         parameters = env.get("GIT_CONFIG_PARAMETERS", "").strip()
-        env["GIT_CONFIG_PARAMETERS"] = f"{parameters} 'commit.gpgsign=false'".strip()
+        env["GIT_CONFIG_PARAMETERS"] = f"{parameters} '{key}={value}'".strip()
     try:
         count = int(env.get("GIT_CONFIG_COUNT", "0"))
         if count < 0:
@@ -5049,6 +5049,39 @@ def _append_git_config_override(key, value, environ=None):
         env["GIT_CONFIG_COUNT"] = str(count + 1)
     else:
         env["GIT_CONFIG_COUNT"] = str(count)
+
+
+def _snapshot_build_git_identity(repo_root: Path = ROOT) -> tuple[str, str] | None:
+    """Probe exact repo-wide git SHA and dirty status once for non-release check builds."""
+    if not (repo_root / ".git").exists():
+        return None
+    sha = "unknown"
+    dirty = "unknown"
+    try:
+        rev = subprocess.run(
+            ["git", "--no-optional-locks", "rev-parse", "--verify", "HEAD^{commit}"],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        candidate = rev.stdout.strip() if isinstance(rev.stdout, str) else ""
+        if rev.returncode == 0 and len(candidate) == 40 and all(c in "0123456789abcdef" for c in candidate):
+            sha = candidate
+        status = subprocess.run(
+            ["git", "--no-optional-locks", "status", "--porcelain=v1", "--untracked-files=normal"],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        if status.returncode == 0 and isinstance(status.stdout, str):
+            dirty = "dirty" if status.stdout.strip() else "clean"
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return sha, dirty
 
 
 _COMPILER_CACHE_BACKENDS = ("auto", "kache", "sccache", "none")
@@ -7676,6 +7709,14 @@ def cmd_check(
         # entries take precedence.
         _append_git_config_override("commit.gpgsign", "false")
         _append_git_config_override("core.hooksPath", os.devnull)
+
+        # Snapshot exact repo-wide git identity once before running check's
+        # multiple Cargo invocations so build.rs does not force redundant
+        # phoenix-db / phoenix_ide recompiles between steps while remaining
+        # exact across any unstaged or untracked change between check runs.
+        build_git_identity = _snapshot_build_git_identity(ROOT)
+        if build_git_identity is not None:
+            os.environ["PHOENIX_BUILD_GIT_SHA"], os.environ["PHOENIX_BUILD_GIT_DIRTY"] = build_git_identity
 
     # nextest probe, thread sizing, and codegen command shapes are rust-only.
     if "rust" in active:

@@ -2598,7 +2598,7 @@ _PARALLEL_SCENARIO_PRIORITY = (
 def _e2e_worker_budget() -> int:
     for env_name in ("PHOENIX_CHECK_WORKERS", "CARGO_BUILD_JOBS"):
         raw = os.environ.get(env_name, "").strip()
-        if raw.isdigit() and int(raw) >= 1:
+        if raw.isascii() and raw.isdigit() and int(raw) >= 1:
             return max(1, min(int(raw), os.cpu_count() or 1))
     return max(1, min(4, os.cpu_count() or 1))
 

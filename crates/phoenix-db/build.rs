@@ -1,5 +1,3 @@
-use std::path::{Path, PathBuf};
-
 fn git(args: &[&str]) -> Option<String> {
     let output = phoenix_core::git::command()
         .arg("--no-optional-locks")
@@ -13,59 +11,54 @@ fn git(args: &[&str]) -> Option<String> {
     })?
 }
 
-fn resolve_git_path(rel: &str) -> Option<PathBuf> {
-    let raw = git(&["rev-parse", "--git-path", rel])?;
-    let path = PathBuf::from(raw);
-    let abs = if path.is_absolute() {
-        path
-    } else {
-        std::env::current_dir().ok()?.join(path)
-    };
-    abs.exists().then_some(abs)
+fn is_valid_sha(sha: &str) -> bool {
+    sha.len() == 40 && sha.chars().all(|character| character.is_ascii_hexdigit())
 }
 
-fn emit_rerun_if_exists(path: &Path) {
-    if path.exists() {
-        println!("cargo:rerun-if-changed={}", path.display());
+fn dev_check_git_identity() -> Option<(String, &'static str)> {
+    // Release builds must always probe live git state directly.
+    if std::env::var("PROFILE").as_deref() == Ok("release") {
+        return None;
     }
+    let sha = std::env::var("PHOENIX_BUILD_GIT_SHA").ok()?;
+    let dirty = std::env::var("PHOENIX_BUILD_GIT_DIRTY").ok()?;
+    let valid_sha = sha == "unknown" || is_valid_sha(&sha);
+    let normalized_dirty = match dirty.as_str() {
+        "clean" => "clean",
+        "dirty" => "dirty",
+        "unknown" => "unknown",
+        _ => return None,
+    };
+    valid_sha.then_some((sha, normalized_dirty))
 }
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
-    println!("cargo:rerun-if-changed=Cargo.toml");
-    println!("cargo:rerun-if-changed=src");
+    println!("cargo:rerun-if-env-changed=PHOENIX_BUILD_GIT_SHA");
+    println!("cargo:rerun-if-env-changed=PHOENIX_BUILD_GIT_DIRTY");
 
-    for git_path in ["HEAD", "index", "packed-refs"] {
-        if let Some(path) = resolve_git_path(git_path) {
-            emit_rerun_if_exists(&path);
-        }
-    }
-    if let Some(sym_ref) = git(&["symbolic-ref", "-q", "HEAD"]) {
-        if let Some(path) = resolve_git_path(&sym_ref) {
-            emit_rerun_if_exists(&path);
-        } else if let Some(path) = resolve_git_path("refs/heads") {
-            emit_rerun_if_exists(&path);
-        }
-    }
-
-    let sha = git(&["rev-parse", "--verify", "HEAD^{commit}"]).filter(|sha| {
-        sha.len() == 40 && sha.chars().all(|character| character.is_ascii_hexdigit())
-    });
-    let dirty = git(&["status", "--porcelain=v1", "--untracked-files=normal"])
-        .map(|status| !status.is_empty());
-
-    println!(
-        "cargo:rustc-env=PHOENIX_DB_GIT_SHA={}",
-        sha.as_deref().unwrap_or("unknown")
-    );
-    println!(
-        "cargo:rustc-env=PHOENIX_DB_GIT_DIRTY={}",
-        match dirty {
+    let (sha, dirty) = if let Some((sha, dirty)) = dev_check_git_identity() {
+        (sha, dirty)
+    } else {
+        // Standalone and release builds probe live git state on every build so
+        // unstaged edits anywhere in the repository (including UI assets or
+        // untracked files) can never leave a stale dirty/clean marker.
+        println!("cargo:rerun-if-changed=__phoenix_db_git_identity_force_rerun__");
+        let sha = git(&["rev-parse", "--verify", "HEAD^{commit}"])
+            .filter(|sha| is_valid_sha(sha))
+            .unwrap_or_else(|| "unknown".to_string());
+        let dirty = match git(&["status", "--porcelain=v1", "--untracked-files=normal"])
+            .map(|status| !status.is_empty())
+        {
             Some(true) => "dirty",
             Some(false) => "clean",
             None => "unknown",
-        }
-    );
+        };
+        (sha, dirty)
+    };
+
+    println!("cargo:rustc-env=PHOENIX_DB_GIT_SHA={sha}");
+    println!("cargo:rustc-env=PHOENIX_DB_GIT_DIRTY={dirty}");
     println!(
         "cargo:rustc-env=PHOENIX_DB_PACKAGE_VERSION={}",
         env!("CARGO_PKG_VERSION")

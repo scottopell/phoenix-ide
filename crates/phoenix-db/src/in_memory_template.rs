@@ -233,6 +233,10 @@ async fn deserialize_into_connection(
     unsafe {
         std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf, bytes.len());
     }
+    // SQLITE_DESERIALIZE_FREEONCLOSE transfers ownership of `buf` to SQLite:
+    // on both success (connection close) and every runtime error path inside
+    // sqlite3_deserialize (`end_deserialize:`), SQLite frees `buf` itself, so
+    // the caller must NOT call sqlite3_free on error.
     let flags = ffi::SQLITE_DESERIALIZE_FREEONCLOSE | ffi::SQLITE_DESERIALIZE_RESIZEABLE;
     let rc = unsafe {
         ffi::sqlite3_deserialize(
@@ -245,9 +249,6 @@ async fn deserialize_into_connection(
         )
     };
     if rc != ffi::SQLITE_OK {
-        unsafe {
-            ffi::sqlite3_free(buf.cast());
-        }
         return Err(sqlx::Error::Protocol(format!(
             "sqlite3_deserialize failed with status {rc}"
         )));
@@ -369,6 +370,14 @@ pub(crate) async fn seed_migrated_file_for_test(path: &Path) -> DbResult<bool> {
         return Ok(false);
     }
     let template_bytes = load_or_build_template().await?;
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let pid = std::process::id();
+    let nonce = uuid::Uuid::new_v4().simple();
+    let tmp = parent.join(format!(".seed-{pid}-{nonce}.tmp"));
+
     let mut open_opts = fs::OpenOptions::new();
     open_opts.write(true).create_new(true);
     #[cfg(unix)]
@@ -376,25 +385,65 @@ pub(crate) async fn seed_migrated_file_for_test(path: &Path) -> DbResult<bool> {
         use std::os::unix::fs::OpenOptionsExt;
         open_opts.mode(0o600);
     }
-    let mut file = match open_opts.open(path) {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => return Ok(false),
-        Err(error) => {
-            return Err(DbError::Serialization(format!(
-                "failed to seed test database template at {}: {error}",
-                path.display()
-            )));
-        }
-    };
+    let mut file = open_opts.open(&tmp).map_err(|error| {
+        DbError::Serialization(format!(
+            "failed to create staging file for test database template at {}: {error}",
+            tmp.display()
+        ))
+    })?;
     if let Err(error) = file.write_all(template_bytes) {
         drop(file);
-        let _ = fs::remove_file(path);
+        let _ = fs::remove_file(&tmp);
         return Err(DbError::Serialization(format!(
             "failed to write test database template at {}: {error}",
-            path.display()
+            tmp.display()
         )));
     }
-    Ok(true)
+    drop(file);
+
+    // Publish atomically without clobbering an existing file: hard_link fails
+    // with AlreadyExists if another caller created `path` first.
+    let link_result = fs::hard_link(&tmp, path);
+    let _ = fs::remove_file(&tmp);
+    match link_result {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::Unsupported => {
+            // Fallback for filesystems without hard links.
+            let mut fallback_opts = fs::OpenOptions::new();
+            fallback_opts.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                fallback_opts.mode(0o600);
+            }
+            let mut fallback = match fallback_opts.open(path) {
+                Ok(file) => file,
+                Err(open_err) if open_err.kind() == std::io::ErrorKind::AlreadyExists => {
+                    return Ok(false);
+                }
+                Err(open_err) => {
+                    return Err(DbError::Serialization(format!(
+                        "failed to seed test database template at {}: {open_err}",
+                        path.display()
+                    )));
+                }
+            };
+            if let Err(write_err) = fallback.write_all(template_bytes) {
+                drop(fallback);
+                let _ = fs::remove_file(path);
+                return Err(DbError::Serialization(format!(
+                    "failed to write test database template at {}: {write_err}",
+                    path.display()
+                )));
+            }
+            Ok(true)
+        }
+        Err(error) => Err(DbError::Serialization(format!(
+            "failed to publish test database template at {}: {error}",
+            path.display()
+        ))),
+    }
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -403,6 +452,7 @@ pub(crate) async fn open_migrated_for_test(path: &str) -> DbResult<Database> {
     if !seeded {
         let db = Database::open(path).await?;
         migrations::run_pending_migrations(db.pool()).await?;
+        db.restrict_file_permissions();
         return Ok(db);
     }
     let opts = SqliteConnectOptions::from_str(&format!("sqlite:{path}?mode=rwc"))?

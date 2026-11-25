@@ -1,4 +1,4 @@
-# ADR-283: Extend Kache v1.2.2 strict local-only qualification to Linux x86_64
+# ADR-285: Extend Kache v1.2.2 strict local-only qualification to Linux x86_64
 
 - **Status:** Accepted
 - **Date:** 2026-11-25

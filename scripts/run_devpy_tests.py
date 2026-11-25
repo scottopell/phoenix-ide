@@ -33,7 +33,7 @@ _PRIORITY_MODULES = (
 )
 
 _RAN_RE = re.compile(r"^Ran (\d+) tests? in ", re.MULTILINE)
-_SKIP_RE = re.compile(r"skipped=(\d+)")
+_SKIP_RE = re.compile(r"^(?:OK|FAILED) \([^)]*\bskipped=(\d+)\b", re.MULTILINE)
 
 
 def discover_test_modules(tests_dir: Path = TESTS_DIR) -> list[str]:
@@ -52,7 +52,7 @@ def _run_module(module: str, *, tests_dir: Path, verbose: bool) -> tuple[str, in
         cmd.append("-v")
     env = os.environ.copy()
     existing_pythonpath = env.get("PYTHONPATH", "")
-    extra = f"{ROOT}{os.pathsep}{tests_dir}"
+    extra = f"{tests_dir}{os.pathsep}{ROOT}"
     env["PYTHONPATH"] = f"{extra}{os.pathsep}{existing_pythonpath}" if existing_pythonpath else extra
     proc = subprocess.run(
         cmd,
@@ -63,10 +63,10 @@ def _run_module(module: str, *, tests_dir: Path, verbose: bool) -> tuple[str, in
         text=True,
     )
     output = proc.stdout or ""
-    ran_match = _RAN_RE.search(output)
-    ran = int(ran_match.group(1)) if ran_match else 0
-    skip_match = _SKIP_RE.search(output)
-    skipped = int(skip_match.group(1)) if skip_match else 0
+    ran_matches = list(_RAN_RE.finditer(output))
+    ran = int(ran_matches[-1].group(1)) if ran_matches else 0
+    skip_matches = list(_SKIP_RE.finditer(output))
+    skipped = int(skip_matches[-1].group(1)) if skip_matches else 0
     return module, proc.returncode, ran, skipped, output
 
 
