@@ -481,6 +481,14 @@ export function ConversationList({
     </li>
   ) : null;
 
+  const handleProductRowClick = useCallback(
+    (productRow: ProductConversationListRow) => {
+      if (onProductConversationClick) onProductConversationClick(productRow);
+      else navigate(productRow.canonical_route);
+    },
+    [navigate, onProductConversationClick],
+  );
+
   return (
     <section ref={listRootRef} id="conversation-list" className={`view active ${isSidebarLayout ? 'sidebar-mode' : ''} ${isMobileList ? 'mobile-list-density' : ''}`}>
       {!isSidebarLayout && (
@@ -564,10 +572,7 @@ export function ConversationList({
                 menuRef={expandedId === row.product_conversation_id ? menuRef : undefined}
                 isActive={activeSlug === row.product_conversation_id || activeSlug === row.canonical_root.slug || activeSlug === row.canonical_root.transcript_row_id}
                 isKeyboardSelected={selectedId === row.product_conversation_id}
-                onClick={(productRow) => {
-                  if (onProductConversationClick) onProductConversationClick(productRow);
-                  else navigate(productRow.canonical_route);
-                }}
+                onClick={handleProductRowClick}
                 {...(onProductConversationClose ? { onProductConversationClose } : {})}
                 {...(onProductConversationDelete ? { onProductConversationDelete } : {})}
                 {...(onProductConversationRename ? { onProductConversationRename } : {})}

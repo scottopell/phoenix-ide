@@ -231,6 +231,11 @@ export function Sidebar({
     navigate('/terminal');
   }, [navigate]);
 
+  const handleProductConversationClick = useCallback(
+    (row: ProductConversationListRow) => navigate(row.canonical_route),
+    [navigate],
+  );
+
   const handleToggleArchived = useCallback(() => {
     setShowArchived((prev) => !prev);
   }, []);
@@ -385,7 +390,7 @@ export function Sidebar({
           showArchived={showArchived}
           onToggleArchived={handleToggleArchived}
           onNewConversation={handleNewClick}
-          onProductConversationClick={(row) => navigate(row.canonical_route)}
+          onProductConversationClick={handleProductConversationClick}
           onProductConversationRename={productActions.openRename}
           onProductConversationClose={productActions.openClose}
           onProductConversationDelete={productActions.openDelete}

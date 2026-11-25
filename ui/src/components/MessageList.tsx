@@ -1,3 +1,5 @@
+const EMPTY_TOOL_IDS: readonly string[] = [];
+
 import { conversationProjectionSessionMatches } from './viewer-find/projectionSession';
 import { observeOwningAnchor, type ViewAnchorIntent, type ViewAnchorProbe, type ViewAnchorTerminal } from '../hooks/conversationViewAnchorProbe';
 import {
@@ -714,7 +716,10 @@ function MessageListImpl({
   const findOpen = findSession !== null;
   const findQuery = findSession?.query ?? '';
   const findUsesLiveBashProgress = findOpen && findQuery.length > 0;
-  const findLiveBashProgress = useLiveBashProgressForToolIds(slug ?? null, findUsesLiveBashProgress ? null : []);
+  const findLiveBashProgress = useLiveBashProgressForToolIds(
+    findUsesLiveBashProgress ? slug ?? null : null,
+    findUsesLiveBashProgress ? null : EMPTY_TOOL_IDS,
+  );
   const findProjection = useMemo(
     () => (findOpen && findQuery.length > 0
       ? buildConversationSearchProjection(allUnits, findQuery, {
