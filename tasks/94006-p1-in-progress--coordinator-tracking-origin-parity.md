@@ -20,3 +20,10 @@ On this checkout, the scanner already accepts a user-role `InputOrigin::Coordina
 - On the migrated schema, store a future kind on user-role scanner evidence and verify tracking still returns the item, evidence and locator, with an untrusted fallback and the original DB label untouched. Verify recognized neighboring evidence still decodes normally and unrelated validation errors are not swallowed.
 - Test a pre-fix database with existing scanner provenance (including the reply kind admitted by migration 168) and a fresh database. Check retained rows and foreign keys.
 - Run `./dev.py check`, fix in-scope failures and rerun until green. Leave clean, verified local commits and the validation evidence. Do not modify Coordinator system prompts or UX error reporting. No push, merge, release, or deploy.
+
+## Verification
+
+- `713b5b953` implements the fix; `f92501eef` scopes the migration 171 test to that version. All 97 focused origin, scanner, and migration tests passed. The tracking tool serializes the same paged detail tested by the scanner regression without reshaping it.
+- `PHOENIX_CHECK_BASE=8333032a7 ./dev.py check` completed with extended time budgets. The Rust lane ran 6,389 tests: 6,380 passed, including the origin regressions, and 9 failed. The Python lane ran 1,070 tests with one error. Clippy, fmt, codegen, specs, task validation, and e2e passed. Tests did not hit the lane timeout on this run.
+- Five Rust deadline failures (two worktree inspections, fresh handoff, and two tmux replacements) and the Python command-timeout error reproduced on unchanged parent `8333032a7`. The other four Rust failures (two browser tests and two worktree inspections) passed when rerun outside the suite on this change. No out-of-scope tests or runtime code were changed to get a pass.
+- Local logs: `/tmp/phoenix-94006-focused-final.log`, `/tmp/phoenix-94006-check-final.ntGviQ/`, and `/tmp/phoenix-94006-isolated/`. The task is still open: rerun the full check in an environment where the baseline tests pass, or fix the baseline failures separately.
