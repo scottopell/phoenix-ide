@@ -33,6 +33,8 @@ pub struct AgentConfig {
 #[serde(deny_unknown_fields)]
 struct ConfigFile {
     version: u32,
+    #[serde(rename = "llm")]
+    _llm: Option<serde::de::IgnoredAny>,
     #[serde(rename = "models")]
     _models: Option<serde::de::IgnoredAny>,
     #[serde(default)]

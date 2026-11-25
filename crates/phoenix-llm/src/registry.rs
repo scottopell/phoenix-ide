@@ -69,7 +69,7 @@ impl CredentialSource for StaticCredential {
 }
 
 /// How an LLM credential should be sent in HTTP headers.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthStyle {
     /// `x-api-key: <credential>` (standard API keys)
     ApiKey,
@@ -203,8 +203,21 @@ impl RequestModelOverrides {
     fn parse(raw: &str, specs: &[super::ModelSpec]) -> Result<Self, String> {
         let routes: NoDupMap<NoDupMap<String>> =
             serde_json::from_str(raw).map_err(|error| format!("invalid JSON map: {error}"))?;
+        Self::from_entries(
+            routes
+                .0
+                .into_iter()
+                .map(|(route, names)| (route, names.0.into_iter().collect())),
+            specs,
+        )
+    }
+
+    fn from_entries<I>(routes: I, specs: &[super::ModelSpec]) -> Result<Self, String>
+    where
+        I: IntoIterator<Item = (String, Vec<(String, String)>)>,
+    {
         let mut overrides = HashMap::new();
-        for (route, names) in routes.0 {
+        for (route, names) in routes {
             let backend = match route.as_str() {
                 "anthropic" => ModelBackend::Anthropic,
                 "openai_responses" => ModelBackend::OpenAIResponses,
@@ -212,7 +225,7 @@ impl RequestModelOverrides {
                 _ => return Err(format!("unknown route '{route}'")),
             };
             let mut mapped = HashMap::new();
-            for (id, name) in names.0 {
+            for (id, name) in names {
                 let spec = specs
                     .iter()
                     .find(|spec| spec.id == id)
@@ -402,27 +415,47 @@ impl LlmConfig {
     /// than silently fall back to defaults.
     #[allow(clippy::too_many_lines)]
     pub fn from_env(runtime_env: Arc<PhoenixRuntimeEnvironment>) -> Self {
-        let credential_helper = std::env::var("LLM_API_KEY_HELPER")
+        let user_config_path = phoenix_agents::config_path_for(&runtime_env)
+            .unwrap_or_else(|error| panic!("Cannot locate Phoenix config: {error}"));
+        let user_config = super::model_config::load_user_config(
+            &user_config_path,
+            std::env::var("PHOENIX_LLM_MODELS").ok().as_deref(),
+        )
+        .unwrap_or_else(|error| panic!("Cannot load Phoenix config: {error}"));
+        let external_models = user_config.external_models;
+        let toml_llm = user_config.llm.unwrap_or_default();
+
+        let helper_command = std::env::var("LLM_API_KEY_HELPER")
             .ok()
             .filter(|s| !s.is_empty())
-            .map(|command| {
-                let ttl_ms = std::env::var("LLM_API_KEY_HELPER_TTL_MS")
-                    .ok()
-                    .and_then(|s| s.parse::<u64>().ok())
-                    .unwrap_or(2 * 60 * 60 * 1000); // default 2 hours
-                crate::CredentialHelper::new(command, Duration::from_millis(ttl_ms))
-            });
+            .or(toml_llm.api_key_helper);
+        let credential_helper = helper_command.map(|command| {
+            let ttl_ms = std::env::var("LLM_API_KEY_HELPER_TTL_MS")
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok())
+                .or(toml_llm.api_key_helper_ttl_ms)
+                .unwrap_or(2 * 60 * 60 * 1000); // default 2 hours
+            crate::CredentialHelper::new(command, Duration::from_millis(ttl_ms))
+        });
 
-        let anthropic_base_url = endpoint_env("ANTHROPIC_BASE_URL");
-        let openai_base_url = endpoint_env("OPENAI_BASE_URL");
-        let openai_responses_base_url = endpoint_env("OPENAI_RESPONSES_BASE_URL")
-            .or_else(|| legacy_openai_base_url_for_responses(openai_base_url.as_deref()));
-        let openai_chat_completions_base_url = endpoint_env("OPENAI_CHAT_COMPLETIONS_BASE_URL")
-            .or_else(|| legacy_openai_base_url_for_chat(openai_base_url.as_deref()));
+        let anthropic_base_url =
+            endpoint_env_or_toml("ANTHROPIC_BASE_URL", toml_llm.anthropic_base_url);
+        let openai_base_url = endpoint_env_or_toml("OPENAI_BASE_URL", toml_llm.openai_base_url);
+        let openai_responses_base_url = endpoint_env_or_toml(
+            "OPENAI_RESPONSES_BASE_URL",
+            toml_llm.openai_responses_base_url,
+        )
+        .or_else(|| legacy_openai_base_url_for_responses(openai_base_url.as_deref()));
+        let openai_chat_completions_base_url = endpoint_env_or_toml(
+            "OPENAI_CHAT_COMPLETIONS_BASE_URL",
+            toml_llm.openai_chat_completions_base_url,
+        )
+        .or_else(|| legacy_openai_base_url_for_chat(openai_base_url.as_deref()));
 
         // Parse newline-separated "key: value" pairs (supports real newlines and literal \n)
         let custom_headers = std::env::var("LLM_CUSTOM_HEADERS")
             .ok()
+            .filter(|raw| !raw.trim().is_empty())
             .map(|raw| {
                 raw.replace("\\n", "\n")
                     .lines()
@@ -433,21 +466,14 @@ impl LlmConfig {
                     })
                     .collect()
             })
-            .unwrap_or_default();
+            .unwrap_or_else(|| toml_llm.custom_headers.into_iter().collect());
 
         let request_tags = std::env::var("LLM_REQUEST_TAGS")
             .ok()
+            .filter(|raw| !raw.trim().is_empty())
             .as_deref()
             .map(parse_request_tags)
-            .unwrap_or_default();
-
-        let user_config_path = phoenix_agents::config_path_for(&runtime_env)
-            .unwrap_or_else(|error| panic!("Cannot locate Phoenix config: {error}"));
-        let external_models = super::model_config::load_external_models(
-            &user_config_path,
-            std::env::var("PHOENIX_LLM_MODELS").ok().as_deref(),
-        )
-        .unwrap_or_else(|error| panic!("Cannot load external models: {error}"));
+            .unwrap_or(toml_llm.request_tags);
 
         // Resolve Phoenix's native ChatGPT credential at startup.
         let active_auth_path = codex_credential::resolve_active_auth_path(&runtime_env);
@@ -470,25 +496,57 @@ impl LlmConfig {
             None => (None, None),
         };
         let use_codex_auth = active_auth_path.is_some();
-        let request_models = std::env::var("PHOENIX_LLM_REQUEST_MODELS")
+        let request_models = match std::env::var("PHOENIX_LLM_REQUEST_MODELS")
             .ok()
-            .map(|raw| {
+            .filter(|raw| !raw.trim().is_empty())
+        {
+            Some(raw) => {
                 let specs = merge_model_specs(all_models(), &external_models);
                 RequestModelOverrides::parse(&raw, &specs)
                     .unwrap_or_else(|error| panic!("PHOENIX_LLM_REQUEST_MODELS: {error}"))
-            })
-            .unwrap_or_default();
+            }
+            None => match toml_llm.request_models {
+                Some(routes) => {
+                    let specs = merge_model_specs(all_models(), &external_models);
+                    RequestModelOverrides::from_entries(
+                        routes
+                            .into_iter()
+                            .map(|(route, names)| (route, names.into_iter().collect())),
+                        &specs,
+                    )
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "{}: llm.request_models: {error}",
+                            user_config_path.display()
+                        )
+                    })
+                }
+                None => RequestModelOverrides::default(),
+            },
+        };
         if request_models.len() > 0 {
             tracing::info!(
                 count = request_models.len(),
-                "validated PHOENIX_LLM_REQUEST_MODELS overrides"
+                "validated request model overrides"
             );
         }
+
+        let auth_style = match std::env::var("LLM_AUTH_HEADER")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+        {
+            Some(v) if v.eq_ignore_ascii_case("bearer") => AuthStyle::PlainBearer,
+            Some(_) => AuthStyle::ApiKey,
+            None => toml_llm.auth_header.map_or(AuthStyle::ApiKey, Into::into),
+        };
 
         Self {
             anthropic_api_key: std::env::var("ANTHROPIC_API_KEY").ok(),
             openai_api_key: std::env::var("OPENAI_API_KEY").ok(),
-            default_model: std::env::var("DEFAULT_MODEL").ok(),
+            default_model: std::env::var("DEFAULT_MODEL")
+                .ok()
+                .filter(|v| !v.trim().is_empty())
+                .or(toml_llm.default_model),
             credential_helper,
             anthropic_base_url,
             openai_base_url,
@@ -496,14 +554,7 @@ impl LlmConfig {
             openai_chat_completions_base_url,
             custom_headers,
             request_tags,
-            auth_style: if std::env::var("LLM_AUTH_HEADER")
-                .ok()
-                .is_some_and(|v| v.eq_ignore_ascii_case("bearer"))
-            {
-                AuthStyle::PlainBearer
-            } else {
-                AuthStyle::ApiKey
-            },
+            auth_style,
             external_models,
             request_models,
             use_codex_auth,
@@ -540,8 +591,11 @@ fn discovery_auth_headers(
     Some(headers)
 }
 
-fn endpoint_env(name: &str) -> Option<String> {
-    let url = std::env::var(name).ok().filter(|s| !s.is_empty());
+fn endpoint_env_or_toml(name: &str, toml_value: Option<String>) -> Option<String> {
+    let url = std::env::var(name)
+        .ok()
+        .filter(|s| !s.is_empty())
+        .or(toml_value);
     if let Some(value) = url.as_deref() {
         warn_if_endpoint_url_has_no_path(name, value);
     }

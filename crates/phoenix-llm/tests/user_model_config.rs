@@ -74,3 +74,91 @@ fn restart_loads_edited_toml_with_the_same_process_environment() {
     assert!(error.contains("PHOENIX_LLM_MODELS"));
     assert!(error.contains(path.to_str().unwrap()));
 }
+
+#[test]
+fn startup_llm_toml_probe() {
+    let Ok(_) = std::env::var("PHOENIX_TEST_LLM_TOML_PROBE") else {
+        return;
+    };
+    let config = LlmConfig::from_env(Arc::new(PhoenixRuntimeEnvironment::detect()));
+    assert!(config.credential_helper.is_some());
+    assert_eq!(config.auth_style, phoenix_llm::AuthStyle::PlainBearer);
+    assert_eq!(
+        config.openai_chat_completions_base_url.as_deref(),
+        Some("https://gateway.example.test/v1/chat/completions")
+    );
+    assert_eq!(
+        config.default_model.as_deref(),
+        std::env::var("EXPECTED_DEFAULT_MODEL").ok().as_deref()
+    );
+    assert_eq!(
+        config.custom_headers,
+        vec![("X-Gateway".to_string(), "phoenix".to_string())]
+    );
+    assert_eq!(
+        config.request_tags.get("team").map(String::as_str),
+        Some("ide")
+    );
+    let registry = ModelRegistry::new(&config);
+    assert!(registry.get("google/gemini-4-neon").is_some());
+}
+
+#[test]
+fn llm_toml_populates_from_env_and_env_overrides_per_field() {
+    let root = tempfile::tempdir().unwrap();
+    let directory = root.path().join("phoenix-ide");
+    std::fs::create_dir(&directory).unwrap();
+    let path = directory.join("config.toml");
+    std::fs::write(
+        &path,
+        r#"
+version = 1
+
+[llm]
+api_key_helper = "echo test-token"
+auth_header = "bearer"
+default_model = "google/gemini-4-neon"
+openai_chat_completions_base_url = "https://gateway.example.test/v1/chat/completions"
+
+[llm.custom_headers]
+X-Gateway = "phoenix"
+
+[llm.request_tags]
+team = "ide"
+"#,
+    )
+    .unwrap();
+
+    // Pure TOML config (simulates Finder-launched Phoenix.app with no shell env)
+    let toml_only = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "startup_llm_toml_probe", "--nocapture"])
+        .env_clear()
+        .env("HOME", root.path())
+        .env("XDG_CONFIG_HOME", root.path())
+        .env("PHOENIX_TEST_LLM_TOML_PROBE", "1")
+        .env("EXPECTED_DEFAULT_MODEL", "google/gemini-4-neon")
+        .output()
+        .unwrap();
+    assert!(
+        toml_only.status.success(),
+        "{}",
+        String::from_utf8_lossy(&toml_only.stderr)
+    );
+
+    // Env overrides DEFAULT_MODEL while inheriting helper, URL, headers, tags from TOML
+    let env_override = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "startup_llm_toml_probe", "--nocapture"])
+        .env_clear()
+        .env("HOME", root.path())
+        .env("XDG_CONFIG_HOME", root.path())
+        .env("PHOENIX_TEST_LLM_TOML_PROBE", "1")
+        .env("DEFAULT_MODEL", "claude-sonnet-4-6")
+        .env("EXPECTED_DEFAULT_MODEL", "claude-sonnet-4-6")
+        .output()
+        .unwrap();
+    assert!(
+        env_override.status.success(),
+        "{}",
+        String::from_utf8_lossy(&env_override.stderr)
+    );
+}
