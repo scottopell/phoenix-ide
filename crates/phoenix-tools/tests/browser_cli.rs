@@ -741,34 +741,49 @@ fn wait_for_observation<T>(reason: &str, mut observe: impl FnMut() -> Option<T>)
     }
 }
 
+/// Whether `process`'s OS-visible lifecycle is effectively over: either its
+/// exact identity no longer resolves, or the kernel has already marked it
+/// exited and it is only waiting on an ancestor to `waitpid` it (a retained
+/// `Z`/`X` `ps` state).
+///
+/// A container `PID 1`/subreaper that does not promptly reap a reparented
+/// orphan can hold that terminal state indefinitely; `kill(pid, 0)` and
+/// `/proc/<pid>/stat`'s `starttime` (what `process_identity_matches` reads)
+/// both still succeed for a zombie, since the kernel keeps its process-table
+/// entry until something reaps it. Treating a retained zombie/dead state as
+/// "still running" would make exit observation hang on such a host even
+/// though the process has already terminated and released its resources.
+/// This is an exit observation, not cleanup authority: callers still assert
+/// filesystem/socket resource removal separately.
+fn process_exited_or_is_zombie(process: ProcessIdentity) -> bool {
+    if !process_identity_matches(process) {
+        return true;
+    }
+    let output = Command::new("ps")
+        .args(["-p", &process.pid.to_string(), "-o", "stat="])
+        .output()
+        .unwrap();
+    let state = String::from_utf8_lossy(&output.stdout);
+    eprintln!(
+        "owned_process_observation pid={} identity_retained=true state={}",
+        process.pid,
+        state.trim()
+    );
+    output.status.success() && matches!(state.trim_start().chars().next(), Some('Z' | 'X'))
+}
+
 fn observe_process_exited_or_retained_zombie(process: ProcessIdentity) {
     wait_for_observation(
         "killed Chrome is gone or kernel-exited with retained identity",
-        || {
-            if !process_identity_matches(process) {
-                return Some(());
-            }
-            let output = Command::new("ps")
-                .args(["-p", &process.pid.to_string(), "-o", "stat="])
-                .output()
-                .unwrap();
-            let state = String::from_utf8_lossy(&output.stdout);
-            eprintln!(
-                "pre_close_process_observation pid={} identity_retained=true state={}",
-                process.pid,
-                state.trim()
-            );
-            (output.status.success()
-                && matches!(state.trim_start().chars().next(), Some('Z' | 'X')))
-            .then_some(())
-        },
+        || process_exited_or_is_zombie(process).then_some(()),
     );
 }
 
 fn await_process_exit(process: ProcessIdentity) {
-    wait_for_observation("owned process exited", || {
-        (!process_identity_matches(process)).then_some(())
-    });
+    wait_for_observation(
+        "owned process exited or kernel-exited with retained identity",
+        || process_exited_or_is_zombie(process).then_some(()),
+    );
 }
 
 struct PendingLaunchCleanup<'a> {
