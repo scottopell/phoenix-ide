@@ -86,8 +86,8 @@ fn parse(input: &Value) -> Result<NativeCloseIntent, String> {
     Ok(intent)
 }
 
-// Provider schemas cannot use root combinators. Nest the exact closed action
-// variants under a single required request, with no nullable coordinates.
+// Provider schemas support nested anyOf, not root unions or oneOf. The action
+// enums keep these closed variants disjoint, with no nullable coordinates.
 fn schema() -> Value {
     let target = json!({"type":"string", "minLength":1});
     let attempt = json!({"type":"string", "minLength":1});
@@ -95,7 +95,7 @@ fn schema() -> Value {
     json!({
         "type":"object",
         "properties": {
-            "request": {"oneOf": [
+            "request": {"anyOf": [
                 {
                     "type":"object",
                     "properties": {
@@ -448,7 +448,7 @@ mod tests {
         }
         let request = &schema["properties"]["request"];
         assert_eq!(request.as_object().unwrap().len(), 1);
-        let variants = request["oneOf"].as_array().unwrap();
+        let variants = request["anyOf"].as_array().unwrap();
         assert_eq!(variants.len(), 3);
         for (variant, action, fields) in [
             (

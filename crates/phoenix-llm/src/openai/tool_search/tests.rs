@@ -200,7 +200,7 @@ fn nested_request_union_is_preserved_in_hosted_and_codex_discovery_declarations(
     let schema = json!({
         "type":"object",
         "properties": {
-            "request": {"oneOf": [
+            "request": {"anyOf": [
                 {
                     "type":"object",
                     "properties": {

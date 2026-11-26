@@ -3357,7 +3357,9 @@ mod tests {
         assert_eq!(schema["additionalProperties"], false);
         assert_eq!(schema["required"], json!(["request"]));
         assert_eq!(schema["properties"].as_object().unwrap().len(), 1);
-        let variants = schema["properties"]["request"]["oneOf"].as_array().unwrap();
+        let request = &schema["properties"]["request"];
+        assert!(request.get("oneOf").is_none());
+        let variants = request["anyOf"].as_array().unwrap();
         assert_eq!(variants.len(), 3);
         for (variant, action) in variants
             .iter()
