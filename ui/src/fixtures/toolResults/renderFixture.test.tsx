@@ -29,7 +29,7 @@ describe('ToolResultsFixture', () => {
     expect(screen.getByText(/Navigation complete — fixture page ready/)).toBeInTheDocument();
     expect(screen.getByText('resize 390x844')).toBeInTheDocument();
     expect(screen.getByText(/Which tool-result family should we refine next/)).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: 'Review' })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Review' })).not.toBeInTheDocument();
     expect(container.querySelector('[data-tool-results-fixture-ready="shell-full"]')).not.toBeNull();
     expect(screen.getByText(/1 more returned lines/)).toBeInTheDocument();
     expect(screen.getByText(/earlier click is a finalized missing result/)).toBeInTheDocument();
