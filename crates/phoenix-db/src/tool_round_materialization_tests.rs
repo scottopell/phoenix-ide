@@ -21,6 +21,107 @@ fn assistant(calls: &[(&str, &str)]) -> AssistantMessage {
     assistant
 }
 
+#[tokio::test]
+async fn restart_acknowledges_only_matching_durable_child_terminal_calls() {
+    let db = Database::open_in_memory().await.unwrap();
+    db.create_conversation("parent", "parent", "/tmp", true, None, None)
+        .await
+        .unwrap();
+    let success = ConvState::Completed {
+        result: "done".into(),
+    };
+    let failure = ConvState::Failed {
+        error: "partially done".into(),
+        error_kind: ErrorKind::SubAgentError,
+    };
+    let cases = [
+        (
+            "success",
+            "submit_result",
+            serde_json::json!({"result": "done"}),
+            Some((SubAgentTerminalCause::SubmitResult, &success)),
+            Some("Sub-agent result recorded."),
+        ),
+        (
+            "partial",
+            "submit_error",
+            serde_json::json!({"error": "partially done"}),
+            Some((SubAgentTerminalCause::SubmitError, &failure)),
+            Some("Sub-agent error report recorded."),
+        ),
+        (
+            "different-result",
+            "submit_result",
+            serde_json::json!({"result": "another result"}),
+            Some((SubAgentTerminalCause::SubmitResult, &success)),
+            None,
+        ),
+        (
+            "uncommitted",
+            "submit_result",
+            serde_json::json!({"result": "done"}),
+            None,
+            None,
+        ),
+    ];
+    for (child, tool, input, terminal, _) in &cases {
+        db.create_conversation(child, child, "/tmp", false, Some("parent"), None)
+            .await
+            .unwrap();
+        db.admit_sub_agent_batch(&SubAgentBatchAdmission {
+            batch_id: format!("{child}-batch"),
+            parent_conversation_id: "parent".into(),
+            parallel_work_qualified: false,
+            runs: vec![SubAgentRunAdmission {
+                child_conversation_id: (*child).into(),
+                execution_authority: SubAgentExecutionAuthority::ReadOnly,
+            }],
+        })
+        .await
+        .unwrap();
+        db.add_message(
+            &format!("{child}-assistant"),
+            child,
+            &MessageContent::agent(vec![ContentBlock::tool_use("call", *tool, input.clone())]),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        if let Some((cause, state)) = terminal {
+            let now = Utc::now();
+            db.update_child_state_and_record_sub_agent_terminal(child, state, now, *cause, now)
+                .await
+                .established()
+                .unwrap()
+                .unwrap();
+        }
+    }
+
+    for _ in 0..2 {
+        db.reset_all_to_idle().await.unwrap();
+        for (child, _, _, _, expected) in &cases {
+            let rows = db.get_messages(child).await.unwrap();
+            assert_eq!(rows.len(), 2, "{child}");
+            let MessageContent::Tool(receipt) = &rows[1].content else {
+                panic!("missing terminal tool result for {child}");
+            };
+            assert_eq!(receipt.tool_use_id, "call");
+            if let Some(text) = expected {
+                assert!(!receipt.is_error, "{child}");
+                assert_eq!(receipt.content, *text);
+                assert_eq!(
+                    rows[1].message_id,
+                    tool_result_message_id(&format!("{child}-assistant"), "call")
+                );
+            } else {
+                assert!(receipt.is_error, "{child}");
+                assert!(receipt.content.contains("interrupted"));
+            }
+        }
+    }
+}
+
 #[test]
 fn restart_orders_out_of_order_sibling_results_by_source_identity() {
     let assistant = assistant(&[("unfinished", "bash"), ("finished", "read_image")]);
