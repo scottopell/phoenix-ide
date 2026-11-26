@@ -5,11 +5,14 @@
 - **Affects:** REQ-WL-002f; REQ-BED-029; unified native `close_conversation`, retained Close operation/run identity
 
 Identity note: this branch-local proposal is ADR-288 after integration numbering
-reconciliation. Main's published ADR-283 (ordinary foreground batches), ADR-284
-(eight-owner foreground window), and both existing ADR-285 records (Kache
-qualification and Coordinator evidence labels) remain unchanged. Its original
-date, Proposed status and decision substance are unchanged; branch-local ADR-286
-supersedes its automatic completion policy.
+reconciliation. At that integration, main's published ADR-283 (ordinary
+foreground batches), ADR-284 (eight-owner foreground window), and both original
+ADR-285 records (Kache qualification and Coordinator evidence labels) were left
+unchanged. The later collision correction retains Coordinator labels as canonical
+ADR-285 and renumbers Kache qualification to ADR-289; its provenance note records
+its original #1183 publication. This proposal's original date, Proposed status
+and decision substance are unchanged; branch-local ADR-286 supersedes its
+automatic completion policy.
 
 ## Context
 

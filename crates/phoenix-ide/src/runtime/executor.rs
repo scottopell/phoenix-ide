@@ -7833,7 +7833,10 @@ where
         disposition: RuntimeExitDisposition,
     ) -> Option<RuntimeExitDisposition> {
         self.revoke_native_close_source_entry().await;
-        if self.fatal_local_authority_fence.fatal_authority_loss_is_latched() {
+        if self
+            .fatal_local_authority_fence
+            .fatal_authority_loss_is_latched()
+        {
             Box::pin(self.join_pending_native_close_before_fatal(
                 pending_native_close_initial,
                 pending_native_close_retry,
@@ -7853,7 +7856,10 @@ where
         if let Some(continuation) = pending_native_close_retry.take() {
             Box::pin(continuation.join_before_exit()).await;
         }
-        if self.fatal_local_authority_fence.fatal_authority_loss_is_latched() {
+        if self
+            .fatal_local_authority_fence
+            .fatal_authority_loss_is_latched()
+        {
             Box::pin(self.join_pending_native_close_before_fatal(
                 pending_native_close_initial,
                 pending_native_close_retry,

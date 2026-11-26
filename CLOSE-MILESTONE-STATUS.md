@@ -7,8 +7,10 @@
 - Preserves main migration 172 (`coordinator_scan_origin_labels`) and moves only
   the unshipped feature migration tail to 173–191. Fresh/through-171/main-172
   upgrade and idempotence coverage is present in source; execution is pending.
-  Published main ADR identities are preserved; the three unmerged feature ADRs
-  move to 286–288 (including upstream's existing duplicate 285, left unchanged).
+  Published main ADR identities were preserved at integration; the three unmerged
+  feature ADRs moved to 286–288. At that time the duplicate published ADR-285 was
+  left unchanged; it is now reconciled by retaining Coordinator ADR-285 and
+  renumbering the Kache qualification to ADR-289 (originally #1183).
 - Reconciles Close serial dispatch with main's ordinary concurrent-tool batches
   and cancellation inbox. Close envelopes preserve acknowledgement/retirement
   ownership; only acknowledged UserCancel enters the cancellation inbox.
@@ -808,10 +810,12 @@ The current source reduces the Close expansion against shipped RC16
   gate waiting and post-wait replacement preservation; existing blocking-profile
   cleanup tests, not those synthetic fixtures, cover physical deletion custody.
   Main's published ADR-283 (ordinary foreground batches), ADR-284 (eight-owner
-  window), and both existing ADR-285 records (Kache qualification and Coordinator
-  evidence labels) remain unchanged. Branch-local Close records move 283→286,
-  native task approval 284→287, and unified Close 285→288. The duplicate main ADR-285
-  records are pre-existing upstream entries and are not resolved here. Proposed
+  window), and both original ADR-285 records (Kache qualification and Coordinator
+  evidence labels) were left unchanged at integration. Branch-local Close records
+  moved 283→286, native task approval 284→287, and unified Close 285→288. The
+  duplicate was pre-existing upstream and was not resolved in that integration;
+  the subsequent documentation correction retains Coordinator as canonical
+  ADR-285 and renumbers Kache qualification to ADR-289 (original #1183). Proposed
   Close ADR-288 remains superseded by accepted Close ADR-286. Integrated behavior
   remains unqualified pending exact-head hosted checks.
 - Previous head `cb7e805735220fd260537a42e33e15baacaff70f`: Close qualification
