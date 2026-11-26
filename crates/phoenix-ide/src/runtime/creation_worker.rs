@@ -94,145 +94,144 @@ async fn process_claimed_product_creation(
         return Err("pinned Git creation can no longer resolve its repository".to_string());
     }
 
-    let (
-        effective_cwd,
-        conv_mode,
-        authority_kind,
-        environment,
-        logical_base,
-        git_publication,
-    ) = if let Some(repo_root) = repo_root {
-        let repo_root = repo_root.trim().to_string();
-        checkpoint_product_creation_stage(
-            manager,
-            claimed,
-            &mut current_stage,
-            Stage::ResolveStartingPin,
-        )
-        .await?;
-        let (oid, logical_base) = if let (Some(oid), Some(base)) = (
-            job.pin_exact_checkout_oid.clone(),
-            job.pin_logical_base.clone(),
-        ) {
-            (oid, base)
-        } else {
-            let resolved = tokio::task::spawn_blocking({
-                let repo_root = repo_root.clone();
-                move || strict_product_creation_pin(Path::new(&repo_root))
-            })
-            .await
-            .map_err(|error| format!("starting-pin join failed: {error}"))??;
-            match manager
+    let (effective_cwd, conv_mode, authority_kind, environment, logical_base, git_publication) =
+        if let Some(repo_root) = repo_root {
+            let repo_root = repo_root.trim().to_string();
+            checkpoint_product_creation_stage(
+                manager,
+                claimed,
+                &mut current_stage,
+                Stage::ResolveStartingPin,
+            )
+            .await?;
+            let (oid, logical_base) = if let (Some(oid), Some(base)) = (
+                job.pin_exact_checkout_oid.clone(),
+                job.pin_logical_base.clone(),
+            ) {
+                (oid, base)
+            } else {
+                let resolved = tokio::task::spawn_blocking({
+                    let repo_root = repo_root.clone();
+                    move || strict_product_creation_pin(Path::new(&repo_root))
+                })
+                .await
+                .map_err(|error| format!("starting-pin join failed: {error}"))??;
+                match manager
+                    .db()
+                    .pin_product_creation_once(
+                        &job.request_id,
+                        &claimed.claim,
+                        &resolved.0,
+                        &resolved.1,
+                        "fresh",
+                    )
+                    .await
+                    .map_err(|error| error.to_string())?
+                {
+                    crate::db::ProductCreationPinOutcome::Pinned(_)
+                    | crate::db::ProductCreationPinOutcome::Same(_) => resolved,
+                    crate::db::ProductCreationPinOutcome::Conflict(existing) => (
+                        existing
+                            .pin_exact_checkout_oid
+                            .ok_or_else(|| "conflicting pin lacked OID".to_string())?,
+                        existing
+                            .pin_logical_base
+                            .ok_or_else(|| "conflicting pin lacked logical base".to_string())?,
+                    ),
+                }
+            };
+            checkpoint_product_creation_stage(
+                manager,
+                claimed,
+                &mut current_stage,
+                Stage::MaterializeWorktree,
+            )
+            .await?;
+            let planned_path = match job.staging_path.as_deref() {
+                Some(path)
+                    if job.staging_exact_oid.as_deref() == Some(oid.as_str())
+                        && job.staging_repo_root.as_deref() == Some(repo_root.as_str()) =>
+                {
+                    PathBuf::from(path)
+                }
+                Some(_) => {
+                    return Err(
+                        "staged worktree does not match the durable repository and pin".to_string(),
+                    );
+                }
+                None => product_worktree_path(
+                    Path::new(&repo_root),
+                    job.product_conversation_id.as_str(),
+                )?,
+            };
+            let reservation_id = format!("{}:worktree", job.request_id);
+            let reserved = manager
                 .db()
-                .pin_product_creation_once(
+                .reserve_product_creation_resource(
+                    &reservation_id,
                     &job.request_id,
                     &claimed.claim,
-                    &resolved.0,
-                    &resolved.1,
-                    "fresh",
+                    &repo_root,
+                    planned_path.to_string_lossy().as_ref(),
+                    chrono::Utc::now(),
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+            if !reserved {
+                return Err("product creation claim was lost before reserving worktree".to_string());
+            }
+            let reservation = manager
+                .db()
+                .get_product_creation_resource_reservations(&job.request_id)
+                .await
+                .map_err(|error| error.to_string())?
+                .into_iter()
+                .find(|reservation| reservation.id == reservation_id)
+                .ok_or_else(|| "product creation worktree reservation disappeared".to_string())?;
+            if !manager
+                .db()
+                .record_product_creation_staging(
+                    &job.request_id,
+                    &claimed.claim,
+                    planned_path.to_string_lossy().as_ref(),
+                    &repo_root,
+                    &oid,
                 )
                 .await
                 .map_err(|error| error.to_string())?
             {
-                crate::db::ProductCreationPinOutcome::Pinned(_)
-                | crate::db::ProductCreationPinOutcome::Same(_) => resolved,
-                crate::db::ProductCreationPinOutcome::Conflict(existing) => (
-                    existing
-                        .pin_exact_checkout_oid
-                        .ok_or_else(|| "conflicting pin lacked OID".to_string())?,
-                    existing
-                        .pin_logical_base
-                        .ok_or_else(|| "conflicting pin lacked logical base".to_string())?,
-                ),
+                return Err("product creation staging claim was lost".to_string());
             }
-        };
-        checkpoint_product_creation_stage(
-            manager,
-            claimed,
-            &mut current_stage,
-            Stage::MaterializeWorktree,
-        )
-        .await?;
-        let planned_path = match job.staging_path.as_deref() {
-            Some(path)
-                if job.staging_exact_oid.as_deref() == Some(oid.as_str())
-                    && job.staging_repo_root.as_deref() == Some(repo_root.as_str()) =>
+            let materialization_lock = tokio::task::spawn_blocking({
+                let repo_root = repo_root.clone();
+                move || {
+                    RepositoryMutationLock::acquire(Path::new(&repo_root)).map_err(|error| error.0)
+                }
+            })
+            .await
+            .map_err(|error| format!("repository lock acquisition join failed: {error}"))??;
+            let persisted_ownership_token = reservation.ownership_token.clone();
+            let ownership_token = persisted_ownership_token
+                .clone()
+                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+            if !manager
+                .db()
+                .record_product_creation_resource_ownership(
+                    &job.request_id,
+                    &claimed.claim,
+                    &planned_path.to_string_lossy(),
+                    &ownership_token,
+                    chrono::Utc::now(),
+                )
+                .await
+                .map_err(|error| error.to_string())?
             {
-                PathBuf::from(path)
+                return Err(
+                    "product creation claim was lost before materializing worktree".to_string(),
+                );
             }
-            Some(_) => {
-                return Err("staged worktree does not match the durable repository and pin".to_string());
-            }
-            None => {
-                product_worktree_path(Path::new(&repo_root), job.product_conversation_id.as_str())?
-            }
-        };
-        let reservation_id = format!("{}:worktree", job.request_id);
-        let reserved = manager
-            .db()
-            .reserve_product_creation_resource(
-                &reservation_id,
-                &job.request_id,
-                &claimed.claim,
-                &repo_root,
-                planned_path.to_string_lossy().as_ref(),
-                chrono::Utc::now(),
-            )
-            .await
-            .map_err(|error| error.to_string())?;
-        if !reserved {
-            return Err("product creation claim was lost before reserving worktree".to_string());
-        }
-        let reservation = manager
-            .db()
-            .get_product_creation_resource_reservations(&job.request_id)
-            .await
-            .map_err(|error| error.to_string())?
-            .into_iter()
-            .find(|reservation| reservation.id == reservation_id)
-            .ok_or_else(|| "product creation worktree reservation disappeared".to_string())?;
-        if !manager
-            .db()
-            .record_product_creation_staging(
-                &job.request_id,
-                &claimed.claim,
-                planned_path.to_string_lossy().as_ref(),
-                &repo_root,
-                &oid,
-            )
-            .await
-            .map_err(|error| error.to_string())?
-        {
-            return Err("product creation staging claim was lost".to_string());
-        }
-        let materialization_lock = tokio::task::spawn_blocking({
-            let repo_root = repo_root.clone();
-            move || RepositoryMutationLock::acquire(Path::new(&repo_root)).map_err(|error| error.0)
-        })
-        .await
-        .map_err(|error| format!("repository lock acquisition join failed: {error}"))??;
-        let persisted_ownership_token = reservation.ownership_token.clone();
-        let ownership_token = persisted_ownership_token
-            .clone()
-            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-        if !manager
-            .db()
-            .record_product_creation_resource_ownership(
-                &job.request_id,
-                &claimed.claim,
-                &planned_path.to_string_lossy(),
-                &ownership_token,
-                chrono::Utc::now(),
-            )
-            .await
-            .map_err(|error| error.to_string())?
-        {
-            return Err(
-                "product creation claim was lost before materializing worktree".to_string(),
-            );
-        }
-        let had_materialization_authority = persisted_ownership_token.is_some();
-        let (worktree, ownership_token) = tokio::task::spawn_blocking({
+            let had_materialization_authority = persisted_ownership_token.is_some();
+            let (worktree, ownership_token) = tokio::task::spawn_blocking({
             let repo_root = repo_root.clone();
             let planned_path = planned_path.clone();
             let oid = oid.clone();
@@ -285,71 +284,71 @@ async fn process_claimed_product_creation(
         })
         .await
         .map_err(|error| format!("worktree materialization join failed: {error}"))??;
-        let non_empty = NonEmptyString::new(worktree.clone())
-            .map_err(|_| "materialized worktree path was empty".to_string())?;
-        if reservation.status == "reserved" {
-            let present = manager
-                .db()
-                .mark_product_creation_resource_present(
-                    &job.request_id,
-                    &claimed.claim,
-                    &planned_path.to_string_lossy(),
-                    &ownership_token,
-                    chrono::Utc::now(),
-                )
-                .await
-                .map_err(|error| error.to_string())?;
-            if !present {
-                return Err(
-                    "product creation claim was lost after materializing worktree".to_string(),
-                );
+            let non_empty = NonEmptyString::new(worktree.clone())
+                .map_err(|_| "materialized worktree path was empty".to_string())?;
+            if reservation.status == "reserved" {
+                let present = manager
+                    .db()
+                    .mark_product_creation_resource_present(
+                        &job.request_id,
+                        &claimed.claim,
+                        &planned_path.to_string_lossy(),
+                        &ownership_token,
+                        chrono::Utc::now(),
+                    )
+                    .await
+                    .map_err(|error| error.to_string())?;
+                if !present {
+                    return Err(
+                        "product creation claim was lost after materializing worktree".to_string(),
+                    );
+                }
             }
-        }
-        (
-            worktree.clone(),
-            ConvMode::DetachedProductCreation {
-                worktree_path: non_empty,
-                base_branch: NonEmptyString::new(logical_base.clone())
-                    .map_err(|_| "logical base was empty".to_string())?,
-            },
-            phoenix_core::work_scope::AuthorityKind::RestrictedExplore,
-            phoenix_core::work_scope::EnvironmentContext::AllocatedWorktree {
-                cwd: worktree.clone(),
-                worktree_path: worktree,
-                branch_name: None,
-                base_branch: Some(logical_base.clone()),
-            },
-            Some(logical_base),
-            Some(crate::db::ProductCreationGitPublicationFacts {
-                exact_checkout_oid: oid,
-                repository_root: repo_root,
-                ownership_token,
-            }),
-        )
-    } else {
-        checkpoint_product_creation_stage(
-            manager,
-            claimed,
-            &mut current_stage,
-            Stage::ResolveStartingPin,
-        )
-        .await?;
-        checkpoint_product_creation_stage(
-            manager,
-            claimed,
-            &mut current_stage,
-            Stage::MaterializeWorktree,
-        )
-        .await?;
-        (
-            cwd.clone(),
-            ConvMode::Direct,
-            phoenix_core::work_scope::AuthorityKind::Direct,
-            phoenix_core::work_scope::EnvironmentContext::UnownedCwd { cwd },
-            None,
-            None,
-        )
-    };
+            (
+                worktree.clone(),
+                ConvMode::DetachedProductCreation {
+                    worktree_path: non_empty,
+                    base_branch: NonEmptyString::new(logical_base.clone())
+                        .map_err(|_| "logical base was empty".to_string())?,
+                },
+                phoenix_core::work_scope::AuthorityKind::RestrictedExplore,
+                phoenix_core::work_scope::EnvironmentContext::AllocatedWorktree {
+                    cwd: worktree.clone(),
+                    worktree_path: worktree,
+                    branch_name: None,
+                    base_branch: Some(logical_base.clone()),
+                },
+                Some(logical_base),
+                Some(crate::db::ProductCreationGitPublicationFacts {
+                    exact_checkout_oid: oid,
+                    repository_root: repo_root,
+                    ownership_token,
+                }),
+            )
+        } else {
+            checkpoint_product_creation_stage(
+                manager,
+                claimed,
+                &mut current_stage,
+                Stage::ResolveStartingPin,
+            )
+            .await?;
+            checkpoint_product_creation_stage(
+                manager,
+                claimed,
+                &mut current_stage,
+                Stage::MaterializeWorktree,
+            )
+            .await?;
+            (
+                cwd.clone(),
+                ConvMode::Direct,
+                phoenix_core::work_scope::AuthorityKind::Direct,
+                phoenix_core::work_scope::EnvironmentContext::UnownedCwd { cwd },
+                None,
+                None,
+            )
+        };
 
     checkpoint_product_creation_stage(
         manager,

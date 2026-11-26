@@ -4038,7 +4038,13 @@ mod product_creation_tests {
             .await
             .unwrap());
         assert!(db
-            .mark_product_creation_resource_present(request_id, claim, worktree, "fixture-owner", now)
+            .mark_product_creation_resource_present(
+                request_id,
+                claim,
+                worktree,
+                "fixture-owner",
+                now
+            )
             .await
             .unwrap());
     }
@@ -6874,13 +6880,11 @@ mod product_creation_tests {
             Err(DbError::Serialization(message)) if message.contains("durable creation pin")
         ));
         assert!(db.get_conversation("unproven-conversation").await.is_err());
-        let scope_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM work_scopes WHERE id = ?1",
-        )
-        .bind(scope_id.as_str())
-        .fetch_one(db.pool())
-        .await
-        .unwrap();
+        let scope_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM work_scopes WHERE id = ?1")
+            .bind(scope_id.as_str())
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
         assert_eq!(scope_count, 0);
         assert_eq!(
             db.get_product_creation_job("unproven-publication")
@@ -6891,7 +6895,10 @@ mod product_creation_tests {
             "claimed"
         );
         input.git_publication.as_mut().unwrap().ownership_token = "fixture-owner".into();
-        assert!(db.publish_product_creation_atomically(&input).await.unwrap());
+        assert!(db
+            .publish_product_creation_atomically(&input)
+            .await
+            .unwrap());
     }
 
     #[tokio::test]
