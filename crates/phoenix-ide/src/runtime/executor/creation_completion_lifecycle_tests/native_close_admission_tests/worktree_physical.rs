@@ -515,6 +515,28 @@ impl DisposableGit {
                 .unwrap(),
             phoenix_db::ProductCreationPinOutcome::Pinned(_)
         ));
+        self.reserve_physical_worktree(fixture, request_id, cwd, &claimed, &oid)
+            .await;
+        assert!(fixture
+            .db
+            .advance_product_creation_provisioning_stage(
+                request_id,
+                &claimed.claim,
+                Stage::CommitMetadata,
+            )
+            .await
+            .unwrap());
+        (claimed, oid)
+    }
+
+    async fn reserve_physical_worktree(
+        &self,
+        fixture: &CloseFixture,
+        request_id: &str,
+        cwd: &str,
+        claimed: &phoenix_db::ClaimedProductCreationJob,
+        oid: &str,
+    ) {
         let path = self.worktree.to_string_lossy();
         let now = chrono::Utc::now();
         assert!(fixture
@@ -558,20 +580,10 @@ impl DisposableGit {
                 &claimed.claim,
                 &self.worktree.to_string_lossy(),
                 cwd,
-                &oid,
+                oid,
             )
             .await
             .unwrap());
-        assert!(fixture
-            .db
-            .advance_product_creation_provisioning_stage(
-                request_id,
-                &claimed.claim,
-                Stage::CommitMetadata,
-            )
-            .await
-            .unwrap());
-        (claimed, oid)
     }
 
     fn conversation(
