@@ -88,7 +88,9 @@ fn inventory(
             add_durable(repo, reference?, &mut durable)?;
         }
     }
-    if let Some(stash) = repo.try_find_reference("refs/stash")? {
+    if let Some(stash) = repo.try_find_reference("refs/stash")?
+        && stash.name().as_bstr().as_slice() == b"refs/stash"
+    {
         charge(deadline, &mut remaining)?;
         add_durable(repo, stash, &mut durable)?;
     }
@@ -143,7 +145,7 @@ fn main() -> Result<()> {
         .map(|value| value.to_string_lossy().parse::<usize>())
         .transpose()?
         .unwrap_or(100_000);
-    let repo = Repository::open_opts(worktree, gix::open::Options::isolated())?;
+    let repo = gix::open_opts(worktree, gix::open::Options::isolated())?;
     if let Some(storage) = repo.config_snapshot().string("extensions.refStorage")
         && storage.as_slice() != b"files"
     {

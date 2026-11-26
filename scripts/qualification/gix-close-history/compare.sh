@@ -31,10 +31,16 @@ for format in sha1 sha256; do
     zero=${base//?/0}
     printf '%s %s Fixture <fixture@example.test> 1600000000 +0000\tfixture\n' "$old" "$zero" "$zero" "$new" > "$log"
     compare() {
-        local roots=("$base" "$old" "$new")
+        local roots=("$base" "$old" "$new") durable=(--branches --remotes --tags) status=0
+        git show-ref --verify --quiet refs/stash || status=$?
+        case $status in
+            0) durable+=(refs/stash) ;;
+            1) ;;
+            *) return "$status" ;;
+        esac
         {
             echo "detached $base"
-            git rev-list "${roots[@]}" --not --branches --remotes --tags --glob=refs/stash | LC_ALL=C sort
+            git rev-list "${roots[@]}" --not "${durable[@]}" | LC_ALL=C sort
         } > "$scratch/expected"
         "$probe" . < "$log" > "$scratch/actual"
         diff -u "$scratch/expected" "$scratch/actual"

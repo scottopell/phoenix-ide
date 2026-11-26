@@ -16,7 +16,7 @@ jobs:
       - run: |
           git --version
           rustc --version
-          cargo generate-lockfile
+          test -f Cargo.lock
           cargo tree --locked -e features > resolved-features.txt
           cargo metadata --locked --format-version 1 > metadata.json
           /usr/bin/time -v cargo build --locked --release 2>&1 | tee build.txt
