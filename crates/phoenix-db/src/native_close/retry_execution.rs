@@ -435,8 +435,9 @@ impl Database {
             .await
             .map_err(|error| NativeCloseInitialFirstEffectError::NotStarted(error.into()))?;
         let validation = async {
-            command.verify_executing_source(live_source, command.source())
-            .map_err(|_| refused("Close requires its current executing source"))?;
+            command
+                .verify_executing_source(live_source, command.source())
+                .map_err(|_| refused("Close requires its current executing source"))?;
             let effect = CloseSafeRetryEffect {
                 scope,
                 resource: resource.clone(),

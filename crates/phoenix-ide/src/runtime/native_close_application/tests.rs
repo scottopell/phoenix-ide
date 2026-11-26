@@ -313,32 +313,28 @@ fn derive_intent(
             target,
             attempt_id,
             run_ordinal,
-        } => {
-            observe_command_from_executing_source(
-                state,
-                "source-transcript",
-                source,
-                NativeCloseRunRef {
-                    target: target.clone(),
-                    attempt_id: attempt_id.clone(),
-                    run_ordinal: *run_ordinal,
-                },
-            )
-        }
+        } => observe_command_from_executing_source(
+            state,
+            "source-transcript",
+            source,
+            NativeCloseRunRef {
+                target: target.clone(),
+                attempt_id: attempt_id.clone(),
+                run_ordinal: *run_ordinal,
+            },
+        ),
         NativeCloseIntent::ExplicitRetry {
             target,
             attempt_id,
             failed_run_ordinal,
-        } => {
-            retry_command_from_executing_source(
-                state,
-                "source-transcript",
-                source,
-                target.clone(),
-                attempt_id.clone(),
-                *failed_run_ordinal,
-            )
-        }
+        } => retry_command_from_executing_source(
+            state,
+            "source-transcript",
+            source,
+            target.clone(),
+            attempt_id.clone(),
+            *failed_run_ordinal,
+        ),
     }
 }
 

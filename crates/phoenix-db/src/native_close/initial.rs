@@ -2164,7 +2164,9 @@ pub(super) async fn require_initial_identity_tx(
     command
         .verify_executing_source(live_source, command.source())
         .map_err(|_| {
-            DbError::CloseFoundationPrecondition("Close requires its current executing source".into())
+            DbError::CloseFoundationPrecondition(
+                "Close requires its current executing source".into(),
+            )
         })?;
     if receipt.request_id != command.request_id()
         || receipt.admitted.target != *target

@@ -3357,11 +3357,12 @@ mod tests {
         assert_eq!(schema["additionalProperties"], false);
         assert_eq!(schema["required"], json!(["request"]));
         assert_eq!(schema["properties"].as_object().unwrap().len(), 1);
-        let variants = schema["properties"]["request"]["oneOf"]
-            .as_array()
-            .unwrap();
+        let variants = schema["properties"]["request"]["oneOf"].as_array().unwrap();
         assert_eq!(variants.len(), 3);
-        for (variant, action) in variants.iter().zip(["initial", "observe", "explicit_retry"]) {
+        for (variant, action) in variants
+            .iter()
+            .zip(["initial", "observe", "explicit_retry"])
+        {
             assert_eq!(variant["type"], "object");
             assert_eq!(variant["additionalProperties"], false);
             assert_eq!(variant["properties"]["action"]["enum"], json!([action]));

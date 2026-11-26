@@ -23,7 +23,9 @@ pub(super) async fn require_source_and_target_tx(
     command
         .verify_executing_source(&state, command.source())
         .map_err(|_| {
-            DbError::CloseFoundationPrecondition("Close requires its current executing source".into())
+            DbError::CloseFoundationPrecondition(
+                "Close requires its current executing source".into(),
+            )
         })?;
     let ordinary: bool = sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM product_conversations WHERE id = ?1 AND kind = 'ordinary')",

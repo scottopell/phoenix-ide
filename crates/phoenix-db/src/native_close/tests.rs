@@ -206,7 +206,7 @@ fn legacy_fingerprint_bytes_are_unchanged_and_wrapping_is_domain_separated() {
         super::append_field(&mut bytes, intent.receipt_intent().as_bytes());
         super::append_field(&mut bytes, intent.target().as_str().as_bytes());
         match &intent {
-            NativeCloseIntent::Initial { .. } => {},
+            NativeCloseIntent::Initial { .. } => {}
             NativeCloseIntent::Observe {
                 attempt_id,
                 run_ordinal,
@@ -214,7 +214,7 @@ fn legacy_fingerprint_bytes_are_unchanged_and_wrapping_is_domain_separated() {
             } => {
                 super::append_field(&mut bytes, attempt_id.as_str().as_bytes());
                 super::append_field(&mut bytes, &run_ordinal.get().to_be_bytes());
-            },
+            }
             NativeCloseIntent::ExplicitRetry {
                 attempt_id,
                 failed_run_ordinal,
@@ -222,9 +222,12 @@ fn legacy_fingerprint_bytes_are_unchanged_and_wrapping_is_domain_separated() {
             } => {
                 super::append_field(&mut bytes, attempt_id.as_str().as_bytes());
                 super::append_field(&mut bytes, &failed_run_ordinal.get().to_be_bytes());
-            },
+            }
         }
-        assert_eq!(legacy.fingerprint(), format!("{:x}", Sha256::digest(&bytes)));
+        assert_eq!(
+            legacy.fingerprint(),
+            format!("{:x}", Sha256::digest(&bytes))
+        );
         assert_ne!(legacy.fingerprint(), wrapped.fingerprint());
         assert_eq!(legacy.request_id(), wrapped.request_id());
         assert_eq!(

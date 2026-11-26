@@ -231,11 +231,16 @@ pub(crate) async fn fence_pre_completion_native_sources_tx(
             NativeCloseIntent::Initial { target }
         };
         let command = NativeCloseCommand::new_from_retained_fingerprint(
-            transcript_id.to_owned(), source.clone(), intent,
+            transcript_id.to_owned(),
+            source.clone(),
+            intent,
             &row.try_get::<String, _>("request_fingerprint")?,
         )
         .map_err(|error| DbError::Serialization(error.to_string()))?;
-        if command.verify_executing_source(next_state, &source).is_err() {
+        if command
+            .verify_executing_source(next_state, &source)
+            .is_err()
+        {
             let acknowledged_completed_initial = !explicit_retry
                 && row.try_get::<String, _>("status")? == "stopped"
                 && (row.try_get::<bool, _>("acknowledged")?
@@ -471,8 +476,9 @@ pub(crate) async fn acknowledge_initial_result_tx(
                     .pointer("/admitted/run_ordinal")
                     .and_then(serde_json::Value::as_i64)
                     != Some(1)
-                || (command.verify_executing_source(&current_state, &source)
-                .is_err()
+                || (command
+                    .verify_executing_source(&current_state, &source)
+                    .is_err()
                     && !completed_initial_result_matches(&current_state, &command, &attempt_id))
             {
                 continue;
@@ -576,7 +582,9 @@ async fn fence_completion_sources_tx(
             &origin.try_get::<String, _>("origin_request_fingerprint")?,
         )
         .map_err(|error| DbError::Serialization(error.to_string()))?;
-        let source_lost = command.verify_executing_source(next_state, &source).is_err();
+        let source_lost = command
+            .verify_executing_source(next_state, &source)
+            .is_err();
         if !source_lost && matches!(cause, NativeSourceLossCause::UserSourceLoss) {
             continue;
         }
