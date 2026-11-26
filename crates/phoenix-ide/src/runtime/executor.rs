@@ -33555,7 +33555,7 @@ mod close_run_inner_layout_tests {
             future_size4(ProductionRuntime::apply_transition_result_with_deadline);
         let execute_effect_bytes = future_size2(ProductionRuntime::execute_effect);
         let execute_authoritative_bytes =
-            future_size4(ProductionRuntime::execute_authoritative_effect);
+            future_size3(ProductionRuntime::execute_authoritative_effect);
         let inline_drain_bytes = future_size7(ProductionRuntime::run_effects_with_inline_drain);
         let apply_inner_bytes = future_size4(ProductionRuntime::apply_transition_result_inner);
         let persist_state_bytes = future_size3(ProductionRuntime::persist_state_effect);

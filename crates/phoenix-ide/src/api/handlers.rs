@@ -6926,10 +6926,13 @@ async fn cleanup_browser_with_retry(
 
 #[derive(Debug)]
 pub(crate) struct ResourceCleanupReceipt {
+    #[cfg(test)]
     work_scope: crate::work_scope::ResourceScopeKey,
+    #[cfg(test)]
     bash_teardown_generation: Option<phoenix_tools::bash::registry::BashTeardownGeneration>,
 }
 
+#[cfg(test)]
 pub(super) async fn reopen_bash_after_failed_lifecycle_mutation(
     state: &AppState,
     conversation: &crate::db::Conversation,
@@ -7048,7 +7051,9 @@ pub(crate) async fn run_runtime_resource_cleanup_cascade(
     .await;
 
     Ok(ResourceCleanupReceipt {
+        #[cfg(test)]
         work_scope,
+        #[cfg(test)]
         bash_teardown_generation: bash_report.teardown_generation,
     })
 }
@@ -14179,11 +14184,6 @@ pub(crate) mod api_test_support {
         assert_eq!(paths, vec!["src/right.rs"]);
     }
 
-    /// Hand-rolled property-style sweep: across a small set of arbitrary
-    /// (id, mode) combinations, every successful cascade leaves the in-
-    /// memory bash and tmux registries clean of any reference to the
-    /// deleted conversation.
-
     /// Build a 2-member chain via raw SQL — same trick as the chains.rs
     /// test helper. The cascade tests only need the linkage; they don't
     /// exercise the `continue_conversation` gating on `context_exhausted`.
@@ -15008,22 +15008,6 @@ pub(crate) mod api_test_support {
         table.write().await.insert(handle);
     }
 
-    /// REQ-BASH-WS-002: deleting a Work-mode sub-agent that shares its
-    /// parent's `ResourceScopeKey` (no continuation of its own) must PRESERVE the
-    /// still-live parent's bash handles. The parent has a live runtime
-    /// handle and is non-terminal, so it is a live owner of the scope; the
-    /// any-live-owner preservation signal keeps the handle table intact.
-    ///
-    /// Regression guard for the P1 where the continuation-only signal
-    /// resolved `inheritor_scope = None` for a sub-agent and SIGKILL'd the
-    /// parent's b-* handles.
-
-    /// Counterpart: when the conversation being deleted is the LAST live
-    /// conversation on its scope (no continuation, no live sibling), the
-    /// cascade must tear the scope down — the deleted conv reads
-    /// non-terminal in the DB at cascade time, so excluding it from the
-    /// live-owner enumeration is what lets teardown fire.
-
     /// Build a real git repo + shared worktree with a parent + sub-agent
     /// pair of Work-mode conversations bound to it. The sub-agent points at the
     /// parent via `parent_conversation_id` and shares its durable work scope.
@@ -15086,17 +15070,6 @@ pub(crate) mod api_test_support {
 
         (tmp, repo, worktree, branch)
     }
-
-    /// REQ-PROJ-029: deleting a Work-mode sub-agent that shares its live
-    /// parent's worktree must PRESERVE the worktree on disk and the task
-    /// branch. The sub-agent inherits the parent's `worktree_path`, so the
-    /// project cascade would `git worktree remove --force` + `branch -D`
-    /// the parent's still-in-use checkout — destructive data loss against a
-    /// live conversation. The any-live-owner signal must suppress it.
-
-    /// Counterpart: deleting the LAST live owner of the worktree scope (the
-    /// parent here, with no live sibling) must still reap the worktree and
-    /// the task branch as a normal solo Work conversation would.
 
     /// The cleanup cascade fails loud when the sibling-liveness lookup cannot
     /// reach the DB. Proceeding on a fail-closed "assume live" would skip every

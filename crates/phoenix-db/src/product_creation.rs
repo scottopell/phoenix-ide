@@ -2978,7 +2978,8 @@ impl Database {
         cleanup_error: &str,
         now: DateTime<Utc>,
     ) -> DbResult<bool> {
-        let result = sqlx::query(
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let reserved_id: Option<String> = sqlx::query_scalar(
             "UPDATE product_creation_jobs
              SET status = 'cleanup_ambiguous', retry_at_unix_micros = NULL,
                  deletion_requested_at_unix_micros = NULL,
@@ -2988,7 +2989,9 @@ impl Database {
              WHERE request_id = ?3 AND claim_generation = ?4
                AND status IN ('cancelling', 'deletion_pending')
                AND cleanup_worker_id = ?5 AND cleanup_token = ?6
-               AND cleanup_lease_until_unix_micros > ?2",
+               AND cleanup_lease_until_unix_micros > ?2
+               AND published_product_id IS NULL AND published_conversation_id IS NULL
+             RETURNING product_conversation_id",
         )
         .bind(cleanup_error)
         .bind(datetime_to_unix_micros(now))
@@ -2996,9 +2999,14 @@ impl Database {
         .bind(cleanup.claim.generation)
         .bind(&cleanup.claim.worker_id)
         .bind(&cleanup.claim.token)
-        .execute(&self.pool)
+        .fetch_optional(&mut *tx)
         .await?;
-        Ok(result.rows_affected() == 1)
+        let Some(reserved_id) = reserved_id else {
+            return Ok(false);
+        };
+        Self::remove_owned_hidden_creation_aggregate(&mut tx, &reserved_id).await?;
+        tx.commit().await?;
+        Ok(true)
     }
 
     pub async fn schedule_product_creation_cleanup_retry(
@@ -3116,67 +3124,7 @@ impl Database {
                 "product creation cleanup retained published identity".to_string(),
             ));
         }
-        let staged_product_exists: bool =
-            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM product_conversations WHERE id = ?1)")
-                .bind(&reserved_id)
-                .fetch_one(&mut *tx)
-                .await?;
-        if staged_product_exists {
-            let aggregate: Option<(String, String)> = sqlx::query_as(
-                "SELECT c.id, c.work_scope_id FROM conversations c
-                 JOIN product_conversations p ON p.id = c.product_conversation_id
-                 JOIN product_conversation_work_scopes attachment
-                   ON attachment.product_conversation_id = p.id
-                  AND attachment.work_scope_id = c.work_scope_id
-                 WHERE p.id = ?1 AND p.kind = 'ordinary'
-                   AND p.ordinary_lifecycle = 'open' AND c.archived = 1
-                   AND c.runtime_role = 'user' AND c.parent_conversation_id IS NULL
-                   AND NOT EXISTS (SELECT 1 FROM conversations other
-                       WHERE other.id <> c.id AND (other.product_conversation_id = p.id
-                           OR other.work_scope_id = c.work_scope_id
-                           OR other.parent_conversation_id = c.id))
-                   AND NOT EXISTS (SELECT 1 FROM product_conversation_work_scopes other_attachment
-                       WHERE other_attachment.product_conversation_id = p.id
-                         AND other_attachment.work_scope_id <> c.work_scope_id)
-                   AND NOT EXISTS (SELECT 1 FROM product_conversation_work_scopes other_owner
-                       WHERE other_owner.work_scope_id = c.work_scope_id
-                         AND other_owner.product_conversation_id <> p.id)
-                   AND NOT EXISTS (SELECT 1 FROM steering_acceptance_receipts receipt
-                       WHERE receipt.conversation_id = c.id)",
-            )
-            .bind(&reserved_id)
-            .fetch_optional(&mut *tx)
-            .await?;
-            let Some((conversation_id, scope_id)) = aggregate else {
-                return Err(DbError::Serialization(
-                    "product creation cleanup staged aggregate mismatch or accepted input"
-                        .to_string(),
-                ));
-            };
-            let deleted = Self::hard_delete_conversation_tx(
-                &mut tx,
-                &conversation_id,
-                sqlite_telemetry::ParentSqliteObserver::UninstrumentedNested,
-                None,
-            )
-            .await?;
-            if deleted != (true, true) {
-                return Err(DbError::Serialization(
-                    "staged aggregate was not deleted".to_string(),
-                ));
-            }
-            Self::delete_work_scope_if_empty(&mut tx, &scope_id).await?;
-            let scope_remains: bool =
-                sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM work_scopes WHERE id = ?1)")
-                    .bind(&scope_id)
-                    .fetch_one(&mut *tx)
-                    .await?;
-            if scope_remains {
-                return Err(DbError::Serialization(
-                    "staged work scope was not deleted".to_string(),
-                ));
-            }
-        }
+        Self::remove_owned_hidden_creation_aggregate(&mut tx, &reserved_id).await?;
         match cleanup.job.status.as_str() {
             "cancelling" => {
                 let updated = sqlx::query(
@@ -3229,6 +3177,74 @@ impl Database {
         }
         tx.commit().await?;
         Ok(true)
+    }
+
+    async fn remove_owned_hidden_creation_aggregate(
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        reserved_id: &str,
+    ) -> DbResult<()> {
+        let staged_product_exists: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM product_conversations WHERE id = ?1)")
+                .bind(reserved_id)
+                .fetch_one(&mut **tx)
+                .await?;
+        if staged_product_exists {
+            let aggregate: Option<(String, String)> = sqlx::query_as(
+                "SELECT c.id, c.work_scope_id FROM conversations c
+                 JOIN product_conversations p ON p.id = c.product_conversation_id
+                 JOIN product_conversation_work_scopes attachment
+                   ON attachment.product_conversation_id = p.id
+                  AND attachment.work_scope_id = c.work_scope_id
+                 WHERE p.id = ?1 AND p.kind = 'ordinary'
+                   AND p.ordinary_lifecycle = 'open' AND c.archived = 1
+                   AND c.runtime_role = 'user' AND c.parent_conversation_id IS NULL
+                   AND NOT EXISTS (SELECT 1 FROM conversations other
+                       WHERE other.id <> c.id AND (other.product_conversation_id = p.id
+                           OR other.work_scope_id = c.work_scope_id
+                           OR other.parent_conversation_id = c.id))
+                   AND NOT EXISTS (SELECT 1 FROM product_conversation_work_scopes other_attachment
+                       WHERE other_attachment.product_conversation_id = p.id
+                         AND other_attachment.work_scope_id <> c.work_scope_id)
+                   AND NOT EXISTS (SELECT 1 FROM product_conversation_work_scopes other_owner
+                       WHERE other_owner.work_scope_id = c.work_scope_id
+                         AND other_owner.product_conversation_id <> p.id)
+                   AND NOT EXISTS (SELECT 1 FROM steering_acceptance_receipts receipt
+                       WHERE receipt.conversation_id = c.id)",
+            )
+            .bind(reserved_id)
+            .fetch_optional(&mut **tx)
+            .await?;
+            let Some((conversation_id, scope_id)) = aggregate else {
+                return Err(DbError::Serialization(
+                    "product creation cleanup staged aggregate mismatch or accepted input"
+                        .to_string(),
+                ));
+            };
+            let deleted = Self::hard_delete_conversation_tx(
+                tx,
+                &conversation_id,
+                sqlite_telemetry::ParentSqliteObserver::UninstrumentedNested,
+                None,
+            )
+            .await?;
+            if deleted != (true, true) {
+                return Err(DbError::Serialization(
+                    "staged aggregate was not deleted".to_string(),
+                ));
+            }
+            Self::delete_work_scope_if_empty(tx, &scope_id).await?;
+            let scope_remains: bool =
+                sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM work_scopes WHERE id = ?1)")
+                    .bind(&scope_id)
+                    .fetch_one(&mut **tx)
+                    .await?;
+            if scope_remains {
+                return Err(DbError::Serialization(
+                    "staged work scope was not deleted".to_string(),
+                ));
+            }
+        }
+        Ok(())
     }
 
     pub async fn next_product_creation_deadline(&self) -> DbResult<Option<DateTime<Utc>>> {
@@ -6127,7 +6143,10 @@ mod product_creation_tests {
         assert_eq!(ambiguous.status, "cleanup_ambiguous");
         assert!(ambiguous.published_product_id.is_none());
         assert!(ambiguous.published_conversation_id.is_none());
-        assert!(db.get_conversation(conversation_id).await.unwrap().archived);
+        assert!(matches!(
+            db.get_conversation(conversation_id).await,
+            Err(DbError::ConversationNotFound(_))
+        ));
         assert!(db
             .list_ordinary_product_conversation_projections()
             .await
