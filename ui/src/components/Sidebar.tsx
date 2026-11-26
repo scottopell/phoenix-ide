@@ -116,18 +116,8 @@ export function Sidebar({
   const refreshScheduledRef = useRef<number | null>(null);
   const [activeProductSnapshot, setActiveProductSnapshot] = useState<Awaited<ReturnType<typeof api.getProductConversationSnapshot>> | null>(null);
 
-  const shouldNavigateHomeOnDelete = useCallback((row: ProductConversationListRow) => {
-    const productId = row.product_conversation_id;
-    const activeSnapshotMatches = activeProductSnapshot?.product_conversation_id === productId
-      && activeProductSnapshot.segments.some((segment) => (
-        segment.transcript_row_id === activeSlug || segment.slug === activeSlug
-      ));
-    return productRowMatchesRoute(row, activeSlug) || activeSnapshotMatches;
-  }, [activeProductSnapshot, activeSlug]);
-
   const productActions = useProductConversationActions({
     onAfterMutate: onConversationCreated,
-    shouldNavigateHomeOnDelete,
   });
 
   const scheduleProductRefresh = useCallback(() => {

@@ -1061,7 +1061,14 @@ describe('AboutDeploymentPage disk usage health', () => {
     expect(screen.getByText('Phoenix-managed worktrees').closest('tr')).toHaveClass('deploy-table__row--largest');
   });
 
-  it('renders managed worktree drilldown actions from typed disposition', async () => {
+  it('shows managed worktree details without offering leftover cleanup', async () => {
+    const leftover = {
+      kind: 'leftover' as const,
+      source_conversation_id: 'old-conv',
+      source_state: 'Terminal',
+      archived: true,
+      cleanup_allowed: true,
+    };
     renderPage(deployment(), deploymentDisk({
       disk: [
         { category: 'managed_worktrees', label: 'Phoenix-managed worktrees', path: '/repo/.phoenix/worktrees/*', size: { kind: 'measured', bytes: 3000 } },
@@ -1079,7 +1086,7 @@ describe('AboutDeploymentPage disk usage health', () => {
           size: { kind: 'measured', bytes: 1000 },
           repository: '/repo',
           branch_name: 'task-leftover',
-          disposition: { kind: 'leftover', source_conversation_id: 'old-conv', source_state: 'Terminal', archived: true },
+          disposition: leftover,
         },
       ],
     }));

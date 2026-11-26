@@ -10538,8 +10538,6 @@ impl Database {
         Ok(usize::try_from(result.rows_affected()).unwrap_or(0))
     }
 
-    }
-
     /// Atomically persist a completed tool round: the assistant message row and
     /// each of its tool-result rows commit in a single transaction, or none do.
     ///

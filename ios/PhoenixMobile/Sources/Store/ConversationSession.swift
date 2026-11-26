@@ -311,7 +311,7 @@ final class ConversationSession {
     private func completeSnapshotPersistence(
         _ snapshot: Snapshot, revision: Int, didSave: Bool
     ) -> Bool {
-        guard latestSnapshotRevision == revision, snapshotPersistenceEnabled,
+        guard latestSnapshotRevision == revision, snapshotPersistenceEnabled
         else { return false }
         if didSave {
             snapshotSyncedAt = snapshot.syncedAt

@@ -680,7 +680,6 @@ function ConversationPageContent({
     // useState resets — React batches these into the same render.
     setError(null);
     setResolvedRouteConversationId(null);
-    setDeletingConversation(false);
     setShowFileBrowser(false);
     setShowMobileTerminal(false);
     setTerminalStatus({ activity: 'disconnected', unreadLines: 0, cwd: '' });

@@ -276,7 +276,7 @@ struct ConversationListView: View {
                         }
                     }
                     .swipeActions(edge: .trailing, allowsFullSwipe: false) {
-                        if if !isCoordinator && conversation.product_close_action == .available {
+                        if !isCoordinator && conversation.product_close_action == .available {
                             Button {
                                 Task { await model.closeProductConversation(conversation) }
                             } label: {

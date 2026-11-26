@@ -1,13 +1,9 @@
-import { useCallback, useEffect, useRef } from 'react';
+import { useCallback, useContext, useEffect, useRef } from 'react';
 import { ConversationContext } from './ConversationContext';
 import type { ConversationStore } from './ConversationStore';
 import { api } from '../api';
 import { cacheDB } from '../cache';
-import {
-  notifyProductConversationListMayHaveChanged,
-  notifyProductConversationSnapshotChanged,
-  notifyProductConversationsReconciled,
-} from '../notifications';
+import { notifyProductConversationListMayHaveChanged } from '../notifications';
 
 const POLL_INTERVAL_MS = 5000;
 
