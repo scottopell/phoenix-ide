@@ -88,6 +88,11 @@ async fn registered_native_close_with_loss_content_stops_incomplete_without_reti
 }
 
 #[tokio::test]
+async fn registered_native_close_with_reflog_only_commit_stops_incomplete_without_retirement() {
+    run_public_worktree_close(WorktreeJourney::ReflogOnlyBlocker).await;
+}
+
+#[tokio::test]
 async fn registered_native_close_captured_loss_can_be_reinspected_after_separate_cleanup() {
     run_public_worktree_close(WorktreeJourney::ReinspectCapturedLossAfterCleanup).await;
 }
@@ -175,6 +180,7 @@ enum WorktreeJourney {
     CapturedLossPublicRetryStoppedDuringPhysicalMutation,
     CapturedLossPublicRetryResumedDuringPhysicalMutation,
     RetainContentBlockers,
+    ReflogOnlyBlocker,
     ReinspectCapturedLossAfterCleanup,
     RetryLossClassification,
     StopBeforeAdmission,
@@ -312,8 +318,7 @@ impl DisposableGit {
             &[
                 "worktree",
                 "add",
-                "-b",
-                "disposable-close",
+                "--detach",
                 git.worktree.to_str().unwrap(),
                 "main",
             ],
@@ -331,6 +336,11 @@ impl DisposableGit {
         );
         git.worktree = git.worktree.canonicalize().unwrap();
         git.sibling = git.sibling.canonicalize().unwrap();
+        assert_eq!(
+            git.run(&git.worktree, &["rev-parse", "HEAD"]),
+            git.run(&git.repo, &["rev-parse", "refs/heads/main"]),
+            "supported detached target starts at the preserved default-branch commit"
+        );
         git.admin = git.administrative_directory(&git.worktree);
         git.sibling_admin = git.administrative_directory(&git.sibling);
         assert_ne!(git.admin, git.sibling_admin);
@@ -404,14 +414,11 @@ impl DisposableGit {
             .unwrap()
             .attached_work_scope_id
             .expect("target already owns its original WorkScope");
-        // Use the same ConvMode -> allocated_worktree conversion as normal Work
-        // registration, rather than inventing a scope or injecting its identity.
-        let mode = phoenix_core::domain::db_schema::ConvMode::Work {
-            branch_name: NonEmptyString::new("disposable-close").unwrap(),
+        // Use the supported detached ProductCreation mode -> allocated_worktree
+        // conversion rather than inventing a scope or injecting its identity.
+        let mode = phoenix_core::domain::db_schema::ConvMode::DetachedProductCreation {
             worktree_path: NonEmptyString::new(self.worktree.to_str().unwrap()).unwrap(),
             base_branch: NonEmptyString::new("main").unwrap(),
-            task_id: NonEmptyString::new("disposable-close-fixture").unwrap(),
-            task_title: NonEmptyString::new("Disposable Worktree Close qualification").unwrap(),
         };
         fixture
             .db
@@ -542,6 +549,32 @@ async fn run_public_worktree_close_inner(journey: WorktreeJourney) {
     use tokio_util::sync::CancellationToken;
 
     let mut git = DisposableGit::new();
+    // Start at ancestor A, create C, then leave HEAD at A. C has no ref and is
+    // reachable only through this linked checkout's HEAD reflog.
+    let reflog_only_commit = if matches!(journey, WorktreeJourney::ReflogOnlyBlocker) {
+        let ancestor = git.run(&git.worktree, &["rev-parse", "HEAD"]);
+        std::fs::write(git.worktree.join("tracked.txt"), b"reflog-only commit\n").unwrap();
+        git.run(&git.worktree, &["add", "--", "tracked.txt"]);
+        git.run(&git.worktree, &["commit", "-m", "Detached reflog-only fixture"]);
+        let commit = git.run(&git.worktree, &["rev-parse", "HEAD"]);
+        git.run(
+            &git.worktree,
+            &["checkout", "--detach", std::str::from_utf8(&ancestor).unwrap().trim()],
+        );
+        assert_eq!(
+            git.run(&git.worktree, &["rev-parse", "HEAD"]),
+            ancestor,
+            "the fixture returns to A after creating reflog-only C"
+        );
+        let commit = std::str::from_utf8(&commit).unwrap().trim().to_owned();
+        let reflog = git.run(&git.worktree, &["reflog", "--format=%H"]);
+        assert!(String::from_utf8_lossy(&reflog).lines().any(|line| line == commit));
+        Some(
+            phoenix_core::domain::close::GitOidIdentity::parse_hex(&commit).unwrap(),
+        )
+    } else {
+        None
+    };
     let stop_before_admission = matches!(
         journey,
         WorktreeJourney::StopBeforeAdmission | WorktreeJourney::StopBeforeAdmissionWithReusedPath
@@ -563,6 +596,7 @@ async fn run_public_worktree_close_inner(journey: WorktreeJourney) {
     let content_blocked = matches!(
         journey,
         WorktreeJourney::RetainContentBlockers
+            | WorktreeJourney::ReflogOnlyBlocker
             | WorktreeJourney::RetryLossClassification
             | WorktreeJourney::ReinspectCapturedLossAfterCleanup
             | WorktreeJourney::CapturedLossPublicRetryWithProductionDetector
@@ -574,12 +608,14 @@ async fn run_public_worktree_close_inner(journey: WorktreeJourney) {
             | WorktreeJourney::CapturedLossPublicRetryResumedDuringPhysicalMutation
     );
     if content_blocked {
-        std::fs::create_dir_all(git.repo.join(".git/info")).unwrap();
-        std::fs::write(git.repo.join(".git/info/exclude"), b"build/\n").unwrap();
-        std::fs::create_dir(git.worktree.join("build")).unwrap();
-        std::fs::write(git.worktree.join("build/a.bin"), b"retained build a").unwrap();
-        std::fs::write(git.worktree.join("build/b.bin"), b"retained build b").unwrap();
-        std::fs::write(git.worktree.join("tracked.txt"), b"unpreserved edits\n").unwrap();
+        if !matches!(journey, WorktreeJourney::ReflogOnlyBlocker) {
+            std::fs::create_dir_all(git.repo.join(".git/info")).unwrap();
+            std::fs::write(git.repo.join(".git/info/exclude"), b"build/\n").unwrap();
+            std::fs::create_dir(git.worktree.join("build")).unwrap();
+            std::fs::write(git.worktree.join("build/a.bin"), b"retained build a").unwrap();
+            std::fs::write(git.worktree.join("build/b.bin"), b"retained build b").unwrap();
+            std::fs::write(git.worktree.join("tracked.txt"), b"unpreserved edits\n").unwrap();
+        }
         if public_captured_retry {
             std::fs::write(
                 git.worktree.join("untracked.txt"),
@@ -593,6 +629,7 @@ async fn run_public_worktree_close_inner(journey: WorktreeJourney) {
         journey,
         WorktreeJourney::Retire
             | WorktreeJourney::RetainContentBlockers
+            | WorktreeJourney::ReflogOnlyBlocker
             | WorktreeJourney::RetryLossClassification
             | WorktreeJourney::ReinspectCapturedLossAfterCleanup
             | WorktreeJourney::CapturedLossPublicRetryStoppedDuringPhysicalMutation
@@ -920,7 +957,21 @@ async fn run_public_worktree_close_inner(journey: WorktreeJourney) {
             .list_close_retirement_losses(attempt.as_str())
             .await
             .unwrap();
-        assert_eq!(losses.len(), if public_captured_retry { 4 } else { 3 });
+        assert_eq!(
+            losses.len(),
+            if reflog_only_commit.is_some() {
+                1
+            } else {
+                3 + usize::from(public_captured_retry)
+            }
+        );
+        if let Some(commit) = &reflog_only_commit {
+            assert!(losses.iter().any(|loss| {
+                loss.scope == scope
+                    && loss.item
+                        == CloseLossItem::DetachedUnreachableCommit(commit.clone())
+            }));
+        }
         if public_captured_retry {
             assert!(losses.iter().any(|loss| {
                 loss.scope == scope
@@ -931,16 +982,18 @@ async fn run_public_worktree_close_inner(journey: WorktreeJourney) {
             }));
             captured_retry_run = Some(run.clone());
         }
-        for item in [
-            CloseLossItem::UnstagedTrackedPath(GitPathIdentity::from_bytes(
-                b"tracked.txt".to_vec(),
-            )),
-            CloseLossItem::IgnoredPath(GitPathIdentity::from_bytes(b"build/a.bin".to_vec())),
-            CloseLossItem::IgnoredPath(GitPathIdentity::from_bytes(b"build/b.bin".to_vec())),
-        ] {
-            assert!(losses
-                .iter()
-                .any(|loss| loss.scope == scope && loss.item == item));
+        if reflog_only_commit.is_none() {
+            for item in [
+                CloseLossItem::UnstagedTrackedPath(GitPathIdentity::from_bytes(
+                    b"tracked.txt".to_vec(),
+                )),
+                CloseLossItem::IgnoredPath(GitPathIdentity::from_bytes(b"build/a.bin".to_vec())),
+                CloseLossItem::IgnoredPath(GitPathIdentity::from_bytes(b"build/b.bin".to_vec())),
+            ] {
+                assert!(losses
+                    .iter()
+                    .any(|loss| loss.scope == scope && loss.item == item));
+            }
         }
         let certainty: String = sqlx::query_scalar(
             "SELECT stop_certainty FROM close_cleanup_failures WHERE attempt_id = ?1",
@@ -984,6 +1037,15 @@ async fn run_public_worktree_close_inner(journey: WorktreeJourney) {
         assert_eq!(physical_snapshot(&git.root), physical_before_admission);
         assert_eq!(directory_identity(&git.worktree), git.checkout_identity);
         assert_eq!(directory_identity(&git.admin), git.admin_identity);
+        if matches!(journey, WorktreeJourney::ReflogOnlyBlocker) {
+            assert_eq!(
+                git.run(&git.worktree, &["rev-parse", "HEAD"]),
+                git.run(&git.repo, &["rev-parse", "refs/heads/main"]),
+                "blocked reflog-only loss leaves detached HEAD at ancestor A"
+            );
+            assert!(git.admin.is_dir(), "the exact target admin remains registered");
+            assert!(git.worktree.is_dir(), "the exact target checkout remains present");
+        }
         let before_replay = durable_native_close_rows(&fixture, &run).await;
         let replay = tokio::time::timeout(Duration::from_secs(10), tool.run(input, context))
             .await
@@ -1262,6 +1324,15 @@ async fn run_public_worktree_close_inner(journey: WorktreeJourney) {
             .await
             .unwrap();
         assert_eq!(outcomes.len(), 2);
+        assert!(
+            fixture
+                .db
+                .list_close_retirement_losses(attempt.as_str())
+                .await
+                .unwrap()
+                .is_empty(),
+            "the detached checkout at preserved main has no at-risk loss rows"
+        );
         for item in &expected {
             assert_eq!(item.attempt_id, attempt);
             assert_eq!(item.scope, scope);
