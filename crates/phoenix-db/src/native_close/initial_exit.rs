@@ -124,7 +124,6 @@ mod tests {
     use phoenix_core::domain::llm_types::ContentBlock;
     use phoenix_core::domain::sm_state::{AssistantMessage, ConvState, ToolCall, ToolInput};
     use phoenix_core::llm_language::LlmLanguage;
-    use serde_json::json;
 
     struct Fixture {
         db: Database,
@@ -148,10 +147,10 @@ mod tests {
                 message_id: "exit-source-message".into(),
                 tool_use_id: "exit-source-tool".into(),
             };
-            let input = json!({
-                "action": "initial",
-                "product_conversation_id": target.as_str()
-            });
+            let input = NativeCloseIntent::Initial {
+                target: target.clone(),
+            }
+            .source_input();
             let state = ConvState::ToolExecuting {
                 current_tool: ToolCall::new(
                     &source.tool_use_id,

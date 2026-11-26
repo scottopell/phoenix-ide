@@ -137,6 +137,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(command.intent(), &intent);
+        assert_eq!(command.source_input(), input);
         assert_eq!(
             retry_command_from_executing_source(
                 &ConvState::Idle,
@@ -149,15 +150,9 @@ mod tests {
             Err(NativeCloseSourceRefusal::NotExactExecutingSource)
         );
 
-        let wrong = fixture(
-            source.clone(),
-            json!({
-                "action":"explicit_retry",
-                "product_conversation_id":"target",
-                "attempt_id":"attempt",
-                "failed_run_ordinal":3
-            }),
-        );
+        let mut wrong_input = intent.source_input();
+        wrong_input["request"]["failed_run_ordinal"] = json!(3);
+        let wrong = fixture(source.clone(), wrong_input);
         assert_eq!(
             retry_command_from_executing_source(
                 &wrong,

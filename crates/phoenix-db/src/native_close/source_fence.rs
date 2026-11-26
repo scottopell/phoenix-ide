@@ -1,6 +1,5 @@
 use super::{NativeCloseCommand, NativeCloseIntent};
 use crate::close_foundation::CloseCleanupFailureAuthority;
-use crate::executing_source::require_executing_source;
 use crate::{ConvState, Database, DbError, DbResult};
 use phoenix_core::domain::close::{CloseAttemptId, CloseObligation, CloseRunOrdinal, CloseRunRef};
 use phoenix_core::domain::db_schema::SourceToolCall;
@@ -231,15 +230,17 @@ pub(crate) async fn fence_pre_completion_native_sources_tx(
         } else {
             NativeCloseIntent::Initial { target }
         };
-        let command = NativeCloseCommand::new(transcript_id.to_owned(), source.clone(), intent)
-            .map_err(|error| DbError::Serialization(error.to_string()))?;
-        if command.fingerprint() != row.try_get::<String, _>("request_fingerprint")? {
-            return Err(DbError::Serialization(
-                "native Close source receipt differs from its intent".into(),
-            ));
-        }
-        let input = command.intent().source_input();
-        if require_executing_source(next_state, &source, "close_conversation", &input).is_err() {
+        let command = NativeCloseCommand::new_from_retained_fingerprint(
+            transcript_id,
+            &source,
+            &intent,
+            &row.try_get::<String, _>("request_fingerprint")?,
+        )
+        .map_err(|error| DbError::Serialization(error.to_string()))?;
+        if command
+            .verify_executing_source(next_state, &source)
+            .is_err()
+        {
             let acknowledged_completed_initial = !explicit_retry
                 && row.try_get::<String, _>("status")? == "stopped"
                 && (row.try_get::<bool, _>("acknowledged")?
@@ -298,7 +299,7 @@ fn completed_initial_result_matches(
         || !assistant_message.content.iter().any(|block| {
             matches!(block,
             ContentBlock::ToolUse { id, name, input } if id == &command.source().tool_use_id
-                && name == "close_conversation" && input == &command.intent().source_input())
+                && name == "close_conversation" && command.matches_source_input(input))
         })
     {
         return false;
@@ -427,12 +428,13 @@ pub(crate) async fn acknowledge_initial_result_tx(
                 message_id: assistant.message_id.clone(),
                 tool_use_id: tool_result.tool_use_id.clone(),
             };
-            let command = NativeCloseCommand::new(
-                transcript_id.to_owned(),
-                source.clone(),
-                NativeCloseIntent::Initial {
+            let command = NativeCloseCommand::new_from_retained_fingerprint(
+                transcript_id,
+                &source,
+                &NativeCloseIntent::Initial {
                     target: target.clone(),
                 },
+                &receipt.try_get::<String, _>("request_fingerprint")?,
             )
             .map_err(|error| DbError::Serialization(error.to_string()))?;
             let request_id: String = receipt.try_get("request_id")?;
@@ -454,7 +456,7 @@ pub(crate) async fn acknowledge_initial_result_tx(
             }
             if prior.is_some()
                 || command.fingerprint() != fingerprint
-                || input != &command.intent().source_input()
+                || !command.matches_source_input(input)
                 || output.get("action").and_then(serde_json::Value::as_str) != Some("initial")
                 || !matches!(
                     output.get("status").and_then(serde_json::Value::as_str),
@@ -474,13 +476,9 @@ pub(crate) async fn acknowledge_initial_result_tx(
                     .pointer("/admitted/run_ordinal")
                     .and_then(serde_json::Value::as_i64)
                     != Some(1)
-                || (require_executing_source(
-                    &current_state,
-                    &source,
-                    "close_conversation",
-                    &command.intent().source_input(),
-                )
-                .is_err()
+                || (command
+                    .verify_executing_source(&current_state, &source)
+                    .is_err()
                     && !completed_initial_result_matches(&current_state, &command, &attempt_id))
             {
                 continue;
@@ -577,24 +575,16 @@ async fn fence_completion_sources_tx(
         let target =
             ProductConversationId::parse(origin.try_get::<String, _>("product_conversation_id")?)
                 .map_err(|error| DbError::Serialization(error.to_string()))?;
-        let command = NativeCloseCommand::new(
-            transcript_id.to_owned(),
-            source.clone(),
-            NativeCloseIntent::Initial { target },
+        let command = NativeCloseCommand::new_from_retained_fingerprint(
+            transcript_id,
+            &source,
+            &NativeCloseIntent::Initial { target },
+            &origin.try_get::<String, _>("origin_request_fingerprint")?,
         )
         .map_err(|error| DbError::Serialization(error.to_string()))?;
-        if command.fingerprint() != origin.try_get::<String, _>("origin_request_fingerprint")? {
-            return Err(DbError::Serialization(
-                "automatic Close origin differs from initial source".into(),
-            ));
-        }
-        let source_lost = require_executing_source(
-            next_state,
-            &source,
-            "close_conversation",
-            &command.intent().source_input(),
-        )
-        .is_err();
+        let source_lost = command
+            .verify_executing_source(next_state, &source)
+            .is_err();
         if !source_lost && matches!(cause, NativeSourceLossCause::UserSourceLoss) {
             continue;
         }

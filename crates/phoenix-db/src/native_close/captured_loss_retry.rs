@@ -209,15 +209,16 @@ impl Database {
                 "captured loss origin requires exactly one initial receipt",
             ));
         };
-        let initial_command = NativeCloseCommand::new(
-            receipt.try_get("source_transcript_id")?,
-            SourceToolCall {
+        let initial_command = NativeCloseCommand::new_from_retained_fingerprint(
+            &receipt.try_get::<String, _>("source_transcript_id")?,
+            &SourceToolCall {
                 message_id: receipt.try_get("source_message_id")?,
                 tool_use_id: receipt.try_get("source_tool_use_id")?,
             },
-            NativeCloseIntent::Initial {
+            &NativeCloseIntent::Initial {
                 target: target.clone(),
             },
+            &receipt.try_get::<String, _>("request_fingerprint")?,
         )
         .map_err(decode_error)?;
         if receipt.try_get::<String, _>("request_id")? != initial_command.request_id().to_string()
@@ -429,37 +430,15 @@ mod tests {
     }
 
     async fn retained_loss_origin() -> (Database, NativeCloseCommand, CloseRunRef) {
-        let database = Database::open_in_memory().await.unwrap();
-        let owner = database
-            .get_or_create_coordinator(None, LlmLanguage::default())
-            .await
-            .unwrap();
-        let product = database
-            .create_conversation(
-                "captured-loss-target",
-                "captured-loss-target",
-                "/tmp",
-                true,
-                None,
-                None,
-            )
-            .await
-            .unwrap();
-        let work_scope =
-            crate::close_foundation::allocate_scope_worktree(&database, &product.id).await;
-        let command = NativeCloseCommand::new(
-            owner.id.clone(),
-            SourceToolCall {
-                message_id: "loss-message".into(),
-                tool_use_id: "loss-call".into(),
-            },
-            NativeCloseIntent::Initial {
-                target: product.product_conversation_id,
-            },
-        )
-        .unwrap();
-        let input = command.intent().source_input();
-        let live = ConvState::ToolExecuting {
+        retained_loss_origin_with_wire_shape(false).await
+    }
+
+    async fn retained_flat_loss_origin() -> (Database, NativeCloseCommand, CloseRunRef) {
+        retained_loss_origin_with_wire_shape(true).await
+    }
+
+    fn retained_loss_executing_state(input: serde_json::Value) -> ConvState {
+        ConvState::ToolExecuting {
             current_tool: ToolCall::new(
                 "loss-call",
                 ToolInput::Unknown {
@@ -480,7 +459,49 @@ mod tests {
                 None,
                 None,
             ),
+        }
+    }
+
+    async fn retained_loss_origin_with_wire_shape(
+        legacy_flat: bool,
+    ) -> (Database, NativeCloseCommand, CloseRunRef) {
+        let database = Database::open_in_memory().await.unwrap();
+        let owner = database
+            .get_or_create_coordinator(None, LlmLanguage::default())
+            .await
+            .unwrap();
+        let product = database
+            .create_conversation(
+                "captured-loss-target",
+                "captured-loss-target",
+                "/tmp",
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let work_scope =
+            crate::close_foundation::allocate_scope_worktree(&database, &product.id).await;
+        let intent = NativeCloseIntent::Initial {
+            target: product.product_conversation_id,
         };
+        let input = if legacy_flat {
+            intent.legacy_source_input()
+        } else {
+            intent.source_input()
+        };
+        let command = NativeCloseCommand::new_with_source_input(
+            owner.id.clone(),
+            SourceToolCall {
+                message_id: "loss-message".into(),
+                tool_use_id: "loss-call".into(),
+            },
+            intent,
+            &input,
+        )
+        .unwrap();
+        let live = retained_loss_executing_state(input);
         database
             .update_conversation_state(&owner.id, &live)
             .await

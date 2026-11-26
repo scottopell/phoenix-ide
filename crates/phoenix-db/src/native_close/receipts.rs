@@ -20,16 +20,13 @@ pub(super) async fn require_source_and_target_tx(
     let state: ConvState = serde_json::from_str(&state_json)
         .map_err(|error| DbError::Serialization(error.to_string()))?;
     let target = command.intent().target();
-    let input = command.intent().source_input();
-    crate::executing_source::require_executing_source(
-        &state,
-        command.source(),
-        "close_conversation",
-        &input,
-    )
-    .map_err(|_| {
-        DbError::CloseFoundationPrecondition("Close requires its current executing source".into())
-    })?;
+    command
+        .verify_executing_source(&state, command.source())
+        .map_err(|_| {
+            DbError::CloseFoundationPrecondition(
+                "Close requires its current executing source".into(),
+            )
+        })?;
     let ordinary: bool = sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM product_conversations WHERE id = ?1 AND kind = 'ordinary')",
     )

@@ -14,7 +14,6 @@ use phoenix_core::work_scope::WorkScopeId;
 use phoenix_workflow::{
     AcceptedDisposition, ClientTurnKey, ConversationAuthority, PreparedTurn, Timestamp, TurnOutcome,
 };
-use serde_json::json;
 use sqlx::Connection;
 use std::collections::BTreeSet;
 use uuid::Uuid;
@@ -82,10 +81,10 @@ impl Fixture {
     }
 
     async fn executing(&self, source: &SourceToolCall, target: &ProductConversationId) {
-        let input = json!({
-            "action": "initial",
-            "product_conversation_id": target.as_str()
-        });
+        let input = NativeCloseIntent::Initial {
+            target: target.clone(),
+        }
+        .source_input();
         let state = ConvState::ToolExecuting {
             current_tool: ToolCall::new(
                 &source.tool_use_id,
@@ -2769,6 +2768,148 @@ async fn preparation_rejects_stale_durable_source_with_held_snapshot() {
             .unwrap();
     assert_eq!(phase, "completed");
     assert_no_settlement_effects(&f.db, &receipt).await;
+}
+
+#[tokio::test]
+async fn initial_receipt_replay_and_source_fence_accept_both_exact_retained_shapes() {
+    for legacy in [false, true] {
+        let f = Fixture::new().await;
+        let command = f.command(f.source.clone(), &f.target);
+        let input = if legacy {
+            command.intent().legacy_source_input()
+        } else {
+            command.intent().source_input()
+        };
+        let command = NativeCloseCommand::new_with_source_input(
+            f.coordinator.clone(),
+            f.source.clone(),
+            command.intent().clone(),
+            &input,
+        )
+        .unwrap();
+        let state = crate::native_close::tests::executing_state(
+            command.source(),
+            input.clone(),
+            input.clone(),
+        );
+        f.db.update_conversation_state(&f.coordinator, &state)
+            .await
+            .unwrap();
+        let NativeCloseInitialResult::NewlyAdmitted(receipt) = f.apply(&command).await.unwrap() else {
+            panic!("expected admission for legacy={legacy}");
+        };
+        // Rewriting the unchanged source exercises the durable source fence.
+        f.db.update_conversation_state(&f.coordinator, &state)
+            .await
+            .unwrap();
+        assert_eq!(
+            f.db.get_conversation(&f.coordinator).await.unwrap().state,
+            state
+        );
+        let NativeCloseInitialResult::Replay(replay) = f.apply(&command).await.unwrap() else {
+            panic!("expected exact replay for legacy={legacy}");
+        };
+        assert_eq!(replay, receipt);
+        assert_one_operation(&f, &receipt, 0).await;
+        let opposite = if legacy {
+            command.intent().source_input()
+        } else {
+            command.intent().legacy_source_input()
+        };
+        let coherent_opposite = crate::native_close::tests::executing_state(
+            command.source(),
+            opposite.clone(),
+            opposite,
+        );
+        // The fence must select the original shape from the saved fingerprint,
+        // not adopt a coherent replacement carrying the same source IDs.
+        f.db.update_conversation_state(&f.coordinator, &coherent_opposite)
+            .await
+            .unwrap();
+        assert!(f.apply(&command).await.is_err());
+        assert_one_operation(&f, &receipt, 1).await;
+    }
+}
+
+#[tokio::test]
+async fn coherent_live_and_durable_opposite_wire_shapes_refuse_both_directions() {
+    for legacy in [false, true] {
+        let f = Fixture::new().await;
+        let intent = NativeCloseIntent::Initial {
+            target: f.target.clone(),
+        };
+        let flat = intent.legacy_source_input();
+        let wrapped = intent.source_input();
+        let (input, opposite) = if legacy {
+            (flat, wrapped)
+        } else {
+            (wrapped, flat)
+        };
+        let command = NativeCloseCommand::new_with_source_input(
+            f.coordinator.clone(),
+            f.source.clone(),
+            intent.clone(),
+            &input,
+        )
+        .unwrap();
+        let matching = crate::native_close::tests::executing_state(
+            &f.source,
+            input.clone(),
+            input.clone(),
+        );
+        f.db.update_conversation_state(&f.coordinator, &matching)
+            .await
+            .unwrap();
+        let NativeCloseInitialResult::NewlyAdmitted(receipt) = f.apply(&command).await.unwrap() else {
+            panic!("expected admission");
+        };
+        let opposite_state = crate::native_close::tests::executing_state(
+            &f.source,
+            opposite.clone(),
+            opposite.clone(),
+        );
+        // Durable source matches the command; coherent live source does not.
+        let mut tx = f.db.pool().begin().await.unwrap();
+        assert!(require_initial_identity_tx(&mut tx, &command, &receipt, &opposite_state)
+            .await
+            .is_err());
+        assert_eq!(
+            super::super::receipts::read_receipt_tx(&mut tx, &command)
+                .await
+                .unwrap(),
+            Some(receipt.admitted.clone())
+        );
+        tx.rollback().await.unwrap();
+
+        // Bypass the fence deliberately to test durable authority independently.
+        sqlx::query("UPDATE conversations SET state = ?2, state_kind = ?3 WHERE id = ?1")
+            .bind(&f.coordinator)
+            .bind(serde_json::to_string(&opposite_state).unwrap())
+            .bind(crate::conv_state_kind(&opposite_state))
+            .execute(f.db.pool())
+            .await
+            .unwrap();
+        let mut tx = f.db.pool().begin().await.unwrap();
+        assert!(require_initial_identity_tx(&mut tx, &command, &receipt, &matching)
+            .await
+            .is_err());
+        tx.rollback().await.unwrap();
+        assert!(f.apply(&command).await.is_err());
+        let opposite_command = NativeCloseCommand::new_with_source_input(
+            f.coordinator.clone(),
+            f.source.clone(),
+            intent,
+            &opposite,
+        )
+        .unwrap();
+        assert_eq!(opposite_command.request_id(), command.request_id());
+        assert_ne!(opposite_command.fingerprint(), command.fingerprint());
+        let mut tx = f.db.pool().begin().await.unwrap();
+        assert!(super::super::receipts::read_receipt_tx(&mut tx, &opposite_command)
+            .await
+            .is_err());
+        tx.rollback().await.unwrap();
+    }
 }
 
 #[tokio::test]

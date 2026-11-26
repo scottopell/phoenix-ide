@@ -19,6 +19,12 @@ use crate::tools::{Tool, ToolContext, ToolOutput};
 pub(super) struct CloseConversation(pub Arc<SendChatApplicationService>);
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InputEnvelope {
+    request: Input,
+}
+
+#[derive(Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 enum Input {
     Initial {
@@ -37,7 +43,14 @@ enum Input {
 }
 
 fn parse(input: &Value) -> Result<NativeCloseIntent, String> {
-    let raw: Input = serde_json::from_value(input.clone()).map_err(|error| error.to_string())?;
+    // Publish only the envelope, but retain exact legacy occurrences without
+    // normalizing their wire representation or source identity.
+    let raw = match serde_json::from_value::<InputEnvelope>(input.clone()) {
+        Ok(envelope) => envelope.request,
+        Err(_) => {
+            serde_json::from_value::<Input>(input.clone()).map_err(|error| error.to_string())?
+        }
+    };
     let intent = match raw {
         Input::Initial {
             product_conversation_id,
@@ -67,28 +80,56 @@ fn parse(input: &Value) -> Result<NativeCloseIntent, String> {
                 .map_err(|e| e.to_string())?,
         },
     };
-    if &intent.source_input() != input {
+    if !intent.matches_source_input(input) {
         return Err("Close input must exactly match its canonical action coordinates".into());
     }
     Ok(intent)
 }
 
-// Provider schemas cannot use root combinators. The tagged parser above owns
-// exact action-specific requirements and rejects irrelevant coordinates.
+// Provider schemas support nested anyOf, not root unions or oneOf. The action
+// enums keep these closed variants disjoint, with no nullable coordinates.
 fn schema() -> Value {
     let target = json!({"type":"string", "minLength":1});
+    let attempt = json!({"type":"string", "minLength":1});
     let ordinal = json!({"type":"integer", "minimum":1, "maximum":i64::MAX});
     json!({
         "type":"object",
-        "description":"initial requires only action and product_conversation_id. observe additionally requires attempt_id and run_ordinal. explicit_retry additionally requires attempt_id and failed_run_ordinal. No other action coordinates are allowed.",
         "properties": {
-            "action":{"type":"string", "enum":["initial", "observe", "explicit_retry"]},
-            "product_conversation_id":target,
-            "attempt_id":{"type":"string", "minLength":1},
-            "run_ordinal":ordinal,
-            "failed_run_ordinal":ordinal
+            "request": {"anyOf": [
+                {
+                    "type":"object",
+                    "properties": {
+                        "action":{"type":"string", "enum":["initial"]},
+                        "product_conversation_id":target
+                    },
+                    "required":["action", "product_conversation_id"],
+                    "additionalProperties":false
+                },
+                {
+                    "type":"object",
+                    "properties": {
+                        "action":{"type":"string", "enum":["observe"]},
+                        "product_conversation_id":target,
+                        "attempt_id":attempt,
+                        "run_ordinal":ordinal
+                    },
+                    "required":["action", "product_conversation_id", "attempt_id", "run_ordinal"],
+                    "additionalProperties":false
+                },
+                {
+                    "type":"object",
+                    "properties": {
+                        "action":{"type":"string", "enum":["explicit_retry"]},
+                        "product_conversation_id":target,
+                        "attempt_id":attempt,
+                        "failed_run_ordinal":ordinal
+                    },
+                    "required":["action", "product_conversation_id", "attempt_id", "failed_run_ordinal"],
+                    "additionalProperties":false
+                }
+            ]}
         },
-        "required":["action", "product_conversation_id"],
+        "required":["request"],
         "additionalProperties":false
     })
 }
@@ -254,7 +295,21 @@ mod tests {
             json!({"action":"observe","product_conversation_id":"target","attempt_id":"attempt","run_ordinal":1}),
             json!({"action":"explicit_retry","product_conversation_id":"target","attempt_id":"attempt","failed_run_ordinal":2}),
         ] {
-            assert_eq!(parse(&input).unwrap().source_input(), input);
+            let wrapped = json!({"request":input});
+            assert_eq!(parse(&wrapped).unwrap().source_input(), wrapped);
+            let legacy = parse(&input).unwrap();
+            assert!(legacy.matches_source_input(&input));
+            assert_eq!(legacy.source_input(), wrapped);
+            for field in input.as_object().unwrap().keys() {
+                let mut missing = input.clone();
+                missing.as_object_mut().unwrap().remove(field);
+                let mut null = input.clone();
+                null[field] = Value::Null;
+                for invalid in [missing, null] {
+                    assert!(parse(&invalid).is_err(), "accepted {invalid}");
+                    assert!(parse(&json!({"request":invalid})).is_err());
+                }
+            }
             for key in [
                 "source",
                 "request_id",
@@ -265,10 +320,17 @@ mod tests {
                 let mut extra = input.clone();
                 extra[key] = json!("untrusted");
                 assert!(parse(&extra).is_err(), "accepted {key}");
+                assert!(parse(&json!({"request":extra})).is_err());
+                let mut extra_root = wrapped.clone();
+                extra_root[key] = json!("untrusted");
+                assert!(parse(&extra_root).is_err(), "accepted root {key}");
             }
         }
         for input in [
             json!({"product_conversation_id":"target"}),
+            json!({"action":"unknown","product_conversation_id":"target"}),
+            json!({"action":"initial","product_conversation_id":""}),
+            json!({"action":"initial","product_conversation_id":null}),
             json!({"action":"initial","product_conversation_id":"target","attempt_id":null}),
             json!({"action":"initial","product_conversation_id":"target","run_ordinal":1}),
             json!({"action":"observe","product_conversation_id":"target","attempt_id":"attempt"}),
@@ -279,6 +341,159 @@ mod tests {
             json!({"action":"observe","product_conversation_id":"target","attempt_id":"attempt","run_ordinal":1,"failed_run_ordinal":1}),
         ] {
             assert!(parse(&input).is_err(), "accepted {input}");
+            assert!(parse(&json!({"request":input})).is_err());
+        }
+        for input in [
+            Value::Null,
+            json!({}),
+            json!({"request":null}),
+            json!({"request":[]}),
+            json!({"request":{"request":{"action":"initial","product_conversation_id":"target"}}}),
+            json!({"request":{"action":"initial","product_conversation_id":"target"},"action":"initial"}),
+        ] {
+            assert!(parse(&input).is_err(), "accepted {input}");
+        }
+    }
+
+    #[test]
+    fn native_close_parser_preserves_whitespace_attempt_ids_in_both_wire_shapes() {
+        for (action, ordinal) in [
+            ("observe", "run_ordinal"),
+            ("explicit_retry", "failed_run_ordinal"),
+        ] {
+            // Persisted attempt IDs are exact nonempty strings, not trimmed identifiers.
+            for attempt_id in ["   ", " \tattempt\n "] {
+                let input = json!({
+                    "action": action,
+                    "product_conversation_id": "target",
+                    "attempt_id": attempt_id,
+                    ordinal: 1
+                });
+                let wrapped = json!({"request": input});
+                for source in [&input, &wrapped] {
+                    let intent = parse(source).unwrap();
+                    assert!(intent.matches_source_input(source));
+                    assert_eq!(intent.source_input(), wrapped);
+                    assert_eq!(intent.source_input()["request"]["attempt_id"], attempt_id);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn native_close_parser_rejects_invalid_coordinates_in_both_wire_shapes() {
+        for (action, ordinal) in [
+            ("observe", "run_ordinal"),
+            ("explicit_retry", "failed_run_ordinal"),
+        ] {
+            let valid = json!({
+                "action": action,
+                "product_conversation_id": "target",
+                "attempt_id": "attempt",
+                ordinal: 1
+            });
+            for value in [json!(1), json!(i64::MAX)] {
+                let mut input = valid.clone();
+                input[ordinal] = value;
+                assert!(parse(&input).is_ok());
+                assert!(parse(&json!({"request":input})).is_ok());
+            }
+            for value in [
+                Value::Null,
+                json!(0),
+                json!(-1),
+                json!(2.0),
+                json!(u64::MAX),
+                json!("1"),
+                json!(true),
+            ] {
+                let mut input = valid.clone();
+                input[ordinal] = value;
+                assert!(parse(&input).is_err(), "accepted {input}");
+                assert!(parse(&json!({"request":input})).is_err());
+            }
+            for field in ["product_conversation_id", "attempt_id"] {
+                for value in [json!(""), json!(1)] {
+                    let mut input = valid.clone();
+                    input[field] = value;
+                    assert!(parse(&input).is_err(), "accepted {input}");
+                    assert!(parse(&json!({"request":input})).is_err());
+                }
+            }
+            let mut blank_target = valid.clone();
+            blank_target["product_conversation_id"] = json!("   ");
+            assert!(parse(&blank_target).is_err());
+            assert!(parse(&json!({"request":blank_target})).is_err());
+            let mut wrong = valid.clone();
+            wrong.as_object_mut().unwrap().remove(ordinal);
+            wrong[if action == "observe" {
+                "failed_run_ordinal"
+            } else {
+                "run_ordinal"
+            }] = json!(1);
+            assert!(parse(&wrong).is_err());
+            assert!(parse(&json!({"request":wrong})).is_err());
+        }
+    }
+
+    #[test]
+    fn native_close_schema_exposes_only_closed_required_request_variants() {
+        let schema = schema();
+        assert_eq!(schema["type"], "object");
+        assert_eq!(schema["additionalProperties"], false);
+        assert_eq!(schema["required"], json!(["request"]));
+        assert_eq!(schema["properties"].as_object().unwrap().len(), 1);
+        for combinator in ["oneOf", "anyOf", "allOf"] {
+            assert!(schema.get(combinator).is_none());
+        }
+        let request = &schema["properties"]["request"];
+        assert_eq!(request.as_object().unwrap().len(), 1);
+        let variants = request["anyOf"].as_array().unwrap();
+        assert_eq!(variants.len(), 3);
+        for (variant, action, fields) in [
+            (
+                &variants[0],
+                "initial",
+                vec!["action", "product_conversation_id"],
+            ),
+            (
+                &variants[1],
+                "observe",
+                vec![
+                    "action",
+                    "product_conversation_id",
+                    "attempt_id",
+                    "run_ordinal",
+                ],
+            ),
+            (
+                &variants[2],
+                "explicit_retry",
+                vec![
+                    "action",
+                    "product_conversation_id",
+                    "attempt_id",
+                    "failed_run_ordinal",
+                ],
+            ),
+        ] {
+            assert_eq!(variant["type"], "object");
+            assert_eq!(variant["additionalProperties"], false);
+            assert_eq!(variant["required"], json!(fields));
+            let properties = variant["properties"].as_object().unwrap();
+            assert_eq!(properties.len(), fields.len());
+            assert_eq!(
+                properties["action"],
+                json!({"type":"string","enum":[action]})
+            );
+            for field in fields.into_iter().filter(|field| *field != "action") {
+                let expected = if field.ends_with("ordinal") {
+                    json!({"type":"integer","minimum":1,"maximum":i64::MAX})
+                } else {
+                    json!({"type":"string","minLength":1})
+                };
+                assert_eq!(properties[field], expected);
+            }
         }
     }
 

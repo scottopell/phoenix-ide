@@ -967,6 +967,40 @@ def _assert_next_chat_is_accepted(base_url: str, conv_id: str) -> None:
     )
 
 
+def _poll_accepted_message_to_idle(
+    base_url: str,
+    conv_id: str,
+    message_id: str,
+    text: str,
+    timeout: float = 30.0,
+) -> dict:
+    """Wait for exact accepted-message durability and effective idle, then verify its turn completed."""
+    start = time.monotonic()
+    last_status = "unknown"
+    while time.monotonic() - start < timeout:
+        response = httpx.post(
+            f"{base_url}/api/conversations/{conv_id}/messages/reconcile",
+            json={"message_ids": [message_id]}, follow_redirects=False, timeout=10.0,
+        )
+        assert response.status_code == 200, f"accepted-message reconciliation failed: {response.status_code} {response.text}"
+        data = response.json()
+        entries = data.get("entries") or []
+        entry = next((item for item in entries if item.get("message_id") == message_id), None)
+        last_status = (entry or {}).get("status", "missing")
+        if data.get("conversation_idle") is True and last_status == "persisted":
+            message = (entry or {}).get("message") or {}
+            assert message.get("message_type") == "user", message
+            assert (message.get("content") or {}).get("text") == text, message
+            transcript = _get_conv(base_url, conv_id)
+            if _has_agent_after_message(transcript.get("messages") or [], message_id):
+                return transcript
+        time.sleep(0.1)
+    raise TimeoutError(
+        f"poll timeout waiting for exact accepted message and completed idle turn: "
+        f"{conv_id}:{message_id} (last disposition: {last_status})"
+    )
+
+
 def _poll_to_idle_with_messages(
     base_url: str,
     conv_id: str,
@@ -1412,7 +1446,7 @@ def _scenario_public_literal_chat(base_url: str) -> None:
             base_url, "[[scenario:plain_text]] literal idle setup", SCENARIO_TIMEOUT_SECONDS
         )
         smoke = {
-            "text": "literal steering smoke test", "message_id": str(uuid.uuid4()),
+            "text": "[[scenario:plain_text]] literal steering smoke test", "message_id": str(uuid.uuid4()),
             "expansion_policy": "literal_text",
         }
         print(f"[public_literal_chat:{phase}] harmless literal smoke POST", flush=True)
@@ -1420,10 +1454,8 @@ def _scenario_public_literal_chat(base_url: str) -> None:
         assert accepted.status_code == 200 and accepted.json().get("steering", False) is False, accepted.text
         print(f"[public_literal_chat:{phase}] await smoke materialization", flush=True)
         smoke_id = f"{conv_id}:{smoke['message_id']}"
-        materialized = _poll_to_idle_with_messages(
-            base_url, conv_id,
-            lambda messages: any(m.get("message_id") == smoke_id for m in _user_messages(messages)),
-            "harmless literal smoke materialization", timeout=SCENARIO_TIMEOUT_SECONDS,
+        materialized = _poll_accepted_message_to_idle(
+            base_url, conv_id, smoke_id, smoke["text"], timeout=SCENARIO_TIMEOUT_SECONDS,
         )
         smoke_messages = [m for m in _user_messages(materialized["messages"]) if m.get("message_id") == smoke_id]
         assert len(smoke_messages) == 1 and smoke_messages[0]["content"]["text"] == smoke["text"], smoke_messages
@@ -2372,32 +2404,76 @@ class PublicLiteralChatPreflightTests(unittest.TestCase):
             return {"messages": messages}
 
         conflict = httpx.Response(409, json={"error_type": "idempotency_conflict"})
+
+        def post_api(url, **kwargs):
+            if url.endswith("/messages/reconcile"):
+                message_id = kwargs["json"]["message_ids"][0]
+                conv_id, raw_id = message_id.split(":", 1)
+                body = submitted[(conv_id, raw_id)]
+                user = {"message_id": message_id, "message_type": "user", "content": {"text": body["text"]}}
+                return httpx.Response(200, json={"conversation_idle": True, "entries": [
+                    {"message_id": message_id, "status": "persisted", "message": user},
+                ]})
+            return conflict
+
+        def smoke_transcript(_base_url, conv_id):
+            body = last_post[conv_id]
+            smoke_id = f"{conv_id}:{body['message_id']}"
+            user = {"message_id": smoke_id, "message_type": "user", "content": {"text": body["text"]}}
+            assistant = {"message_id": f"{conv_id}:assistant", "message_type": "agent"}
+            return {"messages": [user, assistant]}
+
         with mock.patch.dict(globals(), {
             "_new_conv_and_stream": mock.Mock(side_effect=["idle-conv", "running-conv"]),
+            "_get_conv": smoke_transcript,
             "_post_public_literal_chat": post,
             "_queue_literal_behind_gated_turn": mock.Mock(side_effect=queue),
             "_poll_to_idle_with_messages": poll,
         }), mock.patch("subprocess.run", side_effect=[
             mock.Mock(stdout="a" * 40), mock.Mock(stdout=""),
         ]), mock.patch("uuid.uuid4", side_effect=["smoke-idle", "literal-idle", "smoke-running", "literal-running"]), \
-                mock.patch("httpx.post", return_value=conflict) as changed_policy:
+                mock.patch("httpx.post", side_effect=post_api) as changed_policy:
             scenario_public_literal_chat("http://local.test")
 
         self.assertEqual(polls, [
-            ("idle-conv", "idle-conv:smoke-idle"),
             ("idle-conv", "idle-conv:literal-idle"),
-            ("running-conv", "running-conv:smoke-running"),
             ("running-conv", "literal-running"),
         ])
         self.assertEqual(len(submitted), 4)
         self.assertEqual(retries, [("idle-conv", "literal-idle"), ("running-conv", "literal-running")])
-        self.assertEqual(changed_policy.call_count, 2)
-        for call, (conv_id, client_id) in zip(changed_policy.call_args_list, [
+        policy_calls = [call for call in changed_policy.call_args_list if call.args[0].endswith("/chat")]
+        self.assertEqual(len(policy_calls), 2)
+        for call, (conv_id, client_id) in zip(policy_calls, [
             ("idle-conv", "literal-idle"), ("running-conv", "literal-running"),
         ]):
             body = call.kwargs["json"]
             self.assertEqual(body, {**submitted[(conv_id, client_id)], "expansion_policy": "expand_references"})
             self.assertEqual(call.args[0], f"http://local.test/api/conversations/{conv_id}/chat")
+
+    def test_smoke_readiness_waits_for_live_idle_after_exact_persisted_message(self):
+        message_id = "conv:smoke"
+        user = {"message_id": message_id, "message_type": "user", "content": {"text": "exact smoke"}}
+        transcript = {"messages": [user, {"message_id": "assistant", "message_type": "agent"}]}
+        responses = [
+            httpx.Response(200, json={"conversation_idle": False, "entries": [{"message_id": message_id, "status": "persisted", "message": user}]}),
+            httpx.Response(200, json={"conversation_idle": True, "entries": [{"message_id": message_id, "status": "persisted", "message": user}]}),
+        ]
+        with mock.patch("httpx.post", side_effect=responses) as reconcile:
+            with mock.patch.dict(globals(), {"_get_conv": mock.Mock(return_value=transcript)}):
+                result = _poll_accepted_message_to_idle("http://local.test", "conv", message_id, "exact smoke")
+        self.assertIs(result, transcript)
+        self.assertEqual(reconcile.call_count, 2)
+        reconcile.assert_called_with(
+            "http://local.test/api/conversations/conv/messages/reconcile",
+            json={"message_ids": [message_id]}, follow_redirects=False, timeout=10.0,
+        )
+
+    def test_smoke_readiness_rejects_assistant_preceding_user(self):
+        messages = [
+            {"message_id": "assistant", "message_type": "agent"},
+            {"message_id": "conv:smoke", "message_type": "user"},
+        ]
+        self.assertFalse(_has_agent_after_message(messages, "conv:smoke"))
 
     def test_scenario_failure_prints_causal_stage_and_traceback_then_reraises(self):
         error = httpx.ReadError("connection reset by peer")

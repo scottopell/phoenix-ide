@@ -14,7 +14,7 @@ fn initial_result_round(
         content: MessageContent::Agent(vec![ContentBlock::ToolUse {
             id: command.source().tool_use_id.clone(),
             name: "close_conversation".into(),
-            input: command.intent().source_input(),
+            input: command.source_input(),
         }]),
         display_data: None,
         usage_data: None,
@@ -72,6 +72,64 @@ async fn canonical_initial_result_acknowledgement_preserves_loss_retry_origin() 
     assert_eq!(initial_ack_counts(&db, &run).await, (1, 0, 1, 0));
     db.update_conversation_state(command.source_transcript_id(), &ConvState::Idle).await.unwrap();
     assert_eq!(initial_ack_counts(&db, &run).await, (1, 0, 1, 0));
+}
+
+#[tokio::test]
+async fn legacy_flat_initial_result_acknowledgement_preserves_loss_retry_origin() {
+    let (db, command, run) = retained_flat_loss_origin().await;
+    assert_eq!(command.source_input(), command.intent().legacy_source_input());
+    let (assistant, result) = initial_result_round(&command, &run);
+    db.persist_tool_round_and_state(
+        command.source_transcript_id(),
+        &assistant,
+        std::slice::from_ref(&result),
+        &ConvState::Idle,
+        chrono::Utc::now(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(initial_ack_counts(&db, &run).await, (1, 0, 1, 0));
+    db.read_native_close_captured_loss_retry_context(command.intent().target(), &run)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn opposite_initial_result_wire_shape_cannot_acknowledge_either_origin() {
+    for flat_origin in [false, true] {
+        let (db, command, run) = if flat_origin {
+            retained_flat_loss_origin().await
+        } else {
+            retained_loss_origin().await
+        };
+        let opposite = if flat_origin {
+            command.intent().source_input()
+        } else {
+            command.intent().legacy_source_input()
+        };
+        let (mut assistant, result) = initial_result_round(&command, &run);
+        let MessageContent::Agent(blocks) = &mut assistant.content else {
+            panic!("assistant");
+        };
+        let Some(ContentBlock::ToolUse { input, .. }) = blocks.first_mut() else {
+            panic!("tool use");
+        };
+        *input = opposite;
+        db.persist_tool_round_and_state(
+            command.source_transcript_id(),
+            &assistant,
+            &[result],
+            &ConvState::Idle,
+            chrono::Utc::now(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(initial_ack_counts(&db, &run).await, (0, 1, 1, 0));
+        assert!(db
+            .read_native_close_captured_loss_retry_context(command.intent().target(), &run)
+            .await
+            .is_err());
+    }
 }
 
 #[tokio::test]

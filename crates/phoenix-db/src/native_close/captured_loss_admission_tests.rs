@@ -32,7 +32,17 @@ impl NativeCloseCapturedLossRetryAssessment for CapturedLossAssessment {
 }
 
 async fn captured_loss_assessment() -> (Database, CapturedLossAssessment) {
-    let (db, initial, failed_run) = retained_loss_origin().await;
+    captured_loss_assessment_with_wire_shape(false).await
+}
+
+async fn captured_loss_assessment_with_wire_shape(
+    legacy_flat_origin: bool,
+) -> (Database, CapturedLossAssessment) {
+    let (db, initial, failed_run) = if legacy_flat_origin {
+        retained_flat_loss_origin().await
+    } else {
+        retained_loss_origin().await
+    };
     // Finish the original tool round through its owning API before installing a
     // distinct retry occurrence. Replacing an unacknowledged source suppresses it.
     let (assistant, result) = initial_result_round(&initial, &failed_run);
@@ -45,20 +55,34 @@ async fn captured_loss_assessment() -> (Database, CapturedLossAssessment) {
     )
     .await
     .unwrap();
-    let command = NativeCloseCommand::new(
+    let acknowledgement_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM native_close_initial_result_acknowledgements WHERE attempt_id = ?1",
+    )
+    .bind(failed_run.attempt_id.as_str())
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(acknowledgement_count, 1);
+    let retry_intent = NativeCloseIntent::ExplicitRetry {
+        target: initial.intent().target().clone(),
+        attempt_id: failed_run.attempt_id.clone(),
+        failed_run_ordinal: failed_run.ordinal,
+    };
+    let input = if legacy_flat_origin {
+        retry_intent.legacy_source_input()
+    } else {
+        retry_intent.source_input()
+    };
+    let command = NativeCloseCommand::new_with_source_input(
         initial.source_transcript_id().to_owned(),
         SourceToolCall {
             message_id: "captured-retry-message".into(),
             tool_use_id: "captured-retry-call".into(),
         },
-        NativeCloseIntent::ExplicitRetry {
-            target: initial.intent().target().clone(),
-            attempt_id: failed_run.attempt_id.clone(),
-            failed_run_ordinal: failed_run.ordinal,
-        },
+        retry_intent,
+        &input,
     )
     .unwrap();
-    let input = command.intent().source_input();
     let executing = ConvState::ToolExecuting {
         current_tool: ToolCall::new(
             &command.source().tool_use_id,
@@ -204,9 +228,43 @@ async fn captured_loss_admits_distinct_successor_without_rewriting_original_evid
     assert_eq!(receipt.admitted.attempt_id, successor.attempt_id);
     assert_eq!(receipt.admitted.run_ordinal, successor.ordinal);
     assert_eq!(db.get_close_run(&successor).await.unwrap().status, CloseRunStatus::Running);
-    assert_eq!(db.read_native_close_explicit_retry_receipt(&assessment.command).await.unwrap(), Some(receipt.admitted));
+    assert_eq!(db.read_native_close_explicit_retry_receipt(&assessment.command).await.unwrap(), Some(receipt.admitted.clone()));
     assert_eq!(db.list_close_attempt_members(origin.failed_run().attempt_id.as_str()).await.unwrap(), members);
+    assert_eq!(
+        established(db.apply_native_close_captured_loss_retry(&assessment).await),
+        NativeCloseRetryResult::Replay(receipt),
+    );
+    let run_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM close_runs WHERE attempt_id = ?1")
+        .bind(origin.failed_run().attempt_id.as_str())
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(run_count, 2);
     assert_captured_origin_preserved(&db, origin).await;
+}
+
+#[tokio::test]
+async fn captured_loss_admits_legacy_flat_origin_after_initial_acknowledgement() {
+    let (db, assessment) = captured_loss_assessment_with_wire_shape(true).await;
+    assert_eq!(
+        assessment.command.source_input(),
+        assessment.command.intent().legacy_source_input()
+    );
+    let successor = captured_successor(&assessment.context);
+    let NativeCloseRetryResult::NewlyAdmitted(receipt) =
+        established(db.apply_native_close_captured_loss_retry(&assessment).await)
+    else {
+        panic!("expected a newly admitted captured-loss successor");
+    };
+    assert_eq!(receipt.admitted.run_ordinal, successor.ordinal);
+    assert_eq!(
+        db.get_close_run(&successor).await.unwrap().status,
+        CloseRunStatus::Running
+    );
+    assert_eq!(
+        established(db.apply_native_close_captured_loss_retry(&assessment).await),
+        NativeCloseRetryResult::Replay(receipt)
+    );
 }
 
 async fn accept_captured_loss_failure(db: &Database, failure_occurrence_id: &str, receipt: &str) {

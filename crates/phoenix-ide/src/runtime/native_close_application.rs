@@ -109,25 +109,24 @@ fn command_from_executing_source(
     intent: NativeCloseIntent,
 ) -> Result<NativeCloseCommand, NativeCloseSourceRefusal> {
     let invalid = NativeCloseSourceRefusal::NotExactExecutingSource;
-    if phoenix_core::domain::executing_source::verify_executing_source(
-        state,
-        source,
-        "close_conversation",
-        &intent.source_input(),
-    )
-    .is_err()
-    {
-        return Err(invalid);
-    }
     let ConvState::ToolExecuting { current_tool, .. } = state else {
         return Err(invalid);
     };
     let executing_input = current_tool.input.to_value();
-    if executing_input != intent.source_input() {
-        return Err(invalid);
-    }
-    NativeCloseCommand::new(source_transcript_id.to_owned(), source.clone(), intent)
-        .map_err(|_| invalid)
+    phoenix_core::domain::executing_source::verify_executing_source(
+        state,
+        source,
+        "close_conversation",
+        &executing_input,
+    )
+    .map_err(|_| invalid)?;
+    NativeCloseCommand::new_with_source_input(
+        source_transcript_id.to_owned(),
+        source.clone(),
+        intent,
+        &executing_input,
+    )
+    .map_err(|_| invalid)
 }
 
 /// Owned queue envelope: neither caller cancellation nor a dropped reply can

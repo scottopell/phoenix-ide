@@ -96,10 +96,10 @@ fn observe_fingerprint_binds_intent_target_attempt_and_exact_ordinal_not_source(
     assert_eq!(base.fingerprint(), other_source.fingerprint());
     assert_eq!(
         base.intent().source_input(),
-        serde_json::json!({
+        serde_json::json!({"request": {
             "action": "observe", "product_conversation_id": "ab",
             "attempt_id": "c", "run_ordinal": 1,
-        })
+        }})
     );
 }
 
@@ -126,5 +126,220 @@ fn empty_source_fields_are_rejected() {
             ),
             Err(NativeCloseCommandError::EmptySource)
         );
+    }
+}
+
+fn source_intents() -> Vec<NativeCloseIntent> {
+    use phoenix_core::domain::close::{CloseAttemptId, CloseRunOrdinal};
+
+    let target = ProductConversationId::parse("target").unwrap();
+    let attempt_id = CloseAttemptId::parse("attempt").unwrap();
+    vec![
+        NativeCloseIntent::Initial {
+            target: target.clone(),
+        },
+        NativeCloseIntent::Observe {
+            target: target.clone(),
+            attempt_id: attempt_id.clone(),
+            run_ordinal: CloseRunOrdinal::parse(2).unwrap(),
+        },
+        NativeCloseIntent::ExplicitRetry {
+            target,
+            attempt_id,
+            failed_run_ordinal: CloseRunOrdinal::parse(2).unwrap(),
+        },
+    ]
+}
+
+pub(super) fn executing_state(
+    source: &SourceToolCall,
+    assistant_input: serde_json::Value,
+    current_input: serde_json::Value,
+) -> phoenix_core::domain::sm_state::ConvState {
+    use phoenix_core::domain::llm_types::ContentBlock;
+    use phoenix_core::domain::sm_state::{AssistantMessage, ConvState, ToolCall, ToolInput};
+
+    ConvState::ToolExecuting {
+        current_tool: ToolCall::new(
+            &source.tool_use_id,
+            ToolInput::Unknown {
+                name: "close_conversation".into(),
+                input: current_input,
+            },
+        ),
+        remaining_tools: vec![],
+        completed_results: vec![],
+        pending_sub_agents: vec![],
+        assistant_message: AssistantMessage::new(
+            source.message_id.clone(),
+            vec![ContentBlock::ToolUse {
+                id: source.tool_use_id.clone(),
+                name: "close_conversation".into(),
+                input: assistant_input,
+            }],
+            None,
+            None,
+        ),
+    }
+}
+
+#[test]
+fn legacy_fingerprint_bytes_are_unchanged_and_wrapping_is_domain_separated() {
+    use sha2::{Digest, Sha256};
+
+    let source = SourceToolCall {
+        message_id: "message".into(),
+        tool_use_id: "tool".into(),
+    };
+    for intent in source_intents() {
+        let wrapped =
+            NativeCloseCommand::new("transcript".into(), source.clone(), intent.clone()).unwrap();
+        let legacy = NativeCloseCommand::new_with_source_input(
+            "transcript".into(),
+            source.clone(),
+            intent.clone(),
+            &intent.legacy_source_input(),
+        )
+        .unwrap();
+        let mut bytes = b"phoenix.native_close.intent.v1\0".to_vec();
+        // This is the historical algorithm: action, target, then exact run coordinates.
+        super::append_field(&mut bytes, intent.receipt_intent().as_bytes());
+        super::append_field(&mut bytes, intent.target().as_str().as_bytes());
+        match &intent {
+            NativeCloseIntent::Initial { .. } => {}
+            NativeCloseIntent::Observe {
+                attempt_id,
+                run_ordinal,
+                ..
+            } => {
+                super::append_field(&mut bytes, attempt_id.as_str().as_bytes());
+                super::append_field(&mut bytes, &run_ordinal.get().to_be_bytes());
+            }
+            NativeCloseIntent::ExplicitRetry {
+                attempt_id,
+                failed_run_ordinal,
+                ..
+            } => {
+                super::append_field(&mut bytes, attempt_id.as_str().as_bytes());
+                super::append_field(&mut bytes, &failed_run_ordinal.get().to_be_bytes());
+            }
+        }
+        assert_eq!(
+            legacy.fingerprint(),
+            Sha256::digest(&bytes)
+                .iter()
+                .fold(String::with_capacity(64), |mut output, byte| {
+                    use std::fmt::Write as _;
+                    write!(output, "{byte:02x}").expect("writing to String cannot fail");
+                    output
+                },)
+        );
+        assert_ne!(legacy.fingerprint(), wrapped.fingerprint());
+        assert_eq!(legacy.request_id(), wrapped.request_id());
+        assert_eq!(
+            NativeCloseCommand::new_from_retained_fingerprint(
+                "transcript",
+                &source,
+                &intent,
+                "unknown-fingerprint",
+            ),
+            Err(NativeCloseCommandError::InvalidRetainedFingerprint)
+        );
+    }
+}
+
+#[test]
+fn supported_source_shapes_are_exact_and_must_agree_within_the_occurrence() {
+    let source = SourceToolCall {
+        message_id: "message".into(),
+        tool_use_id: "tool".into(),
+    };
+    for intent in source_intents() {
+        let wrapped = intent.source_input();
+        let flat = intent.legacy_source_input();
+        let command =
+            NativeCloseCommand::new("transcript".into(), source.clone(), intent.clone()).unwrap();
+        assert_eq!(wrapped, serde_json::json!({"request": flat.clone()}));
+        for input in [&wrapped, &flat] {
+            assert!(intent.matches_source_input(input));
+            let command = NativeCloseCommand::new_with_source_input(
+                "transcript".into(),
+                source.clone(),
+                intent.clone(),
+                input,
+            )
+            .unwrap();
+            assert_eq!(command.source_input(), *input);
+            let retained = NativeCloseCommand::new_from_retained_fingerprint(
+                "transcript",
+                &source,
+                &intent,
+                command.fingerprint(),
+            )
+            .unwrap();
+            assert_eq!(retained, command);
+            let opposite = if input == &wrapped { &flat } else { &wrapped };
+            assert!(!command.matches_source_input(opposite));
+            assert!(command
+                .verify_executing_source(
+                    &executing_state(&source, opposite.clone(), opposite.clone()),
+                    &source,
+                )
+                .is_err());
+            let state = executing_state(&source, input.clone(), input.clone());
+            assert!(command.verify_executing_source(&state, &source).is_ok());
+            for wrong_source in [
+                SourceToolCall {
+                    message_id: "other".into(),
+                    ..source.clone()
+                },
+                SourceToolCall {
+                    tool_use_id: "other".into(),
+                    ..source.clone()
+                },
+            ] {
+                assert!(command
+                    .verify_executing_source(&state, &wrong_source)
+                    .is_err());
+            }
+        }
+        for (assistant, current) in [(&wrapped, &flat), (&flat, &wrapped)] {
+            let state = executing_state(&source, assistant.clone(), current.clone());
+            assert!(command.verify_executing_source(&state, &source).is_err());
+        }
+        for wrapped_shape in [false, true] {
+            let mut malformed = vec![serde_json::json!({"request": {"request": flat.clone()}})];
+            let mut extra = flat.clone();
+            extra["irrelevant"] = serde_json::json!(true);
+            malformed.push(extra);
+            for key in flat.as_object().unwrap().keys() {
+                let mut changed = flat.clone();
+                changed[key] = serde_json::json!("altered-coordinate");
+                malformed.push(changed);
+                let mut missing = flat.clone();
+                missing.as_object_mut().unwrap().remove(key);
+                malformed.push(missing);
+            }
+            for input in malformed {
+                let input = if wrapped_shape {
+                    serde_json::json!({"request": input})
+                } else {
+                    input
+                };
+                assert!(!intent.matches_source_input(&input));
+                assert!(NativeCloseCommand::new_with_source_input(
+                    "transcript".into(),
+                    source.clone(),
+                    intent.clone(),
+                    &input,
+                )
+                .is_err());
+                let state = executing_state(&source, input.clone(), input);
+                assert!(command.verify_executing_source(&state, &source).is_err());
+            }
+        }
+        let mut extra_wrapper = wrapped;
+        extra_wrapper["irrelevant"] = serde_json::json!(true);
+        assert!(!intent.matches_source_input(&extra_wrapper));
     }
 }

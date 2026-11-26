@@ -34,7 +34,10 @@ fn fixture(input: Value) -> (ConvState, SourceToolCall) {
 }
 
 fn initial_input() -> Value {
-    json!({"action":"initial", "product_conversation_id":"target"})
+    NativeCloseIntent::Initial {
+        target: ProductConversationId::parse("target").unwrap(),
+    }
+    .source_input()
 }
 
 fn derive(
@@ -233,7 +236,7 @@ fn observe_source_rejects_nonexact_payloads_even_when_canonical_and_executing_ag
         ("cancelled_predecessor", json!("predecessor")),
     ] {
         let mut input = observe_input();
-        input[field] = value;
+        input["request"][field] = value;
         let (state, source) = fixture(input);
         assert!(derive_observe(&state, &source).is_err(), "{field}");
     }
@@ -273,4 +276,136 @@ fn observe_source_rejects_duplicate_canonical_and_pending_occurrences() {
     };
     remaining_tools.push(current_tool.clone());
     assert!(derive_observe(&state, &source).is_err());
+}
+
+fn close_intents() -> [NativeCloseIntent; 3] {
+    let referenced = observed_reference();
+    [
+        NativeCloseIntent::Initial {
+            target: referenced.target.clone(),
+        },
+        NativeCloseIntent::Observe {
+            target: referenced.target.clone(),
+            attempt_id: referenced.attempt_id.clone(),
+            run_ordinal: referenced.run_ordinal,
+        },
+        NativeCloseIntent::ExplicitRetry {
+            target: referenced.target,
+            attempt_id: referenced.attempt_id,
+            failed_run_ordinal: referenced.run_ordinal,
+        },
+    ]
+}
+
+fn derive_intent(
+    state: &ConvState,
+    source: &SourceToolCall,
+    intent: &NativeCloseIntent,
+) -> Result<NativeCloseCommand, NativeCloseSourceRefusal> {
+    match intent {
+        NativeCloseIntent::Initial { target } => initial_command_from_executing_source(
+            state,
+            "source-transcript",
+            source,
+            target.clone(),
+        ),
+        NativeCloseIntent::Observe {
+            target,
+            attempt_id,
+            run_ordinal,
+        } => observe_command_from_executing_source(
+            state,
+            "source-transcript",
+            source,
+            NativeCloseRunRef {
+                target: target.clone(),
+                attempt_id: attempt_id.clone(),
+                run_ordinal: *run_ordinal,
+            },
+        ),
+        NativeCloseIntent::ExplicitRetry {
+            target,
+            attempt_id,
+            failed_run_ordinal,
+        } => retry_command_from_executing_source(
+            state,
+            "source-transcript",
+            source,
+            target.clone(),
+            attempt_id.clone(),
+            *failed_run_ordinal,
+        ),
+    }
+}
+
+#[test]
+fn all_close_intents_accept_exact_wrapped_and_historical_flat_live_sources() {
+    for intent in close_intents() {
+        let wrapped = intent.source_input();
+        let flat = wrapped
+            .get("request")
+            .expect("public Close wire wrapper")
+            .clone();
+        let mut commands = Vec::new();
+        for input in [wrapped, flat] {
+            let (state, source) = fixture(input.clone());
+            let command = derive_intent(&state, &source, &intent).unwrap();
+            assert_eq!(command.intent(), &intent);
+            assert_eq!(command.source_input(), input);
+            assert_eq!(command, derive_intent(&state, &source, &intent).unwrap());
+            commands.push(command);
+        }
+        assert_eq!(commands[0].request_id(), commands[1].request_id());
+        assert_ne!(commands[0].fingerprint(), commands[1].fingerprint());
+    }
+}
+
+#[test]
+fn all_close_intents_refuse_mixed_assistant_and_executing_wire_shapes() {
+    for intent in close_intents() {
+        let wrapped = intent.source_input();
+        let flat = wrapped
+            .get("request")
+            .expect("public Close wire wrapper")
+            .clone();
+        for (canonical, executing) in [(wrapped.clone(), flat.clone()), (flat, wrapped)] {
+            let (mut state, source) = fixture(canonical);
+            let ConvState::ToolExecuting { current_tool, .. } = &mut state else {
+                unreachable!()
+            };
+            current_tool.input = ToolInput::Unknown {
+                name: "close_conversation".into(),
+                input: executing,
+            };
+            assert_eq!(
+                derive_intent(&state, &source, &intent),
+                Err(NativeCloseSourceRefusal::NotExactExecutingSource),
+            );
+        }
+    }
+}
+
+#[test]
+fn all_close_intents_refuse_nonexact_wrappers_without_normalizing() {
+    for intent in close_intents() {
+        let wrapped = intent.source_input();
+        let flat = wrapped
+            .get("request")
+            .expect("public Close wire wrapper")
+            .clone();
+        let mut extra_flat = flat.clone();
+        extra_flat["request_id"] = json!("forged");
+        for input in [
+            json!({"request": wrapped}),
+            json!({"request": flat, "extra": true}),
+            json!({"request": extra_flat}),
+            extra_flat,
+        ] {
+            let (state, source) = fixture(input);
+            assert_eq!(
+                derive_intent(&state, &source, &intent),
+                Err(NativeCloseSourceRefusal::NotExactExecutingSource),
+            );
+        }
+    }
 }

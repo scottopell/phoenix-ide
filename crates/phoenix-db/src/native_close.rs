@@ -42,9 +42,19 @@ impl NativeCloseIntent {
         }
     }
 
-    /// The exact source occurrence matched by both the actor and durable verifier.
+    /// The canonical wrapped input emitted for new native Close occurrences.
     #[must_use]
     pub fn source_input(&self) -> serde_json::Value {
+        serde_json::json!({"request": self.legacy_source_input()})
+    }
+
+    /// Matches only a complete canonical input or a complete historical flat input.
+    #[must_use]
+    pub fn matches_source_input(&self, input: &serde_json::Value) -> bool {
+        input == &self.source_input() || input == &self.legacy_source_input()
+    }
+
+    fn legacy_source_input(&self) -> serde_json::Value {
         match self {
             Self::Initial { target } => serde_json::json!({
                 "action": "initial", "product_conversation_id": target.as_str()
@@ -81,6 +91,16 @@ impl NativeCloseIntent {
 pub enum NativeCloseCommandError {
     #[error("native Close source transcript, message and tool-use IDs must be nonempty")]
     EmptySource,
+    #[error("native Close source input is not an exact supported canonical shape")]
+    InvalidSourceInput,
+    #[error("native Close retained fingerprint does not match a supported wire command")]
+    InvalidRetainedFingerprint,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NativeCloseSourceShape {
+    Wrapped,
+    LegacyFlat,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -88,6 +108,7 @@ pub struct NativeCloseCommand {
     source_transcript_id: String,
     source: SourceToolCall,
     intent: NativeCloseIntent,
+    source_shape: NativeCloseSourceShape,
     request_id: Uuid,
     fingerprint: String,
 }
@@ -100,6 +121,67 @@ impl NativeCloseCommand {
         source_transcript_id: String,
         source: SourceToolCall,
         intent: NativeCloseIntent,
+    ) -> Result<Self, NativeCloseCommandError> {
+        Self::new_with_shape(
+            source_transcript_id,
+            source,
+            intent,
+            NativeCloseSourceShape::Wrapped,
+        )
+    }
+
+    /// Binds authority to exactly the canonical wrapped or historical flat input supplied.
+    ///
+    /// # Errors
+    /// Rejects unsupported inputs or empty source identity fields.
+    pub fn new_with_source_input(
+        source_transcript_id: String,
+        source: SourceToolCall,
+        intent: NativeCloseIntent,
+        input: &serde_json::Value,
+    ) -> Result<Self, NativeCloseCommandError> {
+        let shape = if input == &intent.source_input() {
+            NativeCloseSourceShape::Wrapped
+        } else if input == &intent.legacy_source_input() {
+            NativeCloseSourceShape::LegacyFlat
+        } else {
+            return Err(NativeCloseCommandError::InvalidSourceInput);
+        };
+        Self::new_with_shape(source_transcript_id, source, intent, shape)
+    }
+
+    /// Reconstructs the original wire shape using retained authority, never current state.
+    ///
+    /// # Errors
+    /// Rejects unknown fingerprints or empty source identity fields.
+    pub fn new_from_retained_fingerprint(
+        source_transcript_id: &str,
+        source: &SourceToolCall,
+        intent: &NativeCloseIntent,
+        fingerprint: &str,
+    ) -> Result<Self, NativeCloseCommandError> {
+        for shape in [
+            NativeCloseSourceShape::Wrapped,
+            NativeCloseSourceShape::LegacyFlat,
+        ] {
+            let command = Self::new_with_shape(
+                source_transcript_id.to_owned(),
+                source.clone(),
+                intent.clone(),
+                shape,
+            )?;
+            if command.fingerprint() == fingerprint {
+                return Ok(command);
+            }
+        }
+        Err(NativeCloseCommandError::InvalidRetainedFingerprint)
+    }
+
+    fn new_with_shape(
+        source_transcript_id: String,
+        source: SourceToolCall,
+        intent: NativeCloseIntent,
+        source_shape: NativeCloseSourceShape,
     ) -> Result<Self, NativeCloseCommandError> {
         if source_transcript_id.trim().is_empty()
             || source.message_id.trim().is_empty()
@@ -115,6 +197,11 @@ impl NativeCloseCommand {
         let request_id = Uuid::new_v5(&REQUEST_NAMESPACE, &name);
 
         let mut canonical = FINGERPRINT_DOMAIN.to_vec();
+        // Flat commands retain the exact historical v1 bytes. Wrapped commands
+        // are domain-separated so the saved fingerprint also binds the wire shape.
+        if source_shape == NativeCloseSourceShape::Wrapped {
+            append_field(&mut canonical, b"wire.request.wrapped.v1");
+        }
         match &intent {
             NativeCloseIntent::Initial { target } => {
                 append_field(&mut canonical, b"initial");
@@ -153,9 +240,38 @@ impl NativeCloseCommand {
             source_transcript_id,
             source,
             intent,
+            source_shape,
             request_id,
             fingerprint,
         })
+    }
+
+    #[must_use]
+    pub fn source_input(&self) -> serde_json::Value {
+        match self.source_shape {
+            NativeCloseSourceShape::Wrapped => self.intent.source_input(),
+            NativeCloseSourceShape::LegacyFlat => self.intent.legacy_source_input(),
+        }
+    }
+
+    #[must_use]
+    pub fn matches_source_input(&self, input: &serde_json::Value) -> bool {
+        input == &self.source_input()
+    }
+
+    /// # Errors
+    /// Refuses unless both retained occurrences match this command's single wire shape.
+    pub fn verify_executing_source(
+        &self,
+        state: &phoenix_core::domain::sm_state::ConvState,
+        source: &SourceToolCall,
+    ) -> crate::DbResult<()> {
+        crate::executing_source::require_executing_source(
+            state,
+            source,
+            "close_conversation",
+            &self.source_input(),
+        )
     }
 
     /// Historical source correlation only; this does not confer live authority.
