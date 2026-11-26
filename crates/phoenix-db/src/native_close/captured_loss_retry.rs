@@ -437,6 +437,31 @@ mod tests {
         retained_loss_origin_with_wire_shape(true).await
     }
 
+    fn retained_loss_executing_state(input: serde_json::Value) -> ConvState {
+        ConvState::ToolExecuting {
+            current_tool: ToolCall::new(
+                "loss-call",
+                ToolInput::Unknown {
+                    name: "close_conversation".into(),
+                    input: input.clone(),
+                },
+            ),
+            remaining_tools: Vec::new(),
+            completed_results: Vec::new(),
+            pending_sub_agents: Vec::new(),
+            assistant_message: AssistantMessage::new(
+                "loss-message".into(),
+                vec![ContentBlock::ToolUse {
+                    id: "loss-call".into(),
+                    name: "close_conversation".into(),
+                    input,
+                }],
+                None,
+                None,
+            ),
+        }
+    }
+
     async fn retained_loss_origin_with_wire_shape(
         legacy_flat: bool,
     ) -> (Database, NativeCloseCommand, CloseRunRef) {
@@ -476,28 +501,7 @@ mod tests {
             &input,
         )
         .unwrap();
-        let live = ConvState::ToolExecuting {
-            current_tool: ToolCall::new(
-                "loss-call",
-                ToolInput::Unknown {
-                    name: "close_conversation".into(),
-                    input: input.clone(),
-                },
-            ),
-            remaining_tools: Vec::new(),
-            completed_results: Vec::new(),
-            pending_sub_agents: Vec::new(),
-            assistant_message: AssistantMessage::new(
-                "loss-message".into(),
-                vec![ContentBlock::ToolUse {
-                    id: "loss-call".into(),
-                    name: "close_conversation".into(),
-                    input,
-                }],
-                None,
-                None,
-            ),
-        };
+        let live = retained_loss_executing_state(input);
         database
             .update_conversation_state(&owner.id, &live)
             .await
