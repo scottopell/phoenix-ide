@@ -159,7 +159,9 @@ async fn process_claimed_product_creation(
                 PathBuf::from(path)
             }
             Some(_) => return Err("staged worktree does not match the durable pin".to_string()),
-            None => product_worktree_path(Path::new(&repo_root), job.product_conversation_id.as_str())?,
+            None => {
+                product_worktree_path(Path::new(&repo_root), job.product_conversation_id.as_str())?
+            }
         };
         let reservation_id = format!("{}:worktree", job.request_id);
         let reserved = manager
@@ -765,8 +767,12 @@ async fn reconcile_unpublished_staging(
     };
     match tokio::fs::symlink_metadata(path).await {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Ok(_) => Err(format!("unpublished path {path} has an occupant without proven custody")),
-        Err(error) => Err(format!("could not inspect {path}: {error}; staging was retained")),
+        Ok(_) => Err(format!(
+            "unpublished path {path} has an occupant without proven custody"
+        )),
+        Err(error) => Err(format!(
+            "could not inspect {path}: {error}; staging was retained"
+        )),
     }
 }
 
@@ -994,9 +1000,10 @@ fn verify_existing_product_creation_staging(
     let admin_dir = canonicalize(Path::new(admin_dir.trim()))?;
     let backpointer = admin_dir.join("gitdir");
     let registrations = canonicalize(&Path::new(&common).join("worktrees"))?;
-    if admin_dir.parent() != Some(registrations.as_path()) || !file_type(&backpointer)?.is_file()
-    {
-        return Err("existing staging has no exact Git registration in the reserved repository".to_string());
+    if admin_dir.parent() != Some(registrations.as_path()) || !file_type(&backpointer)?.is_file() {
+        return Err(
+            "existing staging has no exact Git registration in the reserved repository".to_string(),
+        );
     }
     let registered = std::fs::read_to_string(backpointer).map_err(|error| error.to_string())?;
     let registered = admin_dir.join(registered.trim_end_matches(['\r', '\n']));
@@ -1257,7 +1264,7 @@ pub(crate) async fn drain_pending_jobs(manager: &Arc<RuntimeManager>) -> Result<
         else {
             break;
         };
-        if let Err(error) = reconcile_creation_cleanup(manager, &cleanup).await {
+        if let Err(error) = reconcile_creation_cleanup(&cleanup) {
             tracing::warn!(job_id = %cleanup.job_id, error = %error, "conversation creation cleanup will retry");
             let _admitted = manager.acquire_local_authority_pass().map_err(|()| {
                 "creation cleanup retry rejected after fatal local authority closure".to_string()
@@ -1311,10 +1318,7 @@ pub(crate) async fn drain_pending_jobs(manager: &Arc<RuntimeManager>) -> Result<
     .await
 }
 
-async fn reconcile_creation_cleanup(
-    _manager: &Arc<RuntimeManager>,
-    cleanup: &crate::db::CreationCleanupJob,
-) -> Result<(), String> {
+fn reconcile_creation_cleanup(cleanup: &crate::db::CreationCleanupJob) -> Result<(), String> {
     Err(format!(
         "refusing legacy creation cleanup for job {}; resources and registrations are retained",
         cleanup.job_id
@@ -4259,15 +4263,13 @@ mod product_creation_staging_ownership_tests {
         std::fs::write(&user_file, "preserve me").unwrap();
         let oid = crate::git_ops::run_git(repo.path(), &["rev-parse", "HEAD"]).unwrap();
 
-        assert!(
-            verify_existing_product_creation_staging(
-                repo.path().to_str().unwrap(),
-                &path,
-                oid.trim(),
-                Some("owner-token"),
-            )
-                .is_err()
-        );
+        assert!(verify_existing_product_creation_staging(
+            repo.path().to_str().unwrap(),
+            &path,
+            oid.trim(),
+            Some("owner-token"),
+        )
+        .is_err());
         assert_eq!(std::fs::read_to_string(user_file).unwrap(), "preserve me");
     }
 
@@ -4318,7 +4320,10 @@ mod product_creation_staging_ownership_tests {
         std::fs::create_dir(&original).unwrap();
         std::fs::copy(moved.join(".git"), original.join(".git")).unwrap();
         assert!(!can_adopt_original());
-        assert_eq!(git(&["worktree", "list", "--porcelain", "-z"]), registrations);
+        assert_eq!(
+            git(&["worktree", "list", "--porcelain", "-z"]),
+            registrations
+        );
         assert!(moved.join(".git").is_file());
     }
 
@@ -4390,8 +4395,12 @@ mod product_creation_staging_ownership_tests {
     async fn absent_path_does_not_clear_previous_materialization_authority() {
         let repo = initialized_repo();
         let path = product_worktree_path(repo.path(), "owned").unwrap();
-        assert!(reconcile_unpublished_staging(path.to_str(), false).await.is_ok());
-        assert!(reconcile_unpublished_staging(path.to_str(), true).await.is_err());
+        assert!(reconcile_unpublished_staging(path.to_str(), false)
+            .await
+            .is_ok());
+        assert!(reconcile_unpublished_staging(path.to_str(), true)
+            .await
+            .is_err());
     }
 
     #[tokio::test]

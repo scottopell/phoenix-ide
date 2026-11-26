@@ -3083,7 +3083,7 @@ where
                     let _ = ack.send(Ok(()));
                 }
             } else {
-                self.emit_terminal_lifecycle_event().await;
+                self.emit_terminal_lifecycle_event();
                 if let Some(ack) = self.startup_llm_recovery_ack.take() {
                     let _ = ack.send(Ok(()));
                 }
@@ -3706,7 +3706,7 @@ where
                     clean_up_native_close_after_source_event!();
                     let terminal = matches!(self.state.step_result(), StepResult::Terminal(_));
                     if terminal {
-                        self.emit_terminal_lifecycle_event().await;
+                        self.emit_terminal_lifecycle_event();
                     }
                     if self.creation_settlement_disposition == CreationSettlementDisposition::StaleAuthority {
                         let _ = retirement.await;
@@ -3779,7 +3779,7 @@ where
                             ?outcome,
                             "Conversation reached terminal state, exiting executor loop"
                         );
-                        self.emit_terminal_lifecycle_event().await;
+                        self.emit_terminal_lifecycle_event();
                         defer_exit_until_native_close_observed!(
                             'runtime_events,
                             RuntimeExitDisposition::Terminal
@@ -3796,7 +3796,7 @@ where
                             ?outcome,
                             "Conversation reached terminal state, exiting executor loop"
                         );
-                        self.emit_terminal_lifecycle_event().await;
+                        self.emit_terminal_lifecycle_event();
                         defer_exit_until_native_close_observed!(
                             'runtime_events,
                             RuntimeExitDisposition::Terminal
@@ -3816,7 +3816,7 @@ where
                             state = self.state.variant_name(),
                             "Conversation reached terminal state, exiting executor loop"
                         );
-                        self.emit_terminal_lifecycle_event().await;
+                        self.emit_terminal_lifecycle_event();
                         defer_exit_until_native_close_observed!(
                             'runtime_events,
                             RuntimeExitDisposition::Terminal
@@ -3848,7 +3848,7 @@ where
                         return self.fatal_local_authority_exit();
                     }
                     if matches!(self.state.step_result(), StepResult::Terminal(_)) {
-                        self.emit_terminal_lifecycle_event().await;
+                        self.emit_terminal_lifecycle_event();
                         defer_exit_until_native_close_observed!(
                             'runtime_events,
                             RuntimeExitDisposition::Terminal
@@ -3898,7 +3898,7 @@ where
                             ?outcome,
                             "Conversation reached terminal state, exiting executor loop"
                         );
-                        self.emit_terminal_lifecycle_event().await;
+                        self.emit_terminal_lifecycle_event();
                         defer_exit_until_native_close_observed!(
                             'runtime_events,
                             RuntimeExitDisposition::Terminal
@@ -3933,7 +3933,7 @@ where
                             ?outcome,
                             "Conversation reached terminal state, exiting executor loop"
                         );
-                        self.emit_terminal_lifecycle_event().await;
+                        self.emit_terminal_lifecycle_event();
                         defer_exit_until_native_close_observed!(
                             'runtime_events,
                             RuntimeExitDisposition::Terminal
@@ -3957,7 +3957,7 @@ where
                             ?outcome,
                             "Conversation reached terminal state, exiting executor loop"
                         );
-                        self.emit_terminal_lifecycle_event().await;
+                        self.emit_terminal_lifecycle_event();
                         defer_exit_until_native_close_observed!(
                             'runtime_events,
                             RuntimeExitDisposition::Terminal
@@ -3980,7 +3980,7 @@ where
                             ?outcome,
                             "Conversation reached terminal state, exiting executor loop"
                         );
-                        self.emit_terminal_lifecycle_event().await;
+                        self.emit_terminal_lifecycle_event();
                         defer_exit_until_native_close_observed!(
                             'runtime_events,
                             RuntimeExitDisposition::Terminal
@@ -4034,7 +4034,7 @@ where
     }
 
     /// Broadcast the terminal lifecycle edge.
-    async fn emit_terminal_lifecycle_event(&self) {
+    fn emit_terminal_lifecycle_event(&self) {
         let _ = self
             .broadcast_tx
             .send_seq(|seq| SseEvent::ConversationBecameTerminal { sequence_id: seq });
@@ -12684,7 +12684,15 @@ where
             .broadcast_tx
             .admitted_publication(admitted)
             .persisted_message(message);
-        let task_title = reviewed.task_title;
+        self.publish_approved_task_title(reviewed.task_title, admitted);
+        Ok(())
+    }
+
+    fn publish_approved_task_title(
+        &self,
+        task_title: String,
+        admitted: &mut crate::runtime::AdmittedOperation,
+    ) {
         let _ = self
             .broadcast_tx
             .admitted_publication(admitted)
@@ -12708,7 +12716,6 @@ where
                     continued_in_conv_id: None,
                 },
             });
-        Ok(())
     }
 
     async fn promote_live_approved_task_authority(&mut self) {
@@ -20578,7 +20585,7 @@ mod context_exhausted_preserves_worktree_tests {
 
         // Fire the exact lifecycle hook the executor's `run()` loop calls
         // when it observes a terminal state.
-        rt.emit_terminal_lifecycle_event().await;
+        rt.emit_terminal_lifecycle_event();
 
         assert!(
             Path::new(&wt_path).exists(),
@@ -20606,7 +20613,7 @@ mod context_exhausted_preserves_worktree_tests {
             ConvState::Terminal,
         );
 
-        rt.emit_terminal_lifecycle_event().await;
+        rt.emit_terminal_lifecycle_event();
 
         assert!(Path::new(&wt_path).exists());
         assert!(branch_exists(&repo_root, branch));
@@ -20648,7 +20655,7 @@ mod context_exhausted_preserves_worktree_tests {
             ConvState::Terminal,
         );
 
-        rt.emit_terminal_lifecycle_event().await;
+        rt.emit_terminal_lifecycle_event();
 
         assert_eq!(
             std::fs::read_to_string(tracked_path).unwrap(),
@@ -20677,7 +20684,7 @@ mod context_exhausted_preserves_worktree_tests {
         let (rt, _rx) =
             build_runtime_with_state(storage, leaf_id, nested_path, ConvState::Terminal);
 
-        rt.emit_terminal_lifecycle_event().await;
+        rt.emit_terminal_lifecycle_event();
 
         assert_eq!(
             std::fs::read_to_string(unique_path).unwrap(),
@@ -20707,7 +20714,7 @@ mod context_exhausted_preserves_worktree_tests {
         rt.context.is_sub_agent = true;
         rt.context.root_conversation_id = owner_id.to_string();
 
-        rt.emit_terminal_lifecycle_event().await;
+        rt.emit_terminal_lifecycle_event();
 
         assert!(
             Path::new(&wt_path).exists(),
@@ -20732,7 +20739,7 @@ mod context_exhausted_preserves_worktree_tests {
         );
         rt.context.work_scope_worktree = None;
 
-        rt.emit_terminal_lifecycle_event().await;
+        rt.emit_terminal_lifecycle_event();
 
         assert!(
             Path::new(&wt_path).exists(),
