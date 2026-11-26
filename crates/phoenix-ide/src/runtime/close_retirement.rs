@@ -8048,16 +8048,26 @@ fn quarantine_has_process_cwd_in_until(
 }
 
 #[cfg(target_os = "macos")]
-fn macos_all_pids_until(deadline: std::time::Instant) -> Result<Vec<i32>, WriterScanError> {
-    macos_all_pids_with_until(
-        |buffer, buffer_bytes| unsafe { libc::proc_listpids(1, 0, buffer, buffer_bytes) },
+fn macos_uid_pids_until(
+    effective_uid: libc::uid_t,
+    deadline: std::time::Instant,
+) -> Result<Vec<i32>, WriterScanError> {
+    macos_uid_pids_with_until(
+        effective_uid,
+        |selector, uid, buffer, buffer_bytes| unsafe {
+            libc::proc_listpids(selector, uid, buffer, buffer_bytes)
+        },
         deadline,
     )
 }
 
 #[cfg(test)]
-fn macos_all_pids_with(mut list: impl FnMut(*mut libc::c_void, i32) -> i32) -> Option<Vec<i32>> {
-    macos_all_pids_with_until(
+fn macos_uid_pids_with(
+    effective_uid: libc::uid_t,
+    mut list: impl FnMut(u32, u32, *mut libc::c_void, i32) -> i32,
+) -> Option<Vec<i32>> {
+    macos_uid_pids_with_until(
+        effective_uid,
         &mut list,
         std::time::Instant::now() + std::time::Duration::from_secs(30),
     )
@@ -8065,11 +8075,16 @@ fn macos_all_pids_with(mut list: impl FnMut(*mut libc::c_void, i32) -> i32) -> O
 }
 
 #[cfg(any(target_os = "macos", test))]
-fn macos_all_pids_with_until(
-    mut list: impl FnMut(*mut libc::c_void, i32) -> i32,
+fn macos_uid_pids_with_until(
+    effective_uid: libc::uid_t,
+    mut list: impl FnMut(u32, u32, *mut libc::c_void, i32) -> i32,
     deadline: std::time::Instant,
 ) -> Result<Vec<i32>, WriterScanError> {
     use std::mem::size_of;
+
+    // XNU's PROC_UID_ONLY selector restricts the inventory before per-PID
+    // inspection, avoiding EPERM on unrelated users' live processes.
+    const PROC_UID_ONLY: u32 = 4;
     let mut capacity = 4096_usize;
     loop {
         writer_scan_check(deadline)?;
@@ -8080,7 +8095,12 @@ fn macos_all_pids_with_until(
         let capacity_bytes_i32 = i32::try_from(capacity_bytes)
             .map_err(|_| WriterScanError::Gap(CloseWriterGap::Unavailable))?;
         writer_scan_check(deadline)?;
-        let pid_bytes = list(pids.as_mut_ptr().cast(), capacity_bytes_i32);
+        let pid_bytes = list(
+            PROC_UID_ONLY,
+            effective_uid,
+            pids.as_mut_ptr().cast(),
+            capacity_bytes_i32,
+        );
         writer_scan_check(deadline)?;
         if pid_bytes <= 0 {
             return Err(WriterScanError::Gap(CloseWriterGap::Unavailable));
@@ -8967,12 +8987,24 @@ fn mac_mapping_is_writer(protection: u32, share_mode: u32) -> bool {
     protection & 2 != 0 && matches!(share_mode, 4 | 5 | 7)
 }
 
+#[cfg(any(target_os = "macos", test))]
+fn macos_selected_process_uid(
+    observed_uid: libc::uid_t,
+    effective_uid: libc::uid_t,
+) -> Result<(), CloseWriterGap> {
+    if observed_uid == effective_uid {
+        Ok(())
+    } else {
+        Err(CloseWriterGap::ProcessChanged)
+    }
+}
+
 #[cfg(target_os = "macos")]
 fn mac_writer_process_until(
     pid: libc::pid_t,
     effective_uid: libc::uid_t,
     deadline: std::time::Instant,
-) -> Result<Option<CloseWriterProcess>, WriterScanError> {
+) -> Result<CloseWriterProcess, WriterScanError> {
     use std::mem::{size_of, MaybeUninit};
     use std::os::unix::ffi::OsStrExt as _;
     writer_scan_check(deadline)?;
@@ -8993,9 +9025,7 @@ fn mac_writer_process_until(
     }
     // SAFETY: the complete structure was initialized above.
     let info = unsafe { info.assume_init() };
-    if info.pbi_uid != effective_uid {
-        return Ok(None);
-    }
+    macos_selected_process_uid(info.pbi_uid, effective_uid)?;
     let mut executable = [0_u8; 4096];
     writer_scan_check(deadline)?;
     // SAFETY: executable is a writable buffer with the declared length.
@@ -9012,7 +9042,7 @@ fn mac_writer_process_until(
         return Err(CloseWriterGap::Malformed.into());
     }
     writer_scan_check(deadline)?;
-    Ok(Some(CloseWriterProcess {
+    Ok(CloseWriterProcess {
         pid: u32::try_from(pid).map_err(|_| CloseWriterGap::Malformed)?,
         incarnation: OpaqueIdentity::parse(format!(
             "{}:{}",
@@ -9020,7 +9050,7 @@ fn mac_writer_process_until(
         ))
         .map_err(|_| CloseWriterGap::Malformed)?,
         executable: PathBuf::from(std::ffi::OsStr::from_bytes(&executable[..end])),
-    }))
+    })
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -9061,21 +9091,20 @@ fn mac_writer_scan_until(
     check_directory_deletion_deadline(Some(deadline))?;
     let canonical =
         canonical_result.map_err(|error| format!("cannot bind Close writer target: {error}"))?;
-    let pids_result = macos_all_pids_until(deadline);
+    let effective_uid = unsafe { libc::geteuid() };
+    let pids_result = macos_uid_pids_until(effective_uid, deadline);
     check_directory_deletion_deadline(Some(deadline))?;
     let pids = match pids_result {
         Ok(pids) => pids,
         Err(WriterScanError::Stopped(s)) => return Err(s),
         Err(WriterScanError::Gap(reason)) => return Ok(writer_gap(detector, None, reason)),
     };
-    let effective_uid = unsafe { libc::geteuid() };
     for pid in pids.into_iter().filter(|pid| *pid > 0) {
         check_directory_deletion_deadline(Some(deadline))?;
         let before_result = mac_writer_process_until(pid, effective_uid, deadline);
         check_directory_deletion_deadline(Some(deadline))?;
         let before = match before_result {
-            Ok(Some(identity)) => identity,
-            Ok(None) => continue,
+            Ok(identity) => identity,
             Err(WriterScanError::Stopped(message)) => return Err(message),
             Err(WriterScanError::Gap(gap)) => {
                 return Ok(writer_gap(detector, u32::try_from(pid).ok(), gap))
@@ -9091,7 +9120,7 @@ fn mac_writer_scan_until(
         let after_result = mac_writer_process_until(pid, effective_uid, deadline);
         check_directory_deletion_deadline(Some(deadline))?;
         let after = match after_result {
-            Ok(identity) => Ok(identity),
+            Ok(identity) => Ok(Some(identity)),
             Err(WriterScanError::Gap(gap)) => Err(gap),
             Err(WriterScanError::Stopped(message)) => return Err(message),
         };
@@ -14224,6 +14253,94 @@ mod tests {
     }
 
     #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn macos_disposable_detached_worktree_retires_with_real_writer_scans() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let repository = root.join("repository");
+        let target = root.join("detached");
+        initialize_repository(&repository);
+        run_git(
+            &repository,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "--detach",
+                target.to_str().unwrap(),
+                "HEAD",
+            ],
+        );
+        let identity = inspection_identity(&target);
+        let confirmed = inspect_worktree(&identity).await.unwrap().0;
+        let common = super::exact_worktree_common_git_dir(&target).unwrap();
+        let admin = exact_worktree_administrative_dir(&target, &common).unwrap();
+        let mut effects = injected_close_worktree_effects(|_| Ok(super::FsmonitorStop::NotRunning));
+        // Keep persistence and fsmonitor fixture-local; use the actual host
+        // descriptor, cwd, and mapping probes at the normal removal boundary.
+        effects.observe_open_descriptors = Box::new(super::quarantine_has_open_descriptors_until);
+        effects.observe_external_writer = Box::new(|path, deadline| {
+            Ok(super::quarantine_has_external_writer_until(path, deadline)?.blocks_retirement())
+        });
+        let outcome = super::quarantine_and_remove_exact_worktree_with_effects(
+            &identity,
+            &confirmed,
+            admin.clone(),
+            observe_administrative_dir_incarnation(&admin).unwrap(),
+            None,
+            |_, _, _| Ok(()),
+            |_| {},
+            effects,
+        )
+        .await
+        .unwrap();
+        match outcome {
+            ExactWorktreeRemoval::Retired => {}
+            ExactWorktreeRemoval::StopFailed { detail }
+            | ExactWorktreeRemoval::ReinspectionRequired { detail }
+            | ExactWorktreeRemoval::Residual { detail } => panic!("retirement blocked: {detail}"),
+        }
+        assert!(!target.exists());
+        assert!(!worktree_quarantine_path(&identity).unwrap().exists());
+        assert!(!admin.exists());
+        let listing = run_git_output(&repository, &["worktree", "list", "--porcelain"]);
+        assert!(!listing.contains(target.to_str().unwrap()));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_disposable_writer_scan_finds_same_user_process_cwd() {
+        use std::process::Command;
+        use std::time::{Duration, Instant};
+
+        let target = tempfile::tempdir().unwrap();
+        let mut writer = Command::new("/bin/sleep")
+            .arg("30")
+            .current_dir(target.path())
+            .spawn()
+            .unwrap();
+        let evidence = super::quarantine_has_process_cwd_mac_until(
+            target.path(),
+            Instant::now() + Duration::from_secs(10),
+        );
+        let _ = writer.kill();
+        let _ = writer.wait();
+        assert!(
+            matches!(
+                &evidence,
+                Ok(super::ExternalWriterEvidence::Blocked(
+                    super::CloseWriterObservation::Authority {
+                        authority: super::CloseWriterAuthority::WorkingDirectory,
+                        process,
+                        ..
+                    }
+                )) if process.pid == writer.id()
+            ),
+            "same-user process cwd should block retirement: {evidence:?}"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
     #[test]
     fn full_descriptor_buffer_requires_larger_inventory() {
         assert!(super::descriptor_inventory_may_be_truncated(4096, 4096));
@@ -14233,16 +14350,46 @@ mod tests {
 
     #[test]
     fn macos_process_inventory_failures_are_absent_evidence() {
-        assert_eq!(super::macos_all_pids_with(|_, _| 0), None);
-        assert_eq!(super::macos_all_pids_with(|_, _| -1), None);
-        assert_eq!(super::macos_all_pids_with(|_, _| 3), None);
+        assert_eq!(super::macos_uid_pids_with(501, |_, _, _, _| 0), None);
+        assert_eq!(super::macos_uid_pids_with(501, |_, _, _, _| -1), None);
+        assert_eq!(super::macos_uid_pids_with(501, |_, _, _, _| 3), None);
+    }
+
+    #[test]
+    fn selected_macos_pid_with_changed_uid_fails_closed_as_process_changed() {
+        assert_eq!(super::macos_selected_process_uid(501, 501), Ok(()));
+        assert_eq!(
+            super::macos_selected_process_uid(502, 501),
+            Err(super::CloseWriterGap::ProcessChanged)
+        );
+    }
+
+    #[test]
+    fn macos_process_inventory_excludes_foreign_uid_before_inspection() {
+        const FOREIGN_PID: i32 = 17;
+        const SAME_USER_PID: i32 = 23;
+        let list = |selector, uid, buffer: *mut libc::c_void, _| {
+            // Model XNU: the live foreign PID is visible to the all-PID
+            // selector, but its per-PID identity read would be denied.
+            let values: &[i32] = match (selector, uid) {
+                (1, _) => &[FOREIGN_PID, SAME_USER_PID],
+                (4, 501) => &[SAME_USER_PID],
+                _ => panic!("unexpected inventory selector {selector}, uid {uid}"),
+            };
+            // SAFETY: the scanner supplied its initial 4096-PID buffer.
+            unsafe { std::ptr::copy_nonoverlapping(values.as_ptr(), buffer.cast(), values.len()) };
+            i32::try_from(std::mem::size_of_val(values)).unwrap()
+        };
+        let pids = super::macos_uid_pids_with(501, list).unwrap();
+        assert_eq!(pids, [SAME_USER_PID]);
     }
 
     #[test]
     fn expired_macos_process_inventory_stops_before_listing() {
         let listed = std::cell::Cell::new(false);
-        let result = super::macos_all_pids_with_until(
-            |_, _| {
+        let result = super::macos_uid_pids_with_until(
+            501,
+            |_, _, _, _| {
                 listed.set(true);
                 0
             },
@@ -14259,7 +14406,9 @@ mod tests {
         use std::mem::size_of;
 
         let mut calls = 0;
-        let pids = super::macos_all_pids_with(|buffer, capacity_bytes| {
+        let pids = super::macos_uid_pids_with(501, |selector, uid, buffer, capacity_bytes| {
+            assert_eq!(selector, 4);
+            assert_eq!(uid, 501);
             calls += 1;
             if calls == 1 {
                 return capacity_bytes;
