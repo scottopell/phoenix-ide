@@ -3398,7 +3398,7 @@ where
         macro_rules! defer_exit_until_native_close_observed {
             ($event_loop:lifetime, $disposition:expr) => {{
                 let disposition = $disposition;
-                match Box::pin(self.prepare_native_close_exit(
+                let exit = match Box::pin(self.prepare_native_close_exit(
                     &mut pending_native_close_initial,
                     &mut pending_native_close_retry,
                     &mut admitted_native_close_retry,
@@ -3406,12 +3406,13 @@ where
                 ))
                 .await
                 {
-                    Some(exit) => return exit,
+                    Some(exit) => exit,
                     None => {
                         deferred_native_close_exit = Some(disposition);
                         continue $event_loop;
                     }
-                }
+                };
+                return exit;
             }};
         }
 
