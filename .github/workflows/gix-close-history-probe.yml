@@ -23,6 +23,9 @@ jobs:
           wc -c target/release/gix-close-history-probe
       - run: timeout 60s bash compare.sh "$PWD/target/release/gix-close-history-probe"
       - run: timeout 90s bash measure.sh "$PWD/target/release/gix-close-history-probe" 2>&1 | tee runtime.txt
+      - run: timeout 120s bash decoder-build.sh 2>&1 | tee decoder-build.txt
+      - run: timeout 60s bash decoder-compare.sh 2>&1 | tee decoder-compare.txt
+      - run: timeout 60s bash head-compare.sh 2>&1 | tee head-compare.txt
 
       - uses: actions/upload-artifact@v6
         if: always()
@@ -34,3 +37,5 @@ jobs:
             scripts/qualification/gix-close-history/metadata.json
             scripts/qualification/gix-close-history/build.txt
             scripts/qualification/gix-close-history/runtime.txt
+            scripts/qualification/gix-close-history/decoder-*.txt
+            scripts/qualification/gix-close-history/head-compare.txt
