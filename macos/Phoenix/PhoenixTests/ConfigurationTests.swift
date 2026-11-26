@@ -2337,4 +2337,101 @@ final class ServerManagerHelpersTests: XCTestCase {
         restartState.markApplyCompleted(for: .bundled)
         XCTAssertFalse(restartState.shouldForceRestart(for: .bundled, tomlEdited: false))
     }
+
+    func testUserConfigTomlDecodesSingleLineAndMultilineTripleQuotedStrings() throws {
+        let snippet = """
+        [llm]
+        api_key_helper = '''ddtool auth token --scope 'ai' # not a comment''' # trailing comment
+        default_model = \"\"\"google/gemini-4-neon\"\"\"
+        anthropic_base_url = \"\"\"
+        https://gateway.example.test/\\
+          anthropic/v1/messages\"\"\"
+
+        [llm.custom_headers]
+        X-Org = '''engineering'''
+        X-Multi = '''
+        line-one
+        line-two'''
+        """
+        let parsed = try UserConfigTomlParser.parseSnippet(snippet)
+        XCTAssertEqual(parsed.llm.apiKeyHelper, "ddtool auth token --scope 'ai' # not a comment")
+        XCTAssertEqual(parsed.llm.defaultModel, "google/gemini-4-neon")
+        XCTAssertEqual(parsed.llm.anthropicBaseURL, "https://gateway.example.test/anthropic/v1/messages")
+        XCTAssertEqual(parsed.llm.customHeaders["X-Org"], "engineering")
+        XCTAssertEqual(parsed.llm.customHeaders["X-Multi"], "line-one\nline-two")
+    }
+
+    func testSidecarLaunchEnvironmentUsesSameFallbackPathAsHelperTestsWhenCaptureIsNil() {
+        let home = URL(fileURLWithPath: "/Users/example")
+        let environment = SidecarLaunchEnvironment.build(
+            inherited: ["PATH": "/usr/bin:/bin"],
+            userHome: home,
+            instanceID: UUID(),
+            publicEnvironment: [:],
+            sidecarSecrets: [:],
+            loginShellPath: nil
+        )
+        let expected = LoginShellPathResolver.mergedSearchPath(
+            loginShellPath: nil,
+            inheritedPath: "/usr/bin:/bin",
+            userHome: home
+        )
+        XCTAssertEqual(environment["PATH"], expected)
+        XCTAssertTrue(environment["PATH"]?.contains("/Users/example/.local/bin") == true)
+        XCTAssertTrue(environment["PATH"]?.contains("/Users/example/bin") == true)
+    }
+
+    func testAuthHelperTestRunnerPreservesStandaloneDeviceCodeOnStderrWhileRunning() async throws {
+        let runner = AuthHelperTestRunner()
+        runner.run(command: "printf 'Open https://sso.example.test/device\\nABCD-EFGH\\n' >&2; sleep 0.25; printf 'final-secret-token\\n'")
+
+        var sawDeviceCodeWhileRunning = false
+        var sawURLWhileRunning = false
+        let deadline = ContinuousClock.now + .seconds(5)
+        while ContinuousClock.now < deadline {
+            switch runner.status {
+            case .running(let lines, let urls):
+                if lines.contains("ABCD-EFGH") {
+                    sawDeviceCodeWhileRunning = true
+                }
+                if urls.contains(URL(string: "https://sso.example.test/device")!) {
+                    sawURLWhileRunning = true
+                }
+            case .succeeded(let length, _, _):
+                XCTAssertEqual(length, "final-secret-token".count)
+                XCTAssertTrue(sawDeviceCodeWhileRunning, "Standalone device code on stderr must stay visible while helper is running")
+                XCTAssertTrue(sawURLWhileRunning, "Sign-in URL on stderr must be detected while helper is running")
+                return
+            case .failed(let message, _):
+                XCTFail("Expected helper test to succeed, got failure: \(message)")
+                return
+            case .idle:
+                break
+            }
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        XCTFail("Timed out waiting for AuthHelperTestRunner; final status: \(runner.status)")
+    }
+
+    func testOnboardingAPIKeysClearsExistingAPIKeyHelperWhilePreservingOtherLLMFields() {
+        let onlyHelper = UserLLMConfig(apiKeyHelper: "ddtool auth token")
+        let clearedAll = OnboardingAuthHelperConflict.configAfterChoosingAPIKeys(existing: onlyHelper)
+        XCTAssertTrue(clearedAll.shouldWrite)
+        XCTAssertNil(clearedAll.updated)
+
+        let helperAndEndpoint = UserLLMConfig(
+            apiKeyHelper: "ddtool auth token",
+            defaultModel: "claude-sonnet-4-6",
+            anthropicBaseURL: "https://gateway.example.test/v1/messages"
+        )
+        let keptEndpoint = OnboardingAuthHelperConflict.configAfterChoosingAPIKeys(existing: helperAndEndpoint)
+        XCTAssertTrue(keptEndpoint.shouldWrite)
+        XCTAssertNil(keptEndpoint.updated?.apiKeyHelper)
+        XCTAssertEqual(keptEndpoint.updated?.defaultModel, "claude-sonnet-4-6")
+        XCTAssertEqual(keptEndpoint.updated?.anthropicBaseURL, "https://gateway.example.test/v1/messages")
+
+        let noHelper = UserLLMConfig(defaultModel: "claude-sonnet-4-6")
+        let untouched = OnboardingAuthHelperConflict.configAfterChoosingAPIKeys(existing: noHelper)
+        XCTAssertFalse(untouched.shouldWrite)
+    }
 }

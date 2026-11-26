@@ -238,16 +238,11 @@ struct SidecarLaunchEnvironment {
         sidecarSecrets: [String: String],
         loginShellPath: String? = nil
     ) -> [String: String] {
-        let resolvedPath: String
-        if let loginShellPath, !loginShellPath.isEmpty {
-            resolvedPath = LoginShellPathResolver.mergedSearchPath(
-                loginShellPath: loginShellPath,
-                inheritedPath: inherited["PATH"],
-                userHome: userHome
-            )
-        } else {
-            resolvedPath = executableSearchPath(inherited: inherited["PATH"])
-        }
+        let resolvedPath = LoginShellPathResolver.mergedSearchPath(
+            loginShellPath: loginShellPath,
+            inheritedPath: inherited["PATH"],
+            userHome: userHome
+        )
         var environment = [
             "PATH": resolvedPath,
             "TMPDIR": inherited["TMPDIR"] ?? NSTemporaryDirectory(),

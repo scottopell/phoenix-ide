@@ -267,6 +267,8 @@ enum UserConfigTomlParser {
         var rawModelsBlocks: [String] = []
         var activeModelsBlock: [String]?
         var multiline = TomlMultilineTracker()
+        var bufferedStatementLines: [String]?
+        var bufferedStatementStartLine = 1
 
         let lines = normalized.components(separatedBy: "\n")
 
@@ -280,6 +282,88 @@ enum UserConfigTomlParser {
             }
         }
 
+        func processStatement(_ statement: String, lineNumber: Int) throws {
+            let cleaned = stripComment(statement).trimmingCharacters(in: .whitespacesAndNewlines)
+            guard let (rawKeyPath, rawValue) = splitKeyValue(cleaned) else {
+                throw UserConfigTomlError.invalidSyntax(line: lineNumber, detail: "expected 'key = value'")
+            }
+
+            let keySegments = try parseKeyPath(rawKeyPath, line: lineNumber)
+            guard !keySegments.isEmpty else {
+                throw UserConfigTomlError.invalidSyntax(line: lineNumber, detail: "empty key")
+            }
+
+            if case .root = currentSection {
+                if keySegments == ["version"] {
+                    let version = try parseInt(rawValue, field: "version", line: lineNumber)
+                    guard version == 1 else {
+                        throw UserConfigTomlError.unsupportedVersion(version)
+                    }
+                    return
+                }
+                // Allow bare [llm] snippets without an explicit [llm] header
+                if !sawExplicitSection, let first = keySegments.first,
+                   allowedLLMScalarKeys.contains(first) || first == "custom_headers" || first == "request_tags" || first == "request_models" || first == "anthropic_api_key" || first == "openai_api_key" {
+                    try applyLLMKeyPath(keySegments, rawValue: rawValue, into: &llm, line: lineNumber)
+                    return
+                }
+                if keySegments.first == "llm", keySegments.count >= 2 {
+                    try applyLLMKeyPath(Array(keySegments.dropFirst()), rawValue: rawValue, into: &llm, line: lineNumber)
+                    return
+                }
+                throw UserConfigTomlError.unknownField(section: "root", key: keySegments.joined(separator: "."), line: lineNumber)
+            }
+
+            switch currentSection {
+            case .llm:
+                try applyLLMKeyPath(keySegments, rawValue: rawValue, into: &llm, line: lineNumber)
+            case .llmCustomHeaders:
+                guard keySegments.count == 1 else {
+                    throw UserConfigTomlError.invalidSyntax(line: lineNumber, detail: "header name must be a single key")
+                }
+                let key = keySegments[0].trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !key.isEmpty else {
+                    throw UserConfigTomlError.invalidValue(field: "llm.custom_headers", detail: "header name must not be blank")
+                }
+                let value = try parseString(rawValue, field: "llm.custom_headers.\(key)", line: lineNumber)
+                llm.customHeaders[key] = value.trimmingCharacters(in: .whitespacesAndNewlines)
+            case .llmRequestTags:
+                guard keySegments.count == 1 else {
+                    throw UserConfigTomlError.invalidSyntax(line: lineNumber, detail: "tag key must be a single key")
+                }
+                let key = keySegments[0].trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !key.isEmpty else {
+                    throw UserConfigTomlError.invalidValue(field: "llm.request_tags", detail: "tag key must not be blank")
+                }
+                let value = try parseString(rawValue, field: "llm.request_tags.\(key)", line: lineNumber)
+                llm.requestTags[key] = value.trimmingCharacters(in: .whitespacesAndNewlines)
+            case .llmRequestModels(let route):
+                guard keySegments.count == 1 else {
+                    throw UserConfigTomlError.invalidSyntax(line: lineNumber, detail: "model ID must be a single key (quote IDs containing '/' or '.')")
+                }
+                let modelID = keySegments[0].trimmingCharacters(in: .whitespacesAndNewlines)
+                let target = try parseNonBlankString(rawValue, field: "llm.request_models.\(route).\(modelID)", line: lineNumber)
+                var routeMap = llm.requestModels[route] ?? [:]
+                routeMap[modelID] = target
+                llm.requestModels[route] = routeMap
+            case .llmRequestModelsRoot:
+                guard keySegments.count == 2 else {
+                    throw UserConfigTomlError.invalidSyntax(line: lineNumber, detail: "use [llm.request_models.<route>] for route overrides")
+                }
+                let route = keySegments[0]
+                guard allowedRequestModelRoutes.contains(route) else {
+                    throw UserConfigTomlError.invalidValue(field: "llm.request_models", detail: "unknown route '\(route)'")
+                }
+                let modelID = keySegments[1]
+                let target = try parseNonBlankString(rawValue, field: "llm.request_models.\(route).\(modelID)", line: lineNumber)
+                var routeMap = llm.requestModels[route] ?? [:]
+                routeMap[modelID] = target
+                llm.requestModels[route] = routeMap
+            case .root, .models, .other:
+                return
+            }
+        }
+
         for (zeroIndex, rawLine) in lines.enumerated() {
             let lineNumber = zeroIndex + 1
 
@@ -287,6 +371,12 @@ enum UserConfigTomlParser {
                 multiline.consume(line: rawLine)
                 if activeModelsBlock != nil {
                     activeModelsBlock?.append(rawLine)
+                } else if bufferedStatementLines != nil {
+                    bufferedStatementLines?.append(rawLine)
+                    if !multiline.isInsideMultilineString, let buffered = bufferedStatementLines {
+                        bufferedStatementLines = nil
+                        try processStatement(buffered.joined(separator: "\n"), lineNumber: bufferedStatementStartLine)
+                    }
                 }
                 continue
             }
@@ -352,84 +442,18 @@ enum UserConfigTomlParser {
                 continue
             }
 
-            guard let (rawKeyPath, rawValue) = splitKeyValue(cleaned) else {
-                throw UserConfigTomlError.invalidSyntax(line: lineNumber, detail: "expected 'key = value'")
-            }
-
-            let keySegments = try parseKeyPath(rawKeyPath, line: lineNumber)
-            guard !keySegments.isEmpty else {
-                throw UserConfigTomlError.invalidSyntax(line: lineNumber, detail: "empty key")
-            }
-
-            if case .root = currentSection {
-                if keySegments == ["version"] {
-                    let version = try parseInt(rawValue, field: "version", line: lineNumber)
-                    guard version == 1 else {
-                        throw UserConfigTomlError.unsupportedVersion(version)
-                    }
-                    continue
-                }
-                // Allow bare [llm] snippets without an explicit [llm] header
-                if !sawExplicitSection, let first = keySegments.first,
-                   allowedLLMScalarKeys.contains(first) || first == "custom_headers" || first == "request_tags" || first == "request_models" || first == "anthropic_api_key" || first == "openai_api_key" {
-                    try applyLLMKeyPath(keySegments, rawValue: rawValue, into: &llm, line: lineNumber)
-                    continue
-                }
-                if keySegments.first == "llm", keySegments.count >= 2 {
-                    try applyLLMKeyPath(Array(keySegments.dropFirst()), rawValue: rawValue, into: &llm, line: lineNumber)
-                    continue
-                }
-                throw UserConfigTomlError.unknownField(section: "root", key: keySegments.joined(separator: "."), line: lineNumber)
-            }
-
-            switch currentSection {
-            case .llm:
-                try applyLLMKeyPath(keySegments, rawValue: rawValue, into: &llm, line: lineNumber)
-            case .llmCustomHeaders:
-                guard keySegments.count == 1 else {
-                    throw UserConfigTomlError.invalidSyntax(line: lineNumber, detail: "header name must be a single key")
-                }
-                let key = keySegments[0].trimmingCharacters(in: .whitespacesAndNewlines)
-                guard !key.isEmpty else {
-                    throw UserConfigTomlError.invalidValue(field: "llm.custom_headers", detail: "header name must not be blank")
-                }
-                let value = try parseString(rawValue, field: "llm.custom_headers.\(key)", line: lineNumber)
-                llm.customHeaders[key] = value.trimmingCharacters(in: .whitespacesAndNewlines)
-            case .llmRequestTags:
-                guard keySegments.count == 1 else {
-                    throw UserConfigTomlError.invalidSyntax(line: lineNumber, detail: "tag key must be a single key")
-                }
-                let key = keySegments[0].trimmingCharacters(in: .whitespacesAndNewlines)
-                guard !key.isEmpty else {
-                    throw UserConfigTomlError.invalidValue(field: "llm.request_tags", detail: "tag key must not be blank")
-                }
-                let value = try parseString(rawValue, field: "llm.request_tags.\(key)", line: lineNumber)
-                llm.requestTags[key] = value.trimmingCharacters(in: .whitespacesAndNewlines)
-            case .llmRequestModels(let route):
-                guard keySegments.count == 1 else {
-                    throw UserConfigTomlError.invalidSyntax(line: lineNumber, detail: "model ID must be a single key (quote IDs containing '/' or '.')")
-                }
-                let modelID = keySegments[0].trimmingCharacters(in: .whitespacesAndNewlines)
-                let target = try parseNonBlankString(rawValue, field: "llm.request_models.\(route).\(modelID)", line: lineNumber)
-                var routeMap = llm.requestModels[route] ?? [:]
-                routeMap[modelID] = target
-                llm.requestModels[route] = routeMap
-            case .llmRequestModelsRoot:
-                guard keySegments.count == 2 else {
-                    throw UserConfigTomlError.invalidSyntax(line: lineNumber, detail: "use [llm.request_models.<route>] for route overrides")
-                }
-                let route = keySegments[0]
-                guard allowedRequestModelRoutes.contains(route) else {
-                    throw UserConfigTomlError.invalidValue(field: "llm.request_models", detail: "unknown route '\(route)'")
-                }
-                let modelID = keySegments[1]
-                let target = try parseNonBlankString(rawValue, field: "llm.request_models.\(route).\(modelID)", line: lineNumber)
-                var routeMap = llm.requestModels[route] ?? [:]
-                routeMap[modelID] = target
-                llm.requestModels[route] = routeMap
-            case .root, .models, .other:
+            multiline.consume(line: rawLine)
+            if multiline.isInsideMultilineString {
+                bufferedStatementLines = [rawLine]
+                bufferedStatementStartLine = lineNumber
                 continue
             }
+
+            try processStatement(rawLine, lineNumber: lineNumber)
+        }
+
+        if bufferedStatementLines != nil || multiline.isInsideMultilineString {
+            throw UserConfigTomlError.invalidSyntax(line: bufferedStatementStartLine, detail: "unterminated multiline string")
         }
 
         flushModelsBlock()
@@ -673,7 +697,27 @@ enum UserConfigTomlParser {
     }
 
     private static func parseString(_ rawValue: String, field: String, line: Int) throws -> String {
-        let trimmed = rawValue.trimmingCharacters(in: .whitespaces)
+        let trimmed = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.hasPrefix("'''") {
+            guard trimmed.count >= 6, trimmed.hasSuffix("'''") else {
+                throw UserConfigTomlError.invalidSyntax(line: line, detail: "unterminated multiline literal string for \(field)")
+            }
+            var inner = String(trimmed.dropFirst(3).dropLast(3))
+            if inner.hasPrefix("\n") {
+                inner.removeFirst()
+            }
+            return inner
+        }
+        if trimmed.hasPrefix("\"\"\"") {
+            guard trimmed.count >= 6, trimmed.hasSuffix("\"\"\"") else {
+                throw UserConfigTomlError.invalidSyntax(line: line, detail: "unterminated multiline basic string for \(field)")
+            }
+            var inner = String(trimmed.dropFirst(3).dropLast(3))
+            if inner.hasPrefix("\n") {
+                inner.removeFirst()
+            }
+            return try decodeBasicStringBody(inner, allowLineEndingBackslash: true, field: field, line: line)
+        }
         if trimmed.hasPrefix("'") {
             guard trimmed.count >= 2, trimmed.hasSuffix("'") else {
                 throw UserConfigTomlError.invalidSyntax(line: line, detail: "unterminated single-quoted string for \(field)")
@@ -683,13 +727,48 @@ enum UserConfigTomlParser {
         guard trimmed.hasPrefix("\""), trimmed.count >= 2, trimmed.hasSuffix("\"") else {
             throw UserConfigTomlError.invalidSyntax(line: line, detail: "expected quoted string for \(field)")
         }
+        return try decodeBasicStringBody(
+            String(trimmed.dropFirst().dropLast()),
+            allowLineEndingBackslash: false,
+            field: field,
+            line: line
+        )
+    }
+
+    private static func decodeBasicStringBody(
+        _ inner: String,
+        allowLineEndingBackslash: Bool,
+        field: String,
+        line: Int
+    ) throws -> String {
         var result = ""
-        let inner = trimmed.dropFirst().dropLast()
-        var iterator = inner.makeIterator()
-        while let ch = iterator.next() {
+        var index = inner.startIndex
+        while index < inner.endIndex {
+            let ch = inner[index]
             if ch == "\\" {
-                guard let escaped = iterator.next() else {
+                let next = inner.index(after: index)
+                guard next < inner.endIndex else {
                     throw UserConfigTomlError.invalidSyntax(line: line, detail: "dangling escape in \(field)")
+                }
+                let escaped = inner[next]
+                if allowLineEndingBackslash && (escaped == "\n" || escaped == " " || escaped == "\t") {
+                    var scan = next
+                    var sawNewline = false
+                    while scan < inner.endIndex {
+                        let ws = inner[scan]
+                        if ws == "\n" {
+                            sawNewline = true
+                            scan = inner.index(after: scan)
+                        } else if ws == " " || ws == "\t" {
+                            scan = inner.index(after: scan)
+                        } else {
+                            break
+                        }
+                    }
+                    if sawNewline {
+                        index = scan
+                        continue
+                    }
                 }
                 switch escaped {
                 case "\"": result.append("\"")
@@ -700,8 +779,10 @@ enum UserConfigTomlParser {
                 default:
                     throw UserConfigTomlError.invalidSyntax(line: line, detail: "unsupported escape \\\(escaped) in \(field)")
                 }
+                index = inner.index(after: next)
             } else {
                 result.append(ch)
+                index = inner.index(after: index)
             }
         }
         return result
@@ -736,25 +817,68 @@ enum UserConfigTomlParser {
     }
 
     static func stripComment(_ line: String) -> String {
+        var index = line.startIndex
+        var activeMultiline: TomlMultilineDelimiter?
         var inDouble = false
         var inSingle = false
-        var escaping = false
-        for index in line.indices {
+        while index < line.endIndex {
             let ch = line[index]
-            if escaping {
-                escaping = false
+            if let delimiter = activeMultiline {
+                if delimiter == .basic && ch == "\\" {
+                    index = line.index(after: index)
+                    if index < line.endIndex { index = line.index(after: index) }
+                    continue
+                }
+                let quoteChar: Character = delimiter == .basic ? "\"" : "'"
+                if ch == quoteChar {
+                    var runEnd = index
+                    var runLength = 0
+                    while runEnd < line.endIndex && line[runEnd] == quoteChar {
+                        runEnd = line.index(after: runEnd)
+                        runLength += 1
+                    }
+                    if runLength >= 3 {
+                        activeMultiline = nil
+                    }
+                    index = runEnd
+                    continue
+                }
+                index = line.index(after: index)
                 continue
             }
             if inDouble {
-                if ch == "\\" { escaping = true }
-                else if ch == "\"" { inDouble = false }
-            } else if inSingle {
-                if ch == "'" { inSingle = false }
-            } else {
-                if ch == "\"" { inDouble = true }
-                else if ch == "'" { inSingle = true }
-                else if ch == "#" { return String(line[..<index]) }
+                if ch == "\\" {
+                    index = line.index(after: index)
+                    if index < line.endIndex { index = line.index(after: index) }
+                    continue
+                }
+                if ch == "\"" { inDouble = false }
+                index = line.index(after: index)
+                continue
             }
+            if inSingle {
+                if ch == "'" { inSingle = false }
+                index = line.index(after: index)
+                continue
+            }
+            if line[index...].hasPrefix("\"\"\"") {
+                activeMultiline = .basic
+                index = line.index(index, offsetBy: 3)
+                continue
+            }
+            if line[index...].hasPrefix("'''") {
+                activeMultiline = .literal
+                index = line.index(index, offsetBy: 3)
+                continue
+            }
+            if ch == "\"" {
+                inDouble = true
+            } else if ch == "'" {
+                inSingle = true
+            } else if ch == "#" {
+                return String(line[..<index])
+            }
+            index = line.index(after: index)
         }
         return line
     }

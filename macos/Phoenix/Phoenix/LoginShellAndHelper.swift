@@ -271,11 +271,18 @@ final class AuthHelperTestRunner: ObservableObject {
     private var runToken = UUID()
     private var liveDisplayLines: [String] = []
     private var detectedURLs: [URL] = []
+    private var heldStdoutLine: String?
+
+    enum OutputStream {
+        case stdout
+        case stderr
+    }
 
     func reset() {
         cancel()
         liveDisplayLines = []
         detectedURLs = []
+        heldStdoutLine = nil
         status = .idle
     }
 
@@ -293,6 +300,7 @@ final class AuthHelperTestRunner: ObservableObject {
         activeProcess = nil
         liveDisplayLines = []
         detectedURLs = []
+        heldStdoutLine = nil
         if case .running = status {
             status = .idle
         }
@@ -439,6 +447,7 @@ final class AuthHelperTestRunner: ObservableObject {
         let collector = StreamCollector()
         liveDisplayLines = []
         detectedURLs = []
+        heldStdoutLine = nil
         status = .running(lines: ["Running auth helper…"], detectedURLs: [])
 
         stdoutPipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
@@ -451,7 +460,7 @@ final class AuthHelperTestRunner: ObservableObject {
             guard !emitted.isEmpty else { return }
             Task { @MainActor in
                 guard let self, self.runToken == token else { return }
-                self.ingestLiveLines(emitted)
+                self.ingestLiveLines(emitted, stream: .stdout)
             }
         }
 
@@ -465,7 +474,7 @@ final class AuthHelperTestRunner: ObservableObject {
             guard !emitted.isEmpty else { return }
             Task { @MainActor in
                 guard let self, self.runToken == token else { return }
-                self.ingestLiveLines(emitted)
+                self.ingestLiveLines(emitted, stream: .stderr)
             }
         }
 
@@ -524,17 +533,30 @@ final class AuthHelperTestRunner: ObservableObject {
         }
     }
 
-    private func ingestLiveLines(_ newLines: [String]) {
-        for line in newLines {
-            let urls = Self.extractHTTPSURLs(from: line)
-            for url in urls where !detectedURLs.contains(url) {
-                detectedURLs.append(url)
-            }
-            // Avoid displaying single-line raw tokens while streaming; show URL/instruction lines.
-            if !urls.isEmpty || line.contains(" ") {
-                liveDisplayLines.append(SidecarLogRecorder.defaultRedact(line))
-                if liveDisplayLines.count > 20 {
-                    liveDisplayLines = Array(liveDisplayLines.suffix(20))
+    private func ingestLiveLines(_ newLines: [String], stream: OutputStream) {
+        for rawLine in newLines {
+            let trimmed = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { continue }
+            switch stream {
+            case .stderr:
+                // stderr never carries the credential (REQ-CREDHELPER-001); preserve every
+                // instruction line including standalone device codes like ABCD-EFGH.
+                recordDisplayLine(trimmed)
+            case .stdout:
+                // The last non-empty stdout line is the credential (REQ-CREDHELPER-001).
+                // Hold back only the most recent stdout line; once another line arrives, the
+                // previous one is guaranteed not to be the credential. If the held line itself
+                // contains an interactive URL (e.g. OIDC sign-in prompt while waiting), show it
+                // immediately so the user can complete browser auth.
+                if let previous = heldStdoutLine {
+                    recordDisplayLine(previous)
+                    heldStdoutLine = nil
+                }
+                let urls = Self.extractHTTPSURLs(from: trimmed)
+                if !urls.isEmpty {
+                    recordDisplayLine(trimmed)
+                } else {
+                    heldStdoutLine = trimmed
                 }
             }
         }
@@ -543,6 +565,16 @@ final class AuthHelperTestRunner: ObservableObject {
                 lines: liveDisplayLines.isEmpty ? ["Running auth helper…"] : liveDisplayLines,
                 detectedURLs: detectedURLs
             )
+        }
+    }
+
+    private func recordDisplayLine(_ line: String) {
+        for url in Self.extractHTTPSURLs(from: line) where !detectedURLs.contains(url) {
+            detectedURLs.append(url)
+        }
+        liveDisplayLines.append(SidecarLogRecorder.defaultRedact(line))
+        if liveDisplayLines.count > 20 {
+            liveDisplayLines = Array(liveDisplayLines.suffix(20))
         }
     }
 

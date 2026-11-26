@@ -334,6 +334,16 @@ struct AuthHelperConfigEditor: View {
     """
 }
 
+enum OnboardingAuthHelperConflict {
+    static func configAfterChoosingAPIKeys(existing: UserLLMConfig?) -> (shouldWrite: Bool, updated: UserLLMConfig?) {
+        guard var current = existing, current.apiKeyHelper != nil else {
+            return (false, nil)
+        }
+        current.apiKeyHelper = nil
+        return (true, current.isEmpty ? nil : current)
+    }
+}
+
 struct OnboardingView: View {
     let onComplete: (ServerMode) -> Void
 
@@ -341,6 +351,7 @@ struct OnboardingView: View {
     @State private var providerChoice: OnboardingProviderChoice = .authHelper
     @State private var tomlText = ""
     @State private var loadedExistingToml = false
+    @State private var existingLLMConfig: UserLLMConfig?
     @State private var anthropicKey = ""
     @State private var openAIKey = ""
     @State private var attachedOrigin = ConfigurationStore.defaultAttachedOrigin
@@ -427,9 +438,12 @@ struct OnboardingView: View {
         .padding(24)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .onAppear {
-            if tomlText.isEmpty, let existing = try? UserConfigStore.loadExistingLLMConfig(at: configURL) {
-                tomlText = UserConfigTomlParser.serializeLLMBlock(existing)
-                loadedExistingToml = true
+            if let existing = try? UserConfigStore.loadExistingLLMConfig(at: configURL) {
+                existingLLMConfig = existing
+                if tomlText.isEmpty {
+                    tomlText = UserConfigTomlParser.serializeLLMBlock(existing)
+                    loadedExistingToml = true
+                }
             }
         }
         .task {
@@ -547,6 +561,20 @@ struct OnboardingView: View {
 
             case .apiKeys:
                 VStack(alignment: .leading, spacing: 10) {
+                    if existingLLMConfig?.apiKeyHelper != nil {
+                        HStack(alignment: .top, spacing: 8) {
+                            Image(systemName: "info.circle.fill")
+                                .foregroundStyle(.orange)
+                            Text("\(configPathDisplay) currently sets api_key_helper, which overrides static API keys. Starting with API Keys will clear api_key_helper from \(configPathDisplay) so these keys take effect.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                        .padding(10)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(Color.orange.opacity(0.08))
+                        .clipShape(RoundedRectangle(cornerRadius: 6))
+                    }
                     Text("Enter one or both provider API keys. Keys are stored in your Mac's Keychain, never in plain text.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
@@ -638,15 +666,20 @@ struct OnboardingView: View {
             draft.mode = .bundled
 
             let parsedAuthHelper: ParsedPastedConfig?
+            let apiKeyConflictResolution: (shouldWrite: Bool, updated: UserLLMConfig?)
             switch providerChoice {
             case .authHelper:
                 parsedAuthHelper = try UserConfigTomlParser.parseSnippet(tomlText)
+                apiKeyConflictResolution = (false, nil)
             case .codex:
                 parsedAuthHelper = nil
+                apiKeyConflictResolution = (false, nil)
             case .apiKeys:
                 parsedAuthHelper = nil
                 draft.anthropicKey = anthropicKey
                 draft.openAIKey = openAIKey
+                let currentExisting = (try? UserConfigStore.loadExistingLLMConfig(at: configURL)) ?? existingLLMConfig
+                apiKeyConflictResolution = OnboardingAuthHelperConflict.configAfterChoosingAPIKeys(existing: currentExisting)
             }
 
             // Validate bundled candidate (e.g. sidecar executable present) before writing config.toml.
@@ -662,6 +695,11 @@ struct OnboardingView: View {
                 try UserConfigStore.mergeAndWrite(
                     llm: parsed.llm,
                     rawModelsBlocks: parsed.rawModelsBlocks.isEmpty ? nil : parsed.rawModelsBlocks,
+                    to: configURL
+                )
+            } else if apiKeyConflictResolution.shouldWrite {
+                try UserConfigStore.mergeAndWrite(
+                    llm: apiKeyConflictResolution.updated,
                     to: configURL
                 )
             }
