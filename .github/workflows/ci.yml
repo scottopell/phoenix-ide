@@ -416,6 +416,14 @@ jobs:
       - name: ./dev.py check (rust) ${{ matrix.part }}
         timeout-minutes: 35
         run: ./dev.py check --lanes rust --rust-phase ${{ matrix.phase }} ${{ matrix.partition && format('--rust-partition {0}', matrix.partition) || '' }} --profile-work --profile-work-dir "$RUST_EVIDENCE_DIR/check"
+      - name: Retain generated wire bindings with the source receipt
+        if: ${{ !cancelled() && matrix.phase == 'codegen' }}
+        timeout-minutes: 1
+        run: |
+          generated=target/codegen-scratch/ui/src/generated
+          if [ -d "$generated" ]; then
+            cp -R "$generated" "$RUST_EVIDENCE_DIR/generated"
+          fi
       - name: Upload Rust evidence
         if: always()
         timeout-minutes: 2
