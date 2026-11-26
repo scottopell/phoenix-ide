@@ -9328,8 +9328,7 @@ where
                     "Dispatching LLM request after steering drain"
                 );
                 let effect = AuthoritativeEffect::RequestLlm;
-                match Box::pin(self.execute_authoritative_effect(effect, admitted)).await
-                {
+                match Box::pin(self.execute_authoritative_effect(effect, admitted)).await {
                     Ok(event) => Ok(event),
                     Err(error) => Ok(Some(self.llm_dispatch_failure_event(error))),
                 }
@@ -10822,7 +10821,12 @@ where
                     .any(|result| matches!(result, ToolRoundResult::PendingSelfGoal { .. }))
                 {
                     return self
-                        .persist_self_goal_checkpoint(assistant_message, tool_results, None, admitted)
+                        .persist_self_goal_checkpoint(
+                            assistant_message,
+                            tool_results,
+                            None,
+                            admitted,
+                        )
                         .await;
                 }
 
@@ -20032,10 +20036,19 @@ mod approved_explore_follow_up_tests {
 
         assert_eq!(branch_before, "HEAD");
         assert_eq!(std::fs::read(index.trim()).unwrap(), index_before);
-        assert_eq!(std::fs::read_to_string(&tracked).unwrap(), "unstaged bytes\n");
+        assert_eq!(
+            std::fs::read_to_string(&tracked).unwrap(),
+            "unstaged bytes\n"
+        );
         assert_eq!(run_git(&repo_root, &["show-ref"]).unwrap(), refs_before);
-        assert_eq!(run_git(&repo_root, &["rev-parse", "HEAD"]).unwrap(), main_head);
-        assert_eq!(run_git(&worktree, &["rev-parse", "HEAD"]).unwrap(), head_before);
+        assert_eq!(
+            run_git(&repo_root, &["rev-parse", "HEAD"]).unwrap(),
+            main_head
+        );
+        assert_eq!(
+            run_git(&worktree, &["rev-parse", "HEAD"]).unwrap(),
+            head_before
+        );
         assert_eq!(
             run_git(&worktree, &["rev-parse", "--abbrev-ref", "HEAD"]).unwrap(),
             branch_before,
