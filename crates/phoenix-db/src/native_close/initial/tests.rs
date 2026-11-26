@@ -14,7 +14,6 @@ use phoenix_core::work_scope::WorkScopeId;
 use phoenix_workflow::{
     AcceptedDisposition, ClientTurnKey, ConversationAuthority, PreparedTurn, Timestamp, TurnOutcome,
 };
-use serde_json::json;
 use sqlx::Connection;
 use std::collections::BTreeSet;
 use uuid::Uuid;

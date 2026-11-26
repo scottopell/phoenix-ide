@@ -231,9 +231,9 @@ pub(crate) async fn fence_pre_completion_native_sources_tx(
             NativeCloseIntent::Initial { target }
         };
         let command = NativeCloseCommand::new_from_retained_fingerprint(
-            transcript_id.to_owned(),
-            source.clone(),
-            intent,
+            transcript_id,
+            &source,
+            &intent,
             &row.try_get::<String, _>("request_fingerprint")?,
         )
         .map_err(|error| DbError::Serialization(error.to_string()))?;
@@ -429,9 +429,9 @@ pub(crate) async fn acknowledge_initial_result_tx(
                 tool_use_id: tool_result.tool_use_id.clone(),
             };
             let command = NativeCloseCommand::new_from_retained_fingerprint(
-                transcript_id.to_owned(),
-                source.clone(),
-                NativeCloseIntent::Initial {
+                transcript_id,
+                &source,
+                &NativeCloseIntent::Initial {
                     target: target.clone(),
                 },
                 &receipt.try_get::<String, _>("request_fingerprint")?,
@@ -576,9 +576,9 @@ async fn fence_completion_sources_tx(
             ProductConversationId::parse(origin.try_get::<String, _>("product_conversation_id")?)
                 .map_err(|error| DbError::Serialization(error.to_string()))?;
         let command = NativeCloseCommand::new_from_retained_fingerprint(
-            transcript_id.to_owned(),
-            source.clone(),
-            NativeCloseIntent::Initial { target },
+            transcript_id,
+            &source,
+            &NativeCloseIntent::Initial { target },
             &origin.try_get::<String, _>("origin_request_fingerprint")?,
         )
         .map_err(|error| DbError::Serialization(error.to_string()))?;

@@ -210,12 +210,12 @@ impl Database {
             ));
         };
         let initial_command = NativeCloseCommand::new_from_retained_fingerprint(
-            receipt.try_get("source_transcript_id")?,
-            SourceToolCall {
+            &receipt.try_get::<String, _>("source_transcript_id")?,
+            &SourceToolCall {
                 message_id: receipt.try_get("source_message_id")?,
                 tool_use_id: receipt.try_get("source_tool_use_id")?,
             },
-            NativeCloseIntent::Initial {
+            &NativeCloseIntent::Initial {
                 target: target.clone(),
             },
             &receipt.try_get::<String, _>("request_fingerprint")?,

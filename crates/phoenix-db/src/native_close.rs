@@ -155,9 +155,9 @@ impl NativeCloseCommand {
     /// # Errors
     /// Rejects unknown fingerprints or empty source identity fields.
     pub fn new_from_retained_fingerprint(
-        source_transcript_id: String,
-        source: SourceToolCall,
-        intent: NativeCloseIntent,
+        source_transcript_id: &str,
+        source: &SourceToolCall,
+        intent: &NativeCloseIntent,
         fingerprint: &str,
     ) -> Result<Self, NativeCloseCommandError> {
         for shape in [
@@ -165,7 +165,7 @@ impl NativeCloseCommand {
             NativeCloseSourceShape::LegacyFlat,
         ] {
             let command = Self::new_with_shape(
-                source_transcript_id.clone(),
+                source_transcript_id.to_owned(),
                 source.clone(),
                 intent.clone(),
                 shape,
@@ -265,8 +265,8 @@ impl NativeCloseCommand {
         &self,
         state: &phoenix_core::domain::sm_state::ConvState,
         source: &SourceToolCall,
-    ) -> Result<(), phoenix_core::domain::executing_source::ExecutingSourceRefusal> {
-        phoenix_core::domain::executing_source::verify_executing_source(
+    ) -> crate::DbResult<()> {
+        crate::executing_source::require_executing_source(
             state,
             source,
             "close_conversation",

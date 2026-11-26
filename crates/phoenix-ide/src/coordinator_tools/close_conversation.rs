@@ -356,6 +356,31 @@ mod tests {
     }
 
     #[test]
+    fn native_close_parser_preserves_whitespace_attempt_ids_in_both_wire_shapes() {
+        for (action, ordinal) in [
+            ("observe", "run_ordinal"),
+            ("explicit_retry", "failed_run_ordinal"),
+        ] {
+            // Persisted attempt IDs are exact nonempty strings, not trimmed identifiers.
+            for attempt_id in ["   ", " \tattempt\n "] {
+                let input = json!({
+                    "action": action,
+                    "product_conversation_id": "target",
+                    "attempt_id": attempt_id,
+                    ordinal: 1
+                });
+                let wrapped = json!({"request": input});
+                for source in [&input, &wrapped] {
+                    let intent = parse(source).unwrap();
+                    assert!(intent.matches_source_input(source));
+                    assert_eq!(intent.source_input(), wrapped);
+                    assert_eq!(intent.source_input()["request"]["attempt_id"], attempt_id);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn native_close_parser_rejects_invalid_coordinates_in_both_wire_shapes() {
         for (action, ordinal) in [
             ("observe", "run_ordinal"),
@@ -388,13 +413,17 @@ mod tests {
                 assert!(parse(&json!({"request":input})).is_err());
             }
             for field in ["product_conversation_id", "attempt_id"] {
-                for value in [json!(""), json!("   "), json!(1)] {
+                for value in [json!(""), json!(1)] {
                     let mut input = valid.clone();
                     input[field] = value;
                     assert!(parse(&input).is_err(), "accepted {input}");
                     assert!(parse(&json!({"request":input})).is_err());
                 }
             }
+            let mut blank_target = valid.clone();
+            blank_target["product_conversation_id"] = json!("   ");
+            assert!(parse(&blank_target).is_err());
+            assert!(parse(&json!({"request":blank_target})).is_err());
             let mut wrong = valid.clone();
             wrong.as_object_mut().unwrap().remove(ordinal);
             wrong[if action == "observe" {

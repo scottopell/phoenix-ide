@@ -226,15 +226,22 @@ fn legacy_fingerprint_bytes_are_unchanged_and_wrapping_is_domain_separated() {
         }
         assert_eq!(
             legacy.fingerprint(),
-            format!("{:x}", Sha256::digest(&bytes))
+            Sha256::digest(&bytes).iter().fold(
+                String::with_capacity(64),
+                |mut output, byte| {
+                    use std::fmt::Write as _;
+                    write!(output, "{byte:02x}").expect("writing to String cannot fail");
+                    output
+                },
+            )
         );
         assert_ne!(legacy.fingerprint(), wrapped.fingerprint());
         assert_eq!(legacy.request_id(), wrapped.request_id());
         assert_eq!(
             NativeCloseCommand::new_from_retained_fingerprint(
-                "transcript".into(),
-                source.clone(),
-                intent,
+                "transcript",
+                &source,
+                &intent,
                 "unknown-fingerprint",
             ),
             Err(NativeCloseCommandError::InvalidRetainedFingerprint)
@@ -265,9 +272,9 @@ fn supported_source_shapes_are_exact_and_must_agree_within_the_occurrence() {
             .unwrap();
             assert_eq!(command.source_input(), *input);
             let retained = NativeCloseCommand::new_from_retained_fingerprint(
-                "transcript".into(),
-                source.clone(),
-                intent.clone(),
+                "transcript",
+                &source,
+                &intent,
                 command.fingerprint(),
             )
             .unwrap();
@@ -281,7 +288,7 @@ fn supported_source_shapes_are_exact_and_must_agree_within_the_occurrence() {
                 )
                 .is_err());
             let state = executing_state(&source, input.clone(), input.clone());
-            assert_eq!(command.verify_executing_source(&state, &source), Ok(()));
+            assert!(command.verify_executing_source(&state, &source).is_ok());
             for wrong_source in [
                 SourceToolCall {
                     message_id: "other".into(),
