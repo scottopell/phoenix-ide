@@ -12670,12 +12670,14 @@ where
             admitted.close("approval_authority_establishment");
             return Err("FATAL_LOCAL_AUTHORITY_UNCLASSIFIED: approval authority establishment is unclassified".to_string());
         }
-        if let Err(error) = self.install_live_state(approved_state, state_updated_at, true) {
+        if let Err(error) = self.install_live_state(approved_state, state_updated_at, false) {
             admitted.close("approval_authority_projection");
             return Err(format!(
                 "FATAL_LOCAL_AUTHORITY_UNCLASSIFIED: approval projection failed: {error}"
             ));
         }
+        self.promote_live_approved_task_authority().await;
+        self.publish_live_state_admitted();
 
         let _ = self
             .broadcast_tx
@@ -12706,6 +12708,30 @@ where
                 },
             });
         Ok(())
+    }
+
+    async fn promote_live_approved_task_authority(&mut self) {
+        if self.context.resource_authority == crate::work_scope::ResourceAuthority::Restricted {
+            self.context.resource_authority = crate::work_scope::ResourceAuthority::Work;
+            let browser_promoted = self
+                .browser_sessions
+                .promote_actor_to_work_scope(
+                    &self.context.resource_scope,
+                    &self.context.conversation_id,
+                )
+                .await;
+            if !browser_promoted {
+                let restricted_actor = phoenix_core::work_scope::EffectiveResourceAccess::new(
+                    &self.context.conversation_id,
+                    crate::work_scope::ResourceAuthority::Restricted,
+                );
+                self.browser_sessions
+                    .request_kill_session_for_actor(&self.context.resource_scope, &restricted_actor)
+                    .await;
+            }
+            self.tool_executor.upgrade_to_work_mode();
+            self.clearable_names = Arc::new(self.tool_executor.clearable_tool_names());
+        }
     }
 
     fn restore_retryable_task_approval(
@@ -20019,6 +20045,7 @@ mod approved_explore_follow_up_tests {
         let mut admitted = authority_fence.try_acquire().expect("open authority fence");
 
         let branch_before = run_git(&worktree, &["rev-parse", "--abbrev-ref", "HEAD"]).unwrap();
+        runtime.context.resource_authority = crate::work_scope::ResourceAuthority::Restricted;
         runtime
             .execute_approve_task(
                 TaskApprovalInput {
@@ -20033,6 +20060,10 @@ mod approved_explore_follow_up_tests {
             .await
             .expect("initial approval");
 
+        assert_eq!(
+            runtime.context.resource_authority,
+            crate::work_scope::ResourceAuthority::Work
+        );
         assert_eq!(branch_before, "HEAD");
         assert_eq!(std::fs::read(index.trim()).unwrap(), index_before);
         assert_eq!(
